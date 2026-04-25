@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Paged Attention MIX Kernel — AIC + AIV with step-2 pipeline + FFTS cross-core sync
+ * Paged Attention MIX Kernel — AIC + AIV in single source via TPUSH/TPOP
  *
  * Hardware block_num is fixed at 24. Each hardware block strides over
  * total_logical_blocks = batch * q_loop logical work items:
@@ -21,18 +21,15 @@
  * Two q_tile shapes are statically dispatched: 16 (default) and 64.
  *
  * Compiled twice: once with __DAV_CUBE__ (AIC), once with __DAV_VEC__ (AIV).
- * AIC and AIV cooperate via 3 GM workspace buffers + FFTS cross-core sync flags
- * (one set per hardware block, with stage1/stage2 ping-pong):
- *   - s_ws: QK scores    (Q_TILE, block_size) fp32
- *   - p_ws: softmax probs (Q_TILE, block_size) bf16
- *   - o_ws: PV output    (Q_TILE, head_dim)   fp32
+ * AIC and AIV cooperate via 3 GM-backed FIFO pipes (one set per hardware block,
+ * reused across stride-loop iterations):
+ *   - sij_pipe (C2V): QK scores    (Q_TILE, block_size) fp32, TILE_UP_DOWN
+ *   - pij_pipe (V2C): softmax probs (Q_TILE, block_size) bf16, TILE_UP_DOWN
+ *   - oi_pipe  (C2V): PV output    (Q_TILE, head_dim)   fp32, TILE_UP_DOWN
  *
- * Step-2 pipeline: AIC processes KV blocks in pairs (i, i+1), doing two QK
- * matmuls before waiting for softmax, which eliminates the Cube idle gap:
- *   AIC: QK[i] → signal → QK[i+1] → signal → wait SF[i] → PV[i] → signal →
- *        wait SF[i+1] → PV[i+1] → signal
- *   AIV: wait QK[i] → SF[i] → signal → wait QK[i+1] → SF[i+1] → signal →
- *        wait PV[i] → UP[i] → wait PV[i+1] → UP[i+1]
+ * Per-block pipeline:
+ *   AIC: QK matmul → TPUSH(sij) → TPOP(pij) → PV matmul → TPUSH(oi_new)
+ *   AIV: TPOP(sij) → online softmax → TPUSH(pij) → TPOP(oi_new) → online update
  *
  * MixedKernels args:
  *   args[0]  = query         Tensor* (batch*num_heads, head_dim) bf16
@@ -41,9 +38,9 @@
  *   args[3]  = block_table   Tensor* (batch, max_blocks_per_req) int32
  *   args[4]  = context_lens  Tensor* (batch,) int32
  *   args[5]  = out           Tensor* (batch*num_heads, head_dim) float32 [output]
- *   args[6]  = s_ws          Tensor* GM workspace for QK scores
- *   args[7]  = p_ws          Tensor* GM workspace for softmax probs
- *   args[8]  = o_ws          Tensor* GM workspace for PV output
+ *   args[6]  = sij_fifo      Tensor* GM ring buffer for sij pipe
+ *   args[7]  = pij_fifo      Tensor* GM ring buffer for pij pipe
+ *   args[8]  = oi_fifo       Tensor* GM ring buffer for oi_new pipe
  *   args[9]  = scale_value   scalar (float bits in uint64)
  *   args[10] = num_heads     scalar
  *   args[11] = head_dim      scalar
@@ -57,10 +54,12 @@
 #include <cstdint>
 // NOLINTBEGIN(clang-diagnostic-error,bugprone-reserved-identifier,bugprone-easily-swappable-parameters,modernize-use-auto)
 #include <pto/pto-inst.hpp>
+#include <pto/common/fifo.hpp>
 
 #include "tensor.h"
 
 using pto::BLayout;
+using pto::Direction;
 using pto::GlobalTensor;
 using pto::Layout;
 using pto::PadValue;
@@ -74,6 +73,7 @@ using pto::TileLeft;
 using pto::TileRight;
 using pto::TileSplitAxis;
 using pto::TileType;
+using pto::TPipe;
 
 #ifndef __gm__
 #define __gm__
@@ -101,193 +101,155 @@ static constexpr int MAX_Q_TILE = 64;
 static constexpr int HEAD_DIM = 128;
 static constexpr int MAX_BLOCK_SIZE = 128;
 
-// FFTS cross-core sync flag IDs (stage1 / stage2 pairs)
-static constexpr uint16_t QK_READY_S1 = 0;
-static constexpr uint16_t SF_READY_S1 = 1;
-static constexpr uint16_t UP_READY_S1 = 2;
-static constexpr uint16_t QK_READY_S2 = 3;
-static constexpr uint16_t SF_READY_S2 = 4;
-static constexpr uint16_t UP_READY_S2 = 5;
+// TPUSH/TPOP pipe flag IDs (each consumes 2 consecutive IDs: data + backpressure)
+static constexpr uint16_t SIJ_FLAG_ID = 0;
+static constexpr uint16_t PIJ_FLAG_ID = 2;
+static constexpr uint16_t OI_FLAG_ID = 4;
+static constexpr uint8_t FIFO_DEPTH = 2;
 
-// FFTS helpers (from highperf utils)
-static __aicore__ inline void WaitFlagDev(uint16_t flagId) { wait_flag_dev(flagId); }
-
-template <pipe_t pipe, uint8_t mode>
-static __aicore__ inline void FftsCrossCoreSync(uint16_t flagId) {
-    uint64_t config = 1ULL | (static_cast<uint64_t>(mode) << 4) | (static_cast<uint64_t>(flagId) << 8);
-    ffts_cross_core_sync(pipe, config);
-}
-
-template <int V>
-static constexpr int RoundUp16 = ((V) + 15) & ~15;
-
-// Per-q_tile compile-time configuration: workspace sizes, UB/L1 layouts.
+// Per-q_tile compile-time configuration: pipe types, slot sizes, UB/L1 layouts.
 // QT must be 16 or 64. SUB_QT = QT / 2 (each of AIV0/AIV1 handles half the rows).
 template <int QT>
 struct PAConfig {
     static constexpr int Q_TILE = QT;
     static constexpr int SUB_QT = QT / 2;
 
-    // GM workspace sizes per stage (sized for max block_size)
-    static constexpr uint32_t S_WS_SIZE = QT * MAX_BLOCK_SIZE * sizeof(float);
-    static constexpr uint32_t P_WS_SIZE = QT * MAX_BLOCK_SIZE * sizeof(bfloat16_t);
-    static constexpr uint32_t O_WS_SIZE = QT * HEAD_DIM * sizeof(float);
+    // GM FIFO slot sizes (full tile per slot, sized for max block_size to allow
+    // the same FIFO to host both block_size=64 and block_size=128 cases).
+    static constexpr uint32_t SIJ_SLOT_SIZE = QT * MAX_BLOCK_SIZE * sizeof(float);
+    static constexpr uint32_t PIJ_SLOT_SIZE = QT * MAX_BLOCK_SIZE * sizeof(bfloat16_t);
+    static constexpr uint32_t OI_SLOT_SIZE = QT * HEAD_DIM * sizeof(float);
 
-    // AIV UB buffer layout (sized for SUB_QT rows per AIV lane)
+    using SijPipeT = TPipe<SIJ_FLAG_ID, Direction::DIR_C2V, SIJ_SLOT_SIZE, FIFO_DEPTH>;
+    using PijPipeT = TPipe<PIJ_FLAG_ID, Direction::DIR_V2C, PIJ_SLOT_SIZE, FIFO_DEPTH>;
+    using OiPipeT = TPipe<OI_FLAG_ID, Direction::DIR_C2V, OI_SLOT_SIZE, FIFO_DEPTH>;
+
+    // AIV UB consumer buffer layout (sized for SUB_QT rows per AIV lane)
     static constexpr uint32_t SIJ_UB_BASE = 0x0;
     static constexpr uint32_t SIJ_UB_SIZE = 2 * SUB_QT * MAX_BLOCK_SIZE * sizeof(float);
     static constexpr uint32_t OI_UB_BASE = SIJ_UB_BASE + SIJ_UB_SIZE;
     static constexpr uint32_t OI_UB_SIZE = 2 * SUB_QT * HEAD_DIM * sizeof(float);
     static constexpr uint32_t WORK_UB_BASE = OI_UB_BASE + OI_UB_SIZE;
 
-    // AIC L1 buffer for P (softmax probs from GM) — loaded via TLOAD from GM
+    // AIC L1 consumer buffer for V2C pij pipe (full QT * MAX_BLOCK_SIZE rows)
     static constexpr uint32_t PIJ_L1_BASE = 0x40000;
     static constexpr uint32_t PIJ_L1_SIZE = 2 * QT * MAX_BLOCK_SIZE * sizeof(bfloat16_t);
 };
 
 // ============================================================================
-// AIC (Cube) processing — step-2 pipeline with FFTS cross-core sync
+// AIC (Cube) processing — QK-first offset-loop software pipeline
 //
-// Step-2 pipeline: processes KV blocks in pairs (i, i+1).
-// For each pair:
-//   1. QK[i]   → write s_ws stage1 → signal QK_READY_S1
-//   2. QK[i+1] → write s_ws stage2 → signal QK_READY_S2
-//   3. Wait SF_READY_S1 → load p_ws stage1 → PV[i]   → write o_ws stage1 → signal UP_READY_S1
-//   4. Wait SF_READY_S2 → load p_ws stage2 → PV[i+1] → write o_ws stage2 → signal UP_READY_S2
+// QK-first order: each steady-state iteration does QK[i] then PV[i-1].
+// This maximizes overlap by hiding AIV's softmax behind AIC's QK matmul:
+// while AIC computes QK[i], AIV concurrently processes SF[i-1].
+// By the time AIC finishes QK[i] and needs pij[i-1], SF[i-1] is done.
+// FIFO_DEPTH=2 supports the 2-deep sij buffering (sij[i-1] + sij[i]).
 //
-// AIC does two consecutive QK matmuls before waiting for softmax,
-// eliminating the Cube idle gap present in the FIFO-based pipeline.
+// Timeline (steady state):
+//   AIC:  QK[i] → TPUSH(sij[i]) → TPOP(pij[i-1]) → PV[i-1] → TPUSH(oi[i-1])
+//   AIV:  TPOP(sij[i-1]) → SF[i-1] → TPUSH(pij[i-1]) → TPOP(oi[i-2]) → UP[i-2]
+//   ──────────────────────────────────────────────────────────────────────────
+//   QK[i] overlaps with SF[i-1]   (Cube compute ∥ Vector softmax)
+//   PV[i-1] overlaps with UP[i-2] (Cube compute ∥ Vector online update)
 // ============================================================================
 
-// Helper: begin K block load from GM→L1 into the ping or pong buffer (non-blocking)
-template <int K, int N, typename GlobalB_QK, typename TileMatB_QK>
-static __aicore__ void aic_start_k_load(
-    __gm__ bfloat16_t *key_base, __gm__ int32_t *bt, uint64_t bt_offset, uint64_t i, TileMatB_QK &bMatTile_QK_ping,
-    TileMatB_QK &bMatTile_QK_pong, uint64_t ping_flag
+// Helper: QK matmul for block i — load key, move to L0, matmul, TPUSH sij
+template <
+    int M, int K, int N, typename SijPipeT, typename GlobalB_QK, typename TileMatA_QK, typename TileMatB_QK,
+    typename LeftTile_QK, typename RightTile_QK, typename AccTile_QK>
+static __aicore__ void aic_qk_step(
+    __gm__ bfloat16_t *key_base, __gm__ int32_t *bt, uint64_t bt_offset, uint64_t i, TileMatA_QK &aMatTile_QK,
+    TileMatB_QK &bMatTile_QK_A, TileMatB_QK &bMatTile_QK_B, LeftTile_QK &aTile_QK, RightTile_QK &bTile_QK,
+    AccTile_QK &cTile_QK, SijPipeT &sij_pipe
 ) {
     GlobalB_QK kjGlobal(key_base + static_cast<uint64_t>(bt[bt_offset + i]) * N * K);
-    if (ping_flag == 0) {
-        TLOAD(bMatTile_QK_ping, kjGlobal);
+    if (i % 2 == 0) {
+        TLOAD(bMatTile_QK_A, kjGlobal);
     } else {
-        TLOAD(bMatTile_QK_pong, kjGlobal);
+        TLOAD(bMatTile_QK_B, kjGlobal);
     }
-}
 
-// Helper: complete QK — wait for K load, move Q+K to L0, matmul, write L0C→GM via fixpipe.
-template <
-    int M, int K, int N, typename TileMatA_QK, typename TileMatB_QK, typename LeftTile_QK, typename RightTile_QK,
-    typename AccTile_QK>
-static __aicore__ void aic_qk_compute_to_gm(
-    TileMatA_QK &aMatTile_QK, TileMatB_QK &bMatTile_QK_cur, LeftTile_QK &aTile_QK, RightTile_QK &bTile_QK,
-    AccTile_QK &cTile_QK, __gm__ float *s_ws_dst, int block_size
-) {
-    // Wait for K GM→L1 (and any prior Q GM→L1) to complete
     set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
 
-    // Q L1→L0A: Q stays in L1, reused across all KV blocks
     TMOV(aTile_QK, aMatTile_QK);
-    // K L1→L0B: from current ping-pong buffer
-    TMOV(bTile_QK, bMatTile_QK_cur);
+    if (i % 2 == 0) {
+        TMOV(bTile_QK, bMatTile_QK_A);
+    } else {
+        TMOV(bTile_QK, bMatTile_QK_B);
+    }
 
-    // Gate matmul on both L1→L0 moves completing
-    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
-    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
 
     TMATMUL(cTile_QK, aTile_QK, bTile_QK);
 
-    set_flag(PIPE_M, PIPE_FIX, EVENT_ID3);
-    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID3);
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
-    // Write L0C→GM via fixpipe (replaces TPUSH)
-    set_nd_para(1ULL);
-    pipe_barrier(PIPE_FIX);
-    copy_matrix_cc_to_gm(
-        s_ws_dst,
-        reinterpret_cast<__cc__ float *>(0x0),  // L0C address (TASSIGN'd)
-        0,                                      // sid
-        static_cast<uint16_t>(block_size),      // nSize
-        static_cast<uint16_t>(M),               // mSize
-        static_cast<uint16_t>(block_size),      // dstStride
-        static_cast<uint16_t>(RoundUp16<M>),    // srcStride (NZ format)
-        0,                                      // unitFlag
-        QuantMode_t::NoQuant, 0, false, true
-    );
-
-    // Ensure fixpipe DMA to GM is complete before signaling
+    // TPUSH sij (C2V): AccTile L0C -> GM. Ensure prior MTE3 is done,
+    // then push, then wait for MTE3 DMA to complete before signaling consumer.
+    TPUSH<SijPipeT, AccTile_QK, TileSplitAxis::TILE_UP_DOWN>(sij_pipe, cTile_QK);
     set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
     wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    sij_pipe.prod.record();
 }
 
-// Helper: begin V block load from GM→L1 (non-blocking)
-template <int K, int N, typename GlobalB_PV, typename TileMatB_PV>
-static __aicore__ void aic_start_v_load(
-    __gm__ bfloat16_t *val_base, __gm__ int32_t *bt, uint64_t bt_offset, uint64_t i, TileMatB_PV &bMatTile_PV_ping,
-    TileMatB_PV &bMatTile_PV_pong, uint64_t ping_flag
+// Helper: PV matmul for block i — TPOP pij, load value, move to L0, matmul, TPUSH oi
+template <
+    int M, int K, int N, typename PijPipeT, typename OiPipeT, typename GlobalB_PV, typename PijMatTile,
+    typename TileMatB_PV, typename LeftTile_PV, typename RightTile_PV, typename AccTile_PV>
+static __aicore__ void aic_pv_step(
+    __gm__ bfloat16_t *val_base, __gm__ int32_t *bt, uint64_t bt_offset, uint64_t i, PijMatTile &pijMatTile,
+    TileMatB_PV &bMatTile_PV_A, TileMatB_PV &bMatTile_PV_B, LeftTile_PV &aTile_PV, RightTile_PV &bTile_PV,
+    AccTile_PV &cTile_PV, PijPipeT &pij_pipe, OiPipeT &oi_pipe
 ) {
     GlobalB_PV vjGlobal(val_base + static_cast<uint64_t>(bt[bt_offset + i]) * N * K);
-    if (ping_flag == 0) {
-        TLOAD(bMatTile_PV_ping, vjGlobal);
+    if (i % 2 == 0) {
+        TLOAD(bMatTile_PV_A, vjGlobal);
     } else {
-        TLOAD(bMatTile_PV_pong, vjGlobal);
+        TLOAD(bMatTile_PV_B, vjGlobal);
     }
-}
 
-// Helper: complete PV — load p_ws from GM→L1, wait for V, matmul, write L0C→GM
-template <
-    int M, int K, int N, typename PijGlobal, typename PijMatTile, typename TileMatB_PV, typename LeftTile_PV,
-    typename RightTile_PV, typename AccTile_PV>
-static __aicore__ void aic_pv_compute_to_gm(
-    PijMatTile &pijMatTile, TileMatB_PV &bMatTile_PV_cur, LeftTile_PV &aTile_PV, RightTile_PV &bTile_PV,
-    AccTile_PV &cTile_PV, __gm__ bfloat16_t *p_ws_src, __gm__ float *o_ws_dst
-) {
-    // Load P from GM workspace into L1
-    PijGlobal pijGlobal(p_ws_src);
-    TLOAD(pijMatTile, pijGlobal);
+    TPOP<PijPipeT, PijMatTile, TileSplitAxis::TILE_NO_SPLIT>(pij_pipe, pijMatTile);
 
-    // Wait for V GM→L1 to complete
-    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
-    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID4);
+    // PV step uses EVENT_ID1 (QK step uses EVENT_ID0) to avoid flag aliasing
+    // when pipe_barrier(PIPE_ALL) is removed between steps.
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
 
-    // P L1→L0A
     TMOV(aTile_PV, pijMatTile);
-    // V L1→L0B from current ping-pong buffer
-    TMOV(bTile_PV, bMatTile_PV_cur);
+    if (i % 2 == 0) {
+        TMOV(bTile_PV, bMatTile_PV_A);
+    } else {
+        TMOV(bTile_PV, bMatTile_PV_B);
+    }
 
-    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID5);
-    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID5);
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
 
     TMATMUL(cTile_PV, aTile_PV, bTile_PV);
 
-    set_flag(PIPE_M, PIPE_FIX, EVENT_ID6);
-    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID6);
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
 
-    // Write L0C→GM via fixpipe (replaces TPUSH)
-    set_nd_para(1ULL);
-    pipe_barrier(PIPE_FIX);
-    copy_matrix_cc_to_gm(
-        o_ws_dst,
-        reinterpret_cast<__cc__ float *>(0x0),  // L0C address (TASSIGN'd)
-        0,                                      // sid
-        static_cast<uint16_t>(K),               // nSize = HEAD_DIM
-        static_cast<uint16_t>(M),               // mSize = Q_TILE
-        static_cast<uint16_t>(K),               // dstStride
-        static_cast<uint16_t>(RoundUp16<M>),    // srcStride (NZ format)
-        0,                                      // unitFlag
-        QuantMode_t::NoQuant, 0, false, true
-    );
-
+    // TPUSH oi (C2V): AccTile L0C -> GM. Same manual record pattern as sij.
+    TPUSH<OiPipeT, AccTile_PV, TileSplitAxis::TILE_UP_DOWN>(oi_pipe, cTile_PV);
     set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
     wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    oi_pipe.prod.record();
 }
 
 template <typename Cfg, int K, int N>
 static __aicore__ void aic_process_blocks(
     __gm__ bfloat16_t *qi_base, __gm__ bfloat16_t *key_base, __gm__ bfloat16_t *val_base, __gm__ int32_t *bt,
-    uint64_t bt_offset, uint64_t n_blocks, int64_t block_size, __gm__ float *s_ws_base, __gm__ bfloat16_t *p_ws_base,
-    __gm__ float *o_ws_base
+    uint64_t bt_offset, uint64_t n_blocks, typename Cfg::SijPipeT &sij_pipe, typename Cfg::PijPipeT &pij_pipe,
+    typename Cfg::OiPipeT &oi_pipe
 ) {
     constexpr int M = Cfg::Q_TILE;
+    using SijPipeT = typename Cfg::SijPipeT;
+    using PijPipeT = typename Cfg::PijPipeT;
+    using OiPipeT = typename Cfg::OiPipeT;
 
     using GlobalA_QK = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
     using GlobalB_QK = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, 1, K>, Layout::DN>;
@@ -300,7 +262,6 @@ static __aicore__ void aic_process_blocks(
     using GlobalB_PV = GlobalTensor<bfloat16_t, Shape<1, 1, 1, N, K>, Stride<N * K, N * K, N * K, K, 1>>;
     using TileMatB_PV = Tile<TileType::Mat, bfloat16_t, N, K, BLayout::ColMajor, N, K, SLayout::RowMajor, 512>;
     using PijMatTile = Tile<TileType::Mat, bfloat16_t, M, N, BLayout::ColMajor, M, N, SLayout::RowMajor, 512>;
-    using PijGlobal = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, N>, Stride<M * N, M * N, M * N, N, 1>>;
     using LeftTile_PV = TileLeft<bfloat16_t, M, N, M, N>;
     using RightTile_PV = TileRight<bfloat16_t, N, K, N, K>;
     using AccTile_PV = TileAcc<float, M, K, M, K>;
@@ -308,7 +269,6 @@ static __aicore__ void aic_process_blocks(
     constexpr int kQKBBytes = K * N * static_cast<int>(sizeof(bfloat16_t));
     constexpr int kPVBBytes = N * K * static_cast<int>(sizeof(bfloat16_t));
 
-    // L1 buffer layout: Q at 0x0, K ping/pong at 0x20000
     TileMatA_QK aMatTile_QK;
     TileMatB_QK bMatTile_QK_A, bMatTile_QK_B;
     TASSIGN(aMatTile_QK, 0x0);
@@ -322,10 +282,8 @@ static __aicore__ void aic_process_blocks(
     TASSIGN(bTile_QK, 0x0);
     TASSIGN(cTile_QK, 0x0);
 
-    // L1 buffer layout: pij at PIJ_L1_BASE, V ping/pong after
     PijMatTile pijMatTile;
     TileMatB_PV bMatTile_PV_A, bMatTile_PV_B;
-    TASSIGN(pijMatTile, Cfg::PIJ_L1_BASE);
     TASSIGN(bMatTile_PV_A, Cfg::PIJ_L1_BASE + Cfg::PIJ_L1_SIZE);
     TASSIGN(bMatTile_PV_B, Cfg::PIJ_L1_BASE + Cfg::PIJ_L1_SIZE + kPVBBytes);
 
@@ -336,103 +294,60 @@ static __aicore__ void aic_process_blocks(
     TASSIGN(bTile_PV, 0x0);
     TASSIGN(cTile_PV, 0x0);
 
-    // Q loaded once to L1 — reused across all KV blocks within this logical block
     GlobalA_QK qiGlobal(qi_base);
     TLOAD(aMatTile_QK, qiGlobal);
 
-    // Workspace stage offsets (in elements)
-    constexpr uint32_t S_STAGE_ELEMS = Cfg::S_WS_SIZE / sizeof(float);
-    constexpr uint32_t P_STAGE_ELEMS = Cfg::P_WS_SIZE / sizeof(bfloat16_t);
-    constexpr uint32_t O_STAGE_ELEMS = Cfg::O_WS_SIZE / sizeof(float);
-
-    __gm__ float *s_ws_s1 = s_ws_base;
-    __gm__ float *s_ws_s2 = s_ws_base + S_STAGE_ELEMS;
-    __gm__ bfloat16_t *p_ws_s1 = p_ws_base;
-    __gm__ bfloat16_t *p_ws_s2 = p_ws_base + P_STAGE_ELEMS;
-    __gm__ float *o_ws_s1 = o_ws_base;
-    __gm__ float *o_ws_s2 = o_ws_base + O_STAGE_ELEMS;
-
-    // Ping-pong flag: 0 = use buffer A (ping), 1 = use buffer B (pong)
-    uint64_t k_ping = 0;
-    uint64_t v_ping = 0;
-
-    // Step-2 loop: process KV blocks in pairs
-    for (uint64_t i = 0; i < n_blocks; i += 2) {
-        // ── CUBE1 Stage1: QK[i] ──
-        aic_start_k_load<K, N, GlobalB_QK>(key_base, bt, bt_offset, i, bMatTile_QK_A, bMatTile_QK_B, k_ping);
-        if (k_ping == 0) {
-            aic_qk_compute_to_gm<M, K, N>(
-                aMatTile_QK, bMatTile_QK_A, aTile_QK, bTile_QK, cTile_QK, s_ws_s1, static_cast<int>(block_size)
+    if (n_blocks == 1) {
+        // Degenerate case: no pipeline overlap possible
+        aic_qk_step<M, K, N, SijPipeT, GlobalB_QK>(
+            key_base, bt, bt_offset, 0, aMatTile_QK, bMatTile_QK_A, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK,
+            sij_pipe
+        );
+        aic_pv_step<M, K, N, PijPipeT, OiPipeT, GlobalB_PV>(
+            val_base, bt, bt_offset, 0, pijMatTile, bMatTile_PV_A, bMatTile_PV_B, aTile_PV, bTile_PV, cTile_PV,
+            pij_pipe, oi_pipe
+        );
+    } else {
+        // Prologue: QK[0] — produces sij[0] for AIV to start SF[0]
+        aic_qk_step<M, K, N, SijPipeT, GlobalB_QK>(
+            key_base, bt, bt_offset, 0, aMatTile_QK, bMatTile_QK_A, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK,
+            sij_pipe
+        );
+        // Steady state: QK[i] then PV[i-1] (QK-first order).
+        for (uint64_t i = 1; i < n_blocks; i++) {
+            aic_qk_step<M, K, N, SijPipeT, GlobalB_QK>(
+                key_base, bt, bt_offset, i, aMatTile_QK, bMatTile_QK_A, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK,
+                sij_pipe
             );
-        } else {
-            aic_qk_compute_to_gm<M, K, N>(
-                aMatTile_QK, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK, s_ws_s1, static_cast<int>(block_size)
+            aic_pv_step<M, K, N, PijPipeT, OiPipeT, GlobalB_PV>(
+                val_base, bt, bt_offset, i - 1, pijMatTile, bMatTile_PV_A, bMatTile_PV_B, aTile_PV, bTile_PV, cTile_PV,
+                pij_pipe, oi_pipe
             );
         }
-        k_ping = 1 - k_ping;
-        FftsCrossCoreSync<PIPE_FIX, 2>(QK_READY_S1);
 
-        // ── CUBE1 Stage2: QK[i+1] (if exists) ──
-        if (i + 1 < n_blocks) {
-            aic_start_k_load<K, N, GlobalB_QK>(key_base, bt, bt_offset, i + 1, bMatTile_QK_A, bMatTile_QK_B, k_ping);
-            if (k_ping == 0) {
-                aic_qk_compute_to_gm<M, K, N>(
-                    aMatTile_QK, bMatTile_QK_A, aTile_QK, bTile_QK, cTile_QK, s_ws_s2, static_cast<int>(block_size)
-                );
-            } else {
-                aic_qk_compute_to_gm<M, K, N>(
-                    aMatTile_QK, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK, s_ws_s2, static_cast<int>(block_size)
-                );
-            }
-            k_ping = 1 - k_ping;
-            FftsCrossCoreSync<PIPE_FIX, 2>(QK_READY_S2);
-        }
-
-        // ── CUBE2 Stage1: PV[i] ──
-        WaitFlagDev(SF_READY_S1);
-        aic_start_v_load<K, N, GlobalB_PV>(val_base, bt, bt_offset, i, bMatTile_PV_A, bMatTile_PV_B, v_ping);
-        if (v_ping == 0) {
-            aic_pv_compute_to_gm<M, K, N, PijGlobal>(
-                pijMatTile, bMatTile_PV_A, aTile_PV, bTile_PV, cTile_PV, p_ws_s1, o_ws_s1
-            );
-        } else {
-            aic_pv_compute_to_gm<M, K, N, PijGlobal>(
-                pijMatTile, bMatTile_PV_B, aTile_PV, bTile_PV, cTile_PV, p_ws_s1, o_ws_s1
-            );
-        }
-        v_ping = 1 - v_ping;
-        FftsCrossCoreSync<PIPE_FIX, 2>(UP_READY_S1);
-
-        // ── CUBE2 Stage2: PV[i+1] (if exists) ──
-        if (i + 1 < n_blocks) {
-            WaitFlagDev(SF_READY_S2);
-            aic_start_v_load<K, N, GlobalB_PV>(val_base, bt, bt_offset, i + 1, bMatTile_PV_A, bMatTile_PV_B, v_ping);
-            if (v_ping == 0) {
-                aic_pv_compute_to_gm<M, K, N, PijGlobal>(
-                    pijMatTile, bMatTile_PV_A, aTile_PV, bTile_PV, cTile_PV, p_ws_s2, o_ws_s2
-                );
-            } else {
-                aic_pv_compute_to_gm<M, K, N, PijGlobal>(
-                    pijMatTile, bMatTile_PV_B, aTile_PV, bTile_PV, cTile_PV, p_ws_s2, o_ws_s2
-                );
-            }
-            v_ping = 1 - v_ping;
-            FftsCrossCoreSync<PIPE_FIX, 2>(UP_READY_S2);
-        }
+        // Epilogue: PV[n-1] — consume last pij
+        aic_pv_step<M, K, N, PijPipeT, OiPipeT, GlobalB_PV>(
+            val_base, bt, bt_offset, n_blocks - 1, pijMatTile, bMatTile_PV_A, bMatTile_PV_B, aTile_PV, bTile_PV,
+            cTile_PV, pij_pipe, oi_pipe
+        );
     }
 }
 
 // ============================================================================
-// AIV (Vector) processing — step-2 pipeline with FFTS cross-core sync
+// AIV (Vector) processing — SF-first offset-loop software pipeline
 //
-// For each pair (i, i+1):
-//   1. Wait QK_READY_S1 → read s_ws stage1 → softmax[i] → write p_ws stage1 → signal SF_READY_S1
-//   2. Wait QK_READY_S2 → read s_ws stage2 → softmax[i+1] → write p_ws stage2 → signal SF_READY_S2
-//   3. Wait UP_READY_S1 → read o_ws stage1 → online update[i]
-//   4. Wait UP_READY_S2 → read o_ws stage2 → online update[i+1]
+// SF-first order: each steady-state iteration does SF[i] then UP[i-1].
+// This ensures pij[i] is produced as early as possible so AIC's TPOP(pij)
+// never stalls behind a pending UP computation. Combined with AIC's
+// QK-first order, SF[i] overlaps with AIC's PV[i-1] Cube matmul.
 // ============================================================================
 
-// Helper: softmax step for block i — read sij from GM, compute softmax, write pij to GM
+// Helper: softmax step for block i — TPOP sij, compute softmax, TPUSH pij
+//
+// globalMaxRow is used as a running accumulator: on entry it holds the max
+// from the previous iteration (or is undefined when i==0). SF updates it
+// in-place to max(globalMaxRow, localMaxRow_i * scale). The caller must
+// save globalMaxRow before calling SF if the old value is still needed.
 template <
     typename Cfg, int TM, int TN, typename SijVecTile, typename TileSijPad, typename TileVecMxN,
     typename PijVecBf16Tile, typename TileScalarDN, typename TileScalarRow>
@@ -440,21 +355,19 @@ static __aicore__ void aiv_sf_step(
     uint64_t i, bool is_last_partial, uint64_t valid_len_last, float scale_value, SijVecTile &sijTile,
     TileSijPad &sijPadTile, TileVecMxN &pijTile, TileVecMxN &tmpTile, PijVecBf16Tile &pijBf16Tile,
     TileScalarDN &localMaxDN, TileScalarDN &globalMaxDN, TileScalarDN &llDN, TileScalarRow &localMaxRow,
-    TileScalarRow &globalMaxRow, __gm__ float *s_ws_src, __gm__ bfloat16_t *p_ws_dst, int sij_ub_addr,
-    int pij_bf16_ub_addr, int64_t block_size
+    TileScalarRow &globalMaxRow, typename Cfg::SijPipeT &sij_pipe, typename Cfg::PijPipeT &pij_pipe
 ) {
     using TileSijDyn = Tile<TileType::Vec, float, TM, TN, BLayout::RowMajor, TM, -1>;
+    using SijPipeT = typename Cfg::SijPipeT;
+    using PijPipeT = typename Cfg::PijPipeT;
 
-    // Read sij from GM workspace to UB (replaces TPOP)
-    uint16_t sij_nburst = static_cast<uint16_t>(TM);
-    uint16_t sij_len_burst = static_cast<uint16_t>(block_size * sizeof(float) / 32);
-    copy_gm_to_ubuf(reinterpret_cast<__ubuf__ float *>(sij_ub_addr), s_ws_src, 0, sij_nburst, sij_len_burst, 0, 0);
+    TPOP<SijPipeT, SijVecTile, TileSplitAxis::TILE_UP_DOWN>(sij_pipe, sijTile);
 
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
     if (is_last_partial) {
-        int sij_addr = sij_ub_addr;
+        int sij_addr = Cfg::SIJ_UB_BASE + static_cast<int>((i % 2) * TM * TN * static_cast<int>(sizeof(float)));
         TASSIGN(sijPadTile, sij_addr);
         TileSijDyn sijDynTile(static_cast<size_t>(valid_len_last));
         TASSIGN(sijDynTile, sij_addr);
@@ -489,34 +402,28 @@ static __aicore__ void aiv_sf_step(
 
     TROWSUM(llDN, pijTile, tmpTile);
 
-    // Write pij to GM workspace (replaces TPUSH)
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-
-    uint16_t pij_nburst = static_cast<uint16_t>(TM);
-    uint16_t pij_len_burst = static_cast<uint16_t>(block_size * sizeof(bfloat16_t) / 32);
-    copy_ubuf_to_gm(
-        p_ws_dst, reinterpret_cast<__ubuf__ bfloat16_t *>(pij_bf16_ub_addr), 0, pij_nburst, pij_len_burst, 0, 0
-    );
-
-    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
-    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    TPUSH<PijPipeT, PijVecBf16Tile, TileSplitAxis::TILE_UP_DOWN>(pij_pipe, pijBf16Tile);
 }
 
-// Helper: online update step for block i — read oi from GM, merge with accumulators
+// Helper: online update step for block i — TPOP oi, merge with accumulators
+//
+// curMaxRow  = M[i]   = running max over blocks 0..i   (mij in FlashAttention notation)
+// prevMaxRow = M[i-1] = running max over blocks 0..i-1 (dm / old max)
+// llDN_i     = row-sum of pij for block i
+//
+// alpha = exp(prevMaxRow - curMaxRow), used to rescale accumulated go and gl.
 template <
     typename Cfg, int TM, int TN, typename OiVecTile, typename TileDataMxHD, typename TileScalarDN,
     typename TileScalarND, typename TileScalarRow>
 static __aicore__ void aiv_up_step(
     uint64_t i, OiVecTile &oiNewTile, TileDataMxHD &goTile, TileScalarDN &alphaDN_dn, TileScalarDN &llDN_i,
     TileScalarND &glND, TileScalarND &alphaND, TileScalarND &llND, TileScalarND &dmND, TileScalarND &mijND,
-    TileScalarRow &curMaxRow, TileScalarRow &prevMaxRow, __gm__ float *o_ws_src, int oi_ub_addr
+    TileScalarRow &curMaxRow, TileScalarRow &prevMaxRow, typename Cfg::OiPipeT &oi_pipe
 ) {
-    // Read oi_new from GM workspace to UB (replaces TPOP)
-    constexpr int HD = HEAD_DIM;
-    uint16_t oi_nburst = static_cast<uint16_t>(TM);
-    uint16_t oi_len_burst = static_cast<uint16_t>(HD * sizeof(float) / 32);
-    copy_gm_to_ubuf(reinterpret_cast<__ubuf__ float *>(oi_ub_addr), o_ws_src, 0, oi_nburst, oi_len_burst, 0, 0);
+    using OiPipeT = typename Cfg::OiPipeT;
+    TPOP<OiPipeT, OiVecTile, TileSplitAxis::TILE_UP_DOWN>(oi_pipe, oiNewTile);
 
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
@@ -551,8 +458,8 @@ static __aicore__ void aiv_up_step(
 
 template <typename Cfg, int TN>
 static __aicore__ void aiv_process_blocks(
-    float scale_value, uint64_t n_blocks, uint64_t valid_len_last, __gm__ float *dst_ptr, __gm__ float *s_ws_base,
-    __gm__ bfloat16_t *p_ws_base, __gm__ float *o_ws_base, int32_t sub_block_id, int64_t block_size
+    float scale_value, uint64_t n_blocks, uint64_t valid_len_last, __gm__ float *dst_ptr,
+    typename Cfg::SijPipeT &sij_pipe, typename Cfg::PijPipeT &pij_pipe, typename Cfg::OiPipeT &oi_pipe
 ) {
     constexpr int TM = Cfg::SUB_QT;
     constexpr int HD = HEAD_DIM;
@@ -593,21 +500,9 @@ static __aicore__ void aiv_process_blocks(
     OiVecTile oiNewTile;
     TileDataMxHD goTile;
 
-    // SIJ double-buffer in UB (for step-2 stage1/stage2)
-    int sij_ub_s1 = Cfg::SIJ_UB_BASE;
-    int sij_ub_s2 = Cfg::SIJ_UB_BASE + TM * TN * static_cast<int>(sizeof(float));
-    TASSIGN(sijTile, sij_ub_s1);
-    TASSIGN(sijPadTile, sij_ub_s1);
-
-    // OI double-buffer in UB
-    int oi_ub_s1 = Cfg::OI_UB_BASE;
-    int oi_ub_s2 = Cfg::OI_UB_BASE + TM * HD * static_cast<int>(sizeof(float));
-    TASSIGN(oiNewTile, oi_ub_s1);
-
     int ub = Cfg::WORK_UB_BASE;
     TASSIGN(pijTile, ub);
     ub += kSijBytes;
-    int pij_bf16_ub_addr = ub;
     TASSIGN(pijBf16Tile, ub);
     ub += kPijBf16Bytes;
     TASSIGN(tmpTile, ub);
@@ -649,96 +544,48 @@ static __aicore__ void aiv_process_blocks(
 
     bool last_partial = (valid_len_last < static_cast<uint64_t>(TN));
 
-    // Workspace stage offsets (in elements)
-    constexpr uint32_t S_STAGE_ELEMS = Cfg::S_WS_SIZE / sizeof(float);
-    constexpr uint32_t P_STAGE_ELEMS = Cfg::P_WS_SIZE / sizeof(bfloat16_t);
-    constexpr uint32_t O_STAGE_ELEMS = Cfg::O_WS_SIZE / sizeof(float);
-
-    // AIV sub-block offset: AIV0 reads top half, AIV1 reads bottom half
-    uint32_t sij_sub_offset = static_cast<uint32_t>(sub_block_id) * TM * static_cast<uint32_t>(block_size);
-    uint32_t pij_sub_offset = static_cast<uint32_t>(sub_block_id) * TM * static_cast<uint32_t>(block_size);
-    uint32_t oi_sub_offset = static_cast<uint32_t>(sub_block_id) * TM * HD;
-
-    __gm__ float *s_ws_s1 = s_ws_base + sij_sub_offset;
-    __gm__ float *s_ws_s2 = s_ws_base + S_STAGE_ELEMS + sij_sub_offset;
-    __gm__ bfloat16_t *p_ws_s1 = p_ws_base + pij_sub_offset;
-    __gm__ bfloat16_t *p_ws_s2 = p_ws_base + P_STAGE_ELEMS + pij_sub_offset;
-    __gm__ float *o_ws_s1 = o_ws_base + oi_sub_offset;
-    __gm__ float *o_ws_s2 = o_ws_base + O_STAGE_ELEMS + oi_sub_offset;
-
-    // Running block counter for online update (tracks logical block index)
-    uint64_t blk_idx = 0;
-
-    // Step-2 loop: process KV blocks in pairs (i, i+1).
-    // State entering each pair: globalMaxRow = M[blk_idx-1], llDN = ll[blk_idx-1]
-    // (undefined for blk_idx == 0, but UP[0] doesn't use curMax/prevMax).
-    for (uint64_t i = 0; i < n_blocks; i += 2) {
-        bool has_s2 = (i + 1 < n_blocks);
-
-        // Save M[blk_idx-1] for UP[i]'s prevMax (only needed when blk_idx > 0)
-        if (blk_idx > 0) {
-            TMULS(prevMaxRow, globalMaxRow, 1.0f);
-            pipe_barrier(PIPE_V);
-        }
-
-        // ── SF Stage1: softmax[i] ──
-        bool cur_last_partial_s1 = (i == n_blocks - 1) && last_partial;
-        WaitFlagDev(QK_READY_S1);
-        TASSIGN(sijTile, sij_ub_s1);
-        TASSIGN(sijPadTile, sij_ub_s1);
+    if (n_blocks == 1) {
         aiv_sf_step<Cfg, TM, TN>(
-            blk_idx, cur_last_partial_s1, valid_len_last, scale_value, sijTile, sijPadTile, pijTile, tmpTile,
-            pijBf16Tile, localMaxDN, globalMaxDN, llDN, localMaxRow, globalMaxRow, s_ws_s1, p_ws_s1, sij_ub_s1,
-            pij_bf16_ub_addr, block_size
+            0, last_partial, valid_len_last, scale_value, sijTile, sijPadTile, pijTile, tmpTile, pijBf16Tile,
+            localMaxDN, globalMaxDN, llDN, localMaxRow, globalMaxRow, sij_pipe, pij_pipe
         );
-        FftsCrossCoreSync<PIPE_MTE3, 2>(SF_READY_S1);
-        // After SF[i]: globalMaxRow = M[i], llDN = ll[i]
+        aiv_up_step<Cfg, TM, TN>(
+            0, oiNewTile, goTile, alphaDN_dn, llDN, glND, alphaND, llND, dmND, mijND, globalMaxRow, globalMaxRow,
+            oi_pipe
+        );
+    } else {
+        // Prologue: SF[0] — not the last block
+        aiv_sf_step<Cfg, TM, TN>(
+            0, false, valid_len_last, scale_value, sijTile, sijPadTile, pijTile, tmpTile, pijBf16Tile, localMaxDN,
+            globalMaxDN, llDN, localMaxRow, globalMaxRow, sij_pipe, pij_pipe
+        );
 
-        if (has_s2) {
-            // Save M[i] and ll[i] before SF[i+1] overwrites them
+        // Steady state: SF[i] then UP[i-1] (SF-first order).
+        for (uint64_t i = 1; i < n_blocks; i++) {
+            // Shift max history: prevMaxRow ← savedMaxRow (M[i-2])
+            // Save current: savedMaxRow ← globalMaxRow (M[i-1])
+            TMULS(prevMaxRow, savedMaxRow, 1.0f);
             TMULS(savedMaxRow, globalMaxRow, 1.0f);
             TMULS(savedLlDN, llDN, 1.0f);
             pipe_barrier(PIPE_V);
 
-            // ── SF Stage2: softmax[i+1] ──
-            bool cur_last_partial_s2 = (i + 1 == n_blocks - 1) && last_partial;
-            WaitFlagDev(QK_READY_S2);
-            TASSIGN(sijTile, sij_ub_s2);
-            TASSIGN(sijPadTile, sij_ub_s2);
+            bool cur_last_partial = (i == n_blocks - 1) && last_partial;
             aiv_sf_step<Cfg, TM, TN>(
-                blk_idx + 1, cur_last_partial_s2, valid_len_last, scale_value, sijTile, sijPadTile, pijTile, tmpTile,
-                pijBf16Tile, localMaxDN, globalMaxDN, llDN, localMaxRow, globalMaxRow, s_ws_s2, p_ws_s2, sij_ub_s2,
-                pij_bf16_ub_addr, block_size
+                i, cur_last_partial, valid_len_last, scale_value, sijTile, sijPadTile, pijTile, tmpTile, pijBf16Tile,
+                localMaxDN, globalMaxDN, llDN, localMaxRow, globalMaxRow, sij_pipe, pij_pipe
             );
-            FftsCrossCoreSync<PIPE_MTE3, 2>(SF_READY_S2);
-            // After SF[i+1]: globalMaxRow = M[i+1], llDN = ll[i+1]
-        }
 
-        // ── UP Stage1: update[i] ──
-        // curMax = M[i]: savedMaxRow if has_s2, else globalMaxRow (still live)
-        // prevMax = M[i-1]: prevMaxRow (saved above, only used when blk_idx > 0)
-        // llDN_i = ll[i]: savedLlDN if has_s2, else llDN (still live)
-        WaitFlagDev(UP_READY_S1);
-        TASSIGN(oiNewTile, oi_ub_s1);
-        aiv_up_step<Cfg, TM, TN>(
-            blk_idx, oiNewTile, goTile, alphaDN_dn, has_s2 ? savedLlDN : llDN, glND, alphaND, llND, dmND, mijND,
-            has_s2 ? savedMaxRow : globalMaxRow, prevMaxRow, o_ws_s1, oi_ub_s1
-        );
-        blk_idx++;
-
-        // ── UP Stage2: update[i+1] (if exists) ──
-        // curMax = M[i+1] = globalMaxRow (live)
-        // prevMax = M[i] = savedMaxRow (saved before SF[i+1])
-        // llDN_i = ll[i+1] = llDN (live)
-        if (has_s2) {
-            WaitFlagDev(UP_READY_S2);
-            TASSIGN(oiNewTile, oi_ub_s2);
             aiv_up_step<Cfg, TM, TN>(
-                blk_idx, oiNewTile, goTile, alphaDN_dn, llDN, glND, alphaND, llND, dmND, mijND, globalMaxRow,
-                savedMaxRow, o_ws_s2, oi_ub_s2
+                i - 1, oiNewTile, goTile, alphaDN_dn, savedLlDN, glND, alphaND, llND, dmND, mijND, savedMaxRow,
+                prevMaxRow, oi_pipe
             );
-            blk_idx++;
         }
+
+        // Epilogue: UP[n-1] — uses live globalMaxRow (M[n-1]) and savedMaxRow (M[n-2])
+        aiv_up_step<Cfg, TM, TN>(
+            n_blocks - 1, oiNewTile, goTile, alphaDN_dn, llDN, glND, alphaND, llND, dmND, mijND, globalMaxRow,
+            savedMaxRow, oi_pipe
+        );
     }
 
     // Final normalization: output = goTile / glDN
@@ -754,7 +601,7 @@ static __aicore__ void aiv_process_blocks(
 }
 
 // ============================================================================
-// Per-config dispatch: computes per-hw-block workspace pointers, then runs
+// Per-config dispatch: builds pipes from per-hw-block FIFO bases, then runs
 // the AIC or AIV stride loop over total_logical_blocks.
 // ============================================================================
 
@@ -762,8 +609,36 @@ template <typename Cfg>
 static __aicore__ void run_aic(
     __gm__ int64_t *args, __gm__ int32_t *ctx_ptr, int32_t hw_block_idx, int32_t hw_block_num,
     int64_t total_logical_blocks, int64_t num_heads, int64_t head_dim, int64_t block_size, int64_t max_blocks_per_req,
-    int64_t q_loop, __gm__ float *s_ws_base, __gm__ bfloat16_t *p_ws_base, __gm__ float *o_ws_base
+    int64_t q_loop, __gm__ void *sij_fifo_base, __gm__ void *pij_fifo_base, __gm__ void *oi_fifo_base
 ) {
+    typename Cfg::SijPipeT sij_pipe(sij_fifo_base, Cfg::SIJ_UB_BASE, 0U);
+    typename Cfg::PijPipeT pij_pipe(pij_fifo_base, 0U, Cfg::PIJ_L1_BASE);
+    typename Cfg::OiPipeT oi_pipe(oi_fifo_base, Cfg::OI_UB_BASE, 0U);
+
+    // Disable auto-record on C2V pipes: AccTile TSTORE goes through FIX → MTE3,
+    // but auto-record fires on PIPE_FIX which may complete before MTE3 DMA writes
+    // to GM. Manual pipe_barrier(PIPE_MTE3) + record() in each step ensures the
+    // cross-core signal fires only after the GM write is visible.
+    sij_pipe.prod.setRecordStatus(false);
+    oi_pipe.prod.setRecordStatus(false);
+
+    // Disable reverse-dependency sync (back-pressure). Forward dependency chain
+    // (AIC: QK-first; AIV: SF-first; FIFO_DEPTH=2) guarantees producer is at
+    // most SLOT_NUM=2 tiles ahead of consumer:
+    //   sij: AIC pushes sij[i+1] only after TPOP(pij[i-1]), which requires
+    //        AIV TPOP(sij[i-1]) — slot reuse safe.
+    //   oi : AIC pushes oi[i+1]  only after TPOP(pij[i+1]), which requires
+    //        AIV's iter i+1 SF, by which time AIV iter i finished UP[i-1]
+    //        i.e. TPOP(oi[i-1]) — slot reuse safe.
+    //   pij: AIV pushes pij[i+1] only after TPOP(sij[i+1]), which fires after
+    //        AIC iter i+1 starts and AIC iter i has finished TPOP(pij[i-1])
+    //        — slot reuse safe.
+    // If the QK-first/SF-first interleaving or FIFO_DEPTH changes, restore
+    // these flags.
+    sij_pipe.prod.setAllocateStatus(false);
+    oi_pipe.prod.setAllocateStatus(false);
+    pij_pipe.cons.setFreeStatus(false);
+
     __gm__ Tensor *query_t = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *key_cache_t = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *value_cache_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
@@ -790,13 +665,11 @@ static __aicore__ void run_aic(
 
         if (block_size == 128) {
             aic_process_blocks<Cfg, 128, 128>(
-                qi_base, key_base, val_base, bt, bt_offset, static_cast<uint64_t>(n_blocks), block_size, s_ws_base,
-                p_ws_base, o_ws_base
+                qi_base, key_base, val_base, bt, bt_offset, static_cast<uint64_t>(n_blocks), sij_pipe, pij_pipe, oi_pipe
             );
         } else {
             aic_process_blocks<Cfg, 128, 64>(
-                qi_base, key_base, val_base, bt, bt_offset, static_cast<uint64_t>(n_blocks), block_size, s_ws_base,
-                p_ws_base, o_ws_base
+                qi_base, key_base, val_base, bt, bt_offset, static_cast<uint64_t>(n_blocks), sij_pipe, pij_pipe, oi_pipe
             );
         }
     }
@@ -806,13 +679,34 @@ template <typename Cfg>
 static __aicore__ void run_aiv(
     __gm__ int64_t *args, __gm__ int32_t *ctx_ptr, int32_t hw_block_idx, int32_t hw_block_num,
     int64_t total_logical_blocks, int64_t num_heads, int64_t head_dim, int64_t block_size, int64_t q_loop,
-    __gm__ float *s_ws_base, __gm__ bfloat16_t *p_ws_base, __gm__ float *o_ws_base
+    __gm__ void *sij_fifo_base, __gm__ void *pij_fifo_base, __gm__ void *oi_fifo_base
 ) {
+    typename Cfg::SijPipeT sij_pipe(sij_fifo_base, Cfg::SIJ_UB_BASE, 0U);
+    typename Cfg::PijPipeT pij_pipe(pij_fifo_base, 0U, Cfg::PIJ_L1_BASE);
+    typename Cfg::OiPipeT oi_pipe(oi_fifo_base, Cfg::OI_UB_BASE, 0U);
+
     __gm__ Tensor *out_t = reinterpret_cast<__gm__ Tensor *>(args[5]);
     float scale_value = from_u64<float>(static_cast<uint64_t>(args[9]));
 
     int32_t sub_block_id = get_sub_block_id(args);
     int64_t row_offset = sub_block_id * Cfg::SUB_QT;
+
+    // Entry offsets depend on the actual tile width (block_size for sij/pij, HEAD_DIM for oi).
+    // TILE_UP_DOWN splits Q_TILE rows into two SUB_QT halves; AIV1's data starts at
+    // SUB_QT * tile_width * sizeof(element) within the contiguous TPUSH'd tile.
+    int sij_sub_offset = sub_block_id * Cfg::SUB_QT * static_cast<int>(block_size) * static_cast<int>(sizeof(float));
+    int pij_sub_offset =
+        sub_block_id * Cfg::SUB_QT * static_cast<int>(block_size) * static_cast<int>(sizeof(bfloat16_t));
+    int oi_sub_offset = sub_block_id * Cfg::SUB_QT * HEAD_DIM * static_cast<int>(sizeof(float));
+    sij_pipe.cons.setEntryOffset(sij_sub_offset);
+    pij_pipe.prod.setEntryOffset(pij_sub_offset);
+    oi_pipe.cons.setEntryOffset(oi_sub_offset);
+
+    // Mirror reverse-dependency disable on the AIV side (see run_aic for
+    // the full forward-chain argument).
+    pij_pipe.prod.setAllocateStatus(false);
+    sij_pipe.cons.setFreeStatus(false);
+    oi_pipe.cons.setFreeStatus(false);
 
     __gm__ float *out_base = reinterpret_cast<__gm__ float *>(out_t->buffer.addr) + out_t->start_offset;
 
@@ -849,13 +743,11 @@ static __aicore__ void run_aiv(
 
         if (block_size == 128) {
             aiv_process_blocks<Cfg, 128>(
-                scale_value, static_cast<uint64_t>(n_blocks), valid_len_last, dst, s_ws_base, p_ws_base, o_ws_base,
-                sub_block_id, block_size
+                scale_value, static_cast<uint64_t>(n_blocks), valid_len_last, dst, sij_pipe, pij_pipe, oi_pipe
             );
         } else {
             aiv_process_blocks<Cfg, 64>(
-                scale_value, static_cast<uint64_t>(n_blocks), valid_len_last, dst, s_ws_base, p_ws_base, o_ws_base,
-                sub_block_id, block_size
+                scale_value, static_cast<uint64_t>(n_blocks), valid_len_last, dst, sij_pipe, pij_pipe, oi_pipe
             );
         }
     }
@@ -867,9 +759,9 @@ static __aicore__ void run_aiv(
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *context_lens_t = reinterpret_cast<__gm__ Tensor *>(args[4]);
-    __gm__ Tensor *s_ws_t = reinterpret_cast<__gm__ Tensor *>(args[6]);
-    __gm__ Tensor *p_ws_t = reinterpret_cast<__gm__ Tensor *>(args[7]);
-    __gm__ Tensor *o_ws_t = reinterpret_cast<__gm__ Tensor *>(args[8]);
+    __gm__ Tensor *sij_fifo_t = reinterpret_cast<__gm__ Tensor *>(args[6]);
+    __gm__ Tensor *pij_fifo_t = reinterpret_cast<__gm__ Tensor *>(args[7]);
+    __gm__ Tensor *oi_fifo_t = reinterpret_cast<__gm__ Tensor *>(args[8]);
 
     int64_t num_heads = static_cast<int64_t>(args[10]);
     int64_t head_dim = static_cast<int64_t>(args[11]);
@@ -885,31 +777,32 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ int32_t *ctx_ptr =
         reinterpret_cast<__gm__ int32_t *>(context_lens_t->buffer.addr) + context_lens_t->start_offset;
 
-    // Per-hw-block workspace (×2 for stage1/stage2 ping-pong)
-    constexpr uint32_t S_WS_HW_STRIDE = PAConfig<MAX_Q_TILE>::S_WS_SIZE * 2;
-    constexpr uint32_t P_WS_HW_STRIDE = PAConfig<MAX_Q_TILE>::P_WS_SIZE * 2;
-    constexpr uint32_t O_WS_HW_STRIDE = PAConfig<MAX_Q_TILE>::O_WS_SIZE * 2;
+    // GM FIFO buffer per hardware block (reused across stride-loop iterations).
+    // Slot stride is sized for max(Q_TILE) so the same offset works for both q_tile=16 and 64.
+    constexpr uint32_t SIJ_HW_STRIDE = PAConfig<MAX_Q_TILE>::SIJ_SLOT_SIZE * FIFO_DEPTH;
+    constexpr uint32_t PIJ_HW_STRIDE = PAConfig<MAX_Q_TILE>::PIJ_SLOT_SIZE * FIFO_DEPTH;
+    constexpr uint32_t OI_HW_STRIDE = PAConfig<MAX_Q_TILE>::OI_SLOT_SIZE * FIFO_DEPTH;
 
-    __gm__ float *s_ws_base = reinterpret_cast<__gm__ float *>(
-        reinterpret_cast<__gm__ uint8_t *>(s_ws_t->buffer.addr) + hw_block_idx * S_WS_HW_STRIDE
+    __gm__ void *sij_fifo_base = reinterpret_cast<__gm__ void *>(
+        reinterpret_cast<__gm__ uint8_t *>(sij_fifo_t->buffer.addr) + hw_block_idx * SIJ_HW_STRIDE
     );
-    __gm__ bfloat16_t *p_ws_base = reinterpret_cast<__gm__ bfloat16_t *>(
-        reinterpret_cast<__gm__ uint8_t *>(p_ws_t->buffer.addr) + hw_block_idx * P_WS_HW_STRIDE
+    __gm__ void *pij_fifo_base = reinterpret_cast<__gm__ void *>(
+        reinterpret_cast<__gm__ uint8_t *>(pij_fifo_t->buffer.addr) + hw_block_idx * PIJ_HW_STRIDE
     );
-    __gm__ float *o_ws_base = reinterpret_cast<__gm__ float *>(
-        reinterpret_cast<__gm__ uint8_t *>(o_ws_t->buffer.addr) + hw_block_idx * O_WS_HW_STRIDE
+    __gm__ void *oi_fifo_base = reinterpret_cast<__gm__ void *>(
+        reinterpret_cast<__gm__ uint8_t *>(oi_fifo_t->buffer.addr) + hw_block_idx * OI_HW_STRIDE
     );
 
     if constexpr (DAV_CUBE) {
         if (q_tile == 16) {
             run_aic<PAConfig<16>>(
                 args, ctx_ptr, hw_block_idx, hw_block_num, total_logical_blocks, num_heads, head_dim, block_size,
-                max_blocks_per_req, q_loop, s_ws_base, p_ws_base, o_ws_base
+                max_blocks_per_req, q_loop, sij_fifo_base, pij_fifo_base, oi_fifo_base
             );
         } else {
             run_aic<PAConfig<MAX_Q_TILE>>(
                 args, ctx_ptr, hw_block_idx, hw_block_num, total_logical_blocks, num_heads, head_dim, block_size,
-                max_blocks_per_req, q_loop, s_ws_base, p_ws_base, o_ws_base
+                max_blocks_per_req, q_loop, sij_fifo_base, pij_fifo_base, oi_fifo_base
             );
         }
     }
@@ -918,12 +811,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         if (q_tile == 16) {
             run_aiv<PAConfig<16>>(
                 args, ctx_ptr, hw_block_idx, hw_block_num, total_logical_blocks, num_heads, head_dim, block_size,
-                q_loop, s_ws_base, p_ws_base, o_ws_base
+                q_loop, sij_fifo_base, pij_fifo_base, oi_fifo_base
             );
         } else {
             run_aiv<PAConfig<MAX_Q_TILE>>(
                 args, ctx_ptr, hw_block_idx, hw_block_num, total_logical_blocks, num_heads, head_dim, block_size,
-                q_loop, s_ws_base, p_ws_base, o_ws_base
+                q_loop, sij_fifo_base, pij_fifo_base, oi_fifo_base
             );
         }
     }

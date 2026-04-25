@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Paged attention with step-2 pipeline + FFTS cross-core sync: MIX kernel AIC+AIV cooperative pipeline."""
+"""Paged attention unroll with TPUSH/TPOP: MIX kernel AIC+AIV cooperative pipeline."""
 
 import torch
 from simpler.task_interface import ArgDirection as D
