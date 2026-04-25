@@ -28,6 +28,7 @@
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
 #include "callable.h"
+#include "utils/elf_build_id.h"
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
 
@@ -616,6 +617,14 @@ int DeviceRunner::run(
     });
 
     std::cout << "\n=== Initialize runtime args ===" << '\n';
+    // Resolve the orchestration SO into a device-resident buffer and refresh
+    // runtime metadata before the Runtime struct is uploaded to device.
+    rc = prepare_orch_so(runtime);
+    if (rc != 0) {
+        LOG_ERROR("prepare_orch_so failed: %d", rc);
+        return rc;
+    }
+
     // Initialize runtime args
     rc = kernel_args_.init_runtime_args(runtime, mem_alloc_);
     if (rc != 0) {
@@ -775,6 +784,63 @@ void DeviceRunner::print_handshake_results() {
     }
 }
 
+int DeviceRunner::prepare_orch_so(Runtime &runtime) {
+    const void *host_so_data = runtime.pending_orch_so_data_;
+    const size_t host_so_size = runtime.pending_orch_so_size_;
+    runtime.pending_orch_so_data_ = nullptr;
+    runtime.pending_orch_so_size_ = 0;
+
+    if (host_so_data == nullptr || host_so_size == 0) {
+        // Host-orchestration mode (no device SO needed).
+        runtime.set_dev_orch_so(0, 0, false);
+        return 0;
+    }
+
+    const uint64_t new_hash = simpler::common::utils::elf_build_id_64(host_so_data, host_so_size);
+
+    if (new_hash == cached_orch_so_hash_ && dev_orch_so_buffer_ != nullptr) {
+        LOG_INFO("Orch SO cache hit (hash=0x%lx, %zu bytes)", new_hash, host_so_size);
+        runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/false);
+        return 0;
+    }
+
+    if (host_so_size > dev_orch_so_capacity_) {
+        if (dev_orch_so_buffer_ != nullptr) {
+            mem_alloc_.free(dev_orch_so_buffer_);
+            dev_orch_so_buffer_ = nullptr;
+            dev_orch_so_capacity_ = 0;
+        }
+        dev_orch_so_buffer_ = mem_alloc_.alloc(host_so_size);
+        if (dev_orch_so_buffer_ == nullptr) {
+            LOG_ERROR("Failed to allocate %zu bytes for orchestration SO buffer", host_so_size);
+            cached_orch_so_hash_ = 0;
+            return -1;
+        }
+        dev_orch_so_capacity_ = host_so_size;
+    }
+
+    // Persist a host-side copy so the rtMemcpy source is independent from
+    // any Python ctypes buffer the caller may release as soon as run()
+    // returns. This is also what runtime_maker hands us by reference.
+    host_orch_so_copy_.assign(
+        static_cast<const uint8_t *>(host_so_data), static_cast<const uint8_t *>(host_so_data) + host_so_size
+    );
+
+    int rc = rtMemcpy(
+        dev_orch_so_buffer_, dev_orch_so_capacity_, host_orch_so_copy_.data(), host_so_size, RT_MEMCPY_HOST_TO_DEVICE
+    );
+    if (rc != 0) {
+        LOG_ERROR("rtMemcpy for orchestration SO failed: %d", rc);
+        cached_orch_so_hash_ = 0;
+        return rc;
+    }
+
+    cached_orch_so_hash_ = new_hash;
+    runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/true);
+    LOG_INFO("Orch SO cache miss (hash=0x%lx, %zu bytes uploaded)", new_hash, host_so_size);
+    return 0;
+}
+
 int DeviceRunner::finalize() {
     if (device_id_ == -1) {
         return 0;
@@ -806,6 +872,16 @@ int DeviceRunner::finalize() {
     }
     func_id_to_addr_.clear();
     binaries_loaded_ = false;
+
+    // Release the cached orchestration SO buffer.
+    if (dev_orch_so_buffer_ != nullptr) {
+        mem_alloc_.free(dev_orch_so_buffer_);
+        dev_orch_so_buffer_ = nullptr;
+    }
+    dev_orch_so_capacity_ = 0;
+    cached_orch_so_hash_ = 0;
+    host_orch_so_copy_.clear();
+    host_orch_so_copy_.shrink_to_fit();
 
     // Cleanup performance profiling
     if (l2_perf_collector_.is_initialized()) {

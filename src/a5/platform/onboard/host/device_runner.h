@@ -371,6 +371,12 @@ private:
     bool binaries_loaded_{false};              // true after AICPU SO loaded
     std::map<int, uint64_t> func_id_to_addr_;  // func_id -> function_bin_addr (device GM)
 
+    // Orchestration SO cache (host-tracked, device-resident).
+    uint64_t cached_orch_so_hash_{0};
+    void *dev_orch_so_buffer_{nullptr};
+    size_t dev_orch_so_capacity_{0};
+    std::vector<uint8_t> host_orch_so_copy_;
+
     // Performance profiling
     L2PerfCollector l2_perf_collector_;
 
@@ -412,6 +418,12 @@ private:
     int ensure_binaries_loaded(
         const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
     );
+
+    /**
+     * Stage the orchestration SO into a device-resident buffer (with hash
+     * cache). See a2a3 onboard documentation for details.
+     */
+    int prepare_orch_so(Runtime &runtime);
 
     /**
      * Initialize performance profiling device buffers

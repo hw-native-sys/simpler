@@ -478,6 +478,25 @@ public:
     // Host API function pointers for device memory operations
     // NOTE: Placed at end of class to avoid affecting device memory layout
     HostApi host_api;
+
+    // Device orchestration SO metadata: device buffer + dirty flag (host
+    // populates these via DeviceRunner::prepare_orch_so before launch).
+    // host_build_graph runtime variant currently does not load device
+    // orchestration SOs, but DeviceRunner is shared with the other variants
+    // and unconditionally writes these fields, so they must exist.
+    uint64_t dev_orch_so_addr_{0};
+    uint64_t dev_orch_so_size_{0};
+    bool has_new_orch_so_{false};
+
+    // Host-only staging fields (mirror tensormap_and_ringbuffer variant).
+    const void *pending_orch_so_data_{nullptr};
+    size_t pending_orch_so_size_{0};
+
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new) {
+        dev_orch_so_addr_ = dev_addr;
+        dev_orch_so_size_ = size;
+        has_new_orch_so_ = is_new;
+    }
 };
 
 #endif  // SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_

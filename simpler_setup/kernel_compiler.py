@@ -453,6 +453,15 @@ class KernelCompiler:
 
         cmd = [toolchain.cxx_path] + toolchain.get_compile_flags()
 
+        # Force a deterministic ELF GNU Build-ID into every orchestration .so.
+        # The host-side DeviceRunner reads `.note.gnu.build-id` to detect when
+        # the same callable is being re-run (cache hit → skip device upload +
+        # device dlopen). The compiler default already injects a Build-ID,
+        # but pass it explicitly so the cache key remains stable across
+        # toolchain versions. macOS/clang ld silently ignores this flag.
+        if sys.platform != "darwin":
+            cmd.append("-Wl,--build-id=sha1")
+
         if extra_sources:
             for src in extra_sources:
                 src = os.path.abspath(src)

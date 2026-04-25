@@ -35,6 +35,7 @@
 
 #include "aicpu/platform_aicpu_affinity.h"
 #include "callable.h"
+#include "utils/elf_build_id.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
 
@@ -115,11 +116,10 @@ int DeviceRunner::ensure_device_initialized(
 int DeviceRunner::ensure_binaries_loaded(
     const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
 ) {
-    // Close any previously loaded binaries before reloading
-    unload_executor_binaries();
-
-    // Write AICPU binary to temp file and dlopen
-    if (!aicpu_so_binary.empty()) {
+    // AICPU .so: load-once, matching onboard's binaries_loaded_ pattern.
+    // Keeping the DSO alive across runs preserves g_aicpu_executor state
+    // (orch_so_handle_ etc.), which is required for the orch-SO cache-hit path.
+    if (!aicpu_so_loaded_ && !aicpu_so_binary.empty()) {
         if (!create_temp_so_file(
                 "/tmp/aicpu_sim_XXXXXX", aicpu_so_binary.data(), aicpu_so_binary.size(), &aicpu_so_path_
             )) {
@@ -166,7 +166,20 @@ int DeviceRunner::ensure_binaries_loaded(
             reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_pmu_base"));
         set_enable_pmu_func_ = reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_enable_pmu"));
 
+        aicpu_so_loaded_ = true;
         LOG_INFO("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
+    }
+
+    // AICore kernel .so: reload every run — kernel binary varies per case and
+    // the AICore DSO holds no cross-run state that needs preserving.
+    if (aicore_so_handle_ != nullptr) {
+        dlclose(aicore_so_handle_);
+        aicore_so_handle_ = nullptr;
+        aicore_execute_func_ = nullptr;
+    }
+    if (!aicore_so_path_.empty()) {
+        std::remove(aicore_so_path_.c_str());
+        aicore_so_path_.clear();
     }
 
     // Write AICore binary to temp file and dlopen
@@ -331,6 +344,12 @@ int DeviceRunner::run(
     // Store runtime pointer for print_handshake_results
     last_runtime_ = &runtime;
 
+    int rc_orch_so = prepare_orch_so(runtime);
+    if (rc_orch_so != 0) {
+        LOG_ERROR("prepare_orch_so failed: %d", rc_orch_so);
+        return rc_orch_so;
+    }
+
     // Initialize performance profiling if enabled
     if (runtime.enable_l2_swimlane) {
         rc = init_l2_perf_collection(runtime, num_aicore, device_id);
@@ -472,11 +491,19 @@ int DeviceRunner::run(
     // Print handshake results at end of run
     print_handshake_results();
 
-    // Close executor .so files now while the process is healthy, rather than
-    // deferring to finalize()/destructor where static destruction order on
-    // macOS can cause segfaults (aicpu.so contains file-scope statics with
-    // std::mutex that crash when dlclosed during process teardown).
-    unload_executor_binaries();
+    // Close AICore kernel .so now while the process is healthy.
+    // AICPU .so is kept alive (load-once) so that g_aicpu_executor state
+    // (orch_so_handle_ etc.) survives across runs for the orch-SO cache-hit path.
+    // It will be closed in finalize() / unload_executor_binaries().
+    if (aicore_so_handle_ != nullptr) {
+        dlclose(aicore_so_handle_);
+        aicore_so_handle_ = nullptr;
+        aicore_execute_func_ = nullptr;
+    }
+    if (!aicore_so_path_.empty()) {
+        std::remove(aicore_so_path_.c_str());
+        aicore_so_path_.clear();
+    }
 
     return 0;
 }
@@ -505,6 +532,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_enable_dump_tensor_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
         set_enable_pmu_func_ = nullptr;
+        aicpu_so_loaded_ = false;
     }
     if (!aicpu_so_path_.empty()) {
         std::remove(aicpu_so_path_.c_str());
@@ -520,6 +548,51 @@ void DeviceRunner::unload_executor_binaries() {
         std::remove(aicore_so_path_.c_str());
         aicore_so_path_.clear();
     }
+}
+
+int DeviceRunner::prepare_orch_so(Runtime &runtime) {
+    const void *host_so_data = runtime.pending_orch_so_data_;
+    const size_t host_so_size = runtime.pending_orch_so_size_;
+    runtime.pending_orch_so_data_ = nullptr;
+    runtime.pending_orch_so_size_ = 0;
+
+    if (host_so_data == nullptr || host_so_size == 0) {
+        runtime.set_dev_orch_so(0, 0, false);
+        return 0;
+    }
+
+    const uint64_t new_hash = simpler::common::utils::elf_build_id_64(host_so_data, host_so_size);
+
+    if (new_hash == cached_orch_so_hash_ && dev_orch_so_buffer_ != nullptr) {
+        LOG_INFO("Orch SO cache hit (hash=0x%lx, %zu bytes)", new_hash, host_so_size);
+        runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/false);
+        return 0;
+    }
+
+    if (host_so_size > dev_orch_so_capacity_) {
+        if (dev_orch_so_buffer_ != nullptr) {
+            mem_alloc_.free(dev_orch_so_buffer_);
+            dev_orch_so_buffer_ = nullptr;
+            dev_orch_so_capacity_ = 0;
+        }
+        dev_orch_so_buffer_ = mem_alloc_.alloc(host_so_size);
+        if (dev_orch_so_buffer_ == nullptr) {
+            LOG_ERROR("Failed to allocate %zu bytes for orchestration SO buffer", host_so_size);
+            cached_orch_so_hash_ = 0;
+            return -1;
+        }
+        dev_orch_so_capacity_ = host_so_size;
+    }
+
+    host_orch_so_copy_.assign(
+        static_cast<const uint8_t *>(host_so_data), static_cast<const uint8_t *>(host_so_data) + host_so_size
+    );
+    std::memcpy(dev_orch_so_buffer_, host_orch_so_copy_.data(), host_so_size);
+
+    cached_orch_so_hash_ = new_hash;
+    runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/true);
+    LOG_INFO("Orch SO cache miss (hash=0x%lx, %zu bytes uploaded)", new_hash, host_so_size);
+    return 0;
 }
 
 int DeviceRunner::finalize() {
@@ -557,6 +630,15 @@ int DeviceRunner::finalize() {
         }
     }
     func_id_to_addr_.clear();
+
+    if (dev_orch_so_buffer_ != nullptr) {
+        mem_alloc_.free(dev_orch_so_buffer_);
+        dev_orch_so_buffer_ = nullptr;
+    }
+    dev_orch_so_capacity_ = 0;
+    cached_orch_so_hash_ = 0;
+    host_orch_so_copy_.clear();
+    host_orch_so_copy_.shrink_to_fit();
 
     // Close executor .so files (typically already closed by run(), this is a safety net)
     unload_executor_binaries();

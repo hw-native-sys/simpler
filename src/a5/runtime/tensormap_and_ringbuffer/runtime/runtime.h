@@ -209,10 +209,15 @@ private:
     void *pto2_slot_states_ptr_;             // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
-    // Device orchestration SO binary (for dlopen on AICPU thread 3)
-    // Stored as a copy to avoid lifetime issues with Python ctypes arrays
-    uint8_t device_orch_so_storage_[RUNTIME_MAX_ORCH_SO_SIZE];
-    size_t device_orch_so_size_;
+    // Device orchestration SO (for dlopen on AICPU thread 3).
+    // The SO bytes themselves live in a separately-allocated device buffer
+    // owned by DeviceRunner; only the metadata below travels inside Runtime.
+    // `has_new_orch_so_` tells AICPU whether the host believes the SO identity
+    // changed since the previous run — when false AICPU reuses its cached
+    // dlopen handle and skips writing the file again.
+    uint64_t dev_orch_so_addr_;
+    uint64_t dev_orch_so_size_;
+    bool has_new_orch_so_;
     char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
     char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
 
@@ -265,9 +270,10 @@ public:
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)
-    void set_device_orch_so(const void *data, size_t size);
-    const void *get_device_orch_so_data() const;
-    size_t get_device_orch_so_size() const;
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new);
+    uint64_t get_dev_orch_so_addr() const;
+    uint64_t get_dev_orch_so_size() const;
+    bool has_new_orch_so() const;
     void set_device_orch_func_name(const char *name);
     const char *get_device_orch_func_name() const;
     void set_device_orch_config_name(const char *name);
@@ -298,6 +304,13 @@ public:
     // Host API function pointers for device memory operations
     // NOTE: Placed at end of class to avoid affecting device memory layout
     HostApi host_api;
+
+    // Host-only staging for orchestration SO. runtime_maker publishes the
+    // callable-owned pointer here; DeviceRunner consumes it before launching
+    // the device-side execution and replaces it with the device-resident
+    // buffer metadata (dev_orch_so_addr_, ..., has_new_orch_so_).
+    const void *pending_orch_so_data_{nullptr};
+    size_t pending_orch_so_size_{0};
 };
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

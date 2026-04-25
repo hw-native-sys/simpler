@@ -50,7 +50,9 @@ Runtime::Runtime() {
     orch_args_storage_.clear();
 
     // Initialize device orchestration SO binary
-    device_orch_so_size_ = 0;
+    dev_orch_so_addr_ = 0;
+    dev_orch_so_size_ = 0;
+    has_new_orch_so_ = false;
 
     // Initialize kernel binary tracking
     registered_kernel_count_ = 0;
@@ -97,27 +99,19 @@ void Runtime::set_pto2_gm_heap(void *p) { pto2_gm_heap_ptr_ = p; }
 void Runtime::set_pto2_slot_states_ptr(void *p) { pto2_slot_states_ptr_ = p; }
 void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { orch_args_storage_ = args; }
 
-// Device orchestration SO binary (for dlopen on AICPU thread 3)
-// Copies data to internal storage to avoid lifetime issues with Python ctypes arrays
-void Runtime::set_device_orch_so(const void *data, size_t size) {
-    if (data == nullptr || size == 0) {
-        device_orch_so_size_ = 0;
-        return;
-    }
-    if (size > RUNTIME_MAX_ORCH_SO_SIZE) {
-        LOG_ERROR("[Runtime] Orchestration SO too large (%zu > %d)", size, RUNTIME_MAX_ORCH_SO_SIZE);
-        device_orch_so_size_ = 0;
-        return;
-    }
-    memcpy(device_orch_so_storage_, data, size);
-    device_orch_so_size_ = size;
+// Device orchestration SO metadata (bytes live in a separate device buffer
+// owned by DeviceRunner; only the address/size/dirty-flag travels in Runtime).
+void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new) {
+    dev_orch_so_addr_ = dev_addr;
+    dev_orch_so_size_ = size;
+    has_new_orch_so_ = is_new;
 }
 
-const void *Runtime::get_device_orch_so_data() const {
-    return device_orch_so_size_ > 0 ? device_orch_so_storage_ : nullptr;
-}
+uint64_t Runtime::get_dev_orch_so_addr() const { return dev_orch_so_addr_; }
 
-size_t Runtime::get_device_orch_so_size() const { return device_orch_so_size_; }
+uint64_t Runtime::get_dev_orch_so_size() const { return dev_orch_so_size_; }
+
+bool Runtime::has_new_orch_so() const { return has_new_orch_so_; }
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;

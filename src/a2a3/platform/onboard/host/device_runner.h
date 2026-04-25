@@ -443,6 +443,15 @@ private:
     bool binaries_loaded_{false};              // true after AICPU SO loaded
     std::map<int, uint64_t> func_id_to_addr_;  // func_id -> function_bin_addr (device GM)
 
+    // Orchestration SO cache. `cached_orch_so_hash_ == 0` means "no cache".
+    // The device buffer grows monotonically — cache miss with a larger SO
+    // reallocates, a smaller SO reuses the existing capacity. The host copy
+    // insulates us from Python ctypes array lifetimes.
+    uint64_t cached_orch_so_hash_{0};
+    void *dev_orch_so_buffer_{nullptr};
+    size_t dev_orch_so_capacity_{0};
+    std::vector<uint8_t> host_orch_so_copy_;
+
     // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
     // gates it behind this flag. finalize() drives aclFinalize only if we observed
     // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
@@ -488,6 +497,21 @@ private:
     int ensure_binaries_loaded(
         const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
     );
+
+    /**
+     * Populate runtime.{dev_orch_so_addr_, dev_orch_so_size_, has_new_orch_so_}
+     * from `runtime.pending_orch_so_data_` / `_size_`.
+     *
+     * The host tracks the SO identity via a 64-bit hash derived from the ELF
+     * GNU Build-ID. When the hash matches the previous run, the device-side
+     * AICPU thread reuses its cached dlopen handle and we skip the rtMemcpy
+     * entirely. On a miss we allocate (or grow) a device-resident buffer,
+     * copy the SO bytes once, and update the cached hash.
+     *
+     * @param runtime  Runtime whose device-SO metadata will be rewritten.
+     * @return 0 on success, non-zero on failure.
+     */
+    int prepare_orch_so(Runtime &runtime);
 
     /**
      * Initialize performance profiling shared memory

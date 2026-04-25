@@ -1704,11 +1704,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         } else {
             DEV_INFO("Thread %d: Orchestrator, loading SO via dlopen", thread_idx);
 
-            const void *so_data = runtime->get_device_orch_so_data();
-            size_t so_size = runtime->get_device_orch_so_size();
+            const void *so_data = reinterpret_cast<const void *>(runtime->get_dev_orch_so_addr());
+            size_t so_size = runtime->get_dev_orch_so_size();
 
             if (so_data == nullptr || so_size == 0) {
                 DEV_ERROR("Thread %d: Device orchestration SO not set", thread_idx);
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
@@ -1743,6 +1745,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             if (!file_created) {
                 DEV_ERROR("Thread %d: Failed to create SO file in any candidate path", thread_idx);
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
@@ -1752,6 +1756,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             if (handle == nullptr) {
                 DEV_ERROR("Thread %d: dlopen failed: %s", thread_idx, dlopen_err ? dlopen_err : "unknown");
                 unlink(so_path);
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
             DEV_INFO("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
@@ -1768,12 +1774,16 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 DEV_ERROR("Thread %d: dlsym failed: %s", thread_idx, dlsym_error);
                 dlclose(handle);
                 unlink(so_path);
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
             if (orch_func == nullptr) {
                 DEV_ERROR("Thread %d: dlsym returned NULL for aicpu_orchestration_entry", thread_idx);
                 dlclose(handle);
                 unlink(so_path);
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
@@ -1809,6 +1819,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 DEV_ERROR("Thread %d: arg_count %d < expected %d", thread_idx, arg_count, expected_arg_count);
                 dlclose(handle);
                 unlink(so_path);
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
@@ -1837,6 +1849,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 DEV_ERROR("Thread %d: Failed to create shared memory handle", thread_idx);
                 dlclose(handle);
                 unlink(so_path);
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
@@ -1846,6 +1860,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 pto2_sm_destroy(sm_handle);
                 dlclose(handle);
                 unlink(so_path);
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
@@ -2051,9 +2067,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 SPIN_WAIT_HINT();
             }
         }
-        always_assert(rt != nullptr);
-        int32_t completed = resolve_and_dispatch_pto2(runtime, thread_idx);
-        DEV_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+        if (rt == nullptr) {
+            DEV_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
+        } else {
+            int32_t completed = resolve_and_dispatch_pto2(runtime, thread_idx);
+            DEV_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+        }
     }
 
     // Always shutdown AICore — even if completed_ was already true.

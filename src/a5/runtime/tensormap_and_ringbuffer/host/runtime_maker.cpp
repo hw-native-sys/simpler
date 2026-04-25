@@ -192,25 +192,11 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
     }
     int64_t t_args_end = _now_ms();
 
-    // Copy orchestration SO to device memory (AICPU cannot access host memory)
+    // Stage the orchestration SO for DeviceRunner::prepare_orch_so to consume.
     int64_t t_so_start = _now_ms();
-    void *dev_so = runtime->host_api.device_malloc(orch_so_size);
-    if (dev_so == nullptr) {
-        LOG_ERROR("Failed to allocate device memory for orchestration SO");
-        return -1;
-    }
-    int rc = runtime->host_api.copy_to_device(dev_so, orch_so_binary, orch_so_size);
-    if (rc != 0) {
-        LOG_ERROR("Failed to copy orchestration SO to device");
-        runtime->host_api.device_free(dev_so);
-        return -1;
-    }
-    // Copy SO binary into Runtime's internal storage (device_orch_so_storage_)
-    // Pass the HOST pointer (orch_so_binary), not the device pointer (dev_so)
-    // AICPU Thread 3 will read from get_device_orch_so_data() which returns this storage
-    runtime->set_device_orch_so(orch_so_binary, orch_so_size);
-    runtime->record_tensor_pair(nullptr, dev_so, orch_so_size);
-    LOG_INFO("Orchestration SO: %zu bytes copied to device", orch_so_size);
+    runtime->pending_orch_so_data_ = orch_so_binary;
+    runtime->pending_orch_so_size_ = orch_so_size;
+    LOG_INFO("Orchestration SO: %zu bytes staged (host-only)", orch_so_size);
     int64_t t_so_end = _now_ms();
 
     // Read ready queue shard count from environment for AICPU scheduler

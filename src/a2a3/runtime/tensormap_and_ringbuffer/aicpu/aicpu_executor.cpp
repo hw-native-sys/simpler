@@ -115,6 +115,7 @@ struct AicpuExecutor {
     // Shared orchestration function pointer (loaded by first orch thread, used by all)
     DeviceOrchestrationFunc orch_func_{nullptr};
     DeviceOrchestrationBindRuntimeFunc orch_bind_runtime_{nullptr};
+    DeviceOrchestrationConfigFunc orch_config_func_{nullptr};
     const ChipStorageTaskArgs *orch_args_cached_{nullptr};
 
     // ===== Scheduler context (owns all dispatch/completion/drain state) =====
@@ -124,6 +125,19 @@ struct AicpuExecutor {
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime);
     void deinit(Runtime *runtime);
+
+    ~AicpuExecutor() {
+        // Process-wide teardown (the single static instance dies here). The
+        // handle is otherwise kept alive across runs for cache-hit reuse.
+        if (orch_so_handle_ != nullptr) {
+            dlclose(orch_so_handle_);
+            orch_so_handle_ = nullptr;
+        }
+        if (orch_so_path_[0] != '\0') {
+            unlink(orch_so_path_);
+            orch_so_path_[0] = '\0';
+        }
+    }
 };
 
 static AicpuExecutor g_aicpu_executor;
@@ -184,109 +198,195 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (runtime->get_orch_built_on_host()) {
             DEV_INFO("Thread %d: Host orchestration mode, no-op", thread_idx);
         } else {
-            DEV_INFO("Thread %d: Orchestrator, loading SO via dlopen", thread_idx);
+            // Two paths:
+            //   1) has_new_orch_so == true → host believes the SO identity
+            //      changed, so we drop the cached handle (if any), write the
+            //      new bytes to disk, and dlopen + dlsym a fresh handle.
+            //   2) has_new_orch_so == false → host detected a cache hit, so
+            //      we reuse `orch_so_handle_` / `orch_func_` / `orch_bind_runtime_`
+            //      from the previous run untouched. sm_handle / rt below are
+            //      always recreated because they bind this run's memory.
+            const bool reload_so = runtime->has_new_orch_so();
 
-            const void *so_data = runtime->get_device_orch_so_data();
-            size_t so_size = runtime->get_device_orch_so_size();
-
-            if (so_data == nullptr || so_size == 0) {
-                DEV_ERROR("Thread %d: Device orchestration SO not set", thread_idx);
-                return -1;
-            }
-
-            // Try multiple paths that may allow execution on AICPU
-            char so_path[256];
-            bool file_created = false;
-            const char *candidate_dirs[] = {
-                "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device", "/usr/lib64", "/lib64", "/var/tmp", "/tmp"
-            };
-            const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
-
-            for (int32_t i = 0; i < num_candidates && !file_created; i++) {
-                int32_t fd = create_orch_so_file(candidate_dirs[i], so_path, sizeof(so_path));
-                if (fd < 0) {
-                    DEV_INFO(
-                        "Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx, so_path, errno
-                    );
-                    continue;
+            if (reload_so) {
+                DEV_INFO("Thread %d: New orch SO detected, (re)loading", thread_idx);
+                if (orch_so_handle_ != nullptr) {
+                    dlclose(orch_so_handle_);
+                    orch_so_handle_ = nullptr;
+                    orch_func_ = nullptr;
+                    orch_bind_runtime_ = nullptr;
+                    if (orch_so_path_[0] != '\0') {
+                        // Unlink the old file so the new open() lands on a
+                        // fresh inode — protects against SIGBUS / ETXTBSY when
+                        // the kernel still has the old mapping pinned.
+                        unlink(orch_so_path_);
+                        orch_so_path_[0] = '\0';
+                    }
                 }
-                ssize_t written = write(fd, so_data, so_size);
-                close(fd);
-                if (written != static_cast<ssize_t>(so_size)) {
-                    DEV_INFO(
-                        "Thread %d: Cannot write SO to %s (errno=%d), trying next path", thread_idx, so_path, errno
-                    );
+
+                const void *so_data = reinterpret_cast<const void *>(runtime->get_dev_orch_so_addr());
+                size_t so_size = runtime->get_dev_orch_so_size();
+
+                if (so_data == nullptr || so_size == 0) {
+                    DEV_ERROR("Thread %d: Device orchestration SO not set", thread_idx);
+                    // Unblock scheduler threads before returning so they don't spin forever.
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+
+                // Try multiple paths that may allow execution on AICPU
+                char so_path[256];
+                bool file_created = false;
+                const char *candidate_dirs[] = {
+                    "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device", "/usr/lib64", "/lib64", "/var/tmp", "/tmp"
+                };
+                const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
+
+                for (int32_t i = 0; i < num_candidates && !file_created; i++) {
+                    int32_t fd = create_orch_so_file(candidate_dirs[i], so_path, sizeof(so_path));
+                    if (fd < 0) {
+                        DEV_INFO(
+                            "Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx, so_path, errno
+                        );
+                        continue;
+                    }
+                    ssize_t written = write(fd, so_data, so_size);
+                    close(fd);
+                    if (written != static_cast<ssize_t>(so_size)) {
+                        DEV_INFO(
+                            "Thread %d: Cannot write SO to %s (errno=%d), trying next path", thread_idx, so_path, errno
+                        );
+                        unlink(so_path);
+                        continue;
+                    }
+                    file_created = true;
+                    DEV_INFO("Thread %d: Created SO file at %s (%zu bytes)", thread_idx, so_path, so_size);
+                }
+
+                if (!file_created) {
+                    DEV_ERROR("Thread %d: Failed to create SO file in any candidate path", thread_idx);
+                    // Unblock scheduler threads before returning so they don't spin forever.
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+
+                dlerror();
+                void *handle = dlopen(so_path, RTLD_LAZY | RTLD_LOCAL);
+                const char *dlopen_err = dlerror();
+                if (handle == nullptr) {
+                    DEV_ERROR("Thread %d: dlopen failed: %s", thread_idx, dlopen_err ? dlopen_err : "unknown");
                     unlink(so_path);
-                    continue;
+                    // Unblock scheduler threads before returning so they don't spin forever.
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
                 }
-                file_created = true;
-                DEV_INFO("Thread %d: Created SO file at %s (%zu bytes)", thread_idx, so_path, so_size);
+                DEV_INFO("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
+
+                const char *entry_symbol = runtime->get_device_orch_func_name();
+                if (entry_symbol == nullptr || entry_symbol[0] == '\0') {
+                    entry_symbol = DEFAULT_ORCH_ENTRY_SYMBOL;
+                }
+                const char *config_symbol = runtime->get_device_orch_config_name();
+                if (config_symbol == nullptr || config_symbol[0] == '\0') {
+                    config_symbol = DEFAULT_ORCH_CONFIG_SYMBOL;
+                }
+
+                dlerror();
+                DeviceOrchestrationFunc orch_func =
+                    reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, entry_symbol));
+                const char *entry_dlsym_error = dlerror();
+                if (entry_dlsym_error != nullptr) {
+                    DEV_ERROR(
+                        "Thread %d: dlsym failed for entry symbol '%s': %s", thread_idx, entry_symbol, entry_dlsym_error
+                    );
+                    dlclose(handle);
+                    unlink(so_path);
+                    // Unblock scheduler threads before returning so they don't spin forever.
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+                if (orch_func == nullptr) {
+                    DEV_ERROR("Thread %d: dlsym returned NULL for entry symbol '%s'", thread_idx, entry_symbol);
+                    dlclose(handle);
+                    unlink(so_path);
+                    // Unblock scheduler threads before returning so they don't spin forever.
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+
+                dlerror();
+                auto config_func = reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, config_symbol));
+                const char *config_dlsym_error = dlerror();
+                if (config_dlsym_error != nullptr || config_func == nullptr) {
+                    DEV_ERROR(
+                        "Thread %d: dlsym failed for config symbol '%s': %s", thread_idx, config_symbol,
+                        config_dlsym_error ? config_dlsym_error : "NULL function pointer"
+                    );
+                    config_func = nullptr;
+                }
+
+                dlerror();
+                auto bind_runtime_func =
+                    reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "pto2_framework_bind_runtime"));
+                const char *bind_runtime_error = dlerror();
+                if (bind_runtime_error != nullptr) {
+                    DEV_ERROR(
+                        "Thread %d: dlsym failed for pto2_framework_bind_runtime: %s", thread_idx, bind_runtime_error
+                    );
+                    bind_runtime_func = nullptr;
+                }
+
+                orch_so_handle_ = handle;
+                orch_func_ = orch_func;
+                orch_bind_runtime_ = bind_runtime_func;
+                orch_config_func_ = config_func;
+                snprintf(orch_so_path_, sizeof(orch_so_path_), "%s", so_path);
+            } else {
+                DEV_INFO("Thread %d: Reusing cached orch SO handle=%p", thread_idx, orch_so_handle_);
+                if (orch_so_handle_ == nullptr || orch_func_ == nullptr) {
+                    DEV_ERROR("Thread %d: has_new_orch_so=false but no cached SO handle/func", thread_idx);
+                    // Unblock scheduler threads before returning so they don't spin forever.
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
             }
 
-            if (!file_created) {
-                DEV_ERROR("Thread %d: Failed to create SO file in any candidate path", thread_idx);
-                return -1;
+            // Validate arg count on every run (reload or cache hit).
+            if (orch_config_func_ != nullptr) {
+                PTO2OrchestrationConfig cfg = orch_config_func_(runtime->get_orch_args());
+                DEV_INFO("Thread %d: Config: expected_args=%d", thread_idx, cfg.expected_arg_count);
+                if (cfg.expected_arg_count > 0) {
+                    const ChipStorageTaskArgs &args_validate = runtime->get_orch_args();
+                    int32_t actual_arg_count = args_validate.tensor_count() + args_validate.scalar_count();
+                    if (actual_arg_count < cfg.expected_arg_count) {
+                        DEV_ERROR(
+                            "Thread %d: arg_count %d < expected %d", thread_idx, actual_arg_count,
+                            cfg.expected_arg_count
+                        );
+                        // Clean up cached state so a subsequent run does a full reload.
+                        if (orch_so_handle_ != nullptr) {
+                            dlclose(orch_so_handle_);
+                            orch_so_handle_ = nullptr;
+                        }
+                        if (orch_so_path_[0] != '\0') {
+                            unlink(orch_so_path_);
+                            orch_so_path_[0] = '\0';
+                        }
+                        orch_func_ = nullptr;
+                        orch_bind_runtime_ = nullptr;
+                        orch_config_func_ = nullptr;
+                        // Unblock scheduler threads before returning so they don't spin forever.
+                        runtime_init_ready_.store(true, std::memory_order_release);
+                        return -1;
+                    }
+                }
+            } else {
+                DEV_INFO("Thread %d: No config function, using defaults", thread_idx);
             }
 
-            dlerror();
-            void *handle = dlopen(so_path, RTLD_LAZY | RTLD_LOCAL);
-            const char *dlopen_err = dlerror();
-            if (handle == nullptr) {
-                DEV_ERROR("Thread %d: dlopen failed: %s", thread_idx, dlopen_err ? dlopen_err : "unknown");
-                unlink(so_path);
-                return -1;
-            }
-            DEV_INFO("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
-
-            const char *entry_symbol = runtime->get_device_orch_func_name();
-            if (entry_symbol == nullptr || entry_symbol[0] == '\0') {
-                entry_symbol = DEFAULT_ORCH_ENTRY_SYMBOL;
-            }
-            const char *config_symbol = runtime->get_device_orch_config_name();
-            if (config_symbol == nullptr || config_symbol[0] == '\0') {
-                config_symbol = DEFAULT_ORCH_CONFIG_SYMBOL;
-            }
-
-            dlerror();
-            DeviceOrchestrationFunc orch_func = reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, entry_symbol));
-            const char *entry_dlsym_error = dlerror();
-            if (entry_dlsym_error != nullptr) {
-                DEV_ERROR(
-                    "Thread %d: dlsym failed for entry symbol '%s': %s", thread_idx, entry_symbol, entry_dlsym_error
-                );
-                dlclose(handle);
-                unlink(so_path);
-                return -1;
-            }
-            if (orch_func == nullptr) {
-                DEV_ERROR("Thread %d: dlsym returned NULL for entry symbol '%s'", thread_idx, entry_symbol);
-                dlclose(handle);
-                unlink(so_path);
-                return -1;
-            }
-
-            dlerror();
-            auto config_func = reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, config_symbol));
-            const char *config_dlsym_error = dlerror();
-            if (config_dlsym_error != nullptr || config_func == nullptr) {
-                DEV_ERROR(
-                    "Thread %d: dlsym failed for config symbol '%s': %s", thread_idx, config_symbol,
-                    config_dlsym_error ? config_dlsym_error : "NULL function pointer"
-                );
-                config_func = nullptr;
-            }
-
-            dlerror();
-            auto bind_runtime_func =
-                reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "pto2_framework_bind_runtime"));
-            const char *bind_runtime_error = dlerror();
-            if (bind_runtime_error != nullptr) {
-                DEV_ERROR(
-                    "Thread %d: dlsym failed for pto2_framework_bind_runtime: %s", thread_idx, bind_runtime_error
-                );
-                bind_runtime_func = nullptr;
-            }
-
+            // sm_handle / rt are bound to *this* run's memory and must be
+            // (re)created every run, regardless of whether the SO itself was
+            // reused above.
             const ChipStorageTaskArgs &args = runtime->get_orch_args();
             int32_t arg_count = args.tensor_count() + args.scalar_count();
             DEV_INFO("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_pto2_gm_sm_ptr(), arg_count);
@@ -306,21 +406,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
             uint64_t heap_size = PTO2_HEAP_SIZE;
-            int32_t expected_arg_count = 0;
-            if (config_func) {
-                PTO2OrchestrationConfig cfg = config_func(args);
-                expected_arg_count = cfg.expected_arg_count;
-                DEV_INFO("Thread %d: Config: expected_args=%d", thread_idx, expected_arg_count);
-            } else {
-                DEV_INFO("Thread %d: No config function, using defaults", thread_idx);
-            }
-
-            if (expected_arg_count > 0 && arg_count < expected_arg_count) {
-                DEV_ERROR("Thread %d: arg_count %d < expected %d", thread_idx, arg_count, expected_arg_count);
-                dlclose(handle);
-                unlink(so_path);
-                return -1;
-            }
 
             if (runtime->pto2_task_window_size > 0) {
                 task_window_size = runtime->pto2_task_window_size;
@@ -345,8 +430,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 pto2_sm_create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
             if (!sm_handle) {
                 DEV_ERROR("Thread %d: Failed to create shared memory handle", thread_idx);
-                dlclose(handle);
-                unlink(so_path);
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
@@ -354,8 +439,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             if (!rt) {
                 DEV_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
                 pto2_sm_destroy(sm_handle);
-                dlclose(handle);
-                unlink(so_path);
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
@@ -370,11 +455,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // With multi-ring, slot_states are per-ring inside the scheduler.
             runtime->set_pto2_slot_states_ptr(nullptr);
 
-            orch_func_ = orch_func;
-            orch_bind_runtime_ = bind_runtime_func;
             orch_args_cached_ = &args;
-            orch_so_handle_ = handle;
-            snprintf(orch_so_path_, sizeof(orch_so_path_), "%s", so_path);
 
             // Wire scheduler context to the newly created PTO2Runtime before
             // releasing scheduler threads from runtime_init_ready_.
@@ -535,9 +616,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 SPIN_WAIT_HINT();
             }
         }
-        sched_ctx_.bind_runtime(rt);
-        int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
-        DEV_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+        if (rt == nullptr) {
+            DEV_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
+        } else {
+            sched_ctx_.bind_runtime(rt);
+            int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            DEV_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+        }
     }
 
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
@@ -554,8 +639,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
     if (prev_finished + 1 == thread_num_) {
         finished_.store(true, std::memory_order_release);
-        // Destroy PTO2 runtime and close orchestration SO (moved from orchestrator path)
-        if (!runtime->get_orch_built_on_host() && orch_so_handle_ != nullptr) {
+        // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
+        // always tear them down here, but we keep orch_so_handle_ alive for
+        // the next run's cache-hit reuse (see run() reload_so branch).
+        if (!runtime->get_orch_built_on_host() && rt != nullptr) {
             // Clear g_pto2_current_runtime in this DSO and in the orchestration SO before destroying rt.
             pto2_framework_bind_runtime(nullptr);
             if (orch_bind_runtime_ != nullptr) {
@@ -584,17 +671,11 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
 
-    orch_func_ = nullptr;
-    orch_bind_runtime_ = nullptr;
     orch_args_cached_ = nullptr;
-    if (orch_so_handle_ != nullptr) {
-        dlclose(orch_so_handle_);
-    }
-    if (orch_so_path_[0] != '\0') {
-        unlink(orch_so_path_);
-    }
-    orch_so_handle_ = nullptr;
-    orch_so_path_[0] = '\0';
+    // orch_so_handle_ / orch_func_ / orch_bind_runtime_ / orch_config_func_ / orch_so_path_ are
+    // intentionally preserved across deinit: the next run reuses them when
+    // has_new_orch_so() == false. The destructor releases them at process
+    // teardown.
 
     // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
     rt = nullptr;

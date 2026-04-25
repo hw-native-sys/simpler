@@ -227,6 +227,17 @@ private:
     // Kernel binary mapping (func_id -> executable memory)
     std::map<int, MappedKernel> func_id_to_addr_;
 
+    // Orchestration SO cache (host-resident in sim; see onboard for shape).
+    uint64_t cached_orch_so_hash_{0};
+    void *dev_orch_so_buffer_{nullptr};
+    size_t dev_orch_so_capacity_{0};
+    std::vector<uint8_t> host_orch_so_copy_;
+
+    // AICPU executor SO: load-once, matching onboard's binaries_loaded_ pattern.
+    // The aicpu_executor g_aicpu_executor static lives inside the dlopen'd DSO;
+    // reloading it destroys orch_so_handle_ and breaks the orch-SO cache-hit path.
+    bool aicpu_so_loaded_{false};
+
     // Runtime pointer for print_handshake_results
     Runtime *last_runtime_{nullptr};
 
@@ -260,6 +271,15 @@ private:
         const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
     );
     void unload_executor_binaries();
+
+    /**
+     * Stage the orchestration SO bytes into a host-resident buffer that
+     * `aicpu_executor` can dlopen. Identical contract to the onboard
+     * version: `runtime.pending_orch_so_data_/size_` are consumed and
+     * `runtime.{dev_orch_so_addr_, dev_orch_so_size_, has_new_orch_so_}`
+     * are populated with the cache-aware result.
+     */
+    int prepare_orch_so(Runtime &runtime);
 
     /**
      * Initialize performance profiling shared memory

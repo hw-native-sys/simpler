@@ -214,11 +214,18 @@ private:
     // Kernel binary mapping (func_id -> executable memory)
     std::map<int, MappedKernel> func_id_to_addr_;
 
+    // Orchestration SO cache (host-resident in sim).
+    uint64_t cached_orch_so_hash_{0};
+    void *dev_orch_so_buffer_{nullptr};
+    size_t dev_orch_so_capacity_{0};
+    std::vector<uint8_t> host_orch_so_copy_;
+
     // Runtime pointer for print_handshake_results
     Runtime *last_runtime_{nullptr};
 
     // Dynamically loaded executor libraries and function pointers
     void *aicpu_so_handle_{nullptr};
+    bool aicpu_so_loaded_{false};  // true after AICPU SO is dlopen'd; load-once across runs.
     void *aicore_so_handle_{nullptr};
     int (*aicpu_execute_func_)(Runtime *){nullptr};
     void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t){nullptr};
@@ -247,6 +254,12 @@ private:
         const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
     );
     void unload_executor_binaries();
+
+    /**
+     * Stage the orchestration SO bytes for aicpu_executor consumption, with
+     * identity caching. See a2a3/sim/host/device_runner.h.
+     */
+    int prepare_orch_so(Runtime &runtime);
 
     /**
      * Initialize performance profiling shared memory

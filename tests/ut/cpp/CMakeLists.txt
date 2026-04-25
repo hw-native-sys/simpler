@@ -209,6 +209,23 @@ function(add_task_interface_test name src)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+function(add_common_utils_test name src)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        # utils/elf_build_id.h lives under src/common, exposed as "utils/..."
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
 enable_testing()
 
 # ---------------------------------------------------------------------------
@@ -224,6 +241,12 @@ add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
 # Types / task_interface tests (src/common/task_interface/)
 # ---------------------------------------------------------------------------
 add_task_interface_test(test_child_memory types/test_child_memory.cpp)
+
+# ---------------------------------------------------------------------------
+# Common utilities tests (src/common/utils/)
+# ---------------------------------------------------------------------------
+add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
+add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 
 # ---------------------------------------------------------------------------
 # A2A3 tests (src/a2a3/runtime/tensormap_and_ringbuffer/)
