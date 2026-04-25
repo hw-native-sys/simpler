@@ -8,17 +8,18 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-
 // Softmax Preparation Kernel (AIV) with partial block masking
 //
-// Fixed tile size: sij is (16, 16)
+// Operates on (M, N) tile where M=q_tile_size, N=block_size:
+//   Case1: sij is (16, 128)
+//   Case2: sij is (64, 64)
 //
 // For partial blocks (valid_len < N), positions [valid_len, N) in sij are
-// filled with -inf before softmax, ensuring exp(-inf)=0 so that invalid
-// key positions contribute zero attention weight.
+// filled with -inf via TFILLPAD_INPLACE before softmax, ensuring exp(-inf)=0
+// so that invalid key positions contribute zero attention weight.
 //
 // Computes:
-//   sij_masked = pad(sij, valid_len, -inf)
+//   sij_masked = TFILLPAD(sij, valid_len, pad=-inf)
 //   sij_scale = sij_masked * scale
 //   mij = row_max(sij_scale)        -> (M, 1)
 //   pij = exp(sij_scale - mij)      -> (M, N)
@@ -27,17 +28,18 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
-#include "tensor.h"  // NOLINT(build/include_subdir)
+#include "tensor.h"
 
-// NOLINTNEXTLINE(build/namespaces)
 using namespace pto;
+
+#include "pipe_sync.h"
 
 #ifndef __gm__
 #define __gm__
 #endif
 
 #ifndef __aicore__
-#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
+#define __aicore__ [aicore]
 #endif
 
 template <int M, int N>
@@ -79,6 +81,7 @@ static __aicore__ void softmax_prepare_impl(
     TileScalarDN sumTile;
     TileVecMxN_bf16 pijBf16Tile;
 
+    // All sij tiles share UB address 0x0 (in-place masking)
     TASSIGN(sijTile, 0x0);
     TASSIGN(sijDynTile, 0x0);
     TASSIGN(sijPadTile, 0x0);
@@ -89,11 +92,13 @@ static __aicore__ void softmax_prepare_impl(
     TASSIGN(pijBf16Tile, 3 * M * N * sizeof(float) + 2 * kAlignedRows * sizeof(float));
 
     // Load full sij (M, N) tile from GM - all N columns including garbage for partial blocks
+    // printf("sij addr incore %x\n", sij->buffer.addr);
     TLOAD(sijTile, sijGlobal);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-    // manually fill invalid columns with -inf as a workaround.
+    // Mask columns [valid_len, N) with -inf. sijDynTile provides the valid boundary,
+    // sijPadTile provides PadValue::Min as the fill value. No-op when valid_len == N.
     TFILLPAD_INPLACE(sijPadTile, sijDynTile);
     pipe_barrier(PIPE_V);
 
@@ -104,19 +109,28 @@ static __aicore__ void softmax_prepare_impl(
     TROWEXPANDSUB(pijTile, sijTile, maxTile);
     pipe_barrier(PIPE_V);
     TEXP(pijTile, pijTile);
-    // Truncate pij to bf16 first, then compute lij from truncated values (matches golden)
+    // Truncate pij to bf16 first
+    pipe_barrier(PIPE_V);
     TCVT(pijBf16Tile, pijTile, RoundMode::CAST_ROUND);
-    TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
-    TROWSUM(sumTile, pijTile, tmpTile);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);  // pij bf16 ready, can store early
 
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    // Continue computing: bf16 → f32 and rowsum while pij store proceeds in parallel
+    pipe_barrier(PIPE_V);
+    TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
+    pipe_barrier(PIPE_V);
+    TROWSUM(sumTile, pijTile, tmpTile);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);  // sum ready
+
+    // Store pij (overlaps with TCVT + TROWSUM above)
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    TSTORE(mijGlobal, maxTile);
-    TSTORE(lijGlobal, sumTile);
     TSTORE(pijGlobal, pijBf16Tile);
 
-    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
-    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    // Store max and sum
+    TSTORE(mijGlobal, maxTile);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+    TSTORE(lijGlobal, sumTile);
+
+    pipe_sync();
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
@@ -124,7 +138,19 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *pij = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *mij = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *lij = reinterpret_cast<__gm__ Tensor *>(args[3]);
-    float scale_value = from_u64<float>(static_cast<uint64_t>(args[4]));
+    union {
+        uint64_t u;
+        float f;
+    } scale_conv;
+    scale_conv.u = static_cast<uint64_t>(args[4]);
+    float scale_value = scale_conv.f;
+    uint64_t q_tile_size = static_cast<uint64_t>(sij->shapes[0]);
 
-    softmax_prepare_impl<16, 16>(sij, scale_value, pij, mij, lij);
+    if (q_tile_size == 16 && pij->shapes[1] <= 16) {
+        softmax_prepare_impl<16, 16>(sij, scale_value, pij, mij, lij);
+    } else if (q_tile_size == 16) {
+        softmax_prepare_impl<16, 128>(sij, scale_value, pij, mij, lij);
+    } else {
+        softmax_prepare_impl<64, 64>(sij, scale_value, pij, mij, lij);
+    }
 }

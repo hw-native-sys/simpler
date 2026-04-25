@@ -10,7 +10,9 @@
  */
 // PV Matmul Kernel: pij(M, K) @ vj(K, N) -> oi_new(M, N)
 //
-// Fixed tile size: (16, 16) @ (16, 16) -> (16, 16)
+// Supports two tile configurations via runtime dispatch:
+//   Case1: (16, 128) @ (128, 128) -> (16, 128)
+//   Case2: (64,  64) @ ( 64, 128) -> (64, 128)
 //
 // pij is bfloat16 (converted from fp32 in softmax_prepare via TCVT).
 // vj is stored as (K, N) = (block_size, head_dim) in row-major (ND) layout.
@@ -22,6 +24,8 @@
 #include "tensor.h"
 
 using namespace pto;
+
+#include "pipe_sync.h"
 
 #ifndef __gm__
 #define __gm__
@@ -67,15 +71,17 @@ static __aicore__ void pv_matmul_impl(__gm__ Tensor *pij, __gm__ Tensor *vj, __g
     TASSIGN(bTile, 0x0);
     TASSIGN(cTile, 0x0);
 
-    // Load pij and vj to L1
+    // Load pij and vj to L1 with separate events for pipeline overlap
     TLOAD(aMatTile, pijGlobal);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);  // A load done
     TLOAD(bMatTile, vjGlobal);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);  // B load done
 
-    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    // Move A to L0A as soon as A load completes (B may still be loading)
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-
-    // Move to L0A/L0B
     TMOV(aTile, aMatTile);
+    // Move B to L0B after B load completes
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
     TMOV(bTile, bMatTile);
 
     set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
@@ -89,14 +95,20 @@ static __aicore__ void pv_matmul_impl(__gm__ Tensor *pij, __gm__ Tensor *vj, __g
 
     TSTORE(oiGlobal, cTile);
 
-    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
-    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    pipe_sync();
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *pij = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *vj = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *oi_new = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    uint64_t q_tile_size = static_cast<uint64_t>(pij->shapes[0]);
 
-    pv_matmul_impl<16, 16, 16>(pij, vj, oi_new);
+    if (q_tile_size == 16 && pij->shapes[1] <= 16) {
+        pv_matmul_impl<16, 16, 16>(pij, vj, oi_new);
+    } else if (q_tile_size == 16) {
+        pv_matmul_impl<16, 128, 128>(pij, vj, oi_new);
+    } else {
+        pv_matmul_impl<64, 64, 128>(pij, vj, oi_new);
+    }
 }
