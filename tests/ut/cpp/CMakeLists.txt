@@ -258,6 +258,25 @@ add_a2a3_test(test_a2a3_fatal a2a3/test_a2a3_fatal.cpp)
 # ---------------------------------------------------------------------------
 add_a5_test(test_a5_fatal a5/test_a5_fatal.cpp)
 
+# Host logger silent/off behavior — no runtime deps, just compile host_log.cpp
+# alongside the test.
+set(A5_HOST_LOG_DIR ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/src/host)
+add_executable(test_host_log_off
+    a5/test_host_log_off.cpp
+    ${A5_HOST_LOG_DIR}/host_log.cpp
+)
+target_include_directories(test_host_log_off PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${A5_HOST_LOG_DIR}
+)
+target_compile_options(test_host_log_off PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+target_link_libraries(test_host_log_off PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_host_log_off COMMAND test_host_log_off)
+
 # Hardware-gated tests.  Block is only entered when the project is configured
 # with -DSIMPLER_ENABLE_HARDWARE_TESTS=ON.  CI's no-hw `ut` job does not pass
 # this flag, so nothing here is compiled there — this is the structural

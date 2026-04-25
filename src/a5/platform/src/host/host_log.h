@@ -16,10 +16,11 @@
  * Integrates with Python logging system via environment variables.
  *
  * Environment Variables:
- * - PTO_LOG_LEVEL: error/warn/info/debug (default: info)
+ * - PTO_LOG_LEVEL: off/error/warn/info/debug (default: info)
  * - PTO_LOG_FILE: Optional log file path (default: stdout/stderr)
  *
  * Log Levels (1-to-1 mapping with Python logging):
+ * - OFF: Suppress everything, including ALWAYS
  * - ERROR: Only errors and failures
  * - WARN: Warnings and above
  * - INFO: Key progress steps and above (default)
@@ -40,6 +41,7 @@
 // =============================================================================
 
 enum class HostLogLevel {
+    OFF = -2,     // suppress everything (including ALWAYS)
     ALWAYS = -1,  // always logging
     ERROR = 0,    // error level only
     WARN = 1,     // warn level and above

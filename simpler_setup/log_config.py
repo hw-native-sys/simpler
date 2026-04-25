@@ -20,10 +20,11 @@ pyproject `log_cli_level` knobs.
 import logging
 import os
 
-LOG_LEVEL_CHOICES = ["error", "warn", "info", "debug"]
+LOG_LEVEL_CHOICES = ["off", "error", "warn", "info", "debug"]
 DEFAULT_LOG_LEVEL = "info"
 
 _LEVEL_MAP = {
+    "off": logging.CRITICAL + 1,
     "error": logging.ERROR,
     "warn": logging.WARNING,
     "info": logging.INFO,
@@ -35,14 +36,15 @@ def configure_logging(log_level: str = DEFAULT_LOG_LEVEL) -> None:
     """Configure root logger for a CLI entry point.
 
     Args:
-        log_level: one of "error" / "warn" / "info" / "debug" (case-insensitive).
-            Unknown values fall back to INFO.
+        log_level: one of "off" / "error" / "warn" / "info" / "debug"
+            (case-insensitive). Unknown values fall back to INFO.
     """
     log_level = log_level.lower()
     level = _LEVEL_MAP.get(log_level, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="[%(levelname)s] %(message)s",
-        force=True,
-    )
+    root = logging.getLogger()
+    root.setLevel(level)
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+        root.addHandler(handler)
     os.environ["PTO_LOG_LEVEL"] = log_level

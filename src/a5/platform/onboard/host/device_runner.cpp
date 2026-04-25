@@ -436,7 +436,7 @@ int DeviceRunner::run(
         }
     }
 
-    std::cout << "\n=== Initialize runtime args ===" << '\n';
+    LOG_INFO("=== Initialize runtime args ===");
     rc = prepare_orch_so(runtime);
     if (rc != 0) {
         LOG_ERROR("prepare_orch_so failed: %d", rc);
@@ -449,7 +449,7 @@ int DeviceRunner::run(
         return rc;
     }
 
-    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerInit===" << '\n';
+    LOG_INFO("=== launch_aicpu_kernel DynTileFwkKernelServerInit ===");
     // Launch AICPU init kernel
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
     if (rc != 0) {
@@ -457,7 +457,7 @@ int DeviceRunner::run(
         return rc;
     }
 
-    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServer===" << '\n';
+    LOG_INFO("=== launch_aicpu_kernel DynTileFwkKernelServer ===");
     // Launch AICPU main kernel (over-launch for affinity gate)
     rc = launch_aicpu_kernel(
         stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
@@ -467,7 +467,7 @@ int DeviceRunner::run(
         return rc;
     }
 
-    std::cout << "\n=== launch_aicore_kernel===" << '\n';
+    LOG_INFO("=== launch_aicore_kernel ===");
     // Launch AICore kernel
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.args.runtime_args);
     if (rc != 0) {
@@ -476,7 +476,7 @@ int DeviceRunner::run(
     }
 
     {
-        std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
+        LOG_INFO("=== rtStreamSynchronize stream_aicpu_ ===");
         // Synchronize streams
         rc = rtStreamSynchronize(stream_aicpu_);
         if (rc != 0) {
@@ -484,7 +484,7 @@ int DeviceRunner::run(
             return rc;
         }
 
-        std::cout << "\n=== rtStreamSynchronize stream_aicore_===" << '\n';
+        LOG_INFO("=== rtStreamSynchronize stream_aicore_ ===");
         rc = rtStreamSynchronize(stream_aicore_);
         if (rc != 0) {
             LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);

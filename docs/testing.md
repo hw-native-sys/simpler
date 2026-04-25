@@ -114,7 +114,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--build` | | false | Compile runtime from source (not pre-built) |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
-| `--log-level LEVEL` | | (none) | Set `PTO_LOG_LEVEL` env var (`error`/`warn`/`info`/`debug`) |
+| `--log-level LEVEL` | | (none) | Set `PTO_LOG_LEVEL` env var (`off`/`error`/`warn`/`info`/`debug`). `off` suppresses all Host/Python/sim-device logs including `ALWAYS`; onboard AICPU logs are managed by CANN and must be controlled via CANN env vars (e.g. `ASCEND_GLOBAL_LOG_LEVEL`) |
 
 Profiling is enabled only on the first round to avoid overhead on subsequent iterations. Output tensors are reset to their initial values between rounds.
 

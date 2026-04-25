@@ -58,7 +58,9 @@ void HostLogger::init_from_env() {
         }
 
         // Map log level strings to enum values (1-to-1 mapping)
-        if (level == "error") {
+        if (level == "off") {
+            current_level_ = HostLogLevel::OFF;
+        } else if (level == "error") {
             current_level_ = HostLogLevel::ERROR;
         } else if (level == "warn") {
             current_level_ = HostLogLevel::WARN;
@@ -119,6 +121,8 @@ const char *HostLogger::get_level_name(HostLogLevel level) const {
         return "DEBUG";
     case HostLogLevel::ALWAYS:
         return "ALWAYS";
+    case HostLogLevel::OFF:
+        return "OFF";
     default:
         return "UNKNOWN";
     }
@@ -139,6 +143,10 @@ FILE *HostLogger::get_output_file(HostLogLevel level) {
 }
 
 void HostLogger::log(HostLogLevel level, const char *format, ...) {
+    // Hard mute: OFF suppresses everything including ALWAYS
+    if (current_level_ == HostLogLevel::OFF) {
+        return;
+    }
     // Check if this level is enabled
     if (!is_enabled(level)) {
         return;

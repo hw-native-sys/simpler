@@ -57,8 +57,14 @@ void init_log_switch() {
         }
 
         // Parse log level
-        if (strcmp(level, "silent") == 0 || strcmp(level, "error") == 0) {
-            // Silent/Error: only errors
+        if (strcmp(level, "off") == 0) {
+            // Off: suppress everything
+            g_is_log_enable_debug = false;
+            g_is_log_enable_info = false;
+            g_is_log_enable_warn = false;
+            g_is_log_enable_error = false;
+        } else if (strcmp(level, "error") == 0) {
+            // Error: only errors
             g_is_log_enable_debug = false;
             g_is_log_enable_info = false;
             g_is_log_enable_warn = false;
