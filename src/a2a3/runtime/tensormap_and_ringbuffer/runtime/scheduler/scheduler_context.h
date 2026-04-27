@@ -26,7 +26,7 @@
 #define RUNTIME_MAX_WORKER 72
 #endif
 #ifndef RUNTIME_MAX_FUNC_ID
-#define RUNTIME_MAX_FUNC_ID 32
+#define RUNTIME_MAX_FUNC_ID 1024
 #endif
 
 // Forward declarations — avoid pulling in full headers for pointer/reference params.

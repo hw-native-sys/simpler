@@ -70,7 +70,7 @@
 #endif
 
 #ifndef RUNTIME_MAX_FUNC_ID
-#define RUNTIME_MAX_FUNC_ID 32
+#define RUNTIME_MAX_FUNC_ID 1024
 #endif
 
 // =============================================================================

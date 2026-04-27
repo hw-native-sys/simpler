@@ -31,7 +31,7 @@
  *
  * Type aliases:
  *   CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>       — leaf kernel binary
- *   ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 32> — orchestration + child kernels
+ *   ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024> — orchestration + child kernels
  */
 
 #pragma once
@@ -151,7 +151,7 @@ private:
 // ============================================================================
 
 using CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>;
-using ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 32>;
+using ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>;
 
 // ============================================================================
 // Factory: make_callable for static leaf

@@ -427,7 +427,7 @@ NB_MODULE(_task_interface, m) {
                     child_bufs[i] = std::get<1>(children[i]).buffer_;
                 }
 
-                auto buf = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 32>(
+                auto buf = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
                     signature.data(), static_cast<int32_t>(signature.size()), func_name.c_str(), bin_ptr, bin_size,
                     func_ids.data(), child_bufs.data(), child_count, config_name.c_str()
                 );
