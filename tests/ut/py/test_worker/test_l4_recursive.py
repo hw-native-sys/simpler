@@ -19,7 +19,7 @@ import struct
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
-from simpler.task_interface import ChipCallConfig, TaskArgs
+from simpler.task_interface import CallConfig, TaskArgs
 from simpler.worker import Worker
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ class TestL4ToL3SingleDispatch:
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
 
             w4.run(l4_orch)
             w4.close()
@@ -169,7 +169,7 @@ class TestL4ToL3MultipleDispatches:
 
             def l4_orch(orch, args, config):
                 for _ in range(3):
-                    orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+                    orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
 
             w4.run(l4_orch)
             w4.close()
@@ -210,7 +210,7 @@ class TestL4WithOwnSubs:
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
                 orch.submit_sub(l4_verify_cid)
 
             w4.run(l4_orch)
@@ -246,7 +246,7 @@ class TestL4MultipleRuns:
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
 
             for _ in range(5):
                 w4.run(l4_orch)
@@ -287,7 +287,7 @@ class TestL4L3WithMultipleSubs:
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
 
             w4.run(l4_orch)
             w4.close()
@@ -323,7 +323,7 @@ class TestL3OwnOrchestrator:
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
 
             w4.run(l4_orch)
             w4.close()

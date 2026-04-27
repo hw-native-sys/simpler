@@ -39,10 +39,10 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import torch  # noqa: E402
 from simpler.task_interface import (  # noqa: E402
     ArgDirection,
+    CallConfig,
     ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
-    ChipCallConfig,
     ChipCommBootstrapConfig,
     ChipContext,
     ContinuousTensor,
@@ -253,7 +253,7 @@ def run(device_ids: list[int]) -> int:
                 orch.submit_next_level(allreduce_cc, a2, cfg, worker=i)
 
         print("[ffn_tp_parallel] running 2-chip 2-stage DAG...")
-        worker.run(orch_fn, args=None, config=ChipCallConfig())
+        worker.run(orch_fn, args=None, config=CallConfig())
 
         # Golden: every rank's y should equal sum over r of x_shard[r] @ w_shard[r].
         expected = torch.zeros(M, N, dtype=torch.float32)

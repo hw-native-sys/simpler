@@ -100,8 +100,7 @@ inline void bind_worker(nb::module_ &m) {
     nb::class_<Orchestrator>(m, "_Orchestrator")
         .def(
             "submit_next_level",
-            [](Orchestrator &self, uint64_t callable, const TaskArgs &args, const ChipCallConfig &config,
-               int8_t worker) {
+            [](Orchestrator &self, uint64_t callable, const TaskArgs &args, const CallConfig &config, int8_t worker) {
                 return self.submit_next_level(callable, args, config, worker);
             },
             nb::arg("callable"), nb::arg("args"), nb::arg("config"), nb::arg("worker") = int8_t(-1),
@@ -109,8 +108,8 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "submit_next_level_group",
-            [](Orchestrator &self, uint64_t callable, const std::vector<TaskArgs> &args_list,
-               const ChipCallConfig &config, const std::vector<int8_t> &workers) {
+            [](Orchestrator &self, uint64_t callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
+               const std::vector<int8_t> &workers) {
                 return self.submit_next_level_group(callable, args_list, config, workers);
             },
             nb::arg("callable"), nb::arg("args_list"), nb::arg("config"), nb::arg("workers") = std::vector<int8_t>{},
@@ -245,7 +244,7 @@ inline void bind_worker(nb::module_ &m) {
             "set_run_callback",
             [](Worker &self, nb::object cb) {
                 self.set_run_callback(
-                    [cb_stored = nb::object(cb)](uint64_t callable, TaskArgsView view, const ChipCallConfig &config) {
+                    [cb_stored = nb::object(cb)](uint64_t callable, TaskArgsView view, const CallConfig &config) {
                         nb::gil_scoped_acquire gil;
                         TaskArgs args;
                         for (int32_t i = 0; i < view.tensor_count; i++) {
@@ -260,7 +259,7 @@ inline void bind_worker(nb::module_ &m) {
             },
             nb::arg("callback"),
             "Set the Python callback for THREAD-mode L4+ dispatch. The callback "
-            "receives (callable_id, TaskArgs, ChipCallConfig) with the GIL held."
+            "receives (callable_id, TaskArgs, CallConfig) with the GIL held."
         )
 
         .def(

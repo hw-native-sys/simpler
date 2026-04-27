@@ -857,9 +857,9 @@ class SceneTestCase:
         raise ValueError(f"Unsupported level: {self._st_level}")
 
     def _build_config(self, config_dict, enable_l2_swimlane=False, enable_dump_tensor=False, enable_pmu=0):
-        from simpler.task_interface import ChipCallConfig  # noqa: PLC0415
+        from simpler.task_interface import CallConfig  # noqa: PLC0415
 
-        config = ChipCallConfig()
+        config = CallConfig()
         config.block_dim = config_dict.get("block_dim", 1)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
         config.enable_l2_swimlane = enable_l2_swimlane

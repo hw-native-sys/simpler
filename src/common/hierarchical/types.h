@@ -21,7 +21,7 @@
  *   - IWorker: abstract interface implemented by ChipWorker, SubWorker,
  *              and Worker itself (recursive composition)
  *
- * IWorker::run takes (callable, TaskArgsView, ChipCallConfig) directly.
+ * IWorker::run takes (callable, TaskArgsView, CallConfig) directly.
  * THREAD-mode dispatch builds the view via `slot.args_view(i)` from the
  * slot's stored TaskArgs; PROCESS-mode dispatch encodes the TaskArgs into
  * the per-WorkerThread shm mailbox via write_blob() and the child rebuilds
@@ -38,7 +38,7 @@
 #include <queue>
 #include <vector>
 
-#include "../task_interface/chip_call_config.h"
+#include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
 
 // =============================================================================
@@ -148,7 +148,7 @@ struct TaskSlotState {
     WorkerType worker_type{WorkerType::NEXT_LEVEL};
     uint64_t callable{0};     // NEXT_LEVEL: ChipCallable buffer ptr; SUB: unused
     int32_t callable_id{-1};  // SUB: registered callable id
-    ChipCallConfig config{};  // NEXT_LEVEL config (block_dim, aicpu_thread_num, diagnostics sub-features)
+    CallConfig config{};      // NEXT_LEVEL config (block_dim, aicpu_thread_num, diagnostics sub-features)
 
     // Unified task-args storage: `task_args` is the single-task builder;
     // when `is_group_` is true, `task_args_list` carries one TaskArgs per
@@ -236,5 +236,5 @@ public:
     //
     // slot_id is not a parameter — completion routing is owned by
     // WorkerThread / Scheduler at a higher layer.
-    virtual void run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) = 0;
+    virtual void run(uint64_t callable, TaskArgsView args, const CallConfig &config) = 0;
 };

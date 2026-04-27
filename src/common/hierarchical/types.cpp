@@ -30,7 +30,7 @@ void TaskSlotState::reset() {
     worker_type = WorkerType::NEXT_LEVEL;
     callable = 0;
     callable_id = -1;
-    config = ChipCallConfig{};
+    config = CallConfig{};
     task_args.clear();
     task_args_list.clear();
     is_group_ = false;

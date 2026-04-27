@@ -45,10 +45,10 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import torch  # noqa: E402
 from simpler.task_interface import (  # noqa: E402
     ArgDirection,
+    CallConfig,
     ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
-    ChipCallConfig,
     ChipCommBootstrapConfig,
     ChipContext,
     ContinuousTensor,
@@ -230,7 +230,7 @@ def run(device_ids: list[int]) -> int:
                 orch.submit_next_level(chip_callable, chip_args, cfg, worker=i)
 
         print("[allreduce] running 2-chip allreduce DAG...")
-        worker.run(orch_fn, args=None, config=ChipCallConfig())
+        worker.run(orch_fn, args=None, config=CallConfig())
 
         expected = torch.tensor(expected_output(nranks), dtype=torch.float32)
         ok = True

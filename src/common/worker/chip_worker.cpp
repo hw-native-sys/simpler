@@ -226,7 +226,7 @@ void ChipWorker::finalize() {
     finalized_ = true;
 }
 
-void ChipWorker::run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) {
+void ChipWorker::run(uint64_t callable, TaskArgsView args, const CallConfig &config) {
     // L2 ABI edge: assemble the fixed-size ChipStorageTaskArgs POD from the
     // view and hand it to the runtime. This conversion used to happen at
     // submit time (stored on the slot); it now runs lazily in the worker so
@@ -235,7 +235,7 @@ void ChipWorker::run(uint64_t callable, TaskArgsView args, const ChipCallConfig 
     run(reinterpret_cast<const void *>(callable), &chip_storage, config);
 }
 
-void ChipWorker::run(const void *callable, const void *args, const ChipCallConfig &config) {
+void ChipWorker::run(const void *callable, const void *args, const CallConfig &config) {
     if (!device_set_) {
         throw std::runtime_error("ChipWorker device not set; call set_device() first");
     }

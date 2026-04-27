@@ -137,25 +137,25 @@ ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataTyp
 // =============================================================================
 
 SubmitResult
-Orchestrator::submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config, int8_t worker) {
+Orchestrator::submit_next_level(uint64_t callable, const TaskArgs &args, const CallConfig &config, int8_t worker) {
     std::vector<int8_t> affinities;
     if (worker >= 0) affinities = {worker};
     return submit_impl(WorkerType::NEXT_LEVEL, callable, /*callable_id=*/-1, config, {args}, std::move(affinities));
 }
 
 SubmitResult Orchestrator::submit_next_level_group(
-    uint64_t callable, const std::vector<TaskArgs> &args_list, const ChipCallConfig &config,
+    uint64_t callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
     const std::vector<int8_t> &workers
 ) {
     return submit_impl(WorkerType::NEXT_LEVEL, callable, /*callable_id=*/-1, config, args_list, workers);
 }
 
 SubmitResult Orchestrator::submit_sub(int32_t callable_id, const TaskArgs &args) {
-    return submit_impl(WorkerType::SUB, /*callable_ptr=*/0, callable_id, ChipCallConfig{}, {args});
+    return submit_impl(WorkerType::SUB, /*callable_ptr=*/0, callable_id, CallConfig{}, {args});
 }
 
 SubmitResult Orchestrator::submit_sub_group(int32_t callable_id, const std::vector<TaskArgs> &args_list) {
-    return submit_impl(WorkerType::SUB, /*callable_ptr=*/0, callable_id, ChipCallConfig{}, args_list);
+    return submit_impl(WorkerType::SUB, /*callable_ptr=*/0, callable_id, CallConfig{}, args_list);
 }
 
 // =============================================================================
@@ -163,7 +163,7 @@ SubmitResult Orchestrator::submit_sub_group(int32_t callable_id, const std::vect
 // =============================================================================
 
 SubmitResult Orchestrator::submit_impl(
-    WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const ChipCallConfig &config,
+    WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const CallConfig &config,
     std::vector<TaskArgs> args_list, std::vector<int8_t> affinities
 ) {
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");

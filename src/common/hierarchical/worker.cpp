@@ -167,7 +167,7 @@ void Worker::close() {
 // IWorker::run() — Worker as sub-worker of a higher level (THREAD mode)
 // =============================================================================
 
-void Worker::run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) {
+void Worker::run(uint64_t callable, TaskArgsView args, const CallConfig &config) {
     if (run_callback_) {
         run_callback_(callable, args, config);
     }

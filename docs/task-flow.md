@@ -201,8 +201,7 @@ Propagated by value throughout:
 5. `IWorker::run` receives `const CallConfig&`; passed on to `pto2_run_runtime`
    at the L2 edge
 
-Same type at every level. `ChipCallConfig` is an alias for `CallConfig` at the
-L2 runtime ABI (they must have identical layout).
+Same type at every level. Used directly at the L2 runtime ABI.
 
 ---
 
@@ -425,7 +424,7 @@ w4.add_worker(l3)                   # add un-init'd L3 Worker as child
 w4.init()
 
 def my_l4_orch(orch, args):
-    orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+    orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
 
 w4.run(Task(orch=my_l4_orch))
 w4.close()

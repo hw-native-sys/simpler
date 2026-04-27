@@ -13,8 +13,8 @@
  * Orchestrator — DAG builder.
  *
  * Public API (called by the user's orch fn during Worker::run):
- *   - submit_next_level(callable, TaskArgs, ChipCallConfig)
- *   - submit_next_level_group(callable, vector<TaskArgs>, ChipCallConfig)
+ *   - submit_next_level(callable, TaskArgs, CallConfig)
+ *   - submit_next_level_group(callable, vector<TaskArgs>, CallConfig)
  *   - submit_sub(callable_id, TaskArgs)
  *   - submit_sub_group(callable_id, vector<TaskArgs>)
  *   - alloc(shape, dtype) — runtime-owned intermediate buffer
@@ -37,7 +37,7 @@
 #include <mutex>
 #include <vector>
 
-#include "../task_interface/chip_call_config.h"
+#include "../task_interface/call_config.h"
 #include "../task_interface/data_type.h"
 #include "../task_interface/task_args.h"
 #include "../task_interface/tensor_arg.h"
@@ -98,12 +98,12 @@ public:
     // data are auto-allocated from the HeapRing.
     // `worker`: logical worker id for affinity (-1 = unconstrained).
     SubmitResult
-    submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config, int8_t worker = -1);
+    submit_next_level(uint64_t callable, const TaskArgs &args, const CallConfig &config, int8_t worker = -1);
 
     // Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node.
     // `workers`: per-args affinity (empty = all unconstrained).
     SubmitResult submit_next_level_group(
-        uint64_t callable, const std::vector<TaskArgs> &args_list, const ChipCallConfig &config,
+        uint64_t callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
         const std::vector<int8_t> &workers = {}
     );
 
@@ -178,7 +178,7 @@ private:
     // Shared submit machinery. Takes `args_list` by value so the Orchestrator
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
     SubmitResult submit_impl(
-        WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const ChipCallConfig &config,
+        WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const CallConfig &config,
         std::vector<TaskArgs> args_list, std::vector<int8_t> affinities = {}
     );
 

@@ -31,10 +31,10 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     ArgDirection,
+    CallConfig,
     ChipBootstrapChannel,
     ChipBootstrapMailboxState,
     ChipCallable,
-    ChipCallConfig,
     ChipStorageTaskArgs,
     ContinuousTensor,
     CoreCallable,
@@ -65,7 +65,7 @@ __all__ = [
     "ArgDirection",
     "CoreCallable",
     "ChipCallable",
-    "ChipCallConfig",
+    "CallConfig",
     "ChipWorker",
     "arg_direction_name",
     "scalar_to_uint64",
@@ -288,11 +288,11 @@ class ChipWorker:
         Args:
             callable: ChipCallable built from orchestration + kernel binaries.
             args: ChipStorageTaskArgs for this invocation.
-            config: Optional ChipCallConfig. If None, a default is created.
+            config: Optional CallConfig. If None, a default is created.
             **kwargs: Overrides applied to config (e.g. block_dim=24).
         """
         if config is None:
-            config = ChipCallConfig()
+            config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
         self._impl.run(callable, args, config)

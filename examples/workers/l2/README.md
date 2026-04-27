@@ -24,7 +24,7 @@ worker = Worker(
 worker.init()             # load host.so + aicpu.so + aicore.o, set device
 try:
     # ... allocate device buffers, build ChipCallable, run ...
-    worker.run(chip_callable, task_args, chip_call_config)
+    worker.run(chip_callable, task_args, call_config)
 finally:
     worker.close()        # release ACL resources and device
 ```

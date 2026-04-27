@@ -110,7 +110,7 @@ the DAG before returning.
 ### 4. `Worker.run(orch_fn, ...)` — blocks until DAG drains
 
 ```python
-worker.run(orch_fn, args=None, config=ChipCallConfig())
+worker.run(orch_fn, args=None, config=CallConfig())
 ```
 
 After this returns, all tags on `host_out` are satisfied: chip tasks have

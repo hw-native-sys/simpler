@@ -12,7 +12,7 @@
 import os
 
 import pytest
-from simpler.task_interface import ChipCallable, ChipCallConfig, ChipStorageTaskArgs
+from simpler.task_interface import CallConfig, ChipCallable, ChipStorageTaskArgs
 from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
@@ -43,7 +43,7 @@ def test_explicit_fatal_reports(st_platform, st_device_ids, monkeypatch):
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     worker.init()
     try:
-        config = ChipCallConfig()
+        config = CallConfig()
         config.block_dim = 24
         config.aicpu_thread_num = 4
         with pytest.raises(RuntimeError, match=r"run_runtime failed with code -9"):

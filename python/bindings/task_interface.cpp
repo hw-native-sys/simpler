@@ -551,17 +551,17 @@ NB_MODULE(_task_interface, m) {
             return os.str();
         });
 
-    // --- ChipCallConfig ---
-    nb::class_<ChipCallConfig>(m, "ChipCallConfig")
+    // --- CallConfig ---
+    nb::class_<CallConfig>(m, "CallConfig")
         .def(nb::init<>())
-        .def_rw("block_dim", &ChipCallConfig::block_dim)
-        .def_rw("aicpu_thread_num", &ChipCallConfig::aicpu_thread_num)
-        .def_rw("enable_l2_swimlane", &ChipCallConfig::enable_l2_swimlane)
-        .def_rw("enable_dump_tensor", &ChipCallConfig::enable_dump_tensor)
-        .def_rw("enable_pmu", &ChipCallConfig::enable_pmu)
-        .def("__repr__", [](const ChipCallConfig &self) -> std::string {
+        .def_rw("block_dim", &CallConfig::block_dim)
+        .def_rw("aicpu_thread_num", &CallConfig::aicpu_thread_num)
+        .def_rw("enable_l2_swimlane", &CallConfig::enable_l2_swimlane)
+        .def_rw("enable_dump_tensor", &CallConfig::enable_dump_tensor)
+        .def_rw("enable_pmu", &CallConfig::enable_pmu)
+        .def("__repr__", [](const CallConfig &self) -> std::string {
             std::ostringstream os;
-            os << "ChipCallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
+            os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
                << ", enable_l2_swimlane=" << (self.enable_l2_swimlane ? "True" : "False")
                << ", enable_dump_tensor=" << (self.enable_dump_tensor ? "True" : "False")
                << ", enable_pmu=" << self.enable_pmu << ")";
@@ -580,8 +580,7 @@ NB_MODULE(_task_interface, m) {
         .def("finalize", &ChipWorker::finalize)
         .def(
             "run",
-            [](ChipWorker &self, const PyChipCallable &callable, ChipStorageTaskArgs &args,
-               const ChipCallConfig &config) {
+            [](ChipWorker &self, const PyChipCallable &callable, ChipStorageTaskArgs &args, const CallConfig &config) {
                 self.run(callable.buffer_.data(), &args, config);
             },
             nb::arg("callable"), nb::arg("args"), nb::arg("config")
@@ -590,7 +589,7 @@ NB_MODULE(_task_interface, m) {
             "run_raw",
             [](ChipWorker &self, uint64_t callable, uint64_t args, int block_dim, int aicpu_thread_num,
                bool enable_l2_swimlane, bool enable_dump_tensor, int enable_pmu) {
-                ChipCallConfig config;
+                CallConfig config;
                 config.block_dim = block_dim;
                 config.aicpu_thread_num = aicpu_thread_num;
                 config.enable_l2_swimlane = enable_l2_swimlane;
@@ -606,7 +605,7 @@ NB_MODULE(_task_interface, m) {
             "run_from_blob",
             [](ChipWorker &self, uint64_t callable, uint64_t blob_ptr, int block_dim, int aicpu_thread_num,
                bool enable_l2_swimlane, bool enable_dump_tensor, int enable_pmu) {
-                ChipCallConfig config;
+                CallConfig config;
                 config.block_dim = block_dim;
                 config.aicpu_thread_num = aicpu_thread_num;
                 config.enable_l2_swimlane = enable_l2_swimlane;

@@ -27,7 +27,7 @@ import time
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
-from simpler.task_interface import ChipCallConfig, TaskArgs
+from simpler.task_interface import CallConfig, TaskArgs
 from simpler.worker import Worker
 
 # ---------------------------------------------------------------------------
@@ -220,7 +220,7 @@ class TestL4ChainedFailure:
         try:
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
 
             with pytest.raises(RuntimeError) as info:
                 w4.run(l4_orch)

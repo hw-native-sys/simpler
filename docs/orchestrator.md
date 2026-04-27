@@ -21,10 +21,10 @@ public:
     // --- User-facing submit API (tags inside TaskArgs drive deps) ---
     SubmitResult submit_next_level(uint64_t callable,
                                     const TaskArgs &args,
-                                    const ChipCallConfig &config);
+                                    const CallConfig &config);
     SubmitResult submit_next_level_group(uint64_t callable,
                                           const std::vector<TaskArgs> &args_list,
-                                          const ChipCallConfig &config);
+                                          const CallConfig &config);
     SubmitResult submit_sub(int32_t callable_id, const TaskArgs &args);
     SubmitResult submit_sub_group(int32_t callable_id,
                                    const std::vector<TaskArgs> &args_list);

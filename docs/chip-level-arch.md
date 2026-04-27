@@ -126,13 +126,13 @@ destroy_device_context(ctx);
 ### Layer 3: Python API (`python/bindings/task_interface.cpp` via nanobind)
 
 ```python
-from simpler.task_interface import ChipWorker, ChipCallable, ChipStorageTaskArgs, ChipCallConfig
+from simpler.task_interface import ChipWorker, ChipCallable, ChipStorageTaskArgs, CallConfig
 
 worker = ChipWorker()
 worker.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path="")
 worker.set_device(device_id)
 
-config = ChipCallConfig()
+config = CallConfig()
 config.block_dim = 24
 config.aicpu_thread_num = 3
 config.enable_pmu = 0
@@ -150,10 +150,12 @@ level model (see [hierarchical_level_runtime.md](hierarchical_level_runtime.md))
 | Worker | `ChipWorker` | `Worker` | `Worker(level=N)` |
 | Callable | `ChipCallable` | *(planned)* | — |
 | TaskArgs | `ChipStorageTaskArgs` | *(planned)* | — |
-| Config | `ChipCallConfig` | *(planned)* | — |
+| Config | `CallConfig` | `CallConfig` | — |
 
+`CallConfig` is the exception — same type used at every level, with no
+`Chip*` / unprefixed split (see [task-flow.md](task-flow.md) for details).
 The unified `Worker(level=N)` factory already routes to the correct backend.
-When new level-specific types are added (e.g. `CallConfig`), each concept
+When new level-specific types are added (e.g. `ChipCallable`), each concept
 should follow the same pattern: a `Chip*` concrete type for L2, a prefix-less
 concrete type for L3+, and optionally a factory function that routes by level.
 
@@ -187,7 +189,7 @@ worker.set_device(device_id)
 ### 3. Execution Phase
 
 ```text
-worker.run(callable, args, ChipCallConfig(block_dim, aicpu_thread_num))
+worker.run(callable, args, CallConfig(block_dim, aicpu_thread_num))
   │
   └─→ run_runtime(ctx, runtime, callable, args, ...)
        │
