@@ -97,6 +97,10 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
         LOG_INFO("Registering %d kernel(s) in init_runtime_impl", callable->child_count());
         for (int32_t i = 0; i < callable->child_count(); i++) {
             int func_id = callable->child_func_id(i);
+            if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
+                LOG_ERROR("func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
+                return -1;
+            }
             const auto &kernel = callable->child(i);
             uint64_t addr = runtime->host_api.upload_kernel_binary(
                 func_id, reinterpret_cast<const uint8_t *>(&kernel),

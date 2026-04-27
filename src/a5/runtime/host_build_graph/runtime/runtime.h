@@ -452,14 +452,7 @@ public:
      * Set function binary address for a func_id.
      * Called by platform layer after kernel registration.
      */
-    void set_function_bin_addr(int func_id, uint64_t addr) {
-        if (func_id >= 0 && func_id < RUNTIME_MAX_FUNC_ID) {
-            func_id_to_addr_[func_id] = addr;
-            if (addr != 0 && registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
-                registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
-            }
-        }
-    }
+    void set_function_bin_addr(int func_id, uint64_t addr);
 
     int get_registered_kernel_count() const { return registered_kernel_count_; }
 

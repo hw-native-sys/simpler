@@ -230,3 +230,25 @@ TensorPair *Runtime::get_tensor_pairs() { return tensor_pairs; }
 int Runtime::get_tensor_pair_count() const { return tensor_pair_count; }
 
 void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }
+
+// =============================================================================
+// Kernel Binary Address Management
+// =============================================================================
+
+void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
+    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
+        LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
+        return;
+    }
+    if (addr != 0 && func_id_to_addr_[func_id] == 0) {
+        if (registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
+            registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
+        } else {
+            LOG_ERROR(
+                "[Runtime] Registration limit reached (%d). Cannot track func_id=%d for cleanup.", RUNTIME_MAX_FUNC_ID,
+                func_id
+            );
+        }
+    }
+    func_id_to_addr_[func_id] = addr;
+}

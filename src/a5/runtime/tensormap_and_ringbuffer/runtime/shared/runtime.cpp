@@ -145,12 +145,21 @@ uint64_t Runtime::get_function_bin_addr(int func_id) const {
 }
 
 void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
-    if (func_id >= 0 && func_id < RUNTIME_MAX_FUNC_ID) {
-        func_id_to_addr_[func_id] = addr;
-        if (addr != 0 && registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
+    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
+        LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
+        return;
+    }
+    if (addr != 0 && func_id_to_addr_[func_id] == 0) {
+        if (registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
             registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
+        } else {
+            LOG_ERROR(
+                "[Runtime] Registration limit reached (%d). Cannot track func_id=%d for cleanup.", RUNTIME_MAX_FUNC_ID,
+                func_id
+            );
         }
     }
+    func_id_to_addr_[func_id] = addr;
 }
 
 int Runtime::get_registered_kernel_count() const { return registered_kernel_count_; }
