@@ -1,0 +1,81 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <cstdint>
+
+#ifndef __gm__
+#define __gm__
+#endif
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
+
+#include <pto/pto-inst.hpp>
+#include <pto/comm/comm_types.hpp>
+#include <pto/comm/pto_comm_inst.hpp>
+
+#include "platform_comm/comm_context.h"
+#include "tensor.h"
+
+using namespace pto;
+
+template <typename T>
+static inline __aicore__ __gm__ T *comm_remote_ptr(__gm__ CommContext *ctx, __gm__ T *local_ptr, int peer_rank) {
+    uint64_t local_base = ctx->windowsIn[ctx->rankId];
+    uint64_t offset = reinterpret_cast<uint64_t>(local_ptr) - local_base;
+    return reinterpret_cast<__gm__ T *>(ctx->windowsIn[peer_rank] + offset);
+}
+
+extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *in_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ int32_t *local_counter = reinterpret_cast<__gm__ int32_t *>(args[2]);
+    __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[3]);
+
+    __gm__ float *in_data = reinterpret_cast<__gm__ float *>(in_tensor->buffer.addr) + in_tensor->start_offset;
+    __gm__ float *out_data = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
+
+    int my_rank = static_cast<int>(comm_ctx->rankId);
+    int peer_rank = 1 - my_rank;
+
+    constexpr int kRows = 128;
+    constexpr int kCols = 128;
+    using DynShapeDim5 = Shape<1, 1, 1, kRows, kCols>;
+    using DynStridDim5 = Stride<1, 1, 1, kCols, 1>;
+    using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
+    using TileData = Tile<TileType::Vec, float, kRows, kCols, BLayout::RowMajor, -1, -1>;
+
+    TileData in_tile(kRows, kCols);
+    TileData out_tile(kRows, kCols);
+    TASSIGN(in_tile, 0x0);
+    TASSIGN(out_tile, 0x10000);
+
+    GlobalData in_global(in_data);
+    GlobalData out_global(out_data);
+    TLOAD(in_tile, in_global);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    TADD(out_tile, in_tile, in_tile);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(out_global, out_tile);
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+
+    if (my_rank == 1) {
+        for (volatile int i = 0; i < 2000000; ++i) {}
+    }
+
+    __gm__ int32_t *remote_counter = comm_remote_ptr(comm_ctx, local_counter, peer_rank);
+    pto::comm::Signal remote_signal(remote_counter);
+    pto::comm::TNOTIFY(remote_signal, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
+    pipe_barrier(PIPE_ALL);
+}

@@ -32,6 +32,7 @@
 #include <atomic>
 
 #include "common/core_type.h"
+#include "pto_async_wait.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
@@ -593,6 +594,8 @@ struct PTO2SchedulerState {
     );
     static_assert(sizeof(WiringState) == 576, "WiringState must be exactly 9 cache lines (576B)");
 
+    alignas(64) PTO2AsyncWaitList async_wait_list;
+
     // Statistics (cold path, isolated from hot-path fields)
 #if PTO2_SCHED_PROFILING
     alignas(64) std::atomic<int64_t> tasks_completed;
@@ -993,6 +996,78 @@ bool pto2_scheduler_init(
     PTO2SchedulerState *sched, PTO2SharedMemoryHeader *sm_header, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
 );
 void pto2_scheduler_destroy(PTO2SchedulerState *sched);
+
+template <bool Profiling>
+inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
+    volatile PTO2CompletionIngressQueue *completion_ingress, PTO2SchedulerState *sched,
+    PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
+    int32_t deferred_release_capacity
+#if PTO2_SCHED_PROFILING
+    ,
+    int thread_idx
+#endif
+) {
+    PTO2AsyncPollResult result;
+    if (!try_lock()) return result;
+
+    int32_t drain_err = PTO2_ERROR_NONE;
+    drain_completion_ingress_locked(completion_ingress, drain_err);
+    if (drain_err != PTO2_ERROR_NONE) {
+        result.error_code = drain_err;
+        unlock();
+        return result;
+    }
+
+    for (int32_t i = count - 1; i >= 0; --i) {
+        PTO2AsyncWaitEntry &entry = entries[i];
+        uintptr_t last_invalidated_counter_line = static_cast<uintptr_t>(-1);
+        for (int32_t c = 0; c < entry.condition_count; c++) {
+            PTO2CompletionCondition &cond = entry.conditions[c];
+            if (cond.satisfied) continue;
+            if (cond.counter_addr) {
+                uintptr_t counter_line = pto2_completion_ingress_cache_line(cond.counter_addr);
+                if (counter_line != last_invalidated_counter_line) {
+                    cache_invalidate_range(reinterpret_cast<const void *>(counter_line), sizeof(uint32_t));
+                    last_invalidated_counter_line = counter_line;
+                }
+            }
+            PTO2CompletionPollResult poll = cond.test();
+            if (poll.state == PTO2CompletionPollState::FAILED) {
+                result.error_code = poll.error_code;
+                result.failed_slot_state = entry.slot_state;
+                unlock();
+                return result;
+            }
+            if (poll.state == PTO2CompletionPollState::READY) {
+                cond.satisfied = true;
+                entry.waiting_completion_count--;
+            }
+        }
+
+        if (entry.normal_done && entry.waiting_completion_count <= 0) {
+            if (deferred_release_count >= deferred_release_capacity) {
+                result.error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
+                result.failed_slot_state = entry.slot_state;
+                unlock();
+                return result;
+            }
+#if PTO2_SCHED_PROFILING
+            sched->on_mixed_task_complete(*entry.slot_state, thread_idx, local_bufs);
+#else
+            sched->on_mixed_task_complete(*entry.slot_state, local_bufs);
+#endif
+            deferred_release_slot_states[deferred_release_count++] = entry.slot_state;
+            result.completed++;
+
+            int32_t last = count - 1;
+            if (i != last) entries[i] = entries[last];
+            count = last;
+        }
+    }
+
+    unlock();
+    return result;
+}
 
 // =============================================================================
 // Debug Utilities (cold path, defined in pto_scheduler.cpp)

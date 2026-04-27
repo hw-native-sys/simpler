@@ -15,6 +15,8 @@
 
 #include "scheduler/pto_scheduler.h"
 
+#include "pto_completion_ingress.h"
+
 // These macros are defined in runtime.h, but we cannot include it here
 // (it pulls in Handshake which we only forward-declare).  Mirror the
 // authoritative values so the class layout compiles standalone.
@@ -108,6 +110,7 @@ private:
 
     // --- Scheduler binding & per-core runtime state ---
     alignas(64) PTO2SchedulerState *sched_{nullptr};
+    PTO2Runtime *rt_{nullptr};
 
     // Per-core execution state, indexed by core_id (= worker_id)
     CoreExecState core_exec_states_[RUNTIME_MAX_WORKER];
@@ -118,6 +121,11 @@ private:
     // Per-core dispatch payload storage: dual-buffer for pipelining.
     // buf_idx = reg_task_id & 1; adjacent dispatches alternate automatically.
     PTO2DispatchPayload payload_per_core_[RUNTIME_MAX_WORKER][2];
+
+    // Per-core deferred-completion ingress storage.  This has the same runtime
+    // lifetime as payload_per_core_, but is kept out of the dispatch payload so
+    // normal task dispatch layout and cache footprint stay unchanged.
+    PTO2DeferredCompletionIngressBuffer deferred_ingress_per_core_[RUNTIME_MAX_WORKER][2];
 
     // sync_start drain coordination
     SyncStartDrainState drain_state_;
@@ -198,7 +206,10 @@ private:
         int max_count
     );
 
-    void build_payload(PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot);
+    void build_payload(
+        PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
+        PTO2DeferredCompletionIngressBuffer *deferred_ingress
+    );
 
     void dispatch_subtask_to_core(
         Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,

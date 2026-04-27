@@ -657,6 +657,7 @@ int32_t SchedulerContext::init(
 
     // Clear per-core dispatch payloads
     memset(payload_per_core_, 0, sizeof(payload_per_core_));
+    memset(deferred_ingress_per_core_, 0, sizeof(deferred_ingress_per_core_));
 
     // Initialize per-core GlobalContext (sub_block_id) based on cluster position.
     // This is done once at startup and never modified afterwards.
@@ -688,6 +689,7 @@ void SchedulerContext::deinit() {
 
     // Clear per-core dispatch payloads
     memset(payload_per_core_, 0, sizeof(payload_per_core_));
+    memset(deferred_ingress_per_core_, 0, sizeof(deferred_ingress_per_core_));
 
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
     // would otherwise leave dirty pending/elected/ack state for the next reuse.
@@ -723,6 +725,7 @@ void SchedulerContext::deinit() {
 
     regs_ = 0;
     sched_ = nullptr;
+    rt_ = nullptr;
     func_id_to_addr_ = nullptr;
 }
 
@@ -732,7 +735,10 @@ void SchedulerContext::wait_pto2_init_complete() const {
     }
 }
 
-void SchedulerContext::bind_runtime(PTO2Runtime *rt) { sched_ = &rt->scheduler; }
+void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
+    rt_ = rt;
+    sched_ = &rt->scheduler;
+}
 
 // =============================================================================
 // Post-orchestration bookkeeping. Runs on the orchestrator thread once the

@@ -46,6 +46,18 @@
 #define PTO2_MAX_INPUTS 16   // Maximum inputs per task
 #define PTO2_MAX_INOUTS 8    // Maximum in-out args per task
 
+typedef enum {
+    PTO2_ASYNC_ENGINE_SDMA = 0,
+    PTO2_ASYNC_ENGINE_ROCE = 1,
+    PTO2_ASYNC_ENGINE_URMA = 2,
+    PTO2_ASYNC_ENGINE_CCU = 3,
+    PTO2_NUM_ASYNC_ENGINES = 4,
+} PTO2AsyncEngine;
+
+enum class PTO2CompletionType : int32_t {
+    COUNTER = 0,
+};
+
 // =============================================================================
 // Task Output Tensors (return value from submit)
 // =============================================================================

@@ -17,7 +17,9 @@
 #include "aicpu/platform_regs.h"
 #include "callable.h"
 #include "common/l2_perf_profiling.h"
+#include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "pto_runtime2.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
@@ -29,6 +31,10 @@
 // =============================================================================
 // Dispatch helpers
 // =============================================================================
+
+namespace {
+inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
+}
 
 const char *SchedulerContext::shape_name(PTO2ResourceShape shape) {
     switch (shape) {
@@ -81,7 +87,8 @@ int SchedulerContext::pop_ready_tasks_batch(
 }
 
 void SchedulerContext::build_payload(
-    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot
+    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
+    PTO2DeferredCompletionIngressBuffer *deferred_ingress
 ) {
     int32_t slot_idx = static_cast<int32_t>(subslot);
     uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
@@ -97,8 +104,13 @@ void SchedulerContext::build_payload(
     }
     dispatch_payload.local_context.s_block_idx = slot_state.next_block_idx;
     dispatch_payload.local_context.s_block_num = slot_state.logical_block_num;
-    dispatch_payload.args[SPMD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.local_context);
-    dispatch_payload.args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.global_context);
+    dispatch_payload.local_context.task_token =
+        payload.complete_in_future ? slot_state.task->task_id : PTO2TaskId::invalid();
+    dispatch_payload.local_context.deferred_ingress = payload.complete_in_future ? deferred_ingress : nullptr;
+    dispatch_payload.local_context.deferred_completion_capacity =
+        payload.complete_in_future ? PTO2_MAX_COMPLETIONS_PER_TASK : 0;
+    dispatch_payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.local_context);
+    dispatch_payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.global_context);
 }
 
 void SchedulerContext::dispatch_subtask_to_core(
@@ -126,7 +138,15 @@ void SchedulerContext::dispatch_subtask_to_core(
 
     uint32_t buf_idx = reg_task_id & 1u;
     PTO2DispatchPayload &payload = payload_per_core_[core_id][buf_idx];
-    build_payload(payload, slot_state, subslot);
+    PTO2DeferredCompletionIngressBuffer *deferred_ingress = nullptr;
+    if (slot_state.payload != nullptr && slot_state.payload->complete_in_future) {
+        deferred_ingress = &deferred_ingress_per_core_[core_id][buf_idx];
+        deferred_ingress->count = 0;
+        deferred_ingress->error_code = PTO2_ERROR_NONE;
+        OUT_OF_ORDER_STORE_BARRIER();
+        cache_flush_range(deferred_ingress, PTO2_ALIGN_SIZE);
+    }
+    build_payload(payload, slot_state, subslot, deferred_ingress);
 
     if (to_pending) {
         core_exec_state.pending_subslot = subslot;
@@ -360,7 +380,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     for (int32_t i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         local_bufs[i].reset(local_ptrs[i], LOCAL_READY_CAP_PER_TYPE);
     }
-    PTO2TaskSlotState *deferred_release_slot_states[256];
+    PTO2TaskSlotState *deferred_release_slot_states[PTO2_DEFERRED_RELEASE_CAP];
     int32_t deferred_release_count = 0;
 
     bool cores_released = false;
@@ -416,6 +436,35 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                         100.0 * new_total / task_count
                     );
                 }
+            }
+        }
+
+        if (rt_ != nullptr && rt_->completion_ingress != nullptr &&
+            (sched_->async_wait_list.count > 0 || sched_->async_wait_list.pending_completion_count > 0)) {
+            PTO2AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
+                rt_->completion_ingress, sched_, local_bufs, deferred_release_slot_states, deferred_release_count,
+                PTO2_DEFERRED_RELEASE_CAP
+#if PTO2_SCHED_PROFILING
+                ,
+                thread_idx
+#endif
+            );
+            if (poll_result.error_code != PTO2_ERROR_NONE) {
+                int32_t expected = PTO2_ERROR_NONE;
+                header->sched_error_code.compare_exchange_strong(
+                    expected, poll_result.error_code, std::memory_order_acq_rel, std::memory_order_acquire
+                );
+                completed_.store(true, std::memory_order_release);
+                break;
+            }
+            if (poll_result.completed > 0) {
+#if PTO2_SCHED_PROFILING
+                sched_->tasks_completed.fetch_add(poll_result.completed, std::memory_order_relaxed);
+#endif
+                int32_t prev = completed_tasks_.fetch_add(poll_result.completed, std::memory_order_relaxed);
+                int32_t new_total = prev + poll_result.completed;
+                last_progress_count = new_total;
+                made_progress = true;
             }
         }
 

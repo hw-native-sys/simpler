@@ -15,6 +15,7 @@
 #include "aicpu/platform_regs.h"
 #include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
+#include "pto_runtime2.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
@@ -26,6 +27,10 @@
 // =============================================================================
 // Dual-slot state machine helpers
 // =============================================================================
+
+namespace {
+inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
+}
 
 // Pure function: read register result -> SlotTransition (no side effects).
 SlotTransition SchedulerContext::decide_slot_transition(
@@ -76,6 +81,32 @@ void SchedulerContext::complete_slot_task(
     (void)hank;
 #endif
     bool mixed_complete = sched_->on_subtask_complete(slot_state);
+    if (slot_state.payload != nullptr && slot_state.payload->complete_in_future) {
+        int32_t reg_err = PTO2_ERROR_NONE;
+        PTO2AsyncWaitList::RegisterResult reg_result;
+        volatile PTO2DeferredCompletionIngressBuffer *deferred_ingress =
+            &deferred_ingress_per_core_[core_id][expected_reg_task_id & 1];
+        do {
+            reg_result =
+                sched_->async_wait_list.register_deferred(slot_state, deferred_ingress, mixed_complete, reg_err);
+            if (reg_result == PTO2AsyncWaitList::RegisterResult::Skipped) {
+                SPIN_WAIT_HINT();
+            }
+        } while (reg_result == PTO2AsyncWaitList::RegisterResult::Skipped);
+
+        if (reg_result == PTO2AsyncWaitList::RegisterResult::Error) {
+            int32_t expected = PTO2_ERROR_NONE;
+            sched_->sm_header->sched_error_code.compare_exchange_strong(
+                expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
+            );
+            completed_.store(true, std::memory_order_release);
+            return;
+        }
+
+        if (mixed_complete && reg_result == PTO2AsyncWaitList::RegisterResult::Registered) {
+            return;
+        }
+    }
     if (mixed_complete) {
 #if PTO2_PROFILING
         if (is_dump_tensor_enabled()) {
@@ -102,7 +133,7 @@ void SchedulerContext::complete_slot_task(
         l2_perf.phase_complete_count++;
 #endif
 #endif
-        if (deferred_release_count < 256) {
+        if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         } else {
             DEV_ALWAYS("Thread %d: release", thread_idx);

@@ -489,8 +489,9 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
 // =============================================================================
 // Task Submission
 // =============================================================================
-TaskOutputTensors
-pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args) {
+TaskOutputTensors pto2_submit_mixed_task(
+    PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args, bool complete_in_future
+) {
     CYCLE_COUNT_START();
 
     TaskOutputTensors result;
@@ -678,7 +679,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
     }
 
-    payload.init(args, result, prepared.alloc_result, layout);
+    payload.init(args, result, prepared.alloc_result, layout, complete_in_future);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 #if PTO2_ORCH_PROFILING
@@ -771,7 +772,7 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
 
     TaskOutputTensors outputs;
     outputs.set_task_id(prepared.task_id);
-    payload.init(args, outputs, prepared.alloc_result, layout);
+    payload.init(args, outputs, prepared.alloc_result, layout, false);
     payload.fanin_actual_count = 0;
     payload.fanin_spill_start = 0;
     payload.fanin_spill_pool = &orch->rings[prepared.task_id.ring()].fanin_pool;
