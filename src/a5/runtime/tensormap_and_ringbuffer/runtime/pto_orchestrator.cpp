@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "aicpu/device_time.h"
 #include "common/unified_log.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"

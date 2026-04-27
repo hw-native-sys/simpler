@@ -268,29 +268,47 @@ PTO2Runtime *pto2_runtime_create_from_sm(
 ) {
     if (!sm_handle) return NULL;
 
+    uint64_t t0, t1;
+
+    t0 = get_sys_cnt_aicpu();
     PTO2Runtime *rt = static_cast<PTO2Runtime *>(calloc(1, sizeof(PTO2Runtime)));
+    t1 = get_sys_cnt_aicpu();
+    unified_log_always(__FUNCTION__, "[memfd_profiling] calloc PTO2Runtime cycles: %lu", t1 - t0);
+
     if (!rt) return NULL;
 
+    t0 = get_sys_cnt_aicpu();
     rt->ops = &s_runtime_ops;
     rt->mode = mode;
     rt->sm_handle = sm_handle;
     rt->gm_heap = gm_heap;
     rt->gm_heap_size = heap_size > 0 ? heap_size * PTO2_MAX_RING_DEPTH : 0;
     rt->gm_heap_owned = false;
+    t1 = get_sys_cnt_aicpu();
+    unified_log_always(__FUNCTION__, "[memfd_profiling] init PTO2Runtime fields cycles: %lu", t1 - t0);
 
+    t0 = get_sys_cnt_aicpu();
     if (!pto2_orchestrator_init(&rt->orchestrator, rt->sm_handle, rt->gm_heap, heap_size, dep_pool_capacity)) {
         free(rt);
         return NULL;
     }
+    t1 = get_sys_cnt_aicpu();
+    unified_log_always(__FUNCTION__, "[memfd_profiling] pto2_orchestrator_init cycles: %lu", t1 - t0);
 
     // Initialize scheduler (heap_size = per-ring heap size)
+    t0 = get_sys_cnt_aicpu();
     if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle)) {
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt);
         return NULL;
     }
+    t1 = get_sys_cnt_aicpu();
+    unified_log_always(__FUNCTION__, "[memfd_profiling] pto2_scheduler_init cycles: %lu", t1 - t0);
 
+    t0 = get_sys_cnt_aicpu();
     pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
+    t1 = get_sys_cnt_aicpu();
+    unified_log_always(__FUNCTION__, "[memfd_profiling] pto2_orchestrator_set_scheduler cycles: %lu", t1 - t0);
 
     return rt;
 }

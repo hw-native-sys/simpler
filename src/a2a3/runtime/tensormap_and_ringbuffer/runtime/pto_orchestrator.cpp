@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "aicpu/device_time.h"
 #include "common/unified_log.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
@@ -328,6 +329,8 @@ bool pto2_orchestrator_init(
     PTO2OrchestratorState *orch, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
     int32_t dep_pool_capacity
 ) {
+    uint64_t t0, t1;
+
     *orch = PTO2OrchestratorState{};
 
     orch->sm_handle = sm_handle;
@@ -336,6 +339,7 @@ bool pto2_orchestrator_init(
     orch->fatal = false;
 
     // Initialize per-ring resources
+    t0 = get_sys_cnt_aicpu();
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + r * heap_size;
         auto &fc = sm_handle->header->rings[r].fc;
@@ -373,8 +377,11 @@ bool pto2_orchestrator_init(
         }
         orch->rings[r].dep_pool.init(dep_entries, dep_pool_capacity, &sm_handle->header->orch_error_code);
     }
+    t1 = get_sys_cnt_aicpu();
+    unified_log_always(__FUNCTION__, "[memfd_profiling] init per-ring resources cycles: %lu", t1 - t0);
 
     // Initialize TensorMap with per-ring task window sizes
+    t0 = get_sys_cnt_aicpu();
     int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_window_sizes[r] = sm_handle->header->rings[r].task_window_size;
@@ -387,8 +394,11 @@ bool pto2_orchestrator_init(
         return false;
     }
     orch->tensor_map.orch = orch;
+    t1 = get_sys_cnt_aicpu();
+    unified_log_always(__FUNCTION__, "[memfd_profiling] tensor_map.init_default cycles: %lu", t1 - t0);
 
     // Initialize scope stack: one flat buffer for task IDs + one array for begin offsets
+    t0 = get_sys_cnt_aicpu();
     uint64_t max_depth = PTO2_MAX_SCOPE_DEPTH;
     int32_t init_cap = PTO2_SCOPE_TASKS_INIT_CAP;
     orch->scope_tasks = reinterpret_cast<PTO2TaskSlotState **>(malloc(init_cap * sizeof(PTO2TaskSlotState *)));
@@ -407,6 +417,8 @@ bool pto2_orchestrator_init(
     orch->scope_tasks_capacity = init_cap;
     orch->scope_stack_top = -1;
     orch->scope_stack_capacity = max_depth;
+    t1 = get_sys_cnt_aicpu();
+    unified_log_always(__FUNCTION__, "[memfd_profiling] init scope stack cycles: %lu", t1 - t0);
 
     return true;
 }

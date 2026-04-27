@@ -21,7 +21,12 @@
 #include <new>
 #include <stdlib.h>
 #include <utility>
+
+#include "aicpu/device_time.h"
 #include "common/unified_log.h"
+
+// Weak fallback for HOST .so builds
+__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 
 // =============================================================================
 // Scheduler Profiling Counters
@@ -158,6 +163,8 @@ void PTO2SchedulerState::RingSchedState::destroy() {
 }
 
 bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_handle) {
+    uint64_t t0, t1;
+
     sched->sm_handle = sm_handle;
 #if PTO2_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
@@ -165,6 +172,7 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
 #endif
 
     // Initialize per-ring state
+    t0 = get_sys_cnt_aicpu();
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         if (!sched->ring_sched_states[r].init(sm_handle, r)) {
             for (int j = 0; j < r; j++) {
@@ -173,8 +181,11 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
             return false;
         }
     }
+    t1 = get_sys_cnt_aicpu();
+    unified_log_always(__FUNCTION__, "[memfd_profiling] init per-ring state cycles: %lu", t1 - t0);
 
     // Initialize ready queues (one per resource shape, global)
+    t0 = get_sys_cnt_aicpu();
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         if (!pto2_ready_queue_init(&sched->ready_queues[i], PTO2_READY_QUEUE_SIZE)) {
             // Cleanup on failure
@@ -187,6 +198,8 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
             return false;
         }
     }
+    t1 = get_sys_cnt_aicpu();
+    unified_log_always(__FUNCTION__, "[memfd_profiling] init ready queues cycles: %lu", t1 - t0);
 
     return true;
 }
