@@ -1916,6 +1916,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 return -1;
             }
 
+            uint64_t t_load_start = get_sys_cnt_aicpu();
+
             // Try memfd first (Linux only), fall back to file-based
             char so_path[256];
             void *handle = nullptr;
@@ -1982,13 +1984,21 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 DEV_INFO("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
             }
 
-            dlerror();
-            auto config_func =
-                reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, "aicpu_orchestration_config"));
+            uint64_t t0, t1;
 
             dlerror();
+            t0 = get_sys_cnt_aicpu();
+            auto config_func =
+                reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, "aicpu_orchestration_config"));
+            t1 = get_sys_cnt_aicpu();
+            DEV_INFO("[memfd_profiling] dlsym aicpu_orchestration_config cycles: %lu", t1 - t0);
+
+            dlerror();
+            t0 = get_sys_cnt_aicpu();
             DeviceOrchestrationFunc orch_func =
                 reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, "aicpu_orchestration_entry"));
+            t1 = get_sys_cnt_aicpu();
+            DEV_INFO("[memfd_profiling] dlsym aicpu_orchestration_entry cycles: %lu", t1 - t0);
             const char *dlsym_error = dlerror();
             if (dlsym_error != nullptr) {
                 DEV_ERROR("Thread %d: dlsym failed: %s", thread_idx, dlsym_error);
@@ -2004,8 +2014,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
             dlerror();
+            t0 = get_sys_cnt_aicpu();
             auto bind_runtime_func =
                 reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "pto2_framework_bind_runtime"));
+            t1 = get_sys_cnt_aicpu();
+            DEV_INFO("[memfd_profiling] dlsym pto2_framework_bind_runtime cycles: %lu", t1 - t0);
             const char *bind_runtime_error = dlerror();
             if (bind_runtime_error != nullptr) {
                 DEV_INFO("Thread %d: Optional TLS runtime binder not found: %s", thread_idx, bind_runtime_error);
@@ -2033,7 +2046,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             uint64_t heap_size = PTO2_HEAP_SIZE;
             int32_t expected_arg_count = 0;
             if (config_func) {
+                t0 = get_sys_cnt_aicpu();
                 PTO2OrchestrationConfig cfg = config_func(args);
+                t1 = get_sys_cnt_aicpu();
+                DEV_INFO("[memfd_profiling] config_func() call cycles: %lu", t1 - t0);
                 expected_arg_count = cfg.expected_arg_count;
                 DEV_INFO("Thread %d: Config: expected_args=%d", thread_idx, expected_arg_count);
             } else {
@@ -2065,9 +2081,16 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             void *sm_ptr = runtime->get_pto2_gm_sm_ptr();
             void *gm_heap = runtime->get_pto2_gm_heap_ptr();
 
+            t0 = get_sys_cnt_aicpu();
             uint64_t sm_size = pto2_sm_calculate_size(task_window_size);
+            t1 = get_sys_cnt_aicpu();
+            DEV_INFO("[memfd_profiling] pto2_sm_calculate_size cycles: %lu", t1 - t0);
+
+            t0 = get_sys_cnt_aicpu();
             PTO2SharedMemoryHandle *sm_handle =
                 pto2_sm_create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
+            t1 = get_sys_cnt_aicpu();
+            DEV_INFO("[memfd_profiling] pto2_sm_create_from_buffer cycles: %lu", t1 - t0);
             if (!sm_handle) {
                 DEV_ERROR("Thread %d: Failed to create shared memory handle", thread_idx);
                 dlclose(handle);
@@ -2075,7 +2098,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 return -1;
             }
 
+            t0 = get_sys_cnt_aicpu();
             rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
+            t1 = get_sys_cnt_aicpu();
+            DEV_INFO("[memfd_profiling] pto2_runtime_create_from_sm cycles: %lu", t1 - t0);
+
             if (!rt) {
                 DEV_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
                 pto2_sm_destroy(sm_handle);
@@ -2119,15 +2146,34 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
             if (orch_bind_runtime_ != nullptr) {
+                t0 = get_sys_cnt_aicpu();
                 orch_bind_runtime_(rt);
+                t1 = get_sys_cnt_aicpu();
+                DEV_INFO("[memfd_profiling] orch_bind_runtime_() cycles: %lu", t1 - t0);
             }
+
+            t0 = get_sys_cnt_aicpu();
             pto2_rt_scope_begin(rt);
+            t1 = get_sys_cnt_aicpu();
+            DEV_INFO("[memfd_profiling] pto2_rt_scope_begin cycles: %lu", t1 - t0);
+
+            t0 = get_sys_cnt_aicpu();
             orch_func_(*orch_args_cached_);
+            t1 = get_sys_cnt_aicpu();
+            DEV_INFO("[memfd_profiling] orch_func_() execution cycles: %lu", t1 - t0);
+
+            t0 = get_sys_cnt_aicpu();
             pto2_rt_scope_end(rt);
+            t1 = get_sys_cnt_aicpu();
+            DEV_INFO("[memfd_profiling] pto2_rt_scope_end cycles: %lu", t1 - t0);
+
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             (void)orch_cycle_end;  // NOLINT(readability/casting)
 #endif
+
+            uint64_t t_load_end = get_sys_cnt_aicpu();
+            DEV_ALWAYS("[memfd_profiling] Total SO load to orch completion cycles: %lu", t_load_end - t_load_start);
 
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING

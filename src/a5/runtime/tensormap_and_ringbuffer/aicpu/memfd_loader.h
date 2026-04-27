@@ -34,6 +34,7 @@ extern "C" {
 #include <cstdio>
 
 #include "aicpu/device_log.h"
+#include "aicpu/device_time.h"
 
 /**
  * Load orchestration SO using memfd
@@ -49,8 +50,13 @@ static inline int load_orchestration_so_with_memfd(
         return -1;
     }
 
+    uint64_t t0, t1;
+
     // Create memfd
+    t0 = get_sys_cnt_aicpu();
     int fd = memfd_create("libdevice_orch", MFD_CLOEXEC);
+    t1 = get_sys_cnt_aicpu();
+    DEV_INFO("[memfd_profiling] memfd_create cycles: %lu", t1 - t0);
 
     if (fd < 0) {
         DEV_INFO("memfd_create failed: errno=%d", errno);
@@ -58,7 +64,10 @@ static inline int load_orchestration_so_with_memfd(
     }
 
     // Write SO data to memfd
+    t0 = get_sys_cnt_aicpu();
     ssize_t written = write(fd, so_data, so_size);
+    t1 = get_sys_cnt_aicpu();
+    DEV_INFO("[memfd_profiling] write %zu bytes cycles: %lu", so_size, t1 - t0);
 
     if (written < 0) {
         DEV_INFO("memfd write failed: errno=%d", errno);
@@ -72,7 +81,10 @@ static inline int load_orchestration_so_with_memfd(
     }
 
     // Reset file position to beginning before dlopen
+    t0 = get_sys_cnt_aicpu();
     lseek(fd, 0, SEEK_SET);
+    t1 = get_sys_cnt_aicpu();
+    DEV_INFO("[memfd_profiling] lseek cycles: %lu", t1 - t0);
 
     // Construct /proc/self/fd/N path for symlink target
     char proc_fd_path[256];
@@ -83,7 +95,11 @@ static inline int load_orchestration_so_with_memfd(
     char link_path[256];
     snprintf(link_path, sizeof(link_path), "/tmp/libdevice_orch_%d_%d.so", getpid(), orch_thread_num);
 
+    t0 = get_sys_cnt_aicpu();
     int symlink_rc = symlink(proc_fd_path, link_path);
+    t1 = get_sys_cnt_aicpu();
+    DEV_INFO("[memfd_profiling] symlink cycles: %lu", t1 - t0);
+
     if (symlink_rc != 0) {
         DEV_INFO("symlink failed: errno=%d", errno);
         close(fd);
@@ -93,8 +109,11 @@ static inline int load_orchestration_so_with_memfd(
     snprintf(out_so_path, 256, "%s", link_path);
 
     // Try dlopen from the symlink
+    t0 = get_sys_cnt_aicpu();
     dlerror();
     void *handle = dlopen(out_so_path, RTLD_LAZY | RTLD_LOCAL);
+    t1 = get_sys_cnt_aicpu();
+    DEV_INFO("[memfd_profiling] dlopen cycles: %lu", t1 - t0);
 
     // Clean up symlink immediately after dlopen (dlopen has its own reference)
     unlink(link_path);
