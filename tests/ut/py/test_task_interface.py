@@ -48,6 +48,7 @@ class TestDataType:
         assert DataType.UINT32 is not None
 
     def test_enum_int_values(self):
+        # ABI contract: values must match C++ header.
         assert DataType.FLOAT32.value == 0
         assert DataType.FLOAT16.value == 1
         assert DataType.INT32.value == 2
@@ -315,6 +316,7 @@ class TestChipStorageTaskArgs:
 
 class TestTensorArgType:
     def test_enum_values(self):
+        # ABI contract: values must match C++ header.
         assert TensorArgType.INPUT.value == 0
         assert TensorArgType.OUTPUT.value == 1
         assert TensorArgType.INOUT.value == 2
@@ -444,7 +446,7 @@ class TestTaskArgs:
         assert args.scalar_count() == 0
 
     def test_no_capacity_limit_tensors(self):
-        """TaskArgs is vector-backed — no per-class capacity limit on tensors."""
+        """TaskArgs is vector-backed -- no per-class capacity limit on tensors."""
         args = TaskArgs()
         for i in range(20):
             args.add_tensor(ContinuousTensor.make(i, (1,), DataType.INT8))
@@ -464,6 +466,7 @@ class TestTaskArgs:
 
 class TestArgDirection:
     def test_enum_values(self):
+        # ABI contract: values must match C++ header.
         assert ArgDirection.SCALAR.value == 0
         assert ArgDirection.IN.value == 1
         assert ArgDirection.OUT.value == 2
