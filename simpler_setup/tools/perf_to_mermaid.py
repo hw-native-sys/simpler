@@ -26,7 +26,6 @@ import importlib.util
 import json
 import sys
 import traceback
-from datetime import datetime
 from pathlib import Path
 
 
@@ -237,7 +236,7 @@ View the Mermaid diagram:
     parser.add_argument(
         "-o",
         "--output",
-        help="Output Markdown path (default: outputs/mermaid_diagram_<timestamp>.md)",
+        help="Output Markdown path (default: <input_dir>/mermaid_diagram.md)",
     )
     parser.add_argument(
         "-k",
@@ -274,32 +273,26 @@ def _resolve_input_path(args):
         return input_path
 
     outputs_dir = Path.cwd() / "outputs"
-    json_files = list(outputs_dir.glob("l2_perf_records_*.json"))
+    json_files = list(outputs_dir.glob("*/l2_perf_records.json"))
     if not json_files:
-        print(f"Error: no l2_perf_records_*.json under {outputs_dir}", file=sys.stderr)
-        print("Specify an input file or add .json files under outputs/", file=sys.stderr)
+        print(f"Error: no outputs/*/l2_perf_records.json under {outputs_dir}", file=sys.stderr)
+        print("Run a test with --enable-l2-swimlane first, or specify an explicit input.", file=sys.stderr)
         return None
 
     input_path = max(json_files, key=lambda p: p.stat().st_mtime)
     if args.verbose:
-        print(f"Auto-selected latest file: {input_path.name}")
+        print(f"Auto-selected latest file: {input_path}")
     return input_path
 
 
 def _resolve_output_path(args, input_path):
-    """Determine output path from args or derive from input filename."""
+    """Determine output path from args or derive from input directory name."""
     if args.output:
         return Path(args.output)
 
-    input_stem = input_path.stem
-    if input_stem.startswith("l2_perf_records_"):
-        suffix_part = input_stem[len("l2_perf_records_") :]
-    else:
-        suffix_part = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    outputs_dir = Path.cwd() / "outputs"
-    outputs_dir.mkdir(exist_ok=True)
-    return outputs_dir / f"mermaid_diagram_{suffix_part}.md"
+    # Default: write mermaid_diagram.md next to the input. The parent
+    # directory name (e.g. outputs/<case>_<ts>/) already disambiguates runs.
+    return input_path.parent / "mermaid_diagram.md"
 
 
 def main():

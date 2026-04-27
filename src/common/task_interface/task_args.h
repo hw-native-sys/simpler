@@ -237,11 +237,37 @@ inline void write_blob(uint8_t *dst, const TaskArgs &a) {
 
 // Zero-copy view into a blob written by write_blob. The returned view is only
 // valid as long as `src` stays alive in mapped/shm memory.
-inline TaskArgsView read_blob(const uint8_t *src) {
+//
+// `capacity` is the maximum number of bytes the reader is allowed to consume
+// from `src` (e.g. MAILBOX_ARGS_CAPACITY when reading from the IPC mailbox).
+// Throws std::runtime_error if the header reports counts that would walk past
+// `capacity` — defends against shared-memory corruption or a writer-side bug
+// that slipped past the writer's own bounds check.
+inline TaskArgsView read_blob(const uint8_t *src, size_t capacity) {
+    if (capacity < TASK_ARGS_BLOB_HEADER_SIZE) {
+        throw std::runtime_error(
+            "read_blob: capacity " + std::to_string(capacity) + " < header size " +
+            std::to_string(TASK_ARGS_BLOB_HEADER_SIZE)
+        );
+    }
     int32_t T;
     int32_t S;
     std::memcpy(&T, src + 0, sizeof(T));
     std::memcpy(&S, src + 4, sizeof(S));
+    if (T < 0 || S < 0) {
+        throw std::runtime_error(
+            "read_blob: negative counts — tensors=" + std::to_string(T) + ", scalars=" + std::to_string(S)
+        );
+    }
+    const size_t needed = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(ContinuousTensor) +
+                          static_cast<size_t>(S) * sizeof(uint64_t);
+    if (needed > capacity) {
+        throw std::runtime_error(
+            "read_blob: header reports " + std::to_string(needed) + " bytes (T=" + std::to_string(T) +
+            ", S=" + std::to_string(S) + ") but capacity is " + std::to_string(capacity) +
+            " — likely shm corruption or a writer-side bug"
+        );
+    }
     return TaskArgsView{
         T,
         S,

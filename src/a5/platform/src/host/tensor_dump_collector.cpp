@@ -346,16 +346,9 @@ int TensorDumpCollector::export_dump_files(const std::string &output_path) {
         return static_cast<uint8_t>(a.role) < static_cast<uint8_t>(b.role);
     });
 
-    // Create timestamped output directory
-    auto now = std::chrono::system_clock::now();
-    auto time_t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm = {};
-    localtime_r(&time_t, &tm);
-    std::ostringstream ts;
-    ts << std::put_time(&tm, "%Y%m%d_%H%M%S");
-    std::string timestamp = ts.str();
-
-    std::filesystem::path run_dir = std::filesystem::path(output_path) / ("tensor_dump_" + timestamp);
+    // The run directory is fixed (`<prefix>/tensor_dump`) — caller-provided
+    // `output_path` is the per-task uniqueness boundary.
+    std::filesystem::path run_dir = std::filesystem::path(output_path) / "tensor_dump";
     std::filesystem::create_directories(run_dir);
 
     std::string base_name = run_dir.filename().string();
@@ -405,7 +398,6 @@ int TensorDumpCollector::export_dump_files(const std::string &output_path) {
     LOG_INFO("Writing JSON manifest for %zu tensors...", collected_.size());
     std::ofstream json(run_dir / (base_name + ".json"));
     json << "{\n";
-    json << "  \"timestamp\": \"" << timestamp << "\",\n";
     json << "  \"run_dir\": \"" << base_name << "\",\n";
     json << "  \"bin_format\": {\n";
     json << "    \"type\": \"logical_contiguous\",\n";

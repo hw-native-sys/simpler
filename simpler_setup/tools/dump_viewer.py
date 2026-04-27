@@ -20,20 +20,20 @@ With no filters: lists all tensors.
 With filters: lists matching tensors. Add --export to save them to txt.
 
 Usage:
-    # List all tensors (auto-picks latest outputs/tensor_dump_* dir under ./outputs/)
+    # List all tensors (auto-picks latest outputs/*/tensor_dump dir under ./outputs/)
     python -m simpler_setup.tools.dump_viewer
 
     # List all tensors in a specific dump dir
-    python -m simpler_setup.tools.dump_viewer outputs/tensor_dump_xxx/
+    python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump/
 
     # List before-dispatch inputs of func_id=3 (latest dir)
     python -m simpler_setup.tools.dump_viewer --func 3 --stage before --role input
 
     # Export them to txt
-    python -m simpler_setup.tools.dump_viewer outputs/tensor_dump_xxx/ --func 3 --stage before --role input --export
+    python -m simpler_setup.tools.dump_viewer outputs/<case>/tensor_dump/ --func 3 --stage before --export
 
     # Export a specific tensor by index
-    python -m simpler_setup.tools.dump_viewer outputs/tensor_dump_xxx/ --index 42 --export
+    python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump/ --index 42 --export
 """
 
 from __future__ import annotations
@@ -197,9 +197,10 @@ def list_tensors(tensors: list):
 def _resolve_dump_dir(dump_dir_arg: str | None) -> Path:
     if dump_dir_arg is not None:
         return Path(dump_dir_arg)
-    candidates = sorted(Path("outputs").glob("tensor_dump_*"), key=lambda p: p.name)
+    # Tests/runtime now write tensor_dump under outputs/<case>/tensor_dump/.
+    candidates = sorted(Path("outputs").glob("*/tensor_dump"), key=lambda p: p.stat().st_mtime)
     if not candidates:
-        print("Error: no tensor_dump_* directory found in outputs/", file=sys.stderr)
+        print("Error: no outputs/*/tensor_dump directory found", file=sys.stderr)
         sys.exit(1)
     print(f"Using latest dump directory: {candidates[-1]}")
     return candidates[-1]
@@ -259,7 +260,7 @@ def main():
         "dump_dir",
         nargs="?",
         default=None,
-        help="Path to tensor_dump_YYYYMMDD_HHMMSS directory (default: latest outputs/tensor_dump_* dir)",
+        help="Path to outputs/<case>_<ts>/tensor_dump directory (default: latest outputs/*/tensor_dump dir)",
     )
     parser.add_argument("--task", "-t", help="Filter by task_id (e.g. 0x0000000200000a00)")
     parser.add_argument("--func", "-f", type=int, help="Filter by func_id")

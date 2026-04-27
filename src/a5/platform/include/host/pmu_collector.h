@@ -39,8 +39,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
 #include <string>
-#include <sys/stat.h>
 #include <vector>
 
 #include "common/pmu_profiling.h"
@@ -94,7 +94,7 @@ public:
     /**
      * Export collected records to a LuoPan-compatible CSV under output_dir/.
      */
-    int export_csv(const std::string &output_dir = "outputs");
+    int export_csv(const std::string &output_dir);
 
     /**
      * Free all device buffers and reset host state.
@@ -156,22 +156,14 @@ inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
 }
 
 inline std::string make_pmu_csv_path(const std::string &output_dir) {
-    if (mkdir(output_dir.c_str(), 0755) != 0 && errno != EEXIST) {
-        LOG_WARN("Failed to create PMU output directory %s: errno=%d", output_dir.c_str(), errno);
+    std::error_code ec;
+    std::filesystem::create_directories(output_dir, ec);
+    if (ec) {
+        LOG_WARN("Failed to create PMU output directory %s: %s", output_dir.c_str(), ec.message().c_str());
     }
-    char csv_name[128];
-    auto now = std::chrono::system_clock::now();
-    std::time_t t_now = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
-    std::tm *tm_info = std::localtime(&t_now);
-    if (tm_info != nullptr) {
-        char base[96];
-        std::strftime(base, sizeof(base), "pmu_%Y%m%d_%H%M%S", tm_info);
-        std::snprintf(csv_name, sizeof(csv_name), "%s_%03ld.csv", base, static_cast<long>(ms));
-    } else {
-        std::snprintf(csv_name, sizeof(csv_name), "pmu_output.csv");
-    }
-    return output_dir + "/" + csv_name;
+    // Filename is fixed (no timestamp) — the caller-provided directory is the
+    // per-task uniqueness boundary.
+    return output_dir + "/pmu.csv";
 }
 
 #endif  // SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_

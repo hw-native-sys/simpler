@@ -216,8 +216,10 @@ public:
     );
 
     void start_memory_manager();
-    void poll_and_collect();
-    int export_dump_files(const std::string &output_path = "outputs");
+    // `output_prefix` is the per-task directory under which tensor_dump/ lands.
+    // Required (non-empty); CallConfig::validate() enforces this upstream.
+    void poll_and_collect(const std::string &output_prefix);
+    int export_dump_files();
     void stop_memory_manager();
     void drain_remaining_buffers();
     void scan_remaining_dump_buffers();

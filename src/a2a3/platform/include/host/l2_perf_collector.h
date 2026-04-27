@@ -309,7 +309,7 @@ public:
      * @param output_path Output directory path
      * @return 0 on success, error code on failure
      */
-    int export_swimlane_json(const std::string &output_path = "outputs");
+    int export_swimlane_json(const std::string &output_path);
 
     /**
      * Stop the memory management thread and clean up remaining data

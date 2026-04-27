@@ -15,9 +15,10 @@ no repo checkout required.
 - **[dump_viewer](#dump_viewer)** — inspect / export tensor dumps (see [docs/tensor-dump.md](../../docs/tensor-dump.md) for full workflow)
 - **[device_log_resolver](#device_log_resolver)** — shared device-log path resolver library
 
-Auto-detection paths (`outputs/l2_perf_records_*.json`, `outputs/tensor_dump_*/`)
+Auto-detection paths (`outputs/*/l2_perf_records.json`, `outputs/*/tensor_dump/`)
 are resolved relative to the **current working directory** — run these from the
-directory that holds your `outputs/`.
+directory that holds your `outputs/`. Each test case writes into its own
+`outputs/<case>_<ts>/` directory; the tools auto-pick the latest by mtime.
 
 ---
 
@@ -36,20 +37,20 @@ Converts PTO Runtime profiling data (`l2_perf_records_*.json`) into the format u
 python -m simpler_setup.tools.swimlane_converter
 
 # Specify an input file
-python -m simpler_setup.tools.swimlane_converter outputs/l2_perf_records_20260210_143526.json
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json
 
 # Specify an output file
-python -m simpler_setup.tools.swimlane_converter outputs/l2_perf_records_20260210_143526.json -o custom_output.json
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json -o custom_output.json
 
 # Load function name mapping from kernel_config.py
-python -m simpler_setup.tools.swimlane_converter outputs/l2_perf_records_20260210_143526.json \
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json \
     -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
 # Select the device log automatically using a specific device id (device-<id>)
-python -m simpler_setup.tools.swimlane_converter outputs/l2_perf_records_20260210_143526.json -d 0
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json -d 0
 
 # Verbose mode (for debugging)
-python -m simpler_setup.tools.swimlane_converter outputs/l2_perf_records_20260210_143526.json -v
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json -v
 ```
 
 ### Command-Line Options
@@ -153,11 +154,11 @@ Three device log formats are supported:
 python -m simpler_setup.tools.sched_overhead_analysis
 
 # Use a specific device id to auto-pick the device-<id> log
-python -m simpler_setup.tools.sched_overhead_analysis --l2-perf-records-json outputs/l2_perf_records_20260210_143526.json -d 0
+python -m simpler_setup.tools.sched_overhead_analysis --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json -d 0
 
 # Specify files explicitly
 python -m simpler_setup.tools.sched_overhead_analysis \
-    --l2-perf-records-json outputs/l2_perf_records_20260210_143526.json \
+    --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json \
     --device-log ~/ascend/log/debug/device-0/device-*.log
 ```
 
@@ -198,23 +199,23 @@ Convert profiling data into Mermaid flowchart format to visualize task dependenc
 python -m simpler_setup.tools.perf_to_mermaid
 
 # Specify an input file
-python -m simpler_setup.tools.perf_to_mermaid outputs/l2_perf_records_20260210_143526.json
+python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json
 
 # Specify an output file
-python -m simpler_setup.tools.perf_to_mermaid outputs/l2_perf_records_20260210_143526.json -o diagram.md
+python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json -o diagram.md
 
 # Load function name mapping from kernel_config.py
-python -m simpler_setup.tools.perf_to_mermaid outputs/l2_perf_records_20260210_143526.json \
+python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json \
     -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
 # Use compact style (only task id and function name)
-python -m simpler_setup.tools.perf_to_mermaid outputs/l2_perf_records_20260210_143526.json --style compact
+python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json --style compact
 
 # Specify flowchart direction (left to right)
-python -m simpler_setup.tools.perf_to_mermaid outputs/l2_perf_records_20260210_143526.json --direction LR
+python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json --direction LR
 
 # Verbose mode
-python -m simpler_setup.tools.perf_to_mermaid outputs/l2_perf_records_20260210_143526.json -v
+python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json -v
 ```
 
 ### Command-Line Options
@@ -298,7 +299,7 @@ python -m simpler_setup.tools.dump_viewer --func 3 --stage before --role input
 python -m simpler_setup.tools.dump_viewer --func 3 --stage before --role input --export
 
 # Export a specific tensor by index (always exports)
-python -m simpler_setup.tools.dump_viewer outputs/tensor_dump_xxx/ --index 42
+python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump/ --index 42
 ```
 
 ---
@@ -329,7 +330,7 @@ from simpler_setup.tools.device_log_resolver import resolve_device_log_path
 log_path, strategy = resolve_device_log_path(
     device_id="0",
     device_log=None,
-    l2_perf_records_path=Path("outputs/l2_perf_records_20260210_143526.json"),
+    l2_perf_records_path=Path("outputs/<case>_<ts>/l2_perf_records.json"),
 )
 ```
 
@@ -446,7 +447,7 @@ For batch-run hardware regression, see the dev-only script
 - This error means the input `l2_perf_records_*.json` lacks fields required by the deep-dive analysis (typically `dispatch_time_us` / `finish_time_us`)
 - The basic conversion in `swimlane_converter` can still succeed, but the deep-dive will be skipped or fail
 - Remediation:
-  1. Re-run with `--enable-l2-swimlane` to produce a new `outputs/l2_perf_records_*.json`
+  1. Re-run with `--enable-l2-swimlane` to produce a new `outputs/*/l2_perf_records.json`
   2. Re-run `swimlane_converter` or `sched_overhead_analysis`
   3. Verify that each task in the JSON contains `dispatch_time_us` and `finish_time_us`
 

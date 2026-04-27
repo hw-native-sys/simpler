@@ -27,7 +27,6 @@ import json
 import sys
 import traceback
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -1120,7 +1119,7 @@ Examples:
         nargs="?",
         help="Input JSON file (.json). If not specified, uses the latest l2_perf_records_*.json in outputs/",
     )
-    parser.add_argument("-o", "--output", help="Output JSON file (default: outputs/merged_swimlane_<timestamp>.json)")
+    parser.add_argument("-o", "--output", help="Output JSON file (default: <input_dir>/merged_swimlane.json)")
     parser.add_argument(
         "-k",
         "--kernel-config",
@@ -1137,7 +1136,7 @@ Examples:
 
 
 def _resolve_input_path(args):
-    """Resolve input path, auto-selecting latest l2_perf_records_*.json if not specified."""
+    """Resolve input path, auto-selecting newest outputs/<case>/l2_perf_records.json if unspecified."""
     if args.input is not None:
         input_path = Path(args.input)
         if not input_path.exists():
@@ -1146,32 +1145,26 @@ def _resolve_input_path(args):
         return input_path
 
     outputs_dir = Path.cwd() / "outputs"
-    json_files = list(outputs_dir.glob("l2_perf_records_*.json"))
+    json_files = list(outputs_dir.glob("*/l2_perf_records.json"))
     if not json_files:
-        print(f"Error: No l2_perf_records_*.json files found in {outputs_dir}", file=sys.stderr)
-        print("Please specify an input file or ensure .json files exist in outputs/", file=sys.stderr)
+        print(f"Error: No outputs/*/l2_perf_records.json found under {outputs_dir}", file=sys.stderr)
+        print("Run a test with --enable-l2-swimlane first, or specify an explicit input.", file=sys.stderr)
         return None
 
     input_path = max(json_files, key=lambda p: p.stat().st_mtime)
     if args.verbose:
-        print(f"Auto-selected latest file: {input_path.name}")
+        print(f"Auto-selected latest file: {input_path}")
     return input_path
 
 
 def _resolve_output_path(args, input_path):
-    """Determine output path from args or derive from input filename."""
+    """Determine output path from args or derive from input directory name."""
     if args.output:
         return Path(args.output)
 
-    input_stem = input_path.stem
-    if input_stem.startswith("l2_perf_records_"):
-        suffix_part = input_stem[len("l2_perf_records_") :]
-    else:
-        suffix_part = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    outputs_dir = Path.cwd() / "outputs"
-    outputs_dir.mkdir(exist_ok=True)
-    return outputs_dir / f"merged_swimlane_{suffix_part}.json"
+    # Default: write merged_swimlane.json next to the input. The parent
+    # directory name (e.g. outputs/<case>_<ts>/) already disambiguates runs.
+    return input_path.parent / "merged_swimlane.json"
 
 
 def _print_verbose_data_info(data, verbose):

@@ -72,8 +72,8 @@ TEST(ChildMemory, BlobRoundtripPreservesChildMemory) {
     std::vector<uint8_t> buf(blob_size);
     write_blob(buf.data(), args);
 
-    // Deserialize
-    TaskArgsView view = read_blob(buf.data());
+    // Deserialize (test owns the buffer, so capacity = blob_size).
+    TaskArgsView view = read_blob(buf.data(), blob_size);
     ASSERT_EQ(view.tensor_count, 2);
     ASSERT_EQ(view.scalar_count, 1);
 

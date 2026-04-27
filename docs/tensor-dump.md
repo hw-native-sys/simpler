@@ -329,12 +329,11 @@ outputs/
 The JSON file is the manifest; `bin_file` points at the sibling binary
 payload file.
 
-`tensor_dump_<YYYYMMDD_HHMMSS>.json`:
+`tensor_dump.json`:
 
 ```json
 {
-  "timestamp": "20260415_103522",
-  "run_dir": "tensor_dump_20260415_103522",
+  "run_dir": "tensor_dump",
   "bin_format": {
     "type": "logical_contiguous",
     "byte_order": "little_endian"
@@ -348,7 +347,7 @@ payload file.
   "truncated_tensors": 0,
   "dropped_records": 0,
   "dropped_overwrite": 0,
-  "bin_file": "tensor_dump_20260415_103522.bin",
+  "bin_file": "tensor_dump.bin",
   "tensors": [
     {
       "task_id": "0x0000000200000a00",
@@ -388,7 +387,7 @@ python -m simpler_setup.tools.dump_viewer --func 0 --stage before --role input -
 python -m simpler_setup.tools.dump_viewer --index 42
 
 # Pin to a specific dump directory
-python -m simpler_setup.tools.dump_viewer outputs/tensor_dump_20260414_092413 \
+python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump \
     --task 0x0000000200000a00 --export
 ```
 

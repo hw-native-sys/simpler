@@ -132,7 +132,7 @@ public:
      * @param output_path Output directory
      * @return 0 on success, -1 on failure
      */
-    int export_dump_files(const std::string &output_path = "outputs");
+    int export_dump_files(const std::string &output_path);
 
     /**
      * Free all device buffers and clear host-side state.

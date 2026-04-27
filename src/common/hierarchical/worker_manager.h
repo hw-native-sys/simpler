@@ -79,23 +79,23 @@ static constexpr size_t MAILBOX_ERROR_MSG_SIZE = 256;
 // CallConfig is written/read as a single packed POD block (see call_config.h).
 // Both ends transfer it with one memcpy — no per-field offsets to keep in sync.
 //
-// MAILBOX_OFF_ARGS is held at 64 (rather than packed flush against CONFIG) for
-// two reasons: (a) the args blob is `[T:i32][S:i32][ContinuousTensor[T]][u64[S]]`,
-// so the first ContinuousTensor's `uint64_t data` field lands at OFF_ARGS+8 —
-// it must be 8-byte aligned to avoid SIGBUS on strict-alignment platforms
-// (aarch64 atomics, some ARM cores); (b) the control region (CTRL_OFF_ARG0..
-// CTRL_OFF_RESULT) overlaps offsets 16–47 and is mutually exclusive with task
-// dispatch, but using offset 64 keeps the two regions visually disjoint.
+// MAILBOX_OFF_ARGS is derived: round up CallConfig's end to 8 bytes so the
+// args blob's first ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte
+// aligned, avoiding SIGBUS on strict-alignment platforms (aarch64 atomics,
+// some ARM cores). The control region (CTRL_OFF_ARG0..CTRL_OFF_RESULT) lives
+// inside the CallConfig byte range — that's safe because control commands
+// and task dispatch are mutually exclusive in time.
 static constexpr ptrdiff_t MAILBOX_OFF_STATE = 0;
 static constexpr ptrdiff_t MAILBOX_OFF_ERROR = 4;
 static constexpr ptrdiff_t MAILBOX_OFF_CALLABLE = 8;  // also: control sub-command (uint64)
 static constexpr ptrdiff_t MAILBOX_OFF_CONFIG = 16;
-static constexpr ptrdiff_t MAILBOX_OFF_ARGS = 64;
+static constexpr ptrdiff_t MAILBOX_OFF_ARGS =
+    (MAILBOX_OFF_CONFIG + static_cast<ptrdiff_t>(sizeof(CallConfig)) + 7) & ~ptrdiff_t{7};
+static_assert(MAILBOX_OFF_ARGS % 8 == 0, "MAILBOX_OFF_ARGS must be 8-aligned for ContinuousTensor.data");
 static_assert(
     MAILBOX_OFF_CONFIG + static_cast<ptrdiff_t>(sizeof(CallConfig)) <= MAILBOX_OFF_ARGS,
     "CallConfig overflows reserved config region"
 );
-static_assert(MAILBOX_OFF_ARGS % 8 == 0, "MAILBOX_OFF_ARGS must be 8-aligned for ContinuousTensor.data");
 static constexpr ptrdiff_t MAILBOX_OFF_ERROR_MSG =
     static_cast<ptrdiff_t>(MAILBOX_SIZE) - static_cast<ptrdiff_t>(MAILBOX_ERROR_MSG_SIZE);
 static constexpr size_t MAILBOX_ARGS_CAPACITY =

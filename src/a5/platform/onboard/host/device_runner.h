@@ -242,6 +242,11 @@ public:
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
+    // Directory under which all diagnostic artifacts (l2_perf_records.json /
+    // tensor_dump/ / pmu.csv) land. Required (non-empty) when any diagnostic
+    // is enabled; CallConfig::validate() enforces this contract upstream.
+    void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
+    const std::string &output_prefix() const { return output_prefix_; }
 
     /**
      * Print handshake results from device
@@ -468,6 +473,7 @@ private:
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
+    std::string output_prefix_{};                                  // diagnostic artifact root directory
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H
