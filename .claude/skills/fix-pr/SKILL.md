@@ -26,6 +26,7 @@ Accept PR number (`123`, `#123`), branch name, or no argument (uses current bran
 
 1. [Setup](../../lib/github/setup.md) — authenticate and detect context (role, remotes, state)
 2. **Auto-detect cross-fork PR context**: If no PR number provided, check upstream tracking to detect cross-fork push target:
+
    ```bash
    UPSTREAM=$(git rev-parse --abbrev-ref "@{upstream}" 2>/dev/null || echo "")
    if [ -n "$UPSTREAM" ]; then
@@ -126,15 +127,23 @@ For Category B, explain why code may already comply with `.claude/rules/`.
 # List failed checks to get the link for each failed job
 gh pr checks <NUMBER> --json name,state,link
 
-# Extract run ID from a failed check's link
+# Extract IDs from a failed check's link
 # Link format: https://github.com/<owner>/<repo>/actions/runs/<RUN_ID>/job/<JOB_ID>
 RUN_ID=$(echo "$LINK" | sed -En 's|.*/runs/([0-9]+)/.*|\1|p')
+JOB_ID=$(echo "$LINK" | sed -En 's|.*/job/([0-9]+).*|\1|p')
+
+# Whole-run logs (requires run to be complete — see note below)
 gh run view "$RUN_ID" --log-failed
+
+# Single-job logs — works even while the run is still in progress
+gh run view --job "$JOB_ID" --log-failed
 ```
 
-**`--log-failed` requires the entire run to be complete** (all jobs, not just the failed one). If any job is still pending, `gh` returns "run is still in progress". Check first: `gh run view <RUN_ID> --json status --jq '.status'` — must return `"completed"`.
+**`gh run view <RUN_ID> --log-failed` requires the entire run to be complete** (all jobs, not just the failed one). If any job is still pending, `gh` returns "run is still in progress". Check first: `gh run view <RUN_ID> --json status --jq '.status'` — must return `"completed"`.
 
-For large logs: `gh run view <RUN_ID> --log-failed 2>&1 | grep -E "error:|FAILED|fatal" | head -20`
+**When the run is still partially running but some jobs have already failed**, prefer `gh run view --job <JOB_ID> --log-failed` — it pulls the single job's log without waiting for siblings. List job IDs with `gh run view <RUN_ID> --json jobs --jq '.jobs[] | {name, status, conclusion, databaseId}'`.
+
+For large logs: `gh run view --job <JOB_ID> --log-failed 2>&1 | grep -E "error:|FAILED|fatal" | head -20`
 
 **External checks** (non-GitHub Actions): no run ID exists — open the `link` URL directly to view logs from the external provider.
 
@@ -167,6 +176,7 @@ On subsequent iterations, reuse prior "address all" policy for same categories. 
 Work directly on the PR branch. Setup depends on permission level:
 
 **For owner/write permission:**
+
 ```bash
 git checkout $HEAD_BRANCH
 git pull "$PUSH_REMOTE" "$HEAD_BRANCH"
@@ -183,6 +193,7 @@ Run [checkout-fork-branch](../../lib/github/checkout-fork-branch.md) to create/s
 3. Commit using `/git-commit` skill (skip testing/review for minor fixes)
 
 Then run [commit-and-push](../../lib/github/commit-and-push.md):
+
 1. Rebase onto `$BASE_REF`
 2. Ensure single valid commit (squash with original PR commit)
 3. Push (update push with `--force-with-lease` to `$PUSH_REMOTE`)
@@ -194,12 +205,14 @@ Then run [commit-and-push](../../lib/github/commit-and-push.md):
 For each comment, **both steps are mandatory** (see [reply-and-resolve](../../lib/github/reply-and-resolve.md)):
 
 1. **Reply** using the comment's `databaseId`:
+
    ```bash
    gh api "repos/${PR_REPO_OWNER}/${PR_REPO_NAME}/pulls/${PR_NUMBER}/comments/${COMMENT_DATABASE_ID}/replies" \
      -f body='Fixed — description of change'
    ```
 
 2. **Resolve the thread** using the thread's GraphQL node `id` (from fetch-comments, NOT the databaseId):
+
    ```bash
    gh api graphql -f query='
    mutation { resolveReviewThread(input: {threadId: "THREAD_NODE_ID"}) {
@@ -210,6 +223,7 @@ For each comment, **both steps are mandatory** (see [reply-and-resolve](../../li
 **Important:** The thread `id` comes from `reviewThreads.nodes[].id` in the fetch-comments GraphQL response. Each thread contains comments — use the thread's `id` to resolve, and the comment's `databaseId` to reply.
 
 Reply templates:
+
 - **Fixed** → "Fixed in `<commit>` — description of change"
 - **Skip** → "Follows `.claude/rules/<file>` — explanation"
 - **Ack** → "Acknowledged!"
@@ -217,11 +231,11 @@ Reply templates:
 ### Step 8: Wait and Re-check
 
 ```bash
-# Verify run is complete before fetching logs
+# Verify run is complete before fetching whole-run logs
 gh run view <RUN_ID> --json status --jq '.status'  # must be "completed"
 ```
 
-Poll with `gh pr checks <NUMBER>` — proceed early if all checks finish. **Do not fetch logs until run status is "completed".**
+Poll with `gh pr checks <NUMBER>` — proceed early if all checks finish. **For whole-run logs, wait until status is "completed".** If a job has already failed and you only need that job's output, fetch it now via `gh run view --job <JOB_ID> --log-failed` (see Step 4) rather than blocking on the rest of the run.
 
 Then loop back to Step 2.
 
