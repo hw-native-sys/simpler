@@ -97,12 +97,17 @@ _BOOTSTRAP_POLL_INTERVAL_S = 0.001
 _OFF_STATE = 0
 _OFF_ERROR = 4
 _OFF_CALLABLE = 8
-_OFF_BLOCK_DIM = 16
-_OFF_AICPU_THREAD_NUM = 20
-_OFF_ENABLE_L2_SWIMLANE = 24
-_OFF_ENABLE_DUMP_TENSOR = 28
-_OFF_ENABLE_PMU = 32
+_OFF_CONFIG = 16
+# Packed CallConfig wire layout (5 int32s in declaration order, see call_config.h).
+# struct.calcsize("=iiiii") == 20.
+_CFG_FMT = struct.Struct("=iiiii")
+# Held at 64 (not packed flush against CONFIG) so the args blob's first
+# ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
+# SIGBUS on strict-alignment platforms. Also keeps clear of the control
+# region (offsets 16–47, mutually exclusive with task dispatch).
 _OFF_ARGS = 64
+assert _OFF_CONFIG + _CFG_FMT.size <= _OFF_ARGS, "CallConfig overflows config region"
+assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for ContinuousTensor.data"
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
 
@@ -277,11 +282,7 @@ def _chip_process_loop(
         state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
             callable_ptr = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-            block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
-            aicpu_tn = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
-            enable_l2_swimlane = struct.unpack_from("i", buf, _OFF_ENABLE_L2_SWIMLANE)[0]
-            dump_tensor = struct.unpack_from("i", buf, _OFF_ENABLE_DUMP_TENSOR)[0]
-            enable_pmu = struct.unpack_from("i", buf, _OFF_ENABLE_PMU)[0]
+            block_dim, aicpu_tn, enable_l2_swimlane, dump_tensor, enable_pmu = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
 
             code = 0
             msg = ""
@@ -397,11 +398,9 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
             state = _mailbox_load_i32(state_addr)
             if state == _TASK_READY:
                 callable_ptr = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-                block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
-                aicpu_tn = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
-                enable_l2_swimlane = struct.unpack_from("i", buf, _OFF_ENABLE_L2_SWIMLANE)[0]
-                dump_tensor = struct.unpack_from("i", buf, _OFF_ENABLE_DUMP_TENSOR)[0]
-                enable_pmu = struct.unpack_from("i", buf, _OFF_ENABLE_PMU)[0]
+                block_dim, aicpu_tn, enable_l2_swimlane, dump_tensor, enable_pmu = _CFG_FMT.unpack_from(
+                    buf, _OFF_CONFIG
+                )
 
                 code = 0
                 msg = ""
@@ -492,12 +491,13 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
 
 def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     """Reconstruct a CallConfig from the unified mailbox layout."""
+    block_dim, aicpu_tn, swl, dt, pmu = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
     cfg = CallConfig()
-    cfg.block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
-    cfg.aicpu_thread_num = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
-    cfg.enable_l2_swimlane = bool(struct.unpack_from("i", buf, _OFF_ENABLE_L2_SWIMLANE)[0])
-    cfg.enable_dump_tensor = bool(struct.unpack_from("i", buf, _OFF_ENABLE_DUMP_TENSOR)[0])
-    cfg.enable_pmu = struct.unpack_from("i", buf, _OFF_ENABLE_PMU)[0]
+    cfg.block_dim = block_dim
+    cfg.aicpu_thread_num = aicpu_tn
+    cfg.enable_l2_swimlane = bool(swl)
+    cfg.enable_dump_tensor = bool(dt)
+    cfg.enable_pmu = pmu
     return cfg
 
 

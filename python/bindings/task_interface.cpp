@@ -552,12 +552,30 @@ NB_MODULE(_task_interface, m) {
         });
 
     // --- CallConfig ---
+    // The two enable_* fields are stored as int32 on the wire (see call_config.h).
+    // Expose them as Python `bool` via def_property so user-facing API is unchanged.
     nb::class_<CallConfig>(m, "CallConfig")
         .def(nb::init<>())
         .def_rw("block_dim", &CallConfig::block_dim)
         .def_rw("aicpu_thread_num", &CallConfig::aicpu_thread_num)
-        .def_rw("enable_l2_swimlane", &CallConfig::enable_l2_swimlane)
-        .def_rw("enable_dump_tensor", &CallConfig::enable_dump_tensor)
+        .def_prop_rw(
+            "enable_l2_swimlane",
+            [](const CallConfig &c) {
+                return static_cast<bool>(c.enable_l2_swimlane);
+            },
+            [](CallConfig &c, bool v) {
+                c.enable_l2_swimlane = v ? 1 : 0;
+            }
+        )
+        .def_prop_rw(
+            "enable_dump_tensor",
+            [](const CallConfig &c) {
+                return static_cast<bool>(c.enable_dump_tensor);
+            },
+            [](CallConfig &c, bool v) {
+                c.enable_dump_tensor = v ? 1 : 0;
+            }
+        )
         .def_rw("enable_pmu", &CallConfig::enable_pmu)
         .def("__repr__", [](const CallConfig &self) -> std::string {
             std::ostringstream os;

@@ -45,6 +45,7 @@
 #include <thread>
 #include <vector>
 
+#include "../task_interface/call_config.h"
 #include "types.h"
 
 class Ring;  // forward decl — owns the slot state pool
@@ -70,21 +71,31 @@ enum class MailboxState : int32_t {
 
 static constexpr size_t MAILBOX_SIZE = 4096;
 
-// Error message region lives at the mailbox tail so OFF_ARGS and all earlier
-// offsets stay byte-compatible with the pre-L4 layout. 256 B of headroom is
+// Error message region lives at the mailbox tail. 256 B of headroom is
 // enough for `<ExceptionType>: <short message>` produced by the child-side
 // Python loops; anything longer is truncated + NUL-terminated.
 static constexpr size_t MAILBOX_ERROR_MSG_SIZE = 256;
 
+// CallConfig is written/read as a single packed POD block (see call_config.h).
+// Both ends transfer it with one memcpy — no per-field offsets to keep in sync.
+//
+// MAILBOX_OFF_ARGS is held at 64 (rather than packed flush against CONFIG) for
+// two reasons: (a) the args blob is `[T:i32][S:i32][ContinuousTensor[T]][u64[S]]`,
+// so the first ContinuousTensor's `uint64_t data` field lands at OFF_ARGS+8 —
+// it must be 8-byte aligned to avoid SIGBUS on strict-alignment platforms
+// (aarch64 atomics, some ARM cores); (b) the control region (CTRL_OFF_ARG0..
+// CTRL_OFF_RESULT) overlaps offsets 16–47 and is mutually exclusive with task
+// dispatch, but using offset 64 keeps the two regions visually disjoint.
 static constexpr ptrdiff_t MAILBOX_OFF_STATE = 0;
 static constexpr ptrdiff_t MAILBOX_OFF_ERROR = 4;
 static constexpr ptrdiff_t MAILBOX_OFF_CALLABLE = 8;  // also: control sub-command (uint64)
-static constexpr ptrdiff_t MAILBOX_OFF_BLOCK_DIM = 16;
-static constexpr ptrdiff_t MAILBOX_OFF_AICPU_THREAD_NUM = 20;
-static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_L2_SWIMLANE = 24;
-static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_DUMP_TENSOR = 28;
-static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_PMU = 32;
+static constexpr ptrdiff_t MAILBOX_OFF_CONFIG = 16;
 static constexpr ptrdiff_t MAILBOX_OFF_ARGS = 64;
+static_assert(
+    MAILBOX_OFF_CONFIG + static_cast<ptrdiff_t>(sizeof(CallConfig)) <= MAILBOX_OFF_ARGS,
+    "CallConfig overflows reserved config region"
+);
+static_assert(MAILBOX_OFF_ARGS % 8 == 0, "MAILBOX_OFF_ARGS must be 8-aligned for ContinuousTensor.data");
 static constexpr ptrdiff_t MAILBOX_OFF_ERROR_MSG =
     static_cast<ptrdiff_t>(MAILBOX_SIZE) - static_cast<ptrdiff_t>(MAILBOX_ERROR_MSG_SIZE);
 static constexpr size_t MAILBOX_ARGS_CAPACITY =
