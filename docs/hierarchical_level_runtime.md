@@ -184,7 +184,7 @@ w4.add_worker(l3)
 w4.init()
 
 def my_l4_orch(orch, args, config):
-    orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+    orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
 
 w4.run(my_l4_orch)
 w4.close()

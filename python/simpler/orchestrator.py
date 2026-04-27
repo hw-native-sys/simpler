@@ -34,7 +34,7 @@ from collections.abc import Iterator, Sequence
 from typing import Any, Optional
 
 from .task_interface import (
-    ChipCallConfig,
+    CallConfig,
     ContinuousTensor,
     DataType,
     TaskArgs,
@@ -68,20 +68,20 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def submit_next_level(
-        self, callable_: Any, args: TaskArgs, config: Optional[ChipCallConfig] = None, *, worker: int = -1
+        self, callable_: Any, args: TaskArgs, config: Optional[CallConfig] = None, *, worker: int = -1
     ):
         """Submit a NEXT_LEVEL (chip) task. Tags inside ``args`` drive deps.
 
         ``worker``: logical worker id for affinity (-1 = unconstrained).
         """
-        cfg = config if config is not None else ChipCallConfig()
+        cfg = config if config is not None else CallConfig()
         return self._o.submit_next_level(_resolve_callable_ptr(callable_), args, cfg, int(worker))
 
     def submit_next_level_group(
         self,
         callable_: Any,
         args_list: list,
-        config: Optional[ChipCallConfig] = None,
+        config: Optional[CallConfig] = None,
         *,
         workers: Optional[list] = None,
     ):
@@ -89,7 +89,7 @@ class Orchestrator:
 
         ``workers``: per-args affinity list (None/empty = all unconstrained).
         """
-        cfg = config if config is not None else ChipCallConfig()
+        cfg = config if config is not None else CallConfig()
         w = [int(x) for x in workers] if workers else []
         return self._o.submit_next_level_group(_resolve_callable_ptr(callable_), args_list, cfg, w)
 

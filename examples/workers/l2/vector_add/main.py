@@ -39,8 +39,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import torch  # noqa: E402
 from simpler.task_interface import (
     ArgDirection,
+    CallConfig,
     ChipCallable,
-    ChipCallConfig,
     ChipStorageTaskArgs,
     ContinuousTensor,
     CoreCallable,
@@ -151,8 +151,8 @@ def _run(worker: Worker, chip_callable: ChipCallable) -> None:
     args.add_tensor(ContinuousTensor.make(dev_b, (N_ROWS, N_COLS), DataType.FLOAT32))
     args.add_tensor(ContinuousTensor.make(dev_out, (N_ROWS, N_COLS), DataType.FLOAT32))
 
-    # --- 4. Run. ChipCallConfig() defaults are fine for this kernel. ---
-    config = ChipCallConfig()
+    # --- 4. Run. CallConfig() defaults are fine for this kernel. ---
+    config = CallConfig()
     print("[vector_add] running on device...")
     worker.run(chip_callable, args, config)
 

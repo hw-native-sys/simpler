@@ -13,7 +13,7 @@
 
 #include <atomic>
 
-#include "chip_call_config.h"
+#include "call_config.h"
 #include "ring.h"
 #include "orchestrator.h"
 #include "scope.h"
@@ -33,7 +33,7 @@ struct OrchestratorFixture : public ::testing::Test {
     ReadyQueue rq_next_level;
     ReadyQueue rq_sub;
     Orchestrator orch;
-    ChipCallConfig cfg;
+    CallConfig cfg;
 
     // Tests in this file only submit NEXT_LEVEL tasks, so `rq` is a
     // convenience alias for the next-level queue. Kept public so existing

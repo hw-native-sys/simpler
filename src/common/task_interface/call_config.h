@@ -10,7 +10,7 @@
  */
 
 /**
- * ChipCallConfig — per-NEXT_LEVEL-task config. Carries execution knobs
+ * CallConfig — per-NEXT_LEVEL-task config. Carries execution knobs
  * (block_dim, aicpu_thread_num) plus the three parallel diagnostics
  * sub-features under the profiling umbrella: `enable_l2_swimlane` (swimlane),
  * `enable_dump_tensor`, and `enable_pmu`.
@@ -22,7 +22,7 @@
 
 #pragma once
 
-struct ChipCallConfig {
+struct CallConfig {
     int block_dim = 24;
     int aicpu_thread_num = 3;
     bool enable_l2_swimlane = false;

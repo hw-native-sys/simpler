@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-#include "../task_interface/chip_call_config.h"
+#include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
 #include "types.h"
 
@@ -50,11 +50,11 @@ public:
     // IWorker: build a ChipStorageTaskArgs POD from `args` and execute the
     // runtime synchronously. `callable` is a ChipCallable buffer pointer
     // cast to uint64.
-    void run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) override;
+    void run(uint64_t callable, TaskArgsView args, const CallConfig &config) override;
 
     // Direct invocation (used by Python wrapper and internal tests) — bypasses
     // the TaskArgsView path and takes a ready-made ChipStorageTaskArgs POD.
-    void run(const void *callable, const void *args, const ChipCallConfig &config);
+    void run(const void *callable, const void *args, const CallConfig &config);
 
     uint64_t malloc(size_t size);
     void free(uint64_t ptr);

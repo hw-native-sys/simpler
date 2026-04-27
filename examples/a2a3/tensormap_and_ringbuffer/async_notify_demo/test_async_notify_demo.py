@@ -18,10 +18,10 @@ import tempfile
 import torch
 from simpler.task_interface import (
     ArgDirection,
+    CallConfig,
     ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
-    ChipCallConfig,
     ChipCommBootstrapConfig,
     ChipContext,
     ContinuousTensor,
@@ -159,7 +159,7 @@ def run(
                 args.add_scalar(ctx.device_ctx)
                 orch.submit_next_level(chip_callable, args, cfg, worker=rank)
 
-        worker.run(orch_fn, args=None, config=ChipCallConfig())
+        worker.run(orch_fn, args=None, config=CallConfig())
 
         ok = True
         for rank in range(nranks):

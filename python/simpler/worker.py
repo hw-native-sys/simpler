@@ -69,8 +69,8 @@ from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
+    CallConfig,
     ChipBootstrapConfig,
-    ChipCallConfig,
     ChipContext,
     ChipWorker,
     ContinuousTensor,
@@ -490,9 +490,9 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
             cw.finalize()
 
 
-def _read_config_from_mailbox(buf: memoryview) -> "ChipCallConfig":
-    """Reconstruct a ChipCallConfig from the unified mailbox layout."""
-    cfg = ChipCallConfig()
+def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
+    """Reconstruct a CallConfig from the unified mailbox layout."""
+    cfg = CallConfig()
     cfg.block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
     cfg.aicpu_thread_num = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
     cfg.enable_l2_swimlane = bool(struct.unpack_from("i", buf, _OFF_ENABLE_L2_SWIMLANE)[0])
@@ -1049,10 +1049,10 @@ class Worker:
 
         callable: ChipCallable (L2) or Python orch fn (L3+)
         args:     TaskArgs (optional)
-        config:   ChipCallConfig (optional, default-constructed if None)
+        config:   CallConfig (optional, default-constructed if None)
         """
         assert self._initialized, "Worker not initialized; call init() first"
-        cfg = config if config is not None else ChipCallConfig()
+        cfg = config if config is not None else CallConfig()
 
         if self.level == 2:
             assert self._chip_worker is not None

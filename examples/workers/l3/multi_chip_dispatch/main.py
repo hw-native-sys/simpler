@@ -37,8 +37,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import torch  # noqa: E402
 from simpler.task_interface import (
     ArgDirection,
+    CallConfig,
     ChipCallable,
-    ChipCallConfig,
     CoreCallable,
     TaskArgs,
     TensorArgType,
@@ -178,7 +178,7 @@ def run(platform: str, device_ids: list[int]) -> int:
         # --- 7. Run the DAG. Worker.run() opens a scope, invokes orch_fn,
         # drains the DAG to completion, then closes the scope.
         print("[multi_chip_dispatch] running DAG (2 chip tasks + 1 sub)...")
-        worker.run(orch_fn, args=None, config=ChipCallConfig())
+        worker.run(orch_fn, args=None, config=CallConfig())
 
         # --- 8. Verify outputs. ``host_out`` was written in-place by the
         # chip processes via shared memory; no explicit copy needed.

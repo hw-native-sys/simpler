@@ -279,12 +279,12 @@ execution is never affected.
 ### 3.1 Enable at runtime
 
 The user-facing switch is still
-`ChipCallConfig::enable_dump_tensor`, but the runtime no longer relies
+`CallConfig::enable_dump_tensor`, but the runtime no longer relies
 on `dump_data_base` as the enable signal.
 
 Current propagation chain:
 
-1. Python / test harness sets `ChipCallConfig::enable_dump_tensor`.
+1. Python / test harness sets `CallConfig::enable_dump_tensor`.
 2. Host `DeviceRunner` allocates dump storage and publishes its base
    address via `kernel_args.dump_data_base`.
 3. Host also sets `PROFILING_FLAG_DUMP_TENSOR` in each worker

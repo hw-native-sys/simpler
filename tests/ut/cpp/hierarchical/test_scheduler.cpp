@@ -19,7 +19,7 @@
 #include <thread>
 #include <vector>
 
-#include "chip_call_config.h"
+#include "call_config.h"
 #include "orchestrator.h"
 #include "ring.h"
 #include "scheduler.h"
@@ -48,7 +48,7 @@ struct MockWorker : public IWorker {
     std::atomic<bool> should_complete{false};
     std::atomic<bool> is_running{false};
 
-    void run(uint64_t callable, TaskArgsView args, const ChipCallConfig & /*cfg*/) override {
+    void run(uint64_t callable, TaskArgsView args, const CallConfig & /*cfg*/) override {
         {
             std::lock_guard<std::mutex> lk(dispatched_mu);
             uint64_t key = (args.tensor_count > 0) ? args.tensors[0].data : 0;
@@ -113,7 +113,7 @@ struct SchedulerFixture : public ::testing::Test {
     MockWorker mock_worker;
     WorkerManager manager;
     Scheduler sched;
-    ChipCallConfig cfg;
+    CallConfig cfg;
 
     std::vector<TaskSlot> consumed_slots;
     std::mutex consumed_mu;
@@ -220,7 +220,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
     MockWorker worker_b;
     WorkerManager manager;
     Scheduler sched;
-    ChipCallConfig cfg;
+    CallConfig cfg;
 
     std::vector<TaskSlot> consumed_slots;
     std::mutex consumed_mu;
@@ -331,7 +331,7 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
     MockWorker sub_worker;
     WorkerManager manager;
     Scheduler sched;
-    ChipCallConfig cfg;
+    CallConfig cfg;
 
     std::vector<TaskSlot> consumed_slots;
     std::mutex consumed_mu;
