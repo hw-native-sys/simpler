@@ -42,6 +42,7 @@ struct PTO2TaskId {
     constexpr uint8_t ring() const { return static_cast<uint8_t>(raw >> 32); }
     constexpr uint32_t local() const { return static_cast<uint32_t>(raw & 0xFFFFFFFFu); }
     constexpr bool is_valid() const { return raw != UINT64_MAX; }
+    constexpr bool is_invalid() const { return raw == UINT64_MAX; }
 
     constexpr bool operator==(const PTO2TaskId &other) const { return raw == other.raw; }
     constexpr bool operator!=(const PTO2TaskId &other) const { return raw != other.raw; }

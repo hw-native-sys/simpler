@@ -24,7 +24,7 @@
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     uint64_t notify_counter_addr = static_cast<uint64_t>(args[1]);
     uint32_t expected_value = static_cast<uint32_t>(args[2]);
-    PTO2AsyncCtx ctx = pto2_async_ctx(args);
-    pto2_defer_counter(ctx, reinterpret_cast<volatile __gm__ void *>(notify_counter_addr), expected_value);
-    pto2_defer_flush(ctx);
+    pto2_save_expected_notification_counter(
+        args, reinterpret_cast<volatile __gm__ void *>(notify_counter_addr), expected_value
+    );
 }
