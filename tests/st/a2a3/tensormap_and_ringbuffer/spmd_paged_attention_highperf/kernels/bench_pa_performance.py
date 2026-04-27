@@ -138,7 +138,7 @@ class CustomPARunner:
         block_size = k_page.shape[1]
         max_blocks = bt.shape[1]
 
-        self.tiling, self.eff_bd = make_pa_nd_decode_tiling(
+        self.tiling, self.eff_bd, kv_cn = make_pa_nd_decode_tiling(
             batch=b,
             kv_seq_lens=ctx_lens.tolist(),
             num_heads=nq,
@@ -153,7 +153,7 @@ class CustomPARunner:
             device=device,
             dtype=dtype,
         )
-        ws = workspace_sizes(b, nq, head_dim, head_dim, block_dim)
+        ws = workspace_sizes(b, nq, head_dim, head_dim, block_dim, kv_cn)
         self.s_gm    = torch.zeros(ws["s"],         dtype=torch.uint8, device=device)
         self.p_gm    = torch.zeros(ws["p"],         dtype=torch.uint8, device=device)
         self.o_tmp   = torch.zeros(ws["o_tmp"],     dtype=torch.uint8, device=device)
@@ -235,19 +235,20 @@ def bench_case(lib, name, b, nq, nkv, d, s_kv, bs, dtype, device,
 # Same shapes as atb_pa/README.md (ifa-gpa suite), block_size=128
 DEFAULT_CASES = [
     # (name, batch, nq, nkv, head_dim, kv_seq, block_size)
-    ("Qwen3-0.6B b1 h16/kv8 kv2048",  1,  16,  8, 128, 2048, 128),
-    ("Qwen3-1.7B b1 h16/kv8 kv4096",  1,  16,  8, 128, 4096, 128),
-    ("Qwen3-4B   b1 h32/kv8 kv2048",  1,  32,  8, 128, 2048, 128),
-    ("Qwen3-8B   b1 h32/kv8 kv4096",  1,  32,  8, 128, 4096, 128),
-    ("Qwen3-8B   b1 h32/kv8 kv8192",  1,  32,  8, 128, 8192, 128),
-    ("Qwen3-14B  b1 h40/kv8 kv2048",  1,  40,  8, 128, 2048, 128),
-    ("Qwen3-32B  b1 h64/kv8 kv2048",  1,  64,  8, 128, 2048, 128),
-    ("MHA        b1 h32/kv32 kv2048", 1,  32, 32, 128, 2048, 128),
-    ("Qwen3-8B   b4 h32/kv8 kv2048",  4,  32,  8, 128, 2048, 128),
-    ("Qwen3-8B   b8 h32/kv8 kv2048",  8,  32,  8, 128, 2048, 128),
-    ("Qwen3-8B  b16 h32/kv8 kv2048", 16,  32,  8, 128, 2048, 128),
-    ("Qwen3-8B  b32 h32/kv8 kv2048", 32,  32,  8, 128, 2048, 128),
-    ("Qwen3-8B  b64 h32/kv8 kv2048", 64,  32,  8, 128, 2048, 128),
+    # ("Qwen3-0.6B b1 h16/kv8 kv2048",  1,  16,  8, 128, 2048, 128),
+    # ("Qwen3-1.7B b1 h16/kv8 kv4096",  1,  16,  8, 128, 4096, 128),
+    # ("Qwen3-4B   b1 h32/kv8 kv2048",  1,  32,  8, 128, 2048, 128),
+    # ("Qwen3-8B   b1 h32/kv8 kv4096",  1,  32,  8, 128, 4096, 128),
+    # ("Qwen3-8B   b1 h32/kv8 kv8192",  1,  32,  8, 128, 8192, 128),
+    # ("Qwen3-14B  b1 h40/kv8 kv2048",  1,  40,  8, 128, 2048, 128),
+    # ("Qwen3-32B  b1 h64/kv8 kv2048",  1,  64,  8, 128, 2048, 128),
+    # ("MHA        b1 h32/kv32 kv2048", 1,  32, 32, 128, 2048, 128),
+    # ("Qwen3-8B   b4 h32/kv8 kv2048",  4,  32,  8, 128, 2048, 128),
+    # ("Qwen3-8B   b8 h32/kv8 kv2048",  8,  32,  8, 128, 2048, 128),
+    # ("Qwen3-8B  b16 h32/kv8 kv2048", 16,  32,  8, 128, 2048, 128),
+    # ("Qwen3-8B  b32 h32/kv8 kv2048", 32,  32,  8, 128, 2048, 128),
+    # ("Qwen3-8B  b64 h32/kv8 kv2048", 64,  32,  8, 128, 2048, 128),
+    ("Qwen3-8B  b256 h16/kv1 kv8192", 256,  16,  1, 128, 8192, 128),
 ]
 
 

@@ -230,7 +230,7 @@ def make_pa_nd_decode_tiling(
     block_dim: int,
     device: str = "npu",
     dtype: torch.dtype = torch.float16,
-) -> tuple[torch.Tensor, int]:
+) -> tuple[torch.Tensor, int, int]:
     """
     Build PAGED_ATTENTION_MASK_ND tiling for decode-only GQA.
 
@@ -250,7 +250,7 @@ def make_pa_nd_decode_tiling(
         dtype:               fp16 or bf16 (selects tiling key 0 or 1)
 
     Returns:
-        (tiling_tensor, effective_block_dim)
+        (tiling_tensor, effective_block_dim, kv_split_core_num)
     """
     kv_real = kv_heads if kv_heads > 0 else num_heads
     max_kv = max(kv_seq_lens)
@@ -423,7 +423,7 @@ def make_pa_nd_decode_tiling(
     tiling_i32 = tiling.view(np.int32)
     tiling_tensor = torch.tensor(tiling_i32, dtype=torch.int32, device=device)
 
-    return tiling_tensor, eff_bd
+    return tiling_tensor, eff_bd, kvCN
 
 
 def workspace_sizes(
@@ -432,12 +432,15 @@ def workspace_sizes(
     head_dim: int,
     head_dim_v: int,
     block_dim: int,
+    kv_cn: int = 1,
 ) -> dict[str, int]:
     """Return byte sizes for each workspace tensor (from PagedAttentionTiling scratch sizes)."""
     basic_half = block_dim * WORKSPACE_BLOCK_SIZE_DB * 2    # basicWorkSpaceHalf
     basic_float = block_dim * WORKSPACE_BLOCK_SIZE_DB * 4   # basicWorkSpaceFloat
-    o_core = int(block_dim * SPLITKV_RATIO) * num_heads * block_dim * head_dim * 4
-    l_size = int(block_dim * SPLITKV_RATIO) * num_heads * block_dim * 4
+    # SplitKV paths need global workspace sized by (batch * kv_cn * num_heads).
+    # The old per-core estimate under-allocates for large-batch split-KV cases.
+    o_core = max(16, batch * kv_cn * num_heads * head_dim * 4)
+    l_size = max(16, batch * kv_cn * num_heads * 4)
     k16 = 2 * block_dim * 256 * num_heads * head_dim * 2
     v16 = 2 * block_dim * 256 * num_heads * head_dim_v * 2
     return {
@@ -445,8 +448,8 @@ def workspace_sizes(
         "p":          basic_half,        # scratch[1] = basicWorkSpaceHalf
         "o_tmp":      basic_float * 2,   # scratch[2] = basicWorkSpaceFloat * 2
         "go":         basic_float,       # scratch[3] = basicWorkSpaceFloat (go_gm for AiV)
-        "o_core_tmp": max(16, o_core),   # scratch[4] = oCoreTempSize
-        "l":          max(16, l_size),   # scratch[5] = lCoreTempSize
+        "o_core_tmp": o_core,            # scratch[4] = oCoreTempSize
+        "l":          l_size,            # scratch[5] = lCoreTempSize
         "k16":        max(16, k16),      # scratch[6]
         "v16":        max(16, v16),      # scratch[7]
     }

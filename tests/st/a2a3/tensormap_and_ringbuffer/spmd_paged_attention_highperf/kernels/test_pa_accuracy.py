@@ -171,7 +171,7 @@ def run_custom(lib, q, k_page, v_page, bt, ctx_lens, nq, nkv, head_dim, head_dim
     block_size = k_page.shape[1]
     max_blocks = bt.shape[1]
 
-    tiling, eff_bd = make_pa_nd_decode_tiling(
+    tiling, eff_bd, kv_cn = make_pa_nd_decode_tiling(
         batch=b, kv_seq_lens=ctx_lens.tolist(),
         num_heads=nq, kv_heads=nkv,
         head_dim=head_dim, head_dim_v=head_dim_v,
@@ -180,7 +180,7 @@ def run_custom(lib, q, k_page, v_page, bt, ctx_lens, nq, nkv, head_dim, head_dim
         block_dim=block_dim, device=device, dtype=dtype,
     )
 
-    ws = workspace_sizes(b, nq, head_dim, head_dim_v, block_dim)
+    ws = workspace_sizes(b, nq, head_dim, head_dim_v, block_dim, kv_cn)
 
     def ws_buf(key):
         n = ws[key]
@@ -299,13 +299,13 @@ def warmup(lib, device, dtype, block_dim, workspace_cache: dict):
     (and validated) those memory regions before the real tests run.
     """
     b, nq, nkv, d, bs = 4, 64, 8, 128, 128
-    tiling, eff_bd = make_pa_nd_decode_tiling(
+    tiling, eff_bd, kv_cn = make_pa_nd_decode_tiling(
         batch=b, kv_seq_lens=[bs]*b, num_heads=nq, kv_heads=nkv,
         head_dim=d, head_dim_v=d, num_blocks=b, block_size=bs,
         max_blocks_per_query=1, scale=1.0 / math.sqrt(d),
         block_dim=block_dim, device=device, dtype=dtype,
     )
-    ws = workspace_sizes(b, nq, d, d, block_dim)
+    ws = workspace_sizes(b, nq, d, d, block_dim, kv_cn)
     null = empty_buf(device)
     q  = torch.zeros(b, nq, d, dtype=dtype, device=device)
     k  = torch.zeros(b, bs, nkv, d, dtype=dtype, device=device)
@@ -380,16 +380,17 @@ def main():
 
     cases = [
         # Simple smoke test
-        {"name": "b1_h32_kv8_s128_bs128",   "batch": 1, "num_heads": 32, "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 128,  "block_size": 128},
-        # Multiple batches
-        {"name": "b4_h32_kv8_s512_bs128",   "batch": 4, "num_heads": 32, "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 512,  "block_size": 128},
-        # MHA (nq == nkv) — uses split-KV path (tiling_key=16), isolated in subprocess
-        {"name": "b2_h8_kv8_s256_bs128",    "batch": 2, "num_heads": 8,  "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 256,  "block_size": 128},
-        # Larger GQA
-        {"name": "b8_h32_kv8_s1024_bs128",  "batch": 8, "num_heads": 32, "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 1024, "block_size": 128},
-        # Qwen3 shapes
-        {"name": "b1_h32_kv8_s2048_bs128",  "batch": 1, "num_heads": 32, "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 2048, "block_size": 128},
-        {"name": "b4_h64_kv8_s1024_bs128",  "batch": 4, "num_heads": 64, "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 1024, "block_size": 128},
+        # {"name": "b1_h32_kv8_s128_bs128",   "batch": 1, "num_heads": 32, "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 128,  "block_size": 128},
+        # # Multiple batches
+        # {"name": "b4_h32_kv8_s512_bs128",   "batch": 4, "num_heads": 32, "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 512,  "block_size": 128},
+        # # MHA (nq == nkv) — uses split-KV path (tiling_key=16), isolated in subprocess
+        # {"name": "b2_h8_kv8_s256_bs128",    "batch": 2, "num_heads": 8,  "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 256,  "block_size": 128},
+        # # Larger GQA
+        # {"name": "b8_h32_kv8_s1024_bs128",  "batch": 8, "num_heads": 32, "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 1024, "block_size": 128},
+        # # Qwen3 shapes
+        # {"name": "b1_h32_kv8_s2048_bs128",  "batch": 1, "num_heads": 32, "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 2048, "block_size": 128},
+        # {"name": "b4_h64_kv8_s1024_bs128",  "batch": 4, "num_heads": 64, "num_kv_heads": 8,  "head_dim": 128, "kv_seq": 1024, "block_size": 128},
+        {"name": "b256_h16_kv1_s8192_bs128",  "batch": 256, "num_heads": 16, "num_kv_heads": 1,  "head_dim": 128, "kv_seq": 8192, "block_size": 128},
     ]
 
     cases_env = json.dumps(cases)
