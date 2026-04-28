@@ -474,9 +474,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
 
     # Duration events (Complete events "X")
     # Build task_id -> event_id mapping for flow events
-    task_to_event_id = {}
-    task_to_aicpu_event_id: dict[int, int] = {}
-    task_to_aicpu_tid: dict[int, int] = {}
+    task_to_event_id: dict[tuple[int, int], int] = {}
+    task_to_aicpu_event_id: dict[tuple[int, int], int] = {}
+    task_to_aicpu_tid: dict[tuple[int, int], int] = {}
     event_id = 0
 
     for task in tasks:
@@ -516,7 +516,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         )
 
         # Record mapping for flow events
-        task_to_event_id[task["task_id"]] = event_id
+        task_to_event_id[(task["task_id"], task["core_id"])] = event_id
         event_id += 1
 
     # AICPU View duration events (dispatch_time to finish_time)
@@ -552,7 +552,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     lane_finish.append(0.0)
                 lane_finish[assigned] = task["finish_time_us"]
                 tid = base_tid if assigned == 0 else base_tid + assigned
-                task_to_aicpu_tid[task["task_id"]] = tid
+                task_to_aicpu_tid[(task["task_id"], task["core_id"])] = tid
                 aicpu_tid_set.add(tid)
 
         # Thread name metadata for AICPU View (one entry per unique tid used)
@@ -593,7 +593,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             if dispatch_us < 0 or finish_us <= 0:
                 continue
 
-            tid = task_to_aicpu_tid.get(task["task_id"], core_to_tid[task["core_id"]])
+            tid = task_to_aicpu_tid.get((task["task_id"], task["core_id"]), core_to_tid[task["core_id"]])
             aicpu_dur = finish_us - dispatch_us
 
             # Get function name if available
@@ -624,16 +624,23 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     "dur": aicpu_dur,
                 }
             )
-            task_to_aicpu_event_id[task["task_id"]] = event_id
+            task_to_aicpu_event_id[(task["task_id"], task["core_id"])] = event_id
             event_id += 1
 
     # Flow events (Flow events "s" and "f" for dependencies)
-    task_map = {t["task_id"]: t for t in tasks}
+    task_map: dict[int, list] = defaultdict(list)
+    for t in tasks:
+        task_map[t["task_id"]].append(t)
     flow_id = 0
 
     for task in tasks:
         src_tid = core_to_tid[task["core_id"]]
         src_ts_end = task["end_time_us"]
+        # Get event ID for source task
+        src_event_id = task_to_event_id[(task["task_id"], task["core_id"])]
+        # Flow start timestamp (at end of source task, slightly before)
+        # Use a small offset (0.01 us) for visual clarity
+        flow_start_us = src_ts_end - 0.01
 
         for succ_task_id in task["fanout"]:
             if succ_task_id not in task_map:
@@ -644,48 +651,39 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     )
                 continue
 
-            succ_task = task_map[succ_task_id]
-            dst_tid = core_to_tid[succ_task["core_id"]]
-            dst_ts_start = succ_task["start_time_us"]
+            for succ_task in task_map[succ_task_id]:
+                dst_tid = core_to_tid[succ_task["core_id"]]
+                dst_ts_start = succ_task["start_time_us"]
+                dst_event_id = task_to_event_id[(succ_task["task_id"], succ_task["core_id"])]
 
-            # Get event IDs for source and destination tasks
-            src_event_id = task_to_event_id[task["task_id"]]
-            dst_event_id = task_to_event_id[succ_task["task_id"]]
-
-            # Flow start timestamp (at end of source task, slightly before)
-            # Use a small offset (0.01 us) for visual clarity
-            flow_start_us = src_ts_end - 0.01
-
-            # Flow start event (at end of source task)
-            events.append(
-                {
-                    "cat": "flow",
-                    "id": flow_id,
-                    "name": "dependency",
-                    "ph": "s",
-                    "pid": 1,
-                    "tid": src_tid,
-                    "ts": flow_start_us,
-                    "bind_id": src_event_id,
-                }
-            )
-
-            # Flow finish event (at start of destination task)
-            events.append(
-                {
-                    "cat": "flow",
-                    "id": flow_id,
-                    "name": "dependency",
-                    "ph": "f",
-                    "pid": 1,
-                    "tid": dst_tid,
-                    "ts": dst_ts_start,
-                    "bp": "e",
-                    "bind_id": dst_event_id,
-                }
-            )
-
-            flow_id += 1
+                # Flow start event (at end of source task)
+                events.append(
+                    {
+                        "cat": "flow",
+                        "id": flow_id,
+                        "name": "dependency",
+                        "ph": "s",
+                        "pid": 1,
+                        "tid": src_tid,
+                        "ts": flow_start_us,
+                        "bind_id": src_event_id,
+                    }
+                )
+                # Flow finish event (at start of destination task)
+                events.append(
+                    {
+                        "cat": "flow",
+                        "id": flow_id,
+                        "name": "dependency",
+                        "ph": "f",
+                        "pid": 1,
+                        "tid": dst_tid,
+                        "ts": dst_ts_start,
+                        "bp": "e",
+                        "bind_id": dst_event_id,
+                    }
+                )
+                flow_id += 1
 
     # AICPU Scheduler phase events (version 2)
     if scheduler_phases:
@@ -865,49 +863,51 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             if src_finish_us < 0:
                 continue
 
-            src_tid = task_to_aicpu_tid.get(task["task_id"], core_to_tid[task["core_id"]])
-            src_aicpu_eid = task_to_aicpu_event_id.get(task["task_id"])
+            src_tid = task_to_aicpu_tid.get((task["task_id"], task["core_id"]), core_to_tid[task["core_id"]])
+            src_aicpu_eid = task_to_aicpu_event_id.get((task["task_id"], task["core_id"]))
 
             for succ_task_id in task["fanout"]:
                 if succ_task_id not in task_map:
                     continue
 
-                succ_task = task_map[succ_task_id]
-                dst_dispatch_us = succ_task.get("dispatch_time_us", 0)
-                if dst_dispatch_us < 0:
-                    continue
+                for succ_task in task_map[succ_task_id]:
+                    dst_dispatch_us = succ_task.get("dispatch_time_us", 0)
+                    if dst_dispatch_us < 0:
+                        continue
 
-                dst_tid = task_to_aicpu_tid.get(succ_task_id, core_to_tid[succ_task["core_id"]])
-                dst_aicpu_eid = task_to_aicpu_event_id.get(succ_task_id)
+                    dst_tid = task_to_aicpu_tid.get(
+                        (succ_task["task_id"], succ_task["core_id"]), core_to_tid[succ_task["core_id"]]
+                    )
+                    dst_aicpu_eid = task_to_aicpu_event_id.get((succ_task["task_id"], succ_task["core_id"]))
 
-                flow_s = {
-                    "cat": "flow",
-                    "id": flow_id,
-                    "name": "dependency",
-                    "ph": "s",
-                    "pid": 2,
-                    "tid": src_tid,
-                    "ts": src_finish_us - 0.01,
-                }
-                if src_aicpu_eid is not None:
-                    flow_s["bind_id"] = src_aicpu_eid
-                events.append(flow_s)
+                    flow_s = {
+                        "cat": "flow",
+                        "id": flow_id,
+                        "name": "dependency",
+                        "ph": "s",
+                        "pid": 2,
+                        "tid": src_tid,
+                        "ts": src_finish_us - 0.01,
+                    }
+                    if src_aicpu_eid is not None:
+                        flow_s["bind_id"] = src_aicpu_eid
+                    events.append(flow_s)
 
-                flow_f = {
-                    "cat": "flow",
-                    "id": flow_id,
-                    "name": "dependency",
-                    "ph": "f",
-                    "pid": 2,
-                    "tid": dst_tid,
-                    "ts": dst_dispatch_us,
-                    "bp": "e",
-                }
-                if dst_aicpu_eid is not None:
-                    flow_f["bind_id"] = dst_aicpu_eid
-                events.append(flow_f)
+                    flow_f = {
+                        "cat": "flow",
+                        "id": flow_id,
+                        "name": "dependency",
+                        "ph": "f",
+                        "pid": 2,
+                        "tid": dst_tid,
+                        "ts": dst_dispatch_us,
+                        "bp": "e",
+                    }
+                    if dst_aicpu_eid is not None:
+                        flow_f["bind_id"] = dst_aicpu_eid
+                    events.append(flow_f)
 
-                flow_id += 1
+                    flow_id += 1
 
     # Scheduler DISPATCH → task execution arrows
     if scheduler_phases and has_aicpu_data:
@@ -957,7 +957,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             if matched_thread is not None:
                 sched_tid = 3000 + matched_thread
                 core_tid = core_to_tid[task["core_id"]]
-                aicpu_tid = task_to_aicpu_tid.get(task["task_id"], core_tid)
+                aicpu_tid = task_to_aicpu_tid.get((task["task_id"], task["core_id"]), core_tid)
 
                 # Flow: scheduler DISPATCH → AICore View task start
                 events.append(
@@ -986,7 +986,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 flow_id += 1
 
                 # Flow: scheduler DISPATCH → AICPU View task start
-                aicpu_eid = task_to_aicpu_event_id.get(task["task_id"])
+                aicpu_eid = task_to_aicpu_event_id.get((task["task_id"], task["core_id"]))
                 events.append(
                     {
                         "cat": "flow",
