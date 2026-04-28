@@ -771,13 +771,16 @@ struct PTO2SchedulerState {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
-            // Local-first: try per-CoreType thread-local buffer before global queue
-            // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
-            PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
-            if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
-                ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
+            PTO2TaskState expected = PTO2_TASK_PENDING;
+            if (slot_state.task_state.compare_exchange_strong(
+                    expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
+                if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
+                    ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
+                }
+                return true;
             }
-            return true;
         }
         return false;
     }
@@ -1021,7 +1024,7 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
         for (int32_t c = 0; c < entry.condition_count; c++) {
             PTO2CompletionCondition &cond = entry.conditions[c];
             if (cond.satisfied) continue;
-            if (cond.counter_addr) {
+            if (cond.completion_type == PTO2_COMPLETION_TYPE_COUNTER && cond.counter_addr != nullptr) {
                 uintptr_t counter_line = pto2_completion_ingress_cache_line(cond.counter_addr);
                 if (counter_line != last_invalidated_counter_line) {
                     cache_invalidate_range(reinterpret_cast<const void *>(counter_line), sizeof(uint32_t));
@@ -1037,6 +1040,7 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
             }
             if (poll.state == PTO2CompletionPollState::READY) {
                 cond.satisfied = true;
+                cond.retire();
                 entry.waiting_completion_count--;
             }
         }
