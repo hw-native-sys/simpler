@@ -20,7 +20,11 @@
 #include <dlfcn.h>
 
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "acl/acl.h"
@@ -65,6 +69,24 @@ HalHostUnregisterFn get_halHostUnregister() {
         return nullptr;
     }
     return reinterpret_cast<HalHostUnregisterFn>(dlsym(g_hal_handle, "halHostUnregister"));
+}
+
+/** Shared state between the main thread and the create_thread worker for rtStreamSynchronize timeout. */
+struct StreamSyncWorkerState {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool completed{false};
+    int rc{0};
+};
+
+/** Wait up to timeout_ms for the worker to set completed=true. Returns completed state. */
+bool wait_for_completed(const std::shared_ptr<StreamSyncWorkerState> &worker_state, int timeout_ms) {
+    std::unique_lock<std::mutex> lock(worker_state->mu);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    worker_state->cv.wait_until(lock, deadline, [&worker_state]() {
+        return worker_state->completed;
+    });
+    return worker_state->completed;
 }
 
 }  // namespace
@@ -375,6 +397,94 @@ void DeviceRunner::release_run_context() {
     }
 }
 
+int DeviceRunner::synchronize_stream_with_timeout(
+    rtStream_t stream, const char *stream_name, int timeout_ms, bool *timed_out
+) {
+    if (timed_out != nullptr) {
+        *timed_out = false;
+    }
+    if (stream == nullptr) {
+        LOG_ERROR("synchronize_stream_with_timeout: stream %s is null", stream_name);
+        return -1;
+    }
+
+    auto worker_state = std::make_shared<StreamSyncWorkerState>();
+
+    aclrtContext ctx = nullptr;
+    aclrtGetCurrentContext(&ctx);
+
+    // create_thread binds rtSetDevice(device_id_); ACL context is thread-local so
+    // the worker still mirrors the caller's context for this stream.
+    std::thread worker = create_thread([worker_state, stream, ctx]() {
+        if (ctx != nullptr) {
+            aclrtSetCurrentContext(ctx);
+        }
+        int local_rc = rtStreamSynchronize(stream);
+        {
+            std::lock_guard<std::mutex> lock(worker_state->mu);
+            worker_state->rc = local_rc;
+            worker_state->completed = true;
+        }
+        worker_state->cv.notify_one();
+    });
+
+    if (wait_for_completed(worker_state, timeout_ms)) {
+        worker.join();
+        int rc = worker_state->rc;
+        if (rc != 0) {
+            LOG_ERROR("rtStreamSynchronize (%s) failed: %d", stream_name, rc);
+        }
+        return rc;
+    }
+
+    LOG_ERROR(
+        "Stream sync timeout: stream=%s timeout_ms=%d device_id=%d block_dim=%d worker_count=%d "
+        "binaries_loaded=%d stream_aicpu=%p stream_aicore=%p",
+        stream_name, timeout_ms, device_id_, block_dim_, worker_count_, binaries_loaded_ ? 1 : 0,
+        static_cast<void *>(stream_aicpu_), static_cast<void *>(stream_aicore_)
+    );
+
+    bool device_reset_ok = false;
+    if (device_id_ >= 0) {
+        LOG_ERROR("Forcing aclrtResetDevice(%d) to unblock stuck stream sync", device_id_);
+        int reset_rc = aclrtResetDevice(device_id_);
+        if (reset_rc != 0) {
+            LOG_ERROR("aclrtResetDevice(%d) failed: %d", device_id_, reset_rc);
+        } else {
+            device_reset_ok = true;
+        }
+    }
+
+    bool worker_joined = false;
+    if (wait_for_completed(worker_state, timeout_ms)) {
+        worker.join();
+        worker_joined = true;
+    } else {
+        LOG_ERROR(
+            "Worker thread still blocked after aclrtResetDevice + %dms grace; "
+            "detaching to avoid permanent hang (possible resource leak)",
+            timeout_ms
+        );
+        worker.detach();
+    }
+
+    if (device_reset_ok) {
+        stream_aicpu_ = nullptr;
+        stream_aicore_ = nullptr;
+    } else if (!worker_joined) {
+        LOG_ERROR("Stream pointers cleared to prevent UAF with detached worker (stream leak)");
+        stream_aicpu_ = nullptr;
+        stream_aicore_ = nullptr;
+    }
+    // !device_reset_ok && worker_joined: reset failed but sync eventually completed;
+    // stream is still owned by this runner — leave pointers for normal teardown.
+
+    if (timed_out != nullptr) {
+        *timed_out = true;
+    }
+    return -1;
+}
+
 int DeviceRunner::ensure_binaries_loaded(
     const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
 ) {
@@ -437,6 +547,7 @@ int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
     const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
 ) {
+    last_run_timed_out_ = false;
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
@@ -718,18 +829,26 @@ int DeviceRunner::run(
             }
         });
 
+        bool aicpu_timed_out = false;
         LOG_INFO("=== rtStreamSynchronize stream_aicpu_ ===");
-        // Synchronize streams
-        rc = rtStreamSynchronize(stream_aicpu_);
+        // Synchronize streams with host-side timeout watchdog.
+        rc = synchronize_stream_with_timeout(stream_aicpu_, "AICPU", PLATFORM_STREAM_SYNC_TIMEOUT_MS, &aicpu_timed_out);
         if (rc != 0) {
-            LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
+            if (aicpu_timed_out) {
+                last_run_timed_out_ = true;
+            }
             return rc;
         }
 
+        bool aicore_timed_out = false;
         LOG_INFO("=== rtStreamSynchronize stream_aicore_ ===");
-        rc = rtStreamSynchronize(stream_aicore_);
+        rc = synchronize_stream_with_timeout(
+            stream_aicore_, "AICore", PLATFORM_STREAM_SYNC_TIMEOUT_MS, &aicore_timed_out
+        );
         if (rc != 0) {
-            LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
+            if (aicore_timed_out) {
+                last_run_timed_out_ = true;
+            }
             return rc;
         }
     }

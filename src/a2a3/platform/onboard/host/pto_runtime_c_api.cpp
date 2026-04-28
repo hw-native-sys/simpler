@@ -239,6 +239,13 @@ int run_runtime(
         if (rc != 0) {
             validate_runtime_impl(r);
             r->~Runtime();
+            if (runner->last_run_timed_out()) {
+                LOG_ERROR("run_runtime: stream sync timeout detected, triggering full DeviceRunner reset");
+                int reset_rc = runner->finalize();
+                if (reset_rc != 0) {
+                    LOG_ERROR("run_runtime: DeviceRunner finalize after timeout failed: %d", reset_rc);
+                }
+            }
             return rc;
         }
 
