@@ -640,8 +640,8 @@ int32_t SchedulerContext::init(
     }
 
     // Initialize task counters. Task count comes from PTO2 shared memory.
-    if (runtime->get_pto2_gm_sm_ptr()) {
-        auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_pto2_gm_sm_ptr());
+    if (runtime->get_gm_sm_ptr()) {
+        auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
         int32_t pto2_count = 0;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             pto2_count += header->rings[r].fc.current_task_index.load(std::memory_order_acquire);

@@ -181,7 +181,7 @@ struct PTO2FaninBuilder {
 
     template <typename Fn>
     PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const {
-        return pto2_for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
+        return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
     }
 
     bool contains(PTO2TaskSlotState *prod_state) const {
@@ -702,7 +702,7 @@ PTO2OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const Arg 
 
     // Increment fanout_count on each producer (no lock — only orch writes this field).
     // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
-    pto2_for_each_fanin_storage(
+    for_each_fanin_storage(
         fanin_builder.inline_slots, fanin_builder.count, fanin_builder.spill_start, fanin_builder.spill_pool,
         [](PTO2TaskSlotState *producer) {
             producer->fanout_count++;

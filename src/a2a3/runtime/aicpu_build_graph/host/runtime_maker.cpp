@@ -209,27 +209,22 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
 
     // Read ring buffer size overrides from environment
     {
-        runtime->pto2_task_window_size = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
-        runtime->pto2_heap_size = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
-        runtime->pto2_dep_pool_size = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
-        if (runtime->pto2_task_window_size || runtime->pto2_heap_size || runtime->pto2_dep_pool_size) {
+        runtime->task_window_size = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
+        runtime->heap_size = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
+        runtime->dep_pool_size = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
+        if (runtime->task_window_size || runtime->heap_size || runtime->dep_pool_size) {
             LOG_INFO(
                 "Ring buffer overrides: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%" PRIu64,
-                static_cast<uint64_t>(
-                    runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE
-                ),
-                static_cast<uint64_t>(runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE),
-                static_cast<uint64_t>(
-                    runtime->pto2_dep_pool_size ? runtime->pto2_dep_pool_size : PTO2_DEP_LIST_POOL_SIZE
-                )
+                static_cast<uint64_t>(runtime->task_window_size ? runtime->task_window_size : PTO2_TASK_WINDOW_SIZE),
+                static_cast<uint64_t>(runtime->heap_size ? runtime->heap_size : PTO2_HEAP_SIZE),
+                static_cast<uint64_t>(runtime->dep_pool_size ? runtime->dep_pool_size : PTO2_DEP_LIST_POOL_SIZE)
             );
         }
     }
 
     // Resolve effective sizes (env override or compile-time default)
-    uint64_t eff_heap_size = runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE;
-    uint64_t eff_task_window_size =
-        runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE;
+    uint64_t eff_heap_size = runtime->heap_size ? runtime->heap_size : PTO2_HEAP_SIZE;
+    uint64_t eff_task_window_size = runtime->task_window_size ? runtime->task_window_size : PTO2_TASK_WINDOW_SIZE;
 
     // Allocate GM heap for orchestrator output buffers (all rings combined)
     uint64_t total_heap_size = eff_heap_size * PTO2_MAX_RING_DEPTH;
@@ -241,7 +236,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
         return -1;
     }
     runtime->record_tensor_pair(nullptr, gm_heap, total_heap_size);
-    runtime->set_pto2_gm_heap(gm_heap);
+    runtime->set_gm_heap(gm_heap);
 
     // Allocate PTO2 shared memory
     int64_t t_sm_start = _now_ms();
@@ -252,7 +247,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
         LOG_ERROR("Failed to allocate PTO2 shared memory");
         return -1;
     }
-    runtime->set_pto2_gm_sm_ptr(sm_ptr);
+    runtime->set_gm_sm_ptr(sm_ptr);
     runtime->record_tensor_pair(nullptr, sm_ptr, static_cast<size_t>(sm_size));
 
     // Set up device orchestration state
@@ -299,7 +294,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     LOG_INFO("Tensor pairs to process: %d", tensor_pair_count);
 
     // PTO2 (device orchestration): graph output may be in packed buffer
-    void *pto2_sm = runtime->get_pto2_gm_sm_ptr();
+    void *pto2_sm = runtime->get_gm_sm_ptr();
     uint64_t graph_out_ptr = 0;
     uint64_t graph_out_size = 0;
 

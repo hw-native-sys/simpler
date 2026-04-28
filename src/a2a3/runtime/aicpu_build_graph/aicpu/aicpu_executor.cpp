@@ -862,8 +862,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
     // Initialize runtime execution state
     // Task count comes from PTO2 shared memory
-    if (runtime->get_pto2_gm_sm_ptr()) {
-        auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_pto2_gm_sm_ptr());
+    if (runtime->get_gm_sm_ptr()) {
+        auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
         int32_t pto2_count = 0;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             pto2_count += header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
@@ -930,7 +930,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     CoreStateTracker &tracker = trackers_[thread_idx];
     DEV_INFO("Thread %d: resolve_and_dispatch_pto2 entry", thread_idx);
 
-    void *sm_base = runtime->get_pto2_gm_sm_ptr();
+    void *sm_base = runtime->get_gm_sm_ptr();
     if (!sm_base) {
         DEV_ERROR("PTO2 dispatch: sm_base is null");
         return -1;
@@ -1789,7 +1789,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             const ChipStorageTaskArgs &args = runtime->get_orch_args();
             int32_t arg_count = args.tensor_count() + args.scalar_count();
-            DEV_INFO("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_pto2_gm_sm_ptr(), arg_count);
+            DEV_INFO("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_gm_sm_ptr(), arg_count);
             for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
                 const ContinuousTensor &t = args.tensor(i);
                 DEV_INFO(
@@ -1824,23 +1824,23 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 return -1;
             }
 
-            if (runtime->pto2_task_window_size > 0) {
-                task_window_size = runtime->pto2_task_window_size;
+            if (runtime->task_window_size > 0) {
+                task_window_size = runtime->task_window_size;
             }
-            if (runtime->pto2_heap_size > 0) {
-                heap_size = runtime->pto2_heap_size;
+            if (runtime->heap_size > 0) {
+                heap_size = runtime->heap_size;
             }
             int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
-            if (runtime->pto2_dep_pool_size > 0) {
-                dep_pool_capacity = static_cast<int32_t>(runtime->pto2_dep_pool_size);
+            if (runtime->dep_pool_size > 0) {
+                dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
             }
             DEV_INFO(
                 "Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%d", thread_idx,
                 static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
             );
 
-            void *sm_ptr = runtime->get_pto2_gm_sm_ptr();
-            void *gm_heap = runtime->get_pto2_gm_heap_ptr();
+            void *sm_ptr = runtime->get_gm_sm_ptr();
+            void *gm_heap = runtime->get_gm_heap_ptr();
 
             uint64_t sm_size = pto2_sm_calculate_size(task_window_size);
             PTO2SharedMemoryHandle *sm_handle =
@@ -1870,7 +1870,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #endif
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
-            runtime->set_pto2_slot_states_ptr(nullptr);
+            runtime->set_slot_states_ptr(nullptr);
 
             // Store shared state for orchestrator thread
             orch_func_ = orch_func;
@@ -1977,7 +1977,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Signal completion and trigger core transition
             pto2_rt_orchestration_done(rt);
 
-            void *sm = runtime->get_pto2_gm_sm_ptr();
+            void *sm = runtime->get_gm_sm_ptr();
             PTO2SharedMemoryHeader *sm_header = static_cast<PTO2SharedMemoryHeader *>(sm);
             int32_t pto2_task_count = 0;
             if (sm_header) {
@@ -1998,7 +1998,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             orchestrator_done_ = true;
             {
                 int32_t orch_err = 0;
-                void *sm = runtime->get_pto2_gm_sm_ptr();
+                void *sm = runtime->get_gm_sm_ptr();
                 if (sm) {
                     orch_err =
                         static_cast<PTO2SharedMemoryHeader *>(sm)->orch_error_code.load(std::memory_order_relaxed);

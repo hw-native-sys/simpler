@@ -431,7 +431,7 @@ public:
      * Set PTO2 shared memory pointer (stub for host_build_graph).
      * This is a no-op for host orchestration; only used by rt2.
      */
-    void set_pto2_gm_sm_ptr(void *) { /* no-op */ }
+    void set_gm_sm_ptr(void *) { /* no-op */ }
 
     /**
      * Get function binary address by func_id.

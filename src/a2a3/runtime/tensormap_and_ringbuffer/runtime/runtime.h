@@ -17,7 +17,7 @@
  * - Handshake buffers for AICPU-AICore communication
  * - Execution parameters (block_dim, sche_cpu_num)
  * - Tensor pair management for host-device memory tracking
- * - Device orchestration state (pto2_gm_sm_ptr_, orch_args_)
+ * - Device orchestration state (gm_sm_ptr_, orch_args_)
  * - Function address mapping (func_id_to_addr_)
  *
  * Task dispatch uses a per-core PTO2DispatchPayload written by the scheduler.
@@ -166,9 +166,9 @@ public:
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Ring buffer size overrides (0 = use compile-time defaults)
-    uint64_t pto2_task_window_size;
-    uint64_t pto2_heap_size;
-    uint64_t pto2_dep_pool_size;
+    uint64_t task_window_size;
+    uint64_t heap_size;
+    uint64_t dep_pool_size;
 
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code
@@ -191,9 +191,9 @@ private:
 
     // Device orchestration: when false, orchestration runs on device (thread 3)
     bool orch_built_on_host_;
-    void *pto2_gm_sm_ptr_;                   // GM pointer to PTO2 shared memory (device)
-    void *pto2_gm_heap_ptr_;                 // GM heap for orchestrator output buffers (device)
-    void *pto2_slot_states_ptr_;             // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
+    void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
+    void *gm_heap_ptr_;                      // GM heap for orchestrator output buffers (device)
+    void *slot_states_ptr_;                  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
     // Device orchestration SO (for dlopen on AICPU thread 3).
@@ -247,13 +247,13 @@ public:
     // =========================================================================
 
     bool get_orch_built_on_host() const;
-    void *get_pto2_gm_sm_ptr() const;
-    void *get_pto2_gm_heap_ptr() const;
+    void *get_gm_sm_ptr() const;
+    void *get_gm_heap_ptr() const;
     const ChipStorageTaskArgs &get_orch_args() const;
     void set_orch_built_on_host(bool v);
-    void set_pto2_gm_sm_ptr(void *p);
-    void set_pto2_gm_heap(void *p);
-    void set_pto2_slot_states_ptr(void *p);
+    void set_gm_sm_ptr(void *p);
+    void set_gm_heap(void *p);
+    void set_slot_states_ptr(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)

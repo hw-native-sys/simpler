@@ -666,7 +666,7 @@ struct PTO2SchedulerState {
 
         if (wfanin != 0) {
             int32_t early_finished = 0;
-            pto2_for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
+            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
                 producer->lock_fanout();
                 int32_t pstate = producer->task_state.load(std::memory_order_acquire);
                 if (pstate >= PTO2_TASK_COMPLETED) {
@@ -961,7 +961,7 @@ struct PTO2SchedulerState {
     int32_t on_task_release(PTO2TaskSlotState &slot_state) {
 #endif
         PTO2TaskPayload *payload = slot_state.payload;
-        pto2_for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
+        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
 #if PTO2_SCHED_PROFILING
             release_producer(*producer_slot_state, fanin_atomics);
 #else

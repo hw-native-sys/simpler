@@ -34,9 +34,9 @@ Runtime::Runtime() {
     worker_count = 0;
     sche_cpu_num = 1;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
-    pto2_task_window_size = 0;
-    pto2_heap_size = 0;
-    pto2_dep_pool_size = 0;
+    task_window_size = 0;
+    heap_size = 0;
+    dep_pool_size = 0;
     orch_to_sched = false;
 
     // Initialize tensor pairs
@@ -44,9 +44,9 @@ Runtime::Runtime() {
 
     // Initialize device orchestration state
     orch_built_on_host_ = true;
-    pto2_gm_sm_ptr_ = nullptr;
-    pto2_gm_heap_ptr_ = nullptr;
-    pto2_slot_states_ptr_ = nullptr;
+    gm_sm_ptr_ = nullptr;
+    gm_heap_ptr_ = nullptr;
+    slot_states_ptr_ = nullptr;
     orch_args_storage_.clear();
 
     // Initialize device orchestration SO binary
@@ -90,13 +90,13 @@ void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }
 // =============================================================================
 
 bool Runtime::get_orch_built_on_host() const { return orch_built_on_host_; }
-void *Runtime::get_pto2_gm_sm_ptr() const { return pto2_gm_sm_ptr_; }
-void *Runtime::get_pto2_gm_heap_ptr() const { return pto2_gm_heap_ptr_; }
+void *Runtime::get_gm_sm_ptr() const { return gm_sm_ptr_; }
+void *Runtime::get_gm_heap_ptr() const { return gm_heap_ptr_; }
 const ChipStorageTaskArgs &Runtime::get_orch_args() const { return orch_args_storage_; }
 void Runtime::set_orch_built_on_host(bool v) { orch_built_on_host_ = v; }
-void Runtime::set_pto2_gm_sm_ptr(void *p) { pto2_gm_sm_ptr_ = p; }
-void Runtime::set_pto2_gm_heap(void *p) { pto2_gm_heap_ptr_ = p; }
-void Runtime::set_pto2_slot_states_ptr(void *p) { pto2_slot_states_ptr_ = p; }
+void Runtime::set_gm_sm_ptr(void *p) { gm_sm_ptr_ = p; }
+void Runtime::set_gm_heap(void *p) { gm_heap_ptr_ = p; }
+void Runtime::set_slot_states_ptr(void *p) { slot_states_ptr_ = p; }
 void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { orch_args_storage_ = args; }
 
 // Device orchestration SO metadata (bytes live in a separate device buffer

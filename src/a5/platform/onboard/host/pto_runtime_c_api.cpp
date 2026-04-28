@@ -190,7 +190,7 @@ int run_runtime(
         );
         LOG_DEBUG("init_runtime_impl returned: %d", rc);
         if (rc != 0) {
-            r->set_pto2_gm_sm_ptr(nullptr);
+            r->set_gm_sm_ptr(nullptr);
             validate_runtime_impl(r);
             r->~Runtime();
             return rc;

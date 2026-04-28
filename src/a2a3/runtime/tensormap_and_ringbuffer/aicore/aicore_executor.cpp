@@ -51,7 +51,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * 3. Cache per-core PTO2DispatchPayload pointer from hank->task
  * 4. Poll DATA_MAIN_BASE register for task dispatch until exit signal
  *
- * AICPU writes &s_pto2_payload_per_core[i] to hank->task before setting
+ * AICPU writes &s_payload_per_core[i] to hank->task before setting
  * aicpu_ready=1. AICore caches this pointer and reads function_bin_addr +
  * args pointer from it on each dispatch. reg_val is a monotonically
  * increasing task ID used only for dispatch signaling and ACK/FIN protocol.

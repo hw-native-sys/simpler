@@ -77,7 +77,7 @@ static int32_t read_pto2_runtime_status(Runtime *runtime) {
         return 0;
     }
 
-    void *sm = runtime->get_pto2_gm_sm_ptr();
+    void *sm = runtime->get_gm_sm_ptr();
     if (sm == nullptr) {
         return 0;
     }
@@ -387,7 +387,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // reused above.
             const ChipStorageTaskArgs &args = runtime->get_orch_args();
             int32_t arg_count = args.tensor_count() + args.scalar_count();
-            DEV_INFO("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_pto2_gm_sm_ptr(), arg_count);
+            DEV_INFO("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_gm_sm_ptr(), arg_count);
             for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
                 const ContinuousTensor &t = args.tensor(i);
                 DEV_INFO(
@@ -405,23 +405,23 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
             uint64_t heap_size = PTO2_HEAP_SIZE;
 
-            if (runtime->pto2_task_window_size > 0) {
-                task_window_size = runtime->pto2_task_window_size;
+            if (runtime->task_window_size > 0) {
+                task_window_size = runtime->task_window_size;
             }
-            if (runtime->pto2_heap_size > 0) {
-                heap_size = runtime->pto2_heap_size;
+            if (runtime->heap_size > 0) {
+                heap_size = runtime->heap_size;
             }
             int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
-            if (runtime->pto2_dep_pool_size > 0) {
-                dep_pool_capacity = static_cast<int32_t>(runtime->pto2_dep_pool_size);
+            if (runtime->dep_pool_size > 0) {
+                dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
             }
             DEV_INFO(
                 "Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%d", thread_idx,
                 static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
             );
 
-            void *sm_ptr = runtime->get_pto2_gm_sm_ptr();
-            void *gm_heap = runtime->get_pto2_gm_heap_ptr();
+            void *sm_ptr = runtime->get_gm_sm_ptr();
+            void *gm_heap = runtime->get_gm_heap_ptr();
 
             uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
             PTO2SharedMemoryHandle *sm_handle =
@@ -451,7 +451,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt->orchestrator.total_aiv_count = sched_ctx_.aiv_count();
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
-            runtime->set_pto2_slot_states_ptr(nullptr);
+            runtime->set_slot_states_ptr(nullptr);
 
             orch_args_cached_ = &args;
 

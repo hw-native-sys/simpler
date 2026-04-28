@@ -180,7 +180,7 @@ int run_runtime(
             r, reinterpret_cast<const ChipCallable *>(callable), reinterpret_cast<const ChipStorageTaskArgs *>(args)
         );
         if (rc != 0) {
-            r->set_pto2_gm_sm_ptr(nullptr);
+            r->set_gm_sm_ptr(nullptr);
             validate_runtime_impl(r);
             r->~Runtime();
             pthread_setspecific(g_runner_key, nullptr);
