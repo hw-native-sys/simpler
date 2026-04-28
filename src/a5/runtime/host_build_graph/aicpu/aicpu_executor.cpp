@@ -1085,6 +1085,19 @@ int AicpuExecutor::run(Runtime *runtime) {
     int completed = resolve_and_dispatch(*runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
 
+    // Flush performance buffers for cores managed by this thread.
+    if (is_l2_swimlane_enabled()) {
+        l2_perf_aicpu_flush_buffers(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
+    }
+#if PTO2_PROFILING
+    if (is_pmu_enabled()) {
+        pmu_aicpu_flush_buffers(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
+    }
+    if (is_dump_tensor_enabled()) {
+        dump_tensor_flush(thread_idx);
+    }
+#endif
+
 #if PTO2_PROFILING
     // Restore PMU CTRL registers for this thread's cores before AICore shutdown
     if (is_pmu_enabled()) {
@@ -1096,12 +1109,6 @@ int AicpuExecutor::run(Runtime *runtime) {
     if (rc != 0) {
         return rc;
     }
-
-#if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
-        dump_tensor_flush(thread_idx);
-    }
-#endif
 
     LOG_INFO("Thread %d: Completed", thread_idx);
 

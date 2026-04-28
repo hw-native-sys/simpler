@@ -11,21 +11,35 @@
 
 /**
  * @file tensor_dump_collector.h
- * @brief Host-side tensor dump collector (memcpy-based)
+ * @brief Host-side tensor dump collector with independent shared memory
  *
- * - Host allocates per-thread DumpBuffers + arenas on device
- * - AICPU writes records and payload during execution
- * - After stream sync, host copies everything back via rtMemcpy/memcpy
- * - Export dump files (JSON manifest + binary payload)
+ * Fully decoupled from profiling: uses its own shared memory region,
+ * ready queues, and memory manager thread.
  *
- * No background threads, no SPSC queues — simple collect-after-sync.
+ * Mirrors L2PerfCollector architecture:
+ * - DumpMemoryManager: Background thread that polls dump ready queues,
+ *   recycles metadata buffers, and hands off full buffers to the main thread.
+ * - TensorDumpCollector: Main thread copies tensor data from arenas,
+ *   manages lifecycle, and exports dump files.
+ *
+ * A5 specifics: memory access uses host-shadow copies + explicit memcpy
+ * instead of halHostRegister/SVM. Data structures and interaction logic
+ * are identical to A2A3.
  */
 
 #ifndef SRC_A5_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
 #define SRC_A5_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
 
-#include <cstddef>
+#include <atomic>
+#include <condition_variable>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/platform_config.h"
@@ -34,30 +48,133 @@
 
 /**
  * Device memory allocation callback.
+ *
+ * @param size Memory size in bytes
+ * @return Allocated device memory pointer, or nullptr on failure
  */
 using DumpAllocCallback = void *(*)(size_t size);
 
 /**
- * Device memory free callback.
+ * Memory registration callback (for Host-Device shared memory).
+ *
+ * Kept for interface parity with A2A3. A5 does not support host register,
+ * so callers pass nullptr and the collector ignores it.
+ */
+using DumpRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
+
+/**
+ * Memory unregister callback.
+ *
+ * Kept for interface parity with A2A3. A5 does not support host register,
+ * so callers pass nullptr and the collector ignores it.
+ */
+using DumpUnregisterCallback = int (*)(void *dev_ptr, int device_id);
+
+/**
+ * Memory free callback.
+ *
+ * @param dev_ptr Device memory pointer
+ * @return 0 on success, error code on failure
  */
 using DumpFreeCallback = int (*)(void *dev_ptr);
 
 /**
- * Host -> Device copy callback.
+ * Callback for binding the memory-manager thread to a device context.
+ *
+ * Called once at the start of the management thread. On A5 onboard this
+ * wraps rtSetDevice; in simulation mode callers pass nullptr.
+ *
+ * @param device_id Device ID
+ * @return 0 on success, error code on failure
  */
-using DumpCopyToDeviceCallback = int (*)(void *dev_dst, const void *host_src, size_t size);
+using DumpSetDeviceCallback = int (*)(int device_id);
 
-/**
- * Device -> Host copy callback.
- */
-using DumpCopyFromDeviceCallback = int (*)(void *host_dst, const void *dev_src, size_t size);
+// Platform-specific hooks provided by onboard/sim host implementations.
+int dump_platform_copy_to_device(volatile void *dev_dst, const void *host_src, size_t size);
+int dump_platform_copy_from_device(volatile void *host_dst, const volatile void *dev_src, size_t size);
 
 // =============================================================================
-// DumpedTensor - Collected tensor metadata + payload bytes
+// DumpMemoryManager - Background Thread
 // =============================================================================
 
 /**
- * Collected tensor metadata + payload bytes (identical to A2A3 DumpedTensor).
+ * Information about a ready (full) dump metadata buffer
+ */
+struct DumpReadyBufferInfo {
+    uint32_t thread_index;
+    void *dev_buffer_ptr;
+    void *host_buffer_ptr;
+    uint32_t buffer_seq;
+};
+
+/**
+ * Dump buffer memory manager thread.
+ *
+ * Polls per-thread ready queues in DumpDataHeader, hands off full
+ * DumpMetaBuffers to the main thread, and recycles them back into
+ * the SPSC free_queue.
+ */
+class DumpMemoryManager {
+public:
+    DumpMemoryManager() = default;
+    ~DumpMemoryManager();
+
+    DumpMemoryManager(const DumpMemoryManager &) = delete;
+    DumpMemoryManager &operator=(const DumpMemoryManager &) = delete;
+
+    friend class TensorDumpCollector;
+
+    void start(
+        void *shared_mem_host, void *shared_mem_dev, int num_dump_threads, DumpAllocCallback alloc_cb,
+        DumpRegisterCallback register_cb, DumpFreeCallback free_cb, int device_id,
+        DumpSetDeviceCallback set_device_cb = nullptr
+    );
+
+    void stop();
+
+    bool try_pop_ready(DumpReadyBufferInfo &info);
+    bool wait_pop_ready(DumpReadyBufferInfo &info, std::chrono::milliseconds timeout);
+    void notify_copy_done(void *dev_buffer_ptr);
+
+    bool is_running() const { return running_.load(); }
+
+private:
+    std::thread mgmt_thread_;
+    std::atomic<bool> running_{false};
+
+    void *shared_mem_host_{nullptr};
+    void *shared_mem_dev_{nullptr};
+    int num_dump_threads_{0};
+
+    DumpAllocCallback alloc_cb_{nullptr};
+    DumpRegisterCallback register_cb_{nullptr};
+    DumpFreeCallback free_cb_{nullptr};
+    DumpSetDeviceCallback set_device_cb_{nullptr};
+    int device_id_{-1};
+    std::mutex ready_mutex_;
+    std::condition_variable ready_cv_;
+    std::queue<DumpReadyBufferInfo> ready_queue_;
+
+    std::mutex done_mutex_;
+    std::queue<void *> done_queue_;  // Device pointers to recycle
+
+    std::unordered_map<void *, void *> dev_to_host_;
+    std::vector<void *> recycled_dump_buffers_;
+
+    void mgmt_loop();
+    void *alloc_and_register(size_t size, void **host_ptr_out);
+    void free_buffer(void *dev_ptr);
+    void *resolve_host_ptr(void *dev_ptr);
+    void register_mapping(void *dev_ptr, void *host_ptr);
+    void process_dump_entry(DumpDataHeader *header, int thread_idx, const DumpReadyQueueEntry &entry);
+};
+
+// =============================================================================
+// TensorDumpCollector - Main Collector
+// =============================================================================
+
+/**
+ * Collected tensor metadata + payload bytes
  */
 struct DumpedTensor {
     uint64_t task_id;
@@ -74,26 +191,11 @@ struct DumpedTensor {
     bool is_contiguous;
     bool truncated;
     bool overwritten;
-    uint64_t payload_size;
-    uint64_t bin_offset;
+    uint64_t payload_size;  // original payload size (bytes may be cleared after writing)
+    uint64_t bin_offset;    // byte offset into tensors.bin
     std::vector<uint8_t> bytes;
 };
 
-// =============================================================================
-// TensorDumpCollector - Main Collector
-// =============================================================================
-
-/**
- * Host-side tensor dump collector.
- *
- * Lifecycle:
- *   1. initialize() — allocate DumpSetupHeader + per-thread DumpBuffers + arenas,
- *      caller reads get_dump_setup_device_ptr() and sets kernel_args.dump_data_base
- *   2. (AICPU execution writes records and payload data)
- *   3. collect_all() — after stream sync, copy header + buffers + arenas back
- *   4. export_dump_files() — write JSON manifest + binary payload
- *   5. finalize() — free all device allocations
- */
 class TensorDumpCollector {
 public:
     TensorDumpCollector() = default;
@@ -103,80 +205,98 @@ public:
     TensorDumpCollector &operator=(const TensorDumpCollector &) = delete;
 
     /**
-     * Initialize tensor dump device buffers.
+     * Initialize tensor dump shared memory.
      *
-     * @param num_dump_threads Number of AICPU scheduling threads
-     * @param device_id        Device ID
-     * @param alloc_cb         Device memory alloc
-     * @param free_cb          Device memory free
-     * @param copy_to_dev_cb   Host->device copy
-     * @param copy_from_dev_cb Device->host copy
+     * Allocates DumpDataHeader + DumpBufferState array, per-thread arenas,
+     * and initial DumpMetaBuffers.
+     *
      * @return 0 on success, error code on failure
      */
     int initialize(
-        int num_dump_threads, int device_id, DumpAllocCallback alloc_cb, DumpFreeCallback free_cb,
-        DumpCopyToDeviceCallback copy_to_dev_cb, DumpCopyFromDeviceCallback copy_from_dev_cb
+        int num_dump_threads, int device_id, DumpAllocCallback alloc_cb, DumpRegisterCallback register_cb,
+        DumpFreeCallback free_cb, DumpSetDeviceCallback set_device_cb = nullptr
     );
 
-    /**
-     * Copy all dump data back from device and parse into collected_ vector.
-     * Must be called after execution stream has been fully synchronized.
-     *
-     * @return 0 on success, error code on failure
-     */
-    int collect_all();
+    void start_memory_manager();
 
     /**
-     * Export collected data to dump files (JSON manifest + binary payload).
-     *
-     * @param output_path Output directory
-     * @return 0 on success, -1 on failure
+     * Streams payloads to `<output_path>/tensor_dump/<base>.bin` while the device
+     * runs. Caller-provided directory is the per-task uniqueness boundary.
      */
-    int export_dump_files(const std::string &output_path);
+    void poll_and_collect(const std::string &output_path);
 
     /**
-     * Free all device buffers and clear host-side state.
-     *
-     * @return 0 on success, error code on failure
+     * Write JSON manifest. Bin file is already written by poll_and_collect's
+     * writer thread, so no parameter is needed (uses run_dir_).
      */
-    int finalize();
+    int export_dump_files();
+    void stop_memory_manager();
+    void drain_remaining_buffers();
+    void scan_remaining_dump_buffers();
+    void signal_execution_complete();
 
-    /**
-     * Check if the collector has been initialized.
-     */
-    bool is_initialized() const { return setup_header_dev_ != nullptr; }
+    int finalize(DumpUnregisterCallback unregister_cb, DumpFreeCallback free_cb);
 
-    /**
-     * Get the device pointer to the DumpSetupHeader.
-     * Used to set kernel_args.dump_data_base.
-     */
-    void *get_dump_setup_device_ptr() const { return setup_header_dev_; }
+    bool is_initialized() const { return dump_shared_mem_host_ != nullptr; }
+
+    void *get_dump_shm_device_ptr() const { return dump_shared_mem_dev_; }
 
 private:
-    // Device-side allocations
-    void *setup_header_dev_{nullptr};
-    std::vector<void *> dump_buffers_dev_;   // Per-thread DumpBuffer
-    std::vector<void *> arena_headers_dev_;  // Per-thread DumpArenaHeader
-    std::vector<void *> arena_data_dev_;     // Per-thread arena data
-
-    // Configuration
-    int num_dump_threads_{0};
+    void *dump_shared_mem_dev_{nullptr};
+    void *dump_shared_mem_host_{nullptr};
     int device_id_{-1};
-    size_t dump_buffer_bytes_{0};
+    int num_dump_threads_{0};
 
-    // Callbacks
     DumpAllocCallback alloc_cb_{nullptr};
+    DumpRegisterCallback register_cb_{nullptr};
     DumpFreeCallback free_cb_{nullptr};
-    DumpCopyToDeviceCallback copy_to_dev_cb_{nullptr};
-    DumpCopyFromDeviceCallback copy_from_dev_cb_{nullptr};
+    DumpSetDeviceCallback set_device_cb_{nullptr};
 
-    // Collected data
+    // Per-thread arena pointers
+    struct ArenaInfo {
+        void *dev_ptr{nullptr};
+        void *host_ptr{nullptr};
+        uint64_t size{0};
+        uint64_t high_water{0};  // For overwrite detection
+    };
+    std::vector<ArenaInfo> arenas_;
+
+    DumpMemoryManager memory_manager_;
+
+    // Collected dump tensors
     std::vector<DumpedTensor> collected_;
+    std::mutex collected_mutex_;
+
+    // Execution complete signal
+    std::atomic<bool> execution_complete_{false};
 
     // Stats
-    uint32_t total_dropped_count_{0};
+    uint32_t total_dropped_record_count_{0};
     uint32_t total_truncated_count_{0};
     uint32_t total_overwrite_count_{0};
+
+    void *alloc_single_buffer(size_t size, void **host_ptr_out);
+    void process_dump_buffer(const DumpReadyBufferInfo &info);
+
+    // Track processed buffer pointers to prevent double-processing
+    std::unordered_set<void *> processed_buffers_;
+
+    // Writer thread: streams tensor payloads to a single tensors.bin
+    std::thread writer_thread_;
+    std::mutex write_mutex_;
+    std::condition_variable write_cv_;
+    std::queue<DumpedTensor> write_queue_;
+    std::atomic<bool> writer_done_{false};
+
+    // Output directory and single binary file
+    std::filesystem::path run_dir_;
+    std::ofstream bin_file_;
+    uint64_t next_bin_offset_{0};  // only accessed by collect thread
+
+    // Writer stats
+    std::atomic<uint64_t> bytes_written_{0};
+
+    void writer_loop();
 };
 
 #endif  // SRC_A5_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_

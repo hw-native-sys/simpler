@@ -748,6 +748,13 @@ void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
 void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
+#if PTO2_PROFILING
+    if (is_l2_swimlane_enabled()) {
+        // Flush orchestrator's phase record buffer
+        l2_perf_aicpu_flush_phase_buffers(thread_idx);
+    }
+#endif
+
     total_tasks_ = total_tasks;
 
     // Fold tasks completed inline during orchestration

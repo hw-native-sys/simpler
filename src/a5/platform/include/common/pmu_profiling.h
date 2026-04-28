@@ -17,11 +17,15 @@
  * CANN Open Software License 2.0). Register offsets live in platform_config.h
  * and are accessed via RegId / reg_index().
  *
- * a5 has no shared-memory transport (halHostRegister is not supported on
- * DAV_3510). The PMU buffer is a single per-core PmuBuffer allocated on
- * device at init time, written to by AICPU during task execution, and
- * drained to the host via rtMemcpy after stream sync. This mirrors the
- * memcpy pattern already used by PerformanceCollector and TensorDumpCollector.
+ * Streaming buffer design (mirrors a2a3 pmu_profiling.h):
+ *   PmuFreeQueue       — SPSC queue: Host pushes free PmuBuffers, AICPU pops them.
+ *   PmuBufferState     — Per-core state: current active buffer pointer + free_queue.
+ *   PmuDataHeader      — Fixed shared-memory header: per-thread ready queues.
+ *   PmuBuffer          — Fixed-capacity record buffer (PLATFORM_PMU_RECORDS_PER_BUFFER).
+ *
+ * a5 has no halHostRegister (DAV_3510), so host↔device SPSC fields are
+ * read/written via rtMemcpy (onboard) or memcpy (sim), using host shadow
+ * buffers — same pattern as a5 l2_perf_collector and tensor_dump_collector.
  */
 
 #ifndef SRC_A5_PLATFORM_INCLUDE_COMMON_PMU_PROFILING_H_
@@ -49,6 +53,7 @@ enum class PmuEventType : uint32_t {
 };
 
 constexpr uint32_t PMU_EVENT_TYPE_DEFAULT = static_cast<uint32_t>(PmuEventType::PIPE_UTILIZATION);
+constexpr int PMU_COUNTER_COUNT_A5 = 10;
 
 /**
  * Event ID table for a single event type.
@@ -130,20 +135,14 @@ inline const PmuEventConfig *pmu_resolve_event_config_a5(PmuEventType event_type
 }
 
 // =============================================================================
-// PMU Record + Buffer
+// PMU Record
 // =============================================================================
 
 /**
  * Per-task PMU snapshot written by AICPU after each AICore task FIN.
  *
  * AICore writes task_id / pmu_total_cycles / pmu_counters[] into the
- * dual-issue staging slot. AICPU fills func_id / core_type on commit —
- * those are consumer-owned and AICore never touches them.
- *
- * Thread ownership is tracked per-core in PmuBufferState::owning_thread_id,
- * not per-record — it's a buffer-level attribute (same core is always
- * driven by the same AICPU scheduler thread). Mirrors a2a3's per-queue
- * thread association.
+ * dual-issue staging slot. AICPU fills func_id / core_type on commit.
  */
 struct PmuRecord {
     uint64_t task_id;                             // Runtime task id
@@ -153,32 +152,24 @@ struct PmuRecord {
     uint32_t pmu_counters[PMU_COUNTER_COUNT_A5];  // PMU_CNT0..CNT9
 } __attribute__((aligned(64)));
 
+// =============================================================================
+// PMU Streaming Buffer Structures (mirrors a2a3 pmu_profiling.h)
+// =============================================================================
+
 /**
- * Fixed-capacity per-core PMU record buffer.
+ * Fixed-capacity PMU record buffer.
+ * Allocated by Host, pushed into per-core free_queue.
  *
- * Layout:
- *   [0,64)              — header: count + padding (host reads this 64-byte
- *                         header first to learn how many records to drain)
- *   [64, 64+2*PmuRecord) — dual_issue_slots: AICore writes a PmuRecord
- *                         here after each task, indexed by task_id & 1
- *   [...)                — records: AICPU commits finished PmuRecords here
- *
- * The two dual_issue_slots exist because AICore's dual-issue dispatch
- * can have up to two tasks in flight per core (task N+1 can begin
- * before AICPU has committed the record for N). Parity `task_id & 1`
- * picks the slot so N and N+1 never collide — this is exactly the
- * reason a2a3 perf uses `wip[2]` on PerfBuffer.
- *
- * dropped_record_count / total_record_count live on PmuBufferState (mirrors
- * a2a3) so cross-checking is centralized in a single per-core state region.
- *
- * Written by AICore (dual_issue_slots) + AICPU (records/count); drained
- * to host via rtMemcpy after stream sync.
+ * a5-specific: dual_issue_slots[2] exist because AICore reads PMU MMIO
+ * itself (via ld_dev) and writes the snapshot here. AICPU validates and
+ * commits into records[] on COND FIN. Parity task_id & 1 picks the slot
+ * so adjacent dual-issue dispatches never collide.
  */
 struct PmuBuffer {
     // Header (first 64 bytes) — host copies this alone first to learn count.
     volatile uint32_t count;  // Number of valid records
-    uint32_t pad[15];         // Pad header to 64 bytes
+    uint32_t pad[15];         // Pad count to 64 bytes; isolates count's cache line from
+                              // dual_issue_slots (AICore writer) to avoid false sharing.
 
     // Dual-issue staging slots — AICore writes a PmuRecord here after
     // each task, then AICPU copies it into records[count] and fills
@@ -198,72 +189,94 @@ static_assert(
 );
 
 /**
- * Per-core PMU buffer state. Mirrors a2a3 PmuBufferState (minus the
- * free_queue / current_buf_ptr fields, which a5 doesn't need because it
- * uses a single pre-allocated PmuBuffer per core).
+ * SPSC lock-free queue for free PmuBuffer management.
  *
- * Writers (AICPU only):
- *   owning_thread_id:     AICPU scheduler thread that drives this core.
- *                         Stamped on first PMU commit and stable thereafter
- *                         (a5 binds core→thread at scheduler init).
- *   dropped_record_count: Tasks whose record was dropped on device
- *                         (PmuBuffer full).
- *   total_record_count:   Monotonic count of every task the AICPU attempted
- *                         to record (success + dropped + slot-mismatch).
+ * Producer: Host (PmuCollector thread) pushes recycled/new buffers.
+ * Consumer: Device (AICPU thread) pops buffers when switching.
+ *
+ * Memory ordering:
+ *   Device pop:  rmb() → read tail → read buffer_ptrs[head % COUNT] → rmb() → write head → wmb()
+ *   Host push:   write buffer_ptrs[tail % COUNT] → wmb() → write tail → wmb()
+ */
+struct PmuFreeQueue {
+    volatile uint64_t buffer_ptrs[PLATFORM_PMU_SLOT_COUNT];  // 4 * 8 = 32 bytes
+    volatile uint32_t head;                                  // Consumer read position (Device increments)
+    volatile uint32_t tail;                                  // Producer write position (Host increments)
+    uint32_t pad[22];                                        // Pad 40 + 88 -> 128 bytes
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(PmuFreeQueue) == 128, "PmuFreeQueue must be 128 bytes");
+
+/**
+ * Per-core PMU buffer state.
+ *
+ * Writers:
+ *   free_queue.tail:        Host writes (pushes new/recycled buffers)
+ *   free_queue.head:        Device writes (pops buffers)
+ *   current_buf_ptr:        Device writes (after pop), Host reads (for collect/drain)
+ *   current_buf_seq:        Device writes (monotonic counter)
+ *   dropped_record_count:   Device writes (tasks whose PmuRecord was never handed
+ *                           to the host, e.g. free_queue empty, ready_queue full,
+ *                           no active buffer)
+ *   total_record_count:     Device writes — monotonic count of every task the
+ *                           AICPU attempted to record (success + dropped)
  *
  * Host reads dropped / total at finalize time to cross-check:
- *   collected_on_host + dropped == total
- * Any shortfall is silent slot-mismatch loss (AICore hadn't yet published
- * its dual-issue slot when AICPU tried to commit).
+ *   collected_on_host + sum(dropped) == sum(total)
  */
 struct PmuBufferState {
-    volatile uint32_t owning_thread_id;
-    volatile uint32_t dropped_record_count;
-    volatile uint32_t total_record_count;
-    uint32_t pad[13];
+    PmuFreeQueue free_queue;                 // SPSC queue of free PmuBuffer addresses
+    volatile uint64_t current_buf_ptr;       // Current active PmuBuffer (0 = none)
+    volatile uint32_t current_buf_seq;       // Sequence number for ordering
+    volatile uint32_t dropped_record_count;  // Tasks whose record was dropped on device
+    volatile uint32_t total_record_count;    // Total tasks the AICPU attempted to record
+    uint32_t pad[11];                        // Pad to 192 bytes
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(PmuBufferState) == 64, "PmuBufferState must be 64 bytes");
+static_assert(sizeof(PmuBufferState) == 192, "PmuBufferState must be 192 bytes");
 
 /**
- * PMU setup header, allocated once on device and published into
- * kernel_args.pmu_data_base.
- *
- * The on-device shared region layout is:
- *   [PmuSetupHeader] [PmuBufferState[num_cores]]
- *
- * a5 uses one rtMemcpy at finalize to bring all PmuBufferState back to
- * host (mirrors a2a3's get_pmu_buffer_state offset math).
+ * Ready queue entry.
+ * When a PmuBuffer is full, AICPU adds this entry to the thread's ready queue.
  */
-struct PmuSetupHeader {
+struct PmuReadyQueueEntry {
+    uint32_t core_index;  // Core index (0 ~ num_cores-1)
+    uint32_t pad0;
+    uint64_t buffer_ptr;  // Device pointer to the full PmuBuffer
+    uint32_t buffer_seq;  // Sequence number for ordering
+    uint32_t pad1;
+} __attribute__((aligned(32)));
+
+static_assert(sizeof(PmuReadyQueueEntry) == 32, "PmuReadyQueueEntry must be 32 bytes");
+
+/**
+ * PMU data fixed header, located at the start of PMU shared memory.
+ *
+ * Per-thread ready queues (one per AICPU scheduling thread):
+ *   Producer: AICPU thread (adds full PmuBuffers)
+ *   Consumer: Host PmuCollector thread
+ */
+struct PmuDataHeader {
+    PmuReadyQueueEntry queues[PLATFORM_MAX_AICPU_THREADS][PLATFORM_PMU_READYQUEUE_SIZE];
+    volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS];  // Host reads (consumer)
+    volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // AICPU writes (producer)
     uint32_t num_cores;
-    uint32_t event_type;  // PmuEventType value
-    uint32_t pad[14];     // Pad header to 64 bytes
-    // Device pointers to the per-core PmuBuffer, one entry per core.
-    // AICPU reads buffer_ptrs[core_id] to get its PmuBuffer.
-    uint64_t buffer_ptrs[PLATFORM_MAX_CORES];
+    uint32_t event_type;  // PmuEventType value, written by host at init
+    uint32_t pad[2];
 } __attribute__((aligned(64)));
 
-static_assert(offsetof(PmuSetupHeader, buffer_ptrs) == 64, "PmuSetupHeader header must be exactly 64 bytes");
-
 // =============================================================================
-// Helpers
+// Helper Functions
 // =============================================================================
 
-constexpr size_t PMU_BUFFER_HEADER_BYTES = 64;
-constexpr size_t PMU_SETUP_HEADER_BYTES = 64;
-
-/**
- * Total bytes of the [PmuSetupHeader][PmuBufferState[num_cores]] shared region.
- */
-inline size_t calc_pmu_setup_size(int num_cores) {
-    return sizeof(PmuSetupHeader) + static_cast<size_t>(num_cores) * sizeof(PmuBufferState);
+inline size_t calc_pmu_data_size(int num_cores) {
+    return sizeof(PmuDataHeader) + static_cast<size_t>(num_cores) * sizeof(PmuBufferState);
 }
 
-inline PmuSetupHeader *get_pmu_setup_header(void *base_ptr) { return reinterpret_cast<PmuSetupHeader *>(base_ptr); }
+inline PmuDataHeader *get_pmu_header(void *base_ptr) { return reinterpret_cast<PmuDataHeader *>(base_ptr); }
 
 inline PmuBufferState *get_pmu_buffer_state(void *base_ptr, int core_id) {
-    return reinterpret_cast<PmuBufferState *>(reinterpret_cast<char *>(base_ptr) + sizeof(PmuSetupHeader)) + core_id;
+    return reinterpret_cast<PmuBufferState *>(reinterpret_cast<char *>(base_ptr) + sizeof(PmuDataHeader)) + core_id;
 }
 
 #endif  // SRC_A5_PLATFORM_INCLUDE_COMMON_PMU_PROFILING_H_
