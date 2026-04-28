@@ -40,22 +40,22 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 
 static TaskOutputTensors
 submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args, bool complete_in_future) {
-    return pto2_submit_mixed_task(&rt->orchestrator, mixed_kernels, args, complete_in_future);
+    return rt->orchestrator.submit_task(mixed_kernels, args, complete_in_future);
 }
 
 static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
-    return pto2_alloc_tensors(&rt->orchestrator, args);
+    return rt->orchestrator.alloc_tensors(args);
 }
 
 void pto2_rt_scope_begin(PTO2Runtime *rt) {
     PTO2ScopeMode mode = rt->pending_scope_mode;
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
-    pto2_scope_begin(&rt->orchestrator, mode);
+    rt->orchestrator.begin_scope(mode);
 }
 
-void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrator); }
+void pto2_rt_scope_end(PTO2Runtime *rt) { rt->orchestrator.end_scope(); }
 
-void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrator); }
+void pto2_rt_orchestration_done(PTO2Runtime *rt) { rt->orchestrator.mark_done(); }
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
@@ -63,11 +63,11 @@ void pto2_rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func,
     va_list args;
     va_start(args, fmt);
     if (fmt == nullptr || fmt[0] == '\0') {
-        pto2_orch_report_fatal(&rt->orchestrator, error_code, func, nullptr);
+        rt->orchestrator.report_fatal(error_code, func, nullptr);
     } else {
         char message[1024];
         vsnprintf(message, sizeof(message), fmt, args);
-        pto2_orch_report_fatal(&rt->orchestrator, error_code, func, "%s", message);
+        rt->orchestrator.report_fatal(error_code, func, "%s", message);
     }
     va_end(args);
 }
@@ -104,8 +104,8 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         while (slot.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                pto2_orch_report_fatal(
-                    &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                orch.report_fatal(
+                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                     "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
                     (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
                 );
@@ -123,8 +123,8 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         while (slot.fanout_refcount.load(std::memory_order_acquire) < slot.fanout_count - 1) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                pto2_orch_report_fatal(
-                    &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                orch.report_fatal(
+                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                     "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
                     (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
                 );
@@ -292,7 +292,7 @@ PTO2Runtime *pto2_runtime_create_custom(
     rt->gm_heap_owned = true;
 
     // Initialize orchestrator
-    if (!pto2_orchestrator_init(&rt->orchestrator, rt->sm_handle->header, rt->gm_heap, heap_size, dep_pool_capacity)) {
+    if (!rt->orchestrator.init(rt->sm_handle->header, rt->gm_heap, heap_size, dep_pool_capacity)) {
         free(rt->gm_heap);
         rt->sm_handle->destroy();
         free(rt);
@@ -301,7 +301,7 @@ PTO2Runtime *pto2_runtime_create_custom(
 
     // Initialize scheduler (heap_size = per-ring heap size)
     if (!rt->scheduler.init(rt->sm_handle->header, dep_pool_capacity)) {
-        pto2_orchestrator_destroy(&rt->orchestrator);
+        rt->orchestrator.destroy();
         free(rt->gm_heap);
         rt->sm_handle->destroy();
         free(rt);
@@ -309,12 +309,12 @@ PTO2Runtime *pto2_runtime_create_custom(
     }
 
     // Connect orchestrator to scheduler (for simulated mode)
-    pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
+    rt->orchestrator.set_scheduler(&rt->scheduler);
 
     rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
     if (!rt->completion_ingress) {
         rt->scheduler.destroy();
-        pto2_orchestrator_destroy(&rt->orchestrator);
+        rt->orchestrator.destroy();
         free(rt->gm_heap);
         rt->sm_handle->destroy();
         free(rt);
@@ -340,24 +340,24 @@ PTO2Runtime *pto2_runtime_create_from_sm(
     rt->gm_heap_size = heap_size > 0 ? heap_size * PTO2_MAX_RING_DEPTH : 0;
     rt->gm_heap_owned = false;
 
-    if (!pto2_orchestrator_init(&rt->orchestrator, rt->sm_handle->header, rt->gm_heap, heap_size, dep_pool_capacity)) {
+    if (!rt->orchestrator.init(rt->sm_handle->header, rt->gm_heap, heap_size, dep_pool_capacity)) {
         free(rt);
         return NULL;
     }
 
     // Initialize scheduler (heap_size = per-ring heap size)
     if (!rt->scheduler.init(rt->sm_handle->header, dep_pool_capacity)) {
-        pto2_orchestrator_destroy(&rt->orchestrator);
+        rt->orchestrator.destroy();
         free(rt);
         return NULL;
     }
 
-    pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
+    rt->orchestrator.set_scheduler(&rt->scheduler);
 
     rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
     if (!rt->completion_ingress) {
         rt->scheduler.destroy();
-        pto2_orchestrator_destroy(&rt->orchestrator);
+        rt->orchestrator.destroy();
         free(rt);
         return NULL;
     }
@@ -369,7 +369,7 @@ void pto2_runtime_destroy(PTO2Runtime *rt) {
     if (!rt) return;
 
     rt->scheduler.destroy();
-    pto2_orchestrator_destroy(&rt->orchestrator);
+    rt->orchestrator.destroy();
 
     free(rt->completion_ingress);
 

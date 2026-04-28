@@ -489,7 +489,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
-            PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
+            PTO2OrchProfilingData p = orchestrator_get_profiling();
             uint64_t total =
                 p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero

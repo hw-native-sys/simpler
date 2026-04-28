@@ -22,12 +22,12 @@
  * - Orchestrator-Scheduler decoupling via shared memory
  *
  * Usage:
- *   1. Create runtime: pto2_runtime_create()
+ *   1. Create runtime: PTO2Runtime create methods
  *   2. Build task graph in orchestration function:
- *      - pto2_scope_begin() / pto2_scope_end()
- *      - pto2_submit_task()
- *   3. Mark orchestration complete: pto2_orchestrator_done()
- *   4. Destroy runtime: pto2_runtime_destroy()
+ *      - begin_scope() / end_scope()
+ *      - submit_task()
+ *   3. Mark orchestration complete: mark_done()
+ *   4. Destroy runtime
  *
  * Based on: docs/RUNTIME_LOGIC.md
  */
