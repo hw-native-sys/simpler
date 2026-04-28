@@ -65,14 +65,14 @@ typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime *rt);
 // Config function exported by orchestration .so
 typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const ChipStorageTaskArgs &orch_args);
 
-// From orchestration/common.cpp linked into this DSO — updates g_pto2_current_runtime here (distinct from
-// pto2_framework_bind_runtime in the dlopen'd libdevice_orch_*.so).
-extern "C" void pto2_framework_bind_runtime(PTO2Runtime *rt);
+// From orchestration/common.cpp linked into this DSO — updates g_current_runtime here (distinct from
+// framework_bind_runtime in the dlopen'd libdevice_orch_*.so).
+extern "C" void framework_bind_runtime(PTO2Runtime *rt);
 
 constexpr const char *DEFAULT_ORCH_ENTRY_SYMBOL = "aicpu_orchestration_entry";
 constexpr const char *DEFAULT_ORCH_CONFIG_SYMBOL = "aicpu_orchestration_config";
 
-static int32_t read_pto2_runtime_status(Runtime *runtime) {
+static int32_t read_runtime_status(Runtime *runtime) {
     if (runtime == nullptr) {
         return 0;
     }
@@ -85,7 +85,7 @@ static int32_t read_pto2_runtime_status(Runtime *runtime) {
     auto *header = static_cast<PTO2SharedMemoryHeader *>(sm);
     int32_t orch_error_code = header->orch_error_code.load(std::memory_order_acquire);
     int32_t sched_error_code = header->sched_error_code.load(std::memory_order_acquire);
-    return pto2_runtime_status_from_error_codes(orch_error_code, sched_error_code);
+    return runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
 static PTO2Runtime *rt{nullptr};
@@ -193,7 +193,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     if (thread_idx >= sched_thread_num_) {
 #if PTO2_PROFILING
         uint64_t orch_cycle_start = 0;
-        int32_t pto2_submitted_tasks = -1;
+        int32_t submitted_tasks = -1;
 #endif
         if (runtime->get_orch_built_on_host()) {
             DEV_INFO("Thread %d: Host orchestration mode, no-op", thread_idx);
@@ -327,12 +327,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
                 dlerror();
                 auto bind_runtime_func =
-                    reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "pto2_framework_bind_runtime"));
+                    reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "framework_bind_runtime"));
                 const char *bind_runtime_error = dlerror();
                 if (bind_runtime_error != nullptr) {
-                    DEV_ERROR(
-                        "Thread %d: dlsym failed for pto2_framework_bind_runtime: %s", thread_idx, bind_runtime_error
-                    );
+                    DEV_ERROR("Thread %d: dlsym failed for framework_bind_runtime: %s", thread_idx, bind_runtime_error);
                     bind_runtime_func = nullptr;
                 }
 
@@ -425,9 +423,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             void *sm_ptr = runtime->get_gm_sm_ptr();
             void *gm_heap = runtime->get_gm_heap_ptr();
 
-            uint64_t sm_size = pto2_sm_calculate_size(task_window_size);
+            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
             PTO2SharedMemoryHandle *sm_handle =
-                pto2_sm_create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
+                PTO2SharedMemoryHandle::create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
             if (!sm_handle) {
                 DEV_ERROR("Thread %d: Failed to create shared memory handle", thread_idx);
                 // Unblock scheduler threads before returning so they don't spin forever.
@@ -435,10 +433,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 return -1;
             }
 
-            rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
+            rt = runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
             if (!rt) {
                 DEV_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
-                pto2_sm_destroy(sm_handle);
+                sm_handle->destroy();
                 // Unblock scheduler threads before returning so they don't spin forever.
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
@@ -464,7 +462,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             runtime_init_ready_.store(true, std::memory_order_release);
 
             // Wait for scheduler's one-time init to complete
-            sched_ctx_.wait_pto2_init_complete();
+            sched_ctx_.wait_init_complete();
 
 #if PTO2_PROFILING
             if (is_l2_swimlane_enabled()) {
@@ -475,13 +473,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if PTO2_PROFILING
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
-            pto2_framework_bind_runtime(rt);
+            framework_bind_runtime(rt);
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(rt);
             }
-            pto2_rt_scope_begin(rt);
+            rt_scope_begin(rt);
             orch_func_(*orch_args_cached_);
-            pto2_rt_scope_end(rt);
+            rt_scope_end(rt);
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             (void)orch_cycle_end;
@@ -489,7 +487,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
-            PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
+            PTO2OrchProfilingData p = orchestrator_get_profiling();
             uint64_t total =
                 p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero
@@ -571,7 +569,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #endif
 
             // Signal completion to the orchestrator state machine
-            pto2_rt_orchestration_done(rt);
+            rt_orchestration_done(rt);
 
             // Latch task count from PTO2 shared memory
             int32_t total_tasks = 0;
@@ -582,7 +580,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 }
             }
 #if PTO2_PROFILING
-            pto2_submitted_tasks = total_tasks;
+            submitted_tasks = total_tasks;
 #endif
 
             if (is_l2_swimlane_enabled() && total_tasks > 0) {
@@ -598,9 +596,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             static_cast<uint64_t>(orch_cycle_start), static_cast<uint64_t>(orch_end_ts),
             cycles_to_us(orch_end_ts - orch_cycle_start)
         );
-        if (pto2_submitted_tasks >= 0) {
+        if (submitted_tasks >= 0) {
             DEV_ALWAYS(
-                "PTO2 total submitted tasks = %d, already executed %d tasks", pto2_submitted_tasks,
+                "PTO2 total submitted tasks = %d, already executed %d tasks", submitted_tasks,
                 sched_ctx_.completed_tasks_count()
             );
         }
@@ -643,12 +641,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // always tear them down here, but we keep orch_so_handle_ alive for
         // the next run's cache-hit reuse (see run() reload_so branch).
         if (!runtime->get_orch_built_on_host() && rt != nullptr) {
-            // Clear g_pto2_current_runtime in this DSO and in the orchestration SO before destroying rt.
-            pto2_framework_bind_runtime(nullptr);
+            // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.
+            framework_bind_runtime(nullptr);
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(nullptr);
             }
-            pto2_runtime_destroy(rt);
+            runtime_destroy(rt);
         }
     }
 
@@ -729,7 +727,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         return rc;
     }
 
-    int32_t runtime_rc = read_pto2_runtime_status(runtime);
+    int32_t runtime_rc = read_runtime_status(runtime);
 
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {

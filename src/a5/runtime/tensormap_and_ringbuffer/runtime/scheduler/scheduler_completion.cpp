@@ -112,8 +112,8 @@ void SchedulerContext::complete_slot_task(
         if (is_dump_tensor_enabled()) {
             dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                 thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
-                [](uint8_t active_mask, uint8_t raw_subtask_id) {
-                    return pto2_subtask_active(active_mask, static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                [](ActiveMask active_mask, int raw_subtask_id) {
+                    return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
                 },
                 [this](int32_t func_id) {
                     return get_function_bin_addr(func_id);
@@ -362,7 +362,7 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
         drain_state_.sync_start_pending.store(0, std::memory_order_release);
         return;
     }
-    PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state->active_mask);
+    PTO2ResourceShape shape = slot_state->active_mask.to_shape();
 
     for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
         auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
@@ -433,7 +433,7 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
 
     // Elected: check if global resources are sufficient.
     PTO2TaskSlotState *slot_state = drain_state_.pending_task;
-    PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state->active_mask);
+    PTO2ResourceShape shape = slot_state->active_mask.to_shape();
     int32_t available = count_global_available(shape);
 
     if (available < block_num) {

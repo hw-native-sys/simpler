@@ -40,34 +40,34 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 
 static TaskOutputTensors
 submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args, bool complete_in_future) {
-    return pto2_submit_mixed_task(&rt->orchestrator, mixed_kernels, args, complete_in_future);
+    return rt->orchestrator.submit_task(mixed_kernels, args, complete_in_future);
 }
 
 static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
-    return pto2_alloc_tensors(&rt->orchestrator, args);
+    return rt->orchestrator.alloc_tensors(args);
 }
 
-void pto2_rt_scope_begin(PTO2Runtime *rt) {
+void rt_scope_begin(PTO2Runtime *rt) {
     PTO2ScopeMode mode = rt->pending_scope_mode;
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
-    pto2_scope_begin(&rt->orchestrator, mode);
+    rt->orchestrator.begin_scope(mode);
 }
 
-void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrator); }
+void rt_scope_end(PTO2Runtime *rt) { rt->orchestrator.end_scope(); }
 
-void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrator); }
+void rt_orchestration_done(PTO2Runtime *rt) { rt->orchestrator.mark_done(); }
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
-void pto2_rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...) {
+void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     if (fmt == nullptr || fmt[0] == '\0') {
-        pto2_orch_report_fatal(&rt->orchestrator, error_code, func, nullptr);
+        rt->orchestrator.report_fatal(error_code, func, nullptr);
     } else {
         char message[1024];
         vsnprintf(message, sizeof(message), fmt, args);
-        pto2_orch_report_fatal(&rt->orchestrator, error_code, func, "%s", message);
+        rt->orchestrator.report_fatal(error_code, func, "%s", message);
     }
     va_end(args);
 }
@@ -104,8 +104,8 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         while (slot.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                pto2_orch_report_fatal(
-                    &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                orch.report_fatal(
+                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                     "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
                     (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
                 );
@@ -123,8 +123,8 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         while (slot.fanout_refcount.load(std::memory_order_acquire) < slot.fanout_count - 1) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                pto2_orch_report_fatal(
-                    &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                orch.report_fatal(
+                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                     "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
                     (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
                 );
@@ -187,7 +187,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
 }
 MAYBE_UNINITIALIZED_END
 
-uint64_t pto2_get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "get_tensor_data: buffer not allocated (addr=0). "
@@ -208,9 +208,7 @@ uint64_t pto2_get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t nd
     return result;
 }
 
-void pto2_set_tensor_data(
-    PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
-) {
+void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value) {
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "set_tensor_data: buffer not allocated (addr=0). "
@@ -232,18 +230,18 @@ void pto2_set_tensor_data(
 
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
-    .scope_begin = pto2_rt_scope_begin,
-    .scope_end = pto2_rt_scope_end,
-    .orchestration_done = pto2_rt_orchestration_done,
+    .scope_begin = rt_scope_begin,
+    .scope_end = rt_scope_end,
+    .orchestration_done = rt_orchestration_done,
     .is_fatal = is_fatal_impl,
-    .report_fatal = pto2_rt_report_fatal,
+    .report_fatal = rt_report_fatal,
     .log_error = unified_log_error,
     .log_warn = unified_log_warn,
     .log_info = unified_log_info,
     .log_debug = unified_log_debug,
     .log_always = unified_log_always,
-    .get_tensor_data = pto2_get_tensor_data,
-    .set_tensor_data = pto2_set_tensor_data,
+    .get_tensor_data = get_tensor_data,
+    .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
 };
 
@@ -251,13 +249,12 @@ static const PTO2RuntimeOps s_runtime_ops = {
 // Runtime Creation and Destruction
 // =============================================================================
 
-PTO2Runtime *pto2_runtime_create(PTO2RuntimeMode mode) {
-    return pto2_runtime_create_custom(mode, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE);
+PTO2Runtime *runtime_create(PTO2RuntimeMode mode) {
+    return runtime_create_custom(mode, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE);
 }
 
-PTO2Runtime *pto2_runtime_create_custom(
-    PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity
-) {
+PTO2Runtime *
+runtime_create_custom(PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity) {
     // Allocate runtime context
     PTO2Runtime *rt = static_cast<PTO2Runtime *>(calloc(1, sizeof(PTO2Runtime)));
     if (!rt) {
@@ -266,7 +263,7 @@ PTO2Runtime *pto2_runtime_create_custom(
 
     rt->ops = &s_runtime_ops;
     rt->mode = mode;
-    rt->sm_handle = pto2_sm_create(task_window_size, heap_size);
+    rt->sm_handle = PTO2SharedMemoryHandle::create(task_window_size, heap_size);
     if (!rt->sm_handle) {
         free(rt);
         return NULL;
@@ -277,14 +274,14 @@ PTO2Runtime *pto2_runtime_create_custom(
     rt->gm_heap_size = total_heap_size;
 #if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
     if (posix_memalign(&rt->gm_heap, PTO2_ALIGN_SIZE, total_heap_size) != 0) {
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
         free(rt);
         return NULL;
     }
 #else
     rt->gm_heap = aligned_alloc(PTO2_ALIGN_SIZE, total_heap_size);
     if (!rt->gm_heap) {
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
         free(rt);
         return NULL;
     }
@@ -292,31 +289,31 @@ PTO2Runtime *pto2_runtime_create_custom(
     rt->gm_heap_owned = true;
 
     // Initialize orchestrator
-    if (!pto2_orchestrator_init(&rt->orchestrator, rt->sm_handle->header, rt->gm_heap, heap_size, dep_pool_capacity)) {
+    if (!rt->orchestrator.init(rt->sm_handle->header, rt->gm_heap, heap_size, dep_pool_capacity)) {
         free(rt->gm_heap);
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
         free(rt);
         return NULL;
     }
 
     // Initialize scheduler (heap_size = per-ring heap size)
-    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle->header, dep_pool_capacity)) {
-        pto2_orchestrator_destroy(&rt->orchestrator);
+    if (!rt->scheduler.init(rt->sm_handle->header, dep_pool_capacity)) {
+        rt->orchestrator.destroy();
         free(rt->gm_heap);
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
         free(rt);
         return NULL;
     }
 
     // Connect orchestrator to scheduler (for simulated mode)
-    pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
+    rt->orchestrator.set_scheduler(&rt->scheduler);
 
     rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
     if (!rt->completion_ingress) {
-        pto2_scheduler_destroy(&rt->scheduler);
-        pto2_orchestrator_destroy(&rt->orchestrator);
+        rt->scheduler.destroy();
+        rt->orchestrator.destroy();
         free(rt->gm_heap);
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
         free(rt);
         return NULL;
     }
@@ -324,7 +321,7 @@ PTO2Runtime *pto2_runtime_create_custom(
     return rt;
 }
 
-PTO2Runtime *pto2_runtime_create_from_sm(
+PTO2Runtime *runtime_create_from_sm(
     PTO2RuntimeMode mode, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
     int32_t dep_pool_capacity
 ) {
@@ -340,24 +337,24 @@ PTO2Runtime *pto2_runtime_create_from_sm(
     rt->gm_heap_size = heap_size > 0 ? heap_size * PTO2_MAX_RING_DEPTH : 0;
     rt->gm_heap_owned = false;
 
-    if (!pto2_orchestrator_init(&rt->orchestrator, rt->sm_handle->header, rt->gm_heap, heap_size, dep_pool_capacity)) {
+    if (!rt->orchestrator.init(rt->sm_handle->header, rt->gm_heap, heap_size, dep_pool_capacity)) {
         free(rt);
         return NULL;
     }
 
     // Initialize scheduler (heap_size = per-ring heap size)
-    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle->header, dep_pool_capacity)) {
-        pto2_orchestrator_destroy(&rt->orchestrator);
+    if (!rt->scheduler.init(rt->sm_handle->header, dep_pool_capacity)) {
+        rt->orchestrator.destroy();
         free(rt);
         return NULL;
     }
 
-    pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
+    rt->orchestrator.set_scheduler(&rt->scheduler);
 
     rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
     if (!rt->completion_ingress) {
-        pto2_scheduler_destroy(&rt->scheduler);
-        pto2_orchestrator_destroy(&rt->orchestrator);
+        rt->scheduler.destroy();
+        rt->orchestrator.destroy();
         free(rt);
         return NULL;
     }
@@ -365,11 +362,11 @@ PTO2Runtime *pto2_runtime_create_from_sm(
     return rt;
 }
 
-void pto2_runtime_destroy(PTO2Runtime *rt) {
+void runtime_destroy(PTO2Runtime *rt) {
     if (!rt) return;
 
-    pto2_scheduler_destroy(&rt->scheduler);
-    pto2_orchestrator_destroy(&rt->orchestrator);
+    rt->scheduler.destroy();
+    rt->orchestrator.destroy();
 
     free(rt->completion_ingress);
 
@@ -378,13 +375,13 @@ void pto2_runtime_destroy(PTO2Runtime *rt) {
     }
 
     if (rt->sm_handle) {
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
     }
 
     free(rt);
 }
 
-void pto2_runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {
+void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {
     if (rt) {
         rt->mode = mode;
     }

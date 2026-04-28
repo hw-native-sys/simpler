@@ -70,17 +70,17 @@ static uint64_t parse_env_uint64(const char *name, uint64_t min_val, bool requir
     return static_cast<uint64_t>(val);
 }
 
-static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *host_header) {
+static int32_t read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *host_header) {
     if (runtime == nullptr || host_header == nullptr) {
         return 0;
     }
 
-    void *pto2_sm = runtime->get_gm_sm_ptr();
-    if (pto2_sm == nullptr) {
+    void *sm_ptr = runtime->get_gm_sm_ptr();
+    if (sm_ptr == nullptr) {
         return 0;
     }
 
-    int hdr_rc = runtime->host_api.copy_from_device(host_header, pto2_sm, sizeof(PTO2SharedMemoryHeader));
+    int hdr_rc = runtime->host_api.copy_from_device(host_header, sm_ptr, sizeof(PTO2SharedMemoryHeader));
     if (hdr_rc != 0) {
         LOG_WARN("Failed to copy PTO2 header from device");
         return 0;
@@ -88,7 +88,7 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
 
     int32_t orch_error_code = host_header->orch_error_code.load(std::memory_order_relaxed);
     int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
-    return pto2_runtime_status_from_error_codes(orch_error_code, sched_error_code);
+    return runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
 /**
@@ -264,7 +264,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
 
     // Allocate PTO2 shared memory
     int64_t t_sm_start = _now_ms();
-    uint64_t sm_size = pto2_sm_calculate_size(eff_task_window_size);
+    uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(eff_task_window_size);
     void *sm_ptr = runtime->host_api.device_malloc(sm_size);
     int64_t t_sm_end = _now_ms();
     if (sm_ptr == nullptr) {
@@ -325,7 +325,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     PTO2SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    runtime_status = pto2_read_runtime_status(runtime, &host_header);
+    runtime_status = read_runtime_status(runtime, &host_header);
     if (runtime_status != 0) {
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);

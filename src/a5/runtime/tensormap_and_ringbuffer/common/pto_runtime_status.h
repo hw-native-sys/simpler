@@ -38,7 +38,7 @@
 #define PTO2_ERROR_ASYNC_WAIT_OVERFLOW 102
 #define PTO2_ERROR_ASYNC_REGISTRATION_FAILED 103
 
-static inline int32_t pto2_runtime_status_from_error_codes(int32_t orch_error_code, int32_t sched_error_code) {
+static inline int32_t runtime_status_from_error_codes(int32_t orch_error_code, int32_t sched_error_code) {
     if (orch_error_code != PTO2_ERROR_NONE) {
         return orch_error_code < 0 ? orch_error_code : -orch_error_code;
     }

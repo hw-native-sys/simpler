@@ -41,10 +41,6 @@
 
 #include "pto_runtime2_types.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 // =============================================================================
 // Shared Memory Header
 // =============================================================================
@@ -76,7 +72,7 @@ static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be e
  * Per-ring shared memory header section.
  *
  * Groups flow-control, layout info, and per-ring data pointers for a single ring.
- * Pointers are host-side only (set by pto2_sm_setup_pointers, invalid on device).
+ * Pointers are host-side only (set by setup_pointers, invalid on device).
  */
 struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2RingFlowControl fc;
@@ -87,7 +83,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     uint64_t heap_size;
     uint64_t task_descriptors_offset;  // Offset from SM base, in bytes
 
-    // Per-ring data pointers (host-side, set by pto2_sm_setup_pointers)
+    // Per-ring data pointers (host-side, set by setup_pointers)
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
@@ -159,91 +155,30 @@ struct PTO2SharedMemoryHandle {
 
     // Ownership flag
     bool is_owner;  // True if this handle allocated the memory
+
+    // === Static factory methods ===
+
+    static uint64_t calculate_size(uint64_t task_window_size);
+    static uint64_t calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
+
+    static PTO2SharedMemoryHandle *create(uint64_t task_window_size, uint64_t heap_size);
+    static PTO2SharedMemoryHandle *create_default();
+    static PTO2SharedMemoryHandle *
+    create_from_buffer(void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size);
+
+    // === Instance methods ===
+
+    void destroy();
+    void print_layout();
+    bool validate();
+
+private:
+    void init_header(uint64_t task_window_size, uint64_t heap_size);
+    void init_header_per_ring(
+        const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
+    );
+    void setup_pointers(uint64_t task_window_size);
+    void setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
 };
-
-// =============================================================================
-// Shared Memory API
-// =============================================================================
-
-/**
- * Calculate required shared memory size
- *
- * @param task_window_size  Number of task slots per ring
- * @return Total bytes required
- */
-uint64_t pto2_sm_calculate_size(uint64_t task_window_size);
-
-/**
- * Calculate required shared memory size for per-ring task windows.
- *
- * @param task_window_sizes  Array of window sizes per ring
- * @return Total bytes required
- */
-uint64_t pto2_sm_calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
-
-/**
- * Create shared memory for Orchestrator and Scheduler
- *
- * @param task_window_size  Number of task slots per ring
- * @param heap_size         Heap size per ring for output buffers
- * @return Handle with both views, or NULL on failure
- */
-PTO2SharedMemoryHandle *pto2_sm_create(uint64_t task_window_size, uint64_t heap_size);
-
-/**
- * Create shared memory with default sizes
- */
-PTO2SharedMemoryHandle *pto2_sm_create_default(void);
-
-/**
- * Wrap an existing buffer as shared memory (e.g. device GM buffer).
- * Caller owns the buffer; handle will not free sm_base.
- *
- * @param sm_base            Base address of pre-allocated buffer
- * @param sm_size            Total size in bytes
- * @param task_window_size   Number of task slots per ring (must match buffer layout)
- * @param heap_size          Heap size per ring (for layout; buffer has no heap region)
- * @return Handle, or NULL on failure
- */
-PTO2SharedMemoryHandle *
-pto2_sm_create_from_buffer(void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size);
-
-/**
- * Destroy shared memory and free resources
- */
-void pto2_sm_destroy(PTO2SharedMemoryHandle *handle);
-
-/**
- * Initialize shared memory header with layout information
- * Called after memory is allocated
- */
-void pto2_sm_init_header(PTO2SharedMemoryHandle *handle, uint64_t task_window_size, uint64_t heap_size);
-
-/**
- * Initialize shared memory header with per-ring layout information.
- */
-void pto2_sm_init_header_per_ring(
-    PTO2SharedMemoryHandle *handle, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
-    const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
-);
-
-// =============================================================================
-// Debug Utilities
-// =============================================================================
-
-/**
- * Print shared memory layout info
- */
-void pto2_sm_print_layout(PTO2SharedMemoryHandle *handle);
-
-/**
- * Validate shared memory integrity
- * @return true if valid, false if corrupted
- */
-bool pto2_sm_validate(PTO2SharedMemoryHandle *handle);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif  // PTO_SHARED_MEMORY_H

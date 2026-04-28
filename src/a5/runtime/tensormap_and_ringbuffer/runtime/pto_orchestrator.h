@@ -113,104 +113,22 @@ struct PTO2OrchestratorState {
     }
 
     bool in_manual_scope() const { return scope_stack_top >= manual_begin_depth; }
+
+    // === Cold-path API (defined in pto_orchestrator.cpp) ===
+
+    bool init(
+        PTO2SharedMemoryHeader *sm_header, void *gm_heap, uint64_t heap_size,
+        int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
+    );
+    void destroy();
+    void set_scheduler(PTO2SchedulerState *scheduler);
+    void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
+    void begin_scope(PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
+    void end_scope();
+    TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const Arg &args, bool complete_in_future);
+    TaskOutputTensors alloc_tensors(const Arg &args);
+    void mark_done();
 };
-
-// =============================================================================
-// Orchestrator API
-// =============================================================================
-
-/**
- * Initialize orchestrator state
- *
- * @param orch       Orchestrator state to initialize
- * @param sm_handle  Shared memory handle
- * @param gm_heap    GM heap memory for output buffers
- * @param heap_size  Size of GM heap
- * @return true on success
- */
-bool pto2_orchestrator_init(
-    PTO2OrchestratorState *orch, PTO2SharedMemoryHeader *sm_header, void *gm_heap, uint64_t heap_size,
-    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
-);
-
-/**
- * Destroy orchestrator state and free resources
- */
-void pto2_orchestrator_destroy(PTO2OrchestratorState *orch);
-
-/**
- * Set scheduler reference (for simulated mode)
- */
-void pto2_orchestrator_set_scheduler(PTO2OrchestratorState *orch, PTO2SchedulerState *scheduler);
-
-// =============================================================================
-// Fatal Reporting
-// =============================================================================
-
-void pto2_orch_report_fatal(PTO2OrchestratorState *orch, int32_t error_code, const char *func, const char *fmt, ...);
-
-// =============================================================================
-// Scope Management
-// =============================================================================
-
-/**
- * Begin a new scope
- *
- * Pushes a new empty task list onto the scope stack.
- * Tasks submitted while this scope is at the top of the stack are
- * owned by it and have their fanout_count initialized to 1.
- */
-void pto2_scope_begin(PTO2OrchestratorState *orch, PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
-
-/**
- * End current scope
- *
- * Pops the top scope and increments fanout_refcount for each task
- * directly owned by that scope.
- * May trigger buffer release for tasks that are now fully consumed.
- */
-void pto2_scope_end(PTO2OrchestratorState *orch);
-
-// =============================================================================
-// Task Submission
-// =============================================================================
-
-/**
- * Submit a task with InCore function and parameters
- *
- * This is the main API for building the task graph:
- * 1. Allocates task slot + packed output buffer via TaskAllocator (blocks until available)
- * 2. Looks up inputs in TensorMap to find dependencies
- * 3. Updates producer's fanout_count/list (with spinlock)
- * 4. Registers outputs in TensorMap
- * 5. Initializes task state in scheduler
- *
- * @param orch        Orchestrator state
- * @param mixed_kernels  Kernel IDs for AIC/AIV0/AIV1 slots
- * @param args      Aggregated tensor and scalar parameters
- */
-TaskOutputTensors pto2_submit_mixed_task(
-    PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args, bool complete_in_future
-);
-
-/**
- * Allocate fresh tensors by creating one hidden runtime-owned output task.
- *
- * The returned tensors are already materialized and bound to the same creator
- * task id for scope lifetime and future creator-retention dependencies.
- */
-TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args);
-
-// =============================================================================
-// Flow Control
-// =============================================================================
-
-/**
- * Mark orchestration as complete
- *
- * Signals to scheduler that no more tasks will be submitted.
- */
-void pto2_orchestrator_done(PTO2OrchestratorState *orch);
 
 // =============================================================================
 // Orchestrator Profiling Data
@@ -237,11 +155,7 @@ struct PTO2OrchProfilingData {
     uint64_t scope_end_atomic_count;
 };
 
-/**
- * Get and reset orchestrator profiling data.
- * Returns accumulated profiling data and resets counters.
- */
-PTO2OrchProfilingData pto2_orchestrator_get_profiling();
+PTO2OrchProfilingData orchestrator_get_profiling();
 #endif
 
 #endif  // PTO_ORCHESTRATOR_H

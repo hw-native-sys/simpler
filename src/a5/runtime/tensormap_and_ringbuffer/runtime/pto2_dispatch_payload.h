@@ -60,7 +60,7 @@ static_assert(
 /**
  * Per-core dispatch payload: function address + args[] + SPMD context.
  *
- * AICPU maintains a static array s_pto2_payload_per_core[RUNTIME_MAX_WORKER].
+ * AICPU maintains a static array s_payload_per_core[RUNTIME_MAX_WORKER].
  * AICore caches a pointer to its per-core slot at startup (via Handshake.task)
  * and reads from it on each dispatch.
  *

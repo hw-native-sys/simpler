@@ -83,7 +83,7 @@ public:
     //  - folds inline_completed_tasks into completed_tasks_
     //  - flips orchestrator_done_ and triggers core transition
     //    (skipped on fatal error — emergency_shutdown runs instead)
-    // Callers must invoke pto2_rt_orchestration_done(rt) before this — that
+    // Callers must invoke rt_orchestration_done(rt) before this — that
     // step belongs to the orchestrator lifecycle, not the scheduler.
     void on_orchestration_done(Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks);
 
@@ -102,7 +102,7 @@ public:
 
     // Block until the first scheduler thread has finished one-time PTO2 init.
     // Called by the orchestrator thread in device-orch mode.
-    void wait_pto2_init_complete() const;
+    void wait_init_complete() const;
 
 private:
     // =========================================================================
@@ -175,8 +175,8 @@ private:
     uint64_t regs_{0};
 
     // --- One-time init coordination ---
-    std::atomic<bool> pto2_init_done_{false};
-    std::atomic<bool> pto2_init_complete_{false};
+    std::atomic<bool> init_done_{false};
+    std::atomic<bool> init_complete_{false};
 
     // =========================================================================
     // Core management (scheduler_cold_path.cpp)

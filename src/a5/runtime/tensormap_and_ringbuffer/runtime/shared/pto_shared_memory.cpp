@@ -27,15 +27,15 @@
 // Size Calculation
 // =============================================================================
 
-uint64_t pto2_sm_calculate_size(uint64_t task_window_size) {
+uint64_t PTO2SharedMemoryHandle::calculate_size(uint64_t task_window_size) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_window_sizes[r] = task_window_size;
     }
-    return pto2_sm_calculate_size_per_ring(task_window_sizes);
+    return calculate_size_per_ring(task_window_sizes);
 }
 
-uint64_t pto2_sm_calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
+uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
     uint64_t size = 0;
 
     // Header (aligned to cache line)
@@ -55,17 +55,16 @@ uint64_t pto2_sm_calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_M
 // Creation and Destruction
 // =============================================================================
 
-static void
-pto2_sm_setup_pointers_per_ring(PTO2SharedMemoryHandle *handle, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
-    char *ptr = (char *)handle->sm_base;
+void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
+    char *ptr = (char *)sm_base;
 
     // Header
-    handle->header = (PTO2SharedMemoryHeader *)ptr;
+    header = (PTO2SharedMemoryHeader *)ptr;
     ptr += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
 
     // Per-ring task descriptors, payloads, and slot states
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        auto &ring = handle->header->rings[r];
+        auto &ring = header->rings[r];
         ring.task_descriptors = (PTO2TaskDescriptor *)ptr;
         ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
 
@@ -77,15 +76,15 @@ pto2_sm_setup_pointers_per_ring(PTO2SharedMemoryHandle *handle, const uint64_t t
     }
 }
 
-static void pto2_sm_setup_pointers(PTO2SharedMemoryHandle *handle, uint64_t task_window_size) {
+void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_window_sizes[r] = task_window_size;
     }
-    pto2_sm_setup_pointers_per_ring(handle, task_window_sizes);
+    setup_pointers_per_ring(task_window_sizes);
 }
 
-PTO2SharedMemoryHandle *pto2_sm_create(uint64_t task_window_size, uint64_t heap_size) {
+PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create(uint64_t task_window_size, uint64_t heap_size) {
     // Allocate handle
     PTO2SharedMemoryHandle *handle = (PTO2SharedMemoryHandle *)calloc(1, sizeof(PTO2SharedMemoryHandle));
     if (!handle) {
@@ -93,7 +92,7 @@ PTO2SharedMemoryHandle *pto2_sm_create(uint64_t task_window_size, uint64_t heap_
     }
 
     // Calculate total size
-    uint64_t sm_size = pto2_sm_calculate_size(task_window_size);
+    uint64_t sm_size = calculate_size(task_window_size);
 
 // Allocate shared memory (aligned for DMA efficiency)
 #if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
@@ -116,21 +115,24 @@ PTO2SharedMemoryHandle *pto2_sm_create(uint64_t task_window_size, uint64_t heap_
     memset(handle->sm_base, 0, static_cast<size_t>(sm_size));
 
     // Set up pointers
-    pto2_sm_setup_pointers(handle, task_window_size);
+    handle->setup_pointers(task_window_size);
 
     // Initialize header
-    pto2_sm_init_header(handle, task_window_size, heap_size);
+    handle->init_header(task_window_size, heap_size);
 
     return handle;
 }
 
-PTO2SharedMemoryHandle *pto2_sm_create_default(void) { return pto2_sm_create(PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE); }
+PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create_default() {
+    return create(PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE);
+}
 
-PTO2SharedMemoryHandle *
-pto2_sm_create_from_buffer(void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size) {
+PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create_from_buffer(
+    void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size
+) {
     if (!sm_base || sm_size == 0) return NULL;
 
-    uint64_t required = pto2_sm_calculate_size(task_window_size);
+    uint64_t required = calculate_size(task_window_size);
     if (sm_size < required) return NULL;
 
     PTO2SharedMemoryHandle *handle = (PTO2SharedMemoryHandle *)calloc(1, sizeof(PTO2SharedMemoryHandle));
@@ -140,20 +142,18 @@ pto2_sm_create_from_buffer(void *sm_base, uint64_t sm_size, uint64_t task_window
     handle->sm_size = sm_size;
     handle->is_owner = false;
 
-    pto2_sm_setup_pointers(handle, task_window_size);
-    pto2_sm_init_header(handle, task_window_size, heap_size);
+    handle->setup_pointers(task_window_size);
+    handle->init_header(task_window_size, heap_size);
 
     return handle;
 }
 
-void pto2_sm_destroy(PTO2SharedMemoryHandle *handle) {
-    if (!handle) return;
-
-    if (handle->is_owner && handle->sm_base) {
-        free(handle->sm_base);
+void PTO2SharedMemoryHandle::destroy() {
+    if (is_owner && sm_base) {
+        free(sm_base);
     }
 
-    free(handle);
+    free(this);
 }
 
 // =============================================================================
@@ -161,22 +161,19 @@ void pto2_sm_destroy(PTO2SharedMemoryHandle *handle) {
 // =============================================================================
 //
 // no need init data in pool, init pool data when used
-void pto2_sm_init_header(PTO2SharedMemoryHandle *handle, uint64_t task_window_size, uint64_t heap_size) {
+void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t heap_size) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_window_sizes[r] = task_window_size;
         heap_sizes[r] = heap_size;
     }
-    pto2_sm_init_header_per_ring(handle, task_window_sizes, heap_sizes);
+    init_header_per_ring(task_window_sizes, heap_sizes);
 }
 
-void pto2_sm_init_header_per_ring(
-    PTO2SharedMemoryHandle *handle, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
-    const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
+void PTO2SharedMemoryHandle::init_header_per_ring(
+    const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
 ) {
-    PTO2SharedMemoryHeader *header = handle->header;
-
     // Per-ring flow control (start at 0)
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         header->rings[r].fc.init();
@@ -196,7 +193,7 @@ void pto2_sm_init_header_per_ring(
         offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     }
 
-    header->total_size = handle->sm_size;
+    header->total_size = sm_size;
     header->graph_output_ptr.store(0, std::memory_order_relaxed);
     header->graph_output_size.store(0, std::memory_order_relaxed);
 
@@ -211,13 +208,13 @@ void pto2_sm_init_header_per_ring(
 // Debug Utilities
 // =============================================================================
 
-void pto2_sm_print_layout(PTO2SharedMemoryHandle *handle) {
-    if (!handle || !handle->header) return;
+void PTO2SharedMemoryHandle::print_layout() {
+    if (!header) return;
 
-    PTO2SharedMemoryHeader *h = handle->header;
+    PTO2SharedMemoryHeader *h = header;
 
     LOG_INFO("=== PTO2 Shared Memory Layout ===");
-    LOG_INFO("Base address:       %p", handle->sm_base);
+    LOG_INFO("Base address:       %p", sm_base);
     LOG_INFO("Total size:         %" PRIu64 " bytes", h->total_size);
     LOG_INFO("Ring depth:         %d", PTO2_MAX_RING_DEPTH);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -240,15 +237,14 @@ void pto2_sm_print_layout(PTO2SharedMemoryHandle *handle) {
     LOG_INFO("================================");
 }
 
-bool pto2_sm_validate(PTO2SharedMemoryHandle *handle) {
-    if (!handle) return false;
-    if (!handle->sm_base) return false;
-    if (!handle->header) return false;
+bool PTO2SharedMemoryHandle::validate() {
+    if (!sm_base) return false;
+    if (!header) return false;
 
-    PTO2SharedMemoryHeader *h = handle->header;
+    PTO2SharedMemoryHeader *h = header;
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (!h->rings[r].fc.validate(handle, r)) return false;
+        if (!h->rings[r].fc.validate(this, r)) return false;
     }
 
     return true;

@@ -439,7 +439,7 @@ template <typename Fn>
 using PTO2FaninForEachReturn = std::conditional_t<std::is_same_v<PTO2FaninCallbackResult<Fn>, void>, void, bool>;
 
 template <typename InlineSlots, typename Fn>
-inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_storage(
+inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(
     InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t spill_start, PTO2FaninPool &spill_pool, Fn &&fn
 ) {
     using FaninCallbackResult = PTO2FaninCallbackResult<Fn>;
@@ -504,8 +504,8 @@ inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_storage(
 }
 
 template <typename Fn>
-inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn) {
-    return pto2_for_each_fanin_storage(
+inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn) {
+    return for_each_fanin_storage(
         payload.fanin_inline_slot_states, payload.fanin_actual_count, payload.fanin_spill_start,
         *payload.fanin_spill_pool, static_cast<Fn &&>(fn)
     );

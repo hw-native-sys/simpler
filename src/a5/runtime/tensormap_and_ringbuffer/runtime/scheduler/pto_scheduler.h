@@ -401,8 +401,10 @@ struct alignas(64) PTO2ReadyQueue {
 };
 
 // Cold-path ready queue operations (defined in pto_scheduler.cpp)
-bool pto2_ready_queue_init(PTO2ReadyQueue *queue, uint64_t capacity);
-void pto2_ready_queue_destroy(PTO2ReadyQueue *queue);
+// Declared as non-member to keep PTO2ReadyQueue a POD-like struct with
+// cache-line alignment. The struct body above contains only hot-path inlines.
+bool ready_queue_init(PTO2ReadyQueue *queue, uint64_t capacity);
+void ready_queue_destroy(PTO2ReadyQueue *queue);
 
 // =============================================================================
 // SPSC Queue (Single-Producer Single-Consumer, wait-free)
@@ -497,9 +499,6 @@ struct alignas(64) PTO2SpscQueue {
 };
 
 static_assert(sizeof(PTO2SpscQueue) == 256, "PTO2SpscQueue must be exactly 4 cache lines (256B)");
-
-// =============================================================================
-// Scheduler State
 // =============================================================================
 
 /**
@@ -667,25 +666,25 @@ struct PTO2SchedulerState {
 
         if (wfanin != 0) {
             int32_t early_finished = 0;
-            pto2_for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-                pto2_fanout_lock(*producer);
+            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
+                producer->lock_fanout();
                 int32_t pstate = producer->task_state.load(std::memory_order_acquire);
                 if (pstate >= PTO2_TASK_COMPLETED) {
                     early_finished++;
                 } else {
                     producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
                 }
-                pto2_fanout_unlock(*producer);
+                producer->unlock_fanout();
             });
 
             int32_t init_rc = early_finished + 1;
             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
             if (new_rc >= ws->fanin_count) {
-                ready_queues[static_cast<int32_t>(pto2_active_mask_to_shape(ws->active_mask))].push(ws);
+                ready_queues[static_cast<int32_t>(ws->active_mask.to_shape())].push(ws);
             }
         } else {
             ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-            ready_queues[static_cast<int32_t>(pto2_active_mask_to_shape(ws->active_mask))].push(ws);
+            ready_queues[static_cast<int32_t>(ws->active_mask.to_shape())].push(ws);
         }
 
         ws->dep_pool_mark = rss.dep_pool.top;
@@ -776,7 +775,7 @@ struct PTO2SchedulerState {
         if (new_refcount == slot_state.fanin_count) {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
-            PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
+            PTO2ResourceShape shape = slot_state.active_mask.to_shape();
             if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
             }
@@ -800,7 +799,7 @@ struct PTO2SchedulerState {
                 )) {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
                 // Local-first: try per-CoreType thread-local buffer before global queue
-                PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
+                PTO2ResourceShape shape = slot_state.active_mask.to_shape();
                 if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                     ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
                 }
@@ -905,13 +904,13 @@ struct PTO2SchedulerState {
 #endif
 
 #if PTO2_SCHED_PROFILING
-        pto2_fanout_lock(slot_state, lock_atomics, lock_wait);
+        slot_state.lock_fanout(lock_atomics, lock_wait);
 #else
-        pto2_fanout_lock(slot_state);
+        slot_state.lock_fanout();
 #endif
         slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
         PTO2DepListEntry *current = slot_state.fanout_head;  // Protected by fanout_lock
-        pto2_fanout_unlock(slot_state);
+        slot_state.unlock_fanout();
 
 #if PTO2_SCHED_PROFILING
         lock_atomics += 2;  // state.store + unlock.store
@@ -962,7 +961,7 @@ struct PTO2SchedulerState {
     int32_t on_task_release(PTO2TaskSlotState &slot_state) {
 #endif
         PTO2TaskPayload *payload = slot_state.payload;
-        pto2_for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
+        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
 #if PTO2_SCHED_PROFILING
             release_producer(*producer_slot_state, fanin_atomics);
 #else
@@ -986,16 +985,16 @@ struct PTO2SchedulerState {
 #endif
         return payload->fanin_actual_count;
     }
+
+    // === Cold-path API (defined in pto_scheduler.cpp) ===
+    bool init(PTO2SharedMemoryHeader *sm_header, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    void destroy();
+    void print_stats();
+    void print_queues();
 };
 
-// =============================================================================
-// Scheduler API (cold path, defined in pto_scheduler.cpp)
-// =============================================================================
-
-bool pto2_scheduler_init(
-    PTO2SchedulerState *sched, PTO2SharedMemoryHeader *sm_header, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
-);
-void pto2_scheduler_destroy(PTO2SchedulerState *sched);
+// Scheduler cold-path API is declared as PTO2SchedulerState member functions.
+// See init()/destroy()/print_stats()/print_queues() below the struct definition.
 
 template <bool Profiling>
 inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
@@ -1025,7 +1024,7 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
             PTO2CompletionCondition &cond = entry.conditions[c];
             if (cond.satisfied) continue;
             if (cond.counter_addr) {
-                uintptr_t counter_line = pto2_completion_ingress_cache_line(cond.counter_addr);
+                uintptr_t counter_line = completion_ingress_cache_line(cond.counter_addr);
                 if (counter_line != last_invalidated_counter_line) {
                     cache_invalidate_range(reinterpret_cast<const void *>(counter_line), sizeof(uint32_t));
                     last_invalidated_counter_line = counter_line;
@@ -1073,9 +1072,7 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
 // Debug Utilities (cold path, defined in pto_scheduler.cpp)
 // =============================================================================
 
-void pto2_scheduler_print_stats(PTO2SchedulerState *sched);
-void pto2_scheduler_print_queues(PTO2SchedulerState *sched);
-const char *pto2_task_state_name(PTO2TaskState state);
+const char *task_state_name(PTO2TaskState state);
 
 // =============================================================================
 // Scheduler Profiling Data
@@ -1084,7 +1081,7 @@ const char *pto2_task_state_name(PTO2TaskState state);
 #if PTO2_SCHED_PROFILING
 struct PTO2SchedProfilingData {
     // Sub-phase cycle breakdown within on_mixed_task_complete
-    uint64_t lock_cycle;           // pto2_fanout_lock + state store + unlock
+    uint64_t lock_cycle;           // lock_fanout + state store + unlock
     uint64_t fanout_cycle;         // fanout traversal
     uint64_t fanin_cycle;          // fanin traversal
     uint64_t self_consumed_cycle;  // self check_and_handle_consumed
@@ -1108,5 +1105,5 @@ struct PTO2SchedProfilingData {
  * Get and reset scheduler profiling data for a specific thread.
  * Returns accumulated profiling data and resets counters.
  */
-PTO2SchedProfilingData pto2_scheduler_get_profiling(int thread_idx);
+PTO2SchedProfilingData scheduler_get_profiling(int thread_idx);
 #endif

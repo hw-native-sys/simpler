@@ -201,7 +201,7 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
 
 #if PTO2_SCHED_PROFILING
     {
-        PTO2SchedProfilingData sp = pto2_scheduler_get_profiling(thread_idx);
+        PTO2SchedProfilingData sp = scheduler_get_profiling(thread_idx);
         uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle + sp.self_consumed_cycle;
         uint64_t complete_poll = (l2_perf.sched_complete_cycle > otc_total + l2_perf.sched_complete_perf_cycle) ?
                                      (l2_perf.sched_complete_cycle - otc_total - l2_perf.sched_complete_perf_cycle) :
@@ -642,11 +642,11 @@ int32_t SchedulerContext::init(
     // Initialize task counters. Task count comes from PTO2 shared memory.
     if (runtime->get_gm_sm_ptr()) {
         auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-        int32_t pto2_count = 0;
+        int32_t task_count = 0;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            pto2_count += header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+            task_count += header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
         }
-        total_tasks_ = pto2_count > 0 ? pto2_count : 0;
+        total_tasks_ = task_count > 0 ? task_count : 0;
     } else {
         total_tasks_ = 0;
     }
@@ -702,8 +702,8 @@ void SchedulerContext::deinit() {
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
     orchestrator_done_ = false;
-    pto2_init_done_.store(false, std::memory_order_release);
-    pto2_init_complete_.store(false, std::memory_order_release);
+    init_done_.store(false, std::memory_order_release);
+    init_complete_.store(false, std::memory_order_release);
 
     // Reset core transition state
     transition_requested_.store(false, std::memory_order_release);
@@ -729,8 +729,8 @@ void SchedulerContext::deinit() {
     func_id_to_addr_ = nullptr;
 }
 
-void SchedulerContext::wait_pto2_init_complete() const {
-    while (!pto2_init_complete_.load(std::memory_order_acquire)) {
+void SchedulerContext::wait_init_complete() const {
+    while (!init_complete_.load(std::memory_order_acquire)) {
         SPIN_WAIT_HINT();
     }
 }
