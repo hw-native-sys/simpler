@@ -81,9 +81,10 @@ struct alignas(64) CoreExecState {
     uint8_t pad0_[2];                       // offset 38: alignment padding
 #if PTO2_PROFILING
     // --- Profiling fields (dispatch path, compile-time gated) ---
-    uint64_t running_dispatch_timestamp;  // offset 40: AICPU dispatch timestamp for running task
-    uint64_t pending_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for pending task
-    uint8_t pad1_[8];                     // offset 56: pad to 64 bytes
+    uint32_t dispatch_count;              // offset 40: dispatched task count (buffer mgmt)
+    uint32_t pad1_;                       // offset 44: alignment padding for timestamp
+    uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
+    uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
 #else
     // --- Cold fields (init/diagnostics only, never in hot path) ---
     int32_t worker_id;          // offset 40: index in runtime.workers[]

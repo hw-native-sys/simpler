@@ -13,20 +13,42 @@
  * @file l2_perf_profiling.h
  * @brief Performance profiling data structures
  *
- * Architecture: per-core L2PerfBuffer + per-thread PhaseBuffer + a single
- * L2PerfSetupHeader, all allocated on device by Host.
+ * Architecture: Fixed header + per-core/thread buffer states + optional phase profiling region
  *
- * Layout (count-first + flexible array):
- *   L2PerfBuffer  = 64B header (count + padding) + records[capacity]
- *   PhaseBuffer = 64B header (count + padding) + records[capacity]
+ * Memory layout (shared memory between Host and Device):
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │ L2PerfDataHeader (fixed header)                             │
+ * │  - ReadyQueue (FIFO, capacity=PLATFORM_PROF_READYQUEUE_SIZE)│
+ * │  - Metadata (num_cores, flags)                              │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ L2PerfBufferState[0] (Core 0)                               │
+ * │  - free_queue: SPSC queue of available buffer pointers      │
+ * │  - current_buf_ptr, current_buf_seq                         │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ L2PerfBufferState[1] (Core 1)                               │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ ...                                                         │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ L2PerfBufferState[num_cores-1]                              │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ AicpuPhaseHeader (optional, present when phase profiling)   │
+ * │  - magic, num_sched_threads, records_per_thread             │
+ * │  - orch_summary                                             │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ PhaseBufferState[thread0]                                   │
+ * │  - free_queue: SPSC queue of available buffer pointers      │
+ * │  - current_buf_ptr, current_buf_seq                         │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ PhaseBufferState[thread1]                                   │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ ...                                                         │
+ * └─────────────────────────────────────────────────────────────┘
  *
- * Buffer device pointers + total_tasks + AicpuPhaseHeader (with orch_summary
- * and core_to_thread) are consolidated in L2PerfSetupHeader. Host copies
- * L2PerfSetupHeader to device once before execution; AICPU reads pointers in
- * its profiling init. After execution, Host copies L2PerfSetupHeader back, then
- * does a two-step memcpy (header → count → records) on each L2PerfBuffer /
- * PhaseBuffer to reduce transfer to "actual records" instead of full
- * capacity.
+ * Actual L2PerfBuffer / PhaseBuffer are allocated dynamically by Host
+ * and pushed into the per-core/thread free_queue.
+ *
+ * Base size = sizeof(L2PerfDataHeader) + num_cores * sizeof(L2PerfBufferState)
+ * With phases = Base + sizeof(AicpuPhaseHeader) + num_threads * sizeof(PhaseBufferState)
  */
 
 #ifndef SRC_A5_PLATFORM_INCLUDE_COMMON_L2_PERF_PROFILING_H_
@@ -76,27 +98,138 @@ struct L2PerfRecord {
 static_assert(sizeof(L2PerfRecord) % 64 == 0, "L2PerfRecord must be 64-byte aligned for optimal cache performance");
 
 // =============================================================================
-// L2PerfBuffer - Record Buffer with Count-First Layout and WIP Staging Slots
+// L2PerfBuffer - Fixed-Size Record Buffer with WIP Staging Slots
 // =============================================================================
 
 /**
- * Performance record buffer (count-first + flexible array)
+ * Fixed-size performance record buffer
  *
- * Layout: 64B header (count + padding), then wip[2] staging slots,
- * then records[].
- * Actual allocation: sizeof(L2PerfBuffer) + capacity * sizeof(L2PerfRecord).
- *
- * Count-first enables two-step collection: Host copies sizeof(L2PerfBuffer) to
- * read count, then copies only count * sizeof(L2PerfRecord) of actual data.
+ * Capacity: PLATFORM_PROF_BUFFER_SIZE (defined in platform_config.h)
+ * Allocated dynamically by Host, pushed into per-core free_queue.
  *
  * WIP protocol: AICore writes timing to wip[reg_task_id & 1], AICPU copies
  * it into records[count] at completion. Dual-slot parity ensures no overlap.
  */
 struct L2PerfBuffer {
-    volatile uint32_t count;  // Current committed record count (at offset 0 for cache-line read)
-    uint32_t pad[15];         // Pad to 64B cache line boundary
-    L2PerfRecord wip[2];      // AICore WIP staging slots (index = reg_task_id & 1)
-    L2PerfRecord records[];   // Flexible array member (not counted in sizeof)
+    L2PerfRecord wip[2];                              // AICore WIP staging slots (index = reg_task_id & 1)
+    L2PerfRecord records[PLATFORM_PROF_BUFFER_SIZE];  // Committed records (AICPU writes)
+    volatile uint32_t count;                          // Current committed record count
+} __attribute__((aligned(64)));
+
+// =============================================================================
+// L2PerfFreeQueue - SPSC Lock-Free Queue for Free Buffers
+// =============================================================================
+
+/**
+ * Single Producer Single Consumer (SPSC) lock-free queue for free buffer management
+ *
+ * Producer: Host (ProfMemoryManager thread) pushes newly allocated buffers
+ * Consumer: Device (AICPU thread) pops buffers when switching
+ *
+ * Queue semantics:
+ * - Empty: head == tail
+ * - Full: (tail - head) >= PLATFORM_PROF_SLOT_COUNT
+ * - Capacity: PLATFORM_PROF_SLOT_COUNT buffers
+ *
+ * Memory ordering:
+ * - Device pop: rmb() → read tail → read buffer_ptrs[head % COUNT] → rmb() → write head → wmb()
+ * - Host push: write buffer_ptrs[tail % COUNT] → wmb() → write tail → wmb()
+ */
+struct L2PerfFreeQueue {
+    volatile uint64_t buffer_ptrs[PLATFORM_PROF_SLOT_COUNT];  // Free buffer addresses
+    volatile uint32_t head;                                   // Consumer read position (Device increments)
+    volatile uint32_t tail;                                   // Producer write position (Host increments)
+    uint32_t pad[22];                                         // Pad to 128 bytes (aligned to cache line)
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(L2PerfFreeQueue) == 128, "L2PerfFreeQueue must be 128 bytes for cache alignment");
+
+// =============================================================================
+// L2PerfBufferState - Per-Core/Thread Buffer State (Unified for L2PerfRecord and Phase)
+// =============================================================================
+
+/**
+ * Per-core or per-thread buffer state for dynamic profiling
+ *
+ * Contains:
+ * - free_queue: SPSC queue of available buffer addresses
+ * - current_buf_ptr: Currently active buffer being written (0 = no active buffer)
+ * - current_buf_seq: Monotonic sequence number for ordering
+ *
+ * Used in two contexts:
+ * - Per-core L2PerfRecord profiling (current_buf_ptr → L2PerfBuffer)
+ * - Per-thread Phase profiling (current_buf_ptr → PhaseBuffer)
+ *
+ * Writers:
+ * - free_queue.tail: Host writes (pushes new buffers)
+ * - free_queue.head: Device writes (pops buffers)
+ * - current_buf_ptr: Device writes (after pop), Host reads (for flush/collect)
+ * - current_buf_seq: Device writes (monotonic counter)
+ */
+struct L2PerfBufferState {
+    L2PerfFreeQueue free_queue;         // SPSC queue of free buffer addresses
+    volatile uint64_t current_buf_ptr;  // Current active buffer (0 = none)
+    volatile uint32_t current_buf_seq;  // Sequence number for ordering
+    uint32_t pad[13];                   // Pad to 192 bytes (aligned to cache line)
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(L2PerfBufferState) == 192, "L2PerfBufferState must be 192 bytes for cache alignment");
+
+// Type alias for semantic clarity in Phase profiling context
+using PhaseBufferState = L2PerfBufferState;  // Per-thread Phase profiling
+
+// =============================================================================
+// ReadyQueueEntry - Queue Entry for Ready Buffers
+// =============================================================================
+
+/**
+ * Ready queue entry
+ *
+ * When a buffer on a core/thread is full, AICPU adds this entry to the queue.
+ * Host memory manager retrieves entries from the queue.
+ *
+ * Entry types (distinguished by is_phase flag):
+ * - L2PerfRecord entry: core_index = core ID, is_phase = 0
+ * - Phase entry:      core_index = thread_idx, is_phase = 1
+ */
+struct ReadyQueueEntry {
+    uint32_t core_index;  // Core index (0 ~ num_cores-1), or thread_idx for phase entries
+    uint32_t is_phase;    // 0 = L2PerfRecord, 1 = Phase
+    uint64_t buffer_ptr;  // Device pointer to the full buffer
+    uint32_t buffer_seq;  // Sequence number for ordering
+    uint32_t pad;         // Alignment padding
+} __attribute__((aligned(32)));
+
+// =============================================================================
+// L2PerfDataHeader - Fixed Header
+// =============================================================================
+
+/**
+ * Performance data fixed header
+ *
+ * Located at the start of shared memory, contains:
+ * 1. Per-thread ready queues (FIFO Circular Buffers)
+ * 2. Metadata (core count)
+ *
+ * Ready queue design:
+ * - Per-thread queues: Avoid lock contention between AICPU threads
+ * - Capacity per queue: PLATFORM_PROF_READYQUEUE_SIZE (full capacity for each thread)
+ * - Implementation: Circular Buffer
+ * - Producer: AICPU thread (adds full buffers to its own queue)
+ * - Consumer: Host memory manager thread (reads from all queues)
+ * - Queue empty: head == tail
+ * - Queue full: (tail + 1) % capacity == head
+ */
+struct L2PerfDataHeader {
+    // Per-thread ready queues (FIFO Circular Buffers)
+    // Each AICPU thread has its own queue to avoid lock contention
+    ReadyQueueEntry queues[PLATFORM_MAX_AICPU_THREADS][PLATFORM_PROF_READYQUEUE_SIZE];
+    volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS];  // Consumer read positions (Host modifies)
+    volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // Producer write positions (AICPU modifies)
+
+    // Metadata (Host initializes, Device read-only)
+    uint32_t num_cores;             // Actual number of cores launched
+    volatile uint32_t total_tasks;  // Total tasks (AICPU writes after orchestration)
 } __attribute__((aligned(64)));
 
 // =============================================================================
@@ -171,23 +304,21 @@ struct AicpuOrchSummary {
 constexpr uint32_t AICPU_PHASE_MAGIC = 0x41435048;  // "ACPH"
 
 /**
- * Phase record buffer (count-first + flexible array)
+ * Fixed-size phase record buffer (analogous to L2PerfBuffer)
  *
  * Capacity: PLATFORM_PHASE_RECORDS_PER_THREAD
- * Actual allocation: 64 + capacity * sizeof(AicpuPhaseRecord).
+ * Allocated dynamically by Host, pushed into per-thread free_queue.
  */
 struct PhaseBuffer {
-    volatile uint32_t count;     // Current record count (at offset 0 for cache-line read)
-    uint32_t pad[15];            // Pad to 64B cache line boundary
-    AicpuPhaseRecord records[];  // Flexible array member
+    AicpuPhaseRecord records[PLATFORM_PHASE_RECORDS_PER_THREAD];
+    volatile uint32_t count;
 } __attribute__((aligned(64)));
 
 /**
  * AICPU phase profiling header
  *
- * Embedded in L2PerfSetupHeader. Contains the magic, per-thread metadata, the
- * core_id → scheduler thread mapping, and the orchestrator's cumulative
- * cycle summary.
+ * Located after the L2PerfBufferState array in shared memory.
+ * Contains metadata and per-thread tracking.
  */
 struct AicpuPhaseHeader {
     uint32_t magic;                             // Validation magic (AICPU_PHASE_MAGIC)
@@ -199,39 +330,6 @@ struct AicpuPhaseHeader {
 } __attribute__((aligned(64)));
 
 // =============================================================================
-// L2PerfSetupHeader - Host/Device Metadata Exchange
-// =============================================================================
-
-/**
- * Performance setup header
- *
- * Allocated on device by Host. Host writes buffer pointers and metadata,
- * then copies this struct to device once before execution. AICPU reads
- * buffer pointers during init. After execution completes, Host copies
- * this struct back to read total_tasks and phase_header.
- *
- * Memory layout: kernel_args.l2_perf_data_base points to this struct on
- * device (read by AICPU via get_platform_l2_perf_base()).
- */
-struct L2PerfSetupHeader {
-    // Host writes, AICPU reads (init)
-    uint32_t num_cores;          // Number of AICore instances
-    uint32_t num_phase_threads;  // Number of phase profiling threads
-    uint32_t pad0[14];           // Pad to 64B
-
-    // Host writes, AICPU reads: per-core / per-thread buffer device pointers
-    uint64_t core_buffer_ptrs[PLATFORM_MAX_CORES];           // L2PerfBuffer* on device
-    uint64_t phase_buffer_ptrs[PLATFORM_MAX_AICPU_THREADS];  // PhaseBuffer* on device
-
-    // AICPU writes, host reads back
-    volatile uint32_t total_tasks;  // Updated by orchestrator
-    uint32_t pad1[15];              // Pad to 64B
-
-    // AICPU writes, host reads back (via collect_all)
-    AicpuPhaseHeader phase_header;  // Contains orch_summary and core_to_thread
-} __attribute__((aligned(64)));
-
-// =============================================================================
 // Helper Functions - Memory Layout
 // =============================================================================
 
@@ -240,38 +338,92 @@ extern "C" {
 #endif
 
 /**
- * Get L2PerfSetupHeader pointer from base address
+ * Calculate total memory size for performance data (buffer states only, no buffers)
  *
- * @param base_ptr Device base address (kernel_args.l2_perf_data_base)
- * @return L2PerfSetupHeader pointer
+ * Formula: Total size = Fixed header + Dynamic tail
+ *                     = sizeof(L2PerfDataHeader) + num_cores × sizeof(L2PerfBufferState)
+ *
+ * @param num_cores Number of cores (block_dim × PLATFORM_CORES_PER_BLOCKDIM)
+ * @return Total bytes for header + buffer states
  */
-inline L2PerfSetupHeader *get_perf_setup_header(void *base_ptr) {
-    return reinterpret_cast<L2PerfSetupHeader *>(base_ptr);
+inline size_t calc_perf_data_size(int num_cores) {
+    return sizeof(L2PerfDataHeader) + num_cores * sizeof(L2PerfBufferState);
 }
 
 /**
- * Calculate L2PerfSetupHeader allocation size
+ * Get header pointer
+ *
+ * @param base_ptr Shared memory base address (device_ptr or host_ptr)
+ * @return L2PerfDataHeader pointer
  */
-inline size_t calc_l2_perf_setup_size() { return sizeof(L2PerfSetupHeader); }
+inline L2PerfDataHeader *get_l2_perf_header(void *base_ptr) { return reinterpret_cast<L2PerfDataHeader *>(base_ptr); }
 
 /**
- * Calculate total bytes for a L2PerfBuffer with the given capacity
+ * Get L2PerfBufferState array start address
  *
- * @param capacity Number of L2PerfRecord slots (e.g. PLATFORM_PROF_BUFFER_SIZE)
- * @return 64B header + capacity * sizeof(L2PerfRecord)
+ * @param base_ptr Shared memory base address
+ * @return L2PerfBufferState array pointer
  */
-inline size_t calc_l2_perf_buffer_size(int capacity) {
-    return sizeof(L2PerfBuffer) + static_cast<size_t>(capacity) * sizeof(L2PerfRecord);
+inline L2PerfBufferState *get_perf_buffer_states(void *base_ptr) {
+    return reinterpret_cast<L2PerfBufferState *>(reinterpret_cast<char *>(base_ptr) + sizeof(L2PerfDataHeader));
 }
 
 /**
- * Calculate total bytes for a PhaseBuffer with the given capacity
+ * Get L2PerfBufferState for specified core
  *
- * @param capacity Number of AicpuPhaseRecord slots (e.g. PLATFORM_PHASE_RECORDS_PER_THREAD)
- * @return 64B header + capacity * sizeof(AicpuPhaseRecord)
+ * @param base_ptr Shared memory base address
+ * @param core_index Core index (0 ~ num_cores-1)
+ * @return L2PerfBufferState pointer
  */
-inline size_t calc_phase_buffer_size(int capacity) {
-    return sizeof(PhaseBuffer) + static_cast<size_t>(capacity) * sizeof(AicpuPhaseRecord);
+inline L2PerfBufferState *get_perf_buffer_state(void *base_ptr, int core_index) {
+    return &get_perf_buffer_states(base_ptr)[core_index];
+}
+
+/**
+ * Calculate total memory size including phase profiling region (buffer states only)
+ *
+ * @param num_cores Number of AICore instances
+ * @param num_sched_threads Number of phase profiling threads (scheduler + orchestrator)
+ * @return Total bytes needed for header + all buffer states
+ */
+inline size_t calc_perf_data_size_with_phases(int num_cores, int num_sched_threads) {
+    return calc_perf_data_size(num_cores) + sizeof(AicpuPhaseHeader) + num_sched_threads * sizeof(PhaseBufferState);
+}
+
+/**
+ * Get AicpuPhaseHeader pointer (located after L2PerfBufferState array)
+ *
+ * @param base_ptr Shared memory base address
+ * @param num_cores Number of AICore instances
+ * @return AicpuPhaseHeader pointer
+ */
+inline AicpuPhaseHeader *get_phase_header(void *base_ptr, int num_cores) {
+    return reinterpret_cast<AicpuPhaseHeader *>(reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(num_cores));
+}
+
+/**
+ * Get PhaseBufferState array start address (located after AicpuPhaseHeader)
+ *
+ * @param base_ptr Shared memory base address
+ * @param num_cores Number of AICore instances
+ * @return PhaseBufferState array pointer
+ */
+inline PhaseBufferState *get_phase_buffer_states(void *base_ptr, int num_cores) {
+    return reinterpret_cast<PhaseBufferState *>(
+        reinterpret_cast<char *>(get_phase_header(base_ptr, num_cores)) + sizeof(AicpuPhaseHeader)
+    );
+}
+
+/**
+ * Get PhaseBufferState for specified thread
+ *
+ * @param base_ptr Shared memory base address
+ * @param num_cores Number of AICore instances
+ * @param thread_idx Thread index
+ * @return PhaseBufferState pointer
+ */
+inline PhaseBufferState *get_phase_buffer_state(void *base_ptr, int num_cores, int thread_idx) {
+    return &get_phase_buffer_states(base_ptr, num_cores)[thread_idx];
 }
 
 #ifdef __cplusplus

@@ -262,6 +262,17 @@ public:
     void print_handshake_results();
 
     /**
+     * Poll and collect performance data from the memory manager's queue
+     *
+     * Runs on a dedicated collector thread. Pulls ready buffers from
+     * ProfMemoryManager, copies records to host vectors, and notifies
+     * the manager to free old device buffers.
+     *
+     * @param expected_tasks Expected total number of tasks
+     */
+    void poll_and_collect_performance_data(int expected_tasks);
+
+    /**
      * Cleanup all resources
      *
      * Frees all device memory, destroys streams, and resets state.
@@ -462,14 +473,10 @@ private:
     /**
      * Initialize PMU profiling device buffers.
      *
-     * Allocates a PmuSetupHeader and one PmuBuffer per core on device, then
-     * publishes the setup-header pointer into kernel_args.pmu_data_base.
-     *
-     * @param num_aicore   Number of AICore instances to profile
-     * @param event_type   Resolved PmuEventType value
-     * @return 0 on success, error code on failure
+     * Allocates a PmuDataHeader and one PmuBuffer per core on device, then
+     * publishes the data-header pointer into kernel_args.pmu_data_base.
+     * Signature matches a2a3 for cross-platform consistency.
      */
-    int init_pmu(int num_aicore, PmuEventType event_type);
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use
@@ -481,6 +488,10 @@ private:
     std::string output_prefix_{};                                  // diagnostic artifact root directory
     int log_level_{1};                                             // 0=DEBUG..4=NUL; default INFO
     int log_info_v_{5};                                            // INFO verbosity threshold; default V5
+
+    int init_pmu_buffers(
+        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
+    );
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H

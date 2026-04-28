@@ -411,6 +411,10 @@ int DeviceRunner::run(
             LOG_ERROR("init_l2_perf_collection failed: %d", rc);
             return rc;
         }
+        // Start memory management thread (needs device context)
+        l2_perf_collector_.start_memory_manager([this](std::function<void()> fn) {
+            return create_thread(std::move(fn));
+        });
     }
 
     // Initialize tensor dump if enabled
@@ -420,14 +424,17 @@ int DeviceRunner::run(
             LOG_ERROR("init_tensor_dump failed: %d", rc);
             return rc;
         }
+        dump_collector_.start_memory_manager();
     }
 
-    // Initialize PMU profiling if enabled
     if (enable_pmu_) {
-        rc = init_pmu(num_aicore, pmu_event_type_);
+        rc = init_pmu_buffers(
+            num_aicore, launch_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id
+        );
         if (rc != 0) {
-            LOG_ERROR("init_pmu failed: %d", rc);
-            return rc;
+            LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
+            kernel_args_.args.pmu_data_base = 0;
+            enable_pmu_ = false;
         }
     }
 
@@ -474,9 +481,61 @@ int DeviceRunner::run(
         return rc;
     }
 
+    // Launch collector threads before synchronization.
+    // The enclosing scope ensures guards signal + join on any early return.
     {
+        std::thread collector_thread;
+        if (enable_l2_swimlane_) {
+            collector_thread = create_thread([this]() {
+                poll_and_collect_performance_data(0);  // auto-detect task count
+            });
+        }
+        auto perf_thread_guard = RAIIScopeGuard([&]() {
+            if (collector_thread.joinable()) {
+                collector_thread.join();
+            }
+        });
+        auto perf_signal_guard = RAIIScopeGuard([this]() {
+            if (enable_l2_swimlane_) {
+                l2_perf_collector_.signal_execution_complete();
+            }
+        });
+
+        std::thread dump_collector_thread;
+        if (enable_dump_tensor_) {
+            dump_collector_thread = create_thread([this]() {
+                dump_collector_.poll_and_collect(output_prefix_);
+            });
+        }
+        auto dump_thread_guard = RAIIScopeGuard([&]() {
+            if (dump_collector_thread.joinable()) {
+                dump_collector_thread.join();
+            }
+        });
+        auto dump_signal_guard = RAIIScopeGuard([this]() {
+            if (enable_dump_tensor_) {
+                dump_collector_.signal_execution_complete();
+            }
+        });
+
+        std::thread pmu_collector_thread;
+        if (enable_pmu_ && pmu_collector_.is_initialized()) {
+            pmu_collector_thread = create_thread([this]() {
+                pmu_collector_.poll_and_collect();
+            });
+        }
+        auto pmu_thread_guard = RAIIScopeGuard([&]() {
+            if (pmu_collector_thread.joinable()) {
+                pmu_collector_thread.join();
+            }
+        });
+        auto pmu_signal_guard = RAIIScopeGuard([&]() {
+            if (enable_pmu_ && pmu_collector_.is_initialized()) {
+                pmu_collector_.signal_execution_complete();
+            }
+        });
+
         LOG_INFO_V0("=== rtStreamSynchronize stream_aicpu_ ===");
-        // Synchronize streams
         rc = rtStreamSynchronize(stream_aicpu_);
         if (rc != 0) {
             LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
@@ -491,23 +550,27 @@ int DeviceRunner::run(
         }
     }
 
-    // After streams are synchronized, pull profiling data back in one batch
-    // (memcpy-based: two-step count-first copy per buffer). All three
-    // collectors write under `output_prefix_`, the per-task directory the
-    // user must set on CallConfig (CallConfig::validate() enforces non-empty).
+    // After streams are synchronized and guards have signal+joined all threads,
+    // stop memory managers, drain remaining buffers, and export.
+    // All three collectors write under `output_prefix_`, the per-task directory
+    // the user must set on CallConfig (CallConfig::validate() enforces non-empty).
     if (enable_l2_swimlane_) {
-        l2_perf_collector_.collect_all();
+        l2_perf_collector_.stop_memory_manager();
+        l2_perf_collector_.drain_remaining_buffers();
+        l2_perf_collector_.scan_remaining_perf_buffers();
+        l2_perf_collector_.collect_phase_data();
         l2_perf_collector_.export_swimlane_json(output_prefix_);
     }
 
     if (enable_dump_tensor_) {
-        dump_collector_.collect_all();
-        dump_collector_.export_dump_files(output_prefix_);
+        dump_collector_.stop_memory_manager();
+        dump_collector_.drain_remaining_buffers();
+        dump_collector_.scan_remaining_dump_buffers();
+        dump_collector_.export_dump_files();
     }
 
     if (enable_pmu_ && pmu_collector_.is_initialized()) {
-        pmu_collector_.collect_all();
-        pmu_collector_.export_csv(output_prefix_);
+        pmu_collector_.drain_remaining_buffers();
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -630,17 +693,26 @@ int DeviceRunner::finalize() {
 
     // Cleanup performance profiling (frees L2PerfSetupHeader + all per-core/per-thread buffers)
     if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.finalize();
+        auto free_cb = [](void *dev_ptr) -> int {
+            return rtFree(dev_ptr);
+        };
+        l2_perf_collector_.finalize(nullptr, free_cb);
     }
 
     // Cleanup tensor dump
     if (dump_collector_.is_initialized()) {
-        dump_collector_.finalize();
+        auto free_cb = [](void *dev_ptr) -> int {
+            return rtFree(dev_ptr);
+        };
+        dump_collector_.finalize(nullptr, free_cb);
     }
 
     // Cleanup PMU profiling
     if (pmu_collector_.is_initialized()) {
-        pmu_collector_.finalize();
+        auto free_cb = [](void *dev_ptr, void * /*user_data*/) -> int {
+            return rtFree(dev_ptr);
+        };
+        pmu_collector_.finalize(nullptr, free_cb, nullptr);
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
@@ -812,21 +884,16 @@ int DeviceRunner::init_l2_perf_collection(int num_aicore, int device_id) {
         return rtFree(dev_ptr);
     };
 
-    // Host->device and device->host copies via rtMemcpy
-    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size) -> int {
-        return rtMemcpy(dev_dst, size, host_src, size, RT_MEMCPY_HOST_TO_DEVICE);
-    };
-
-    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size) -> int {
-        return rtMemcpy(host_dst, size, dev_src, size, RT_MEMCPY_DEVICE_TO_HOST);
-    };
-
-    int rc = l2_perf_collector_.initialize(num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb);
+    int rc = l2_perf_collector_.initialize(num_aicore, device_id, alloc_cb, nullptr, free_cb);
     if (rc == 0) {
         kernel_args_.args.l2_perf_data_base =
             reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
     }
     return rc;
+}
+
+void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
+    l2_perf_collector_.poll_and_collect(expected_tasks);
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_id) {
@@ -843,42 +910,35 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
         return rtFree(dev_ptr);
     };
 
-    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size) -> int {
-        return rtMemcpy(dev_dst, size, host_src, size, RT_MEMCPY_HOST_TO_DEVICE);
+    auto set_device_cb = [](int dev_id) -> int {
+        return rtSetDevice(dev_id);
     };
 
-    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size) -> int {
-        return rtMemcpy(host_dst, size, dev_src, size, RT_MEMCPY_DEVICE_TO_HOST);
-    };
-
-    int rc =
-        dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb);
+    int rc = dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, nullptr, free_cb, set_device_cb);
     if (rc != 0) {
         return rc;
     }
 
-    kernel_args_.args.dump_data_base = reinterpret_cast<uint64_t>(dump_collector_.get_dump_setup_device_ptr());
+    kernel_args_.args.dump_data_base = reinterpret_cast<uint64_t>(dump_collector_.get_dump_shm_device_ptr());
     return 0;
 }
 
-int DeviceRunner::init_pmu(int num_aicore, PmuEventType event_type) {
-    auto alloc_cb = [](size_t size) -> void * {
+int DeviceRunner::init_pmu_buffers(
+    int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
+) {
+    auto alloc_cb = [](size_t size, void * /*user_data*/) -> void * {
         void *ptr = nullptr;
         int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
         return (rc == 0) ? ptr : nullptr;
     };
-    auto free_cb = [](void *dev_ptr) -> int {
+
+    auto free_cb = [](void *dev_ptr, void * /*user_data*/) -> int {
         return rtFree(dev_ptr);
     };
-    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size) -> int {
-        return rtMemcpy(dev_dst, size, host_src, size, RT_MEMCPY_HOST_TO_DEVICE);
-    };
-    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size) -> int {
-        return rtMemcpy(host_dst, size, dev_src, size, RT_MEMCPY_DEVICE_TO_HOST);
-    };
 
-    int rc = pmu_collector_.initialize(
-        num_aicore, event_type, &kernel_args_.args.pmu_data_base, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb
+    int rc = pmu_collector_.init(
+        num_cores, num_threads, &kernel_args_.args.pmu_data_base, csv_path, event_type, alloc_cb, free_cb, nullptr,
+        device_id
     );
     return rc;
 }

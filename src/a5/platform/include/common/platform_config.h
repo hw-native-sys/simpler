@@ -88,16 +88,43 @@ constexpr int PLATFORM_MAX_CORES_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD + PLAT
 constexpr int PLATFORM_MAX_CORES = PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BLOCKDIM;  // 108
 
 /**
- * Performance buffer capacity per core
- * Maximum number of L2PerfRecord entries per L2PerfBuffer.
- * Each core gets one L2PerfBuffer; when full, AICPU silently stops recording.
+ * Performance buffer capacity per buffer
+ * Number of L2PerfRecord entries per dynamically allocated L2PerfBuffer
  */
-constexpr int PLATFORM_PROF_BUFFER_SIZE = 10000;
+constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
+
+/**
+ * Number of buffer slots per core/thread for dynamic profiling
+ * Host dynamically allocates buffers and writes addresses into these slots.
+ * Device reads slot addresses when switching buffers.
+ * Using slots: provides full pipeline depth for buffer recycling.
+ * No runtime rtMalloc — all buffers are pre-allocated and recycled in a closed loop.
+ */
+constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
+
+/**
+ * L2PerfBuffer pre-allocation count per AICore.
+ * 1 goes into the free_queue at init, the rest into the recycled pool.
+ */
+constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
+
+/**
+ * PhaseBuffer pre-allocation count per AICPU thread.
+ * 1 goes into the free_queue at init, the rest into the recycled pool.
+ */
+constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
+
+/**
+ * Ready queue capacity for performance data collection
+ * Queue holds ReadyQueueEntry structs for buffers ready to be read by Host.
+ * Sized to match pre-allocation total across all cores and threads.
+ */
+constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
+    PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE + PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_BUFFERS_PER_THREAD;
 
 /**
  * Performance buffer capacity per AICPU thread
  * Maximum number of AicpuPhaseRecord entries per PhaseBuffer.
- * Each thread gets one PhaseBuffer; when full, records are silently dropped.
  */
 constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 500000;
 
@@ -106,6 +133,16 @@ constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 500000;
  * Used to convert timestamps to microseconds.
  */
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 1000000000;  // 1000 MHz
+
+/**
+ * Timeout duration for performance data collection (seconds)
+ */
+constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 30;
+
+/**
+ * Number of empty polling iterations before checking timeout
+ */
+constexpr int PLATFORM_PROF_EMPTY_POLLS_CHECK_NUM = 1000;
 
 inline double cycles_to_us(uint64_t cycles) {
     return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
@@ -126,21 +163,19 @@ inline double cycles_to_us(uint64_t cycles) {
 // =============================================================================
 
 /**
- * Number of TensorDumpRecord entries per DumpBuffer.
+ * Number of TensorDumpRecord entries per DumpMetaBuffer.
  * Each record is 128 bytes, so one buffer = RECORDS * 128 bytes.
  */
 constexpr int PLATFORM_DUMP_RECORDS_PER_BUFFER = 256;
 
 /**
- * Pre-allocated DumpBuffer count per AICPU scheduling thread.
- * Retained for configuration parity with A2A3; in the memcpy design
- * this controls arena sizing only (no SPSC free queues).
+ * Pre-allocated DumpMetaBuffer count per AICPU scheduling thread.
+ * Controls initial buffer supply and arena sizing.
  */
 constexpr int PLATFORM_DUMP_BUFFERS_PER_THREAD = 8;
 
 /**
  * SPSC free_queue slot count for dump metadata buffers.
- * Retained for configuration parity with A2A3.
  */
 constexpr int PLATFORM_DUMP_SLOT_COUNT = 4;
 
@@ -149,7 +184,7 @@ constexpr int PLATFORM_DUMP_SLOT_COUNT = 4;
  * Used together with BUFFERS_PER_THREAD and RECORDS_PER_BUFFER to compute
  * per-thread arena size:
  *   arena = BUFFERS_PER_THREAD * RECORDS_PER_BUFFER * AVG_TENSOR_BYTES
- * Default: 4 * 256 * 65536 = 64 MB per thread.
+ * Default: 8 * 256 * 65536 = 128 MB per thread.
  */
 constexpr uint64_t PLATFORM_DUMP_AVG_TENSOR_BYTES = 65536;
 
@@ -159,14 +194,12 @@ constexpr uint64_t PLATFORM_DUMP_AVG_TENSOR_BYTES = 65536;
 constexpr int PLATFORM_DUMP_MAX_DIMS = 5;
 
 /**
- * Ready queue capacity for dump data.
- * Retained for configuration parity with A2A3.
+ * Ready queue capacity for dump data per AICPU thread.
  */
 constexpr int PLATFORM_DUMP_READYQUEUE_SIZE = PLATFORM_MAX_AICPU_THREADS * PLATFORM_DUMP_BUFFERS_PER_THREAD * 2;
 
 /**
- * Idle timeout duration for tensor dump collection (seconds)
- * Retained for configuration parity with A2A3.
+ * Idle timeout duration for tensor dump collection (seconds).
  */
 constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 
@@ -176,14 +209,26 @@ constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 
 /**
  * Number of PmuRecord entries per PmuBuffer.
- * A5 uses a single pre-allocated PmuBuffer per core (no SPSC free-queue
- * streaming — device memory is drained via rtMemcpy after stream sync).
- * Tasks past this count are dropped and counted in the buffer header.
  */
-constexpr int PLATFORM_PMU_RECORDS_PER_BUFFER = 4096;
+constexpr int PLATFORM_PMU_RECORDS_PER_BUFFER = 512;
 
 /**
- * Idle timeout duration for PMU collection (seconds)
+ * SPSC free-queue slot count per core (Host pushes, AICPU pops).
+ */
+constexpr int PLATFORM_PMU_SLOT_COUNT = 4;
+
+/**
+ * Number of PmuBuffers pre-allocated per core (initial pool size).
+ */
+constexpr int PLATFORM_PMU_BUFFERS_PER_CORE = 4;
+
+/**
+ * Ready queue capacity for PMU data per AICPU thread.
+ */
+constexpr int PLATFORM_PMU_READYQUEUE_SIZE = PLATFORM_MAX_CORES * PLATFORM_PMU_BUFFERS_PER_CORE;
+
+/**
+ * Idle timeout duration for PMU collection (seconds).
  */
 constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
 
@@ -201,9 +246,6 @@ constexpr uint32_t AICORE_EXIT_SIGNAL = 0x7FFFFFF0;
 
 // Physical core ID mask for get_coreid()
 constexpr uint32_t AICORE_COREID_MASK = 0x0FFF;
-
-// DAV_3510 hardware counter count.
-constexpr int PMU_COUNTER_COUNT_A5 = 10;
 
 // PMU MMIO register offsets (DAV_3510 / a5). Values ported from pypto
 // aicore_prof_dav3510_pmu.h. Accessed by AICPU through the per-core PMU
