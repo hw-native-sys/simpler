@@ -425,9 +425,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             void *sm_ptr = runtime->get_pto2_gm_sm_ptr();
             void *gm_heap = runtime->get_pto2_gm_heap_ptr();
 
-            uint64_t sm_size = pto2_sm_calculate_size(task_window_size);
+            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
             PTO2SharedMemoryHandle *sm_handle =
-                pto2_sm_create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
+                PTO2SharedMemoryHandle::create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
             if (!sm_handle) {
                 DEV_ERROR("Thread %d: Failed to create shared memory handle", thread_idx);
                 // Unblock scheduler threads before returning so they don't spin forever.
@@ -438,7 +438,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
             if (!rt) {
                 DEV_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
-                pto2_sm_destroy(sm_handle);
+                sm_handle->destroy();
                 // Unblock scheduler threads before returning so they don't spin forever.
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;

@@ -151,7 +151,7 @@ PTO2Runtime *pto2_runtime_create_custom(
  * Does not allocate sm_handle or gm_heap; caller owns them.
  *
  * @param mode      Execution mode
- * @param sm_handle Pre-created shared memory handle (e.g. from pto2_sm_create_from_buffer)
+ * @param sm_handle Pre-created shared memory handle (e.g. from PTO2SharedMemoryHandle::create_from_buffer)
  * @param gm_heap   GM heap base for output buffers (or NULL if not used)
  * @param heap_size GM heap size in bytes
  * @return Runtime context, or NULL on failure

@@ -266,7 +266,7 @@ PTO2Runtime *pto2_runtime_create_custom(
 
     rt->ops = &s_runtime_ops;
     rt->mode = mode;
-    rt->sm_handle = pto2_sm_create(task_window_size, heap_size);
+    rt->sm_handle = PTO2SharedMemoryHandle::create(task_window_size, heap_size);
     if (!rt->sm_handle) {
         free(rt);
         return NULL;
@@ -277,14 +277,14 @@ PTO2Runtime *pto2_runtime_create_custom(
     rt->gm_heap_size = total_heap_size;
 #if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
     if (posix_memalign(&rt->gm_heap, PTO2_ALIGN_SIZE, total_heap_size) != 0) {
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
         free(rt);
         return NULL;
     }
 #else
     rt->gm_heap = aligned_alloc(PTO2_ALIGN_SIZE, total_heap_size);
     if (!rt->gm_heap) {
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
         free(rt);
         return NULL;
     }
@@ -294,7 +294,7 @@ PTO2Runtime *pto2_runtime_create_custom(
     // Initialize orchestrator
     if (!pto2_orchestrator_init(&rt->orchestrator, rt->sm_handle->header, rt->gm_heap, heap_size, dep_pool_capacity)) {
         free(rt->gm_heap);
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
         free(rt);
         return NULL;
     }
@@ -303,7 +303,7 @@ PTO2Runtime *pto2_runtime_create_custom(
     if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle->header, dep_pool_capacity)) {
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt->gm_heap);
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
         free(rt);
         return NULL;
     }
@@ -316,7 +316,7 @@ PTO2Runtime *pto2_runtime_create_custom(
         pto2_scheduler_destroy(&rt->scheduler);
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt->gm_heap);
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
         free(rt);
         return NULL;
     }
@@ -378,7 +378,7 @@ void pto2_runtime_destroy(PTO2Runtime *rt) {
     }
 
     if (rt->sm_handle) {
-        pto2_sm_destroy(rt->sm_handle);
+        rt->sm_handle->destroy();
     }
 
     free(rt);

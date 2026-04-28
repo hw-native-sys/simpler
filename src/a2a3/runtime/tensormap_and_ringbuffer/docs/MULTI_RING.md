@@ -93,7 +93,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     uint64_t heap_size;
     uint64_t task_descriptors_offset;
 
-    // Per-ring data pointers (host-side, set by pto2_sm_setup_pointers)
+    // Per-ring data pointers (host-side, set by setup_pointers)
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;

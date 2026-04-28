@@ -268,7 +268,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
 
     // Allocate PTO2 shared memory
     int64_t t_sm_start = _now_ms();
-    uint64_t sm_size = pto2_sm_calculate_size(eff_task_window_size);
+    uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(eff_task_window_size);
     void *sm_ptr = runtime->host_api.device_malloc(sm_size);
     int64_t t_sm_end = _now_ms();
     if (sm_ptr == nullptr) {
