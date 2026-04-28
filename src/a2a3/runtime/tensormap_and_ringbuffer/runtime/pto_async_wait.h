@@ -28,11 +28,11 @@ struct PTO2CompletionStats;
 inline constexpr int32_t PTO2_MAX_ASYNC_WAITS = 64;
 inline constexpr int32_t PTO2_MAX_PENDING_COMPLETIONS = 128;
 
-inline uintptr_t pto2_completion_ingress_cache_line(const volatile void *addr) {
+inline uintptr_t completion_ingress_cache_line(const volatile void *addr) {
     return reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
 }
 
-inline void pto2_completion_ingress_invalidate_entries(
+inline void completion_ingress_invalidate_entries(
     volatile PTO2CompletionIngressQueue *completion_ingress, uint64_t tail, uint64_t head
 ) {
     uint64_t active_count = head - tail;
@@ -59,7 +59,7 @@ inline void pto2_completion_ingress_invalidate_entries(
     );
 }
 
-inline bool pto2_completion_ingress_has_pending(volatile PTO2CompletionIngressQueue *completion_ingress) {
+inline bool completion_ingress_has_pending(volatile PTO2CompletionIngressQueue *completion_ingress) {
     if (completion_ingress == nullptr) return false;
     cache_invalidate_range(
         const_cast<const void *>(reinterpret_cast<volatile void *>(&completion_ingress->head)),
@@ -173,7 +173,7 @@ struct PTO2AsyncWaitList {
             );
             uint64_t head_snapshot = __atomic_load_n(&completion_ingress->head, __ATOMIC_ACQUIRE);
             if (tail >= head_snapshot) break;
-            pto2_completion_ingress_invalidate_entries(completion_ingress, tail, head_snapshot);
+            completion_ingress_invalidate_entries(completion_ingress, tail, head_snapshot);
 
             while (tail < head_snapshot) {
                 volatile PTO2CompletionIngressEntry *slot =
@@ -327,7 +327,7 @@ struct PTO2AsyncWaitList {
             volatile PTO2DeferredCompletionEntry *deferred = &ingress->entries[i];
             volatile uint32_t *counter = reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(deferred->addr));
             cache_invalidate_range(
-                reinterpret_cast<const void *>(pto2_completion_ingress_cache_line(counter)), sizeof(uint32_t)
+                reinterpret_cast<const void *>(completion_ingress_cache_line(counter)), sizeof(uint32_t)
             );
             if (!append_condition_locked(
                     *entry, deferred->addr, deferred->expected_value, static_cast<PTO2AsyncEngine>(deferred->engine),

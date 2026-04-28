@@ -1024,7 +1024,7 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
             PTO2CompletionCondition &cond = entry.conditions[c];
             if (cond.satisfied) continue;
             if (cond.counter_addr) {
-                uintptr_t counter_line = pto2_completion_ingress_cache_line(cond.counter_addr);
+                uintptr_t counter_line = completion_ingress_cache_line(cond.counter_addr);
                 if (counter_line != last_invalidated_counter_line) {
                     cache_invalidate_range(reinterpret_cast<const void *>(counter_line), sizeof(uint32_t));
                     last_invalidated_counter_line = counter_line;
