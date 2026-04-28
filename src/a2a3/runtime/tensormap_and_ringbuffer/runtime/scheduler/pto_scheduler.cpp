@@ -42,7 +42,7 @@ uint64_t g_sched_self_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_pop_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_complete_count[PLATFORM_MAX_AICPU_THREADS] = {};
 
-PTO2SchedProfilingData pto2_scheduler_get_profiling(int thread_idx) {
+PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
     PTO2SchedProfilingData d;
     d.lock_cycle = std::exchange(g_sched_lock_cycle[thread_idx], 0);
     d.fanout_cycle = std::exchange(g_sched_fanout_cycle[thread_idx], 0);
@@ -138,7 +138,8 @@ bool PTO2SchedulerState::RingSchedState::init(PTO2SharedMemoryHeader *sm_header,
 
 void PTO2SchedulerState::RingSchedState::destroy() { ring = nullptr; }
 
-bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHeader *sm_header, int32_t dep_pool_capacity) {
+bool PTO2SchedulerState::init(PTO2SharedMemoryHeader *sm_header, int32_t dep_pool_capacity) {
+    PTO2SchedulerState *sched = this;
     sched->sm_header = sm_header;
 #if PTO2_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
@@ -209,7 +210,8 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHeader *sm_h
     return true;
 }
 
-void pto2_scheduler_destroy(PTO2SchedulerState *sched) {
+void PTO2SchedulerState::destroy() {
+    PTO2SchedulerState *sched = this;
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         sched->ring_sched_states[r].destroy();
         free(sched->ring_sched_states[r].dep_pool.base);
@@ -227,7 +229,8 @@ void pto2_scheduler_destroy(PTO2SchedulerState *sched) {
 // Debug Utilities
 // =============================================================================
 
-void pto2_scheduler_print_stats(PTO2SchedulerState *sched) {
+void PTO2SchedulerState::print_stats() {
+    PTO2SchedulerState *sched = this;
     LOG_INFO("=== Scheduler Statistics ===");
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         if (sched->ring_sched_states[r].last_task_alive > 0) {
@@ -249,7 +252,8 @@ void pto2_scheduler_print_stats(PTO2SchedulerState *sched) {
     LOG_INFO("============================");
 }
 
-void pto2_scheduler_print_queues(PTO2SchedulerState *sched) {
+void PTO2SchedulerState::print_queues() {
+    PTO2SchedulerState *sched = this;
     LOG_INFO("=== Ready Queues ===");
 
     const char *shape_names[] = {"AIC", "AIV", "MIX"};

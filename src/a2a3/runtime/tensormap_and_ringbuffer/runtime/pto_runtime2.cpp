@@ -300,7 +300,7 @@ PTO2Runtime *pto2_runtime_create_custom(
     }
 
     // Initialize scheduler (heap_size = per-ring heap size)
-    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle->header, dep_pool_capacity)) {
+    if (!rt->scheduler.init(rt->sm_handle->header, dep_pool_capacity)) {
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt->gm_heap);
         rt->sm_handle->destroy();
@@ -313,7 +313,7 @@ PTO2Runtime *pto2_runtime_create_custom(
 
     rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
     if (!rt->completion_ingress) {
-        pto2_scheduler_destroy(&rt->scheduler);
+        rt->scheduler.destroy();
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt->gm_heap);
         rt->sm_handle->destroy();
@@ -346,7 +346,7 @@ PTO2Runtime *pto2_runtime_create_from_sm(
     }
 
     // Initialize scheduler (heap_size = per-ring heap size)
-    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle->header, dep_pool_capacity)) {
+    if (!rt->scheduler.init(rt->sm_handle->header, dep_pool_capacity)) {
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt);
         return NULL;
@@ -356,7 +356,7 @@ PTO2Runtime *pto2_runtime_create_from_sm(
 
     rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
     if (!rt->completion_ingress) {
-        pto2_scheduler_destroy(&rt->scheduler);
+        rt->scheduler.destroy();
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt);
         return NULL;
@@ -368,7 +368,7 @@ PTO2Runtime *pto2_runtime_create_from_sm(
 void pto2_runtime_destroy(PTO2Runtime *rt) {
     if (!rt) return;
 
-    pto2_scheduler_destroy(&rt->scheduler);
+    rt->scheduler.destroy();
     pto2_orchestrator_destroy(&rt->orchestrator);
 
     free(rt->completion_ingress);

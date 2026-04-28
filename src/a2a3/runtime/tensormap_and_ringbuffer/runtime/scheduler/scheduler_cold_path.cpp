@@ -201,7 +201,7 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
 
 #if PTO2_SCHED_PROFILING
     {
-        PTO2SchedProfilingData sp = pto2_scheduler_get_profiling(thread_idx);
+        PTO2SchedProfilingData sp = scheduler_get_profiling(thread_idx);
         uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle + sp.self_consumed_cycle;
         uint64_t complete_poll = (l2_perf.sched_complete_cycle > otc_total + l2_perf.sched_complete_perf_cycle) ?
                                      (l2_perf.sched_complete_cycle - otc_total - l2_perf.sched_complete_perf_cycle) :

@@ -985,16 +985,16 @@ struct PTO2SchedulerState {
 #endif
         return payload->fanin_actual_count;
     }
+
+    // === Cold-path API (defined in pto_scheduler.cpp) ===
+    bool init(PTO2SharedMemoryHeader *sm_header, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    void destroy();
+    void print_stats();
+    void print_queues();
 };
 
-// =============================================================================
-// Scheduler API (cold path, defined in pto_scheduler.cpp)
-// =============================================================================
-
-bool pto2_scheduler_init(
-    PTO2SchedulerState *sched, PTO2SharedMemoryHeader *sm_header, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
-);
-void pto2_scheduler_destroy(PTO2SchedulerState *sched);
+// Scheduler cold-path API is declared as PTO2SchedulerState member functions.
+// See init()/destroy()/print_stats()/print_queues() below the struct definition.
 
 template <bool Profiling>
 inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
@@ -1072,8 +1072,6 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
 // Debug Utilities (cold path, defined in pto_scheduler.cpp)
 // =============================================================================
 
-void pto2_scheduler_print_stats(PTO2SchedulerState *sched);
-void pto2_scheduler_print_queues(PTO2SchedulerState *sched);
 const char *task_state_name(PTO2TaskState state);
 
 // =============================================================================
@@ -1107,5 +1105,5 @@ struct PTO2SchedProfilingData {
  * Get and reset scheduler profiling data for a specific thread.
  * Returns accumulated profiling data and resets counters.
  */
-PTO2SchedProfilingData pto2_scheduler_get_profiling(int thread_idx);
+PTO2SchedProfilingData scheduler_get_profiling(int thread_idx);
 #endif
