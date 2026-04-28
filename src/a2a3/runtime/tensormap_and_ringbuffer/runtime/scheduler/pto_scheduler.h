@@ -665,14 +665,14 @@ struct PTO2SchedulerState {
         if (wfanin != 0) {
             int32_t early_finished = 0;
             pto2_for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-                pto2_fanout_lock(*producer);
+                producer->lock_fanout();
                 int32_t pstate = producer->task_state.load(std::memory_order_acquire);
                 if (pstate >= PTO2_TASK_COMPLETED) {
                     early_finished++;
                 } else {
                     producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
                 }
-                pto2_fanout_unlock(*producer);
+                producer->unlock_fanout();
             });
 
             int32_t init_rc = early_finished + 1;
@@ -902,13 +902,13 @@ struct PTO2SchedulerState {
 #endif
 
 #if PTO2_SCHED_PROFILING
-        pto2_fanout_lock(slot_state, lock_atomics, lock_wait);
+        slot_state.lock_fanout(lock_atomics, lock_wait);
 #else
-        pto2_fanout_lock(slot_state);
+        slot_state.lock_fanout();
 #endif
         slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
         PTO2DepListEntry *current = slot_state.fanout_head;  // Protected by fanout_lock
-        pto2_fanout_unlock(slot_state);
+        slot_state.unlock_fanout();
 
 #if PTO2_SCHED_PROFILING
         lock_atomics += 2;  // state.store + unlock.store
@@ -1081,7 +1081,7 @@ const char *task_state_name(PTO2TaskState state);
 #if PTO2_SCHED_PROFILING
 struct PTO2SchedProfilingData {
     // Sub-phase cycle breakdown within on_mixed_task_complete
-    uint64_t lock_cycle;           // pto2_fanout_lock + state store + unlock
+    uint64_t lock_cycle;           // lock_fanout + state store + unlock
     uint64_t fanout_cycle;         // fanout traversal
     uint64_t fanin_cycle;          // fanin traversal
     uint64_t self_consumed_cycle;  // self check_and_handle_consumed
