@@ -65,7 +65,7 @@ PTO2SchedProfilingData pto2_scheduler_get_profiling(int thread_idx) {
 // Task State Names
 // =============================================================================
 
-const char *pto2_task_state_name(PTO2TaskState state) {
+const char *task_state_name(PTO2TaskState state) {
     switch (state) {
     case PTO2_TASK_PENDING:
         return "PENDING";
@@ -130,7 +130,7 @@ bool PTO2SchedulerState::RingSchedState::init(PTO2SharedMemoryHeader *sm_header,
         ring->slot_states[i].bind(&ring->task_payloads[i], &ring->task_descriptors[i], static_cast<uint8_t>(ring_id));
         ring->slot_states[i].reset_for_reuse();
         ring->slot_states[i].fanin_count = 0;
-        ring->slot_states[i].active_mask = 0;
+        ring->slot_states[i].active_mask = ActiveMask{};
     }
 
     return true;

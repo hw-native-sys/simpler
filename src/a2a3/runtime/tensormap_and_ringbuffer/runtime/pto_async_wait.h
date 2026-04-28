@@ -123,7 +123,7 @@ struct PTO2AsyncPollResult {
     PTO2TaskSlotState *failed_slot_state{nullptr};
 };
 
-inline const char *pto2_async_engine_name(PTO2AsyncEngine engine) {
+inline const char *async_engine_name(PTO2AsyncEngine engine) {
     switch (engine) {
     case PTO2_ASYNC_ENGINE_SDMA:
         return "SDMA";

@@ -88,7 +88,7 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
 
     int32_t orch_error_code = host_header->orch_error_code.load(std::memory_order_relaxed);
     int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
-    return pto2_runtime_status_from_error_codes(orch_error_code, sched_error_code);
+    return runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
 /**

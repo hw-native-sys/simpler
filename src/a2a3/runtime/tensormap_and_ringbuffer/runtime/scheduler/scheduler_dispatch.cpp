@@ -185,22 +185,22 @@ void SchedulerContext::dispatch_mix_block_to_cluster(
     Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
-    uint8_t core_mask = pto2_core_mask(slot_state.active_mask);
-    if (core_mask & PTO2_SUBTASK_MASK_AIC) {
+    uint8_t cmask = slot_state.active_mask.core_mask();
+    if (cmask & PTO2_SUBTASK_MASK_AIC) {
         bool aic_to_pending = to_pending && !tracker.is_aic_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC,
             aic_to_pending
         );
     }
-    if (core_mask & PTO2_SUBTASK_MASK_AIV0) {
+    if (cmask & PTO2_SUBTASK_MASK_AIV0) {
         bool aiv0_to_pending = to_pending && !tracker.is_aiv0_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0,
             aiv0_to_pending
         );
     }
-    if (core_mask & PTO2_SUBTASK_MASK_AIV1) {
+    if (cmask & PTO2_SUBTASK_MASK_AIV1) {
         bool aiv1_to_pending = to_pending && !tracker.is_aiv1_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1,
@@ -217,8 +217,8 @@ void SchedulerContext::dispatch_block(
     if (is_dump_tensor_enabled()) {
         dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
             thread_idx, slot_state, TensorDumpStage::BEFORE_DISPATCH,
-            [](uint8_t active_mask, uint8_t raw_subtask_id) {
-                return pto2_subtask_active(active_mask, static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+            [](ActiveMask active_mask, int raw_subtask_id) {
+                return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
             },
             [this](int32_t func_id) {
                 return get_function_bin_addr(func_id);
@@ -234,7 +234,7 @@ void SchedulerContext::dispatch_block(
         dispatch_subtask_to_core(runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending);
     }
 #if PTO2_PROFILING
-    sched_l2_perf_[thread_idx].phase_dispatch_count += __builtin_popcount(pto2_core_mask(slot_state.active_mask));
+    sched_l2_perf_[thread_idx].phase_dispatch_count += __builtin_popcount(slot_state.active_mask.core_mask());
 #endif
 }
 
@@ -261,7 +261,7 @@ void SchedulerContext::dispatch_shape(
         for (int bi = 0; bi < got; bi++) {
             PTO2TaskSlotState *slot_state = batch[bi];
 
-            if (pto2_requires_sync_start(slot_state->active_mask)) {
+            if (slot_state->active_mask.requires_sync_start()) {
                 if (is_pending) {
                     sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
                     continue;

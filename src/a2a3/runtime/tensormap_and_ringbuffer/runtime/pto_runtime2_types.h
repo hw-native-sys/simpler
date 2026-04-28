@@ -343,7 +343,7 @@ struct alignas(64) PTO2TaskSlotState {
     PTO2TaskDescriptor *task;
 
     // --- Set per-submit (depend on task inputs) ---
-    uint8_t active_mask;       // Bitmask of active subtask slots (set once)
+    ActiveMask active_mask;    // Bitmask of active subtask slots (set once)
     uint8_t ring_id;           // Ring layer (immutable after init)
     int32_t dep_pool_mark{0};  // Dep pool top after wiring (thread-0-only)
 

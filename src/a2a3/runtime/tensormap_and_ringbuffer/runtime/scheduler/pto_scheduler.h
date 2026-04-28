@@ -678,11 +678,11 @@ struct PTO2SchedulerState {
             int32_t init_rc = early_finished + 1;
             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
             if (new_rc >= ws->fanin_count) {
-                ready_queues[static_cast<int32_t>(pto2_active_mask_to_shape(ws->active_mask))].push(ws);
+                ready_queues[static_cast<int32_t>(ws->active_mask.to_shape())].push(ws);
             }
         } else {
             ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-            ready_queues[static_cast<int32_t>(pto2_active_mask_to_shape(ws->active_mask))].push(ws);
+            ready_queues[static_cast<int32_t>(ws->active_mask.to_shape())].push(ws);
         }
 
         ws->dep_pool_mark = rss.dep_pool.top;
@@ -773,7 +773,7 @@ struct PTO2SchedulerState {
         if (new_refcount == slot_state.fanin_count) {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
-            PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
+            PTO2ResourceShape shape = slot_state.active_mask.to_shape();
             if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
             }
@@ -797,7 +797,7 @@ struct PTO2SchedulerState {
                 )) {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
                 // Local-first: try per-CoreType thread-local buffer before global queue
-                PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
+                PTO2ResourceShape shape = slot_state.active_mask.to_shape();
                 if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                     ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
                 }
@@ -1072,7 +1072,7 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
 
 void pto2_scheduler_print_stats(PTO2SchedulerState *sched);
 void pto2_scheduler_print_queues(PTO2SchedulerState *sched);
-const char *pto2_task_state_name(PTO2TaskState state);
+const char *task_state_name(PTO2TaskState state);
 
 // =============================================================================
 // Scheduler Profiling Data

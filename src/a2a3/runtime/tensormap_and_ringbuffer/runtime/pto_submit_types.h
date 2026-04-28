@@ -37,43 +37,12 @@ enum class PTO2SubtaskSlot : uint8_t {
 };
 
 /**
- * Subtask mask bits (for active_mask)
+ * Subtask mask bits (for ActiveMask)
  */
 inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC = (1u << 0);         // 0x1
 inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV0 = (1u << 1);        // 0x2
 inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV1 = (1u << 2);        // 0x4
 inline constexpr uint8_t PTO2_SUBTASK_FLAG_SYNC_START = (1u << 3);  // 0x8: all blocks must launch atomically
-
-/**
- * Test whether a subtask slot is active in a given mask
- */
-static inline bool pto2_subtask_active(uint8_t mask, PTO2SubtaskSlot slot) {
-    return (mask & (1u << static_cast<uint8_t>(slot))) != 0;
-}
-
-/**
- * Extract only the core bits from active_mask (strips flag bits).
- */
-static inline uint8_t pto2_core_mask(uint8_t active_mask) { return active_mask & 0x07u; }
-
-/**
- * Check whether a task requires all blocks to be launched atomically.
- */
-static inline bool pto2_requires_sync_start(uint8_t active_mask) {
-    return (active_mask & PTO2_SUBTASK_FLAG_SYNC_START) != 0;
-}
-
-/**
- * Mixed-task submit contract.
- *
- * Each field holds either a valid kernel ID or INVALID_KERNEL_ID (inactive).
- * At least one slot must be valid.
- */
-struct MixedKernels {
-    int32_t aic_kernel_id{INVALID_KERNEL_ID};
-    int32_t aiv0_kernel_id{INVALID_KERNEL_ID};
-    int32_t aiv1_kernel_id{INVALID_KERNEL_ID};
-};
 
 /**
  * Resource shape — classifies a MixedKernels into one of 3 scheduling buckets.
@@ -92,27 +61,70 @@ enum class PTO2ResourceShape : uint8_t {
 inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 3;
 
 /**
- * Derive resource shape from active_mask.
- * Caller must ensure active_mask is valid (at least one bit set).
+ * Bitmask of active subtask slots + flags, sizeof == 1.
  */
-static inline PTO2ResourceShape pto2_active_mask_to_shape(uint8_t active_mask) {
-    uint8_t core_mask = pto2_core_mask(active_mask);
-    int bit_count = __builtin_popcount(core_mask);
-    if (bit_count >= 2) return PTO2ResourceShape::MIX;
-    if (core_mask & PTO2_SUBTASK_MASK_AIC) return PTO2ResourceShape::AIC;
-    return PTO2ResourceShape::AIV;
-}
+class ActiveMask {
+public:
+    constexpr ActiveMask() = default;
+    constexpr explicit ActiveMask(uint8_t raw) :
+        raw_(raw) {}
+
+    uint8_t raw() const { return raw_; }
+
+    bool subtask_active(PTO2SubtaskSlot slot) const { return (raw_ & (1u << static_cast<uint8_t>(slot))) != 0; }
+
+    uint8_t core_mask() const { return raw_ & 0x07u; }
+
+    bool requires_sync_start() const { return (raw_ & PTO2_SUBTASK_FLAG_SYNC_START) != 0; }
+
+    PTO2ResourceShape to_shape() const {
+        uint8_t cmask = core_mask();
+        int bit_count = __builtin_popcount(cmask);
+        if (bit_count >= 2) return PTO2ResourceShape::MIX;
+        if (cmask & PTO2_SUBTASK_MASK_AIC) return PTO2ResourceShape::AIC;
+        return PTO2ResourceShape::AIV;
+    }
+
+    void set_sync_start() { raw_ |= PTO2_SUBTASK_FLAG_SYNC_START; }
+
+    bool operator==(ActiveMask other) const { return raw_ == other.raw_; }
+    bool operator!=(ActiveMask other) const { return raw_ != other.raw_; }
+
+    ActiveMask operator|(ActiveMask other) const { return ActiveMask(raw_ | other.raw_); }
+    ActiveMask &operator|=(ActiveMask other) {
+        raw_ |= other.raw_;
+        return *this;
+    }
+
+    uint8_t operator&(uint8_t mask) const { return raw_ & mask; }
+
+    explicit operator bool() const { return raw_ != 0; }
+
+private:
+    uint8_t raw_{0};
+};
+
+static_assert(sizeof(ActiveMask) == 1, "ActiveMask must be exactly 1 byte");
 
 /**
- * Compute active_mask from MixedKernels.
+ * Mixed-task submit contract.
+ *
+ * Each field holds either a valid kernel ID or INVALID_KERNEL_ID (inactive).
+ * At least one slot must be valid.
  */
-static inline uint8_t pto2_mixed_kernels_to_active_mask(const MixedKernels &mk) {
-    uint8_t mask = 0;
-    if (mk.aic_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIC;
-    if (mk.aiv0_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIV0;
-    if (mk.aiv1_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIV1;
-    return mask;
-}
+struct MixedKernels {
+    int32_t aic_kernel_id{INVALID_KERNEL_ID};
+    int32_t aiv0_kernel_id{INVALID_KERNEL_ID};
+    int32_t aiv1_kernel_id{INVALID_KERNEL_ID};
+
+    ActiveMask to_active_mask() const {
+        uint8_t mask = 0;
+        if (aic_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIC;
+        if (aiv0_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIV0;
+        if (aiv1_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIV1;
+        return ActiveMask(mask);
+    }
+};
 
 /**
  * SPMD launch parameters carried inside Arg.

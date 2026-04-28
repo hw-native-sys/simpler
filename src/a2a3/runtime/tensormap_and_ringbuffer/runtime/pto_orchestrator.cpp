@@ -300,7 +300,8 @@ static void pto2_prefetch_payload(PTO2TaskPayload *payload, int32_t tensor_count
 }
 
 static bool pto2_prepare_task(
-    PTO2OrchestratorState *orch, const Arg &args, int32_t total_output_size, uint8_t active_mask, PTO2PreparedTask *out
+    PTO2OrchestratorState *orch, const Arg &args, int32_t total_output_size, ActiveMask active_mask,
+    PTO2PreparedTask *out
 ) {
     uint8_t ring_id = orch->current_ring_id();
     auto &allocator = orch->rings[ring_id].task_allocator;
@@ -332,7 +333,7 @@ static bool pto2_prepare_task(
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
     int16_t block_num = args.launch_spec.block_num();
     out->slot_state->total_required_subtasks =
-        static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
+        static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
     // fanin_count is set by scheduler during wiring
@@ -531,8 +532,8 @@ TaskOutputTensors pto2_submit_mixed_task(
     }
     always_assert(orch->scheduler != nullptr);
     // === Validate submit inputs ===
-    uint8_t active_mask = pto2_mixed_kernels_to_active_mask(mixed_kernels);
-    always_assert(active_mask != 0 && "MixedKernels must have at least one active slot");
+    ActiveMask active_mask = mixed_kernels.to_active_mask();
+    always_assert(static_cast<bool>(active_mask) && "MixedKernels must have at least one active slot");
 
     int16_t block_num = args.launch_spec.block_num();
     always_assert(block_num >= 1 && "block_num must be >= 1");
@@ -549,7 +550,7 @@ TaskOutputTensors pto2_submit_mixed_task(
     if (!has_aic && has_aiv1 && !has_aiv0) {
         normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
         normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
-        active_mask = pto2_mixed_kernels_to_active_mask(normalized);
+        active_mask = normalized.to_active_mask();
     }
 
     // Encode require_sync_start into active_mask bit 3 (only meaningful for tasks with block_num > 1)
@@ -557,7 +558,7 @@ TaskOutputTensors pto2_submit_mixed_task(
         // Deadlock check: block_num >= total available slots of the required type.
         // For MIX/AIC: limit is total_cluster_count (one AIC per cluster).
         // For AIV:     limit is total_aiv_count.
-        PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
+        PTO2ResourceShape shape = active_mask.to_shape();
         int32_t limit = (shape == PTO2ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
         if (limit > 0 && block_num > limit) {
             pto2_orch_report_fatal(
@@ -566,7 +567,7 @@ TaskOutputTensors pto2_submit_mixed_task(
             );
             return result;
         }
-        active_mask |= PTO2_SUBTASK_FLAG_SYNC_START;
+        active_mask.set_sync_start();
     }
     PTO2OutputLayout layout = pto2_calculate_output_layout(args);
     PTO2PreparedTask prepared;
@@ -789,7 +790,7 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
 
     PTO2OutputLayout layout = pto2_calculate_output_layout(args);
     PTO2PreparedTask prepared;
-    if (!pto2_prepare_task(orch, args, layout.total_output_size, 0, &prepared)) {
+    if (!pto2_prepare_task(orch, args, layout.total_output_size, ActiveMask{}, &prepared)) {
         return TaskOutputTensors{};
     }
 
