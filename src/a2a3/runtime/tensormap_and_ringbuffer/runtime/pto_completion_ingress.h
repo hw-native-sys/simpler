@@ -33,6 +33,7 @@ inline constexpr int32_t PTO2_MAX_COMPLETIONS_PER_TASK = 64;
 #define PTO2_COMPLETION_ENGINE_CCU 3u
 
 #define PTO2_COMPLETION_TYPE_COUNTER 0
+#define PTO2_COMPLETION_TYPE_SDMA_EVENT_RECORD 1
 
 struct PTO2CompletionIngressEntry {
     volatile uint64_t seq;

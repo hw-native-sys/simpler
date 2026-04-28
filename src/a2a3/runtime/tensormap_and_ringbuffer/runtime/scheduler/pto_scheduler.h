@@ -1019,9 +1019,17 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
 
     for (int32_t i = count - 1; i >= 0; --i) {
         PTO2AsyncWaitEntry &entry = entries[i];
+        uintptr_t last_invalidated_counter_line = static_cast<uintptr_t>(-1);
         for (int32_t c = 0; c < entry.condition_count; c++) {
             PTO2CompletionCondition &cond = entry.conditions[c];
             if (cond.satisfied) continue;
+            if (cond.completion_type == PTO2_COMPLETION_TYPE_COUNTER && cond.counter_addr != nullptr) {
+                uintptr_t counter_line = completion_ingress_cache_line(cond.counter_addr);
+                if (counter_line != last_invalidated_counter_line) {
+                    cache_invalidate_range(reinterpret_cast<const void *>(counter_line), sizeof(uint32_t));
+                    last_invalidated_counter_line = counter_line;
+                }
+            }
             PTO2CompletionPollResult poll = cond.test();
             if (poll.state == PTO2CompletionPollState::FAILED) {
                 result.error_code = poll.error_code;
@@ -1031,6 +1039,7 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
             }
             if (poll.state == PTO2CompletionPollState::READY) {
                 cond.satisfied = true;
+                cond.retire();
                 entry.waiting_completion_count--;
             }
         }

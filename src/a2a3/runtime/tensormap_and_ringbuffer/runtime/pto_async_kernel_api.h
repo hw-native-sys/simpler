@@ -41,14 +41,26 @@ inline __aicore__ void defer_load_ingress(AsyncCtx &ctx) {
 inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
     __gm__ LocalContext *lc =
         reinterpret_cast<__gm__ LocalContext *>(static_cast<uintptr_t>(args[PAYLOAD_LOCAL_CONTEXT_INDEX]));
-    AsyncCtx ctx = lc->async_ctx;
+    AsyncCtx ctx{};
+    ctx.completion_count = lc->async_ctx.completion_count;
+    ctx.completion_error_code = lc->async_ctx.completion_error_code;
+    ctx.completion_entries = lc->async_ctx.completion_entries;
+    ctx.completion_capacity = lc->async_ctx.completion_capacity;
+    ctx.task_token.raw = lc->async_ctx.task_token.raw;
     defer_load_ingress(ctx);
     return ctx;
 }
 
-inline __aicore__ void defer_condition(
-    AsyncCtx &ctx, volatile __gm__ void *addr, uint32_t expected, uint32_t engine, int32_t completion_type
-) {
+inline __aicore__ bool async_ctx_is_deferred(const AsyncCtx &ctx) { return ctx.task_token.is_valid(); }
+
+inline __aicore__ void defer_error(AsyncCtx &ctx, int32_t error_code) {
+    if (ctx.task_token.is_valid() && ctx.completion_error_code != nullptr) {
+        *ctx.completion_error_code = error_code;
+    }
+}
+
+inline __aicore__ void
+defer_condition(AsyncCtx &ctx, uint64_t addr, uint32_t expected, uint32_t engine, int32_t completion_type) {
     if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
         return;
     }
@@ -62,13 +74,72 @@ inline __aicore__ void defer_condition(
     }
 
     volatile __gm__ PTO2DeferredCompletionEntry *slot = &ctx.completion_entries[idx];
-    slot->addr = reinterpret_cast<uint64_t>(addr);
+    slot->addr = addr;
     slot->expected_value = expected;
     slot->engine = engine;
     slot->completion_type = completion_type;
     slot->_pad = 0;
     *ctx.completion_count = idx + 1;
 }
+
+inline __aicore__ void defer_condition(
+    AsyncCtx &ctx, volatile __gm__ void *addr, uint32_t expected, uint32_t engine, int32_t completion_type
+) {
+    defer_condition(ctx, reinterpret_cast<uint64_t>(addr), expected, engine, completion_type);
+}
+
+inline __aicore__ void defer_counter(AsyncCtx &ctx, volatile __gm__ void *counter_addr, uint32_t expected) {
+    defer_condition(
+        ctx, reinterpret_cast<uint64_t>(counter_addr), expected, PTO2_COMPLETION_ENGINE_SDMA,
+        PTO2_COMPLETION_TYPE_COUNTER
+    );
+}
+
+inline __aicore__ void defer_sdma_event_record(AsyncCtx &ctx, volatile __gm__ void *record_addr) {
+    defer_condition(
+        ctx, reinterpret_cast<uint64_t>(record_addr), 0, PTO2_COMPLETION_ENGINE_SDMA,
+        PTO2_COMPLETION_TYPE_SDMA_EVENT_RECORD
+    );
+}
+
+#if defined(PTO_COMM_ASYNC_COMMON_ASYNC_EVENT_IMPL_HPP)
+template <typename PtoAsyncEvent, typename PtoAsyncSession>
+inline __aicore__ void
+defer_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session) {
+    if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
+        (void)event.Wait(session);
+        return;
+    }
+    if (event.handle == 0) {
+        return;
+    }
+
+    const uint32_t engine = static_cast<uint32_t>(event.engine);
+    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::SDMA)) {
+        defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
+        return;
+    }
+
+    ::pto::comm::sdma::detail::UbTmpBuf tmp_buf;
+    uint32_t sync_id = 0;
+    __gm__ uint8_t *recv_workspace = nullptr;
+    uint32_t queue_num = 0;
+    if (!::pto::comm::sdma::detail::PrepareEventCheck(
+            session.sdmaSession, tmp_buf, sync_id, recv_workspace, queue_num
+        )) {
+        defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
+        return;
+    }
+    for (uint32_t queue_id = 0; queue_id < queue_num; ++queue_id) {
+        defer_sdma_event_record(ctx, ::pto::comm::sdma::detail::GetEventRecord(recv_workspace, queue_id));
+    }
+}
+#else
+template <typename PtoAsyncEvent, typename PtoAsyncSession>
+inline __aicore__ void defer_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &, const PtoAsyncSession &) {
+    defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
+}
+#endif
 
 inline __aicore__ void defer_flush_range(volatile __gm__ void *addr, uint32_t size_bytes) {
     if (addr == nullptr || size_bytes == 0) return;
