@@ -401,8 +401,10 @@ struct alignas(64) PTO2ReadyQueue {
 };
 
 // Cold-path ready queue operations (defined in pto_scheduler.cpp)
-bool pto2_ready_queue_init(PTO2ReadyQueue *queue, uint64_t capacity);
-void pto2_ready_queue_destroy(PTO2ReadyQueue *queue);
+// Declared as non-member to keep PTO2ReadyQueue a POD-like struct with
+// cache-line alignment. The struct body above contains only hot-path inlines.
+bool ready_queue_init(PTO2ReadyQueue *queue, uint64_t capacity);
+void ready_queue_destroy(PTO2ReadyQueue *queue);
 
 // =============================================================================
 // SPSC Queue (Single-Producer Single-Consumer, wait-free)
