@@ -9,13 +9,13 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Unit tests for PTO2FaninPool and pto2_for_each_fanin_storage/slot_state
+ * Unit tests for PTO2FaninPool and for_each_fanin_storage/slot_state
  * from pto_ring_buffer.h / pto_ring_buffer.cpp
  *
  * Tests:
  * 1. PTO2FaninPool — ring buffer allocation, overflow, tail advance,
  *    high-water tracking
- * 2. pto2_for_each_fanin_storage — inline-only, spill without wrap,
+ * 2. for_each_fanin_storage — inline-only, spill without wrap,
  *    spill with wrap, callback early return
  */
 
@@ -137,7 +137,7 @@ TEST_F(FaninPoolTest, WrapAroundAllocation) {
 }
 
 // =============================================================================
-// pto2_for_each_fanin_storage: inline only
+// for_each_fanin_storage: inline only
 // =============================================================================
 
 class ForEachFaninTest : public ::testing::Test {
@@ -165,7 +165,7 @@ TEST_F(ForEachFaninTest, InlineOnlyVoid) {
     }
 
     std::vector<PTO2TaskSlotState *> visited;
-    pto2_for_each_fanin_storage(inline_slots, 5, 0, spill_pool, [&](PTO2TaskSlotState *s) {
+    for_each_fanin_storage(inline_slots, 5, 0, spill_pool, [&](PTO2TaskSlotState *s) {
         visited.push_back(s);
     });
 
@@ -182,7 +182,7 @@ TEST_F(ForEachFaninTest, InlineOnlyBoolEarlyReturn) {
     }
 
     int count = 0;
-    bool result = pto2_for_each_fanin_storage(inline_slots, 5, 0, spill_pool, [&](PTO2TaskSlotState *) -> bool {
+    bool result = for_each_fanin_storage(inline_slots, 5, 0, spill_pool, [&](PTO2TaskSlotState *) -> bool {
         count++;
         return count < 3;  // stop after 3rd
     });
@@ -197,7 +197,7 @@ TEST_F(ForEachFaninTest, InlineOnlyBoolAllTrue) {
         inline_slots[i] = &slots[i];
     }
 
-    bool result = pto2_for_each_fanin_storage(inline_slots, 3, 0, spill_pool, [](PTO2TaskSlotState *) -> bool {
+    bool result = for_each_fanin_storage(inline_slots, 3, 0, spill_pool, [](PTO2TaskSlotState *) -> bool {
         return true;
     });
 
@@ -207,14 +207,14 @@ TEST_F(ForEachFaninTest, InlineOnlyBoolAllTrue) {
 TEST_F(ForEachFaninTest, ZeroFanin) {
     PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP] = {};
     int count = 0;
-    pto2_for_each_fanin_storage(inline_slots, 0, 0, spill_pool, [&](PTO2TaskSlotState *) {
+    for_each_fanin_storage(inline_slots, 0, 0, spill_pool, [&](PTO2TaskSlotState *) {
         count++;
     });
     EXPECT_EQ(count, 0);
 }
 
 // =============================================================================
-// pto2_for_each_fanin_storage: spill without wrap
+// for_each_fanin_storage: spill without wrap
 // =============================================================================
 
 TEST_F(ForEachFaninTest, SpillNoWrap) {
@@ -232,7 +232,7 @@ TEST_F(ForEachFaninTest, SpillNoWrap) {
     s1->slot_state = &slots[17];
 
     std::vector<PTO2TaskSlotState *> visited;
-    pto2_for_each_fanin_storage(inline_slots, 18, spill_start, spill_pool, [&](PTO2TaskSlotState *s) {
+    for_each_fanin_storage(inline_slots, 18, spill_start, spill_pool, [&](PTO2TaskSlotState *s) {
         visited.push_back(s);
     });
 
@@ -245,7 +245,7 @@ TEST_F(ForEachFaninTest, SpillNoWrap) {
 }
 
 // =============================================================================
-// pto2_for_each_fanin_storage: spill with wrap
+// for_each_fanin_storage: spill with wrap
 // =============================================================================
 
 TEST_F(ForEachFaninTest, SpillWithWrap) {
@@ -268,7 +268,7 @@ TEST_F(ForEachFaninTest, SpillWithWrap) {
     }
 
     std::vector<PTO2TaskSlotState *> visited;
-    pto2_for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, [&](PTO2TaskSlotState *s) {
+    for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, [&](PTO2TaskSlotState *s) {
         visited.push_back(s);
     });
 
@@ -284,7 +284,7 @@ TEST_F(ForEachFaninTest, SpillWithWrap) {
 }
 
 // =============================================================================
-// pto2_for_each_fanin_storage: spill with bool callback early return
+// for_each_fanin_storage: spill with bool callback early return
 // =============================================================================
 
 TEST_F(ForEachFaninTest, SpillBoolEarlyReturnInSpillRegion) {
@@ -300,11 +300,10 @@ TEST_F(ForEachFaninTest, SpillBoolEarlyReturnInSpillRegion) {
     }
 
     int count = 0;
-    bool result =
-        pto2_for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, [&](PTO2TaskSlotState *) -> bool {
-            count++;
-            return count < 17;  // stop on 17th (first spill entry)
-        });
+    bool result = for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, [&](PTO2TaskSlotState *) -> bool {
+        count++;
+        return count < 17;  // stop on 17th (first spill entry)
+    });
 
     EXPECT_FALSE(result);
     EXPECT_EQ(count, 17);

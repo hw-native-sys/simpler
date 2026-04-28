@@ -169,7 +169,7 @@ void pto2_runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode);
  * bounded by the scope. When scope_end() is called, the scope
  * releases its reference to all enclosed tasks.
  */
-void pto2_rt_scope_begin(PTO2Runtime *rt);
+void rt_scope_begin(PTO2Runtime *rt);
 
 /**
  * End current scope
@@ -177,14 +177,14 @@ void pto2_rt_scope_begin(PTO2Runtime *rt);
  * Releases scope reference for all tasks submitted since scope_begin().
  * Tasks whose refcount reaches zero will have their buffers released.
  */
-void pto2_rt_scope_end(PTO2Runtime *rt);
+void rt_scope_end(PTO2Runtime *rt);
 
 /**
  * Mark orchestration as complete
  *
  * Signals that no more tasks will be submitted.
  */
-void pto2_rt_orchestration_done(PTO2Runtime *rt);
+void rt_orchestration_done(PTO2Runtime *rt);
 
 /**
  * Scope helper macros for C
@@ -194,35 +194,35 @@ void pto2_rt_orchestration_done(PTO2Runtime *rt);
  *
  * Usage (C):
  *   PTO2_SCOPE_BEGIN(rt);
- *   pto2_rt_submit_task(...);
- *   pto2_rt_submit_task(...);
+ *   rt_submit_task(...);
+ *   rt_submit_task(...);
  *   PTO2_SCOPE_END(rt);
  */
-#define PTO2_SCOPE_BEGIN(rt) pto2_rt_scope_begin(rt)
-#define PTO2_SCOPE_END(rt) pto2_rt_scope_end(rt)
+#define PTO2_SCOPE_BEGIN(rt) rt_scope_begin(rt)
+#define PTO2_SCOPE_END(rt) rt_scope_end(rt)
 
 /**
  * RAII Scope Guard for C++
  *
  * PTO2ScopeGuard is a C++ RAII wrapper that automatically manages scope lifetime.
- * It calls pto2_rt_scope_begin() on construction and pto2_rt_scope_end() on destruction,
+ * It calls rt_scope_begin() on construction and rt_scope_end() on destruction,
  * ensuring proper cleanup even in error paths.
  *
  * Usage Option 1 - Direct instantiation (recommended):
  *   PTO2ScopeGuard scope_guard(rt);
- *   pto2_rt_submit_task(...);
- *   pto2_rt_submit_task(...);
+ *   rt_submit_task(...);
+ *   rt_submit_task(...);
  *   // scope automatically ends here when scope_guard destructor is called
  *
  * Usage Option 2 - Macro for anonymous guard:
  *   PTO2_SCOPE_GUARD(rt);
- *   pto2_rt_submit_task(...);
+ *   rt_submit_task(...);
  *   // scope automatically ends at end of current block
  *
  * Usage Option 3 - Scoped block with if statement:
  *   PTO2_SCOPE(rt) {
- *       pto2_rt_submit_task(...);
- *       pto2_rt_submit_task(...);
+ *       rt_submit_task(...);
+ *       rt_submit_task(...);
  *   } // scope automatically ends here
  *
  * Benefits:
@@ -235,9 +235,9 @@ class PTO2ScopeGuard {
 public:
     explicit PTO2ScopeGuard(PTO2Runtime *rt) :
         rt_(rt) {
-        pto2_rt_scope_begin(rt_);
+        rt_scope_begin(rt_);
     }
-    ~PTO2ScopeGuard() { pto2_rt_scope_end(rt_); }
+    ~PTO2ScopeGuard() { rt_scope_end(rt_); }
 
 private:
     PTO2Runtime *rt_;
@@ -250,7 +250,7 @@ private:
  *
  * Example:
  *   PTO2_SCOPE_GUARD(rt);
- *   pto2_rt_submit_task(...);
+ *   rt_submit_task(...);
  */
 #define _PTO2_CONCATENATE_IMPL(x, y) x##y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)
@@ -262,7 +262,7 @@ private:
  *
  * Example:
  *   PTO2_SCOPE(rt) {
- *       pto2_rt_submit_task(...);
+ *       rt_submit_task(...);
  *   } // scope automatically ends here
  */
 #define PTO2_SCOPE(rt) if (PTO2_SCOPE_GUARD(rt); true)

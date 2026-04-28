@@ -36,9 +36,9 @@ PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
 Manual mode still uses the normal submit calls:
 
 ```cpp
-auto out = pto2_rt_submit_aic_task(FUNC_ID, args);
-auto out = pto2_rt_submit_aiv_task(FUNC_ID, args);
-auto out = pto2_rt_submit_task(mixed_kernels, args);
+auto out = rt_submit_aic_task(FUNC_ID, args);
+auto out = rt_submit_aiv_task(FUNC_ID, args);
+auto out = rt_submit_task(mixed_kernels, args);
 ```
 
 ### Explicit deps
@@ -89,8 +89,8 @@ The runtime keeps two manual-scope-specific pieces of state:
 
 `manual_begin_depth` decides whether the current submit is in manual mode.
 `scope_tasks[...]` remains scope-lifetime bookkeeping for `scope_end()`.
-`manual_begin_depth` is explicitly initialized in `pto2_orchestrator_init()` and
-reset in `pto2_orchestrator_done()` so a reused orchestrator starts cleanly on
+`manual_begin_depth` is explicitly initialized in `PTO2OrchestratorState::init()` and
+reset in `mark_done()` so a reused orchestrator starts cleanly on
 the next run.
 
 The depth model treats `manual_begin_depth` as the depth where the outermost
@@ -129,20 +129,20 @@ PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
     qk.add_input(qi, kj);
     qk.add_output(sij_ci);
     qk.add_dep(alloc.task_id());
-    auto qk_out = pto2_rt_submit_aic_task(FUNC_QK, qk);
+    auto qk_out = rt_submit_aic_task(FUNC_QK, qk);
 
     Arg sf;
     sf.add_input(qk_out.get_ref(0));
     sf.add_output(pij_ci, li_ci, mi_ci);
     sf.add_dep(qk_out.task_id());
-    auto sf_out = pto2_rt_submit_aiv_task(FUNC_SF, sf);
+    auto sf_out = rt_submit_aiv_task(FUNC_SF, sf);
 
     Arg up;
     up.add_input(sf_out.get_ref(1), sf_out.get_ref(2), pv_out.get_ref(0));
     up.add_inout(mi, li, out_view, tmp);
     up.add_dep(sf_out.task_id());
     up.add_dep(pv_out.task_id());
-    auto up_out = pto2_rt_submit_aiv_task(FUNC_UP, up);
+    auto up_out = rt_submit_aiv_task(FUNC_UP, up);
 }
 ```
 
@@ -155,7 +155,7 @@ for (...) {
     if (prev_update.is_valid()) {
         up.add_dep(prev_update);
     }
-    prev_update = pto2_rt_submit_aiv_task(FUNC_UP, up).task_id();
+    prev_update = rt_submit_aiv_task(FUNC_UP, up).task_id();
 }
 ```
 

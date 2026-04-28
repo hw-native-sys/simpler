@@ -56,9 +56,9 @@ protected:
 
     PTO2ReadyQueue queue;
 
-    void SetUp() override { ASSERT_TRUE(pto2_ready_queue_init(&queue, CAPACITY)); }
+    void SetUp() override { ASSERT_TRUE(ready_queue_init(&queue, CAPACITY)); }
 
-    void TearDown() override { pto2_ready_queue_destroy(&queue); }
+    void TearDown() override { ready_queue_destroy(&queue); }
 };
 
 // =============================================================================
@@ -217,8 +217,8 @@ protected:
     PTO2ReadyQueue queue{};
     PTO2TaskSlotState dummy[8]{};
 
-    void SetUp() override { ASSERT_TRUE(pto2_ready_queue_init(&queue, QUEUE_CAP)); }
-    void TearDown() override { pto2_ready_queue_destroy(&queue); }
+    void SetUp() override { ASSERT_TRUE(ready_queue_init(&queue, QUEUE_CAP)); }
+    void TearDown() override { ready_queue_destroy(&queue); }
 };
 
 TEST_F(ReadyQueueBoundaryTest, ExactCapacityFillDrain) {
@@ -307,8 +307,8 @@ protected:
     static constexpr uint64_t CAPACITY = 1024;
     PTO2ReadyQueue queue;
 
-    void SetUp() override { ASSERT_TRUE(pto2_ready_queue_init(&queue, CAPACITY)); }
-    void TearDown() override { pto2_ready_queue_destroy(&queue); }
+    void SetUp() override { ASSERT_TRUE(ready_queue_init(&queue, CAPACITY)); }
+    void TearDown() override { ready_queue_destroy(&queue); }
 };
 
 TEST_P(ReadyQueueMPMCTest, NoDuplicateNoLoss) {

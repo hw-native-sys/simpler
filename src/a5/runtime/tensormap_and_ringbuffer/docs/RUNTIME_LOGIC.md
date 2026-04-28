@@ -434,8 +434,8 @@ Scopes control the lifetime of intermediate buffers. Each scope:
 ```cpp
 PTO2_SCOPE(rt) {
     // Tasks submitted here belong to this scope
-    pto2_rt_submit_aic_task(FUNC_QK, args);
-    pto2_rt_submit_aiv_task(FUNC_SF, args);
+    rt_submit_aic_task(FUNC_QK, args);
+    rt_submit_aiv_task(FUNC_SF, args);
 }
 // scope_end: scope reference released from all tasks above
 ```
@@ -479,7 +479,7 @@ After these phases, the scheduler updates profiling headers and checks for termi
 Ready queues use a lock-free bounded MPMC (Vyukov) design:
 
 - One `PTO2ReadyQueue` per resource shape (5 shapes: `AIC_ONLY`, `AIV_X1`, `AIV_X2`, `AIC_AIV_X1`, `AIC_AIV_X2`)
-- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the queue matching `pto2_active_mask_to_shape(task->active_mask)`
+- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()`
 - **Pop**: scheduler threads pop from the queue matching the idle core's resource shape
 - Per-slot sequence counters prevent ABA problems
 - `enqueue_pos` and `dequeue_pos` are on separate cache lines to avoid false sharing
@@ -617,11 +617,11 @@ The orchestration API is defined in `pto_orchestration_api.h`. Orchestration cod
 
 | Function/Macro | Purpose |
 | -------------- | ------- |
-| `pto2_rt_submit_task(mixed_kernels, args)` | Submit a mixed task with `MixedKernels` struct |
-| `pto2_rt_submit_aic_task(kernel_id, args)` | Convenience: submit AIC-only task |
-| `pto2_rt_submit_aiv_task(kernel_id, args)` | Convenience: submit AIV-only task |
+| `rt_submit_task(mixed_kernels, args)` | Submit a mixed task with `MixedKernels` struct |
+| `rt_submit_aic_task(kernel_id, args)` | Convenience: submit AIC-only task |
+| `rt_submit_aiv_task(kernel_id, args)` | Convenience: submit AIV-only task |
 | `PTO2_SCOPE() { ... }` | RAII scope for buffer lifetime |
-| `pto2_rt_orchestration_done()` | Signal orchestration complete |
+| `rt_orchestration_done()` | Signal orchestration complete |
 
 ### 11.2 Parameter Construction
 

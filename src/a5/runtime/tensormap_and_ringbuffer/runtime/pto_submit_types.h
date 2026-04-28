@@ -96,7 +96,9 @@ public:
         return *this;
     }
 
-    uint8_t operator&(uint8_t mask) const { return raw_ & mask; }
+    ActiveMask operator&(uint8_t mask) const { return ActiveMask(raw_ & mask); }
+
+    bool has_mask(uint8_t mask) const { return (raw_ & mask) != 0; }
 
     explicit operator bool() const { return raw_ != 0; }
 

@@ -155,7 +155,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_sf.add_output(TensorCreateInfo(li_shapes, 1, DataType::FLOAT32));
                     args_sf.add_scalar(scale_value);
                     SubmitResult r_sf = rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf);
-                    pto2_rt_add_dependency(rt, r_qk.task_id, r_sf.task_id);
+                    rt_add_dependency(rt, r_qk.task_id, r_sf.task_id);
 
                     // === Task 3: PV matmul ===
                     uint32_t oi_tmp_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
@@ -165,7 +165,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_pv.add_input(vj);
                     args_pv.add_output(TensorCreateInfo(oi_tmp_shapes, 2, DataType::FLOAT32));
                     SubmitResult r_pv = rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv);
-                    pto2_rt_add_dependency(rt, r_sf.task_id, r_pv.task_id);
+                    rt_add_dependency(rt, r_sf.task_id, r_pv.task_id);
 
                     // === Task 4: Online update ===
                     uint64_t is_first = (bn == 0) ? 1 : 0;
@@ -182,9 +182,9 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_up.add_scalar(is_first);
                     args_up.add_scalar(is_last);
                     SubmitResult r_up = rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up);
-                    pto2_rt_add_dependency(rt, r_sf.task_id, r_up.task_id);
-                    pto2_rt_add_dependency(rt, r_pv.task_id, r_up.task_id);
-                    pto2_rt_add_dependency(rt, prev_update_task, r_up.task_id);
+                    rt_add_dependency(rt, r_sf.task_id, r_up.task_id);
+                    rt_add_dependency(rt, r_pv.task_id, r_up.task_id);
+                    rt_add_dependency(rt, prev_update_task, r_up.task_id);
 
                     prev_update_task = r_up.task_id;
                 }

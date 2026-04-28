@@ -16,13 +16,13 @@
  *
  * Design contracts:
  *
- * - pto2_sm_validate checks `top > heap_size`.  top == heap_size is a
+ * - validate() checks `top > heap_size`.  top == heap_size is a
  *   legitimate "filled exactly to end" state, so strict > is correct.
  *
- * - Zero window size: if pto2_sm_calculate_size() is called with 0, all ring
+ * - Zero window size: if calculate_size() is called with 0, all ring
  *   descriptors/payloads alias the same address.  Current entry path
- *   (pto2_sm_create) is called only with valid sizes, but there is no
- *   explicit guard.  pto2_sm_create should reject task_window_size==0.
+ *   (create) is called only with valid sizes, but there is no
+ *   explicit guard.  create should reject task_window_size==0.
  *
  * - Flow control heap_top validation: validate() does not verify
  *   heap_top <= heap_size.  After a corruption, heap_top could exceed
@@ -42,13 +42,13 @@ protected:
     PTO2SharedMemoryHandle *handle = nullptr;
 
     void SetUp() override {
-        handle = pto2_sm_create_default();
+        handle = PTO2SharedMemoryHandle::create_default();
         ASSERT_NE(handle, nullptr);
     }
 
     void TearDown() override {
         if (handle) {
-            pto2_sm_destroy(handle);
+            handle->destroy();
             handle = nullptr;
         }
     }
@@ -79,7 +79,7 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
     }
 }
 
-TEST_F(SharedMemoryTest, Validate) { EXPECT_TRUE(pto2_sm_validate(handle)); }
+TEST_F(SharedMemoryTest, Validate) { EXPECT_TRUE(handle->validate()); }
 
 TEST_F(SharedMemoryTest, PerRingIndependence) {
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -106,7 +106,7 @@ TEST_F(SharedMemoryTest, HeaderAlignment) {
 // Descriptor and payload regions don't overlap within or across rings.
 TEST_F(SharedMemoryTest, RegionsNonOverlapping) {
     uint64_t ws = 64;  // Use a known window size for byte arithmetic
-    PTO2SharedMemoryHandle *h = pto2_sm_create(ws, 4096);
+    PTO2SharedMemoryHandle *h = PTO2SharedMemoryHandle::create(ws, 4096);
     ASSERT_NE(h, nullptr);
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -123,7 +123,7 @@ TEST_F(SharedMemoryTest, RegionsNonOverlapping) {
         EXPECT_GE(next_desc_start, this_payload_end) << "Ring " << r << " and " << (r + 1) << " should not overlap";
     }
 
-    pto2_sm_destroy(h);
+    h->destroy();
 }
 
 // =============================================================================
@@ -131,13 +131,13 @@ TEST_F(SharedMemoryTest, RegionsNonOverlapping) {
 // =============================================================================
 
 TEST(SharedMemoryCalcSize, NonZero) {
-    uint64_t size = pto2_sm_calculate_size(PTO2_TASK_WINDOW_SIZE);
+    uint64_t size = PTO2SharedMemoryHandle::calculate_size(PTO2_TASK_WINDOW_SIZE);
     EXPECT_GT(size, 0u);
 }
 
 TEST(SharedMemoryCalcSize, LargerWindowGivesLargerSize) {
-    uint64_t small_size = pto2_sm_calculate_size(64);
-    uint64_t large_size = pto2_sm_calculate_size(256);
+    uint64_t small_size = PTO2SharedMemoryHandle::calculate_size(64);
+    uint64_t large_size = PTO2SharedMemoryHandle::calculate_size(256);
     EXPECT_GT(large_size, small_size);
 }
 
@@ -145,9 +145,9 @@ TEST(SharedMemoryCalcSize, HeaderAligned) { EXPECT_EQ(sizeof(PTO2SharedMemoryHea
 
 TEST(SharedMemoryCalcSize, PerRingDifferentSizes) {
     uint64_t ws[PTO2_MAX_RING_DEPTH] = {128, 256, 512, 1024};
-    uint64_t size = pto2_sm_calculate_size_per_ring(ws);
+    uint64_t size = PTO2SharedMemoryHandle::calculate_size_per_ring(ws);
 
-    uint64_t uniform_size = pto2_sm_calculate_size(128);
+    uint64_t uniform_size = PTO2SharedMemoryHandle::calculate_size(128);
     EXPECT_GT(size, uniform_size);
 }
 
@@ -157,35 +157,33 @@ TEST(SharedMemoryCalcSize, PerRingDifferentSizes) {
 
 // Zero window size: all ring descriptors collapse to same address.
 TEST(SharedMemoryBoundary, ZeroWindowSize) {
-    uint64_t size = pto2_sm_calculate_size(0);
+    uint64_t size = PTO2SharedMemoryHandle::calculate_size(0);
     uint64_t header_size = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
     EXPECT_EQ(size, header_size);
 
-    PTO2SharedMemoryHandle *h = pto2_sm_create(0, 4096);
+    PTO2SharedMemoryHandle *h = PTO2SharedMemoryHandle::create(0, 4096);
     if (h) {
         for (int r = 0; r < PTO2_MAX_RING_DEPTH - 1; r++) {
             EXPECT_EQ(h->header->rings[r].task_descriptors, h->header->rings[r + 1].task_descriptors)
                 << "Zero window: all rings' descriptor pointers collapse to same address";
         }
-        pto2_sm_destroy(h);
+        h->destroy();
     }
 }
 
 TEST(SharedMemoryBoundary, ValidateDetectsCorruption) {
-    PTO2SharedMemoryHandle *h = pto2_sm_create(256, 4096);
+    PTO2SharedMemoryHandle *h = PTO2SharedMemoryHandle::create(256, 4096);
     ASSERT_NE(h, nullptr);
-    EXPECT_TRUE(pto2_sm_validate(h));
+    EXPECT_TRUE(h->validate());
 
     h->header->rings[0].fc.current_task_index.store(-1);
-    EXPECT_FALSE(pto2_sm_validate(h));
+    EXPECT_FALSE(h->validate());
 
-    pto2_sm_destroy(h);
+    h->destroy();
 }
-
-TEST(SharedMemoryBoundary, ValidateNullHandle) { EXPECT_FALSE(pto2_sm_validate(nullptr)); }
 
 TEST(SharedMemoryBoundary, CreateFromUndersizedBuffer) {
     char buf[64]{};
-    PTO2SharedMemoryHandle *h = pto2_sm_create_from_buffer(buf, 64, 256, 4096);
+    PTO2SharedMemoryHandle *h = PTO2SharedMemoryHandle::create_from_buffer(buf, 64, 256, 4096);
     EXPECT_EQ(h, nullptr) << "Undersized buffer should fail";
 }

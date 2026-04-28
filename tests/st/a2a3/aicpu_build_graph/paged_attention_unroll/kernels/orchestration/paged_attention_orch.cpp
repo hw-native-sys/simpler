@@ -260,7 +260,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     CYCLE_COUNT_LAP(prof_param_setup);
                     SubmitResult r_sf = rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf);
                     // QK → Softmax (sij_buf)
-                    pto2_rt_add_dependency(rt, r_qk.task_id, r_sf.task_id);
+                    rt_add_dependency(rt, r_qk.task_id, r_sf.task_id);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -282,7 +282,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     CYCLE_COUNT_LAP(prof_param_setup);
                     SubmitResult r_pv = rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv);
                     // Softmax → PV (pij_buf)
-                    pto2_rt_add_dependency(rt, r_sf.task_id, r_pv.task_id);
+                    rt_add_dependency(rt, r_sf.task_id, r_pv.task_id);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -305,11 +305,11 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     CYCLE_COUNT_LAP(prof_param_setup);
                     SubmitResult r_up = rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up);
                     // Softmax → Update (mi, li)
-                    pto2_rt_add_dependency(rt, r_sf.task_id, r_up.task_id);
+                    rt_add_dependency(rt, r_sf.task_id, r_up.task_id);
                     // PV → Update (oi_new)
-                    pto2_rt_add_dependency(rt, r_pv.task_id, r_up.task_id);
+                    rt_add_dependency(rt, r_pv.task_id, r_up.task_id);
                     // Previous update → this update (mi_update, li_update, oi accumulation chain)
-                    pto2_rt_add_dependency(rt, prev_update_task, r_up.task_id);
+                    rt_add_dependency(rt, prev_update_task, r_up.task_id);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);

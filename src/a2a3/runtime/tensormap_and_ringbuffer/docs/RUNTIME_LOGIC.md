@@ -434,8 +434,8 @@ Scopes control the lifetime of intermediate buffers. Each scope:
 ```cpp
 PTO2_SCOPE(rt) {
     // Tasks submitted here belong to this scope
-    pto2_rt_submit_aic_task(FUNC_QK, args);
-    pto2_rt_submit_aiv_task(FUNC_SF, args);
+    rt_submit_aic_task(FUNC_QK, args);
+    rt_submit_aiv_task(FUNC_SF, args);
 }
 // scope_end: scope reference released from all tasks above
 ```
@@ -617,11 +617,11 @@ The orchestration API is defined in `pto_orchestration_api.h`. Orchestration cod
 
 | Function/Macro | Purpose |
 | -------------- | ------- |
-| `pto2_rt_submit_task(mixed_kernels, args)` | Submit a mixed task with `MixedKernels` struct |
-| `pto2_rt_submit_aic_task(kernel_id, args)` | Convenience: submit AIC-only task |
-| `pto2_rt_submit_aiv_task(kernel_id, args)` | Convenience: submit AIV-only task |
+| `rt_submit_task(mixed_kernels, args)` | Submit a mixed task with `MixedKernels` struct |
+| `rt_submit_aic_task(kernel_id, args)` | Convenience: submit AIC-only task |
+| `rt_submit_aiv_task(kernel_id, args)` | Convenience: submit AIV-only task |
 | `PTO2_SCOPE() { ... }` | RAII scope for buffer lifetime |
-| `pto2_rt_orchestration_done()` | Signal orchestration complete |
+| `rt_orchestration_done()` | Signal orchestration complete |
 
 ### 11.2 Parameter Construction
 

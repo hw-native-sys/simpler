@@ -143,9 +143,10 @@ typedef struct PTO2RuntimeOps {
 /**
  * Partial PTO2Runtime definition for orchestration.
  *
- * Only the ops pointer is visible.  The real struct (in pto_runtime2.h)
- * has the same first field, so accessing rt->ops through this definition
- * is well-defined (C struct layout guarantee).
+ * Exposes the ops pointer (for runtime calls) and pending_scope_mode
+ * (read directly by inline scope wrappers).  The real struct (in
+ * pto_runtime2.h) has the same first fields, so accessing them through
+ * this definition is well-defined (C struct layout guarantee).
  */
 struct PTO2Runtime {
     const PTO2RuntimeOps *ops;

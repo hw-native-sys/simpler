@@ -135,7 +135,7 @@ union TensorRef {
  *   args.add_input(x);
  *   args.add_output(TensorCreateInfo(shapes, 2));
  *   args.add_scalar(some_value);
- *   SubmitResult r = pto2_rt_submit_aic_task(rt, kernel_id, args);
+ *   SubmitResult r = rt_submit_aic_task(rt, kernel_id, args);
  *   const Tensor& y = r.outputs.get_ref(0);
  */
 struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> {

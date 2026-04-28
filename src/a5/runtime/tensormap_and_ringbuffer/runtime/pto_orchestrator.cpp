@@ -542,9 +542,9 @@ PTO2OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const Arg 
     // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
     // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
     MixedKernels normalized = mixed_kernels;
-    bool has_aic = (active_mask & PTO2_SUBTASK_MASK_AIC) != 0;
-    bool has_aiv0 = (active_mask & PTO2_SUBTASK_MASK_AIV0) != 0;
-    bool has_aiv1 = (active_mask & PTO2_SUBTASK_MASK_AIV1) != 0;
+    bool has_aic = active_mask.has_mask(PTO2_SUBTASK_MASK_AIC);
+    bool has_aiv0 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV0);
+    bool has_aiv1 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV1);
     if (!has_aic && has_aiv1 && !has_aiv0) {
         normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
         normalized.aiv1_kernel_id = INVALID_KERNEL_ID;

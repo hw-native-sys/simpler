@@ -41,16 +41,16 @@ protected:
     PTO2SharedMemoryHandle *sm_handle = nullptr;
 
     void SetUp() override {
-        sm_handle = pto2_sm_create_default();
+        sm_handle = PTO2SharedMemoryHandle::create_default();
         ASSERT_NE(sm_handle, nullptr);
-        bool ok = pto2_scheduler_init(&sched, sm_handle->header);
+        bool ok = sched.init(sm_handle->header);
         ASSERT_TRUE(ok);
     }
 
     void TearDown() override {
-        pto2_scheduler_destroy(&sched);
+        sched.destroy();
         if (sm_handle) {
-            pto2_sm_destroy(sm_handle);
+            sm_handle->destroy();
         }
     }
 
@@ -67,7 +67,7 @@ protected:
         slot.fanout_lock.store(0);
         slot.fanout_head = nullptr;
         slot.ring_id = ring_id;
-        slot.active_mask = PTO2_SUBTASK_MASK_AIC;
+        slot.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
         slot.completed_subtasks.store(0);
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;
@@ -100,7 +100,7 @@ TEST_F(WiringTest, WireTaskNoFaninBecomesReady) {
     EXPECT_EQ(task_slot.fanin_refcount.load(), 1);
 
     // Task should be in ready queue
-    PTO2ResourceShape shape = pto2_active_mask_to_shape(task_slot.active_mask);
+    PTO2ResourceShape shape = task_slot.active_mask.to_shape();
     auto *popped = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     EXPECT_EQ(popped, &task_slot);
 }
@@ -139,7 +139,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
     EXPECT_GE(task_slot.fanin_refcount.load(), task_slot.fanin_count);
 
     // Task should be in ready queue
-    PTO2ResourceShape shape = pto2_active_mask_to_shape(task_slot.active_mask);
+    PTO2ResourceShape shape = task_slot.active_mask.to_shape();
     auto *popped = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     EXPECT_EQ(popped, &task_slot);
 }
@@ -177,7 +177,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
     EXPECT_LT(task_slot.fanin_refcount.load(), task_slot.fanin_count);
 
     // Ready queue should be empty
-    PTO2ResourceShape shape = pto2_active_mask_to_shape(task_slot.active_mask);
+    PTO2ResourceShape shape = task_slot.active_mask.to_shape();
     auto *popped = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     EXPECT_EQ(popped, nullptr);
 
@@ -245,12 +245,12 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     // Consumer1: needs 1 more fanin to become ready
     init_slot(consumer1, PTO2_TASK_PENDING, 2, 1);
     consumer1.fanin_refcount.store(1);  // 1 of 2 satisfied
-    consumer1.active_mask = PTO2_SUBTASK_MASK_AIC;
+    consumer1.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
 
     // Consumer2: this release will make it ready
     init_slot(consumer2, PTO2_TASK_PENDING, 2, 1);
     consumer2.fanin_refcount.store(1);  // 1 of 2 satisfied
-    consumer2.active_mask = PTO2_SUBTASK_MASK_AIC;
+    consumer2.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
 
     // Build fanout chain: producer -> consumer2 -> consumer1
     PTO2DepListEntry dep_entries[2];
@@ -270,7 +270,7 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     EXPECT_EQ(consumer2.fanin_refcount.load(), 2);
 
     // Both consumers should be ready (fanin_refcount == fanin_count)
-    PTO2ResourceShape shape = pto2_active_mask_to_shape(consumer1.active_mask);
+    PTO2ResourceShape shape = consumer1.active_mask.to_shape();
     auto *r1 = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     auto *r2 = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     EXPECT_TRUE((r1 == &consumer1 && r2 == &consumer2) || (r1 == &consumer2 && r2 == &consumer1));
@@ -403,7 +403,7 @@ TEST_F(WiringTest, DrainWiringQueueProcessesTasks) {
     EXPECT_EQ(wired, 1);
 
     // Task should be ready
-    PTO2ResourceShape shape = pto2_active_mask_to_shape(task_slot.active_mask);
+    PTO2ResourceShape shape = task_slot.active_mask.to_shape();
     auto *popped = sched.ready_queues[static_cast<int32_t>(shape)].pop();
     EXPECT_EQ(popped, &task_slot);
 }

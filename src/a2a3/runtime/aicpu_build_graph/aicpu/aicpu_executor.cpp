@@ -1975,7 +1975,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #endif
 
             // Signal completion and trigger core transition
-            pto2_rt_orchestration_done(rt);
+            rt_orchestration_done(rt);
 
             void *sm = runtime->get_gm_sm_ptr();
             PTO2SharedMemoryHeader *sm_header = static_cast<PTO2SharedMemoryHeader *>(sm);

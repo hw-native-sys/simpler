@@ -37,20 +37,20 @@ static void add_dependency_impl(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId
     pto2_add_dependency(&rt->orchestrator, producer, consumer);
 }
 
-void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrator); }
+void rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrator); }
 
-void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrator); }
+void rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrator); }
 
-void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrator); }
+void rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrator); }
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
     .add_dependency = add_dependency_impl,
-    .scope_begin = pto2_rt_scope_begin,
-    .scope_end = pto2_rt_scope_end,
-    .orchestration_done = pto2_rt_orchestration_done,
+    .scope_begin = rt_scope_begin,
+    .scope_end = rt_scope_end,
+    .orchestration_done = rt_orchestration_done,
     .is_fatal = is_fatal_impl,
     .log_error = unified_log_error,
     .log_warn = unified_log_warn,

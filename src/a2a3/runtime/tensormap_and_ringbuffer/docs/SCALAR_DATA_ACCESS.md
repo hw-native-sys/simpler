@@ -80,7 +80,7 @@ TensorCreateInfo scalar_ci(shapes, 1, DataType::FLOAT32);
 scalar_ci.set_initial_value(float_to_u64(77.0f));
 Arg args;
 args.add_output(scalar_ci);
-TaskOutputTensors outs = pto2_rt_submit_aiv_task(FUNC_NOOP, args);
+TaskOutputTensors outs = rt_submit_aiv_task(FUNC_NOOP, args);
 const Tensor& scalar_tensor = outs.get_ref(0);
 
 // Orchestration-side blocking read (waits for kernel completion)

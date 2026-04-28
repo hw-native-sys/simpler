@@ -94,14 +94,14 @@ struct PTO2Runtime {
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================
 
-static inline SubmitResult pto2_rt_submit_task(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
+static inline SubmitResult rt_submit_task(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
     return rt->ops->submit_task(rt, mixed_kernels, args);
 }
 
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
-static inline SubmitResult pto2_rt_submit_aic_task(PTO2Runtime *rt, int32_t kernel_id, const Arg &args) {
+static inline SubmitResult rt_submit_aic_task(PTO2Runtime *rt, int32_t kernel_id, const Arg &args) {
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, args);
@@ -110,7 +110,7 @@ static inline SubmitResult pto2_rt_submit_aic_task(PTO2Runtime *rt, int32_t kern
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
-static inline SubmitResult pto2_rt_submit_aiv_task(PTO2Runtime *rt, int32_t kernel_id, const Arg &args) {
+static inline SubmitResult rt_submit_aiv_task(PTO2Runtime *rt, int32_t kernel_id, const Arg &args) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, args);
@@ -119,17 +119,17 @@ static inline SubmitResult pto2_rt_submit_aiv_task(PTO2Runtime *rt, int32_t kern
 /**
  * Add an explicit dependency: consumer waits for producer to complete.
  */
-static inline void pto2_rt_add_dependency(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer) {
+static inline void rt_add_dependency(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer) {
     rt->ops->add_dependency(rt, producer, consumer);
 }
 
-static inline void pto2_rt_scope_begin(PTO2Runtime *rt) { rt->ops->scope_begin(rt); }
+static inline void rt_scope_begin(PTO2Runtime *rt) { rt->ops->scope_begin(rt); }
 
-static inline void pto2_rt_scope_end(PTO2Runtime *rt) { rt->ops->scope_end(rt); }
+static inline void rt_scope_end(PTO2Runtime *rt) { rt->ops->scope_end(rt); }
 
-static inline void pto2_rt_orchestration_done(PTO2Runtime *rt) { rt->ops->orchestration_done(rt); }
+static inline void rt_orchestration_done(PTO2Runtime *rt) { rt->ops->orchestration_done(rt); }
 
-static inline bool pto2_rt_is_fatal(PTO2Runtime *rt) { return rt->ops->is_fatal(rt); }
+static inline bool rt_is_fatal(PTO2Runtime *rt) { return rt->ops->is_fatal(rt); }
 
 // =============================================================================
 // Logging Macros for Orchestration (call through ops table)
@@ -168,7 +168,7 @@ private:
 /**
  * Scoped block macro:
  *   PTO2_SCOPE(rt) {
- *       pto2_rt_submit_task(rt, ...);
+ *       rt_submit_task(rt, ...);
  *   }
  */
 #define PTO2_SCOPE(rt) if (PTO2_SCOPE_GUARD(rt); true)

@@ -36,16 +36,16 @@ protected:
     PTO2SharedMemoryHandle *sm_handle = nullptr;
 
     void SetUp() override {
-        sm_handle = pto2_sm_create_default();
+        sm_handle = PTO2SharedMemoryHandle::create_default();
         ASSERT_NE(sm_handle, nullptr);
-        bool ok = pto2_scheduler_init(&sched, sm_handle->header);
+        bool ok = sched.init(sm_handle->header);
         ASSERT_TRUE(ok);
     }
 
     void TearDown() override {
-        pto2_scheduler_destroy(&sched);
+        sched.destroy();
         if (sm_handle) {
-            pto2_sm_destroy(sm_handle);
+            sm_handle->destroy();
         }
     }
 
@@ -59,7 +59,7 @@ protected:
         slot.fanout_lock.store(0);
         slot.fanout_head = nullptr;
         slot.ring_id = 0;
-        slot.active_mask = PTO2_SUBTASK_MASK_AIC;
+        slot.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIC);
         slot.completed_subtasks.store(0);
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;
