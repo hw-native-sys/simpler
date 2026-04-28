@@ -12,8 +12,6 @@
 #include <cstdint>
 
 #include <pto/pto-inst.hpp>
-#include <pto/comm/comm_types.hpp>
-#include <pto/comm/pto_comm_inst.hpp>
 
 #ifndef __gm__
 #define __gm__
@@ -23,6 +21,7 @@
 #endif
 
 #include "platform_comm/comm_context.h"
+#include "pto_async_kernel_api.h"
 #include "tensor.h"
 
 template <typename T>
@@ -60,6 +59,5 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 #endif
 
     __gm__ int32_t *peer_counter = comm_remote_ptr(ctx, local_counter, peer_rank);
-    pto::comm::Signal peer_signal(peer_counter);
-    pto::comm::TNOTIFY(peer_signal, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
+    pto2_send_notification(peer_counter, 1, pto::comm::NotifyOp::AtomicAdd);
 }

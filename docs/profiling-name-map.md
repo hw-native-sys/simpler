@@ -148,10 +148,10 @@ takes precedence over `-k` (kernel_config.py):
 pytest tests/st/... --platform a5onboard --enable-l2-swimlane
 
 # Manual
-python -m simpler_setup.tools.swimlane_converter outputs/l2_perf_records_*.json \
+python -m simpler_setup.tools.swimlane_converter outputs/*/l2_perf_records.json \
     --func-names outputs/name_map_TestPA_basic.json
 
-python -m simpler_setup.tools.perf_to_mermaid outputs/l2_perf_records_*.json \
+python -m simpler_setup.tools.perf_to_mermaid outputs/*/l2_perf_records.json \
     --func-names outputs/name_map_TestPA_basic.json
 ```
 

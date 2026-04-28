@@ -237,25 +237,11 @@ def pytest_configure(config):
         ids = _parse_device_range(device_spec)
         if 0 <= idx < len(ids):
             config.option.device = str(ids[idx])
-        # Each xdist worker gets its own perf output dir so parallel profiling
-        # runs don't fight over the same l2_perf_records_*.json filename (the
-        # runtime's timestamp is second-precision). Anchor to config.rootpath
-        # so the C++ runtime (which resolves the path against its own CWD) and
-        # Python post-processing always point at the same filesystem location
-        # regardless of where pytest was invoked. Only set if the parent
-        # hasn't already scoped us into a subprocess dir.
-        if "SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR" not in os.environ:
-            os.environ["SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR"] = str(
-                config.rootpath / "outputs" / f"l2_perf_records_{worker_id}"
-            )
-        # else: more xdist workers than devices — fall through with original range;
-        # DevicePool will fail clearly if the test tries to allocate.
 
-    # Note: profiling + parallelism used to be blocked here because perf files
-    # shared a process-global directory. The test dispatcher now scopes each
-    # subprocess to its own SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR (see _dispatch_test_phases and
-    # the xdist slicing above) and flatten_l2_perf_records_subdirs reassembles outputs/
-    # at the end, so the combination is now safe.
+    # Profiling + parallelism is safe: each test case sets its own per-task
+    # `output_prefix` on CallConfig (see scene_test.py::_build_config), so
+    # diagnostic artifacts land in distinct directories with no shared
+    # filenames or rename dance.
 
 
 def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
@@ -386,9 +372,8 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
 class _ResourceJob(typing.NamedTuple):
     """One device-allocating subprocess job fed into Resource phase.
 
-    ``kind`` drives only two things: the ``--level 3`` filter added to the
-    child command (for L3 classes) and the ``SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR``
-    prefix. The dispatch itself (bin-pack over ``--device`` pool,
+    ``kind`` drives the ``--level 3`` filter added to the child command (for
+    L3 classes). The dispatch itself (bin-pack over ``--device`` pool,
     ``run_jobs`` scheduling, fail-fast semantics) is identical.
     """
 
@@ -583,22 +568,12 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
                     cmd.extend(["--platform", platform])
                 return cmd
 
-            # SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR scopes this job's perf files to its own
-            # subdir so concurrent jobs can't collide on filename.
-            safe_nodeid = spec.nodeid.replace("/", "_").replace(":", "_").replace(".", "_")
-            child_env = {
-                **os.environ,
-                "SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR": str(
-                    cfg.rootpath / "outputs" / f"l2_perf_records_{spec.kind}_{safe_nodeid}"
-                ),
-            }
             jobs.append(
                 _ps.Job(
                     label=label,
                     device_count=spec.device_count,
                     build_cmd=_build,
                     cwd=str(cwd),
-                    env=child_env,
                 )
             )
 
@@ -685,13 +660,6 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             print(f"*** FAIL: L2 {rt} — expand group above ***", flush=True)
             if fail_fast:
                 break
-
-    # Flatten per-subprocess outputs/l2_perf_records_*/ subdirs back to outputs/ so
-    # downstream tools (swimlane_converter.py, CI artifact upload) find
-    # everything in the historical location. Anchor to config.rootpath (not
-    # invocation_params.dir) so a user running pytest from a subdirectory
-    # still flushes files into the project's top-level outputs/.
-    _ps.flatten_l2_perf_records_subdirs(cfg.rootpath / "outputs")
 
     session.testsfailed = 1 if (resource_failed or l2_failed) else 0
     if not (resource_failed or l2_failed):

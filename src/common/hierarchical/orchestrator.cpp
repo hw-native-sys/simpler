@@ -167,6 +167,7 @@ SubmitResult Orchestrator::submit_impl(
     std::vector<TaskArgs> args_list, std::vector<int8_t> affinities
 ) {
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
+    config.validate();
 
     // Fail-fast: if a previously-dispatched task has already failed, abort
     // this submit before any bookkeeping so the orch fn unwinds promptly

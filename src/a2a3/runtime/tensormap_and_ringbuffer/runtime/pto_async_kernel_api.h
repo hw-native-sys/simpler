@@ -14,6 +14,9 @@
 
 #include <stdint.h>
 
+#include <pto/comm/comm_types.hpp>
+#include <pto/comm/pto_comm_inst.hpp>
+
 #include "intrinsic.h"
 #include "pto_completion_ingress.h"
 #include "pto_runtime_status.h"
@@ -49,9 +52,10 @@ inline __aicore__ void pto2_defer_error(PTO2AsyncCtx &ctx, int32_t error_code) {
     }
 }
 
-inline __aicore__ void
-pto2_defer_completion(PTO2AsyncCtx &ctx, uint64_t addr, uint32_t expected, uint32_t engine, int32_t completion_type) {
-    if (!ctx.task_token.is_valid() || ctx.ingress == nullptr) {
+inline __aicore__ void pto2_defer_condition(
+    PTO2AsyncCtx &ctx, volatile __gm__ void *addr, uint32_t expected, uint32_t engine, int32_t completion_type
+) {
+    if (ctx.task_token.is_invalid() || ctx.ingress == nullptr) {
         return;
     }
 
@@ -62,7 +66,7 @@ pto2_defer_completion(PTO2AsyncCtx &ctx, uint64_t addr, uint32_t expected, uint3
     }
 
     volatile __gm__ PTO2DeferredCompletionEntry *slot = &ctx.ingress->entries[idx];
-    slot->addr = addr;
+    slot->addr = reinterpret_cast<uint64_t>(addr);
     slot->expected_value = expected;
     slot->engine = engine;
     slot->completion_type = completion_type;
@@ -71,24 +75,18 @@ pto2_defer_completion(PTO2AsyncCtx &ctx, uint64_t addr, uint32_t expected, uint3
 }
 
 inline __aicore__ void pto2_defer_counter(PTO2AsyncCtx &ctx, volatile __gm__ void *counter_addr, uint32_t expected) {
-    pto2_defer_completion(
-        ctx, reinterpret_cast<uint64_t>(counter_addr), expected, PTO2_COMPLETION_ENGINE_SDMA,
-        PTO2_COMPLETION_TYPE_COUNTER
-    );
+    pto2_defer_condition(ctx, counter_addr, expected, PTO2_COMPLETION_ENGINE_SDMA, PTO2_COMPLETION_TYPE_COUNTER);
 }
 
 inline __aicore__ void pto2_defer_sdma_event_record(PTO2AsyncCtx &ctx, volatile __gm__ void *record_addr) {
-    pto2_defer_completion(
-        ctx, reinterpret_cast<uint64_t>(record_addr), 0, PTO2_COMPLETION_ENGINE_SDMA,
-        PTO2_COMPLETION_TYPE_SDMA_EVENT_RECORD
-    );
+    pto2_defer_condition(ctx, record_addr, 0, PTO2_COMPLETION_ENGINE_SDMA, PTO2_COMPLETION_TYPE_SDMA_EVENT_RECORD);
 }
 
 #if defined(PTO_COMM_ASYNC_COMMON_ASYNC_EVENT_IMPL_HPP)
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
 inline __aicore__ void pto2_defer_pto_async_event(PTO2AsyncCtx &ctx, const PtoAsyncEvent &event,
                                                   const PtoAsyncSession &session) {
-    if (!ctx.task_token.is_valid() || ctx.ingress == nullptr) {
+    if (ctx.task_token.is_invalid() || ctx.ingress == nullptr) {
         (void)event.Wait(session);
         return;
     }
@@ -125,7 +123,7 @@ inline __aicore__ void pto2_defer_pto_async_event(PTO2AsyncCtx &ctx, const PtoAs
 #endif
 
 inline __aicore__ void pto2_defer_flush(PTO2AsyncCtx &ctx) {
-    if (!ctx.task_token.is_valid() || ctx.ingress == nullptr) return;
+    if (ctx.task_token.is_invalid() || ctx.ingress == nullptr) return;
 #if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
     dcci((__gm__ int32_t *)ctx.ingress->entries, ENTIRE_DATA_CACHE, CACHELINE_OUT);
     dcci((__gm__ int32_t *)ctx.ingress, SINGLE_CACHE_LINE, CACHELINE_OUT);
@@ -139,6 +137,21 @@ inline __aicore__ void pto2_defer_flush(PTO2AsyncCtx &ctx) {
     (void)ctx;
     __asm__ __volatile__("" ::: "memory");
 #endif
+}
+
+inline __aicore__ void
+pto2_send_notification(volatile __gm__ void *remote_counter_addr, int32_t value, pto::comm::NotifyOp notify_op) {
+    __gm__ int32_t *counter = reinterpret_cast<__gm__ int32_t *>(const_cast<__gm__ void *>(remote_counter_addr));
+    pto::comm::Signal signal(counter);
+    pto::comm::TNOTIFY(signal, value, notify_op);
+}
+
+inline __aicore__ void pto2_save_expected_notification_counter(
+    __gm__ int64_t *args, volatile __gm__ void *counter_addr, uint32_t expected_value
+) {
+    PTO2AsyncCtx ctx = pto2_async_ctx(args);
+    pto2_defer_condition(ctx, counter_addr, expected_value, PTO2_COMPLETION_ENGINE_SDMA, PTO2_COMPLETION_TYPE_COUNTER);
+    pto2_defer_flush(ctx);
 }
 
 #endif  // PTO_ASYNC_KERNEL_API_H

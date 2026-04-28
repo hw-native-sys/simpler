@@ -577,12 +577,32 @@ NB_MODULE(_task_interface, m) {
             }
         )
         .def_rw("enable_pmu", &CallConfig::enable_pmu)
+        .def_prop_rw(
+            "output_prefix",
+            [](const CallConfig &c) -> std::string {
+                return std::string(c.output_prefix, ::strnlen(c.output_prefix, sizeof(c.output_prefix)));
+            },
+            [](CallConfig &c, const std::string &s) {
+                if (s.size() >= sizeof(c.output_prefix)) {
+                    throw std::invalid_argument(
+                        "CallConfig.output_prefix length " + std::to_string(s.size()) + " exceeds buffer (" +
+                        std::to_string(sizeof(c.output_prefix) - 1) + " bytes)"
+                    );
+                }
+                std::memset(c.output_prefix, 0, sizeof(c.output_prefix));
+                std::memcpy(c.output_prefix, s.data(), s.size());
+            }
+        )
         .def("__repr__", [](const CallConfig &self) -> std::string {
             std::ostringstream os;
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
                << ", enable_l2_swimlane=" << (self.enable_l2_swimlane ? "True" : "False")
                << ", enable_dump_tensor=" << (self.enable_dump_tensor ? "True" : "False")
-               << ", enable_pmu=" << self.enable_pmu << ")";
+               << ", enable_pmu=" << self.enable_pmu;
+            if (self.output_prefix_set()) {
+                os << ", output_prefix='" << self.output_prefix << "'";
+            }
+            os << ")";
             return os.str();
         });
 
@@ -605,35 +625,19 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "run_raw",
-            [](ChipWorker &self, uint64_t callable, uint64_t args, int block_dim, int aicpu_thread_num,
-               bool enable_l2_swimlane, bool enable_dump_tensor, int enable_pmu) {
-                CallConfig config;
-                config.block_dim = block_dim;
-                config.aicpu_thread_num = aicpu_thread_num;
-                config.enable_l2_swimlane = enable_l2_swimlane;
-                config.enable_dump_tensor = enable_dump_tensor;
-                config.enable_pmu = enable_pmu;
+            [](ChipWorker &self, uint64_t callable, uint64_t args, const CallConfig &config) {
                 self.run(reinterpret_cast<const void *>(callable), reinterpret_cast<const void *>(args), config);
             },
-            nb::arg("callable"), nb::arg("args"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
-            nb::arg("enable_l2_swimlane") = false, nb::arg("enable_dump_tensor") = false, nb::arg("enable_pmu") = 0,
+            nb::arg("callable"), nb::arg("args"), nb::arg("config"),
             "Run with raw pointer arguments (used from forked chip process)."
         )
         .def(
             "run_from_blob",
-            [](ChipWorker &self, uint64_t callable, uint64_t blob_ptr, int block_dim, int aicpu_thread_num,
-               bool enable_l2_swimlane, bool enable_dump_tensor, int enable_pmu) {
-                CallConfig config;
-                config.block_dim = block_dim;
-                config.aicpu_thread_num = aicpu_thread_num;
-                config.enable_l2_swimlane = enable_l2_swimlane;
-                config.enable_dump_tensor = enable_dump_tensor;
-                config.enable_pmu = enable_pmu;
-                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr));
+            [](ChipWorker &self, uint64_t callable, uint64_t blob_ptr, const CallConfig &config) {
+                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), MAILBOX_ARGS_CAPACITY);
                 self.run(callable, view, config);
             },
-            nb::arg("callable"), nb::arg("blob_ptr"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
-            nb::arg("enable_l2_swimlane") = false, nb::arg("enable_dump_tensor") = false, nb::arg("enable_pmu") = 0,
+            nb::arg("callable"), nb::arg("blob_ptr"), nb::arg("config"),
             "Decode a length-prefixed TaskArgs blob ([T][S][tensors][scalars]) at "
             "blob_ptr and dispatch to the runtime. Used from forked chip processes "
             "reading the WorkerThread mailbox."
@@ -673,7 +677,7 @@ NB_MODULE(_task_interface, m) {
     m.def(
         "read_args_from_blob",
         [](uint64_t blob_ptr) {
-            TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr));
+            TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), MAILBOX_ARGS_CAPACITY);
             TaskArgs args;
             for (int32_t i = 0; i < view.tensor_count; i++) {
                 args.add_tensor(view.tensors[i]);

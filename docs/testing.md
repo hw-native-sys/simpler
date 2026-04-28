@@ -109,7 +109,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
 | `--manual` | | `exclude` | `exclude`/`include`/`only` for manual cases |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
-| `--enable-l2-swimlane` | | false | Enable L2 swimlane collection on first round only. Works under parallelism — each subprocess writes to its own `outputs/l2_perf_records_*/` subdir, flattened back to `outputs/` on completion. |
+| `--enable-l2-swimlane` | | false | Enable L2 swimlane collection on first round only. Each test case gets its own `outputs/<case>_<ts>/` directory under which `l2_perf_records.json` lands; parallel runs never collide. |
 | `--dump-tensor` | | false | Dump per-task tensor I/O during runtime execution |
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--build` | | false | Compile runtime from source (not pre-built) |
@@ -240,18 +240,15 @@ A single file can declare both L2 and L3 classes; they're grouped by `(runtime, 
 
 ### Profiling under parallelism
 
-`--enable-l2-swimlane` writes `outputs/l2_perf_records_*.json`; the runtime's filename has second-precision timestamps, so two subprocesses producing perf files in the same second would collide on one path. The dispatcher sidesteps this by giving each subprocess its own directory via the `SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR` env var:
+Each test case sets its own `CallConfig.output_prefix` (chosen by `scene_test.py::_build_output_prefix` as `outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/`). The C++ runtime writes all diagnostic artifacts under that prefix with fixed filenames:
 
-| Subprocess | Scoped directory |
-| ---------- | ---------------- |
-| xdist worker `gwK` (L2 phase) | `outputs/l2_perf_records_gwK/` |
-| L3 case (pytest path) | `outputs/l2_perf_records_l3_<nodeid-sanitized>/` |
-| Standalone L3 class | `outputs/l2_perf_records_l3_<ClassName>/` |
-| Standalone L2 fanout child | `outputs/l2_perf_records_l2_<runtime>_dev<N>/` |
+- `outputs/<case>_<ts>/l2_perf_records.json` — swimlane (`--enable-l2-swimlane`)
+- `outputs/<case>_<ts>/tensor_dump/` — tensor dump (`--dump-tensor`)
+- `outputs/<case>_<ts>/pmu.csv` — PMU counters (`--enable-pmu`)
 
-After all phases drain, `flatten_l2_perf_records_subdirs()` moves the contents of every `outputs/l2_perf_records_*/` subdir back to `outputs/` so downstream tools (`swimlane_converter.py`, CI artifact upload) still find everything in one place. Name collisions on the destination keep the first writer and suffix the loser with the subdir tag (e.g. `l2_perf_records_…__gw1.json`) so nothing is silently overwritten.
+Because each case gets its own directory, parallel runs (xdist workers, L3 case fanout, L2 device fanout) can never collide on filename — there is no per-file timestamp, no env-var scoping, and no post-run flatten step. `CallConfig::validate()` throws if any diagnostic flag is enabled but `output_prefix` is empty; `scene_test.py::run_class_cases` always fills it from the case label.
 
-The C++ runtime honors `SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR` at `L2PerfCollector::export_swimlane_json` — empty/unset falls through to the caller-supplied path (historical `outputs/` default), so standalone invocations that don't set the env var behave exactly as before.
+Standalone invocations of CLIs (`python -m simpler_setup.tools.swimlane_converter`, etc.) auto-detect the latest `outputs/*/l2_perf_records.json` (sorted by mtime); pass `--input <path>` to override.
 
 ### Dispatcher skip conditions (normal pytest runs)
 

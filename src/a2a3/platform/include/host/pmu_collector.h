@@ -41,10 +41,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
-#include <sys/stat.h>
 #include <unordered_set>
 #include <vector>
 
@@ -220,25 +220,16 @@ inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
 }
 
 /**
- * Generate a timestamped CSV output path under outputs/.
+ * Build the CSV path under the caller-provided per-task directory. Filename is
+ * fixed (no timestamp) — the directory is the per-task uniqueness boundary.
  */
-inline std::string make_pmu_csv_path() {
-    if (mkdir("outputs", 0755) != 0 && errno != EEXIST) {
-        LOG_WARN("Failed to create outputs directory for PMU CSV: errno=%d", errno);
+inline std::string make_pmu_csv_path(const std::string &output_dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(output_dir, ec);
+    if (ec) {
+        LOG_WARN("Failed to create PMU output directory %s: %s", output_dir.c_str(), ec.message().c_str());
     }
-    char csv_name[128];
-    auto now = std::chrono::system_clock::now();
-    std::time_t t_now = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
-    std::tm *tm_info = std::localtime(&t_now);
-    if (tm_info != nullptr) {
-        char base[96];
-        std::strftime(base, sizeof(base), "pmu_%Y%m%d_%H%M%S", tm_info);
-        std::snprintf(csv_name, sizeof(csv_name), "%s_%03ld.csv", base, static_cast<long>(ms));
-    } else {
-        std::snprintf(csv_name, sizeof(csv_name), "pmu_output.csv");
-    }
-    return std::string("outputs/") + csv_name;
+    return output_dir + "/pmu.csv";
 }
 
 #endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_

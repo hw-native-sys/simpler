@@ -488,22 +488,22 @@ int DeviceRunner::run(
     }
 
     // After streams are synchronized, pull profiling data back in one batch
-    // (memcpy-based: two-step count-first copy per buffer).
+    // (memcpy-based: two-step count-first copy per buffer). All three
+    // collectors write under `output_prefix_`, the per-task directory the
+    // user must set on CallConfig (CallConfig::validate() enforces non-empty).
     if (enable_l2_swimlane_) {
         l2_perf_collector_.collect_all();
-        l2_perf_collector_.export_swimlane_json();
+        l2_perf_collector_.export_swimlane_json(output_prefix_);
     }
 
-    // Collect and export tensor dump data
     if (enable_dump_tensor_) {
         dump_collector_.collect_all();
-        dump_collector_.export_dump_files();
+        dump_collector_.export_dump_files(output_prefix_);
     }
 
-    // Collect and export PMU data (two-step rtMemcpy per core)
     if (enable_pmu_ && pmu_collector_.is_initialized()) {
         pmu_collector_.collect_all();
-        pmu_collector_.export_csv();
+        pmu_collector_.export_csv(output_prefix_);
     }
 
     // Print handshake results (reads from device memory, must be before free)

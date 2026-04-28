@@ -32,11 +32,11 @@ from .device_log_resolver import infer_device_id_from_log_path, resolve_device_l
 
 
 def auto_select_l2_perf_records_json():
-    """Find the latest l2_perf_records_*.json under ./outputs/."""
+    """Find the latest outputs/<case>/l2_perf_records.json (sorted by mtime)."""
     outputs_dir = Path.cwd() / "outputs"
-    files = sorted(outputs_dir.glob("l2_perf_records_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted(outputs_dir.glob("*/l2_perf_records.json"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
-        raise FileNotFoundError(f"No l2_perf_records_*.json files found in {outputs_dir}")
+        raise FileNotFoundError(f"No outputs/*/l2_perf_records.json found under {outputs_dir}")
     return files[0]
 
 
@@ -243,7 +243,7 @@ def validate_perf_tasks_for_overhead_analysis(tasks):
                 "",
                 "How to fix:",
                 "  1) Re-run workload with profiling enabled (e.g. run_example.py --enable-l2-swimlane).",
-                "  2) Use the newly generated outputs/l2_perf_records_*.json as --l2-perf-records-json input.",
+                "  2) Pass the newly generated outputs/<case>/l2_perf_records.json via --l2-perf-records-json.",
                 "  3) Verify each task includes dispatch_time_us and finish_time_us.",
                 "",
                 "Note:",
@@ -486,9 +486,9 @@ def main():
         epilog="""
 Examples:
   %(prog)s                                          # auto-select latest files
-  %(prog)s --l2-perf-records-json outputs/l2_perf_records_*.json
+  %(prog)s --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json
   %(prog)s --device-log ~/ascend/log/debug/device-0/device-*.log
-  %(prog)s --l2-perf-records-json outputs/l2_perf_records_*.json -d 0
+  %(prog)s --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json -d 0
         """,
     )
     parser.add_argument(

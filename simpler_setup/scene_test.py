@@ -487,36 +487,24 @@ def _project_root() -> Path:
 
 
 def _outputs_dir() -> Path:
-    """Return the directory where l2_perf_records_*.json lands.
-
-    Honors ``SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR`` so the parallel test dispatcher can give each
-    subprocess its own isolated output directory. Absolute paths pass through;
-    relative paths are interpreted against the project root. Empty/unset env
-    var falls back to ``<project>/outputs`` (the historical default).
-    """
-    env = os.environ.get("SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR")
-    if env:
-        p = Path(env)
-        return p if p.is_absolute() else _project_root() / p
+    """Root directory under which per-case output prefixes are created."""
     return _project_root() / "outputs"
 
 
-def _snapshot_l2_perf_records_files() -> set[Path]:
-    d = _outputs_dir()
-    return set(d.glob("l2_perf_records_*.json")) if d.exists() else set()
+def _build_output_prefix(case_label: str) -> Path:
+    """Per-case directory for diagnostic artifacts.
 
+    Each case gets its own ``outputs/<case_label>_<timestamp>/`` directory; the
+    runtime writes ``l2_perf_records.json``, ``tensor_dump/``, and ``pmu.csv``
+    under that root with fixed filenames. Two cases of the same name run in
+    the same second is not a contemplated scenario (parallel xdist runs differ
+    by class+method).
+    """
+    from datetime import datetime  # noqa: PLC0415
 
-def _wait_new_l2_perf_records_file(before: set[Path], timeout: float = 2.0) -> Path | None:
-    """Wait briefly for a new ``l2_perf_records_*.json`` to appear in outputs/."""
-    import time  # noqa: PLC0415
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        new = _snapshot_l2_perf_records_files() - before
-        if new:
-            return max(new, key=lambda p: p.stat().st_mtime)
-        time.sleep(0.1)
-    return None
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_label = _sanitize_for_filename(case_label)
+    return _outputs_dir() / f"{safe_label}_{timestamp}"
 
 
 def _get_device_log_dir(device_id) -> Path:
@@ -593,45 +581,29 @@ def _sanitize_for_filename(s: str) -> str:
 
 def _convert_case_swimlane(
     case_label: str,
+    output_prefix: Path,
     device_id,
-    before_l2_perf_records: set[Path],
     before_device: set[Path] | None,
     callable_spec: dict | None = None,
 ) -> None:
-    """Post-case: rename the new perf file to include ``case_label`` (guarding against
-    the runtime's second-precision filename collisions), then invoke the converter.
-
-    The ``l2_perf_records_`` prefix is preserved so the converter's stem-based output
-    naming still strips it and produces ``merged_swimlane_<case_label>_<ts>.json``.
-
-    When ``callable_spec`` is provided and contains ``"name"`` entries on incores,
-    a ``func_id_names_<label>.json`` sidecar is written and passed to the converter
-    so that swimlane visualizations display human-readable kernel names.
+    """Post-case: invoke the swimlane converter on the perf file the runtime
+    just wrote into ``<output_prefix>/l2_perf_records.json``. No diff/rename
+    dance — the path is known a priori from CallConfig.output_prefix.
     """
     import logging  # noqa: PLC0415
 
     logger = logging.getLogger(__name__)
-    l2_perf_records_file = _wait_new_l2_perf_records_file(before_l2_perf_records)
-    if l2_perf_records_file is None:
-        logger.warning(f"[{case_label}] No new l2_perf_records_*.json produced; skipping conversion")
+    perf_file = output_prefix / "l2_perf_records.json"
+    if not perf_file.exists():
+        logger.warning(f"[{case_label}] {perf_file} not produced; skipping conversion")
         return
-    safe_label = _sanitize_for_filename(case_label)
-    timestamp = (
-        l2_perf_records_file.stem[len("l2_perf_records_") :]
-        if l2_perf_records_file.stem.startswith("l2_perf_records_")
-        else l2_perf_records_file.stem
-    )
-    renamed = l2_perf_records_file.with_name(f"l2_perf_records_{safe_label}_{timestamp}.json")
-    if renamed.exists():
-        logger.warning(f"[{case_label}] target {renamed.name} already exists; overwriting")
-        renamed.unlink()
-    l2_perf_records_file.rename(renamed)
 
     # Dump callable name mapping if the CALLABLE spec provides names
     func_names_path = None
     if callable_spec:
         mapping = _extract_name_map(callable_spec)
-        func_names_path = _dump_name_map(mapping, renamed.parent / f"name_map_{safe_label}.json")
+        safe_label = _sanitize_for_filename(case_label)
+        func_names_path = _dump_name_map(mapping, output_prefix / f"name_map_{safe_label}.json")
 
     device_log = None
     if before_device is not None:
@@ -639,7 +611,7 @@ def _convert_case_swimlane(
         if device_log is None:
             logger.warning(f"[{case_label}] no new device log found; scheduler deep-dive may use stale log")
     _run_swimlane_converter(
-        input_path=renamed, device_id=device_id, device_log=device_log, func_names_path=func_names_path
+        input_path=perf_file, device_id=device_id, device_log=device_log, func_names_path=func_names_path
     )
 
 
@@ -666,8 +638,12 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     """
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
+    diagnostics_on = enable_l2_swimlane or enable_dump_tensor or enable_pmu
     for case in cases:
-        before_l2_perf_records = _snapshot_l2_perf_records_files() if enable_l2_swimlane else set()
+        case_label = f"{cls_name}_{case['name']}"
+        # Per-case directory the runtime writes into. Required (non-empty) when
+        # any diagnostic flag is on; CallConfig::validate() throws otherwise.
+        prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
         before_device = _snapshot_device_logs(primary_device_id) if enable_l2_swimlane and is_hardware else None
         try:
             cls_inst._run_and_validate(
@@ -680,13 +656,14 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                output_prefix=str(prefix) if diagnostics_on else "",
             )
         finally:
             if enable_l2_swimlane:
                 _convert_case_swimlane(
-                    f"{cls_name}_{case['name']}",
+                    case_label,
+                    prefix,
                     primary_device_id,
-                    before_l2_perf_records,
                     before_device,
                     callable_spec=callable_spec,
                 )
@@ -856,7 +833,9 @@ class SceneTestCase:
             return self._compile_l3_callables(platform)
         raise ValueError(f"Unsupported level: {self._st_level}")
 
-    def _build_config(self, config_dict, enable_l2_swimlane=False, enable_dump_tensor=False, enable_pmu=0):
+    def _build_config(
+        self, config_dict, enable_l2_swimlane=False, enable_dump_tensor=False, enable_pmu=0, *, output_prefix=""
+    ):
         from simpler.task_interface import CallConfig  # noqa: PLC0415
 
         config = CallConfig()
@@ -865,6 +844,11 @@ class SceneTestCase:
         config.enable_l2_swimlane = enable_l2_swimlane
         config.enable_dump_tensor = enable_dump_tensor
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
+        # `output_prefix` is required by CallConfig::validate() whenever any
+        # diagnostic flag is enabled. Caller threads it down from the per-case
+        # directory built by _build_output_prefix().
+        if output_prefix:
+            config.output_prefix = str(output_prefix)
         return config
 
     def _resolve_env(self):
@@ -895,6 +879,7 @@ class SceneTestCase:
         enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
+        output_prefix="",
     ):
         if self._st_level == 2:
             self._run_and_validate_l2(
@@ -906,6 +891,7 @@ class SceneTestCase:
                 enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                output_prefix=output_prefix,
             )
         elif self._st_level == 3:
             self._run_and_validate_l3(
@@ -918,6 +904,7 @@ class SceneTestCase:
                 enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                output_prefix=output_prefix,
             )
 
     def _run_and_validate_l2(
@@ -930,6 +917,7 @@ class SceneTestCase:
         enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
+        output_prefix="",
     ):
         params = case.get("params", {})
         config_dict = case.get("config", {})
@@ -962,6 +950,7 @@ class SceneTestCase:
                 enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                output_prefix=output_prefix,
             )
 
             with _temporary_env(self._resolve_env()):
@@ -981,6 +970,7 @@ class SceneTestCase:
         enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
+        output_prefix="",
     ):
         # Defensive belt-and-braces: the pytest dispatcher and run_module both
         # block --enable-l2-swimlane for L3 at the CLI boundary. Catch any code
@@ -1030,6 +1020,7 @@ class SceneTestCase:
                 enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                output_prefix=output_prefix,
             )
 
             # Orch fn signature: (orch, args, cfg) — inner fn forwards to
@@ -1251,10 +1242,9 @@ class SceneTestCase:
             if args.max_parallel < 1:
                 print(f"ERROR: -j must be >= 1, got {args.max_parallel}", file=sys.stderr)
                 sys.exit(2)
-        # Note: profiling + parallelism used to be blocked here because perf
-        # files shared a process-global directory. The test dispatcher now scopes
-        # each subprocess to its own SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR so the combination
-        # is safe.
+        # Profiling + parallelism is safe: each test case sets its own
+        # `output_prefix` on CallConfig (see run_class_cases) so diagnostic
+        # artifacts land in distinct directories with no shared filenames.
 
         module = sys.modules[module_name]
         test_classes = [
@@ -1430,17 +1420,9 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
                 "3",
             ]
 
-        # Each L3 class gets its own perf output subdir so two concurrent L3
-        # cases can't collide on a per_swimlane_<second-precision-ts>.json.
-        # Anchor to _project_root() so the C++ runtime (resolved against its
-        # own CWD) and Python post-processing agree on the location.
-        child_env = {
-            **os.environ,
-            "SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR": str(
-                _project_root() / "outputs" / f"l2_perf_records_l3_{cls.__name__}"
-            ),
-        }
-        l3_jobs.append(Job(label=label, device_count=class_dev_count, build_cmd=_build, env=child_env))
+        # Per-case output_prefix is chosen inside the child by run_class_cases,
+        # so no env var is needed to scope concurrent jobs.
+        l3_jobs.append(Job(label=label, device_count=class_dev_count, build_cmd=_build))
 
     l3_failed = False
     if l3_jobs:
@@ -1535,17 +1517,9 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
                 return cmd
 
             # device_count=1 for L2 fanout children (each child uses one slot).
-            # Scope perf output to this fanout child's own subdir so concurrent
-            # L2 children don't collide on the second-precision perf filename.
-            # Absolute path anchored to _project_root() so the C++ runtime and
-            # Python post-processing agree on the filesystem location.
-            child_env = {
-                **os.environ,
-                "SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR": str(
-                    _project_root() / "outputs" / f"l2_perf_records_l2_{rt}_dev{dev}"
-                ),
-            }
-            l2_jobs.append(Job(label=label, device_count=1, build_cmd=_build, env=child_env))
+            # Per-case output_prefix is chosen inside the child by run_class_cases,
+            # so no env var is needed to scope concurrent jobs.
+            l2_jobs.append(Job(label=label, device_count=1, build_cmd=_build))
 
         # Use the same scheduler: pool=device_ids, fail_fast=exitfirst. This
         # gives us automatic parallelism + SIGTERM on fail-fast.
@@ -1572,13 +1546,6 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
             l2_failed = True
             if args.exitfirst:
                 break
-
-    # Flatten per-subprocess outputs/l2_perf_records_*/ subdirs back to outputs/.
-    # Anchor to _project_root() so flushing works when the user runs a
-    # standalone test from a subdirectory.
-    from .parallel_scheduler import flatten_l2_perf_records_subdirs  # noqa: PLC0415
-
-    flatten_l2_perf_records_subdirs(_project_root() / "outputs")
 
     return not (l3_failed or l2_failed)
 

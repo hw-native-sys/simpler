@@ -98,16 +98,19 @@ _OFF_STATE = 0
 _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
-# Packed CallConfig wire layout (5 int32s in declaration order, see call_config.h).
-# struct.calcsize("=iiiii") == 20.
-_CFG_FMT = struct.Struct("=iiiii")
-# Held at 64 (not packed flush against CONFIG) so the args blob's first
+# Packed CallConfig wire layout — must match call_config.h byte for byte:
+# 5 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
+# enable_pmu) + 1024-byte NUL-terminated output_prefix.
+_CFG_FMT = struct.Struct("=iiiii1024s")
+# Args region starts after CONFIG, rounded up to 8 bytes so the first
 # ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
-# SIGBUS on strict-alignment platforms. Also keeps clear of the control
-# region (offsets 16–47, mutually exclusive with task dispatch).
-_OFF_ARGS = 64
-assert _OFF_CONFIG + _CFG_FMT.size <= _OFF_ARGS, "CallConfig overflows config region"
+# SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
+_OFF_ARGS = (_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
 assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for ContinuousTensor.data"
+# MAILBOX_ARGS_CAPACITY mirrors the C++ constexpr in worker_manager.h so the
+# Python reader can bounds-check incoming args blobs. Source-of-truth for the
+# constants on the right is the nanobind binding (cannot drift).
+_MAILBOX_ARGS_CAPACITY = MAILBOX_SIZE - _OFF_ARGS - MAILBOX_ERROR_MSG_SIZE
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
 
@@ -193,6 +196,14 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     base = _OFF_ARGS
     t_count = struct.unpack_from("i", buf, base)[0]
     s_count = struct.unpack_from("i", buf, base + 4)[0]
+    if t_count < 0 or s_count < 0:
+        raise RuntimeError(f"args blob has negative counts: tensors={t_count}, scalars={s_count}")
+    blob_bytes = 8 + t_count * 40 + s_count * 8
+    if blob_bytes > _MAILBOX_ARGS_CAPACITY:
+        raise RuntimeError(
+            f"args blob ({blob_bytes} bytes) exceeds mailbox capacity ({_MAILBOX_ARGS_CAPACITY} bytes); "
+            f"tensors={t_count}, scalars={s_count} — likely a corrupt header or a writer bug"
+        )
 
     args = TaskArgs()
     ct_off = base + 8
@@ -282,20 +293,12 @@ def _chip_process_loop(
         state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
             callable_ptr = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-            block_dim, aicpu_tn, enable_l2_swimlane, dump_tensor, enable_pmu = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
+            cfg = _read_config_from_mailbox(buf)
 
             code = 0
             msg = ""
             try:
-                cw.run_from_blob(
-                    callable_ptr,
-                    args_ptr,
-                    block_dim,
-                    aicpu_tn,
-                    bool(enable_l2_swimlane),
-                    bool(dump_tensor),
-                    enable_pmu,
-                )
+                cw.run_from_blob(callable_ptr, args_ptr, cfg)
             except Exception as e:  # noqa: BLE001
                 code = 1
                 msg = _format_exc(f"chip_process dev={device_id}", e)
@@ -398,22 +401,12 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
             state = _mailbox_load_i32(state_addr)
             if state == _TASK_READY:
                 callable_ptr = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-                block_dim, aicpu_tn, enable_l2_swimlane, dump_tensor, enable_pmu = _CFG_FMT.unpack_from(
-                    buf, _OFF_CONFIG
-                )
+                cfg = _read_config_from_mailbox(buf)
 
                 code = 0
                 msg = ""
                 try:
-                    cw._impl.run_from_blob(
-                        callable_ptr,
-                        args_ptr,
-                        block_dim,
-                        aicpu_tn,
-                        bool(enable_l2_swimlane),
-                        bool(dump_tensor),
-                        enable_pmu,
-                    )
+                    cw._impl.run_from_blob(callable_ptr, args_ptr, cfg)
                 except Exception as e:  # noqa: BLE001
                     code = 1
                     msg = _format_exc(f"chip_process dev={device_id}", e)
@@ -491,13 +484,15 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
 
 def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     """Reconstruct a CallConfig from the unified mailbox layout."""
-    block_dim, aicpu_tn, swl, dt, pmu = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
+    block_dim, aicpu_tn, swl, dt, pmu, prefix_bytes = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
     cfg = CallConfig()
     cfg.block_dim = block_dim
     cfg.aicpu_thread_num = aicpu_tn
     cfg.enable_l2_swimlane = bool(swl)
     cfg.enable_dump_tensor = bool(dt)
     cfg.enable_pmu = pmu
+    # NUL-terminated C string in a 1024-byte field.
+    cfg.output_prefix = prefix_bytes.split(b"\x00", 1)[0].decode("utf-8")
     return cfg
 
 

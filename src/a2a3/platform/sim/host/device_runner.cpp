@@ -27,6 +27,7 @@
 #include "device_runner.h"
 
 #include <stdlib.h>
+#include <sys/stat.h>
 
 #include <atomic>
 #include <cstdio>
@@ -400,7 +401,9 @@ int DeviceRunner::run(
     }
 
     if (enable_pmu_) {
-        rc = init_pmu_buffers(num_aicore, launch_aicpu_num, make_pmu_csv_path(), pmu_event_type_, device_id);
+        rc = init_pmu_buffers(
+            num_aicore, launch_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id
+        );
         if (rc != 0) {
             LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
             kernel_args_.pmu_data_base = 0;
@@ -508,7 +511,7 @@ int DeviceRunner::run(
     std::thread dump_collector_thread;
     if (enable_dump_tensor_) {
         dump_collector_thread = std::thread([this]() {
-            dump_collector_.poll_and_collect();
+            dump_collector_.poll_and_collect(output_prefix_);
         });
     }
 
@@ -558,13 +561,14 @@ int DeviceRunner::run(
         return runtime_rc;
     }
 
-    // Stop memory management, drain remaining buffers, collect phase data, export
+    // Diagnostic exports use the per-task `output_prefix_` directory the user
+    // set on CallConfig (CallConfig::validate() enforces non-empty upstream).
     if (enable_l2_swimlane_) {
         l2_perf_collector_.stop_memory_manager();
         l2_perf_collector_.drain_remaining_buffers();
         l2_perf_collector_.scan_remaining_perf_buffers();
         l2_perf_collector_.collect_phase_data();
-        l2_perf_collector_.export_swimlane_json();
+        l2_perf_collector_.export_swimlane_json(output_prefix_);
     }
 
     if (enable_dump_tensor_) {

@@ -540,7 +540,7 @@ static std::string dims_to_string(const uint32_t dims[], int ndims) {
     return ss.str();
 }
 
-void TensorDumpCollector::poll_and_collect() {
+void TensorDumpCollector::poll_and_collect(const std::string &output_prefix_) {
     const auto wait_timeout = std::chrono::milliseconds(100);
     const auto idle_timeout = std::chrono::seconds(PLATFORM_DUMP_TIMEOUT_SECONDS);
     uint64_t buffers_collected = 0;
@@ -549,16 +549,11 @@ void TensorDumpCollector::poll_and_collect() {
     bool idle_timer_started = false;
     std::chrono::steady_clock::time_point idle_start;
 
-    // Create output directory and start writer thread
-    auto now_wall = std::chrono::system_clock::now();
-    auto time_t_now = std::chrono::system_clock::to_time_t(now_wall);
-    struct tm tm_now;
-    localtime_r(&time_t_now, &tm_now);
-    char ts[32];
-    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_now);
-
-    std::string base_name = std::string("tensor_dump_") + ts;
-    run_dir_ = std::filesystem::path("outputs") / base_name;
+    // Create output directory and start writer thread. Caller-provided
+    // `output_prefix_` is the per-task uniqueness boundary; the dump dir
+    // name is fixed (`<prefix>/tensor_dump`).
+    std::string base_name = "tensor_dump";
+    run_dir_ = std::filesystem::path(output_prefix_) / base_name;
     std::filesystem::create_directories(run_dir_);
     bin_file_.open(run_dir_ / (base_name + ".bin"), std::ios::binary);
     next_bin_offset_ = 0;
@@ -731,7 +726,7 @@ void TensorDumpCollector::writer_loop() {
     }
 }
 
-int TensorDumpCollector::export_dump_files(const std::string & /*output_path*/) {
+int TensorDumpCollector::export_dump_files() {
     if (collected_.empty()) {
         LOG_WARN("No tensor dump data to export");
         return 0;
@@ -778,7 +773,6 @@ int TensorDumpCollector::export_dump_files(const std::string & /*output_path*/) 
     std::string base_name = run_dir_.filename().string();
     std::ofstream json(run_dir_ / (base_name + ".json"));
     json << "{\n";
-    json << "  \"timestamp\": \"" << base_name.substr(sizeof("tensor_dump_") - 1) << "\",\n";
     json << "  \"run_dir\": \"" << base_name << "\",\n";
     json << "  \"bin_format\": {\n";
     json << "    \"type\": \"logical_contiguous\",\n";

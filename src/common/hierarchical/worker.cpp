@@ -168,6 +168,7 @@ void Worker::close() {
 // =============================================================================
 
 void Worker::run(uint64_t callable, TaskArgsView args, const CallConfig &config) {
+    config.validate();
     if (run_callback_) {
         run_callback_(callable, args, config);
     }

@@ -16,14 +16,12 @@
 
 #include "host/l2_perf_collector.h"
 
-#include <sys/stat.h>
-#include <sys/types.h>
-
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <string>
@@ -319,15 +317,7 @@ int L2PerfCollector::collect_all() {
     return 0;
 }
 
-int L2PerfCollector::export_swimlane_json(const std::string &output_path_arg) {
-    // Step 0: Resolve effective output directory. SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR (when set)
-    // overrides the caller-supplied path so the parallel test orchestrator can
-    // give each subprocess its own directory — avoids filename collisions when
-    // two concurrent runs produce a l2_perf_records_*.json with the same
-    // second-precision timestamp. Empty env var is treated as unset.
-    const char *env_dir = std::getenv("SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR");
-    const std::string output_path = (env_dir != nullptr && env_dir[0] != '\0') ? std::string(env_dir) : output_path_arg;
-
+int L2PerfCollector::export_swimlane_json(const std::string &output_path) {
     // Step 1: Validate collected data
     bool has_any_records = false;
     for (const auto &core_records : collected_perf_records_) {
@@ -341,13 +331,13 @@ int L2PerfCollector::export_swimlane_json(const std::string &output_path_arg) {
         return -1;
     }
 
-    // Step 2: Create output directory if it doesn't exist
-    struct stat st;
-    if (stat(output_path.c_str(), &st) == -1) {
-        if (mkdir(output_path.c_str(), 0755) != 0) {
-            LOG_ERROR("Error: Failed to create output directory.");
-            return -1;
-        }
+    // Step 2: Create output directory (recursively — parent `outputs/` may not
+    // yet exist on a clean checkout / standalone run).
+    std::error_code ec;
+    std::filesystem::create_directories(output_path, ec);
+    if (ec) {
+        LOG_ERROR("Error: Failed to create output directory %s: %s", output_path.c_str(), ec.message().c_str());
+        return -1;
     }
 
     // Step 3: Flatten per-core vectors into tagged records with core_id derived from index
@@ -398,12 +388,9 @@ int L2PerfCollector::export_swimlane_json(const std::string &output_path_arg) {
         }
     }
 
-    // Step 5: Generate filename with timestamp (YYYYMMDD_HHMMSS)
-    std::time_t now = time(nullptr);
-    std::tm *timeinfo = std::localtime(&now);
-    char time_buffer[32];
-    std::strftime(time_buffer, sizeof(time_buffer), "%Y%m%d_%H%M%S", timeinfo);
-    std::string filepath = output_path + "/l2_perf_records_" + std::string(time_buffer) + ".json";
+    // Step 5: Compose output path. Filename is fixed (no timestamp) — the
+    // caller-provided directory is the per-task uniqueness boundary.
+    std::string filepath = output_path + "/l2_perf_records.json";
 
     // Step 6: Open JSON file for writing
     std::ofstream outfile(filepath);
