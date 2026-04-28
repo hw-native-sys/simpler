@@ -54,14 +54,14 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
         args_t0.add_input(ext_a);
         args_t0.add_input(ext_b);
         args_t0.add_output(TensorCreateInfo(shapes, 1, DataType::FLOAT32));
-        SubmitResult r0 = pto2_rt_submit_aiv_task(rt, 0, args_t0);
+        SubmitResult r0 = rt_submit_aiv_task(rt, 0, args_t0);
 
         // t1: d = c + 1.0
         Arg args_t1;
         args_t1.add_input(r0.outputs.get_ref(0));
         args_t1.add_output(TensorCreateInfo(shapes, 1, DataType::FLOAT32));
         args_t1.add_scalar(1.0f);
-        SubmitResult r1 = pto2_rt_submit_aiv_task(rt, 1, args_t1);
+        SubmitResult r1 = rt_submit_aiv_task(rt, 1, args_t1);
         pto2_rt_add_dependency(rt, r0.task_id, r1.task_id);
 
         // t2: e = c + 2.0
@@ -69,7 +69,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
         args_t2.add_input(r0.outputs.get_ref(0));
         args_t2.add_output(TensorCreateInfo(shapes, 1, DataType::FLOAT32));
         args_t2.add_scalar(2.0f);
-        SubmitResult r2 = pto2_rt_submit_aiv_task(rt, 1, args_t2);
+        SubmitResult r2 = rt_submit_aiv_task(rt, 1, args_t2);
         pto2_rt_add_dependency(rt, r0.task_id, r2.task_id);
 
         // t3: f = d * e
@@ -77,7 +77,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
         args_t3.add_input(r1.outputs.get_ref(0));
         args_t3.add_input(r2.outputs.get_ref(0));
         args_t3.add_inout(ext_f);
-        SubmitResult r3 = pto2_rt_submit_aiv_task(rt, 2, args_t3);
+        SubmitResult r3 = rt_submit_aiv_task(rt, 2, args_t3);
         pto2_rt_add_dependency(rt, r1.task_id, r3.task_id);
         pto2_rt_add_dependency(rt, r2.task_id, r3.task_id);
     }  // scope_end: batch-publish all tasks

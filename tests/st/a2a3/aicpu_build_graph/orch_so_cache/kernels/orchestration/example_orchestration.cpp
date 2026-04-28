@@ -48,7 +48,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
         args.add_input(ext_a);
         args.add_input(ext_b);
         args.add_inout(ext_f);
-        pto2_rt_submit_aiv_task(rt, FUNC_ADD, args);
+        rt_submit_aiv_task(rt, FUNC_ADD, args);
     }
 }
 

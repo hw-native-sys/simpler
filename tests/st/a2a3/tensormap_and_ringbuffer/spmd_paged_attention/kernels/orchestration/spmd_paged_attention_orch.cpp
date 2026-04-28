@@ -148,7 +148,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         mk.aic_kernel_id = FUNC_PA_AIC;
         mk.aiv0_kernel_id = FUNC_PA_AIV;
         mk.aiv1_kernel_id = FUNC_PA_AIV;
-        pto2_rt_submit_task(mk, args);
+        rt_submit_task(mk, args);
     }
 
     LOG_INFO(

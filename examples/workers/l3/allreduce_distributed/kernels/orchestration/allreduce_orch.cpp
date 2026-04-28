@@ -50,7 +50,7 @@ __attribute__((visibility("default"))) void allreduce_orchestration(const ChipSt
     params.add_inout(scratch);
     params.add_scalar(orch_args.scalar(0));  // nranks
     params.add_scalar(orch_args.scalar(1));  // CommContext
-    pto2_rt_submit_aiv_task(0, params);
+    rt_submit_aiv_task(0, params);
 }
 
 }  // extern "C"

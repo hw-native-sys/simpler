@@ -45,7 +45,7 @@ static void submit_spmd_aiv(int32_t kernel_id, Tensor &out, int16_t block_num, i
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.launch_spec.set_block_num(block_num);
-    pto2_rt_submit_aiv_task(kernel_id, args);
+    rt_submit_aiv_task(kernel_id, args);
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {

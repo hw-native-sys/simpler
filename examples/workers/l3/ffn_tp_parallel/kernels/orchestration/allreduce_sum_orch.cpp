@@ -41,7 +41,7 @@ __attribute__((visibility("default"))) void allreduce_sum_orchestration(const Ch
     params.add_inout(scratch);
     params.add_scalar(orch_args.scalar(0));  // nranks
     params.add_scalar(orch_args.scalar(1));  // CommContext
-    pto2_rt_submit_aiv_task(1, params);
+    rt_submit_aiv_task(1, params);
 }
 
 }  // extern "C"

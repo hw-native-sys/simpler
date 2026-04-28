@@ -208,7 +208,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_qk.add_output(sij_buf_ci);
                     params_qk.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
+                    TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     const Tensor &sij_buf = qk_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
@@ -230,7 +230,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_sf.add_output(pij_buf_ci, scalar_ci, scalar_ci);
                     params_sf.add_scalar(scale_value, n_blocks, valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
+                    TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     const Tensor &pij_buf = sf_outs.get_ref(0);
                     const Tensor &mi = sf_outs.get_ref(1);
                     const Tensor &li = sf_outs.get_ref(2);
@@ -245,7 +245,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_pv.add_output(tile2d_ci);
                     params_pv.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
+                    TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_new = pv_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
@@ -261,7 +261,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_up.add_inout(mi_update, li_update, oi, out_view);
                     params_up.add_scalar(is_first, is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+                    rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);

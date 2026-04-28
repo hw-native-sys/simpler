@@ -117,7 +117,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                 args_inplace.add_output(TensorCreateInfo(oi_shapes, 2, DataType::FLOAT32));
                 args_inplace.add_output(TensorCreateInfo(li_shapes, 1, DataType::FLOAT32));
                 args_inplace.add_output(TensorCreateInfo(mi_shapes, 1, DataType::FLOAT32));
-                SubmitResult r_hub = pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace);
+                SubmitResult r_hub = rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace);
                 const Tensor &oi = r_hub.outputs.get_ref(0);
                 const Tensor &li_update = r_hub.outputs.get_ref(1);
                 const Tensor &mi_update = r_hub.outputs.get_ref(2);
@@ -141,7 +141,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_qk.add_input(qi);
                     args_qk.add_input(kj);
                     args_qk.add_output(TensorCreateInfo(sij_shapes, 2, DataType::FLOAT32));
-                    SubmitResult r_qk = pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, args_qk);
+                    SubmitResult r_qk = rt_submit_aic_task(rt, FUNC_QK_MATMUL, args_qk);
 
                     // === Task 2: Softmax ===
                     uint32_t sij_valid_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(valid_len)};
@@ -154,7 +154,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_sf.add_output(TensorCreateInfo(mi_shapes, 1, DataType::FLOAT32));
                     args_sf.add_output(TensorCreateInfo(li_shapes, 1, DataType::FLOAT32));
                     args_sf.add_scalar(scale_value);
-                    SubmitResult r_sf = pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf);
+                    SubmitResult r_sf = rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf);
                     pto2_rt_add_dependency(rt, r_qk.task_id, r_sf.task_id);
 
                     // === Task 3: PV matmul ===
@@ -164,7 +164,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_pv.add_input(r_sf.outputs.get_ref(0));
                     args_pv.add_input(vj);
                     args_pv.add_output(TensorCreateInfo(oi_tmp_shapes, 2, DataType::FLOAT32));
-                    SubmitResult r_pv = pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv);
+                    SubmitResult r_pv = rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv);
                     pto2_rt_add_dependency(rt, r_sf.task_id, r_pv.task_id);
 
                     // === Task 4: Online update ===
@@ -181,7 +181,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_up.add_inout(out_view);
                     args_up.add_scalar(is_first);
                     args_up.add_scalar(is_last);
-                    SubmitResult r_up = pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up);
+                    SubmitResult r_up = rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up);
                     pto2_rt_add_dependency(rt, r_sf.task_id, r_up.task_id);
                     pto2_rt_add_dependency(rt, r_pv.task_id, r_up.task_id);
                     pto2_rt_add_dependency(rt, prev_update_task, r_up.task_id);

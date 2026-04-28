@@ -189,7 +189,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_qk.add_input(kj);
                     params_qk.add_output(sij_ci);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
+                    TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     const Tensor &sij = qk_outs.get_ref(0);
                     PROF_INC(prof_submit_count, 1);
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -208,7 +208,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_sf.add_dep(qk_outs.task_id());
                     params_sf.add_scalar(scale_value);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
+                    TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     const Tensor &pij_f16 = sf_outs.get_ref(0);
                     const Tensor &mi = sf_outs.get_ref(1);
                     const Tensor &li = sf_outs.get_ref(2);
@@ -221,7 +221,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_pv.add_output(tile2d_ci);
                     params_pv.add_dep(sf_outs.task_id());
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
+                    TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_tmp = pv_outs.get_ref(0);
                     PROF_INC(prof_submit_count, 1);
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -252,7 +252,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors up_outs = pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+                    TaskOutputTensors up_outs = rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
                     prev_update_task = up_outs.task_id();
                     PROF_INC(prof_submit_count, 1);
                     CYCLE_COUNT_LAP(prof_submit_task);

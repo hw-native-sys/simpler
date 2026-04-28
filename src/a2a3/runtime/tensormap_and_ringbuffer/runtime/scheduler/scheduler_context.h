@@ -84,7 +84,7 @@ public:
     //  - folds inline_completed_tasks into completed_tasks_
     //  - flips orchestrator_done_ and triggers core transition
     //    (skipped on fatal error — emergency_shutdown runs instead)
-    // Callers must invoke pto2_rt_orchestration_done(rt) before this — that
+    // Callers must invoke rt_orchestration_done(rt) before this — that
     // step belongs to the orchestrator lifecycle, not the scheduler.
     void on_orchestration_done(Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks);
 

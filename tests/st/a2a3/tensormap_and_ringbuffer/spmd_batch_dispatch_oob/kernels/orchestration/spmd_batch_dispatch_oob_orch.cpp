@@ -47,7 +47,7 @@ static void submit_spmd_mix(Tensor &out, int16_t block_num, int64_t base_cl) {
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.launch_spec.set_block_num(block_num);
-    pto2_rt_submit_task(mk, args);
+    rt_submit_task(mk, args);
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {

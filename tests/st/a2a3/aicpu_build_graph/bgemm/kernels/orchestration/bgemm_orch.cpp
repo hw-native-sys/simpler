@@ -105,13 +105,13 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                         args_gemm.add_input(A_view);
                         args_gemm.add_input(B_view);
                         args_gemm.add_output(TensorCreateInfo(tile_shapes, 1, DataType::FLOAT32));
-                        SubmitResult r_gemm = pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE, args_gemm);
+                        SubmitResult r_gemm = rt_submit_aic_task(rt, FUNC_GEMM_TILE, args_gemm);
 
                         // C[m,n] += P
                         Arg args_add;
                         args_add.add_inout(C_view);
                         args_add.add_input(r_gemm.outputs.get_ref(0));
-                        SubmitResult r_add = pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD, args_add);
+                        SubmitResult r_add = rt_submit_aiv_task(rt, FUNC_TILE_ADD, args_add);
 
                         // gemm -> add: add reads P which gemm produces
                         pto2_rt_add_dependency(rt, r_gemm.task_id, r_add.task_id);

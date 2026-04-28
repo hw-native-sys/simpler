@@ -131,7 +131,7 @@ struct PTO2Runtime {
  * @param mode Execution mode
  * @return Runtime context, or NULL on failure
  */
-PTO2Runtime *pto2_runtime_create(PTO2RuntimeMode mode);
+PTO2Runtime *runtime_create(PTO2RuntimeMode mode);
 
 /**
  * Create runtime with custom sizes
@@ -141,7 +141,7 @@ PTO2Runtime *pto2_runtime_create(PTO2RuntimeMode mode);
  * @param heap_size        Size of GM heap
  * @return Runtime context, or NULL on failure
  */
-PTO2Runtime *pto2_runtime_create_custom(
+PTO2Runtime *runtime_create_custom(
     PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size,
     int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
 );
@@ -156,7 +156,7 @@ PTO2Runtime *pto2_runtime_create_custom(
  * @param heap_size GM heap size in bytes
  * @return Runtime context, or NULL on failure
  */
-PTO2Runtime *pto2_runtime_create_from_sm(
+PTO2Runtime *runtime_create_from_sm(
     PTO2RuntimeMode mode, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
     int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
 );
@@ -164,12 +164,12 @@ PTO2Runtime *pto2_runtime_create_from_sm(
 /**
  * Destroy runtime and free all resources
  */
-void pto2_runtime_destroy(PTO2Runtime *rt);
+void runtime_destroy(PTO2Runtime *rt);
 
 /**
  * Set execution mode
  */
-void pto2_runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode);
+void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode);
 
 // =============================================================================
 // Orchestration API (called by orchestration function)
@@ -182,7 +182,7 @@ void pto2_runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode);
  * bounded by the scope. When scope_end() is called, the scope
  * releases its reference to all enclosed tasks.
  */
-void pto2_rt_scope_begin(PTO2Runtime *rt);
+void rt_scope_begin(PTO2Runtime *rt);
 
 /**
  * End current scope
@@ -190,33 +190,31 @@ void pto2_rt_scope_begin(PTO2Runtime *rt);
  * Releases scope reference for all tasks submitted since scope_begin().
  * Tasks whose refcount reaches zero will have their buffers released.
  */
-void pto2_rt_scope_end(PTO2Runtime *rt);
+void rt_scope_end(PTO2Runtime *rt);
 
 /**
  * Mark orchestration as complete
  *
  * Signals that no more tasks will be submitted.
  */
-void pto2_rt_orchestration_done(PTO2Runtime *rt);
+void rt_orchestration_done(PTO2Runtime *rt);
 
 /**
  * Enter fatal state explicitly from orchestration.
  */
-void pto2_rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
+void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
 
 /**
  * Cross-layer data access: read a tensor value by waiting for its producer.
  */
-uint64_t pto2_get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
 
 /**
  * Cross-layer data access: write a value to a tensor at given indices.
  * Waits for producer completion (WAW) and all consumers (WAR) via TensorMap.
  * See set_tensor_data in pto_orchestration_api.h for full documentation.
  */
-void pto2_set_tensor_data(
-    PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
-);
+void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
 
 /**
  * Slim config struct exported by orchestration .so via aicpu_orchestration_config().

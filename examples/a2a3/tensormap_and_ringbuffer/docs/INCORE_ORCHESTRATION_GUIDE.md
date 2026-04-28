@@ -52,30 +52,30 @@ Validate `arg_count` in `aicpu_orchestration_config` and interpret pointers as d
    ```
 
 5. Submit tasks with one of:
-   - `pto2_rt_submit_aic_task(kernel_id, args)` — AIC (CUBE) task
-   - `pto2_rt_submit_aiv_task(kernel_id, args)` — AIV (VECTOR) task
-   - `pto2_rt_submit_task(mixed_kernels, args)` — mixed task with a `MixedKernels` struct
+   - `rt_submit_aic_task(kernel_id, args)` — AIC (CUBE) task
+   - `rt_submit_aiv_task(kernel_id, args)` — AIV (VECTOR) task
+   - `rt_submit_task(mixed_kernels, args)` — mixed task with a `MixedKernels` struct
 
 Dependencies are inferred by TensorMap from input/inout/output tensors, so you do not add explicit edges.
 
 ## Submit API And Kernel IDs
 
 - Submit helpers are defined in `pto_orchestration_api.h`.
-- `pto2_rt_submit_aic_task` and `pto2_rt_submit_aiv_task` are convenience wrappers around `pto2_rt_submit_task` with a `MixedKernels` struct.
+- `rt_submit_aic_task` and `rt_submit_aiv_task` are convenience wrappers around `rt_submit_task` with a `MixedKernels` struct.
 - For mixed AIC+AIV tasks, construct a `MixedKernels` struct directly:
 
   ```cpp
   MixedKernels mk;
   mk.aic_kernel_id = FUNC_QK;
   mk.aiv0_kernel_id = FUNC_SF;
-  pto2_rt_submit_task(mk, args);
+  rt_submit_task(mk, args);
   ```
 
 - Kernel `func_id` values are defined in `kernels/kernel_config.py` under `KERNELS`.
 
 ## Completion Semantics
 
-Do not call `pto2_rt_orchestration_done` yourself in device mode. The executor wraps the entry call in an outer scope and signals completion after `aicpu_orchestration_entry` returns.
+Do not call `rt_orchestration_done` yourself in device mode. The executor wraps the entry call in an outer scope and signals completion after `aicpu_orchestration_entry` returns.
 
 ## Examples
 

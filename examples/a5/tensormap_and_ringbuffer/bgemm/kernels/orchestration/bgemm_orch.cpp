@@ -106,7 +106,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         mk.aic_kernel_id = FUNC_GEMM_TILE;
                         mk.aiv0_kernel_id = FUNC_TILE_ADD;
                         mk.aiv1_kernel_id = FUNC_TILE_ADD;
-                        pto2_rt_submit_task(mk, args);
+                        rt_submit_task(mk, args);
                     }
                 }
             }

@@ -194,7 +194,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                 args_inplace.add_output(TensorCreateInfo(li_shapes, 1, DataType::FLOAT32));
                 args_inplace.add_output(TensorCreateInfo(mi_shapes, 1, DataType::FLOAT32));
                 CYCLE_COUNT_LAP(prof_param_setup);
-                SubmitResult r_hub = pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace);
+                SubmitResult r_hub = rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace);
                 const Tensor &oi = r_hub.outputs.get_ref(0);
                 const Tensor &li_update = r_hub.outputs.get_ref(1);
                 const Tensor &mi_update = r_hub.outputs.get_ref(2);
@@ -234,7 +234,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_qk.add_scalar(n_blocks);
                     args_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    SubmitResult r_qk = pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, args_qk);
+                    SubmitResult r_qk = rt_submit_aic_task(rt, FUNC_QK_MATMUL, args_qk);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -258,7 +258,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_sf.add_scalar(n_blocks);
                     args_sf.add_scalar(valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    SubmitResult r_sf = pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf);
+                    SubmitResult r_sf = rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf);
                     // QK → Softmax (sij_buf)
                     pto2_rt_add_dependency(rt, r_qk.task_id, r_sf.task_id);
 #ifdef ENABLE_PROFILING
@@ -280,7 +280,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_pv.add_scalar(n_blocks);
                     args_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    SubmitResult r_pv = pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv);
+                    SubmitResult r_pv = rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv);
                     // Softmax → PV (pij_buf)
                     pto2_rt_add_dependency(rt, r_sf.task_id, r_pv.task_id);
 #ifdef ENABLE_PROFILING
@@ -303,7 +303,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
                     args_up.add_scalar(is_first);
                     args_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    SubmitResult r_up = pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up);
+                    SubmitResult r_up = rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up);
                     // Softmax → Update (mi, li)
                     pto2_rt_add_dependency(rt, r_sf.task_id, r_up.task_id);
                     // PV → Update (oi_new)

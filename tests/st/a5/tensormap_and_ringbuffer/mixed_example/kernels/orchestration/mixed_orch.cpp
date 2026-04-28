@@ -105,7 +105,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 args.add_input(ext_G);
                 args.add_input(ext_H);
                 args.add_output(I_view);
-                pto2_rt_submit_task(mk, args);
+                rt_submit_task(mk, args);
             }
 
             // 2. AIC_ONLY: standalone matmul
@@ -114,7 +114,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 args.add_input(ext_A);
                 args.add_input(ext_B);
                 args.add_output(J_view);
-                pto2_rt_submit_aic_task(FUNC_MATMUL, args);
+                rt_submit_aic_task(FUNC_MATMUL, args);
             }
 
             // 3. AIV_X1: standalone add
@@ -123,7 +123,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 args.add_input(ext_D);
                 args.add_input(ext_E);
                 args.add_output(K_view);
-                pto2_rt_submit_aiv_task(FUNC_ADD_STANDALONE, args);
+                rt_submit_aiv_task(FUNC_ADD_STANDALONE, args);
             }
 
             // 4. AIV_X2: add (AIV0) + mul (AIV1)
@@ -138,7 +138,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 args.add_input(ext_G);
                 args.add_input(ext_H);
                 args.add_output(M_view);
-                pto2_rt_submit_task(mk, args);
+                rt_submit_task(mk, args);
             }
 
             // 5. AIC_AIV_X1: matmul (AIC) + add (AIV0)
@@ -153,7 +153,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 args.add_input(ext_D);
                 args.add_input(ext_E);
                 args.add_output(O_view);
-                pto2_rt_submit_task(mk, args);
+                rt_submit_task(mk, args);
             }
         }
     }

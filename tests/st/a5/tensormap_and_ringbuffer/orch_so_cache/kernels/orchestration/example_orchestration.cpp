@@ -46,7 +46,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     params.add_input(ext_a);
     params.add_input(ext_b);
     params.add_output(ext_f);
-    pto2_rt_submit_aiv_task(FUNC_ADD, params);
+    rt_submit_aiv_task(FUNC_ADD, params);
 }
 
 }  // extern "C"

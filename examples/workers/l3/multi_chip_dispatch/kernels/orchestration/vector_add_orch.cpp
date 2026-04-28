@@ -41,7 +41,7 @@ __attribute__((visibility("default"))) void vector_add_orchestration(const ChipS
     params.add_input(a);
     params.add_input(b);
     params.add_output(out);
-    pto2_rt_submit_aiv_task(0, params);  // func_id=0 -> vector_add_kernel
+    rt_submit_aiv_task(0, params);  // func_id=0 -> vector_add_kernel
 }
 
 }  // extern "C"

@@ -25,7 +25,7 @@ vector_add/
 The kernel source is a verbatim copy of
 `examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels/aiv/kernel_add.cpp`.
 The orchestration is intentionally simpler than the `vector_example` one — it
-calls `pto2_rt_submit_aiv_task` exactly once and has no nested scopes.
+calls `rt_submit_aiv_task` exactly once and has no nested scopes.
 
 ## The six steps in `main.py`
 
@@ -72,7 +72,7 @@ chip_callable = ChipCallable.build(
 
 `func_name` must match the `__attribute__((visibility("default")))` symbol in
 the orchestration `.cpp`. The `children` list maps `func_id` integers used in
-`pto2_rt_submit_aiv_task(func_id, ...)` to the corresponding `CoreCallable`.
+`rt_submit_aiv_task(func_id, ...)` to the corresponding `CoreCallable`.
 In our orch `func_id=0` is the only value, so one child.
 
 ### 4. Allocate device memory, push inputs

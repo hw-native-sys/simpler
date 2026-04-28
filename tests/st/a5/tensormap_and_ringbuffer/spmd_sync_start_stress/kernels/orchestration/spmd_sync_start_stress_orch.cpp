@@ -64,7 +64,7 @@ static void submit_mix(Tensor &out, int16_t block_num, int64_t base_cl, bool syn
     args.add_scalar(base_cl);
     args.launch_spec.set_core_num(block_num);
     args.launch_spec.set_require_sync_start(sync_start);
-    pto2_rt_submit_task(mk, args);
+    rt_submit_task(mk, args);
 }
 
 static void submit_aiv(Tensor &out, int16_t block_num, int64_t base_cl, bool sync_start) {
@@ -73,7 +73,7 @@ static void submit_aiv(Tensor &out, int16_t block_num, int64_t base_cl, bool syn
     args.add_scalar(base_cl);
     args.launch_spec.set_core_num(block_num);
     args.launch_spec.set_require_sync_start(sync_start);
-    pto2_rt_submit_aiv_task(FUNC_SPMD_WRITE_AIV, args);
+    rt_submit_aiv_task(FUNC_SPMD_WRITE_AIV, args);
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {

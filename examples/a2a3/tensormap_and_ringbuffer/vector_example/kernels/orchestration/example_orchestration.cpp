@@ -69,7 +69,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     params_t0.add_input(ext_a);
     params_t0.add_input(ext_b);
     params_t0.add_output(inter_ci);
-    TaskOutputTensors outs_t0 = pto2_rt_submit_aiv_task(0, params_t0);  // kernel_add
+    TaskOutputTensors outs_t0 = rt_submit_aiv_task(0, params_t0);  // kernel_add
     const Tensor &c = outs_t0.get_ref(0);
 
     // Inner scope: owns t1, t2, t3, t4; intermediates d, e, g release on scope end.
@@ -81,7 +81,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         params_t1.add_output(inter_ci);
         params_t1.add_scalar(1.0f);
         params_t1.add_scalar(3u);
-        TaskOutputTensors outs_t1 = pto2_rt_submit_aiv_task(1, params_t1);  // kernel_add_scalar
+        TaskOutputTensors outs_t1 = rt_submit_aiv_task(1, params_t1);  // kernel_add_scalar
         const Tensor &d = outs_t1.get_ref(0);
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
@@ -90,7 +90,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         params_t2.add_output(inter_ci);
         params_t2.add_scalar(2.0f);
         params_t2.add_scalar(3u);
-        TaskOutputTensors outs_t2 = pto2_rt_submit_aiv_task(1, params_t2);  // kernel_add_scalar
+        TaskOutputTensors outs_t2 = rt_submit_aiv_task(1, params_t2);  // kernel_add_scalar
         const Tensor &e = outs_t2.get_ref(0);
 
         // t3: g = d * e (kernel_id=2, kernel_mul)
@@ -99,7 +99,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         params_t3.add_input(e);
         params_t3.add_output(inter_ci);
         params_t3.add_scalar(3u);
-        TaskOutputTensors outs_t3 = pto2_rt_submit_aiv_task(2, params_t3);  // kernel_mul
+        TaskOutputTensors outs_t3 = rt_submit_aiv_task(2, params_t3);  // kernel_mul
         const Tensor &g = outs_t3.get_ref(0);
 
         // t4: f = g + c (kernel_id=0, kernel_add)
@@ -107,7 +107,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         params_t4.add_input(g);
         params_t4.add_input(c);
         params_t4.add_output(ext_f);
-        pto2_rt_submit_aiv_task(0, params_t4);  // kernel_add
+        rt_submit_aiv_task(0, params_t4);  // kernel_add
     }  // inner scope ends: releases d, e, g
 }
 

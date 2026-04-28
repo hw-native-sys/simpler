@@ -47,19 +47,19 @@ static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
     return rt->orchestrator.alloc_tensors(args);
 }
 
-void pto2_rt_scope_begin(PTO2Runtime *rt) {
+void rt_scope_begin(PTO2Runtime *rt) {
     PTO2ScopeMode mode = rt->pending_scope_mode;
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
     rt->orchestrator.begin_scope(mode);
 }
 
-void pto2_rt_scope_end(PTO2Runtime *rt) { rt->orchestrator.end_scope(); }
+void rt_scope_end(PTO2Runtime *rt) { rt->orchestrator.end_scope(); }
 
-void pto2_rt_orchestration_done(PTO2Runtime *rt) { rt->orchestrator.mark_done(); }
+void rt_orchestration_done(PTO2Runtime *rt) { rt->orchestrator.mark_done(); }
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
-void pto2_rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...) {
+void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     if (fmt == nullptr || fmt[0] == '\0') {
@@ -187,7 +187,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
 }
 MAYBE_UNINITIALIZED_END
 
-uint64_t pto2_get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "get_tensor_data: buffer not allocated (addr=0). "
@@ -208,9 +208,7 @@ uint64_t pto2_get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t nd
     return result;
 }
 
-void pto2_set_tensor_data(
-    PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
-) {
+void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value) {
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "set_tensor_data: buffer not allocated (addr=0). "
@@ -232,18 +230,18 @@ void pto2_set_tensor_data(
 
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
-    .scope_begin = pto2_rt_scope_begin,
-    .scope_end = pto2_rt_scope_end,
-    .orchestration_done = pto2_rt_orchestration_done,
+    .scope_begin = rt_scope_begin,
+    .scope_end = rt_scope_end,
+    .orchestration_done = rt_orchestration_done,
     .is_fatal = is_fatal_impl,
-    .report_fatal = pto2_rt_report_fatal,
+    .report_fatal = rt_report_fatal,
     .log_error = unified_log_error,
     .log_warn = unified_log_warn,
     .log_info = unified_log_info,
     .log_debug = unified_log_debug,
     .log_always = unified_log_always,
-    .get_tensor_data = pto2_get_tensor_data,
-    .set_tensor_data = pto2_set_tensor_data,
+    .get_tensor_data = get_tensor_data,
+    .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
 };
 
@@ -251,13 +249,12 @@ static const PTO2RuntimeOps s_runtime_ops = {
 // Runtime Creation and Destruction
 // =============================================================================
 
-PTO2Runtime *pto2_runtime_create(PTO2RuntimeMode mode) {
-    return pto2_runtime_create_custom(mode, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE);
+PTO2Runtime *runtime_create(PTO2RuntimeMode mode) {
+    return runtime_create_custom(mode, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE);
 }
 
-PTO2Runtime *pto2_runtime_create_custom(
-    PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity
-) {
+PTO2Runtime *
+runtime_create_custom(PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity) {
     // Allocate runtime context
     PTO2Runtime *rt = static_cast<PTO2Runtime *>(calloc(1, sizeof(PTO2Runtime)));
     if (!rt) {
@@ -324,7 +321,7 @@ PTO2Runtime *pto2_runtime_create_custom(
     return rt;
 }
 
-PTO2Runtime *pto2_runtime_create_from_sm(
+PTO2Runtime *runtime_create_from_sm(
     PTO2RuntimeMode mode, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
     int32_t dep_pool_capacity
 ) {
@@ -365,7 +362,7 @@ PTO2Runtime *pto2_runtime_create_from_sm(
     return rt;
 }
 
-void pto2_runtime_destroy(PTO2Runtime *rt) {
+void runtime_destroy(PTO2Runtime *rt) {
     if (!rt) return;
 
     rt->scheduler.destroy();
@@ -384,7 +381,7 @@ void pto2_runtime_destroy(PTO2Runtime *rt) {
     free(rt);
 }
 
-void pto2_runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {
+void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {
     if (rt) {
         rt->mode = mode;
     }

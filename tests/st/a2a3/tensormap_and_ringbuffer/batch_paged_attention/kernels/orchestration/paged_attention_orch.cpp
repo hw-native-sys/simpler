@@ -153,7 +153,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         params_qk.add_scalar(block_num);
                         params_qk.add_scalar(num_heads);
                         params_qk.add_scalar(batch_start);
-                        TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
+                        TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                         const Tensor &sij_b = qk_outs.get_ref(0);
 
                         Arg params_sf;
@@ -166,7 +166,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         params_sf.add_scalar(chunk_bc);
                         params_sf.add_scalar(bn);
                         params_sf.add_scalar(batch_start);
-                        TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
+                        TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                         const Tensor &pij_b = sf_outs.get_ref(0);
                         const Tensor &mij_b = sf_outs.get_ref(1);
                         const Tensor &lij_b = sf_outs.get_ref(2);
@@ -180,7 +180,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         params_pv.add_scalar(bn);
                         params_pv.add_scalar(block_num);
                         params_pv.add_scalar(batch_start);
-                        TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
+                        TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                         const Tensor &oi_new_b = pv_outs.get_ref(0);
 
                         uint64_t is_first = (bn == 0) ? 1 : 0;
@@ -199,7 +199,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         params_up.add_scalar(q_offset);
                         params_up.add_scalar(num_heads);
                         params_up.add_scalar(batch_start);
-                        pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+                        rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
                     }
                 }
             }

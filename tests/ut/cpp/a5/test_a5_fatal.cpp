@@ -23,8 +23,8 @@ namespace {
 
 PTO2Runtime *g_bound_runtime = nullptr;
 
-extern "C" PTO2Runtime *pto2_framework_current_runtime(void) { return g_bound_runtime; }
-extern "C" void pto2_framework_bind_runtime(PTO2Runtime *rt) { g_bound_runtime = rt; }
+extern "C" PTO2Runtime *framework_current_runtime(void) { return g_bound_runtime; }
+extern "C" void framework_bind_runtime(PTO2Runtime *rt) { g_bound_runtime = rt; }
 
 struct FakeRuntime {
     const PTO2RuntimeOps *ops;
@@ -107,8 +107,8 @@ const PTO2RuntimeOps kFakeOps = {
 
 class RuntimeBindingGuard {
 public:
-    explicit RuntimeBindingGuard(PTO2Runtime *rt) { pto2_framework_bind_runtime(rt); }
-    ~RuntimeBindingGuard() { pto2_framework_bind_runtime(nullptr); }
+    explicit RuntimeBindingGuard(PTO2Runtime *rt) { framework_bind_runtime(rt); }
+    ~RuntimeBindingGuard() { framework_bind_runtime(nullptr); }
 };
 
 TensorCreateInfo make_ci() {
@@ -130,12 +130,12 @@ TEST(A5Fatal, ApiShortCircuitsAfterFatal) {
     uint32_t shape[1] = {1};
     Tensor tensor = make_tensor_external(reinterpret_cast<void *>(0x1), shape, 1);
 
-    EXPECT_TRUE(pto2_rt_submit_task(mixed, args).empty());
+    EXPECT_TRUE(rt_submit_task(mixed, args).empty());
     EXPECT_TRUE(alloc_tensors(args).empty());
     EXPECT_EQ(get_tensor_data<uint64_t>(tensor, 0, indices), 0U);
     set_tensor_data<uint64_t>(tensor, 0, indices, 1U);
-    pto2_rt_scope_begin();
-    pto2_rt_scope_end();
+    rt_scope_begin();
+    rt_scope_end();
     {
         PTO2ScopeGuard guard;
         (void)guard;
@@ -155,7 +155,7 @@ TEST(A5Fatal, ExplicitFatalRoutesThroughOps) {
     runtime.ops = &kFakeOps;
     RuntimeBindingGuard bind(reinterpret_cast<PTO2Runtime *>(&runtime));
 
-    pto2_rt_report_fatal(PTO2_ERROR_EXPLICIT_ORCH_FATAL, "boom %d", 7);
+    rt_report_fatal(PTO2_ERROR_EXPLICIT_ORCH_FATAL, "boom %d", 7);
 
     EXPECT_TRUE(runtime.fatal);
     EXPECT_EQ(runtime.report_fatal_calls, 1);
@@ -165,7 +165,7 @@ TEST(A5Fatal, ExplicitFatalRoutesThroughOps) {
 
     MixedKernels mixed{};
     Arg args;
-    EXPECT_TRUE(pto2_rt_submit_task(mixed, args).empty());
+    EXPECT_TRUE(rt_submit_task(mixed, args).empty());
     EXPECT_EQ(runtime.submit_calls, 0);
 }
 

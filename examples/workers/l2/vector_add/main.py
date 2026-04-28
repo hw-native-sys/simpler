@@ -109,7 +109,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
 
     # 3. Wrap the kernel bytes as a CoreCallable with its tensor-arg signature
     # (a, b are inputs; out is output). ``func_id=0`` matches the first
-    # (and only) ``pto2_rt_submit_aiv_task(0, ...)`` in vector_add_orch.cpp.
+    # (and only) ``rt_submit_aiv_task(0, ...)`` in vector_add_orch.cpp.
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
         binary=kernel_bytes,

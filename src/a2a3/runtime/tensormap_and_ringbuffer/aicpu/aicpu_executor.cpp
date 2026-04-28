@@ -66,8 +66,8 @@ typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime *rt);
 typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const ChipStorageTaskArgs &orch_args);
 
 // From orchestration/common.cpp linked into this DSO — updates g_pto2_current_runtime here (distinct from
-// pto2_framework_bind_runtime in the dlopen'd libdevice_orch_*.so).
-extern "C" void pto2_framework_bind_runtime(PTO2Runtime *rt);
+// framework_bind_runtime in the dlopen'd libdevice_orch_*.so).
+extern "C" void framework_bind_runtime(PTO2Runtime *rt);
 
 constexpr const char *DEFAULT_ORCH_ENTRY_SYMBOL = "aicpu_orchestration_entry";
 constexpr const char *DEFAULT_ORCH_CONFIG_SYMBOL = "aicpu_orchestration_config";
@@ -327,12 +327,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
                 dlerror();
                 auto bind_runtime_func =
-                    reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "pto2_framework_bind_runtime"));
+                    reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "framework_bind_runtime"));
                 const char *bind_runtime_error = dlerror();
                 if (bind_runtime_error != nullptr) {
-                    DEV_ERROR(
-                        "Thread %d: dlsym failed for pto2_framework_bind_runtime: %s", thread_idx, bind_runtime_error
-                    );
+                    DEV_ERROR("Thread %d: dlsym failed for framework_bind_runtime: %s", thread_idx, bind_runtime_error);
                     bind_runtime_func = nullptr;
                 }
 
@@ -435,7 +433,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 return -1;
             }
 
-            rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
+            rt = runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
             if (!rt) {
                 DEV_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
                 sm_handle->destroy();
@@ -475,13 +473,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if PTO2_PROFILING
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
-            pto2_framework_bind_runtime(rt);
+            framework_bind_runtime(rt);
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(rt);
             }
-            pto2_rt_scope_begin(rt);
+            rt_scope_begin(rt);
             orch_func_(*orch_args_cached_);
-            pto2_rt_scope_end(rt);
+            rt_scope_end(rt);
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             (void)orch_cycle_end;
@@ -571,7 +569,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #endif
 
             // Signal completion to the orchestrator state machine
-            pto2_rt_orchestration_done(rt);
+            rt_orchestration_done(rt);
 
             // Latch task count from PTO2 shared memory
             int32_t total_tasks = 0;
@@ -644,11 +642,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // the next run's cache-hit reuse (see run() reload_so branch).
         if (!runtime->get_orch_built_on_host() && rt != nullptr) {
             // Clear g_pto2_current_runtime in this DSO and in the orchestration SO before destroying rt.
-            pto2_framework_bind_runtime(nullptr);
+            framework_bind_runtime(nullptr);
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(nullptr);
             }
-            pto2_runtime_destroy(rt);
+            runtime_destroy(rt);
         }
     }
 

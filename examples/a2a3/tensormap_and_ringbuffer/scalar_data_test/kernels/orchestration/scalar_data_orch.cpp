@@ -68,7 +68,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     params_c.add_input(ext_a);
     params_c.add_input(ext_b);
     params_c.add_output(inter_ci);
-    TaskOutputTensors c_outs = pto2_rt_submit_aiv_task(FUNC_ADD, params_c);
+    TaskOutputTensors c_outs = rt_submit_aiv_task(FUNC_ADD, params_c);
     const Tensor &c = c_outs.get_ref(0);
 
     // =========================================================
@@ -121,7 +121,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     {
         Arg args;
         args.add_inout(scalar_tensor);
-        pto2_rt_submit_aiv_task(FUNC_NOOP, args);
+        rt_submit_aiv_task(FUNC_NOOP, args);
     }
 
     // =========================================================
@@ -174,7 +174,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     params_e.add_input(d);
     params_e.add_input(ext_a);
     params_e.add_output(inter_ci);
-    TaskOutputTensors e_outs = pto2_rt_submit_aiv_task(FUNC_ADD, params_e);
+    TaskOutputTensors e_outs = rt_submit_aiv_task(FUNC_ADD, params_e);
     const Tensor &e = e_outs.get_ref(0);
 
     float e0_val = get_tensor_data<float>(e, 1, idx);
@@ -203,7 +203,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         args.add_input(c);
         args.add_input(ext_b);
         args.add_output(inter_ci);
-        (void)pto2_rt_submit_aiv_task(FUNC_ADD, args);  // NOLINT(readability/casting)
+        (void)rt_submit_aiv_task(FUNC_ADD, args);  // NOLINT(readability/casting)
     }
 
     // set_tensor_data auto-waits for producer + consumer before writing
@@ -233,7 +233,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     {
         Arg args;
         args.add_output(ext_b);  // write-only: creates TensorMap entry (not add_input!)
-        pto2_rt_submit_aiv_task(FUNC_NOOP, args);
+        rt_submit_aiv_task(FUNC_NOOP, args);
     }
 
     idx[0] = 0;
@@ -257,7 +257,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         args.add_input(ext_a);
         args.add_input(ext_b);
         args.add_output(ext_result);
-        pto2_rt_submit_aiv_task(FUNC_ADD, args);
+        rt_submit_aiv_task(FUNC_ADD, args);
     }
 
     LOG_INFO("scalar_data_test: orchestration complete");

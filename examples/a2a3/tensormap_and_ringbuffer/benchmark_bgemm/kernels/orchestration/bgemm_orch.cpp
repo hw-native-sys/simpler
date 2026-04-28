@@ -100,14 +100,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             params_gemm.add_input(B_view);
             params_gemm.add_output(group_ci);
             params_gemm.add_input(ext_config);
-            TaskOutputTensors gemm_outs = pto2_rt_submit_aic_task(FUNC_GEMM_TILE, params_gemm);
+            TaskOutputTensors gemm_outs = rt_submit_aic_task(FUNC_GEMM_TILE, params_gemm);
             total_gemm++;
 
             Arg params_add;
             params_add.add_inout(C_view);
             params_add.add_input(gemm_outs.get_ref(0));
             params_add.add_input(ext_config);
-            pto2_rt_submit_aiv_task(FUNC_TILE_ADD, params_add);
+            rt_submit_aiv_task(FUNC_TILE_ADD, params_add);
             total_add++;
         }
     }

@@ -44,7 +44,7 @@ __attribute__((visibility("default"))) void async_notify_orchestration(const Chi
     params_producer.add_output(output);
     params_producer.add_scalar(notify_counter.buffer.addr);
     params_producer.add_scalar(reinterpret_cast<uint64_t>(comm_ctx));
-    pto2_rt_submit_aiv_task(0, params_producer);
+    rt_submit_aiv_task(0, params_producer);
 
     uint32_t notify_token_shape[1] = {1};
     TensorCreateInfo notify_token_info(notify_token_shape, 1, DataType::INT32);
@@ -52,7 +52,7 @@ __attribute__((visibility("default"))) void async_notify_orchestration(const Chi
     params_notify.add_output(notify_token_info);
     params_notify.add_scalar(notify_counter.buffer.addr);
     params_notify.add_scalar(static_cast<uint64_t>(1));
-    TaskOutputTensors notify_outputs = pto2_rt_submit_aiv_task_deferred(2, params_notify);
+    TaskOutputTensors notify_outputs = rt_submit_aiv_task_deferred(2, params_notify);
     Tensor notify_token = notify_outputs.get_ref(0);
 
     Arg params_consumer;
@@ -60,7 +60,7 @@ __attribute__((visibility("default"))) void async_notify_orchestration(const Chi
     params_consumer.add_input(output);
     params_consumer.add_output(result);
     params_consumer.add_scalar(notify_counter.buffer.addr);
-    pto2_rt_submit_aiv_task(1, params_consumer);
+    rt_submit_aiv_task(1, params_consumer);
 }
 
 }  // extern "C"

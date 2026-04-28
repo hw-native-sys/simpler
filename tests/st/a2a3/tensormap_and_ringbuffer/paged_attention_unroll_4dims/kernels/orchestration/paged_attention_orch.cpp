@@ -132,7 +132,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_qk.add_output(sij_buf_ci);
                     params_qk.add_scalar(n_blocks);
                     params_qk.add_scalar(b_idx * block_num + bn);
-                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
+                    TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     const Tensor &sij_buf = qk_outs.get_ref(0);
 
                     // === Task 2: Two-pass softmax — produces 4D pij_buf, 3D mi, li ===
@@ -147,7 +147,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_sf.add_scalar(scale_value);
                     params_sf.add_scalar(n_blocks);
                     params_sf.add_scalar(valid_len_last);
-                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
+                    TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     const Tensor &pij_buf = sf_outs.get_ref(0);
                     const Tensor &mi = sf_outs.get_ref(1);
                     const Tensor &li = sf_outs.get_ref(2);
@@ -160,7 +160,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_pv.add_output(tile4d_ci);
                     params_pv.add_scalar(n_blocks);
                     params_pv.add_scalar(b_idx * block_num + bn);
-                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
+                    TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_new = pv_outs.get_ref(0);
 
                     // === Task 4: Online update (per-group) ===
@@ -177,7 +177,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_up.add_inout(out_view);
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
-                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+                    rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
                 }
             }
         }

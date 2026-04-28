@@ -30,7 +30,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     TensorCreateInfo ci(shape, 1, DataType::FLOAT32);
     (void)alloc_tensors(ci);
 
-    pto2_rt_report_fatal(PTO2_ERROR_EXPLICIT_ORCH_FATAL, "st injected fatal");
+    rt_report_fatal(PTO2_ERROR_EXPLICIT_ORCH_FATAL, "st injected fatal");
 
     // Exercise API short-circuit after fatal. These calls must become no-ops
     // instead of falling through into runtime-side asserts or extra reporting.
@@ -42,8 +42,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     (void)get_tensor_data<uint64_t>(dummy, 0, indices);
     set_tensor_data<uint64_t>(dummy, 0, indices, 1U);
 
-    pto2_rt_scope_begin();
-    pto2_rt_scope_end();
+    rt_scope_begin();
+    rt_scope_end();
 }
 
 }  // extern "C"

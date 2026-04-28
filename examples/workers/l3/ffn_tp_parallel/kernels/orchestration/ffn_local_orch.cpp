@@ -37,7 +37,7 @@ __attribute__((visibility("default"))) void ffn_local_orchestration(const ChipSt
     params.add_input(x_shard);
     params.add_input(w_shard);
     params.add_output(partial_local);
-    pto2_rt_submit_aic_task(0, params);
+    rt_submit_aic_task(0, params);
 }
 
 }  // extern "C"

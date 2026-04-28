@@ -53,7 +53,7 @@ submit_spmd_mix(int32_t aic_id, int32_t aiv0_id, int32_t aiv1_id, Tensor &out, i
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.launch_spec.set_core_num(block_num);
-    pto2_rt_submit_task(mk, args);
+    rt_submit_task(mk, args);
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
