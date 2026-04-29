@@ -168,6 +168,25 @@ public:
     void print_handshake_results();
 
     /**
+     * Export performance data to merged_swimlane.json
+     *
+     * Converts collected performance records to Chrome Trace Event Format
+     * and writes to outputs/merged_swimlane_<timestamp>.json for visualization in Perfetto.
+     * Should be called after execution completes.
+     *
+     * @param output_path Path to output directory (default: "outputs")
+     * @return 0 on success, error code on failure
+     */
+    int export_swimlane_json(const std::string &output_path = "outputs");
+
+    /**
+     * Poll and collect performance data from the memory manager's queue
+     *
+     * @param expected_tasks Expected total number of tasks
+     */
+    void poll_and_collect_performance_data(int expected_tasks);
+
+    /**
      * Cleanup all resources
      *
      * Use this for final cleanup when no more tests will run.
@@ -288,11 +307,11 @@ private:
     /**
      * Initialize PMU profiling buffers for simulation.
      *
-     * Allocates PmuSetupHeader + per-core PmuBuffer on host memory, publishes
-     * the setup-header pointer into kernel_args.pmu_data_base. pmu_reg_addrs
+     * Allocates PmuDataHeader + per-core PmuBuffer on host memory, publishes
+     * the header pointer into kernel_args.pmu_data_base. pmu_reg_addrs
      * stays 0 on sim (no hardware PMU model).
+     * Signature matches a2a3 for cross-platform consistency.
      */
-    int init_pmu(int num_aicore, PmuEventType event_type);
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use
@@ -302,6 +321,10 @@ private:
     bool enable_pmu_{false};
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
+
+    int init_pmu_buffers(
+        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
+    );
 };
 
 #endif  // SRC_A5_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

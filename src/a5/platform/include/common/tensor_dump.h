@@ -11,19 +11,34 @@
 
 /**
  * @file tensor_dump.h
- * @brief Tensor dump data structures for device-to-host tensor collection (memcpy-based)
+ * @brief Tensor dump data structures for device-to-host tensor collection
  *
- * A5 simplified design: pre-allocated buffers + direct write + memcpy collect-after-sync.
- * No shared memory, no background threads, no SPSC queues.
+ * Independent shared memory region for capturing per-task tensor I/O.
+ * Fully decoupled from profiling — uses its own ready queues, buffer states,
+ * and memory manager thread.
  *
  * Memory layout (allocated only when enable_dump_tensor=true):
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │ DumpDataHeader (fixed header)                               │
+ * │  - Per-thread ready queues (circular FIFOs)                 │
+ * │  - Metadata (num_dump_threads, config)                      │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ DumpBufferState[0] (Thread 0)                               │
+ * │  - free_queue: SPSC queue of DumpMetaBuffer addresses       │
+ * │  - current_buf_ptr, arena_base, arena_write_offset          │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ DumpBufferState[1] (Thread 1)                               │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ ...                                                         │
+ * └─────────────────────────────────────────────────────────────┘
  *
- *   DumpSetupHeader (single, published via kernel_args.dump_data_base)
- *   ├── dump_buffer_ptrs[]   → per-thread DumpBuffer (count + records[])
- *   ├── arena_header_ptrs[]  → per-thread DumpArenaHeader (write_offset)
- *   └── arena_data_ptrs[]    → per-thread arena data region
+ * Per-thread payload arenas are separate allocations.
+ * DumpMetaBuffers are allocated by the host and pushed
+ * into per-thread free_queues.
  *
- * After stream sync, host copies everything back via rtMemcpy / memcpy.
+ * A5 specifics: memory access uses host-shadow copies + explicit memcpy
+ * instead of halHostRegister/SVM. Data structures and interaction logic
+ * are identical to A2A3.
  */
 
 #ifndef SRC_A5_PLATFORM_INCLUDE_COMMON_TENSOR_DUMP_H_
@@ -65,7 +80,6 @@ enum class TensorDumpStage : uint8_t {
 
 /**
  * Per-tensor metadata + payload reference.
- * Identical layout to A2A3 for binary compatibility.
  *
  * Cache line 1 (64B): identifiers, payload location, compact scalar metadata
  * Cache line 2 (64B): logical/source layout arrays
@@ -97,60 +111,114 @@ struct alignas(64) TensorDumpRecord {
 static_assert(sizeof(TensorDumpRecord) == 128, "TensorDumpRecord must be 128 bytes (2 cache lines)");
 
 // =============================================================================
-// DumpBuffer - Per-Thread Record Buffer (count-first, like L2PerfBuffer)
+// DumpMetaBuffer - Fixed-Size Record Buffer
 // =============================================================================
 
 /**
- * Per-thread dump record buffer. AICPU writes records sequentially;
- * when count reaches capacity, further records are silently dropped.
- * Host copies the buffer back after stream sync.
+ * Fixed-size dump record buffer.
+ * Capacity: PLATFORM_DUMP_RECORDS_PER_BUFFER
+ * Allocated by host, pushed into per-thread free_queue.
  */
-struct DumpBuffer {
-    volatile uint32_t count;          // Records written by AICPU (at offset 0)
-    uint32_t capacity;                // Max records (set by host during init)
-    volatile uint32_t dropped_count;  // Records dropped (buffer or arena full)
-    uint32_t pad[13];                 // Pad header to 64B cache line
-    // TensorDumpRecord records[] follows (flexible array member)
-    // Access via: reinterpret_cast<TensorDumpRecord *>(this + 1)
+struct DumpMetaBuffer {
+    TensorDumpRecord records[PLATFORM_DUMP_RECORDS_PER_BUFFER];
+    volatile uint32_t count;  // Current record count
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(DumpBuffer) == 64, "DumpBuffer header must be 64 bytes");
-
 // =============================================================================
-// DumpArenaHeader - Per-Thread Arena Metadata
+// DumpFreeQueue - SPSC Lock-Free Queue for Free Buffers
 // =============================================================================
 
 /**
- * Per-thread arena metadata. Separate from the arena data region
- * so host can read just the header to determine how much data was written.
+ * Single Producer Single Consumer (SPSC) lock-free queue.
+ * Same layout and semantics as PerfFreeQueue, separate type for decoupling.
+ *
+ * Producer: Host (DumpMemoryManager thread) pushes recycled/new buffers
+ * Consumer: Device (AICPU thread) pops buffers when switching
  */
-struct DumpArenaHeader {
-    volatile uint64_t write_offset;  // Monotonic write cursor (AICPU increments)
-    uint64_t arena_size;             // Total arena bytes (set by host)
-    uint32_t pad[12];                // Pad to 64B
+struct DumpFreeQueue {
+    volatile uint64_t buffer_ptrs[PLATFORM_DUMP_SLOT_COUNT];
+    volatile uint32_t head;  // Consumer read position (Device increments)
+    volatile uint32_t tail;  // Producer write position (Host increments)
+    uint32_t pad[22];        // Pad to 128 bytes (40 + 88 = 128)
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(DumpArenaHeader) == 64, "DumpArenaHeader must be 64 bytes");
+static_assert(sizeof(DumpFreeQueue) == 128, "DumpFreeQueue must be 128 bytes");
 
 // =============================================================================
-// DumpSetupHeader - Host-Initialized, AICPU Reads
+// DumpBufferState - Per-Thread Buffer State
 // =============================================================================
 
 /**
- * Setup header published via kernel_args.dump_data_base.
- * Host initializes all fields and copies to device before execution.
- * AICPU reads pointers during dump_tensor_init().
+ * Per-thread buffer management state.
+ *
+ * Writers:
+ * - free_queue.tail: Host writes (pushes new buffers)
+ * - free_queue.head: Device writes (pops buffers)
+ * - current_buf_ptr: Device writes (after pop), Host reads (for flush/collect)
+ * - current_buf_seq: Device writes (monotonic counter)
+ * - arena_write_offset: Device writes (monotonic), Host reads (for overwrite detection)
+ * - dropped_record_count: Device writes (records lost before host export)
  */
-struct DumpSetupHeader {
+struct DumpBufferState {
+    DumpFreeQueue free_queue;                // SPSC queue of free DumpMetaBuffer addresses
+    volatile uint64_t current_buf_ptr;       // Current active DumpMetaBuffer (0 = none)
+    volatile uint32_t current_buf_seq;       // Sequence number for ordering
+    uint32_t pad0;                           // Alignment
+    volatile uint64_t arena_base;            // Device pointer to this thread's arena
+    volatile uint64_t arena_size;            // Arena size in bytes
+    volatile uint64_t arena_write_offset;    // Monotonic write cursor (host computes % arena_size)
+    volatile uint32_t dropped_record_count;  // Records dropped before host export
+    uint8_t pad1[84];                        // Pad to 256 bytes (172 + 84 = 256)
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(DumpBufferState) == 256, "DumpBufferState must be 256 bytes");
+
+// =============================================================================
+// DumpReadyQueueEntry - Ready Queue Entry
+// =============================================================================
+
+/**
+ * When a DumpMetaBuffer is full, AICPU adds this entry to the thread's ready queue.
+ * Host memory manager retrieves entries and processes them.
+ */
+struct DumpReadyQueueEntry {
+    uint32_t thread_index;  // Thread index (0 ~ num_dump_threads-1)
+    uint32_t pad0;
+    uint64_t buffer_ptr;  // Device pointer to the full DumpMetaBuffer
+    uint32_t buffer_seq;  // Sequence number for ordering
+    uint32_t pad1;
+} __attribute__((aligned(32)));
+
+// =============================================================================
+// DumpDataHeader - Fixed Header
+// =============================================================================
+
+/**
+ * Dump data fixed header, located at the start of dump shared memory.
+ *
+ * Contains:
+ * 1. Per-thread ready queues (circular FIFOs) — one per AICPU thread
+ * 2. Metadata (thread count, config)
+ *
+ * Ready queue design mirrors PerfDataHeader but is independent:
+ * - Per-thread queues avoid lock contention
+ * - Producer: AICPU thread (adds full DumpMetaBuffers)
+ * - Consumer: Host DumpMemoryManager thread
+ * - Queue empty: head == tail
+ * - Queue full: (tail + 1) % capacity == head
+ */
+struct DumpDataHeader {
+    // Per-thread ready queues
+    DumpReadyQueueEntry queues[PLATFORM_MAX_AICPU_THREADS][PLATFORM_DUMP_READYQUEUE_SIZE];
+    volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS];  // Host reads (consumer)
+    volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // AICPU writes (producer)
+
+    // Metadata (Host initializes, Device reads)
     uint32_t num_dump_threads;
     uint32_t records_per_buffer;
+    uint64_t arena_size_per_thread;
     uint32_t magic;
-    uint32_t pad0;
-    // Per-thread device pointers
-    uint64_t dump_buffer_ptrs[PLATFORM_MAX_AICPU_THREADS];   // -> DumpBuffer
-    uint64_t arena_header_ptrs[PLATFORM_MAX_AICPU_THREADS];  // -> DumpArenaHeader
-    uint64_t arena_data_ptrs[PLATFORM_MAX_AICPU_THREADS];    // -> arena data region
-    uint64_t arena_sizes[PLATFORM_MAX_AICPU_THREADS];
+    uint32_t pad;
 } __attribute__((aligned(64)));
 
 // =============================================================================
@@ -160,7 +228,6 @@ struct DumpSetupHeader {
 /**
  * Caller fills this struct from runtime-specific tensor types.
  * Platform layer is agnostic to runtime-specific types (Tensor, PTO2TaskPayload, etc.).
- * Identical to A2A3 TensorDumpInfo for API compatibility.
  */
 struct TensorDumpInfo {
     uint64_t task_id;
@@ -186,13 +253,13 @@ extern "C" {
 #endif
 
 /**
- * Calculate DumpBuffer allocation size (header + records array).
+ * Calculate total memory size for dump header + buffer states.
  *
- * @param capacity Number of TensorDumpRecord entries
- * @return Total bytes to allocate for one DumpBuffer
+ * @param num_dump_threads Number of AICPU scheduling threads
+ * @return Total bytes for DumpDataHeader + DumpBufferState array
  */
-inline size_t calc_dump_buffer_size(int capacity) {
-    return sizeof(DumpBuffer) + static_cast<size_t>(capacity) * sizeof(TensorDumpRecord);
+inline size_t calc_dump_data_size(int num_dump_threads) {
+    return sizeof(DumpDataHeader) + num_dump_threads * sizeof(DumpBufferState);
 }
 
 /**
@@ -206,21 +273,32 @@ inline uint64_t calc_dump_arena_size() {
 }
 
 /**
- * Get DumpSetupHeader pointer from dump base address.
+ * Get DumpDataHeader pointer.
  *
- * @param base_ptr Dump shared memory base address (kernel_args.dump_data_base)
- * @return DumpSetupHeader pointer
+ * @param base_ptr Dump shared memory base address
+ * @return DumpDataHeader pointer
  */
-inline DumpSetupHeader *get_dump_setup_header(void *base_ptr) { return reinterpret_cast<DumpSetupHeader *>(base_ptr); }
+inline DumpDataHeader *get_dump_header(void *base_ptr) { return reinterpret_cast<DumpDataHeader *>(base_ptr); }
 
 /**
- * Get pointer to the records array of a DumpBuffer.
+ * Get DumpBufferState array start address (after DumpDataHeader).
  *
- * @param buf DumpBuffer pointer
- * @return Pointer to the first TensorDumpRecord
+ * @param base_ptr Dump shared memory base address
+ * @return DumpBufferState array pointer
  */
-inline TensorDumpRecord *get_dump_buffer_records(DumpBuffer *buf) {
-    return reinterpret_cast<TensorDumpRecord *>(buf + 1);
+inline DumpBufferState *get_dump_buffer_states(void *base_ptr) {
+    return reinterpret_cast<DumpBufferState *>(reinterpret_cast<char *>(base_ptr) + sizeof(DumpDataHeader));
+}
+
+/**
+ * Get DumpBufferState for specified thread.
+ *
+ * @param base_ptr Dump shared memory base address
+ * @param thread_idx Thread index (0 ~ num_dump_threads-1)
+ * @return DumpBufferState pointer
+ */
+inline DumpBufferState *get_dump_buffer_state(void *base_ptr, int thread_idx) {
+    return &get_dump_buffer_states(base_ptr)[thread_idx];
 }
 
 #ifdef __cplusplus

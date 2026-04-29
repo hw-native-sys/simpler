@@ -13,31 +13,21 @@
  * @file pmu_collector_aicpu.h
  * @brief AICPU-side PMU collection interface (a5)
  *
- * Split of duties:
- *   - AICPU owns init (event selectors, PMU_CTRL_0/1 start) and finalize
- *     (CTRL restore). It also publishes per-core pmu_buffer_addr /
- *     pmu_reg_base into Handshake at init time so AICore can do the
- *     MMIO read itself.
- *   - AICore reads PMU counters + PMU_CNT_TOTAL via MMIO after each task
- *     (pmu_aicore_record_task), writing into PmuBuffer::dual_issue_slots.
- *   - AICPU, on COND FIN, validates the slot and commits a full PmuRecord
- *     into PmuBuffer::records[] (pmu_aicpu_complete_record).
- *
  * Lifecycle (called from aicpu_executor.cpp):
  *   pmu_aicpu_init()              — resolve per-core PMU MMIO bases + buffer
  *                                   pointers, program events, start counters,
+ *                                   pop initial PmuBuffers from free_queues,
  *                                   publish (pmu_buffer_addr, pmu_reg_base)
  *                                   to each Handshake.
  *   [task loop]
- *     pmu_aicpu_complete_record() — copy the dual-issue slot AICore wrote
+ *     pmu_aicpu_complete_record()     — copy the dual-issue slot AICore wrote
  *                                   into PmuBuffer::records[count], filling
- *                                   func_id + core_type. Drops the record
- *                                   silently if the buffer is full.
+ *                                   func_id + core_type. Switches buffer
+ *                                   when full.
+ *   pmu_aicpu_flush_buffers()     — per-thread: flush each of this thread's
+ *                                   non-empty PmuBuffers to the ready_queue
+ *                                   (mirrors a2a3 pmu_aicpu_flush_buffers)
  *   pmu_aicpu_finalize()          — per-thread: restore CTRL registers.
- *
- * a5 uses a single pre-allocated PmuBuffer per core; the host drains it via
- * rtMemcpy after stream sync (see src/a5/platform/src/host/pmu_collector.cpp).
- * There is no SPSC queue and no per-thread flush step.
  */
 
 #ifndef PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_
@@ -62,6 +52,7 @@ extern "C" bool is_pmu_enabled();
  *     PMU reg-addr table.
  *   - Program event selectors (PMU_CNT0_IDX..CNT9_IDX).
  *   - Start counters (set PMU_CTRL_0 and PMU_CTRL_1).
+ *   - Pop an initial PmuBuffer from the per-core free_queue.
  *   - Publish (pmu_buffer_addr, pmu_reg_base) into handshakes[i] so the
  *     matching AICore can read PMU MMIO and write the dual-issue slot.
  *
@@ -73,44 +64,40 @@ extern "C" bool is_pmu_enabled();
  * Must be called after the host has published pmu_data_base (via
  * set_platform_pmu_base) and after every active core has reported its
  * physical_core_id via handshake. Must be called BEFORE the caller
- * sets aicpu_regs_ready=1 on each handshake, so AICore observes the
- * new fields via the same release/acquire boundary.
+ * sets aicpu_regs_ready=1 on each handshake.
  *
- * @param handshakes         Handshake array (one per core). This function
- *                           writes pmu_buffer_addr and pmu_reg_base into
- *                           handshakes[0..num_cores). Caller owns lifetime.
- * @param physical_core_ids  Array of hardware physical core ids, indexed by
- *                           logical core_id. Caller owns the memory; this
- *                           function does not retain the pointer.
- * @param num_cores          Number of active cores (logical core_id range is [0, num_cores))
+ * @param handshakes         Handshake array (one per core)
+ * @param physical_core_ids  Array of hardware physical core ids
+ * @param num_cores          Number of active cores
  */
 void pmu_aicpu_init(Handshake *handshakes, const uint32_t *physical_core_ids, int num_cores);
 
 /**
- * Commit one PmuRecord from the dual-issue staging slot that AICore wrote
- * into PmuBuffer::dual_issue_slots[task_id & 1]. Copies register state
- * (pmu_counters + pmu_total_cycles) and fills AICPU-owned metadata
- * (task_id, func_id, core_type). When the buffer is full the record is
- * dropped and the core's PmuBufferState::dropped_record_count is incremented.
- * Every call bumps PmuBufferState::total_record_count so host can cross-check
- * collected + dropped against the AICPU's attempted-commit count.
- * No-op if PMU is not enabled or the core has no PMU buffer bound.
+ * Commit one PmuRecord from the dual-issue staging slot.
+ * Switches buffer via SPSC free_queue/ready_queue when full.
  *
  * @param core_id     Logical core index
- * @param thread_idx  AICPU thread index (reserved; not used on a5 memcpy path)
- * @param reg_task_id Register dispatch token (DATA_MAIN_BASE value). AICore
- *                    wrote this 32-bit value into dual_issue_slots[...].task_id,
- *                    so AICPU uses it to locate the slot and validate its
- *                    freshness. Callers should pass the same register token
- *                    they observed on COND / wrote via DATA_MAIN_BASE.
- * @param task_id     Full task_id to store in the PmuRecord (e.g. PTO2's
- *                    (ring_id<<32)|local_id). May differ from reg_task_id.
+ * @param thread_idx  AICPU thread index (selects ready_queue)
+ * @param reg_task_id Register dispatch token (slot match key)
+ * @param task_id     Full task_id to store in the PmuRecord
  * @param func_id     kernel_id from the completed task slot
  * @param core_type   AIC or AIV
  */
 void pmu_aicpu_complete_record(
     int core_id, int thread_idx, uint32_t reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type
 );
+
+/**
+ * Per-thread PMU buffer flush. Mirrors a2a3 pmu_aicpu_flush_buffers().
+ *
+ * For each core in cur_thread_cores, enqueue its non-empty PmuBuffer into the
+ * thread's ready_queue so the host collector can pick it up.
+ *
+ * @param thread_idx        AICPU thread index (selects ready_queue)
+ * @param cur_thread_cores  Array of logical core ids owned by this thread
+ * @param core_num          Entries in cur_thread_cores
+ */
+void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int core_num);
 
 /**
  * Per-thread PMU finalize: restore CTRL registers for this thread's cores.

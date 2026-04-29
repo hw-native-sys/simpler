@@ -160,6 +160,15 @@ void SchedulerContext::dispatch_subtask_to_core(
 #endif
         tracker.change_core_state(core_offset);
     }
+#if PTO2_PROFILING
+    if (l2_perf.l2_perf_enabled) {
+        if (core_exec_state.dispatch_count >= PLATFORM_PROF_BUFFER_SIZE) {
+            l2_perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
+            core_exec_state.dispatch_count = 0;
+        }
+        core_exec_state.dispatch_count++;
+    }
+#endif
 
     write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
     tracker.set_pending_occupied(core_offset);
@@ -334,7 +343,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_PROFILING
         if (is_l2_swimlane_enabled()) {
             l2_perf_aicpu_init_profiling(runtime);
-            l2_perf_aicpu_init_phase_profiling(sched_thread_num_);
+            l2_perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
             l2_perf_aicpu_set_orch_thread_idx(sched_thread_num_);
         }
 #endif
@@ -598,8 +607,23 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
 #if PTO2_PROFILING
+    if (l2_perf.l2_perf_enabled) {
+        l2_perf_aicpu_flush_buffers(
+            thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
+        );
+        l2_perf_aicpu_flush_phase_buffers(thread_idx);
+    }
+#endif
+#if PTO2_PROFILING
     if (is_dump_tensor_enabled()) {
         dump_tensor_flush(thread_idx);
+    }
+#endif
+#if PTO2_PROFILING
+    if (is_pmu_enabled()) {
+        pmu_aicpu_flush_buffers(
+            thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
+        );
     }
 #endif
 
