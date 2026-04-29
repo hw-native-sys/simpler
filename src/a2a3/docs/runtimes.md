@@ -1,20 +1,20 @@
 # Runtime Variants (a2a3)
 
-Three runtime implementations live under `src/a2a3/runtime/`, each providing a different graph-building strategy. The `RUNTIME_CONFIG.runtime` field in `kernel_config.py` selects which runtime to use.
+Two runtime implementations live under `src/a2a3/runtime/`, each providing a different graph-building strategy. The `RUNTIME_CONFIG.runtime` field in `kernel_config.py` selects which runtime to use.
 
 ## Comparison
 
-| Feature | host_build_graph | aicpu_build_graph | tensormap_and_ringbuffer |
-| ------- | ---------------- | ----------------- | ------------------------ |
-| Graph built on | Host CPU | AICPU (device) | AICPU (device) |
-| Task storage | Fixed `Task[]` array | Fixed `Task[]` array | Ring buffer (`PTO2TaskDescriptor[]`) |
-| Dependencies | Explicit edges | Explicit edges | Auto-derived via TensorMap |
-| Memory management | Host-side | Host + device malloc | Ring buffer heap (GM) |
-| Concurrent build+schedule | No | Optional (`build_mode=1`) | Yes (always) |
-| Profiling support | Basic | Basic | Multi-level hierarchy |
-| Batch/streaming | No | No | Yes (flow control, back-pressure) |
-| Thread model | N scheduler threads | 1 builder + N schedulers | 1 orchestrator + 3 schedulers |
-| Use case | Development, debugging | Reduced host-device transfer | Production workloads |
+| Feature | host_build_graph | tensormap_and_ringbuffer |
+| ------- | ---------------- | ------------------------ |
+| Graph built on | Host CPU | AICPU (device) |
+| Task storage | Fixed `Task[]` array | Ring buffer (`PTO2TaskDescriptor[]`) |
+| Dependencies | Explicit edges | Auto-derived via TensorMap |
+| Memory management | Host-side | Ring buffer heap (GM) |
+| Concurrent build+schedule | No | Yes (always) |
+| Profiling support | Basic | Multi-level hierarchy |
+| Batch/streaming | No | Yes (flow control, back-pressure) |
+| Thread model | N scheduler threads | 1 orchestrator + 3 schedulers |
+| Use case | Development, debugging | Production workloads |
 
 ## host_build_graph
 
@@ -25,16 +25,6 @@ The simplest runtime. The host CPU builds the complete task dependency graph bef
 - No device-side orchestration overhead
 
 See [host_build_graph/docs/RUNTIME_LOGIC.md](../runtime/host_build_graph/docs/RUNTIME_LOGIC.md) for details.
-
-## aicpu_build_graph
-
-Orchestration runs on an AICPU thread, building the task graph on device. Supports concurrent build + schedule (`build_mode=1`).
-
-- Same task array as host_build_graph
-- Device-side API: `add_task`, `add_successor_conditional`, `publish_task`, `device_malloc`
-- Reduces host-device data transfer; graph can depend on device-side data
-
-See [aicpu_build_graph/docs/RUNTIME_LOGIC.md](../runtime/aicpu_build_graph/docs/RUNTIME_LOGIC.md) for details.
 
 ## tensormap_and_ringbuffer (PTO2)
 

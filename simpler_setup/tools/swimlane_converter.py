@@ -1015,7 +1015,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
 
     # Orchestrator → scheduler dispatch:
     # - Prefer orch_fanin end → dispatch (explicit deps / fanin path).
-    # - If no orch_fanin for this task (e.g. aicpu_build_graph without fanin records), use orch_params end → dispatch.
+    # - If no orch_fanin for this task, use orch_params end → dispatch.
     if orchestrator_phases and scheduler_phases:
         orch_fanin_by_task = {}
         orch_params_by_task = {}

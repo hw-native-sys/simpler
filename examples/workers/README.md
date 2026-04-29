@@ -35,8 +35,8 @@ workers/
 
 Why no `tensormap_and_ringbuffer/` layer? Because every example here hard-codes
 `runtime="tensormap_and_ringbuffer"` in its `Worker(...)` call — that is the
-default user-facing runtime. Other runtimes (`host_build_graph`,
-`aicpu_build_graph`) are covered by scene tests under `tests/st/`, not here.
+default user-facing runtime. The other runtime (`host_build_graph`) is
+covered by scene tests under `tests/st/`, not here.
 
 ## Prerequisites
 

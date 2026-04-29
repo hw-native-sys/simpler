@@ -127,11 +127,6 @@ def pytest_collection_modifyitems(session, config, items):
     available_runtimes = discover_runtimes_for_arch(arch)
 
     for item in items:
-        # Skip aicpu_build_graph tests for architectures that don't have it
-        if "test_discovers_aicpu_build_graph" in item.nodeid:
-            if "aicpu_build_graph" not in available_runtimes:
-                item.add_marker(pytest.mark.skip(reason=f"aicpu_build_graph not available for {arch} architecture"))
-
         # Skip tensormap_and_ringbuffer tests for architectures that don't have it
         if "tensormap_and_ringbuffer" in item.nodeid:
             if "tensormap_and_ringbuffer" not in available_runtimes:

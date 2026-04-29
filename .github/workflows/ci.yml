@@ -209,8 +209,8 @@ jobs:
           set +e
           pytest examples tests/st --platform a2a3sim --device 0-15 -v --pto-session-timeout 600 --clone-protocol https
           rc=$?
-          if [ $rc -eq 124 ]; then
-            echo "pytest timed out; retrying with pinned PTO-ISA commit"
+          if [ $rc -ne 0 ]; then
+            echo "pytest failed with rc=$rc; retrying with pinned PTO-ISA commit"
             pytest examples tests/st --platform a2a3sim --device 0-15 -v \
               --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https
             rc=$?
@@ -267,8 +267,8 @@ jobs:
           set +e
           pytest examples tests/st --platform a5sim --device 0-15 -v --pto-session-timeout 600 --clone-protocol https
           rc=$?
-          if [ $rc -eq 124 ]; then
-            echo "pytest timed out; retrying with pinned PTO-ISA commit"
+          if [ $rc -ne 0 ]; then
+            echo "pytest failed with rc=$rc; retrying with pinned PTO-ISA commit"
             pytest examples tests/st --platform a5sim --device 0-15 -v \
               --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https
             rc=$?
@@ -338,8 +338,8 @@ jobs:
           source .venv/bin/activate
           python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v --pto-session-timeout 600 --clone-protocol https
           rc=$?
-          if [ $rc -eq 124 ]; then
-            echo "pytest timed out; retrying with pinned PTO-ISA commit"
+          if [ $rc -ne 0 ]; then
+            echo "pytest failed with rc=$rc; retrying with pinned PTO-ISA commit"
             python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v \
               --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https
             rc=$?
@@ -450,4 +450,4 @@ jobs:
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --clone-protocol https"
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "set +e; $PYTEST --pto-session-timeout 1200; rc=\$?; if [ \$rc -eq 124 ]; then echo 'pytest timed out; retrying with pinned PTO-ISA commit'; $PYTEST --pto-session-timeout 1200 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https; rc=\$?; fi; exit \$rc"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "set +e; $PYTEST --pto-session-timeout 1200; rc=\$?; if [ \$rc -ne 0 ]; then echo \"pytest failed with rc=\$rc; retrying with pinned PTO-ISA commit\"; $PYTEST --pto-session-timeout 1200 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https; rc=\$?; fi; exit \$rc"

@@ -221,7 +221,7 @@ SchedulerContext owns its own teardown:
   (`initialized_`, `init_done_`, `init_failed_`, `finished_`, `thread_idx_`,
   `finished_count_`).
 
-Applies to all 5 runtime executors: a2a3 (abg, hbg, tmr), a5 (hbg, tmr).
+Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 
 ## SO Handle Caching and Reuse
 

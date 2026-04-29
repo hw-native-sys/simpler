@@ -22,12 +22,12 @@ elapsed time.
 ```
 
 Requires `PTO2_PROFILING=1` in the runtime; device log must include the
-`orch_*` / `sched_*` lines. The `EXAMPLE_CASES` maps at the top of the script
-control which examples/cases are run per runtime.
+`orch_*` / `sched_*` lines. The `TMR_EXAMPLE_CASES` map at the top of the
+script controls which examples/cases are run.
 
 ## verify_packaging.sh
 
-Exercises all 5 install paths × 4 entry points from a fully clean state.
+Exercises all 5 install paths × 2 entry points from a fully clean state.
 CI calls this directly; see [docs/python-packaging.md](../docs/python-packaging.md).
 Must run from the repo root inside an activated venv.
 

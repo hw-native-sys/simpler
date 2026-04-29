@@ -29,7 +29,6 @@ body:
       description: Which runtime variant is affected?
       options:
         - tensormap_and_ringbuffer
-        - aicpu_build_graph
         - host_build_graph
         - All / Unknown
     validations:

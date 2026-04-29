@@ -61,8 +61,8 @@ struct L2PerfRecord {
     uint64_t finish_time;    // AICPU timestamp: when AICPU observed task completion
 
     // AICore writes the register dispatch token (low 32 bits only) zero-extended into task_id.
-    // For multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph), AICPU overwrites
-    // with the full PTO2 encoding (ring_id << 32) | local_id after FIN/perf row match.
+    // For tensormap_and_ringbuffer, AICPU overwrites with the full PTO2 encoding
+    // (ring_id << 32) | local_id after FIN/perf row match.
     // For host_build_graph, task_id stays as the plain integer task index (ring_id = 0).
     uint64_t task_id;
     uint32_t func_id;    // Kernel function identifier
@@ -140,8 +140,8 @@ struct AicpuPhaseRecord {
     uint32_t loop_iter;     // Loop iteration number
     AicpuPhaseId phase_id;  // Phase type
     union {
-        uint64_t task_id;          // Multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph):
-                                   // full PTO2 encoding (ring_id << 32) | local_id for cross-view correlation.
+        uint64_t task_id;          // tensormap_and_ringbuffer: full PTO2 encoding
+                                   // (ring_id << 32) | local_id for cross-view correlation.
         uint64_t tasks_processed;  // Scheduler phases: number of tasks processed in this batch
     };
 };

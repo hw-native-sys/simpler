@@ -6,8 +6,8 @@ runtime observability feature: host pre-allocates buffers on device,
 AICPU writes records during execution, host collects data and exports
 JSON manifest + binary payload.
 
-Supported on both architectures (`a2a3` / `a5`) and all three runtimes
-(`host_build_graph`, `aicpu_build_graph`, `tensormap_and_ringbuffer`).
+Supported on both architectures (`a2a3` / `a5`) and both runtimes
+(`host_build_graph`, `tensormap_and_ringbuffer`).
 Opt-in via `--dump-tensor` — zero overhead when disabled.
 
 The **primary design** (a2a3) uses shared memory (`halHostRegister`) +
@@ -250,8 +250,8 @@ all device-side writes were globally visible.
 
 AICPU only has device addresses and sizes — it does **not** know the
 logical shape / dtype / view geometry of each tensor unless the runtime
-registers it. Each of the three runtimes exposes metadata through a
-slightly different path, but they all converge on `TensorInfo` (see
+registers it. Each runtime exposes metadata through a slightly different
+path, but they all converge on `TensorInfo` (see
 [`tensor_info.h`](../src/a5/runtime/host_build_graph/runtime/tensor_info.h)):
 
 - **`host_build_graph`** — two orchestration-side APIs:
@@ -261,11 +261,10 @@ slightly different path, but they all converge on `TensorInfo` (see
   See
   [`dump_tensor_orch.cpp`](../tests/st/a5/host_build_graph/dump_tensor_example/kernels/orchestration/dump_tensor_orch.cpp)
   for both styles in one file.
-- **`aicpu_build_graph`** — runtime layer fills `TensorInfo` from
-  `PTO2TaskPayload::tensors[]` directly. No orchestration API needed.
-- **`tensormap_and_ringbuffer`** — identical to `aicpu_build_graph`;
-  the ring buffer carries `PTO2TaskPayload` which already contains
-  shape/offset arrays.
+- **`tensormap_and_ringbuffer`** — runtime layer fills `TensorInfo`
+  from `PTO2TaskPayload::tensors[]` directly. The ring buffer carries
+  `PTO2TaskPayload` which already contains shape/offset arrays, so no
+  orchestration API is needed.
 
 When metadata is missing or inconsistent, the task is **skipped for
 dump** and a single `LOG_WARN` is emitted (guarded by

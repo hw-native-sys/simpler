@@ -45,20 +45,8 @@ The `-d` flag specifies NPU device IDs.
 `tools/benchmark_rounds.sh` supports `-r <runtime>`:
 
 - `tensormap_and_ringbuffer` (default)
-- `aicpu_build_graph`
 
-Each runtime has its own example list defined at the top of the script (`TMR_EXAMPLE_CASES` / `ABG_EXAMPLE_CASES`).
-
-**Auto-detection (compare mode only):** Always benchmark TMR. Also benchmark `aicpu_build_graph` if the diff touches its files:
-
-```bash
-RUNTIMES_TO_BENCH=(tensormap_and_ringbuffer)
-if git diff --name-only "$MERGE_BASE"...HEAD | grep -q 'aicpu_build_graph'; then
-  RUNTIMES_TO_BENCH+=(aicpu_build_graph)
-fi
-```
-
-Run `benchmark_rounds.sh` once per runtime, with `-r <runtime>` appended. **Runtimes are always benchmarked serially** — finish all baseline+current runs for one runtime before starting the next. This ensures no device ever runs two benchmark processes concurrently.
+The example list is defined at the top of the script (`TMR_EXAMPLE_CASES`).
 
 ## Step 1: Detect Mode
 

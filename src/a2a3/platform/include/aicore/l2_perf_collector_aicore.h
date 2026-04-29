@@ -38,8 +38,8 @@
  * Buffer management and final commit are handled by AICPU.
  *
  * AICore writes L2PerfRecord.task_id as the register dispatch token (low 32 bits, zero-extended).
- * For multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph), AICPU overwrites
- * with the full (ring_id << 32) | local_id encoding after handshake match.
+ * For tensormap_and_ringbuffer, AICPU overwrites with the full (ring_id << 32) | local_id
+ * encoding after handshake match.
  *
  * @param l2_perf_buf Performance buffer pointer
  * @param task_id Register dispatch id (DATA_MAIN_BASE), stored in task_id low 32 bits

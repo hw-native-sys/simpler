@@ -22,7 +22,6 @@ pto-runtime/
 │       └── runtime/                   # Runtime implementations
 │           ├── common/                # Shared components across runtimes
 │           ├── host_build_graph/      # Host-built graph runtime
-│           ├── aicpu_build_graph/     # AICPU-built graph runtime
 │           └── tensormap_and_ringbuffer/  # Advanced production runtime
 │
 ├── python/                            # Language bindings
@@ -55,7 +54,6 @@ pto-runtime/
 ├── examples/                          # Working examples
 │   └── {arch}/                        # Architecture-specific examples
 │       ├── host_build_graph/
-│       ├── aicpu_build_graph/
 │       └── tensormap_and_ringbuffer/
 │
 ├── tests/                             # Test suite

@@ -29,12 +29,11 @@ PTO ISA headers are automatically cloned on first run. See [Getting Started](doc
 
 ## Runtime Variants
 
-Three runtimes under `src/{arch}/runtime/`, each with a different graph-building strategy:
+Two runtimes under `src/{arch}/runtime/`, each with a different graph-building strategy:
 
 | Runtime | Graph built on | Use case |
 | ------- | -------------- | -------- |
 | `host_build_graph` | Host CPU | Development, debugging |
-| `aicpu_build_graph` | AICPU (device) | Reduced host-device transfer |
 | `tensormap_and_ringbuffer` | AICPU (device) | Production workloads |
 
 See runtime docs per arch: [a2a3](src/a2a3/docs/runtimes.md), [a5](src/a5/docs/runtimes.md).

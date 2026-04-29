@@ -372,7 +372,7 @@ class KernelCompiler:
 
         Args:
             runtime_name: Name of the runtime (e.g., "host_build_graph",
-                         "tensormap_and_ringbuffer", "aicpu_build_graph")
+                         "tensormap_and_ringbuffer")
             source_path: Path to orchestration source file (.cpp)
             extra_include_dirs: Additional include directories (merged with
                                the runtime/platform include dirs)

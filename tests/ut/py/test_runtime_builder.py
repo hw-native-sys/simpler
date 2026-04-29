@@ -28,14 +28,6 @@ class TestRuntimeBuilderDiscovery:
         runtimes = builder.list_runtimes()
         assert "host_build_graph" in runtimes
 
-    def test_discovers_aicpu_build_graph(self, default_test_platform):
-        """RuntimeBuilder discovers aicpu_build_graph from the real project tree."""
-        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-        builder = RuntimeBuilder(platform=default_test_platform)
-        runtimes = builder.list_runtimes()
-        assert "aicpu_build_graph" in runtimes
-
     def test_runtime_dir_resolves_to_project_root(self, default_test_platform, test_arch):
         """runtime_dir resolves to src/{arch}/runtime/ under the project root."""
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415

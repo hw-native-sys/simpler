@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# Verify all 5 install paths x 4 entry points are green.
+# Verify all 5 install paths x 2 entry points are green.
 #
 # Each mode runs from a fully clean state (uninstall + wipe build artifacts) so
 # leftover binaries from a previous mode cannot mask a regression in the next.
@@ -70,7 +70,7 @@ print('incore helpers OK:', inc_dirs)
 "
     echo "::endgroup::"
     echo "::group::[${mode}] standalone test_*.py --help"
-    python tests/st/a2a3/aicpu_build_graph/paged_attention/test_paged_attention.py --help >/dev/null
+    python tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll/test_paged_attention_unroll.py --help >/dev/null
     echo "::endgroup::"
     echo "smoke[${mode}] OK"
 }

@@ -13,7 +13,7 @@
 # Usage:
 #   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>]
 #
-# Edit the EXAMPLE_CASES maps below to control which examples and cases to run.
+# Edit the EXAMPLE_CASES map below to control which examples and cases to run.
 
 set -euo pipefail
 
@@ -42,14 +42,6 @@ TMR_EXAMPLE_ORDER=(
     paged_attention_unroll_manual_scope
     batch_paged_attention
     spmd_paged_attention
-)
-
-# --- aicpu_build_graph ---
-declare -A ABG_EXAMPLE_CASES=(
-    [paged_attention_unroll]="Case1,Case2"
-)
-ABG_EXAMPLE_ORDER=(
-    paged_attention_unroll
 )
 
 # ---------------------------------------------------------------------------
@@ -95,7 +87,7 @@ Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 100)
-  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default), aicpu_build_graph
+  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default)
   -v, --verbose  Save detailed test_*.py output to a timestamped log file
   -h, --help     Show this help
 
@@ -156,12 +148,8 @@ case "$RUNTIME" in
         declare -n EXAMPLE_CASES=TMR_EXAMPLE_CASES
         EXAMPLE_ORDER=("${TMR_EXAMPLE_ORDER[@]}")
         ;;
-    aicpu_build_graph)
-        declare -n EXAMPLE_CASES=ABG_EXAMPLE_CASES
-        EXAMPLE_ORDER=("${ABG_EXAMPLE_ORDER[@]}")
-        ;;
     *)
-        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer or aicpu_build_graph."
+        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer."
         exit 1
         ;;
 esac

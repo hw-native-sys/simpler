@@ -96,7 +96,7 @@ Plus one build-time entry point invoked by CMake during `pip install`:
 
 ## Install modes
 
-Five install paths × four entry points = the verification matrix. CI enforces the matrix on macOS and Ubuntu via `.github/workflows/ci.yml::packaging-matrix`.
+Five install paths × two entry points = the verification matrix. CI enforces the matrix on macOS and Ubuntu via `.github/workflows/ci.yml::packaging-matrix`.
 
 ### Mode-by-mode
 

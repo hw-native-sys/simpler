@@ -35,7 +35,7 @@ PTO2 (Parallel Task Orchestration v2) is a runtime system for executing task gra
 
 ## 1. Runtime Variants
 
-Three runtime backends exist under `src/runtime/`, each representing a different orchestration and scheduling strategy.
+Two runtime backends exist under `src/runtime/`, each representing a different orchestration and scheduling strategy.
 
 ### 1.1 host_build_graph
 
@@ -45,15 +45,7 @@ The host builds the complete task graph before launching device execution. The o
 - **Scheduling**: AICPU receives the pre-built graph and dispatches tasks by traversing dependencies
 - **Use case**: development and debugging; no device-side orchestration overhead
 
-### 1.2 aicpu_build_graph
-
-The orchestration runs on an AICPU thread, building the task graph on device. Supports concurrent build + schedule (`build_mode=1`).
-
-- **Task storage**: same `Task[]` array as host_build_graph
-- **AicpuBuildApi**: `add_task`, `add_successor_conditional`, `publish_task`, `device_malloc`
-- **Use case**: reduced host→device data transfer; graph can depend on device-side data
-
-### 1.3 tensormap_and_ringbuffer (PTO2)
+### 1.2 tensormap_and_ringbuffer (PTO2)
 
 The primary production runtime. Uses ring buffers for task slots and output memory, with a TensorMap for automatic dependency tracking.
 

@@ -420,7 +420,6 @@ pytest tests/ut --platform a2a3
 Small, fast examples that run on both simulation and real hardware. Organized by runtime:
 
 - `host_build_graph/` — HBG examples
-- `aicpu_build_graph/` — ABG examples
 - `tensormap_and_ringbuffer/` — TMR examples
 
 Each example has a `golden.py` with `generate_inputs()` and `compute_golden()` for result validation.

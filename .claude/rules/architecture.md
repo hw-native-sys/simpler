@@ -5,7 +5,7 @@ See [docs/chip-level-arch.md](../../docs/chip-level-arch.md) for the full diagra
 ## Key Concepts
 
 - **Three programs**: Host `.so`, AICPU `.so`, AICore `.o` — compiled independently, linked at runtime
-- **Three runtimes** under `src/{arch}/runtime/`: `host_build_graph`, `aicpu_build_graph`, `tensormap_and_ringbuffer`
+- **Two runtimes** under `src/{arch}/runtime/`: `host_build_graph`, `tensormap_and_ringbuffer`
 - **Two platform backends** under `src/{arch}/platform/`: `onboard/` (hardware), `sim/` (simulation)
 
 ## Python Package Layout
