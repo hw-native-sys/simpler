@@ -68,10 +68,21 @@ void ProfMemoryManager::start(
     LOG_INFO("ProfMemoryManager started: %d cores, %d phase threads", num_cores, num_phase_threads);
 }
 
-void ProfMemoryManager::stop() {
+void ProfMemoryManager::stop(bool free_buffers) {
     running_.store(false);
     if (mgmt_thread_.joinable()) {
         mgmt_thread_.join();
+    }
+
+    if (!free_buffers) {
+        // After device reset, device memory is already reclaimed.
+        // Just clear host-side tracking without calling rtFree.
+        std::scoped_lock<std::mutex> lock(done_mutex_);
+        std::queue<CopyDoneInfo>().swap(done_queue_);
+        recycled_perf_buffers_.clear();
+        recycled_phase_buffers_.clear();
+        LOG_INFO("ProfMemoryManager stopped (buffers abandoned after device reset)");
+        return;
     }
 
     // Drain remaining done_queue and free buffers
@@ -710,9 +721,9 @@ void L2PerfCollector::start_memory_manager(const ThreadFactory &thread_factory) 
     );
 }
 
-void L2PerfCollector::stop_memory_manager() {
+void L2PerfCollector::stop_memory_manager(bool free_buffers) {
     if (memory_manager_.is_running()) {
-        memory_manager_.stop();
+        memory_manager_.stop(free_buffers);
     }
 }
 
