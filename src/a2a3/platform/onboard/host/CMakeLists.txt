@@ -27,6 +27,22 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build Host runtime")
 endif()
 
+set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE_DEFAULT OFF)
+if(DEFINED ENV{PTO_ISA_ROOT})
+    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE_DEFAULT ON)
+endif()
+option(
+    SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    "Enable PTO-ISA SDMA workspace support for async SDMA completion"
+    ${SIMPLER_ENABLE_PTO_SDMA_WORKSPACE_DEFAULT}
+)
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    if(NOT DEFINED ENV{PTO_ISA_ROOT})
+        message(FATAL_ERROR "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE requires PTO_ISA_ROOT")
+    endif()
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
+endif()
+
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES
@@ -73,6 +89,10 @@ target_compile_options(host_runtime
         -g
 )
 
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
+endif()
+
 # Include directories - always include local headers
 target_include_directories(host_runtime
     PRIVATE
@@ -97,6 +117,10 @@ target_link_directories(host_runtime
         ${ASCEND_HOME_PATH}/runtime/lib64
 )
 
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    target_link_directories(host_runtime PRIVATE ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64)
+endif()
+
 # CANN 9.x exposes the working non-V2 HCCL entry points through libhcomm.
 # Link it explicitly so comm_hccl.cpp can follow the same initialization path
 # as the pto-isa communication tests.
@@ -118,5 +142,9 @@ target_link_libraries(host_runtime
         ${HCCL_LINK_TARGETS}
         dl
 )
+
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    target_link_libraries(host_runtime PRIVATE nnopbase)
+endif()
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")
