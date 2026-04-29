@@ -292,6 +292,11 @@ public:
     int finalize();
 
     /**
+     * Whether the most recent run() exited due to stream sync timeout.
+     */
+    bool last_run_timed_out() const { return last_run_timed_out_; }
+
+    /**
      * Launch an AICPU kernel
      *
      * Internal method used by run(). Can be called directly for custom
@@ -422,6 +427,7 @@ private:
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results in destructor
     std::vector<uint8_t> aicore_kernel_binary_;
+    bool last_run_timed_out_{false};
 
     // Memory management
     MemoryAllocator mem_alloc_;
@@ -506,6 +512,23 @@ private:
      * @return 0 on success, non-zero on failure.
      */
     int prepare_orch_so(Runtime &runtime);
+
+    /**
+     * Synchronize stream with host-side timeout watchdog.
+     *
+     * Runs rtStreamSynchronize inside create_thread() (rtSetDevice + user fn);
+     * the caller thread waits on shared state with a deadline. On timeout,
+     * tries aclrtResetDevice and a second wait; if still blocked, detaches.
+     * Stream pointers are cleared when reset succeeds or on detach to avoid
+     * finalize-time UAF (detach path may leak stream handles).
+     *
+     * @param stream Stream to synchronize
+     * @param stream_name Stream label for logs
+     * @param timeout_ms Timeout threshold in milliseconds
+     * @param timed_out Output flag: true if watchdog timeout happened
+     * @return 0 on success, error code on failure/timeout
+     */
+    int synchronize_stream_with_timeout(rtStream_t stream, const char *stream_name, int timeout_ms, bool *timed_out);
 
     /**
      * Initialize performance profiling shared memory
