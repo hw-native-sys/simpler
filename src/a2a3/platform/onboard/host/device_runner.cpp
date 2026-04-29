@@ -433,10 +433,33 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
     return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
+int DeviceRunner::synchronize_stream_with_timeout(rtStream_t stream, const char *stream_name, int timeout_ms) {
+    if (stream == nullptr) {
+        LOG_ERROR("synchronize_stream_with_timeout: stream %s is null", stream_name);
+        return -1;
+    }
+
+    int rc = aclrtSynchronizeStreamWithTimeout(stream, timeout_ms);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=%s timeout_ms=%d device_id=%d block_dim=%d "
+            "worker_count=%d binaries_loaded=%d",
+            stream_name, timeout_ms, device_id_, block_dim_, worker_count_, binaries_loaded_ ? 1 : 0
+        );
+        last_run_timed_out_ = true;
+        return rc;
+    }
+    if (rc != 0) {
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (%s) failed: %d", stream_name, rc);
+    }
+    return rc;
+}
+
 int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
     const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
 ) {
+    last_run_timed_out_ = false;
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
@@ -554,6 +577,7 @@ int DeviceRunner::run(
 
     // Scope guards for cleanup on all exit paths
     auto regs_cleanup = RAIIScopeGuard([this]() {
+        if (last_run_timed_out_) return;
         if (kernel_args_.args.regs != 0) {
             mem_alloc_.free(reinterpret_cast<void *>(kernel_args_.args.regs));
             kernel_args_.args.regs = 0;
@@ -561,6 +585,7 @@ int DeviceRunner::run(
     });
 
     auto pmu_regs_cleanup = RAIIScopeGuard([this]() {
+        if (last_run_timed_out_) return;
         if (kernel_args_.args.pmu_reg_addrs != 0) {
             mem_alloc_.free(reinterpret_cast<void *>(kernel_args_.args.pmu_reg_addrs));
             kernel_args_.args.pmu_reg_addrs = 0;
@@ -568,6 +593,7 @@ int DeviceRunner::run(
     });
 
     auto runtime_args_cleanup = RAIIScopeGuard([this]() {
+        if (last_run_timed_out_) return;
         kernel_args_.finalize_device_kernel_args();
         kernel_args_.finalize_runtime_args();
     });
@@ -607,9 +633,8 @@ int DeviceRunner::run(
     }
 
     auto perf_cleanup = RAIIScopeGuard([this]() {
-        bool was_initialized = l2_perf_collector_.is_initialized();
-        if (was_initialized) {
-            l2_perf_collector_.stop_memory_manager();
+        if (l2_perf_collector_.is_initialized()) {
+            l2_perf_collector_.stop_memory_manager(/*free_buffers=*/!last_run_timed_out_);
         }
     });
 
@@ -721,17 +746,14 @@ int DeviceRunner::run(
         });
 
         LOG_INFO("=== rtStreamSynchronize stream_aicpu_ ===");
-        // Synchronize streams
-        rc = rtStreamSynchronize(stream_aicpu_);
+        rc = synchronize_stream_with_timeout(stream_aicpu_, "AICPU", PLATFORM_STREAM_SYNC_TIMEOUT_MS);
         if (rc != 0) {
-            LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
             return rc;
         }
 
         LOG_INFO("=== rtStreamSynchronize stream_aicore_ ===");
-        rc = rtStreamSynchronize(stream_aicore_);
+        rc = synchronize_stream_with_timeout(stream_aicore_, "AICore", PLATFORM_STREAM_SYNC_TIMEOUT_MS);
         if (rc != 0) {
-            LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
             return rc;
         }
     }
@@ -851,6 +873,50 @@ int DeviceRunner::finalize() {
         return rc;
     }
 
+    if (last_run_timed_out_) {
+        // Device is unresponsive — skip all rt* cleanup (rtFree, rtStreamDestroy,
+        // halHostUnregister) which would block. Go directly to aclrtResetDevice.
+        // Device reset reclaims all device memory, so skipped frees are safe.
+        // Every cached device pointer must be nulled to prevent stale reuse.
+        LOG_ERROR("finalize: timeout recovery — skipping rt* cleanup, resetting device directly");
+        stream_aicpu_ = nullptr;
+        stream_aicore_ = nullptr;
+        kernel_args_.abandon();
+        so_info_.abandon();
+        func_id_to_addr_.clear();
+        binaries_loaded_ = false;
+        dev_orch_so_buffer_ = nullptr;
+        dev_orch_so_capacity_ = 0;
+        cached_orch_so_hash_ = 0;
+        host_orch_so_copy_.clear();
+        host_orch_so_copy_.shrink_to_fit();
+        mem_alloc_.abandon();
+
+        // aclrtResetDevice must execute unconditionally here — the run() path
+        // uses rtSetDevice (not aclInit), so acl_ready_ is false, but the
+        // device still needs resetting.  reset_device_and_acl() gates on
+        // acl_ready_ and would skip the reset entirely.
+        if (device_id_ >= 0) {
+            int reset_rc = aclrtResetDevice(device_id_);
+            if (reset_rc != 0) {
+                LOG_ERROR("aclrtResetDevice(%d) failed during timeout recovery: %d", device_id_, reset_rc);
+            }
+        }
+        if (acl_ready_) {
+            int fin_rc = aclFinalize();
+            if (fin_rc != 0) {
+                LOG_ERROR("aclFinalize failed during timeout recovery: %d", fin_rc);
+            }
+            acl_ready_ = false;
+        }
+        device_id_ = -1;
+        block_dim_ = 0;
+        worker_count_ = 0;
+        aicore_kernel_binary_.clear();
+        LOG_INFO("DeviceRunner finalized (timeout recovery)");
+        return 0;
+    }
+
     release_run_context();
 
     // Cleanup kernel args (deviceArgs)
@@ -938,7 +1004,11 @@ int DeviceRunner::finalize() {
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
 
-    // Reset device and finalize ACL AFTER all device memory is freed.
+    return reset_device_and_acl();
+}
+
+int DeviceRunner::reset_device_and_acl() {
+    int rc = 0;
     // Gated on acl_ready_ so rt-only runtimes that never called
     // ensure_acl_ready() do not try to aclFinalize an un-init'd ACL state.
     if (acl_ready_ && device_id_ >= 0) {

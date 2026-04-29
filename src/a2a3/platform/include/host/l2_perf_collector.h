@@ -158,8 +158,10 @@ public:
     /**
      * Stop the memory management thread
      * Blocks until the thread exits.
+     *
+     * @param free_buffers If false, skip freeing device buffers (use after device reset).
      */
-    void stop();
+    void stop(bool free_buffers = true);
 
     /**
      * Try to pop a ready buffer info (non-blocking)
@@ -315,8 +317,10 @@ public:
      * Stop the memory management thread and clean up remaining data
      *
      * Must be called after device execution completes.
+     *
+     * @param free_buffers If false, skip freeing device buffers (use after device reset).
      */
-    void stop_memory_manager();
+    void stop_memory_manager(bool free_buffers = true);
 
     /**
      * Cleanup all resources
