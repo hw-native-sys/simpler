@@ -107,7 +107,7 @@ struct L2PerfBuffer {
  * AICPU phase identifier
  *
  * Scheduler phases (0-3): four phases in each scheduler loop iteration.
- * Orchestrator phases (16-24): sub-steps within each pto2_submit_task() call.
+ * Orchestrator phases (16-24): sub-steps within each submit_task() call.
  */
 enum class AicpuPhaseId : uint32_t {
     // Scheduler phases (0-3)

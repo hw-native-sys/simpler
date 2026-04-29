@@ -65,7 +65,7 @@ typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime *rt);
 // Config function exported by orchestration .so
 typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const ChipStorageTaskArgs &orch_args);
 
-// From orchestration/common.cpp linked into this DSO — updates g_pto2_current_runtime here (distinct from
+// From orchestration/common.cpp linked into this DSO — updates g_current_runtime here (distinct from
 // framework_bind_runtime in the dlopen'd libdevice_orch_*.so).
 extern "C" void framework_bind_runtime(PTO2Runtime *rt);
 
@@ -641,7 +641,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // always tear them down here, but we keep orch_so_handle_ alive for
         // the next run's cache-hit reuse (see run() reload_so branch).
         if (!runtime->get_orch_built_on_host() && rt != nullptr) {
-            // Clear g_pto2_current_runtime in this DSO and in the orchestration SO before destroying rt.
+            // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.
             framework_bind_runtime(nullptr);
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(nullptr);

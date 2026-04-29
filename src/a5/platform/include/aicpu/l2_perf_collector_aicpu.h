@@ -139,7 +139,7 @@ void l2_perf_aicpu_set_orch_thread_idx(int thread_idx);
 /**
  * Record a single orchestrator phase
  *
- * Appends an AicpuPhaseRecord for one sub-step of pto2_submit_task().
+ * Appends an AicpuPhaseRecord for one sub-step of submit_task().
  * Uses the orchestrator's dedicated buffer slot (set via set_orch_thread_idx).
  *
  * @param phase_id Orchestrator phase identifier (ORCH_SYNC..ORCH_SCOPE_END)

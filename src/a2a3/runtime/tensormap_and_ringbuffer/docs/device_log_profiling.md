@@ -56,7 +56,7 @@ Thread 3: PTO2 total submitted tasks = 16704
 | Field | Source (`pto_orchestrator.cpp`) | Description |
 | ----- | ------------------------------- | ----------- |
 | **cost** | Wall-clock around `orch_func()` call | Total time including orchestration logic + scope overhead |
-| **total** | Sum of all sub-steps below | Accumulated time inside `pto2_submit_task` across all tasks |
+| **total** | Sum of all sub-steps below | Accumulated time inside `submit_task` across all tasks |
 | **sync_tensormap** | `g_orch_sync_cycle` | TensorMap validity sync and optional cleanup before each submission |
 | **task_ring_alloc** | `g_orch_alloc_cycle` | Allocating a task slot from the task ring buffer |
 | **param_copy** | `g_orch_args_cycle` | Copying param descriptors + tensor descriptor copies into task-owned storage |
@@ -64,12 +64,12 @@ Thread 3: PTO2 total submitted tasks = 16704
 | **heap_alloc** | `g_orch_heap_cycle` | Allocating packed output buffers from the heap ring |
 | **tensormap_ins** | `g_orch_insert_cycle` | Inserting output/inout tensors into the TensorMap |
 | **fanin+ready** | `g_orch_fanin_cycle` | Building the fanin list + checking if task is already ready (Step 5/5b) |
-| **scope_end** | `g_orch_scope_end_cycle` | `pto2_scope_end` overhead (notifying scheduler of scope completion) |
+| **scope_end** | `g_orch_scope_end_cycle` | `end_scope` overhead (notifying scheduler of scope completion) |
 | **avg/task** | `total / submit_count` | Average orchestrator time per task submission |
 
 ### Interpreting the Numbers
 
-- **cost > total**: The difference is overhead outside `pto2_submit_task` (the orchestration user code itself, scope_begin/end, TensorCreateInfo construction, etc.).
+- **cost > total**: The difference is overhead outside `submit_task` (the orchestration user code itself, scope_begin/end, TensorCreateInfo construction, etc.).
 - **lookup+dep** is typically the dominant cost (~50%) because it involves TensorMap hash lookups and building dependency edges with spinlock-protected fanout list insertions.
 - **param_copy** scales with the number of parameters per task.
 - **avg/task < 1us** indicates efficient graph construction.

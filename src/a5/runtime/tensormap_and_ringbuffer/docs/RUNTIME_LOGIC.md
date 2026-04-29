@@ -162,7 +162,7 @@ The task ring manages task slot allocation with back-pressure flow control.
 
 **Slot mapping**: `slot = task_id & (window_size - 1)`
 
-**Allocation** (`pto2_task_ring_alloc`):
+**Allocation** (`PTO2TaskAllocator::alloc`):
 
 ```text
 active_count = current_index - *last_alive_ptr
@@ -203,11 +203,11 @@ A simple bump allocator for `PTO2DepListEntry` nodes used in fanin/fanout linked
 
 The ring buffer mechanism provides **flow control** between the orchestrator (producer) and the scheduler (consumer). When a ring is exhausted, the orchestrator **blocks** — it cannot submit new tasks or allocate more output memory until the scheduler reclaims slots/space by advancing the watermarks.
 
-**Task Ring back-pressure**: When `active_count = current_index - last_task_alive >= window_size - 1`, `pto2_task_ring_alloc` spin-waits until the scheduler completes tasks and advances `last_task_alive`.
+**Task Ring back-pressure**: When `active_count = current_index - last_task_alive >= window_size - 1`, `PTO2TaskAllocator::alloc` spin-waits until the scheduler completes tasks and advances `last_task_alive`.
 
-**Heap Ring back-pressure**: When the heap has insufficient contiguous space, `pto2_heap_ring_alloc` spin-waits until the scheduler advances `heap_tail` past completed tasks' output buffers.
+**Heap Ring back-pressure**: When the heap has insufficient contiguous space, `PTO2TaskAllocator::alloc` spin-waits until the scheduler advances `heap_tail` past completed tasks' output buffers.
 
-**TensorMap pool back-pressure**: When the entry pool is exhausted, `new_entry()` spin-waits on `pto2_orchestrator_sync_tensormap(force=true)` until cleanup frees entries (see Section 5.4).
+**TensorMap pool back-pressure**: When the entry pool is exhausted, `new_entry()` spin-waits on `PTO2TensorMap::sync_tensormap(force=true)` until cleanup frees entries (see Section 5.4).
 
 This back-pressure is essential for correctness with small ring sizes — for example, with `PTO2_RING_TASK_WINDOW=16` and 208 tasks, the orchestrator blocks ~192 times, each time waiting for the scheduler to drain completed tasks before continuing.
 
@@ -273,7 +273,7 @@ Unlike the Task Ring and Heap Ring, TensorMap entries are **not** managed by a r
 
 1. **Free list first**: `free_entry_list[]` stores pointers to released entries. Allocation pops from here (O(1)).
 2. **Bump allocation**: if free list is empty, `entry_pool[next_entry_idx++]` allocates from the end of the pool.
-3. **Blocking reclaim**: if the pool is fully exhausted, `pto2_orchestrator_sync_tensormap(force=true)` reads the latest `last_task_alive` and calls `cleanup_retired` to batch-free all entries belonging to retired tasks, returning them to the free list.
+3. **Blocking reclaim**: if the pool is fully exhausted, `PTO2TensorMap::sync_tensormap(force=true)` reads the latest `last_task_alive` and calls `cleanup_retired` to batch-free all entries belonging to retired tasks, returning them to the free list.
 
 This design avoids the complexity of ring-based wrapping while still being bounded by `PTO2_TENSORMAP_POOL_SIZE` (default 65536 entries).
 
@@ -288,19 +288,19 @@ Three complementary mechanisms achieve this:
 
 **Layer 1 — Chain Truncation during Lookup** (lazy, per-bucket):
 
-Since `insert` always prepends to the bucket head, entries in each bucket chain are in **descending task_id order**. When `pto2_tensormap_lookup` encounters the first stale entry (`producer_task_id < last_task_alive`), all subsequent entries in the chain are guaranteed stale too. The entire tail is truncated in one operation using `prev_in_bucket` pointers for O(1) unlinking.
+Since `insert` always prepends to the bucket head, entries in each bucket chain are in **descending task_id order**. When `PTO2TensorMap::lookup` encounters the first stale entry (`producer_task_id < last_task_alive`), all subsequent entries in the chain are guaranteed stale too. The entire tail is truncated in one operation using `prev_in_bucket` pointers for O(1) unlinking.
 
 This guarantees lookup only traverses valid entries — O(valid_entries_in_bucket), not O(total_entries).
 
 **Layer 2 — Periodic Batch Cleanup** (`cleanup_retired`, per-task):
 
-Every time the orchestrator submits a task (Step 0 of `pto2_submit_task`), it calls `pto2_orchestrator_sync_tensormap`. When `last_task_alive` has advanced by more than `PTO2_TENSORMAP_CLEANUP_INTERVAL` (default 64) tasks since the last cleanup, `pto2_tensormap_cleanup_retired` runs:
+Every time the orchestrator submits a task (Step 0 of `PTO2OrchestratorState::submit_task`), it calls `PTO2TensorMap::sync_tensormap`. When `last_task_alive` has advanced by more than `PTO2_TENSORMAP_CLEANUP_INTERVAL` (default 64) tasks since the last cleanup, `PTO2TensorMap::cleanup_retired` runs:
 
 This uses the **per-task entry chain** (`task_entry_head[task_slot]`) — each task's entries are doubly-linked together at insert time via `next_in_task`/`prev_in_task`, allowing O(entries_per_task) cleanup without scanning the entire pool or all buckets. Freed entries are returned to `free_entry_list` for immediate reuse.
 
 **Layer 3 — Back-Pressure on Pool Exhaustion** (blocking):
 
-If both the free list and bump region are depleted, `new_entry()` blocks until `pto2_orchestrator_sync_tensormap(force=true)` frees entries by advancing `last_task_alive` through `cleanup_retired`.
+If both the free list and bump region are depleted, `new_entry()` blocks until `PTO2TensorMap::sync_tensormap(force=true)` frees entries by advancing `last_task_alive` through `cleanup_retired`.
 
 This forms a back-pressure mechanism analogous to the Task Ring's flow control.
 
@@ -316,11 +316,11 @@ In steady state, the number of valid TensorMap entries ≈ `active_tasks × avg_
 
 ### 5.5 Dependency Discovery Flow
 
-When `pto2_submit_task` processes parameters:
+When `PTO2OrchestratorState::submit_task` processes parameters:
 
-1. **INPUT/INOUT**: `pto2_tensormap_lookup` searches for overlapping producers (with chain truncation)
-2. For each producer found: `pto2_add_consumer_to_producer` adds the dependency
-3. **OUTPUT/INOUT**: `pto2_tensormap_insert` registers the current task as the new producer at bucket head
+1. **INPUT/INOUT**: `PTO2TensorMap::lookup` searches for overlapping producers (with chain truncation)
+2. For each producer found: `append_fanin_or_fail` adds the dependency
+3. **OUTPUT/INOUT**: `PTO2TensorMap::insert` registers the current task as the new producer at bucket head
 4. Stale entries are pruned lazily during lookup (Layer 1) and periodically by cleanup (Layer 2)
 
 ---
@@ -386,12 +386,12 @@ Key members:
 - `scheduler`: pointer to scheduler state (for wiring queue and ready queue access)
 - `gm_heap_base`, `gm_heap_size`: GM heap for output buffers
 
-### 7.2 Task Submission Flow (`pto2_submit_mixed_task`)
+### 7.2 Task Submission Flow (`PTO2OrchestratorState::submit_task`)
 
 | Step | Operation |
 | ---- | --------- |
-| 0 | `pto2_orchestrator_sync_tensormap` — prune stale TensorMap entries |
-| 1 | `pto2_task_ring_alloc` — allocate task slot (may block on flow control) |
+| 0 | `PTO2TensorMap::sync_tensormap` — prune stale TensorMap entries |
+| 1 | `PTO2TaskAllocator::alloc` — allocate task slot (may block on flow control) |
 | 2 | Initialize task descriptor + slot state, copy parameters |
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
