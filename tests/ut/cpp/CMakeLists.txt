@@ -94,6 +94,26 @@ set(A2A3_COMMON_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
 )
 
+# ---------------------------------------------------------------------------
+# A5 runtime sources and stubs for ring-buffer / tensormap tests
+# ---------------------------------------------------------------------------
+set(A5_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime)
+set(A5_STUB_SOURCES ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp)
+set(A5_RUNTIME_SOURCES
+    ${A5_RUNTIME_DIR}/pto_ring_buffer.cpp
+    ${A5_RUNTIME_DIR}/shared/pto_shared_memory.cpp
+    ${A5_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
+    ${A5_RUNTIME_DIR}/pto_tensormap.cpp
+)
+
+set(A5_COMMON_INCLUDE_DIRS
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/orchestration
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+
 function(add_a2a3_runtime_test name)
     cmake_parse_arguments(ARG "" "" "SOURCES;EXTRA_SOURCES" ${ARGN})
     set(_all_sources ${ARG_SOURCES} ${A2A3_STUB_SOURCES})
@@ -106,6 +126,29 @@ function(add_a2a3_runtime_test name)
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
         ${A2A3_COMMON_INCLUDE_DIRS}
+    )
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+function(add_a5_runtime_test name)
+    cmake_parse_arguments(ARG "" "" "SOURCES;EXTRA_SOURCES" ${ARGN})
+    set(_all_sources ${ARG_SOURCES} ${A5_STUB_SOURCES})
+    foreach(src ${ARG_SOURCES} ${ARG_EXTRA_SOURCES})
+        if(EXISTS ${src})
+            list(APPEND _all_sources ${src})
+        endif()
+    endforeach()
+    add_executable(${name} ${_all_sources})
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${A5_COMMON_INCLUDE_DIRS}
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
@@ -248,6 +291,30 @@ add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 
+# PTO2 runtime-linked tests (tensormap, orchestrator, coupling, boundary)
+add_a2a3_runtime_test(test_runtime_coupling
+    SOURCES a2a3/test_runtime_coupling.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES} ${A2A3_RUNTIME_DIR}/pto_orchestrator.cpp
+)
+add_a2a3_runtime_test(test_link_isolation
+    SOURCES a2a3/test_link_isolation.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
+add_a2a3_runtime_test(test_orchestrator_submit
+    SOURCES a2a3/test_orchestrator_submit.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES} ${A2A3_RUNTIME_DIR}/pto_orchestrator.cpp
+)
+add_a2a3_runtime_test(test_orchestrator_report_fatal
+    SOURCES a2a3/test_orchestrator_report_fatal.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES} ${A2A3_RUNTIME_DIR}/pto_orchestrator.cpp
+)
+add_a2a3_runtime_test(test_runtime_lifecycle
+    SOURCES a2a3/test_runtime_lifecycle.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+                  ${A2A3_RUNTIME_DIR}/pto_runtime2.cpp
+                  ${A2A3_RUNTIME_DIR}/pto_orchestrator.cpp
+)
+
 # ---------------------------------------------------------------------------
 # A2A3 tests (src/a2a3/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------
@@ -299,6 +366,69 @@ add_a2a3_runtime_test(test_wiring
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------
 add_a5_test(test_a5_fatal a5/test_a5_fatal.cpp)
+
+add_a5_runtime_test(test_a5_runtime_coupling
+    SOURCES a5/test_runtime_coupling.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES} ${A5_RUNTIME_DIR}/pto_orchestrator.cpp
+)
+add_a5_runtime_test(test_a5_link_isolation
+    SOURCES a5/test_link_isolation.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
+add_a5_runtime_test(test_a5_orchestrator_submit
+    SOURCES a5/test_orchestrator_submit.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES} ${A5_RUNTIME_DIR}/pto_orchestrator.cpp
+)
+add_a5_runtime_test(test_a5_orchestrator_report_fatal
+    SOURCES a5/test_orchestrator_report_fatal.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES} ${A5_RUNTIME_DIR}/pto_orchestrator.cpp
+)
+add_a5_runtime_test(test_a5_runtime_lifecycle
+    SOURCES a5/test_runtime_lifecycle.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+                  ${A5_RUNTIME_DIR}/pto_runtime2.cpp
+                  ${A5_RUNTIME_DIR}/pto_orchestrator.cpp
+)
+add_a5_runtime_test(test_a5_task_allocator
+    SOURCES a5/test_task_allocator.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
+add_a5_runtime_test(test_a5_dep_list_pool
+    SOURCES a5/test_dep_list_pool.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
+add_a5_runtime_test(test_a5_scheduler_state
+    SOURCES a5/test_scheduler_state.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
+add_a5_runtime_test(test_a5_task_state
+    SOURCES a5/test_task_state.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
+add_a5_runtime_test(test_a5_ready_queue
+    SOURCES a5/test_ready_queue.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
+add_a5_runtime_test(test_a5_shared_memory
+    SOURCES a5/test_shared_memory.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
+add_a5_runtime_test(test_a5_tensormap
+    SOURCES a5/test_tensormap.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
+add_a5_runtime_test(test_a5_fanin_pool
+    SOURCES a5/test_fanin_pool.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
+add_a5_runtime_test(test_a5_spsc_queue
+    SOURCES a5/test_spsc_queue.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
+add_a5_runtime_test(test_a5_wiring
+    SOURCES a5/test_wiring.cpp
+    EXTRA_SOURCES ${A5_RUNTIME_SOURCES}
+)
 
 # Host logger silent/off behavior — no runtime deps, just compile host_log.cpp
 # alongside the test.
