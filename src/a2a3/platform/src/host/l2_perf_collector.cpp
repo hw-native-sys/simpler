@@ -11,10 +11,11 @@
 
 /**
  * @file l2_perf_collector.cpp
- * @brief Platform-agnostic performance data collector implementation
- *
- * Implements ProfMemoryManager (dynamic buffer management thread) and
- * L2PerfCollector (data collection and export).
+ * @brief Performance data collector implementation. The mgmt-thread + buffer-pool
+ *        machinery lives in profiling_common::BufferPoolManager parameterized by
+ *        L2PerfModule (host/l2_perf_collector.h); the poll loop lives in
+ *        profiling_common::ProfilerBase. This file owns the per-buffer
+ *        on_buffer_collected callback and the export logic.
  */
 
 #include "host/l2_perf_collector.h"
@@ -27,470 +28,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <optional>
 #include <string>
 #include <vector>
 
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
-
-// =============================================================================
-// ProfMemoryManager Implementation
-// =============================================================================
-
-ProfMemoryManager::~ProfMemoryManager() {
-    if (running_.load()) {
-        stop();
-    }
-}
-
-void ProfMemoryManager::start(
-    void *shared_mem_host, int num_cores, int num_phase_threads, L2PerfAllocCallback alloc_cb,
-    L2PerfRegisterCallback register_cb, L2PerfFreeCallback free_cb, int device_id, const ThreadFactory &thread_factory
-) {
-    shared_mem_host_ = shared_mem_host;
-    num_cores_ = num_cores;
-    num_phase_threads_ = num_phase_threads;
-    alloc_cb_ = alloc_cb;
-    register_cb_ = register_cb;
-    free_cb_ = free_cb;
-    device_id_ = device_id;
-
-    running_.store(true);
-    if (thread_factory) {
-        mgmt_thread_ = thread_factory([this]() {
-            mgmt_loop();
-        });
-    } else {
-        mgmt_thread_ = std::thread(&ProfMemoryManager::mgmt_loop, this);
-    }
-
-    LOG_INFO_V0("ProfMemoryManager started: %d cores, %d phase threads", num_cores, num_phase_threads);
-}
-
-void ProfMemoryManager::stop() {
-    running_.store(false);
-    if (mgmt_thread_.joinable()) {
-        mgmt_thread_.join();
-    }
-
-    // Drain remaining done_queue and free buffers
-    {
-        std::scoped_lock<std::mutex> lock(done_mutex_);
-        while (!done_queue_.empty()) {
-            CopyDoneInfo info = done_queue_.front();
-            done_queue_.pop();
-            free_buffer(info.dev_buffer_ptr);
-        }
-    }
-
-    // Free recycled buffers
-    for (void *ptr : recycled_perf_buffers_) {
-        free_buffer(ptr);
-    }
-    recycled_perf_buffers_.clear();
-    for (void *ptr : recycled_phase_buffers_) {
-        free_buffer(ptr);
-    }
-    recycled_phase_buffers_.clear();
-
-    LOG_INFO_V0("ProfMemoryManager stopped");
-}
-
-bool ProfMemoryManager::try_pop_ready(ReadyBufferInfo &info) {
-    std::scoped_lock<std::mutex> lock(ready_mutex_);
-    if (ready_queue_.empty()) {
-        return false;
-    }
-    info = ready_queue_.front();
-    ready_queue_.pop();
-    return true;
-}
-
-bool ProfMemoryManager::wait_pop_ready(ReadyBufferInfo &info, std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lock(ready_mutex_);
-    if (ready_cv_.wait_for(lock, timeout, [this] {
-            return !ready_queue_.empty();
-        })) {
-        info = ready_queue_.front();
-        ready_queue_.pop();
-        return true;
-    }
-    return false;
-}
-
-void ProfMemoryManager::notify_copy_done(const CopyDoneInfo &info) {
-    std::scoped_lock<std::mutex> lock(done_mutex_);
-    done_queue_.push(info);
-}
-
-void *ProfMemoryManager::alloc_and_register(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size);
-    if (dev_ptr == nullptr) {
-        const char *hint = (size == sizeof(L2PerfBuffer)) ?
-                               "increase PLATFORM_PROF_BUFFERS_PER_CORE to reduce profiling data loss" :
-                               "increase PLATFORM_PROF_BUFFERS_PER_THREAD to reduce profiling data loss";
-        LOG_WARN("ProfMemoryManager: alloc failed for %zu bytes, %s", size, hint);
-        *host_ptr_out = nullptr;
-        return nullptr;
-    }
-
-    if (register_cb_ != nullptr) {
-        void *host_ptr = nullptr;
-        int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
-        if (rc != 0 || host_ptr == nullptr) {
-            LOG_ERROR("ProfMemoryManager: register failed: %d", rc);
-            free_buffer(dev_ptr);
-            *host_ptr_out = nullptr;
-            return nullptr;
-        }
-        *host_ptr_out = host_ptr;
-    } else {
-        // Simulation mode: dev_ptr == host_ptr
-        *host_ptr_out = dev_ptr;
-    }
-
-    dev_to_host_[dev_ptr] = *host_ptr_out;
-    return dev_ptr;
-}
-
-void ProfMemoryManager::free_buffer(void *dev_ptr) {
-    if (dev_ptr != nullptr && free_cb_ != nullptr) {
-        dev_to_host_.erase(dev_ptr);
-        free_cb_(dev_ptr);
-    }
-}
-
-void *ProfMemoryManager::resolve_host_ptr(void *dev_ptr) {
-    if (register_cb_ == nullptr) {
-        return dev_ptr;  // Simulation mode: dev_ptr == host_ptr
-    }
-    auto it = dev_to_host_.find(dev_ptr);
-    if (it != dev_to_host_.end()) {
-        return it->second;
-    }
-    LOG_ERROR("ProfMemoryManager: no host mapping for dev_ptr=%p", dev_ptr);
-    return nullptr;
-}
-
-void ProfMemoryManager::register_mapping(void *dev_ptr, void *host_ptr) { dev_to_host_[dev_ptr] = host_ptr; }
-
-void ProfMemoryManager::process_ready_entry(
-    L2PerfDataHeader * /*header*/, int /*thread_idx*/, const ReadyQueueEntry &entry
-) {
-    bool is_phase = (entry.is_phase != 0);
-    uint64_t old_dev_ptr = entry.buffer_ptr;
-    uint32_t seq = entry.buffer_seq;
-
-    if (is_phase) {
-        uint32_t tidx = entry.core_index;
-        if (tidx >= static_cast<uint32_t>(PLATFORM_MAX_AICPU_THREADS)) {
-            LOG_ERROR("ProfMemoryManager: invalid phase entry: thread=%u", tidx);
-            return;
-        }
-
-        PhaseBufferState *state = get_phase_buffer_state(shared_mem_host_, num_cores_, tidx);
-
-        // Replenish free_queue with up to 2 buffers (1 active + 1 spare).
-        // Source priority: recycled pool → drain done_queue → alloc (last resort).
-        rmb();
-        uint32_t head_val = state->free_queue.head;
-        uint32_t tail = state->free_queue.tail;
-        uint32_t available = tail - head_val;
-
-        int to_push = PLATFORM_PROF_SLOT_COUNT;
-        for (int p = 0; p < to_push && available + p < static_cast<uint32_t>(PLATFORM_PROF_SLOT_COUNT); p++) {
-            void *host_ptr = nullptr;
-            void *new_dev_ptr = nullptr;
-
-            if (!recycled_phase_buffers_.empty()) {
-                new_dev_ptr = recycled_phase_buffers_.back();
-                recycled_phase_buffers_.pop_back();
-                host_ptr = resolve_host_ptr(new_dev_ptr);
-            }
-            if (new_dev_ptr == nullptr) {
-                std::scoped_lock<std::mutex> lock(done_mutex_);
-                while (!done_queue_.empty()) {
-                    CopyDoneInfo dinfo = done_queue_.front();
-                    done_queue_.pop();
-                    if (dinfo.type == ProfBufferType::PERF_RECORD)
-                        recycled_perf_buffers_.push_back(dinfo.dev_buffer_ptr);
-                    else recycled_phase_buffers_.push_back(dinfo.dev_buffer_ptr);
-                }
-            }
-            if (new_dev_ptr == nullptr && !recycled_phase_buffers_.empty()) {
-                new_dev_ptr = recycled_phase_buffers_.back();
-                recycled_phase_buffers_.pop_back();
-                host_ptr = resolve_host_ptr(new_dev_ptr);
-            }
-            if (new_dev_ptr == nullptr) {
-                new_dev_ptr = alloc_and_register(sizeof(PhaseBuffer), &host_ptr);
-            }
-            if (new_dev_ptr == nullptr) break;
-
-            reinterpret_cast<PhaseBuffer *>(host_ptr)->count = 0;
-            uint32_t cur_tail = tail + p;
-            state->free_queue.buffer_ptrs[cur_tail % PLATFORM_PROF_SLOT_COUNT] =
-                reinterpret_cast<uint64_t>(new_dev_ptr);
-            wmb();
-            state->free_queue.tail = cur_tail + 1;
-            wmb();
-        }
-
-        // Resolve host pointer of old buffer
-        void *old_host_ptr = resolve_host_ptr(reinterpret_cast<void *>(old_dev_ptr));
-        if (old_host_ptr == nullptr) {
-            LOG_ERROR(
-                "ProfMemoryManager: cannot resolve host ptr for phase buffer dev=%p",
-                reinterpret_cast<void *>(old_dev_ptr)
-            );
-            return;
-        }
-
-        // Push old buffer to ready queue for main thread to copy
-        ReadyBufferInfo info;
-        info.type = ProfBufferType::PHASE;
-        info.index = tidx;
-        info.slot_idx = 0;  // Not used in free queue design
-        info.dev_buffer_ptr = reinterpret_cast<void *>(old_dev_ptr);
-        info.host_buffer_ptr = old_host_ptr;
-        info.buffer_seq = seq;
-
-        {
-            std::scoped_lock<std::mutex> lock(ready_mutex_);
-            ready_queue_.push(info);
-        }
-        ready_cv_.notify_one();
-
-    } else {
-        uint32_t core_index = entry.core_index;
-        if (core_index >= static_cast<uint32_t>(num_cores_)) {
-            LOG_ERROR("ProfMemoryManager: invalid perf entry: core=%u", core_index);
-            return;
-        }
-
-        L2PerfBufferState *state = get_perf_buffer_state(shared_mem_host_, core_index);
-
-        // Replenish free_queue with up to 2 buffers (1 active + 1 spare).
-        rmb();
-        uint32_t head_val = state->free_queue.head;
-        uint32_t tail = state->free_queue.tail;
-        uint32_t available = tail - head_val;
-
-        int to_push = PLATFORM_PROF_SLOT_COUNT;
-        for (int p = 0; p < to_push && available + p < static_cast<uint32_t>(PLATFORM_PROF_SLOT_COUNT); p++) {
-            void *host_ptr = nullptr;
-            void *new_dev_ptr = nullptr;
-
-            if (!recycled_perf_buffers_.empty()) {
-                new_dev_ptr = recycled_perf_buffers_.back();
-                recycled_perf_buffers_.pop_back();
-                host_ptr = resolve_host_ptr(new_dev_ptr);
-            }
-            if (new_dev_ptr == nullptr) {
-                std::scoped_lock<std::mutex> lock(done_mutex_);
-                while (!done_queue_.empty()) {
-                    CopyDoneInfo dinfo = done_queue_.front();
-                    done_queue_.pop();
-                    if (dinfo.type == ProfBufferType::PERF_RECORD)
-                        recycled_perf_buffers_.push_back(dinfo.dev_buffer_ptr);
-                    else recycled_phase_buffers_.push_back(dinfo.dev_buffer_ptr);
-                }
-            }
-            if (new_dev_ptr == nullptr && !recycled_perf_buffers_.empty()) {
-                new_dev_ptr = recycled_perf_buffers_.back();
-                recycled_perf_buffers_.pop_back();
-                host_ptr = resolve_host_ptr(new_dev_ptr);
-            }
-            if (new_dev_ptr == nullptr) {
-                new_dev_ptr = alloc_and_register(sizeof(L2PerfBuffer), &host_ptr);
-            }
-            if (new_dev_ptr == nullptr) break;
-
-            reinterpret_cast<L2PerfBuffer *>(host_ptr)->count = 0;
-            uint32_t cur_tail = tail + p;
-            state->free_queue.buffer_ptrs[cur_tail % PLATFORM_PROF_SLOT_COUNT] =
-                reinterpret_cast<uint64_t>(new_dev_ptr);
-            wmb();
-            state->free_queue.tail = cur_tail + 1;
-            wmb();
-        }
-
-        void *old_host_ptr = resolve_host_ptr(reinterpret_cast<void *>(old_dev_ptr));
-        if (old_host_ptr == nullptr) {
-            LOG_ERROR(
-                "ProfMemoryManager: cannot resolve host ptr for perf buffer dev=%p",
-                reinterpret_cast<void *>(old_dev_ptr)
-            );
-            return;
-        }
-
-        ReadyBufferInfo info;
-        info.type = ProfBufferType::PERF_RECORD;
-        info.index = core_index;
-        info.slot_idx = 0;  // Not used in free queue design
-        info.dev_buffer_ptr = reinterpret_cast<void *>(old_dev_ptr);
-        info.host_buffer_ptr = old_host_ptr;
-        info.buffer_seq = seq;
-
-        {
-            std::scoped_lock<std::mutex> lock(ready_mutex_);
-            ready_queue_.push(info);
-        }
-        ready_cv_.notify_one();
-    }
-}
-
-void ProfMemoryManager::mgmt_loop() {
-    L2PerfDataHeader *header = get_l2_perf_header(shared_mem_host_);
-
-    while (running_.load()) {
-        // 1. Recycle done queue: move completed buffers to recycled pools for reuse
-        {
-            std::scoped_lock<std::mutex> lock(done_mutex_);
-            while (!done_queue_.empty()) {
-                CopyDoneInfo info = done_queue_.front();
-                done_queue_.pop();
-                if (info.type == ProfBufferType::PERF_RECORD) {
-                    recycled_perf_buffers_.push_back(info.dev_buffer_ptr);
-                } else {
-                    recycled_phase_buffers_.push_back(info.dev_buffer_ptr);
-                }
-            }
-        }
-
-        // 2. Poll ReadyQueues from all AICPU threads
-        bool found_any = false;
-        for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; t++) {
-            rmb();
-            uint32_t head = header->queue_heads[t];
-            uint32_t tail = header->queue_tails[t];
-
-            // Validate indices to prevent OOB access from corrupted shared memory
-            if (head >= PLATFORM_PROF_READYQUEUE_SIZE || tail >= PLATFORM_PROF_READYQUEUE_SIZE) {
-                LOG_ERROR(
-                    "mgmt_loop: invalid queue indices for thread %d: head=%u tail=%u (max=%d)", t, head, tail,
-                    PLATFORM_PROF_READYQUEUE_SIZE
-                );
-                continue;
-            }
-
-            while (head != tail) {
-                ReadyQueueEntry entry = header->queues[t][head];
-
-                process_ready_entry(header, t, entry);
-
-                head = (head + 1) % PLATFORM_PROF_READYQUEUE_SIZE;
-                header->queue_heads[t] = head;
-                wmb();
-
-                found_any = true;
-
-                // Re-read tail in case more entries arrived
-                rmb();
-                tail = header->queue_tails[t];
-                if (tail >= PLATFORM_PROF_READYQUEUE_SIZE) {
-                    LOG_ERROR("mgmt_loop: invalid tail for thread %d: %u", t, tail);
-                    break;
-                }
-            }
-        }
-
-        // 3. Proactive replenishment: push buffers to cores/threads whose free_queue
-        //    is completely empty (avail == 0). Try recycled pool first, alloc as fallback.
-        if (!recycled_perf_buffers_.empty() || !recycled_phase_buffers_.empty()) {
-            for (int i = 0; i < num_cores_ && !recycled_perf_buffers_.empty(); i++) {
-                L2PerfBufferState *state = get_perf_buffer_state(shared_mem_host_, i);
-                rmb();
-                uint32_t avail = state->free_queue.tail - state->free_queue.head;
-                if (avail == 0) {
-                    void *dev_ptr = recycled_perf_buffers_.back();
-                    recycled_perf_buffers_.pop_back();
-                    void *host_ptr = resolve_host_ptr(dev_ptr);
-                    if (host_ptr != nullptr) {
-                        reinterpret_cast<L2PerfBuffer *>(host_ptr)->count = 0;
-                        uint32_t t_val = state->free_queue.tail;
-                        state->free_queue.buffer_ptrs[t_val % PLATFORM_PROF_SLOT_COUNT] =
-                            reinterpret_cast<uint64_t>(dev_ptr);
-                        wmb();
-                        state->free_queue.tail = t_val + 1;
-                        wmb();
-                    }
-                }
-            }
-            for (int t = 0; t < num_phase_threads_ && !recycled_phase_buffers_.empty(); t++) {
-                PhaseBufferState *state = get_phase_buffer_state(shared_mem_host_, num_cores_, t);
-                rmb();
-                uint32_t avail = state->free_queue.tail - state->free_queue.head;
-                if (avail == 0) {
-                    void *dev_ptr = recycled_phase_buffers_.back();
-                    recycled_phase_buffers_.pop_back();
-                    void *host_ptr = resolve_host_ptr(dev_ptr);
-                    if (host_ptr != nullptr) {
-                        reinterpret_cast<PhaseBuffer *>(host_ptr)->count = 0;
-                        uint32_t t_val = state->free_queue.tail;
-                        state->free_queue.buffer_ptrs[t_val % PLATFORM_PROF_SLOT_COUNT] =
-                            reinterpret_cast<uint64_t>(dev_ptr);
-                        wmb();
-                        state->free_queue.tail = t_val + 1;
-                        wmb();
-                    }
-                }
-            }
-        }
-        // Alloc fallback: if recycled pools are both empty, scan for depleted cores and alloc.
-        // This only triggers when ALL pre-allocated buffers are in-flight (extreme workloads).
-        if (recycled_perf_buffers_.empty() && recycled_phase_buffers_.empty()) {
-            for (int i = 0; i < num_cores_; i++) {
-                L2PerfBufferState *state = get_perf_buffer_state(shared_mem_host_, i);
-                rmb();
-                if (state->free_queue.tail - state->free_queue.head == 0) {
-                    void *host_ptr = nullptr;
-                    void *dev_ptr = alloc_and_register(sizeof(L2PerfBuffer), &host_ptr);
-                    if (dev_ptr == nullptr) break;  // HBM exhausted, stop trying
-                    reinterpret_cast<L2PerfBuffer *>(host_ptr)->count = 0;
-                    uint32_t t_val = state->free_queue.tail;
-                    state->free_queue.buffer_ptrs[t_val % PLATFORM_PROF_SLOT_COUNT] =
-                        reinterpret_cast<uint64_t>(dev_ptr);
-                    wmb();
-                    state->free_queue.tail = t_val + 1;
-                    wmb();
-                    break;  // One alloc per iteration to limit rtMalloc frequency
-                }
-            }
-        }
-
-        // 4. If nothing found, yield briefly to avoid busy-spinning
-        if (!found_any) {
-            std::this_thread::sleep_for(std::chrono::microseconds(10));
-        }
-    }
-
-    // Final drain: process any remaining entries
-    L2PerfDataHeader *hdr = get_l2_perf_header(shared_mem_host_);
-    for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; t++) {
-        rmb();
-        uint32_t head = hdr->queue_heads[t];
-        uint32_t tail = hdr->queue_tails[t];
-        if (head >= PLATFORM_PROF_READYQUEUE_SIZE || tail >= PLATFORM_PROF_READYQUEUE_SIZE) {
-            LOG_ERROR("mgmt_loop drain: invalid queue indices for thread %d: head=%u tail=%u", t, head, tail);
-            continue;
-        }
-        while (head != tail) {
-            ReadyQueueEntry entry = hdr->queues[t][head];
-            process_ready_entry(hdr, t, entry);
-            head = (head + 1) % PLATFORM_PROF_READYQUEUE_SIZE;
-            hdr->queue_heads[t] = head;
-            wmb();
-            rmb();
-            tail = hdr->queue_tails[t];
-            if (tail >= PLATFORM_PROF_READYQUEUE_SIZE) {
-                LOG_ERROR("mgmt_loop drain: invalid tail for thread %d: %u", t, tail);
-                break;
-            }
-        }
-    }
-}
 
 // =============================================================================
 // L2PerfCollector Implementation
@@ -506,13 +48,14 @@ static bool is_scheduler_phase(AicpuPhaseId id) {
 }
 
 L2PerfCollector::~L2PerfCollector() {
-    if (perf_shared_mem_host_ != nullptr) {
+    stop();
+    if (shm_host_ != nullptr) {
         LOG_WARN("L2PerfCollector destroyed without finalize()");
     }
 }
 
 void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size);
+    void *dev_ptr = alloc_cb_(size, user_data_);
     if (dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate buffer (%zu bytes)", size);
         *host_ptr_out = nullptr;
@@ -532,16 +75,16 @@ void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
         *host_ptr_out = dev_ptr;
     }
 
-    // Register mapping so ProfMemoryManager can resolve dev→host
-    memory_manager_.register_mapping(dev_ptr, *host_ptr_out);
+    // Register mapping so the BufferPoolManager can resolve dev→host
+    manager_.register_mapping(dev_ptr, *host_ptr_out);
     return dev_ptr;
 }
 
 int L2PerfCollector::initialize(
     int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfRegisterCallback register_cb,
-    L2PerfFreeCallback free_cb
+    L2PerfFreeCallback free_cb, void *user_data, const std::string &output_prefix
 ) {
-    if (perf_shared_mem_host_ != nullptr) {
+    if (shm_host_ != nullptr) {
         LOG_ERROR("L2PerfCollector already initialized");
         return -1;
     }
@@ -553,11 +96,15 @@ int L2PerfCollector::initialize(
         return -1;
     }
 
-    device_id_ = device_id;
     num_aicore_ = num_aicore;
-    alloc_cb_ = alloc_cb;
-    register_cb_ = register_cb;
-    free_cb_ = free_cb;
+    output_prefix_ = output_prefix;
+    total_perf_collected_ = 0;
+
+    // Stash the memory context on the base up-front so alloc_single_buffer
+    // sees consistent values during init. shm_host_ stays nullptr until the
+    // shm allocation succeeds — the nullptr guard makes a post-failure
+    // start(tf) a no-op.
+    set_memory_context(alloc_cb, register_cb, free_cb, user_data, /*shm_host=*/nullptr, device_id);
 
     // Step 1: Calculate shared memory size (slot arrays only, no actual buffers)
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
@@ -571,7 +118,7 @@ int L2PerfCollector::initialize(
     LOG_DEBUG("  Total shared memory:  %zu bytes (%zu KB)", total_size, total_size / 1024);
 
     // Step 2: Allocate shared memory for slot arrays
-    void *perf_dev_ptr = alloc_cb(total_size);
+    void *perf_dev_ptr = alloc_cb(total_size, user_data);
     if (perf_dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate shared memory (%zu bytes)", total_size);
         return -1;
@@ -607,7 +154,6 @@ int L2PerfCollector::initialize(
     }
 
     header->num_cores = num_aicore;
-    header->total_tasks = 0;
 
     LOG_DEBUG("Initialized L2PerfDataHeader:");
     LOG_DEBUG("  num_cores:        %d", header->num_cores);
@@ -638,7 +184,7 @@ int L2PerfCollector::initialize(
             if (s == 0) {
                 state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(dev_buf_ptr);
             } else {
-                memory_manager_.recycled_perf_buffers_.push_back(dev_buf_ptr);
+                manager_.push_recycled(static_cast<int>(ProfBufferType::PERF_RECORD), dev_buf_ptr);
             }
         }
         wmb();
@@ -674,7 +220,7 @@ int L2PerfCollector::initialize(
             if (s == 0) {
                 state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(dev_buf_ptr);
             } else {
-                memory_manager_.recycled_phase_buffers_.push_back(dev_buf_ptr);
+                manager_.push_recycled(static_cast<int>(ProfBufferType::PHASE), dev_buf_ptr);
             }
         }
         wmb();
@@ -693,366 +239,187 @@ int L2PerfCollector::initialize(
     LOG_DEBUG("L2 perf device base = 0x%lx", reinterpret_cast<uint64_t>(perf_dev_ptr));
 
     perf_shared_mem_dev_ = perf_dev_ptr;
-    perf_shared_mem_host_ = perf_host_ptr;
+    shm_host_ = perf_host_ptr;
+
+    collected_perf_records_.assign(num_aicore_, {});
+    collected_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
 
     LOG_INFO_V0("Performance profiling initialized (dynamic buffer mode)");
     return 0;
 }
 
-void L2PerfCollector::start_memory_manager(const ThreadFactory &thread_factory) {
-    if (perf_shared_mem_host_ == nullptr) {
-        return;
-    }
+// ---------------------------------------------------------------------------
+// ProfilerBase callbacks
+// ---------------------------------------------------------------------------
 
-    memory_manager_.start(
-        perf_shared_mem_host_, num_aicore_, PLATFORM_MAX_AICPU_THREADS, alloc_cb_, register_cb_, free_cb_, device_id_,
-        thread_factory
-    );
-}
-
-void L2PerfCollector::stop_memory_manager() {
-    if (memory_manager_.is_running()) {
-        memory_manager_.stop();
-    }
-}
-
-void L2PerfCollector::signal_execution_complete() { execution_complete_.store(true); }
-
-void L2PerfCollector::poll_and_collect(int expected_tasks) {
-    if (perf_shared_mem_host_ == nullptr) {
-        return;
-    }
-
-    execution_complete_.store(false);
-
-    LOG_INFO_V0("Collecting performance data");
-
-    L2PerfDataHeader *header = get_l2_perf_header(perf_shared_mem_host_);
-
-    const auto timeout_duration = std::chrono::seconds(PLATFORM_PROF_TIMEOUT_SECONDS);
-    std::optional<std::chrono::steady_clock::time_point> idle_start;
-
-    // Initialize collection storage before the waiting loop so buffers
-    // can be processed immediately, preventing device memory leaks.
-    int total_records_collected = 0;
-    int buffers_processed = 0;
-
-    collected_perf_records_.clear();
-    collected_perf_records_.resize(num_aicore_);
-    collected_phase_records_.clear();
-    collected_phase_records_.resize(PLATFORM_MAX_AICPU_THREADS);
-
-    if (expected_tasks <= 0) {
-        LOG_INFO_V0("Waiting for AICPU to write total_tasks in L2PerfDataHeader...");
-        idle_start = std::chrono::steady_clock::now();
-
-        while (true) {
-            rmb();
-            uint32_t raw_total_tasks = header->total_tasks;
-
-            if (raw_total_tasks > 0) {
-                expected_tasks = static_cast<int>(raw_total_tasks);
-                LOG_INFO_V0("AICPU reported task count: %d", expected_tasks);
-                break;
-            }
-
-            auto elapsed = std::chrono::steady_clock::now() - idle_start.value();
-            if (elapsed >= timeout_duration) {
-                LOG_ERROR(
-                    "Timeout waiting for AICPU task count after %ld seconds",
-                    std::chrono::duration_cast<std::chrono::seconds>(elapsed).count()
-                );
-                return;
-            }
-
-            // Process ready buffers while waiting to free device memory
-            ReadyBufferInfo info;
-            if (memory_manager_.try_pop_ready(info)) {
-                if (info.type == ProfBufferType::PERF_RECORD) {
-                    L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(info.host_buffer_ptr);
-                    rmb();
-                    uint32_t count = buf->count;
-                    if (count > PLATFORM_PROF_BUFFER_SIZE) {
-                        count = PLATFORM_PROF_BUFFER_SIZE;
-                    }
-                    uint32_t core_index = info.index;
-                    if (core_index < static_cast<uint32_t>(num_aicore_)) {
-                        for (uint32_t i = 0; i < count; i++) {
-                            collected_perf_records_[core_index].push_back(buf->records[i]);
-                        }
-                        total_records_collected += count;
-                    }
-                } else {
-                    PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(info.host_buffer_ptr);
-                    rmb();
-                    uint32_t count = buf->count;
-                    if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
-                        count = PLATFORM_PHASE_RECORDS_PER_THREAD;
-                    }
-                    uint32_t tidx = info.index;
-                    for (uint32_t i = 0; i < count; i++) {
-                        collected_phase_records_[tidx].push_back(buf->records[i]);
-                    }
-                }
-                memory_manager_.notify_copy_done({info.dev_buffer_ptr, info.type});
-                buffers_processed++;
-            }
-        }
-    }
-
-    LOG_DEBUG("Initial expected tasks: %d", expected_tasks);
-
-    // Check phase header for scheduler thread info
-    AicpuPhaseHeader *phase_header = get_phase_header(perf_shared_mem_host_, num_aicore_);
-    int num_sched_for_poll = 0;
-    if (phase_header->magic == AICPU_PHASE_MAGIC) {
-        num_sched_for_poll = phase_header->num_sched_threads;
-        if (num_sched_for_poll > PLATFORM_MAX_AICPU_THREADS) {
-            num_sched_for_poll = PLATFORM_MAX_AICPU_THREADS;
-        }
-    }
-
-    idle_start.reset();
-    int last_logged_expected = -1;
-
-    while (total_records_collected < expected_tasks) {
-        // Check for updated expected_tasks
-        rmb();
-        int current_expected = static_cast<int>(header->total_tasks);
-        if (current_expected > expected_tasks) {
-            expected_tasks = current_expected;
-            if (last_logged_expected < 0) {
-                LOG_INFO_V0("Updated expected_tasks to %d (orchestrator progress)", expected_tasks);
-                last_logged_expected = expected_tasks;
-            }
-        }
-
-        ReadyBufferInfo info;
-        if (memory_manager_.wait_pop_ready(info, std::chrono::milliseconds(100))) {
-            idle_start.reset();
-
-            if (info.type == ProfBufferType::PERF_RECORD) {
-                L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(info.host_buffer_ptr);
-                rmb();
-                uint32_t count = buf->count;
-                if (count > PLATFORM_PROF_BUFFER_SIZE) {
-                    count = PLATFORM_PROF_BUFFER_SIZE;
-                }
-
-                uint32_t core_index = info.index;
-                if (core_index < static_cast<uint32_t>(num_aicore_)) {
-                    for (uint32_t i = 0; i < count; i++) {
-                        collected_perf_records_[core_index].push_back(buf->records[i]);
-                    }
-                    total_records_collected += count;
-                }
-
-                LOG_DEBUG(
-                    "Collected %u perf records from core %u (total: %d/%d)", count, core_index, total_records_collected,
-                    expected_tasks
-                );
-
-            } else {
-                PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(info.host_buffer_ptr);
-                rmb();
-                uint32_t count = buf->count;
-                if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
-                    count = PLATFORM_PHASE_RECORDS_PER_THREAD;
-                }
-
-                uint32_t tidx = info.index;
-                for (uint32_t i = 0; i < count; i++) {
-                    collected_phase_records_[tidx].push_back(buf->records[i]);
-                }
-
-                LOG_DEBUG("Collected %u phase records from thread %u", count, tidx);
-            }
-
-            // Notify memory manager to recycle old buffer
-            memory_manager_.notify_copy_done({info.dev_buffer_ptr, info.type});
-            buffers_processed++;
-
-        } else {
-            // Timeout on wait — check for execution complete signal or overall timeout
-            if (execution_complete_.load()) {
-                // Device is done. Final non-blocking drain and exit.
-                ReadyBufferInfo drain_info;
-                while (memory_manager_.try_pop_ready(drain_info)) {
-                    if (drain_info.type == ProfBufferType::PERF_RECORD) {
-                        L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(drain_info.host_buffer_ptr);
-                        rmb();
-                        uint32_t count = buf->count;
-                        if (count > PLATFORM_PROF_BUFFER_SIZE) count = PLATFORM_PROF_BUFFER_SIZE;
-                        uint32_t ci = drain_info.index;
-                        if (ci < static_cast<uint32_t>(num_aicore_)) {
-                            for (uint32_t i = 0; i < count; i++) {
-                                collected_perf_records_[ci].push_back(buf->records[i]);
-                            }
-                            total_records_collected += count;
-                        }
-                    } else {
-                        PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(drain_info.host_buffer_ptr);
-                        rmb();
-                        uint32_t count = buf->count;
-                        if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD))
-                            count = PLATFORM_PHASE_RECORDS_PER_THREAD;
-                        uint32_t tidx = drain_info.index;
-                        for (uint32_t i = 0; i < count; i++) {
-                            collected_phase_records_[tidx].push_back(buf->records[i]);
-                        }
-                    }
-                    memory_manager_.notify_copy_done({drain_info.dev_buffer_ptr, drain_info.type});
-                    buffers_processed++;
-                }
-                LOG_INFO_V0(
-                    "Execution complete signal received, exiting with %d/%d records", total_records_collected,
-                    expected_tasks
-                );
-                break;
-            }
-            if (!idle_start.has_value()) {
-                idle_start = std::chrono::steady_clock::now();
-            }
-            auto elapsed = std::chrono::steady_clock::now() - idle_start.value();
-            if (elapsed >= timeout_duration) {
-                LOG_ERROR(
-                    "Performance data collection idle timeout after %ld seconds",
-                    std::chrono::duration_cast<std::chrono::seconds>(elapsed).count()
-                );
-                LOG_ERROR("Collected %d / %d records before timeout", total_records_collected, expected_tasks);
-                break;
-            }
-        }
-    }
-
-    LOG_INFO_V0("Total buffers processed: %d", buffers_processed);
-    LOG_INFO_V0("Total records collected: %d", total_records_collected);
-
-    if (total_records_collected < expected_tasks) {
-        LOG_WARN("Incomplete collection (%d / %d records)", total_records_collected, expected_tasks);
-    }
-
-    LOG_INFO_V0("Performance data collection complete");
-}
-
-void L2PerfCollector::drain_remaining_buffers() {
-    if (perf_shared_mem_host_ == nullptr) {
-        return;
-    }
-
-    // Ensure phase record storage is initialized
-    AicpuPhaseHeader *phase_header = get_phase_header(perf_shared_mem_host_, num_aicore_);
+void L2PerfCollector::copy_perf_buffer(const ReadyBufferInfo &info) {
+    L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(info.host_buffer_ptr);
     rmb();
-    int num_sched = 0;
-    if (phase_header->magic == AICPU_PHASE_MAGIC) {
-        num_sched = phase_header->num_sched_threads;
-        if (num_sched > PLATFORM_MAX_AICPU_THREADS) {
-            num_sched = PLATFORM_MAX_AICPU_THREADS;
-        }
+    uint32_t count = buf->count;
+    if (count > PLATFORM_PROF_BUFFER_SIZE) {
+        count = PLATFORM_PROF_BUFFER_SIZE;
     }
-
-    int drained_perf = 0;
-    int drained_phase = 0;
-
-    ReadyBufferInfo info;
-    while (memory_manager_.try_pop_ready(info)) {
-        if (info.type == ProfBufferType::PERF_RECORD) {
-            L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(info.host_buffer_ptr);
-            rmb();
-            uint32_t count = buf->count;
-            if (count > PLATFORM_PROF_BUFFER_SIZE) {
-                count = PLATFORM_PROF_BUFFER_SIZE;
-            }
-            uint32_t core_index = info.index;
-            if (core_index < static_cast<uint32_t>(num_aicore_)) {
-                for (uint32_t i = 0; i < count; i++) {
-                    collected_perf_records_[core_index].push_back(buf->records[i]);
-                }
-                drained_perf += count;
-            }
-        } else {
-            PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(info.host_buffer_ptr);
-            rmb();
-            uint32_t count = buf->count;
-            if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
-                count = PLATFORM_PHASE_RECORDS_PER_THREAD;
-            }
-            uint32_t tidx = info.index;
-            for (uint32_t i = 0; i < count; i++) {
-                collected_phase_records_[tidx].push_back(buf->records[i]);
-            }
-            drained_phase += count;
-        }
-
-        memory_manager_.notify_copy_done({info.dev_buffer_ptr, info.type});
-    }
-
-    if (drained_perf > 0 || drained_phase > 0) {
-        LOG_INFO_V0("Drained remaining buffers: %d perf records, %d phase records", drained_perf, drained_phase);
-    }
-
-    if (drained_phase > 0) {
-        has_phase_data_ = true;
-    }
-}
-
-void L2PerfCollector::scan_remaining_perf_buffers() {
-    if (perf_shared_mem_host_ == nullptr) {
-        return;
-    }
-
-    rmb();
-
-    int total_recovered = 0;
-
-    for (int core_index = 0; core_index < num_aicore_; core_index++) {
-        L2PerfBufferState *state = get_perf_buffer_state(perf_shared_mem_host_, core_index);
-
-        rmb();
-        uint64_t buf_ptr = state->current_buf_ptr;
-        if (buf_ptr == 0) {
-            continue;
-        }
-
-        void *host_ptr = memory_manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_ptr));
-        if (host_ptr == nullptr) {
-            LOG_ERROR(
-                "scan_remaining_perf_buffers: no host mapping for dev_ptr=%p (core %d)",
-                reinterpret_cast<void *>(buf_ptr), core_index
-            );
-            continue;
-        }
-
-        L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(host_ptr);
-        uint32_t count = buf->count;
-        if (count == 0) {
-            continue;
-        }
-        if (count > PLATFORM_PROF_BUFFER_SIZE) {
-            count = PLATFORM_PROF_BUFFER_SIZE;
-        }
-
+    uint32_t core_index = info.index;
+    if (core_index < static_cast<uint32_t>(num_aicore_)) {
         for (uint32_t i = 0; i < count; i++) {
             collected_perf_records_[core_index].push_back(buf->records[i]);
         }
-        total_recovered += count;
-    }
-
-    if (total_recovered > 0) {
-        LOG_INFO_V0("scan_remaining_perf_buffers: recovered %d records from active buffers", total_recovered);
+        total_perf_collected_ += count;
     }
 }
 
-void L2PerfCollector::collect_phase_data() {
-    if (perf_shared_mem_host_ == nullptr) {
+void L2PerfCollector::copy_phase_buffer(const ReadyBufferInfo &info) {
+    PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(info.host_buffer_ptr);
+    rmb();
+    uint32_t count = buf->count;
+    if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
+        count = PLATFORM_PHASE_RECORDS_PER_THREAD;
+    }
+    uint32_t tidx = info.index;
+    if (tidx < collected_phase_records_.size()) {
+        for (uint32_t i = 0; i < count; i++) {
+            collected_phase_records_[tidx].push_back(buf->records[i]);
+        }
+        total_phase_collected_ += count;
+        if (count > 0) {
+            has_phase_data_ = true;
+        }
+    }
+}
+
+void L2PerfCollector::on_buffer_collected(const ReadyBufferInfo &info) {
+    if (info.type == ProfBufferType::PERF_RECORD) {
+        copy_perf_buffer(info);
+    } else {
+        copy_phase_buffer(info);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// reconcile_counters / read_phase_header_metadata
+// ---------------------------------------------------------------------------
+//
+// Host never recovers records from device-side current_buf_ptr. Device flush
+// is the only data path: a flush failure must bump dropped_record_count and
+// clear current_buf_ptr on the device side. Host's job here is purely
+// accounting + sanity check.
+
+void L2PerfCollector::reconcile_counters() {
+    if (shm_host_ == nullptr) {
         return;
     }
 
     rmb();
 
-    AicpuPhaseHeader *phase_header = get_phase_header(perf_shared_mem_host_, num_aicore_);
+    // Three-bucket invariant for one pool: every commit attempt bumps
+    // total_record_count; buffer-full, overwrite, and flush-enqueue failures
+    // bump dropped_record_count. So
+    //   silent_loss = device_total - (collected + dropped)
+    // and any non-zero silent loss flags an AICore/AICPU WIP-mismatch race
+    // (a different fault class from capacity-driven drops).
+    //
+    // Sanity sub-check: after stop(), any active buffer with records must
+    // have been flushed by AICPU (success → current_buf_ptr=0; failure →
+    // bump dropped, clear count + current_buf_ptr). A non-zero pointer with
+    // non-zero count means records AICPU neither delivered nor accounted
+    // for — i.e. a device-side flush bug. Empty buffers (count=0, never
+    // written) are fine; AICPU's flush legitimately skips them.
+    auto reconcile_one = [&](const char *kind, const char *unit_name, int unit_count, auto get_state,
+                             auto read_buf_count, uint64_t collected, bool optional) {
+        int leftover_active = 0;
+        for (int i = 0; i < unit_count; i++) {
+            L2PerfBufferState *state = get_state(i);
+            uint64_t buf_ptr = state->current_buf_ptr;
+            if (buf_ptr == 0) continue;
+            void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_ptr));
+            if (host_ptr == nullptr) continue;
+            uint32_t count = read_buf_count(host_ptr);
+            if (count == 0) continue;
+            LOG_ERROR(
+                "L2Perf reconcile: %s %d has un-flushed %s buffer (current_buf_ptr=0x%lx, count=%u) "
+                "after stop() — device flush failed",
+                unit_name, i, kind, static_cast<unsigned long>(buf_ptr), count
+            );
+            leftover_active++;
+        }
 
-    // Validate magic
+        uint64_t total_device = 0;
+        uint64_t dropped_device = 0;
+        for (int i = 0; i < unit_count; i++) {
+            L2PerfBufferState *state = get_state(i);
+            total_device += state->total_record_count;
+            dropped_device += state->dropped_record_count;
+        }
+
+        // PHASE counters are populated only by runtimes that actually emit
+        // phase records; skip the comparison entirely when nothing happened.
+        if (optional && total_device == 0 && collected == 0 && dropped_device == 0) {
+            return;
+        }
+
+        if (dropped_device > 0) {
+            LOG_WARN(
+                "L2Perf reconcile: %lu %s records dropped on device side (buffer full / "
+                "ready_queue full).",
+                static_cast<unsigned long>(dropped_device), kind
+            );
+        }
+        uint64_t accounted = collected + dropped_device;
+        if (accounted != total_device) {
+            LOG_WARN(
+                "L2Perf reconcile: %s count mismatch (collected=%lu + dropped=%lu != "
+                "device_total=%lu, silent_loss=%ld) — AICore/AICPU race",
+                kind, static_cast<unsigned long>(collected), static_cast<unsigned long>(dropped_device),
+                static_cast<unsigned long>(total_device), static_cast<long>(total_device) - static_cast<long>(accounted)
+            );
+        } else {
+            LOG_INFO_V0(
+                "L2Perf reconcile: %s counts match (collected=%lu, dropped=%lu, device_total=%lu)", kind,
+                static_cast<unsigned long>(collected), static_cast<unsigned long>(dropped_device),
+                static_cast<unsigned long>(total_device)
+            );
+        }
+
+        if (leftover_active > 0) {
+            LOG_ERROR(
+                "L2Perf reconcile: %d %s(s) had un-cleared %s current_buf_ptr — see prior errors", leftover_active,
+                unit_name, kind
+            );
+        }
+    };
+
+    reconcile_one(
+        "PERF", "core", num_aicore_,
+        [this](int core_index) {
+            return get_perf_buffer_state(shm_host_, core_index);
+        },
+        [](void *host_ptr) {
+            return reinterpret_cast<L2PerfBuffer *>(host_ptr)->count;
+        },
+        total_perf_collected_, /*optional=*/false
+    );
+
+    reconcile_one(
+        "PHASE", "thread", PLATFORM_MAX_AICPU_THREADS,
+        [this](int thread_index) {
+            return get_phase_buffer_state(shm_host_, num_aicore_, thread_index);
+        },
+        [](void *host_ptr) {
+            return reinterpret_cast<PhaseBuffer *>(host_ptr)->count;
+        },
+        total_phase_collected_, /*optional=*/true
+    );
+}
+
+void L2PerfCollector::read_phase_header_metadata() {
+    if (shm_host_ == nullptr) {
+        return;
+    }
+
+    rmb();
+
+    AicpuPhaseHeader *phase_header = get_phase_header(shm_host_, num_aicore_);
+
     if (phase_header->magic != AICPU_PHASE_MAGIC) {
         LOG_INFO_V0(
             "No phase profiling data found (magic mismatch: 0x%x vs 0x%x)", phase_header->magic, AICPU_PHASE_MAGIC
@@ -1067,45 +434,9 @@ void L2PerfCollector::collect_phase_data() {
         );
         return;
     }
-    LOG_INFO_V0("Collecting remaining phase data: %d scheduler threads", num_sched_threads);
+    LOG_INFO_V0("Collecting phase metadata: %d scheduler threads", num_sched_threads);
 
-    int total_slots = PLATFORM_MAX_AICPU_THREADS;
-
-    // Scan remaining PhaseBufferStates for active buffers with partial data.
-    // READY buffers were already enqueued to the ReadyQueue and collected via
-    // poll_and_collect() or drain_remaining_buffers(). Only current_buf_ptr
-    // contains partial data that was never enqueued (the active buffer when execution ended).
-    int total_phase_records = 0;
-    for (int t = 0; t < total_slots; t++) {
-        PhaseBufferState *state = get_phase_buffer_state(perf_shared_mem_host_, num_aicore_, t);
-
-        rmb();
-        uint64_t buf_ptr = state->current_buf_ptr;
-        if (buf_ptr != 0) {
-            void *host_ptr = memory_manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_ptr));
-            if (host_ptr == nullptr) {
-                LOG_ERROR(
-                    "collect_phase_data: no host mapping for dev_ptr=%p (thread %d)", reinterpret_cast<void *>(buf_ptr),
-                    t
-                );
-                continue;
-            }
-            PhaseBuffer *pbuf = reinterpret_cast<PhaseBuffer *>(host_ptr);
-            if (pbuf->count > 0) {
-                uint32_t count = pbuf->count;
-                if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
-                    count = PLATFORM_PHASE_RECORDS_PER_THREAD;
-                }
-
-                for (uint32_t i = 0; i < count; i++) {
-                    collected_phase_records_[t].push_back(pbuf->records[i]);
-                }
-                total_phase_records += count;
-            }
-        }
-    }
-
-    // Log per-thread totals
+    // Per-thread breakdown of records already collected via the buffer pipeline.
     for (size_t t = 0; t < collected_phase_records_.size(); t++) {
         if (!collected_phase_records_[t].empty()) {
             size_t sched_count = 0, orch_count = 0;
@@ -1120,10 +451,9 @@ void L2PerfCollector::collect_phase_data() {
         }
     }
 
-    // Read orchestrator summary
+    // Orchestrator summary (header-resident; not buffered).
     collected_orch_summary_ = phase_header->orch_summary;
     bool orch_valid = (collected_orch_summary_.magic == AICPU_PHASE_MAGIC);
-
     if (orch_valid) {
         LOG_INFO_V0(
             "  Orchestrator: %" PRId64 " tasks, %.3fus", static_cast<int64_t>(collected_orch_summary_.submit_count),
@@ -1133,7 +463,6 @@ void L2PerfCollector::collect_phase_data() {
         LOG_INFO_V0("  Orchestrator: no summary data");
     }
 
-    // Check if drain_remaining_buffers() already accumulated some Phase records
     bool has_accumulated = has_phase_data_;
     if (!has_accumulated) {
         for (const auto &v : collected_phase_records_) {
@@ -1143,22 +472,19 @@ void L2PerfCollector::collect_phase_data() {
             }
         }
     }
-    has_phase_data_ = (total_phase_records > 0 || orch_valid || has_accumulated);
+    has_phase_data_ = (orch_valid || has_accumulated);
 
-    // Read core-to-thread mapping
+    // Core-to-thread mapping (header-resident; not buffered).
     int num_cores = static_cast<int>(phase_header->num_cores);
     if (num_cores > 0 && num_cores <= PLATFORM_MAX_CORES) {
         core_to_thread_.assign(phase_header->core_to_thread, phase_header->core_to_thread + num_cores);
         LOG_INFO_V0("  Core-to-thread mapping: %d cores", num_cores);
     }
 
-    LOG_INFO_V0(
-        "Phase data collection complete: %d remaining records, orch_summary=%s", total_phase_records,
-        orch_valid ? "yes" : "no"
-    );
+    LOG_INFO_V0("Phase metadata collection complete: orch_summary=%s", orch_valid ? "yes" : "no");
 }
 
-int L2PerfCollector::export_swimlane_json(const std::string &output_path) {
+int L2PerfCollector::export_swimlane_json() {
     // Step 1: Validate collected data
     bool has_any_records = false;
     for (const auto &core_records : collected_perf_records_) {
@@ -1173,11 +499,12 @@ int L2PerfCollector::export_swimlane_json(const std::string &output_path) {
     }
 
     // Step 2: Create output directory (recursively — parent `outputs/` may not
-    // yet exist on a clean checkout / standalone run).
+    // yet exist on a clean checkout / standalone run). `output_prefix_` was
+    // captured at initialize() time.
     std::error_code ec;
-    std::filesystem::create_directories(output_path, ec);
+    std::filesystem::create_directories(output_prefix_, ec);
     if (ec) {
-        LOG_ERROR("Error: Failed to create output directory %s: %s", output_path.c_str(), ec.message().c_str());
+        LOG_ERROR("Error: Failed to create output directory %s: %s", output_prefix_.c_str(), ec.message().c_str());
         return -1;
     }
 
@@ -1231,7 +558,7 @@ int L2PerfCollector::export_swimlane_json(const std::string &output_path) {
 
     // Step 5: Compose output path. Filename is fixed (no timestamp) — the
     // caller-provided directory is the per-task uniqueness boundary.
-    std::string filepath = output_path + "/l2_perf_records.json";
+    std::string filepath = output_prefix_ + "/l2_perf_records.json";
 
     // Step 6: Open JSON file for writing
     std::ofstream outfile(filepath);
@@ -1444,69 +771,82 @@ int L2PerfCollector::export_swimlane_json(const std::string &output_path) {
     return 0;
 }
 
-int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb) {
-    if (perf_shared_mem_host_ == nullptr) {
+int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb, void *user_data) {
+    if (shm_host_ == nullptr) {
         return 0;
     }
 
-    // Stop memory manager if still running
-    stop_memory_manager();
+    // Stop mgmt + collector threads if the caller didn't already (idempotent).
+    stop();
 
     LOG_DEBUG("Cleaning up performance profiling resources");
 
-    // Free initial buffers that are still in the slot arrays
-    // (These were not freed by the memory manager because they were never replaced)
-    // The memory manager frees old buffers after copy; initial buffers in free_queues remain.
-    // Free all buffers in the free_queues and current_buf_ptr.
+    // Release framework-owned buffers (recycled pools, done_queue, ready_queue).
+    // These were not consumed via the AICPU side, so the per-pool free_queue
+    // and current_buf_ptr remain populated and are handled in the loops below.
+    if (free_cb != nullptr) {
+        manager_.release_owned_buffers([free_cb, user_data](void *p) {
+            free_cb(p, user_data);
+        });
+    }
+
+    // Free buffers still parked in per-core / per-thread free_queues and as
+    // current_buf_ptr — these were owned by the AICPU side, not the framework.
     for (int i = 0; i < num_aicore_; i++) {
-        L2PerfBufferState *state = get_perf_buffer_state(perf_shared_mem_host_, i);
+        L2PerfBufferState *state = get_perf_buffer_state(shm_host_, i);
 
         // Free current buffer if any
         if (state->current_buf_ptr != 0 && free_cb != nullptr) {
-            free_cb(reinterpret_cast<void *>(state->current_buf_ptr));
+            free_cb(reinterpret_cast<void *>(state->current_buf_ptr), user_data);
         }
+        state->current_buf_ptr = 0;
 
-        // Free all buffers in free_queue (limit iterations to max capacity)
+        // Free all buffers remaining in free_queue
         rmb();
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
-        uint32_t max_iters = PLATFORM_PROF_SLOT_COUNT;
-        while (head != tail && max_iters-- > 0) {
-            uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
+        uint32_t queued = tail - head;
+        if (queued > PLATFORM_PROF_SLOT_COUNT) {
+            queued = PLATFORM_PROF_SLOT_COUNT;
+        }
+        for (uint32_t k = 0; k < queued; k++) {
+            uint32_t slot = (head + k) % PLATFORM_PROF_SLOT_COUNT;
+            uint64_t buf_ptr = state->free_queue.buffer_ptrs[slot];
             if (buf_ptr != 0 && free_cb != nullptr) {
-                free_cb(reinterpret_cast<void *>(buf_ptr));
+                free_cb(reinterpret_cast<void *>(buf_ptr), user_data);
             }
-            head++;
+            state->free_queue.buffer_ptrs[slot] = 0;
         }
-        if (head != tail) {
-            LOG_WARN("finalize: perf free_queue not fully drained for core %d (head=%u tail=%u)", i, head, tail);
-        }
+        state->free_queue.head = tail;
     }
 
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
     for (int t = 0; t < num_phase_threads; t++) {
-        PhaseBufferState *state = get_phase_buffer_state(perf_shared_mem_host_, num_aicore_, t);
+        PhaseBufferState *state = get_phase_buffer_state(shm_host_, num_aicore_, t);
 
         // Free current buffer if any
         if (state->current_buf_ptr != 0 && free_cb != nullptr) {
-            free_cb(reinterpret_cast<void *>(state->current_buf_ptr));
+            free_cb(reinterpret_cast<void *>(state->current_buf_ptr), user_data);
         }
+        state->current_buf_ptr = 0;
 
-        // Free all buffers in free_queue (limit iterations to max capacity)
+        // Free all buffers remaining in free_queue
         rmb();
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
-        uint32_t max_iters = PLATFORM_PROF_SLOT_COUNT;
-        while (head != tail && max_iters-- > 0) {
-            uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
+        uint32_t queued = tail - head;
+        if (queued > PLATFORM_PROF_SLOT_COUNT) {
+            queued = PLATFORM_PROF_SLOT_COUNT;
+        }
+        for (uint32_t k = 0; k < queued; k++) {
+            uint32_t slot = (head + k) % PLATFORM_PROF_SLOT_COUNT;
+            uint64_t buf_ptr = state->free_queue.buffer_ptrs[slot];
             if (buf_ptr != 0 && free_cb != nullptr) {
-                free_cb(reinterpret_cast<void *>(buf_ptr));
+                free_cb(reinterpret_cast<void *>(buf_ptr), user_data);
             }
-            head++;
+            state->free_queue.buffer_ptrs[slot] = 0;
         }
-        if (head != tail) {
-            LOG_WARN("finalize: phase free_queue not fully drained for thread %d (head=%u tail=%u)", t, head, tail);
-        }
+        state->free_queue.head = tail;
     }
 
     // Unregister host mapping (optional)
@@ -1521,21 +861,18 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
 
     // Free shared memory (slot arrays)
     if (free_cb != nullptr && perf_shared_mem_dev_ != nullptr) {
-        free_cb(perf_shared_mem_dev_);
+        free_cb(perf_shared_mem_dev_, user_data);
         LOG_DEBUG("Shared memory freed");
     }
 
     perf_shared_mem_dev_ = nullptr;
-    perf_shared_mem_host_ = nullptr;
     was_registered_ = false;
     collected_perf_records_.clear();
     collected_phase_records_.clear();
     core_to_thread_.clear();
     has_phase_data_ = false;
-    device_id_ = -1;
-    alloc_cb_ = nullptr;
-    register_cb_ = nullptr;
-    free_cb_ = nullptr;
+    total_perf_collected_ = 0;
+    clear_memory_context();
 
     LOG_DEBUG("Performance profiling cleanup complete");
     return 0;

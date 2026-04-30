@@ -341,11 +341,16 @@ void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int co
             state->current_buf_ptr = 0;
             wmb();
         } else {
+            // ready_queue full at end-of-run: account the loss and clear the
+            // buffer so host reconcile sees a clean state (current_buf_ptr=0)
+            // and dropped == flush failures rather than silent wip-mismatch.
             LOG_ERROR(
-                "Thread %d: Core %d failed to flush PMU buffer (ready_queue full), data lost!", thread_idx, core_id
+                "Thread %d: Core %d failed to flush PMU buffer (ready_queue full), %u records lost!", thread_idx,
+                core_id, buf->count
             );
             state->dropped_record_count += buf->count;
             buf->count = 0;
+            state->current_buf_ptr = 0;
             wmb();
         }
     }
