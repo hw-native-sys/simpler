@@ -64,6 +64,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _mailbox_store_i32,
 )
 
+from . import _log as _simpler_log
 from .orchestrator import Orchestrator
 from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
@@ -100,7 +101,8 @@ _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
 # 5 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
-# enable_pmu) + 1024-byte NUL-terminated output_prefix.
+# enable_pmu) + 1024-byte NUL-terminated output_prefix. Log config travels
+# separately via ChipWorker.init(log_level, log_info_v) — not on per-task wire.
 _CFG_FMT = struct.Struct("=iiiii1024s")
 # Args region starts after CONFIG, rounded up to 8 bytes so the first
 # ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
@@ -658,12 +660,16 @@ class Worker:
         builder = RuntimeBuilder(platform)
         binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
 
+        sev, info_v = _simpler_log.get_current_config()
+
         self._chip_worker = ChipWorker()
         self._chip_worker.init(
             str(binaries.host_path),
             str(binaries.aicpu_path),
             str(binaries.aicore_path),
             str(binaries.sim_context_path) if binaries.sim_context_path else "",
+            sev,
+            info_v,
         )
         self._chip_worker.set_device(device_id)
 

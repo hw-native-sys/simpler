@@ -78,6 +78,8 @@ struct KernelArgs {
     uint64_t l2_perf_data_base{0};  // L2 perf shared memory base address; use explicit flags to detect enablement
     uint64_t pmu_data_base{0};      // PMU shared memory base address; use explicit flags to detect enablement
     uint64_t pmu_reg_addrs{0};      // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
+    uint32_t log_level{1};          // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
+    uint32_t log_info_v{5};         // INFO verbosity threshold (0..9); default V5
 };
 
 #ifdef __cplusplus

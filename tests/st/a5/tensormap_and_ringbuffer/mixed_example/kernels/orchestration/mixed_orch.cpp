@@ -72,7 +72,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint32_t total_elems = orch_args.tensor(2).shapes[0];
     int num_iters = static_cast<int>(total_elems / TILE_ELEMS);
 
-    LOG_INFO("[mixed_orch] num_iters=%d", num_iters);
+    LOG_INFO_V0("[mixed_orch] num_iters=%d", num_iters);
 
     for (int i = 0; i < num_iters; i++) {
         PTO2_SCOPE() {
@@ -158,7 +158,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         }
     }
 
-    LOG_INFO("[mixed_orch] Submitted %d iterations x 5 shapes = %d tasks", num_iters, num_iters * 5);
+    LOG_INFO_V0("[mixed_orch] Submitted %d iterations x 5 shapes = %d tasks", num_iters, num_iters * 5);
 }
 
 }  // extern "C"

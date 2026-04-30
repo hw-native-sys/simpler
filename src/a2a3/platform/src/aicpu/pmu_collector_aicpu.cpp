@@ -170,7 +170,7 @@ static void pmu_switch_buffer(int core_id, int thread_idx) {
     PmuBuffer *new_buf = reinterpret_cast<PmuBuffer *>(new_buf_ptr);
     new_buf->count = 0;
 
-    LOG_INFO("Thread %d: Core %d switched to new PMU buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
+    LOG_INFO_V0("Thread %d: Core %d switched to new PMU buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +243,7 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
     }
 
     wmb();
-    LOG_INFO("PMU initialized: %d cores, event_type=%u", num_cores, pmu_event_type);
+    LOG_INFO_V0("PMU initialized: %d cores, event_type=%u", num_cores, pmu_event_type);
 }
 
 void pmu_aicpu_record_task(int core_id, int thread_idx, uint64_t task_id, uint32_t func_id, CoreType core_type) {
@@ -337,7 +337,7 @@ void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int co
         uint32_t seq = state->current_buf_seq;
         int rc = enqueue_pmu_ready_buffer(thread_idx, static_cast<uint32_t>(core_id), buf_ptr, seq);
         if (rc == 0) {
-            LOG_INFO("Thread %d: Core %d flushed PMU buffer with %u records", thread_idx, core_id, buf->count);
+            LOG_INFO_V0("Thread %d: Core %d flushed PMU buffer with %u records", thread_idx, core_id, buf->count);
             state->current_buf_ptr = 0;
             wmb();
         } else {

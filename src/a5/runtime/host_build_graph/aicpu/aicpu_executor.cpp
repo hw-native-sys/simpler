@@ -255,7 +255,7 @@ inline bool AicpuExecutor::try_dispatch_task(
     ready_count--;
 
     const char *core_type_str = (core_type == CoreType::AIC) ? "AIC" : "AIV";
-    LOG_INFO(
+    LOG_INFO_V0(
         "Thread %d: Dispatching %s task %d to core %d (running_id=%d)", thread_idx, core_type_str, task_id, core_id,
         running_task_ids_[core_id]
     );
@@ -303,7 +303,7 @@ int AicpuExecutor::init(Runtime *runtime) {
         return 0;
     }
 
-    LOG_INFO("AicpuExecutor: Initializing");
+    LOG_INFO_V0("AicpuExecutor: Initializing");
 
     if (runtime == nullptr) {
         LOG_ERROR("runtime is nullptr");
@@ -335,7 +335,7 @@ int AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
 
-    LOG_INFO("Config: threads=%d, cores=%d", thread_num_, cores_total_num_);
+    LOG_INFO_V0("Config: threads=%d, cores=%d", thread_num_, cores_total_num_);
 
     for (int i = 0; i < cores_total_num_; i++) {
         pending_task_ids_[i] = AICPU_TASK_INVALID;
@@ -362,12 +362,12 @@ int AicpuExecutor::init(Runtime *runtime) {
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(runtime->workers, physical_core_ids_, cores_total_num_);
-        LOG_INFO("PMU profiling started on %d cores", cores_total_num_);
+        LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
     }
 #endif
 
     init_done_.store(true, std::memory_order_release);
-    LOG_INFO("AicpuExecutor: Init complete");
+    LOG_INFO_V0("AicpuExecutor: Init complete");
     return 0;
 }
 
@@ -400,7 +400,7 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
     aic_count_ = 0;
     aiv_count_ = 0;
 
-    LOG_INFO("Core Discovery: Handshaking with %d cores", cores_total_num_);
+    LOG_INFO_V0("Core Discovery: Handshaking with %d cores", cores_total_num_);
 
     // Step 1: Send handshake signal to all cores
     for (int i = 0; i < cores_total_num_; i++) {
@@ -470,7 +470,7 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         physical_core_ids_[i] = physical_core_id;
 #endif
 
-        LOG_INFO(
+        LOG_INFO_V0(
             "  Core %d: type=%s, physical_id=%u, reg_addr=0x%lx", i, core_type_to_string(type), physical_core_id,
             reg_addr
         );
@@ -481,7 +481,7 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         return -1;
     }
 
-    LOG_INFO("Discovery complete: AIC=%d, AIV=%d, Total=%d", aic_count_, aiv_count_, cores_total_num_);
+    LOG_INFO_V0("Discovery complete: AIC=%d, AIV=%d, Total=%d", aic_count_, aiv_count_, cores_total_num_);
     return 0;
 }
 
@@ -493,7 +493,7 @@ void AicpuExecutor::assign_cores_to_threads() {
     aic_per_thread_ = (aic_count_ + thread_num_ - 1) / thread_num_;
     aiv_per_thread_ = (aiv_count_ + thread_num_ - 1) / thread_num_;
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Core Assignment: %d AIC cores, %d AIV cores across %d threads (max %d AIC/thread, %d AIV/thread)", aic_count_,
         aiv_count_, thread_num_, aic_per_thread_, aiv_per_thread_
     );
@@ -534,7 +534,7 @@ void AicpuExecutor::assign_cores_to_threads() {
 
         offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "]");
 
-        LOG_INFO("%s", log_buffer);
+        LOG_INFO_V0("%s", log_buffer);
     }
 }
 
@@ -576,7 +576,7 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime *runtime) {
                 cur_ready_queue_aiv_[thread_idx][*tail_ptr] = task_id;
             }
             *tail_ptr = (*tail_ptr + 1) % MAX_CORES_PER_THREAD;
-            LOG_INFO(
+            LOG_INFO_V0(
                 "Init: %s task %d -> Thread %d local queue (size=%d)", core_type == CoreType::AIC ? "AIC" : "AIV",
                 task_id, thread_idx, cur_size + 1
             );
@@ -610,16 +610,16 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime *runtime) {
         }
     }
 
-    LOG_INFO("Init: Found %d initially ready tasks", initial_count);
-    LOG_INFO("Init: Initial ready tasks by type: AIC=%d, AIV=%d", initial_aic_count, initial_aiv_count);
+    LOG_INFO_V0("Init: Found %d initially ready tasks", initial_count);
+    LOG_INFO_V0("Init: Initial ready tasks by type: AIC=%d, AIV=%d", initial_aic_count, initial_aiv_count);
     ready_count_aic_.store(aic_shared_count, std::memory_order_release);
     ready_count_aiv_.store(aiv_shared_count, std::memory_order_release);
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Init: Task distribution complete - AIC: %d in local queues, %d in shared queue",
         initial_aic_count - aic_shared_count, aic_shared_count
     );
-    LOG_INFO(
+    LOG_INFO_V0(
         "Init: Task distribution complete - AIV: %d in local queues, %d in shared queue",
         initial_aiv_count - aiv_shared_count, aiv_shared_count
     );
@@ -629,7 +629,7 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime *runtime) {
             (cur_ready_queue_aic_tail_[t] - cur_ready_queue_aic_head_[t] + MAX_CORES_PER_THREAD) % MAX_CORES_PER_THREAD;
         int aiv_size =
             (cur_ready_queue_aiv_tail_[t] - cur_ready_queue_aiv_head_[t] + MAX_CORES_PER_THREAD) % MAX_CORES_PER_THREAD;
-        LOG_INFO("Init: Thread %d local queues - AIC: %d tasks, AIV: %d tasks", t, aic_size, aiv_size);
+        LOG_INFO_V0("Init: Thread %d local queues - AIC: %d tasks, AIV: %d tasks", t, aic_size, aiv_size);
     }
 }
 
@@ -639,12 +639,12 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime *runtime) {
 int AicpuExecutor::shutdown_aicore(Runtime *runtime, int thread_idx, const int *cur_thread_cores) {
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
 
-    LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, thread_cores_num_[thread_idx]);
+    LOG_INFO_V0("Thread %d: Shutting down %d cores", thread_idx, thread_cores_num_[thread_idx]);
 
     for (int i = 0; i < thread_cores_num_[thread_idx]; i++) {
         int core_id = cur_thread_cores[i];
         Handshake *hank = &all_handshakes[core_id];
-        LOG_INFO("Thread %d: AICPU hank addr = 0x%lx", thread_idx, reinterpret_cast<uint64_t>(hank));
+        LOG_INFO_V0("Thread %d: AICPU hank addr = 0x%lx", thread_idx, reinterpret_cast<uint64_t>(hank));
 
         uint64_t reg_addr = core_id_to_reg_addr_[core_id];
         if (reg_addr != 0) {
@@ -653,7 +653,7 @@ int AicpuExecutor::shutdown_aicore(Runtime *runtime, int thread_idx, const int *
             LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
         }
     }
-    LOG_INFO("Thread %d: Shutdown complete", thread_idx);
+    LOG_INFO_V0("Thread %d: Shutdown complete", thread_idx);
     return 0;
 }
 
@@ -663,7 +663,7 @@ int AicpuExecutor::shutdown_aicore(Runtime *runtime, int thread_idx, const int *
 int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const int *cur_thread_cores, int core_num) {
     Handshake *hank = reinterpret_cast<Handshake *>(runtime.workers);
 
-    LOG_INFO("Thread %d: Starting execution with %d cores", thread_idx, core_num);
+    LOG_INFO_V0("Thread %d: Starting execution with %d cores", thread_idx, core_num);
 
     int cur_thread_completed = 0;
     int task_count = total_tasks_.load(std::memory_order_acquire);
@@ -693,7 +693,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
     int cur_aic_ready_count = (cur_aic_tail - cur_aic_head + MAX_CORES_PER_THREAD) % MAX_CORES_PER_THREAD;
     int cur_aiv_ready_count = (cur_aiv_tail - cur_aiv_head + MAX_CORES_PER_THREAD) % MAX_CORES_PER_THREAD;
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Thread %d: Initial state - local queue: %d AIC, %d AIV", thread_idx, cur_aic_ready_count, cur_aiv_ready_count
     );
 
@@ -717,7 +717,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
             // Case 1: Pending task finished directly
             if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
-                LOG_INFO(
+                LOG_INFO_V0(
                     "Thread %d: Core %d completed task %d (running_id=%d)", thread_idx, core_id,
                     pending_task_ids_[core_id], running_task_ids_[core_id]
                 );
@@ -804,7 +804,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         cur_aic_tail, cur_aic_ready_count, cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                     );
 
-                    LOG_INFO("Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id);
+                    LOG_INFO_V0(
+                        "Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id
+                    );
                 }
 
                 Task *task = runtime.get_task(completed_task_id);
@@ -821,7 +823,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 }
             } else if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_ACK_STATE) {
                 // Case 2: Pending task received ACK
-                LOG_INFO(
+                LOG_INFO_V0(
                     "Thread %d: Core %d ACKed task %d (running_id=%d)", thread_idx, core_id, pending_task_ids_[core_id],
                     running_task_ids_[core_id]
                 );
@@ -868,14 +870,16 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         cur_aic_tail, cur_aic_ready_count, cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                     );
 
-                    LOG_INFO("Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id);
+                    LOG_INFO_V0(
+                        "Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id
+                    );
                 }
 
                 // Core can accept new task now (pipeline!)
                 // Continue to Case 4 to dispatch next task
             } else if (reg_task_id == running_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
                 // Case 3: Running task finished
-                LOG_INFO(
+                LOG_INFO_V0(
                     "Thread %d: Core %d completed task %d (pending_id=%d)", thread_idx, core_id,
                     running_task_ids_[core_id], pending_task_ids_[core_id]
                 );
@@ -972,7 +976,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 ready_count_aic_.fetch_sub(to_grab, std::memory_order_release);
                 cur_aic_ready_count += to_grab;
 
-                LOG_INFO(
+                LOG_INFO_V0(
                     "Thread %d: Grabbed %d AIC tasks from shared queue (available=%d)", thread_idx, to_grab, available
                 );
             }
@@ -993,7 +997,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 ready_count_aiv_.fetch_sub(to_grab, std::memory_order_release);
                 cur_aiv_ready_count += to_grab;
 
-                LOG_INFO(
+                LOG_INFO_V0(
                     "Thread %d: Grabbed %d AIV tasks from shared queue (available=%d)", thread_idx, to_grab, available
                 );
             }
@@ -1070,20 +1074,20 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
         made_progress = false;
     }
 
-    LOG_INFO("Thread %d: Execution complete, completed %d tasks", thread_idx, cur_thread_completed);
+    LOG_INFO_V0("Thread %d: Execution complete, completed %d tasks", thread_idx, cur_thread_completed);
     return cur_thread_completed;
 }
 
 int AicpuExecutor::run(Runtime *runtime) {
     int thread_idx = thread_idx_++;
 
-    LOG_INFO("Thread %d: Start", thread_idx);
+    LOG_INFO_V0("Thread %d: Start", thread_idx);
 
     const int *cur_thread_cores = core_assignments_[thread_idx];
 
-    LOG_INFO("Thread %d: Runtime has %d tasks", thread_idx, runtime->get_task_count());
+    LOG_INFO_V0("Thread %d: Runtime has %d tasks", thread_idx, runtime->get_task_count());
     int completed = resolve_and_dispatch(*runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
-    LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+    LOG_INFO_V0("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
 
 #if PTO2_PROFILING
     // Restore PMU CTRL registers for this thread's cores before AICore shutdown
@@ -1103,12 +1107,12 @@ int AicpuExecutor::run(Runtime *runtime) {
     }
 #endif
 
-    LOG_INFO("Thread %d: Completed", thread_idx);
+    LOG_INFO_V0("Thread %d: Completed", thread_idx);
 
     int prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
     if (prev_finished + 1 == thread_num_) {
         finished_.store(true, std::memory_order_release);
-        LOG_INFO("Thread %d: Last thread, marking executor finished", thread_idx);
+        LOG_INFO_V0("Thread %d: Last thread, marking executor finished", thread_idx);
     }
 
     return 0;
@@ -1177,7 +1181,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     thread_idx_.store(0, std::memory_order_release);
     finished_.store(false, std::memory_order_release);
 
-    LOG_INFO("DeInit: AicpuExecutor reset complete");
+    LOG_INFO_V0("DeInit: AicpuExecutor reset complete");
 }
 
 void AicpuExecutor::emergency_shutdown(Runtime *runtime) {
@@ -1307,7 +1311,7 @@ extern "C" int aicpu_execute(Runtime *runtime) {
         return -1;
     }
 
-    LOG_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
+    LOG_INFO_V0("%s", "aicpu_execute: Starting AICPU kernel execution");
 
     // Get platform register addresses from platform-level global
     g_aicpu_executor.regs_ = get_platform_regs();
@@ -1329,10 +1333,10 @@ extern "C" int aicpu_execute(Runtime *runtime) {
 
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
-        LOG_INFO("aicpu_execute: Last thread finished, cleaning up");
+        LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
     }
 
-    LOG_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
+    LOG_INFO_V0("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }

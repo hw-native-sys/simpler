@@ -48,18 +48,18 @@ void unified_log_warn(const char *func, const char *fmt, ...) {
     va_end(args);
 }
 
-void unified_log_info(const char * /* func */, const char * /* fmt */, ...) {
-    // Suppress info in tests
-}
-
 void unified_log_debug(const char * /* func */, const char * /* fmt */, ...) {
     // Suppress debug in tests
 }
 
-void unified_log_always(const char *func, const char *fmt, ...) {
+void unified_log_info_v(const char *func, int v, const char *fmt, ...) {
+    // Only emit V9 (must-see) in tests; quieter tiers are suppressed.
+    if (v < 9) {
+        return;
+    }
     va_list args;
     va_start(args, fmt);
-    fprintf(stderr, "[ALWAYS] %s: ", func);
+    fprintf(stderr, "[INFO_V%d] %s: ", v, func);
     vfprintf(stderr, fmt, args);
     fprintf(stderr, "\n");
     va_end(args);

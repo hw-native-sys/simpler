@@ -226,7 +226,7 @@ void dump_tensor_init(int num_dump_threads) {
 
     s_setup_header = get_dump_setup_header(dump_base);
 
-    LOG_INFO("Initializing tensor dump for %d threads (memcpy-based)", num_dump_threads);
+    LOG_INFO_V0("Initializing tensor dump for %d threads (memcpy-based)", num_dump_threads);
 
     for (int t = 0; t < num_dump_threads && t < PLATFORM_MAX_AICPU_THREADS; t++) {
         uint64_t buf_ptr = s_setup_header->dump_buffer_ptrs[t];
@@ -261,7 +261,7 @@ void dump_tensor_init(int num_dump_threads) {
     s_logged_dump_layout_mismatch = false;
 
     wmb();
-    LOG_INFO("Tensor dump initialized for %d threads", num_dump_threads);
+    LOG_INFO_V0("Tensor dump initialized for %d threads", num_dump_threads);
 }
 
 int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
@@ -367,7 +367,7 @@ void dump_tensor_flush(int thread_idx) {
     if (thread_idx >= 0 && thread_idx < PLATFORM_MAX_AICPU_THREADS) {
         DumpBuffer *buf = s_dump_buffers[thread_idx];
         uint32_t dropped = (buf != nullptr) ? buf->dropped_count : 0;
-        LOG_INFO(
+        LOG_INFO_V0(
             "Thread %d: dump_tensor_flush (records=%u, dropped=%u)", thread_idx, s_records_written[thread_idx], dropped
         );
     }

@@ -9,18 +9,20 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-// Covers PTO_LOG_LEVEL=off: when set, every level including ALWAYS
-// must be fully muted. Regression guard for the bug where invalid level
-// strings were silently mapped to INFO in the host path and ALWAYS
-// bypassed the filter.
+// HostLogger filtering: severity floor + INFO verbosity threshold.
+// Drives the singleton via direct setters (no env vars; Python pushes via
+// nanobind in production), captures stderr, and asserts on the buffered output.
 
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
 #include "host_log.h"
+
+using simpler::log::LogLevel;
 
 namespace {
 
@@ -29,8 +31,7 @@ struct CapturedStdio {
     std::string err;
 };
 
-CapturedStdio run_with_level(const char *level_value, void (*fn)()) {
-    // Redirect stdout/stderr to temp files so we can read the bytes back.
+CapturedStdio run_with_config(LogLevel level, int info_v, void (*fn)()) {
     fflush(stdout);
     fflush(stderr);
     FILE *out_tmp = tmpfile();
@@ -40,12 +41,8 @@ CapturedStdio run_with_level(const char *level_value, void (*fn)()) {
     dup2(fileno(out_tmp), fileno(stdout));
     dup2(fileno(err_tmp), fileno(stderr));
 
-    if (level_value != nullptr) {
-        setenv("PTO_LOG_LEVEL", level_value, 1);
-    } else {
-        unsetenv("PTO_LOG_LEVEL");
-    }
-    HostLogger::get_instance().reinitialize();
+    HostLogger::get_instance().set_level(level);
+    HostLogger::get_instance().set_info_v(info_v);
 
     fn();
 
@@ -72,25 +69,57 @@ CapturedStdio run_with_level(const char *level_value, void (*fn)()) {
 
 }  // namespace
 
-TEST(HostLogOffTest, OffMutesEverythingIncludingAlways) {
-    auto captured = run_with_level("off", [] {
-        HostLogger::get_instance().log(HostLogLevel::ERROR, "err-msg");
-        HostLogger::get_instance().log(HostLogLevel::WARN, "warn-msg");
-        HostLogger::get_instance().log(HostLogLevel::INFO, "info-msg");
-        HostLogger::get_instance().log(HostLogLevel::DEBUG, "dbg-msg");
-        HostLogger::get_instance().log(HostLogLevel::ALWAYS, "always-msg");
+TEST(HostLogTest, NulLevelMutesAllSeverities) {
+    auto captured = run_with_config(LogLevel::NUL, 0, [] {
+        HostLogger::get_instance().log(LogLevel::ERROR, "fn", "err-msg");
+        HostLogger::get_instance().log(LogLevel::WARN, "fn", "warn-msg");
+        HostLogger::get_instance().log(LogLevel::DEBUG, "fn", "dbg-msg");
+        HostLogger::get_instance().log_info_v(9, "fn", "v9-msg");
+        HostLogger::get_instance().log_info_v(0, "fn", "v0-msg");
     });
     EXPECT_EQ(captured.out, "");
     EXPECT_EQ(captured.err, "");
 }
 
-TEST(HostLogOffTest, ErrorLevelStillEmitsErrorAndAlways) {
-    auto captured = run_with_level("error", [] {
-        HostLogger::get_instance().log(HostLogLevel::ERROR, "err-msg");
-        HostLogger::get_instance().log(HostLogLevel::INFO, "info-msg");
-        HostLogger::get_instance().log(HostLogLevel::ALWAYS, "always-msg");
+TEST(HostLogTest, ErrorLevelEmitsErrorOnly) {
+    auto captured = run_with_config(LogLevel::ERROR, 5, [] {
+        HostLogger::get_instance().log(LogLevel::ERROR, "fn", "err-msg");
+        HostLogger::get_instance().log(LogLevel::WARN, "fn", "warn-msg");
+        HostLogger::get_instance().log_info_v(9, "fn", "v9-msg");
     });
+    EXPECT_EQ(captured.out, "");
     EXPECT_NE(captured.err.find("err-msg"), std::string::npos);
-    EXPECT_EQ(captured.out.find("info-msg"), std::string::npos);
-    EXPECT_NE((captured.out + captured.err).find("always-msg"), std::string::npos);
+    EXPECT_EQ(captured.err.find("warn-msg"), std::string::npos);
+    EXPECT_EQ(captured.err.find("v9-msg"), std::string::npos);
+}
+
+TEST(HostLogTest, InfoVerbosityCutsBelowThreshold) {
+    // Threshold V5: V0..V4 silenced, V5..V9 printed.
+    auto captured = run_with_config(LogLevel::INFO, 5, [] {
+        HostLogger::get_instance().log_info_v(0, "fn", "v0-msg");
+        HostLogger::get_instance().log_info_v(4, "fn", "v4-msg");
+        HostLogger::get_instance().log_info_v(5, "fn", "v5-msg");
+        HostLogger::get_instance().log_info_v(9, "fn", "v9-msg");
+    });
+    EXPECT_EQ(captured.out, "");
+    EXPECT_EQ(captured.err.find("v0-msg"), std::string::npos);
+    EXPECT_EQ(captured.err.find("v4-msg"), std::string::npos);
+    EXPECT_NE(captured.err.find("v5-msg"), std::string::npos);
+    EXPECT_NE(captured.err.find("v9-msg"), std::string::npos);
+}
+
+TEST(HostLogTest, AllOutputGoesToStderr) {
+    auto captured = run_with_config(LogLevel::DEBUG, 0, [] {
+        HostLogger::get_instance().log(LogLevel::ERROR, "fn", "e");
+        HostLogger::get_instance().log(LogLevel::WARN, "fn", "w");
+        HostLogger::get_instance().log(LogLevel::DEBUG, "fn", "d");
+        HostLogger::get_instance().log_info_v(0, "fn", "i0");
+        HostLogger::get_instance().log_info_v(9, "fn", "i9");
+    });
+    EXPECT_EQ(captured.out, "");
+    EXPECT_NE(captured.err.find("e"), std::string::npos);
+    EXPECT_NE(captured.err.find("w"), std::string::npos);
+    EXPECT_NE(captured.err.find("d"), std::string::npos);
+    EXPECT_NE(captured.err.find("i0"), std::string::npos);
+    EXPECT_NE(captured.err.find("i9"), std::string::npos);
 }

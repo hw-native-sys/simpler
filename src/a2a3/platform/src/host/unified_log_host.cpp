@@ -10,64 +10,55 @@
  */
 /**
  * @file unified_log_host.cpp
- * @brief Unified logging - Host implementation
+ * @brief Unified logging - Host implementation.
+ *
+ * Adapter that forwards the unified C ABI to HostLogger via va_list, avoiding
+ * an intermediate vsnprintf-to-buffer round-trip.
  */
 
 #include "common/unified_log.h"
 #include "host_log.h"
 
 #include <cstdarg>
-#include <cstdio>
+
+using simpler::log::LogLevel;
 
 void unified_log_error(const char *func, const char *fmt, ...) {
+    if (!HostLogger::get_instance().is_severity_enabled(LogLevel::ERROR)) {
+        return;
+    }
     va_list args;
     va_start(args, fmt);
-    char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    HostLogger::get_instance().vlog(LogLevel::ERROR, func, fmt, args);
     va_end(args);
-    HostLogger::get_instance().log(HostLogLevel::ERROR, "%s: %s", func, buffer);
 }
 
 void unified_log_warn(const char *func, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-
-    char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
-
-    HostLogger::get_instance().log(HostLogLevel::WARN, "%s: %s", func, buffer);
-}
-
-void unified_log_info(const char *func, const char *fmt, ...) {
-    if (!HostLogger::get_instance().is_enabled(HostLogLevel::INFO)) {
+    if (!HostLogger::get_instance().is_severity_enabled(LogLevel::WARN)) {
         return;
     }
     va_list args;
     va_start(args, fmt);
-    char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    HostLogger::get_instance().vlog(LogLevel::WARN, func, fmt, args);
     va_end(args);
-    HostLogger::get_instance().log(HostLogLevel::INFO, "%s: %s", func, buffer);
 }
 
 void unified_log_debug(const char *func, const char *fmt, ...) {
-    if (!HostLogger::get_instance().is_enabled(HostLogLevel::DEBUG)) {
+    if (!HostLogger::get_instance().is_severity_enabled(LogLevel::DEBUG)) {
         return;
     }
     va_list args;
     va_start(args, fmt);
-    char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    HostLogger::get_instance().vlog(LogLevel::DEBUG, func, fmt, args);
     va_end(args);
-    HostLogger::get_instance().log(HostLogLevel::DEBUG, "%s: %s", func, buffer);
 }
 
-void unified_log_always(const char *func, const char *fmt, ...) {
+void unified_log_info_v(const char *func, int v, const char *fmt, ...) {
+    if (!HostLogger::get_instance().is_info_v_enabled(v)) {
+        return;
+    }
     va_list args;
     va_start(args, fmt);
-    char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    HostLogger::get_instance().vlog_info_v(v, func, fmt, args);
     va_end(args);
-    HostLogger::get_instance().log(HostLogLevel::ALWAYS, "%s: %s", func, buffer);
 }

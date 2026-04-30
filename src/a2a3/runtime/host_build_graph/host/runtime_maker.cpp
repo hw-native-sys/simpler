@@ -238,7 +238,7 @@ int upload_tensor_info_storage(Runtime *runtime, const TensorInfoBuilder &builde
     }
 
     runtime->set_tensor_info_storage(dev_tensor_info_storage, tensor_info_bytes);
-    LOG_INFO("Uploaded %zu tensor info entries (%zu bytes)", compact_tensor_info.size(), tensor_info_bytes);
+    LOG_INFO_V0("Uploaded %zu tensor info entries (%zu bytes)", compact_tensor_info.size(), tensor_info_bytes);
     return 0;
 }
 
@@ -265,7 +265,7 @@ int upload_tensor_allocation_storage(Runtime *runtime, const TensorAllocationBui
     runtime->set_tensor_allocation_storage(
         dev_allocation_storage, static_cast<uint32_t>(builder.allocations.size()), allocation_bytes
     );
-    LOG_INFO("Uploaded %zu tensor allocation ranges (%zu bytes)", builder.allocations.size(), allocation_bytes);
+    LOG_INFO_V0("Uploaded %zu tensor allocation ranges (%zu bytes)", builder.allocations.size(), allocation_bytes);
     return 0;
 }
 
@@ -300,7 +300,7 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
 
     // Register kernel binaries from ChipCallable children
     if (callable->child_count() > 0) {
-        LOG_INFO("Registering %d kernel(s) in init_runtime_impl", callable->child_count());
+        LOG_INFO_V0("Registering %d kernel(s) in init_runtime_impl", callable->child_count());
         for (int32_t i = 0; i < callable->child_count(); i++) {
             int func_id = callable->child_func_id(i);
             if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
@@ -352,12 +352,12 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
         return -1;
     }
 
-    LOG_INFO("Loaded orchestration function: %s", orch_func_name);
+    LOG_INFO_V0("Loaded orchestration function: %s", orch_func_name);
 
     // Clear any previous tensor pairs
     runtime->clear_tensor_pairs();
 
-    LOG_INFO("=== Calling Orchestration Function ===");
+    LOG_INFO_V0("=== Calling Orchestration Function ===");
 
     LOG_DEBUG(
         "Args count: %d (%d tensors + %d scalars)", orch_args->tensor_count() + orch_args->scalar_count(),
@@ -400,7 +400,7 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
         return rc;
     }
 
-    LOG_INFO("Runtime initialized. Ready for execution from Python.");
+    LOG_INFO_V0("Runtime initialized. Ready for execution from Python.");
 
     // Host orchestration is complete once orch_func returns. The task graph now
     // lives in Runtime, so the orchestration SO can be closed immediately.
@@ -428,7 +428,7 @@ int validate_runtime_impl(Runtime *runtime) {
 
     int rc = 0;
 
-    LOG_INFO("=== Copying Results Back to Host ===");
+    LOG_INFO_V0("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
     TensorPair *tensor_pairs = runtime->get_tensor_pairs();
@@ -449,11 +449,11 @@ int validate_runtime_impl(Runtime *runtime) {
     // Note: print_handshake_results() is called in DeviceRunner::run()
 
     // Cleanup device tensors
-    LOG_INFO("=== Cleaning Up ===");
+    LOG_INFO_V0("=== Cleaning Up ===");
     for (int i = 0; i < tensor_pair_count; i++) {
         runtime->host_api.device_free(tensor_pairs[i].dev_ptr);
     }
-    LOG_INFO("Freed %d device tensors", tensor_pair_count);
+    LOG_INFO_V0("Freed %d device tensors", tensor_pair_count);
 
     // Cleanup kernel binaries
     int kernel_count = runtime->get_registered_kernel_count();
@@ -463,7 +463,7 @@ int validate_runtime_impl(Runtime *runtime) {
         runtime->set_function_bin_addr(func_id, 0);
     }
     if (kernel_count > 0) {
-        LOG_INFO("Freed %d kernel binaries", kernel_count);
+        LOG_INFO_V0("Freed %d kernel binaries", kernel_count);
     }
     runtime->clear_registered_kernels();
 
@@ -479,7 +479,7 @@ int validate_runtime_impl(Runtime *runtime) {
     // Clear tensor pairs
     runtime->clear_tensor_pairs();
 
-    LOG_INFO("=== Finalize Complete ===");
+    LOG_INFO_V0("=== Finalize Complete ===");
 
     return rc;
 }

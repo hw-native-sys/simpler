@@ -116,7 +116,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
 
     // Register kernel binaries from ChipCallable children
     if (callable->child_count() > 0) {
-        LOG_INFO("Registering %d kernel(s) in init_runtime_impl", callable->child_count());
+        LOG_INFO_V0("Registering %d kernel(s) in init_runtime_impl", callable->child_count());
         for (int32_t i = 0; i < callable->child_count(); i++) {
             int func_id = callable->child_func_id(i);
             if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
@@ -153,7 +153,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
 
     int tensor_count = orch_args->tensor_count();
     int scalar_count = orch_args->scalar_count();
-    LOG_INFO("RT2 init: %d tensors + %d scalars, device orchestration mode", tensor_count, scalar_count);
+    LOG_INFO_V0("RT2 init: %d tensors + %d scalars, device orchestration mode", tensor_count, scalar_count);
 
     int64_t t_total_start = _now_ms();
 
@@ -165,7 +165,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
         ContinuousTensor t = orch_args->tensor(i);
 
         if (t.is_child_memory()) {
-            LOG_INFO("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.data);
+            LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.data);
             device_args.add_tensor(t);
             continue;
         }
@@ -186,7 +186,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
             return -1;
         }
         runtime->record_tensor_pair(host_ptr, dev_ptr, size);
-        LOG_INFO("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
+        LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         t.data = reinterpret_cast<uint64_t>(dev_ptr);
         device_args.add_tensor(t);
@@ -203,7 +203,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
     int64_t t_so_start = _now_ms();
     runtime->pending_orch_so_data_ = orch_so_binary;
     runtime->pending_orch_so_size_ = orch_so_size;
-    LOG_INFO("Orchestration SO: %zu bytes staged (host-only)", orch_so_size);
+    LOG_INFO_V0("Orchestration SO: %zu bytes staged (host-only)", orch_so_size);
     int64_t t_so_end = _now_ms();
 
     // Read ready queue shard count from environment for AICPU scheduler
@@ -222,7 +222,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
                 runtime->ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
             }
         }
-        LOG_INFO("Ready queue shards: %d", runtime->ready_queue_shards);
+        LOG_INFO_V0("Ready queue shards: %d", runtime->ready_queue_shards);
     }
 
     // Read orchestrator-to-scheduler transition flag from environment
@@ -231,7 +231,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
         if (env_val && (env_val[0] == '1' || env_val[0] == 't' || env_val[0] == 'T')) {
             runtime->orch_to_sched = true;
         }
-        LOG_INFO("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
+        LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
     }
 
     // Read ring buffer size overrides from environment
@@ -240,7 +240,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
         runtime->heap_size = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
         runtime->dep_pool_size = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
         if (runtime->task_window_size || runtime->heap_size || runtime->dep_pool_size) {
-            LOG_INFO(
+            LOG_INFO_V0(
                 "Ring buffer overrides: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%" PRIu64,
                 (uint64_t)(runtime->task_window_size ? runtime->task_window_size : PTO2_TASK_WINDOW_SIZE),
                 (uint64_t)(runtime->heap_size ? runtime->heap_size : PTO2_HEAP_SIZE),
@@ -281,14 +281,14 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
     runtime->set_orch_built_on_host(false);
     runtime->set_orch_args(device_args);
 
-    LOG_INFO("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
+    LOG_INFO_V0("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
 
     int64_t t_total_end = _now_ms();
-    LOG_INFO("TIMING: args_malloc_copy = %" PRId64 "ms", t_args_end - t_args_start);
-    LOG_INFO("TIMING: orch_so_copy = %" PRId64 "ms", t_so_end - t_so_start);
-    LOG_INFO("TIMING: gm_heap_alloc(1GB) = %" PRId64 "ms", t_heap_end - t_heap_start);
-    LOG_INFO("TIMING: shared_mem_alloc = %" PRId64 "ms", t_sm_end - t_sm_start);
-    LOG_INFO("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
+    LOG_INFO_V0("TIMING: args_malloc_copy = %" PRId64 "ms", t_args_end - t_args_start);
+    LOG_INFO_V0("TIMING: orch_so_copy = %" PRId64 "ms", t_so_end - t_so_start);
+    LOG_INFO_V0("TIMING: gm_heap_alloc(1GB) = %" PRId64 "ms", t_heap_end - t_heap_start);
+    LOG_INFO_V0("TIMING: shared_mem_alloc = %" PRId64 "ms", t_sm_end - t_sm_start);
+    LOG_INFO_V0("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
 
     return 0;
 }
@@ -312,13 +312,13 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
 
     int rc = 0;
 
-    LOG_INFO("=== Copying Results Back to Host ===");
+    LOG_INFO_V0("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
     TensorPair *tensor_pairs = runtime->get_tensor_pairs();
     int tensor_pair_count = runtime->get_tensor_pair_count();
 
-    LOG_INFO("Tensor pairs to process: %d", tensor_pair_count);
+    LOG_INFO_V0("Tensor pairs to process: %d", tensor_pair_count);
 
     // PTO2 (device orchestration): graph output may be in packed buffer
     uint64_t graph_out_ptr = 0;
@@ -341,7 +341,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
         graph_out_ptr = host_header.graph_output_ptr;
         graph_out_size = host_header.graph_output_size;
         if (graph_out_ptr != 0) {
-            LOG_INFO("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
+            LOG_INFO_V0("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
         }
     }
 
@@ -360,7 +360,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
             if (pair.host_ptr == nullptr) {
-                LOG_INFO("Tensor %d: device-only allocation (no copy-back)", i);
+                LOG_INFO_V0("Tensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
@@ -371,7 +371,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
             if (first_output_tensor && graph_out_ptr != 0 && graph_out_size > 0) {
                 src_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(graph_out_ptr));
                 copy_size = static_cast<size_t>(graph_out_size);
-                LOG_INFO("Using packed output buffer for tensor %d", i);
+                LOG_INFO_V0("Using packed output buffer for tensor %d", i);
                 first_output_tensor = false;
             }
 
@@ -380,19 +380,19 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_INFO("Tensor %d: %zu bytes copied to host", i, pair.size);
+                LOG_INFO_V0("Tensor %d: %zu bytes copied to host", i, pair.size);
             }
         }
     }
 
     // Cleanup device tensors
-    LOG_INFO("=== Cleaning Up ===");
+    LOG_INFO_V0("=== Cleaning Up ===");
     for (int i = 0; i < tensor_pair_count; i++) {
         if (tensor_pairs[i].dev_ptr != nullptr) {
             runtime->host_api.device_free(tensor_pairs[i].dev_ptr);
         }
     }
-    LOG_INFO("Freed %d device allocations", tensor_pair_count);
+    LOG_INFO_V0("Freed %d device allocations", tensor_pair_count);
 
     // Cleanup kernel binaries
     int kernel_count = runtime->get_registered_kernel_count();
@@ -402,14 +402,14 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
         runtime->set_function_bin_addr(func_id, 0);
     }
     if (kernel_count > 0) {
-        LOG_INFO("Freed %d kernel binaries", kernel_count);
+        LOG_INFO_V0("Freed %d kernel binaries", kernel_count);
     }
     runtime->clear_registered_kernels();
 
     // Clear tensor pairs
     runtime->clear_tensor_pairs();
 
-    LOG_INFO("=== Finalize Complete ===");
+    LOG_INFO_V0("=== Finalize Complete ===");
 
     if (rc == 0 && runtime_status != 0) {
         rc = runtime_status;

@@ -80,7 +80,7 @@ void Runtime::record_tensor_pair(void *host_ptr, void *dev_ptr, size_t size) {
     tensor_pairs[tensor_pair_count].dev_ptr = dev_ptr;
     tensor_pairs[tensor_pair_count].size = size;
     tensor_pair_count++;
-    LOG_INFO("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
+    LOG_INFO_V0("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
 }
 
 TensorPair *Runtime::get_tensor_pairs() { return tensor_pairs; }

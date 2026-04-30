@@ -25,8 +25,14 @@
 
 #include "common/unified_log.h"
 #include "device_runner.h"
+#include "host_log.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
+
+// Forward-declared (rather than #include "dlog_pub.h") so this TU does not
+// require CANN's toolchain include path on the host build. Resolved at link
+// time against libunified_dlog.so / libascendalog.so.
+extern "C" int dlog_setlevel(int moduleId, int level, int enableEvent);
 
 extern "C" {
 
@@ -300,6 +306,26 @@ void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, si
     if (runtime == NULL) return;
     Runtime *r = static_cast<Runtime *>(runtime);
     r->record_tensor_pair(host_ptr, dev_ptr, size);
+}
+
+void simpler_init(DeviceContextHandle ctx, int log_level, int log_info_v) {
+    if (ctx == NULL) return;
+
+    // CANN dlog: derive from simpler logger choice unless ASCEND_GLOBAL_LOG_LEVEL
+    // is externally configured. dlog_setlevel mutates libunified_dlog.so's
+    // runtime filter so this works even after other Ascend libs have loaded.
+    if (std::getenv("ASCEND_GLOBAL_LOG_LEVEL") == NULL) {
+        dlog_setlevel(-1, log_level, /*enableEvent*/ 0);
+    }
+
+    // Host C++ LOG_* gating
+    HostLogger::get_instance().set_level(static_cast<simpler::log::LogLevel>(log_level));
+    HostLogger::get_instance().set_info_v(log_info_v);
+
+    // Snapshot into runner — read by run_runtime when populating KernelArgs
+    DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
+    runner->set_log_level(log_level);
+    runner->set_log_info_v(log_info_v);
 }
 
 }  // extern "C"

@@ -9,139 +9,101 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * @file device_log.cpp
+ * @file device_log.cpp (sim)
  * @brief Simulation Platform Log Implementation
  *
- * Provides log enable flags and initialization for simulation environment.
- * Log levels can be controlled via PTO_LOG_LEVEL environment variable.
+ * Severity and verbosity flags are populated by host via set_log_level() /
+ * set_log_info_v() at AICPU kernel init (see kernel.cpp / aicpu_executor.cpp);
+ * this file does not read env vars.
  */
 
 #include "aicpu/device_log.h"
+
 #include <cstdarg>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <cctype>
 
 // =============================================================================
-// Log Enable Flags (Simulation: controlled by PTO_LOG_LEVEL)
+// Severity enable flags + verbosity threshold (mutated by setters below)
 // =============================================================================
 
 bool g_is_log_enable_debug = false;
-bool g_is_log_enable_info = true;
+bool g_is_log_enable_info = true;  // default INFO+ on
 bool g_is_log_enable_warn = true;
 bool g_is_log_enable_error = true;
 
-// =============================================================================
-// Platform Constant
-// =============================================================================
+// Default V5 (matches HostLogger / Python defaults).
+int g_log_info_v = 5;
 
 const char *TILE_FWK_DEVICE_MACHINE = "SIM_CPU";
 
 // =============================================================================
-// Log Initialization (Read from PTO_LOG_LEVEL environment variable)
+// Setters (called by AICPU init from KernelArgs)
+// =============================================================================
+
+extern "C" void set_log_level(int level) {
+    // CANN-aligned: DEBUG=0, INFO=1, WARN=2, ERROR=3, NUL=4. Floor semantics:
+    // messages with severity >= floor are kept.
+    g_is_log_enable_debug = (level <= 0) && (level != 4);
+    g_is_log_enable_info = (level <= 1) && (level != 4);
+    g_is_log_enable_warn = (level <= 2) && (level != 4);
+    g_is_log_enable_error = (level <= 3) && (level != 4);
+}
+
+extern "C" void set_log_info_v(int v) {
+    if (v < 0) v = 0;
+    if (v > 9) v = 9;
+    g_log_info_v = v;
+}
+
+extern "C" int get_log_info_v() { return g_log_info_v; }
+
+// =============================================================================
+// init_log_switch: sim respects host-pushed config — this is now a no-op
+// (kept for ABI compatibility with onboard, where it queries CANN dlog).
 // =============================================================================
 
 void init_log_switch() {
-    // Read PTO_LOG_LEVEL environment variable
-    const char *level_str = std::getenv("PTO_LOG_LEVEL");
-
-    if (level_str != nullptr) {
-        // Convert to lowercase for comparison
-        char level[64];
-        strncpy(level, level_str, sizeof(level) - 1);
-        level[sizeof(level) - 1] = '\0';
-
-        for (char *p = level; *p; ++p) {
-            *p = tolower(*p);
-        }
-
-        // Parse log level
-        if (strcmp(level, "off") == 0) {
-            // Off: suppress everything
-            g_is_log_enable_debug = false;
-            g_is_log_enable_info = false;
-            g_is_log_enable_warn = false;
-            g_is_log_enable_error = false;
-        } else if (strcmp(level, "error") == 0) {
-            // Error: only errors
-            g_is_log_enable_debug = false;
-            g_is_log_enable_info = false;
-            g_is_log_enable_warn = false;
-            g_is_log_enable_error = true;
-        } else if (strcmp(level, "normal") == 0 || strcmp(level, "info") == 0) {
-            // Normal/Info: info, warn, error (default)
-            g_is_log_enable_debug = false;
-            g_is_log_enable_info = true;
-            g_is_log_enable_warn = true;
-            g_is_log_enable_error = true;
-        } else if (strcmp(level, "verbose") == 0 || strcmp(level, "debug") == 0) {
-            // Verbose/Debug: all levels
-            g_is_log_enable_debug = true;
-            g_is_log_enable_info = true;
-            g_is_log_enable_warn = true;
-            g_is_log_enable_error = true;
-        } else {
-            // Unknown value: default to INFO
-            g_is_log_enable_debug = false;
-            g_is_log_enable_info = true;
-            g_is_log_enable_warn = true;
-            g_is_log_enable_error = true;
-        }
-    } else {
-        // No environment variable: default to INFO level
-        g_is_log_enable_debug = false;
-        g_is_log_enable_info = true;
-        g_is_log_enable_warn = true;
-        g_is_log_enable_error = true;
-    }
+    // Sim has no env / dlog to consult. Defaults already applied at static
+    // init; host overrides via set_log_level()/set_log_info_v() before this
+    // is called.
 }
 
 // =============================================================================
-// Platform-Specific Logging Functions (Simulation: use printf)
+// Low-level dev_log_* (sim: fprintf to stderr; severity-by-prefix)
 // =============================================================================
 
 void dev_log_debug(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    printf("[DEBUG] %s: ", func);
-    vprintf(fmt, args);
-    printf("\n");
-    va_end(args);
-}
-
-void dev_log_info(const char *func, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    printf("[INFO] %s: ", func);
-    vprintf(fmt, args);
-    printf("\n");
+    fprintf(stderr, "[DEBUG] %s: ", func);
+    vfprintf(stderr, fmt, args);
+    fputc('\n', stderr);
     va_end(args);
 }
 
 void dev_log_warn(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    printf("[WARN] %s: ", func);
-    vprintf(fmt, args);
-    printf("\n");
+    fprintf(stderr, "[WARN] %s: ", func);
+    vfprintf(stderr, fmt, args);
+    fputc('\n', stderr);
     va_end(args);
 }
 
 void dev_log_error(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    printf("[ERROR] %s: ", func);
-    vprintf(fmt, args);
-    printf("\n");
+    fprintf(stderr, "[ERROR] %s: ", func);
+    vfprintf(stderr, fmt, args);
+    fputc('\n', stderr);
     va_end(args);
 }
 
-void dev_log_always(const char *func, const char *fmt, ...) {
+void dev_log_info_v(int v, const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    printf("[ALWAYS] %s: ", func);
-    vprintf(fmt, args);
-    printf("\n");
+    fprintf(stderr, "[INFO_V%d] %s: ", v, func);
+    vfprintf(stderr, fmt, args);
+    fputc('\n', stderr);
     va_end(args);
 }

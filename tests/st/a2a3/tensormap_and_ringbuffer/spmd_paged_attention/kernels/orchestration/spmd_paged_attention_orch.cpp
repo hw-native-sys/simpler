@@ -78,7 +78,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint64_t q_loop = (num_heads + q_tile - 1) / q_tile;
     int64_t total_logical_blocks = static_cast<int64_t>(batch * q_loop);
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "SPMD PA TPUSH/TPOP: batch=%" PRIu64 " heads=%" PRIu64 " hd=%" PRIu64 " bs=%" PRIu64 " q_tile=%" PRIu64
         " q_loop=%" PRIu64 " hw_blocks=%d logical_blocks=%" PRId64,
         batch, num_heads, head_dim, block_size, q_tile, q_loop, SPMD_BLOCK_NUM, total_logical_blocks
@@ -151,7 +151,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         rt_submit_task(mk, args);
     }
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "SPMD PA TPUSH/TPOP: submitted 1 MixedKernels task, hw_blocks=%d logical=%" PRId64,
         static_cast<int>(SPMD_BLOCK_NUM), total_logical_blocks
     );

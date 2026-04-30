@@ -156,6 +156,11 @@ public:
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
+    // Severity floor (0=DEBUG..4=NUL) and INFO verbosity threshold (0..9).
+    // Pushed in by the Python layer via run_runtime() and propagated to AICPU
+    // through KernelArgs.
+    void set_log_level(int log_level) { log_level_ = log_level; }
+    void set_log_info_v(int log_info_v) { log_info_v_ = log_info_v; }
     // Directory under which all diagnostic artifacts (l2_perf_records.json /
     // tensor_dump/ / pmu.csv) land. Required (non-empty) when any diagnostic
     // is enabled; CallConfig::validate() enforces this contract upstream.
@@ -241,6 +246,8 @@ private:
     void (*set_platform_l2_perf_base_func_)(uint64_t){nullptr};
     void (*set_l2_swimlane_enabled_func_)(bool){nullptr};
     void (*set_pmu_enabled_func_)(bool){nullptr};
+    void (*set_log_level_func_)(int){nullptr};
+    void (*set_log_info_v_func_)(int){nullptr};
     std::string aicpu_so_path_;
     std::string aicore_so_path_;
 
@@ -302,6 +309,8 @@ private:
     bool enable_pmu_{false};
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
+    int log_level_{1};                                             // 0=DEBUG..4=NUL; default INFO
+    int log_info_v_{5};                                            // INFO verbosity threshold; default V5
 };
 
 #endif  // SRC_A5_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

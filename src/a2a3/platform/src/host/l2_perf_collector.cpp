@@ -65,7 +65,7 @@ void ProfMemoryManager::start(
         mgmt_thread_ = std::thread(&ProfMemoryManager::mgmt_loop, this);
     }
 
-    LOG_INFO("ProfMemoryManager started: %d cores, %d phase threads", num_cores, num_phase_threads);
+    LOG_INFO_V0("ProfMemoryManager started: %d cores, %d phase threads", num_cores, num_phase_threads);
 }
 
 void ProfMemoryManager::stop() {
@@ -94,7 +94,7 @@ void ProfMemoryManager::stop() {
     }
     recycled_phase_buffers_.clear();
 
-    LOG_INFO("ProfMemoryManager stopped");
+    LOG_INFO_V0("ProfMemoryManager stopped");
 }
 
 bool ProfMemoryManager::try_pop_ready(ReadyBufferInfo &info) {
@@ -546,7 +546,7 @@ int L2PerfCollector::initialize(
         return -1;
     }
 
-    LOG_INFO("Initializing performance profiling");
+    LOG_INFO_V0("Initializing performance profiling");
 
     if (num_aicore <= 0 || num_aicore > PLATFORM_MAX_CORES) {
         LOG_ERROR("Invalid number of AICores: %d (max=%d)", num_aicore, PLATFORM_MAX_CORES);
@@ -695,7 +695,7 @@ int L2PerfCollector::initialize(
     perf_shared_mem_dev_ = perf_dev_ptr;
     perf_shared_mem_host_ = perf_host_ptr;
 
-    LOG_INFO("Performance profiling initialized (dynamic buffer mode)");
+    LOG_INFO_V0("Performance profiling initialized (dynamic buffer mode)");
     return 0;
 }
 
@@ -725,7 +725,7 @@ void L2PerfCollector::poll_and_collect(int expected_tasks) {
 
     execution_complete_.store(false);
 
-    LOG_INFO("Collecting performance data");
+    LOG_INFO_V0("Collecting performance data");
 
     L2PerfDataHeader *header = get_l2_perf_header(perf_shared_mem_host_);
 
@@ -743,7 +743,7 @@ void L2PerfCollector::poll_and_collect(int expected_tasks) {
     collected_phase_records_.resize(PLATFORM_MAX_AICPU_THREADS);
 
     if (expected_tasks <= 0) {
-        LOG_INFO("Waiting for AICPU to write total_tasks in L2PerfDataHeader...");
+        LOG_INFO_V0("Waiting for AICPU to write total_tasks in L2PerfDataHeader...");
         idle_start = std::chrono::steady_clock::now();
 
         while (true) {
@@ -752,7 +752,7 @@ void L2PerfCollector::poll_and_collect(int expected_tasks) {
 
             if (raw_total_tasks > 0) {
                 expected_tasks = static_cast<int>(raw_total_tasks);
-                LOG_INFO("AICPU reported task count: %d", expected_tasks);
+                LOG_INFO_V0("AICPU reported task count: %d", expected_tasks);
                 break;
             }
 
@@ -822,7 +822,7 @@ void L2PerfCollector::poll_and_collect(int expected_tasks) {
         if (current_expected > expected_tasks) {
             expected_tasks = current_expected;
             if (last_logged_expected < 0) {
-                LOG_INFO("Updated expected_tasks to %d (orchestrator progress)", expected_tasks);
+                LOG_INFO_V0("Updated expected_tasks to %d (orchestrator progress)", expected_tasks);
                 last_logged_expected = expected_tasks;
             }
         }
@@ -904,7 +904,7 @@ void L2PerfCollector::poll_and_collect(int expected_tasks) {
                     memory_manager_.notify_copy_done({drain_info.dev_buffer_ptr, drain_info.type});
                     buffers_processed++;
                 }
-                LOG_INFO(
+                LOG_INFO_V0(
                     "Execution complete signal received, exiting with %d/%d records", total_records_collected,
                     expected_tasks
                 );
@@ -925,14 +925,14 @@ void L2PerfCollector::poll_and_collect(int expected_tasks) {
         }
     }
 
-    LOG_INFO("Total buffers processed: %d", buffers_processed);
-    LOG_INFO("Total records collected: %d", total_records_collected);
+    LOG_INFO_V0("Total buffers processed: %d", buffers_processed);
+    LOG_INFO_V0("Total records collected: %d", total_records_collected);
 
     if (total_records_collected < expected_tasks) {
         LOG_WARN("Incomplete collection (%d / %d records)", total_records_collected, expected_tasks);
     }
 
-    LOG_INFO("Performance data collection complete");
+    LOG_INFO_V0("Performance data collection complete");
 }
 
 void L2PerfCollector::drain_remaining_buffers() {
@@ -988,7 +988,7 @@ void L2PerfCollector::drain_remaining_buffers() {
     }
 
     if (drained_perf > 0 || drained_phase > 0) {
-        LOG_INFO("Drained remaining buffers: %d perf records, %d phase records", drained_perf, drained_phase);
+        LOG_INFO_V0("Drained remaining buffers: %d perf records, %d phase records", drained_perf, drained_phase);
     }
 
     if (drained_phase > 0) {
@@ -1039,7 +1039,7 @@ void L2PerfCollector::scan_remaining_perf_buffers() {
     }
 
     if (total_recovered > 0) {
-        LOG_INFO("scan_remaining_perf_buffers: recovered %d records from active buffers", total_recovered);
+        LOG_INFO_V0("scan_remaining_perf_buffers: recovered %d records from active buffers", total_recovered);
     }
 }
 
@@ -1054,7 +1054,7 @@ void L2PerfCollector::collect_phase_data() {
 
     // Validate magic
     if (phase_header->magic != AICPU_PHASE_MAGIC) {
-        LOG_INFO(
+        LOG_INFO_V0(
             "No phase profiling data found (magic mismatch: 0x%x vs 0x%x)", phase_header->magic, AICPU_PHASE_MAGIC
         );
         return;
@@ -1067,7 +1067,7 @@ void L2PerfCollector::collect_phase_data() {
         );
         return;
     }
-    LOG_INFO("Collecting remaining phase data: %d scheduler threads", num_sched_threads);
+    LOG_INFO_V0("Collecting remaining phase data: %d scheduler threads", num_sched_threads);
 
     int total_slots = PLATFORM_MAX_AICPU_THREADS;
 
@@ -1113,7 +1113,7 @@ void L2PerfCollector::collect_phase_data() {
                 if (is_scheduler_phase(r.phase_id)) sched_count++;
                 else orch_count++;
             }
-            LOG_INFO(
+            LOG_INFO_V0(
                 "  Thread %zu: %zu records (sched=%zu, orch=%zu)", t, collected_phase_records_[t].size(), sched_count,
                 orch_count
             );
@@ -1125,12 +1125,12 @@ void L2PerfCollector::collect_phase_data() {
     bool orch_valid = (collected_orch_summary_.magic == AICPU_PHASE_MAGIC);
 
     if (orch_valid) {
-        LOG_INFO(
+        LOG_INFO_V0(
             "  Orchestrator: %" PRId64 " tasks, %.3fus", static_cast<int64_t>(collected_orch_summary_.submit_count),
             cycles_to_us(collected_orch_summary_.end_time - collected_orch_summary_.start_time)
         );
     } else {
-        LOG_INFO("  Orchestrator: no summary data");
+        LOG_INFO_V0("  Orchestrator: no summary data");
     }
 
     // Check if drain_remaining_buffers() already accumulated some Phase records
@@ -1149,10 +1149,10 @@ void L2PerfCollector::collect_phase_data() {
     int num_cores = static_cast<int>(phase_header->num_cores);
     if (num_cores > 0 && num_cores <= PLATFORM_MAX_CORES) {
         core_to_thread_.assign(phase_header->core_to_thread, phase_header->core_to_thread + num_cores);
-        LOG_INFO("  Core-to-thread mapping: %d cores", num_cores);
+        LOG_INFO_V0("  Core-to-thread mapping: %d cores", num_cores);
     }
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Phase data collection complete: %d remaining records, orch_summary=%s", total_phase_records,
         orch_valid ? "yes" : "no"
     );
@@ -1437,9 +1437,9 @@ int L2PerfCollector::export_swimlane_json(const std::string &output_path) {
     outfile.close();
 
     uint32_t record_count = static_cast<uint32_t>(tagged_records.size());
-    LOG_INFO("=== JSON Export Complete ===");
-    LOG_INFO("File: %s", filepath.c_str());
-    LOG_INFO("Records: %u", record_count);
+    LOG_INFO_V0("=== JSON Export Complete ===");
+    LOG_INFO_V0("File: %s", filepath.c_str());
+    LOG_INFO_V0("Records: %u", record_count);
 
     return 0;
 }

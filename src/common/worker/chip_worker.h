@@ -30,9 +30,13 @@ public:
 
     /// Bind the runtime library and cache platform binaries.
     /// Can only be called once per lifetime — the runtime cannot be changed.
+    /// `log_level` (0=DEBUG..4=NUL) and `log_info_v` (0..9) are pushed into
+    /// HostLogger + runner state and (onboard) into CANN dlog at this point;
+    /// they reflect the user's `simpler` Python logger at Worker.init() time
+    /// and are then fixed for this ChipWorker's lifetime.
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-        const std::string &sim_context_lib_path = ""
+        const std::string &sim_context_lib_path = "", int log_level = 1, int log_info_v = 5
     );
 
     /// Set the target NPU device. Requires init() first.
@@ -101,6 +105,7 @@ private:
         void *, void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t,
         int, int, int, const char *
     );
+    using SimplerInitFn = void (*)(void *, int, int);
     using FinalizeDeviceFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
@@ -122,6 +127,7 @@ private:
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     RunRuntimeFn run_runtime_fn_ = nullptr;
+    SimplerInitFn simpler_init_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;

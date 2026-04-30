@@ -99,7 +99,7 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime) {
     int32_t task_count = runtime->get_task_count();
     s_l2_perf_header->total_tasks = static_cast<uint32_t>(task_count);
 
-    LOG_INFO("Initializing performance profiling for %d cores (free queue)", runtime->worker_count);
+    LOG_INFO_V0("Initializing performance profiling for %d cores (free queue)", runtime->worker_count);
 
     // Pop first buffer from free_queue for each core
     for (int i = 0; i < runtime->worker_count; i++) {
@@ -135,7 +135,7 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime) {
 
     wmb();
 
-    LOG_INFO("Performance profiling initialized for %d cores", runtime->worker_count);
+    LOG_INFO_V0("Performance profiling initialized for %d cores", runtime->worker_count);
 }
 
 int l2_perf_aicpu_complete_record(
@@ -196,7 +196,7 @@ void l2_perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx) 
         return;
     }
 
-    LOG_INFO("Thread %d: Core %d buffer is full (count=%u)", thread_idx, core_id, full_buf->count);
+    LOG_INFO_V0("Thread %d: Core %d buffer is full (count=%u)", thread_idx, core_id, full_buf->count);
 
     // Check free_queue before committing the full buffer
     rmb();
@@ -238,7 +238,7 @@ void l2_perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx) 
     h->l2_perf_records_addr = new_buf_ptr;
     wmb();
 
-    LOG_INFO("Thread %d: Core %d switched to new buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
+    LOG_INFO_V0("Thread %d: Core %d switched to new buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
 }
 
 void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int core_num) {
@@ -253,7 +253,7 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
 
     rmb();
 
-    LOG_INFO("Thread %d: Flushing performance buffers for %d cores", thread_idx, core_num);
+    LOG_INFO_V0("Thread %d: Flushing performance buffers for %d cores", thread_idx, core_num);
 
     int flushed_count = 0;
 
@@ -277,7 +277,7 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
         uint32_t seq = state->current_buf_seq;
         int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, buf_ptr, seq, 0);
         if (rc == 0) {
-            LOG_INFO("Thread %d: Core %d flushed buffer with %u records", thread_idx, core_id, buf->count);
+            LOG_INFO_V0("Thread %d: Core %d flushed buffer with %u records", thread_idx, core_id, buf->count);
             flushed_count++;
             state->current_buf_ptr = 0;
             wmb();
@@ -288,7 +288,7 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
 
     wmb();
 
-    LOG_INFO("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
+    LOG_INFO_V0("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
 void l2_perf_aicpu_update_total_tasks(uint32_t total_tasks) {
@@ -364,7 +364,7 @@ void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads)
 
     wmb();
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Phase profiling initialized: %d scheduler + 1 orch thread, %d records/thread", num_sched_threads,
         PLATFORM_PHASE_RECORDS_PER_THREAD
     );
@@ -384,7 +384,7 @@ static void switch_phase_buffer(int thread_idx) {
     PhaseBuffer *full_buf = s_current_phase_buf[thread_idx];
     if (full_buf == nullptr) return;
 
-    LOG_INFO("Thread %d: phase buffer is full (count=%u)", thread_idx, full_buf->count);
+    LOG_INFO_V0("Thread %d: phase buffer is full (count=%u)", thread_idx, full_buf->count);
 
     // Enqueue to ReadyQueue
     uint32_t seq = state->current_buf_seq;
@@ -413,7 +413,7 @@ static void switch_phase_buffer(int thread_idx) {
         new_buf->count = 0;
         s_current_phase_buf[thread_idx] = new_buf;
 
-        LOG_INFO("Thread %d: switched to new phase buffer", thread_idx);
+        LOG_INFO_V0("Thread %d: switched to new phase buffer", thread_idx);
     } else {
         // No free buffer available, drop subsequent records
         LOG_WARN("Thread %d: no free phase buffer available, dropping records until Host catches up", thread_idx);
@@ -454,7 +454,7 @@ void l2_perf_aicpu_record_phase(
             buf->count = 0;
             s_current_phase_buf[thread_idx] = buf;
 
-            LOG_INFO("Thread %d: recovered phase buffer", thread_idx);
+            LOG_INFO_V0("Thread %d: recovered phase buffer", thread_idx);
         }
         if (buf == nullptr) return;  // Still no buffer available
     }
@@ -495,7 +495,7 @@ void l2_perf_aicpu_write_orch_summary(const AicpuOrchSummary *src) {
 
     wmb();
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Orchestrator summary written: %" PRId64 " tasks, %.3fus", static_cast<int64_t>(src->submit_count),
         cycles_to_us(src->end_time - src->start_time)
     );
@@ -533,7 +533,7 @@ void l2_perf_aicpu_flush_phase_buffers(int thread_idx) {
     uint32_t seq = state->current_buf_seq;
     int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, thread_idx, buf_ptr, seq, 1);
     if (rc == 0) {
-        LOG_INFO("Thread %d: flushed phase buffer with %u records", thread_idx, buf->count);
+        LOG_INFO_V0("Thread %d: flushed phase buffer with %u records", thread_idx, buf->count);
         state->current_buf_ptr = 0;
         s_current_phase_buf[thread_idx] = nullptr;
         wmb();
@@ -551,7 +551,7 @@ void l2_perf_aicpu_init_core_assignments(int total_cores) {
     memset(s_phase_header->core_to_thread, -1, sizeof(s_phase_header->core_to_thread));
     s_phase_header->num_cores = static_cast<uint32_t>(total_cores);
     wmb();
-    LOG_INFO("Core-to-thread mapping init: %d cores", total_cores);
+    LOG_INFO_V0("Core-to-thread mapping init: %d cores", total_cores);
 }
 
 void l2_perf_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num) {

@@ -87,7 +87,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 - `Thread %d: Scheduler summary: total_time=%.3fus, loops=%llu, tasks_scheduled=%d` — each sched thread
 - `Thread %d: sched_start=%llu sched_end(timeout)=%llu sched_cost=%.3fus` — timeout path only (replaces normal `sched_end`)
 
-**DEV_ALWAYS count (normal run):**
+**LOG_INFO_V9 count (normal run):**
 
 - `orch_to_sched_=false` (default): `N_sched*2 + N_orch*1 + 1` (orch_timing + PTO2_total + sched_timing + Scheduler_summary)
 - `orch_to_sched_=true` (`PTO2_ORCH_TO_SCHED=1`): adds 1 (`orch_stage_end`)
@@ -140,7 +140,7 @@ Thread 1: Scheduler summary: total_time=168.620us, loops=3880, tasks_scheduled=9
 - Phase-specific statistics (complete, scan, dispatch, idle)
 - Hit rate tracking (complete poll, ready queue pop)
 
-**Log output:** 18 DEV_ALWAYS logs (11 debug + 2 basic + 7 scheduler detailed - 2 replaced)
+**Log output:** 18 LOG_INFO_V9 logs (11 debug + 2 basic + 7 scheduler detailed - 2 replaced)
 
 - Replaces scheduler summary with detailed breakdown
 
@@ -179,7 +179,7 @@ Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 - Atomic operation counters
 - Wait time tracking
 
-**Log output:** 30 DEV_ALWAYS logs (11 debug + 2 basic + 1 scheduler summary + 17 orchestrator detailed - 1 replaced)
+**Log output:** 30 LOG_INFO_V9 logs (11 debug + 2 basic + 1 scheduler summary + 17 orchestrator detailed - 1 replaced)
 
 - Replaces basic orchestration completion with detailed breakdown
 
@@ -214,7 +214,7 @@ Thread X:   avg/task       : XXXus
 - Hash chain walk tracking
 - Overlap check counters
 
-**Log output:** 34 DEV_ALWAYS logs (30 from Level 3 + 4 tensormap)
+**Log output:** 34 LOG_INFO_V9 logs (30 from Level 3 + 4 tensormap)
 
 **TensorMap output:**
 
@@ -331,8 +331,8 @@ add_definitions(-DPTO2_ORCH_PROFILING=1)
 
 > Example: `paged_attention` on Ascend hardware, 2 sched threads + 2 orch threads, normal run (no stall/timeout).
 
-| Level | Macro Settings | DEV_ALWAYS Count (`orch_to_sched_=false`) | DEV_ALWAYS Count (`orch_to_sched_=true`) | Description |
-| ----- | -------------- | ----------------------------------------- | ---------------------------------------- | ----------- |
+| Level | Macro Settings | LOG_INFO_V9 Count (`orch_to_sched_=false`) | LOG_INFO_V9 Count (`orch_to_sched_=true`) | Description |
+| ----- | -------------- | ------------------------------------------ | ----------------------------------------- | ----------- |
 | 0 | `PTO2_PROFILING=0` | 0 | 0 | No timing output |
 | 1 | `PTO2_PROFILING=1` | 7 | 8 | Timing timestamps + scheduler summary |
 | 2 | `+PTO2_SCHED_PROFILING=1` | — | — | Scheduler detailed phase breakdown |

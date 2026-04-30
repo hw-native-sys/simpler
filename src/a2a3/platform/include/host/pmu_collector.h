@@ -212,7 +212,7 @@ inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
     int val = std::atoi(pmu_env);
     if (val > 0 && pmu_resolve_event_config_a2a3(static_cast<PmuEventType>(val)) != nullptr) {
         resolved = static_cast<PmuEventType>(val);
-        LOG_INFO("PMU event type set to %u from SIMPLER_PMU_EVENT_TYPE", static_cast<uint32_t>(resolved));
+        LOG_INFO_V0("PMU event type set to %u from SIMPLER_PMU_EVENT_TYPE", static_cast<uint32_t>(resolved));
         return resolved;
     }
     LOG_WARN("Invalid SIMPLER_PMU_EVENT_TYPE=%s, using default (PIPE_UTILIZATION=%u)", pmu_env, PMU_EVENT_TYPE_DEFAULT);

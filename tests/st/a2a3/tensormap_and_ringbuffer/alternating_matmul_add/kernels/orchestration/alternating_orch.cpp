@@ -63,7 +63,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     int matmul_batch = static_cast<int>(orch_args.scalar(3));
     int add_batch = static_cast<int>(orch_args.scalar(4));
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d", batch, M, N, matmul_batch,
         add_batch
     );
@@ -121,7 +121,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         }
     }
 
-    LOG_ALWAYS("[alternating_orch] Submitted %d matmul groups and %d add groups", total_matmul, total_add);
+    LOG_INFO_V9("[alternating_orch] Submitted %d matmul groups and %d add groups", total_matmul, total_add);
 }
 
 }  // extern "C"

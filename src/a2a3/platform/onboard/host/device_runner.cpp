@@ -359,7 +359,7 @@ int DeviceRunner::prepare_run_context(int device_id) {
         return rc;
     }
 
-    LOG_INFO("DeviceRunner: device=%d set, streams created", device_id);
+    LOG_INFO_V0("DeviceRunner: device=%d set, streams created", device_id);
     return 0;
 }
 
@@ -413,7 +413,7 @@ int DeviceRunner::ensure_binaries_loaded(
     }
 
     binaries_loaded_ = true;
-    LOG_INFO("DeviceRunner: binaries loaded");
+    LOG_INFO_V0("DeviceRunner: binaries loaded");
     return 0;
 }
 
@@ -460,7 +460,7 @@ int DeviceRunner::run(
             return -1;
         }
     } else {
-        LOG_INFO(
+        LOG_INFO_V0(
             "All %d threads are orchestrators, cores will be assigned after orchestration completes", launch_aicpu_num
         );
         // Post-transition: all threads become schedulers
@@ -613,7 +613,7 @@ int DeviceRunner::run(
         }
     });
 
-    LOG_INFO("=== Initialize runtime args ===");
+    LOG_INFO_V0("=== Initialize runtime args ===");
     // Resolve the orchestration SO into a device-resident buffer and refresh
     // runtime metadata before the Runtime struct is uploaded to device.
     rc = prepare_orch_so(runtime);
@@ -629,6 +629,10 @@ int DeviceRunner::run(
         return rc;
     }
 
+    // Publish log config to AICPU via KernelArgs (severity floor + INFO verbosity).
+    kernel_args_.args.log_level = static_cast<uint32_t>(log_level_);
+    kernel_args_.args.log_info_v = static_cast<uint32_t>(log_info_v_);
+
     rc = kernel_args_.init_ffts_base_addr();
     if (rc != 0) {
         LOG_ERROR("init_ffts_base_addr failed: %d", rc);
@@ -642,7 +646,7 @@ int DeviceRunner::run(
         return rc;
     }
 
-    LOG_INFO("=== launch_aicpu_kernel DynTileFwkKernelServerInit ===");
+    LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServerInit ===");
     // Launch AICPU init kernel
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
     if (rc != 0) {
@@ -650,7 +654,7 @@ int DeviceRunner::run(
         return rc;
     }
 
-    LOG_INFO("=== launch_aicpu_kernel DynTileFwkKernelServer ===");
+    LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServer ===");
     // Launch AICPU main kernel (over-launch for affinity gate)
     rc = launch_aicpu_kernel(
         stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
@@ -660,7 +664,7 @@ int DeviceRunner::run(
         return rc;
     }
 
-    LOG_INFO("=== launch_aicore_kernel ===");
+    LOG_INFO_V0("=== launch_aicore_kernel ===");
     // Launch AICore kernel (pass device copy of KernelArgs)
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
     if (rc != 0) {
@@ -720,7 +724,7 @@ int DeviceRunner::run(
             }
         });
 
-        LOG_INFO("=== rtStreamSynchronize stream_aicpu_ ===");
+        LOG_INFO_V0("=== rtStreamSynchronize stream_aicpu_ ===");
         // Synchronize streams
         rc = rtStreamSynchronize(stream_aicpu_);
         if (rc != 0) {
@@ -728,7 +732,7 @@ int DeviceRunner::run(
             return rc;
         }
 
-        LOG_INFO("=== rtStreamSynchronize stream_aicore_ ===");
+        LOG_INFO_V0("=== rtStreamSynchronize stream_aicore_ ===");
         rc = rtStreamSynchronize(stream_aicore_);
         if (rc != 0) {
             LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
@@ -798,7 +802,7 @@ int DeviceRunner::prepare_orch_so(Runtime &runtime) {
     const uint64_t new_hash = simpler::common::utils::elf_build_id_64(host_so_data, host_so_size);
 
     if (new_hash == cached_orch_so_hash_ && dev_orch_so_buffer_ != nullptr) {
-        LOG_INFO("Orch SO cache hit (hash=0x%lx, %zu bytes)", new_hash, host_so_size);
+        LOG_INFO_V0("Orch SO cache hit (hash=0x%lx, %zu bytes)", new_hash, host_so_size);
         runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/false);
         return 0;
     }
@@ -836,7 +840,7 @@ int DeviceRunner::prepare_orch_so(Runtime &runtime) {
 
     cached_orch_so_hash_ = new_hash;
     runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/true);
-    LOG_INFO("Orch SO cache miss (hash=0x%lx, %zu bytes uploaded)", new_hash, host_so_size);
+    LOG_INFO_V0("Orch SO cache miss (hash=0x%lx, %zu bytes uploaded)", new_hash, host_so_size);
     return 0;
 }
 
@@ -960,7 +964,7 @@ int DeviceRunner::finalize() {
     worker_count_ = 0;
     aicore_kernel_binary_.clear();
 
-    LOG_INFO("DeviceRunner finalized");
+    LOG_INFO_V0("DeviceRunner finalized");
     return rc;
 }
 
@@ -1050,7 +1054,7 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
     // Return cached callable address if already uploaded
     auto it = func_id_to_addr_.find(func_id);
     if (it != func_id_to_addr_.end()) {
-        LOG_INFO("Kernel func_id=%d already uploaded, returning cached address", func_id);
+        LOG_INFO_V0("Kernel func_id=%d already uploaded, returning cached address", func_id);
         return it->second;
     }
 

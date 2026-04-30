@@ -93,7 +93,7 @@ void DumpMemoryManager::process_dump_entry(
     info.buffer_seq = entry.buffer_seq;
 
     {
-        std::lock_guard<std::mutex> lock(ready_mutex_);
+        std::scoped_lock lock(ready_mutex_);
         ready_queue_.push(info);
     }
     ready_cv_.notify_one();
@@ -173,7 +173,7 @@ void DumpMemoryManager::mgmt_loop() {
 
         // Proactively replenish free queues from recycled pool even when no new ready entries
         {
-            std::lock_guard<std::mutex> lock(done_mutex_);
+            std::scoped_lock lock(done_mutex_);
             while (!done_queue_.empty()) {
                 void *dev_ptr = done_queue_.front();
                 done_queue_.pop();
@@ -225,7 +225,7 @@ void DumpMemoryManager::start(
     device_id_ = device_id;
     set_device_cb_ = set_device_cb;
 
-    LOG_INFO("Starting dump memory manager (device=%d, threads=%d)", device_id, num_dump_threads);
+    LOG_INFO_V0("Starting dump memory manager (device=%d, threads=%d)", device_id, num_dump_threads);
     running_.store(true);
     mgmt_thread_ = std::thread(&DumpMemoryManager::mgmt_loop, this);
 }
@@ -238,7 +238,7 @@ void DumpMemoryManager::stop() {
 }
 
 bool DumpMemoryManager::try_pop_ready(DumpReadyBufferInfo &info) {
-    std::lock_guard<std::mutex> lock(ready_mutex_);
+    std::scoped_lock lock(ready_mutex_);
     if (ready_queue_.empty()) {
         return false;
     }
@@ -260,7 +260,7 @@ bool DumpMemoryManager::wait_pop_ready(DumpReadyBufferInfo &info, std::chrono::m
 }
 
 void DumpMemoryManager::notify_copy_done(void *dev_buffer_ptr) {
-    std::lock_guard<std::mutex> lock(done_mutex_);
+    std::scoped_lock lock(done_mutex_);
     done_queue_.push(dev_buffer_ptr);
 }
 
@@ -344,7 +344,7 @@ int TensorDumpCollector::initialize(
         state->arena_write_offset = 0;
         state->dropped_record_count = 0;
 
-        LOG_INFO(
+        LOG_INFO_V0(
             "Thread %d: dump arena allocated (dev=%p, host=%p, size=%lu MB)", t, ai.dev_ptr, ai.host_ptr,
             arena_size / (1024 * 1024)
         );
@@ -376,7 +376,7 @@ int TensorDumpCollector::initialize(
         }
     }
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Tensor dump initialized: %d threads, arena=%lu MB/thread, %d buffers/thread", num_dump_threads,
         arena_size / (1024 * 1024), PLATFORM_DUMP_BUFFERS_PER_THREAD
     );
@@ -490,14 +490,14 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         DumpedTensor meta = dt;
         meta.bytes.clear();
         {
-            std::lock_guard<std::mutex> lock(collected_mutex_);
+            std::scoped_lock lock(collected_mutex_);
             collected_.push_back(std::move(meta));
         }
 
         // Enqueue full tensor (with payload) to writer thread
         if (has_payload) {
             {
-                std::lock_guard<std::mutex> lock(write_mutex_);
+                std::scoped_lock lock(write_mutex_);
                 write_queue_.push(std::move(dt));
             }
             write_cv_.notify_one();
@@ -573,7 +573,7 @@ void TensorDumpCollector::poll_and_collect(const std::string &output_prefix_) {
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_time).count() >= 5) {
                 auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-                LOG_INFO(
+                LOG_INFO_V0(
                     "Collecting: %zu tensors, %.1f GB written (%lds)", collected_.size(), bytes_written_.load() / 1e9,
                     elapsed_s
                 );
@@ -625,7 +625,7 @@ void TensorDumpCollector::poll_and_collect(const std::string &output_prefix_) {
         }
         auto elapsed_s =
             std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start_time).count();
-        LOG_INFO(
+        LOG_INFO_V0(
             "Writing to disk: %.1f GB written, %zu tensors remaining (%lds)", bytes_written_.load() / 1e9,
             write_queue_.size(), elapsed_s
         );
@@ -636,7 +636,7 @@ void TensorDumpCollector::poll_and_collect(const std::string &output_prefix_) {
 
     auto elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_time).count();
-    LOG_INFO(
+    LOG_INFO_V0(
         "Collected %zu tensors, wrote %.1f GB to disk (%.1fs)", collected_.size(), bytes_written_.load() / 1e9,
         elapsed_ms / 1000.0
     );
@@ -743,7 +743,7 @@ int TensorDumpCollector::export_dump_files() {
         return static_cast<uint8_t>(a.role) < static_cast<uint8_t>(b.role);
     });
 
-    LOG_INFO("Writing JSON manifest for %zu tensors...", collected_.size());
+    LOG_INFO_V0("Writing JSON manifest for %zu tensors...", collected_.size());
 
     uint32_t num_before_dispatch = 0;
     uint32_t num_after_completion = 0;
@@ -820,7 +820,7 @@ int TensorDumpCollector::export_dump_files() {
 
     auto export_end = std::chrono::steady_clock::now();
     auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(export_end - export_start).count();
-    LOG_INFO("Wrote JSON manifest (%zu tensors) to %s (%ldms)", collected_.size(), run_dir_.c_str(), total_ms);
+    LOG_INFO_V0("Wrote JSON manifest (%zu tensors) to %s (%ldms)", collected_.size(), run_dir_.c_str(), total_ms);
 
     if (total_truncated_count_ > 0 || total_dropped_record_count_ > 0 || total_overwrite_count_ > 0) {
         LOG_WARN(
@@ -888,7 +888,7 @@ int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, DumpFree
 
     // Free buffers still queued for host processing
     {
-        std::lock_guard<std::mutex> lock(memory_manager_.ready_mutex_);
+        std::scoped_lock lock(memory_manager_.ready_mutex_);
         while (!memory_manager_.ready_queue_.empty()) {
             release_meta_buffer(memory_manager_.ready_queue_.front().dev_buffer_ptr);
             memory_manager_.ready_queue_.pop();
@@ -897,7 +897,7 @@ int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, DumpFree
 
     // Free buffers held by memory manager (done_queue + recycled pool)
     {
-        std::lock_guard<std::mutex> lock(memory_manager_.done_mutex_);
+        std::scoped_lock lock(memory_manager_.done_mutex_);
         while (!memory_manager_.done_queue_.empty()) {
             void *ptr = memory_manager_.done_queue_.front();
             memory_manager_.done_queue_.pop();

@@ -63,7 +63,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     int grid_m = 1;
     int grid_n = 1;
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "[bgemm_orch] tile_size: %d, grid_m: %d, grid_n: %d, grid_k: %d, num_groups: %d, incore_loop: %d", tile_size,
         grid_m, grid_n, grid_k, num_groups, incore_loop
     );
@@ -112,7 +112,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         }
     }
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "[bgemm_orch] Submitted %d gemm tasks and %d add tasks (%d total)", total_gemm, total_add,
         total_gemm + total_add
     );

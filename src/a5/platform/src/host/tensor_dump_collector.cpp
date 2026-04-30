@@ -61,7 +61,7 @@ int TensorDumpCollector::initialize(
     dump_buffer_bytes_ = calc_dump_buffer_size(capacity);
     uint64_t arena_size = calc_dump_arena_size();
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Initializing tensor dump: %d threads, %d records/buffer, %zu bytes/buffer, %lu bytes/arena", num_dump_threads,
         capacity, dump_buffer_bytes_, arena_size
     );
@@ -151,7 +151,7 @@ int TensorDumpCollector::initialize(
         return rc;
     }
 
-    LOG_INFO("Tensor dump initialized: %d threads, header at %p", num_dump_threads, setup_header_dev_);
+    LOG_INFO_V0("Tensor dump initialized: %d threads, header at %p", num_dump_threads, setup_header_dev_);
     return 0;
 }
 
@@ -160,7 +160,7 @@ int TensorDumpCollector::collect_all() {
         return -1;
     }
 
-    LOG_INFO("Collecting tensor dump data from %d threads...", num_dump_threads_);
+    LOG_INFO_V0("Collecting tensor dump data from %d threads...", num_dump_threads_);
 
     uint64_t arena_size = calc_dump_arena_size();
 
@@ -273,10 +273,10 @@ int TensorDumpCollector::collect_all() {
             collected_.push_back(std::move(dt));
         }
 
-        LOG_INFO("Thread %d: collected %u records (dropped=%u)", t, count, dropped);
+        LOG_INFO_V0("Thread %d: collected %u records (dropped=%u)", t, count, dropped);
     }
 
-    LOG_INFO("Tensor dump collection complete: %zu tensors total", collected_.size());
+    LOG_INFO_V0("Tensor dump collection complete: %zu tensors total", collected_.size());
     return 0;
 }
 
@@ -395,7 +395,7 @@ int TensorDumpCollector::export_dump_files(const std::string &output_path) {
     }
 
     // Write JSON manifest
-    LOG_INFO("Writing JSON manifest for %zu tensors...", collected_.size());
+    LOG_INFO_V0("Writing JSON manifest for %zu tensors...", collected_.size());
     std::ofstream json(run_dir / (base_name + ".json"));
     json << "{\n";
     json << "  \"run_dir\": \"" << base_name << "\",\n";
@@ -444,7 +444,7 @@ int TensorDumpCollector::export_dump_files(const std::string &output_path) {
 
     auto export_end = std::chrono::steady_clock::now();
     auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(export_end - export_start).count();
-    LOG_INFO(
+    LOG_INFO_V0(
         "Wrote dump files (%zu tensors, %lu bytes payload) to %s (%ldms)", collected_.size(), bin_offset,
         run_dir.c_str(), total_ms
     );
@@ -503,6 +503,6 @@ int TensorDumpCollector::finalize() {
     num_dump_threads_ = 0;
     device_id_ = -1;
 
-    LOG_INFO("TensorDumpCollector finalized");
+    LOG_INFO_V0("TensorDumpCollector finalized");
     return 0;
 }

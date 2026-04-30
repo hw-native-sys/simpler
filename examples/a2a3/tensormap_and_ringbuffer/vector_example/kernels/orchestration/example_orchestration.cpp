@@ -59,7 +59,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     Tensor ext_f = from_tensor_arg(orch_args.tensor(2));
 
     uint32_t SIZE = orch_args.tensor(0).shapes[0];
-    LOG_INFO("===============SIZE=%u", SIZE);
+    LOG_INFO_V0("===============SIZE=%u", SIZE);
 
     uint32_t inter_shapes[1] = {SIZE};
     TensorCreateInfo inter_ci(inter_shapes, 1, DataType::FLOAT32);

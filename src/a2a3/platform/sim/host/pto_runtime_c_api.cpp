@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/unified_log.h"
+#include "host_log.h"
 #include "cpu_sim_context.h"
 #include "device_runner.h"
 #include "runtime.h"
@@ -269,6 +270,16 @@ void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, si
     if (runtime == NULL) return;
     Runtime *r = static_cast<Runtime *>(runtime);
     r->record_tensor_pair(host_ptr, dev_ptr, size);
+}
+
+void simpler_init(DeviceContextHandle ctx, int log_level, int log_info_v) {
+    if (ctx == NULL) return;
+    // No CANN dlog on sim.
+    HostLogger::get_instance().set_level(static_cast<simpler::log::LogLevel>(log_level));
+    HostLogger::get_instance().set_info_v(log_info_v);
+    DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
+    runner->set_log_level(log_level);
+    runner->set_log_info_v(log_info_v);
 }
 
 }  // extern "C"

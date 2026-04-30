@@ -159,7 +159,7 @@ int PmuCollectorHost::init(
     }
 
     initialized_ = true;
-    LOG_INFO(
+    LOG_INFO_V0(
         "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
         num_threads, static_cast<unsigned long>(*kernel_args_pmu_data_base), csv_path_.c_str()
     );
@@ -198,7 +198,7 @@ void PmuCollectorHost::write_buffer_to_csv(int core_id, int thread_idx, const vo
         return;
     }
 
-    std::lock_guard<std::mutex> lock(csv_mutex_);
+    std::scoped_lock lock(csv_mutex_);
     ensure_csv_open_unlocked();
     if (!csv_file_.is_open()) {
         return;
@@ -319,7 +319,7 @@ void PmuCollectorHost::poll_and_collect() {
         }
     }
 
-    LOG_INFO("PMU collector thread exiting");
+    LOG_INFO_V0("PMU collector thread exiting");
 }
 
 // ---------------------------------------------------------------------------
@@ -410,14 +410,14 @@ void PmuCollectorHost::drain_remaining_buffers() {
             static_cast<unsigned long>(total_device)
         );
     } else {
-        LOG_INFO(
+        LOG_INFO_V0(
             "PMU collector: record counts match (collected=%lu, dropped=%lu, device_total=%lu)",
             static_cast<unsigned long>(total_collected_), static_cast<unsigned long>(dropped_device),
             static_cast<unsigned long>(total_device)
         );
     }
 
-    LOG_INFO("PMU collector: drain_remaining_buffers complete");
+    LOG_INFO_V0("PMU collector: drain_remaining_buffers complete");
 }
 
 // ---------------------------------------------------------------------------
@@ -460,5 +460,5 @@ void PmuCollectorHost::finalize(PmuUnregisterCallback unregister_cb, PmuFreeCall
     }
 
     initialized_ = false;
-    LOG_INFO("PMU collector finalized");
+    LOG_INFO_V0("PMU collector finalized");
 }

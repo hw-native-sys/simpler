@@ -12,13 +12,20 @@
  * @file device_log.h
  * @brief Unified Device Logging Interface for AICPU
  *
- * Provides logging macros that work on both real hardware (using CANN dlog)
- * and simulation (using printf). Uses conditional compilation to select
- * the appropriate backend with a layered design to minimize code duplication.
+ * Layered design:
+ *   - Low-level dev_log_*() functions are platform-specific (CANN dlog on
+ *     real hardware, fprintf(stderr,...) in simulation).
+ *   - Severity gating uses the same flag table on both backends:
+ *     onboard fills it from CheckLogLevel(AICPU,...) (CANN-managed),
+ *     sim fills it from set_log_level() called by the host (dlsym path).
+ *   - INFO verbosity gating (V0..V9) is simpler-managed on both backends:
+ *     g_log_info_v populated from set_log_info_v(); onboard receives the
+ *     value via KernelArgs.log_info_v at kernel entry, sim receives it via
+ *     dlsym from the host runner.
  *
  * Platform Support:
- * - a2a3: Real hardware with CANN dlog API
- * - a2a3sim: Host-based simulation using printf
+ * - a5     : Real hardware with CANN dlog API
+ * - a5sim  : Host-based simulation using fprintf(stderr,...)
  */
 
 #ifndef PLATFORM_DEVICE_LOG_H_
@@ -40,85 +47,82 @@
 #endif
 
 // =============================================================================
-// Log Enable Flags
+// Severity enable flags (defined in platform-specific device_log.cpp)
 // =============================================================================
 
-// Unified: flags defined in platform-specific device_log.cpp
 extern bool g_is_log_enable_debug;
 extern bool g_is_log_enable_info;
 extern bool g_is_log_enable_warn;
 extern bool g_is_log_enable_error;
 
+// INFO verbosity threshold (0..9). Default 5.
+extern int g_log_info_v;
+
 // Platform constant (defined in platform-specific device_log.cpp)
 extern const char *TILE_FWK_DEVICE_MACHINE;
 
 // =============================================================================
-// Platform-Specific Logging Functions (Low-Level Layer)
+// Configuration setters (called by AICPU kernel init from KernelArgs)
 // =============================================================================
 
-// Platform-specific logging functions (implemented in device_log.cpp)
+// Severity. Levels are CANN-aligned ints: DEBUG=0, INFO=1, WARN=2, ERROR=3, NUL=4.
+// Onboard ignores this (CANN dlog is the source); sim uses it to set the flag table.
+extern "C" void set_log_level(int level);
+extern "C" void set_log_info_v(int v);
+extern "C" int get_log_info_v();
+
+// =============================================================================
+// Platform-specific logging functions (low-level layer)
+// =============================================================================
+
 void dev_log_debug(const char *func, const char *fmt, ...);
-void dev_log_info(const char *func, const char *fmt, ...);
 void dev_log_warn(const char *func, const char *fmt, ...);
 void dev_log_error(const char *func, const char *fmt, ...);
-void dev_log_always(const char *func, const char *fmt, ...);
+void dev_log_info_v(int v, const char *func, const char *fmt, ...);
 
 // =============================================================================
-// High-Level Logging Macros (Platform-Independent Layer)
+// High-level macros (platform-independent layer)
 // =============================================================================
 
 #define D_DEV_LOGD(MODE_NAME, fmt, ...)                      \
     do {                                                     \
-        if (is_log_enable_debug()) {                         \
+        if (g_is_log_enable_debug) {                         \
             dev_log_debug(__FUNCTION__, fmt, ##__VA_ARGS__); \
         }                                                    \
     } while (0)
 
-#define D_DEV_LOGI(MODE_NAME, fmt, ...)                     \
-    do {                                                    \
-        if (is_log_enable_info()) {                         \
-            dev_log_info(__FUNCTION__, fmt, ##__VA_ARGS__); \
-        }                                                   \
-    } while (0)
-
 #define D_DEV_LOGW(MODE_NAME, fmt, ...)                     \
     do {                                                    \
-        if (is_log_enable_warn()) {                         \
+        if (g_is_log_enable_warn) {                         \
             dev_log_warn(__FUNCTION__, fmt, ##__VA_ARGS__); \
         }                                                   \
     } while (0)
 
 #define D_DEV_LOGE(MODE_NAME, fmt, ...)                      \
     do {                                                     \
-        if (is_log_enable_error()) {                         \
+        if (g_is_log_enable_error) {                         \
             dev_log_error(__FUNCTION__, fmt, ##__VA_ARGS__); \
         }                                                    \
     } while (0)
 
-// =============================================================================
-// Convenience Macros
-// =============================================================================
+#define D_DEV_LOGI_V(MODE_NAME, V, fmt, ...)                       \
+    do {                                                           \
+        if (g_is_log_enable_info && (V) >= g_log_info_v) {         \
+            dev_log_info_v((V), __FUNCTION__, fmt, ##__VA_ARGS__); \
+        }                                                          \
+    } while (0)
 
 #define DEV_DEBUG(fmt, args...) D_DEV_LOGD(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
-#define DEV_INFO(fmt, args...) D_DEV_LOGI(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
 #define DEV_WARN(fmt, args...) D_DEV_LOGW(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
 #define DEV_ERROR(fmt, args...) D_DEV_LOGE(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
-#define DEV_ALWAYS(fmt, args...) dev_log_always(__FUNCTION__, fmt, ##args)
+#define DEV_INFO_V(v, fmt, args...) D_DEV_LOGI_V(TILE_FWK_DEVICE_MACHINE, v, fmt, ##args)
 
 // =============================================================================
-// Platform-Specific Assertion
-// =============================================================================
-
-// =============================================================================
-// Assertion (Unified: both platforms use assert)
+// Assertions
 // =============================================================================
 
 #include <cassert>
 #define DEV_ASSERT(condition) assert(condition)
-
-// =============================================================================
-// Conditional Check Macros
-// =============================================================================
 
 #define DEV_CHECK_COND_RETURN_VOID(cond, fmt, ...) \
     do {                                           \
@@ -151,7 +155,6 @@ void dev_log_always(const char *func, const char *fmt, ...);
 // Helper Functions
 // =============================================================================
 
-// Check if log level is enabled (inline for efficiency)
 inline bool is_log_enable_debug() { return g_is_log_enable_debug; }
 inline bool is_log_enable_info() { return g_is_log_enable_info; }
 inline bool is_log_enable_warn() { return g_is_log_enable_warn; }

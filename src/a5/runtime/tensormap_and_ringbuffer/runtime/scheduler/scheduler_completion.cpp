@@ -136,7 +136,7 @@ void SchedulerContext::complete_slot_task(
         if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         } else {
-            DEV_ALWAYS("Thread %d: release", thread_idx);
+            DEV_INFO_V(9, "Thread %d: release", thread_idx);
             while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
                 int32_t fe =

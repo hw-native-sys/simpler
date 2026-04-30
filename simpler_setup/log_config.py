@@ -8,43 +8,87 @@
 # -----------------------------------------------------------------------------------------------------------
 """Shared CLI log-level helper.
 
-Used by SceneTestCase.run_module (`python test_*.py`) so the standalone entry
-point wires `--log-level` the same way as the rest of the codebase and defaults
-to INFO. Also propagates via `PTO_LOG_LEVEL` env var so subprocesses spawned
-by the parallel scheduler inherit the level.
+The CLI accepts a string from {debug, V0..V9, info, warn, error, null} or a
+raw integer; we map it to a Python `logging` level and call
+`logging.getLogger("simpler").setLevel(...)`. The C++ side picks up the same
+level via `simpler_init` at `Worker.init()` time (one-shot snapshot) — there
+is no env var; the Python "simpler" logger is the single source of truth.
 
 pytest is intentionally not touched — it has its own `--log-cli-level` and
 pyproject `log_cli_level` knobs.
 """
 
+from __future__ import annotations
+
 import logging
-import os
 
-LOG_LEVEL_CHOICES = ["off", "error", "warn", "info", "debug"]
-DEFAULT_LOG_LEVEL = "info"
-
-_LEVEL_MAP = {
-    "off": logging.CRITICAL + 1,
-    "error": logging.ERROR,
-    "warn": logging.WARNING,
-    "info": logging.INFO,
+# Recognised level names → Python integer level.
+# V0..V9 are simpler's INFO sub-tiers (15..24); INFO == V5 == 20.
+_NAME_TO_LEVEL = {
     "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warn": logging.WARNING,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+    "null": 60,
+    "v0": 15,
+    "v1": 16,
+    "v2": 17,
+    "v3": 18,
+    "v4": 19,
+    "v5": 20,
+    "v6": 21,
+    "v7": 22,
+    "v8": 23,
+    "v9": 24,
 }
 
+LOG_LEVEL_CHOICES = [
+    "debug",
+    "v0",
+    "v1",
+    "v2",
+    "v3",
+    "v4",
+    "v5",
+    "v6",
+    "v7",
+    "v8",
+    "v9",
+    "info",
+    "warn",
+    "error",
+    "null",
+]
+DEFAULT_LOG_LEVEL = "v5"  # = INFO = simpler default threshold
 
-def configure_logging(log_level: str = DEFAULT_LOG_LEVEL) -> None:
-    """Configure root logger for a CLI entry point.
+
+def parse_level(level: str | int) -> int:
+    """Translate a CLI-style level into a Python logger level integer.
+
+    Accepts either a name from `LOG_LEVEL_CHOICES` (case-insensitive) or a
+    raw integer. Unknown names fall back to V5 (INFO) — silently — to match
+    the previous behaviour that mapped unknown strings to INFO.
+    """
+    if isinstance(level, int):
+        return level
+    name = str(level).lower()
+    return _NAME_TO_LEVEL.get(name, _NAME_TO_LEVEL[DEFAULT_LOG_LEVEL])
+
+
+def configure_logging(log_level: str | int = DEFAULT_LOG_LEVEL) -> None:
+    """Configure the simpler-namespaced logger from a CLI-style level.
 
     Args:
-        log_level: one of "off" / "error" / "warn" / "info" / "debug"
-            (case-insensitive). Unknown values fall back to INFO.
+        log_level: name (case-insensitive) or raw integer; see LOG_LEVEL_CHOICES.
     """
-    log_level = log_level.lower()
-    level = _LEVEL_MAP.get(log_level, logging.INFO)
+    level = parse_level(log_level)
+    simpler_logger = logging.getLogger("simpler")
+    simpler_logger.setLevel(level)
+    # Ensure root has at least one handler so the message reaches stderr;
+    # this matches the prior behaviour for first-time CLI invocations.
     root = logging.getLogger()
-    root.setLevel(level)
     if not root.handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
         root.addHandler(handler)
-    os.environ["PTO_LOG_LEVEL"] = log_level

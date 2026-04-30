@@ -1200,8 +1200,8 @@ class SceneTestCase:
         parser.add_argument(
             "--log-level",
             choices=LOG_LEVEL_CHOICES,
-            default=os.environ.get("PTO_LOG_LEVEL", DEFAULT_LOG_LEVEL),
-            help=f"Root logger level (default: $PTO_LOG_LEVEL or {DEFAULT_LOG_LEVEL})",
+            default=DEFAULT_LOG_LEVEL,
+            help=f"Simpler logger level (debug/V0..V9/info/warn/error/null; default {DEFAULT_LOG_LEVEL})",
         )
         args = parser.parse_args()
         configure_logging(args.log_level)

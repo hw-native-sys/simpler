@@ -12,19 +12,14 @@
  * @file host_log.h
  * @brief Unified Host Logging System
  *
- * Provides thread-safe logging interface for Host-side C++ code.
- * Integrates with Python logging system via environment variables.
+ * Two orthogonal axes:
+ *   - Severity: DEBUG/INFO/WARN/ERROR/NUL (matches CANN dlog 1:1)
+ *   - INFO verbosity: integer 0..9 (only meaningful when severity == INFO)
  *
- * Environment Variables:
- * - PTO_LOG_LEVEL: off/error/warn/info/debug (default: info)
- * - PTO_LOG_FILE: Optional log file path (default: stdout/stderr)
- *
- * Log Levels (1-to-1 mapping with Python logging):
- * - OFF: Suppress everything, including ALWAYS
- * - ERROR: Only errors and failures
- * - WARN: Warnings and above
- * - INFO: Key progress steps and above (default)
- * - DEBUG: Detailed debug info and above
+ * Configuration is pushed in from Python via nanobind binding
+ * `set_host_log_config(severity, info_v)`; this module never reads env vars.
+ * The Python-facing integer level layout (V0=15..V9=24, INFO=20=V5, etc.)
+ * lives in the Python module — C++ only stores the two axes separately.
  */
 
 #ifndef PLATFORM_HOST_LOG_H_
@@ -32,94 +27,65 @@
 
 #include <cstdarg>
 #include <cstdio>
-#include <fstream>
 #include <mutex>
-#include <string>
 
-// =============================================================================
-// Log Level Enum
-// =============================================================================
+namespace simpler::log {
 
-enum class HostLogLevel {
-    OFF = -2,     // suppress everything (including ALWAYS)
-    ALWAYS = -1,  // always logging
-    ERROR = 0,    // error level only
-    WARN = 1,     // warn level and above
-    INFO = 2,     // info level and above (default)
-    DEBUG = 3     // debug level (all messages)
+// Severity (matches CANN dlog enum 1:1)
+enum class LogLevel : int {
+    DEBUG = 0,
+    INFO = 1,
+    WARN = 2,
+    ERROR = 3,
+    NUL = 4,
 };
 
-// =============================================================================
-// HostLogger Class (Singleton)
-// =============================================================================
+// Defaults — single source of truth shared with Python via nanobind binding.
+// The full integer level layout (DEBUG=10, V0..V9=15..24, WARN=30, etc.)
+// is Python-side; C++ only stores severity + verbosity as separate axes.
+constexpr int kDefaultInfoV = 5;       // V5
+constexpr int kDefaultThreshold = 20;  // V5 = Python INFO
+
+}  // namespace simpler::log
 
 class HostLogger {
 public:
-    // Get singleton instance
     static HostLogger &get_instance();
 
-    // Log a message with specified level
-    void log(HostLogLevel level, const char *format, ...);
+    // Severity-only entry (DEBUG/WARN/ERROR). NOTE: caller must NOT pass INFO here;
+    // INFO goes through log_info_v with a verbosity tier.
+    void log(simpler::log::LogLevel level, const char *func, const char *fmt, ...);
 
-    // Check if a log level is enabled
-    bool is_enabled(HostLogLevel level) const;
+    // INFO with verbosity tier (v ∈ [0, 9]).
+    void log_info_v(int v, const char *func, const char *fmt, ...);
 
-    // Reinitialize from environment (useful if env vars change)
-    void reinitialize();
+    // va_list-taking primitives — used by unified_log_* adapters to forward
+    // a caller's variadic args without an intermediate vsnprintf-to-buffer
+    // round-trip. Caller is responsible for `va_start` / `va_end`.
+    void vlog(simpler::log::LogLevel level, const char *func, const char *fmt, va_list args);
+    void vlog_info_v(int v, const char *func, const char *fmt, va_list args);
+
+    void set_level(simpler::log::LogLevel level);
+    void set_info_v(int v);
+
+    bool is_severity_enabled(simpler::log::LogLevel level) const;
+    bool is_info_v_enabled(int v) const;
 
 private:
     HostLogger();
-    ~HostLogger();
+    ~HostLogger() = default;
 
-    // Delete copy/move constructors
     HostLogger(const HostLogger &) = delete;
     HostLogger &operator=(const HostLogger &) = delete;
     HostLogger(HostLogger &&) = delete;
     HostLogger &operator=(HostLogger &&) = delete;
 
-    // Initialize from environment variables
-    void init_from_env();
+    const char *level_name(simpler::log::LogLevel level) const;
+    void emit(const char *level_tag, const char *func, const char *fmt, va_list args);
 
-    // Get level name string
-    const char *get_level_name(HostLogLevel level) const;
-
-    // Get output file handle (FILE* for stdout/stderr or file)
-    FILE *get_output_file(HostLogLevel level);
-
-    // Member variables
-    HostLogLevel current_level_;
-    std::string log_file_path_;
-    FILE *log_file_handle_;
+    simpler::log::LogLevel current_level_;
+    int current_info_v_;
     std::mutex mutex_;
-    bool initialized_;
 };
-
-// =============================================================================
-// Logging Macros (High-Level Interface)
-// =============================================================================
-
-#define HOST_LOG_ERROR(fmt, ...)                                                 \
-    do {                                                                         \
-        HostLogger::get_instance().log(HostLogLevel::ERROR, fmt, ##__VA_ARGS__); \
-    } while (0)
-
-#define HOST_LOG_WARN(fmt, ...)                                                 \
-    do {                                                                        \
-        HostLogger::get_instance().log(HostLogLevel::WARN, fmt, ##__VA_ARGS__); \
-    } while (0)
-
-#define HOST_LOG_INFO(fmt, ...)                                                     \
-    do {                                                                            \
-        if (HostLogger::get_instance().is_enabled(HostLogLevel::INFO)) {            \
-            HostLogger::get_instance().log(HostLogLevel::INFO, fmt, ##__VA_ARGS__); \
-        }                                                                           \
-    } while (0)
-
-#define HOST_LOG_DEBUG(fmt, ...)                                                     \
-    do {                                                                             \
-        if (HostLogger::get_instance().is_enabled(HostLogLevel::DEBUG)) {            \
-            HostLogger::get_instance().log(HostLogLevel::DEBUG, fmt, ##__VA_ARGS__); \
-        }                                                                            \
-    } while (0)
 
 #endif  // PLATFORM_HOST_LOG_H_

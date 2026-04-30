@@ -15,13 +15,10 @@
 
 #include "host_log.h"
 
-#include <cstdlib>
+#include <cstdio>
 #include <cstring>
-#include <ctime>
 
-// =============================================================================
-// HostLogger Implementation
-// =============================================================================
+using simpler::log::LogLevel;
 
 HostLogger &HostLogger::get_instance() {
     static HostLogger instance;
@@ -29,151 +26,80 @@ HostLogger &HostLogger::get_instance() {
 }
 
 HostLogger::HostLogger() :
-    current_level_(HostLogLevel::INFO),
-    log_file_path_(""),
-    log_file_handle_(nullptr),
-    initialized_(false) {
-    init_from_env();
+    current_level_(LogLevel::INFO),
+    current_info_v_(simpler::log::kDefaultInfoV) {}
+
+void HostLogger::set_level(LogLevel level) {
+    std::scoped_lock lock(mutex_);
+    current_level_ = level;
 }
 
-HostLogger::~HostLogger() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (log_file_handle_ != nullptr && log_file_handle_ != stdout && log_file_handle_ != stderr) {
-        fclose(log_file_handle_);
-        log_file_handle_ = nullptr;
-    }
+void HostLogger::set_info_v(int v) {
+    if (v < 0) v = 0;
+    if (v > 9) v = 9;
+    std::scoped_lock lock(mutex_);
+    current_info_v_ = v;
 }
 
-void HostLogger::init_from_env() {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // Parse PTO_LOG_LEVEL environment variable
-    const char *level_str = std::getenv("PTO_LOG_LEVEL");
-    if (level_str != nullptr) {
-        std::string level(level_str);
-
-        // Convert to lowercase for comparison
-        for (char &c : level) {
-            c = std::tolower(c);
-        }
-
-        // Map log level strings to enum values (1-to-1 mapping)
-        if (level == "off") {
-            current_level_ = HostLogLevel::OFF;
-        } else if (level == "error") {
-            current_level_ = HostLogLevel::ERROR;
-        } else if (level == "warn") {
-            current_level_ = HostLogLevel::WARN;
-        } else if (level == "info") {
-            current_level_ = HostLogLevel::INFO;
-        } else if (level == "debug") {
-            current_level_ = HostLogLevel::DEBUG;
-        } else {
-            // Default to INFO for unknown values
-            current_level_ = HostLogLevel::INFO;
-        }
-    } else {
-        // Default to INFO
-        current_level_ = HostLogLevel::INFO;
-    }
-
-    // Parse PTO_LOG_FILE environment variable
-    const char *file_path = std::getenv("PTO_LOG_FILE");
-    if (file_path != nullptr && strlen(file_path) > 0) {
-        log_file_path_ = file_path;
-
-        // Close previous file handle if it exists
-        if (log_file_handle_ != nullptr && log_file_handle_ != stdout && log_file_handle_ != stderr) {
-            fclose(log_file_handle_);
-        }
-
-        // Open log file in append mode
-        log_file_handle_ = fopen(log_file_path_.c_str(), "a");
-        if (log_file_handle_ == nullptr) {
-            // Fall back to stderr if file cannot be opened
-            fprintf(stderr, "[ERROR] Failed to open log file: %s\n", log_file_path_.c_str());
-            log_file_handle_ = nullptr;
-            log_file_path_.clear();
-        }
-    }
-
-    initialized_ = true;
+bool HostLogger::is_severity_enabled(LogLevel level) const {
+    // current_level_ is the floor: messages with severity >= floor are kept.
+    return static_cast<int>(level) >= static_cast<int>(current_level_) && current_level_ != LogLevel::NUL;
 }
 
-void HostLogger::reinitialize() {
-    initialized_ = false;
-    init_from_env();
-}
+bool HostLogger::is_info_v_enabled(int v) const { return is_severity_enabled(LogLevel::INFO) && v >= current_info_v_; }
 
-bool HostLogger::is_enabled(HostLogLevel level) const {
-    return static_cast<int>(level) <= static_cast<int>(current_level_);
-}
-
-const char *HostLogger::get_level_name(HostLogLevel level) const {
+const char *HostLogger::level_name(LogLevel level) const {
     switch (level) {
-    case HostLogLevel::ERROR:
-        return "ERROR";
-    case HostLogLevel::WARN:
-        return "WARN";
-    case HostLogLevel::INFO:
-        return "INFO";
-    case HostLogLevel::DEBUG:
+    case LogLevel::DEBUG:
         return "DEBUG";
-    case HostLogLevel::ALWAYS:
-        return "ALWAYS";
-    case HostLogLevel::OFF:
-        return "OFF";
-    default:
-        return "UNKNOWN";
+    case LogLevel::INFO:
+        return "INFO";
+    case LogLevel::WARN:
+        return "WARN";
+    case LogLevel::ERROR:
+        return "ERROR";
+    case LogLevel::NUL:
+        return "NUL";
     }
+    return "?";
 }
 
-FILE *HostLogger::get_output_file(HostLogLevel level) {
-    // If log file is configured, use it for all levels
-    if (log_file_handle_ != nullptr) {
-        return log_file_handle_;
+void HostLogger::emit(const char *level_tag, const char *func, const char *fmt, va_list args) {
+    std::scoped_lock lock(mutex_);
+    fprintf(stderr, "[%s] %s: ", level_tag, func);
+    vfprintf(stderr, fmt, args);
+    if (fmt[0] != '\0' && fmt[strlen(fmt) - 1] != '\n') {
+        fputc('\n', stderr);
     }
-
-    // Otherwise, use stderr for ERROR/WARN, stdout for INFO/DEBUG
-    if (level == HostLogLevel::ERROR || level == HostLogLevel::WARN) {
-        return stderr;
-    } else {
-        return stdout;
-    }
+    fflush(stderr);
 }
 
-void HostLogger::log(HostLogLevel level, const char *format, ...) {
-    // Hard mute: OFF suppresses everything including ALWAYS
-    if (current_level_ == HostLogLevel::OFF) {
+void HostLogger::vlog(LogLevel level, const char *func, const char *fmt, va_list args) {
+    if (!is_severity_enabled(level)) {
         return;
     }
-    // Check if this level is enabled
-    if (!is_enabled(level)) {
+    emit(level_name(level), func, fmt, args);
+}
+
+void HostLogger::vlog_info_v(int v, const char *func, const char *fmt, va_list args) {
+    if (!is_info_v_enabled(v)) {
         return;
     }
+    char tag[8];
+    snprintf(tag, sizeof(tag), "INFO_V%d", v);
+    emit(tag, func, fmt, args);
+}
 
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // Get output file
-    FILE *output = get_output_file(level);
-    if (output == nullptr) {
-        return;
-    }
-
-    // Print log level prefix (matching Python format)
-    fprintf(output, "[%s] ", get_level_name(level));
-
-    // Print formatted message
+void HostLogger::log(LogLevel level, const char *func, const char *fmt, ...) {
     va_list args;
-    va_start(args, format);
-    vfprintf(output, format, args);
+    va_start(args, fmt);
+    vlog(level, func, fmt, args);
     va_end(args);
+}
 
-    // Add newline if not already present
-    if (format[strlen(format) - 1] != '\n') {
-        fprintf(output, "\n");
-    }
-
-    // Flush to ensure immediate output
-    fflush(output);
+void HostLogger::log_info_v(int v, const char *func, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vlog_info_v(v, func, fmt, args);
+    va_end(args);
 }

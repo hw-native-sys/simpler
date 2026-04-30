@@ -125,9 +125,9 @@ typedef struct PTO2RuntimeOps {
     // Logging (populated by runtime, called by orchestration)
     void (*log_error)(const char *func, const char *fmt, ...);
     void (*log_warn)(const char *func, const char *fmt, ...);
-    void (*log_info)(const char *func, const char *fmt, ...);
     void (*log_debug)(const char *func, const char *fmt, ...);
-    void (*log_always)(const char *func, const char *fmt, ...);
+    // INFO with explicit verbosity tier (v ∈ [0,9]; gating done inside).
+    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
@@ -272,9 +272,19 @@ static inline bool rt_is_fatal() {
 
 #define LOG_ERROR(fmt, ...) current_runtime()->ops->log_error(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...) current_runtime()->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...) current_runtime()->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...) current_runtime()->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_ALWAYS(fmt, ...) current_runtime()->ops->log_always(__FUNCTION__, fmt, ##__VA_ARGS__)
+
+// INFO verbosity tiers. v=0 most verbose, v=9 must-see, v=5 default.
+#define LOG_INFO_V0(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 0, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V1(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 1, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V2(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 2, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V3(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 3, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V4(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 4, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V5(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 5, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V6(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 6, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V7(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 7, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V8(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 8, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V9(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 9, fmt, ##__VA_ARGS__)
 
 // =============================================================================
 // Cross-Layer Data Access

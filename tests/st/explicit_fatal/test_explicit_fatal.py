@@ -16,6 +16,7 @@ from simpler.task_interface import CallConfig, ChipCallable, ChipStorageTaskArgs
 from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
+from simpler_setup.log_config import configure_logging
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = "tensormap_and_ringbuffer"
@@ -36,8 +37,8 @@ def _build_chip_callable(platform: str) -> ChipCallable:
 @pytest.mark.platforms(["a5sim", "a2a3sim"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-def test_explicit_fatal_reports(st_platform, st_device_ids, monkeypatch):
-    monkeypatch.setenv("PTO_LOG_LEVEL", "error")
+def test_explicit_fatal_reports(st_platform, st_device_ids):
+    configure_logging("error")
 
     chip_callable = _build_chip_callable(st_platform)
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))

@@ -206,20 +206,20 @@ void PTO2TensorMap::print_stats() {
         }
     }
 
-    LOG_INFO("=== TensorMap Statistics ===");
-    LOG_INFO("Pool size:           %d", pool_size);
-    LOG_INFO("Pool next entry idx: %d", next_entry_idx);
-    LOG_INFO("Pool free_num:       %d", free_num);
-    LOG_INFO("Num buckets:         %d", num_buckets);
-    LOG_INFO("Valid entries:       %d", valid);
-    LOG_INFO("Stale entries:       %d", stale);
-    LOG_INFO("Empty buckets:       %d", empty_buckets);
-    LOG_INFO("Max chain len:       %d", max_chain);
-    LOG_INFO("Avg chain len:       %.2f", non_empty_buckets > 0 ? (float)total_chain / non_empty_buckets : 0);
+    LOG_INFO_V0("=== TensorMap Statistics ===");
+    LOG_INFO_V0("Pool size:           %d", pool_size);
+    LOG_INFO_V0("Pool next entry idx: %d", next_entry_idx);
+    LOG_INFO_V0("Pool free_num:       %d", free_num);
+    LOG_INFO_V0("Num buckets:         %d", num_buckets);
+    LOG_INFO_V0("Valid entries:       %d", valid);
+    LOG_INFO_V0("Stale entries:       %d", stale);
+    LOG_INFO_V0("Empty buckets:       %d", empty_buckets);
+    LOG_INFO_V0("Max chain len:       %d", max_chain);
+    LOG_INFO_V0("Avg chain len:       %.2f", non_empty_buckets > 0 ? (float)total_chain / non_empty_buckets : 0);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        LOG_INFO("Last task alive[%d]: %d", r, last_task_alives[r]);
+        LOG_INFO_V0("Last task alive[%d]: %d", r, last_task_alives[r]);
     }
-    LOG_INFO("============================");
+    LOG_INFO_V0("============================");
 }
 
 int32_t PTO2TensorMap::valid_count() {

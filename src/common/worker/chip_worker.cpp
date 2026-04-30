@@ -79,7 +79,7 @@ ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-    const std::string &sim_context_lib_path
+    const std::string &sim_context_lib_path, int log_level, int log_info_v
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -120,6 +120,7 @@ void ChipWorker::init(
         copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
+        simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
         // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
         // Every platform runtime exports all of them — runtimes that do not
@@ -154,6 +155,10 @@ void ChipWorker::init(
     aicore_binary_ = read_binary_file(aicore_path);
 
     runtime_buf_.resize(get_runtime_size_fn_());
+
+    // One-shot platform-side log init: pushes user's simpler-logger choice
+    // into HostLogger + runner state, and (onboard) into CANN dlog.
+    simpler_init_fn_(device_ctx_, log_level, log_info_v);
 
     initialized_ = true;
 }

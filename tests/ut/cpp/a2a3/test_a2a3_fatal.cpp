@@ -79,6 +79,7 @@ void fake_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, co
 }
 
 void fake_log(const char *, const char *, ...) {}
+void fake_log_v(const char *, int, const char *, ...) {}
 
 uint64_t fake_get_tensor_data(PTO2Runtime *rt, const Tensor &, uint32_t, const uint32_t[]) {
     as_fake(rt)->get_calls++;
@@ -103,9 +104,8 @@ const PTO2RuntimeOps kFakeOps = {
     .report_fatal = fake_report_fatal,
     .log_error = fake_log,
     .log_warn = fake_log,
-    .log_info = fake_log,
     .log_debug = fake_log,
-    .log_always = fake_log,
+    .log_info_v = fake_log_v,
     .get_tensor_data = fake_get_tensor_data,
     .set_tensor_data = fake_set_tensor_data,
     .alloc_tensors = fake_alloc_tensors,

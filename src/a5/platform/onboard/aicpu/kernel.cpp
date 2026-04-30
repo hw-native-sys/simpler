@@ -50,8 +50,11 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
         LOG_ERROR("%s", "Invalid kernel arguments: null pointer");
         return -1;
     }
+    auto k_args = (KernelArgs *)arg;
+    set_log_level(static_cast<int>(k_args->log_level));
+    set_log_info_v(static_cast<int>(k_args->log_info_v));
 
-    LOG_INFO("%s", "Runtime Executor Init: Initializing AICPU kernel");
+    LOG_INFO_V0("%s", "Runtime Executor Init: Initializing AICPU kernel");
     return 0;
 }
 
@@ -81,6 +84,10 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
         return -1;
     }
 
+    // Push host-published log config into device globals.
+    set_log_level(static_cast<int>(k_args->log_level));
+    set_log_info_v(static_cast<int>(k_args->log_info_v));
+
     // Store platform regs before calling aicpu_execute
     // Dump enable is an execution control flag propagated via handshake.
     // The dump base address is only the backing storage location.
@@ -94,17 +101,17 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
 
     // Affinity gate: drop excess threads before entering runtime
     if (!platform_aicpu_affinity_gate(runtime->sche_cpu_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
-        LOG_INFO("Thread dropped by cluster affinity");
+        LOG_INFO_V0("Thread dropped by cluster affinity");
         return 0;
     }
 
-    LOG_INFO("%s", "DynTileFwkBackendKernelServer: Calling aicpu_execute with Runtime");
+    LOG_INFO_V0("%s", "DynTileFwkBackendKernelServer: Calling aicpu_execute with Runtime");
     int rc = aicpu_execute(runtime);
     if (rc != 0) {
         LOG_ERROR("DynTileFwkBackendKernelServer: aicpu_execute failed with rc=%d", rc);
         return rc;
     }
-    LOG_INFO("%s", "DynTileFwkBackendKernelServer: aicpu_execute completed successfully");
+    LOG_INFO_V0("%s", "DynTileFwkBackendKernelServer: aicpu_execute completed successfully");
 
     return rc;
 }

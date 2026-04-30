@@ -85,7 +85,7 @@ int PmuCollector::initialize(
     }
 
     *kernel_args_pmu_data_base = reinterpret_cast<uint64_t>(setup_header_dev_);
-    LOG_INFO(
+    LOG_INFO_V0(
         "PMU collector initialized: %d cores, event_type=%u, setup_header=0x%lx", num_cores_,
         static_cast<uint32_t>(event_type_), static_cast<unsigned long>(*kernel_args_pmu_data_base)
     );
@@ -216,7 +216,7 @@ int PmuCollector::export_csv(const std::string &output_dir) {
         device_total += total_counts_[core_id];
     }
     csv.flush();
-    LOG_INFO("PMU CSV written to %s", csv_path.c_str());
+    LOG_INFO_V0("PMU CSV written to %s", csv_path.c_str());
 
     // Cross-check device-side totals against what we wrote to CSV. Invariant:
     //   device_total == collected + dropped (buffer-full) + slot-mismatch
@@ -238,7 +238,7 @@ int PmuCollector::export_csv(const std::string &output_dir) {
             static_cast<long>(device_total) - static_cast<long>(total_rows + total_dropped)
         );
     } else {
-        LOG_INFO(
+        LOG_INFO_V0(
             "PMU collector: record counts match (collected=%lu, dropped=%lu, device_total=%lu)",
             static_cast<unsigned long>(total_rows), static_cast<unsigned long>(total_dropped),
             static_cast<unsigned long>(device_total)

@@ -59,7 +59,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     submit_spmd_mix(ext_output, 48, 0);
     submit_spmd_mix(ext_output, 48, 144);
 
-    LOG_ALWAYS("[spmd_batch_dispatch_oob] Submitted 2 MIX tasks: block_num=48,48");
+    LOG_INFO_V9("[spmd_batch_dispatch_oob] Submitted 2 MIX tasks: block_num=48,48");
 }
 
 }  // extern "C"

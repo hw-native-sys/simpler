@@ -77,9 +77,9 @@ struct PTO2RuntimeOps {
     // Logging (populated by runtime, called by orchestration)
     void (*log_error)(const char *func, const char *fmt, ...);
     void (*log_warn)(const char *func, const char *fmt, ...);
-    void (*log_info)(const char *func, const char *fmt, ...);
     void (*log_debug)(const char *func, const char *fmt, ...);
-    void (*log_always)(const char *func, const char *fmt, ...);
+    // INFO with explicit verbosity tier (v ∈ [0,9]; gating done inside).
+    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.

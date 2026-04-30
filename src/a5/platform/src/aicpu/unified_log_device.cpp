@@ -10,7 +10,11 @@
  */
 /**
  * @file unified_log_device.cpp
- * @brief Unified logging - Device implementation
+ * @brief Unified logging - Device implementation.
+ *
+ * Adapter that forwards the unified C ABI to the device-specific dev_log_*
+ * functions. Severity flags and verbosity threshold come from
+ * device_log.cpp's globals (set at init time from KernelArgs).
  */
 
 #include "common/unified_log.h"
@@ -34,52 +38,34 @@ void unified_log_warn(const char *func, const char *fmt, ...) {
     if (!is_log_enable_warn()) {
         return;
     }
-
     va_list args;
     va_start(args, fmt);
-
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
-
     dev_log_warn(func, "%s", buffer);
-}
-
-void unified_log_info(const char *func, const char *fmt, ...) {
-    if (!is_log_enable_info()) {
-        return;
-    }
-
-    va_list args;
-    va_start(args, fmt);
-
-    char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
-
-    dev_log_info(func, "%s", buffer);
 }
 
 void unified_log_debug(const char *func, const char *fmt, ...) {
     if (!is_log_enable_debug()) {
         return;
     }
-
     va_list args;
     va_start(args, fmt);
-
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
-
     dev_log_debug(func, "%s", buffer);
 }
 
-void unified_log_always(const char *func, const char *fmt, ...) {
+void unified_log_info_v(const char *func, int v, const char *fmt, ...) {
+    if (!is_log_enable_info() || v < g_log_info_v) {
+        return;
+    }
     va_list args;
     va_start(args, fmt);
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
-    dev_log_always(func, "%s", buffer);
+    dev_log_info_v(v, func, "%s", buffer);
 }

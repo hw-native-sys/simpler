@@ -93,7 +93,7 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
         int32_t major_cnt = clusters[major_id].count;
         int32_t minor_cnt = clusters[minor_id].count;
 
-        LOG_INFO(
+        LOG_INFO_V0(
             "AICPU affinity gate: major=%d(cnt=%d) minor=%d(cnt=%d) logical=%d", major_id, major_cnt, minor_id,
             minor_cnt, logical_count
         );
@@ -140,9 +140,9 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
     }
 
     if (!survive) {
-        LOG_INFO("AICPU affinity gate: thread idx=%d cpu=%d DROPPED", idx, normalized_cpu);
+        LOG_INFO_V0("AICPU affinity gate: thread idx=%d cpu=%d DROPPED", idx, normalized_cpu);
     } else {
-        LOG_INFO("AICPU affinity gate: thread idx=%d cpu=%d ACTIVE", idx, normalized_cpu);
+        LOG_INFO_V0("AICPU affinity gate: thread idx=%d cpu=%d ACTIVE", idx, normalized_cpu);
     }
 
     return survive;

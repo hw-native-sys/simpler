@@ -90,7 +90,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     for (int i = 0; i < 6; i++, cl += NORMAL_CL)
         submit_mix(ext_output, NORMAL_BLOCK_NUM, cl, false);
 
-    LOG_ALWAYS("[spmd_starvation] Submitted 20 tasks (18 normal + 2 sync_start)");
+    LOG_INFO_V9("[spmd_starvation] Submitted 20 tasks (18 normal + 2 sync_start)");
 }
 
 }  // extern "C"

@@ -180,8 +180,13 @@ int DeviceRunner::ensure_binaries_loaded(
             reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_pmu_base"));
         set_pmu_enabled_func_ = reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_pmu_enabled"));
 
+        // Log config bindings (optional; older SOs without these stay at their
+        // compile-time defaults).
+        set_log_level_func_ = reinterpret_cast<void (*)(int)>(dlsym(aicpu_so_handle_, "set_log_level"));
+        set_log_info_v_func_ = reinterpret_cast<void (*)(int)>(dlsym(aicpu_so_handle_, "set_log_info_v"));
+
         aicpu_so_loaded_ = true;
-        LOG_INFO("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
+        LOG_INFO_V0("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
     }
 
     // AICore kernel .so: reload every run — kernel binary varies per case and
@@ -218,7 +223,7 @@ int DeviceRunner::ensure_binaries_loaded(
             LOG_ERROR("dlsym failed for aicore_execute_wrapper: %s", dlerror());
             return -1;
         }
-        LOG_INFO("DeviceRunner(sim): Loaded aicore_execute_wrapper from %s", aicore_so_path_.c_str());
+        LOG_INFO_V0("DeviceRunner(sim): Loaded aicore_execute_wrapper from %s", aicore_so_path_.c_str());
 
         // Pass core identity setter function pointers to the AICore SO so it can
         // set per-thread subblock_id and cluster_id for pto-isa's TPUSH/TPOP hooks.
@@ -282,7 +287,7 @@ int DeviceRunner::run(
             return -1;
         }
     } else {
-        LOG_INFO(
+        LOG_INFO_V0(
             "All %d threads are orchestrators, cores will be assigned after orchestration completes", launch_aicpu_num
         );
         // Post-transition: all threads become schedulers
@@ -421,7 +426,9 @@ int DeviceRunner::run(
         }
     });
 
-    LOG_INFO("Allocated simulated registers: %d cores x 0x%x bytes (sparse: 3 pages)", num_aicore, SIM_REG_TOTAL_SIZE);
+    LOG_INFO_V0(
+        "Allocated simulated registers: %d cores x 0x%x bytes (sparse: 3 pages)", num_aicore, SIM_REG_TOTAL_SIZE
+    );
 
     // Check if executors are loaded
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr) {
@@ -446,9 +453,18 @@ int DeviceRunner::run(
         set_pmu_enabled_func_(enable_pmu_);
     }
 
+    // Publish log config to the AICPU SO. Optional dlsym for forward
+    // compatibility with pre-log-config SOs.
+    if (set_log_level_func_ != nullptr) {
+        set_log_level_func_(log_level_);
+    }
+    if (set_log_info_v_func_ != nullptr) {
+        set_log_info_v_func_(log_info_v_);
+    }
+
     // Launch AICPU threads (over-launch for affinity gate)
     constexpr int over_launch = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    LOG_INFO("Launching %d AICPU threads (logical=%d)", over_launch, launch_aicpu_num);
+    LOG_INFO_V0("Launching %d AICPU threads (logical=%d)", over_launch, launch_aicpu_num);
     std::vector<std::thread> aicpu_threads;
     aicpu_threads.reserve(over_launch);
     for (int i = 0; i < over_launch; i++) {
@@ -461,7 +477,7 @@ int DeviceRunner::run(
     }
 
     // Launch AICore threads
-    LOG_INFO("Launching %d AICore thread(s)", num_aicore);
+    LOG_INFO_V0("Launching %d AICore thread(s)", num_aicore);
     std::vector<std::thread> aicore_threads;
     for (int i = 0; i < num_aicore; i++) {
         CoreType core_type = runtime.workers[i].core_type;
@@ -472,7 +488,7 @@ int DeviceRunner::run(
     }
 
     // Wait for all threads to complete
-    LOG_INFO("Waiting for threads to complete");
+    LOG_INFO_V0("Waiting for threads to complete");
     for (auto &t : aicpu_threads) {
         t.join();
     }
@@ -480,7 +496,7 @@ int DeviceRunner::run(
         t.join();
     }
 
-    LOG_INFO("All threads completed");
+    LOG_INFO_V0("All threads completed");
 
     // Collect performance data and export. All three collectors write under
     // `output_prefix_`, the per-task directory the user must set on CallConfig
@@ -578,7 +594,7 @@ int DeviceRunner::prepare_orch_so(Runtime &runtime) {
     const uint64_t new_hash = simpler::common::utils::elf_build_id_64(host_so_data, host_so_size);
 
     if (new_hash == cached_orch_so_hash_ && dev_orch_so_buffer_ != nullptr) {
-        LOG_INFO("Orch SO cache hit (hash=0x%lx, %zu bytes)", new_hash, host_so_size);
+        LOG_INFO_V0("Orch SO cache hit (hash=0x%lx, %zu bytes)", new_hash, host_so_size);
         runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/false);
         return 0;
     }
@@ -605,7 +621,7 @@ int DeviceRunner::prepare_orch_so(Runtime &runtime) {
 
     cached_orch_so_hash_ = new_hash;
     runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size, /*is_new=*/true);
-    LOG_INFO("Orch SO cache miss (hash=0x%lx, %zu bytes uploaded)", new_hash, host_so_size);
+    LOG_INFO_V0("Orch SO cache miss (hash=0x%lx, %zu bytes uploaded)", new_hash, host_so_size);
     return 0;
 }
 
@@ -665,7 +681,7 @@ int DeviceRunner::finalize() {
     worker_count_ = 0;
     last_runtime_ = nullptr;
 
-    LOG_INFO("DeviceRunner(sim) finalized");
+    LOG_INFO_V0("DeviceRunner(sim) finalized");
     return 0;
 }
 
@@ -682,7 +698,7 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
     // Return cached callable address if already uploaded
     auto it = func_id_to_addr_.find(func_id);
     if (it != func_id_to_addr_.end()) {
-        LOG_INFO("Kernel func_id=%d already uploaded, returning cached address", func_id);
+        LOG_INFO_V0("Kernel func_id=%d already uploaded, returning cached address", func_id);
         return reinterpret_cast<uint64_t>(it->second.callable_buf);
     }
 

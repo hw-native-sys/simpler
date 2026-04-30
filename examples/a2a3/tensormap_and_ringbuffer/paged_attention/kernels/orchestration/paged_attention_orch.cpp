@@ -106,7 +106,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
     CYCLE_COUNT_LAP(prof_param_extract);
 
-    LOG_ALWAYS(">>>>>> batch = %" PRIu64, batch);
+    LOG_INFO_V9(">>>>>> batch = %" PRIu64, batch);
 
     // Reshape tensors for kernel consumption (2D flattened)
     void *query_ptr = orch_args.tensor(0).data_as<void>();
@@ -255,33 +255,33 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 #ifdef ENABLE_PROFILING
     uint64_t total = prof_param_extract + prof_ext_tensor + prof_make_tensor + prof_tensor_view + prof_param_setup +
                      prof_submit_task + prof_scope;
-    LOG_ALWAYS(
+    LOG_INFO_V9(
         "=== PagedAttn Orch Profiling: %d submits, %d makes, %d views, total=%.3fus ===", prof_submit_count,
         prof_make_count, prof_view_count, cycles_to_us(total)
     );
     if (total > 0) {
-        LOG_ALWAYS(
+        LOG_INFO_V9(
             "  param_extract    : %7.3fus (%5.1f%%)", cycles_to_us(prof_param_extract),
             prof_param_extract * 100.0 / total
         );
-        LOG_ALWAYS(
+        LOG_INFO_V9(
             "  ext_tensor(x4)   : %7.3fus (%5.1f%%)", cycles_to_us(prof_ext_tensor), prof_ext_tensor * 100.0 / total
         );
-        LOG_ALWAYS(
+        LOG_INFO_V9(
             "  create_info(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", prof_make_count, cycles_to_us(prof_make_tensor),
             prof_make_tensor * 100.0 / total,
             prof_make_count > 0 ? cycles_to_us(prof_make_tensor) / prof_make_count : 0.0
         );
-        LOG_ALWAYS(
+        LOG_INFO_V9(
             "  tensor_view(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", prof_view_count, cycles_to_us(prof_tensor_view),
             prof_tensor_view * 100.0 / total,
             prof_view_count > 0 ? cycles_to_us(prof_tensor_view) / prof_view_count : 0.0
         );
-        LOG_ALWAYS(
+        LOG_INFO_V9(
             "  param_setup      : %7.3fus (%5.1f%%)", cycles_to_us(prof_param_setup), prof_param_setup * 100.0 / total
         );
-        LOG_ALWAYS("  scope            : %7.3fus (%5.1f%%)", cycles_to_us(prof_scope), prof_scope * 100.0 / total);
-        LOG_ALWAYS(
+        LOG_INFO_V9("  scope            : %7.3fus (%5.1f%%)", cycles_to_us(prof_scope), prof_scope * 100.0 / total);
+        LOG_INFO_V9(
             "  submit_task(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", prof_submit_count, cycles_to_us(prof_submit_task),
             prof_submit_task * 100.0 / total,
             prof_submit_count > 0 ? cycles_to_us(prof_submit_task) / prof_submit_count : 0.0

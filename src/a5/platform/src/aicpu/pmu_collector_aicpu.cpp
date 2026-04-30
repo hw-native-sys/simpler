@@ -151,7 +151,7 @@ void pmu_aicpu_init(Handshake *handshakes, const uint32_t *physical_core_ids, in
         handshakes[i].pmu_reg_base = s_pmu_reg_addrs[i];
     }
 
-    LOG_INFO("PMU initialized: %d cores, event_type=%u", num_cores, pmu_event_type);
+    LOG_INFO_V0("PMU initialized: %d cores, event_type=%u", num_cores, pmu_event_type);
 }
 
 void pmu_aicpu_complete_record(

@@ -113,7 +113,7 @@ get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, const 
         return ret;
     }
 
-    LOG_INFO("Register base: ptr=0x%llx, len=0x%llx", out_map_para.ptr, out_map_para.len);
+    LOG_INFO_V0("Register base: ptr=0x%llx, len=0x%llx", out_map_para.ptr, out_map_para.len);
 
     // Iterate over all cores and subcores
     for (uint32_t i = 0; i < DAV_2201::PLATFORM_MAX_PHYSICAL_CORES; i++) {
@@ -152,7 +152,7 @@ static int get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id, Aicor
     regs.insert(regs.end(), aic.begin(), aic.end());
     regs.insert(regs.end(), aiv.begin(), aiv.end());
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "get_aicore_regs(%s): Retrieved %zu AIC and %zu AIV register addresses", kind_to_name(kind), aic.size(),
         aiv.size()
     );
@@ -167,7 +167,7 @@ int init_aicore_register_addresses(
         return -1;
     }
 
-    LOG_INFO("Retrieving and allocating AICore %s register addresses...", kind_to_name(kind));
+    LOG_INFO_V0("Retrieving and allocating AICore %s register addresses...", kind_to_name(kind));
 
     std::vector<int64_t> host_regs;
     int rc = get_aicore_regs(host_regs, device_id, kind);
@@ -195,7 +195,7 @@ int init_aicore_register_addresses(
 
     *runtime_regs_ptr = reinterpret_cast<uint64_t>(reg_ptr);
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Successfully initialized %s register addresses: %zu addresses at device 0x%llx", kind_to_name(kind),
         host_regs.size(), *runtime_regs_ptr
     );

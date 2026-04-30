@@ -74,7 +74,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // T4: 48 blocks (144 CL) — two full rounds of all clusters
     submit_spmd_mix(FUNC_SPMD_MIX_AIC, FUNC_SPMD_MIX_AIV0, FUNC_SPMD_MIX_AIV1, ext_output, 48, 138);
 
-    LOG_ALWAYS("[spmd_multiblock_mix] Submitted 5 MIX tasks: block_num=2,8,12,24,48");
+    LOG_INFO_V9("[spmd_multiblock_mix] Submitted 5 MIX tasks: block_num=2,8,12,24,48");
 }
 
 }  // extern "C"

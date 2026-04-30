@@ -70,7 +70,7 @@ int L2PerfCollector::initialize(
         return -1;
     }
 
-    LOG_INFO("Initializing performance profiling (memcpy-based)");
+    LOG_INFO_V0("Initializing performance profiling (memcpy-based)");
 
     device_id_ = device_id;
     num_aicore_ = num_aicore;
@@ -147,7 +147,7 @@ int L2PerfCollector::initialize(
     // get_l2_perf_setup_device_ptr() and publishes to kernel_args.l2_perf_data_base.
     LOG_DEBUG("L2PerfSetupHeader on device at 0x%lx", reinterpret_cast<uint64_t>(setup_header_dev_));
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Performance profiling initialized: %d cores × %zuB L2PerfBuffer, %d threads × %zuB PhaseBuffer", num_aicore_,
         l2_perf_buffer_bytes_, num_phase_threads_, phase_buffer_bytes_
     );
@@ -160,7 +160,7 @@ int L2PerfCollector::collect_all() {
         return -1;
     }
 
-    LOG_INFO("Collecting performance data via device→host memcpy");
+    LOG_INFO_V0("Collecting performance data via device→host memcpy");
 
     // Step 1: Copy back L2PerfSetupHeader (contains total_tasks and phase_header)
     L2PerfSetupHeader host_header;
@@ -289,20 +289,20 @@ int L2PerfCollector::collect_all() {
                 if (is_scheduler_phase(r.phase_id)) sched_count++;
                 else orch_count++;
             }
-            LOG_INFO(
+            LOG_INFO_V0(
                 "  Thread %zu: %zu phase records (sched=%zu, orch=%zu)", t, collected_phase_records_[t].size(),
                 sched_count, orch_count
             );
         }
         if (orch_valid) {
-            LOG_INFO(
+            LOG_INFO_V0(
                 "  Orchestrator: %" PRId64 " tasks, %.3fus", static_cast<int64_t>(collected_orch_summary_.submit_count),
                 cycles_to_us(collected_orch_summary_.end_time - collected_orch_summary_.start_time)
             );
         }
     }
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Collection complete: %" PRIu64 " perf records, %" PRIu64 " phase records, orch_summary=%s", total_perf_records,
         total_phase_records, orch_valid ? "yes" : "no"
     );
@@ -596,9 +596,9 @@ int L2PerfCollector::export_swimlane_json(const std::string &output_path) {
     outfile.close();
 
     uint32_t record_count = static_cast<uint32_t>(tagged_records.size());
-    LOG_INFO("=== JSON Export Complete ===");
-    LOG_INFO("File: %s", filepath.c_str());
-    LOG_INFO("Records: %u", record_count);
+    LOG_INFO_V0("=== JSON Export Complete ===");
+    LOG_INFO_V0("File: %s", filepath.c_str());
+    LOG_INFO_V0("Records: %u", record_count);
 
     return 0;
 }

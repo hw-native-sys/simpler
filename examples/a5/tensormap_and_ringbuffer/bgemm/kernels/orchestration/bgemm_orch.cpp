@@ -67,7 +67,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     Tensor ext_B = from_tensor_arg(orch_args.tensor(1));
     Tensor ext_C = from_tensor_arg(orch_args.tensor(2));
 
-    LOG_INFO("[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d", GRID_M, GRID_K, GRID_N, BATCH, TILE);
+    LOG_INFO_V0("[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d", GRID_M, GRID_K, GRID_N, BATCH, TILE);
 
     uint32_t tile_shapes[1] = {TILE_ELEMS};
 
@@ -113,7 +113,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         }
     }
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each", BATCH, GRID_M, GRID_N,
         GRID_K
     );

@@ -72,7 +72,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // T4: block_num=1, sync_start=false (baseline, 3 CL)
     submit_mix(ext_output, 1, 123, false);
 
-    LOG_ALWAYS("[spmd_sync_start_edge] Submitted 5 tasks: block_num=1,8,9,23 (sync) + 1 (baseline)");
+    LOG_INFO_V9("[spmd_sync_start_edge] Submitted 5 tasks: block_num=1,8,9,23 (sync) + 1 (baseline)");
 }
 
 }  // extern "C"

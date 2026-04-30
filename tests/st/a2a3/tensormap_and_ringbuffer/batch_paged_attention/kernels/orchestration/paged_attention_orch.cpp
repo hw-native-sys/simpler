@@ -75,7 +75,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint64_t q_loop = (num_heads + q_tile - 1) / q_tile;
     uint64_t elem_size = get_element_size(data_type);
 
-    LOG_INFO("batch_paged_attention: batch=%" PRIu64 ", num_heads=%" PRIu64, batch, num_heads);
+    LOG_INFO_V0("batch_paged_attention: batch=%" PRIu64 ", num_heads=%" PRIu64, batch, num_heads);
 
     void *query_ptr = orch_args.tensor(0).data_as<void>();
     void *kc_ptr = orch_args.tensor(1).data_as<void>();
@@ -206,7 +206,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         }
     }
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "batch_paged_attention: %" PRIu64 " tasks (batch=%" PRIu64 ", max_bn=%" PRIu64 ", chunks=%" PRIu64
         ", IN_CORE_BATCH=%" PRIu64 ")",
         static_cast<uint64_t>(num_chunks * (1 + max_bn * 4)), batch, max_bn, num_chunks, IN_CORE_BATCH

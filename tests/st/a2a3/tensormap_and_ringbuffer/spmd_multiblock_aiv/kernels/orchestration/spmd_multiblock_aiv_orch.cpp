@@ -66,7 +66,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // T4: 96 blocks — two full rounds of all AIV cores
     submit_spmd_aiv(FUNC_SPMD_WRITE_AIV, ext_output, 96, 92);
 
-    LOG_ALWAYS("[spmd_multiblock_aiv] Submitted 5 AIV tasks: block_num=4,16,24,48,96");
+    LOG_INFO_V9("[spmd_multiblock_aiv] Submitted 5 AIV tasks: block_num=4,16,24,48,96");
 }
 
 }  // extern "C"

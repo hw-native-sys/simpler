@@ -114,9 +114,77 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--build` | | false | Compile runtime from source (not pre-built) |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
-| `--log-level LEVEL` | | (none) | Set `PTO_LOG_LEVEL` env var (`off`/`error`/`warn`/`info`/`debug`). `off` suppresses all Host/Python/sim-device logs including `ALWAYS`; onboard AICPU logs are managed by CANN and must be controlled via CANN env vars (e.g. `ASCEND_GLOBAL_LOG_LEVEL`) |
+| `--log-level LEVEL` | | `v5` | Simpler logger threshold. Accepts `debug` / `V0..V9` / `info` / `warn` / `error` / `null`. The "simpler" Python logger is the single source of truth; the value is propagated to host C++ `HostLogger` and AICPU via `KernelArgs` automatically on each `Worker.run()`. Onboard AICPU **severity** stays managed by CANN (`ASCEND_GLOBAL_LOG_LEVEL` / `dlog_setlevel`); only the INFO **verbosity** sub-tier is plumbed via simpler. See [Log levels](#log-levels). |
 
 Profiling is enabled only on the first round to avoid overhead on subsequent iterations. Output tensors are reset to their initial values between rounds.
+
+## Log levels
+
+Simpler ties two axes (severity + INFO sub-verbosity) into a single integer
+threshold so users only ever set one knob.
+
+### Integer layout (Python-aligned)
+
+```text
+DEBUG   = 10                                          (Python logging.DEBUG)
+V0..V4  = 15..19   sub-INFO, more verbose
+V5      = 20  =  Python INFO   ← default threshold
+V6..V9  = 21..24   above-INFO, more must-see
+WARN    = 30                                          (Python logging.WARNING)
+ERROR   = 40                                          (Python logging.ERROR)
+NUL     = 60                                          suppress all
+```
+
+The Python `simpler` logger filters by Python's standard `level >= threshold`
+rule; the C++ side splits the threshold back into a (severity, info_v) pair
+and gates host `LOG_*` plus AICPU device logs accordingly.
+
+### Where each tier ends up
+
+| Macro | Where it goes today (post-migration) |
+| ----- | ------------------------------------ |
+| `LOG_DEBUG` | DEBUG severity (`level=10`) — debug-style trace |
+| `LOG_INFO_V0` | INFO sub-tier 0 (`level=15`) — old `LOG_INFO` lands here |
+| `LOG_INFO_V5` | INFO sub-tier 5 (`level=20`) — default threshold (= Python INFO) |
+| `LOG_INFO_V9` | INFO sub-tier 9 (`level=24`) — old `LOG_ALWAYS` lands here |
+| `LOG_WARN` | WARN severity (`level=30`) |
+| `LOG_ERROR` | ERROR severity (`level=40`) |
+
+V0..V4 are silent by default; raise `--log-level v0` to see them. V5..V9 are
+visible by default; lower the threshold (e.g. `--log-level warn`) to hide them.
+
+### Configuration sources
+
+- **Single source of truth**: the Python `simpler` logger
+  (`logging.getLogger("simpler")`).
+- The simpler module sets this logger to V5 at import unless the user has
+  already called `setLevel`. Inheritance from the root logger is intentionally
+  not used so `import simpler` doesn't kill INFO output by inheriting Python's
+  default `WARNING`.
+- `Worker.run()` snapshots the current logger level into `CallConfig.log_level`
+  / `CallConfig.log_info_v`, which travel through `KernelArgs` to AICPU.
+- `pto_runtime_c_api::run_runtime` also pushes the same values into the
+  per-process `HostLogger` so host `LOG_*` calls in the platform SO see the
+  user's threshold.
+
+### Onboard AICPU severity is CANN-owned
+
+The onboard AICPU library reads severity from CANN's `dlog` (CheckLogLevel),
+not from `KernelArgs.log_level`. Configure it via
+`ASCEND_GLOBAL_LOG_LEVEL=0..4` or `dlog_setlevel(-1, level, 0)`.
+`simpler/__init__.py` calls `dlog_setlevel(-1, INFO, 0)` once at import
+unless `ASCEND_GLOBAL_LOG_LEVEL` is already set, so the onboard default is
+INFO out of the box. The INFO **verbosity** sub-tier (V0..V9) is still
+controlled through the simpler logger.
+
+### Behaviour change since the V0..V9 migration
+
+- 30+ historical `LOG_ALWAYS` sites were rewritten to `LOG_INFO_V9` —
+  visible at default V5.
+- 200+ historical `LOG_INFO` sites were rewritten to `LOG_INFO_V0` —
+  hidden by default. Run with `--log-level v0` to bring them back.
+- All log output goes to **stderr** (host + sim AICPU). Onboard AICPU still
+  routes through CANN dlog and lands wherever CANN is configured to write.
 
 ## CLI Design Principles
 

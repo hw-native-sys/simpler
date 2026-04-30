@@ -31,6 +31,8 @@ if sys.platform == "darwin":
 
 import pytest  # noqa: E402
 
+from simpler_setup.log_config import configure_logging  # noqa: E402
+
 # Exit code used when the session watchdog fires. Matches the GNU `timeout`
 # convention so shell wrappers (e.g. CI) can distinguish timeout from other
 # failures.
@@ -189,7 +191,7 @@ def pytest_configure(config):
 
     log_level = config.getoption("--log-level", default=None)
     if log_level:
-        os.environ["PTO_LOG_LEVEL"] = log_level
+        configure_logging(log_level)
 
     commit = config.getoption("--pto-isa-commit")
     clone_protocol = config.getoption("--clone-protocol")

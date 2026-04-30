@@ -51,7 +51,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     rt_submit_task(mk, args);
 
-    LOG_ALWAYS("[spmd_basic_orch] Submitted 1 MIX task (AIC+AIV0+AIV1)");
+    LOG_INFO_V9("[spmd_basic_orch] Submitted 1 MIX task (AIC+AIV0+AIV1)");
 }
 
 }  // extern "C"

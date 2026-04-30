@@ -108,7 +108,7 @@ static void get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id) {
         }
     }
 
-    LOG_INFO("get_aicore_regs: Retrieved %zu register addresses", regs.size());
+    LOG_INFO_V0("get_aicore_regs: Retrieved %zu register addresses", regs.size());
 }
 
 int init_aicore_register_addresses(uint64_t *runtime_regs_ptr, uint64_t device_id, MemoryAllocator &allocator) {
@@ -117,7 +117,7 @@ int init_aicore_register_addresses(uint64_t *runtime_regs_ptr, uint64_t device_i
         return -1;
     }
 
-    LOG_INFO("Retrieving and allocating AICore register addresses...");
+    LOG_INFO_V0("Retrieving and allocating AICore register addresses...");
 
     // Step 1: Get register addresses from HAL
     std::vector<int64_t> host_regs;
@@ -147,7 +147,7 @@ int init_aicore_register_addresses(uint64_t *runtime_regs_ptr, uint64_t device_i
     // Step 4: Store device pointer in output regs field
     *runtime_regs_ptr = reinterpret_cast<uint64_t>(reg_ptr);
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Successfully initialized register addresses: %zu addresses at device 0x%llx", host_regs.size(),
         *runtime_regs_ptr
     );

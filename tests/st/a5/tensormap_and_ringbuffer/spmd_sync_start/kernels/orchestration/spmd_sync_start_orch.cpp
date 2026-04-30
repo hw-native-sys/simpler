@@ -72,7 +72,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // T3: 12 blocks, sync_start=true (36 CL)
     submit_mix(ext_output, 12, 36, true);
 
-    LOG_ALWAYS("[spmd_sync_start] Submitted 4 tasks (3 sync_start + 1 baseline)");
+    LOG_INFO_V9("[spmd_sync_start] Submitted 4 tasks (3 sync_start + 1 baseline)");
 }
 
 }  // extern "C"

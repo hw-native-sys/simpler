@@ -93,6 +93,9 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  *                          artifacts (l2_perf_records.json / tensor_dump/ /
  *                          pmu.csv) are written. Required (non-empty) whenever
  *                          any diagnostic flag is enabled; ignored otherwise.
+ *
+ * Log configuration is applied separately via simpler_init() at ChipWorker
+ * init time and read from runner state when populating KernelArgs.
  * @return 0 on success, negative on error
  */
 int run_runtime(
@@ -100,6 +103,23 @@ int run_runtime(
     int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
     size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, const char *output_prefix
 );
+
+/**
+ * One-shot platform-side log init. Called once by ChipWorker::init() right
+ * after dlopen, before any other entry. Pushes the user's chosen severity +
+ * INFO verbosity into HostLogger and into runner state (which run_runtime
+ * later forwards to AICPU via KernelArgs).
+ *
+ * On onboard, also calls dlog_setlevel(-1, log_level, 0) so CANN's runtime
+ * filter matches the simpler logger — unless ASCEND_GLOBAL_LOG_LEVEL was
+ * externally configured, in which case CANN keeps the user's explicit choice.
+ *
+ * On sim, no CANN dlog state to touch — only HostLogger + runner.
+ *
+ * `log_level` is CANN-aligned: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL.
+ * `log_info_v` ∈ [0, 9]; only meaningful when severity is INFO.
+ */
+void simpler_init(DeviceContextHandle ctx, int log_level, int log_info_v);
 
 /**
  * Release all device resources held by the context.

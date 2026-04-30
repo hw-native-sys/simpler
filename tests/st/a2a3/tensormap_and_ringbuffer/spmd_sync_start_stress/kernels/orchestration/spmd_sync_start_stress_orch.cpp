@@ -99,7 +99,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         cl += NORMAL_AIV_BN;
     }
 
-    LOG_ALWAYS("[spmd_sync_start_stress] Submitted %d tasks over %d rounds", 9 * ROUNDS, ROUNDS);
+    LOG_INFO_V9("[spmd_sync_start_stress] Submitted %d tasks over %d rounds", 9 * ROUNDS, ROUNDS);
 }
 
 }  // extern "C"

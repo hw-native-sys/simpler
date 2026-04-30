@@ -45,7 +45,7 @@
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 
 constexpr int32_t MAX_IDLE_ITERATIONS = 800000;       // ~20s idle then scheduler gives up (avoid long hang)
-constexpr int32_t STALL_LOG_INTERVAL = 50000;         // DEV_ALWAYS every N idle iters to debug hang
+constexpr int32_t STALL_LOG_INTERVAL = 50000;         // LOG_INFO_V9 every N idle iters to debug hang
 constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
 constexpr int32_t STALL_DUMP_READY_MAX = 8;
 constexpr int32_t STALL_DUMP_WAIT_MAX = 4;

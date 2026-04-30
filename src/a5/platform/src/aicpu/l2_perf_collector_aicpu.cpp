@@ -61,7 +61,7 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime) {
     int32_t task_count = runtime->get_task_count();
     s_setup_header->total_tasks = static_cast<uint32_t>(task_count);
 
-    LOG_INFO("Initializing performance profiling for %d cores (memcpy-based)", runtime->worker_count);
+    LOG_INFO_V0("Initializing performance profiling for %d cores (memcpy-based)", runtime->worker_count);
 
     // Initialize each core's L2PerfBuffer and publish the pointer to the handshake
     for (int i = 0; i < runtime->worker_count; i++) {
@@ -83,7 +83,7 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime) {
 
     wmb();
 
-    LOG_INFO("Performance profiling initialized for %d cores", runtime->worker_count);
+    LOG_INFO_V0("Performance profiling initialized for %d cores", runtime->worker_count);
 }
 
 int l2_perf_aicpu_complete_record(
@@ -187,7 +187,7 @@ void l2_perf_aicpu_init_phase_profiling(int num_sched_threads) {
 
     wmb();
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Phase profiling initialized: %d scheduler + 1 orch thread, %d records/thread", num_sched_threads,
         PLATFORM_PHASE_RECORDS_PER_THREAD
     );
@@ -233,7 +233,7 @@ void l2_perf_aicpu_write_orch_summary(const AicpuOrchSummary *src) {
 
     wmb();
 
-    LOG_INFO(
+    LOG_INFO_V0(
         "Orchestrator summary written: %" PRId64 " tasks, %.3fus", static_cast<int64_t>(src->submit_count),
         cycles_to_us(src->end_time - src->start_time)
     );
@@ -256,7 +256,7 @@ void l2_perf_aicpu_init_core_assignments(int total_cores) {
     memset(phase_header->core_to_thread, -1, sizeof(phase_header->core_to_thread));
     phase_header->num_cores = static_cast<uint32_t>(total_cores);
     wmb();
-    LOG_INFO("Core-to-thread mapping init: %d cores", total_cores);
+    LOG_INFO_V0("Core-to-thread mapping init: %d cores", total_cores);
 }
 
 void l2_perf_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num) {

@@ -56,7 +56,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     Tensor ext_check = from_tensor_arg(orch_args.tensor(3));
 
     uint32_t SIZE = orch_args.tensor(0).shapes[0];
-    LOG_INFO("scalar_data_test: SIZE=%u, check_size=%u", SIZE, orch_args.tensor(3).shapes[0]);
+    LOG_INFO_V0("scalar_data_test: SIZE=%u, check_size=%u", SIZE, orch_args.tensor(3).shapes[0]);
 
     uint32_t inter_shapes[1] = {SIZE};
     TensorCreateInfo inter_ci(inter_shapes, 1, DataType::FLOAT32);
@@ -77,7 +77,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // =========================================================
     uint32_t idx[1] = {0};
     float c0_val = get_tensor_data<float>(c, 1, idx);
-    LOG_INFO("get_tensor_data(c, {0}) = %f (expected 2.0)", static_cast<double>(c0_val));
+    LOG_INFO_V0("get_tensor_data(c, {0}) = %f (expected 2.0)", static_cast<double>(c0_val));
 
     uint32_t check_idx[1] = {0};
     set_tensor_data(ext_check, 1, check_idx, c0_val);
@@ -88,7 +88,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // =========================================================
     idx[0] = 100;
     float c100_val = get_tensor_data<float>(c, 1, idx);
-    LOG_INFO("get_tensor_data(c, {100}) = %f (expected 102.0)", static_cast<double>(c100_val));
+    LOG_INFO_V0("get_tensor_data(c, {100}) = %f (expected 102.0)", static_cast<double>(c100_val));
 
     check_idx[0] = 1;
     set_tensor_data(ext_check, 1, check_idx, c100_val);
@@ -109,7 +109,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // =========================================================
     idx[0] = 0;
     float s0_val = get_tensor_data<float>(scalar_tensor, 1, idx);
-    LOG_INFO("get_tensor_data(scalar_tensor, {0}) after init = %f (expected 77.0)", static_cast<double>(s0_val));
+    LOG_INFO_V0("get_tensor_data(scalar_tensor, {0}) after init = %f (expected 77.0)", static_cast<double>(s0_val));
 
     check_idx[0] = 2;
     set_tensor_data(ext_check, 1, check_idx, s0_val);
@@ -129,7 +129,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     //   Value should be preserved (noop kernel didn't modify it)
     // =========================================================
     float s1_val = get_tensor_data<float>(scalar_tensor, 1, idx);
-    LOG_INFO("get_tensor_data(scalar_tensor, {0}) after 2nd noop = %f (expected 77.0)", static_cast<double>(s1_val));
+    LOG_INFO_V0("get_tensor_data(scalar_tensor, {0}) after 2nd noop = %f (expected 77.0)", static_cast<double>(s1_val));
 
     check_idx[0] = 3;
     set_tensor_data(ext_check, 1, check_idx, s1_val);
@@ -139,7 +139,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     //   Tests set_tensor_data write + orchestration arithmetic
     // =========================================================
     float combined = c0_val + s0_val;  // 2.0 + 77.0 = 79.0
-    LOG_INFO(
+    LOG_INFO_V0(
         "Orchestration arithmetic: %f + %f = %f", static_cast<double>(c0_val), static_cast<double>(s0_val),
         static_cast<double>(combined)
     );  // NOLINT(whitespace/line_length)
@@ -154,7 +154,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // =========================================================
     set_tensor_data(scalar_tensor, 1, idx, 42.0f);
     float rw_val = get_tensor_data<float>(scalar_tensor, 1, idx);
-    LOG_INFO("set_tensor_data→get_tensor_data round-trip = %f (expected 42.0)", static_cast<double>(rw_val));
+    LOG_INFO_V0("set_tensor_data→get_tensor_data round-trip = %f (expected 42.0)", static_cast<double>(rw_val));
 
     check_idx[0] = 5;
     set_tensor_data(ext_check, 1, check_idx, rw_val);
@@ -178,7 +178,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const Tensor &e = e_outs.get_ref(0);
 
     float e0_val = get_tensor_data<float>(e, 1, idx);
-    LOG_INFO("Orch→AICore RAW: e[0] = %f (expected 12.0)", static_cast<double>(e0_val));
+    LOG_INFO_V0("Orch→AICore RAW: e[0] = %f (expected 12.0)", static_cast<double>(e0_val));
 
     check_idx[0] = 6;
     set_tensor_data(ext_check, 1, check_idx, e0_val);
@@ -210,7 +210,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     idx[0] = 0;
     set_tensor_data(c, 1, idx, 88.0f);
     float waw_val = get_tensor_data<float>(c, 1, idx);
-    LOG_INFO("WAW+WAR: set_tensor_data(c, 88.0) after consumer = %f (expected 88.0)", static_cast<double>(waw_val));
+    LOG_INFO_V0("WAW+WAR: set_tensor_data(c, 88.0) after consumer = %f (expected 88.0)", static_cast<double>(waw_val));
 
     check_idx[0] = 7;
     set_tensor_data(ext_check, 1, check_idx, waw_val);
@@ -239,7 +239,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     idx[0] = 0;
     set_tensor_data(ext_b, 1, idx, 55.0f);
     float ext_war_val = get_tensor_data<float>(ext_b, 1, idx);
-    LOG_INFO(
+    LOG_INFO_V0(
         "External WAR (INOUT): set_tensor_data(ext_b, 55.0) = %f (expected 55.0)", static_cast<double>(ext_war_val)
     );
 
@@ -260,7 +260,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         rt_submit_aiv_task(FUNC_ADD, args);
     }
 
-    LOG_INFO("scalar_data_test: orchestration complete");
+    LOG_INFO_V0("scalar_data_test: orchestration complete");
 }
 
 }  // extern "C"

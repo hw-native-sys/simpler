@@ -308,28 +308,28 @@ void SchedulerContext::dispatch_shape(
 
 int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
     CoreTracker &tracker = core_trackers_[thread_idx];
-    DEV_INFO("Thread %d: resolve_and_dispatch entry", thread_idx);
+    DEV_INFO_V(0, "Thread %d: resolve_and_dispatch entry", thread_idx);
 
     PTO2SharedMemoryHeader *header = sched_->sm_header;
     if (!header) {
         DEV_ERROR("PTO2 dispatch: header is null");
         return -1;
     }
-    DEV_INFO(
-        "Thread %d: header=%p, task_desc_offset[0]=%lu, window_size=%lu", thread_idx, static_cast<void *>(header),
+    DEV_INFO_V(
+        0, "Thread %d: header=%p, task_desc_offset[0]=%lu, window_size=%lu", thread_idx, static_cast<void *>(header),
         static_cast<uint64_t>(header->rings[0].task_descriptors_offset),
         static_cast<uint64_t>(header->rings[0].task_window_size)
     );
 
     Handshake *hank = static_cast<Handshake *>(runtime->workers);
-    DEV_INFO(
-        "Thread %d: hank=%p, window_size=%lu", thread_idx, static_cast<void *>(hank),
+    DEV_INFO_V(
+        0, "Thread %d: hank=%p, window_size=%lu", thread_idx, static_cast<void *>(hank),
         static_cast<uint64_t>(header->rings[0].task_window_size)
     );
 
     // One-time init: assign perf buffers (one thread does it; others wait)
     if (!init_done_.exchange(true, std::memory_order_acq_rel)) {
-        DEV_INFO("Thread %d: doing one-time init", thread_idx);
+        DEV_INFO_V(0, "Thread %d: doing one-time init", thread_idx);
 
 #if PTO2_PROFILING
         if (is_l2_swimlane_enabled()) {
@@ -344,11 +344,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
         if (is_pmu_enabled()) {
             pmu_aicpu_init(runtime->workers, physical_core_ids_, cores_total_num_);
-            DEV_INFO("PMU profiling started on %d cores", cores_total_num_);
+            DEV_INFO_V(0, "PMU profiling started on %d cores", cores_total_num_);
         }
 #endif
 
-        DEV_INFO("Thread %d: one-time init done", thread_idx);
+        DEV_INFO_V(0, "Thread %d: one-time init done", thread_idx);
         init_complete_.store(true, std::memory_order_release);
     } else {
         while (!init_complete_.load(std::memory_order_acquire)) {
@@ -356,7 +356,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
     }
 
-    DEV_INFO("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, tracker.core_num());
+    DEV_INFO_V(0, "Thread %d: PTO2 dispatch starting with %d cores", thread_idx, tracker.core_num());
     int32_t cur_thread_completed = 0;
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
@@ -423,8 +423,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (thread_idx == 0 && task_count > 0) {
                 if (new_total <= PROGRESS_VERBOSE_THRESHOLD ||
                     new_total / PROGRESS_LOG_INTERVAL != prev / PROGRESS_LOG_INTERVAL || new_total >= task_count) {
-                    DEV_ALWAYS(
-                        "PTO2 progress: completed=%d total=%d (%.1f%%)", new_total, task_count,
+                    DEV_INFO_V(
+                        9, "PTO2 progress: completed=%d total=%d (%.1f%%)", new_total, task_count,
                         100.0 * new_total / task_count
                     );
                 }

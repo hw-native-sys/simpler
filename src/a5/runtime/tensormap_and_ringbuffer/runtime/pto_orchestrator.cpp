@@ -848,11 +848,11 @@ void PTO2OrchestratorState::mark_done() {
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         int32_t total_tasks = orch->rings[r].task_allocator.active_count();
         if (total_tasks > 0) {
-            LOG_INFO("=== [Orchestrator] ring %d: total_tasks=%d ===", r, total_tasks);
+            LOG_INFO_V0("=== [Orchestrator] ring %d: total_tasks=%d ===", r, total_tasks);
         }
         auto &fanin_pool = orch->rings[r].fanin_pool;
         if (fanin_pool.top > 1) {
-            LOG_INFO(
+            LOG_INFO_V0(
                 "=== [FaninPool %d] top=%d tail=%d used=%d high_water=%d capacity=%d ===", r, fanin_pool.top,
                 fanin_pool.tail, fanin_pool.top - fanin_pool.tail, fanin_pool.high_water, fanin_pool.capacity
             );

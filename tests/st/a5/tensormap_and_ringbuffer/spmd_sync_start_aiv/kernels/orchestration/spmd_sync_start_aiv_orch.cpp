@@ -66,7 +66,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // T3: 24 blocks, sync_start=true (cross-thread drain)
     submit_aiv(ext_output, 24, 24, true);
 
-    LOG_ALWAYS("[spmd_sync_start_aiv] Submitted 4 AIV tasks (3 sync_start + 1 baseline)");
+    LOG_INFO_V9("[spmd_sync_start_aiv] Submitted 4 AIV tasks (3 sync_start + 1 baseline)");
 }
 
 }  // extern "C"

@@ -27,7 +27,7 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
     bool survive = (idx < logical_count);
 
     if (!survive) {
-        LOG_INFO(
+        LOG_INFO_V0(
             "AICPU affinity gate (sim): thread idx=%d DROPPED (logical=%d, launched=%d)", idx, logical_count,
             total_launched
         );
