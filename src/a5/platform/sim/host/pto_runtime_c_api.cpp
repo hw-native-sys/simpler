@@ -237,6 +237,11 @@ int finalize_device(DeviceContextHandle ctx) {
     }
 }
 
+int device_unresponsive(DeviceContextHandle ctx) {
+    (void)ctx;
+    return 0;
+}
+
 /* ===========================================================================
  * ACL lifecycle stubs.  Sim has no ACL / aclrtStream concept, so these no-op
  * to satisfy the uniform host_runtime.so ABI that ChipWorker dlsym's.  The

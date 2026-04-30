@@ -132,6 +132,19 @@ struct KernelArgsHelper {
      */
     int finalize_device_kernel_args();
 
+    /** Null out all device pointers without calling rtFree (for use after device reset). */
+    void abandon() {
+        args.device_args = nullptr;
+        args.runtime_args = nullptr;
+        args.regs = 0;
+        args.ffts_base_addr = 0;
+        args.dump_data_base = 0;
+        args.l2_perf_data_base = 0;
+        args.pmu_data_base = 0;
+        args.pmu_reg_addrs = 0;
+        device_k_args_ = nullptr;
+    }
+
     /**
      * Implicit conversion operators for seamless use with runtime APIs
      *
@@ -169,6 +182,12 @@ struct AicpuSoInfo {
      * @return 0 on success, error code on failure
      */
     int finalize();
+
+    /** Null out device pointer without calling rtFree (for use after device reset). */
+    void abandon() {
+        aicpu_so_bin = 0;
+        aicpu_so_len = 0;
+    }
 };
 
 /**
@@ -290,6 +309,11 @@ public:
      * @return 0 on success, error code on failure
      */
     int finalize();
+
+    /**
+     * Whether the most recent run() exited due to stream sync timeout.
+     */
+    bool device_unresponsive() const { return device_unresponsive_; }
 
     /**
      * Launch an AICPU kernel
@@ -422,6 +446,7 @@ private:
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results in destructor
     std::vector<uint8_t> aicore_kernel_binary_;
+    bool device_unresponsive_{false};
 
     // Memory management
     MemoryAllocator mem_alloc_;
@@ -506,6 +531,20 @@ private:
      * @return 0 on success, non-zero on failure.
      */
     int prepare_orch_so(Runtime &runtime);
+
+    /**
+     * Synchronize stream with a host-side timeout via aclrtSynchronizeStreamWithTimeout.
+     * Sets device_unresponsive_ on ACL_ERROR_RT_STREAM_SYNC_TIMEOUT.
+     *
+     * @param stream Stream to synchronize
+     * @param stream_name Stream label for logs
+     * @param timeout_ms Timeout threshold in milliseconds
+     * @return 0 on success, error code on failure/timeout
+     */
+    int synchronize_stream_with_timeout(rtStream_t stream, const char *stream_name, int timeout_ms);
+
+    /** Execute aclrtResetDevice + aclFinalize and clear runner state. */
+    int reset_device_and_acl();
 
     /**
      * Initialize performance profiling shared memory

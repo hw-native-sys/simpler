@@ -59,6 +59,12 @@ constexpr int PLATFORM_MAX_AICPU_THREADS = 4;
  */
 constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 6;
 
+/**
+ * Host-side stream synchronization timeout (milliseconds)
+ * Passed to aclrtSynchronizeStreamWithTimeout to detect stream sync hangs.
+ */
+constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 1000;
+
 // =============================================================================
 // Derived Platform Limits
 // =============================================================================

@@ -1350,13 +1350,19 @@ class SceneTestCase:
                             )
                             print("PASSED")
                         except Exception as e:  # noqa: BLE001
-                            print(f"FAILED: {e}")
+                            print(f"FAILED: {e}", flush=True)
                             ok = False
                             if args.exitfirst:
                                 raise SystemExit(1) from None
             finally:
                 if level == 2:
+                    force_exit = getattr(worker, "device_unresponsive", False)
                     worker.finalize()
+                    if force_exit:
+                        # CANN library fini functions block after aclrtResetDevice;
+                        # skip Python interpreter cleanup to avoid hanging.
+                        print("stream sync timeout recovery — force exit", flush=True)
+                        os._exit(1)
                 else:
                     worker.close()
 

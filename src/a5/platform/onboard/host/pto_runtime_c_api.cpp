@@ -227,6 +227,11 @@ int finalize_device(DeviceContextHandle ctx) {
     }
 }
 
+int device_unresponsive(DeviceContextHandle ctx) {
+    (void)ctx;
+    return 0;
+}
+
 /* ===========================================================================
  * ACL + comm_* placeholders (distributed runtime not yet implemented on a5)
  *

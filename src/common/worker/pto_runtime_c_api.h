@@ -107,6 +107,13 @@ int run_runtime(
  */
 int finalize_device(DeviceContextHandle ctx);
 
+/**
+ * Return 1 if the device is unresponsive (stream sync timeout triggered
+ * aclrtResetDevice), 0 otherwise. Used by ChipWorker to decide whether
+ * os._exit is needed (CANN library fini functions block after device reset).
+ */
+int device_unresponsive(DeviceContextHandle ctx);
+
 #ifdef __cplusplus
 }
 #endif

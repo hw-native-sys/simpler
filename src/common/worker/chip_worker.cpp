@@ -121,6 +121,7 @@ void ChipWorker::init(
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
+        device_unresponsive_fn_ = load_symbol<DeviceUnresponsiveFn>(handle, "device_unresponsive");
         // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
         // Every platform runtime exports all of them — runtimes that do not
         // have a real backend (today: a5) ship not-supported stubs rather
@@ -210,6 +211,7 @@ void ChipWorker::finalize() {
     get_runtime_size_fn_ = nullptr;
     run_runtime_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
+    device_unresponsive_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
     create_comm_stream_fn_ = nullptr;
     destroy_comm_stream_fn_ = nullptr;
@@ -249,6 +251,9 @@ void ChipWorker::run(const void *callable, const void *args, const CallConfig &c
         config.enable_dump_tensor, config.enable_pmu, config.output_prefix
     );
     if (rc != 0) {
+        if (device_unresponsive_fn_ && device_unresponsive_fn_(device_ctx_)) {
+            device_unresponsive_ = true;
+        }
         throw std::runtime_error("run_runtime failed with code " + std::to_string(rc));
     }
 }

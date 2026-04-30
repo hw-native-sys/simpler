@@ -70,3 +70,8 @@ int MemoryAllocator::finalize() {
     ptr_set_.clear();
     return last_error;
 }
+
+void MemoryAllocator::abandon() {
+    std::lock_guard<std::mutex> lk(mu_);
+    ptr_set_.clear();
+}
