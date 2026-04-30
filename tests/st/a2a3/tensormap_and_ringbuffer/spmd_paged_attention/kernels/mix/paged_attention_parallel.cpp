@@ -158,15 +158,17 @@ template <
     int M, int K, int N, typename SijPipeT, typename GlobalB_QK, typename TileMatA_QK, typename TileMatB_QK,
     typename LeftTile_QK, typename RightTile_QK, typename AccTile_QK>
 static __aicore__ void aic_qk_step(
-    __gm__ bfloat16_t *key_base, __gm__ int32_t *bt, uint64_t bt_offset, uint64_t i, TileMatA_QK &aMatTile_QK,
-    TileMatB_QK &bMatTile_QK_A, TileMatB_QK &bMatTile_QK_B, LeftTile_QK &aTile_QK, RightTile_QK &bTile_QK,
-    AccTile_QK &cTile_QK, SijPipeT &sij_pipe
+    __gm__ bfloat16_t *key_base, uint64_t kv_block_id, uint64_t i, TileMatA_QK &aMatTile_QK, TileMatB_QK &bMatTile_QK_A,
+    TileMatB_QK &bMatTile_QK_B, LeftTile_QK &aTile_QK, RightTile_QK &bTile_QK, AccTile_QK &cTile_QK, SijPipeT &sij_pipe,
+    bool current_loaded = false, bool has_next = false, uint64_t next_kv_block_id = 0
 ) {
-    GlobalB_QK kjGlobal(key_base + static_cast<uint64_t>(bt[bt_offset + i]) * N * K);
-    if (i % 2 == 0) {
-        TLOAD(bMatTile_QK_A, kjGlobal);
-    } else {
-        TLOAD(bMatTile_QK_B, kjGlobal);
+    if (!current_loaded) {
+        GlobalB_QK kjGlobal(key_base + kv_block_id * N * K);
+        if (i % 2 == 0) {
+            TLOAD(bMatTile_QK_A, kjGlobal);
+        } else {
+            TLOAD(bMatTile_QK_B, kjGlobal);
+        }
     }
 
     set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
@@ -177,6 +179,15 @@ static __aicore__ void aic_qk_step(
         TMOV(bTile_QK, bMatTile_QK_A);
     } else {
         TMOV(bTile_QK, bMatTile_QK_B);
+    }
+
+    if (has_next) {
+        GlobalB_QK kjGlobalNext(key_base + next_kv_block_id * N * K);
+        if ((i + 1) % 2 == 0) {
+            TLOAD(bMatTile_QK_A, kjGlobalNext);
+        } else {
+            TLOAD(bMatTile_QK_B, kjGlobalNext);
+        }
     }
 
     set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
@@ -200,15 +211,17 @@ template <
     int M, int K, int N, typename PijPipeT, typename OiPipeT, typename GlobalB_PV, typename PijMatTile,
     typename TileMatB_PV, typename LeftTile_PV, typename RightTile_PV, typename AccTile_PV>
 static __aicore__ void aic_pv_step(
-    __gm__ bfloat16_t *val_base, __gm__ int32_t *bt, uint64_t bt_offset, uint64_t i, PijMatTile &pijMatTile,
-    TileMatB_PV &bMatTile_PV_A, TileMatB_PV &bMatTile_PV_B, LeftTile_PV &aTile_PV, RightTile_PV &bTile_PV,
-    AccTile_PV &cTile_PV, PijPipeT &pij_pipe, OiPipeT &oi_pipe
+    __gm__ bfloat16_t *val_base, uint64_t kv_block_id, uint64_t i, PijMatTile &pijMatTile, TileMatB_PV &bMatTile_PV_A,
+    TileMatB_PV &bMatTile_PV_B, LeftTile_PV &aTile_PV, RightTile_PV &bTile_PV, AccTile_PV &cTile_PV, PijPipeT &pij_pipe,
+    OiPipeT &oi_pipe, bool current_loaded = false, bool has_next = false, uint64_t next_kv_block_id = 0
 ) {
-    GlobalB_PV vjGlobal(val_base + static_cast<uint64_t>(bt[bt_offset + i]) * N * K);
-    if (i % 2 == 0) {
-        TLOAD(bMatTile_PV_A, vjGlobal);
-    } else {
-        TLOAD(bMatTile_PV_B, vjGlobal);
+    if (!current_loaded) {
+        GlobalB_PV vjGlobal(val_base + kv_block_id * N * K);
+        if (i % 2 == 0) {
+            TLOAD(bMatTile_PV_A, vjGlobal);
+        } else {
+            TLOAD(bMatTile_PV_B, vjGlobal);
+        }
     }
 
     TPOP<PijPipeT, PijMatTile, TileSplitAxis::TILE_NO_SPLIT>(pij_pipe, pijMatTile);
@@ -223,6 +236,15 @@ static __aicore__ void aic_pv_step(
         TMOV(bTile_PV, bMatTile_PV_A);
     } else {
         TMOV(bTile_PV, bMatTile_PV_B);
+    }
+
+    if (has_next) {
+        GlobalB_PV vjGlobalNext(val_base + next_kv_block_id * N * K);
+        if ((i + 1) % 2 == 0) {
+            TLOAD(bMatTile_PV_A, vjGlobalNext);
+        } else {
+            TLOAD(bMatTile_PV_B, vjGlobalNext);
+        }
     }
 
     set_flag(PIPE_MTE1, PIPE_M, EVENT_ID1);
@@ -299,36 +321,41 @@ static __aicore__ void aic_process_blocks(
 
     if (n_blocks == 1) {
         // Degenerate case: no pipeline overlap possible
+        uint64_t block_id = static_cast<uint64_t>(bt[bt_offset]);
         aic_qk_step<M, K, N, SijPipeT, GlobalB_QK>(
-            key_base, bt, bt_offset, 0, aMatTile_QK, bMatTile_QK_A, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK,
-            sij_pipe
+            key_base, block_id, 0, aMatTile_QK, bMatTile_QK_A, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK, sij_pipe
         );
         aic_pv_step<M, K, N, PijPipeT, OiPipeT, GlobalB_PV>(
-            val_base, bt, bt_offset, 0, pijMatTile, bMatTile_PV_A, bMatTile_PV_B, aTile_PV, bTile_PV, cTile_PV,
-            pij_pipe, oi_pipe
+            val_base, block_id, 0, pijMatTile, bMatTile_PV_A, bMatTile_PV_B, aTile_PV, bTile_PV, cTile_PV, pij_pipe,
+            oi_pipe
         );
     } else {
         // Prologue: QK[0] — produces sij[0] for AIV to start SF[0]
+        uint64_t prev_block_id = static_cast<uint64_t>(bt[bt_offset]);
+        uint64_t next_block_id = static_cast<uint64_t>(bt[bt_offset + 1]);
         aic_qk_step<M, K, N, SijPipeT, GlobalB_QK>(
-            key_base, bt, bt_offset, 0, aMatTile_QK, bMatTile_QK_A, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK,
-            sij_pipe
+            key_base, prev_block_id, 0, aMatTile_QK, bMatTile_QK_A, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK,
+            sij_pipe, false, true, next_block_id
         );
         // Steady state: QK[i] then PV[i-1] (QK-first order).
         for (uint64_t i = 1; i < n_blocks; i++) {
+            uint64_t block_id = static_cast<uint64_t>(bt[bt_offset + i]);
+            uint64_t next_block_id = (i + 1 < n_blocks) ? static_cast<uint64_t>(bt[bt_offset + i + 1]) : 0;
             aic_qk_step<M, K, N, SijPipeT, GlobalB_QK>(
-                key_base, bt, bt_offset, i, aMatTile_QK, bMatTile_QK_A, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK,
-                sij_pipe
+                key_base, block_id, i, aMatTile_QK, bMatTile_QK_A, bMatTile_QK_B, aTile_QK, bTile_QK, cTile_QK,
+                sij_pipe, true, i + 1 < n_blocks, next_block_id
             );
             aic_pv_step<M, K, N, PijPipeT, OiPipeT, GlobalB_PV>(
-                val_base, bt, bt_offset, i - 1, pijMatTile, bMatTile_PV_A, bMatTile_PV_B, aTile_PV, bTile_PV, cTile_PV,
-                pij_pipe, oi_pipe
+                val_base, prev_block_id, i - 1, pijMatTile, bMatTile_PV_A, bMatTile_PV_B, aTile_PV, bTile_PV, cTile_PV,
+                pij_pipe, oi_pipe, i > 1, i < n_blocks, block_id
             );
+            prev_block_id = block_id;
         }
 
         // Epilogue: PV[n-1] — consume last pij
         aic_pv_step<M, K, N, PijPipeT, OiPipeT, GlobalB_PV>(
-            val_base, bt, bt_offset, n_blocks - 1, pijMatTile, bMatTile_PV_A, bMatTile_PV_B, aTile_PV, bTile_PV,
-            cTile_PV, pij_pipe, oi_pipe
+            val_base, prev_block_id, n_blocks - 1, pijMatTile, bMatTile_PV_A, bMatTile_PV_B, aTile_PV, bTile_PV,
+            cTile_PV, pij_pipe, oi_pipe, n_blocks > 1
         );
     }
 }
