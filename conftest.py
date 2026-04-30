@@ -16,12 +16,28 @@ subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
 import sys
 import time
 import typing
+
+# Make simpler's V0..V9 and NUL acceptable to pytest's `--log-level` validator.
+# pytest does `int(getattr(logging, level.upper(), level))`, so the value must
+# exist as a module attribute on `logging` (not just registered via
+# `addLevelName`). Set both — the addLevelName side gives nice formatter output
+# (`%(levelname)s` shows `V3` instead of `Level 18`); the setattr side is what
+# pytest's CLI parser actually consumes.
+for _v in range(10):
+    logging.addLevelName(15 + _v, f"V{_v}")
+    setattr(logging, f"V{_v}", 15 + _v)
+logging.addLevelName(60, "NUL")
+setattr(logging, "NUL", 60)
+# `pytest --log-level null` upcases to "NULL" before the getattr lookup, so
+# expose both spellings.
+setattr(logging, "NULL", 60)
 
 # macOS libomp collision workaround — must run before any import that may
 # transitively load numpy or torch (i.e. before pytest collects scene test

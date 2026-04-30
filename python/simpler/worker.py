@@ -264,17 +264,23 @@ def _chip_process_loop(
     aicpu_path: str,
     aicore_path: str,
     sim_context_lib_path: str = "",
+    log_level: int = 1,
+    log_info_v: int = 5,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
     Reads the unified mailbox layout (same offsets as _sub_worker_loop, but
     this loop also consumes config fields + args_blob).
+
+    `log_level` / `log_info_v` are the parent's snapshot of the simpler logger
+    (computed via `_log.get_current_config()`); the child cannot read the
+    parent's logger after fork, so the values are passed explicitly.
     """
     import traceback as _tb  # noqa: PLC0415
 
     try:
         cw = _ChipWorker()
-        cw.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path)
+        cw.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path, log_level, log_info_v)
         cw.set_device(device_id)
     except Exception as e:
         _tb.print_exc()
@@ -338,7 +344,7 @@ def _chip_process_loop(
             break
 
 
-def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
+def _chip_process_loop_with_bootstrap(  # noqa: PLR0912, PLR0913
     buf: memoryview,
     host_lib_path: str,
     device_id: int,
@@ -348,6 +354,8 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
     bootstrap_cfg: ChipBootstrapConfig,
     bootstrap_mailbox_addr: int,
     max_buffer_count: int,
+    log_level: int = 1,
+    log_info_v: int = 5,
 ) -> None:
     """Chip child variant that runs ``bootstrap_context`` before the main loop.
 
@@ -364,7 +372,7 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
 
     cw = ChipWorker()
     try:
-        cw.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path)
+        cw.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path, log_level, log_info_v)
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         channel.write_error(1, f"{type(e).__name__}: chip_worker.init: {e}")
@@ -763,6 +771,10 @@ class Worker:
         # entering the normal task/control loop.
         bootstrap_configs = self._chip_bootstrap_configs
         use_bootstrap = bootstrap_configs is not None
+        # Snapshot the simpler logger config now, in the parent. After fork the
+        # child cannot read this same logger state across the process boundary,
+        # so the values must be passed explicitly to the child loop.
+        chip_log_level, chip_log_info_v = _simpler_log.get_current_config()
         if device_ids:
             for idx, dev_id in enumerate(device_ids):
                 pid = os.fork()
@@ -785,6 +797,8 @@ class Worker:
                             bootstrap_cfg,
                             bootstrap_addr,
                             max_buffer_count,
+                            chip_log_level,
+                            chip_log_info_v,
                         )
                     else:
                         _chip_process_loop(
@@ -794,6 +808,8 @@ class Worker:
                             self._l3_aicpu_path,
                             self._l3_aicore_path,
                             self._l3_sim_ctx_path,
+                            chip_log_level,
+                            chip_log_info_v,
                         )
                     os._exit(0)
                 else:

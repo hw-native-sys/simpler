@@ -56,6 +56,22 @@ NUL = 60
 
 DEFAULT_THRESHOLD = _NATIVE_DEFAULT  # 20 (V5)
 
+# Register V0..V9 / NUL as Python logging level names so that:
+#   - `logging.LogRecord.levelname` for these tiers prints as "V0".."V9"
+#     instead of the default "Level 18" placeholder.
+#   - `logger.setLevel("V3")` (string form) resolves to 18.
+#   - pytest's own `--log-level` validator (which does
+#     `int(getattr(logging, name.upper(), name))`) accepts `pytest --log-level
+#     v3` — but only if the names exist as module attributes on `logging`.
+#     pytest validates the CLI value before conftest's first `import simpler`,
+#     so the same registration is also mirrored at conftest top-level.
+for _v in range(10):
+    logging.addLevelName(15 + _v, f"V{_v}")
+    setattr(logging, f"V{_v}", 15 + _v)
+logging.addLevelName(NUL, "NUL")
+setattr(logging, "NUL", NUL)
+setattr(logging, "NULL", NUL)  # pytest upcases user's `--log-level null` → NULL
+
 _LOGGER_NAME = "simpler"
 _logger = logging.getLogger(_LOGGER_NAME)
 if _logger.level == logging.NOTSET:
