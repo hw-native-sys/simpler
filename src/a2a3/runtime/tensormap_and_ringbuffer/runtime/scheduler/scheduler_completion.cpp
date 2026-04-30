@@ -171,7 +171,7 @@ void SchedulerContext::complete_slot_task(
 
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_perf_aicpu_complete_record(
-                pbuf, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
+                pbuf, core_id, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
                 slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
                 fanout_n
             ) != 0) {

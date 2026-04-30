@@ -2,7 +2,7 @@
 
 ## Problem
 
-Profiling data (`l2_perf_records_*.json`) identifies tasks by numeric IDs
+Profiling data (`l2_perf_records.json`) identifies tasks by numeric IDs
 (e.g., `func_id: 0`).  Without a mapping, swimlane visualizations show
 opaque labels like `func_0_a(t0)` instead of human-readable names like
 `QK(t0)`.
@@ -132,7 +132,7 @@ class TestL3Group(SceneTestCase):
 When `--enable-l2-swimlane` is used, SceneTest automatically:
 
 1. Extracts the name mapping from `CALLABLE` via `_extract_name_map()`.
-2. Writes `outputs/name_map_<ClassName_casename>.json`.
+2. Writes `<output_prefix>/name_map_<ClassName_casename>.json`.
 3. Passes the file to `swimlane_converter.py` via `--func-names`.
 
 No manual steps are needed.  If no `"name"` fields are defined, no
@@ -147,19 +147,29 @@ takes precedence over `-k` (kernel_config.py):
 # Automatic (via SceneTest profiling)
 pytest tests/st/... --platform a5onboard --enable-l2-swimlane
 
-# Manual
-python -m simpler_setup.tools.swimlane_converter outputs/*/l2_perf_records.json \
-    --func-names outputs/name_map_TestPA_basic.json
+# Manual (paths land alongside l2_perf_records.json inside the same
+# <output_prefix> directory)
+python -m simpler_setup.tools.swimlane_converter \
+    outputs/<case>_<ts>/l2_perf_records.json \
+    --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
 
-python -m simpler_setup.tools.perf_to_mermaid outputs/*/l2_perf_records.json \
-    --func-names outputs/name_map_TestPA_basic.json
+python -m simpler_setup.tools.perf_to_mermaid \
+    outputs/<case>_<ts>/l2_perf_records.json \
+    --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
 ```
 
 ## File Layout
 
+Each test case writes its diagnostic artifacts under
+`CallConfig::output_prefix` (chosen by
+`scene_test.py::_build_output_prefix` as
+`outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/`). Filenames are fixed —
+the per-case directory is the uniqueness boundary, so parallel runs
+cannot collide.
+
 ```text
-outputs/
-  l2_perf_records_20260416_151301_TestPA_basic.json   # perf data (runtime)
-  name_map_TestPA_basic.json                        # name mapping (SceneTest)
-  merged_swimlane_20260416_151301_TestPA_basic.json # Perfetto trace (converter)
+outputs/TestPA_basic_20260416_151301/
+  l2_perf_records.json         # perf data (runtime)
+  name_map_TestPA_basic.json   # name mapping (SceneTest)
+  merged_swimlane.json         # Perfetto trace (converter)
 ```

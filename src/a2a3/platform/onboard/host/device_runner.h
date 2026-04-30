@@ -462,7 +462,7 @@ private:
     // Tensor dump (independent shared memory + memory manager)
     TensorDumpCollector dump_collector_;
     // PMU collector (independent of profiling pipeline)
-    PmuCollectorHost pmu_collector_;
+    PmuCollector pmu_collector_;
 
     /**
      * Ensure device is initialized (lazy initialization)
@@ -523,7 +523,7 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_l2_perf_collection(int num_aicore, int device_id);
+    int init_l2_perf(int num_aicore, int device_id);
 
     /**
      * Initialize tensor dump shared memory and collector.
@@ -532,11 +532,10 @@ private:
      * and stores the dump base in AICPU launch arguments.
      *
      * @param runtime Runtime instance to configure
-     * @param num_aicore Number of AICore instances (unused; dump is per-thread)
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_tensor_dump(Runtime &runtime, int num_aicore, int device_id);
+    int init_tensor_dump(Runtime &runtime, int device_id);
 
     /**
      * Initialize PMU streaming shared memory.
@@ -552,9 +551,7 @@ private:
      * @param device_id  Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_pmu_buffers(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
-    );
+    int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use

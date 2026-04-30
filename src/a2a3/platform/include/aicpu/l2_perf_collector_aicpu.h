@@ -56,7 +56,19 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime);
  * and fills all AICPU-side fields. Callers must pre-extract fanout into a
  * plain uint64_t array (platform layer cannot depend on runtime linked-list types).
  *
+ * Per-core counter accounting (mirrors a5 PMU's three-bucket model):
+ *   total_record_count++       — every commit attempt (success or failure)
+ *   dropped_record_count++     — capacity-driven drop (buffer full); actionable
+ *                                via PLATFORM_PROF_BUFFERS_PER_CORE
+ *   neither + return -1        — WIP slot mismatch (AICore not yet published);
+ *                                surfaced on the host as a "silent wip-mismatch"
+ *                                gap of `device_total - (collected + dropped)`.
+ *                                Different remediation from a buffer-full drop
+ *                                — indicates an AICore/AICPU race, not a
+ *                                capacity problem.
+ *
  * @param l2_perf_buf              L2PerfBuffer pointer (from handshake l2_perf_records_addr)
+ * @param core_id               Core index — used to update per-core counters
  * @param expected_reg_task_id  Register dispatch token (low 32 bits) to validate
  * @param task_id               Task identifier to write (PTO2 encoding or plain id)
  * @param func_id               Kernel function identifier
@@ -67,8 +79,8 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime);
  * @param fanout_count          Number of entries in fanout array (0 if none)
  */
 int l2_perf_aicpu_complete_record(
-    L2PerfBuffer *l2_perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
-    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
+    L2PerfBuffer *l2_perf_buf, int core_id, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id,
+    CoreType core_type, uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
 );
 
 /**
@@ -92,16 +104,6 @@ void l2_perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx);
  * @param core_num Number of cores managed by this thread
  */
 void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int core_num);
-
-/**
- * Update total task count in performance header
- *
- * Allows dynamic update of total_tasks as orchestrator makes progress.
- * Used by tensormap_and_ringbuffer runtime where task count grows incrementally.
- *
- * @param total_tasks Current total task count
- */
-void l2_perf_aicpu_update_total_tasks(uint32_t total_tasks);
 
 /**
  * Initialize AICPU phase profiling

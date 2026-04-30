@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstddef>
 
+#include "common/core_type.h"
 #include "common/platform_config.h"
 
 // DAV_2201 hardware counter count.
@@ -128,8 +129,6 @@ inline const PmuEventConfig *pmu_resolve_event_config_a2a3(PmuEventType event_ty
 // =============================================================================
 // PMU Record
 // =============================================================================
-
-#include "common/core_type.h"
 
 /**
  * Per-task PMU snapshot written by AICPU after each AICore task FIN.
