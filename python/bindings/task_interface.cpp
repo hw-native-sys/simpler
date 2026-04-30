@@ -645,6 +645,7 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
         .def_prop_ro("device_set", &ChipWorker::device_set)
+        .def_prop_ro("device_unresponsive", &ChipWorker::device_unresponsive)
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))

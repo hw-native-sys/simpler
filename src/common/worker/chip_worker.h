@@ -88,6 +88,11 @@ public:
     bool initialized() const { return initialized_; }
     bool device_set() const { return device_set_; }
 
+    /// True after a run() that triggered stream sync timeout + device reset.
+    /// When set, the caller should use os._exit() to avoid CANN library fini
+    /// functions blocking on the reset device during normal process exit.
+    bool device_unresponsive() const { return device_unresponsive_; }
+
 private:
     using CreateDeviceContextFn = void *(*)();
     using DestroyDeviceContextFn = void (*)(void *);
@@ -102,6 +107,7 @@ private:
         int, int, int, const char *
     );
     using FinalizeDeviceFn = int (*)(void *);
+    using DeviceUnresponsiveFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
     using DestroyCommStreamFn = int (*)(void *, void *);
@@ -123,6 +129,7 @@ private:
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     RunRuntimeFn run_runtime_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
+    DeviceUnresponsiveFn device_unresponsive_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
     DestroyCommStreamFn destroy_comm_stream_fn_ = nullptr;
@@ -146,6 +153,7 @@ private:
     bool initialized_ = false;
     bool device_set_ = false;
     bool finalized_ = false;
+    bool device_unresponsive_ = false;
 };
 
 #endif  // SRC_COMMON_WORKER_CHIP_WORKER_H_

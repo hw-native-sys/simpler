@@ -238,8 +238,20 @@ int run_runtime(
         std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
         rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
         if (rc != 0) {
-            validate_runtime_impl(r);
-            r->~Runtime();
+            if (runner->device_unresponsive()) {
+                // Skip validate_runtime_impl: device state is unreliable after
+                // stream sync timeout — copy_from_device / device_free may block
+                // or fault on already-reset resources.
+                LOG_ERROR("run_runtime: stream sync timeout detected, skipping validation, triggering full reset");
+                r->~Runtime();
+                int reset_rc = runner->finalize();
+                if (reset_rc != 0) {
+                    LOG_ERROR("run_runtime: DeviceRunner finalize after timeout failed: %d", reset_rc);
+                }
+            } else {
+                validate_runtime_impl(r);
+                r->~Runtime();
+            }
             return rc;
         }
 
@@ -258,6 +270,11 @@ int finalize_device(DeviceContextHandle ctx) {
     } catch (...) {
         return -1;
     }
+}
+
+int device_unresponsive(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    return static_cast<DeviceRunner *>(ctx)->device_unresponsive() ? 1 : 0;
 }
 
 /* ===========================================================================

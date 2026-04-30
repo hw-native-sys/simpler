@@ -282,6 +282,11 @@ class ChipWorker:
         """
         self._impl.finalize()
 
+    @property
+    def device_unresponsive(self):
+        """True after a run() that triggered stream sync timeout + device reset."""
+        return self._impl.device_unresponsive
+
     def run(self, callable, args, config=None, **kwargs):
         """Execute a callable synchronously.
 

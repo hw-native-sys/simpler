@@ -92,6 +92,14 @@ public:
     int finalize();
 
     /**
+     * Drop all tracked pointers without calling rtFree.
+     *
+     * Use after a device reset (aclrtResetDevice) that reclaims all device
+     * memory, so individual rtFree calls are unnecessary and may block.
+     */
+    void abandon();
+
+    /**
      * Get number of tracked allocations
      *
      * @return Number of currently tracked pointers
