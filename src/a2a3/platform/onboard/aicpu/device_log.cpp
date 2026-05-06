@@ -35,8 +35,6 @@ bool g_is_log_enable_error = false;
 
 int g_log_info_v = 5;
 
-const char *TILE_FWK_DEVICE_MACHINE = "AI_CPU";
-
 void init_log_switch() {
     g_is_log_enable_debug = CheckLogLevel(AICPU, DLOG_DEBUG);
     g_is_log_enable_info = CheckLogLevel(AICPU, DLOG_INFO);

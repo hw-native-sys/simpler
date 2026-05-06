@@ -108,6 +108,29 @@ TEST(HostLogTest, InfoVerbosityCutsBelowThreshold) {
     EXPECT_NE(captured.err.find("v9-msg"), std::string::npos);
 }
 
+TEST(HostLogTest, EmitPrefixHasTimestampAndTid) {
+    auto captured = run_with_config(LogLevel::INFO, 5, [] {
+        HostLogger::get_instance().log(LogLevel::ERROR, "fn", "marker");
+    });
+    // Expected shape: "[YYYY-MM-DD HH:MM:SS.uuuuuu][T0x...][ERROR] fn: marker\n"
+    ASSERT_FALSE(captured.err.empty());
+    EXPECT_EQ(captured.err[0], '[');
+    // Year must be 4 ASCII digits.
+    for (int i = 1; i <= 4; ++i) {
+        EXPECT_GE(captured.err[i], '0');
+        EXPECT_LE(captured.err[i], '9');
+    }
+    EXPECT_EQ(captured.err[5], '-');
+    // Thread-id segment "[T0x" must appear before the level tag.
+    auto tid_pos = captured.err.find("][T0x");
+    auto level_pos = captured.err.find("][ERROR]");
+    ASSERT_NE(tid_pos, std::string::npos);
+    ASSERT_NE(level_pos, std::string::npos);
+    EXPECT_LT(tid_pos, level_pos);
+    // Body still present.
+    EXPECT_NE(captured.err.find("marker"), std::string::npos);
+}
+
 TEST(HostLogTest, AllOutputGoesToStderr) {
     auto captured = run_with_config(LogLevel::DEBUG, 0, [] {
         HostLogger::get_instance().log(LogLevel::ERROR, "fn", "e");

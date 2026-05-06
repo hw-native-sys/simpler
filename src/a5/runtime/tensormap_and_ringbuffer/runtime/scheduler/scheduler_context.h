@@ -11,7 +11,7 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
-#include "aicpu/device_log.h"
+#include "common/unified_log.h"
 #include "scheduler_types.h"
 
 #include "scheduler/pto_scheduler.h"
@@ -298,7 +298,7 @@ private:
 
     uint64_t get_function_bin_addr(int func_id) const {
         if (!func_id_to_addr_ || func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-            DEV_ERROR("func_id=%d is out of range [0, %d) or map is null", func_id, RUNTIME_MAX_FUNC_ID);
+            LOG_ERROR("func_id=%d is out of range [0, %d) or map is null", func_id, RUNTIME_MAX_FUNC_ID);
             return 0;
         }
         return func_id_to_addr_[func_id];

@@ -34,8 +34,6 @@ bool g_is_log_enable_error = true;
 // Default V5 (matches HostLogger / Python defaults).
 int g_log_info_v = 5;
 
-const char *TILE_FWK_DEVICE_MACHINE = "SIM_CPU";
-
 // =============================================================================
 // Setters (called by AICPU init from KernelArgs)
 // =============================================================================

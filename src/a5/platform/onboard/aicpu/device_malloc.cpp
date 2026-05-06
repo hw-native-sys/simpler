@@ -18,7 +18,7 @@
  */
 
 #include "aicpu/device_malloc.h"
-#include "aicpu/device_log.h"
+#include "common/unified_log.h"
 
 #include <dlfcn.h>
 #include <cstdlib>
@@ -37,7 +37,7 @@ static void resolve_hal_mem_functions() {
     g_halMemAlloc = reinterpret_cast<HalMemAllocFn>(dlsym(RTLD_DEFAULT, "halMemAlloc"));
     g_halMemFree = reinterpret_cast<HalMemFreeFn>(dlsym(RTLD_DEFAULT, "halMemFree"));
     if (g_halMemAlloc == nullptr || g_halMemFree == nullptr) {
-        DEV_ERROR("Failed to resolve halMemAlloc/halMemFree: %s", dlerror());
+        LOG_ERROR("Failed to resolve halMemAlloc/halMemFree: %s", dlerror());
         g_halMemAlloc = nullptr;
         g_halMemFree = nullptr;
     }
@@ -48,7 +48,7 @@ void *aicpu_device_malloc(size_t size) {
     resolve_hal_mem_functions();
 
     if (g_halMemAlloc == nullptr) {
-        DEV_ERROR("halMemAlloc not available, cannot allocate device memory");
+        LOG_ERROR("halMemAlloc not available, cannot allocate device memory");
         return nullptr;
     }
 
@@ -61,7 +61,7 @@ void *aicpu_device_malloc(size_t size) {
     unsigned long long flag = MEM_TYPE_HBM;
     int rc = g_halMemAlloc(&ptr, static_cast<unsigned long long>(size), flag);
     if (rc != 0 || ptr == nullptr) {
-        DEV_ERROR("halMemAlloc failed: rc=%d size=%zu flag=0x%llx", rc, size, flag);
+        LOG_ERROR("halMemAlloc failed: rc=%d size=%zu flag=0x%llx", rc, size, flag);
         return nullptr;
     }
     return ptr;
@@ -75,11 +75,11 @@ void aicpu_device_free(void *ptr) {
     resolve_hal_mem_functions();
 
     if (g_halMemFree == nullptr) {
-        DEV_ERROR("halMemFree not available, cannot free device memory");
+        LOG_ERROR("halMemFree not available, cannot free device memory");
         return;
     }
     int rc = g_halMemFree(ptr);
     if (rc != 0) {
-        DEV_ERROR("halMemFree failed: rc=%d ptr=%p", rc, ptr);
+        LOG_ERROR("halMemFree failed: rc=%d ptr=%p", rc, ptr);
     }
 }
