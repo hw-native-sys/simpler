@@ -405,3 +405,99 @@ TEST_F(TaskAllocatorTest, TaskIdNearInt32Max) {
     EXPECT_GE(r3.slot, 0);
     EXPECT_LT(r3.slot, WINDOW_SIZE);
 }
+
+// =============================================================================
+// Re-init safety
+// =============================================================================
+
+class TaskAllocatorReinitTest : public ::testing::Test {
+protected:
+    static constexpr int32_t WINDOW_SIZE = 16;
+    static constexpr uint64_t HEAP_SIZE = 1024;
+
+    std::vector<PTO2TaskDescriptor> descriptors;
+    alignas(64) uint8_t heap_buf[1024]{};
+    std::atomic<int32_t> current_index{0};
+    std::atomic<int32_t> last_alive{0};
+    std::atomic<int32_t> error_code{PTO2_ERROR_NONE};
+    PTO2TaskAllocator allocator{};
+
+    void InitAllocator() {
+        descriptors.assign(WINDOW_SIZE, PTO2TaskDescriptor{});
+        std::memset(heap_buf, 0, sizeof(heap_buf));
+        current_index.store(0);
+        last_alive.store(0);
+        error_code.store(PTO2_ERROR_NONE);
+        allocator.init(descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, heap_buf, HEAP_SIZE, &error_code);
+    }
+};
+
+TEST_F(TaskAllocatorReinitTest, ReInitAfterUse) {
+    InitAllocator();
+
+    auto r1 = allocator.alloc(128);
+    ASSERT_FALSE(r1.failed());
+    auto r2 = allocator.alloc(128);
+    ASSERT_FALSE(r2.failed());
+    EXPECT_EQ(r2.task_id, 1);
+
+    InitAllocator();
+
+    auto r3 = allocator.alloc(64);
+    ASSERT_FALSE(r3.failed());
+    EXPECT_EQ(r3.task_id, 0) << "Re-init should reset task ID counter";
+    EXPECT_EQ(r3.slot, 0);
+}
+
+TEST_F(TaskAllocatorReinitTest, ReInitDifferentHeapSize) {
+    InitAllocator();
+
+    auto r1 = allocator.alloc(HEAP_SIZE);
+    ASSERT_FALSE(r1.failed());
+    EXPECT_EQ(allocator.heap_top(), HEAP_SIZE);
+
+    InitAllocator();
+    EXPECT_EQ(allocator.heap_top(), 0u) << "Re-init resets heap_top";
+    EXPECT_EQ(allocator.heap_available(), HEAP_SIZE) << "Re-init restores full capacity";
+}
+
+TEST_F(TaskAllocatorReinitTest, ReInitClearsErrorState) {
+    InitAllocator();
+
+    auto r = allocator.alloc(HEAP_SIZE * 2);
+    EXPECT_TRUE(r.failed());
+    EXPECT_NE(error_code.load(), PTO2_ERROR_NONE);
+
+    InitAllocator();
+    EXPECT_EQ(error_code.load(), PTO2_ERROR_NONE);
+
+    auto r2 = allocator.alloc(64);
+    EXPECT_FALSE(r2.failed());
+}
+
+TEST_F(TaskAllocatorReinitTest, MultipleReInitCycles) {
+    for (int cycle = 0; cycle < 10; cycle++) {
+        InitAllocator();
+
+        for (int i = 0; i < WINDOW_SIZE - 1; i++) {
+            auto r = allocator.alloc(0);
+            ASSERT_FALSE(r.failed()) << "Cycle " << cycle << " alloc " << i;
+            EXPECT_EQ(r.task_id, i);
+        }
+    }
+}
+
+TEST_F(TaskAllocatorReinitTest, ReInitIgnoresStaleLastAlive) {
+    InitAllocator();
+
+    auto r1 = allocator.alloc(64);
+    ASSERT_FALSE(r1.failed());
+    last_alive.store(5, std::memory_order_release);
+
+    InitAllocator();
+    EXPECT_EQ(last_alive.load(), 0);
+
+    auto r2 = allocator.alloc(64);
+    ASSERT_FALSE(r2.failed());
+    EXPECT_EQ(r2.task_id, 0);
+}
