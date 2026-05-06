@@ -94,6 +94,16 @@ constexpr int PLATFORM_MAX_CORES = PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BL
 constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 
 /**
+ * Per-core AICore→AICPU staging ring slot count.
+ *
+ * AICore writes each task's timing into ring->dual_issue_slots[task_id %
+ * PLATFORM_L2_AICORE_RING_SIZE]. Must be a power of two and ≥ the in-flight
+ * issue depth on a single core. Today's runtime is dual-issue, so 2 slots
+ * suffice; raise to the next power of two when issue depth grows.
+ */
+constexpr int PLATFORM_L2_AICORE_RING_SIZE = 2;
+
+/**
  * Number of buffer slots per core/thread for dynamic profiling
  * Host dynamically allocates buffers and writes addresses into these slots.
  * Device reads slot addresses when switching buffers.

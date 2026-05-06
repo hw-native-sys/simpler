@@ -113,19 +113,20 @@
  * - aicore_done: Written by AICore, read by AICPU
  * - task: Written by AICPU, read by AICore (0 = no task assigned)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
- * - l2_perf_records_addr: Written by AICPU, read by AICore (performance records address)
+ * - l2_perf_aicore_ring_addr: Written by AICPU at init, read by AICore (stable
+ *   per-core L2PerfAicoreRing address for timing publication; never reassigned)
  * - physical_core_id: Written by AICPU, read by AICore (physical core ID)
  * - enable_profiling_flag: Written by host/AICPU init, read by AICore (bitmask)
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;           // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;           // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;                  // Task pointer: 0=no task, non-zero=Task* address
-    volatile CoreType core_type;             // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t l2_perf_records_addr;  // Performance records address
-    volatile uint32_t physical_core_id;      // Physical core ID
-    volatile uint32_t aicpu_regs_ready;      // AICPU register init done: 0=pending, 1=done
-    volatile uint32_t aicore_regs_ready;     // AICore ID reported: 0=pending, 1=done
+    volatile uint32_t aicpu_ready;               // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;               // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;                      // Task pointer: 0=no task, non-zero=Task* address
+    volatile CoreType core_type;                 // Core type: CoreType::AIC or CoreType::AIV
+    volatile uint64_t l2_perf_aicore_ring_addr;  // Stable per-core L2PerfAicoreRing address (AICore writes timing here)
+    volatile uint32_t physical_core_id;          // Physical core ID
+    volatile uint32_t aicpu_regs_ready;          // AICPU register init done: 0=pending, 1=done
+    volatile uint32_t aicore_regs_ready;         // AICore ID reported: 0=pending, 1=done
     volatile uint32_t
         enable_profiling_flag;  // Umbrella diagnostics bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
 } __attribute__((aligned(64)));

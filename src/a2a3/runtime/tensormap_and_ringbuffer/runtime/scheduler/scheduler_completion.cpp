@@ -157,9 +157,7 @@ void SchedulerContext::complete_slot_task(
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        Handshake *h = &hank[core_id];
         uint64_t finish_ts = get_sys_cnt_aicpu();
-        L2PerfBuffer *pbuf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
 
         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
         int32_t fanout_n = 0;
@@ -171,7 +169,7 @@ void SchedulerContext::complete_slot_task(
 
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_perf_aicpu_complete_record(
-                pbuf, core_id, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
+                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
                 slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
                 fanout_n
             ) != 0) {
@@ -184,9 +182,7 @@ void SchedulerContext::complete_slot_task(
         l2_perf.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
 #endif
     }
-#endif
 
-#if PTO2_PROFILING
     if (is_pmu_enabled()) {
         pmu_aicpu_record_task(
             core_id, thread_idx, slot_state.task->task_id.raw,
@@ -351,7 +347,7 @@ int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape) {
 // Drain worker: dispatch all blocks in one pass across all threads' trackers.
 // Called only when global resources >= block_num, so one pass always suffices.
 // All other threads are spinning -- the drain worker has exclusive tracker access.
-void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num) {
+void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
     PTO2TaskSlotState *slot_state = drain_state_.pending_task;
     if (!slot_state) {
         drain_state_.sync_start_pending.store(0, std::memory_order_release);
@@ -362,7 +358,7 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
     for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
         auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
         while (valid.has_value() && slot_state->next_block_idx < block_num) {
-            dispatch_block(runtime, t, valid.pop_first(), *slot_state, shape, false);
+            dispatch_block(t, valid.pop_first(), *slot_state, shape, false);
             slot_state->next_block_idx++;
         }
     }
@@ -389,7 +385,7 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
 //   3. Dispatch: elected thread dispatches all blocks (one pass, resources guaranteed).
 //      Non-elected threads spin-wait until sync_start_pending == 0.
 //      During dispatch the elected thread has exclusive tracker access.
-void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
+void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
     // Spin until drain is fully initialized (sentinel -1 -> block_num > 0).
     int32_t block_num;
     do {
@@ -440,5 +436,5 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
     }
 
     // Dispatch -- all other threads are spinning, elected thread has exclusive tracker access.
-    drain_worker_dispatch(runtime, block_num);
+    drain_worker_dispatch(block_num);
 }

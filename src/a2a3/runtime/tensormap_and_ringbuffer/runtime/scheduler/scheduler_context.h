@@ -213,23 +213,20 @@ private:
     );
 
     void dispatch_subtask_to_core(
-        Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,
-        PTO2SubtaskSlot subslot, bool to_pending
+        int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, bool to_pending
     );
 
     void dispatch_mix_block_to_cluster(
-        Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending
+        int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending
     );
 
     void dispatch_block(
-        Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,
-        PTO2ResourceShape shape, bool to_pending
+        int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape, bool to_pending
     );
 
     void dispatch_shape(
-        Runtime *runtime, int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
-        PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress,
-        bool &try_pushed
+        int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, PTO2LocalReadyBuffer &local_buf,
+        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
     );
 
     // =========================================================================
@@ -261,8 +258,8 @@ private:
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);
     int32_t count_global_available(PTO2ResourceShape shape);
-    void drain_worker_dispatch(Runtime *runtime, int32_t block_num);
-    void handle_drain_mode(Runtime *runtime, int32_t thread_idx);
+    void drain_worker_dispatch(int32_t block_num);
+    void handle_drain_mode(int32_t thread_idx);
 
     // =========================================================================
     // Cold path: exit checks, stall diagnostics, profiling (scheduler_cold_path.cpp)
