@@ -66,8 +66,7 @@ static Tensor make_test_tensor_2d(uint64_t addr, uint32_t s0, uint32_t s1, int32
 }
 
 static Tensor make_test_tensor_nd(
-    uint64_t addr, uint32_t ndims, const uint32_t shapes[], const uint32_t offsets[] = nullptr,
-    int32_t version = 0
+    uint64_t addr, uint32_t ndims, const uint32_t shapes[], const uint32_t offsets[] = nullptr, int32_t version = 0
 ) {
     uint32_t seed_shape[1] = {1};
     Tensor t = make_tensor_external(reinterpret_cast<void *>(addr), seed_shape, 1, DataType::FLOAT32, false, 0);
