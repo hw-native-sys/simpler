@@ -15,8 +15,11 @@
 
 #include "host_log.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <pthread.h>
 
 using simpler::log::LogLevel;
 
@@ -65,8 +68,20 @@ const char *HostLogger::level_name(LogLevel level) const {
 }
 
 void HostLogger::emit(const char *level_tag, const char *func, const char *fmt, va_list args) {
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto t = system_clock::to_time_t(now);
+    auto us = duration_cast<microseconds>(now.time_since_epoch()) % 1'000'000;
+    struct tm tm_buf;
+    localtime_r(&t, &tm_buf);
+    char ts[40];
+    size_t n = strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    snprintf(ts + n, sizeof(ts) - n, ".%06lld", static_cast<long long>(us.count()));
+
+    auto tid = static_cast<unsigned long>(reinterpret_cast<uintptr_t>(pthread_self()));
+
     std::scoped_lock lock(mutex_);
-    fprintf(stderr, "[%s] %s: ", level_tag, func);
+    fprintf(stderr, "[%s][T0x%lx][%s] %s: ", ts, tid, level_tag, func);
     vfprintf(stderr, fmt, args);
     if (fmt[0] != '\0' && fmt[strlen(fmt) - 1] != '\n') {
         fputc('\n', stderr);

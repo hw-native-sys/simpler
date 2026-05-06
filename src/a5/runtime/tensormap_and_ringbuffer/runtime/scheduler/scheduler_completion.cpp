@@ -10,7 +10,7 @@
  */
 #include "scheduler_context.h"
 
-#include "aicpu/device_log.h"
+#include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "common/l2_perf_profiling.h"
@@ -136,7 +136,7 @@ void SchedulerContext::complete_slot_task(
         if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         } else {
-            DEV_INFO_V(9, "Thread %d: release", thread_idx);
+            LOG_INFO_V9("Thread %d: release", thread_idx);
             while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
                 int32_t fe =
@@ -175,7 +175,7 @@ void SchedulerContext::complete_slot_task(
                 slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
                 fanout_n
             ) != 0) {
-            DEV_ERROR(
+            LOG_ERROR(
                 "Core %d: l2_perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
                 static_cast<uint64_t>(slot_state.task->task_id.raw)
             );

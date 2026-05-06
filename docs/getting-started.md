@@ -216,9 +216,14 @@ python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a
 
 Device logs written to `~/ascend/log/debug/device-<id>/`
 
-Kernel uses macros:
+Both host and AICPU kernel code use the unified `LOG_*` macros from
+`common/unified_log.h`:
 
-- `DEV_INFO`: Informational messages
-- `DEV_DEBUG`: Debug messages
-- `DEV_WARN`: Warnings
-- `DEV_ERROR`: Error messages
+- `LOG_INFO_V0` .. `LOG_INFO_V9`: INFO with verbosity tier (V0 most verbose,
+  V9 most must-see, V5 default)
+- `LOG_DEBUG`: Debug messages
+- `LOG_WARN`: Warnings
+- `LOG_ERROR`: Error messages
+
+Threshold is configured from Python via the `simpler` logger:
+`logging.getLogger("simpler").setLevel(simpler.V3)`.

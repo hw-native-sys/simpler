@@ -58,9 +58,6 @@ extern bool g_is_log_enable_error;
 // INFO verbosity threshold (0..9). Default 5.
 extern int g_log_info_v;
 
-// Platform constant (defined in platform-specific device_log.cpp)
-extern const char *TILE_FWK_DEVICE_MACHINE;
-
 // =============================================================================
 // Configuration setters (called by AICPU kernel init from KernelArgs)
 // =============================================================================
@@ -79,77 +76,6 @@ void dev_log_debug(const char *func, const char *fmt, ...);
 void dev_log_warn(const char *func, const char *fmt, ...);
 void dev_log_error(const char *func, const char *fmt, ...);
 void dev_log_info_v(int v, const char *func, const char *fmt, ...);
-
-// =============================================================================
-// High-level macros (platform-independent layer)
-// =============================================================================
-
-#define D_DEV_LOGD(MODE_NAME, fmt, ...)                      \
-    do {                                                     \
-        if (g_is_log_enable_debug) {                         \
-            dev_log_debug(__FUNCTION__, fmt, ##__VA_ARGS__); \
-        }                                                    \
-    } while (0)
-
-#define D_DEV_LOGW(MODE_NAME, fmt, ...)                     \
-    do {                                                    \
-        if (g_is_log_enable_warn) {                         \
-            dev_log_warn(__FUNCTION__, fmt, ##__VA_ARGS__); \
-        }                                                   \
-    } while (0)
-
-#define D_DEV_LOGE(MODE_NAME, fmt, ...)                      \
-    do {                                                     \
-        if (g_is_log_enable_error) {                         \
-            dev_log_error(__FUNCTION__, fmt, ##__VA_ARGS__); \
-        }                                                    \
-    } while (0)
-
-#define D_DEV_LOGI_V(MODE_NAME, V, fmt, ...)                       \
-    do {                                                           \
-        if (g_is_log_enable_info && (V) >= g_log_info_v) {         \
-            dev_log_info_v((V), __FUNCTION__, fmt, ##__VA_ARGS__); \
-        }                                                          \
-    } while (0)
-
-#define DEV_DEBUG(fmt, args...) D_DEV_LOGD(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
-#define DEV_WARN(fmt, args...) D_DEV_LOGW(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
-#define DEV_ERROR(fmt, args...) D_DEV_LOGE(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
-#define DEV_INFO_V(v, fmt, args...) D_DEV_LOGI_V(TILE_FWK_DEVICE_MACHINE, v, fmt, ##args)
-
-// =============================================================================
-// Assertions
-// =============================================================================
-
-#include <cassert>
-#define DEV_ASSERT(condition) assert(condition)
-
-#define DEV_CHECK_COND_RETURN_VOID(cond, fmt, ...) \
-    do {                                           \
-        if (!(cond)) {                             \
-            DEV_ERROR(fmt, ##__VA_ARGS__);         \
-            DEV_ASSERT(0);                         \
-            return;                                \
-        }                                          \
-    } while (0)
-
-#define DEV_CHECK_COND_RETURN(cond, retval, fmt, ...) \
-    do {                                              \
-        if (!(cond)) {                                \
-            DEV_ERROR(fmt, ##__VA_ARGS__);            \
-            DEV_ASSERT(0);                            \
-            return (retval);                          \
-        }                                             \
-    } while (0)
-
-#define DEV_CHECK_POINTER_NULL_RETURN_VOID(ptr, fmt, ...) \
-    do {                                                  \
-        if ((ptr) == nullptr) {                           \
-            DEV_ERROR(fmt, ##__VA_ARGS__);                \
-            DEV_ASSERT(0);                                \
-            return;                                       \
-        }                                                 \
-    } while (0)
 
 // =============================================================================
 // Helper Functions
