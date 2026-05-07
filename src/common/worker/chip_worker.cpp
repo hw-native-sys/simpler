@@ -56,6 +56,27 @@ void ensure_sim_context_loaded(const std::string &path) {
     });
 }
 
+// Process-wide singleton: libsimpler_log.so is loaded once with RTLD_GLOBAL
+// so every consumer .so (host_runtime, cpu_sim_context, the binding, sim
+// AICore) shares one HostLogger across the process.  Must be loaded BEFORE
+// any consumer that has unresolved HostLogger / unified_log_* symbols.
+// Never dlclosed.
+std::once_flag g_simpler_log_once;
+void *g_simpler_log_handle = nullptr;
+
+void ensure_simpler_log_loaded(const std::string &path) {
+    std::call_once(g_simpler_log_once, [&]() {
+        dlerror();
+        g_simpler_log_handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (!g_simpler_log_handle) {
+            std::string err = "dlopen simpler_log failed: ";
+            const char *msg = dlerror();
+            err += msg ? msg : "unknown error";
+            throw std::runtime_error(err);
+        }
+    });
+}
+
 std::vector<uint8_t> read_binary_file(const std::string &path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
@@ -79,7 +100,7 @@ ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-    const std::string &sim_context_lib_path, int log_level, int log_info_v
+    const std::string &simpler_log_lib_path, const std::string &sim_context_lib_path, int log_level, int log_info_v
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -87,6 +108,14 @@ void ChipWorker::init(
     if (initialized_) {
         throw std::runtime_error("ChipWorker already initialized; runtime cannot be changed");
     }
+
+    // Load libsimpler_log FIRST with RTLD_GLOBAL so that subsequent host_runtime
+    // / cpu_sim_context / sim aicore .so loads can resolve their HostLogger and
+    // unified_log_* references against the single process-wide instance.
+    if (simpler_log_lib_path.empty()) {
+        throw std::runtime_error("ChipWorker::init requires simpler_log_lib_path");
+    }
+    ensure_simpler_log_loaded(simpler_log_lib_path);
 
     // Load the sim context SO with RTLD_GLOBAL (once per process) so that
     // PTO ISA TPUSH/TPOP can resolve pto_sim_get_subblock_id and

@@ -606,9 +606,9 @@ NB_MODULE(_task_interface, m) {
             return os.str();
         });
 
-    // Log default constant — single source. Mirrored in src/{a5,a2a3}/platform/
-    // src/host/host_log.h::simpler::log::kDefaultThreshold; if you change one,
-    // change the other.
+    // Log default constant — single source. Mirrored in
+    // src/common/log/host_log.h::simpler::log::kDefaultThreshold; if you change
+    // one, change the other.
     m.attr("DEFAULT_LOG_THRESHOLD") = 20;  // V5 = Python INFO
 
     // --- ChipWorker ---
@@ -616,7 +616,8 @@ NB_MODULE(_task_interface, m) {
         .def(nb::init<>())
         .def(
             "init", &ChipWorker::init, nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"),
-            nb::arg("sim_context_lib_path") = "", nb::arg("log_level") = 1, nb::arg("log_info_v") = 5
+            nb::arg("simpler_log_lib_path"), nb::arg("sim_context_lib_path") = "", nb::arg("log_level") = 1,
+            nb::arg("log_info_v") = 5
         )
         .def("set_device", &ChipWorker::set_device, nb::arg("device_id"))
         .def("reset_device", &ChipWorker::reset_device)

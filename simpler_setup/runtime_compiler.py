@@ -414,3 +414,44 @@ class RuntimeCompiler:
             ctx_build_dir = Path(os.path.realpath(build_dir)) / "sim_context"
             os.makedirs(ctx_build_dir, exist_ok=True)
             return _build(str(ctx_build_dir))
+
+    def compile_simpler_log(
+        self,
+        build_dir: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+    ) -> Union[bytes, Path]:
+        """Compile the standalone libsimpler_log.so (all platforms).
+
+        Single-instance host-side HostLogger. Loaded with RTLD_GLOBAL by
+        ChipWorker so every consumer .so (host_runtime, cpu_sim_context,
+        the binding) shares one HostLogger across the process.
+        """
+        cmake_source_dir = str(self.project_root / "src" / "common" / "log")
+        binary_name = "libsimpler_log.so"
+        cmake_args = self.host_target.toolchain.get_cmake_args()
+
+        def _build(actual_build_dir: str) -> Union[bytes, Path]:
+            binary_path = self._run_compilation(
+                cmake_source_dir,
+                cmake_args,
+                binary_name,
+                platform="SIMPLER_LOG",
+                build_dir=actual_build_dir,
+            )
+            if output_dir is not None:
+                od = Path(output_dir)
+                od.mkdir(parents=True, exist_ok=True)
+                dest = od / binary_name
+                shutil.copy2(binary_path, dest)
+                return dest
+            else:
+                with open(binary_path, "rb") as f:
+                    return f.read()
+
+        if build_dir is None:
+            with tempfile.TemporaryDirectory(prefix="simpler_log_build_", dir="/tmp") as tmp_dir:
+                return _build(tmp_dir)
+        else:
+            log_build_dir = Path(os.path.realpath(build_dir)) / "simpler_log"
+            os.makedirs(log_build_dir, exist_ok=True)
+            return _build(str(log_build_dir))

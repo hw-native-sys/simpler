@@ -129,6 +129,15 @@ constexpr int EXIT_BARRIER = 60;
 constexpr int EXIT_DESTROY = 70;
 
 int run_rank(int rank, int nranks, int device_id, const char *rootinfo_path) {
+    // libsimpler_log.so must be loaded RTLD_GLOBAL first so libhost_runtime.so's
+    // undefined HostLogger / unified_log_* symbols resolve at load time.
+    // Mirrors ChipWorker::init in production.
+    void *log_handle = dlopen(SIMPLER_LOG_LIB_PATH, RTLD_NOW | RTLD_GLOBAL);
+    if (log_handle == nullptr) {
+        fprintf(stderr, "[rank %d] dlopen simpler_log failed: %s\n", rank, dlerror());
+        return EXIT_DLERR;
+    }
+
     // libhost_runtime.so is the subject under test -- dlopen mirrors
     // ChipWorker.  libascendcl is linked in, so acl* is available directly.
     void *host_handle = dlopen(PTO_HOST_RUNTIME_LIB_PATH, RTLD_NOW | RTLD_LOCAL);
@@ -294,12 +303,16 @@ std::vector<int> read_ctest_devices() {
 class HcclCommTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // Path is baked in by tests/ut/cpp/CMakeLists.txt; the only way this
+        // Paths are baked in by tests/ut/cpp/CMakeLists.txt; the only way they
         // can be wrong at test time is if someone ran ctest without first
         // building the onboard runtime.
         if (!std::filesystem::exists(PTO_HOST_RUNTIME_LIB_PATH)) {
             GTEST_SKIP() << "libhost_runtime.so not built: " << PTO_HOST_RUNTIME_LIB_PATH
                          << "\n(build the a2a3 onboard tensormap_and_ringbuffer runtime first)";
+        }
+        if (!std::filesystem::exists(SIMPLER_LOG_LIB_PATH)) {
+            GTEST_SKIP() << "libsimpler_log.so not built: " << SIMPLER_LOG_LIB_PATH
+                         << "\n(build the a2a3 onboard runtime first — runs simpler_log too)";
         }
     }
 };

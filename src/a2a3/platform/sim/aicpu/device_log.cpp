@@ -67,41 +67,29 @@ void init_log_switch() {
 }
 
 // =============================================================================
-// Low-level dev_log_* (sim: fprintf to stderr; severity-by-prefix)
+// Low-level dev_log_* / dev_vlog_* (sim: fprintf to stderr; no buffer needed)
 // =============================================================================
 
-void dev_log_debug(const char *func, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
+void dev_vlog_debug(const char *func, const char *fmt, va_list args) {
     fprintf(stderr, "[DEBUG] %s: ", func);
     vfprintf(stderr, fmt, args);
     fputc('\n', stderr);
-    va_end(args);
 }
 
-void dev_log_warn(const char *func, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
+void dev_vlog_warn(const char *func, const char *fmt, va_list args) {
     fprintf(stderr, "[WARN] %s: ", func);
     vfprintf(stderr, fmt, args);
     fputc('\n', stderr);
-    va_end(args);
 }
 
-void dev_log_error(const char *func, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
+void dev_vlog_error(const char *func, const char *fmt, va_list args) {
     fprintf(stderr, "[ERROR] %s: ", func);
     vfprintf(stderr, fmt, args);
     fputc('\n', stderr);
-    va_end(args);
 }
 
-void dev_log_info_v(int v, const char *func, const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
+void dev_vlog_info_v(int v, const char *func, const char *fmt, va_list args) {
     fprintf(stderr, "[INFO_V%d] %s: ", v, func);
     vfprintf(stderr, fmt, args);
     fputc('\n', stderr);
-    va_end(args);
 }

@@ -15,6 +15,8 @@ add_library(cpu_sim_context SHARED
 
 target_include_directories(cpu_sim_context
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
+    # libsimpler_log public header (LOG_* macros used here for diagnostics).
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../log/include"
 )
 
 target_compile_options(cpu_sim_context PRIVATE
@@ -27,6 +29,12 @@ target_compile_options(cpu_sim_context PRIVATE
 
 target_link_libraries(cpu_sim_context PRIVATE pthread)
 
+
+# Allow undefined HostLogger / unified_log_* symbols — resolved at runtime
+# via libsimpler_log.so loaded with RTLD_GLOBAL by ChipWorker.
+if(APPLE)
+    target_link_options(cpu_sim_context PRIVATE -undefined dynamic_lookup)
+endif()
 set_target_properties(cpu_sim_context PROPERTIES
     OUTPUT_NAME "cpu_sim_context"
     SUFFIX ".so"

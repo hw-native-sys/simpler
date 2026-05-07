@@ -804,15 +804,20 @@ class SceneTestCase:
 
     @classmethod
     def _create_worker(cls, platform, device_id=0, build=False):
+        from simpler import _log as _simpler_log  # noqa: PLC0415
         from simpler.task_interface import ChipWorker  # noqa: PLC0415
 
         bins = cls._get_binaries(platform, build=build)
+        sev, info_v = _simpler_log.get_current_config()
         w = ChipWorker()
         w.init(
             str(bins.host_path),
             str(bins.aicpu_path),
             str(bins.aicore_path),
+            str(bins.simpler_log_path),
             str(bins.sim_context_path) if bins.sim_context_path else "",
+            sev,
+            info_v,
         )
         w.set_device(device_id)
         return w

@@ -36,7 +36,8 @@ public:
     /// and are then fixed for this ChipWorker's lifetime.
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-        const std::string &sim_context_lib_path = "", int log_level = 1, int log_info_v = 5
+        const std::string &simpler_log_lib_path, const std::string &sim_context_lib_path = "", int log_level = 1,
+        int log_info_v = 5
     );
 
     /// Set the target NPU device. Requires init() first.

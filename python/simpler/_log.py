@@ -35,7 +35,7 @@ import logging
 # DEFAULT_LOG_THRESHOLD is exposed by the _task_interface nanobind module so
 # Python and C++ share one constant. During a fresh `pip install -e .` the
 # pre-existing .so may be stale or absent, so fall back to the hardcoded
-# value (kept in sync manually with src/{a5,a2a3}/platform/src/host/host_log.h).
+# value (kept in sync manually with src/common/log/host_log.h).
 try:
     from _task_interface import DEFAULT_LOG_THRESHOLD as _NATIVE_DEFAULT  # pyright: ignore[reportMissingImports]
 except (ImportError, AttributeError):
