@@ -52,23 +52,26 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime);
 /**
  * Complete a L2PerfRecord with AICPU-side metadata after AICore task completion
  *
- * Reads l2_perf_buf->count, validates task_id match against the latest record,
- * and fills all AICPU-side fields. Callers must pre-extract fanout into a
- * plain uint64_t array (platform layer cannot depend on runtime linked-list types).
+ * Reads the AICore-published timing from the per-core staging ring at
+ * `dual_issue_slots[expected_reg_task_id % PLATFORM_L2_AICORE_RING_SIZE]`,
+ * validates the task_id match, fills all AICPU-side fields, commits into
+ * the current records buffer, and rotates the records buffer internally
+ * once it fills up. Callers must pre-extract fanout into a plain uint64_t
+ * array (platform layer cannot depend on runtime linked-list types).
  *
- * Per-core counter accounting (mirrors a5 PMU's three-bucket model):
+ * Per-core counter accounting:
  *   total_record_count++       — every commit attempt (success or failure)
- *   dropped_record_count++     — capacity-driven drop (buffer full); actionable
- *                                via PLATFORM_PROF_BUFFERS_PER_CORE
- *   neither + return -1        — WIP slot mismatch (AICore not yet published);
- *                                surfaced on the host as a "silent wip-mismatch"
- *                                gap of `device_total - (collected + dropped)`.
- *                                Different remediation from a buffer-full drop
- *                                — indicates an AICore/AICPU race, not a
- *                                capacity problem.
+ *   dropped_record_count++     — capacity-driven drop (no free buffer / queue
+ *                                full); actionable via
+ *                                PLATFORM_PROF_BUFFERS_PER_CORE
+ *   mismatch_record_count++    — ring slot/task_id mismatch. The runtime's
+ *                                completion-before-dispatch invariant says
+ *                                this must never happen; if it does, it is a
+ *                                hard error (DEV_ERROR) — surface separately
+ *                                from capacity drops.
  *
- * @param l2_perf_buf              L2PerfBuffer pointer (from handshake l2_perf_records_addr)
- * @param core_id               Core index — used to update per-core counters
+ * @param core_id               Core index — used to resolve buffer state and update counters
+ * @param thread_idx            Owning AICPU thread (used when rotating records buffer)
  * @param expected_reg_task_id  Register dispatch token (low 32 bits) to validate
  * @param task_id               Task identifier to write (PTO2 encoding or plain id)
  * @param func_id               Kernel function identifier
@@ -79,20 +82,9 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime);
  * @param fanout_count          Number of entries in fanout array (0 if none)
  */
 int l2_perf_aicpu_complete_record(
-    L2PerfBuffer *l2_perf_buf, int core_id, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id,
-    CoreType core_type, uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
+    int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
+    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
 );
-
-/**
- * Switch performance buffer when current buffer is full
- *
- * Checks buffer capacity and switches to alternate buffer if needed.
- *
- * @param runtime Runtime instance pointer
- * @param core_id Core ID
- * @param thread_idx Thread index
- */
-void l2_perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx);
 
 /**
  * Flush remaining performance data

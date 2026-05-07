@@ -110,15 +110,12 @@ void SchedulerContext::build_payload(
 }
 
 void SchedulerContext::dispatch_subtask_to_core(
-    Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-    bool to_pending
+    int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, bool to_pending
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto core_id = tracker.get_core_id_by_offset(core_offset);
 #if PTO2_PROFILING
     auto &l2_perf = sched_l2_perf_[thread_idx];
-#else
-    (void)runtime;
 #endif
     CoreExecState &core_exec_state = core_exec_states_[core_id];
     core_exec_state.dispatch_seq++;
@@ -159,51 +156,38 @@ void SchedulerContext::dispatch_subtask_to_core(
 #endif
         tracker.change_core_state(core_offset);
     }
-#if PTO2_PROFILING
-    if (l2_perf.l2_perf_enabled) {
-        if (core_exec_state.dispatch_count >= PLATFORM_PROF_BUFFER_SIZE) {
-            l2_perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
-            core_exec_state.dispatch_count = 0;
-        }
-        core_exec_state.dispatch_count++;
-    }
-#endif
 
     write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
     tracker.set_pending_occupied(core_offset);
 }
 
 void SchedulerContext::dispatch_mix_block_to_cluster(
-    Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending
+    int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     uint8_t cmask = slot_state.active_mask.core_mask();
     if (cmask & PTO2_SUBTASK_MASK_AIC) {
         bool aic_to_pending = to_pending && !tracker.is_aic_core_idle(cluster_offset);
         dispatch_subtask_to_core(
-            runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC,
-            aic_to_pending
+            thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC, aic_to_pending
         );
     }
     if (cmask & PTO2_SUBTASK_MASK_AIV0) {
         bool aiv0_to_pending = to_pending && !tracker.is_aiv0_core_idle(cluster_offset);
         dispatch_subtask_to_core(
-            runtime, thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0,
-            aiv0_to_pending
+            thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0, aiv0_to_pending
         );
     }
     if (cmask & PTO2_SUBTASK_MASK_AIV1) {
         bool aiv1_to_pending = to_pending && !tracker.is_aiv1_core_idle(cluster_offset);
         dispatch_subtask_to_core(
-            runtime, thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1,
-            aiv1_to_pending
+            thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1, aiv1_to_pending
         );
     }
 }
 
 void SchedulerContext::dispatch_block(
-    Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
-    bool to_pending
+    int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape, bool to_pending
 ) {
 #if PTO2_PROFILING
     if (is_dump_tensor_enabled()) {
@@ -219,11 +203,11 @@ void SchedulerContext::dispatch_block(
     }
 #endif
     if (shape == PTO2ResourceShape::MIX) {
-        dispatch_mix_block_to_cluster(runtime, thread_idx, core_offset, slot_state, to_pending);
+        dispatch_mix_block_to_cluster(thread_idx, core_offset, slot_state, to_pending);
     } else if (shape == PTO2ResourceShape::AIC) {
-        dispatch_subtask_to_core(runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending);
+        dispatch_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending);
     } else {
-        dispatch_subtask_to_core(runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending);
+        dispatch_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending);
     }
 #if PTO2_PROFILING
     sched_l2_perf_[thread_idx].phase_dispatch_count += __builtin_popcount(slot_state.active_mask.core_mask());
@@ -231,8 +215,8 @@ void SchedulerContext::dispatch_block(
 }
 
 void SchedulerContext::dispatch_shape(
-    Runtime *runtime, int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
-    PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
+    int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, PTO2LocalReadyBuffer &local_buf,
+    CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
 #if PTO2_SCHED_PROFILING
     auto &l2_perf = sched_l2_perf_[thread_idx];
@@ -283,7 +267,7 @@ void SchedulerContext::dispatch_shape(
 #endif
             do {
                 auto core_offset = cores.pop_first();
-                dispatch_block(runtime, thread_idx, core_offset, *slot_state, shape, is_pending);
+                dispatch_block(thread_idx, core_offset, *slot_state, shape, is_pending);
                 slot_state->next_block_idx++;
                 LOG_DEBUG(
                     "Thread %d: Dispatched %s %s task %" PRId64 " block %d/%d to core_offset %d", thread_idx,
@@ -340,13 +324,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     if (!pto2_init_done_.exchange(true, std::memory_order_acq_rel)) {
         LOG_INFO_V0("Thread %d: doing one-time init", thread_idx);
 
-#if PTO2_PROFILING
-        if (is_l2_swimlane_enabled()) {
-            l2_perf_aicpu_init_profiling(runtime);
-            l2_perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
-            l2_perf_aicpu_set_orch_thread_idx(sched_thread_num_);
-        }
-#endif
 #if PTO2_PROFILING
         if (is_dump_tensor_enabled()) {
             dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
@@ -493,7 +470,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
-            handle_drain_mode(runtime, thread_idx);
+            handle_drain_mode(thread_idx);
             continue;
         }
 
@@ -523,7 +500,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             for (auto phase : {CoreTracker::DispatchPhase::IDLE, CoreTracker::DispatchPhase::PENDING}) {
 #endif
                 dispatch_shape(
-                    runtime, thread_idx, shape, phase, local_bufs[static_cast<int32_t>(shape)], tracker, entered_drain,
+                    thread_idx, shape, phase, local_bufs[static_cast<int32_t>(shape)], tracker, entered_drain,
                     made_progress, try_pushed
                 );
             }

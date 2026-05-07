@@ -106,8 +106,7 @@ struct AicpuExecutor {
     std::atomic<int> finished_count_{0};
 
     // ===== Performance profiling state =====
-    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];   // Per-core AICPU dispatch timestamp
-    uint32_t core_dispatch_counts_[RUNTIME_MAX_WORKER];  // Per-core total dispatched task counter
+    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
 
     // ===== Methods =====
     int init(Runtime *runtime);
@@ -247,13 +246,9 @@ inline bool AicpuExecutor::try_dispatch_task(
     head = (head + 1) % MAX_CORES_PER_THREAD;
     ready_count--;
 
-    // Profiling: buffer switch check. Then record the real AICPU dispatch point for this core.
+    // Profiling: record the real AICPU dispatch point for this core. Buffer
+    // rotation is handled inside l2_perf_aicpu_complete_record.
     if (l2_perf_enabled) {
-        core_dispatch_counts_[core_id]++;
-        if (core_dispatch_counts_[core_id] >= PLATFORM_PROF_BUFFER_SIZE - 1) {
-            l2_perf_aicpu_switch_buffer(&runtime, core_id, thread_idx);
-            core_dispatch_counts_[core_id] = 0;
-        }
         dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
     }
 
@@ -324,6 +319,14 @@ int AicpuExecutor::init(Runtime *runtime) {
         core_id_to_reg_addr_[i] = 0;
     }
 
+    // L2Perf init must run BEFORE handshake_all_cores so AICore observes a
+    // non-zero l2_perf_aicore_ring_addr the moment aicpu_ready=1 unblocks
+    // its Phase 1 spin. AICore caches the ring address once after Phase 3
+    // and never re-reads it.
+    if (is_l2_swimlane_enabled()) {
+        l2_perf_aicpu_init_profiling(runtime);
+    }
+
     // Perform core discovery: handshake with all cores and collect core type information
     int rc = handshake_all_cores(runtime);
     if (rc != 0) {
@@ -349,10 +352,6 @@ int AicpuExecutor::init(Runtime *runtime) {
 
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
-        core_dispatch_counts_[i] = 0;
-    }
-    if (is_l2_swimlane_enabled()) {
-        l2_perf_aicpu_init_profiling(runtime);
     }
 #if PTO2_PROFILING
     if (is_dump_tensor_enabled()) {
@@ -725,11 +724,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 int prev_running_id = running_task_ids_[core_id];
 
                 // Profiling: when prev_running_id exists, its AICore timing was
-                // written to wip[id & 1] first, so complete it BEFORE the
+                // published to the ring slot first, so complete it BEFORE the
                 // pending task's record to maintain buffer ordering.
                 if (l2_perf_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
-                    L2PerfBuffer *l2_perf_buf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
 
                     if (prev_running_id != AICPU_TASK_INVALID) {
                         Task *prev_task = &runtime.tasks[prev_running_id];
@@ -738,7 +736,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                             fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
                         }
                         if (l2_perf_aicpu_complete_record(
-                                l2_perf_buf, core_id, static_cast<uint32_t>(prev_running_id),
+                                core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
                                 static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
                             ) != 0) {
@@ -757,7 +755,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
                     }
                     if (l2_perf_aicpu_complete_record(
-                            l2_perf_buf, core_id, static_cast<uint32_t>(completed_task_id),
+                            core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
                             static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
                         ) != 0) {
@@ -841,14 +839,13 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     // Profiling: complete the implicit task's AICore record
                     if (l2_perf_enabled) {
                         uint64_t finish_ts = get_sys_cnt_aicpu();
-                        L2PerfBuffer *l2_perf_buf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
                         Task *prev_task = &runtime.tasks[prev_running_id];
                         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
                         for (int i = 0; i < prev_task->fanout_count; i++) {
                             fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
                         }
                         if (l2_perf_aicpu_complete_record(
-                                l2_perf_buf, core_id, static_cast<uint32_t>(prev_running_id),
+                                core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
                                 static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
                             ) != 0) {
@@ -887,14 +884,13 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 if (l2_perf_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
-                    L2PerfBuffer *l2_perf_buf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
                     Task *task = &runtime.tasks[completed_task_id];
                     uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
                     for (int i = 0; i < task->fanout_count; i++) {
                         fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
                     }
                     if (l2_perf_aicpu_complete_record(
-                            l2_perf_buf, core_id, static_cast<uint32_t>(completed_task_id),
+                            core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
                             static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
                         ) != 0) {
@@ -1160,7 +1156,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
-        core_dispatch_counts_[i] = 0;
         pending_task_ids_[i] = AICPU_TASK_INVALID;
         running_task_ids_[i] = AICPU_TASK_INVALID;
         core_first_dispatch_[i] = true;

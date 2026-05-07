@@ -170,6 +170,19 @@ int L2PerfCollector::initialize(
         state->current_buf_ptr = 0;
         state->current_buf_seq = 0;
 
+        // Allocate the per-core stable AICore staging ring. Lifetime spans
+        // the whole run — never pushed into free_queue, never recycled.
+        // AICPU caches state->aicore_ring_ptr at init and forwards it to
+        // the handshake; AICore reads timing-publication target from there.
+        void *ring_host_ptr = nullptr;
+        void *ring_dev_ptr = alloc_single_buffer(sizeof(L2PerfAicoreRing), &ring_host_ptr);
+        if (ring_dev_ptr == nullptr) {
+            LOG_ERROR("Failed to allocate L2PerfAicoreRing for core %d", i);
+            return -1;
+        }
+        memset(ring_host_ptr, 0, sizeof(L2PerfAicoreRing));
+        state->aicore_ring_ptr = reinterpret_cast<uint64_t>(ring_dev_ptr);
+
         for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
             void *dev_buf_ptr = alloc_single_buffer(sizeof(L2PerfBuffer), &host_buf_ptr);
@@ -192,7 +205,7 @@ int L2PerfCollector::initialize(
         wmb();
     }
     LOG_DEBUG(
-        "Initialized %d L2PerfBufferStates: 1 buffer/core, %d in recycled pool", num_aicore,
+        "Initialized %d L2PerfBufferStates: 1 buffer/core, %d in recycled pool, 1 AICore ring/core", num_aicore,
         num_aicore * (PLATFORM_PROF_BUFFERS_PER_CORE - 1)
     );
 
@@ -312,11 +325,13 @@ void L2PerfCollector::reconcile_counters() {
     rmb();
 
     // Three-bucket invariant for one pool: every commit attempt bumps
-    // total_record_count; buffer-full, overwrite, and flush-enqueue failures
-    // bump dropped_record_count. So
-    //   silent_loss = device_total - (collected + dropped)
-    // and any non-zero silent loss flags an AICore/AICPU WIP-mismatch race
-    // (a different fault class from capacity-driven drops).
+    // total_record_count; capacity-driven drops (no free buffer / queue
+    // full / flush failure) bump dropped_record_count; AICore↔AICPU ring
+    // task_id mismatches bump mismatch_record_count (a hard error class —
+    // the runtime invariant guarantees this should be 0). So
+    //   silent_loss = device_total - (collected + dropped + mismatch)
+    // and any non-zero silent loss flags an unaccounted gap on top of
+    // the already-classified dropped/mismatch losses.
     //
     // Sanity sub-check: after stop(), any active buffer with records must
     // have been flushed by AICPU (success → current_buf_ptr=0; failure →
@@ -345,15 +360,17 @@ void L2PerfCollector::reconcile_counters() {
 
         uint64_t total_device = 0;
         uint64_t dropped_device = 0;
+        uint64_t mismatch_device = 0;
         for (int i = 0; i < unit_count; i++) {
             L2PerfBufferState *state = get_state(i);
             total_device += state->total_record_count;
             dropped_device += state->dropped_record_count;
+            mismatch_device += state->mismatch_record_count;
         }
 
         // PHASE counters are populated only by runtimes that actually emit
         // phase records; skip the comparison entirely when nothing happened.
-        if (optional && total_device == 0 && collected == 0 && dropped_device == 0) {
+        if (optional && total_device == 0 && collected == 0 && dropped_device == 0 && mismatch_device == 0) {
             return;
         }
 
@@ -364,19 +381,28 @@ void L2PerfCollector::reconcile_counters() {
                 static_cast<unsigned long>(dropped_device), kind
             );
         }
-        uint64_t accounted = collected + dropped_device;
+        if (mismatch_device > 0) {
+            LOG_ERROR(
+                "L2Perf reconcile: %lu %s records lost to ring/task_id mismatch — "
+                "completion-before-dispatch invariant violated (AICore/AICPU race or "
+                "PLATFORM_L2_AICORE_RING_SIZE undersized for current issue depth)",
+                static_cast<unsigned long>(mismatch_device), kind
+            );
+        }
+        uint64_t accounted = collected + dropped_device + mismatch_device;
         if (accounted != total_device) {
             LOG_WARN(
-                "L2Perf reconcile: %s count mismatch (collected=%lu + dropped=%lu != "
-                "device_total=%lu, silent_loss=%ld) — AICore/AICPU race",
+                "L2Perf reconcile: %s count mismatch (collected=%lu + dropped=%lu + mismatch=%lu != "
+                "device_total=%lu, silent_loss=%ld)",
                 kind, static_cast<unsigned long>(collected), static_cast<unsigned long>(dropped_device),
-                static_cast<unsigned long>(total_device), static_cast<long>(total_device) - static_cast<long>(accounted)
+                static_cast<unsigned long>(mismatch_device), static_cast<unsigned long>(total_device),
+                static_cast<long>(total_device) - static_cast<long>(accounted)
             );
         } else {
             LOG_INFO_V0(
-                "L2Perf reconcile: %s counts match (collected=%lu, dropped=%lu, device_total=%lu)", kind,
+                "L2Perf reconcile: %s counts match (collected=%lu, dropped=%lu, mismatch=%lu, device_total=%lu)", kind,
                 static_cast<unsigned long>(collected), static_cast<unsigned long>(dropped_device),
-                static_cast<unsigned long>(total_device)
+                static_cast<unsigned long>(mismatch_device), static_cast<unsigned long>(total_device)
             );
         }
 
@@ -800,6 +826,13 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
             free_cb(reinterpret_cast<void *>(state->current_buf_ptr), user_data);
         }
         state->current_buf_ptr = 0;
+
+        // Free the per-core AICore staging ring (allocated once at init,
+        // never recycled).
+        if (state->aicore_ring_ptr != 0 && free_cb != nullptr) {
+            free_cb(reinterpret_cast<void *>(state->aicore_ring_ptr), user_data);
+        }
+        state->aicore_ring_ptr = 0;
 
         // Free all buffers remaining in free_queue
         rmb();

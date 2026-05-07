@@ -34,22 +34,23 @@
 /**
  * Record task execution performance data
  *
- * Writes timing metrics to the WIP staging slot (wip[task_id & 1]).
- * Buffer management and final commit are handled by AICPU.
+ * Writes timing metrics into the per-core staging ring at
+ * `dual_issue_slots[task_id % PLATFORM_L2_AICORE_RING_SIZE]`. The ring is
+ * stable for the entire run (its address never changes), so AICore is fully
+ * decoupled from the AICPU's records-buffer rotation.
  *
  * AICore writes L2PerfRecord.task_id as the register dispatch token (low 32 bits, zero-extended).
  * For tensormap_and_ringbuffer, AICPU overwrites with the full (ring_id << 32) | local_id
  * encoding after handshake match.
  *
- * @param l2_perf_buf Performance buffer pointer
+ * @param ring Per-core staging ring pointer (from Handshake::l2_perf_aicore_ring_addr)
  * @param task_id Register dispatch id (DATA_MAIN_BASE), stored in task_id low 32 bits
  * @param start_time Start timestamp
  * @param end_time End timestamp
  */
 __aicore__ __attribute__((always_inline)) static inline void
-l2_perf_aicore_record_task(__gm__ L2PerfBuffer *l2_perf_buf, uint32_t task_id, uint64_t start_time, uint64_t end_time) {
-    // Write to WIP staging slot — parity alternates with dual-slot dispatch
-    __gm__ L2PerfRecord *record = &l2_perf_buf->wip[task_id & 1u];
+l2_perf_aicore_record_task(__gm__ L2PerfAicoreRing *ring, uint32_t task_id, uint64_t start_time, uint64_t end_time) {
+    __gm__ L2PerfRecord *record = &ring->dual_issue_slots[task_id % PLATFORM_L2_AICORE_RING_SIZE];
 
     record->start_time = start_time;
     record->end_time = end_time;

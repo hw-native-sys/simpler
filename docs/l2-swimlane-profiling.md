@@ -233,14 +233,21 @@ This is the key reason a single `swimlane_converter` consumes
 both architectures' output unchanged.
 
 **Producer/consumer protocol on AICore.** AICore writes per-task
-timing into the WIP slot `wip[reg_task_id & 1]` of the per-core
-`L2PerfBuffer`. AICPU, on observing FIN, validates the slot's
-register token, copies the WIP record into `records[count]`,
-fills `func_id` / `core_type` / `dispatch_time` / `finish_time`
-/ `fanout`, and advances `count`. The dual-issue WIP slots
-prevent overlap when two tasks are in flight on the same core
-(parity on `reg_task_id & 1` guarantees adjacent dispatches
-land on different slots).
+timing into a stable per-core `L2PerfAicoreRing` at
+`dual_issue_slots[reg_task_id % PLATFORM_L2_AICORE_RING_SIZE]`.
+The ring address is published once via
+`Handshake::l2_perf_aicore_ring_addr` and never reassigned, so AICore
+is fully decoupled from any AICPU-side records-buffer rotation. AICPU,
+on observing FIN, validates the slot's register token, copies the slot
+record into the current `L2PerfBuffer::records[count]`, fills
+`func_id` / `core_type` / `dispatch_time` / `finish_time` / `fanout`,
+advances `count`, and rotates the records buffer in place when it
+fills up. The ring is sized to the runtime's in-flight issue depth
+(2 for dual-issue today; raise to the next power of two when issue
+depth grows). The "completion-before-dispatch" runtime invariant
+guarantees AICore never overwrites a slot before AICPU has read it;
+violations are surfaced via the dedicated `mismatch_record_count`
+counter.
 
 ### 5.2 a2a3 — shared-memory streaming
 
@@ -271,15 +278,15 @@ and TensorDump are single-kind.
 │                          │               │                          │
 │ initialize(prefix)       │  alloc +      │ AICore on task end:      │
 │   rtMalloc + halRegister │──register────>│   write timing into      │
-│   pre-fill free queues   │              │   wip[task_id & 1]       │
+│   pre-fill free queues   │              │   ring[reg_task_id % N]  │
 │   for kind 0 + kind 1    │               │                          │
 │                          │               │ AICPU on FIN:            │
-│ start(tf)                │               │   commit wip slot →      │
+│ start(tf)                │               │   commit ring slot →     │
 │   ┌────────────────────┐ │ SPSC ready    │     records[count],      │
 │   │ mgmt thread        │ │ queues        │   fill func_id /         │
 │   │ (BufferPool driver)│ │<──L2Perf──────│   dispatch / finish /    │
-│   │   poll ready queue │<┼──+ Phase─────<│   fanout                 │
-│   │   recycle buffers  │─┼──free queue──>│                          │
+│   │   poll ready queue │<┼──+ Phase─────<│   fanout; rotate buffer  │
+│   │   recycle buffers  │─┼──free queue──>│   when full              │
 │   └────────────────────┘ │               │ AICPU scheduler thread:  │
 │   ┌────────────────────┐ │               │   per-loop-iter:         │
 │   │ poll thread        │ │               │     write AicpuPhase-    │
