@@ -12,9 +12,13 @@
  * @file unified_log_device.cpp
  * @brief Unified logging - Device implementation.
  *
- * Adapter that forwards the unified C ABI to the device-specific dev_log_*
- * functions. Severity flags and verbosity threshold come from
- * device_log.cpp's globals (set at init time from KernelArgs).
+ * Forwards the unified C ABI to dev_vlog_* primitives via va_list — no
+ * intermediate vsnprintf-to-buffer round-trip in this layer. On sim,
+ * dev_vlog_* is a single vfprintf (buffer-free); on onboard, it still
+ * buffers internally because CANN's dlog has no va_list variant.
+ *
+ * Severity flags and verbosity threshold come from device_log.cpp's globals
+ * (set at init time from KernelArgs).
  */
 
 #include "common/unified_log.h"
@@ -28,10 +32,8 @@ void unified_log_error(const char *func, const char *fmt, ...) {
     }
     va_list args;
     va_start(args, fmt);
-    char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    dev_vlog_error(func, fmt, args);
     va_end(args);
-    dev_log_error(func, "%s", buffer);
 }
 
 void unified_log_warn(const char *func, const char *fmt, ...) {
@@ -40,10 +42,8 @@ void unified_log_warn(const char *func, const char *fmt, ...) {
     }
     va_list args;
     va_start(args, fmt);
-    char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    dev_vlog_warn(func, fmt, args);
     va_end(args);
-    dev_log_warn(func, "%s", buffer);
 }
 
 void unified_log_debug(const char *func, const char *fmt, ...) {
@@ -52,10 +52,8 @@ void unified_log_debug(const char *func, const char *fmt, ...) {
     }
     va_list args;
     va_start(args, fmt);
-    char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    dev_vlog_debug(func, fmt, args);
     va_end(args);
-    dev_log_debug(func, "%s", buffer);
 }
 
 void unified_log_info_v(const char *func, int v, const char *fmt, ...) {
@@ -64,8 +62,6 @@ void unified_log_info_v(const char *func, int v, const char *fmt, ...) {
     }
     va_list args;
     va_start(args, fmt);
-    char buffer[2048];
-    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    dev_vlog_info_v(v, func, fmt, args);
     va_end(args);
-    dev_log_info_v(v, func, "%s", buffer);
 }

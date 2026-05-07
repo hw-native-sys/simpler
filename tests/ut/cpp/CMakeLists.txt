@@ -92,6 +92,7 @@ set(A2A3_COMMON_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
 )
 
 function(add_a2a3_runtime_test name)
@@ -165,6 +166,7 @@ function(add_a2a3_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
         ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
@@ -184,6 +186,7 @@ function(add_a5_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/common
         ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
@@ -301,15 +304,16 @@ add_a2a3_runtime_test(test_wiring
 add_a5_test(test_a5_fatal a5/test_a5_fatal.cpp)
 
 # Host logger silent/off behavior — no runtime deps, just compile host_log.cpp
-# alongside the test.
-set(A5_HOST_LOG_DIR ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/src/host)
+# alongside the test (faster than dlopen'ing libsimpler_log.so for a unit test).
+set(SIMPLER_LOG_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/log)
 add_executable(test_host_log_off
     a5/test_host_log_off.cpp
-    ${A5_HOST_LOG_DIR}/host_log.cpp
+    ${SIMPLER_LOG_DIR}/host_log.cpp
 )
 target_include_directories(test_host_log_off PRIVATE
     ${GTEST_INCLUDE_DIRS}
-    ${A5_HOST_LOG_DIR}
+    ${SIMPLER_LOG_DIR}
+    ${SIMPLER_LOG_DIR}/include
 )
 target_compile_options(test_host_log_off PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
 target_link_libraries(test_host_log_off PRIVATE
@@ -342,6 +346,13 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     set(HOST_RUNTIME_LIB
         "${PROJECT_ROOT}/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so"
     )
+    # libsimpler_log.so must be loaded RTLD_GLOBAL before host_runtime dlopen
+    # so undefined HostLogger / unified_log_* symbols in host_runtime resolve.
+    # Mirrors what ChipWorker::init does in production. The library is
+    # process-global (one .so per host toolchain, not per arch/variant).
+    set(SIMPLER_LOG_LIB
+        "${PROJECT_ROOT}/build/lib/libsimpler_log.so"
+    )
 
     if(NOT DEFINED ENV{ASCEND_HOME_PATH})
         message(FATAL_ERROR
@@ -365,6 +376,7 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
         target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
         target_compile_definitions(${name} PRIVATE
             PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}"
+            SIMPLER_LOG_LIB_PATH="${SIMPLER_LOG_LIB}"
         )
         target_link_libraries(${name} PRIVATE
             ${GTEST_MAIN_LIB}

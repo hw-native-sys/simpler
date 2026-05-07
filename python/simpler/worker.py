@@ -263,6 +263,7 @@ def _chip_process_loop(
     device_id: int,
     aicpu_path: str,
     aicore_path: str,
+    simpler_log_lib_path: str,
     sim_context_lib_path: str = "",
     log_level: int = 1,
     log_info_v: int = 5,
@@ -280,7 +281,15 @@ def _chip_process_loop(
 
     try:
         cw = _ChipWorker()
-        cw.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path, log_level, log_info_v)
+        cw.init(
+            host_lib_path,
+            aicpu_path,
+            aicore_path,
+            simpler_log_lib_path,
+            sim_context_lib_path,
+            log_level,
+            log_info_v,
+        )
         cw.set_device(device_id)
     except Exception as e:
         _tb.print_exc()
@@ -350,6 +359,7 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912, PLR0913
     device_id: int,
     aicpu_path: str,
     aicore_path: str,
+    simpler_log_lib_path: str,
     sim_context_lib_path: str,
     bootstrap_cfg: ChipBootstrapConfig,
     bootstrap_mailbox_addr: int,
@@ -372,7 +382,15 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912, PLR0913
 
     cw = ChipWorker()
     try:
-        cw.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path, log_level, log_info_v)
+        cw.init(
+            host_lib_path,
+            aicpu_path,
+            aicore_path,
+            simpler_log_lib_path,
+            sim_context_lib_path,
+            log_level,
+            log_info_v,
+        )
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         channel.write_error(1, f"{type(e).__name__}: chip_worker.init: {e}")
@@ -675,6 +693,7 @@ class Worker:
             str(binaries.host_path),
             str(binaries.aicpu_path),
             str(binaries.aicore_path),
+            str(binaries.simpler_log_path),
             str(binaries.sim_context_path) if binaries.sim_context_path else "",
             sev,
             info_v,
@@ -705,6 +724,7 @@ class Worker:
             self._l3_host_lib_path = str(binaries.host_path)
             self._l3_aicpu_path = str(binaries.aicpu_path)
             self._l3_aicore_path = str(binaries.aicore_path)
+            self._l3_simpler_log_path = str(binaries.simpler_log_path)
             self._l3_sim_ctx_path = (
                 str(binaries.sim_context_path) if getattr(binaries, "sim_context_path", None) else ""
             )
@@ -793,6 +813,7 @@ class Worker:
                             dev_id,
                             self._l3_aicpu_path,
                             self._l3_aicore_path,
+                            self._l3_simpler_log_path,
                             self._l3_sim_ctx_path,
                             bootstrap_cfg,
                             bootstrap_addr,
@@ -807,6 +828,7 @@ class Worker:
                             dev_id,
                             self._l3_aicpu_path,
                             self._l3_aicore_path,
+                            self._l3_simpler_log_path,
                             self._l3_sim_ctx_path,
                             chip_log_level,
                             chip_log_info_v,

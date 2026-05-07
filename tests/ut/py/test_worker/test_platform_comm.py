@@ -77,6 +77,7 @@ def _rank_entry(
     host_lib: str,
     aicpu_path: str,
     aicore_path: str,
+    simpler_log_path: str,
     sim_context_path: str,
     rootinfo_path: str,
     result_queue: mp.Queue,  # type: ignore[type-arg]
@@ -87,7 +88,7 @@ def _rank_entry(
         from simpler.task_interface import ChipWorker
 
         worker = ChipWorker()
-        worker.init(host_lib, aicpu_path, aicore_path, sim_context_path)
+        worker.init(host_lib, aicpu_path, aicore_path, simpler_log_path, sim_context_path)
         result["stage"] = "init"
 
         worker.set_device(device_id)
@@ -183,6 +184,8 @@ def test_two_rank_comm_lifecycle(st_device_ids):
     host_lib = str(bins.host_path)
     aicpu_path = str(bins.aicpu_path)
     aicore_path = str(bins.aicore_path)
+
+    simpler_log_path = str(bins.simpler_log_path)
     sim_context_path = str(bins.sim_context_path) if bins.sim_context_path else ""
 
     assert len(st_device_ids) >= 2, "device_count(2) fixture must yield >= 2 ids"
@@ -202,6 +205,7 @@ def test_two_rank_comm_lifecycle(st_device_ids):
                 host_lib,
                 aicpu_path,
                 aicore_path,
+                simpler_log_path,
                 sim_context_path,
                 rootinfo_path,
                 result_queue,

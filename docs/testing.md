@@ -121,7 +121,9 @@ Profiling is enabled only on the first round to avoid overhead on subsequent ite
 ## Log levels
 
 Simpler ties two axes (severity + INFO sub-verbosity) into a single integer
-threshold so users only ever set one knob.
+threshold so users only ever set one knob. For implementation details
+(`libsimpler_log.so`, multi-`.so` singleton, host vs device backends, output
+formats), see [logging.md](logging.md).
 
 ### Integer layout (Python-aligned)
 

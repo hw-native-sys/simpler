@@ -23,6 +23,7 @@ set(CMAKE_CUSTOM_INCLUDE_DIRS "")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
 
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
@@ -38,11 +39,6 @@ set(AICORE_SOURCES "")
 # Add local platform-specific sources
 file(GLOB LOCAL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 list(APPEND AICORE_SOURCES ${LOCAL_SOURCES})
-
-# Add host_log.cpp for HostLogger support (required by runtime.cpp)
-list(APPEND AICORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/host_log.cpp")
-# Add unified_log_host.cpp for unified logging support (required by runtime.cpp)
-list(APPEND AICORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/unified_log_host.cpp")
 
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
@@ -78,6 +74,12 @@ target_include_directories(aicore_kernel
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
 )
 
+
+# Allow undefined HostLogger / unified_log_* symbols — resolved at runtime
+# via libsimpler_log.so loaded with RTLD_GLOBAL by ChipWorker.
+if(APPLE)
+    target_link_options(aicore_kernel PRIVATE -undefined dynamic_lookup)
+endif()
 set_target_properties(aicore_kernel PROPERTIES
     OUTPUT_NAME "aicore_kernel"
     # Force .so suffix on all platforms (macOS defaults to .dylib)

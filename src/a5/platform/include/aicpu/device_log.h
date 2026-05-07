@@ -70,12 +70,19 @@ extern "C" int get_log_info_v();
 
 // =============================================================================
 // Platform-specific logging functions (low-level layer)
+//
+// va_list primitives used by the unified_log_* adapter to forward a caller's
+// variadic args without an intermediate vsnprintf-to-buffer round-trip. Sim
+// is buffer-free; onboard still buffers internally because CANN's dlog API
+// has no va_list variant. Caller owns va_start/va_end.
 // =============================================================================
 
-void dev_log_debug(const char *func, const char *fmt, ...);
-void dev_log_warn(const char *func, const char *fmt, ...);
-void dev_log_error(const char *func, const char *fmt, ...);
-void dev_log_info_v(int v, const char *func, const char *fmt, ...);
+#include <cstdarg>
+
+void dev_vlog_debug(const char *func, const char *fmt, va_list args);
+void dev_vlog_warn(const char *func, const char *fmt, va_list args);
+void dev_vlog_error(const char *func, const char *fmt, va_list args);
+void dev_vlog_info_v(int v, const char *func, const char *fmt, va_list args);
 
 // =============================================================================
 // Helper Functions

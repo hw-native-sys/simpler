@@ -94,6 +94,26 @@ def build_all(
 
     logger.info(f"Building for platforms: {', '.join(platforms)}")
 
+    # libsimpler_log.so and libcpu_sim_context.so are process-global (one per
+    # host toolchain, not per arch/variant) — build them once before iterating
+    # platforms. cpu_sim_context is only needed when building any sim platform.
+    if platforms:
+        logger.info("Building simpler_log (process-global)...")
+        try:
+            RuntimeBuilder(platform=platforms[0]).ensure_simpler_log(build=True)
+        except Exception as e:
+            logger.error(f"Failed to build simpler_log: {e}")
+            raise
+
+        sim_platforms = [p for p in platforms if parse_platform(p)[1] == "sim"]
+        if sim_platforms:
+            logger.info("Building cpu_sim_context (process-global)...")
+            try:
+                RuntimeBuilder(platform=sim_platforms[0]).ensure_sim_context(build=True)
+            except Exception as e:
+                logger.error(f"Failed to build cpu_sim_context: {e}")
+                raise
+
     for platform in platforms:
         arch, variant = parse_platform(platform)
         runtimes = discover_runtimes(arch)
@@ -107,14 +127,6 @@ def build_all(
         except (ValueError, FileNotFoundError) as e:
             logger.warning(f"  {platform}: cannot initialize builder: {e}")
             continue
-
-        if variant == "sim":
-            logger.info(f"  Building {platform}/sim_context...")
-            try:
-                builder.ensure_sim_context(build=True)
-            except Exception as e:
-                logger.error(f"  Failed to build {platform}/sim_context: {e}")
-                raise
 
         for runtime_name in runtimes:
             logger.info(f"  Building {platform}/{runtime_name}...")
