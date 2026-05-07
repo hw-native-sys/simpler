@@ -64,7 +64,7 @@ NBYTES = N_ELEMS * 4  # float32
 def parse_args() -> argparse.Namespace:
     """Same CLI shape as every example under ``examples/workers/``."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-p", "--platform", required=True, choices=["a2a3sim", "a2a3", "a5sim", "a5"])
+    parser.add_argument("-p", "--platform", required=True, choices=["a2a3sim", "a2a3"])
     parser.add_argument("-d", "--device", type=int, default=0)
     return parser.parse_args()
 

@@ -28,9 +28,11 @@ is the smallest possible correct program.
 workers/
   l2/                       # Single-chip examples (one NPU device)
     hello_worker/           # Worker(level=2).init().close(), no kernels
+    worker_malloc/          # malloc/copy_to/copy_from/free round-trip, no run()
     vector_add/             # One AIV kernel, TaskArgs, golden check
   l3/                       # Multi-chip examples (host-level DAG)
     multi_chip_dispatch/    # Worker(level=3) + orchestration + SubWorker
+    child_memory/           # orch.malloc + child_memory=True, weight reuse across tasks
 ```
 
 Why no `tensormap_and_ringbuffer/` layer? Because every example here hard-codes
@@ -59,8 +61,10 @@ Each example has a `main.py` with uniform CLI:
 
 ```bash
 python examples/workers/l2/hello_worker/main.py -p a2a3sim -d 0
+python examples/workers/l2/worker_malloc/main.py -p a2a3sim -d 0
 python examples/workers/l2/vector_add/main.py -p a2a3sim -d 0
 python examples/workers/l3/multi_chip_dispatch/main.py -p a2a3sim -d 0-1
+python examples/workers/l3/child_memory/main.py -p a2a3sim -d 0
 ```
 
 Flags:
