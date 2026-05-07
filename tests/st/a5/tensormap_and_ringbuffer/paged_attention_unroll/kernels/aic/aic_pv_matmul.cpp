@@ -48,7 +48,7 @@ using namespace pto;
 #endif
 
 #ifndef __aicore__
-#define __aicore__ [aicore]
+#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
 #endif
 
 template <int M, int K, int N>

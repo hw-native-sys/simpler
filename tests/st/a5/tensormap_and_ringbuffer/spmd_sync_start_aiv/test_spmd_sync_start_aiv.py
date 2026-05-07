@@ -7,18 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""SPMD sync_start AIV: 4 AIV tasks (3 sync_start + 1 baseline).
-
-Exercises AIV-specific fast path (count_idle_aiv_cores) and drain slow path.
-
-Tasks:
-  T0: block_num=4,  sync_start=True  -> CL 0..3    (fast path)
-  T1: block_num=16, sync_start=True  -> CL 4..19   (saturate one thread)
-  T2: block_num=4,  sync_start=False -> CL 20..23  (baseline)
-  T3: block_num=24, sync_start=True  -> CL 24..47  (cross-thread drain)
-
-Output tensor: 48 cache lines = 768 float32.
-"""
+"""SPMD sync_start AIV: 4 AIV tasks testing fast path and drain. Output: 48 CL = 768 float32."""
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -26,15 +15,8 @@ from simpler.task_interface import ArgDirection as D
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 FLOATS_PER_CACHE_LINE = 16
-
-TASKS = [
-    (4, 0),
-    (16, 4),
-    (4, 20),
-    (24, 24),
-]
-
-TOTAL_CL = sum(block_num for block_num, _ in TASKS)
+TASKS = [(4, 0), (16, 4), (4, 20), (24, 24)]
+TOTAL_CL = sum(bn for bn, _ in TASKS)
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -64,19 +46,17 @@ class TestSpmdSyncStartAiv(SceneTestCase):
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {},
-        },
+        }
     ]
 
     def generate_args(self, params):
-        output = torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)
-        return TaskArgsBuilder(Tensor("output", output))
+        return TaskArgsBuilder(Tensor("output", torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)))
 
     def compute_golden(self, args, params):
         out = args.output
         for block_num, base_cl in TASKS:
             for block_idx in range(block_num):
-                cl = base_cl + block_idx
-                out[cl * FLOATS_PER_CACHE_LINE] = float(block_idx)
+                out[(base_cl + block_idx) * FLOATS_PER_CACHE_LINE] = float(block_idx)
 
 
 if __name__ == "__main__":

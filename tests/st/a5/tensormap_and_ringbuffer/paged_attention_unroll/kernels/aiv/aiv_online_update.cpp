@@ -180,11 +180,14 @@ static __aicore__ void online_update_impl(
         TASSIGN(liNewRow, 2 * kDataBytes + 7 * kScalarDNBytes);
         TASSIGN(tmpRow, 2 * kDataBytes + 8 * kScalarDNBytes);
 
-        TMAX(miNewRow, miRow, mijRow);     // mi_new = max(mi, mij)
-        TSUB(alphaRow, miRow, miNewRow);   // alpha_exp = mi - mi_new
-        TEXP(alphaRow, alphaRow);          // alpha = exp(mi - mi_new)
-        TSUB(betaRow, mijRow, miNewRow);   // beta_exp = mij - mi_new
-        TEXP(betaRow, betaRow);            // beta = exp(mij - mi_new)
+        TMAX(miNewRow, miRow, mijRow);  // mi_new = max(mi, mij)
+        // alphaRow and betaRow write to independent UB addresses; both only read miNewRow
+        TSUB(alphaRow, miRow, miNewRow);  // alpha_exp = mi - mi_new
+        TSUB(betaRow, mijRow, miNewRow);  // beta_exp = mij - mi_new
+        // TEXP on independent UB addresses
+        TEXP(alphaRow, alphaRow);  // alpha = exp(mi - mi_new)
+        TEXP(betaRow, betaRow);    // beta = exp(mij - mi_new)
+        // tmpRow and liNewRow write to independent UB addresses
         TMUL(tmpRow, alphaRow, liRow);     // alpha * li
         TMUL(liNewRow, betaRow, lijRow);   // beta * lij
         TADD(liNewRow, tmpRow, liNewRow);  // li_new = alpha*li + beta*lij

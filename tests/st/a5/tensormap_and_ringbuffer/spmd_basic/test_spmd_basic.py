@@ -28,6 +28,8 @@ FLOATS_PER_CACHE_LINE = 16
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestSpmdBasic(SceneTestCase):
+    """SPMD context accessors with a single MIX task."""
+
     RTOL = 0
     ATOL = 0
 

@@ -27,7 +27,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "pto_orchestration_api.h"
 
 #define N_UNROLL 64
 
@@ -43,15 +43,7 @@ inline double cycles_to_us(uint64_t cycles) {
 
 inline uint64_t get_sys_cnt_aicpu() {
     uint64_t ticks;
-#if defined(__aarch64__)
     asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
-#elif defined(__x86_64__)
-    unsigned int lo, hi;
-    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    ticks = (static_cast<uint64_t>(hi) << 32) | lo;
-#else
-    ticks = 0;
-#endif
     return ticks;
 }
 
@@ -75,13 +67,13 @@ extern "C" {
  */
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
 aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
-    (void)orch_args;  // NOLINT(readability/casting)
+    (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void build_paged_attention_graph(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
 #ifdef ENABLE_PROFILING
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;
@@ -153,10 +145,9 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
     uint32_t oi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
     uint32_t li_shapes[1] = {static_cast<uint32_t>(q_tile)};
     TensorCreateInfo tile2d_ci(oi_shapes, 2, DataType::FLOAT32);
-    TensorCreateInfo scalar_noinit_ci(li_shapes, 1, DataType::FLOAT32, false);
     TensorCreateInfo scalar_ci(li_shapes, 1, DataType::FLOAT32);
 #ifdef ENABLE_PROFILING
-    prof_make_count += 3;
+    prof_make_count += 2;
     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
@@ -180,7 +171,7 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
                 CYCLE_COUNT_LAP(prof_tensor_view);
 #endif
                 CYCLE_COUNT_LAP(prof_param_setup);
-                TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_noinit_ci, scalar_noinit_ci);
+                TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_ci, scalar_ci);
                 const Tensor &oi = alloc_outs.get_ref(0);
                 const Tensor &li_update = alloc_outs.get_ref(1);
                 const Tensor &mi_update = alloc_outs.get_ref(2);
@@ -212,12 +203,9 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
 #endif
 
                     params_qk.reset();
-                    params_qk.add_input(qi);
-                    params_qk.add_input(key_cache);
-                    params_qk.add_input(block_table);
+                    params_qk.add_input(qi, key_cache, block_table);
                     params_qk.add_output(sij_buf_ci);
-                    params_qk.add_scalar(n_blocks);
-                    params_qk.add_scalar(b_idx * block_num + bn);
+                    params_qk.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     const Tensor &sij_buf = qk_outs.get_ref(0);
@@ -238,12 +226,8 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
 
                     params_sf.reset();
                     params_sf.add_input(sij_buf);
-                    params_sf.add_output(pij_buf_ci);
-                    params_sf.add_output(scalar_ci);
-                    params_sf.add_output(scalar_ci);
-                    params_sf.add_scalar(scale_value);
-                    params_sf.add_scalar(n_blocks);
-                    params_sf.add_scalar(valid_len_last);
+                    params_sf.add_output(pij_buf_ci, scalar_ci, scalar_ci);
+                    params_sf.add_scalar(scale_value, n_blocks, valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     const Tensor &pij_buf = sf_outs.get_ref(0);
@@ -256,12 +240,9 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
 
                     // === Task 3: SplitK PV matmul (accumulated P @ V) ===
                     params_pv.reset();
-                    params_pv.add_input(pij_buf);
-                    params_pv.add_input(value_cache);
-                    params_pv.add_input(block_table);
+                    params_pv.add_input(pij_buf, value_cache, block_table);
                     params_pv.add_output(tile2d_ci);
-                    params_pv.add_scalar(n_blocks);
-                    params_pv.add_scalar(b_idx * block_num + bn);
+                    params_pv.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_new = pv_outs.get_ref(0);
@@ -275,15 +256,9 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
                     uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
 
                     params_up.reset();
-                    params_up.add_input(mi);
-                    params_up.add_input(li);
-                    params_up.add_input(oi_new);
-                    params_up.add_inout(mi_update);
-                    params_up.add_inout(li_update);
-                    params_up.add_inout(oi);
-                    params_up.add_inout(out_view);
-                    params_up.add_scalar(is_first);
-                    params_up.add_scalar(is_last);
+                    params_up.add_input(mi, li, oi_new);
+                    params_up.add_inout(mi_update, li_update, oi, out_view);
+                    params_up.add_scalar(is_first, is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
 #ifdef ENABLE_PROFILING
