@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package simpler.distributed.v1;
+
+message Empty {}
+
+message Health {
+  bool ok = 1;
+  string message = 2;
+}
+
+message ContinuousTensorRef {
+  uint64 data = 1;
+  repeated uint64 shape = 2;
+  uint32 dtype = 3;
+  uint32 tag = 4;
+}
+
+message TensorHandle {
+  string node_id = 1;
+  uint64 handle_id = 2;
+}
+
+message TensorRef {
+  oneof source {
+    bytes inline_data = 1;
+    TensorHandle handle = 2;
+  }
+  repeated int64 shape = 10;
+  int32 dtype = 11;
+  int32 tag = 12;
+}
+
+message TensorChunk {
+  TensorHandle handle = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool last = 4;
+}
+
+message CallConfigWire {
+  int32 block_dim = 1;
+  int32 aicpu_thread_num = 2;
+  bool enable_l2_swimlane = 3;
+  bool enable_dump_tensor = 4;
+  int32 enable_pmu = 5;
+  string output_prefix = 6;
+}
+
+message DispatchReq {
+  uint64 task_id = 1;
+  uint64 callable_id = 2;
+  uint64 callable_version = 3;
+  bytes config_blob = 4;
+  repeated uint64 scalar_args = 5;
+  repeated ContinuousTensorRef tensor_args = 6;
+  repeated TensorRef tensor_refs = 7;
+}
+
+message DispatchResp {
+  uint64 task_id = 1;
+  int32 error_code = 2;
+  string error_msg = 3;
+  repeated string remote_traceback = 4;
+  repeated TensorRef output_tensors = 5;
+}
+
+message CallableRef {
+  uint64 callable_id = 1;
+  uint64 version = 2;
+}
+
+message CallablePayload {
+  uint64 callable_id = 1;
+  uint64 version = 2;
+  bytes pickled = 3;
+}
+
+service L3Worker {
+  rpc Dispatch(DispatchReq) returns (DispatchResp);
+  rpc Heartbeat(Empty) returns (Health);
+}
+
+service Catalog {
+  rpc PullCallable(CallableRef) returns (CallablePayload);
+  rpc PushCallable(CallablePayload) returns (Empty);
+}
+
+service TensorPool {
+  rpc PullTensor(TensorHandle) returns (stream TensorChunk);
+  rpc PushTensor(stream TensorChunk) returns (TensorHandle);
+}

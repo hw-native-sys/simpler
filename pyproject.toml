@@ -15,13 +15,14 @@ build-backend = "scikit_build_core.build"
 name = "simpler"
 version = "0.1.0"
 requires-python = ">=3.9"
+dependencies = ["grpcio>=1.80", "protobuf>=4.25", "cloudpickle>=2.2"]
 
 [project.optional-dependencies]
 # ``torch>=2.3`` is required by ``simpler_setup.torch_interop`` (uses
 # ``torch.uint16`` / ``torch.uint32``, added in PyTorch 2.3). CI installs
 # torch via a custom index URL and does not rely on this pin; it is here
 # so ``pip install -e '.[test]'`` resolves a usable version for local devs.
-test = ["pytest>=6.0", "pytest-xdist>=3.0", "torch>=2.3"]
+test = ["pytest>=6.0", "pytest-xdist>=3.0", "torch>=2.3", "grpcio-tools>=1.80"]
 
 [tool.ruff]
 line-length = 120

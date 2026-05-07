@@ -51,6 +51,7 @@ import os
 import signal
 import struct
 import sys
+import threading
 import time
 import traceback
 from multiprocessing.shared_memory import SharedMemory
@@ -544,6 +545,36 @@ def _child_worker_loop(
             break
 
 
+def _remote_worker_loop(buf: memoryview, proxy: Any) -> None:
+    """L4-side mailbox shim for one remote L3 worker.
+
+    The C++ scheduler sees a normal PROCESS-mode next-level mailbox. This
+    thread owns the other side of that mailbox and forwards every TASK_READY
+    payload to the remote daemon over RPC.
+    """
+    state_addr = _buffer_field_addr(buf, _OFF_STATE)
+    while True:
+        state = _mailbox_load_i32(state_addr)
+        if state == _TASK_READY:
+            cid = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+            code = 0
+            msg = ""
+            try:
+                args = _read_args_from_mailbox(buf)
+                cfg = _read_config_from_mailbox(buf)
+                proxy.dispatch(int(cid), args, cfg)
+            except Exception as e:  # noqa: BLE001
+                code = 1
+                msg = _format_exc("remote_worker", e)
+            _write_error(buf, code, msg)
+            _mailbox_store_i32(state_addr, _TASK_DONE)
+        elif state == _SHUTDOWN:
+            proxy.close()
+            break
+        else:
+            time.sleep(_BOOTSTRAP_POLL_INTERVAL_S)
+
+
 # ---------------------------------------------------------------------------
 # Worker factory
 # ---------------------------------------------------------------------------
@@ -586,6 +617,11 @@ class Worker:
         self._next_level_workers: list[Worker] = []
         self._next_level_shms: list[SharedMemory] = []
         self._next_level_pids: list[int] = []
+        self._remote_worker_specs: list[tuple[str, dict[str, Any]]] = []
+        self._remote_workers: list[Any] = []
+        self._remote_worker_shms: list[SharedMemory] = []
+        self._remote_worker_threads: list[threading.Thread] = []
+        self._distributed_catalog: Any = None
 
         # Per-chip bootstrap: one `ChipBootstrapConfig` per device_id plus a
         # matching shared-memory mailbox the child publishes its
@@ -616,6 +652,8 @@ class Worker:
             raise RuntimeError("Worker.register() must be called before init()")
         cid = len(self._callable_registry)
         self._callable_registry[cid] = fn
+        if self._distributed_catalog is not None:
+            self._distributed_catalog.register(fn, callable_id=cid)
         return cid
 
     def add_worker(self, worker: "Worker") -> None:
@@ -632,6 +670,24 @@ class Worker:
         if worker._initialized:
             raise RuntimeError("Child worker must not be initialized before add_worker()")
         self._next_level_workers.append(worker)
+
+    def add_remote_worker(self, endpoint: str, **options: Any) -> None:
+        """Add a remote lower-level Worker daemon as a NEXT_LEVEL child."""
+        if self.level < 4:
+            raise RuntimeError("Worker.add_remote_worker() requires level >= 4")
+        if self._initialized:
+            raise RuntimeError("Worker.add_remote_worker() must be called before init()")
+        self._ensure_distributed_catalog()
+        self._remote_worker_specs.append((str(endpoint), dict(options)))
+
+    def _ensure_distributed_catalog(self):
+        if self._distributed_catalog is None:
+            from .distributed.catalog import Catalog  # noqa: PLC0415
+
+            self._distributed_catalog = Catalog()
+            for cid, fn in self._callable_registry.items():
+                self._distributed_catalog.register(fn, callable_id=cid)
+        return self._distributed_catalog
 
     # ------------------------------------------------------------------
     # init — auto-discovery
@@ -722,6 +778,19 @@ class Worker:
             assert shm.buf is not None
             _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
             self._next_level_shms.append(shm)
+
+        # 3a. Allocate remote next-level mailboxes. These are consumed by
+        # Python shim threads rather than forked child processes.
+        if self._remote_worker_specs:
+            from .distributed.remote_proxy import RemoteWorkerProxy  # noqa: PLC0415
+
+            catalog = self._ensure_distributed_catalog()
+            for endpoint, options in self._remote_worker_specs:
+                shm = SharedMemory(create=True, size=MAILBOX_SIZE)
+                assert shm.buf is not None
+                _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
+                self._remote_worker_shms.append(shm)
+                self._remote_workers.append(RemoteWorkerProxy(endpoint, catalog, **options))
 
         # 3b. Allocate per-chip bootstrap mailboxes (one per device_id).  Must
         # live in shared memory so the forked child's `ChipBootstrapChannel`
@@ -832,6 +901,19 @@ class Worker:
             else:
                 self._next_level_pids.append(pid)
 
+        # Start remote mailbox shim threads. Handshake pushes the current
+        # callable catalog before the scheduler can publish TASK_READY.
+        for idx, proxy in enumerate(self._remote_workers):
+            proxy.handshake()
+            thread = threading.Thread(
+                target=_remote_worker_loop,
+                args=(self._remote_worker_shms[idx].buf, proxy),
+                name=f"simpler-remote-worker-{idx}",
+                daemon=True,
+            )
+            thread.start()
+            self._remote_worker_threads.append(thread)
+
         # When chip_bootstrap_configs was provided, block here until every
         # chip child publishes its result on its bootstrap mailbox.  We wait
         # *before* registering the chip mailboxes with the scheduler so a
@@ -858,6 +940,10 @@ class Worker:
 
         # Register Worker children as NEXT_LEVEL (L4+)
         for shm in self._next_level_shms:
+            dw.add_next_level_process(_mailbox_addr(shm))
+
+        # Register remote Worker shim mailboxes as NEXT_LEVEL (L4+)
+        for shm in self._remote_worker_shms:
             dw.add_next_level_process(_mailbox_addr(shm))
 
         for shm in self._sub_shms:
@@ -1160,6 +1246,22 @@ class Worker:
                 shm.close()
                 shm.unlink()
 
+            # Shutdown remote Worker shim threads.
+            for shm in self._remote_worker_shms:
+                buf = shm.buf
+                assert buf is not None
+                _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
+            for thread in self._remote_worker_threads:
+                thread.join(timeout=5.0)
+            for proxy in self._remote_workers:
+                try:
+                    proxy.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            for shm in self._remote_worker_shms:
+                shm.close()
+                shm.unlink()
+
             # Unlink the bootstrap mailboxes last — chip children touch their
             # `ChipBootstrapChannel` from inside `shutdown_bootstrap()` +
             # `finalize()`, which runs after they leave the main loop on
@@ -1182,6 +1284,10 @@ class Worker:
             self._next_level_shms.clear()
             self._next_level_pids.clear()
             self._next_level_workers.clear()
+            self._remote_worker_shms.clear()
+            self._remote_worker_threads.clear()
+            self._remote_workers.clear()
+            self._remote_worker_specs.clear()
             self._bootstrap_shms.clear()
             self._chip_contexts.clear()
 
