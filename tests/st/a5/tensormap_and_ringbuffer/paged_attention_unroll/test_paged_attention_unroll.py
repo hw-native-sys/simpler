@@ -7,10 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Paged attention unroll — tensormap_and_ringbuffer test (production scale, bfloat16).
-
-Same algorithm as paged_attention but with higher block_dim for unrolled dispatch.
-"""
+"""Paged attention unroll: production-scale with unrolled orchestration."""
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -22,15 +19,13 @@ from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generat
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestPagedAttentionUnroll(SceneTestCase):
-    """Paged attention unroll with tensormap_and_ringbuffer runtime on A5."""
-
     RTOL = 1e-3
     ATOL = 1e-3
 
     CALLABLE = {
         "orchestration": {
             "source": "kernels/orchestration/paged_attention_orch.cpp",
-            "function_name": "build_paged_attention_graph",
+            "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
         },
         "incores": [
@@ -42,18 +37,18 @@ class TestPagedAttentionUnroll(SceneTestCase):
                 "signature": [D.IN, D.IN, D.OUT],
             },
             {
-                "func_id": 2,
-                "name": "PV",
-                "source": "kernels/aic/aic_pv_matmul.cpp",
-                "core_type": "aic",
-                "signature": [D.IN, D.IN, D.OUT],
-            },
-            {
                 "func_id": 1,
                 "name": "SF",
                 "source": "kernels/aiv/aiv_softmax_prepare.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.OUT, D.OUT, D.OUT],
+            },
+            {
+                "func_id": 2,
+                "name": "PV",
+                "source": "kernels/aic/aic_pv_matmul.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 3,
@@ -116,13 +111,13 @@ class TestPagedAttentionUnroll(SceneTestCase):
     ]
 
     def generate_args(self, params):
-        inputs = _pa_generate_inputs(params)
+        result = _pa_generate_inputs(params)
         specs = []
-        for name, val in inputs:
-            if isinstance(val, torch.Tensor):
-                specs.append(Tensor(name, val))
+        for name, value in result:
+            if isinstance(value, torch.Tensor):
+                specs.append(Tensor(name, value))
             else:
-                specs.append(Scalar(name, val))
+                specs.append(Scalar(name, value))
         return TaskArgsBuilder(*specs)
 
     def compute_golden(self, args, params):

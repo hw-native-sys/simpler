@@ -7,16 +7,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""SPMD multi-block MIX: five MIX tasks with varying block_num.
+"""SPMD multi-block MIX: five MIX tasks with block_num = 2, 8, 12, 24, 48.
 
-  T0 (block_num=2):  basic multi-block MIX
-  T1 (block_num=8):  saturates one sched thread
-  T2 (block_num=12): forces cross-thread dispatch
-  T3 (block_num=24): occupies all clusters across all 3 sched threads
-  T4 (block_num=48): two full rounds of all clusters
-
-Each block occupies 3 cache lines (AIC, AIV0, AIV1). All three cores
-in the same block write float(block_idx) to their respective CL.
+Each block occupies 3 cache lines (AIC, AIV0, AIV1).
+Output tensor: 282 cache lines = 4512 float32.
 """
 
 import torch
@@ -26,16 +20,8 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 FLOATS_PER_CACHE_LINE = 16
 SLOTS_PER_BLOCK = 3
-
-TASKS = [
-    (2, 0),
-    (8, 6),
-    (12, 30),
-    (24, 66),
-    (48, 138),
-]
-
-TOTAL_CL = sum(block_num * SLOTS_PER_BLOCK for block_num, _ in TASKS)
+TASKS = [(2, 0), (8, 6), (12, 30), (24, 66), (48, 138)]
+TOTAL_CL = sum(bn * SLOTS_PER_BLOCK for bn, _ in TASKS)
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -62,12 +48,11 @@ class TestSpmdMultiblockMix(SceneTestCase):
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {},
-        },
+        }
     ]
 
     def generate_args(self, params):
-        output = torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)
-        return TaskArgsBuilder(Tensor("output", output))
+        return TaskArgsBuilder(Tensor("output", torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)))
 
     def compute_golden(self, args, params):
         out = args.output
