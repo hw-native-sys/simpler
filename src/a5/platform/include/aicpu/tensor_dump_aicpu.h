@@ -10,11 +10,11 @@
  */
 /**
  * @file tensor_dump_aicpu.h
- * @brief AICPU tensor dump collection interface (memcpy-based)
+ * @brief AICPU tensor dump collection interface
  *
  * Provides tensor dump management for AICPU side.
- * Same public API as A2A3 for future migration compatibility.
- * Simplified internals: direct buffer writes, no SPSC queues.
+ * Handles dump shared-memory base propagation plus buffer initialization,
+ * tensor data copying to arenas, metadata recording, and flushing.
  */
 
 #ifndef SRC_A5_PLATFORM_AICPU_TENSOR_DUMP_AICPU_H_
@@ -36,17 +36,17 @@ extern "C" {
 #endif
 
 /**
- * Set the tensor dump base address.
+ * Set the tensor dump shared-memory base address.
  * Called by the platform layer before AICPU execution starts.
  *
- * @param dump_data_base Device pointer (as uint64_t) to DumpSetupHeader
+ * @param dump_data_base Device pointer (as uint64_t) to dump shared memory
  */
 void set_platform_dump_base(uint64_t dump_data_base);
 
 /**
- * Get the tensor dump base address.
+ * Get the tensor dump shared-memory base address.
  *
- * @return Device pointer (as uint64_t) to DumpSetupHeader
+ * @return Device pointer (as uint64_t) to dump shared memory
  */
 uint64_t get_platform_dump_base();
 
@@ -238,8 +238,8 @@ inline void dump_tensors_for_task(
 /**
  * Initialize tensor dump.
  *
- * Reads DumpSetupHeader from dump_data_base and caches per-thread
- * DumpBuffer and arena pointers.
+ * Sets up per-thread DumpBufferState pointers and pops initial
+ * metadata buffers from each thread's free_queue.
  *
  * @param num_dump_threads Number of scheduling threads that will dump tensors
  */
@@ -248,8 +248,12 @@ void dump_tensor_init(int num_dump_threads);
 /**
  * Record a single tensor dump.
  *
- * Copies tensor data to the thread's arena, appends a TensorDumpRecord
- * to the thread's DumpBuffer. Silently drops when buffer is full.
+ * Copies tensor data from GM to the thread's arena, appends a
+ * TensorDumpRecord to the current metadata buffer. Switches
+ * buffers when full via the SPSC free_queue.
+ *
+ * When metadata buffers are temporarily exhausted, old dump metadata may be
+ * overwritten so execution can continue without losing the active buffer.
  *
  * @param thread_idx Scheduling thread index
  * @param info Tensor metadata and identification
@@ -260,8 +264,8 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info);
 /**
  * Flush remaining tensor dump data for a thread.
  *
- * In the memcpy design this is a no-op for data (host reads after sync).
- * Logs per-thread dump statistics.
+ * Marks non-empty metadata buffers as ready and enqueues them
+ * for host collection.
  *
  * @param thread_idx Thread index
  */

@@ -295,11 +295,11 @@ private:
     /**
      * Initialize PMU profiling buffers for simulation.
      *
-     * Allocates PmuSetupHeader + per-core PmuBuffer on host memory, publishes
-     * the setup-header pointer into kernel_args.pmu_data_base. pmu_reg_addrs
+     * Allocates PmuDataHeader + per-core PmuBuffer on host memory, publishes
+     * the header pointer into kernel_args.pmu_data_base. pmu_reg_addrs
      * stays 0 on sim (no hardware PMU model).
+     * Signature matches a2a3 for cross-platform consistency.
      */
-    int init_pmu(int num_aicore, PmuEventType event_type);
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use
@@ -311,6 +311,10 @@ private:
     std::string output_prefix_{};                                  // diagnostic artifact root directory
     int log_level_{1};                                             // 0=DEBUG..4=NUL; default INFO
     int log_info_v_{5};                                            // INFO verbosity threshold; default V5
+
+    int init_pmu_buffers(
+        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
+    );
 };
 
 #endif  // SRC_A5_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

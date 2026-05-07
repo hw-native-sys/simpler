@@ -11,50 +11,73 @@
 
 /**
  * @file pmu_collector.h
- * @brief Host-side PMU data collector (memcpy-based)
+ * @brief Host-side PMU buffer allocation, streaming collection, and CSV export.
  *
- * Design:
- *   1. Host pre-allocates one PmuBuffer per AICore on device, plus a single
- *      PmuSetupHeader that stores all buffer device pointers, core count,
- *      and the selected PMU event type.
- *   2. During execution, AICPU reads PMU MMIO counters after each task FIN
- *      and writes one PmuRecord into that core's PmuBuffer (silently
- *      incrementing PmuBufferState::dropped_record_count when the buffer is full).
- *   3. After stream sync, host copies the PmuBuffer header (to learn count)
- *      and then count*sizeof(PmuRecord) actual records back, per core.
- *   4. Host exports a LuoPan-compatible CSV under outputs/.
+ * Lifecycle mirrors a2a3 PmuCollector:
+ *   init()                    — Allocate PmuDataHeader + PmuBufferState shared memory,
+ *                               pre-allocate PmuBuffers and push into free_queues.
+ *   [start collector thread]
+ *   poll_and_collect()        — Poll ready_queues, recycle buffers, write CSV.
+ *   signal_execution_complete() — Notify collector that device is done.
+ *   [join collector thread]
+ *   drain_remaining_buffers() — Scan any buffers still held by AICPU after execution.
+ *   finalize()                — Free all device memory.
  *
- * halHostRegister is not supported on DAV_3510, so the collector uses
- * post-stream-sync memcpy rather than a shared-memory + SPSC-queue +
- * background-collector-thread streaming model.
+ * Memory model (a5-specific):
+ *   a5 has no halHostRegister, so host↔device SPSC fields are accessed
+ *   through host shadow buffers + rtMemcpy (onboard) or memcpy (sim).
+ *   Each device buffer has a paired host shadow in buf_pool_.
+ *   The shared memory region (PmuDataHeader + PmuBufferState[]) also has
+ *   separate device and host copies synchronized via copy hooks.
  */
 
 #ifndef SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_
 #define SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
-#include "common/pmu_profiling.h"
 #include "common/platform_config.h"
+#include "common/pmu_profiling.h"
 #include "common/unified_log.h"
+#include "host/profiling_copy.h"
 
 // ---------------------------------------------------------------------------
-// Memory operation callbacks (injected by DeviceRunner)
+// Memory operation callbacks (injected by DeviceRunner, same as a2a3)
 // ---------------------------------------------------------------------------
 
-using PmuAllocCallback = void *(*)(size_t size);
-using PmuFreeCallback = int (*)(void *dev_ptr);
-using PmuCopyToDeviceCallback = int (*)(void *dev_dst, const void *host_src, size_t size);
-using PmuCopyFromDeviceCallback = int (*)(void *host_dst, const void *dev_src, size_t size);
+/**
+ * Allocate device memory. Returns nullptr on failure.
+ */
+using PmuAllocCallback = void *(*)(size_t size, void *user_data);
+
+/**
+ * Register device memory for host-visible access.
+ * Unused on a5 (no halHostRegister); kept for interface parity with a2a3.
+ */
+using PmuRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void *user_data, void **host_ptr);
+
+/**
+ * Unregister previously registered host-visible device memory.
+ * Unused on a5; kept for interface parity with a2a3.
+ */
+using PmuUnregisterCallback = int (*)(void *dev_ptr, int device_id, void *user_data);
+
+/**
+ * Free device memory.
+ */
+using PmuFreeCallback = int (*)(void *dev_ptr, void *user_data);
 
 // ---------------------------------------------------------------------------
 // PmuCollector
@@ -69,65 +92,98 @@ public:
     PmuCollector &operator=(const PmuCollector &) = delete;
 
     /**
-     * Allocate device-side PMU buffers and publish the setup header pointer.
+     * Allocate PMU shared memory and pre-populate free_queues.
      *
-     * @param num_cores        Number of AICore instances to profile
-     * @param event_type       PmuEventType value (stored in header, used by AICPU)
-     * @param kernel_args_pmu_data_base Out: device address of PmuSetupHeader
-     * @param alloc_cb         Device memory alloc
-     * @param free_cb          Device memory free
-     * @param copy_to_dev_cb   Host→device (for publishing header)
-     * @param copy_from_dev_cb Device→host (for collect_all)
-     * @return 0 on success
+     * @param num_cores               Number of AICore instances in use
+     * @param num_threads             Number of AICPU scheduling threads
+     * @param kernel_args_pmu_data_base  Out: device address of PmuDataHeader
+     * @param csv_path                Output CSV file path
+     * @param event_type              PmuEventType value (written to CSV rows)
+     * @param alloc_cb / register_cb / free_cb  Memory operation callbacks
+     * @param user_data               Opaque pointer forwarded to callbacks
+     * @param device_id               Device ID (for interface parity)
+     * @return 0 on success, non-zero on failure
      */
-    int initialize(
-        int num_cores, PmuEventType event_type, uint64_t *kernel_args_pmu_data_base, PmuAllocCallback alloc_cb,
-        PmuFreeCallback free_cb, PmuCopyToDeviceCallback copy_to_dev_cb, PmuCopyFromDeviceCallback copy_from_dev_cb
+    int init(
+        int num_cores, int num_threads, uint64_t *kernel_args_pmu_data_base, const std::string &csv_path,
+        PmuEventType event_type, PmuAllocCallback alloc_cb, PmuFreeCallback free_cb, void *user_data, int device_id
     );
 
     /**
-     * Copy all PMU buffers back from device. Fills collected_records_.
-     * Must be called after the execution stream has been fully synchronized.
+     * Main body of the collector thread.
+     * Polls all per-thread ready_queues via rtMemcpy, appends records to CSV,
+     * recycles buffers back into free_queues.
      */
-    int collect_all();
+    void poll_and_collect();
 
     /**
-     * Export collected records to a LuoPan-compatible CSV under output_dir/.
+     * Signal that device execution has finished.
+     * The collector thread will drain remaining entries then exit.
      */
-    int export_csv(const std::string &output_dir);
+    void signal_execution_complete();
 
     /**
-     * Free all device buffers and reset host state.
+     * After the collector thread exits, scan PmuBufferState.current_buf_ptr for
+     * any remaining non-empty buffers that AICPU flushed but the collector
+     * thread may not have consumed yet.
      */
-    int finalize();
+    void drain_remaining_buffers();
 
-    bool is_initialized() const { return setup_header_dev_ != nullptr; }
+    /**
+     * Free all device/shared memory and unregister mapped regions.
+     */
+    void finalize(PmuUnregisterCallback unregister_cb, PmuFreeCallback free_cb, void *user_data);
 
-    const std::vector<std::vector<PmuRecord>> &get_records() const { return collected_records_; }
+    bool is_initialized() const { return initialized_; }
 
 private:
-    void *setup_header_dev_{nullptr};
-    std::vector<void *> core_buffers_dev_;  // PmuBuffer* per core (device)
+    bool initialized_ = false;
+    int num_cores_ = 0;
+    int num_threads_ = 0;
+    int device_id_ = -1;
+    PmuEventType event_type_ = PmuEventType::PIPE_UTILIZATION;
 
-    int num_cores_{0};
-    PmuEventType event_type_{PmuEventType::PIPE_UTILIZATION};
-    size_t pmu_buffer_bytes_{0};
-    size_t setup_region_bytes_{0};
+    // Shared memory region (PmuDataHeader + PmuBufferState[])
+    void *shm_dev_ = nullptr;   // Device address
+    void *shm_host_ = nullptr;  // Host shadow
+    size_t shm_size_ = 0;
 
-    PmuAllocCallback alloc_cb_{nullptr};
-    PmuFreeCallback free_cb_{nullptr};
-    PmuCopyToDeviceCallback copy_to_dev_cb_{nullptr};
-    PmuCopyFromDeviceCallback copy_from_dev_cb_{nullptr};
+    // Pre-allocated PmuBuffers (one pool per core × BUFFERS_PER_CORE)
+    struct BufEntry {
+        void *dev_ptr = nullptr;
+        void *host_ptr = nullptr;
+    };
+    std::vector<BufEntry> buf_pool_;
 
-    // Host-side collected data (indexed by core id)
-    std::vector<std::vector<PmuRecord>> collected_records_;
-    std::vector<uint32_t> dropped_counts_;
-    std::vector<uint32_t> total_counts_;
-    std::vector<uint32_t> owning_thread_ids_;
+    PmuAllocCallback alloc_cb_ = nullptr;
+    PmuFreeCallback free_cb_ = nullptr;
+    void *user_data_ = nullptr;
+
+    std::string csv_path_;
+    std::string csv_header_;
+    std::ofstream csv_file_;
+    std::mutex csv_mutex_;
+
+    std::atomic<bool> execution_complete_{false};
+    uint64_t total_collected_ = 0;
+
+    std::unordered_set<uint64_t> drained_bufs_;
+
+    // Internal helpers
+    PmuDataHeader *pmu_header_host() const { return get_pmu_header(shm_host_); }
+    PmuBufferState *pmu_state_host(int core_id) const { return get_pmu_buffer_state(shm_host_, core_id); }
+    PmuDataHeader *pmu_header_dev() const { return get_pmu_header(shm_dev_); }
+    PmuBufferState *pmu_state_dev(int core_id) const { return get_pmu_buffer_state(shm_dev_, core_id); }
+
+    void write_buffer_to_csv(int core_id, int thread_idx, const void *buf_host_ptr);
+    void push_to_free_queue(int core_id, uint64_t buf_dev_addr);
+    void ensure_csv_open_unlocked();
+
+    void *resolve_host_ptr(uint64_t dev_addr);
 };
 
 // ---------------------------------------------------------------------------
-// Utilities
+// Utility: resolve PMU event type (env-var override)
 // ---------------------------------------------------------------------------
 
 inline PmuEventType resolve_pmu_event_type(int requested_event_type) {

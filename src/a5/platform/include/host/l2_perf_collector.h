@@ -11,185 +11,413 @@
 
 /**
  * @file l2_perf_collector.h
- * @brief Host-side performance data collector (memcpy-based)
+ * @brief Platform-agnostic performance data collector with dynamic memory management
  *
- * Design:
- *   1. Host pre-allocates one L2PerfBuffer per core and one PhaseBuffer per
- *      AICPU thread on device, plus a single L2PerfSetupHeader that stores
- *      all buffer pointers, total_tasks, and the AicpuPhaseHeader.
- *   2. During execution, AICore writes timing into L2PerfBuffers and AICPU
- *      completes records + writes phase data directly into device memory.
- *      When a buffer fills up, records are silently dropped (AICPU-side
- *      early return).
- *   3. After stream sync, Host copies L2PerfSetupHeader, each L2PerfBuffer, and
- *      each PhaseBuffer back via rtMemcpy (two-step: 64B header → read
- *      count → copy count*sizeof(record) actual data).
+ * Architecture:
+ * - ProfMemoryManager: Dedicated thread that polls ReadyQueue, allocates new
+ *   device buffers, and replaces full buffers in slot arrays.
+ * - L2PerfCollector: Main thread collects data from ProfMemoryManager's
+ *   internal queue, copies records to host vectors, and exports results.
  *
- * This replaces the previous shared-memory + ProfMemoryManager design that
- * depended on halHostRegister, which A5 hardware does not support.
+ * Design Pattern: Dependency Injection via Callbacks for memory operations.
+ *
+ * A5 specifics:
+ * - A5 does not support halHostRegister (no SVM/shared memory).
+ * - Both onboard and sim use the same host-shadow collector flow.
+ * - Platform-specific copy hooks handle the actual Host↔Device transfer
+ *   (`rtMemcpy` on onboard, `memcpy` in sim).
  */
 
 #ifndef SRC_A5_PLATFORM_INCLUDE_HOST_L2_PERF_COLLECTOR_H_
 #define SRC_A5_PLATFORM_INCLUDE_HOST_L2_PERF_COLLECTOR_H_
 
-#include <cstddef>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
+#include "host/profiling_copy.h"
 #include "runtime.h"
 
 /**
- * Device memory allocation callback.
+ * Memory allocation callback for performance profiling
  *
- * @param size      Memory size in bytes
+ * @param size Memory size in bytes
  * @return Allocated device memory pointer, or nullptr on failure
  */
 using L2PerfAllocCallback = void *(*)(size_t size);
 
 /**
- * Device memory free callback.
+ * Memory registration callback (for Host-Device shared memory)
  *
- * @param dev_ptr   Device memory pointer
+ * Kept for interface parity with a2a3. A5 does not support host register,
+ * so callers pass nullptr and the collector ignores it.
+ */
+using L2PerfRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
+
+/**
+ * Memory unregister callback
+ *
+ * Kept for interface parity with a2a3. A5 does not support host register,
+ * so callers pass nullptr and the collector ignores it.
+ */
+using L2PerfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
+
+/**
+ * Memory free callback
+ *
+ * @param dev_ptr Device memory pointer
  * @return 0 on success, error code on failure
  */
 using L2PerfFreeCallback = int (*)(void *dev_ptr);
 
 /**
- * Host -> Device copy callback (rtMemcpy HOST_TO_DEVICE / memcpy in sim).
+ * Thread factory callback for creating threads with device binding
  *
- * @param dev_dst   Device destination pointer
- * @param host_src  Host source pointer
- * @param size      Number of bytes to copy
- * @return 0 on success, error code on failure
+ * Creates a std::thread that runs the given function with proper device
+ * context setup/teardown (e.g., rtSetDevice/rtDeviceReset on onboard).
+ *
+ * @param fn Function to execute in the new thread
+ * @return The newly created thread
  */
-using L2PerfCopyToDeviceCallback = int (*)(void *dev_dst, const void *host_src, size_t size);
+using ThreadFactory = std::function<std::thread(std::function<void()>)>;
+
+// =============================================================================
+// ProfMemoryManager - Dynamic Buffer Memory Management Thread
+// =============================================================================
 
 /**
- * Device -> Host copy callback (rtMemcpy DEVICE_TO_HOST / memcpy in sim).
- *
- * @param host_dst  Host destination pointer
- * @param dev_src   Device source pointer
- * @param size      Number of bytes to copy
- * @return 0 on success, error code on failure
+ * Buffer type identifier for ReadyBufferInfo
  */
-using L2PerfCopyFromDeviceCallback = int (*)(void *host_dst, const void *dev_src, size_t size);
+enum class ProfBufferType { PERF_RECORD, PHASE };
 
 /**
- * Host-side performance data collector.
+ * Information about a ready (full) buffer, passed from mgmt thread to main thread
+ */
+struct ReadyBufferInfo {
+    ProfBufferType type;
+    uint32_t index;         // core_index (PERF_RECORD) or thread_idx (PHASE)
+    uint32_t slot_idx;      // Reserved (unused in free queue design)
+    void *dev_buffer_ptr;   // Device address of the full buffer
+    void *host_buffer_ptr;  // Host-side buffer (sim: same as dev; onboard: host copy)
+    uint32_t buffer_seq;    // Sequence number for ordering
+};
+
+/**
+ * Notification that a buffer has been copied and can be freed
+ */
+struct CopyDoneInfo {
+    void *dev_buffer_ptr;  // Device buffer to free
+    ProfBufferType type;   // Buffer type (for recycling)
+};
+
+/**
+ * Dynamic profiling buffer memory manager
  *
- * Lifecycle:
- *   1. initialize() — allocate L2PerfSetupHeader and all per-core/per-thread
- *      buffers on device; caller reads get_l2_perf_setup_device_ptr() and
- *      sets kernel_args.l2_perf_data_base.
- *   2. (AICore/AICPU run, writing directly into device buffers)
- *   3. collect_all() — after stream sync, copy L2PerfSetupHeader back,
- *      then copy each L2PerfBuffer / PhaseBuffer back using two-step
- *      count-first memcpy. Fills collected_*_records_ vectors.
- *   4. export_swimlane_json() — serialize collected data to Chrome Trace
- *      Event Format JSON. Logic unchanged from previous design.
- *   5. finalize() — free all device buffers.
+ * Runs a dedicated thread that:
+ * 1. Polls ReadyQueue in shared memory for full buffer entries
+ * 2. Allocates new device buffers via callback
+ * 3. Writes new buffer addresses into slots (for device to pick up)
+ * 4. Pushes old (full) buffer info to internal queue for main thread to copy
+ * 5. Frees device buffers after main thread confirms copy is done
+ *
+ * A5 specifics:
+ * - The collector always maintains host shadow copies of shared state/buffers.
+ * - Device-visible updates and reads always go through the platform copy hooks.
+ */
+class ProfMemoryManager {
+public:
+    ProfMemoryManager() = default;
+    ~ProfMemoryManager();
+
+    // Disable copy
+    ProfMemoryManager(const ProfMemoryManager &) = delete;
+    ProfMemoryManager &operator=(const ProfMemoryManager &) = delete;
+
+    // Allow L2PerfCollector to register initial buffer mappings
+    friend class L2PerfCollector;
+
+    /**
+     * Start the memory management thread
+     *
+     * @param shared_mem_host Host-side shared memory base address (shadow buffer)
+     * @param num_cores Number of AICore instances (L2PerfBufferState count)
+     * @param num_phase_threads Number of phase profiling threads (PhaseBufferState count)
+     * @param alloc_cb Device memory allocation callback
+     * @param register_cb Host-device mapping callback (nullptr for A5)
+     * @param free_cb Device memory free callback
+     * @param device_id Device ID for interface parity (unused on A5)
+     * @param thread_factory Thread factory for creating device-bound threads (empty to use std::thread)
+     */
+    void start(
+        void *shared_mem_host, int num_cores, int num_phase_threads, L2PerfAllocCallback alloc_cb,
+        L2PerfRegisterCallback register_cb, L2PerfFreeCallback free_cb, int device_id,
+        const ThreadFactory &thread_factory = {}
+    );
+
+    /**
+     * Stop the memory management thread
+     * Blocks until the thread exits.
+     */
+    void stop();
+
+    /**
+     * Try to pop a ready buffer info (non-blocking)
+     *
+     * @param[out] info Ready buffer info
+     * @return true if an item was available, false otherwise
+     */
+    bool try_pop_ready(ReadyBufferInfo &info);
+
+    /**
+     * Wait for a ready buffer info with timeout
+     *
+     * @param[out] info Ready buffer info
+     * @param timeout Maximum wait time
+     * @return true if an item was available, false on timeout
+     */
+    bool wait_pop_ready(ReadyBufferInfo &info, std::chrono::milliseconds timeout);
+
+    /**
+     * Notify that a buffer has been copied and can be freed
+     *
+     * @param info Copy done notification
+     */
+    void notify_copy_done(const CopyDoneInfo &info);
+
+    /**
+     * Check if the manager thread is running
+     */
+    bool is_running() const { return running_.load(); }
+
+private:
+    std::thread mgmt_thread_;
+    std::atomic<bool> running_{false};
+
+    // Shared memory references
+    void *shared_mem_host_{nullptr};  // Host-side shadow buffer
+    void *shared_mem_dev_{nullptr};   // Device-side base address
+    int num_cores_{0};
+    int num_phase_threads_{0};
+
+    // Callbacks
+    L2PerfAllocCallback alloc_cb_{nullptr};
+    L2PerfRegisterCallback register_cb_{nullptr};
+    L2PerfFreeCallback free_cb_{nullptr};
+    int device_id_{-1};
+
+    // Management thread → main thread (ready buffers)
+    std::mutex ready_mutex_;
+    std::condition_variable ready_cv_;
+    std::queue<ReadyBufferInfo> ready_queue_;
+
+    // Main thread → management thread (buffers to free)
+    std::mutex done_mutex_;
+    std::queue<CopyDoneInfo> done_queue_;
+
+    // Device-to-host pointer mapping (populated during alloc_and_register)
+    std::unordered_map<void *, void *> dev_to_host_;
+
+    // Recycled buffer pools (avoids alloc/free churn in mgmt_loop)
+    std::vector<void *> recycled_perf_buffers_;
+    std::vector<void *> recycled_phase_buffers_;
+
+    // Management thread main loop
+    void mgmt_loop();
+
+    // Allocate a new device buffer and paired host shadow
+    void *alloc_and_register(size_t size, void **host_ptr_out);
+
+    // Free a previously allocated buffer and its host shadow
+    void free_buffer(void *dev_ptr);
+
+    // Resolve device pointer to host pointer
+    void *resolve_host_ptr(void *dev_ptr);
+
+    // Register an external dev→host mapping (for initial buffers)
+    void register_mapping(void *dev_ptr, void *host_ptr);
+
+    // Process one ReadyQueue entry
+    void process_ready_entry(L2PerfDataHeader *header, int thread_idx, const ReadyQueueEntry &entry);
+};
+
+// =============================================================================
+// L2PerfCollector - Main Collector
+// =============================================================================
+
+/**
+ * Performance data collector
+ *
+ * Manages performance profiling lifecycle:
+ * 1. Initialize shared memory (Header + SlotArrays) and allocate initial buffers
+ * 2. Start ProfMemoryManager thread
+ * 3. Collect records from ProfMemoryManager's queue (main thread)
+ * 4. Export swimlane visualization
+ *
+ * Platform-agnostic: Memory management delegated to callbacks
  */
 class L2PerfCollector {
 public:
     L2PerfCollector() = default;
     ~L2PerfCollector();
 
+    // Disable copy and move
     L2PerfCollector(const L2PerfCollector &) = delete;
     L2PerfCollector &operator=(const L2PerfCollector &) = delete;
 
     /**
-     * Allocate device buffers and initialize the L2PerfSetupHeader.
+     * Initialize performance profiling
      *
-     * After success, call get_l2_perf_setup_device_ptr() to get the device-side
-     * header pointer; the caller must publish this via kernel_args.l2_perf_data_base
-     * so AICPU code can discover it through get_platform_l2_perf_base().
+     * Allocates shared memory for slot arrays, allocates initial buffers,
+     * and writes buffer addresses into slots.
      *
-     * @param num_aicore       Number of AICore instances to profile
-     * @param device_id        Device ID (stored for later callbacks)
-     * @param alloc_cb         Device memory alloc
-     * @param free_cb          Device memory free
-     * @param copy_to_dev_cb   Host→device copy (used during init to publish header)
-     * @param copy_from_dev_cb Device->host copy (used during collect_all)
+     * @param num_aicore Number of AICore instances
+     * @param device_id Device ID
+     * @param alloc_cb Memory allocation callback
+     * @param register_cb Memory registration callback (ignored on A5)
+     * @param free_cb Memory free callback
      * @return 0 on success, error code on failure
      */
     int initialize(
-        int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfFreeCallback free_cb,
-        L2PerfCopyToDeviceCallback copy_to_dev_cb, L2PerfCopyFromDeviceCallback copy_from_dev_cb
+        int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfRegisterCallback register_cb,
+        L2PerfFreeCallback free_cb
     );
 
     /**
-     * Copy all profiling data back from device and parse it into
-     * collected_perf_records_ / collected_phase_records_ /
-     * collected_orch_summary_ / core_to_thread_.
+     * Start the memory management thread
      *
-     * Must be called after the execution stream has been fully synchronized.
+     * Must be called after initialize() and before device execution starts.
      *
-     * @return 0 on success, error code on failure
+     * @param thread_factory Thread factory for creating device-bound threads (empty to use std::thread)
      */
-    int collect_all();
+    void start_memory_manager(const ThreadFactory &thread_factory = {});
 
     /**
-     * Export collected data to Chrome Trace Event Format JSON.
+     * Poll and collect performance data from the memory manager's queue
      *
-     * @param output_path Output directory
-     * @return 0 on success, -1 on failure
+     * Runs on the main thread (or a dedicated collector thread in sim mode).
+     * Pulls ready buffers from ProfMemoryManager, copies records to host vectors,
+     * and notifies the manager to free old device buffers.
+     *
+     * @param expected_tasks Expected total number of tasks (0 = auto-detect)
+     */
+    void poll_and_collect(int expected_tasks = 0);
+
+    /**
+     * Export performance data to Chrome Trace Event Format
+     *
+     * @param output_path Output directory path
+     * @return 0 on success, error code on failure
      */
     int export_swimlane_json(const std::string &output_path);
 
     /**
-     * Free all device buffers and clear host-side state.
+     * Stop the memory management thread and clean up remaining data
      *
+     * Must be called after device execution completes.
+     */
+    void stop_memory_manager();
+
+    /**
+     * Cleanup all resources
+     *
+     * @param unregister_cb Memory unregister callback (nullptr on A5)
+     * @param free_cb Memory free callback
      * @return 0 on success, error code on failure
      */
-    int finalize();
+    int finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb);
 
     /**
-     * Check if the collector has been initialized.
+     * Check if collector is initialized
      */
-    bool is_initialized() const { return setup_header_dev_ != nullptr; }
+    bool is_initialized() const { return perf_shared_mem_host_ != nullptr; }
 
     /**
-     * Get the device pointer to the L2PerfSetupHeader.
+     * Get the device pointer to the L2PerfDataHeader.
      * Used to set kernel_args.l2_perf_data_base after initialize() succeeds.
      */
-    void *get_l2_perf_setup_device_ptr() const { return setup_header_dev_; }
+    void *get_l2_perf_setup_device_ptr() const { return perf_shared_mem_dev_; }
 
     /**
-     * Accessor used by tests.
+     * Drain remaining buffers from the memory manager's ready queue
+     *
+     * After poll_and_collect() exits (all PERF records collected) and
+     * the memory manager is stopped, Phase buffers may still be in the
+     * ready queue. This method drains them into the collected vectors.
+     *
+     * Must be called after stop_memory_manager() and before collect_phase_data().
+     */
+    void drain_remaining_buffers();
+
+    /**
+     * Collect AICPU phase profiling data from shared memory
+     *
+     * Reads scheduler phase records and orchestrator summary from the
+     * phase profiling region. Must be called after AICPU threads have joined.
+     */
+    void collect_phase_data();
+
+    /**
+     * Scan L2PerfBufferState::current_buf_ptr for all cores to recover
+     * partial records not delivered through the pipeline.
+     *
+     * Must be called after device execution completes and after
+     * stop_memory_manager(). Follows the same pattern as collect_phase_data()
+     * for PhaseBufferStates.
+     */
+    void scan_remaining_perf_buffers();
+
+    /**
+     * Signal that device execution is complete (streams synchronized).
+     * poll_and_collect() will drain remaining pipeline data and exit.
+     */
+    void signal_execution_complete();
+
+    /**
+     * Get collected records (for testing)
      */
     const std::vector<std::vector<L2PerfRecord>> &get_records() const { return collected_perf_records_; }
 
 private:
-    // Device-side allocations
-    void *setup_header_dev_{nullptr};
-    std::vector<void *> core_buffers_dev_;
-    std::vector<void *> phase_buffers_dev_;
+    // Shared memory pointers
+    void *perf_shared_mem_dev_{nullptr};   // Device memory pointer (slot arrays)
+    void *perf_shared_mem_host_{nullptr};  // Host-side shadow buffer
+    int device_id_{-1};
 
     // Configuration
     int num_aicore_{0};
-    int num_phase_threads_{0};
-    int device_id_{-1};
 
-    // Sizes (computed once in initialize)
-    size_t l2_perf_buffer_bytes_{0};
-    size_t phase_buffer_bytes_{0};
-
-    // Callbacks
+    // Callbacks (stored for memory manager and finalize)
     L2PerfAllocCallback alloc_cb_{nullptr};
+    L2PerfRegisterCallback register_cb_{nullptr};
     L2PerfFreeCallback free_cb_{nullptr};
-    L2PerfCopyToDeviceCallback copy_to_dev_cb_{nullptr};
-    L2PerfCopyFromDeviceCallback copy_from_dev_cb_{nullptr};
 
-    // Host-side collected data (indexed by core / thread)
+    // Memory manager
+    ProfMemoryManager memory_manager_;
+
+    // Collected data (per-core vectors, indexed by core_index)
     std::vector<std::vector<L2PerfRecord>> collected_perf_records_;
+
+    // AICPU phase profiling data (per-thread, mixed sched + orch records)
     std::vector<std::vector<AicpuPhaseRecord>> collected_phase_records_;
     AicpuOrchSummary collected_orch_summary_{};
     bool has_phase_data_{false};
 
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)
     std::vector<int8_t> core_to_thread_;
+
+    // Signal from device_runner that execution is complete
+    std::atomic<bool> execution_complete_{false};
+
+    // Allocate a single buffer (L2PerfBuffer or PhaseBuffer) and its host shadow
+    void *alloc_single_buffer(size_t size, void **host_ptr_out);
 };
 
 #endif  // SRC_A5_PLATFORM_INCLUDE_HOST_L2_PERF_COLLECTOR_H_
