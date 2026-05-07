@@ -61,11 +61,7 @@ def _rank_entry(  # noqa: PLR0913
     nranks: int,
     rootinfo_path: str,
     window_size: int,
-    host_lib: str,
-    aicpu_path: str,
-    aicore_path: str,
-    simpler_log_path: str,
-    sim_context_path: str,
+    bins,
     buffer_specs: list[dict],
     host_input_specs: list[dict],
     channel_shm_name: str | None,
@@ -91,7 +87,7 @@ def _rank_entry(  # noqa: PLR0913
         )
 
         worker = ChipWorker()
-        worker.init(host_lib, aicpu_path, aicore_path, simpler_log_path, sim_context_path)
+        worker.init(bins)
         result["stage"] = "init"
 
         cfg = ChipBootstrapConfig(
@@ -157,13 +153,6 @@ def _run_two_rank(
     round-trip check.
     """
     bins = _sim_binaries()
-    host_lib = str(bins.host_path)
-    aicpu_path = str(bins.aicpu_path)
-    aicore_path = str(bins.aicore_path)
-    simpler_log_path = str(bins.simpler_log_path)
-
-    sim_context_path = str(bins.sim_context_path) if bins.sim_context_path else ""
-
     nranks = 2
     rootinfo_path = f"/tmp/pto_bootstrap_sim_{os.getpid()}_{rootinfo_suffix}.bin"
 
@@ -180,11 +169,7 @@ def _run_two_rank(
                 nranks,
                 rootinfo_path,
                 window_size,
-                host_lib,
-                aicpu_path,
-                aicore_path,
-                simpler_log_path,
-                sim_context_path,
+                bins,
                 buffer_specs,
                 staging,
                 channel_name,
@@ -279,13 +264,6 @@ class TestBootstrapContextHostStaging:
             ]
 
             bins = _sim_binaries()
-            host_lib = str(bins.host_path)
-            aicpu_path = str(bins.aicpu_path)
-            aicore_path = str(bins.aicore_path)
-            simpler_log_path = str(bins.simpler_log_path)
-
-            sim_context_path = str(bins.sim_context_path) if bins.sim_context_path else ""
-
             rootinfo_path = f"/tmp/pto_bootstrap_sim_{os.getpid()}_staging.bin"
             ctx = mp.get_context("fork")
             result_queue: mp.Queue = ctx.Queue()  # type: ignore[type-arg]
@@ -299,11 +277,7 @@ class TestBootstrapContextHostStaging:
                         2,
                         rootinfo_path,
                         4096,
-                        host_lib,
-                        aicpu_path,
-                        aicore_path,
-                        simpler_log_path,
-                        sim_context_path,
+                        bins,
                         specs,
                         staging,
                         None,
@@ -344,11 +318,7 @@ def _store_rank_entry(  # noqa: PLR0913
     nranks: int,
     rootinfo_path: str,
     window_size: int,
-    host_lib: str,
-    aicpu_path: str,
-    aicore_path: str,
-    simpler_log_path: str,
-    sim_context_path: str,
+    bins,
     buffer_specs: list[dict],
     host_output_specs: list[dict],
     payload: bytes | None,
@@ -373,7 +343,7 @@ def _store_rank_entry(  # noqa: PLR0913
         )
 
         worker = ChipWorker()
-        worker.init(host_lib, aicpu_path, aicore_path, simpler_log_path, sim_context_path)
+        worker.init(bins)
 
         cfg = ChipBootstrapConfig(
             comm=ChipCommBootstrapConfig(
@@ -457,13 +427,6 @@ class TestBootstrapContextStoreToHost:
             host_outputs_r0 = [{"name": "y", "shm_name": shm.name, "size": nbytes}]
 
             bins = _sim_binaries()
-            host_lib = str(bins.host_path)
-            aicpu_path = str(bins.aicpu_path)
-            aicore_path = str(bins.aicore_path)
-            simpler_log_path = str(bins.simpler_log_path)
-
-            sim_context_path = str(bins.sim_context_path) if bins.sim_context_path else ""
-
             rootinfo_path = f"/tmp/pto_bootstrap_sim_{os.getpid()}_store.bin"
             ctx = mp.get_context("fork")
             result_queue: mp.Queue = ctx.Queue()  # type: ignore[type-arg]
@@ -479,11 +442,7 @@ class TestBootstrapContextStoreToHost:
                         2,
                         rootinfo_path,
                         4096,
-                        host_lib,
-                        aicpu_path,
-                        aicore_path,
-                        simpler_log_path,
-                        sim_context_path,
+                        bins,
                         specs,
                         outputs,
                         pay,
@@ -566,11 +525,7 @@ class TestBootstrapContextChannel:
 
 
 def _missing_output_staging_rank_entry(
-    host_lib: str,
-    aicpu_path: str,
-    aicore_path: str,
-    simpler_log_path: str,
-    sim_context_path: str,
+    bins,
     channel_shm_name: str,
     result_queue: mp.Queue,  # type: ignore[type-arg]
 ) -> None:
@@ -590,7 +545,7 @@ def _missing_output_staging_rank_entry(
         )
 
         worker = ChipWorker()
-        worker.init(host_lib, aicpu_path, aicore_path, simpler_log_path, sim_context_path)
+        worker.init(bins)
 
         shm = SharedMemory(name=channel_shm_name)
         try:
@@ -636,13 +591,6 @@ class TestBootstrapContextMissingOutputStaging:
         )
 
         bins = _sim_binaries()
-        host_lib = str(bins.host_path)
-        aicpu_path = str(bins.aicpu_path)
-        aicore_path = str(bins.aicore_path)
-        simpler_log_path = str(bins.simpler_log_path)
-
-        sim_context_path = str(bins.sim_context_path) if bins.sim_context_path else ""
-
         shm = SharedMemory(create=True, size=CHIP_BOOTSTRAP_MAILBOX_SIZE)
         buf = shm.buf
         assert buf is not None
@@ -653,7 +601,7 @@ class TestBootstrapContextMissingOutputStaging:
             result_queue: mp.Queue = ctx.Queue()  # type: ignore[type-arg]
             p = ctx.Process(
                 target=_missing_output_staging_rank_entry,
-                args=(host_lib, aicpu_path, aicore_path, simpler_log_path, sim_context_path, shm.name, result_queue),
+                args=(bins, shm.name, result_queue),
                 daemon=False,
             )
             p.start()

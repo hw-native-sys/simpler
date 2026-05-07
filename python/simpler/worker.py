@@ -77,7 +77,6 @@ from .task_interface import (
     ContinuousTensor,
     DataType,
     TaskArgs,
-    _ChipWorker,
     _Worker,
 )
 
@@ -259,12 +258,8 @@ def _sub_worker_loop(buf, registry: dict) -> None:
 
 def _chip_process_loop(
     buf: memoryview,
-    host_lib_path: str,
+    bins,
     device_id: int,
-    aicpu_path: str,
-    aicore_path: str,
-    simpler_log_lib_path: str,
-    sim_context_lib_path: str = "",
     log_level: int = 1,
     log_info_v: int = 5,
 ) -> None:
@@ -280,16 +275,8 @@ def _chip_process_loop(
     import traceback as _tb  # noqa: PLC0415
 
     try:
-        cw = _ChipWorker()
-        cw.init(
-            host_lib_path,
-            aicpu_path,
-            aicore_path,
-            simpler_log_lib_path,
-            sim_context_lib_path,
-            log_level,
-            log_info_v,
-        )
+        cw = ChipWorker()
+        cw.init(bins, log_level=log_level, log_info_v=log_info_v)
         cw.set_device(device_id)
     except Exception as e:
         _tb.print_exc()
@@ -353,14 +340,10 @@ def _chip_process_loop(
             break
 
 
-def _chip_process_loop_with_bootstrap(  # noqa: PLR0912, PLR0913
+def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
     buf: memoryview,
-    host_lib_path: str,
+    bins,
     device_id: int,
-    aicpu_path: str,
-    aicore_path: str,
-    simpler_log_lib_path: str,
-    sim_context_lib_path: str,
     bootstrap_cfg: ChipBootstrapConfig,
     bootstrap_mailbox_addr: int,
     max_buffer_count: int,
@@ -382,15 +365,7 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912, PLR0913
 
     cw = ChipWorker()
     try:
-        cw.init(
-            host_lib_path,
-            aicpu_path,
-            aicore_path,
-            simpler_log_lib_path,
-            sim_context_lib_path,
-            log_level,
-            log_info_v,
-        )
+        cw.init(bins, log_level=log_level, log_info_v=log_info_v)
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         channel.write_error(1, f"{type(e).__name__}: chip_worker.init: {e}")
@@ -686,18 +661,8 @@ class Worker:
         builder = RuntimeBuilder(platform)
         binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
 
-        sev, info_v = _simpler_log.get_current_config()
-
         self._chip_worker = ChipWorker()
-        self._chip_worker.init(
-            str(binaries.host_path),
-            str(binaries.aicpu_path),
-            str(binaries.aicore_path),
-            str(binaries.simpler_log_path),
-            str(binaries.sim_context_path) if binaries.sim_context_path else "",
-            sev,
-            info_v,
-        )
+        self._chip_worker.init(binaries)
         self._chip_worker.set_device(device_id)
 
     def _init_hierarchical(self) -> None:
@@ -721,13 +686,12 @@ class Worker:
             builder = RuntimeBuilder(platform)
             binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
 
-            self._l3_host_lib_path = str(binaries.host_path)
-            self._l3_aicpu_path = str(binaries.aicpu_path)
-            self._l3_aicore_path = str(binaries.aicore_path)
-            self._l3_simpler_log_path = str(binaries.simpler_log_path)
-            self._l3_sim_ctx_path = (
-                str(binaries.sim_context_path) if getattr(binaries, "sim_context_path", None) else ""
-            )
+            # Stash the full RuntimeBinaries so forked chip children can
+            # construct a ChipWorker with one call (`cw.init(bins)`) instead
+            # of taking ~10 path strings via positional args.  Forked-child
+            # invocation is `os.fork()` + direct function call, so no pickle
+            # barrier — the bins object is just a Python value passed through.
+            self._l3_bins = binaries
 
             # Allocate chip mailboxes (unified layout, MAILBOX_SIZE each).
             for _ in device_ids:
@@ -809,12 +773,8 @@ class Worker:
                         bootstrap_addr = ctypes.addressof(ctypes.c_char.from_buffer(bootstrap_buf))
                         _chip_process_loop_with_bootstrap(
                             buf,
-                            self._l3_host_lib_path,
+                            self._l3_bins,
                             dev_id,
-                            self._l3_aicpu_path,
-                            self._l3_aicore_path,
-                            self._l3_simpler_log_path,
-                            self._l3_sim_ctx_path,
                             bootstrap_cfg,
                             bootstrap_addr,
                             max_buffer_count,
@@ -824,12 +784,8 @@ class Worker:
                     else:
                         _chip_process_loop(
                             buf,
-                            self._l3_host_lib_path,
+                            self._l3_bins,
                             dev_id,
-                            self._l3_aicpu_path,
-                            self._l3_aicore_path,
-                            self._l3_simpler_log_path,
-                            self._l3_sim_ctx_path,
                             chip_log_level,
                             chip_log_info_v,
                         )

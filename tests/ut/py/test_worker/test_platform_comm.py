@@ -74,11 +74,7 @@ def _rank_entry(
     rank: int,
     nranks: int,
     device_id: int,
-    host_lib: str,
-    aicpu_path: str,
-    aicore_path: str,
-    simpler_log_path: str,
-    sim_context_path: str,
+    bins,
     rootinfo_path: str,
     result_queue: mp.Queue,  # type: ignore[type-arg]
 ) -> None:
@@ -88,7 +84,7 @@ def _rank_entry(
         from simpler.task_interface import ChipWorker
 
         worker = ChipWorker()
-        worker.init(host_lib, aicpu_path, aicore_path, simpler_log_path, sim_context_path)
+        worker.init(bins)
         result["stage"] = "init"
 
         worker.set_device(device_id)
@@ -181,13 +177,6 @@ def test_two_rank_comm_lifecycle(st_device_ids):
 
     build = bool(os.environ.get("PTO_UT_BUILD"))
     bins = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer", build=build)
-    host_lib = str(bins.host_path)
-    aicpu_path = str(bins.aicpu_path)
-    aicore_path = str(bins.aicore_path)
-
-    simpler_log_path = str(bins.simpler_log_path)
-    sim_context_path = str(bins.sim_context_path) if bins.sim_context_path else ""
-
     assert len(st_device_ids) >= 2, "device_count(2) fixture must yield >= 2 ids"
     nranks = 2
     rootinfo_path = f"/tmp/pto_comm_py_ut_rootinfo_{os.getpid()}.bin"
@@ -202,11 +191,7 @@ def test_two_rank_comm_lifecycle(st_device_ids):
                 rank,
                 nranks,
                 int(st_device_ids[rank]),
-                host_lib,
-                aicpu_path,
-                aicore_path,
-                simpler_log_path,
-                sim_context_path,
+                bins,
                 rootinfo_path,
                 result_queue,
             ),
