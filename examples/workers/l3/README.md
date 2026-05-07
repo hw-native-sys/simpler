@@ -62,6 +62,7 @@ Two things to know before reading the example:
 | Directory | New concept |
 | --------- | ----------- |
 | [`multi_chip_dispatch/`](multi_chip_dispatch/) | Two chips + one SubWorker. An orchestration fn dispatches a `ChipCallable` to each chip, then submits a Python callable to collect/verify results. |
+| [`child_memory/`](child_memory/) | `orch.malloc` + `ContinuousTensor(child_memory=True)` to load a weight once and reuse it across multiple kernel invocations on the same chip. |
 
 ## Prerequisites
 

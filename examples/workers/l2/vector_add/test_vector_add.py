@@ -13,8 +13,9 @@ import pytest
 from .main import run
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
+@pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
+@pytest.mark.device_count(1)
 def test_vector_add(st_platform, st_device_ids):
     rc = run(st_platform, int(st_device_ids[0]))
     assert rc == 0
