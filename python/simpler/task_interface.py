@@ -248,36 +248,38 @@ class ChipWorker:
     def __init__(self):
         self._impl = _ChipWorker()
 
-    def init(
-        self,
-        host_path,
-        aicpu_path,
-        aicore_path,
-        simpler_log_lib_path,
-        sim_context_lib_path="",
-        log_level=1,
-        log_info_v=5,
-    ):
+    def init(self, bins, log_level=None, log_info_v=None):
         """Load host runtime library and cache platform binaries.
 
         Can only be called once — the runtime cannot be changed.
 
         Args:
-            host_path: Path to the host runtime shared library (.so).
-            aicpu_path: Path to the AICPU binary (.so).
-            aicore_path: Path to the AICore binary (.o).
-            simpler_log_lib_path: Path to libsimpler_log.so (loaded RTLD_GLOBAL
-                so HostLogger has one instance per process).
-            sim_context_lib_path: Path to libcpu_sim_context.so (sim only).
-            log_level: Severity floor (0=DEBUG..4=NUL). Forwarded to simpler_init().
-            log_info_v: INFO verbosity threshold (0..9). Forwarded to simpler_init().
+            bins: A `simpler_setup.runtime_builder.RuntimeBinaries` (or any
+                object exposing host_path / aicpu_path / aicore_path /
+                simpler_log_path / sim_context_path).
+            log_level: Severity floor (0=DEBUG..4=NUL). Defaults to a snapshot
+                of the simpler logger via `_log.get_current_config()`.
+            log_info_v: INFO verbosity threshold (0..9). Same default.
+
+        For tests that need to drive the binding directly with arbitrary path
+        strings (e.g. to assert dlopen failure on `/nonexistent/foo.so`), call
+        `_ChipWorker.init(...)` from `_task_interface` instead of going
+        through this wrapper.
         """
+        if log_level is None or log_info_v is None:
+            from . import _log  # noqa: PLC0415
+
+            sev, info_v = _log.get_current_config()
+            if log_level is None:
+                log_level = sev
+            if log_info_v is None:
+                log_info_v = info_v
         self._impl.init(
-            str(host_path),
-            str(aicpu_path),
-            str(aicore_path),
-            str(simpler_log_lib_path),
-            str(sim_context_lib_path),
+            str(bins.host_path),
+            str(bins.aicpu_path),
+            str(bins.aicore_path),
+            str(bins.simpler_log_path),
+            str(bins.sim_context_path) if bins.sim_context_path else "",
             log_level,
             log_info_v,
         )
@@ -317,6 +319,15 @@ class ChipWorker:
         for k, v in kwargs.items():
             setattr(config, k, v)
         self._impl.run(callable, args, config)
+
+    def run_from_blob(self, callable, blob_ptr, config):
+        """Execute via a serialized args blob in shared memory.
+
+        Used by `_chip_process_loop` after reading the mailbox: instead of
+        deserializing the args into Python objects, the C++ side parses the
+        POD blob directly at `blob_ptr`.
+        """
+        self._impl.run_from_blob(int(callable), int(blob_ptr), config)
 
     def malloc(self, size):
         """Allocate memory. Returns a pointer (uint64)."""
