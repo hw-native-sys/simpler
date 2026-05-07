@@ -83,32 +83,20 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * The structure is cache-line aligned (64 bytes) to prevent false sharing
  * between cores and optimize cache coherency operations.
  *
- * enable_profiling_flag bit definitions (umbrella bitmask — "profiling"
- * is the umbrella, each bit is a parallel diagnostics sub-feature):
- * - bit0: tensor dump enabled
- * - bit1: L2 swimlane enabled
- * - bit2: PMU enabled
- *
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
  * - aicore_done: Written by AICore, read by AICPU
  * - task: Written by AICPU, read by AICore (0 = not ready, non-zero = PTO2DispatchPayload*)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
- * - l2_perf_aicore_ring_addr: Written by AICPU at init, read by AICore (stable
- *   per-core L2PerfAicoreRing address for timing publication; never reassigned)
- * - enable_profiling_flag: Written by host/AICPU init, read by AICore (bitmask)
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;               // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;               // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;                      // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
-    volatile CoreType core_type;                 // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t l2_perf_aicore_ring_addr;  // Stable per-core L2PerfAicoreRing address (AICore writes timing here)
-    volatile uint32_t physical_core_id;          // Physical core ID
-    volatile uint32_t aicpu_regs_ready;          // AICPU register init done: 0=pending, 1=done
-    volatile uint32_t aicore_regs_ready;         // AICore ID reported: 0=pending, 1=done
-    volatile uint32_t
-        enable_profiling_flag;  // Generic profiling-related flags; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
+    volatile uint32_t aicpu_ready;        // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;        // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;               // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
+    volatile CoreType core_type;          // Core type: CoreType::AIC or CoreType::AIV
+    volatile uint32_t physical_core_id;   // Physical core ID
+    volatile uint32_t aicpu_regs_ready;   // AICPU register init done: 0=pending, 1=done
+    volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
 /**

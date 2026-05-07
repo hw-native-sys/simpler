@@ -107,7 +107,9 @@ static_assert(sizeof(L2PerfRecord) % 64 == 0, "L2PerfRecord must be 64-byte alig
  * AICore stores each task's timing in `dual_issue_slots[reg_task_id %
  * PLATFORM_L2_AICORE_RING_SIZE]` and never touches any other L2Perf memory.
  * The ring is allocated once by the host, addressed through
- * `Handshake::l2_perf_aicore_ring_addr`, and lives for the entire run — its
+ * `L2PerfBufferState[block_idx].aicore_ring_ptr` (also published into the
+ * `KernelArgs::aicore_ring_addr` table the AICore kernel entry forwards
+ * into `set_aicore_l2_perf_ring()`), and lives for the entire run — its
  * address is never reassigned, decoupling AICore writes from the AICPU's
  * records-buffer rotation.
  *

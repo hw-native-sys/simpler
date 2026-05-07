@@ -543,6 +543,7 @@ int DeviceRunner::run(
     if (enable_pmu_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
+    kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -550,8 +551,6 @@ int DeviceRunner::run(
         runtime.workers[i].task = 0;
         // Set core type: first 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
-        runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
-        runtime.workers[i].l2_perf_aicore_ring_addr = static_cast<uint64_t>(0);
     }
 
     // Set function_bin_addr for all tasks: func_id_to_addr_[] stores CoreCallable
@@ -1096,6 +1095,8 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     }
 
     kernel_args_.args.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
+    kernel_args_.args.aicore_ring_addr =
+        reinterpret_cast<uint64_t>(l2_perf_collector_.get_aicore_ring_addr_table_device_ptr());
     return 0;
 }
 

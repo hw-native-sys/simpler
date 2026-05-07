@@ -10,6 +10,7 @@
  */
 
 #include "aicore/aicore.h"
+#include "aicore/aicore_profiling_state.h"
 #include "aicore/l2_perf_collector_aicore.h"
 #include "aicore/pmu_collector_aicore.h"
 #include "common/l2_perf_profiling.h"
@@ -56,6 +57,11 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * args pointer from it on each dispatch. reg_val is a monotonically
  * increasing task ID used only for dispatch signaling and ACK/FIN protocol.
  *
+ * Profiling state (enable flag, L2 perf ring) is published into the platform
+ * via set_aicore_profiling_flag / set_aicore_l2_perf_ring at kernel entry —
+ * this routine reads it through the matching getters, so neither Handshake
+ * nor this signature carry profiling fields.
+ *
  * @param runtime Pointer to Runtime in global memory
  * @param block_idx Block index (core ID)
  * @param core_type Core type (AIC or AIV)
@@ -89,13 +95,15 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Cache per-core dispatch payload pointer (set by AICPU before aicpu_ready)
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
-    bool l2_perf_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    bool dump_tensor_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    bool pmu_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_PMU);
+    uint32_t enable_profiling_flag = get_aicore_profiling_flag();
+    bool l2_perf_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+    bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
 
-    // Ring address is published once by AICPU at init and never changes — cache once.
-    __gm__ L2PerfAicoreRing *l2_perf_ring =
-        l2_perf_enabled ? (__gm__ L2PerfAicoreRing *)my_hank->l2_perf_aicore_ring_addr : nullptr;
+    // Per-core staging ring is published once at kernel entry from
+    // KernelArgs::aicore_ring_addr — cache the pointer locally here so the
+    // hot loop never re-reads platform state.
+    __gm__ L2PerfAicoreRing *l2_perf_ring = l2_perf_enabled ? get_aicore_l2_perf_ring() : nullptr;
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit

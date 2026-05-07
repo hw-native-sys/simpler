@@ -631,13 +631,10 @@ int32_t SchedulerContext::init(
     orch_to_sched_ = orch_to_sched;
     regs_ = regs_base;
 
-    // L2Perf init must run BEFORE handshake_all_cores so AICore observes a
-    // non-zero l2_perf_aicore_ring_addr the moment aicpu_ready=1 unblocks
-    // its Phase 1 spin. AICore caches the ring address once and never re-reads it.
 #if PTO2_PROFILING
     if (is_l2_swimlane_enabled()) {
-        l2_perf_aicpu_init_profiling(runtime);
-        l2_perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
+        l2_perf_aicpu_init(runtime->worker_count);
+        l2_perf_aicpu_init_phase(runtime->worker_count, sched_thread_num_);
         l2_perf_aicpu_set_orch_thread_idx(sched_thread_num_);
     }
 #endif
