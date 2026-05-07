@@ -155,6 +155,10 @@ static_assert(sizeof(L2PerfFreeQueue) == 128, "L2PerfFreeQueue must be 128 bytes
  * - free_queue: SPSC queue of available buffer addresses
  * - current_buf_ptr: Currently active buffer being written (0 = no active buffer)
  * - current_buf_seq: Monotonic sequence number for ordering
+ * - total_record_count / dropped_record_count: per-core/-thread tallies AICPU
+ *   keeps so the host can cross-check `collected + dropped == device_total` at
+ *   end-of-run. Replaces the previous L2PerfDataHeader::total_tasks signal —
+ *   the host no longer needs to know task count up front.
  *
  * Used in two contexts:
  * - Per-core L2PerfRecord profiling (current_buf_ptr → L2PerfBuffer)
@@ -165,12 +169,17 @@ static_assert(sizeof(L2PerfFreeQueue) == 128, "L2PerfFreeQueue must be 128 bytes
  * - free_queue.head: Device writes (pops buffers)
  * - current_buf_ptr: Device writes (after pop), Host reads (for flush/collect)
  * - current_buf_seq: Device writes (monotonic counter)
+ * - total_record_count / dropped_record_count: Device writes, Host reads at
+ *   drain time (no concurrency on a per-state basis since each state belongs
+ *   to a single core/thread)
  */
 struct L2PerfBufferState {
-    L2PerfFreeQueue free_queue;         // SPSC queue of free buffer addresses
-    volatile uint64_t current_buf_ptr;  // Current active buffer (0 = none)
-    volatile uint32_t current_buf_seq;  // Sequence number for ordering
-    uint32_t pad[13];                   // Pad to 192 bytes (aligned to cache line)
+    L2PerfFreeQueue free_queue;              // SPSC queue of free buffer addresses
+    volatile uint64_t current_buf_ptr;       // Current active buffer (0 = none)
+    volatile uint32_t current_buf_seq;       // Sequence number for ordering
+    volatile uint32_t total_record_count;    // Records the AICPU attempted to write to this state
+    volatile uint32_t dropped_record_count;  // Records dropped (queue full / overwrite / no buffer)
+    uint32_t pad[11];                        // Pad to 192 bytes (aligned to cache line)
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(L2PerfBufferState) == 192, "L2PerfBufferState must be 192 bytes for cache alignment");
@@ -228,8 +237,7 @@ struct L2PerfDataHeader {
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // Producer write positions (AICPU modifies)
 
     // Metadata (Host initializes, Device read-only)
-    uint32_t num_cores;             // Actual number of cores launched
-    volatile uint32_t total_tasks;  // Total tasks (AICPU writes after orchestration)
+    uint32_t num_cores;  // Actual number of cores launched
 } __attribute__((aligned(64)));
 
 // =============================================================================

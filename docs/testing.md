@@ -80,7 +80,7 @@ Scene tests support advanced CLI options for benchmarking, profiling, and runtim
 pytest --platform a2a3sim                                        # default: 1 round + golden
 pytest --platform a2a3 --rounds 100 --skip-golden                # benchmark mode
 pytest --platform a2a3 --enable-l2-swimlane                             # L2 swimlane (first round)
-pytest --platform a2a3 --enable-pmu                              # PMU CSV (LuoPan)
+pytest --platform a2a3 --enable-pmu                              # PMU CSV
 pytest --platform a2a3sim --build                                # compile runtime from source
 pytest --platform a2a3sim --log-level debug                        # verbose C++ logging
 ```

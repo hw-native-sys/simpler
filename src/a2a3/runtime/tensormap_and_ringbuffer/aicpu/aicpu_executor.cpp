@@ -582,10 +582,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             pto2_submitted_tasks = total_tasks;
 #endif
 
-            if (is_l2_swimlane_enabled() && total_tasks > 0) {
-                l2_perf_aicpu_update_total_tasks(static_cast<uint32_t>(total_tasks));
-            }
-
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);
         }
 #if PTO2_PROFILING

@@ -11,16 +11,14 @@
 
 /**
  * @file tensor_dump_collector.h
- * @brief Host-side tensor dump collector with independent shared memory
- *
- * Fully decoupled from profiling: uses its own shared memory region,
- * ready queues, and memory manager thread.
+ * @brief Host-side tensor dump collector with independent shared memory.
  *
  * Architecture:
- * - DumpMemoryManager: Background thread that polls dump ready queues,
- *   recycles metadata buffers, and hands off full buffers to the main thread.
- * - TensorDumpCollector: Main thread copies tensor data from arenas,
- *   manages lifecycle, and exports dump files.
+ * - BufferPoolManager<DumpModule>: shared mgmt-thread infrastructure that polls
+ *   per-thread DumpReadyQueues, replenishes free_queues, and hands full
+ *   DumpMetaBuffers off to the collector thread.
+ * - TensorDumpCollector: copies tensor metadata + arena bytes into host vectors
+ *   and writes the result to disk (.bin + JSON).
  */
 
 #ifndef SRC_A2A3_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
@@ -28,75 +26,37 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
+#include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/tensor_dump.h"
+#include "common/unified_log.h"
 #include "data_type.h"
+#include "host/profiling_common/profiler_base.h"
+
+// ---------------------------------------------------------------------------
+// Tensor Dump profiling Module (drives BufferPoolManager<DumpModule>)
+// ---------------------------------------------------------------------------
 
 /**
- * Memory allocation callback for tensor dump buffers and shared memory.
- *
- * @param size Memory size in bytes
- * @param user_data Opaque allocator context
- * @return Allocated device memory pointer, or nullptr on failure
+ * One buffer kind (DumpMetaBuffer); one ready_queue per AICPU thread.
+ * Per-thread arena buffers are owned by the collector itself, not the
+ * framework. process_entry refills the originating thread's free_queue with
+ * exactly one buffer; proactive_replenish tops up to SLOT_COUNT and
+ * batch-allocates when the recycled pool drains.
  */
-using DumpAllocCallback = void *(*)(size_t size, void *user_data);
 
 /**
- * Memory registration callback for host-visible shared memory mappings.
- *
- * @param dev_ptr Device memory pointer
- * @param size Memory size in bytes
- * @param device_id Device ID
- * @param user_data Opaque allocator context
- * @param[out] host_ptr Host-mapped pointer
- * @return 0 on success, error code on failure
- */
-using DumpRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void *user_data, void **host_ptr);
-
-/**
- * Memory unregister callback.
- *
- * @param dev_ptr Device memory pointer
- * @param device_id Device ID
- * @param user_data Opaque allocator context
- * @return 0 on success, error code on failure
- */
-using DumpUnregisterCallback = int (*)(void *dev_ptr, int device_id, void *user_data);
-
-/**
- * Memory free callback.
- *
- * @param dev_ptr Device memory pointer
- * @param user_data Opaque allocator context
- * @return 0 on success, error code on failure
- */
-using DumpFreeCallback = int (*)(void *dev_ptr, void *user_data);
-
-/**
- * Callback for binding the memory-manager thread to a device context.
- *
- * @param device_id Device ID
- * @param user_data Opaque allocator context
- * @return 0 on success, error code on failure
- */
-using DumpSetDeviceCallback = int (*)(int device_id, void *user_data);
-
-// =============================================================================
-// DumpMemoryManager - Background Thread
-// =============================================================================
-
-/**
- * Information about a ready (full) dump metadata buffer
+ * Information about a ready (full) dump metadata buffer.
  */
 struct DumpReadyBufferInfo {
     uint32_t thread_index;
@@ -105,70 +65,92 @@ struct DumpReadyBufferInfo {
     uint32_t buffer_seq;
 };
 
-/**
- * Dump buffer memory manager thread.
- *
- * Polls per-thread ready queues in DumpDataHeader, hands off full
- * DumpMetaBuffers to the main thread, and recycles them back into
- * the SPSC free_queue.
- */
-class DumpMemoryManager {
-public:
-    DumpMemoryManager() = default;
-    ~DumpMemoryManager();
+struct DumpModule {
+    using DataHeader = DumpDataHeader;
+    using ReadyEntry = DumpReadyQueueEntry;
+    using ReadyBufferInfo = ::DumpReadyBufferInfo;
+    using FreeQueue = DumpFreeQueue;
 
-    DumpMemoryManager(const DumpMemoryManager &) = delete;
-    DumpMemoryManager &operator=(const DumpMemoryManager &) = delete;
+    static constexpr int kBufferKinds = 1;
+    static constexpr uint32_t kReadyQueueSize = PLATFORM_DUMP_READYQUEUE_SIZE;
+    static constexpr uint32_t kSlotCount = PLATFORM_DUMP_SLOT_COUNT;
+    static constexpr const char *kSubsystemName = "DumpModule";
 
-    friend class TensorDumpCollector;
+    /**
+     * Tensor-dump bursts can be very large; the batch is sized so a fully
+     * empty recycled pool refills to the configured per-thread ceiling in
+     * one tick.
+     */
+    static constexpr int batch_size(int /*kind*/) {
+        constexpr int kBatch = PLATFORM_DUMP_BUFFERS_PER_THREAD - PLATFORM_DUMP_SLOT_COUNT;
+        return kBatch < 1 ? 1 : kBatch;
+    }
 
-    void start(
-        void *shared_mem_host, int num_dump_threads, DumpAllocCallback alloc_cb, DumpRegisterCallback register_cb,
-        DumpFreeCallback free_cb, void *user_data, int device_id, DumpSetDeviceCallback set_device_cb = nullptr
-    );
+    static DataHeader *header_from_shm(void *shm) { return get_dump_header(shm); }
 
-    void stop();
+    static std::optional<profiling_common::EntrySite<DumpModule>>
+    resolve_entry(void *shm, DataHeader * /*header*/, int /*q*/, const ReadyEntry &entry) {
+        DumpBufferState *state = get_dump_buffer_state(shm, static_cast<int>(entry.thread_index));
+        profiling_common::EntrySite<DumpModule> site;
+        site.kind = 0;
+        site.free_queue = &state->free_queue;
+        site.buffer_size = sizeof(DumpMetaBuffer);
+        site.info.thread_index = entry.thread_index;
+        site.info.dev_buffer_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
+        site.info.host_buffer_ptr = nullptr;  // filled by ProfilerAlgorithms
+        site.info.buffer_seq = entry.buffer_seq;
+        return site;
+    }
 
-    bool try_pop_ready(DumpReadyBufferInfo &info);
-    bool wait_pop_ready(DumpReadyBufferInfo &info, std::chrono::milliseconds timeout);
-    void notify_copy_done(void *dev_buffer_ptr);
-
-    bool is_running() const { return running_.load(); }
-
-private:
-    std::thread mgmt_thread_;
-    std::atomic<bool> running_{false};
-
-    void *shared_mem_host_{nullptr};
-    int num_dump_threads_{0};
-
-    DumpAllocCallback alloc_cb_{nullptr};
-    DumpRegisterCallback register_cb_{nullptr};
-    DumpFreeCallback free_cb_{nullptr};
-    DumpSetDeviceCallback set_device_cb_{nullptr};
-    void *user_data_{nullptr};
-    int device_id_{-1};
-
-    std::mutex ready_mutex_;
-    std::condition_variable ready_cv_;
-    std::queue<DumpReadyBufferInfo> ready_queue_;
-
-    std::mutex done_mutex_;
-    std::queue<void *> done_queue_;  // Device pointers to recycle
-
-    std::unordered_map<void *, void *> dev_to_host_;
-    std::vector<void *> recycled_dump_buffers_;
-
-    void mgmt_loop();
-    void *alloc_and_register(size_t size, void **host_ptr_out);
-    void free_buffer(void *dev_ptr);
-    void *resolve_host_ptr(void *dev_ptr);
-    void register_mapping(void *dev_ptr, void *host_ptr);
-    void process_dump_entry(DumpDataHeader *header, int thread_idx, const DumpReadyQueueEntry &entry);
+    template <typename Cb>
+    static void for_each_instance(void *shm, DataHeader *header, Cb &&cb) {
+        const int n_threads = static_cast<int>(header->num_dump_threads);
+        for (int t = 0; t < n_threads; t++) {
+            DumpBufferState *state = get_dump_buffer_state(shm, t);
+            cb(/*kind=*/0, &state->free_queue, sizeof(DumpMetaBuffer));
+        }
+    }
 };
 
+// ---------------------------------------------------------------------------
+// Memory operation callbacks (injected by DeviceRunner)
+// ---------------------------------------------------------------------------
+
+/**
+ * Allocate device memory.
+ *
+ * @param size       Bytes to allocate
+ * @param user_data  Opaque allocator context
+ * @return Device pointer, or nullptr on failure
+ */
+using DumpAllocCallback = void *(*)(size_t size, void *user_data);
+
+/**
+ * Register device memory for host-visible access. nullptr in sim mode
+ * (dev pointer is directly host-accessible). Stateless: HAL state is global,
+ * so no user_data is threaded through.
+ *
+ * @param dev_ptr        Device memory pointer
+ * @param size           Bytes
+ * @param device_id      Device ID
+ * @param[out] host_ptr  Host-mapped pointer
+ * @return 0 on success, error code on failure
+ */
+using DumpRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
+
+/**
+ * Unregister a previously registered host-visible mapping. May be nullptr.
+ * Stateless (see register_cb).
+ */
+using DumpUnregisterCallback = int (*)(void *dev_ptr, int device_id);
+
+/**
+ * Free device memory.
+ */
+using DumpFreeCallback = int (*)(void *dev_ptr, void *user_data);
+
 // =============================================================================
-// TensorDumpCollector - Main Collector
+// TensorDumpCollector
 // =============================================================================
 
 /**
@@ -194,7 +176,7 @@ struct DumpedTensor {
     std::vector<uint8_t> bytes;
 };
 
-class TensorDumpCollector {
+class TensorDumpCollector : public profiling_common::ProfilerBase<TensorDumpCollector, DumpModule> {
 public:
     TensorDumpCollector() = default;
     ~TensorDumpCollector();
@@ -202,47 +184,93 @@ public:
     TensorDumpCollector(const TensorDumpCollector &) = delete;
     TensorDumpCollector &operator=(const TensorDumpCollector &) = delete;
 
+    // ProfilerBase contract
+    static constexpr int kIdleTimeoutSec = PLATFORM_DUMP_TIMEOUT_SECONDS;
+    static constexpr const char *kSubsystemName = "TensorDump";
+
     /**
      * Initialize tensor dump shared memory.
      *
-     * Allocates DumpDataHeader + DumpBufferState array, per-thread arenas,
-     * and initial DumpMetaBuffers.
+     * Allocates the DumpDataHeader + per-thread DumpBufferState array, the
+     * per-thread arenas (single contiguous payload region per thread), and
+     * the initial DumpMetaBuffers. The first PLATFORM_DUMP_SLOT_COUNT meta
+     * buffers are pushed into each thread's free_queue; the rest go into
+     * the BufferPoolManager's recycled pool.
      *
+     * `output_prefix` is the per-task directory under which tensor_dump/
+     * lands. Required (non-empty); CallConfig::validate() enforces this
+     * upstream. Stored on the collector so the lazily-started writer thread
+     * (kicked off inside on_buffer_collected) can derive its run_dir without
+     * threading the prefix through the buffer-pool callback path.
+     *
+     * @param num_dump_threads  Number of AICPU scheduling threads
+     * @param device_id         Device ID
+     * @param alloc_cb          Memory allocation callback
+     * @param register_cb       Host-visibility callback (nullptr for sim)
+     * @param free_cb           Memory free callback
+     * @param user_data         Opaque pointer forwarded to callbacks
+     * @param output_prefix     Per-task directory; tensor_dump/ subdir lands here
      * @return 0 on success, error code on failure
      */
     int initialize(
         int num_dump_threads, int device_id, DumpAllocCallback alloc_cb, DumpRegisterCallback register_cb,
-        DumpFreeCallback free_cb, void *user_data, DumpSetDeviceCallback set_device_cb = nullptr
+        DumpFreeCallback free_cb, void *user_data, const std::string &output_prefix
     );
 
-    void start_memory_manager();
-    // `output_prefix` is the per-task directory under which tensor_dump/ lands.
-    // Required (non-empty); CallConfig::validate() enforces this upstream.
-    void poll_and_collect(const std::string &output_prefix);
-    int export_dump_files();
-    void stop_memory_manager();
-    void drain_remaining_buffers();
-    void scan_remaining_dump_buffers();
-    void signal_execution_complete();
+    /**
+     * Per-buffer callback invoked by ProfilerBase's poll loop. Copies tensor
+     * metadata + arena bytes into host-side DumpedTensor records and queues
+     * payloads to the writer thread. The writer thread is started lazily on
+     * the first invocation per run.
+     */
+    void on_buffer_collected(const DumpReadyBufferInfo &info);
 
+    /**
+     * Write collected dumps to <output_prefix>/tensor_dump/{*.bin, *.json}.
+     * Sorts tensors by (task_id, subtask_id, func_id, stage, arg_index, role).
+     */
+    int export_dump_files();
+
+    /**
+     * After stop(), perform purely-passive accounting:
+     *   - LOG_ERROR any non-zero DumpBufferState::current_buf_ptr with
+     *     records (device flush should always succeed-or-bump-dropped, so
+     *     a non-empty leftover indicates an AICPU flush bug — host does
+     *     NOT recover, to avoid masking the bug).
+     *   - Accumulate device-side dropped_record_count into
+     *     total_dropped_record_count_ for the final anomaly report.
+     * Must be called after stop().
+     */
+    void reconcile_counters();
+
+    /**
+     * Free all device memory and unregister mappings (per-thread arenas,
+     * DumpMetaBuffers held by the framework or still in per-pool free
+     * queues). Idempotent on a collector that was never initialized.
+     */
     int finalize(DumpUnregisterCallback unregister_cb, DumpFreeCallback free_cb, void *user_data);
 
-    bool is_initialized() const { return dump_shared_mem_host_ != nullptr; }
+    /**
+     * @return true if initialize() succeeded and finalize() has not run.
+     */
+    bool is_initialized() const { return shm_host_ != nullptr; }
 
+    /**
+     * Device pointer to the DumpDataHeader. Set kernel_args.dump_data_base
+     * to this after initialize() succeeds so the AICPU side can find the
+     * shared memory.
+     */
     void *get_dump_shm_device_ptr() const { return dump_shared_mem_dev_; }
 
 private:
     void *dump_shared_mem_dev_{nullptr};
-    void *dump_shared_mem_host_{nullptr};
     bool was_registered_{false};
-    int device_id_{-1};
     int num_dump_threads_{0};
 
-    DumpAllocCallback alloc_cb_{nullptr};
-    DumpRegisterCallback register_cb_{nullptr};
-    DumpFreeCallback free_cb_{nullptr};
-    DumpSetDeviceCallback set_device_cb_{nullptr};
-    void *user_data_{nullptr};
+    // Per-task output directory captured at initialize() time. The writer
+    // thread builds run_dir_ = output_prefix_ / "tensor_dump" lazily on the
+    // first on_buffer_collected.
+    std::string output_prefix_;
 
     // Per-thread arena pointers
     struct ArenaInfo {
@@ -253,25 +281,25 @@ private:
     };
     std::vector<ArenaInfo> arenas_;
 
-    DumpMemoryManager memory_manager_;
-
     // Collected dump tensors
     std::vector<DumpedTensor> collected_;
     std::mutex collected_mutex_;
-
-    // Execution complete signal
-    std::atomic<bool> execution_complete_{false};
 
     // Stats
     uint32_t total_dropped_record_count_{0};
     uint32_t total_truncated_count_{0};
     uint32_t total_overwrite_count_{0};
 
+    // Run-scoped state for the writer thread (lazily started on first
+    // on_buffer_collected and joined by export_dump_files).
+    std::chrono::steady_clock::time_point run_start_time_;
+    std::chrono::steady_clock::time_point last_progress_time_;
+    uint64_t buffers_collected_{0};
+    bool writer_started_{false};
+
     void *alloc_single_buffer(size_t size, void **host_ptr_out);
     void process_dump_buffer(const DumpReadyBufferInfo &info);
-
-    // Track processed buffer pointers to prevent double-processing
-    std::unordered_set<void *> processed_buffers_;
+    void start_writer_thread_once();
 
     // Writer thread: streams tensor payloads to a single tensors.bin
     std::thread writer_thread_;

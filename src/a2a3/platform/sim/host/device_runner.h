@@ -264,7 +264,7 @@ private:
     // Tensor dump (independent shared memory + memory manager)
     TensorDumpCollector dump_collector_;
     // PMU collector (independent of profiling pipeline)
-    PmuCollectorHost pmu_collector_;
+    PmuCollector pmu_collector_;
 
     // Private helper methods
     int ensure_device_initialized(
@@ -294,13 +294,11 @@ private:
      * @param device_id Device ID (ignored in simulation)
      * @return 0 on success, error code on failure
      */
-    int init_l2_perf_collection(int num_aicore, int device_id);
+    int init_l2_perf(int num_aicore, int device_id);
 
-    int init_tensor_dump(Runtime &runtime, int num_aicore, int device_id);
+    int init_tensor_dump(Runtime &runtime, int device_id);
 
-    int init_pmu_buffers(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
-    );
+    int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use

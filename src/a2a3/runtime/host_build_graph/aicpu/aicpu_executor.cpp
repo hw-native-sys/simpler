@@ -738,7 +738,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                             fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
                         }
                         if (l2_perf_aicpu_complete_record(
-                                l2_perf_buf, static_cast<uint32_t>(prev_running_id),
+                                l2_perf_buf, core_id, static_cast<uint32_t>(prev_running_id),
                                 static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
                             ) != 0) {
@@ -757,7 +757,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
                     }
                     if (l2_perf_aicpu_complete_record(
-                            l2_perf_buf, static_cast<uint32_t>(completed_task_id),
+                            l2_perf_buf, core_id, static_cast<uint32_t>(completed_task_id),
                             static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
                         ) != 0) {
@@ -848,7 +848,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                             fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
                         }
                         if (l2_perf_aicpu_complete_record(
-                                l2_perf_buf, static_cast<uint32_t>(prev_running_id),
+                                l2_perf_buf, core_id, static_cast<uint32_t>(prev_running_id),
                                 static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
                             ) != 0) {
@@ -894,7 +894,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
                     }
                     if (l2_perf_aicpu_complete_record(
-                            l2_perf_buf, static_cast<uint32_t>(completed_task_id),
+                            l2_perf_buf, core_id, static_cast<uint32_t>(completed_task_id),
                             static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
                         ) != 0) {
