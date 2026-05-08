@@ -444,7 +444,7 @@ On first `run()`, the deferred `_start_hierarchical()`:
    own children are forked lazily on L3's first `run()`.
 3. Child enters `_child_worker_loop(mailbox, registry, inner_worker)`
 4. **Parent**: registers each mailbox with L4's Worker via
-   `add_next_level_process(mailbox_addr)`
+   `add_next_level_worker(mailbox_addr)`
 
 ```text
 L4 parent process
@@ -478,14 +478,6 @@ L4 parent process
 Each level's orch fn receives **its own** `Orchestrator` — the recursion is
 symmetric. `Worker` code does not branch on `level`; the level is only a
 diagnostic label.
-
-### THREAD mode (alternative)
-
-For in-process dispatch (no fork), L4 can register an L3 `Worker` as a
-THREAD-mode child. `Worker::run()` invokes a Python callback
-(`_run_as_child`) that looks up the orch function in the callable registry
-and calls `Worker.run(orch_fn, args, config)`. The GIL is acquired by the
-binding layer before entering Python.
 
 ---
 
@@ -567,16 +559,15 @@ Slots carry scheduler-only state (atomics, mutex, `std::vector` of fanout
 consumers) that is parent-private. Putting them in shm would force cross-
 process atomics and shm-safe containers. The only data that needs to cross
 the fork boundary is per-task: callable, config, args — and that fits in a
-~2 KB mailbox with a one-time memcpy per dispatch (matches the pattern
-already used by `ChipProcess` today).
+~2 KB mailbox with a one-time memcpy per dispatch.
 
 ### Why TaskArgs in slot (not encoded blob in slot)
 
 `TaskArgs` is vector-backed. Storing an `uint8_t args_blob[N]` inline in the
 slot would cap task size per level and waste memory per slot. Since the slot
 is parent-heap, there is no fork-boundary constraint on what it holds — just
-store the `TaskArgs` object and encode only at dispatch (PROCESS only), or
-hand over `task_args.view()` (THREAD).
+store the `TaskArgs` object and encode it into the mailbox blob at dispatch
+time.
 
 ### Why `TaskArgsView` is just pointers + counts
 

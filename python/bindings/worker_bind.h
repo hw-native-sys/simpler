@@ -15,16 +15,15 @@
  * Compiled into the same _task_interface extension module as task_interface.cpp.
  * Call bind_worker(m) from the NB_MODULE definition in task_interface.cpp.
  *
- * PR-D-2: `ChipProcess` and `SubWorker` bindings are removed; their
- * PROCESS-mode dispatch logic now lives inside `WorkerThread`. Python callers
- * register PROCESS-mode workers via `add_next_level_process(mailbox_ptr)` /
- * `add_sub_process(mailbox_ptr)` instead of wrapping an IWorker subclass.
+ * Python callers register sub-workers via `add_next_level_worker(mailbox_ptr)`
+ * / `add_sub_worker(mailbox_ptr)`. Each mailbox addresses a MAILBOX_SIZE-byte
+ * MAP_SHARED region; the real IWorker lives in a forked Python child consuming
+ * the mailbox via `_chip_process_loop` / `_sub_worker_loop`.
  */
 
 #pragma once
 
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/function.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -32,7 +31,6 @@
 #include <stdexcept>
 
 #include "chip_bootstrap_channel.h"
-#include "chip_worker.h"
 #include "ring.h"
 #include "orchestrator.h"
 #include "types.h"
@@ -194,73 +192,29 @@ inline void bind_worker(nb::module_ &m) {
             "(default 1 GiB; total VA = 4 × heap_ring_size)."
         )
 
-        // THREAD-mode registration (parent calls worker->run directly).
         .def(
             "add_next_level_worker",
-            [](Worker &self, Worker &w) {
-                self.add_worker(WorkerType::NEXT_LEVEL, &w);
-            },
-            nb::arg("worker"), "Add a lower-level Worker as a NEXT_LEVEL sub-worker (THREAD mode)."
-        )
-        .def(
-            "add_next_level_worker",
-            [](Worker &self, ChipWorker &w) {
-                self.add_worker(WorkerType::NEXT_LEVEL, &w);
-            },
-            nb::arg("worker"), "Add a ChipWorker as a NEXT_LEVEL sub-worker (THREAD mode)."
-        )
-
-        // PROCESS-mode registration (parent writes unified mailbox; child runs
-        // the real IWorker in its own address space).
-        .def(
-            "add_next_level_process",
             [](Worker &self, uint64_t mailbox_ptr) {
-                self.add_process_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr));
+                self.add_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr));
             },
             nb::arg("mailbox_ptr"),
-            "Add a PROCESS-mode NEXT_LEVEL worker. `mailbox_ptr` is the address of a "
-            "MAILBOX_SIZE-byte MAP_SHARED region. The child process loop is "
+            "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a "
+            "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _chip_process_loop)."
         )
         .def(
-            "add_sub_process",
+            "add_sub_worker",
             [](Worker &self, uint64_t mailbox_ptr) {
-                self.add_process_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr));
+                self.add_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr));
             },
             nb::arg("mailbox_ptr"),
-            "Add a PROCESS-mode SUB worker. `mailbox_ptr` is the address of a "
-            "MAILBOX_SIZE-byte MAP_SHARED region. The child process loop is "
+            "Add a SUB sub-worker. `mailbox_ptr` is the address of a "
+            "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _sub_worker_loop)."
         )
 
         .def("init", &Worker::init, "Start the Scheduler thread.")
         .def("close", &Worker::close, "Stop the Scheduler thread.")
-
-        // THREAD-mode callback for L4+ recursion (approach b: Python callback).
-        // The lambda captures the Python callable and wraps it with GIL
-        // acquisition + TaskArgsView→TaskArgs reconstruction so the Python
-        // side receives normal objects.
-        .def(
-            "set_run_callback",
-            [](Worker &self, nb::object cb) {
-                self.set_run_callback(
-                    [cb_stored = nb::object(cb)](uint64_t callable, TaskArgsView view, const CallConfig &config) {
-                        nb::gil_scoped_acquire gil;
-                        TaskArgs args;
-                        for (int32_t i = 0; i < view.tensor_count; i++) {
-                            args.add_tensor(view.tensors[i]);
-                        }
-                        for (int32_t i = 0; i < view.scalar_count; i++) {
-                            args.add_scalar(view.scalars[i]);
-                        }
-                        cb_stored(callable, &args, &config);
-                    }
-                );
-            },
-            nb::arg("callback"),
-            "Set the Python callback for THREAD-mode L4+ dispatch. The callback "
-            "receives (callable_id, TaskArgs, CallConfig) with the GIL held."
-        )
 
         .def(
             "get_orchestrator", &Worker::get_orchestrator, nb::rv_policy::reference_internal,

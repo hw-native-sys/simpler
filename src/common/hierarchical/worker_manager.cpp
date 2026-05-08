@@ -15,7 +15,6 @@
 #include <stdexcept>
 #include <string>
 
-#include "../worker/chip_worker.h"
 #include "ring.h"
 
 namespace {
@@ -33,7 +32,7 @@ std::string read_error_msg(const char *mbox) {
 }  // namespace
 
 // =============================================================================
-// WorkerThread — mailbox helpers (PROCESS mode)
+// WorkerThread — mailbox helpers
 // =============================================================================
 
 MailboxState WorkerThread::read_mailbox_state() const {
@@ -68,11 +67,9 @@ void WorkerThread::write_mailbox_state(MailboxState s) {
 // =============================================================================
 
 void WorkerThread::start(
-    Mode mode, IWorker *worker, Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete,
-    void *mailbox
+    Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete, void *mailbox
 ) {
-    mode_ = mode;
-    worker_ = worker;
+    if (mailbox == nullptr) throw std::invalid_argument("WorkerThread::start: null mailbox");
     ring_ = ring;
     manager_ = manager;
     on_complete_ = on_complete;
@@ -99,7 +96,7 @@ void WorkerThread::stop() {
 }
 
 void WorkerThread::shutdown_child() {
-    if (mode_ == Mode::PROCESS && mailbox_) {
+    if (mailbox_) {
         write_mailbox_state(MailboxState::SHUTDOWN);
     }
 }
@@ -123,20 +120,15 @@ void WorkerThread::loop() {
 
         TaskSlotState &s = *ring_->slot_state(d.task_slot);
 
-        // Dispatch may throw from THREAD mode (worker_->run raised) or
-        // PROCESS mode (dispatch_process saw non-zero ERROR from the
-        // child). An uncaught exception escaping loop() would terminate
-        // the std::thread via std::terminate — instead, capture it and
-        // let the orch thread observe it at the next submit_*/drain.
+        // dispatch_process may throw on a non-zero ERROR from the child.
+        // An uncaught exception escaping loop() would terminate the
+        // std::thread via std::terminate — instead, capture it and let
+        // the orch thread observe it at the next submit_*/drain.
         // on_complete_ still fires so the scheduler releases consumers
         // and active_tasks_ eventually reaches zero; otherwise drain()
         // would hang.
         try {
-            if (mode_ == Mode::THREAD) {
-                dispatch_thread(s, d.group_index);
-            } else {
-                dispatch_process(s, d.group_index);
-            }
+            dispatch_process(s, d.group_index);
         } catch (...) {
             if (manager_) manager_->report_error(std::current_exception());
         }
@@ -146,15 +138,15 @@ void WorkerThread::loop() {
     }
 }
 
-void WorkerThread::dispatch_thread(TaskSlotState &s, int32_t group_index) {
-    uint64_t callable = (s.worker_type == WorkerType::SUB) ? static_cast<uint64_t>(s.callable_id) : s.callable;
-    TaskArgsView view = s.args_view(group_index);
-    worker_->run(callable, view, s.config);
-}
-
 void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     uint64_t callable = (s.worker_type == WorkerType::SUB) ? static_cast<uint64_t>(s.callable_id) : s.callable;
     TaskArgsView view = s.args_view(group_index);
+
+    // Hold mailbox_mu_ for the entire round trip (write payload + state +
+    // spin-poll TASK_DONE + reset to IDLE). Any control_* request from the
+    // orch thread waits for the dispatch to finish before claiming the
+    // mailbox; without this they would race on MAILBOX_OFF_STATE.
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
 
     // Clear the child-writable error fields so stale bytes from a prior
     // dispatch cannot masquerade as a fresh failure.
@@ -219,27 +211,16 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
 // WorkerManager
 // =============================================================================
 
-void WorkerManager::add_next_level(IWorker *worker) {
-    next_level_entries_.push_back({worker, WorkerThread::Mode::THREAD, nullptr});
-}
+void WorkerManager::add_next_level(void *mailbox) { next_level_entries_.push_back(mailbox); }
 
-void WorkerManager::add_sub(IWorker *worker) { sub_entries_.push_back({worker, WorkerThread::Mode::THREAD, nullptr}); }
-
-void WorkerManager::add_next_level_process(void *mailbox) {
-    next_level_entries_.push_back({nullptr, WorkerThread::Mode::PROCESS, mailbox});
-}
-
-void WorkerManager::add_sub_process(void *mailbox) {
-    sub_entries_.push_back({nullptr, WorkerThread::Mode::PROCESS, mailbox});
-}
+void WorkerManager::add_sub(void *mailbox) { sub_entries_.push_back(mailbox); }
 
 void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
     if (ring == nullptr) throw std::invalid_argument("WorkerManager::start: null ring");
-    auto make_threads = [&](const std::vector<WorkerEntry> &entries,
-                            std::vector<std::unique_ptr<WorkerThread>> &threads) {
-        for (const WorkerEntry &e : entries) {
+    auto make_threads = [&](const std::vector<void *> &entries, std::vector<std::unique_ptr<WorkerThread>> &threads) {
+        for (void *mailbox : entries) {
             auto wt = std::make_unique<WorkerThread>();
-            wt->start(e.mode, e.worker, ring, this, on_complete, e.mailbox);
+            wt->start(ring, this, on_complete, mailbox);
             threads.push_back(std::move(wt));
         }
     };
@@ -342,67 +323,50 @@ static uint64_t read_control_result(const char *mbox) {
     return r;
 }
 
-uint64_t WorkerThread::control_malloc(size_t size) {
-    if (mode_ == Mode::THREAD) {
-        auto *cw = dynamic_cast<ChipWorker *>(worker_);
-        if (!cw) throw std::runtime_error("control_malloc: worker is not a ChipWorker");
-        return cw->malloc(size);
-    }
+// Issue a control sub-command and block until the child publishes
+// CONTROL_DONE. Caller must hold `mailbox_mu_`. On a non-zero error code
+// from the child, throws and leaves the mailbox in IDLE before unwinding
+// (so the next claim starts from a clean state). The `op_name` is used
+// only for the exception message.
+void WorkerThread::run_control_command(const char *op_name) {
     int32_t zero_err = 0;
     std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
     std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
-    write_control_args(mbox(), CTRL_MALLOC, static_cast<uint64_t>(size));
     write_mailbox_state(MailboxState::CONTROL_REQUEST);
     while (read_mailbox_state() != MailboxState::CONTROL_DONE) {}
-    int32_t err;
+    int32_t err = 0;
     std::memcpy(&err, mbox() + MAILBOX_OFF_ERROR, sizeof(int32_t));
     if (err != 0) {
         std::string msg = read_error_msg(mbox());
         write_mailbox_state(MailboxState::IDLE);
-        throw std::runtime_error("control_malloc failed on child: " + msg);
+        throw std::runtime_error(std::string(op_name) + " failed on child: " + msg);
     }
-    uint64_t result = read_control_result(mbox());
     write_mailbox_state(MailboxState::IDLE);
-    return result;
+}
+
+uint64_t WorkerThread::control_malloc(size_t size) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_MALLOC, static_cast<uint64_t>(size));
+    run_control_command("control_malloc");
+    return read_control_result(mbox());
 }
 
 void WorkerThread::control_free(uint64_t ptr) {
-    if (mode_ == Mode::THREAD) {
-        auto *cw = dynamic_cast<ChipWorker *>(worker_);
-        if (!cw) throw std::runtime_error("control_free: worker is not a ChipWorker");
-        cw->free(ptr);
-        return;
-    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_FREE, ptr);
-    write_mailbox_state(MailboxState::CONTROL_REQUEST);
-    while (read_mailbox_state() != MailboxState::CONTROL_DONE) {}
-    write_mailbox_state(MailboxState::IDLE);
+    run_control_command("control_free");
 }
 
 void WorkerThread::control_copy_to(uint64_t dst, uint64_t src, size_t size) {
-    if (mode_ == Mode::THREAD) {
-        auto *cw = dynamic_cast<ChipWorker *>(worker_);
-        if (!cw) throw std::runtime_error("control_copy_to: worker is not a ChipWorker");
-        cw->copy_to(dst, src, size);
-        return;
-    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_COPY_TO, dst, src, static_cast<uint64_t>(size));
-    write_mailbox_state(MailboxState::CONTROL_REQUEST);
-    while (read_mailbox_state() != MailboxState::CONTROL_DONE) {}
-    write_mailbox_state(MailboxState::IDLE);
+    run_control_command("control_copy_to");
 }
 
 void WorkerThread::control_copy_from(uint64_t dst, uint64_t src, size_t size) {
-    if (mode_ == Mode::THREAD) {
-        auto *cw = dynamic_cast<ChipWorker *>(worker_);
-        if (!cw) throw std::runtime_error("control_copy_from: worker is not a ChipWorker");
-        cw->copy_from(dst, src, size);
-        return;
-    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_COPY_FROM, dst, src, static_cast<uint64_t>(size));
-    write_mailbox_state(MailboxState::CONTROL_REQUEST);
-    while (read_mailbox_state() != MailboxState::CONTROL_DONE) {}
-    write_mailbox_state(MailboxState::IDLE);
+    run_control_command("control_copy_from");
 }
 
 bool WorkerManager::any_busy() const {

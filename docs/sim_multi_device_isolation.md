@@ -10,17 +10,17 @@ When 2+ ChipWorkers run concurrently on the sim platform, `host_runtime.so` glob
 
 ## Solution: Fork+SHM Process Isolation
 
-Each ChipWorker runs in its own forked child process (`ChipProcess`). The OS provides full address-space isolation — all global state in `host_runtime.so` is automatically separate per process.
+Each ChipWorker runs in its own forked Python child process. The OS provides full address-space isolation — all global state in `host_runtime.so` is automatically separate per process.
 
 ```text
 Main process (Scheduler)
-  ├── WorkerThread[0] → ChipProcess[0] → shm mailbox → Child process 0
-  └── WorkerThread[1] → ChipProcess[1] → shm mailbox → Child process 1
-                                                              └── dlopen(host_runtime.so)
-                                                                  ← isolated globals
+  ├── WorkerThread[0] → shm mailbox → Child process 0 (ChipWorker[0])
+  └── WorkerThread[1] → shm mailbox → Child process 1 (ChipWorker[1])
+                                            └── dlopen(host_runtime.so)
+                                                ← isolated globals
 ```
 
-Communication uses a 4096-byte shared-memory mailbox per chip (same pattern as `SubWorker`). The parent copies `ChipStorageTaskArgs` into the mailbox; the child copies it to heap before calling `run_runtime` (sim runtime requires heap-backed args, not mmap-backed).
+Communication uses a 4096-byte shared-memory mailbox per chip — the same layout used for SUB-type workers. The parent copies `ChipStorageTaskArgs` into the mailbox; the child copies it to heap before calling `run_runtime` (sim runtime requires heap-backed args, not mmap-backed).
 
 ## Why Not Fix the Globals
 
@@ -30,5 +30,5 @@ The global state in `host_runtime.so` spans multiple files (`cpu_sim_context.cpp
 
 | File | Role |
 | ---- | ---- |
-| `src/common/hierarchical/chip_process.h/.cpp` | C++ IWorker: mailbox protocol for forked chip |
-| `python/worker.py` (`_chip_process_loop`) | Python child: init ChipWorker, poll mailbox, run tasks |
+| `src/common/hierarchical/worker_manager.{h,cpp}` | C++ `WorkerThread`: mailbox-IPC dispatcher for the forked chip child |
+| `python/simpler/worker.py` (`_chip_process_loop`) | Python child: init ChipWorker, poll mailbox, run tasks |

@@ -100,23 +100,21 @@ See [scheduler.md](scheduler.md) for the dispatch loop and coordination.
 ### Worker / WorkerManager / WorkerThread
 
 The **execution layer**. `WorkerManager` holds two pools of `WorkerThread`s
-(next-level pool and sub pool). Each `WorkerThread`:
+(next-level pool and sub pool). Each `WorkerThread` owns one std::thread that
+encodes `(callable, config, args_blob)` into a `MAILBOX_SIZE`-byte shared
+memory region, signals the pre-forked Python child, and spin-polls
+`TASK_DONE`.
 
-- owns one `IWorker` (`ChipWorker` or nested `Worker`) for next-level workers
-- has its own `std::thread`
-- runs in one of two modes:
-  - `THREAD`: calls `worker->run(callable, view, config)` directly in-process
-  - `PROCESS`: forks a child at init; each dispatch writes task data to a shm
-    mailbox, the child decodes and runs
+- Next-level (chip) children run `_chip_process_loop`, which constructs a
+  `ChipWorker` and dispatches each kernel through it.
+- SUB children run `_sub_worker_loop`, which decodes the args blob into a
+  `TaskArgs` and calls the registered Python callable as `fn(args)`. There
+  is no C++ `SubWorker` class — SUB workers exist only as a worker-type
+  enum value plus a Python child loop.
 
-SUB workers are Python-only: the forked child process runs a Python loop
-(``_sub_worker_loop``) that reads the args blob from the mailbox, decodes it
-into a ``TaskArgs``, and calls the registered callable as ``fn(args)``.
-There is no C++ ``SubWorker`` class.
-
-See [worker-manager.md](worker-manager.md) for thread/process mechanics, fork
-ordering, and mailbox layout. See [task-flow.md](task-flow.md) for what flows
-through `IWorker::run`.
+See [worker-manager.md](worker-manager.md) for the dispatch state machine,
+fork ordering, and mailbox layout. See [task-flow.md](task-flow.md) for
+what flows through `IWorker::run`.
 
 ---
 
@@ -230,34 +228,31 @@ Python handles **when** things happen (fork ordering, lifecycle). C++ handles
 ## 6. Process Model
 
 ```text
-┌─────────────────────────────────────────────────────┐
-│  Parent (main) process                              │
-│                                                      │
-│  Python main thread (Orch)                           │
-│    │                                                 │
-│    ├── C++ Scheduler thread                          │
-│    ├── C++ WorkerThread[0] → ChipWorker[0]           │
-│    ├── C++ WorkerThread[1] → ChipWorker[1]           │
-│    ├── C++ WorkerThread[2] → SubWorker[0]            │
-│    └── C++ WorkerThread[3] → SubWorker[1]            │
-│                                                      │
-└──────────────────────────┬──────────────────────────┘
-                           │ fork() (PROCESS mode only, before C++ threads start)
-            ┌──────────────┼──────────────┐
-            ▼                             ▼
-   ┌────────────────┐            ┌────────────────┐
-   │ Child process 0 │            │ Child process 1 │
-   │ poll mailbox    │            │ poll mailbox    │
-   │ run callable    │            │ run callable    │
-   └────────────────┘            └────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Parent (main) process                                       │
+│                                                              │
+│  Python main thread (Orch)                                   │
+│    │                                                         │
+│    ├── C++ Scheduler thread                                  │
+│    ├── C++ WorkerThread[0] ── shm mailbox ──► chip child 0   │
+│    ├── C++ WorkerThread[1] ── shm mailbox ──► chip child 1   │
+│    ├── C++ WorkerThread[2] ── shm mailbox ──► sub  child 0   │
+│    └── C++ WorkerThread[3] ── shm mailbox ──► sub  child 1   │
+│                                                              │
+└─────────────────────────────┬────────────────────────────────┘
+                              │ fork() (before any C++ thread starts)
+            ┌─────────────────┼─────────────────┐
+            ▼                                   ▼
+   ┌─────────────────┐                 ┌─────────────────┐
+   │ Chip child 0    │                 │ Chip child 1    │
+   │ poll mailbox    │       …         │ poll mailbox    │
+   │ ChipWorker.run  │                 │ ChipWorker.run  │
+   └─────────────────┘                 └─────────────────┘
 ```
 
-**Fork ordering invariant**: Python forks child processes FIRST (before C++
-`Scheduler` / `WorkerThread` threads are started). This avoids
-fork-in-multithreaded-process hazards.
-
-THREAD mode workers skip the fork entirely — they run in the parent process's
-`WorkerThread::std::thread`.
+**Fork ordering invariant**: Python forks every child process FIRST, before
+any C++ `Scheduler` / `WorkerThread` is started. This avoids the classical
+fork-in-a-multi-threaded-process hazard.
 
 ---
 
@@ -283,13 +278,11 @@ device allocation algorithm.
 | ---- | ---- |
 | `src/common/hierarchical/orchestrator.{h,cpp}` | `Orchestrator`: submit, TensorMap, Scope |
 | `src/common/hierarchical/scheduler.{h,cpp}` | `Scheduler`: dispatch loop + queues |
-| `src/common/hierarchical/worker_manager.{h,cpp}` | `WorkerManager`: WorkerThread pool |
-| `src/common/hierarchical/worker_thread.{h,cpp}` | `WorkerThread`: THREAD/PROCESS dispatch |
+| `src/common/hierarchical/worker_manager.{h,cpp}` | `WorkerManager` + `WorkerThread`: pool, mailbox-IPC dispatch |
 | `src/common/hierarchical/worker.{h,cpp}` | `Worker` (L3+): composes the above |
 | `src/common/hierarchical/ring.{h,cpp}` | slot allocator |
 | `src/common/hierarchical/tensormap.{h,cpp}` | base_ptr → producer slot |
 | `src/common/hierarchical/scope.{h,cpp}` | scope lifetime management |
-| `src/common/worker/chip_worker.{h,cpp}` | L2 `ChipWorker` (IWorker leaf) |
-| `src/common/worker/sub_worker.{h,cpp}` | `SubWorker` (IWorker leaf for Python callables) |
+| `src/common/worker/chip_worker.{h,cpp}` | L2 `ChipWorker` (IWorker leaf, runs in the forked chip child) |
 | `python/bindings/` | nanobind exposure of C++ engine to Python |
 | `python/simpler/worker.py` | Python `Worker` factory + lifecycle wrapper |

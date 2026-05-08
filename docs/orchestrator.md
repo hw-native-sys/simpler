@@ -45,9 +45,8 @@ private:
 struct SubmitResult { TaskSlot task_slot; };  // field is `task_slot` in current code
 ```
 
-**Status**: `submit_sub` takes only `(callable_id, args)` — no `config`, SUB
-has no per-call config. Target design (plan §"Why L2 has no submit") allows
-callable IDs that may later unify with ChipCallable pointers; see PR-E.
+**Status**: `submit_sub` takes only `(callable_id, args)` — no `config`,
+since SUB has no per-call config.
 
 `scope_begin` / `scope_end` / `drain` are invoked from Python `Worker.run` via
 `_scope_begin` / `_scope_end` / `_drain` bindings. They are not part of the
@@ -248,10 +247,10 @@ SubmitResult Orchestrator::submit_sub(Callable cb, TaskArgs args, const CallConf
 1. A **monotonic task id** — allocated on every `alloc()`, shared across
    all rings. There is no fixed window and no modulo wrap at L3: slot
    state lives in parent-process heap (never crossed into child workers),
-   so the ring index L2 uses to address shmem descriptors buys us nothing
-   here (see plan Allowed Exception #6). A monotonic `int32_t` gives ~2
-   billion ids per `reset_to_empty()` interval, reset to 0 at the end of
-   every `Worker.run()`.
+   so the ring-index addressing scheme L2 needs for shmem descriptors
+   buys us nothing here. A monotonic `int32_t` gives ~2 billion ids per
+   `reset_to_empty()` interval, reset to 0 at the end of every
+   `Worker.run()`.
 2. **`MAX_RING_DEPTH = 4` independent shared-memory heap slabs**
    (Strict-1; matches L2's `PTO2_MAX_RING_DEPTH`). Each slab has its own
    `mmap(MAP_SHARED | MAP_ANONYMOUS)` region, bump cursor, FIFO
@@ -625,7 +624,7 @@ OUTPUT tensors whose `data` is already set are left alone (legacy
 
 The HeapRing size is a `Worker` ctor parameter, surfaced on the Python
 `Worker` as `heap_ring_size=` (default 1 GiB). The heap is `mmap`'d in the
-C++ ctor — before Python forks the ChipProcess / SubWorker children — so
+C++ ctor — before Python forks the chip / sub child processes — so the
 children inherit the same `MAP_SHARED | MAP_ANONYMOUS` region at the same
 virtual address.
 

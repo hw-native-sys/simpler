@@ -832,14 +832,14 @@ class Worker:
         # Register chip workers as NEXT_LEVEL (L3)
         if device_ids:
             for shm in self._chip_shms:
-                dw.add_next_level_process(_mailbox_addr(shm))
+                dw.add_next_level_worker(_mailbox_addr(shm))
 
         # Register Worker children as NEXT_LEVEL (L4+)
         for shm in self._next_level_shms:
-            dw.add_next_level_process(_mailbox_addr(shm))
+            dw.add_next_level_worker(_mailbox_addr(shm))
 
         for shm in self._sub_shms:
-            dw.add_sub_process(_mailbox_addr(shm))
+            dw.add_sub_worker(_mailbox_addr(shm))
 
         # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
         dw.init()
@@ -1074,17 +1074,6 @@ class Worker:
                 # would hang on in-flight tasks.
                 self._orch._scope_end()
                 self._orch._drain()
-
-    def _run_as_child(self, cid: int, args, config) -> None:
-        """Called from C++ _Worker::run when this Worker is a THREAD-mode child.
-
-        Looks up the orch function from the callable registry and delegates
-        to ``self.run(orch_fn, args, config)``.
-        """
-        orch_fn = self._callable_registry.get(cid)
-        if orch_fn is None:
-            raise KeyError(f"callable id {cid} not found in registry")
-        self.run(orch_fn, args, config)
 
     # ------------------------------------------------------------------
     # close
