@@ -386,8 +386,13 @@ python examples/distributed/l4_l3_remote/l4_master.py --remotes 127.0.0.1:5050
 期望输出：
 
 ```text
-remote counter=7
+remote result=7
 ```
+
+注意：L4 注册的 callable 会通过 catalog 序列化后在 L3 daemon/backend
+进程中执行。闭包里捕获的 Python 对象会变成远端反序列化副本，不会修改 L4
+进程内的原对象。示例通过 `OUTPUT_EXISTING` tensor 把结果写回 L4 本地 buffer，
+而不是依赖远端 callable 修改 L4 本地闭包状态。
 
 ## 当前测试方式
 

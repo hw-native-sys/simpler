@@ -1,15 +1,8 @@
 import argparse
+import ctypes
 
-from simpler.task_interface import CallConfig, TaskArgs
+from simpler.task_interface import CallConfig, ContinuousTensor, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
-
-
-class Counter:
-    def __init__(self) -> None:
-        self.value = 0
-
-    def add(self, amount: int) -> None:
-        self.value += int(amount)
 
 
 def main() -> int:
@@ -17,11 +10,13 @@ def main() -> int:
     parser.add_argument("--remotes", default="127.0.0.1:5050")
     args = parser.parse_args()
 
-    counter = Counter()
+    result = ctypes.c_int64(0)
     endpoints = [item.strip() for item in args.remotes.split(",") if item.strip()]
 
     def l3_sub(task_args):
-        counter.add(task_args.scalar(0))
+        output = task_args.tensor(1)
+        current = ctypes.c_int64.from_address(int(output.data))
+        current.value += int(task_args.scalar(0))
 
     w4 = Worker(level=4, num_sub_workers=0)
     sub_cid = w4.register(l3_sub)
@@ -38,14 +33,18 @@ def main() -> int:
             for value in (2, 5):
                 sub_args = TaskArgs()
                 sub_args.add_scalar(value)
+                sub_args.add_tensor(
+                    ContinuousTensor.make(ctypes.addressof(result), (1,), DataType.INT64),
+                    TensorArgType.OUTPUT_EXISTING,
+                )
                 orch.submit_next_level(l3_cid, sub_args, CallConfig())
 
         w4.run(l4_orch)
     finally:
         w4.close()
 
-    print(f"remote counter={counter.value}")
-    return 0 if counter.value == 7 else 1
+    print(f"remote result={result.value}")
+    return 0 if result.value == 7 else 1
 
 
 if __name__ == "__main__":
