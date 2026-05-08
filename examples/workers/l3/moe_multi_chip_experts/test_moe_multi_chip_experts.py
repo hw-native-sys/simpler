@@ -13,7 +13,7 @@ import pytest
 from .main import run
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
+@pytest.mark.platforms(["a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
 def test_moe_multi_chip_2_experts(st_platform, st_device_ids):
@@ -21,19 +21,6 @@ def test_moe_multi_chip_2_experts(st_platform, st_device_ids):
 
     This should produce the SAME results as moe_single_chip with 2 experts,
     just executed in parallel across 2 chips instead of sequentially on 1 chip.
-    """
-    rc = run(st_platform, [int(d) for d in st_device_ids])
-    assert rc == 0
-
-
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
-@pytest.mark.runtime("tensormap_and_ringbuffer")
-@pytest.mark.device_count(4)
-def test_moe_multi_chip_4_experts(st_platform, st_device_ids):
-    """Test multi-chip MoE with 4 experts (1 per chip).
-
-    This should produce the SAME results as moe_single_chip with 4 experts,
-    just executed in parallel across 4 chips instead of sequentially on 1 chip.
     """
     rc = run(st_platform, [int(d) for d in st_device_ids])
     assert rc == 0

@@ -1,213 +1,128 @@
-# Multi-Chip MoE Example
+# `moe_multi_chip_experts/` — one expert per chip
 
-This example demonstrates a distributed MoE (Mixture of Experts) pattern across **multiple chips**, with **one expert per chip**.
+Runs a small distributed Mixture-of-Experts pipeline across multiple chips.
+Each rank owns one expert, exchanges token slices through HCCL window buffers,
+applies a simple per-expert compute kernel, and gathers the processed expert
+results back to the source ranks.
 
-## Overview
+This example is intentionally tiny: `NUM_TOKENS = 10`, `HIDDEN_DIM = 16`, and
+only the first `COUNT = 4` tokens are processed. The small shape makes the
+data movement easy to inspect while still exercising cross-chip dispatch,
+compute, and combine.
 
-This is the **multi-chip version** of `moe_single_chip`. The computation is **identical** - same kernels, same logic - but distributed across multiple chips for parallel execution.
+## What This Demonstrates
 
-## Key Difference: Single vs Multi-Chip
+| Concept | Where it shows up |
+| ------- | ----------------- |
+| L3 multi-chip worker | `Worker(level=3, device_ids=[...])` in `main.py` |
+| HCCL bootstrap buffers | `ChipBootstrapConfig` with `scratch1` and `scratch2` |
+| Cross-rank dispatch | `kernels/aiv/moe_dispatch_alltoall.cpp` |
+| Per-rank expert compute | `kernels/aiv/moe_simple_compute.cpp` |
+| Cross-rank combine | `kernels/aiv/moe_combine_alltoall.cpp` |
+| Device orchestration | `kernels/orchestration/moe_end2end_orch.cpp` |
+| Pytest integration | `test_moe_multi_chip_experts.py` calls `main.run(...)` |
 
-| Aspect | moe_single_chip | moe_multi_chip_experts |
-|--------|----------------|------------------------|
-| **Execution** | Sequential on one chip | **Parallel across chips** |
-| **Expert placement** | All experts on one chip | **One expert per chip** |
-| **Computation** | Same | **Same (identical kernels)** |
-| **Performance** | Limited by single chip | **Scales with chip count** |
-| **Result** | Deterministic | **Deterministic (same result)** |
+## Layout
 
-## Pattern
-
-```
-Single-Chip Version (moe_single_chip):
-  Input → [Chip 0: Expert 0,1,2,3] → Output
-
-Multi-Chip Version (moe_multi_chip_experts):
-  Input → [Chip 0: Expert 0] ─┐
-         [Chip 1: Expert 1] ─┼→ Output
-         [Chip 2: Expert 2] ─┤  (same result!)
-         [Chip 3: Expert 3] ─┘
-```
-
-## Computation Flow (Identical to Single-Chip)
-
-### 1. Dispatch Stage
-- Copy data from send to recv buffer based on expert assignment
-- Same kernel (`moe_demo_incore_0`) as single-chip version
-
-### 2. Compute Stage
-- Apply expert transformation on recv buffer
-- Same kernel (`moe_demo_incore_1`) as single-chip version
-- **Key difference**: Each chip runs only its assigned expert (parallel)
-
-### 3. Combine Stage
-- Accumulate results from recv to output
-- Same kernel (`moe_demo_incore_2`) as single-chip version
-
-## Kernels
-
-Uses the **exact same kernels** as `moe_single_chip`:
-
-1. **moe_demo_incore_0.cpp** (dispatch): Copy send → recv based on expert assignment
-2. **moe_demo_incore_1.cpp** (compute): Apply expert transformation
-3. **moe_demo_incore_2.cpp** (combine): Accumulate results to output
-
-The kernels are NOT modified - we just distribute the work differently.
-
-## Configuration
-
-```python
-# Device count determines expert count
-NUM_CARDS = len(device_ids)  # e.g., 2, 4, etc.
-NUM_EXPERTS = NUM_CARDS      # One expert per chip
-NUM_TOKENS = 64
-HIDDEN_DIM = 64
-EXPERT_HIDDEN_DIM = 32
+```text
+moe_multi_chip_experts/
+  main.py                         # CLI demo and reusable run() entry
+  test_moe_multi_chip_experts.py  # pytest wrapper, matching other L3 examples
+  kernels/
+    aiv/
+      moe_dispatch_alltoall.cpp   # publish each rank's expert input
+      moe_simple_compute.cpp      # add 1.0 to dispatched token slices
+      moe_combine_alltoall.cpp    # gather processed expert outputs
+    orchestration/
+      moe_end2end_orch.cpp        # submit dispatch -> compute -> combine
+  README.md
 ```
 
-## Running
+## Pipeline
+
+For `N` chips, each chip owns one expert and starts with:
+
+```text
+send[expert_id][token][hidden]
+recv[source_rank][token][hidden]
+output[expert_id][token][hidden]
+```
+
+The orchestration submits three AIV kernels:
+
+```text
+┌──────────┐      ┌─────────┐      ┌─────────┐
+│ Dispatch │ ───▶ │ Compute │ ───▶ │ Combine │
+└──────────┘      └─────────┘      └─────────┘
+```
+
+1. Dispatch writes each rank's expert slice into the owner rank's `recv`.
+2. Compute adds `1.0` to the first `COUNT` tokens in `recv`.
+3. Combine copies each expert's processed slice into the source rank's
+   `output[expert_id]` row.
+
+`scratch1` is the HCCL window used by dispatch. `scratch2` is the HCCL window
+used by combine. Compute only updates `recv`; it does not use either scratch
+window.
+
+The two communication phases use independent windows mainly because each
+kernel places its barrier signal slots at the tail of its scratch buffer and
+does not reset those slots before use. Dispatch leaves its signal slots
+incremented after its cross-rank barrier. If combine reused the same window,
+its `TWAIT` could observe the old dispatch signals and pass before combine has
+staged its own data. A separate `scratch2` gives combine independent data
+storage and independent signal slots.
+
+## Data Pattern
+
+Inputs are initialized with unique values:
+
+```text
+value = card_id * 1_000_000 + expert_id * 10_000 + token * 100 + dim
+```
+
+After compute, every checked output value should be the corresponding input
+value plus `1.0`. `main.py` computes the golden reference in Python and checks
+every `output[expert_id][token][hidden]` element for the processed token
+range.
+
+## Run
+
+Hardware:
 
 ```bash
-# 2 chips (2 experts) - simulation
-python examples/workers/l3/moe_multi_chip_experts/main.py -p a2a3sim -d 0-1
-
-# 4 chips (4 experts) - simulation
-python examples/workers/l3/moe_multi_chip_experts/main.py -p a2a3sim -d 0-3
-
-# 2 chips (2 experts) - hardware
 python examples/workers/l3/moe_multi_chip_experts/main.py -p a2a3 -d 0-1
-
-# Run via pytest
-pytest examples/workers/l3/moe_multi_chip_experts/test_moe_multi_chip.py -v -s
 ```
 
-## How It Works
+Simulation:
 
-### Python Level (main.py)
-
-```python
-# Allocate tensors per chip
-host_input = [torch.randn(...) for _ in device_ids]
-host_recv = [torch.randn(...) for _ in device_ids]
-host_output = [torch.zeros(...) for _ in device_ids]
-
-# Submit task to each chip
-for i in range(len(device_ids)):
-    orch.submit_next_level(moe_cc, moe_args, cfg, worker=i)
-    # Each chip runs the SAME orchestration
-    # But computes different experts based on chip ID
+```bash
+python examples/workers/l3/moe_multi_chip_experts/main.py -p a2a3sim -d 0-1
 ```
 
-### Orchestration Level (moe_multi_chip_orch.cpp)
+The pytest wrapper follows the same style as the other L3 examples:
 
-The orchestration code is identical to `moe_single_chip`:
-- Loops over `card_i` (chip index) and `expert_j` (expert index)
-- In multi-chip: each chip only processes its assigned expert
-- In single-chip: one chip processes all experts
-
-### Kernel Level
-
-**NO CHANGES** - kernels are identical:
-- Same memory access patterns
-- Same computation logic
-- Same results
-
-## Result Equivalence
-
-**The outputs ARE identical** (given same random seed):
-
-```python
-# Single-chip version
-python moe_single_chip/main.py -p a2a3sim -d 0
-# Output: [tensor with values X]
-
-# Multi-chip version (2 chips)
-python moe_multi_chip_experts/main.py -p a2a3sim -d 0-1
-# Output: [tensor with values X]  <- SAME!
+```bash
+python -m pytest examples/workers/l3/moe_multi_chip_experts --platform a2a3 --device 0-1
 ```
 
-The distribution is **transparent** to the computation - we're just
-executing the same work in parallel instead of sequentially.
+For the CLI, device ids can be written as a range (`-d 0-1`) or a
+comma-separated list (`-d 0,1`). For pytest, pass the same device spec to
+`--device`. The examples use ranges because that matches the other L3 docs.
 
-## When to Use Which Version?
+Expected successful output for the two-chip commands above includes:
 
-### Use `moe_single_chip` when:
-- ✅ You only have 1 chip available
-- ✅ You're developing/debugging kernels
-- ✅ Model fits comfortably on single chip
-- ✅ Simpler debugging (everything on one device)
-
-### Use `moe_multi_chip_experts` when:
-- ✅ You have multiple chips available
-- ✅ You want faster execution (parallel compute)
-- ✅ Model is too large for single chip
-- ✅ You're scaling to more experts than fit on one chip
-
-## Memory Layout
-
-Per-chip tensors (same as single-chip):
-
-```python
-# Each chip has:
-input:    [4, 64, 64]    # Input tokens
-recv:     [4, 64, 64]    # Intermediate buffer
-output:   [4, 64]        # Final output
+```text
+[End2End] End-to-end pipeline completed!
+  Total: 256/256 correct
+[End2End] All values correct! End-to-end pipeline works perfectly.
 ```
 
-The shape is identical - only the distribution changes.
+## Notes
 
-## Performance Characteristics
-
-### Single-Chip Version
-- **Compute**: O(num_experts × num_tokens) sequential
-- **Memory**: All expert data on one chip
-- **Latency**: Sum of all expert compute times
-
-### Multi-Chip Version
-- **Compute**: O(num_tokens) parallel per chip
-- **Memory**: Expert data distributed across chips
-- **Latency**: Max of individual expert compute times
-
-**Speedup**: Near-linear with chip count (ignoring communication overhead)
-
-## Implementation Details
-
-### No Kernel Changes
-The kernels (`moe_demo_incore_*.cpp`) are **verbatim copies** from the single-chip version. This ensures:
-
-1. **Correctness**: Same computation = same results
-2. **Simplicity**: No need to rewrite kernel logic
-3. **Maintainability**: Single source of truth for kernels
-
-### Distribution via Orchestration
-The multi-chip behavior comes from:
-1. Python: Submit tasks to multiple chips (`worker=i`)
-2. Orchestration: Each chip runs the same DAG
-3. Kernel: Identical computation, different data subsets
-
-### Key Insight
-```
-Single-chip: Chip 0 runs {Expert 0, Expert 1, Expert 2, Expert 3}
-Multi-chip:  Chip 0 runs {Expert 0}, Chip 1 runs {Expert 1}, ...
-
-Same total work, different distribution.
-```
-
-## Comparison with True Distributed MoE
-
-This example keeps the computation **identical** for educational purposes.
-Real distributed MoE systems would also optimize:
-
-- **Communication**: Reduce all-to-all data movement
-- **Load Balancing**: Dynamic token-to-expert assignment
-- **Gradient Synchronization**: Distributed training considerations
-
-Those optimizations are omitted here to maintain **result equivalence**
-with the single-chip version.
-
-## Next Steps
-
-1. **Compare outputs**: Run both versions and verify results match
-2. **Measure speedup**: Time both versions on your hardware
-3. **Scale up**: Try 4, 8, or more chips
-4. **Real distribution**: Implement data sharding across chips
+- `test_moe_multi_chip_experts.py` is a thin pytest wrapper around
+  `main.run(...)`.
+- The pytest case runs on `a2a3` hardware and requires two available device
+  ids.
+- Each rank allocates independent `scratch1` and `scratch2` HCCL windows
+  during worker bootstrap.

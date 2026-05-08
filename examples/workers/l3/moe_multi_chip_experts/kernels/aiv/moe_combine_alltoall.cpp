@@ -4,7 +4,7 @@
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
@@ -13,20 +13,24 @@
  *
  * This kernel implements the combine phase of distributed MoE:
  * Each card i sends recv[i][card_j] (expert_i's result for card_j) to card j,
- * then directly stores all received results to output without accumulation.
+ * then directly stores all received results to output (one expert per output row).
  *
  * Data flow:
  *   Phase 1 (stage-in):  recv[:][:][:COUNT][:] → scratch[my_rank][:][:][:]
  *   Phase 2 (barrier):   signal matrix + TWAIT cross-rank sync
  *   Phase 3 (store):     for expert_i in num_cards: copy scratch[expert_i][my_rank][:][:] to output[expert_i][:][:]
  *
+ * Output layout:
+ *   output[expert_i][token_t][:] = data from expert_i for this card, token t
+ *
  * args layout:
- *   tensor(0) = recv_local     [num_cards][num_tokens][hidden_dim]
- *   tensor(1) = output_local   [num_cards][count][hidden_dim] - stores all experts' data
- *   tensor(2) = scratch        HCCL window buffer
- *   scalar(0) = card_id        which card this is
- *   scalar(1) = num_cards      total number of cards
- *   scalar(2) = CommContext    device pointer for cross-card communication
+ *   tensor(0) = recv_local       [num_cards][num_tokens][hidden_dim]
+ *   tensor(1) = output_local     [num_cards][count][hidden_dim] - stores all experts' data
+ *   tensor(2) = scratch          HCCL window buffer
+ *   tensor(3) = scratch_print    Debug output buffer (Phase 1 stage-in mirror)
+ *   scalar(0) = card_id          which card this is
+ *   scalar(1) = num_cards        total number of cards
+ *   scalar(2) = CommContext      device pointer for cross-card communication
  */
 
 #include <cstdint>
@@ -44,7 +48,7 @@
 #define __aicore__ [aicore]
 #endif
 
-// Configuration matching golden.py
+// Configuration matching the in-test golden references
 static constexpr size_t NUM_TOKENS = 10;
 static constexpr size_t HIDDEN_DIM = 16;
 static constexpr size_t COUNT = 4;  // tokens to process per (card, expert) pair
@@ -63,21 +67,19 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ Tensor *output_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *scratch_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *scratch_print_tensor = reinterpret_cast<__gm__ Tensor *>(args[3]);
-    __gm__ Tensor *acc_values_tensor = reinterpret_cast<__gm__ Tensor *>(args[4]);
-    __gm__ Tensor *src_values_tensor = reinterpret_cast<__gm__ Tensor *>(args[5]);
 
     // Unpack scalars
-    int64_t card_id = static_cast<int64_t>(args[6]);
-    int num_cards = static_cast<int>(args[7]);
-    __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[8]);
+    int64_t card_id = static_cast<int64_t>(args[4]);
+    int num_cards = static_cast<int>(args[5]);
+    __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[6]);
 
     // Get base pointers
     __gm__ float *recv = reinterpret_cast<__gm__ float *>(recv_tensor->buffer.addr) + recv_tensor->start_offset;
     __gm__ float *output = reinterpret_cast<__gm__ float *>(output_tensor->buffer.addr) + output_tensor->start_offset;
-    __gm__ float *scratch = reinterpret_cast<__gm__ float *>(scratch_tensor->buffer.addr) + scratch_tensor->start_offset;
-    __gm__ float *scratch_print = reinterpret_cast<__gm__ float *>(scratch_print_tensor->buffer.addr) + scratch_print_tensor->start_offset;
-    __gm__ float *acc_values = reinterpret_cast<__gm__ float *>(acc_values_tensor->buffer.addr) + acc_values_tensor->start_offset;
-    __gm__ float *src_values = reinterpret_cast<__gm__ float *>(src_values_tensor->buffer.addr) + src_values_tensor->start_offset;
+    __gm__ float *scratch =
+        reinterpret_cast<__gm__ float *>(scratch_tensor->buffer.addr) + scratch_tensor->start_offset;
+    __gm__ float *scratch_print =
+        reinterpret_cast<__gm__ float *>(scratch_print_tensor->buffer.addr) + scratch_print_tensor->start_offset;
 
     // Signal area at tail of scratch: num_cards int32 slots
     // Must be placed AFTER all data slots to avoid corruption
@@ -108,30 +110,27 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             // recv layout: [num_cards][NUM_TOKENS][HIDDEN_DIM]
             // Base points to current (card_j, t), stride should keep access within current token
             ShapeDyn src_shape(1, 1, 1, 1, HIDDEN_DIM);
-            StrideDyn src_stride(NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM,
-                                 NUM_TOKENS * HIDDEN_DIM, HIDDEN_DIM, 1);
-            Global srcG(recv + card_j * NUM_TOKENS * HIDDEN_DIM + t * HIDDEN_DIM,
-                       src_shape, src_stride);
+            StrideDyn src_stride(
+                NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM, HIDDEN_DIM, 1
+            );
+            Global srcG(recv + card_j * NUM_TOKENS * HIDDEN_DIM + t * HIDDEN_DIM, src_shape, src_stride);
 
             // Destination: scratch[my_rank][card_j][t][:HIDDEN_DIM]
             // Offset = my_rank * (num_cards * NUM_TOKENS * HIDDEN_DIM)
             //        + card_j * (NUM_TOKENS * HIDDEN_DIM)
             //        + t * HIDDEN_DIM
-            size_t dst_offset = my_rank * num_cards * NUM_TOKENS * HIDDEN_DIM
-                              + card_j * NUM_TOKENS * HIDDEN_DIM
-                              + t * HIDDEN_DIM;
+            size_t dst_offset =
+                my_rank * num_cards * NUM_TOKENS * HIDDEN_DIM + card_j * NUM_TOKENS * HIDDEN_DIM + t * HIDDEN_DIM;
 
             ShapeDyn dst_shape(1, 1, 1, 1, HIDDEN_DIM);
-            StrideDyn dst_stride(num_cards * NUM_TOKENS * HIDDEN_DIM,
-                                 num_cards * NUM_TOKENS * HIDDEN_DIM,
-                                 NUM_TOKENS * HIDDEN_DIM, HIDDEN_DIM, 1);
-            Global dstG(scratch + dst_offset,
-                       dst_shape, dst_stride);
-            Global dstG_print(scratch_print + dst_offset,
-                             dst_shape, dst_stride);
+            StrideDyn dst_stride(
+                num_cards * NUM_TOKENS * HIDDEN_DIM, num_cards * NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM,
+                HIDDEN_DIM, 1
+            );
+            Global dstG(scratch + dst_offset, dst_shape, dst_stride);
+            Global dstG_print(scratch_print + dst_offset, dst_shape, dst_stride);
 
-            using TileType = pto::Tile<pto::TileType::Vec, float, 1, HIDDEN_DIM,
-                                       pto::BLayout::RowMajor, -1, -1>;
+            using TileType = pto::Tile<pto::TileType::Vec, float, 1, HIDDEN_DIM, pto::BLayout::RowMajor, -1, -1>;
             TileType tile(1, HIDDEN_DIM);
             TASSIGN(tile, 0);
 
@@ -164,103 +163,53 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
-    // Phase 3: reduce — accumulate all experts' results for this card
-    // Read scratch[expert_i][card_id][:][:] from each expert i's scratch
-    // and accumulate to output[t][:HIDDEN_DIM]
+    // Phase 3: direct store — copy each expert's data to output
+    // Read scratch[expert_i][my_rank][t][:HIDDEN_DIM] from each expert i
+    // and store to output[expert_i][t][:HIDDEN_DIM]
     //
-    // For card_id, accumulate:
-    //   from expert 0: scratch[0][card_id][:][:]
-    //   from expert 1: scratch[1][card_id][:][:]
+    // For card_id with my_rank:
+    //   output[expert_0][t][:] = scratch[expert_0][my_rank][t][:]
+    //   output[expert_1][t][:] = scratch[expert_1][my_rank][t][:]
     //   etc.
     // ------------------------------------------------------------------
-
-    // Initialize output to zero
-    // for (size_t t = 0; t < COUNT; ++t) {
-    //     ShapeDyn out_shape(1, 1, 1, 1, HIDDEN_DIM);
-    //     StrideDyn out_stride(HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, 1);
-    //     Global outG(output + t * HIDDEN_DIM, out_shape, out_stride);
-
-    //     using TileType = pto::Tile<pto::TileType::Vec, float, 1, HIDDEN_DIM,
-    //                                pto::BLayout::RowMajor, -1, -1>;
-    //     TileType tile(1, HIDDEN_DIM);
-    //     TASSIGN(tile, 0);
-    //     TSTORE(outG, tile);
-    //     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    //     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    // }
-
-    // Accumulate from all experts
-    int add_entry = 0;
     for (int expert_i = 0; expert_i < num_cards; ++expert_i) {
         for (size_t t = 0; t < COUNT; ++t) {
             // Source: scratch[expert_i][my_rank][t][:HIDDEN_DIM]
             // Offset = expert_i * (num_cards * NUM_TOKENS * HIDDEN_DIM)
             //        + my_rank * (NUM_TOKENS * HIDDEN_DIM)
             //        + t * HIDDEN_DIM
-            __gm__ float *src_base = (expert_i == my_rank) ? scratch :
-                                     CommRemotePtr(commCtx, scratch, expert_i);
-            size_t src_offset = expert_i * num_cards * NUM_TOKENS * HIDDEN_DIM
-                              + my_rank * NUM_TOKENS * HIDDEN_DIM
-                              + t * HIDDEN_DIM;
+            __gm__ float *src_base = (expert_i == my_rank) ? scratch : CommRemotePtr(commCtx, scratch, expert_i);
+            size_t src_offset =
+                expert_i * num_cards * NUM_TOKENS * HIDDEN_DIM + my_rank * NUM_TOKENS * HIDDEN_DIM + t * HIDDEN_DIM;
 
             ShapeDyn src_shape(1, 1, 1, 1, HIDDEN_DIM);
-            StrideDyn src_stride(num_cards * NUM_TOKENS * HIDDEN_DIM,
-                                 num_cards * NUM_TOKENS * HIDDEN_DIM,
-                                 NUM_TOKENS * HIDDEN_DIM, HIDDEN_DIM, 1);
+            StrideDyn src_stride(
+                num_cards * NUM_TOKENS * HIDDEN_DIM, num_cards * NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM,
+                HIDDEN_DIM, 1
+            );
             Global srcG(src_base + src_offset, src_shape, src_stride);
 
-            // Destination: output[t][:HIDDEN_DIM] (accumulate)
-            ShapeDyn out_shape(1, 1, 1, 1, HIDDEN_DIM);
-            StrideDyn out_stride(HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, 1);
-            Global outG(output + t * HIDDEN_DIM, out_shape, out_stride);
+            // Destination: output[expert_i][t][:HIDDEN_DIM]
+            // Offset = expert_i * (COUNT * HIDDEN_DIM) + t * HIDDEN_DIM
+            size_t dst_offset = expert_i * COUNT * HIDDEN_DIM + t * HIDDEN_DIM;
 
-            // Destinations for acc and src values (before accumulation)
-            ShapeDyn acc_save_shape(1, 1, 1, 1, HIDDEN_DIM);
-            StrideDyn acc_save_stride(HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, 1);
-            Global acc_saveG(acc_values + add_entry * HIDDEN_DIM, acc_save_shape, acc_save_stride);
+            ShapeDyn dst_shape(1, 1, 1, 1, HIDDEN_DIM);
+            StrideDyn dst_stride(COUNT * HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, 1);
+            Global dstG(output + dst_offset, dst_shape, dst_stride);
 
-            ShapeDyn src_save_shape(1, 1, 1, 1, HIDDEN_DIM);
-            StrideDyn src_save_stride(HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, 1);
-            Global src_saveG(src_values + add_entry * HIDDEN_DIM, src_save_shape, src_save_stride);
+            using TileType = pto::Tile<pto::TileType::Vec, float, 1, HIDDEN_DIM, pto::BLayout::RowMajor, -1, -1>;
+            TileType tile(1, HIDDEN_DIM);
+            TASSIGN(tile, 0);
 
-            using TileType = pto::Tile<pto::TileType::Vec, float, 1, HIDDEN_DIM,
-                                       pto::BLayout::RowMajor, -1, -1>;
-            TileType srcTile(1, HIDDEN_DIM);
-            TileType accTile(1, HIDDEN_DIM);
-            constexpr size_t kTileSize = 1 * HIDDEN_DIM * sizeof(float);  // 64 bytes
-            TASSIGN(srcTile, kTileSize);      // Use offset 64
-            TASSIGN(accTile, kTileSize * 2);  // Use offset 128
-
-            // Load current output value (acc before accumulation)
-            TLOAD(accTile, outG);
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-
-            // Load from remote scratch (src)
-            TLOAD(srcTile, srcG);
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-
-            // Save acc and src before accumulation
-            TSTORE(acc_saveG, accTile);
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
-
-            TSTORE(src_saveG, srcTile);
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
-
-            // Accumulate
-            TADD(accTile, accTile, srcTile);
-            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+            // Load from scratch
+            TLOAD(tile, srcG);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
 
             // Store to output
-            TSTORE(outG, accTile);
+            TSTORE(dstG, tile);
             set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-
-            add_entry++;
         }
     }
 

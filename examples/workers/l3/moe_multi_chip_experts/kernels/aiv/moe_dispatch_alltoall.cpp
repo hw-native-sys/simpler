@@ -4,7 +4,7 @@
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
@@ -44,7 +44,7 @@
 #define __aicore__ [aicore]
 #endif
 
-// Configuration matching golden.py
+// Configuration matching the in-test golden references
 static constexpr size_t NUM_TOKENS = 10;
 static constexpr size_t HIDDEN_DIM = 16;
 static constexpr size_t COUNT = 4;  // tokens to process per (card, expert) pair
@@ -71,7 +71,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // Get base pointers
     __gm__ float *send = reinterpret_cast<__gm__ float *>(send_tensor->buffer.addr) + send_tensor->start_offset;
     __gm__ float *recv = reinterpret_cast<__gm__ float *>(recv_tensor->buffer.addr) + recv_tensor->start_offset;
-    __gm__ float *scratch = reinterpret_cast<__gm__ float *>(scratch_tensor->buffer.addr) + scratch_tensor->start_offset;
+    __gm__ float *scratch =
+        reinterpret_cast<__gm__ float *>(scratch_tensor->buffer.addr) + scratch_tensor->start_offset;
 
     // Signal area at tail of scratch: num_cards int32 slots
     // Must be placed AFTER all data slots to avoid corruption
@@ -105,29 +106,25 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         for (size_t t = 0; t < COUNT; ++t) {
             // Load from send[expert_i][t][:HIDDEN_DIM] (ALL experts, not just expert_id)
             ShapeDyn send_shape(1, 1, 1, 1, HIDDEN_DIM);
-            StrideDyn send_stride(NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM,
-                                  HIDDEN_DIM, HIDDEN_DIM, 1);
-            Global sendG(send + expert_i * NUM_TOKENS * HIDDEN_DIM + t * HIDDEN_DIM,
-                        send_shape, send_stride);
+            StrideDyn send_stride(NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, 1);
+            Global sendG(send + expert_i * NUM_TOKENS * HIDDEN_DIM + t * HIDDEN_DIM, send_shape, send_stride);
 
             // Store to scratch[my_rank][expert_i][t][:HIDDEN_DIM]
             // Index = my_rank * (num_cards * NUM_TOKENS * HIDDEN_DIM)
             //       + expert_i * (NUM_TOKENS * HIDDEN_DIM)
             //       + t * HIDDEN_DIM
-            size_t scratch_offset = my_rank * num_cards * NUM_TOKENS * HIDDEN_DIM
-                                  + expert_i * NUM_TOKENS * HIDDEN_DIM
-                                  + t * HIDDEN_DIM;
+            size_t scratch_offset =
+                my_rank * num_cards * NUM_TOKENS * HIDDEN_DIM + expert_i * NUM_TOKENS * HIDDEN_DIM + t * HIDDEN_DIM;
 
             ShapeDyn scratch_shape(1, 1, 1, 1, HIDDEN_DIM);
-            StrideDyn scratch_stride(num_cards * NUM_TOKENS * HIDDEN_DIM,
-                                     num_cards * NUM_TOKENS * HIDDEN_DIM,
-                                     NUM_TOKENS * HIDDEN_DIM, HIDDEN_DIM, 1);
-            Global scratchG(scratch + scratch_offset,
-                            scratch_shape, scratch_stride);
+            StrideDyn scratch_stride(
+                num_cards * NUM_TOKENS * HIDDEN_DIM, num_cards * NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM,
+                HIDDEN_DIM, 1
+            );
+            Global scratchG(scratch + scratch_offset, scratch_shape, scratch_stride);
 
             // Use tile for data movement
-            using TileType = pto::Tile<pto::TileType::Vec, float, 1, HIDDEN_DIM,
-                                       pto::BLayout::RowMajor, -1, -1>;
+            using TileType = pto::Tile<pto::TileType::Vec, float, 1, HIDDEN_DIM, pto::BLayout::RowMajor, -1, -1>;
             TileType tile(1, HIDDEN_DIM);
             TASSIGN(tile, 0);
 
@@ -171,28 +168,23 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             // Offset = card_j * (num_cards * NUM_TOKENS * HIDDEN_DIM)
             //        + expert_id * (NUM_TOKENS * HIDDEN_DIM)
             //        + t * HIDDEN_DIM
-            __gm__ float *src_base = (card_j == my_rank) ? scratch :
-                                     CommRemotePtr(commCtx, scratch, card_j);
-            size_t src_offset = card_j * num_cards * NUM_TOKENS * HIDDEN_DIM
-                              + expert_id * NUM_TOKENS * HIDDEN_DIM
-                              + t * HIDDEN_DIM;
+            __gm__ float *src_base = (card_j == my_rank) ? scratch : CommRemotePtr(commCtx, scratch, card_j);
+            size_t src_offset =
+                card_j * num_cards * NUM_TOKENS * HIDDEN_DIM + expert_id * NUM_TOKENS * HIDDEN_DIM + t * HIDDEN_DIM;
 
             ShapeDyn src_shape(1, 1, 1, 1, HIDDEN_DIM);
-            StrideDyn src_stride(num_cards * NUM_TOKENS * HIDDEN_DIM,
-                                 num_cards * NUM_TOKENS * HIDDEN_DIM,
-                                 NUM_TOKENS * HIDDEN_DIM, HIDDEN_DIM, 1);
-            Global srcG(src_base + src_offset,
-                       src_shape, src_stride);
+            StrideDyn src_stride(
+                num_cards * NUM_TOKENS * HIDDEN_DIM, num_cards * NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM,
+                HIDDEN_DIM, 1
+            );
+            Global srcG(src_base + src_offset, src_shape, src_stride);
 
             // Destination: recv[card_j][t][:HIDDEN_DIM]
             ShapeDyn dst_shape(1, 1, 1, 1, HIDDEN_DIM);
-            StrideDyn dst_stride(NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM,
-                                 HIDDEN_DIM, HIDDEN_DIM, 1);
-            Global dstG(recv + card_j * NUM_TOKENS * HIDDEN_DIM + t * HIDDEN_DIM,
-                       dst_shape, dst_stride);
+            StrideDyn dst_stride(NUM_TOKENS * HIDDEN_DIM, NUM_TOKENS * HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM, 1);
+            Global dstG(recv + card_j * NUM_TOKENS * HIDDEN_DIM + t * HIDDEN_DIM, dst_shape, dst_stride);
 
-            using TileType = pto::Tile<pto::TileType::Vec, float, 1, HIDDEN_DIM,
-                                       pto::BLayout::RowMajor, -1, -1>;
+            using TileType = pto::Tile<pto::TileType::Vec, float, 1, HIDDEN_DIM, pto::BLayout::RowMajor, -1, -1>;
             TileType tile(1, HIDDEN_DIM);
             TASSIGN(tile, 0);
 
