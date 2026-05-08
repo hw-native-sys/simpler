@@ -19,23 +19,6 @@ def test_catalog_export_install_lookup():
     assert got is not None
 
 
-def test_catalog_pull_mock_install():
-    l4 = Catalog()
-    cid, version = l4.register(lambda args: args.scalar(0) * 2)
-
-    class MockClient:
-        def call_unary(self, method, req, timeout=None):
-            assert method == "Catalog.PullCallable"
-            return type("Payload", (), {"callable_id": cid, "version": version, "pickled": l4.export_payload(cid, version)})
-
-    l3 = Catalog()
-    req = type("Req", (), {"callable_id": cid, "version": version})()
-    payload = MockClient().call_unary("Catalog.PullCallable", req)
-    l3.install_from_payload(payload.callable_id, payload.version, payload.pickled)
-
-    assert l3.lookup(cid, version) is not None
-
-
 def test_catalog_version_mismatch():
     catalog = Catalog()
     cid, version = catalog.register(lambda args: None)

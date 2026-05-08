@@ -264,6 +264,21 @@ class TensorPoolStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.AllocTensor = channel.unary_unary(
+                '/simpler.distributed.v1.TensorPool/AllocTensor',
+                request_serializer=dispatch__pb2.TensorAllocReq.SerializeToString,
+                response_deserializer=dispatch__pb2.TensorHandle.FromString,
+                _registered_method=True)
+        self.FreeTensor = channel.unary_unary(
+                '/simpler.distributed.v1.TensorPool/FreeTensor',
+                request_serializer=dispatch__pb2.TensorFreeReq.SerializeToString,
+                response_deserializer=dispatch__pb2.Empty.FromString,
+                _registered_method=True)
+        self.RefreshTensor = channel.unary_unary(
+                '/simpler.distributed.v1.TensorPool/RefreshTensor',
+                request_serializer=dispatch__pb2.TensorRefreshReq.SerializeToString,
+                response_deserializer=dispatch__pb2.TensorHandle.FromString,
+                _registered_method=True)
         self.PullTensor = channel.unary_stream(
                 '/simpler.distributed.v1.TensorPool/PullTensor',
                 request_serializer=dispatch__pb2.TensorHandle.SerializeToString,
@@ -278,6 +293,24 @@ class TensorPoolStub(object):
 
 class TensorPoolServicer(object):
     """Missing associated documentation comment in .proto file."""
+
+    def AllocTensor(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def FreeTensor(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RefreshTensor(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def PullTensor(self, request, context):
         """Missing associated documentation comment in .proto file."""
@@ -294,6 +327,21 @@ class TensorPoolServicer(object):
 
 def add_TensorPoolServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'AllocTensor': grpc.unary_unary_rpc_method_handler(
+                    servicer.AllocTensor,
+                    request_deserializer=dispatch__pb2.TensorAllocReq.FromString,
+                    response_serializer=dispatch__pb2.TensorHandle.SerializeToString,
+            ),
+            'FreeTensor': grpc.unary_unary_rpc_method_handler(
+                    servicer.FreeTensor,
+                    request_deserializer=dispatch__pb2.TensorFreeReq.FromString,
+                    response_serializer=dispatch__pb2.Empty.SerializeToString,
+            ),
+            'RefreshTensor': grpc.unary_unary_rpc_method_handler(
+                    servicer.RefreshTensor,
+                    request_deserializer=dispatch__pb2.TensorRefreshReq.FromString,
+                    response_serializer=dispatch__pb2.TensorHandle.SerializeToString,
+            ),
             'PullTensor': grpc.unary_stream_rpc_method_handler(
                     servicer.PullTensor,
                     request_deserializer=dispatch__pb2.TensorHandle.FromString,
@@ -314,6 +362,87 @@ def add_TensorPoolServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class TensorPool(object):
     """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def AllocTensor(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/simpler.distributed.v1.TensorPool/AllocTensor',
+            dispatch__pb2.TensorAllocReq.SerializeToString,
+            dispatch__pb2.TensorHandle.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def FreeTensor(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/simpler.distributed.v1.TensorPool/FreeTensor',
+            dispatch__pb2.TensorFreeReq.SerializeToString,
+            dispatch__pb2.Empty.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RefreshTensor(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/simpler.distributed.v1.TensorPool/RefreshTensor',
+            dispatch__pb2.TensorRefreshReq.SerializeToString,
+            dispatch__pb2.TensorHandle.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def PullTensor(request,

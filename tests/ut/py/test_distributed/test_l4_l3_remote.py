@@ -1,9 +1,17 @@
+import ctypes
 import struct
 from multiprocessing.shared_memory import SharedMemory
 
+import pytest
+
 from simpler.distributed.l3_daemon import L3Daemon
-from simpler.task_interface import CallConfig, TaskArgs
+from simpler.distributed.catalog import Catalog
+from simpler.distributed.proto import dispatch_pb2
+from simpler.distributed.remote_proxy import RemoteUnavailable, RemoteWorkerProxy
+from simpler.distributed.transport_backend import TransportBackendError, TransportUnavailable
+from simpler.task_interface import CallConfig, ContinuousTensor, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
+
 
 def _scalar_value(args: TaskArgs) -> int:
     return int(args.scalar(0)) if args is not None and args.scalar_count() else 1
@@ -179,6 +187,226 @@ def test_l4_remote_multiple_runs(tmp_path):
         daemon.stop()
 
 
+def test_l4_remote_inline_tensor_dispatch(tmp_path):
+    result = tmp_path / "remote_tensor_sum.txt"
+    payload = b"abcdef"
+    buf = ctypes.create_string_buffer(payload)
+    daemon, endpoint = _start_daemon()
+
+    try:
+        w4 = Worker(level=4, num_sub_workers=0)
+
+        def l3_orch(orch, args, config):
+            tensor = args.tensor(0)
+            data = ctypes.string_at(int(tensor.data), int(tensor.nbytes()))
+            result.write_text(str(sum(data)))
+
+        l3_cid = w4.register(l3_orch)
+        w4.add_remote_worker(endpoint)
+        w4.init()
+
+        def l4_orch(orch, args, config):
+            sub_args = TaskArgs()
+            tensor = ContinuousTensor.make(ctypes.addressof(buf), (len(payload),), DataType.UINT8)
+            sub_args.add_tensor(tensor, TensorArgType.INPUT)
+            orch.submit_next_level(l3_cid, sub_args, CallConfig())
+
+        w4.run(l4_orch)
+        w4.close()
+        assert int(result.read_text()) == sum(payload)
+    finally:
+        daemon.stop()
+
+
+def test_l4_remote_handle_tensor_dispatch(tmp_path):
+    result = tmp_path / "remote_tensor_sum.txt"
+    payload = bytes(range(256)) * 32
+    buf = ctypes.create_string_buffer(payload)
+    daemon, endpoint = _start_daemon()
+
+    try:
+        w4 = Worker(level=4, num_sub_workers=0)
+
+        def l3_orch(orch, args, config):
+            tensor = args.tensor(0)
+            data = ctypes.string_at(int(tensor.data), int(tensor.nbytes()))
+            result.write_text(str(len(data)) + ":" + str(sum(data)))
+
+        l3_cid = w4.register(l3_orch)
+        w4.add_remote_worker(endpoint)
+        w4.init()
+
+        def l4_orch(orch, args, config):
+            sub_args = TaskArgs()
+            tensor = ContinuousTensor.make(ctypes.addressof(buf), (len(payload),), DataType.UINT8)
+            sub_args.add_tensor(tensor, TensorArgType.INPUT)
+            orch.submit_next_level(l3_cid, sub_args, CallConfig())
+
+        w4.run(l4_orch)
+        w4.close()
+        assert result.read_text() == f"{len(payload)}:{sum(payload)}"
+    finally:
+        daemon.stop()
+
+
+def test_l4_remote_inline_output_tensor_writeback():
+    buf = ctypes.create_string_buffer(b"\x00" * 6)
+    daemon, endpoint = _start_daemon()
+
+    try:
+        w4 = Worker(level=4, num_sub_workers=0)
+
+        def l3_orch(orch, args, config):
+            tensor = args.tensor(0)
+            ctypes.memmove(int(tensor.data), b"fedcba", 6)
+
+        l3_cid = w4.register(l3_orch)
+        w4.add_remote_worker(endpoint)
+        w4.init()
+
+        def l4_orch(orch, args, config):
+            sub_args = TaskArgs()
+            tensor = ContinuousTensor.make(ctypes.addressof(buf), (6,), DataType.UINT8)
+            sub_args.add_tensor(tensor, TensorArgType.OUTPUT_EXISTING)
+            orch.submit_next_level(l3_cid, sub_args, CallConfig())
+
+        w4.run(l4_orch)
+        w4.close()
+        assert bytes(buf.raw) == b"fedcba\x00"
+    finally:
+        daemon.stop()
+
+
+def test_l4_remote_handle_output_tensor_writeback():
+    payload = bytes((255 - (i % 256) for i in range(8192)))
+    buf = ctypes.create_string_buffer(b"\x00" * len(payload))
+    daemon, endpoint = _start_daemon()
+
+    try:
+        w4 = Worker(level=4, num_sub_workers=0)
+
+        def l3_orch(orch, args, config):
+            tensor = args.tensor(0)
+            ctypes.memmove(int(tensor.data), payload, len(payload))
+
+        l3_cid = w4.register(l3_orch)
+        w4.add_remote_worker(endpoint)
+        w4.init()
+
+        def l4_orch(orch, args, config):
+            sub_args = TaskArgs()
+            tensor = ContinuousTensor.make(ctypes.addressof(buf), (len(payload),), DataType.UINT8)
+            sub_args.add_tensor(tensor, TensorArgType.OUTPUT_EXISTING)
+            orch.submit_next_level(l3_cid, sub_args, CallConfig())
+
+        w4.run(l4_orch)
+        w4.close()
+        assert bytes(buf.raw) == payload + b"\x00"
+    finally:
+        daemon.stop()
+
+
+def test_l4_remote_inout_tensor_writeback():
+    payload = bytearray(b"abcde")
+    buf = ctypes.create_string_buffer(bytes(payload))
+    daemon, endpoint = _start_daemon()
+
+    try:
+        w4 = Worker(level=4, num_sub_workers=0)
+
+        def l3_orch(orch, args, config):
+            tensor = args.tensor(0)
+            data = bytearray(ctypes.string_at(int(tensor.data), int(tensor.nbytes())))
+            data.reverse()
+            ctypes.memmove(int(tensor.data), bytes(data), len(data))
+
+        l3_cid = w4.register(l3_orch)
+        w4.add_remote_worker(endpoint)
+        w4.init()
+
+        def l4_orch(orch, args, config):
+            sub_args = TaskArgs()
+            tensor = ContinuousTensor.make(ctypes.addressof(buf), (len(payload),), DataType.UINT8)
+            sub_args.add_tensor(tensor, TensorArgType.INOUT)
+            orch.submit_next_level(l3_cid, sub_args, CallConfig())
+
+        w4.run(l4_orch)
+        w4.close()
+        assert bytes(buf.raw) == b"edcba\x00"
+    finally:
+        daemon.stop()
+
+
+def test_l4_remote_tensor_input_reaches_l3_sub(tmp_path):
+    result = tmp_path / "remote_sub_tensor_sum.txt"
+    payload = b"subtensor"
+    buf = ctypes.create_string_buffer(payload)
+    daemon, endpoint = _start_daemon()
+
+    try:
+        w4 = Worker(level=4, num_sub_workers=0)
+
+        def l3_sub(args):
+            tensor = args.tensor(0)
+            data = ctypes.string_at(int(tensor.data), int(tensor.nbytes()))
+            result.write_text(str(sum(data)))
+
+        l3_sub_cid = w4.register(l3_sub)
+
+        def l3_orch(orch, args, config):
+            orch.submit_sub(l3_sub_cid, args)
+
+        l3_cid = w4.register(l3_orch)
+        w4.add_remote_worker(endpoint)
+        w4.init()
+
+        def l4_orch(orch, args, config):
+            sub_args = TaskArgs()
+            tensor = ContinuousTensor.make(ctypes.addressof(buf), (len(payload),), DataType.UINT8)
+            sub_args.add_tensor(tensor, TensorArgType.INPUT)
+            orch.submit_next_level(l3_cid, sub_args, CallConfig())
+
+        w4.run(l4_orch)
+        w4.close()
+        assert int(result.read_text()) == sum(payload)
+    finally:
+        daemon.stop()
+
+
+def test_l4_remote_tensor_output_from_l3_sub_writeback():
+    payload = b"sub-output"
+    buf = ctypes.create_string_buffer(b"\x00" * len(payload))
+    daemon, endpoint = _start_daemon()
+
+    try:
+        w4 = Worker(level=4, num_sub_workers=0)
+
+        def l3_sub(args):
+            tensor = args.tensor(0)
+            ctypes.memmove(int(tensor.data), payload, len(payload))
+
+        l3_sub_cid = w4.register(l3_sub)
+
+        def l3_orch(orch, args, config):
+            orch.submit_sub(l3_sub_cid, args)
+
+        l3_cid = w4.register(l3_orch)
+        w4.add_remote_worker(endpoint)
+        w4.init()
+
+        def l4_orch(orch, args, config):
+            sub_args = TaskArgs()
+            tensor = ContinuousTensor.make(ctypes.addressof(buf), (len(payload),), DataType.UINT8)
+            sub_args.add_tensor(tensor, TensorArgType.OUTPUT_EXISTING)
+            orch.submit_next_level(l3_cid, sub_args, CallConfig())
+
+        w4.run(l4_orch)
+        w4.close()
+        assert bytes(buf.raw) == payload + b"\x00"
+    finally:
+        daemon.stop()
+
+
 def test_l4_remote_l3_multiple_subs(tmp_path):
     read_counter, add_counter = _make_file_counter(tmp_path / "remote_counter.txt")
     daemon, endpoint = _start_daemon()
@@ -233,3 +461,4 @@ def test_l4_remote_error_propagates():
             w4.close()
     finally:
         daemon.stop()
+

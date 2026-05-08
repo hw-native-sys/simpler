@@ -20,6 +20,8 @@
 
 namespace {
 
+constexpr uint32_t TASK_ARGS_TAGS_MAGIC = 0x534C3454;  // "SL4T"
+
 // Read the child-written error message from the mailbox, guaranteeing
 // NUL-termination even if the child wrote exactly MAILBOX_ERROR_MSG_SIZE
 // bytes without a terminator.
@@ -155,6 +157,7 @@ void WorkerThread::dispatch_thread(TaskSlotState &s, int32_t group_index) {
 void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     uint64_t callable = (s.worker_type == WorkerType::SUB) ? static_cast<uint64_t>(s.callable_id) : s.callable;
     TaskArgsView view = s.args_view(group_index);
+    const TaskArgs &source_args = s.is_group() ? s.task_args_list[static_cast<size_t>(group_index)] : s.task_args;
 
     // Clear the child-writable error fields so stale bytes from a prior
     // dispatch cannot masquerade as a fresh failure.
@@ -169,8 +172,12 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     std::memcpy(mbox() + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
 
     // Write length-prefixed TaskArgs blob: [T][S][tensors][scalars].
+    // A tagged extension [magic][int32 tags[T]] is appended for Python
+    // mailbox consumers. C++ read_blob ignores the trailing bytes and remains
+    // compatible with the historical tag-less TaskArgsView wire format.
     size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor) +
-                        static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
+                        static_cast<size_t>(view.scalar_count) * sizeof(uint64_t) + sizeof(uint32_t) +
+                        static_cast<size_t>(view.tensor_count) * sizeof(int32_t);
     if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
         throw std::runtime_error("WorkerThread::dispatch_process: args blob exceeds mailbox capacity");
     }
@@ -188,6 +195,13 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
             d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor),
             view.scalars, static_cast<size_t>(view.scalar_count) * sizeof(uint64_t)
         );
+    }
+    size_t tag_off = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor) +
+                     static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
+    std::memcpy(d + tag_off, &TASK_ARGS_TAGS_MAGIC, sizeof(uint32_t));
+    for (int32_t i = 0; i < view.tensor_count; ++i) {
+        int32_t tag = static_cast<int32_t>(source_args.tag(i));
+        std::memcpy(d + tag_off + sizeof(uint32_t) + static_cast<size_t>(i) * sizeof(int32_t), &tag, sizeof(int32_t));
     }
 
     // Signal child process.

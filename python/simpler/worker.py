@@ -78,6 +78,7 @@ from .task_interface import (
     ContinuousTensor,
     DataType,
     TaskArgs,
+    TensorArgType,
     _ChipWorker,
     _Worker,
 )
@@ -140,6 +141,7 @@ _CTRL_OFF_ARG0 = 16
 _CTRL_OFF_ARG1 = 24
 _CTRL_OFF_ARG2 = 32
 _CTRL_OFF_RESULT = 40
+_TASK_ARGS_TAGS_MAGIC = 0x534C3454  # "SL4T"
 
 
 def _mailbox_addr(shm: SharedMemory) -> int:
@@ -195,6 +197,7 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     Blob layout at _OFF_ARGS:
       int32 tensor_count (T), int32 scalar_count (S),
       ContinuousTensor[T] (40 B each), uint64_t[S] (8 B each).
+      Optional extension: uint32 magic "SL4T", int32 tags[T].
     """
     base = _OFF_ARGS
     t_count = struct.unpack_from("i", buf, base)[0]
@@ -207,6 +210,13 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
             f"args blob ({blob_bytes} bytes) exceeds mailbox capacity ({_MAILBOX_ARGS_CAPACITY} bytes); "
             f"tensors={t_count}, scalars={s_count} — likely a corrupt header or a writer bug"
         )
+    tag_values = None
+    tag_magic_off = base + blob_bytes
+    tag_blob_bytes = blob_bytes + 4 + t_count * 4
+    if tag_blob_bytes <= _MAILBOX_ARGS_CAPACITY:
+        magic = struct.unpack_from("I", buf, tag_magic_off)[0]
+        if magic == _TASK_ARGS_TAGS_MAGIC:
+            tag_values = [struct.unpack_from("i", buf, tag_magic_off + 4 + i * 4)[0] for i in range(t_count)]
 
     args = TaskArgs()
     ct_off = base + 8
@@ -217,7 +227,10 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
         ndims = struct.unpack_from("I", buf, off + 28)[0]
         dtype_val = struct.unpack_from("B", buf, off + 32)[0]
         ct = ContinuousTensor.make(data, tuple(shapes[:ndims]), DataType(dtype_val))
-        args.add_tensor(ct)
+        if tag_values is None:
+            args.add_tensor(ct)
+        else:
+            args.add_tensor(ct, TensorArgType(tag_values[i]))
 
     sc_off = ct_off + t_count * 40
     for i in range(s_count):

@@ -19,6 +19,12 @@ message ContinuousTensorRef {
 message TensorHandle {
   string node_id = 1;
   uint64 handle_id = 2;
+  uint64 remote_addr = 3;
+  uint32 rkey = 4;
+  uint64 nbytes = 5;
+  uint64 lease_deadline_unix_ms = 6;
+  string transport = 7;
+  bytes transport_desc = 8;
 }
 
 message TensorRef {
@@ -36,6 +42,23 @@ message TensorChunk {
   uint64 offset = 2;
   bytes data = 3;
   bool last = 4;
+}
+
+message TensorAllocReq {
+  uint64 nbytes = 1;
+  uint64 ttl_ms = 2;
+  repeated int64 shape = 10;
+  int32 dtype = 11;
+  int32 tag = 12;
+}
+
+message TensorFreeReq {
+  TensorHandle handle = 1;
+}
+
+message TensorRefreshReq {
+  TensorHandle handle = 1;
+  uint64 ttl_ms = 2;
 }
 
 message CallConfigWire {
@@ -87,6 +110,9 @@ service Catalog {
 }
 
 service TensorPool {
+  rpc AllocTensor(TensorAllocReq) returns (TensorHandle);
+  rpc FreeTensor(TensorFreeReq) returns (Empty);
+  rpc RefreshTensor(TensorRefreshReq) returns (TensorHandle);
   rpc PullTensor(TensorHandle) returns (stream TensorChunk);
   rpc PushTensor(stream TensorChunk) returns (TensorHandle);
 }

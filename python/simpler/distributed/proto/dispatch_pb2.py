@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0e\x64ispatch.proto\x12\x16simpler.distributed.v1\"\x07\n\x05\x45mpty\"%\n\x06Health\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"N\n\x13\x43ontinuousTensorRef\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x04\x12\r\n\x05shape\x18\x02 \x03(\x04\x12\r\n\x05\x64type\x18\x03 \x01(\r\x12\x0b\n\x03tag\x18\x04 \x01(\r\"2\n\x0cTensorHandle\x12\x0f\n\x07node_id\x18\x01 \x01(\t\x12\x11\n\thandle_id\x18\x02 \x01(\x04\"\x8f\x01\n\tTensorRef\x12\x15\n\x0binline_data\x18\x01 \x01(\x0cH\x00\x12\x36\n\x06handle\x18\x02 \x01(\x0b\x32$.simpler.distributed.v1.TensorHandleH\x00\x12\r\n\x05shape\x18\n \x03(\x03\x12\r\n\x05\x64type\x18\x0b \x01(\x05\x12\x0b\n\x03tag\x18\x0c \x01(\x05\x42\x08\n\x06source\"o\n\x0bTensorChunk\x12\x34\n\x06handle\x18\x01 \x01(\x0b\x32$.simpler.distributed.v1.TensorHandle\x12\x0e\n\x06offset\x18\x02 \x01(\x04\x12\x0c\n\x04\x64\x61ta\x18\x03 \x01(\x0c\x12\x0c\n\x04last\x18\x04 \x01(\x08\"\xa0\x01\n\x0e\x43\x61llConfigWire\x12\x11\n\tblock_dim\x18\x01 \x01(\x05\x12\x18\n\x10\x61icpu_thread_num\x18\x02 \x01(\x05\x12\x1a\n\x12\x65nable_l2_swimlane\x18\x03 \x01(\x08\x12\x1a\n\x12\x65nable_dump_tensor\x18\x04 \x01(\x08\x12\x12\n\nenable_pmu\x18\x05 \x01(\x05\x12\x15\n\routput_prefix\x18\x06 \x01(\t\"\xf1\x01\n\x0b\x44ispatchReq\x12\x0f\n\x07task_id\x18\x01 \x01(\x04\x12\x13\n\x0b\x63\x61llable_id\x18\x02 \x01(\x04\x12\x18\n\x10\x63\x61llable_version\x18\x03 \x01(\x04\x12\x13\n\x0b\x63onfig_blob\x18\x04 \x01(\x0c\x12\x13\n\x0bscalar_args\x18\x05 \x03(\x04\x12@\n\x0btensor_args\x18\x06 \x03(\x0b\x32+.simpler.distributed.v1.ContinuousTensorRef\x12\x36\n\x0btensor_refs\x18\x07 \x03(\x0b\x32!.simpler.distributed.v1.TensorRef\"\x9b\x01\n\x0c\x44ispatchResp\x12\x0f\n\x07task_id\x18\x01 \x01(\x04\x12\x12\n\nerror_code\x18\x02 \x01(\x05\x12\x11\n\terror_msg\x18\x03 \x01(\t\x12\x18\n\x10remote_traceback\x18\x04 \x03(\t\x12\x39\n\x0eoutput_tensors\x18\x05 \x03(\x0b\x32!.simpler.distributed.v1.TensorRef\"3\n\x0b\x43\x61llableRef\x12\x13\n\x0b\x63\x61llable_id\x18\x01 \x01(\x04\x12\x0f\n\x07version\x18\x02 \x01(\x04\"H\n\x0f\x43\x61llablePayload\x12\x13\n\x0b\x63\x61llable_id\x18\x01 \x01(\x04\x12\x0f\n\x07version\x18\x02 \x01(\x04\x12\x0f\n\x07pickled\x18\x03 \x01(\x0c\x32\xad\x01\n\x08L3Worker\x12U\n\x08\x44ispatch\x12#.simpler.distributed.v1.DispatchReq\x1a$.simpler.distributed.v1.DispatchResp\x12J\n\tHeartbeat\x12\x1d.simpler.distributed.v1.Empty\x1a\x1e.simpler.distributed.v1.Health2\xbf\x01\n\x07\x43\x61talog\x12\\\n\x0cPullCallable\x12#.simpler.distributed.v1.CallableRef\x1a\'.simpler.distributed.v1.CallablePayload\x12V\n\x0cPushCallable\x12\'.simpler.distributed.v1.CallablePayload\x1a\x1d.simpler.distributed.v1.Empty2\xc2\x01\n\nTensorPool\x12Y\n\nPullTensor\x12$.simpler.distributed.v1.TensorHandle\x1a#.simpler.distributed.v1.TensorChunk0\x01\x12Y\n\nPushTensor\x12#.simpler.distributed.v1.TensorChunk\x1a$.simpler.distributed.v1.TensorHandle(\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0e\x64ispatch.proto\x12\x16simpler.distributed.v1\"\x07\n\x05\x45mpty\"%\n\x06Health\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"N\n\x13\x43ontinuousTensorRef\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x04\x12\r\n\x05shape\x18\x02 \x03(\x04\x12\r\n\x05\x64type\x18\x03 \x01(\r\x12\x0b\n\x03tag\x18\x04 \x01(\r\"\xb0\x01\n\x0cTensorHandle\x12\x0f\n\x07node_id\x18\x01 \x01(\t\x12\x11\n\thandle_id\x18\x02 \x01(\x04\x12\x13\n\x0bremote_addr\x18\x03 \x01(\x04\x12\x0c\n\x04rkey\x18\x04 \x01(\r\x12\x0e\n\x06nbytes\x18\x05 \x01(\x04\x12\x1e\n\x16lease_deadline_unix_ms\x18\x06 \x01(\x04\x12\x11\n\ttransport\x18\x07 \x01(\t\x12\x16\n\x0etransport_desc\x18\x08 \x01(\x0c\"\x8f\x01\n\tTensorRef\x12\x15\n\x0binline_data\x18\x01 \x01(\x0cH\x00\x12\x36\n\x06handle\x18\x02 \x01(\x0b\x32$.simpler.distributed.v1.TensorHandleH\x00\x12\r\n\x05shape\x18\n \x03(\x03\x12\r\n\x05\x64type\x18\x0b \x01(\x05\x12\x0b\n\x03tag\x18\x0c \x01(\x05\x42\x08\n\x06source\"o\n\x0bTensorChunk\x12\x34\n\x06handle\x18\x01 \x01(\x0b\x32$.simpler.distributed.v1.TensorHandle\x12\x0e\n\x06offset\x18\x02 \x01(\x04\x12\x0c\n\x04\x64\x61ta\x18\x03 \x01(\x0c\x12\x0c\n\x04last\x18\x04 \x01(\x08\"[\n\x0eTensorAllocReq\x12\x0e\n\x06nbytes\x18\x01 \x01(\x04\x12\x0e\n\x06ttl_ms\x18\x02 \x01(\x04\x12\r\n\x05shape\x18\n \x03(\x03\x12\r\n\x05\x64type\x18\x0b \x01(\x05\x12\x0b\n\x03tag\x18\x0c \x01(\x05\"E\n\rTensorFreeReq\x12\x34\n\x06handle\x18\x01 \x01(\x0b\x32$.simpler.distributed.v1.TensorHandle\"X\n\x10TensorRefreshReq\x12\x34\n\x06handle\x18\x01 \x01(\x0b\x32$.simpler.distributed.v1.TensorHandle\x12\x0e\n\x06ttl_ms\x18\x02 \x01(\x04\"\xa0\x01\n\x0e\x43\x61llConfigWire\x12\x11\n\tblock_dim\x18\x01 \x01(\x05\x12\x18\n\x10\x61icpu_thread_num\x18\x02 \x01(\x05\x12\x1a\n\x12\x65nable_l2_swimlane\x18\x03 \x01(\x08\x12\x1a\n\x12\x65nable_dump_tensor\x18\x04 \x01(\x08\x12\x12\n\nenable_pmu\x18\x05 \x01(\x05\x12\x15\n\routput_prefix\x18\x06 \x01(\t\"\xf1\x01\n\x0b\x44ispatchReq\x12\x0f\n\x07task_id\x18\x01 \x01(\x04\x12\x13\n\x0b\x63\x61llable_id\x18\x02 \x01(\x04\x12\x18\n\x10\x63\x61llable_version\x18\x03 \x01(\x04\x12\x13\n\x0b\x63onfig_blob\x18\x04 \x01(\x0c\x12\x13\n\x0bscalar_args\x18\x05 \x03(\x04\x12@\n\x0btensor_args\x18\x06 \x03(\x0b\x32+.simpler.distributed.v1.ContinuousTensorRef\x12\x36\n\x0btensor_refs\x18\x07 \x03(\x0b\x32!.simpler.distributed.v1.TensorRef\"\x9b\x01\n\x0c\x44ispatchResp\x12\x0f\n\x07task_id\x18\x01 \x01(\x04\x12\x12\n\nerror_code\x18\x02 \x01(\x05\x12\x11\n\terror_msg\x18\x03 \x01(\t\x12\x18\n\x10remote_traceback\x18\x04 \x03(\t\x12\x39\n\x0eoutput_tensors\x18\x05 \x03(\x0b\x32!.simpler.distributed.v1.TensorRef\"3\n\x0b\x43\x61llableRef\x12\x13\n\x0b\x63\x61llable_id\x18\x01 \x01(\x04\x12\x0f\n\x07version\x18\x02 \x01(\x04\"H\n\x0f\x43\x61llablePayload\x12\x13\n\x0b\x63\x61llable_id\x18\x01 \x01(\x04\x12\x0f\n\x07version\x18\x02 \x01(\x04\x12\x0f\n\x07pickled\x18\x03 \x01(\x0c\x32\xad\x01\n\x08L3Worker\x12U\n\x08\x44ispatch\x12#.simpler.distributed.v1.DispatchReq\x1a$.simpler.distributed.v1.DispatchResp\x12J\n\tHeartbeat\x12\x1d.simpler.distributed.v1.Empty\x1a\x1e.simpler.distributed.v1.Health2\xbf\x01\n\x07\x43\x61talog\x12\\\n\x0cPullCallable\x12#.simpler.distributed.v1.CallableRef\x1a\'.simpler.distributed.v1.CallablePayload\x12V\n\x0cPushCallable\x12\'.simpler.distributed.v1.CallablePayload\x1a\x1d.simpler.distributed.v1.Empty2\xd4\x03\n\nTensorPool\x12[\n\x0b\x41llocTensor\x12&.simpler.distributed.v1.TensorAllocReq\x1a$.simpler.distributed.v1.TensorHandle\x12R\n\nFreeTensor\x12%.simpler.distributed.v1.TensorFreeReq\x1a\x1d.simpler.distributed.v1.Empty\x12_\n\rRefreshTensor\x12(.simpler.distributed.v1.TensorRefreshReq\x1a$.simpler.distributed.v1.TensorHandle\x12Y\n\nPullTensor\x12$.simpler.distributed.v1.TensorHandle\x1a#.simpler.distributed.v1.TensorChunk0\x01\x12Y\n\nPushTensor\x12#.simpler.distributed.v1.TensorChunk\x1a$.simpler.distributed.v1.TensorHandle(\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -37,26 +37,32 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_HEALTH']._serialized_end=88
   _globals['_CONTINUOUSTENSORREF']._serialized_start=90
   _globals['_CONTINUOUSTENSORREF']._serialized_end=168
-  _globals['_TENSORHANDLE']._serialized_start=170
-  _globals['_TENSORHANDLE']._serialized_end=220
-  _globals['_TENSORREF']._serialized_start=223
-  _globals['_TENSORREF']._serialized_end=366
-  _globals['_TENSORCHUNK']._serialized_start=368
-  _globals['_TENSORCHUNK']._serialized_end=479
-  _globals['_CALLCONFIGWIRE']._serialized_start=482
-  _globals['_CALLCONFIGWIRE']._serialized_end=642
-  _globals['_DISPATCHREQ']._serialized_start=645
-  _globals['_DISPATCHREQ']._serialized_end=886
-  _globals['_DISPATCHRESP']._serialized_start=889
-  _globals['_DISPATCHRESP']._serialized_end=1044
-  _globals['_CALLABLEREF']._serialized_start=1046
-  _globals['_CALLABLEREF']._serialized_end=1097
-  _globals['_CALLABLEPAYLOAD']._serialized_start=1099
-  _globals['_CALLABLEPAYLOAD']._serialized_end=1171
-  _globals['_L3WORKER']._serialized_start=1174
-  _globals['_L3WORKER']._serialized_end=1347
-  _globals['_CATALOG']._serialized_start=1350
-  _globals['_CATALOG']._serialized_end=1541
-  _globals['_TENSORPOOL']._serialized_start=1544
-  _globals['_TENSORPOOL']._serialized_end=1738
+  _globals['_TENSORHANDLE']._serialized_start=171
+  _globals['_TENSORHANDLE']._serialized_end=347
+  _globals['_TENSORREF']._serialized_start=350
+  _globals['_TENSORREF']._serialized_end=493
+  _globals['_TENSORCHUNK']._serialized_start=495
+  _globals['_TENSORCHUNK']._serialized_end=606
+  _globals['_TENSORALLOCREQ']._serialized_start=608
+  _globals['_TENSORALLOCREQ']._serialized_end=699
+  _globals['_TENSORFREEREQ']._serialized_start=701
+  _globals['_TENSORFREEREQ']._serialized_end=770
+  _globals['_TENSORREFRESHREQ']._serialized_start=772
+  _globals['_TENSORREFRESHREQ']._serialized_end=860
+  _globals['_CALLCONFIGWIRE']._serialized_start=863
+  _globals['_CALLCONFIGWIRE']._serialized_end=1023
+  _globals['_DISPATCHREQ']._serialized_start=1026
+  _globals['_DISPATCHREQ']._serialized_end=1267
+  _globals['_DISPATCHRESP']._serialized_start=1270
+  _globals['_DISPATCHRESP']._serialized_end=1425
+  _globals['_CALLABLEREF']._serialized_start=1427
+  _globals['_CALLABLEREF']._serialized_end=1478
+  _globals['_CALLABLEPAYLOAD']._serialized_start=1480
+  _globals['_CALLABLEPAYLOAD']._serialized_end=1552
+  _globals['_L3WORKER']._serialized_start=1555
+  _globals['_L3WORKER']._serialized_end=1728
+  _globals['_CATALOG']._serialized_start=1731
+  _globals['_CATALOG']._serialized_end=1922
+  _globals['_TENSORPOOL']._serialized_start=1925
+  _globals['_TENSORPOOL']._serialized_end=2393
 # @@protoc_insertion_point(module_scope)
