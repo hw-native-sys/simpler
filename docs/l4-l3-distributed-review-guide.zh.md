@@ -21,6 +21,51 @@
 - 生产设计中的 SO uRPC hot-path 协议栈。
 - UBL128/PC16/SSU 的配置驱动拓扑管理。
 
+## 术语表
+
+这张表只解释本文 review 里会反复出现的词，重点是帮助 reviewer 判断“当前代码实现的是哪一层能力”。
+
+| 术语 | 含义 | 在当前实现里的状态 |
+|------|------|--------------------|
+| L4 | Simpler runtime 的 level-4 orchestrator/parent worker 层，负责向下一层 worker 派发任务。 | 已实现远程 L3 派发入口；不是完整 serving frontend。 |
+| L3 | Simpler runtime 的 level-3 worker 层，接收 L4 派发的 task 并继续执行/下发。 | 远端由 `L3Daemon` + backend process 承载。 |
+| Worker | Simpler 的层级执行单元。L4/L3/L2 等层级通过 mailbox 或 RPC 组织任务。 | 当前复用本地 hierarchical worker 模型，并用 remote mailbox shim 接远端 L3。 |
+| L3Daemon | 远端 L3 的 gRPC server 进程，接收 dispatch、catalog、TensorPool RPC。 | 已实现；真正执行在 daemon 启动前 fork 出来的 backend process。 |
+| backend process | L3 daemon 后面的执行进程，持有 `Worker(level=3)`、`TensorPool` 和 transport backend。 | 已实现；避免在已有 gRPC 线程的进程里继续 fork worker。 |
+| 控制面 | 传 task 元数据、callable id、tensor handle、错误码、heartbeat 等小消息的路径。 | 当前主要是 gRPC + protobuf。 |
+| 数据面 | 传 tensor bytes 的路径。 | 当前支持 inline、gRPC chunk、RXE RDMA write，HCOMM 为可选适配。 |
+| Dispatch | L4 把一个 callable + args + config 发给 L3 执行的动作。 | 已实现 `DispatchReq/DispatchResp`。 |
+| Callable Catalog | callable 的分发/同步表。L4 注册 Python 函数后，把序列化 payload 推给 L3。 | 已实现；使用 `cloudpickle`，只适合受信任集群。 |
+| closure | Python 函数捕获的外部变量。 | 会被序列化到 L3；远端修改的是副本，不会改 L4 本地对象。 |
+| TensorPool | L3 backend 内部的 tensor byte storage 和 handle 管理器。 | 已实现；当前是进程内 bytearray storage，不是 UBL128 设计里的 SSU KV 存储。 |
+| TensorRef | dispatch 消息里的 tensor 参数描述，可能是 inline bytes，也可能指向 `TensorHandle`。 | 已实现。 |
+| TensorHandle | TensorPool/transport 返回的远端数据句柄，包含 shape、dtype、size、transport、transport_desc 等。 | 已实现。 |
+| inline tensor | 小 tensor 直接放进 protobuf 消息里传输。 | 已实现；由 inline threshold 控制。 |
+| transport backend | TensorPool 注册内存和搬运 bytes 的后端抽象。 | 已实现 `grpc`、`rxe`、`hcomm` 三类入口。 |
+| gRPC | 基于 HTTP/2 + protobuf 的通用 RPC。 | 当前控制面主路径；在 UBL128 设计里适合 DCN/运维/非 hot-path。 |
+| RDMA | Remote Direct Memory Access，远端直接内存访问，允许一端把数据直接写入/读出另一端注册内存。 | 当前 RXE helper 用 RDMA write 做实机数据面 smoke。 |
+| RoCE | RDMA over Converged Ethernet，在以太网上承载 RDMA verbs。 | 当前机器 `ibv_devices` 可见时用于 smoke；不是 UBL128 SO/UBG 生产路径。 |
+| RXE | Linux Soft-RoCE provider，用软件方式把普通以太网设备暴露成 RDMA verbs 设备。 | 当前用于开发/烟测真实 ibverbs 流程；性能和生产硬件 RoCE/UB 不是一回事。 |
+| ibverbs / verbs | Linux RDMA 用户态接口族，应用通过 verbs 创建 MR/QP/CQ 并发起 RDMA write/read。 | `rxe_verbs_helper.c` 直接使用。 |
+| MR / QP / CQ | RDMA 里的 Memory Region、Queue Pair、Completion Queue。 | RXE helper 内部使用；文档里不要求 reviewer 深入 verbs 细节。 |
+| HCOMM | 昇腾通信相关库/接口集合，这里作为可选通信后端候选。 | 当前只在 Simpler 侧做适配层，不依赖修改 `3rd/hcomm`。 |
+| CANN | 昇腾软件栈基础组件。 | HCOMM runtime 可能依赖；当前 L4/L3 主路径不依赖 NPU CANN 执行。 |
+| UB / UBG | UBL128 设计里的统一总线/Scale Out 物理协议族。 | 当前代码没有实现 UB/UBG。 |
+| Urma | UB 上的可靠内存访问语义层，类似面向 UB 网络的 RDMA。 | UBL128 目标路径；当前未实现。 |
+| uRPC | 基于 Urma 的轻量 RPC，用于 SO/SU hot-path 内部 RPC。 | UBL128 目标路径；当前未实现，当前用 gRPC 做原型。 |
+| DCN | 数据中心 RoCE/TCP 网络，CPU 可见，承载外部接入、运维和非 hot-path 服务。 | 当前 gRPC 原型可类比 DCN 控制路径。 |
+| SO | Scale Out 网络，跨 UBL128 的 NPU/CPU/SSU any-to-any 网络。 | UBL128 目标数据面/热控制面；当前未实现。 |
+| SU | Scale Up 网络，UBL128 域内 NPU 间高带宽网络，主要承载 EP/DP。 | 当前未实现。 |
+| UBL128 | 设计文档里的 128 NPU high bandwidth domain。 | 当前代码不感知该拓扑。 |
+| PC16 | 设计文档里的 16 NPU 服务器单元。 | 当前代码不感知该拓扑。 |
+| SSU / SSU12 | 设计文档里的 KV/prefix 持久化存储单元/机框。 | 当前未实现；不要和 TensorPool 混淆。 |
+| KV cache | LLM attention 的 key/value 缓存。 | UBL128 核心设计内容；当前 L4/L3 原型未实现 KV 语义。 |
+| Prefix cache | 按 token prefix 复用已计算 KV 的 cache。 | 当前未实现。 |
+| ChunkRecord | UBL128 KV Meta Server 返回的 KV block 元数据，描述每层 KV 在哪个 SSU/LBA。 | 当前未实现。 |
+| LBA | Logical Block Address，SSU 上无文件系统的块地址。 | 当前未实现。 |
+| HBM | NPU 高带宽显存。 | 当前 RXE smoke 传的是 host memory，不是 NPU HBM。 |
+| `INPUT` / `OUTPUT` / `INOUT` | Simpler tensor 参数方向 tag。 | 已支持远程参数语义；`INOUT` 尚未做完整双向 RXE fast path。 |
+
 ## 1. UBL128 Serving 总设计先做什么
 
 `UBL128_serving.md` 的目标是一个带 prefix cache 的 prefill/decode 解耦推理服务。它不是单个 runtime API，而是一套跨 CPU、NPU、SSU 存储和多张网络的完整 serving 系统。
