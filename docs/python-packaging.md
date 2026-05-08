@@ -132,7 +132,7 @@ The cmake build places `_task_interface.cpython-XYZ.so` directly into `python/` 
 | `pytest` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `python <test>.py` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-On macOS with `--system-site-packages`, set `KMP_DUPLICATE_LIB_OK=TRUE` if the system numpy is present and its libomp collides with torch's (see `docs/macos-libomp-collision.md`).
+On macOS with `--system-site-packages`, set `KMP_DUPLICATE_LIB_OK=TRUE` if the system numpy is present and its libomp collides with torch's (see `docs/troubleshooting/macos-libomp-collision.md`).
 
 ## Verification protocol when changing package structure
 

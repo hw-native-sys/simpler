@@ -18,6 +18,7 @@ If no sim build cache exists, the sim runtimes are built first:
 
 import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
@@ -31,11 +32,45 @@ _CACHE_DIR = _ROOT / "build" / "cache"
 from simpler_setup.platform_info import load_build_config, to_platform  # noqa: E402
 from simpler_setup.runtime_compiler import RuntimeCompiler  # noqa: E402
 
+
+def _macos_isysroot_args() -> list[str]:
+    """On macOS, Homebrew clang-tidy is built with a hard-coded default sysroot
+    (e.g. `MacOSX26.sdk`) that often does not exist on a fresh checkout. Without
+    the right sysroot the libc++ → libc include cascade breaks and any C++
+    header transitively pulling in `<wchar.h>` etc. fails — typical symptom is
+    `'algorithm' file not found`.
+
+    We inject two flags:
+      -isysroot $SDK                    → fixes the libc / framework lookup
+      -isystem $SDK/usr/include/c++/v1  → forces clang-tidy to use Apple SDK
+                                          libc++ instead of Homebrew's bundled
+                                          libc++ (driver default), so lint sees
+                                          the same C++ stdlib headers that the
+                                          Apple-Clang build actually compiles
+                                          against.
+
+    Apple Clang resolves the SDK via xcrun at runtime and needs no flag, so
+    both build and lint converge on the same headers. No-op on Linux.
+    """
+    if platform.system() != "Darwin":
+        return []
+    try:
+        sdk_path = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return []
+    if not sdk_path:
+        return []
+    return [
+        f"--extra-arg=-isysroot{sdk_path}",
+        f"--extra-arg=-isystem{sdk_path}/usr/include/c++/v1",
+    ]
+
+
 # Suppress compiler flags that are valid for GCC but unknown to clang.
 _SUPPRESS_ARGS = [
     "--extra-arg=-Wno-unknown-warning-option",
     "--extra-arg=-Wno-unused-command-line-argument",
-]
+] + _macos_isysroot_args()
 
 # GCC-only flags to strip from compile_commands.json before passing to clang-tidy.
 _GCC_ONLY_FLAGS = {"-fno-gnu-unique"}

@@ -31,7 +31,7 @@ import sys
 
 # Workaround for the duplicate-libomp abort when homebrew numpy and pip torch
 # coexist in one macOS process. Harmless on Linux. Must be set before
-# ``import torch``. See docs/macos-libomp-collision.md.
+# ``import torch``. See docs/troubleshooting/macos-libomp-collision.md.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import torch  # noqa: E402

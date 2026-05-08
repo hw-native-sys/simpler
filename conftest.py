@@ -41,7 +41,7 @@ setattr(logging, "NULL", 60)
 
 # macOS libomp collision workaround — must run before any import that may
 # transitively load numpy or torch (i.e. before pytest collects scene test
-# goldens). See docs/macos-libomp-collision.md.
+# goldens). See docs/troubleshooting/macos-libomp-collision.md.
 if sys.platform == "darwin":
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
