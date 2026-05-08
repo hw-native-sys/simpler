@@ -43,7 +43,9 @@
  * For tensormap_and_ringbuffer, AICPU overwrites with the full (ring_id << 32) | local_id
  * encoding after handshake match.
  *
- * @param ring Per-core staging ring pointer (from Handshake::l2_perf_aicore_ring_addr)
+ * @param ring Per-core staging ring pointer (resolved at AICore kernel
+ *             entry from KernelArgs::aicore_ring_addr[block_idx] via
+ *             set_aicore_l2_perf_ring()/get_aicore_l2_perf_ring())
  * @param task_id Register dispatch id (DATA_MAIN_BASE), stored in task_id low 32 bits
  * @param start_time Start timestamp
  * @param end_time End timestamp

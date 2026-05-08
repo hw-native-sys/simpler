@@ -244,7 +244,7 @@ private:
     void *aicpu_so_handle_{nullptr};
     void *aicore_so_handle_{nullptr};
     int (*aicpu_execute_func_)(Runtime *){nullptr};
-    void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t){nullptr};
+    void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t){nullptr};
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_dump_tensor_enabled_func_)(bool){nullptr};

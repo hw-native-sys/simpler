@@ -209,6 +209,25 @@ int L2PerfCollector::initialize(
         num_aicore * (PLATFORM_PROF_BUFFERS_PER_CORE - 1)
     );
 
+    // Step 5b: Standalone uint64_t[num_aicore] table holding per-core ring
+    // addresses. AICore reads ring_table[block_idx] via KernelArgs::aicore_ring_addr
+    // and feeds it into the platform's set_l2_perf_aicore_ring().
+    {
+        size_t table_bytes = static_cast<size_t>(num_aicore) * sizeof(uint64_t);
+        void *ring_table_host = nullptr;
+        void *ring_table_dev = alloc_single_buffer(table_bytes, &ring_table_host);
+        if (ring_table_dev == nullptr) {
+            LOG_ERROR("Failed to allocate aicore_ring_addr table (%zu bytes)", table_bytes);
+            return -1;
+        }
+        uint64_t *ring_table = reinterpret_cast<uint64_t *>(ring_table_host);
+        for (int i = 0; i < num_aicore; i++) {
+            L2PerfBufferState *state = get_perf_buffer_state(perf_host_ptr, i);
+            ring_table[i] = state->aicore_ring_ptr;
+        }
+        aicore_ring_addr_table_dev_ = ring_table_dev;
+    }
+
     // Step 6: Initialize PhaseBufferStates — 1 buffer per thread in free_queue, rest to recycled pool
     for (int t = 0; t < num_phase_threads; t++) {
         PhaseBufferState *state = get_phase_buffer_state(perf_host_ptr, num_aicore, t);
@@ -806,6 +825,12 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
     stop();
 
     LOG_DEBUG("Cleaning up performance profiling resources");
+
+    // Free standalone aicore_ring_addr table
+    if (aicore_ring_addr_table_dev_ != nullptr && free_cb != nullptr) {
+        free_cb(aicore_ring_addr_table_dev_, user_data);
+        aicore_ring_addr_table_dev_ = nullptr;
+    }
 
     // Release framework-owned buffers (recycled pools, done_queue, ready_queue).
     // These were not consumed via the AICPU side, so the per-pool free_queue

@@ -64,6 +64,12 @@ extern "C" {
  * - pmu_data_base: Written by host platform, read by AICPU platform layer;
  *   zero when PMU is unused
  *
+ * enable_profiling_flag bit definitions (umbrella bitmask — "profiling" is
+ * the umbrella, each bit is a parallel diagnostics sub-feature):
+ * - bit0: tensor dump enabled
+ * - bit1: L2 swimlane enabled
+ * - bit2: PMU enabled
+ *
  * Field Access Patterns:
  *       - AICPU: receives KernelArgs* via DynTileFwkBackendKernelServer
  *       - AICore: receives KernelArgs* via KERNEL_ENTRY
@@ -74,12 +80,17 @@ struct KernelArgs {
     __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
     uint64_t ffts_base_addr{0};                             // FFTS base address for AICore
-    uint64_t dump_data_base{0};     // Dump shared memory base address; use explicit flags to detect enablement
-    uint64_t l2_perf_data_base{0};  // L2 perf shared memory base address; use explicit flags to detect enablement
-    uint64_t pmu_data_base{0};      // PMU shared memory base address; use explicit flags to detect enablement
-    uint64_t pmu_reg_addrs{0};      // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
-    uint32_t log_level{1};          // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
-    uint32_t log_info_v{5};         // INFO verbosity threshold (0..9); default V5
+    uint64_t dump_data_base{0};         // Dump shared memory base address; use explicit flags to detect enablement
+    uint64_t l2_perf_data_base{0};      // L2 perf shared memory base address; use explicit flags to detect enablement
+    uint64_t pmu_data_base{0};          // PMU shared memory base address; use explicit flags to detect enablement
+    uint64_t pmu_reg_addrs{0};          // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
+    uint64_t aicore_ring_addr{0};       // Device ptr to a uint64_t[num_aicore] table holding each core's
+                                        // L2PerfAicoreRing address. AICore kernel entry indexes by block_idx
+                                        // and forwards into platform set/get state. 0 when L2 swimlane is off.
+    uint32_t log_level{1};              // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
+    uint32_t log_info_v{5};             // INFO verbosity threshold (0..9); default V5
+    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
+    uint32_t _pad{0};                   // Alignment padding
 };
 
 #ifdef __cplusplus

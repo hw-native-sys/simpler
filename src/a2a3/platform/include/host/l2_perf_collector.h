@@ -302,6 +302,16 @@ public:
     void *get_l2_perf_setup_device_ptr() const { return perf_shared_mem_dev_; }
 
     /**
+     * Device pointer to a uint64_t[num_aicore] table where each entry is
+     * `L2PerfBufferState[i].aicore_ring_ptr`. Allocated and populated by
+     * initialize(); freed by finalize(). Set kernel_args.aicore_ring_addr
+     * to this so the AICore kernel entry can index by block_idx and feed
+     * the per-core ring into the platform's set_l2_perf_aicore_ring().
+     * Returns nullptr before initialize() succeeds.
+     */
+    void *get_aicore_ring_addr_table_device_ptr() const { return aicore_ring_addr_table_dev_; }
+
+    /**
      * Read AICPU phase metadata that lives in AicpuPhaseHeader (not on the
      * buffer pipeline): the orchestrator summary and core→thread mapping.
      * Single-shot — must be called after stop() so orch_summary has settled.
@@ -330,6 +340,11 @@ private:
     // (set via set_memory_context in initialize()).
     void *perf_shared_mem_dev_{nullptr};
     bool was_registered_{false};
+
+    // Standalone uint64_t[num_aicore] table holding per-core L2PerfAicoreRing
+    // addresses. Allocated in initialize(), freed in finalize(). AICore reads
+    // ring_table[block_idx] via KernelArgs::aicore_ring_addr.
+    void *aicore_ring_addr_table_dev_{nullptr};
 
     int num_aicore_{0};
 

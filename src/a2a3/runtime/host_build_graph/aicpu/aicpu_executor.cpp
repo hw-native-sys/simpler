@@ -319,12 +319,8 @@ int AicpuExecutor::init(Runtime *runtime) {
         core_id_to_reg_addr_[i] = 0;
     }
 
-    // L2Perf init must run BEFORE handshake_all_cores so AICore observes a
-    // non-zero l2_perf_aicore_ring_addr the moment aicpu_ready=1 unblocks
-    // its Phase 1 spin. AICore caches the ring address once after Phase 3
-    // and never re-reads it.
     if (is_l2_swimlane_enabled()) {
-        l2_perf_aicpu_init_profiling(runtime);
+        l2_perf_aicpu_init(runtime->worker_count);
     }
 
     // Perform core discovery: handshake with all cores and collect core type information

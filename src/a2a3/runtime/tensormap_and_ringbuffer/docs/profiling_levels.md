@@ -229,8 +229,8 @@ Thread X:   overlap checks : XXX, hits=XXX (XX.X%)
 
 ## Runtime Flag: enable_l2_swimlane
 
-L2 swimlane enablement is published through the handshake
-`enable_profiling_flag` bitmask (bit1 = `PROFILING_FLAG_L2_SWIMLANE`).
+L2 swimlane enablement is published through the
+`KernelArgs::enable_profiling_flag` bitmask (bit1 = `PROFILING_FLAG_L2_SWIMLANE`).
 AICPU code reads it via `is_l2_swimlane_enabled()` (set at launch time
 by the platform from `kernel_args.l2_perf_data_base` + the bitmask). It
 controls **data collection**, NOT log output.

@@ -20,7 +20,6 @@
 #define PLATFORM_AICPU_L2_PERF_COLLECTOR_AICPU_H_
 
 #include "common/l2_perf_profiling.h"
-#include "runtime.h"
 
 // Include platform-specific timestamp implementation
 // Build system selects the correct inner_aicpu.h based on platform:
@@ -31,7 +30,7 @@
 
 /**
  * L2 perf handshake setters — called by the host (sim) or the AICPU kernel
- * entry (onboard) before `l2_perf_aicpu_init_profiling()` so AICPU code can
+ * entry (onboard) before `l2_perf_aicpu_init()` so AICPU code can
  * read perf state without reaching into the generic `Runtime` struct.
  */
 extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base);
@@ -44,10 +43,15 @@ extern "C" bool is_l2_swimlane_enabled();
  *
  * Sets up double buffers for each core and initializes tracking state.
  * Reads the perf device-base pointer published via `set_platform_l2_perf_base()`.
+ * AICPU caches each core's stable AICore staging-ring address from
+ * `L2PerfBufferState[i].aicore_ring_ptr` (host populated it before AICPU
+ * started). AICore receives the same per-core ring through
+ * `KernelArgs::aicore_ring_addr` + `set_aicore_l2_perf_ring()`, so this
+ * routine no longer touches runtime's Handshake.
  *
- * @param runtime Runtime instance pointer (used for worker_count / task_count only)
+ * @param worker_count  Number of AICore workers (cores) to initialize
  */
-void l2_perf_aicpu_init_profiling(Runtime *runtime);
+void l2_perf_aicpu_init(int worker_count);
 
 /**
  * Complete a L2PerfRecord with AICPU-side metadata after AICore task completion
@@ -101,12 +105,13 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
  * Initialize AICPU phase profiling
  *
  * Sets up AicpuPhaseHeader and clears per-thread phase record buffers.
- * Must be called once from thread 0 after l2_perf_aicpu_init_profiling().
+ * Must be called once from thread 0 after l2_perf_aicpu_init().
  *
- * @param runtime Runtime instance pointer
- * @param num_sched_threads Number of scheduler threads
+ * @param worker_count       Number of AICore workers (cores) — used to resolve
+ *                           the phase region's offset relative to the L2Perf base
+ * @param num_sched_threads  Number of scheduler threads
  */
-void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads);
+void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads);
 
 /**
  * Record a single scheduler phase

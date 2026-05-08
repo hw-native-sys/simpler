@@ -95,7 +95,7 @@ static int enqueue_ready_buffer(
     return 0;
 }
 
-void l2_perf_aicpu_init_profiling(Runtime *runtime) {
+void l2_perf_aicpu_init(int worker_count) {
     void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
     if (l2_perf_base == nullptr) {
         LOG_ERROR("l2_perf_data_base is NULL, cannot initialize profiling");
@@ -104,21 +104,20 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime) {
 
     s_l2_perf_header = get_l2_perf_header(l2_perf_base);
 
-    LOG_INFO_V0("Initializing performance profiling for %d cores (free queue)", runtime->worker_count);
+    LOG_INFO_V0("Initializing performance profiling for %d cores (free queue)", worker_count);
 
     // Pop first buffer from free_queue for each core
-    for (int i = 0; i < runtime->worker_count; i++) {
-        Handshake *h = &runtime->workers[i];
+    for (int i = 0; i < worker_count; i++) {
         L2PerfBufferState *state = get_perf_buffer_state(l2_perf_base, i);
 
         s_perf_buffer_states[i] = state;
 
         // Cache the per-core staging ring (host populated state->aicore_ring_ptr
-        // before the AICPU started). Publish it to the handshake so AICore can
-        // read it on every record_task call.
+        // before the AICPU started). AICore receives the same per-core ring via
+        // KernelArgs::aicore_ring_addr + set_aicore_l2_perf_ring() — no
+        // handshake hop, so this routine doesn't republish anything.
         L2PerfAicoreRing *ring = reinterpret_cast<L2PerfAicoreRing *>(state->aicore_ring_ptr);
         s_perf_aicore_rings[i] = ring;
-        h->l2_perf_aicore_ring_addr = state->aicore_ring_ptr;
 
         // Pop first buffer from free_queue
         rmb();
@@ -147,7 +146,7 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime) {
 
     wmb();
 
-    LOG_INFO_V0("Performance profiling initialized for %d cores", runtime->worker_count);
+    LOG_INFO_V0("Performance profiling initialized for %d cores", worker_count);
 }
 
 /**
@@ -361,14 +360,14 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
     LOG_INFO_V0("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
-void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads) {
+void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads) {
     void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
     if (l2_perf_base == nullptr) {
         LOG_ERROR("l2_perf_data_base is NULL, cannot initialize phase profiling");
         return;
     }
 
-    s_phase_header = get_phase_header(l2_perf_base, runtime->worker_count);
+    s_phase_header = get_phase_header(l2_perf_base, worker_count);
     s_l2_perf_header = get_l2_perf_header(l2_perf_base);
 
     s_phase_header->magic = AICPU_PHASE_MAGIC;
@@ -386,7 +385,7 @@ void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads)
         total_threads = PLATFORM_MAX_AICPU_THREADS;
     }
     for (int t = 0; t < total_threads; t++) {
-        PhaseBufferState *state = get_phase_buffer_state(l2_perf_base, runtime->worker_count, t);
+        PhaseBufferState *state = get_phase_buffer_state(l2_perf_base, worker_count, t);
 
         s_phase_buffer_states[t] = state;
 

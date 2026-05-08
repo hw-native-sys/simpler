@@ -43,7 +43,8 @@
 // Function pointer types for dynamically loaded executors
 typedef int (*aicpu_execute_func_t)(Runtime *runtime);
 typedef void (*aicore_execute_func_t)(
-    Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs
+    Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
+    uint32_t enable_profiling_flag, uint64_t aicore_ring_addr
 );
 typedef void (*set_platform_regs_func_t)(uint64_t regs);
 typedef void (*set_platform_dump_base_func_t)(uint64_t dump_data_base);
@@ -232,9 +233,8 @@ int DeviceRunner::ensure_binaries_loaded(
             return -1;
         }
 
-        aicore_execute_func_ = reinterpret_cast<void (*)(Runtime *, int, CoreType, uint32_t, uint64_t)>(
-            dlsym(aicore_so_handle_, "aicore_execute_wrapper")
-        );
+        aicore_execute_func_ =
+            reinterpret_cast<aicore_execute_func_t>(dlsym(aicore_so_handle_, "aicore_execute_wrapper"));
         if (aicore_execute_func_ == nullptr) {
             LOG_ERROR("dlsym failed for aicore_execute_wrapper: %s", dlerror());
             return -1;
@@ -350,6 +350,7 @@ int DeviceRunner::run(
     if (enable_pmu_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
+    kernel_args_.enable_profiling_flag = enable_profiling_flag;
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -357,7 +358,6 @@ int DeviceRunner::run(
         runtime.workers[i].task = 0;
         // First 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
-        runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
     }
 
     // Set function_bin_addr for each task: func_id_to_addr_[] stores CoreCallable
@@ -562,7 +562,10 @@ int DeviceRunner::run(
         CoreType core_type = runtime.workers[i].core_type;
         uint32_t physical_core_id = static_cast<uint32_t>(i);
         aicore_threads.push_back(create_thread([this, &runtime, i, core_type, physical_core_id]() {
-            aicore_execute_func_(&runtime, i, core_type, physical_core_id, kernel_args_.regs);
+            aicore_execute_func_(
+                &runtime, i, core_type, physical_core_id, kernel_args_.regs, kernel_args_.enable_profiling_flag,
+                kernel_args_.aicore_ring_addr
+            );
         }));
     }
 
@@ -902,6 +905,8 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     }
 
     kernel_args_.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
+    kernel_args_.aicore_ring_addr =
+        reinterpret_cast<uint64_t>(l2_perf_collector_.get_aicore_ring_addr_table_device_ptr());
     return 0;
 }
 
