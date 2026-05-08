@@ -178,13 +178,53 @@ def pytest_addoption(parser):
 
 def _install_session_timeout(timeout_s: int) -> None:
     def _handler(signum, frame):
+        from simpler_setup import parallel_scheduler as _ps  # noqa: PLC0415
+
         print(
-            f"\n{'=' * 40}\n"
-            f"[pytest] TIMEOUT: session exceeded {timeout_s}s "
-            f"({timeout_s // 60}min) limit, aborting\n"
-            f"{'=' * 40}",
+            f"\n{'=' * 40}\n[pytest] TIMEOUT: session exceeded {timeout_s}s ({timeout_s // 60}min) limit\n{'=' * 40}",
             flush=True,
         )
+
+        # If the dispatcher is mid-flight, surface every stuck child:
+        # 1. SIGUSR1 each pid so its faulthandler dumps all-thread tracebacks
+        #    (Python + C frames) into its own stdout — pumped into output_lines.
+        # 2. Briefly let pumps drain those bytes before we tear everything down.
+        # 3. Print each in-flight job's tail buffer in a HUNG group so the log
+        #    contains the actual cause, not just the timeout banner.
+        # 4. SIGTERM/SIGKILL the children so they don't outlive us as orphans
+        #    holding NPU device state.
+        state = _ps._active_state
+        if state is not None and state.running:
+            for p in list(state.running):
+                try:
+                    if hasattr(signal, "SIGUSR1"):
+                        p.send_signal(signal.SIGUSR1)
+                except (ProcessLookupError, OSError):
+                    pass
+
+            time.sleep(2.0)
+
+            now = time.monotonic()
+            for p, rj in list(state.running.items()):
+                elapsed = now - rj.start_time
+                tail = "".join(rj.output_lines[-200:])
+                print(
+                    f"::group::HUNG {rj.job.label} pid={p.pid} devices={rj.device_ids} elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+                if tail:
+                    print(tail, end="" if tail.endswith("\n") else "\n", flush=True)
+                print("::endgroup::", flush=True)
+                print(
+                    f"*** HUNG: {rj.job.label} (devices={rj.device_ids}) — expand group above ***",
+                    flush=True,
+                )
+
+            try:
+                _ps._terminate_all(state)
+            except Exception:  # noqa: BLE001
+                pass
+
         os._exit(TIMEOUT_EXIT_CODE)
 
     # signal.alarm / SIGALRM are Unix-only; skip silently on platforms without
@@ -192,6 +232,30 @@ def _install_session_timeout(timeout_s: int) -> None:
     if hasattr(signal, "alarm") and hasattr(signal, "SIGALRM"):
         signal.signal(signal.SIGALRM, _handler)
         signal.alarm(timeout_s)
+
+
+def _install_child_faulthandler() -> None:
+    """In dispatched child pytest processes, let SIGUSR1 dump all-thread stacks.
+
+    The parent dispatcher's session-timeout handler sends SIGUSR1 to every
+    in-flight child before tearing the run down. ``faulthandler.register``
+    runs in the C signal handler, so it works even when the main thread is
+    blocked inside a native call that doesn't release the GIL (NPU runtime,
+    nanobind into C++) — exactly the case Python-level watchdogs miss.
+
+    Always-on ``faulthandler.enable()`` also gives us a stack on real crashes
+    (SIGSEGV/SIGABRT) instead of a silent exit.
+    """
+    import faulthandler  # noqa: PLC0415
+
+    faulthandler.enable()
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            faulthandler.register(signal.SIGUSR1, chain=False, all_threads=True)
+        except (ValueError, RuntimeError):
+            # Fails when stdout/stderr can't be duped (rare in child subprocs);
+            # leave faulthandler.enable() in place and continue.
+            pass
 
 
 def pytest_configure(config):
@@ -239,6 +303,13 @@ def pytest_configure(config):
     timeout = config.getoption("--pto-session-timeout")
     if timeout and timeout > 0:
         _install_session_timeout(timeout)
+
+    # Always register SIGUSR1 → faulthandler. In dispatched child pytest
+    # processes this is what the parent's session-timeout handler relies on
+    # to extract a stack from a hung run. In the parent dispatcher itself
+    # it's harmless and lets a developer query "what is this process doing?"
+    # interactively with `kill -USR1 <pid>`.
+    _install_child_faulthandler()
 
     # xdist worker: bind this process to a single device id from the --device range.
     # The dispatcher (or the user) supplies --device 0-7; xdist spawns N workers

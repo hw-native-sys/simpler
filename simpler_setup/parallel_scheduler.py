@@ -79,6 +79,13 @@ class _RunState:
     cancelled: bool = False
 
 
+# Module-global handle to the active _RunState while run_jobs is in flight.
+# Read by conftest's session-timeout SIGALRM handler so it can SIGUSR1 every
+# stuck child and dump their captured buffers before tearing the parent down.
+# At most one run_jobs is active at a time (the dispatcher is single-threaded).
+_active_state: _RunState | None = None
+
+
 def _device_range_str(ids: list[int]) -> str:
     """Format a device-id list as a CLI-friendly range or comma list.
 
@@ -176,7 +183,12 @@ def run_jobs(
                 f"{len(device_ids)}; widen --device range or shrink the case's device_count"
             )
 
+    # Module-global is intentional: the conftest SIGALRM handler runs in a
+    # signal context with no reference to this function's locals, so it has
+    # to find the in-flight state through a known module attribute.
+    global _active_state  # noqa: PLW0603
     state = _RunState(free_devices=list(device_ids))
+    _active_state = state
     queue = list(jobs)
 
     def _pump_stdout(p: subprocess.Popen, sink: list[str]) -> None:
@@ -230,6 +242,13 @@ def run_jobs(
             start_time=time.monotonic(),
             output_lines=output_lines,
             pump_thread=pump,
+        )
+        # Emit at launch (not just at completion) so a hung child is locatable:
+        # the last START without a matching PASS/FAIL line in _emit_group output
+        # is the case that's stuck.
+        print(
+            f"[scheduler] START {head.label} pid={p.pid} devices={allocated}",
+            flush=True,
         )
         return True
 
@@ -311,6 +330,7 @@ def run_jobs(
                         duration_s=duration,
                     )
                 )
+        _active_state = None
 
     return state.results
 
