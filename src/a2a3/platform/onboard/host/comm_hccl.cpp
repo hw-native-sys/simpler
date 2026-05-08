@@ -25,6 +25,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+#include <memory>
+#endif
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -35,6 +38,9 @@
 #include "acl/acl.h"
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+#include "pto/npu/comm/async/sdma/sdma_workspace_manager.hpp"
+#endif
 
 using CommTopo = uint32_t;
 
@@ -291,6 +297,9 @@ struct CommHandle_ {
     CommContext host_ctx{};
     CommContext *device_ctx = nullptr;
     bool owns_device_ctx = false;
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
+#endif
 };
 
 // ============================================================================
@@ -620,7 +629,22 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t /*win_size*/, uint64_t *d
             h->host_ctx.windowsIn[i] = remoteInfo.windowsIn;
             h->host_ctx.windowsOut[i] = remoteInfo.windowsOut;
         }
+    }
 
+    bool need_device_ctx_copy = topoType != COMM_TOPO_MESH;
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    h->sdma_workspace = std::make_unique<pto::comm::sdma::SdmaWorkspaceManager>();
+    if (!h->sdma_workspace->Init()) {
+        fprintf(stderr, "[comm rank %d] SDMA workspace initialization failed\n", h->rank);
+        h->sdma_workspace.reset();
+        return -1;
+    }
+    h->host_ctx.workSpace = reinterpret_cast<uint64_t>(h->sdma_workspace->GetWorkspaceAddr());
+    h->host_ctx.workSpaceSize = 16 * 1024;
+    need_device_ctx_copy = true;
+#endif
+
+    if (need_device_ctx_copy) {
         void *newDevMem = nullptr;
         aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
         if (aRet != ACL_SUCCESS) return -1;
