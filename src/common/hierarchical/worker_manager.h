@@ -16,18 +16,11 @@
  * Provides idle-worker selection and dispatch to the Scheduler.
  * The Scheduler drives the DAG; the Manager drives the workers.
  *
- * Each WorkerThread operates in one of two modes:
- *
- *   THREAD  — calls `worker_->run(callable, view, config)` directly in
- *             the parent process.
- *   PROCESS — encodes `(callable, config, args_blob)` into a pre-forked
- *             child's shared-memory mailbox, signals TASK_READY, and
- *             spin-polls TASK_DONE. The child process loop (Python) reads
- *             the mailbox and calls the appropriate IWorker / Python
- *             callable in its own address space.
- *
- * PROCESS mode absorbs the logic that used to live in the standalone
- * `ChipProcess` and `SubWorker` classes (deleted in PR-D-2).
+ * Each WorkerThread encodes `(callable, config, args_blob)` into a
+ * pre-forked child's shared-memory mailbox, signals TASK_READY, and
+ * spin-polls TASK_DONE. The child process loop (Python) reads the
+ * mailbox and calls the appropriate IWorker / Python callable in its
+ * own address space.
  */
 
 #pragma once
@@ -57,8 +50,7 @@ class WorkerManager;
 //
 // One layout for both NEXT_LEVEL (chip) and SUB workers. SUB children
 // read `callable` as a uint64 encoding the callable_id and ignore
-// config + args_blob. Matches the former ChipProcess layout at the
-// byte level so the chip child loop in Python needs no offset changes.
+// config + args_blob.
 
 enum class MailboxState : int32_t {
     IDLE = 0,
@@ -131,13 +123,11 @@ struct WorkerDispatch {
 };
 
 // =============================================================================
-// WorkerThread — one worker, one std::thread, two execution modes.
+// WorkerThread — one worker, one std::thread, mailbox-IPC dispatch.
 // =============================================================================
 
 class WorkerThread {
 public:
-    enum class Mode { THREAD, PROCESS };
-
     WorkerThread() = default;
     ~WorkerThread() { stop(); }
     WorkerThread(const WorkerThread &) = delete;
@@ -145,12 +135,9 @@ public:
 
     // Start the worker thread.
     //
-    // THREAD mode: `worker` is called directly via `worker->run(...)`.
-    //   `mailbox` must be nullptr.
-    //
-    // PROCESS mode: `worker` is nullptr (the real IWorker lives in the
-    //   forked child). `mailbox` points to a MAILBOX_SIZE-byte
-    //   MAP_SHARED region managed by the Python facade.
+    // `mailbox` points to a MAILBOX_SIZE-byte MAP_SHARED region managed
+    // by the Python facade — the real IWorker lives in the forked child
+    // and consumes the mailbox via `_chip_process_loop` / `_sub_worker_loop`.
     //
     // `ring` is a borrowed pointer to the engine's slot-state pool —
     // the thread reads callable/args/config from
@@ -158,10 +145,7 @@ public:
     // on_complete(slot) is called (in the WorkerThread) after each run().
     // `manager` is a borrowed pointer used to report dispatch failures
     // (exception_ptr routed out of the worker thread to the orch thread).
-    void start(
-        Mode mode, IWorker *worker, Ring *ring, WorkerManager *manager,
-        const std::function<void(TaskSlot)> &on_complete, void *mailbox = nullptr
-    );
+    void start(Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete, void *mailbox);
 
     // Enqueue a dispatch for the worker. Non-blocking.
     void dispatch(WorkerDispatch d);
@@ -171,23 +155,24 @@ public:
 
     void stop();
 
-    // PROCESS mode only: write SHUTDOWN to the mailbox so the child
-    // process exits its loop. No-op in THREAD mode. Does NOT waitpid —
-    // the Python facade owns the child PID.
+    // Write SHUTDOWN to the mailbox so the child process exits its loop.
+    // Does NOT waitpid — the Python facade owns the child PID.
     void shutdown_child();
 
     // Memory control — callable from the orch thread while the worker
-    // thread may be running a task (MemoryAllocator is mutex-protected).
-    // THREAD mode: direct call on the ChipWorker.
-    // PROCESS mode: control command via mailbox (blocks until child responds).
+    // thread may be running a task. Issues a control command via the
+    // mailbox and blocks until the child responds.
+    //
+    // The mailbox is a single shared region; dispatch_process and the
+    // control_* methods both write its state field. They serialize on
+    // `mailbox_mu_` so a control request issued mid-dispatch waits for
+    // TASK_DONE before claiming the mailbox.
     uint64_t control_malloc(size_t size);
     void control_free(uint64_t ptr);
     void control_copy_to(uint64_t dst, uint64_t src, size_t size);
     void control_copy_from(uint64_t dst, uint64_t src, size_t size);
 
 private:
-    Mode mode_{Mode::THREAD};
-    IWorker *worker_{nullptr};
     Ring *ring_{nullptr};
     WorkerManager *manager_{nullptr};
     void *mailbox_{nullptr};
@@ -200,9 +185,18 @@ private:
     bool shutdown_{false};
     std::atomic<bool> idle_{true};
 
+    // Serializes parent-side mailbox access between this WorkerThread's
+    // dispatch loop and the orch-thread control_* path. Per-WorkerThread,
+    // so different workers can dispatch in parallel.
+    std::mutex mailbox_mu_;
+
     void loop();
-    void dispatch_thread(TaskSlotState &s, int32_t group_index);
     void dispatch_process(TaskSlotState &s, int32_t group_index);
+
+    // Common tail for the four control_* methods. Caller writes the args
+    // region and holds `mailbox_mu_`; this helper signals the child,
+    // spin-polls CONTROL_DONE, and throws on a non-zero child error code.
+    void run_control_command(const char *op_name);
 
     char *mbox() const { return static_cast<char *>(mailbox_); }
     MailboxState read_mailbox_state() const;
@@ -217,14 +211,10 @@ class WorkerManager {
 public:
     using OnCompleteFn = std::function<void(TaskSlot)>;
 
-    // THREAD mode: worker is called directly.
-    void add_next_level(IWorker *worker);
-    void add_sub(IWorker *worker);
-
-    // PROCESS mode: mailbox is a MAILBOX_SIZE-byte MAP_SHARED region.
-    // Worker is nullptr (child has its own).
-    void add_next_level_process(void *mailbox);
-    void add_sub_process(void *mailbox);
+    // Register a worker. `mailbox` is a MAILBOX_SIZE-byte MAP_SHARED
+    // region; the real IWorker lives in the forked child.
+    void add_next_level(void *mailbox);
+    void add_sub(void *mailbox);
 
     void start(Ring *ring, const OnCompleteFn &on_complete);
     void stop();
@@ -240,7 +230,7 @@ public:
 
     bool any_busy() const;
 
-    // Write SHUTDOWN to every PROCESS-mode mailbox.
+    // Write SHUTDOWN to every registered mailbox.
     void shutdown_children();
 
     // Error propagation: first dispatch failure from any WorkerThread wins.
@@ -252,14 +242,8 @@ public:
     void clear_error();
 
 private:
-    struct WorkerEntry {
-        IWorker *worker;  // nullptr for PROCESS mode
-        WorkerThread::Mode mode;
-        void *mailbox;  // nullptr for THREAD mode
-    };
-
-    std::vector<WorkerEntry> next_level_entries_;
-    std::vector<WorkerEntry> sub_entries_;
+    std::vector<void *> next_level_entries_;
+    std::vector<void *> sub_entries_;
 
     std::vector<std::unique_ptr<WorkerThread>> next_level_threads_;
     std::vector<std::unique_ptr<WorkerThread>> sub_threads_;

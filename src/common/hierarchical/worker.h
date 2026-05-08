@@ -13,17 +13,19 @@
  * Worker — top-level distributed worker node.
  *
  * Worker is the implementation of one level in the hierarchy (L3, L4, …).
- * From the level above it looks like an IWorker; internally it contains the
- * full scheduling engine (TensorMap, Allocator, Scope, Orchestrator, Scheduler)
- * and a set of sub-IWorkers it dispatches to.
+ * It contains the full scheduling engine (TensorMap, Allocator, Scope,
+ * Orchestrator, Scheduler) and a set of sub-workers (each a forked Python
+ * child reachable via a shared-memory mailbox) it dispatches to.
  *
  * Public surface:
- *   - add_worker(type, IWorker*)  — register sub-workers (before init)
+ *   - add_worker(type, mailbox)    — register a sub-worker (before init).
+ *                                    `mailbox` is a MAILBOX_SIZE-byte
+ *                                    MAP_SHARED region; the real IWorker
+ *                                    lives in the forked child.
  *   - init() / close()             — lifecycle
- *   - get_orchestrator()           — accessor used by Worker::run / Python facade
- *                                    (scope_begin / drain / scope_end live on the
- *                                     Orchestrator, not here)
- *   - run(payload)                 — IWorker entry (placeholder for L4+ recursion)
+ *   - get_orchestrator()           — accessor used by the Python facade
+ *                                    (scope_begin / drain / scope_end live
+ *                                     on the Orchestrator, not here)
  *
  * Worker holds no submit / scope / drain / active-task bookkeeping — those
  * concepts belong to Orchestrator.
@@ -47,7 +49,7 @@
 #include "types.h"
 #include "worker_manager.h"
 
-class Worker : public IWorker {
+class Worker {
 public:
     // Construct a Worker for hierarchy `level`. `heap_ring_size` is the
     // MAP_SHARED|MAP_ANONYMOUS region handed out by the Orchestrator for
@@ -59,19 +61,15 @@ public:
     // installation) also runs in the ctor, still in the parent, before
     // child forks.
     explicit Worker(int32_t level, uint64_t heap_ring_size = DEFAULT_HEAP_RING_SIZE);
-    ~Worker() override;
+    ~Worker();
 
     Worker(const Worker &) = delete;
     Worker &operator=(const Worker &) = delete;
 
-    // Register sub-workers before calling init().
-    // THREAD mode — parent calls worker->run() directly.
-    void add_worker(WorkerType type, IWorker *worker);
-
-    // PROCESS mode — parent writes the unified mailbox; a pre-forked child
-    // process reads it and runs the real IWorker in its own address space.
-    // `mailbox` must point to a MAILBOX_SIZE-byte MAP_SHARED region.
-    void add_process_worker(WorkerType type, void *mailbox);
+    // Register a sub-worker before calling init(). `mailbox` is a
+    // MAILBOX_SIZE-byte MAP_SHARED region; the real IWorker lives in the
+    // forked child and consumes the mailbox via the Python child loop.
+    void add_worker(WorkerType type, void *mailbox);
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
     // any child workers — init() spins up threads in the parent that would
@@ -85,31 +83,20 @@ public:
     // only between init() and close().
     Orchestrator &get_orchestrator() { return orchestrator_; }
 
-    // IWorker — used when this Worker is itself a sub-worker of L4+.
-    // In THREAD mode, the parent's WorkerThread calls run() directly;
-    // run() invokes run_callback_ which acquires the GIL and delegates
-    // to the Python Worker._run_as_child method (approach (b): Python
-    // callback — simpler than full C++ registry lookup).
-    void run(uint64_t callable, TaskArgsView args, const CallConfig &config) override;
-
-    using RunCallback = std::function<void(uint64_t, TaskArgsView, const CallConfig &)>;
-    void set_run_callback(RunCallback cb) { run_callback_ = std::move(cb); }
-
 private:
-    RunCallback run_callback_;
     int32_t level_;
     bool initialized_{false};
 
     // --- Scheduling engine components ---
     // Per-task slot state lives inside `allocator_` (Ring) — Orchestrator
-    // and Scheduler access it via `allocator_.slot_state(id)`. No separate
-    // fixed-size slots array at L3 (see plan Allowed Exception #6).
+    // and Scheduler access it via `allocator_.slot_state(id)`. The slot
+    // itself is the dispatch state; no separate fixed-size slots array.
     TensorMap tensormap_;
     Ring allocator_;
     Scope scope_;
-    // Strict-4: one ready queue per WorkerType. Submit routes by
-    // s.worker_type; the Scheduler drains each queue independently so
-    // saturation of one pool cannot head-of-line-block the other.
+    // One ready queue per WorkerType. Submit routes by s.worker_type;
+    // the Scheduler drains each queue independently so saturation of
+    // one pool cannot head-of-line-block the other.
     ReadyQueue ready_next_level_queue_;
     ReadyQueue ready_sub_queue_;
     Orchestrator orchestrator_;

@@ -18,14 +18,13 @@
  *   - TaskSlotState: per-task scheduling bookkeeping (stores TaskArgs
  *                        directly — no separate dispatch carrier struct)
  *   - ReadyQueue: Orch→Scheduler notification channel
- *   - IWorker: abstract interface implemented by ChipWorker, SubWorker,
- *              and Worker itself (recursive composition)
+ *   - IWorker: abstract interface implemented by ChipWorker (the in-child
+ *              worker invoked from `_chip_process_loop`)
  *
  * IWorker::run takes (callable, TaskArgsView, CallConfig) directly.
- * THREAD-mode dispatch builds the view via `slot.args_view(i)` from the
- * slot's stored TaskArgs; PROCESS-mode dispatch encodes the TaskArgs into
- * the per-WorkerThread shm mailbox via write_blob() and the child rebuilds
- * the view with read_blob().
+ * Dispatch encodes the TaskArgs into the per-WorkerThread shm mailbox with
+ * inline std::memcpy of [int32 T][int32 S][ContinuousTensor × T][uint64 × S];
+ * the forked child decodes the same layout to rebuild the view.
  */
 
 #pragma once
@@ -108,9 +107,9 @@ enum class TaskState : int32_t {
 // =============================================================================
 //
 // Stores the submitted TaskArgs directly. Dispatch builds a TaskArgsView on
-// demand via `args_view(i)` (THREAD mode) or write_blob → read_blob
-// (PROCESS mode). There is no separate dispatch carrier struct; the old
-// WorkerPayload was removed in PR-C.
+// demand via `args_view(i)` and encodes it into the mailbox blob via
+// write_blob; the child decodes with read_blob. There is no separate
+// dispatch carrier struct — the slot itself is the dispatch state.
 
 struct TaskSlotState {
     std::atomic<TaskState> state{TaskState::FREE};
@@ -222,17 +221,12 @@ class IWorker {
 public:
     virtual ~IWorker() = default;
 
-    // Execute one task synchronously. Called in the worker's own thread,
-    // blocking until the task is complete.
+    // Execute one task synchronously. Invoked in the forked child process
+    // by `_chip_process_loop`, blocking until the task is complete.
     //
-    // Each implementation interprets `callable` per its semantics:
-    //   - ChipWorker: uint64 holding a ChipCallable buffer ptr; builds a
-    //     ChipStorageTaskArgs POD from `args` and calls pto2_run_runtime.
-    //   - ChipProcess / SubWorker: dispatch proxies — forward
-    //     callable / config / args through the shm mailbox to the forked
-    //     child, which invokes the actual IWorker in its own address space.
-    //   - Worker (L4+): `callable` decodes to an orch-fn handle;
-    //     placeholder until PR-F.
+    // For ChipWorker, `callable` is a uint64 holding a ChipCallable buffer
+    // pointer; the implementation builds a ChipStorageTaskArgs POD from
+    // `args` and calls pto2_run_runtime.
     //
     // slot_id is not a parameter — completion routing is owned by
     // WorkerThread / Scheduler at a higher layer.

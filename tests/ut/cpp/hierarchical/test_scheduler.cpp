@@ -12,8 +12,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <iterator>
 #include <mutex>
 #include <thread>
@@ -30,16 +32,31 @@
 #include "task_args.h"
 
 // ---------------------------------------------------------------------------
-// MockWorker: run() blocks until complete() is called by the test thread.
+// MockMailboxWorker: in-process stand-in for the forked Python child loop.
+//
+// The production dispatch path writes (callable, config, args_blob) into a
+// MAILBOX_SIZE-byte shared region and spin-polls TASK_DONE; the real child
+// (`_chip_process_loop` in python/simpler/worker.py) decodes the mailbox and
+// runs an IWorker. For unit testing the Scheduler / WorkerManager state
+// machine in isolation, we replace the forked child with a thread inside
+// the test process that mimics the same handshake but blocks until the
+// test thread releases it via `complete()`.
+//
+// API parity with the previous IWorker-based MockWorker:
+//   - dispatched[i].callable / .tensor_key — recorded on TASK_READY
+//   - is_running                            — atomic flag the test polls
+//   - wait_running()                        — spin-wait until is_running flips
+//   - complete()                            — release the parked dispatch so
+//                                             the loop writes TASK_DONE
 // ---------------------------------------------------------------------------
 
-struct MockWorker : public IWorker {
+struct MockMailboxWorker {
     struct Record {
         uint64_t callable;
-        uint64_t tensor_key;              // tensors[0].data (unique per submit in tests)
-        const ContinuousTensor *tensors;  // backing pointer (distinct per group member)
+        uint64_t tensor_key;  // first tensor's `data` field (unique per submit in tests)
     };
 
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
     std::vector<Record> dispatched;
     std::mutex dispatched_mu;
 
@@ -47,22 +64,33 @@ struct MockWorker : public IWorker {
     std::condition_variable run_cv;
     std::atomic<bool> should_complete{false};
     std::atomic<bool> is_running{false};
+    std::atomic<bool> stop_flag{false};
+    std::thread loop_thread;
 
-    void run(uint64_t callable, TaskArgsView args, const CallConfig & /*cfg*/) override {
-        {
-            std::lock_guard<std::mutex> lk(dispatched_mu);
-            uint64_t key = (args.tensor_count > 0) ? args.tensors[0].data : 0;
-            dispatched.push_back({callable, key, args.tensors});
-        }
-        is_running.store(true, std::memory_order_release);
-
-        std::unique_lock<std::mutex> lk(run_mu);
-        run_cv.wait(lk, [this] {
-            return should_complete.load(std::memory_order_acquire);
-        });
-        should_complete.store(false, std::memory_order_relaxed);
-        is_running.store(false, std::memory_order_release);
+    void start() {
+        // SharedMemory zero-fills, but std::array does not — explicitly
+        // store IDLE (=0) to mirror production parity and keep the polling
+        // loop's first read deterministic.
+        write_state(MailboxState::IDLE);
+        loop_thread = std::thread(&MockMailboxWorker::loop, this);
     }
+
+    ~MockMailboxWorker() {
+        // Defensive teardown — if a test fails before completing every
+        // dispatch, set stop_flag and wake the parked loop so the thread
+        // joins instead of leaking. The loop's TASK_READY branch always
+        // publishes TASK_DONE before checking stop_flag, so any in-flight
+        // WorkerThread::dispatch_process completes its spin-poll cleanly.
+        stop_flag.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(run_mu);
+            should_complete.store(true, std::memory_order_release);
+            run_cv.notify_one();
+        }
+        if (loop_thread.joinable()) loop_thread.join();
+    }
+
+    void *mailbox_ptr() { return mailbox.data(); }
 
     void complete() {
         std::lock_guard<std::mutex> lk(run_mu);
@@ -80,6 +108,76 @@ struct MockWorker : public IWorker {
     int dispatched_count() {
         std::lock_guard<std::mutex> lk(dispatched_mu);
         return static_cast<int>(dispatched.size());
+    }
+
+private:
+    // Mirror the acquire/release semantics in
+    // worker_manager.cpp::read_mailbox_state / write_mailbox_state. Plain
+    // memcpy on the mailbox state would let the parent observe the state
+    // flip before the preceding error-field stores are visible.
+    MailboxState read_state() const {
+        const auto *ptr = reinterpret_cast<const volatile int32_t *>(mailbox.data() + MAILBOX_OFF_STATE);
+        int32_t v = __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+        return static_cast<MailboxState>(v);
+    }
+
+    void write_state(MailboxState s) {
+        auto *ptr = reinterpret_cast<volatile int32_t *>(mailbox.data() + MAILBOX_OFF_STATE);
+        __atomic_store_n(ptr, static_cast<int32_t>(s), __ATOMIC_RELEASE);
+    }
+
+    void loop() {
+        while (true) {
+            if (stop_flag.load(std::memory_order_acquire)) return;
+            MailboxState s = read_state();
+            if (s == MailboxState::TASK_READY) {
+                uint64_t callable = 0;
+                std::memcpy(&callable, mailbox.data() + MAILBOX_OFF_CALLABLE, sizeof(uint64_t));
+                int32_t t_count = 0;
+                std::memcpy(&t_count, mailbox.data() + MAILBOX_OFF_ARGS, sizeof(int32_t));
+                uint64_t tensor_key = 0;
+                if (t_count > 0) {
+                    ContinuousTensor first{};
+                    std::memcpy(
+                        &first, mailbox.data() + MAILBOX_OFF_ARGS + TASK_ARGS_BLOB_HEADER_SIZE, sizeof(ContinuousTensor)
+                    );
+                    tensor_key = first.data;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(dispatched_mu);
+                    dispatched.push_back({callable, tensor_key});
+                }
+                is_running.store(true, std::memory_order_release);
+
+                {
+                    std::unique_lock<std::mutex> lk(run_mu);
+                    run_cv.wait(lk, [this] {
+                        return should_complete.load(std::memory_order_acquire);
+                    });
+                    should_complete.store(false, std::memory_order_relaxed);
+                }
+                is_running.store(false, std::memory_order_release);
+
+                int32_t zero_err = 0;
+                std::memcpy(mailbox.data() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
+                std::memset(mailbox.data() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
+                write_state(MailboxState::TASK_DONE);
+            } else if (s == MailboxState::CONTROL_REQUEST) {
+                // Acknowledge the control request so a future test using
+                // WorkerThread::control_* doesn't hang on the spin-poll.
+                // No memory operation is simulated — result stays zero.
+                int32_t zero_err = 0;
+                std::memcpy(mailbox.data() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
+                std::memset(mailbox.data() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
+                uint64_t zero_result = 0;
+                std::memcpy(mailbox.data() + CTRL_OFF_RESULT, &zero_result, sizeof(uint64_t));
+                write_state(MailboxState::CONTROL_DONE);
+            } else if (s == MailboxState::SHUTDOWN) {
+                return;
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
     }
 };
 
@@ -110,7 +208,7 @@ struct SchedulerFixture : public ::testing::Test {
     ReadyQueue rq_next_level;
     ReadyQueue rq_sub;
     Orchestrator orch;
-    MockWorker mock_worker;
+    MockMailboxWorker mock_worker;
     WorkerManager manager;
     Scheduler sched;
     CallConfig cfg;
@@ -124,7 +222,8 @@ struct SchedulerFixture : public ::testing::Test {
         allocator.init(/*heap_bytes=*/1ULL << 20);
         orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
 
-        manager.add_next_level(&mock_worker);
+        mock_worker.start();
+        manager.add_next_level(mock_worker.mailbox_ptr());
         manager.start(&allocator, [this](TaskSlot slot) {
             sched.worker_done(slot);
         });
@@ -205,7 +304,7 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
 }
 
 // ===========================================================================
-// Group task tests -- fixture with 2 MockWorkers
+// Group task tests -- fixture with 2 MockMailboxWorkers
 // ===========================================================================
 
 struct GroupSchedulerFixture : public ::testing::Test {
@@ -216,8 +315,8 @@ struct GroupSchedulerFixture : public ::testing::Test {
     ReadyQueue rq_next_level;
     ReadyQueue rq_sub;
     Orchestrator orch;
-    MockWorker worker_a;
-    MockWorker worker_b;
+    MockMailboxWorker worker_a;
+    MockMailboxWorker worker_b;
     WorkerManager manager;
     Scheduler sched;
     CallConfig cfg;
@@ -231,8 +330,10 @@ struct GroupSchedulerFixture : public ::testing::Test {
         allocator.init(/*heap_bytes=*/1ULL << 20);
         orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
 
-        manager.add_next_level(&worker_a);
-        manager.add_next_level(&worker_b);
+        worker_a.start();
+        worker_b.start();
+        manager.add_next_level(worker_a.mailbox_ptr());
+        manager.add_next_level(worker_b.mailbox_ptr());
         manager.start(&allocator, [this](TaskSlot slot) {
             sched.worker_done(slot);
         });
@@ -283,12 +384,12 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
     EXPECT_EQ(worker_a.dispatched_count(), 1);
     EXPECT_EQ(worker_b.dispatched_count(), 1);
 
-    // Each worker got a different TaskArgs from the slot's task_args_list.
+    // Each worker got a different TaskArgs from the slot's task_args_list —
+    // proven by the keys 0xA0 and 0xA1 each landing on exactly one worker.
     uint64_t keys[2] = {worker_a.dispatched[0].tensor_key, worker_b.dispatched[0].tensor_key};
     std::sort(std::begin(keys), std::end(keys));
     EXPECT_EQ(keys[0], 0xA0u);
     EXPECT_EQ(keys[1], 0xA1u);
-    EXPECT_NE(worker_a.dispatched[0].tensors, worker_b.dispatched[0].tensors);
     (void)slot;
 
     worker_a.complete();
@@ -327,8 +428,8 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
     ReadyQueue rq_next_level;
     ReadyQueue rq_sub;
     Orchestrator orch;
-    MockWorker next_level_worker;
-    MockWorker sub_worker;
+    MockMailboxWorker next_level_worker;
+    MockMailboxWorker sub_worker;
     WorkerManager manager;
     Scheduler sched;
     CallConfig cfg;
@@ -342,8 +443,10 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
         allocator.init(/*heap_bytes=*/1ULL << 20);
         orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
 
-        manager.add_next_level(&next_level_worker);
-        manager.add_sub(&sub_worker);
+        next_level_worker.start();
+        sub_worker.start();
+        manager.add_next_level(next_level_worker.mailbox_ptr());
+        manager.add_sub(sub_worker.mailbox_ptr());
         manager.start(&allocator, [this](TaskSlot slot) {
             sched.worker_done(slot);
         });
