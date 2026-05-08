@@ -87,7 +87,7 @@ def _rank_entry(  # noqa: PLR0913
         )
 
         worker = ChipWorker()
-        worker.init(bins)
+        worker.init(rank, bins)
         result["stage"] = "init"
 
         cfg = ChipBootstrapConfig(
@@ -343,7 +343,7 @@ def _store_rank_entry(  # noqa: PLR0913
         )
 
         worker = ChipWorker()
-        worker.init(bins)
+        worker.init(rank, bins)
 
         cfg = ChipBootstrapConfig(
             comm=ChipCommBootstrapConfig(
@@ -545,7 +545,7 @@ def _missing_output_staging_rank_entry(
         )
 
         worker = ChipWorker()
-        worker.init(bins)
+        worker.init(0, bins)
 
         shm = SharedMemory(name=channel_shm_name)
         try:

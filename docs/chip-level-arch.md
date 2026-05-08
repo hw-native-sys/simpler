@@ -113,7 +113,7 @@ runner.finalize();
 
 ```c
 DeviceContextHandle ctx = create_device_context();
-set_device(ctx, device_id);
+simpler_init(ctx, device_id, log_level, log_info_v);  // attach + log config
 size_t size = get_runtime_size();
 run_runtime(ctx, runtime, callable, args, block_dim,
             aicpu_thread_num, device_id,
@@ -129,8 +129,8 @@ destroy_device_context(ctx);
 from simpler.task_interface import ChipWorker, ChipCallable, ChipStorageTaskArgs, CallConfig
 
 worker = ChipWorker()
-worker.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path="")
-worker.set_device(device_id)
+worker.init(host_lib_path, aicpu_path, aicore_path, simpler_log_lib_path,
+            device_id, sim_context_lib_path="")
 
 config = CallConfig()
 config.block_dim = 24
@@ -171,20 +171,21 @@ Python test_*.py (SceneTestCase)
   ├─→ KernelCompiler(platform).compile_orchestration(runtime, source) → orch .so
   │
   └─→ ChipWorker()
-       └─→ init(host_path, aicpu_path, aicore_path)
-            └─→ dlopen(host.so) → resolve C API symbols via dlsym
+       └─→ init(host_path, aicpu_path, aicore_path, simpler_log_path, device_id)
+            ├─→ dlopen(host.so) → resolve C API symbols via dlsym
+            ├─→ create_device_context() → DeviceContextHandle
+            └─→ simpler_init(ctx, device_id, log_level, log_info_v)
+                 └─→ DeviceRunner::attach_current_thread(device_id)
+                      ├─→ rtSetDevice(device_id) on onboard
+                      └─→ pto_cpu_sim_bind+acquire on sim
 ```
 
 ### 2. Initialization Phase
 
-```text
-worker.set_device(device_id)
-  │
-  └─→ create_device_context() → DeviceContextHandle
-       └─→ set_device(ctx, device_id)
-            ├─→ Initialize device (CANN on hardware, no-op on sim)
-            └─→ Allocate device streams
-```
+The thread that called `init()` is now attached to `device_id`. Streams are
+created lazily on the first `run()` call (`prepare_run_context`). Subsequent
+device-ops (`malloc`, `copy_to`, `copy_from`, `free`) reuse that per-thread
+binding — they must be called from the same thread that called `init()`.
 
 ### 3. Execution Phase
 

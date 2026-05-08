@@ -100,13 +100,17 @@ ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-    const std::string &simpler_log_lib_path, const std::string &sim_context_lib_path, int log_level, int log_info_v
+    const std::string &simpler_log_lib_path, int device_id, const std::string &sim_context_lib_path, int log_level,
+    int log_info_v
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
     }
     if (initialized_) {
         throw std::runtime_error("ChipWorker already initialized; runtime cannot be changed");
+    }
+    if (device_id < 0) {
+        throw std::runtime_error("ChipWorker::init requires a non-negative device_id");
     }
 
     // Load libsimpler_log FIRST with RTLD_GLOBAL so that subsequent host_runtime
@@ -142,7 +146,6 @@ void ChipWorker::init(
     try {
         create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
         destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
-        set_device_fn_ = load_symbol<SetDeviceFn>(handle, "set_device");
         device_malloc_ctx_fn_ = load_symbol<DeviceMallocCtxFn>(handle, "device_malloc_ctx");
         device_free_ctx_fn_ = load_symbol<DeviceFreeCtxFn>(handle, "device_free_ctx");
         copy_to_device_ctx_fn_ = load_symbol<CopyToDeviceCtxFn>(handle, "copy_to_device_ctx");
@@ -185,35 +188,49 @@ void ChipWorker::init(
 
     runtime_buf_.resize(get_runtime_size_fn_());
 
-    // One-shot platform-side log init: pushes user's simpler-logger choice
-    // into HostLogger + runner state, and (onboard) into CANN dlog.
-    simpler_init_fn_(device_ctx_, log_level, log_info_v);
-
-    initialized_ = true;
-}
-
-void ChipWorker::set_device(int device_id) {
-    if (!initialized_) {
-        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    // One-shot platform-side init: attach the calling thread to `device_id`
+    // (rtSetDevice on onboard, sim bind+acquire on sim) and push the user's
+    // simpler-logger choice into HostLogger + runner state (and CANN dlog
+    // onboard). Subsequent device-ops re-attach their caller threads
+    // idempotently against the recorded device id.
+    int init_rc = simpler_init_fn_(device_ctx_, device_id, log_level, log_info_v);
+    if (init_rc != 0) {
+        // Symmetric teardown: drop the device context, clear all dlsym'd
+        // function pointers, dlclose, and discard cached binaries so the
+        // ChipWorker is back to its zero-initialized state. Mirror finalize()
+        // exactly minus finalize_device_fn_ (we never reached the
+        // initialized_=true point, so device-side teardown is unnecessary).
+        destroy_device_context_fn_(device_ctx_);
+        device_ctx_ = nullptr;
+        dlclose(handle);
+        lib_handle_ = nullptr;
+        create_device_context_fn_ = nullptr;
+        destroy_device_context_fn_ = nullptr;
+        device_malloc_ctx_fn_ = nullptr;
+        device_free_ctx_fn_ = nullptr;
+        copy_to_device_ctx_fn_ = nullptr;
+        copy_from_device_ctx_fn_ = nullptr;
+        get_runtime_size_fn_ = nullptr;
+        run_runtime_fn_ = nullptr;
+        simpler_init_fn_ = nullptr;
+        finalize_device_fn_ = nullptr;
+        ensure_acl_ready_fn_ = nullptr;
+        create_comm_stream_fn_ = nullptr;
+        destroy_comm_stream_fn_ = nullptr;
+        comm_init_fn_ = nullptr;
+        comm_alloc_windows_fn_ = nullptr;
+        comm_get_local_window_base_fn_ = nullptr;
+        comm_get_window_size_fn_ = nullptr;
+        comm_barrier_fn_ = nullptr;
+        comm_destroy_fn_ = nullptr;
+        runtime_buf_.clear();
+        aicpu_binary_.clear();
+        aicore_binary_.clear();
+        throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
-    if (device_set_) {
-        throw std::runtime_error("Device already set; call reset_device() before switching devices");
-    }
 
-    int rc = set_device_fn_(device_ctx_, device_id);
-    if (rc != 0) {
-        throw std::runtime_error("set_device failed with code " + std::to_string(rc));
-    }
     device_id_ = device_id;
-    device_set_ = true;
-}
-
-void ChipWorker::reset_device() {
-    if (device_set_ && finalize_device_fn_) {
-        finalize_device_fn_(device_ctx_);
-    }
-    device_id_ = -1;
-    device_set_ = false;
+    initialized_ = true;
 }
 
 void ChipWorker::finalize() {
@@ -225,7 +242,9 @@ void ChipWorker::finalize() {
     }
     comm_stream_ = nullptr;
 
-    reset_device();
+    if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
+        finalize_device_fn_(device_ctx_);
+    }
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
@@ -236,7 +255,6 @@ void ChipWorker::finalize() {
     lib_handle_ = nullptr;
     create_device_context_fn_ = nullptr;
     destroy_device_context_fn_ = nullptr;
-    set_device_fn_ = nullptr;
     device_malloc_ctx_fn_ = nullptr;
     device_free_ctx_fn_ = nullptr;
     copy_to_device_ctx_fn_ = nullptr;
@@ -257,6 +275,7 @@ void ChipWorker::finalize() {
     aicpu_binary_.clear();
     aicore_binary_.clear();
     initialized_ = false;
+    device_id_ = -1;
     finalized_ = true;
 }
 
@@ -271,8 +290,8 @@ void ChipWorker::run(uint64_t callable, TaskArgsView args, const CallConfig &con
 
 void ChipWorker::run(const void *callable, const void *args, const CallConfig &config) {
     config.validate();
-    if (!device_set_) {
-        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
 
     void *rt = runtime_buf_.data();
@@ -288,8 +307,8 @@ void ChipWorker::run(const void *callable, const void *args, const CallConfig &c
 }
 
 uint64_t ChipWorker::malloc(size_t size) {
-    if (!device_set_) {
-        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
     void *ptr = device_malloc_ctx_fn_(device_ctx_, size);
     if (ptr == nullptr) {
@@ -299,15 +318,15 @@ uint64_t ChipWorker::malloc(size_t size) {
 }
 
 void ChipWorker::free(uint64_t ptr) {
-    if (!device_set_) {
-        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
     device_free_ctx_fn_(device_ctx_, reinterpret_cast<void *>(ptr));
 }
 
 void ChipWorker::copy_to(uint64_t dst, uint64_t src, size_t size) {
-    if (!device_set_) {
-        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
     int rc =
         copy_to_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dst), reinterpret_cast<const void *>(src), size);
@@ -317,8 +336,8 @@ void ChipWorker::copy_to(uint64_t dst, uint64_t src, size_t size) {
 }
 
 void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
-    if (!device_set_) {
-        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
     int rc =
         copy_from_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dst), reinterpret_cast<const void *>(src), size);
@@ -328,8 +347,8 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
 }
 
 uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo_path) {
-    if (!device_set_) {
-        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
     if (comm_stream_ != nullptr) {
         throw std::runtime_error("comm_init: a comm session is already active on this ChipWorker");

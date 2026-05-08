@@ -255,17 +255,18 @@ different tasks have different configurations.
 
 ## Execution Lifecycle
 
-### Simulation (in-process, per-task init/reset)
+### Simulation (in-process, per-task)
 
 ```text
-ChipWorker.init(host_path, aicpu_path, aicore_path)
+ChipWorker.init(host_path, aicpu_path, aicore_path, device_id)
   dlopen(host_runtime.so, RTLD_GLOBAL)
-  dlsym: create_device_context, destroy_device_context, set_device,
+  dlsym: create_device_context, destroy_device_context, simpler_init,
          get_runtime_size, run_runtime, finalize_device
-
-ChipWorker.set_device(device_id)
   create_device_context() → DeviceContextHandle
-  set_device(ctx, device_id)
+  simpler_init(ctx, device_id, log_level, log_info_v)
+    DeviceRunner::attach_current_thread(device_id)
+      pto_cpu_sim_bind_device(device_id)
+      pto_cpu_sim_acquire_device(device_id)
 
 ChipWorker.run(callable, args, config)
   run_runtime(ctx, buf, callable, args, ...)
@@ -280,12 +281,9 @@ ChipWorker.run(callable, args, config)
     validate_runtime_impl(r)                 copy results, remove kernels
     r->~Runtime()
 
-ChipWorker.reset_device()
+ChipWorker.finalize()
   finalize_device(ctx)
   destroy_device_context(ctx)
-
-ChipWorker.finalize()
-  reset_device() (if needed)
   dlclose(host_runtime.so)                   -fno-gnu-unique ensures real unload
 ```
 
@@ -294,11 +292,11 @@ ChipWorker.finalize()
 ```text
 device_worker_main(device_id)
   for each runtime_group:
-    ChipWorker.init(host_path, aicpu_path, aicore_path)
+    ChipWorker.init(host_path, aicpu_path, aicore_path, device_id)
       dlopen(host_runtime.so, RTLD_GLOBAL)
-    ChipWorker.set_device(device_id)
       create_device_context()
-      set_device(ctx, device_id)               rtSetDevice()
+      simpler_init(ctx, device_id, log_level, log_info_v)
+        DeviceRunner::attach_current_thread(device_id)  rtSetDevice()
 
     for each task in group:
       ChipWorker.run(callable, args, config)
@@ -312,10 +310,8 @@ device_worker_main(device_id)
             launch_aicore_kernel()           rtRegisterAllKernel + rtKernelLaunch
           validate_runtime_impl()            rtMemcpy results back to host
 
-    ChipWorker.reset_device()
+    ChipWorker.finalize()
       finalize_device(ctx)                     rtDeviceReset()
       destroy_device_context(ctx)
-
-    ChipWorker.finalize()
       dlclose(host_runtime.so)
 ```

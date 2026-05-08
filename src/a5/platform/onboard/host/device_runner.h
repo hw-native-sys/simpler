@@ -371,7 +371,10 @@ public:
     void release_run_context();
 
 private:
-    // Internal state
+    // Internal state. device_id_ is set once in attach_current_thread() (called
+    // from simpler_init during ChipWorker::init) and read on every subsequent
+    // op. All ChipWorker callers run on the same thread that called init, so
+    // plain int + the init→user happens-before edge is sufficient.
     int device_id_{-1};
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};

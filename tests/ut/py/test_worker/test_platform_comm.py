@@ -12,7 +12,7 @@
 This is the Python twin of tests/ut/cpp/test_hccl_comm.cpp.  It drives the
 full comm lifecycle entirely through ChipWorker's public Python API:
 
-    ChipWorker.init → set_device → comm_init → comm_alloc_windows
+    ChipWorker.init(device_id) → comm_init → comm_alloc_windows
     → comm_get_local_window_base → comm_get_window_size
     → copy_from (reads back CommContext) → comm_barrier (known-issue tolerant)
     → comm_destroy → finalize
@@ -84,11 +84,8 @@ def _rank_entry(
         from simpler.task_interface import ChipWorker
 
         worker = ChipWorker()
-        worker.init(bins)
+        worker.init(device_id, bins)
         result["stage"] = "init"
-
-        worker.set_device(device_id)
-        result["stage"] = "set_device"
 
         # ChipWorker.comm_init owns ACL bring-up and aclrtStream creation
         # internally — Python never touches aclInit / aclrtSetDevice /

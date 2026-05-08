@@ -15,10 +15,20 @@
  * Both the ChipWorker (consumer, resolves public symbols via dlsym) and the
  * platform implementations (producers, define all symbols) include this file.
  *
- * Public API — resolved by ChipWorker via dlsym:
- *   create_device_context, destroy_device_context,
- *   get_runtime_size, set_device, run_runtime, finalize_device,
- *   device_malloc_ctx, device_free_ctx, copy_to_device_ctx, copy_from_device_ctx
+ * Public API — resolved by ChipWorker via dlsym (every host_runtime.so must
+ * export ALL of these; runtimes without a real backend ship not-supported
+ * stubs rather than omitting symbols, so ChipWorker can dlsym the full set
+ * unconditionally without per-symbol probing):
+ *   - lifecycle:    create_device_context, destroy_device_context,
+ *                   simpler_init, finalize_device
+ *   - sizing:       get_runtime_size
+ *   - device-mem:   device_malloc_ctx, device_free_ctx,
+ *                   copy_to_device_ctx, copy_from_device_ctx
+ *   - run:          run_runtime
+ *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
+ *                   destroy_comm_stream_ctx
+ *   - comm:         comm_init, comm_alloc_windows, comm_get_local_window_base,
+ *                   comm_get_window_size, comm_barrier, comm_destroy
  *
  * Memory management: caller allocates a buffer of get_runtime_size() bytes
  * and passes it to run_runtime(). Error codes: 0 = success, negative = error.
@@ -56,9 +66,6 @@ void destroy_device_context(DeviceContextHandle ctx);
 
 /** Return sizeof(Runtime) for caller buffer allocation. */
 size_t get_runtime_size(void);
-
-/** Set the target device. Must be called before the first run_runtime(). */
-int set_device(DeviceContextHandle ctx, int device_id);
 
 /** Allocate device memory in the given device context. */
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size);
@@ -105,10 +112,17 @@ int run_runtime(
 );
 
 /**
- * One-shot platform-side log init. Called once by ChipWorker::init() right
- * after dlopen, before any other entry. Pushes the user's chosen severity +
- * INFO verbosity into HostLogger and into runner state (which run_runtime
- * later forwards to AICPU via KernelArgs).
+ * One-shot platform-side init. Called once by ChipWorker::init() right
+ * after dlopen, before any other entry. Two responsibilities:
+ *
+ *   1. Attach the calling thread to `device_id` (rtSetDevice on onboard,
+ *      pto_cpu_sim_bind_device + pto_cpu_sim_acquire_device on sim) and
+ *      record the device id on the DeviceRunner so subsequent device-ops
+ *      can re-attach their own caller threads idempotently.
+ *
+ *   2. Push the user's chosen severity + INFO verbosity into HostLogger
+ *      and into runner state (which run_runtime later forwards to AICPU
+ *      via KernelArgs).
  *
  * On onboard, also calls dlog_setlevel(-1, log_level, 0) so CANN's runtime
  * filter matches the simpler logger — unless ASCEND_GLOBAL_LOG_LEVEL was
@@ -118,8 +132,10 @@ int run_runtime(
  *
  * `log_level` is CANN-aligned: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL.
  * `log_info_v` ∈ [0, 9]; only meaningful when severity is INFO.
+ *
+ * Returns 0 on success, negative on attach failure.
  */
-void simpler_init(DeviceContextHandle ctx, int log_level, int log_info_v);
+int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_info_v);
 
 /**
  * Release all device resources held by the context.

@@ -65,10 +65,9 @@ class TestChipWorkerStateMachine:
     def test_initial_state(self):
         worker = _ChipWorker()
         assert worker.initialized is False
-        assert worker.device_set is False
         assert worker.device_id == -1
 
-    def test_run_before_set_device_raises(self):
+    def test_run_before_init_raises(self):
         from _task_interface import ChipCallable, ChipStorageTaskArgs  # noqa: PLC0415
 
         worker = _ChipWorker()
@@ -78,20 +77,8 @@ class TestChipWorkerStateMachine:
         # Build a minimal ChipCallable for the test
         callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
 
-        with pytest.raises(RuntimeError, match="device not set"):
-            worker.run(callable_obj, args, config)
-
-    def test_set_device_before_init_raises(self):
-        worker = _ChipWorker()
         with pytest.raises(RuntimeError, match="not initialized"):
-            worker.set_device(0)
-
-    def test_reset_device_idempotent(self):
-        worker = _ChipWorker()
-        # reset_device() on an uninitialized worker should not raise
-        worker.reset_device()
-        worker.reset_device()
-        assert worker.device_set is False
+            worker.run(callable_obj, args, config)
 
     def test_finalize_idempotent(self):
         worker = _ChipWorker()
@@ -103,12 +90,21 @@ class TestChipWorkerStateMachine:
         worker = _ChipWorker()
         worker.finalize()
         with pytest.raises(RuntimeError, match="finalized"):
-            worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null", "/nonexistent/libsimpler_log.so")
+            worker.init(
+                "/nonexistent/libfoo.so", "/dev/null", "/dev/null", "/nonexistent/libsimpler_log.so", device_id=0
+            )
 
     def test_init_with_nonexistent_lib_raises(self):
         worker = _ChipWorker()
         with pytest.raises(RuntimeError, match="dlopen"):
-            worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null", "/nonexistent/libsimpler_log.so")
+            worker.init(
+                "/nonexistent/libfoo.so", "/dev/null", "/dev/null", "/nonexistent/libsimpler_log.so", device_id=0
+            )
+
+    def test_init_with_negative_device_id_raises(self):
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="device_id"):
+            worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null", "/nonexistent/libsimpler_log.so", -1)
 
 
 # ============================================================================
@@ -125,5 +121,4 @@ class TestChipWorkerPython:
 
         worker = ChipWorker()
         assert worker.initialized is False
-        assert worker.device_set is False
         assert isinstance(PyCallConfig(), CallConfig)

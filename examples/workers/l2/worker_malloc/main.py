@@ -19,13 +19,14 @@ This example exercises the four host<->device memory primitives on the
 
 Why a standalone example for these? On real hardware (a2a3 / a5 onboard) the
 CANN device context is per-thread, so ``rtMalloc`` only succeeds on a thread
-that previously executed ``rtSetDevice``. Until you call ``worker.run(...)``
-the only thing that has bound the device on the calling Python thread is
-``Worker.init() -> ChipWorker::set_device(...)``. If that path is broken,
-this example fails at the first ``worker.malloc`` with CANN error 107002.
-``vector_add`` happens to mask that bug because its first malloc lands on
-the same thread that ``run()`` later attaches; this example doesn't ``run``
-at all, so it's a focused regression check for the standalone alloc path.
+that previously executed ``rtSetDevice``. ``Worker.init(...)`` is now the
+single point that performs that bind for the Python caller thread (folded
+down from the previous explicit ``ChipWorker::set_device``). If that path
+breaks, this example fails at the first ``worker.malloc`` with CANN error
+107002. ``vector_add`` happens to mask such a bug because its first malloc
+lands on the same thread that ``run()`` later attaches; this example doesn't
+``run`` at all, so it's a focused regression check for the standalone alloc
+path.
 
 Run:
     python examples/workers/l2/worker_malloc/main.py -p a2a3sim -d 0

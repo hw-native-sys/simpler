@@ -20,10 +20,11 @@
  * thread's device_id (set via pto_cpu_sim_bind_device).
  *
  * Invariant: each simulated device_id has a single owner ChipWorker per
- * process. The owner calls acquire_device() at set_device() time and
- * release_device() at finalize_device() time, after all worker threads
- * for that device have been joined. Concurrent access from multiple
- * ChipWorkers to the same device_id is undefined behavior.
+ * process. The owner calls acquire_device() inside DeviceRunner's
+ * attach_current_thread() (driven by ChipWorker::init) and release_device()
+ * at finalize_device() time, after all worker threads for that device
+ * have been joined. Concurrent access from multiple ChipWorkers to the
+ * same device_id is undefined behavior.
  */
 
 #pragma once

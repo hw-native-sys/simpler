@@ -808,8 +808,7 @@ class SceneTestCase:
 
         bins = cls._get_binaries(platform, build=build)
         w = ChipWorker()
-        w.init(bins)
-        w.set_device(device_id)
+        w.init(device_id, bins)
         return w
 
     # ------------------------------------------------------------------

@@ -12,12 +12,12 @@ the `Worker` API in isolation:
 
 There is **no `worker.run()` call** anywhere — that's deliberate. On real
 hardware the CANN device context is per-thread, so `rtMalloc` only succeeds
-on a thread previously bound by `rtSetDevice`. `Worker.init()` is the only
-thing that performs that bind for the Python caller thread; if its `set_device`
-path is broken, `worker.malloc()` fails with CANN error 107002 *before* any
-kernel ever runs. Every example that does `init() -> run() -> ...` accidentally
-masks that bug because the run path re-binds the device on the same thread
-just before allocations happen. This example doesn't.
+on a thread previously bound by `rtSetDevice`. `Worker.init(...)` is the
+only thing that performs that bind for the Python caller thread; if that
+path is broken, `worker.malloc()` fails with CANN error 107002 *before*
+any kernel ever runs. Every example that does `init() -> run() -> ...`
+accidentally masks that bug because the run path re-binds the device on the
+same thread just before allocations happen. This example doesn't.
 
 ## Run
 
@@ -45,6 +45,6 @@ Same for `a5sim` / `a5`.
 
 If you see `rtMalloc failed: 107002` on `a2a3` / `a5` (but the same example
 passes on `a2a3sim` / `a5sim`), the per-thread `rtSetDevice` is not happening
-during `Worker.init()` — see `src/{arch}/platform/onboard/host/pto_runtime_c_api.cpp`
-and confirm the C-API `set_device` actually calls
-`DeviceRunner::attach_current_thread`.
+during `Worker.init()` — see `simpler_init` in
+`src/{arch}/platform/onboard/host/pto_runtime_c_api.cpp` and confirm it
+forwards to `DeviceRunner::attach_current_thread`.

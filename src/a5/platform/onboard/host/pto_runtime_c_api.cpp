@@ -119,15 +119,6 @@ void destroy_device_context(DeviceContextHandle ctx) { delete static_cast<Device
 
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
-int set_device(DeviceContextHandle ctx, int device_id) {
-    if (ctx == NULL) return -1;
-    try {
-        return static_cast<DeviceRunner *>(ctx)->attach_current_thread(device_id);
-    } catch (...) {
-        return -1;
-    }
-}
-
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
     if (ctx == NULL) return NULL;
     try {
@@ -311,8 +302,20 @@ void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, si
     r->record_tensor_pair(host_ptr, dev_ptr, size);
 }
 
-void simpler_init(DeviceContextHandle ctx, int log_level, int log_info_v) {
-    if (ctx == NULL) return;
+int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_info_v) {
+    if (ctx == NULL) return -1;
+
+    // Attach FIRST so that an attach failure does not leave process-wide side
+    // effects (CANN dlog level, HostLogger singleton) mutated. Subsequent
+    // logger writes only happen on the success path.
+    DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
+    int rc;
+    try {
+        rc = runner->attach_current_thread(device_id);
+    } catch (...) {
+        return -1;
+    }
+    if (rc != 0) return rc;
 
     // CANN dlog: derive from simpler logger choice unless ASCEND_GLOBAL_LOG_LEVEL
     // is externally configured. dlog_setlevel mutates libunified_dlog.so's
@@ -326,9 +329,9 @@ void simpler_init(DeviceContextHandle ctx, int log_level, int log_info_v) {
     HostLogger::get_instance().set_info_v(log_info_v);
 
     // Snapshot into runner — read by run_runtime when populating KernelArgs
-    DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
     runner->set_log_level(log_level);
     runner->set_log_info_v(log_info_v);
+    return 0;
 }
 
 }  // extern "C"
