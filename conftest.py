@@ -16,6 +16,7 @@ subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
 import signal
@@ -47,7 +48,10 @@ if sys.platform == "darwin":
 
 import pytest  # noqa: E402
 
+from simpler_setup import parallel_scheduler as _ps  # noqa: E402
 from simpler_setup.log_config import configure_logging  # noqa: E402
+from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
+from simpler_setup.scene_test import clear_compile_cache  # noqa: E402
 
 # Exit code used when the session watchdog fires. Matches the GNU `timeout`
 # convention so shell wrappers (e.g. CI) can distinguish timeout from other
@@ -62,9 +66,7 @@ def _parse_device_range(s: str) -> list[int]:
     so both conftest and standalone share the same parser (supports ``0``,
     ``0-7``, ``0,2,5``, and mixed ``0,2-4,7``).
     """
-    from simpler_setup.parallel_scheduler import device_range_to_list  # noqa: PLC0415
-
-    return device_range_to_list(s)
+    return _ps.device_range_to_list(s)
 
 
 class DevicePool:
@@ -177,9 +179,12 @@ def pytest_addoption(parser):
 
 
 def _install_session_timeout(timeout_s: int) -> None:
+    # Module-level `_ps` import is intentional (rather than a function-local
+    # one): doing `from simpler_setup import parallel_scheduler` inside a
+    # signal handler can deadlock on the import lock if the module hasn't
+    # been imported yet. Hoisting it to the top guarantees the handler only
+    # touches an already-loaded module.
     def _handler(signum, frame):
-        from simpler_setup import parallel_scheduler as _ps  # noqa: PLC0415
-
         print(
             f"\n{'=' * 40}\n[pytest] TIMEOUT: session exceeded {timeout_s}s ({timeout_s // 60}min) limit\n{'=' * 40}",
             flush=True,
@@ -246,8 +251,6 @@ def _install_child_faulthandler() -> None:
     Always-on ``faulthandler.enable()`` also gives us a stack on real crashes
     (SIGSEGV/SIGABRT) instead of a silent exit.
     """
-    import faulthandler  # noqa: PLC0415
-
     faulthandler.enable()
     if hasattr(signal, "SIGUSR1"):
         try:
@@ -285,8 +288,6 @@ def pytest_configure(config):
     # need PTO-ISA (e.g. pytest tests/ut on a runner without SSH keys) must not
     # be aborted when the eager clone fails. If an actual scene test later needs
     # PTO-ISA, scene_test.py's lazy path will re-raise the original error.
-    from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
-
     try:
         root = ensure_pto_isa_root(
             verbose=True,
@@ -571,11 +572,9 @@ def _base_pytest_argv(session):
 
 def _resolve_max_parallel(cfg, platform: str, device_ids: list[int]) -> int:
     """Parse the -j/--max-parallel CLI value; 'auto' → platform-aware default."""
-    from simpler_setup.parallel_scheduler import default_max_parallel  # noqa: PLC0415
-
     raw = cfg.getoption("--max-parallel", default="auto")
     if raw in (None, "", "auto"):
-        return default_max_parallel(platform or "", device_ids)
+        return _ps.default_max_parallel(platform or "", device_ids)
     try:
         val = int(raw)
     except (TypeError, ValueError) as e:
@@ -611,8 +610,6 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     already has to inspect the list to decide whether to dispatch) so
     this function does not walk ``session.items`` a second time.
     """
-    from simpler_setup import parallel_scheduler as _ps  # noqa: PLC0415
-
     cfg = session.config
     device_spec = cfg.getoption("--device", default="0")
     device_ids = _parse_device_range(device_spec)
@@ -808,8 +805,6 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     worker pool) lets those instances die while nanobind is still
     available.
     """
-    from simpler_setup.scene_test import clear_compile_cache  # noqa: PLC0415
-
     clear_compile_cache()
 
 
