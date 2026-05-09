@@ -75,18 +75,24 @@ if(NOT GTEST_LIB OR NOT GTEST_MAIN_LIB)
 endif()
 
 # ---------------------------------------------------------------------------
-# A2A3 runtime sources and stubs for ring-buffer / tensormap tests
+# A2A3 runtime sources and stubs for ring-buffer / tensormap tests.
+#
+# Bundled into an OBJECT library so the runtime .cpp files compile once and
+# the resulting .o files are reused across every test executable. PUBLIC
+# include dirs / compile options propagate to consumers via
+# target_link_libraries, so test executables get the same flags they would
+# have had if the sources were listed directly.
 # ---------------------------------------------------------------------------
 set(A2A3_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime)
-set(A2A3_STUB_SOURCES ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp)
-set(A2A3_RUNTIME_SOURCES
+
+add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/pto_ring_buffer.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_shared_memory.cpp
     ${A2A3_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
     ${A2A3_RUNTIME_DIR}/pto_tensormap.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
-
-set(A2A3_COMMON_INCLUDE_DIRS
+target_include_directories(a2a3_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
@@ -94,22 +100,13 @@ set(A2A3_COMMON_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
 )
+target_compile_options(a2a3_rt_objs PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
 
-function(add_a2a3_runtime_test name)
-    cmake_parse_arguments(ARG "" "" "SOURCES;EXTRA_SOURCES" ${ARGN})
-    set(_all_sources ${ARG_SOURCES} ${A2A3_STUB_SOURCES})
-    foreach(src ${ARG_SOURCES} ${ARG_EXTRA_SOURCES})
-        if(EXISTS ${src})
-            list(APPEND _all_sources ${src})
-        endif()
-    endforeach()
-    add_executable(${name} ${_all_sources})
-    target_include_directories(${name} PRIVATE
-        ${GTEST_INCLUDE_DIRS}
-        ${A2A3_COMMON_INCLUDE_DIRS}
-    )
-    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+function(add_a2a3_runtime_test name src)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE ${GTEST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE
+        a2a3_rt_objs
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
         pthread
@@ -119,13 +116,13 @@ function(add_a2a3_runtime_test name)
 endfunction()
 
 # ---------------------------------------------------------------------------
-# Distributed runtime sources under test
+# Distributed runtime sources under test, bundled into an OBJECT library so
+# they compile once and link into every hierarchical test.
 # ---------------------------------------------------------------------------
 set(HIERARCHICAL_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/hierarchical)
-
 set(WORKER_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/worker)
 
-set(HIERARCHICAL_SOURCES
+add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/types.cpp
     ${HIERARCHICAL_SRC_DIR}/tensormap.cpp
     ${HIERARCHICAL_SRC_DIR}/ring.cpp
@@ -136,20 +133,18 @@ set(HIERARCHICAL_SOURCES
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
 )
+target_include_directories(hierarchical_objs PUBLIC
+    ${HIERARCHICAL_SRC_DIR}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${WORKER_SRC_DIR}
+)
+target_compile_options(hierarchical_objs PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
 
-# ---------------------------------------------------------------------------
-# Helper: add one test executable
-# ---------------------------------------------------------------------------
 function(add_hierarchical_test name src)
-    add_executable(${name} ${src} ${HIERARCHICAL_SOURCES})
-    target_include_directories(${name} PRIVATE
-        ${GTEST_INCLUDE_DIRS}
-        ${HIERARCHICAL_SRC_DIR}
-        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
-        ${WORKER_SRC_DIR}
-    )
-    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE ${GTEST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE
+        hierarchical_objs
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
         pthread
@@ -257,46 +252,16 @@ add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 add_a2a3_test(test_a2a3_fatal a2a3/test_a2a3_fatal.cpp)
 
 # PTO2 runtime-linked tests
-add_a2a3_runtime_test(test_task_allocator
-    SOURCES a2a3/test_task_allocator.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_dep_list_pool
-    SOURCES a2a3/test_dep_list_pool.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_scheduler_state
-    SOURCES a2a3/test_scheduler_state.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_task_state
-    SOURCES a2a3/test_task_state.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_ready_queue
-    SOURCES a2a3/test_ready_queue.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_shared_memory
-    SOURCES a2a3/test_shared_memory.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_a2a3_tensormap
-    SOURCES a2a3/test_tensormap.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_fanin_pool
-    SOURCES a2a3/test_fanin_pool.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_spsc_queue
-    SOURCES a2a3/test_spsc_queue.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
-add_a2a3_runtime_test(test_wiring
-    SOURCES a2a3/test_wiring.cpp
-    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
-)
+add_a2a3_runtime_test(test_task_allocator   a2a3/test_task_allocator.cpp)
+add_a2a3_runtime_test(test_dep_list_pool    a2a3/test_dep_list_pool.cpp)
+add_a2a3_runtime_test(test_scheduler_state  a2a3/test_scheduler_state.cpp)
+add_a2a3_runtime_test(test_task_state       a2a3/test_task_state.cpp)
+add_a2a3_runtime_test(test_ready_queue      a2a3/test_ready_queue.cpp)
+add_a2a3_runtime_test(test_shared_memory    a2a3/test_shared_memory.cpp)
+add_a2a3_runtime_test(test_a2a3_tensormap   a2a3/test_tensormap.cpp)
+add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
+add_a2a3_runtime_test(test_spsc_queue       a2a3/test_spsc_queue.cpp)
+add_a2a3_runtime_test(test_wiring           a2a3/test_wiring.cpp)
 
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
