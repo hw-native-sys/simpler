@@ -361,7 +361,10 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
         int32_t core_id = cores[i];
         uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
         if (reg_addr != 0) {
-            platform_deinit_aicore_regs(reg_addr);
+            // Timeout means AICore is unresponsive. Log and continue deiniting remaining cores.
+            if (platform_deinit_aicore_regs(reg_addr) != 0) {
+                LOG_ERROR("Thread %d: Core %d deinit timed out", thread_idx, core_id);
+            }
         } else {
             LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
         }

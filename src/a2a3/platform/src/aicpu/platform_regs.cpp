@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include "aicpu/platform_regs.h"
+#include "aicpu/device_time.h"
 #include "common/platform_config.h"
 
 static uint64_t g_platform_regs = 0;
@@ -73,17 +74,25 @@ void platform_init_aicore_regs(uint64_t reg_addr) {
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
 }
 
-void platform_deinit_aicore_regs(uint64_t reg_addr) {
+int32_t platform_deinit_aicore_regs(uint64_t reg_addr) {
     // Send exit signal to AICore
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
 
-    // Wait for AICore to acknowledge exit by writing AICORE_EXITED_VALUE to COND
-    while (read_reg(reg_addr, RegId::COND) != AICORE_EXITED_VALUE) {}
+    // Wait for AICore to acknowledge exit, with timeout.
+    // On timeout, skip register cleanup (AICore is unresponsive; host will
+    // aclrtResetDevice to clear all hardware state).
+    uint64_t t0 = get_sys_cnt_aicpu();
+    while (read_reg(reg_addr, RegId::COND) != AICORE_EXITED_VALUE) {
+        if (get_sys_cnt_aicpu() - t0 > PLATFORM_DEINIT_TIMEOUT_TICKS) {
+            return -1;
+        }
+    }
 
     // Initialize task dispatch register to idle state
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     // Close fast path control
     write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
+    return 0;
 }
 
 uint32_t platform_get_physical_cores_count() {

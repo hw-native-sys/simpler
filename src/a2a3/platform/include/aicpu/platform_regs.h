@@ -106,7 +106,7 @@ void platform_init_aicore_regs(uint64_t reg_addr);
  *
  * @param reg_addr  Register base address of the AICore
  */
-void platform_deinit_aicore_regs(uint64_t reg_addr);
+int32_t platform_deinit_aicore_regs(uint64_t reg_addr);
 
 /**
  * Get physical core count for current platform

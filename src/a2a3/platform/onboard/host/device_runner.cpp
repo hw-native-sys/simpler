@@ -268,8 +268,27 @@ int DeviceRunner::attach_current_thread(int device_id) {
         return rc;
     }
 
+    if (device_id_ == -1) {
+        configure_aicore_op_timeout();
+    }
+
     device_id_ = device_id;
     return 0;
+}
+
+void DeviceRunner::configure_aicore_op_timeout() {
+    uint64_t actual_timeout = 0;
+    int rc = aclrtSetOpExecuteTimeOutV2(PLATFORM_OP_EXECUTE_TIMEOUT_US, &actual_timeout);
+    if (rc != 0) {
+        LOG_ERROR(
+            "aclrtSetOpExecuteTimeOutV2(%llu us) failed: %d", (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, rc
+        );
+    } else {
+        LOG_INFO_V0(
+            "aclrtSetOpExecuteTimeOutV2: requested=%llu us, actual=%llu us",
+            (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, (unsigned long long)actual_timeout
+        );
+    }
 }
 
 int DeviceRunner::ensure_acl_ready(int device_id) {
@@ -684,17 +703,31 @@ int DeviceRunner::run(
         return rc;
     }
 
-    LOG_INFO_V0("=== rtStreamSynchronize stream_aicpu_ ===");
-    rc = rtStreamSynchronize(stream_aicpu_);
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+        );
+        return rc;
+    }
     if (rc != 0) {
-        LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICPU) failed: %d", rc);
         return rc;
     }
 
-    LOG_INFO_V0("=== rtStreamSynchronize stream_aicore_ ===");
-    rc = rtStreamSynchronize(stream_aicore_);
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+        );
+        return rc;
+    }
     if (rc != 0) {
-        LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
         return rc;
     }
 

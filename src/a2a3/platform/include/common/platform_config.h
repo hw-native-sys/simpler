@@ -59,6 +59,21 @@ constexpr int PLATFORM_MAX_AICPU_THREADS = 4;
  */
 constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 6;
 
+/**
+ * AICore op execution timeout (microseconds).
+ * Passed to aclrtSetOpExecuteTimeOutV2 so that STARS actively monitors
+ * AICore task execution and kills ops that exceed this threshold.
+ */
+constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 1000000;  // 1s
+
+/**
+ * Host-side stream synchronization timeout (milliseconds).
+ * Passed to aclrtSynchronizeStreamWithTimeout to detect stream sync hangs.
+ * Must be longer than PLATFORM_OP_EXECUTE_TIMEOUT_US to allow STARS
+ * enough time to kill the timed-out op and propagate the notification.
+ */
+constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 2000;  // 2s (> op timeout 1s)
+
 // =============================================================================
 // Derived Platform Limits
 // =============================================================================
@@ -137,6 +152,14 @@ constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
  * Used to convert timestamps to microseconds.
  */
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 50000000;  // 50 MHz
+
+/**
+ * AICore deinit wait timeout (ticks at PLATFORM_PROF_SYS_CNT_FREQ).
+ * platform_deinit_aicore_regs waits for AICore to acknowledge the exit
+ * signal. If AICore is stuck (STARS-killed op, hardware fault), waiting
+ * forever blocks the AICPU scheduling thread. This timeout bounds the wait.
+ */
+constexpr uint64_t PLATFORM_DEINIT_TIMEOUT_TICKS = PLATFORM_PROF_SYS_CNT_FREQ;  // 1s
 
 /**
  * Timeout duration for performance data collection (seconds)
