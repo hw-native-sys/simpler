@@ -29,12 +29,25 @@
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
 
+static void latch_scheduler_error(PTO2SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code) {
+    if (header == nullptr || error_code == PTO2_ERROR_NONE) {
+        return;
+    }
+    int32_t expected = PTO2_ERROR_NONE;
+    if (header->sched_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel)) {
+        header->sched_error_thread.store(thread_idx, std::memory_order_release);
+    }
+    if (thread_idx >= 0 && thread_idx < 32) {
+        header->sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
+    }
+}
+
 LoopAction SchedulerContext::handle_orchestrator_exit(
     int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count
 ) {
-    bool orch_done = orchestrator_done_;
-    if (!orch_done) return LoopAction::NONE;
-
+    if (completed_.load(std::memory_order_acquire)) {
+        return LoopAction::BREAK_LOOP;
+    }
     int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
     if (orch_err != PTO2_ERROR_NONE) {
         LOG_ERROR(
@@ -42,10 +55,20 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
             "completed_tasks=%d, total_tasks=%d",
             thread_idx, orch_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
         );
-        emergency_shutdown(runtime);
+        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+            emergency_shutdown(runtime);
+        }
+        return LoopAction::BREAK_LOOP;
+    }
+    int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
+    if (sched_err != PTO2_ERROR_NONE) {
+        LOG_ERROR("Thread %d: Scheduler fatal error detected (code=%d)", thread_idx, sched_err);
         completed_.store(true, std::memory_order_release);
         return LoopAction::BREAK_LOOP;
     }
+
+    bool orch_done = orchestrator_done_;
+    if (!orch_done) return LoopAction::NONE;
 
     task_count = total_tasks_;
     if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
@@ -76,10 +99,20 @@ LoopAction SchedulerContext::handle_core_transition(bool &cores_released) {
 
 LoopAction
 SchedulerContext::check_idle_fatal_error(int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime) {
+    if (completed_.load(std::memory_order_acquire)) {
+        return LoopAction::BREAK_LOOP;
+    }
     int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
     if (orch_err != PTO2_ERROR_NONE) {
         LOG_ERROR("Thread %d: Fatal error detected (code=%d), sending EXIT_SIGNAL to all cores", thread_idx, orch_err);
-        emergency_shutdown(runtime);
+        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+            emergency_shutdown(runtime);
+        }
+        return LoopAction::BREAK_LOOP;
+    }
+    int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
+    if (sched_err != PTO2_ERROR_NONE) {
+        LOG_ERROR("Thread %d: Scheduler fatal error detected (code=%d)", thread_idx, sched_err);
         completed_.store(true, std::memory_order_release);
         return LoopAction::BREAK_LOOP;
     }
@@ -167,13 +200,17 @@ void SchedulerContext::log_stall_diagnostics(
 }
 
 int32_t SchedulerContext::handle_timeout_exit(
-    int32_t thread_idx, int32_t idle_iterations
+    int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations
 #if PTO2_PROFILING
     ,
     uint64_t sched_start_ts
 #endif
 ) {
     LOG_ERROR("Thread %d: PTO2 timeout after %d idle iterations", thread_idx, idle_iterations);
+    latch_scheduler_error(header, thread_idx, PTO2_ERROR_SCHEDULER_TIMEOUT);
+    if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+        emergency_shutdown(runtime);
+    }
 #if PTO2_PROFILING
     uint64_t sched_timeout_ts = get_sys_cnt_aicpu();
     LOG_INFO_V9(
@@ -182,7 +219,7 @@ int32_t SchedulerContext::handle_timeout_exit(
         cycles_to_us(sched_timeout_ts - sched_start_ts)
     );
 #endif
-    return -1;
+    return -PTO2_ERROR_SCHEDULER_TIMEOUT;
 }
 
 #if PTO2_PROFILING
@@ -358,17 +395,21 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 #endif
 
     LOG_INFO_V0("Thread %d: Shutting down %d cores", thread_idx, core_num);
+    int32_t rc = 0;
     for (int32_t i = 0; i < core_num; i++) {
         int32_t core_id = cores[i];
         uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
         if (reg_addr != 0) {
-            platform_deinit_aicore_regs(reg_addr);
+            if (platform_deinit_aicore_regs(reg_addr) != 0) {
+                LOG_ERROR("Thread %d: Core %d shutdown timed out", thread_idx, core_id);
+                rc = -1;
+            }
         } else {
             LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
         }
     }
     LOG_INFO_V0("Thread %d: Shutdown complete", thread_idx);
-    return 0;
+    return rc;
 }
 
 // =============================================================================
@@ -603,13 +644,19 @@ void SchedulerContext::reassign_cores_for_all_threads() {
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
     LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
+    int32_t timeout_count = 0;
     for (int32_t i = 0; i < cores_total_num_; i++) {
         Handshake *hank = &all_handshakes[i];
         OUT_OF_ORDER_STORE_BARRIER();
         hank->aicpu_regs_ready = 1;
         if (core_exec_states_[i].reg_addr != 0) {
-            platform_deinit_aicore_regs(core_exec_states_[i].reg_addr);
+            if (platform_deinit_aicore_regs(core_exec_states_[i].reg_addr) != 0) {
+                timeout_count++;
+            }
         }
+    }
+    if (timeout_count > 0) {
+        LOG_ERROR("Emergency shutdown: %d cores did not acknowledge exit", timeout_count);
     }
     LOG_WARN("Emergency shutdown complete");
 }
@@ -775,8 +822,9 @@ void SchedulerContext::on_orchestration_done(
         orch_err = sched_->sm_header->orch_error_code.load(std::memory_order_relaxed);
     }
     if (orch_err != PTO2_ERROR_NONE) {
-        emergency_shutdown(runtime);
-        completed_.store(true, std::memory_order_release);
+        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+            emergency_shutdown(runtime);
+        }
     }
 
     // Skip core transition on fatal error — cores already shut down above.

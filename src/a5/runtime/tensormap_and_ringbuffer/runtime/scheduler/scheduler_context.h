@@ -281,7 +281,7 @@ private:
     log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
 
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
-        int32_t thread_idx, int32_t idle_iterations
+        int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations
 #if PTO2_PROFILING
         ,
         uint64_t sched_start_ts

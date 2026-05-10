@@ -96,8 +96,9 @@ void platform_init_aicore_regs(uint64_t reg_addr);
  * This function sends exit signal and closes fast path control.
  *
  * @param reg_addr  Register base address of the AICore
+ * @return 0 if the core acknowledged exit, non-zero on timeout
  */
-void platform_deinit_aicore_regs(uint64_t reg_addr);
+int32_t platform_deinit_aicore_regs(uint64_t reg_addr);
 
 /**
  * Get physical core count for current platform

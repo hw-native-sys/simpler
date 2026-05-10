@@ -213,7 +213,10 @@ static bool append_fanin_or_fail(
     }
 
     PTO2FaninPool &fanin_pool = fanin_builder->spill_pool;
-    fanin_pool.ensure_space(orch->sm_header->rings[ring_id], 1);
+    if (!fanin_pool.ensure_space(orch->sm_header->rings[ring_id], 1)) {
+        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
+        return false;
+    }
     int32_t spill_idx = fanin_pool.top;
     PTO2FaninSpillEntry *entry = fanin_pool.alloc();
     if (entry == nullptr) {

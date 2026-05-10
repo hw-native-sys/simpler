@@ -186,6 +186,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
  */
 int32_t AicpuExecutor::run(Runtime *runtime) {
     int32_t thread_idx = thread_idx_++;
+    int32_t run_rc = 0;
     LOG_INFO_V0("Thread %d: Start", thread_idx);
 
     // Orchestrator check
@@ -618,16 +619,21 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         } else {
             sched_ctx_.bind_runtime(rt);
             int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
-            LOG_INFO_V0("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+            if (completed < 0) {
+                LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
+                run_rc = completed;
+            } else {
+                LOG_INFO_V0("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+            }
         }
     }
 
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
     // platform_deinit_aicore_regs is idempotent; orchestrator threads have
     // core_trackers_[thread_idx].core_num() == 0 so they skip the loop harmlessly.
-    auto rc = sched_ctx_.shutdown(thread_idx);
-    if (rc != 0) {
-        return rc;
+    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
+    if (shutdown_rc != 0 && run_rc == 0) {
+        run_rc = shutdown_rc;
     }
 
     LOG_INFO_V0("Thread %d: Completed", thread_idx);
@@ -649,7 +655,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
     }
 
-    return 0;
+    return run_rc;
 }
 
 void AicpuExecutor::deinit(Runtime *runtime) {
@@ -723,7 +729,6 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     int32_t rc = g_aicpu_executor.run(runtime);
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
-        return rc;
     }
 
     int32_t runtime_rc = read_runtime_status(runtime);
@@ -737,6 +742,10 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     if (runtime_rc != 0) {
         LOG_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);
         return runtime_rc;
+    }
+
+    if (rc != 0) {
+        return rc;
     }
 
     LOG_INFO_V0("%s", "aicpu_execute: Kernel execution completed successfully");

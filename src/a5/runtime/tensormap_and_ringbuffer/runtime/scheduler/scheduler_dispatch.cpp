@@ -391,6 +391,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
     while (true) {
+        if (completed_.load(std::memory_order_acquire)) {
+            break;
+        }
         bool made_progress = false;
 #if PTO2_PROFILING
         CYCLE_COUNT_START();
@@ -581,7 +584,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
             if (idle_iterations > MAX_IDLE_ITERATIONS) {
                 return handle_timeout_exit(
-                    thread_idx, idle_iterations
+                    thread_idx, header, runtime, idle_iterations
 #if PTO2_PROFILING
                     ,
                     l2_perf.sched_start_ts
