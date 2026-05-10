@@ -9,7 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * EP dispatch kernel — Step 2 of the decode_ep_dispatch_plan, 2-rank demo.
+ * EP dispatch kernel — 2-rank demo. Publishes per-token routing payload
+ * (x BF16 / weight FP32 / idx INT32) to peer ranks' receive areas keyed by
+ * `(local_expert, slot)`, where slot is computed from a globally consistent
+ * pub_counts table. Idx encodes `r = t * TOPK + k` so combine can later
+ * address routed_y_buf[t, k, :] directly.
  *
  * Pipeline:
  *   Phase 0 (scalar)   build local histogram + (dst, loc_e)-sorted route table
@@ -29,26 +33,20 @@
  *                                                recovers column-0 values
  *                                                because columns [1, W_PAD)
  *                                                are zero by design);
- *                      recv_idx_out is [L, R]  (same TROWSUM trick)
+ *                      recv_idx_out is [L, R]  (scalar copy of column 0)
  *
  * Design notes:
- *   - All GM writes go through tile primitives (TPUT / TSTORE). No AIV
+ *   - All cross-rank GM writes go through tile primitives (TPUT). No AIV
  *     scalar GM stores on the cross-rank push path.
- *   - x is BF16 (matches the production decode_ep_dispatch_plan contract);
- *     weight stays FP32; idx is INT32. The three channels use independent
- *     tiles, window regions, and host-backed outputs so dtype changes on
- *     any channel stay local.
+ *   - x is BF16; weight stays FP32; idx is INT32. The three channels use
+ *     independent tiles, window regions, and host-backed outputs so dtype
+ *     changes on any channel stay local.
  *   - Weight uses TROWSUM along the W_PAD axis to compact the wide window
  *     [L, R, W_PAD] → [L, R] FP32: sum-of-row recovers slot [0] because the
  *     other lanes are zero. One TLOAD + TROWSUM + TSTORE per expert.
  *   - Idx uses scalar GM copy of column 0 to compact [L, R, IDX_PAD] →
  *     [L, R] INT32. INT32 TROWSUM exists in pto-isa but hangs on a2a3 in
- *     this configuration — volume is small enough (L*R = 128 INT32 stores)
- *     that scalar copy is acceptable. Outputs match the production
- *     moe_expert input contract ([L, R] FP32 / INT32) exactly.
- *   - The idx channel carries r = t * TOPK + k for each routed row. Combine
- *     uses this to address routed_y_buf[t, k, :] directly without an
- *     origin_map table — see Step 3 in the source plan.
+ *     this configuration; the L*R = 128 scalar stores are negligible.
  */
 
 #include <cstdint>
@@ -92,24 +90,34 @@ static constexpr int IDX_PAD = 8;
 // Window region byte sizes — mirror SCRATCH_NBYTES_* in main.py.
 //
 // Layout:
-//   pub_counts[N][N][L]       INT32   (64 B)
-//   count_done_sig[N]         INT32   (padded slot, 64 B)
-//   recv_x[L][R][D]           BF16    (16 KB)
-//   recv_w[L][R][W_PAD]       FP32    (4  KB; weight at slot [0], rest = 0)
-//   recv_idx[L][R][IDX_PAD]   INT32   (4  KB; r=t*TOPK+k at slot [0], rest = 0)
-//   data_done_sig[N]          INT32   (padded slot, 64 B)
+//   pub_counts[N][N][L]            INT32   (64 B)
+//   count_done_sig[N]              INT32   (padded slot, 64 B)
+//   recv_x[L][R][D]                BF16    (16 KB)
+//   recv_w[L][R][W_PAD]            FP32    (4  KB; weight at slot [0], rest = 0)
+//   recv_idx[L][R][IDX_PAD]        INT32   (4  KB; r=t*TOPK+k at slot [0], rest = 0)
+//   data_done_sig[N]               INT32   (padded slot, 64 B)
+// ---- Cross-rank visible regions consumed by combine.cpp ----
+//   routed_y_buf[T][TOPK][D]       BF16    (2  KB demo; combine push destination,
+//                                            addressed directly by (t, k))
+//   combine_done_sig[N]            INT32   (padded slot, 64 B)
+//
+// recv_y does NOT live in this window — local_expert and combine pass it
+// as a host-backed device tensor via the orch.
 static constexpr int kPubCountsBytes = 64;
 static constexpr int kSignalBytes = 64;
 static constexpr int kRecvXBytes = L * R * D * 2;          // BF16
 static constexpr int kRecvWBytes = L * R * W_PAD * 4;
 static constexpr int kRecvIdxBytes = L * R * IDX_PAD * 4;
+static constexpr int kRoutedYBufBytes = T * TOPK * D * 2;  // BF16
 
-static constexpr int kOffPubCounts = 0;
-static constexpr int kOffCountDone = kOffPubCounts + kPubCountsBytes;
-static constexpr int kOffRecvX     = kOffCountDone + kSignalBytes;
-static constexpr int kOffRecvW     = kOffRecvX     + kRecvXBytes;
-static constexpr int kOffRecvIdx   = kOffRecvW     + kRecvWBytes;
-static constexpr int kOffDataDone  = kOffRecvIdx   + kRecvIdxBytes;
+static constexpr int kOffPubCounts   = 0;
+static constexpr int kOffCountDone   = kOffPubCounts   + kPubCountsBytes;
+static constexpr int kOffRecvX       = kOffCountDone   + kSignalBytes;
+static constexpr int kOffRecvW       = kOffRecvX       + kRecvXBytes;
+static constexpr int kOffRecvIdx     = kOffRecvW       + kRecvWBytes;
+static constexpr int kOffDataDone    = kOffRecvIdx     + kRecvIdxBytes;
+static constexpr int kOffRoutedYBuf  = kOffDataDone    + kSignalBytes;
+static constexpr int kOffCombineDone = kOffRoutedYBuf  + kRoutedYBufBytes;
 
 template <typename T_>
 AICORE inline __gm__ T_ *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T_ *local_ptr, int peer_rank) {
@@ -150,8 +158,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                                     recv_w_out_tensor->start_offset;
     __gm__ int32_t    *recv_idx_out = reinterpret_cast<__gm__ int32_t  *>(recv_idx_out_tensor->buffer.addr) +
                                       recv_idx_out_tensor->start_offset;
-    // recv_count_out is shape [L, 1] INT32 per the source plan; storage is the
-    // same L contiguous int32 slots either way.
+    // recv_count_out is shape [L, 1] INT32 (1-element-per-expert grid);
+    // storage is L contiguous int32 slots either way.
     __gm__ int32_t    *recv_count_out = reinterpret_cast<__gm__ int32_t *>(recv_count_out_tensor->buffer.addr) +
                                         recv_count_out_tensor->start_offset;
 

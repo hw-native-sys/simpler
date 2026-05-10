@@ -7,13 +7,19 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end 2-card EP dispatch demo.
+"""End-to-end 2-card EP dispatch + local_expert + combine demo.
 
-Implements Step 2 of `models/deepseek/v4/deepseek_v4_decode_ep_dispatch_plan.md`,
-modelled on ``examples/workers/l3/ffn_tp_parallel/`` (TPUT push pattern) and
-``examples/workers/l3/allreduce_distributed/`` (HCCL-window bootstrap).
+A single orchestration runs three child AIV kernels back-to-back over a
+shared HCCL window scratch:
 
-Each rank drives the AIV ``ep_dispatch`` kernel:
+  dispatch.cpp      count exchange + 3-channel push + per-channel stage-out
+  local_expert.cpp  recv_y[e, s, :] = recv_x[e, s, :] * recv_w[e, s]
+                    (placeholder for the production moe_expert)
+  combine.cpp       zero-init routed_y_buf, TPUT recv_y rows by recv_idx_out
+                    into routed_y_buf[t, k, :], barrier, reduce_sum along
+                    TOPK -> routed_y FP32
+
+Each rank drives the dispatch kernel through 4 phases:
 
   Phase 0  scalar histogram + (dst, loc_e)-sorted route table from indices
   Phase 1  publish full send_counts table to peers via TNOTIFY(AtomicAdd)
@@ -29,25 +35,21 @@ Each rank drives the AIV ``ep_dispatch`` kernel:
   Phase 4  stage out recv_x / recv_w / recv_idx windows -> host-backed outputs
 
 Type/shape contract:
-  - ``x_norm`` and ``recv_x_out`` are **BF16** (matches the production
-    decode_ep_dispatch_plan). Test inputs use small integer values
-    (≤ 256) that fit BF16 exactly so the host golden can compare bit-for-bit.
+  - ``x_norm`` and ``recv_x_out`` are **BF16**. Test inputs use small
+    integer values (≤ 256) that fit BF16 exactly.
   - Weight uses a 1xW_PAD=8 FP32 tile per route (the minimum vector tile
     granularity = 32 B = one MTE burst). The host pre-packs each row as
-    [weight, 0, 0, …, 0]; receiver writes recv_w[loc_e][slot, :W_PAD] and
-    only slot [0] is meaningful. recv_w_out is therefore ``[L, R, W_PAD]``
-    — close to the protocol's ``[L, R]`` contract; host extracts
-    ``[..., 0]`` to get the real weight grid.
-  - Idx uses the same minimum-tile rationale: 1xIDX_PAD=8 INT32 per route,
-    actual r=t*TOPK+k at slot [0]. Combine (Step 3) reads slot [0] to
-    address routed_y_buf[t, k, :] without a host-built origin_map.
-  - ``recv_count`` and ``origin_map`` are not kernel outputs: the host
-    derives recv_count from ``indices`` directly, and origin_map is
-    replaced by the on-device idx channel.
+    [weight, 0, 0, …, 0]; receiver writes recv_w[loc_e][slot, :W_PAD]
+    and the kernel TROWSUM-compacts to a [L, R] FP32 host output.
+  - Idx uses the same minimum-tile rationale: 1xIDX_PAD=8 INT32 per
+    route, actual r=t*TOPK+k at slot [0]; compacted via scalar copy to
+    [L, R] INT32 host output. Combine reads it to address
+    routed_y_buf[t, k, :] without a host-built origin_map.
+  - ``recv_count_out`` is [L, 1] INT32 emitted by dispatch's Phase 2.
 
 Hardware only. Run:
 
-    python examples/workers/l3/ep_dispatch_distributed/main.py -d 0-1
+    python examples/workers/l3/ep_dispatch_combine/main.py -d 0-1
 """
 
 from __future__ import annotations
@@ -94,12 +96,13 @@ IDX_PAD = 8         # idx tile width   — minimum vector tile (1x8 INT32 = 32 B
 E_GLOBAL = N_RANKS * L
 N_ROUTES = T * TOPK
 
-# Window region byte sizes — mirror kOff*/kScratchBytes in the kernel.
+# Window region byte sizes — mirror kOff*/kScratchBytes in the kernels.
 PUB_COUNTS_BYTES = 64                                   # N*N*L INT32, aligned to 64 B
 SIGNAL_BYTES = 64                                       # padded slot per signal area
 RECV_X_BYTES = L * R * D * 2                            # 16 KB (BF16)
 RECV_W_BYTES = L * R * W_PAD * 4                        # 4  KB (FP32; weight at slot 0)
 RECV_IDX_BYTES = L * R * IDX_PAD * 4                    # 4  KB (INT32; r at slot 0)
+ROUTED_Y_BUF_BYTES = T * TOPK * D * 2                   # 2  KB (BF16; combine push dest)
 SCRATCH_NBYTES = (
     PUB_COUNTS_BYTES
     + SIGNAL_BYTES         # count_done_sig
@@ -107,41 +110,56 @@ SCRATCH_NBYTES = (
     + RECV_W_BYTES
     + RECV_IDX_BYTES
     + SIGNAL_BYTES         # data_done_sig
+    + ROUTED_Y_BUF_BYTES   # combine push destination
+    + SIGNAL_BYTES         # combine_done_sig
 )
 
 
 def parse_device_range(spec: str) -> list[int]:
-    if "-" in spec:
+    if "," in spec:
+        ids = [int(x) for x in spec.split(",")]
+    elif "-" in spec:
         lo, hi = (int(x) for x in spec.split("-"))
         ids = list(range(lo, hi + 1))
     else:
         ids = [int(spec)]
     if len(ids) != N_RANKS:
-        raise ValueError(f"ep_dispatch_distributed needs exactly {N_RANKS} devices, got {ids}")
+        raise ValueError(f"ep_dispatch_combine needs exactly {N_RANKS} devices, got {ids}")
     return ids
 
 
 def build_chip_callable(platform: str) -> ChipCallable:
-    """Compile the AIV ep_dispatch kernel + its C++ orchestration shim."""
+    """Compile the dispatch / local_expert / combine AIV kernels + their
+    shared C++ orchestration shim into a single ChipCallable with three
+    child callables.
+    """
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
     pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
 
-    kernel_bytes = kc.compile_incore(
-        source_path=os.path.join(HERE, "kernels/aiv/ep_dispatch_kernel.cpp"),
-        core_type="aiv",
-        pto_isa_root=pto_isa_root,
-        extra_include_dirs=kernel_include_dirs,
-    )
-    kernel_bytes = extract_text_section(kernel_bytes)
+    def compile_aiv(name: str) -> bytes:
+        b = kc.compile_incore(
+            source_path=os.path.join(HERE, "kernels/aiv", name),
+            core_type="aiv",
+            pto_isa_root=pto_isa_root,
+            extra_include_dirs=kernel_include_dirs,
+        )
+        return extract_text_section(b)
+
+    dispatch_bin = compile_aiv("dispatch.cpp")
+    local_expert_bin = compile_aiv("local_expert.cpp")
+    combine_bin = compile_aiv("combine.cpp")
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
-        source_path=os.path.join(HERE, "kernels/orchestration/ep_dispatch_orch.cpp"),
+        source_path=os.path.join(HERE, "kernels/orchestration/ep_dispatch_combine_orch.cpp"),
     )
-    signature = [
+
+    # Per-child signatures — each kernel sees only the args it actually
+    # consumes (matching the orch's `Arg` packing for that submit).
+    sig_dispatch = [
         ArgDirection.IN,    # indices
         ArgDirection.IN,    # x_norm
         ArgDirection.IN,    # w_padded
@@ -152,12 +170,43 @@ def build_chip_callable(platform: str) -> ChipCallable:
         ArgDirection.OUT,   # recv_count_out
         ArgDirection.INOUT, # scratch
     ]
-    core_callable = CoreCallable.build(signature=signature, binary=kernel_bytes)
+    sig_local_expert = [
+        ArgDirection.IN,    # recv_x_out (reused as INPUT)
+        ArgDirection.IN,    # recv_w_out (reused as INPUT)
+        ArgDirection.IN,    # recv_count_out (reused as INPUT)
+        ArgDirection.OUT,   # recv_y
+    ]
+    sig_combine = [
+        ArgDirection.IN,    # recv_y (reused as INPUT)
+        ArgDirection.IN,    # recv_idx_out (reused as INPUT)
+        ArgDirection.OUT,   # routed_y
+        ArgDirection.INOUT, # scratch
+    ]
+
+    # The orch's view is the union of every child's tensor footprint.
+    sig_orch = [
+        ArgDirection.IN,    # indices
+        ArgDirection.IN,    # x_norm
+        ArgDirection.IN,    # w_padded
+        ArgDirection.IN,    # idx_padded
+        ArgDirection.OUT,   # recv_x_out
+        ArgDirection.OUT,   # recv_w_out
+        ArgDirection.OUT,   # recv_idx_out
+        ArgDirection.OUT,   # recv_count_out
+        ArgDirection.OUT,   # recv_y
+        ArgDirection.OUT,   # routed_y
+        ArgDirection.INOUT, # scratch
+    ]
+
     return ChipCallable.build(
-        signature=signature,
-        func_name="ep_dispatch_orchestration",
+        signature=sig_orch,
+        func_name="ep_dispatch_combine_orchestration",
         binary=orch_bytes,
-        children=[(0, core_callable)],
+        children=[
+            (0, CoreCallable.build(signature=sig_dispatch,     binary=dispatch_bin)),
+            (1, CoreCallable.build(signature=sig_local_expert, binary=local_expert_bin)),
+            (2, CoreCallable.build(signature=sig_combine,      binary=combine_bin)),
+        ],
     )
 
 
@@ -320,12 +369,22 @@ def run(device_ids: list[int]) -> int:
 
     # Outputs — recv_x_out is BF16 (matches kernel TPUT/TSTORE element type);
     # recv_w_out / recv_idx_out are compacted to [L, R] inside the kernel.
-    # recv_count_out is [L, 1] INT32 per the source plan's expert kernel
-    # input contract — kernel Phase 2 fills it from pub_counts.
+    # recv_count_out is [L, 1] INT32 — dispatch's Phase 2 fills it from
+    # pub_counts so local_expert can iterate `recv_count[e]` rows per expert.
     recv_x_outs = [torch.zeros(L, R, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
     recv_w_outs = [torch.zeros(L, R, dtype=torch.float32).share_memory_() for _ in range(nranks)]
     recv_idx_outs = [torch.zeros(L, R, dtype=torch.int32).share_memory_() for _ in range(nranks)]
     recv_count_outs = [torch.zeros(L, 1, dtype=torch.int32).share_memory_() for _ in range(nranks)]
+    # Cross-kernel host-backed tensors:
+    #   recv_y    [L, R, D]  BF16 — local_expert output, also visible to host
+    #                                for debug.
+    #   routed_y  [T, D]     FP32 — combine output; the FP32 reduce accumulator
+    #                                is written out directly without a final
+    #                                cast back to BF16 (mirrors how the
+    #                                production block keeps the FP32 accumulator
+    #                                live until exit).
+    recv_y_outs = [torch.zeros(L, R, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
+    routed_y_outs = [torch.zeros(T, D, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
     print("[ep_dispatch] computing host golden...")
     expected_recv_x, expected_recv_w, expected_recv_idx, expected_count = compute_golden(
@@ -388,6 +447,8 @@ def run(device_ids: list[int]) -> int:
                 chip_args.add_tensor(make_tensor_arg(recv_w_outs[i]), TensorArgType.OUTPUT_EXISTING)
                 chip_args.add_tensor(make_tensor_arg(recv_idx_outs[i]), TensorArgType.OUTPUT_EXISTING)
                 chip_args.add_tensor(make_tensor_arg(recv_count_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                chip_args.add_tensor(make_tensor_arg(recv_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                chip_args.add_tensor(make_tensor_arg(routed_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
                 chip_args.add_tensor(
                     ContinuousTensor.make(
                         data=ctx.buffer_ptrs["scratch"],
@@ -450,6 +511,40 @@ def run(device_ids: list[int]) -> int:
                                 f"  slot {s}: got idx={int(got_idx[s])} "
                                 f"expected={int(exp_idx[s])}"
                             )
+
+        # routed_y golden: routed_y[t, :] should equal
+        #   sum_k weights[me, t, k] * x_norms[me][t, :]
+        # since local_expert is elementwise x*weight and combine reduces
+        # along TOPK. The only BF16 round-trip is local_expert's
+        # `cast(x*w, bf16)`; combine's accumulator stays FP32.
+        for r in range(nranks):
+            # Mirror the device path's BF16 round-trip exactly:
+            #   local_expert: cast((x_bf16 * w_fp32), BF16)        — single round-trip
+            #   combine reduce: BF16 read → cast FP32 → += → store FP32
+            # Per (t, k) the contribution is `bf16(x.f32 * w)`; the per-token
+            # FP32 sum from there should be bit-exact in steady state.
+            expected = torch.zeros(T, D, dtype=torch.float32)
+            for t in range(T):
+                for k in range(TOPK):
+                    weighted_fp32 = weights[r, t, k] * x_norms[r][t, :].to(torch.float32)
+                    weighted_bf16_back = weighted_fp32.to(torch.bfloat16).to(torch.float32)
+                    expected[t, :] += weighted_bf16_back
+            diff = (routed_y_outs[r] - expected).abs().max().item()
+            rel_diff = diff / (expected.abs().max().item() + 1e-9)
+            print(
+                f"[ep_dispatch] chip {r}: routed_y max|diff|={diff:.3e} "
+                f"(rel={rel_diff:.3e})"
+            )
+            # Steady-state expectation: 0 (the model captures every cast).
+            # Allow 1e-3 abs as headroom for any fp32 reorder we missed.
+            if diff > 1e-3:
+                ok = False
+                print(f"[ep_dispatch] chip {r}: routed_y mismatch (tol=1e-3)")
+                for t in range(min(T, 3)):
+                    print(
+                        f"  token {t}: got[0]={float(routed_y_outs[r][t, 0]):.4f} "
+                        f"expected[0]={float(expected[t, 0]):.4f}"
+                    )
 
         if not ok:
             print("[ep_dispatch] golden check FAILED")
