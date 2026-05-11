@@ -496,6 +496,12 @@ namespace DAV_3510 {
 constexpr uint32_t PLATFORM_MAX_PHYSICAL_CORES = PLATFORM_NUM_DIES * PLATFORM_AICORE_PER_DIE;
 }
 
+/**
+ * AICore local memory size (bytes) reserved per task launch.
+ * Passed to rtTaskCfgInfo_t::localMemorySize when launching AICore kernels.
+ */
+constexpr uint32_t PLATFORM_AICORE_LOCAL_MEMORY_SIZE = 229376;  // 224 KB
+
 // =============================================================================
 // ACK/FIN Dual-State Register Protocol
 // =============================================================================
