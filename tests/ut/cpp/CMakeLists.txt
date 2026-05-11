@@ -89,7 +89,7 @@ add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/pto_ring_buffer.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_shared_memory.cpp
     ${A2A3_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
-    ${A2A3_RUNTIME_DIR}/pto_tensormap.cpp
+    ${A2A3_RUNTIME_DIR}/shared/pto_tensormap.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
 target_include_directories(a2a3_rt_objs PUBLIC

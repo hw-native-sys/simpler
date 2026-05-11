@@ -33,6 +33,23 @@
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
 
+// dep_gen_replay_emit_deps_json: strong symbol provided by
+// runtime/tensormap_and_ringbuffer/host/dep_gen_replay.cpp when that runtime is
+// linked into host_runtime.so. host_build_graph has no replay implementation
+// today, so its host_runtime.so falls through to this weak stub. visibility=
+// hidden keeps the stub off the global dynamic symbol table so it can't
+// accidentally shadow the strong symbol via RTLD_GLOBAL.
+// LOG_DEBUG (not WARN): runtimes that don't link dep_gen never enable it in
+// practice, so this path is unreachable for end users — the symbol exists
+// purely to keep the .so loadable.
+extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_deps_json(
+    const struct DepGenRecord * /*records*/, size_t /*num_records*/, const char * /*deps_json_path*/,
+    const int32_t * /*task_window_sizes*/
+) {
+    LOG_DEBUG("dep_gen replay not implemented for this runtime — deps.json skipped");
+    return -1;
+}
+
 // =============================================================================
 // Lazy-loaded HAL (ascend_hal) for profiling host-register only
 // =============================================================================
@@ -621,7 +638,7 @@ int DeviceRunner::run(
     }
 
     if (enable_dep_gen_) {
-        rc = init_dep_gen(launch_aicpu_num, make_dep_gen_path(output_prefix_), device_id);
+        rc = init_dep_gen(launch_aicpu_num, device_id);
         if (rc != 0) {
             LOG_ERROR("init_dep_gen failed: %d", rc);
             return rc;
@@ -773,7 +790,14 @@ int DeviceRunner::run(
 
     if (enable_dep_gen_) {
         dep_gen_collector_.stop();
-        dep_gen_collector_.reconcile_counters();
+        if (dep_gen_collector_.reconcile_counters()) {
+            const auto &records = dep_gen_collector_.records();
+            const std::string deps = output_prefix_ + "/deps.json";
+            int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str(), nullptr);
+            if (rc != 0) {
+                LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
+            }
+        }
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -1497,7 +1521,7 @@ int DeviceRunner::init_pmu(
     return 0;
 }
 
-int DeviceRunner::init_dep_gen(int num_threads, const std::string &submit_trace_path, int device_id) {
+int DeviceRunner::init_dep_gen(int num_threads, int device_id) {
     auto alloc_cb = [](size_t size, void *user_data) -> void * {
         auto *allocator = static_cast<MemoryAllocator *>(user_data);
         return allocator->alloc(size);
@@ -1521,8 +1545,7 @@ int DeviceRunner::init_dep_gen(int num_threads, const std::string &submit_trace_
         return allocator->free(dev_ptr);
     };
 
-    int rc =
-        dep_gen_collector_.init(num_threads, submit_trace_path, alloc_cb, register_cb, free_cb, &mem_alloc_, device_id);
+    int rc = dep_gen_collector_.init(num_threads, alloc_cb, register_cb, free_cb, &mem_alloc_, device_id);
     if (rc != 0) {
         return rc;
     }

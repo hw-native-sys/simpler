@@ -610,15 +610,27 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
     // register themselves.
     if (is_dep_gen_enabled()) {
         const void *tensor_ptrs[MAX_TENSOR_ARGS];
-        const int tc = args.tensor_count();
+        // TensorArgType is `enum class : int32_t` (4 bytes); the on-disk record
+        // packs arg_types as uint8_t[16] (5-value enum fits in a byte). Narrow
+        // each tag here rather than letting the AICPU writer reinterpret a
+        // 4×-wider array as bytes — that path silently lost two of every three
+        // tags on little-endian and synthesized phantom self-edges in replay.
+        uint8_t arg_types_u8[MAX_TENSOR_ARGS];
+        // Clamp to MAX_TENSOR_ARGS even though the Arg builder caps adds at
+        // MAX_TENSOR_ARGS: defensive against any future builder bypass /
+        // shared-memory bit-flip that could otherwise overrun the two
+        // MAX_TENSOR_ARGS-sized stack buffers above.
+        const int tc_raw = args.tensor_count();
+        const int tc = tc_raw > MAX_TENSOR_ARGS ? MAX_TENSOR_ARGS : tc_raw;
         for (int i = 0; i < tc; i++) {
             // OUTPUT slots carry create_info (not yet a Tensor); skip them —
             // they have no producer to look up and replay's per-tensor loop
             // also skips OUTPUT.
             tensor_ptrs[i] = (args.tag(i) == TensorArgType::OUTPUT) ? nullptr : args.tensor(i).ptr;
+            arg_types_u8[i] = static_cast<uint8_t>(args.tag(i));
         }
         dep_gen_aicpu_record_submit(
-            task_id.raw, orch->in_manual_scope(), tc, tensor_ptrs, reinterpret_cast<const uint8_t *>(args.tag_data()),
+            task_id.raw, orch->in_manual_scope(), tc, tensor_ptrs, arg_types_u8,
             static_cast<int>(args.explicit_dep_count()), reinterpret_cast<const uint64_t *>(args.explicit_deps_data())
         );
     }
