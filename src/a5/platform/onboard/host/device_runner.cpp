@@ -155,17 +155,16 @@ std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     });
 }
 
-int DeviceRunner::ensure_device_initialized(
-    int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
+int DeviceRunner::load_executor_blobs(
+    const uint8_t *aicpu_blob, size_t aicpu_blob_size, const uint8_t *aicore_blob, size_t aicore_blob_size
 ) {
-    // First attach the current thread and create fresh run-scoped streams
-    int rc = prepare_run_context(device_id);
-    if (rc != 0) {
-        return rc;
+    if (aicpu_blob == nullptr || aicpu_blob_size == 0 || aicore_blob == nullptr || aicore_blob_size == 0) {
+        LOG_ERROR("load_executor_blobs: blobs must be non-empty");
+        return -1;
     }
-
-    // Then ensure binaries are loaded
-    return ensure_binaries_loaded(aicpu_so_binary, aicore_kernel_binary);
+    aicpu_so_binary_.assign(aicpu_blob, aicpu_blob + aicpu_blob_size);
+    aicore_kernel_binary_.assign(aicore_blob, aicore_blob + aicore_blob_size);
+    return ensure_binaries_loaded();
 }
 
 int DeviceRunner::attach_current_thread(int device_id) {
@@ -234,15 +233,10 @@ void DeviceRunner::release_run_context() {
     }
 }
 
-int DeviceRunner::ensure_binaries_loaded(
-    const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-) {
-    // Check if already loaded
+int DeviceRunner::ensure_binaries_loaded() {
+    // Already loaded — idempotent no-op. The runner-owned vectors are the
+    // source of truth.
     if (binaries_loaded_) {
-        // Just update kernel binary if different
-        if (aicore_kernel_binary_ != aicore_kernel_binary) {
-            aicore_kernel_binary_ = aicore_kernel_binary;
-        }
         return 0;
     }
 
@@ -252,10 +246,9 @@ int DeviceRunner::ensure_binaries_loaded(
         return -1;
     }
 
-    aicore_kernel_binary_ = aicore_kernel_binary;
-
-    // Load AICPU SO
-    int rc = so_info_.init(aicpu_so_binary, mem_alloc_);
+    // Load AICPU SO from the runner-owned vector populated by
+    // `load_executor_blobs`.
+    int rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
         return rc;
@@ -292,10 +285,7 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
     return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
-int DeviceRunner::run(
-    Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
-) {
+int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
@@ -332,11 +322,11 @@ int DeviceRunner::run(
     }
 
     // Ensure device is initialized (lazy initialization)
-    int rc = ensure_device_initialized(device_id, aicpu_so_binary, aicore_kernel_binary);
-    if (rc != 0) {
-        LOG_ERROR("ensure_device_initialized failed: %d", rc);
-        return rc;
+    if (!binaries_loaded_) {
+        LOG_ERROR("DeviceRunner::run: executor blobs not loaded; call simpler_init first");
+        return -1;
     }
+    int rc = 0;
 
     // Calculate execution parameters
     block_dim_ = block_dim;
@@ -353,7 +343,7 @@ int DeviceRunner::run(
     runtime.sche_cpu_num = launch_aicpu_num;
 
     // Get AICore register addresses for register-based task dispatch
-    rc = init_aicore_register_addresses(&kernel_args_.args.regs, static_cast<uint64_t>(device_id), mem_alloc_);
+    rc = init_aicore_register_addresses(&kernel_args_.args.regs, static_cast<uint64_t>(device_id_), mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("init_aicore_register_addresses failed: %d", rc);
         return rc;
@@ -409,7 +399,7 @@ int DeviceRunner::run(
 
     // Initialize performance profiling if enabled
     if (enable_l2_swimlane_) {
-        rc = init_l2_perf_collection(num_aicore, device_id);
+        rc = init_l2_perf_collection(num_aicore, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_l2_perf_collection failed: %d", rc);
             return rc;
@@ -422,7 +412,7 @@ int DeviceRunner::run(
 
     // Initialize tensor dump if enabled
     if (enable_dump_tensor_) {
-        rc = init_tensor_dump(runtime, num_aicore, device_id);
+        rc = init_tensor_dump(runtime, num_aicore, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_tensor_dump failed: %d", rc);
             return rc;
@@ -432,7 +422,7 @@ int DeviceRunner::run(
 
     if (enable_pmu_) {
         rc = init_pmu_buffers(
-            num_aicore, launch_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id
+            num_aicore, launch_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id_
         );
         if (rc != 0) {
             LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);

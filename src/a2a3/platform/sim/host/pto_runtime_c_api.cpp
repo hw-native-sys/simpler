@@ -200,8 +200,12 @@ void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, si
     r->record_tensor_pair(host_ptr, dev_ptr, size);
 }
 
-int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_info_v) {
+int simpler_init(
+    DeviceContextHandle ctx, int device_id, int log_level, int log_info_v, const uint8_t *aicpu_blob,
+    size_t aicpu_blob_size, const uint8_t *aicore_blob, size_t aicore_blob_size
+) {
     if (ctx == NULL) return -1;
+    if (aicpu_blob == NULL || aicpu_blob_size == 0 || aicore_blob == NULL || aicore_blob_size == 0) return -1;
 
     // Attach FIRST so that an attach failure (e.g. invalid device_id) does not
     // leave the process-wide HostLogger singleton mutated.
@@ -209,6 +213,13 @@ int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_
     int rc;
     try {
         rc = runner->attach_current_thread(device_id);
+    } catch (...) {
+        return -1;
+    }
+    if (rc != 0) return rc;
+
+    try {
+        rc = runner->load_executor_blobs(aicpu_blob, aicpu_blob_size, aicore_blob, aicore_blob_size);
     } catch (...) {
         return -1;
     }
@@ -226,18 +237,9 @@ int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_
  * Per-callable_id preparation
  * =========================================================================== */
 
-int prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, int device_id, const uint8_t *aicpu_binary,
-    size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size
-) {
+int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
     if (ctx == NULL || callable == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
-
-    (void)aicpu_binary;
-    (void)aicpu_size;
-    (void)aicore_binary;
-    (void)aicore_size;
-    (void)device_id;
 
     pthread_once(&g_runner_key_once, create_runner_key);
     pthread_setspecific(g_runner_key, ctx);
@@ -292,8 +294,7 @@ int prepare_callable(
 
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
-    int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, const char *output_prefix
+    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, const char *output_prefix
 ) {
     if (ctx == NULL || runtime == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
@@ -336,15 +337,7 @@ int run_prepared(
         runner->set_pmu_enabled(enable_pmu);
         runner->set_output_prefix(output_prefix);
 
-        std::vector<uint8_t> aicpu_vec;
-        std::vector<uint8_t> aicore_vec;
-        if (aicpu_binary != NULL && aicpu_size > 0) {
-            aicpu_vec.assign(aicpu_binary, aicpu_binary + aicpu_size);
-        }
-        if (aicore_binary != NULL && aicore_size > 0) {
-            aicore_vec.assign(aicore_binary, aicore_binary + aicore_size);
-        }
-        rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
+        rc = runner->run(*r, block_dim, aicpu_thread_num);
         if (rc != 0) {
             validate_runtime_impl(r);
             r->~Runtime();

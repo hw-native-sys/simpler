@@ -194,11 +194,16 @@ void ChipWorker::init(
     runtime_buf_.resize(get_runtime_size_fn_());
 
     // One-shot platform-side init: attach the calling thread to `device_id`
-    // (rtSetDevice on onboard, sim bind+acquire on sim) and push the user's
-    // simpler-logger choice into HostLogger + runner state (and CANN dlog
-    // onboard). Subsequent device-ops re-attach their caller threads
-    // idempotently against the recorded device id.
-    int init_rc = simpler_init_fn_(device_ctx_, device_id, log_level, log_info_v);
+    // (rtSetDevice on onboard, sim bind+acquire on sim), hand the executor
+    // blobs over to the DeviceRunner (which copies them and keeps them for
+    // the lifetime of the runtime), and push the user's simpler-logger
+    // choice into HostLogger + runner state (and CANN dlog onboard).
+    // Subsequent device-ops re-attach their caller threads idempotently
+    // against the recorded device id.
+    int init_rc = simpler_init_fn_(
+        device_ctx_, device_id, log_level, log_info_v, aicpu_binary_.data(), aicpu_binary_.size(),
+        aicore_binary_.data(), aicore_binary_.size()
+    );
     if (init_rc != 0) {
         // Symmetric teardown: drop the device context, clear all dlsym'd
         // function pointers, dlclose, and discard cached binaries so the
@@ -303,10 +308,7 @@ void ChipWorker::prepare_callable(int32_t callable_id, const void *callable) {
     if (callable == nullptr) {
         throw std::runtime_error("prepare_callable: callable must not be null");
     }
-    int rc = prepare_callable_fn_(
-        device_ctx_, callable_id, callable, device_id_, aicpu_binary_.data(), aicpu_binary_.size(),
-        aicore_binary_.data(), aicore_binary_.size()
-    );
+    int rc = prepare_callable_fn_(device_ctx_, callable_id, callable);
     if (rc != 0) {
         throw std::runtime_error("prepare_callable failed with code " + std::to_string(rc));
     }
@@ -326,8 +328,7 @@ void ChipWorker::run_prepared(int32_t callable_id, const void *args, const CallC
     void *rt = runtime_buf_.data();
 
     int rc = run_prepared_fn_(
-        device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, device_id_, aicpu_binary_.data(),
-        aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(), config.enable_l2_swimlane,
+        device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.enable_l2_swimlane,
         config.enable_dump_tensor, config.enable_pmu, config.output_prefix
     );
     if (rc != 0) {

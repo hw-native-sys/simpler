@@ -107,13 +107,9 @@ private:
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
-    using SimplerInitFn = int (*)(void *, int, int, int);
-    using PrepareCallableFn =
-        int (*)(void *, int32_t, const void *, int, const uint8_t *, size_t, const uint8_t *, size_t);
-    using RunPreparedFn = int (*)(
-        void *, void *, int32_t, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int,
-        int, int, const char *
-    );
+    using SimplerInitFn = int (*)(void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t);
+    using PrepareCallableFn = int (*)(void *, int32_t, const void *);
+    using RunPreparedFn = int (*)(void *, void *, int32_t, const void *, int, int, int, int, int, const char *);
     using UnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);

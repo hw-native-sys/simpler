@@ -209,28 +209,24 @@ public:
     /**
      * Execute a runtime
      *
-     * This method:
-     * 1. Initializes device if not already done (lazy initialization)
-     * 2. Initializes worker handshake buffers in the runtime based on block_dim
-     * 3. Transfers runtime to device memory
-     * 4. Launches AICPU init kernel
-     * 5. Launches AICPU main kernel
-     * 6. Launches AICore kernel
-     * 7. Synchronizes streams
-     * 8. Cleans up runtime memory
+     * Caller must have done `prepare_run_context()` and `load_executor_blobs()`
+     * once at `simpler_init`; this entry only performs per-task setup + launch.
      *
-     * @param runtime             Runtime to execute (will be modified to
-     * initialize workers)
-     * @param block_dim            Number of blocks (1 block = 1 AIC + 2 AIV)
-     * @param device_id            Device ID (0-15)
-     * @param aicpu_so_binary       Binary data of AICPU shared object
-     * @param aicore_kernel_binary  Binary data of AICore kernel
-     * @param launch_aicpu_num      Number of AICPU instances (default: 1)
+     * @param runtime         Runtime to execute
+     * @param block_dim       Number of blocks
+     * @param launch_aicpu_num Number of AICPU instances (default: 1)
      * @return 0 on success, error code on failure
      */
-    int
-    run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
+    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1);
+
+    /// Bound device id (set by `attach_current_thread` / `simpler_init`).
+    /// Returns -1 before init.
+    int device_id() const noexcept { return device_id_; }
+
+    /// Load AICPU SO + AICore kernel blobs into the runner once. Idempotent.
+    int load_executor_blobs(
+        const uint8_t *aicpu_blob, size_t aicpu_blob_size, const uint8_t *aicore_blob, size_t aicore_blob_size
+    );
 
     /**
      * Enablement setters for the three diagnostics sub-features. Called by
@@ -442,6 +438,9 @@ private:
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results in destructor
+    // Runner-owned copies of the executor blobs, populated once by
+    // `load_executor_blobs()` (from `simpler_init`); read every run.
+    std::vector<uint8_t> aicpu_so_binary_;
     std::vector<uint8_t> aicore_kernel_binary_;
 
     // Memory management
@@ -521,24 +520,12 @@ private:
      * @param aicore_kernel_binary  Binary data of AICore kernel
      * @return 0 on success, error code on failure
      */
-    int ensure_device_initialized(
-        int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-    );
-
     /**
-     * Load AICPU SO and initialize device args
-     *
-     * Called by run() after prepare_run_context(). Performs:
-     * - Load AICPU SO to device memory
-     * - Initialize device args
-     *
-     * @param aicpu_so_binary       Binary data of AICPU shared object
-     * @param aicore_kernel_binary  Binary data of AICore kernel
-     * @return 0 on success, error code on failure
+     * Internal: load AICPU SO + AICore kernel from cached host-side vectors
+     * `aicpu_so_binary_` / `aicore_kernel_binary_`. Called from
+     * `load_executor_blobs()` once the caller has populated those members.
      */
-    int ensure_binaries_loaded(
-        const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-    );
+    int ensure_binaries_loaded();
 
     /**
      * Stage the orchestration SO into a device-resident buffer (with hash

@@ -127,24 +127,23 @@ public:
     /**
      * Execute a runtime using threads
      *
-     * This method simulates the complete execution:
-     * 1. Initializes worker handshake buffers
-     * 2. Sets function_bin_addr for all tasks
-     * 3. Launches AICPU threads
-     * 4. Launches AICore threads
-     * 5. Waits for all threads to complete
+     * Caller must have done `attach_current_thread()` and
+     * `load_executor_blobs()` once at `simpler_init`.
      *
-     * @param runtime              Runtime to execute
-     * @param block_dim            Number of blocks (1 block = 1 AIC + 2 AIV)
-     * @param device_id            Device ID (ignored in simulation)
-     * @param aicpu_so_binary      AICPU binary (ignored in simulation)
-     * @param aicore_kernel_binary AICore binary (ignored in simulation)
-     * @param launch_aicpu_num     Number of AICPU threads
+     * @param runtime          Runtime to execute
+     * @param block_dim        Number of blocks (1 block = 1 AIC + 2 AIV)
+     * @param launch_aicpu_num Number of AICPU threads
      * @return 0 on success
      */
-    int
-    run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
+    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1);
+
+    /// Bound device id (set by `attach_current_thread` / `simpler_init`).
+    int device_id() const noexcept { return device_id_; }
+
+    /// Load AICPU SO + AICore kernel blobs into the runner once.
+    int load_executor_blobs(
+        const uint8_t *aicpu_blob, size_t aicpu_blob_size, const uint8_t *aicore_blob, size_t aicore_blob_size
+    );
 
     /**
      * Enablement setters for the three diagnostics sub-features. Called by
@@ -264,6 +263,11 @@ private:
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};
 
+    // Runner-owned copies of the executor blobs, populated once by
+    // `load_executor_blobs()` (from `simpler_init`).
+    std::vector<uint8_t> aicpu_so_binary_;
+    std::vector<uint8_t> aicore_kernel_binary_;
+
     // Memory management
     MemoryAllocator mem_alloc_;
 
@@ -335,13 +339,9 @@ private:
     // PMU profiling (per-task AICore hardware counters)
     PmuCollector pmu_collector_;
 
-    // Private helper methods
-    int ensure_device_initialized(
-        int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-    );
-    int ensure_binaries_loaded(
-        const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-    );
+    // Internal: load executor SOs from cached host-side vectors
+    // `aicpu_so_binary_` / `aicore_kernel_binary_`.
+    int ensure_binaries_loaded();
     void unload_executor_binaries();
 
     /**

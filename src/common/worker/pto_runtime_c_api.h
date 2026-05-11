@@ -82,14 +82,23 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 
 /**
  * One-shot platform-side init. Called once by ChipWorker::init() right
- * after dlopen, before any other entry. Two responsibilities:
+ * after dlopen, before any other entry. Three responsibilities:
  *
  *   1. Attach the calling thread to `device_id` (rtSetDevice on onboard,
  *      pto_cpu_sim_bind_device + pto_cpu_sim_acquire_device on sim) and
  *      record the device id on the DeviceRunner so subsequent device-ops
- *      can re-attach their own caller threads idempotently.
+ *      can re-attach their own caller threads idempotently. Also creates
+ *      the per-runner streams so binary load can proceed in the same call.
  *
- *   2. Push the user's chosen severity + INFO verbosity into HostLogger
+ *   2. Copy the AICPU/AICore executor blobs into the DeviceRunner
+ *      (one-shot H2D + AicpuSoInfo init). The blobs are raw byte buffers
+ *      already loaded into host memory by the caller (typically the
+ *      ChipWorker reading `aicpu.so` / `aicore_kernel.bin` from disk). The
+ *      caller may release its own buffer immediately after `simpler_init`
+ *      returns; every subsequent `run_prepared` reuses the runner-owned
+ *      copies.
+ *
+ *   3. Push the user's chosen severity + INFO verbosity into HostLogger
  *      and into runner state (which run_prepared later forwards to AICPU
  *      via KernelArgs).
  *
@@ -102,9 +111,12 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  * `log_level` is CANN-aligned: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL.
  * `log_info_v` ∈ [0, 9]; only meaningful when severity is INFO.
  *
- * Returns 0 on success, negative on attach failure.
+ * Returns 0 on success, negative on attach / stream / binary-load failure.
  */
-int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_info_v);
+int simpler_init(
+    DeviceContextHandle ctx, int device_id, int log_level, int log_info_v, const uint8_t *aicpu_blob,
+    size_t aicpu_blob_size, const uint8_t *aicore_blob, size_t aicore_blob_size
+);
 
 /**
  * Release all device resources held by the context.
@@ -133,22 +145,13 @@ int finalize_device(DeviceContextHandle ctx);
  * copies the orchestration SO bytes into a device-resident buffer keyed by
  * the SO's ELF Build-ID hash (so two callable_ids with identical SO share
  * one buffer). Subsequent `run_prepared(callable_id, ...)` calls reuse this
- * state.
- *
- * The `device_id`, `aicpu_binary` / `aicpu_size`, `aicore_binary` /
- * `aicore_size` parameters are accepted to keep the signature aligned with
- * `run_prepared` so codegen layers can share a single forwarding shim; the
- * current implementations ignore them (kernel upload uses the ChipCallable
- * payload, and the AICPU / AICore executor binaries are already loaded at
- * `simpler_init`).
+ * state. The device and executor binaries were bound at `simpler_init`; no
+ * per-call binary or device_id is needed.
  *
  * @return 0 on success, negative on error (NULL ctx, callable_id out of
  *         range, or upload/copy failure).
  */
-int prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, int device_id, const uint8_t *aicpu_binary,
-    size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size
-);
+int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable);
 
 /**
  * Launch a callable previously staged via `prepare_callable`.
@@ -158,14 +161,14 @@ int prepare_callable(
  * kernels or re-copying the orch SO. The AICPU side dispatches via
  * `orch_so_table_[callable_id]` (see runtime.h::set_active_callable_id). The
  * first run for a given callable_id sets `register_new_callable_id_` so the
- * AICPU does its one-time dlopen.
+ * AICPU does its one-time dlopen. The device and executor binaries were
+ * bound at `simpler_init`; this entry only carries per-task state.
  *
  * @return 0 on success, negative on error (no prep state, NULL ctx, etc.).
  */
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
-    int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, const char *output_prefix
+    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, const char *output_prefix
 );
 
 /**
