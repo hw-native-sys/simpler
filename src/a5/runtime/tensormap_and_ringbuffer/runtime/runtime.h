@@ -203,12 +203,14 @@ private:
     // Device orchestration SO (for dlopen on AICPU thread 3).
     // The SO bytes themselves live in a separately-allocated device buffer
     // owned by DeviceRunner; only the metadata below travels inside Runtime.
-    // `has_new_orch_so_` tells AICPU whether the host believes the SO identity
-    // changed since the previous run — when false AICPU reuses its cached
-    // dlopen handle and skips writing the file again.
     uint64_t dev_orch_so_addr_;
     uint64_t dev_orch_so_size_;
-    bool has_new_orch_so_;
+    // Per-callable_id dispatch. AICPU dispatches via
+    // `orch_so_table_[active_callable_id_]`; `register_new_callable_id_`
+    // signals whether the host is delivering a freshly-registered
+    // callable_id (write+dlopen) or reusing an already-loaded one.
+    int32_t active_callable_id_;
+    bool register_new_callable_id_;
     char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
     char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
 
@@ -261,10 +263,16 @@ public:
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new);
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size);
     uint64_t get_dev_orch_so_addr() const;
     uint64_t get_dev_orch_so_size() const;
-    bool has_new_orch_so() const;
+    // Per-callable_id dispatch. callable_id must be in
+    // [0, MAX_REGISTERED_CALLABLE_IDS); register_new_callable_id_ tells AICPU
+    // whether to (re)load the orch SO into orch_so_table_[callable_id] or
+    // reuse the cached entry.
+    void set_active_callable_id(int32_t callable_id, bool is_new);
+    int32_t get_active_callable_id() const;
+    bool register_new_callable_id() const;
     void set_device_orch_func_name(const char *name);
     const char *get_device_orch_func_name() const;
     void set_device_orch_config_name(const char *name);
@@ -272,6 +280,13 @@ public:
 
     uint64_t get_function_bin_addr(int func_id) const;
     void set_function_bin_addr(int func_id, uint64_t addr);
+    /**
+     * Replay a previously-uploaded kernel address onto a fresh Runtime
+     * without recording it in registered_kernel_func_ids_. Used by
+     * DeviceRunner::bind_prepared_callable_to_runtime so prepared kernel
+     * binaries are not freed by validate_runtime_impl across runs.
+     */
+    void replay_function_bin_addr(int func_id, uint64_t addr);
 
     int get_registered_kernel_count() const;
     int get_registered_kernel_func_id(int index) const;
@@ -299,9 +314,16 @@ public:
     // Host-only staging for orchestration SO. runtime_maker publishes the
     // callable-owned pointer here; DeviceRunner consumes it before launching
     // the device-side execution and replaces it with the device-resident
-    // buffer metadata (dev_orch_so_addr_, ..., has_new_orch_so_).
+    // buffer metadata (dev_orch_so_addr_, dev_orch_so_size_).
     const void *pending_orch_so_data_{nullptr};
     size_t pending_orch_so_size_{0};
+
+    // Host-orchestration staging (hbg path). Always nullptr on this trb
+    // variant — included for API parity with host_build_graph so the
+    // shared platform layer can branch on `pending_host_dlopen_handle_ !=
+    // nullptr` at runtime instead of via a build-time macro.
+    void *pending_host_dlopen_handle_{nullptr};
+    void *pending_host_orch_func_ptr_{nullptr};
 };
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

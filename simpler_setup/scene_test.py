@@ -917,6 +917,15 @@ class SceneTestCase:
         config_dict = case.get("config", {})
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
+        # The L2 entry point is `Worker.run(cid, args, cfg)`.  Reuse the
+        # cid registered by the st_worker fixture / standalone path.  For
+        # first-time callers (worker reused across rounds), `_st_l2_cid`
+        # caches the cid so subsequent runs skip re-registration.
+        cid = getattr(type(self), "_st_l2_cid", None)
+        if cid is None:
+            cid = worker.register(callable_obj)
+            type(self)._st_l2_cid = cid
+
         # Build args
         test_args = self.generate_args(params)
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
@@ -948,7 +957,7 @@ class SceneTestCase:
             )
 
             with _temporary_env(self._resolve_env()):
-                worker.run(callable_obj, chip_args, config=config)
+                worker.run(cid, chip_args, config=config)
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
@@ -1056,6 +1065,11 @@ class SceneTestCase:
         cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
         sub_ids = getattr(type(self), "_st_sub_ids", {})
+        # For L3, use pre-registered chip cids instead of raw ChipCallable
+        # objects.
+        chip_cids = getattr(type(self), "_st_chip_cids", {})
+        if self._st_level == 3 and chip_cids:
+            callable_obj = {**chip_cids}
 
         # Primary device id: prefer the one actually allocated by st_worker
         # (each test class can hold a different slot from DevicePool); fall back
@@ -1318,12 +1332,19 @@ class SceneTestCase:
         ok = True
         for (runtime, level), group in by_rt_level.items():
             print(f"\n=== Runtime: {runtime}  Level: {level} ===")
-            worker, per_class_sub_ids = _create_standalone_worker(group, level, args, selected_by_cls)
+            worker, per_class_sub_ids, per_class_chip_cids = _create_standalone_worker(
+                group, level, args, selected_by_cls
+            )
             try:
                 for cls in group:
                     inst = cls()
                     callable_obj = inst.build_callable(args.platform)
                     sub_ids = per_class_sub_ids.get(cls, {})
+                    chip_cids = per_class_chip_cids.get(cls, {})
+                    # For L3: merge chip cids into callable_obj (replacing
+                    # ChipCallable objects with their registered cid).
+                    if level == 3 and chip_cids:
+                        callable_obj = {**chip_cids}
                     for case in selected_by_cls[cls]:
                         label = f"{cls.__name__}::{case['name']}"
                         print(f"  {label} ... ", end="", flush=True)
@@ -1556,11 +1577,15 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
     ``max_sub_workers`` must be computed from these, not from ``cls.CASES``:
     otherwise a manual case with a larger ``device_count`` inflates the
     allocation even when it isn't scheduled.
+
+    Returns ``(worker, per_class_sub_ids, per_class_chip_cids)`` for both
+    L2 and L3 so the caller can unpack uniformly. L2 has neither sub
+    callables nor pre-registered chip callables, so both dicts are empty.
     """
     first_cls = group[0]
     build = getattr(args, "build", False)
     if level == 2:
-        return first_cls._create_worker(args.platform, args.device, build=build), {}
+        return first_cls._create_worker(args.platform, args.device, build=build), {}, {}
 
     from simpler.worker import Worker  # noqa: PLC0415
 
@@ -1589,12 +1614,24 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
     )
     # Register sub callables per-class to avoid name collisions
     per_class_sub_ids: dict[type, dict] = {}
+    # Also register ChipCallables here (before init) so the chip children
+    # pre-warm them via _CTRL_PREPARE.
+    per_class_chip_cids: dict[type, dict] = {}
     for cls in group:
         cls_sub_ids = {}
+        cls_chip_cids = {}
         for entry in cls.CALLABLE.get("callables", []):
             if "callable" in entry:
                 cid = worker.register(entry["callable"])
                 cls_sub_ids[entry["name"]] = cid
+            elif "orchestration" in entry:
+                name = entry["name"]
+                cache_key = (cls.__qualname__, name, args.platform, cls._st_runtime)
+                chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
+                cid = worker.register(chip)
+                cls_chip_cids[name] = cid
+                cls_chip_cids[f"{name}_sig"] = entry["orchestration"].get("signature", [])
         per_class_sub_ids[cls] = cls_sub_ids
+        per_class_chip_cids[cls] = cls_chip_cids
     worker.init()
-    return worker, per_class_sub_ids
+    return worker, per_class_sub_ids, per_class_chip_cids

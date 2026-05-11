@@ -33,6 +33,8 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/kernel_args.h"
@@ -420,6 +422,99 @@ public:
      */
     void release_run_context();
 
+    /**
+     * Stage a per-callable_id orchestration SO into device memory and remember
+     * the supporting metadata (entry/config symbol names, kernel func_id ↔
+     * dev_addr table). Identical SO bytes across two callable_ids share one
+     * device buffer (refcounted by hash) so the worst case for an N-cid pool
+     * is N distinct device buffers, not N copies of the same SO.
+     *
+     * @param callable_id   Caller-stable id, must be in [0, MAX_REGISTERED_CALLABLE_IDS).
+     * @param orch_so_data  Host pointer to orchestration SO bytes (owned by caller).
+     * @param orch_so_size  Size of orchestration SO in bytes.
+     * @param func_name     Entry symbol name (copied).
+     * @param config_name   Config symbol name (copied).
+     * @param kernel_addrs  func_id ↔ dev_addr pairs already uploaded by the
+     *                      caller. Stored verbatim so run_prepared can replay
+     *                      them onto a fresh Runtime without re-uploading.
+     * @return 0 on success, negative on failure.
+     */
+    int register_prepared_callable(
+        int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
+        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs
+    );
+
+    /**
+     * Host-orchestration variant of register_prepared_callable: stores a
+     * dlopen handle + entry-symbol pointer that runtime_maker resolved on the
+     * host (host_build_graph variant). Mutually exclusive with the trb-shaped
+     * `register_prepared_callable` overload — exactly one is invoked for a
+     * given callable_id, picked by the C ABI based on which staging fields the
+     * runtime carries after prepare_callable_impl. dlopen handle is owned by
+     * DeviceRunner from this call onward and dlclose'd by
+     * unregister_prepared_callable. Increments `host_dlopen_count_`.
+     */
+    int register_prepared_callable_host_orch(
+        int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+        std::vector<std::pair<int, uint64_t>> kernel_addrs
+    );
+
+    /**
+     * Drop the prepared state for `callable_id`. trb path: decrement the orch
+     * SO buffer's hash-keyed refcount and free when it hits zero. hbg path:
+     * dlclose the host dlopen handle. Kernel binaries are shared across
+     * callables and only released by finalize().
+     *
+     * @param callable_id  Id previously passed to one of the
+     *                     register_prepared_callable* overloads.
+     * @return 0 on success or if the id was not registered.
+     */
+    int unregister_prepared_callable(int32_t callable_id);
+
+    /**
+     * True iff `callable_id` has prepared state staged via
+     * register_prepared_callable. Lets the c_api layer reject `run_prepared`
+     * calls without a matching `prepare_callable`.
+     */
+    bool has_prepared_callable(int32_t callable_id) const;
+
+    /**
+     * Replay the prepared state for `callable_id` onto a freshly-constructed
+     * Runtime: restores kernel func_id ↔ dev_addr table, the orch entry/config
+     * symbol names, and stamps `runtime.set_active_callable_id` so the
+     * subsequent `run` dispatches via the AICPU per-cid table. The kernel
+     * addresses are written directly into func_id_to_addr_ (bypassing
+     * registered_kernel_func_ids_) so validate_runtime_impl will not free them
+     * — they survive until unregister_prepared_callable / finalize().
+     *
+     * Marks the cid as seen so the upcoming prepare_orch_so resolves
+     * `register_new_callable_id_` correctly (true exactly on first sighting
+     * after registration).
+     *
+     * @return 0 on success, -1 if the cid is not registered.
+     */
+    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+
+    /**
+     * Number of distinct callable_ids the AICPU has been asked to dlopen for.
+     * Monotonically increases on every first-sighting bind; `unregister_callable`
+     * does NOT decrement it. So a `prepare → run → unregister → re-prepare → run`
+     * sequence reports 2 (each AICPU dlopen counted once), even though only one
+     * cid is currently registered. Tests assert this to verify per-cid
+     * registration eliminates duplicate dlopens across repeated runs.
+     */
+    size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
+
+    /**
+     * Number of host-side dlopen() invocations triggered by
+     * `register_prepared_callable_host_orch`. Mirrors `aicpu_dlopen_count` but
+     * counts the host_build_graph variant's host-side dlopens; it never
+     * decrements (re-prepare after unregister still counts). Tests assert
+     * `host_dlopen_count == distinct_registered_cids` to verify the prepared
+     * path doesn't dlopen on every run.
+     */
+    size_t host_dlopen_count() const { return host_dlopen_total_; }
+
 private:
     // Internal state. device_id_ is set once in attach_current_thread() (called
     // from simpler_init during ChipWorker::init) and read on every subsequent
@@ -444,6 +539,10 @@ private:
     // Kernel binary management
     bool binaries_loaded_{false};              // true after AICPU SO loaded
     std::map<int, uint64_t> func_id_to_addr_;  // func_id -> function_bin_addr (device GM)
+    // Parallel hash map for upload_kernel_binary() to detect when the same
+    // func_id is re-uploaded with different binary bytes (different
+    // ChipCallable sharing the same func_id under the per-callable_id path).
+    std::map<int, uint64_t> func_id_to_hash_;
 
     // Orchestration SO cache. `cached_orch_so_hash_ == 0` means "no cache".
     // The device buffer grows monotonically — cache miss with a larger SO
@@ -453,6 +552,50 @@ private:
     void *dev_orch_so_buffer_{nullptr};
     size_t dev_orch_so_capacity_{0};
     std::vector<uint8_t> host_orch_so_copy_;
+
+    // Per-callable_id prepared state.
+    //
+    // `prepared_callables_` maps the caller-stable callable_id to the orch
+    // SO slice + symbol names needed to launch it. `orch_so_dedup_` shares
+    // device buffers across callable_ids whose orch SO bytes have the same
+    // ELF Build-ID hash (refcounted; freed when the count hits zero).
+    // `aicpu_seen_callable_ids_` tracks which ids have already been delivered
+    // to the AICPU at least once so prepare_orch_so can set
+    // register_new_callable_id_ correctly on first sighting.
+    struct PreparedCallableState {
+        // trb path (AICPU dlopens orch SO from device buffer)
+        uint64_t hash{0};
+        uint64_t dev_orch_so_addr{0};
+        size_t dev_orch_so_size{0};
+        std::string func_name;
+        std::string config_name;
+        // common
+        std::vector<std::pair<int, uint64_t>> kernel_addrs;
+        // hbg path (host already dlopen'd the orch SO)
+        void *host_dlopen_handle{nullptr};
+        void *host_orch_func_ptr{nullptr};
+    };
+    struct OrchSoBuffer {
+        void *dev_addr{nullptr};
+        size_t capacity{0};
+        int refcount{0};
+    };
+    std::unordered_map<int32_t, PreparedCallableState> prepared_callables_;
+    std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
+    std::unordered_set<int32_t> aicpu_seen_callable_ids_;
+    // Monotonic count of AICPU dlopens triggered (incremented on each
+    // first-sighting bind; never decremented). Diverges from
+    // aicpu_seen_callable_ids_.size() once any cid is unregistered and
+    // re-prepared. Exposed via aicpu_dlopen_count() for tests.
+    size_t aicpu_dlopen_total_{0};
+    // Monotonic count of host-side dlopens triggered (incremented on every
+    // register_prepared_callable_host_orch call; never decremented). Same
+    // re-prepare semantics as aicpu_dlopen_total_, but for hbg variants.
+    size_t host_dlopen_total_{0};
+    // Sticky flag: prepare_callable was called at least once. Distinguishes
+    // legacy-path "kernel still cached at finalize" leaks from prepared-path
+    // kernels that legitimately live until finalize.
+    bool prepared_callable_path_used_{false};
 
     // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
     // gates it behind this flag. finalize() drives aclFinalize only if we observed
@@ -501,8 +644,8 @@ private:
     );
 
     /**
-     * Populate runtime.{dev_orch_so_addr_, dev_orch_so_size_, has_new_orch_so_}
-     * from `runtime.pending_orch_so_data_` / `_size_`.
+     * Populate runtime.{dev_orch_so_addr_, dev_orch_so_size_} from
+     * `runtime.pending_orch_so_data_` / `_size_`.
      *
      * The host tracks the SO identity via a 64-bit hash derived from the ELF
      * GNU Build-ID. When the hash matches the previous run, the device-side

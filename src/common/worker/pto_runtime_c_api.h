@@ -24,14 +24,15 @@
  *   - sizing:       get_runtime_size
  *   - device-mem:   device_malloc_ctx, device_free_ctx,
  *                   copy_to_device_ctx, copy_from_device_ctx
- *   - run:          run_runtime
+ *   - prepared run: prepare_callable, run_prepared, unregister_callable,
+ *                   get_aicpu_dlopen_count, get_host_dlopen_count
  *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
  *                   destroy_comm_stream_ctx
  *   - comm:         comm_init, comm_alloc_windows, comm_get_local_window_base,
  *                   comm_get_window_size, comm_barrier, comm_destroy
  *
  * Memory management: caller allocates a buffer of get_runtime_size() bytes
- * and passes it to run_runtime(). Error codes: 0 = success, negative = error.
+ * and passes it to run_prepared(). Error codes: 0 = success, negative = error.
  */
 
 #ifndef SRC_COMMON_WORKER_PTO_RUNTIME_C_API_H_
@@ -80,38 +81,6 @@ int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_
 int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size);
 
 /**
- * Build the task graph, execute on device, copy results back, and clean up.
- *
- * @param ctx               Device context from create_device_context()
- * @param runtime           Caller-allocated buffer (size from get_runtime_size())
- * @param callable          Opaque ChipCallable pointer (orchestration + kernel binaries)
- * @param args              Opaque ChipStorageTaskArgs pointer (tensor/scalar arguments)
- * @param block_dim         Number of AICore blocks
- * @param aicpu_thread_num  Number of AICPU scheduler threads
- * @param device_id         Target device
- * @param aicpu_binary      AICPU executor binary blob
- * @param aicpu_size        Size of AICPU binary
- * @param aicore_binary     AICore executor binary blob
- * @param aicore_size       Size of AICore binary
- * @param enable_l2_swimlane       1 to enable perf swimlane collection, 0 to disable
- * @param enable_dump_tensor 1 to enable tensor dump, 0 to disable
- * @param enable_pmu        0 = PMU disabled; >0 = enabled, value selects event type
- * @param output_prefix     NUL-terminated directory path under which diagnostic
- *                          artifacts (l2_perf_records.json / tensor_dump/ /
- *                          pmu.csv) are written. Required (non-empty) whenever
- *                          any diagnostic flag is enabled; ignored otherwise.
- *
- * Log configuration is applied separately via simpler_init() at ChipWorker
- * init time and read from runner state when populating KernelArgs.
- * @return 0 on success, negative on error
- */
-int run_runtime(
-    DeviceContextHandle ctx, RuntimeHandle runtime, const void *callable, const void *args, int block_dim,
-    int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, const char *output_prefix
-);
-
-/**
  * One-shot platform-side init. Called once by ChipWorker::init() right
  * after dlopen, before any other entry. Two responsibilities:
  *
@@ -121,7 +90,7 @@ int run_runtime(
  *      can re-attach their own caller threads idempotently.
  *
  *   2. Push the user's chosen severity + INFO verbosity into HostLogger
- *      and into runner state (which run_runtime later forwards to AICPU
+ *      and into runner state (which run_prepared later forwards to AICPU
  *      via KernelArgs).
  *
  * On onboard, also calls dlog_setlevel(-1, log_level, 0) so CANN's runtime
@@ -142,6 +111,97 @@ int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_
  * Must be called before destroy_device_context() / dlclose().
  */
 int finalize_device(DeviceContextHandle ctx);
+
+/* ===========================================================================
+ * Per-callable_id preparation
+ *
+ * The triplet below decouples the one-shot prep work (kernel upload + orch SO
+ * H2D + caching keyed by `callable_id`) from each `run_prepared` invocation,
+ * so the per-run cost shrinks to "rebuild Runtime args + launch". Callers
+ * keep a stable small-int `callable_id` per ChipCallable; the platform side
+ * caches the prepared state in a fixed-size table (cap 64, see
+ * MAX_REGISTERED_CALLABLE_IDS in the AICPU executor) and rejects ids outside
+ * `[0, 64)`. Lifetime: caller must `unregister_callable` before
+ * `finalize_device` to release the device-side orch SO buffer; kernels stay
+ * resident until finalize regardless.
+ * =========================================================================== */
+
+/**
+ * Stage a callable for repeated cheap launches under the given `callable_id`.
+ *
+ * Uploads child kernels into the DeviceRunner's func_id-keyed cache and
+ * copies the orchestration SO bytes into a device-resident buffer keyed by
+ * the SO's ELF Build-ID hash (so two callable_ids with identical SO share
+ * one buffer). Subsequent `run_prepared(callable_id, ...)` calls reuse this
+ * state.
+ *
+ * The `device_id`, `aicpu_binary` / `aicpu_size`, `aicore_binary` /
+ * `aicore_size` parameters are accepted to keep the signature aligned with
+ * `run_prepared` so codegen layers can share a single forwarding shim; the
+ * current implementations ignore them (kernel upload uses the ChipCallable
+ * payload, and the AICPU / AICore executor binaries are already loaded at
+ * `simpler_init`).
+ *
+ * @return 0 on success, negative on error (NULL ctx, callable_id out of
+ *         range, or upload/copy failure).
+ */
+int prepare_callable(
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, int device_id, const uint8_t *aicpu_binary,
+    size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size
+);
+
+/**
+ * Launch a callable previously staged via `prepare_callable`.
+ *
+ * Looks up the prepared state by `callable_id`, restores the kernel func_id ↔
+ * dev_addr table onto a fresh Runtime, and dispatches without re-uploading
+ * kernels or re-copying the orch SO. The AICPU side dispatches via
+ * `orch_so_table_[callable_id]` (see runtime.h::set_active_callable_id). The
+ * first run for a given callable_id sets `register_new_callable_id_` so the
+ * AICPU does its one-time dlopen.
+ *
+ * @return 0 on success, negative on error (no prep state, NULL ctx, etc.).
+ */
+int run_prepared(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
+    int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
+    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, const char *output_prefix
+);
+
+/**
+ * Drop the prepared state for `callable_id` and release the per-id share of
+ * the device orch SO buffer. The buffer itself is freed only when its
+ * hash-keyed refcount drops to zero (different callable_ids with identical
+ * SO share one allocation).
+ *
+ * Kernel binaries uploaded by `prepare_callable` remain resident — they are
+ * shared across callables by func_id and only released by `finalize_device`.
+ *
+ * AICPU-side dlopen state in `orch_so_table_[callable_id]` is NOT released by
+ * this call. It is reclaimed lazily when the cid is reused (the next
+ * `register_new_callable_id()` triggers `dlclose` + reload), or at process
+ * exit. Long-running processes that register / unregister cids without ever
+ * reusing them will hold the AICPU SO handle until shutdown.
+ *
+ * @return 0 on success or if callable_id was not registered, negative on error.
+ */
+int unregister_callable(DeviceContextHandle ctx, int32_t callable_id);
+
+/**
+ * Number of distinct callable_ids the AICPU has been asked to dlopen for on
+ * the device bound to `ctx`. Returns 0 on runtime variants without per-cid
+ * registration support. Used by tests to assert that `prepare_callable` +
+ * repeated `run_prepared` calls do not trigger redundant AICPU dlopens.
+ */
+size_t get_aicpu_dlopen_count(DeviceContextHandle ctx);
+
+/**
+ * Number of host-side dlopens triggered by `prepare_callable` on the host
+ * orchestration variants (host_build_graph). Mirrors `get_aicpu_dlopen_count`
+ * for the trb path. Returns 0 on runtime variants whose orchestration runs on
+ * the device.
+ */
+size_t get_host_dlopen_count(DeviceContextHandle ctx);
 
 #ifdef __cplusplus
 }

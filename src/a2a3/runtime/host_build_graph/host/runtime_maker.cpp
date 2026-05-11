@@ -276,31 +276,27 @@ extern "C" {
 #endif
 
 /**
- * Initialize a pre-allocated runtime with dynamic orchestration.
- *
- * This function loads the orchestration SO from binary data via a temp file,
- * resolves the orchestration function via dlsym, then calls it to build the
- * task graph. The orchestration function is responsible for:
- * - Allocating device memory via device_malloc()
- * - Copying data to device via copy_to_device()
- * - Building the task graph
- * - Recording tensor pairs via record_tensor_pair()
- *
- * @param runtime   Pointer to pre-constructed Runtime
- * @param callable  ChipCallable containing orch binary, func_name, and child kernels
- * @param orch_args Separated tensor/scalar arguments
- * @return 0 on success, -1 on failure
+ * Stage the per-callable resources for the host_build_graph variant: upload
+ * kernel binaries and dlopen the orchestration SO on the host. The dlopen
+ * handle and resolved entry-symbol pointer are parked on the runtime via
+ * `pending_host_dlopen_handle_` / `pending_host_orch_func_ptr_` so the
+ * platform layer can hoist them into PreparedCallableState. Splitting this
+ * out of init_runtime_impl is what the hbg prepare_callable / run_prepared
+ * path rests on — the dlopen runs once per cid instead of every run.
  */
-int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const ChipStorageTaskArgs *orch_args) {
-    // Validate inputs
+int prepare_callable_impl(Runtime *runtime, const ChipCallable *callable) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
+    if (callable == nullptr) {
+        LOG_ERROR("Callable pointer is null");
         return -1;
     }
 
     // Register kernel binaries from ChipCallable children
     if (callable->child_count() > 0) {
-        LOG_INFO_V0("Registering %d kernel(s) in init_runtime_impl", callable->child_count());
+        LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
         for (int32_t i = 0; i < callable->child_count(); i++) {
             int func_id = callable->child_func_id(i);
             if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
@@ -329,7 +325,9 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
         return -1;
     }
 
-    // Load orchestration SO from binary data via temp file
+    // Load orchestration SO from binary data via temp file. Held open across
+    // the lifetime of the prepared callable; closed by
+    // DeviceRunner::unregister_prepared_callable.
     std::string fd_path;
     if (!create_temp_so_file(orch_so_binary, orch_so_size, &fd_path)) {
         LOG_ERROR("Failed to create temp SO file");
@@ -343,7 +341,7 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
         return -1;
     }
 
-    dlerror();  // Clear any existing error
+    dlerror();
     OrchestrationFunc orch_func = reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
     const char *dlsym_error = dlerror();
     if (dlsym_error != nullptr) {
@@ -354,11 +352,42 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
 
     LOG_INFO_V0("Loaded orchestration function: %s", orch_func_name);
 
-    // Clear any previous tensor pairs
+    runtime->pending_host_dlopen_handle_ = handle;
+    runtime->pending_host_orch_func_ptr_ = reinterpret_cast<void *>(orch_func);
+    // hbg never uploads orch SO bytes to the device; clear the trb staging
+    // fields so DeviceRunner::register_prepared_callable cannot mistake this
+    // for a trb-shaped registration.
+    runtime->pending_orch_so_data_ = nullptr;
+    runtime->pending_orch_so_size_ = 0;
+    return 0;
+}
+
+/**
+ * Per-run binding for hbg: invoke the previously-resolved orchestration entry
+ * point against the supplied args, then upload tensor info / allocation
+ * storage. Assumes prepare_callable_impl populated
+ * `pending_host_orch_func_ptr_` (either freshly during prepare_callable, or
+ * via DeviceRunner::bind_prepared_callable_to_runtime when run_prepared
+ * replays a prepared cid onto a fresh Runtime).
+ */
+int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args) {
+    if (runtime == nullptr) {
+        LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
+    if (orch_args == nullptr) {
+        LOG_ERROR("orch_args pointer is null");
+        return -1;
+    }
+    OrchestrationFunc orch_func = reinterpret_cast<OrchestrationFunc>(runtime->pending_host_orch_func_ptr_);
+    if (orch_func == nullptr) {
+        LOG_ERROR("bind_prepared_to_runtime_impl: host orch_func pointer is null");
+        return -1;
+    }
+
     runtime->clear_tensor_pairs();
 
     LOG_INFO_V0("=== Calling Orchestration Function ===");
-
     LOG_DEBUG(
         "Args count: %d (%d tensors + %d scalars)", orch_args->tensor_count() + orch_args->scalar_count(),
         orch_args->tensor_count(), orch_args->scalar_count()
@@ -370,13 +399,10 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
         &k_orchestration_runtime_ops, runtime, &tensor_info_builder, &tensor_allocation_builder
     };
 
-    // Call orchestration function to build task graph
-    // The orchestration function handles device memory allocation and copy-to-device
     int rc = orch_func(reinterpret_cast<OrchestrationRuntime *>(&orchestration_runtime), *orch_args);
     if (rc != 0) {
         LOG_ERROR("Orchestration function failed with code %d", rc);
         runtime->clear_tensor_pairs();
-        dlclose(handle);
         return rc;
     }
 
@@ -384,7 +410,6 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
     if (rc != 0) {
         LOG_ERROR("Failed to upload tensor allocations: %d", rc);
         runtime->clear_tensor_pairs();
-        dlclose(handle);
         return rc;
     }
 
@@ -396,16 +421,10 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
             runtime->clear_tensor_allocation_storage();
         }
         runtime->clear_tensor_pairs();
-        dlclose(handle);
         return rc;
     }
 
     LOG_INFO_V0("Runtime initialized. Ready for execution from Python.");
-
-    // Host orchestration is complete once orch_func returns. The task graph now
-    // lives in Runtime, so the orchestration SO can be closed immediately.
-    dlclose(handle);
-
     return 0;
 }
 

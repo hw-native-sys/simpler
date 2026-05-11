@@ -19,7 +19,8 @@ Pipeline (what the @scene_test framework normally does for you):
     host arrays ──[worker.malloc + copy_to]──►  device buffers
                                           │
                                           ▼
-                              worker.run(chip_callable, task_args, cfg)
+                       chip_cid = worker.register(chip_callable)  # before init()
+                              worker.run(chip_cid, task_args, cfg)
                                           │
     device result ──[worker.copy_from]──► host array ──[torch compare]
 
@@ -126,7 +127,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
     )
 
 
-def _run(worker: Worker, chip_callable: ChipCallable) -> None:
+def _run(worker: Worker, chip_cid: int) -> None:
     """Allocate device memory, copy inputs, execute, copy outputs back, verify."""
     # --- 1. Prepare host arrays ---
     torch.manual_seed(42)
@@ -154,7 +155,7 @@ def _run(worker: Worker, chip_callable: ChipCallable) -> None:
     # --- 4. Run. CallConfig() defaults are fine for this kernel. ---
     config = CallConfig()
     print("[vector_add] running on device...")
-    worker.run(chip_callable, args, config)
+    worker.run(chip_cid, args, config)
 
     # --- 5. D2H copy back + verify ---
     worker.copy_from(host_out.data_ptr(), dev_out, NBYTES)
@@ -183,10 +184,12 @@ def run(platform: str, device_id: int) -> int:
     chip_callable = build_chip_callable(platform)
     print(f"[vector_add] compiled. binary_size={chip_callable.binary_size} bytes")
 
+    chip_cid = worker.register(chip_callable)
+
     print(f"[vector_add] init worker (device={device_id})...")
     worker.init()
     try:
-        _run(worker, chip_callable)
+        _run(worker, chip_cid)
     finally:
         worker.close()
     return 0

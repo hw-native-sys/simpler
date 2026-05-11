@@ -37,6 +37,8 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/core_type.h"
@@ -222,6 +224,36 @@ public:
      */
     void remove_kernel_binary(int func_id);
 
+    /**
+     * Stage a per-callable_id orchestration SO and its supporting metadata.
+     * See a5 onboard or a2a3 device_runner.h for full contract.
+     */
+    int register_prepared_callable(
+        int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
+        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs
+    );
+
+    /** Host-orchestration sibling for hbg variants. See a2a3 onboard. */
+    int register_prepared_callable_host_orch(
+        int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+        std::vector<std::pair<int, uint64_t>> kernel_addrs
+    );
+
+    /** Drop prepared state for `callable_id`; trb refcounts SO, hbg dlcloses handle. */
+    int unregister_prepared_callable(int32_t callable_id);
+
+    /** True iff `callable_id` has prepared state staged. */
+    bool has_prepared_callable(int32_t callable_id) const;
+
+    /** Replay prepared state onto a freshly-constructed Runtime. */
+    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+
+    /** Monotonic AICPU dlopen counter (first-sighting only; never decremented). */
+    size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
+
+    /** Monotonic host-side dlopen counter for hbg variants. */
+    size_t host_dlopen_count() const { return host_dlopen_total_; }
+
 private:
     // Configuration. device_id_ is set once in attach_current_thread() during
     // simpler_init and read by run() / create_thread() afterward — single-
@@ -246,6 +278,32 @@ private:
     void *dev_orch_so_buffer_{nullptr};
     size_t dev_orch_so_capacity_{0};
     std::vector<uint8_t> host_orch_so_copy_;
+
+    // Per-callable_id prepared state. Mirrors onboard.
+    struct PreparedCallableState {
+        // trb path
+        uint64_t hash{0};
+        uint64_t dev_orch_so_addr{0};
+        size_t dev_orch_so_size{0};
+        std::string func_name;
+        std::string config_name;
+        // common
+        std::vector<std::pair<int, uint64_t>> kernel_addrs;
+        // hbg path
+        void *host_dlopen_handle{nullptr};
+        void *host_orch_func_ptr{nullptr};
+    };
+    struct OrchSoBuffer {
+        void *dev_addr{nullptr};
+        size_t capacity{0};
+        int refcount{0};
+    };
+    std::unordered_map<int32_t, PreparedCallableState> prepared_callables_;
+    std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
+    std::unordered_set<int32_t> aicpu_seen_callable_ids_;
+    size_t aicpu_dlopen_total_{0};
+    size_t host_dlopen_total_{0};
+    bool prepared_callable_path_used_{false};
 
     // Runtime pointer for print_handshake_results
     Runtime *last_runtime_{nullptr};

@@ -139,7 +139,7 @@ void WorkerThread::loop() {
 }
 
 void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
-    uint64_t callable = (s.worker_type == WorkerType::SUB) ? static_cast<uint64_t>(s.callable_id) : s.callable;
+    uint64_t callable = static_cast<uint64_t>(static_cast<uint32_t>(s.callable_id));
     TaskArgsView view = s.args_view(group_index);
 
     // Hold mailbox_mu_ for the entire round trip (write payload + state +

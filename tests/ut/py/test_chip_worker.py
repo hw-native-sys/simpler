@@ -67,19 +67,6 @@ class TestChipWorkerStateMachine:
         assert worker.initialized is False
         assert worker.device_id == -1
 
-    def test_run_before_init_raises(self):
-        from _task_interface import ChipCallable, ChipStorageTaskArgs  # noqa: PLC0415
-
-        worker = _ChipWorker()
-        config = CallConfig()
-        args = ChipStorageTaskArgs()
-
-        # Build a minimal ChipCallable for the test
-        callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
-
-        with pytest.raises(RuntimeError, match="not initialized"):
-            worker.run(callable_obj, args, config)
-
     def test_finalize_idempotent(self):
         worker = _ChipWorker()
         worker.finalize()
@@ -105,6 +92,28 @@ class TestChipWorkerStateMachine:
         worker = _ChipWorker()
         with pytest.raises(RuntimeError, match="device_id"):
             worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null", "/nonexistent/libsimpler_log.so", -1)
+
+    def test_prepare_callable_before_init_raises(self):
+        from _task_interface import ChipCallable  # noqa: PLC0415
+
+        worker = _ChipWorker()
+        callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.prepare_callable(0, callable_obj)
+
+    def test_run_prepared_before_init_raises(self):
+        from _task_interface import ChipStorageTaskArgs  # noqa: PLC0415
+
+        worker = _ChipWorker()
+        config = CallConfig()
+        args = ChipStorageTaskArgs()
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.run_prepared(0, args, config)
+
+    def test_unregister_callable_before_init_raises(self):
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.unregister_callable(0)
 
 
 # ============================================================================

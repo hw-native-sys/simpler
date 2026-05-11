@@ -39,10 +39,15 @@
  * Caller is expected to try the next candidate directory.
  *
  * @param dir            Candidate directory (e.g. "/tmp")
+ * @param callable_id    Per-callable_id table slot id (>= 0). Required for
+ *                       uniqueness on the onboard path so concurrently-
+ *                       resident orch SOs (one per cid) do not collide on
+ *                       the same on-disk file. Pass -1 for the legacy
+ *                       single-slot dispatch path.
  * @param out_path       Buffer that receives the full file path on success
  * @param out_path_size  Size of `out_path` in bytes
  * @return Open writable fd on success, -1 on failure
  */
-int32_t create_orch_so_file(const char *dir, char *out_path, size_t out_path_size);
+int32_t create_orch_so_file(const char *dir, int32_t callable_id, char *out_path, size_t out_path_size);
 
 #endif  // PLATFORM_AICPU_ORCH_SO_FILE_H_

@@ -164,12 +164,19 @@ binaries = builder.get_binaries("tensormap_and_ringbuffer")
 worker = ChipWorker()
 worker.init(device_id=0, bins=binaries)
 
-# Execute callable on device
-worker.run(chip_callable, orch_args, block_dim=24)
+# Register the ChipCallable to obtain a callable_id
+cid = worker.register(chip_callable)
+
+# Execute the registered callable on device
+worker.run(cid, orch_args, block_dim=24)
 
 # Cleanup
 worker.finalize()
 ```
+
+`ChipWorker` follows the same `register → run(cid)` contract as
+`Worker(level=2)`; reach for the high-level `Worker` first and use
+`ChipWorker` only when a low-level handle is required.
 
 ## Configuration
 

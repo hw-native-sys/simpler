@@ -267,13 +267,13 @@ struct SchedulerFixture : public ::testing::Test {
 
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
     auto args_a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
-    auto res = orch.submit_next_level(0xDEAD, args_a, cfg);
+    auto res = orch.submit_next_level(42, args_a, cfg);
     TaskSlot slot = res.task_slot;
 
     mock_worker.wait_running();
     ASSERT_GE(mock_worker.dispatched_count(), 1);
     EXPECT_EQ(mock_worker.dispatched[0].tensor_key, 0xCAFEu);
-    EXPECT_EQ(mock_worker.dispatched[0].callable, 0xDEADu);
+    EXPECT_EQ(mock_worker.dispatched[0].callable, 42u);
 
     mock_worker.complete();
     wait_consumed(slot);
@@ -281,14 +281,14 @@ TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
 
 TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
     auto args_a = single_tensor_args(0xBEEF, TensorArgType::OUTPUT);
-    auto a = orch.submit_next_level(0xAA, args_a, cfg);
+    auto a = orch.submit_next_level(10, args_a, cfg);
 
     auto args_b = single_tensor_args(0xBEEF, TensorArgType::INPUT);
-    auto b = orch.submit_next_level(0xBB, args_b, cfg);
+    auto b = orch.submit_next_level(11, args_b, cfg);
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
 
     mock_worker.wait_running();
-    EXPECT_EQ(mock_worker.dispatched[0].callable, 0xAAu);
+    EXPECT_EQ(mock_worker.dispatched[0].callable, 10u);
     mock_worker.complete();  // A done
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
@@ -296,7 +296,7 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     ASSERT_GE(mock_worker.dispatched_count(), 2);
-    EXPECT_EQ(mock_worker.dispatched[1].callable, 0xBBu);
+    EXPECT_EQ(mock_worker.dispatched[1].callable, 11u);
 
     mock_worker.complete();  // B done
     wait_consumed(b.task_slot);
@@ -375,7 +375,7 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
     TaskArgs a0 = single_tensor_args(0xA0, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xA1, TensorArgType::OUTPUT);
 
-    auto res = orch.submit_next_level_group(0xDEAD, {a0, a1}, cfg);
+    auto res = orch.submit_next_level_group(42, {a0, a1}, cfg);
     TaskSlot slot = res.task_slot;
 
     worker_a.wait_running();
@@ -400,7 +400,7 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
 TEST_F(GroupSchedulerFixture, GroupCompletesOnlyWhenAllDone) {
     TaskArgs a0 = single_tensor_args(0xB0, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xB1, TensorArgType::OUTPUT);
-    auto res = orch.submit_next_level_group(0xDEAD, {a0, a1}, cfg);
+    auto res = orch.submit_next_level_group(42, {a0, a1}, cfg);
     TaskSlot slot = res.task_slot;
 
     worker_a.wait_running();
@@ -491,7 +491,7 @@ TEST_F(MixedTypeSchedulerFixture, SubTaskDispatchesWhileNextLevelPoolSaturated) 
     // Submit a next-level task; the only chip worker begins running it and
     // stays blocked until we call complete() on it.
     auto chip_args = single_tensor_args(0xAAA, TensorArgType::OUTPUT);
-    auto chip = orch.submit_next_level(0xCDCD, chip_args, cfg);
+    auto chip = orch.submit_next_level(20, chip_args, cfg);
     next_level_worker.wait_running();
     ASSERT_TRUE(next_level_worker.is_running.load());
 
@@ -522,10 +522,10 @@ TEST_F(GroupSchedulerFixture, GroupDependencyChain) {
     // Task B reads INPUT at the same key -- depends on group A.
     TaskArgs a0 = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
-    auto a = orch.submit_next_level_group(0xDEAD, {a0, a1}, cfg);
+    auto a = orch.submit_next_level_group(42, {a0, a1}, cfg);
 
     auto args_b = single_tensor_args(0xCAFE, TensorArgType::INPUT);
-    auto b = orch.submit_next_level(0xDEAD, args_b, cfg);
+    auto b = orch.submit_next_level(42, args_b, cfg);
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
 
     worker_a.wait_running();

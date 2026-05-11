@@ -92,31 +92,29 @@ static int32_t read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *hos
 }
 
 /**
- * Initialize a pre-allocated runtime for device orchestration.
+ * Stage the per-callable resources (kernel binaries + orchestration SO) into
+ * the supplied runtime so a subsequent bind_prepared_to_runtime_impl can use
+ * them. This is the cacheable half of init_runtime_impl: nothing here depends
+ * on per-run argument values, so the prepare_callable / run_prepared split
+ * lets us run this once per callable_id and amortize across runs.
  *
- * For rt2 runtime, orchestration runs on AICPU thread 3 (device-side).
- * This function:
- * - Copies tensor metadata and replaces host pointers with device pointers
- * - Copies all tensor data to device
- * - Records all tensors for copy-back
- * - Copies orchestration SO to device memory
- * - Sets up runtime state for device orchestration
- *
- * @param runtime   Pointer to pre-constructed Runtime
- * @param callable  ChipCallable containing orch binary, func_name, and child kernels
- * @param orch_args Separated tensor/scalar arguments
+ * @param runtime   Pointer to pre-constructed Runtime (host_api populated)
+ * @param callable  ChipCallable carrying the orch SO + child kernel binaries
  * @return 0 on success, -1 on failure
  */
-extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const ChipStorageTaskArgs *orch_args) {
-    // Validate inputs
+extern "C" int prepare_callable_impl(Runtime *runtime, const ChipCallable *callable) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
+    if (callable == nullptr) {
+        LOG_ERROR("Callable pointer is null");
         return -1;
     }
 
     // Register kernel binaries from ChipCallable children
     if (callable->child_count() > 0) {
-        LOG_INFO_V0("Registering %d kernel(s) in init_runtime_impl", callable->child_count());
+        LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
         for (int32_t i = 0; i < callable->child_count(); i++) {
             int func_id = callable->child_func_id(i);
             if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
@@ -146,6 +144,32 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
         return -1;
     }
 
+    // Stage the orchestration SO for DeviceRunner::prepare_orch_so to consume.
+    runtime->pending_orch_so_data_ = orch_so_binary;
+    runtime->pending_orch_so_size_ = orch_so_size;
+    LOG_INFO_V0("Orchestration SO: %zu bytes staged (host-only)", orch_so_size);
+    return 0;
+}
+
+/**
+ * Per-run binding: build device-side argument storage (tensor copy-out, GM
+ * heap, PTO2 shared memory) and publish it to the runtime. Assumes the
+ * callable-side state (kernel binaries, orch SO bytes, func/config names)
+ * is already populated by prepare_callable_impl.
+ *
+ * Splitting this from prepare_callable_impl matches the per-callable_id
+ * design: register/run_prepared invokes this every call, while the prep
+ * half runs only once per callable_id.
+ *
+ * @param runtime    Pointer to pre-constructed Runtime (host_api populated)
+ * @param orch_args  Separated tensor/scalar arguments for this run
+ * @return 0 on success, -1 on failure
+ */
+extern "C" int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args) {
+    if (runtime == nullptr) {
+        LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
     if (orch_args == nullptr) {
         LOG_ERROR("orch_args pointer is null");
         return -1;
@@ -153,7 +177,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
 
     int tensor_count = orch_args->tensor_count();
     int scalar_count = orch_args->scalar_count();
-    LOG_INFO_V0("RT2 init: %d tensors + %d scalars, device orchestration mode", tensor_count, scalar_count);
+    LOG_INFO_V0("RT2 bind: %d tensors + %d scalars, device orchestration mode", tensor_count, scalar_count);
 
     int64_t t_total_start = _now_ms();
 
@@ -195,13 +219,6 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
         device_args.add_scalar(orch_args->scalar(i));
     }
     int64_t t_args_end = _now_ms();
-
-    // Stage the orchestration SO for DeviceRunner::prepare_orch_so to consume.
-    int64_t t_so_start = _now_ms();
-    runtime->pending_orch_so_data_ = orch_so_binary;
-    runtime->pending_orch_so_size_ = orch_so_size;
-    LOG_INFO_V0("Orchestration SO: %zu bytes staged (host-only)", orch_so_size);
-    int64_t t_so_end = _now_ms();
 
     // Read ready queue shard count from environment for AICPU scheduler
     {
@@ -282,7 +299,6 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
 
     int64_t t_total_end = _now_ms();
     LOG_INFO_V0("TIMING: args_malloc_copy = %" PRId64 "ms", t_args_end - t_args_start);
-    LOG_INFO_V0("TIMING: orch_so_copy = %" PRId64 "ms", t_so_end - t_so_start);
     LOG_INFO_V0("TIMING: gm_heap_alloc(1GB) = %" PRId64 "ms", t_heap_end - t_heap_start);
     LOG_INFO_V0("TIMING: shared_mem_alloc = %" PRId64 "ms", t_sm_end - t_sm_start);
     LOG_INFO_V0("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);

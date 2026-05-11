@@ -39,6 +39,8 @@
 #include <map>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common/core_type.h"
@@ -225,6 +227,23 @@ public:
      */
     void remove_kernel_binary(int func_id);
 
+    int register_prepared_callable(
+        int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
+        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs
+    );
+    // Host-orchestration sibling of register_prepared_callable; see
+    // src/a2a3/platform/onboard/host/device_runner.h for the contract. Sim
+    // shares the host-only dlopen path verbatim (no AICPU side effects).
+    int register_prepared_callable_host_orch(
+        int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+        std::vector<std::pair<int, uint64_t>> kernel_addrs
+    );
+    int unregister_prepared_callable(int32_t callable_id);
+    bool has_prepared_callable(int32_t callable_id) const;
+    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
+    size_t host_dlopen_count() const { return host_dlopen_total_; }
+
 private:
     // Configuration. device_id_ is set once in attach_current_thread() during
     // simpler_init and read by run() / create_thread() afterward — single-
@@ -249,6 +268,38 @@ private:
     void *dev_orch_so_buffer_{nullptr};
     size_t dev_orch_so_capacity_{0};
     std::vector<uint8_t> host_orch_so_copy_;
+
+    // Per-callable_id prepared state. Mirrors onboard.
+    struct PreparedCallableState {
+        // trb path
+        uint64_t hash{0};
+        uint64_t dev_orch_so_addr{0};
+        size_t dev_orch_so_size{0};
+        std::string func_name;
+        std::string config_name;
+        // common
+        std::vector<std::pair<int, uint64_t>> kernel_addrs;
+        // hbg path
+        void *host_dlopen_handle{nullptr};
+        void *host_orch_func_ptr{nullptr};
+    };
+    struct OrchSoBuffer {
+        void *dev_addr{nullptr};
+        size_t capacity{0};
+        int refcount{0};
+    };
+    std::unordered_map<int32_t, PreparedCallableState> prepared_callables_;
+    std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
+    std::unordered_set<int32_t> aicpu_seen_callable_ids_;
+    size_t aicpu_dlopen_total_{0};
+    size_t host_dlopen_total_{0};
+    // Sticky flag: prepare_callable was called at least once in this
+    // DeviceRunner's lifetime. unregister_prepared_callable clears the maps
+    // above, so we cannot use them at finalize() time to decide whether a
+    // remaining func_id_to_addr_ entry is a legacy-path leak or a kernel
+    // legitimately staged by prepare_callable (which is owned until finalize
+    // by design).
+    bool prepared_callable_path_used_{false};
 
     // AICPU executor SO: load-once, matching onboard's binaries_loaded_ pattern.
     // The aicpu_executor g_aicpu_executor static lives inside the dlopen'd DSO;
@@ -297,8 +348,8 @@ private:
      * Stage the orchestration SO bytes into a host-resident buffer that
      * `aicpu_executor` can dlopen. Identical contract to the onboard
      * version: `runtime.pending_orch_so_data_/size_` are consumed and
-     * `runtime.{dev_orch_so_addr_, dev_orch_so_size_, has_new_orch_so_}`
-     * are populated with the cache-aware result.
+     * `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` are populated with
+     * the cache-aware result.
      */
     int prepare_orch_so(Runtime &runtime);
 

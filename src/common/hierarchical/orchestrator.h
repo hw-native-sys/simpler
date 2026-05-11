@@ -92,18 +92,19 @@ public:
     void copy_to(int worker_id, uint64_t dst, uint64_t src, size_t size);
     void copy_from(int worker_id, uint64_t dst, uint64_t src, size_t size);
 
-    // Submit a NEXT_LEVEL task. `callable` is the chip callable buffer pointer
-    // (uint64_t handle from Python — typically ChipCallable.buffer_ptr()).
-    // Tags inside `args` drive dependency inference; OUTPUT tensors with null
-    // data are auto-allocated from the HeapRing.
+    // Submit a NEXT_LEVEL task. `callable_id` is a cid registered via
+    // Worker.register(): the chip child looks it up in its COW-inherited
+    // Python registry to get the actual ChipCallable.
+    // Tags inside `args` drive dependency inference; OUTPUT tensors with
+    // null data are auto-allocated from the HeapRing.
     // `worker`: logical worker id for affinity (-1 = unconstrained).
     SubmitResult
-    submit_next_level(uint64_t callable, const TaskArgs &args, const CallConfig &config, int8_t worker = -1);
+    submit_next_level(int32_t callable_id, const TaskArgs &args, const CallConfig &config, int8_t worker = -1);
 
     // Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node.
     // `workers`: per-args affinity (empty = all unconstrained).
     SubmitResult submit_next_level_group(
-        uint64_t callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
+        int32_t callable_id, const std::vector<TaskArgs> &args_list, const CallConfig &config,
         const std::vector<int8_t> &workers = {}
     );
 
@@ -178,8 +179,8 @@ private:
     // Shared submit machinery. Takes `args_list` by value so the Orchestrator
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
     SubmitResult submit_impl(
-        WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const CallConfig &config,
-        std::vector<TaskArgs> args_list, std::vector<int8_t> affinities = {}
+        WorkerType worker_type, int32_t callable_id, const CallConfig &config, std::vector<TaskArgs> args_list,
+        std::vector<int8_t> affinities = {}
     );
 
     // Size, in aligned bytes, an OUTPUT tensor should occupy in the HeapRing.

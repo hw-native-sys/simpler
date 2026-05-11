@@ -46,14 +46,27 @@ public:
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
-    // IWorker: build a ChipStorageTaskArgs POD from `args` and execute the
-    // runtime synchronously. `callable` is a ChipCallable buffer pointer
-    // cast to uint64.
-    void run(uint64_t callable, TaskArgsView args, const CallConfig &config) override;
+    // IWorker: dispatch the prepared cid by delegating to run_prepared.
+    // The cid must already have been prepared via prepare_callable.
+    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config) override;
 
-    // Direct invocation (used by Python wrapper and internal tests) — bypasses
-    // the TaskArgsView path and takes a ready-made ChipStorageTaskArgs POD.
-    void run(const void *callable, const void *args, const CallConfig &config);
+    // Per-callable_id preparation. Requires init() first and a callable_id
+    // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
+    void prepare_callable(int32_t callable_id, const void *callable);
+    void run_prepared(int32_t callable_id, TaskArgsView args, const CallConfig &config);
+    void run_prepared(int32_t callable_id, const void *args, const CallConfig &config);
+    void unregister_callable(int32_t callable_id);
+
+    /// Number of distinct callable_ids the AICPU has been asked to dlopen for
+    /// on the bound device. Returns 0 when not initialized or the runtime
+    /// variant has no per-cid registration support. Used by tests to assert
+    /// that prepare_callable + repeated run_prepared do not trigger redundant
+    /// AICPU dlopens.
+    size_t aicpu_dlopen_count() const;
+
+    /// Number of host-side dlopens (host_build_graph variant). Mirrors
+    /// `aicpu_dlopen_count` for the trb path; returns 0 on device-orch variants.
+    size_t host_dlopen_count() const;
 
     uint64_t malloc(size_t size);
     void free(uint64_t ptr);
@@ -94,11 +107,15 @@ private:
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
-    using RunRuntimeFn = int (*)(
-        void *, void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t,
-        int, int, int, const char *
-    );
     using SimplerInitFn = int (*)(void *, int, int, int);
+    using PrepareCallableFn =
+        int (*)(void *, int32_t, const void *, int, const uint8_t *, size_t, const uint8_t *, size_t);
+    using RunPreparedFn = int (*)(
+        void *, void *, int32_t, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int,
+        int, int, const char *
+    );
+    using UnregisterCallableFn = int (*)(void *, int32_t);
+    using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
@@ -118,8 +135,12 @@ private:
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
-    RunRuntimeFn run_runtime_fn_ = nullptr;
     SimplerInitFn simpler_init_fn_ = nullptr;
+    PrepareCallableFn prepare_callable_fn_ = nullptr;
+    RunPreparedFn run_prepared_fn_ = nullptr;
+    UnregisterCallableFn unregister_callable_fn_ = nullptr;
+    GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
+    GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;

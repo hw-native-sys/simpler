@@ -129,8 +129,9 @@ void ChipWorker::init(
     }
 
     // Host runtime SO is loaded with RTLD_LOCAL so that different runtimes'
-    // identically-named symbols (init_runtime_impl, run_runtime, etc.) do
-    // not collide when switching runtimes within the same process.
+    // identically-named symbols (simpler_init, prepare_callable,
+    // run_prepared, etc.) do not collide when switching runtimes within the
+    // same process.
     // Cross-runtime isolation relies on -fno-gnu-unique (#453) allowing
     // dlclose to actually unload the previous runtime's SO before loading
     // the next one.
@@ -151,8 +152,12 @@ void ChipWorker::init(
         copy_to_device_ctx_fn_ = load_symbol<CopyToDeviceCtxFn>(handle, "copy_to_device_ctx");
         copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
-        run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
+        prepare_callable_fn_ = load_symbol<PrepareCallableFn>(handle, "prepare_callable");
+        run_prepared_fn_ = load_symbol<RunPreparedFn>(handle, "run_prepared");
+        unregister_callable_fn_ = load_symbol<UnregisterCallableFn>(handle, "unregister_callable");
+        get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
+        get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
         // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
         // Every platform runtime exports all of them — runtimes that do not
@@ -211,8 +216,12 @@ void ChipWorker::init(
         copy_to_device_ctx_fn_ = nullptr;
         copy_from_device_ctx_fn_ = nullptr;
         get_runtime_size_fn_ = nullptr;
-        run_runtime_fn_ = nullptr;
         simpler_init_fn_ = nullptr;
+        prepare_callable_fn_ = nullptr;
+        run_prepared_fn_ = nullptr;
+        unregister_callable_fn_ = nullptr;
+        get_aicpu_dlopen_count_fn_ = nullptr;
+        get_host_dlopen_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
@@ -260,7 +269,11 @@ void ChipWorker::finalize() {
     copy_to_device_ctx_fn_ = nullptr;
     copy_from_device_ctx_fn_ = nullptr;
     get_runtime_size_fn_ = nullptr;
-    run_runtime_fn_ = nullptr;
+    prepare_callable_fn_ = nullptr;
+    run_prepared_fn_ = nullptr;
+    unregister_callable_fn_ = nullptr;
+    get_aicpu_dlopen_count_fn_ = nullptr;
+    get_host_dlopen_count_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
     create_comm_stream_fn_ = nullptr;
@@ -279,16 +292,32 @@ void ChipWorker::finalize() {
     finalized_ = true;
 }
 
-void ChipWorker::run(uint64_t callable, TaskArgsView args, const CallConfig &config) {
-    // L2 ABI edge: assemble the fixed-size ChipStorageTaskArgs POD from the
-    // view and hand it to the runtime. This conversion used to happen at
-    // submit time (stored on the slot); it now runs lazily in the worker so
-    // the slot can carry a single TaskArgs irrespective of the destination.
-    ChipStorageTaskArgs chip_storage = view_to_chip_storage(args);
-    run(reinterpret_cast<const void *>(callable), &chip_storage, config);
+void ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
+    run_prepared(callable_id, args, config);
 }
 
-void ChipWorker::run(const void *callable, const void *args, const CallConfig &config) {
+void ChipWorker::prepare_callable(int32_t callable_id, const void *callable) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    if (callable == nullptr) {
+        throw std::runtime_error("prepare_callable: callable must not be null");
+    }
+    int rc = prepare_callable_fn_(
+        device_ctx_, callable_id, callable, device_id_, aicpu_binary_.data(), aicpu_binary_.size(),
+        aicore_binary_.data(), aicore_binary_.size()
+    );
+    if (rc != 0) {
+        throw std::runtime_error("prepare_callable failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::run_prepared(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
+    ChipStorageTaskArgs chip_storage = view_to_chip_storage(args);
+    run_prepared(callable_id, &chip_storage, config);
+}
+
+void ChipWorker::run_prepared(int32_t callable_id, const void *args, const CallConfig &config) {
     config.validate();
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
@@ -296,14 +325,38 @@ void ChipWorker::run(const void *callable, const void *args, const CallConfig &c
 
     void *rt = runtime_buf_.data();
 
-    int rc = run_runtime_fn_(
-        device_ctx_, rt, callable, args, config.block_dim, config.aicpu_thread_num, device_id_, aicpu_binary_.data(),
+    int rc = run_prepared_fn_(
+        device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, device_id_, aicpu_binary_.data(),
         aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(), config.enable_l2_swimlane,
         config.enable_dump_tensor, config.enable_pmu, config.output_prefix
     );
     if (rc != 0) {
-        throw std::runtime_error("run_runtime failed with code " + std::to_string(rc));
+        throw std::runtime_error("run_prepared failed with code " + std::to_string(rc));
     }
+}
+
+void ChipWorker::unregister_callable(int32_t callable_id) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = unregister_callable_fn_(device_ctx_, callable_id);
+    if (rc != 0) {
+        throw std::runtime_error("unregister_callable failed with code " + std::to_string(rc));
+    }
+}
+
+size_t ChipWorker::aicpu_dlopen_count() const {
+    if (!initialized_) {
+        return 0;
+    }
+    return get_aicpu_dlopen_count_fn_(device_ctx_);
+}
+
+size_t ChipWorker::host_dlopen_count() const {
+    if (!initialized_) {
+        return 0;
+    }
+    return get_host_dlopen_count_fn_(device_ctx_);
 }
 
 uint64_t ChipWorker::malloc(size_t size) {
