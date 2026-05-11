@@ -47,12 +47,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <system_error>
+#include <vector>
 
 #include "common/dep_gen.h"
 #include "common/platform_config.h"
@@ -172,8 +170,8 @@ public:
      * @return 0 on success, non-zero on failure
      */
     int init(
-        int num_threads, const std::string &submit_trace_path, DepGenAllocCallback alloc_cb,
-        DepGenRegisterCallback register_cb, DepGenFreeCallback free_cb, void *user_data, int device_id
+        int num_threads, DepGenAllocCallback alloc_cb, DepGenRegisterCallback register_cb, DepGenFreeCallback free_cb,
+        void *user_data, int device_id
     );
 
     /**
@@ -184,8 +182,10 @@ public:
     void *get_dep_gen_shm_device_ptr() const { return shm_dev_; }
 
     /**
-     * Per-buffer callback invoked by ProfilerBase's poll loop. Appends each
-     * DepGenRecord to submit_trace.bin.
+     * Per-buffer callback invoked by ProfilerBase's poll loop. Appends the
+     * buffer's DepGenRecord entries to the in-memory ``records_`` vector
+     * (no disk I/O — the host replay consumes that vector directly via
+     * ``records()`` once the device run completes).
      */
     void on_buffer_collected(const DepGenReadyBufferInfo &info);
 
@@ -199,7 +199,7 @@ public:
     bool reconcile_counters();
 
     /**
-     * Free all device memory and close output file. Idempotent.
+     * Free all device memory and release the in-memory record buffer. Idempotent.
      */
     void finalize(DepGenUnregisterCallback unregister_cb, DepGenFreeCallback free_cb, void *user_data);
 
@@ -209,9 +209,16 @@ public:
     bool is_initialized() const { return initialized_; }
 
     /**
-     * Total DepGenRecords written to submit_trace.bin so far.
+     * Total DepGenRecords drained from the device-side ring buffer so far.
      */
     uint64_t total_collected() const { return total_collected_; }
+
+    /**
+     * In-memory record buffer (host replay's input). Valid between init()
+     * and finalize(); pointer/size stay stable after stop() returns, which
+     * is when the caller hands them to ``dep_gen_replay_emit_deps_json``.
+     */
+    const std::vector<DepGenRecord> &records() const { return records_; }
 
 private:
     bool initialized_ = false;
@@ -226,35 +233,22 @@ private:
 
     bool buffers_registered_ = false;
 
-    // Binary output. File opened lazily on first record so a run that
-    // produces no records leaves no empty file on disk.
-    std::string submit_trace_path_;
-    std::ofstream out_file_;
-    std::mutex out_mutex_;
+    // In-memory record buffer — drained from the device ring on
+    // on_buffer_collected() and consumed by the host replay directly (no
+    // disk hop). Mutex serializes the mgmt thread's appends against the
+    // (rare) reader on the same collector instance.
+    std::vector<DepGenRecord> records_;
+    std::mutex records_mutex_;
 
-    // Running total of records written. Used at reconcile time for the
-    // collected + dropped == device_total cross-check.
+    // Running total of records appended. Equal to ``records_.size()`` after
+    // every append; kept separately for the reconcile_counters cross-check
+    // even when records_ may be inspected concurrently.
     uint64_t total_collected_ = 0;
 
     DepGenDataHeader *dep_gen_header() const { return get_dep_gen_header(shm_host_); }
     DepGenBufferState *dep_gen_state(int idx = 0) const { return get_dep_gen_buffer_state(shm_host_, idx); }
 
-    void ensure_out_open_unlocked();
-    void write_buffer(const void *buf_host_ptr);
+    void append_buffer_records(const void *buf_host_ptr);
 };
-
-/**
- * Build the SubmitTrace .bin path under the caller-provided per-task
- * directory. Filename is fixed (no timestamp) — the directory is the
- * per-task uniqueness boundary, mirroring make_pmu_csv_path().
- */
-inline std::string make_dep_gen_path(const std::string &output_dir) {
-    std::error_code ec;
-    std::filesystem::create_directories(output_dir, ec);
-    if (ec) {
-        LOG_WARN("Failed to create dep_gen output directory %s: %s", output_dir.c_str(), ec.message().c_str());
-    }
-    return output_dir + "/submit_trace.bin";
-}
 
 #endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_

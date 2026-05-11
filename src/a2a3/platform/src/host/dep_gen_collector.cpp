@@ -14,8 +14,10 @@
  * @brief Host-side dep_gen collector. The mgmt-thread + buffer-pool machinery
  *        lives in profiling_common::BufferPoolManager parameterized by
  *        DepGenModule (host/dep_gen_collector.h); this file owns the
- *        per-buffer on_buffer_collected callback (raw binary append) and the
- *        device-side cross-check.
+ *        per-buffer on_buffer_collected callback (in-memory append) and the
+ *        device-side cross-check. Records stay in ``records_`` and are
+ *        consumed directly by the host replay — no on-disk submit_trace.bin
+ *        intermediary.
  */
 
 #include "host/dep_gen_collector.h"
@@ -34,8 +36,8 @@ DepGenCollector::~DepGenCollector() { stop(); }
 // ---------------------------------------------------------------------------
 
 int DepGenCollector::init(
-    int num_threads, const std::string &submit_trace_path, DepGenAllocCallback alloc_cb,
-    DepGenRegisterCallback register_cb, DepGenFreeCallback free_cb, void *user_data, int device_id
+    int num_threads, DepGenAllocCallback alloc_cb, DepGenRegisterCallback register_cb, DepGenFreeCallback free_cb,
+    void *user_data, int device_id
 ) {
     if (num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
         LOG_ERROR("DepGenCollector::init: invalid arguments");
@@ -43,13 +45,10 @@ int DepGenCollector::init(
     }
 
     num_threads_ = num_threads;
-    submit_trace_path_ = submit_trace_path;
     buffers_registered_ = (register_cb != nullptr);
     total_collected_ = 0;
+    records_.clear();
     execution_complete_.store(false, std::memory_order_release);
-    if (out_file_.is_open()) {
-        out_file_.close();
-    }
 
     // ---- Allocate shared header + buffer-state region ----
     // dep_gen is single-instance: just one DepGenBufferState after the header.
@@ -118,25 +117,17 @@ int DepGenCollector::init(
     set_memory_context(alloc_cb, register_cb, free_cb, user_data, shm_host_, device_id);
 
     LOG_INFO_V0(
-        "DepGen collector initialized: %d threads, SHM=0x%lx, out=%s (opened on first record)", num_threads,
-        reinterpret_cast<unsigned long>(shm_dev_), submit_trace_path_.c_str()
+        "DepGen collector initialized: %d threads, SHM=0x%lx (records held in memory until replay)", num_threads,
+        reinterpret_cast<unsigned long>(shm_dev_)
     );
     return 0;
 }
 
 // ---------------------------------------------------------------------------
-// Binary output
+// Record accumulation (in-memory — no disk hop)
 // ---------------------------------------------------------------------------
 
-void DepGenCollector::ensure_out_open_unlocked() {
-    if (out_file_.is_open()) return;
-    out_file_.open(submit_trace_path_, std::ios::out | std::ios::binary | std::ios::trunc);
-    if (!out_file_.is_open()) {
-        LOG_ERROR("DepGenCollector: failed to open submit trace file: %s", submit_trace_path_.c_str());
-    }
-}
-
-void DepGenCollector::write_buffer(const void *buf_host_ptr) {
+void DepGenCollector::append_buffer_records(const void *buf_host_ptr) {
     const DepGenBuffer *buf = reinterpret_cast<const DepGenBuffer *>(buf_host_ptr);
     uint32_t n = buf->count;
     if (n > static_cast<uint32_t>(PLATFORM_DEP_GEN_RECORDS_PER_BUFFER)) {
@@ -144,21 +135,18 @@ void DepGenCollector::write_buffer(const void *buf_host_ptr) {
     }
     if (n == 0) return;
 
-    std::scoped_lock lock(out_mutex_);
-    ensure_out_open_unlocked();
-    if (!out_file_.is_open()) return;
-    out_file_.write(
-        reinterpret_cast<const char *>(buf->records), static_cast<std::streamsize>(n) * sizeof(DepGenRecord)
-    );
+    std::scoped_lock lock(records_mutex_);
+    records_.insert(records_.end(), buf->records, buf->records + n);
     total_collected_ += n;
-    out_file_.flush();
 }
 
 // ---------------------------------------------------------------------------
 // ProfilerBase callback
 // ---------------------------------------------------------------------------
 
-void DepGenCollector::on_buffer_collected(const DepGenReadyBufferInfo &info) { write_buffer(info.host_buffer_ptr); }
+void DepGenCollector::on_buffer_collected(const DepGenReadyBufferInfo &info) {
+    append_buffer_records(info.host_buffer_ptr);
+}
 
 // ---------------------------------------------------------------------------
 // reconcile_counters
@@ -228,8 +216,10 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, DepGenFre
 
     stop();
 
-    if (out_file_.is_open()) {
-        out_file_.close();
+    {
+        std::scoped_lock lock(records_mutex_);
+        records_.clear();
+        records_.shrink_to_fit();
     }
 
     // Same pattern as PmuCollector: walk owned buffers, then the free_queue

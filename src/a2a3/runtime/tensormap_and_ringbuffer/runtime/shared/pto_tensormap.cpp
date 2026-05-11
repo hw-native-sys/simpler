@@ -30,7 +30,6 @@
 
 #include "common.h"
 #include "common/unified_log.h"
-#include "pto_orchestrator.h"
 
 // =============================================================================
 // TensorMap Lookup Chain Length Statistics (compile-time toggle)

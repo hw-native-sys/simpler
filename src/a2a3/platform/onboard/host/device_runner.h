@@ -725,7 +725,7 @@ private:
      * @param device_id          Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_dep_gen(int num_threads, const std::string &submit_trace_path, int device_id);
+    int init_dep_gen(int num_threads, int device_id);
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use

@@ -117,6 +117,45 @@ def read_perf_data(filepath):
     return data
 
 
+def load_deps_json(perf_records_path):
+    """Load deps.json (dep_gen replay output) co-located with ``l2_perf_records.json``.
+
+    deps.json supersedes ``task["fanout"]``: fanout is sealed at the moment the
+    producer's L2PerfRecord retires, so consumers submitted after a fast producer
+    completes can never get attributed to it. dep_gen's replay reconstructs the
+    complete graph by replaying every captured ``submit_task`` through a host
+    PTO2TensorMap.
+
+    Returns:
+        dict[int, list[int]] mapping ``pred_raw → [succ_raw, ...]`` (i.e. the
+        same shape as ``task["fanout"]``), or ``None`` if no deps.json is present.
+        Tasks with no successors are absent from the dict (mirrors ``defaultdict``
+        semantics on lookup miss).
+    """
+    deps_path = Path(perf_records_path).parent / "deps.json"
+    if not deps_path.exists():
+        return None
+    try:
+        with deps_path.open() as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"Warning: failed to read {deps_path}: {e}; falling back to fanout", file=sys.stderr)
+        return None
+    edges = data.get("edges")
+    if not isinstance(edges, list):
+        return None
+    by_pred: dict[int, list[int]] = defaultdict(list)
+    for edge in edges:
+        if not isinstance(edge, (list, tuple)) or len(edge) != 2:
+            continue
+        pred = normalize_pto2_task_id_int(edge[0])
+        succ = normalize_pto2_task_id_int(edge[1])
+        if pred is None or succ is None:
+            continue
+        by_pred[pred].append(succ)
+    return dict(by_pred)
+
+
 def load_kernel_config(config_path):
     """Load kernel configuration from kernel_config.py file.
 
@@ -395,6 +434,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     orchestrator_phases=None,
     core_to_thread=None,
     orchestrator_name=None,
+    deps_edges=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -627,11 +667,22 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             task_to_aicpu_event_id[(task["task_id"], task["core_id"])] = event_id
             event_id += 1
 
-    # Flow events (Flow events "s" and "f" for dependencies)
+    # Flow events (Flow events "s" and "f" for dependencies). When deps.json
+    # was produced by dep_gen replay, prefer its edges over task["fanout"] —
+    # fanout is the truncated, race-prone view (see load_deps_json's docstring).
+    # Edges where the predecessor's end_time outlives the successor's start_time
+    # are flagged as happens-before violations and emitted with a distinct flow
+    # name so Perfetto colors them differently from clean dependency arrows.
     task_map: dict[int, list] = defaultdict(list)
     for t in tasks:
         task_map[t["task_id"]].append(t)
     flow_id = 0
+    hb_violation_count = 0
+
+    def _succs_for(task):
+        if deps_edges is not None:
+            return deps_edges.get(task["task_id"], [])
+        return task["fanout"]
 
     for task in tasks:
         src_tid = core_to_tid[task["core_id"]]
@@ -642,7 +693,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         # Use a small offset (0.01 us) for visual clarity
         flow_start_us = src_ts_end - 0.01
 
-        for succ_task_id in task["fanout"]:
+        for succ_task_id in _succs_for(task):
             if succ_task_id not in task_map:
                 if verbose:
                     print(
@@ -656,12 +707,21 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 dst_ts_start = succ_task["start_time_us"]
                 dst_event_id = task_to_event_id[(succ_task["task_id"], succ_task["core_id"])]
 
+                # Happens-before violation: producer outlived consumer's start.
+                # Real time order broke the data dependency the graph asserted;
+                # the runtime got away with it (consumer presumably re-read fresh
+                # data) but it's a smell — surface it.
+                hb_violated = src_ts_end > dst_ts_start
+                flow_name = "hb_violation" if hb_violated else "dependency"
+                if hb_violated:
+                    hb_violation_count += 1
+
                 # Flow start event (at end of source task)
                 events.append(
                     {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": "dependency",
+                        "name": flow_name,
                         "ph": "s",
                         "pid": 1,
                         "tid": src_tid,
@@ -674,7 +734,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": "dependency",
+                        "name": flow_name,
                         "ph": "f",
                         "pid": 1,
                         "tid": dst_tid,
@@ -684,6 +744,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     }
                 )
                 flow_id += 1
+
+    if verbose:
+        edge_source = "deps.json" if deps_edges is not None else "task.fanout"
+        print(f"  Flow events: {flow_id} edges (source: {edge_source})")
+        if hb_violation_count > 0:
+            print(f"  Happens-before violations: {hb_violation_count} edge(s) flagged as 'hb_violation'")
 
     # AICPU Scheduler phase events (version 2)
     if scheduler_phases:
@@ -866,7 +932,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             src_tid = task_to_aicpu_tid.get((task["task_id"], task["core_id"]), core_to_tid[task["core_id"]])
             src_aicpu_eid = task_to_aicpu_event_id.get((task["task_id"], task["core_id"]))
 
-            for succ_task_id in task["fanout"]:
+            for succ_task_id in _succs_for(task):
                 if succ_task_id not in task_map:
                     continue
 
@@ -880,10 +946,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     )
                     dst_aicpu_eid = task_to_aicpu_event_id.get((succ_task["task_id"], succ_task["core_id"]))
 
+                    # Mirror the AICore-view HB-violation classification using
+                    # the AICPU dispatch/finish timestamps.
+                    aicpu_hb_violated = src_finish_us > dst_dispatch_us
+                    aicpu_flow_name = "hb_violation" if aicpu_hb_violated else "dependency"
+
                     flow_s = {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": "dependency",
+                        "name": aicpu_flow_name,
                         "ph": "s",
                         "pid": 2,
                         "tid": src_tid,
@@ -896,7 +967,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     flow_f = {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": "dependency",
+                        "name": aicpu_flow_name,
                         "ph": "f",
                         "pid": 2,
                         "tid": dst_tid,
@@ -1268,6 +1339,10 @@ def main():
             l2_perf_records_path=input_path,
         )
 
+        deps_edges = load_deps_json(input_path)
+        if args.verbose and deps_edges is not None:
+            print(f"  Using deps.json edges ({sum(len(v) for v in deps_edges.values())} total)")
+
         generate_chrome_trace_json(
             data["tasks"],
             str(output_path),
@@ -1278,6 +1353,7 @@ def main():
             orchestrator_data=data.get("aicpu_orchestrator"),
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             core_to_thread=data.get("core_to_thread"),
+            deps_edges=deps_edges,
         )
 
         print("\n✓ Conversion complete")
