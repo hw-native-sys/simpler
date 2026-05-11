@@ -320,12 +320,17 @@ inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
  * fixed (no timestamp) — the directory is the per-task uniqueness boundary.
  */
 inline std::string make_pmu_csv_path(const std::string &output_dir) {
+    // ``std::filesystem::path`` operator/ for the join — robust to trailing
+    // slashes / double separators that bare string concat would silently pass
+    // through. Matches the convention used by ``make_deps_json_path`` in
+    // dep_gen_collector.h.
+    std::filesystem::path dir(output_dir);
     std::error_code ec;
-    std::filesystem::create_directories(output_dir, ec);
+    std::filesystem::create_directories(dir, ec);
     if (ec) {
         LOG_WARN("Failed to create PMU output directory %s: %s", output_dir.c_str(), ec.message().c_str());
     }
-    return output_dir + "/pmu.csv";
+    return (dir / "pmu.csv").string();
 }
 
 #endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_

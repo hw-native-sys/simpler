@@ -12,7 +12,7 @@ no repo checkout required.
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[perf_to_mermaid](#perf_to_mermaid)** — perf JSON → Mermaid dependency graph
-- **[dump_viewer](#dump_viewer)** — inspect / export tensor dumps (see [docs/tensor-dump.md](../../docs/tensor-dump.md) for full workflow)
+- **[dump_viewer](#dump_viewer)** — inspect / export tensor dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
 - **[device_log_resolver](#device_log_resolver)** — shared device-log path resolver library
 
 Auto-detection paths (`outputs/*/l2_perf_records.json`, `outputs/*/tensor_dump/`)
@@ -283,7 +283,7 @@ flowchart TD
 ## dump_viewer
 
 Inspect and export tensors captured by the runtime tensor-dump feature.
-See [docs/tensor-dump.md](../../docs/tensor-dump.md) for the full capture workflow;
+See [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for the full capture workflow;
 this section only documents CLI invocation.
 
 ### Basic Usage
