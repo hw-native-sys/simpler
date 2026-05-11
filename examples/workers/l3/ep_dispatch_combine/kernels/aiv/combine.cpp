@@ -68,21 +68,21 @@ static constexpr int W_PAD = 8;
 static constexpr int IDX_PAD = 8;
 
 // Window offsets — must mirror dispatch.cpp.
-static constexpr int kPubCountsBytes = N * N * L * 4;      // N*N*L INT32
+static constexpr int kPubCountsBytes = N * N * L * 4;  // N*N*L INT32
 static constexpr int kSignalBytes = 64;
 static constexpr int kRecvXBytes = L * R * D * 2;
 static constexpr int kRecvWBytes = L * R * W_PAD * 4;
 static constexpr int kRecvIdxBytes = L * R * IDX_PAD * 4;
 static constexpr int kRoutedYBufBytes = T * TOPK * D * 2;
 
-static constexpr int kOffPubCounts   = 0;
-static constexpr int kOffCountDone   = kOffPubCounts   + kPubCountsBytes;
-static constexpr int kOffRecvX       = kOffCountDone   + kSignalBytes;
-static constexpr int kOffRecvW       = kOffRecvX       + kRecvXBytes;
-static constexpr int kOffRecvIdx     = kOffRecvW       + kRecvWBytes;
-static constexpr int kOffDataDone    = kOffRecvIdx     + kRecvIdxBytes;
-static constexpr int kOffRoutedYBuf  = kOffDataDone    + kSignalBytes;
-static constexpr int kOffCombineDone = kOffRoutedYBuf  + kRoutedYBufBytes;
+static constexpr int kOffPubCounts = 0;
+static constexpr int kOffCountDone = kOffPubCounts + kPubCountsBytes;
+static constexpr int kOffRecvX = kOffCountDone + kSignalBytes;
+static constexpr int kOffRecvW = kOffRecvX + kRecvXBytes;
+static constexpr int kOffRecvIdx = kOffRecvW + kRecvWBytes;
+static constexpr int kOffDataDone = kOffRecvIdx + kRecvIdxBytes;
+static constexpr int kOffRoutedYBuf = kOffDataDone + kSignalBytes;
+static constexpr int kOffCombineDone = kOffRoutedYBuf + kRoutedYBufBytes;
 
 template <typename T_>
 AICORE inline __gm__ T_ *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T_ *local_ptr, int peer_rank) {
@@ -92,10 +92,10 @@ AICORE inline __gm__ T_ *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T_ *local
 }
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *recv_y_tensor       = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *recv_y_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *recv_idx_out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *routed_y_tensor     = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    __gm__ Tensor *scratch_tensor      = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *routed_y_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *scratch_tensor = reinterpret_cast<__gm__ Tensor *>(args[3]);
     int nranks = static_cast<int>(args[4]);
     __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[5]);
 
@@ -104,19 +104,18 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         return;
     }
 
-    __gm__ bfloat16_t *recv_y       = reinterpret_cast<__gm__ bfloat16_t *>(recv_y_tensor->buffer.addr) +
-                                      recv_y_tensor->start_offset;
-    __gm__ int32_t    *recv_idx_out = reinterpret_cast<__gm__ int32_t    *>(recv_idx_out_tensor->buffer.addr) +
-                                      recv_idx_out_tensor->start_offset;
-    __gm__ float      *routed_y     = reinterpret_cast<__gm__ float      *>(routed_y_tensor->buffer.addr) +
-                                      routed_y_tensor->start_offset;
+    __gm__ bfloat16_t *recv_y =
+        reinterpret_cast<__gm__ bfloat16_t *>(recv_y_tensor->buffer.addr) + recv_y_tensor->start_offset;
+    __gm__ int32_t *recv_idx_out =
+        reinterpret_cast<__gm__ int32_t *>(recv_idx_out_tensor->buffer.addr) + recv_idx_out_tensor->start_offset;
+    __gm__ float *routed_y =
+        reinterpret_cast<__gm__ float *>(routed_y_tensor->buffer.addr) + routed_y_tensor->start_offset;
 
     __gm__ uint8_t *scratch_base =
-        reinterpret_cast<__gm__ uint8_t *>(scratch_tensor->buffer.addr) +
-        scratch_tensor->start_offset * sizeof(float);
-    __gm__ int32_t    *pub_counts_local       = reinterpret_cast<__gm__ int32_t    *>(scratch_base + kOffPubCounts);
-    __gm__ bfloat16_t *routed_y_buf_local     = reinterpret_cast<__gm__ bfloat16_t *>(scratch_base + kOffRoutedYBuf);
-    __gm__ int32_t    *combine_done_sig_local = reinterpret_cast<__gm__ int32_t    *>(scratch_base + kOffCombineDone);
+        reinterpret_cast<__gm__ uint8_t *>(scratch_tensor->buffer.addr) + scratch_tensor->start_offset * sizeof(float);
+    __gm__ int32_t *pub_counts_local = reinterpret_cast<__gm__ int32_t *>(scratch_base + kOffPubCounts);
+    __gm__ bfloat16_t *routed_y_buf_local = reinterpret_cast<__gm__ bfloat16_t *>(scratch_base + kOffRoutedYBuf);
+    __gm__ int32_t *combine_done_sig_local = reinterpret_cast<__gm__ int32_t *>(scratch_base + kOffCombineDone);
 
     int my_rank = static_cast<int>(comm_ctx->rankId);
 
@@ -125,9 +124,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // poorly with `Tile<..., -1, -1>` dynamic-valid form here).
     // ------------------------------------------------------------------
     using RowBfG = GlobalTensor<bfloat16_t, Shape<1, 1, 1, 1, D>, Stride<D, D, D, D, 1>>;
-    using RowFpG = GlobalTensor<float,      Shape<1, 1, 1, 1, D>, Stride<D, D, D, D, 1>>;
+    using RowFpG = GlobalTensor<float, Shape<1, 1, 1, 1, D>, Stride<D, D, D, D, 1>>;
     using RowBfTile = Tile<TileType::Vec, bfloat16_t, 1, D, BLayout::RowMajor, 1, D>;
-    using RowFpTile = Tile<TileType::Vec, float,      1, D, BLayout::RowMajor, 1, D>;
+    using RowFpTile = Tile<TileType::Vec, float, 1, D, BLayout::RowMajor, 1, D>;
 
     // routed_y_buf and combine_done_sig start zero by virtue of HCCL's window
     // zero-init at allocation time. We deliberately do NOT clear them per
@@ -156,10 +155,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                 int idx_lin = e * R + src_off + row;
                 int r = recv_idx_out[idx_lin];
 
-                __gm__ bfloat16_t *src_row       = recv_y + idx_lin * D;
+                __gm__ bfloat16_t *src_row = recv_y + idx_lin * D;
                 __gm__ bfloat16_t *dst_row_local = routed_y_buf_local + r * D;
-                __gm__ bfloat16_t *dst_row_remote =
-                    CommRemotePtr(comm_ctx, dst_row_local, dst);
+                __gm__ bfloat16_t *dst_row_remote = CommRemotePtr(comm_ctx, dst_row_local, dst);
 
                 RowBfG src_g(src_row);
                 RowBfG dst_g(dst_row_remote);
@@ -172,8 +170,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // combine_done barrier — same form as dispatch's data_done.
     for (int peer = 0; peer < N; ++peer) {
         if (peer == my_rank) continue;
-        __gm__ int32_t *remote_done =
-            CommRemotePtr(comm_ctx, combine_done_sig_local + my_rank, peer);
+        __gm__ int32_t *remote_done = CommRemotePtr(comm_ctx, combine_done_sig_local + my_rank, peer);
         pto::comm::Signal sig(remote_done);
         pto::comm::TNOTIFY(sig, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
     }
@@ -198,7 +195,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     RowBfTile add_bf_tile;
     RowFpTile add_fp_tile;
     // Reuse push-phase UB slots — barriers above ensure they have drained.
-    TASSIGN(acc_tile,    0x0);
+    TASSIGN(acc_tile, 0x0);
     TASSIGN(add_bf_tile, 0x10000);
     TASSIGN(add_fp_tile, 0x20000);
 

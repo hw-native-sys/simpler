@@ -51,21 +51,20 @@ static constexpr int R = 32;
 static constexpr int D = 64;
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *recv_x_tensor      = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *recv_w_tensor      = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *recv_count_tensor  = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    __gm__ Tensor *recv_y_tensor      = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *recv_x_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *recv_w_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *recv_count_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *recv_y_tensor = reinterpret_cast<__gm__ Tensor *>(args[3]);
     __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[4]);
     (void)comm_ctx;  // unused; kept for ABI symmetry with dispatch / combine
 
-    __gm__ bfloat16_t *recv_x     = reinterpret_cast<__gm__ bfloat16_t *>(recv_x_tensor->buffer.addr) +
-                                    recv_x_tensor->start_offset;
-    __gm__ float      *recv_w     = reinterpret_cast<__gm__ float      *>(recv_w_tensor->buffer.addr) +
-                                    recv_w_tensor->start_offset;
-    __gm__ int32_t    *recv_count = reinterpret_cast<__gm__ int32_t    *>(recv_count_tensor->buffer.addr) +
-                                    recv_count_tensor->start_offset;
-    __gm__ bfloat16_t *recv_y     = reinterpret_cast<__gm__ bfloat16_t *>(recv_y_tensor->buffer.addr) +
-                                    recv_y_tensor->start_offset;
+    __gm__ bfloat16_t *recv_x =
+        reinterpret_cast<__gm__ bfloat16_t *>(recv_x_tensor->buffer.addr) + recv_x_tensor->start_offset;
+    __gm__ float *recv_w = reinterpret_cast<__gm__ float *>(recv_w_tensor->buffer.addr) + recv_w_tensor->start_offset;
+    __gm__ int32_t *recv_count =
+        reinterpret_cast<__gm__ int32_t *>(recv_count_tensor->buffer.addr) + recv_count_tensor->start_offset;
+    __gm__ bfloat16_t *recv_y =
+        reinterpret_cast<__gm__ bfloat16_t *>(recv_y_tensor->buffer.addr) + recv_y_tensor->start_offset;
 
     using XShape = Shape<1, 1, 1, 1, D>;
     using XStride = Stride<D, D, D, D, 1>;
@@ -74,9 +73,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     using XTileF = Tile<TileType::Vec, float, 1, D, BLayout::RowMajor>;
 
     XTileBF x_bf;
-    XTileF  x_f;
+    XTileF x_f;
     TASSIGN(x_bf, 0x0);
-    TASSIGN(x_f,  0x10000);
+    TASSIGN(x_f, 0x10000);
 
     for (int e = 0; e < L; ++e) {
         int n_rows = recv_count[e];

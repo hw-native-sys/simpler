@@ -73,7 +73,7 @@ static constexpr int TOPK = 2;
 static constexpr int D = 64;
 static constexpr int L = 4;
 static constexpr int R = 32;
-static constexpr int N_ROUTES = T * TOPK;     // 16
+static constexpr int N_ROUTES = T * TOPK;  // 16
 
 // Weight payload tile width. The protocol contract is one FP32 weight per
 // (e, slot) — recv_w[L, R] FP32. AIV vector tiles have a hardware minimum
@@ -103,21 +103,21 @@ static constexpr int IDX_PAD = 8;
 //
 // recv_y does NOT live in this window — local_expert and combine pass it
 // as a host-backed device tensor via the orch.
-static constexpr int kPubCountsBytes = N * N * L * 4;      // N*N*L INT32
+static constexpr int kPubCountsBytes = N * N * L * 4;  // N*N*L INT32
 static constexpr int kSignalBytes = 64;
-static constexpr int kRecvXBytes = L * R * D * 2;          // BF16
+static constexpr int kRecvXBytes = L * R * D * 2;  // BF16
 static constexpr int kRecvWBytes = L * R * W_PAD * 4;
 static constexpr int kRecvIdxBytes = L * R * IDX_PAD * 4;
 static constexpr int kRoutedYBufBytes = T * TOPK * D * 2;  // BF16
 
-static constexpr int kOffPubCounts   = 0;
-static constexpr int kOffCountDone   = kOffPubCounts   + kPubCountsBytes;
-static constexpr int kOffRecvX       = kOffCountDone   + kSignalBytes;
-static constexpr int kOffRecvW       = kOffRecvX       + kRecvXBytes;
-static constexpr int kOffRecvIdx     = kOffRecvW       + kRecvWBytes;
-static constexpr int kOffDataDone    = kOffRecvIdx     + kRecvIdxBytes;
-static constexpr int kOffRoutedYBuf  = kOffDataDone    + kSignalBytes;
-static constexpr int kOffCombineDone = kOffRoutedYBuf  + kRoutedYBufBytes;
+static constexpr int kOffPubCounts = 0;
+static constexpr int kOffCountDone = kOffPubCounts + kPubCountsBytes;
+static constexpr int kOffRecvX = kOffCountDone + kSignalBytes;
+static constexpr int kOffRecvW = kOffRecvX + kRecvXBytes;
+static constexpr int kOffRecvIdx = kOffRecvW + kRecvWBytes;
+static constexpr int kOffDataDone = kOffRecvIdx + kRecvIdxBytes;
+static constexpr int kOffRoutedYBuf = kOffDataDone + kSignalBytes;
+static constexpr int kOffCombineDone = kOffRoutedYBuf + kRoutedYBufBytes;
 
 template <typename T_>
 AICORE inline __gm__ T_ *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T_ *local_ptr, int peer_rank) {
@@ -127,15 +127,15 @@ AICORE inline __gm__ T_ *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T_ *local
 }
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *indices_tensor       = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *x_norm_tensor        = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *w_padded_tensor      = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    __gm__ Tensor *idx_padded_tensor    = reinterpret_cast<__gm__ Tensor *>(args[3]);
-    __gm__ Tensor *recv_x_out_tensor    = reinterpret_cast<__gm__ Tensor *>(args[4]);
-    __gm__ Tensor *recv_w_out_tensor    = reinterpret_cast<__gm__ Tensor *>(args[5]);
-    __gm__ Tensor *recv_idx_out_tensor  = reinterpret_cast<__gm__ Tensor *>(args[6]);
+    __gm__ Tensor *indices_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *x_norm_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *w_padded_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *idx_padded_tensor = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *recv_x_out_tensor = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    __gm__ Tensor *recv_w_out_tensor = reinterpret_cast<__gm__ Tensor *>(args[5]);
+    __gm__ Tensor *recv_idx_out_tensor = reinterpret_cast<__gm__ Tensor *>(args[6]);
     __gm__ Tensor *recv_count_out_tensor = reinterpret_cast<__gm__ Tensor *>(args[7]);
-    __gm__ Tensor *scratch_tensor       = reinterpret_cast<__gm__ Tensor *>(args[8]);
+    __gm__ Tensor *scratch_tensor = reinterpret_cast<__gm__ Tensor *>(args[8]);
     int nranks = static_cast<int>(args[9]);
     __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[10]);
 
@@ -144,35 +144,34 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         return;
     }
 
-    __gm__ int32_t    *indices    = reinterpret_cast<__gm__ int32_t    *>(indices_tensor->buffer.addr) +
-                                    indices_tensor->start_offset;
-    __gm__ bfloat16_t *x_norm     = reinterpret_cast<__gm__ bfloat16_t *>(x_norm_tensor->buffer.addr) +
-                                    x_norm_tensor->start_offset;
-    __gm__ float      *w_padded   = reinterpret_cast<__gm__ float      *>(w_padded_tensor->buffer.addr) +
-                                    w_padded_tensor->start_offset;
-    __gm__ int32_t    *idx_padded = reinterpret_cast<__gm__ int32_t    *>(idx_padded_tensor->buffer.addr) +
-                                    idx_padded_tensor->start_offset;
-    __gm__ bfloat16_t *recv_x_out = reinterpret_cast<__gm__ bfloat16_t *>(recv_x_out_tensor->buffer.addr) +
-                                    recv_x_out_tensor->start_offset;
-    __gm__ float      *recv_w_out = reinterpret_cast<__gm__ float      *>(recv_w_out_tensor->buffer.addr) +
-                                    recv_w_out_tensor->start_offset;
-    __gm__ int32_t    *recv_idx_out = reinterpret_cast<__gm__ int32_t  *>(recv_idx_out_tensor->buffer.addr) +
-                                      recv_idx_out_tensor->start_offset;
+    __gm__ int32_t *indices =
+        reinterpret_cast<__gm__ int32_t *>(indices_tensor->buffer.addr) + indices_tensor->start_offset;
+    __gm__ bfloat16_t *x_norm =
+        reinterpret_cast<__gm__ bfloat16_t *>(x_norm_tensor->buffer.addr) + x_norm_tensor->start_offset;
+    __gm__ float *w_padded =
+        reinterpret_cast<__gm__ float *>(w_padded_tensor->buffer.addr) + w_padded_tensor->start_offset;
+    __gm__ int32_t *idx_padded =
+        reinterpret_cast<__gm__ int32_t *>(idx_padded_tensor->buffer.addr) + idx_padded_tensor->start_offset;
+    __gm__ bfloat16_t *recv_x_out =
+        reinterpret_cast<__gm__ bfloat16_t *>(recv_x_out_tensor->buffer.addr) + recv_x_out_tensor->start_offset;
+    __gm__ float *recv_w_out =
+        reinterpret_cast<__gm__ float *>(recv_w_out_tensor->buffer.addr) + recv_w_out_tensor->start_offset;
+    __gm__ int32_t *recv_idx_out =
+        reinterpret_cast<__gm__ int32_t *>(recv_idx_out_tensor->buffer.addr) + recv_idx_out_tensor->start_offset;
     // recv_count_out is shape [L, 1] INT32 (1-element-per-expert grid);
     // storage is L contiguous int32 slots either way.
-    __gm__ int32_t    *recv_count_out = reinterpret_cast<__gm__ int32_t *>(recv_count_out_tensor->buffer.addr) +
-                                        recv_count_out_tensor->start_offset;
+    __gm__ int32_t *recv_count_out =
+        reinterpret_cast<__gm__ int32_t *>(recv_count_out_tensor->buffer.addr) + recv_count_out_tensor->start_offset;
 
     // scratch_tensor's `start_offset` is in element units of its declared dtype (FP32).
     __gm__ uint8_t *scratch_base =
-        reinterpret_cast<__gm__ uint8_t *>(scratch_tensor->buffer.addr) +
-        scratch_tensor->start_offset * sizeof(float);
-    __gm__ int32_t    *pub_counts_local     = reinterpret_cast<__gm__ int32_t    *>(scratch_base + kOffPubCounts);
-    __gm__ int32_t    *count_done_sig_local = reinterpret_cast<__gm__ int32_t    *>(scratch_base + kOffCountDone);
-    __gm__ bfloat16_t *recv_x_local         = reinterpret_cast<__gm__ bfloat16_t *>(scratch_base + kOffRecvX);
-    __gm__ float      *recv_w_local         = reinterpret_cast<__gm__ float      *>(scratch_base + kOffRecvW);
-    __gm__ int32_t    *recv_idx_local       = reinterpret_cast<__gm__ int32_t    *>(scratch_base + kOffRecvIdx);
-    __gm__ int32_t    *data_done_sig_local  = reinterpret_cast<__gm__ int32_t    *>(scratch_base + kOffDataDone);
+        reinterpret_cast<__gm__ uint8_t *>(scratch_tensor->buffer.addr) + scratch_tensor->start_offset * sizeof(float);
+    __gm__ int32_t *pub_counts_local = reinterpret_cast<__gm__ int32_t *>(scratch_base + kOffPubCounts);
+    __gm__ int32_t *count_done_sig_local = reinterpret_cast<__gm__ int32_t *>(scratch_base + kOffCountDone);
+    __gm__ bfloat16_t *recv_x_local = reinterpret_cast<__gm__ bfloat16_t *>(scratch_base + kOffRecvX);
+    __gm__ float *recv_w_local = reinterpret_cast<__gm__ float *>(scratch_base + kOffRecvW);
+    __gm__ int32_t *recv_idx_local = reinterpret_cast<__gm__ int32_t *>(scratch_base + kOffRecvIdx);
+    __gm__ int32_t *data_done_sig_local = reinterpret_cast<__gm__ int32_t *>(scratch_base + kOffDataDone);
 
     int my_rank = static_cast<int>(comm_ctx->rankId);
 
@@ -211,14 +210,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             int cd = route_dst[j], cl = route_loc_e[j];
             bool greater = (cd > kd) || (cd == kd && cl > kl);
             if (!greater) break;
-            route_dst[j + 1]   = cd;
+            route_dst[j + 1] = cd;
             route_loc_e[j + 1] = cl;
-            route_r[j + 1]     = route_r[j];
+            route_r[j + 1] = route_r[j];
             --j;
         }
-        route_dst[j + 1]   = kd;
+        route_dst[j + 1] = kd;
         route_loc_e[j + 1] = kl;
-        route_r[j + 1]     = kr;
+        route_r[j + 1] = kr;
     }
 
     pipe_barrier(PIPE_ALL);
@@ -340,8 +339,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     XTile x_tile(1, D);
     WTile w_tile(1, W_PAD);
     ITile idx_tile(1, IDX_PAD);
-    TASSIGN(x_tile,   0x0);
-    TASSIGN(w_tile,   0x10000);
+    TASSIGN(x_tile, 0x0);
+    TASSIGN(w_tile, 0x10000);
     TASSIGN(idx_tile, 0x20000);
 
     int cursor[N][L];
@@ -432,23 +431,23 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // Wide-window tile types (full RxPAD grid TLOADed in one shot).
     // Sum-output tiles use Layout::DN — TROWSUM produces a column tile
     // (Rx1 ColMajor); writing it back to GM needs DN layout.
-    using WWideShape  = Shape<1, 1, 1, R, W_PAD>;
+    using WWideShape = Shape<1, 1, 1, R, W_PAD>;
     using WWideStride = Stride<R * W_PAD, R * W_PAD, R * W_PAD, W_PAD, 1>;
-    using WWideG      = GlobalTensor<float, WWideShape, WWideStride>;
-    using WWideTile   = Tile<TileType::Vec, float, R, W_PAD, BLayout::RowMajor, R, W_PAD>;
-    using WSumShape   = Shape<1, 1, 1, R, 1>;
-    using WSumStride  = Stride<1, 1, 1, 1, 1>;
-    using WSumG       = GlobalTensor<float, WSumShape, WSumStride, Layout::DN>;
-    using WSumTile    = Tile<TileType::Vec, float, R, 1, BLayout::ColMajor, R, 1>;
+    using WWideG = GlobalTensor<float, WWideShape, WWideStride>;
+    using WWideTile = Tile<TileType::Vec, float, R, W_PAD, BLayout::RowMajor, R, W_PAD>;
+    using WSumShape = Shape<1, 1, 1, R, 1>;
+    using WSumStride = Stride<1, 1, 1, 1, 1>;
+    using WSumG = GlobalTensor<float, WSumShape, WSumStride, Layout::DN>;
+    using WSumTile = Tile<TileType::Vec, float, R, 1, BLayout::ColMajor, R, 1>;
 
-    using IWideShape  = Shape<1, 1, 1, R, IDX_PAD>;
+    using IWideShape = Shape<1, 1, 1, R, IDX_PAD>;
     using IWideStride = Stride<R * IDX_PAD, R * IDX_PAD, R * IDX_PAD, IDX_PAD, 1>;
-    using IWideG      = GlobalTensor<int32_t, IWideShape, IWideStride>;
-    using IWideTile   = Tile<TileType::Vec, int32_t, R, IDX_PAD, BLayout::RowMajor, R, IDX_PAD>;
-    using ISumShape   = Shape<1, 1, 1, R, 1>;
-    using ISumStride  = Stride<1, 1, 1, 1, 1>;
-    using ISumG       = GlobalTensor<int32_t, ISumShape, ISumStride, Layout::DN>;
-    using ISumTile    = Tile<TileType::Vec, int32_t, R, 1, BLayout::ColMajor, R, 1>;
+    using IWideG = GlobalTensor<int32_t, IWideShape, IWideStride>;
+    using IWideTile = Tile<TileType::Vec, int32_t, R, IDX_PAD, BLayout::RowMajor, R, IDX_PAD>;
+    using ISumShape = Shape<1, 1, 1, R, 1>;
+    using ISumStride = Stride<1, 1, 1, 1, 1>;
+    using ISumG = GlobalTensor<int32_t, ISumShape, ISumStride, Layout::DN>;
+    using ISumTile = Tile<TileType::Vec, int32_t, R, 1, BLayout::ColMajor, R, 1>;
 
     // UB allocation. The payload_push phase's x_tile/w_tile/idx_tile have
     // drained, so we can reuse those slots. Slot pitch is 64 KB; the largest
@@ -458,17 +457,17 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // the destination (Rx1) — pto-isa uses it as scratch for partial
     // reductions.
     WWideTile w_wide_tile;
-    WSumTile  w_sum_tile;
+    WSumTile w_sum_tile;
     WWideTile w_tmp_tile;
     IWideTile idx_wide_tile;
-    ISumTile  idx_sum_tile;
+    ISumTile idx_sum_tile;
     IWideTile idx_tmp_tile;
-    TASSIGN(w_wide_tile,   0x10000);
-    TASSIGN(w_sum_tile,    0x20000);
-    TASSIGN(w_tmp_tile,    0x21000);
+    TASSIGN(w_wide_tile, 0x10000);
+    TASSIGN(w_sum_tile, 0x20000);
+    TASSIGN(w_tmp_tile, 0x21000);
     TASSIGN(idx_wide_tile, 0x30000);
-    TASSIGN(idx_sum_tile,  0x40000);
-    TASSIGN(idx_tmp_tile,  0x41000);
+    TASSIGN(idx_sum_tile, 0x40000);
+    TASSIGN(idx_tmp_tile, 0x41000);
 
     // Stage out x: per-row 1xD copies.
     for (int e = 0; e < L; ++e) {
@@ -495,7 +494,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         __gm__ float *w_win = recv_w_local + e * R * W_PAD;
         __gm__ float *w_out = recv_w_out + e * R;
         WWideG w_win_g(w_win);
-        WSumG  w_out_g(w_out);
+        WSumG w_out_g(w_out);
         TLOAD(w_wide_tile, w_win_g);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);

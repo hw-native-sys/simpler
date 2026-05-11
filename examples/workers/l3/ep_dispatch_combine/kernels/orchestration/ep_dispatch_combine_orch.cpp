@@ -59,17 +59,17 @@ ep_dispatch_combine_orchestration_config(const ChipStorageTaskArgs &orch_args) {
 }
 
 __attribute__((visibility("default"))) void ep_dispatch_combine_orchestration(const ChipStorageTaskArgs &orch_args) {
-    Tensor indices         = from_tensor_arg(orch_args.tensor(0));
-    Tensor x_norm          = from_tensor_arg(orch_args.tensor(1));
-    Tensor w_padded        = from_tensor_arg(orch_args.tensor(2));
-    Tensor idx_padded      = from_tensor_arg(orch_args.tensor(3));
-    Tensor recv_x_out      = from_tensor_arg(orch_args.tensor(4));
-    Tensor recv_w_out      = from_tensor_arg(orch_args.tensor(5));
-    Tensor recv_idx_out    = from_tensor_arg(orch_args.tensor(6));
-    Tensor recv_count_out  = from_tensor_arg(orch_args.tensor(7));
-    Tensor recv_y          = from_tensor_arg(orch_args.tensor(8));
-    Tensor routed_y        = from_tensor_arg(orch_args.tensor(9));
-    Tensor scratch         = from_tensor_arg(orch_args.tensor(10));
+    Tensor indices = from_tensor_arg(orch_args.tensor(0));
+    Tensor x_norm = from_tensor_arg(orch_args.tensor(1));
+    Tensor w_padded = from_tensor_arg(orch_args.tensor(2));
+    Tensor idx_padded = from_tensor_arg(orch_args.tensor(3));
+    Tensor recv_x_out = from_tensor_arg(orch_args.tensor(4));
+    Tensor recv_w_out = from_tensor_arg(orch_args.tensor(5));
+    Tensor recv_idx_out = from_tensor_arg(orch_args.tensor(6));
+    Tensor recv_count_out = from_tensor_arg(orch_args.tensor(7));
+    Tensor recv_y = from_tensor_arg(orch_args.tensor(8));
+    Tensor routed_y = from_tensor_arg(orch_args.tensor(9));
+    Tensor scratch = from_tensor_arg(orch_args.tensor(10));
 
     // child 0: dispatch
     {
@@ -83,8 +83,8 @@ __attribute__((visibility("default"))) void ep_dispatch_combine_orchestration(co
         p.add_output(recv_idx_out);
         p.add_output(recv_count_out);
         p.add_inout(scratch);
-        p.add_scalar(orch_args.scalar(0));   // nranks
-        p.add_scalar(orch_args.scalar(1));   // CommContext
+        p.add_scalar(orch_args.scalar(0));  // nranks
+        p.add_scalar(orch_args.scalar(1));  // CommContext
         rt_submit_aiv_task(0, p);
     }
 
@@ -95,7 +95,7 @@ __attribute__((visibility("default"))) void ep_dispatch_combine_orchestration(co
         p.add_input(recv_w_out);
         p.add_input(recv_count_out);
         p.add_output(recv_y);
-        p.add_scalar(orch_args.scalar(1));   // CommContext (only for ABI symmetry)
+        p.add_scalar(orch_args.scalar(1));  // CommContext (only for ABI symmetry)
         rt_submit_aiv_task(1, p);
     }
 

@@ -91,29 +91,29 @@ N_RANKS = 2
 T = 8
 TOPK = 2
 D = 64
-L = 4               # N_LOCAL_EXPERTS per rank
-R = 32              # RECV_MAX (single-expert receive upper bound)
-W_PAD = 8           # weight tile width — minimum vector tile (1x8 FP32 = 32 B)
-IDX_PAD = 8         # idx tile width   — minimum vector tile (1x8 INT32 = 32 B)
+L = 4  # N_LOCAL_EXPERTS per rank
+R = 32  # RECV_MAX (single-expert receive upper bound)
+W_PAD = 8  # weight tile width — minimum vector tile (1x8 FP32 = 32 B)
+IDX_PAD = 8  # idx tile width   — minimum vector tile (1x8 INT32 = 32 B)
 E_GLOBAL = N_RANKS * L
 N_ROUTES = T * TOPK
 
 # Window region byte sizes — mirror k*Bytes / kOff* in the kernels.
-PUB_COUNTS_BYTES = N_RANKS * N_RANKS * L * 4            # N*N*L INT32
-SIGNAL_BYTES = 64                                       # padded slot per signal area
-RECV_X_BYTES = L * R * D * 2                            # 16 KB (BF16)
-RECV_W_BYTES = L * R * W_PAD * 4                        # 4  KB (FP32; weight at slot 0)
-RECV_IDX_BYTES = L * R * IDX_PAD * 4                    # 4  KB (INT32; r at slot 0)
-ROUTED_Y_BUF_BYTES = T * TOPK * D * 2                   # 2  KB (BF16; combine push dest)
+PUB_COUNTS_BYTES = N_RANKS * N_RANKS * L * 4  # N*N*L INT32
+SIGNAL_BYTES = 64  # padded slot per signal area
+RECV_X_BYTES = L * R * D * 2  # 16 KB (BF16)
+RECV_W_BYTES = L * R * W_PAD * 4  # 4  KB (FP32; weight at slot 0)
+RECV_IDX_BYTES = L * R * IDX_PAD * 4  # 4  KB (INT32; r at slot 0)
+ROUTED_Y_BUF_BYTES = T * TOPK * D * 2  # 2  KB (BF16; combine push dest)
 SCRATCH_NBYTES = (
     PUB_COUNTS_BYTES
-    + SIGNAL_BYTES         # count_done_sig
+    + SIGNAL_BYTES  # count_done_sig
     + RECV_X_BYTES
     + RECV_W_BYTES
     + RECV_IDX_BYTES
-    + SIGNAL_BYTES         # data_done_sig
-    + ROUTED_Y_BUF_BYTES   # combine push destination
-    + SIGNAL_BYTES         # combine_done_sig
+    + SIGNAL_BYTES  # data_done_sig
+    + ROUTED_Y_BUF_BYTES  # combine push destination
+    + SIGNAL_BYTES  # combine_done_sig
 )
 
 
@@ -162,42 +162,42 @@ def build_chip_callable(platform: str) -> ChipCallable:
     # Per-child signatures — each kernel sees only the args it actually
     # consumes (matching the orch's `Arg` packing for that submit).
     sig_dispatch = [
-        ArgDirection.IN,    # indices
-        ArgDirection.IN,    # x_norm
-        ArgDirection.IN,    # w_padded
-        ArgDirection.IN,    # idx_padded
-        ArgDirection.OUT,   # recv_x_out
-        ArgDirection.OUT,   # recv_w_out
-        ArgDirection.OUT,   # recv_idx_out
-        ArgDirection.OUT,   # recv_count_out
-        ArgDirection.INOUT, # scratch
+        ArgDirection.IN,  # indices
+        ArgDirection.IN,  # x_norm
+        ArgDirection.IN,  # w_padded
+        ArgDirection.IN,  # idx_padded
+        ArgDirection.OUT,  # recv_x_out
+        ArgDirection.OUT,  # recv_w_out
+        ArgDirection.OUT,  # recv_idx_out
+        ArgDirection.OUT,  # recv_count_out
+        ArgDirection.INOUT,  # scratch
     ]
     sig_local_expert = [
-        ArgDirection.IN,    # recv_x_out (reused as INPUT)
-        ArgDirection.IN,    # recv_w_out (reused as INPUT)
-        ArgDirection.IN,    # recv_count_out (reused as INPUT)
-        ArgDirection.OUT,   # recv_y
+        ArgDirection.IN,  # recv_x_out (reused as INPUT)
+        ArgDirection.IN,  # recv_w_out (reused as INPUT)
+        ArgDirection.IN,  # recv_count_out (reused as INPUT)
+        ArgDirection.OUT,  # recv_y
     ]
     sig_combine = [
-        ArgDirection.IN,    # recv_y (reused as INPUT)
-        ArgDirection.IN,    # recv_idx_out (reused as INPUT)
-        ArgDirection.OUT,   # routed_y
-        ArgDirection.INOUT, # scratch
+        ArgDirection.IN,  # recv_y (reused as INPUT)
+        ArgDirection.IN,  # recv_idx_out (reused as INPUT)
+        ArgDirection.OUT,  # routed_y
+        ArgDirection.INOUT,  # scratch
     ]
 
     # The orch's view is the union of every child's tensor footprint.
     sig_orch = [
-        ArgDirection.IN,    # indices
-        ArgDirection.IN,    # x_norm
-        ArgDirection.IN,    # w_padded
-        ArgDirection.IN,    # idx_padded
-        ArgDirection.OUT,   # recv_x_out
-        ArgDirection.OUT,   # recv_w_out
-        ArgDirection.OUT,   # recv_idx_out
-        ArgDirection.OUT,   # recv_count_out
-        ArgDirection.OUT,   # recv_y
-        ArgDirection.OUT,   # routed_y
-        ArgDirection.INOUT, # scratch
+        ArgDirection.IN,  # indices
+        ArgDirection.IN,  # x_norm
+        ArgDirection.IN,  # w_padded
+        ArgDirection.IN,  # idx_padded
+        ArgDirection.OUT,  # recv_x_out
+        ArgDirection.OUT,  # recv_w_out
+        ArgDirection.OUT,  # recv_idx_out
+        ArgDirection.OUT,  # recv_count_out
+        ArgDirection.OUT,  # recv_y
+        ArgDirection.OUT,  # routed_y
+        ArgDirection.INOUT,  # scratch
     ]
 
     return ChipCallable.build(
@@ -205,9 +205,9 @@ def build_chip_callable(platform: str) -> ChipCallable:
         func_name="ep_dispatch_combine_orchestration",
         binary=orch_bytes,
         children=[
-            (0, CoreCallable.build(signature=sig_dispatch,     binary=dispatch_bin)),
+            (0, CoreCallable.build(signature=sig_dispatch, binary=dispatch_bin)),
             (1, CoreCallable.build(signature=sig_local_expert, binary=local_expert_bin)),
-            (2, CoreCallable.build(signature=sig_combine,      binary=combine_bin)),
+            (2, CoreCallable.build(signature=sig_combine, binary=combine_bin)),
         ],
     )
 
@@ -242,9 +242,9 @@ def generate_routing_indices(seed: int) -> torch.Tensor:
 
 
 def compute_golden(
-    x_norms: list[torch.Tensor],   # [N_RANKS] of [T, D] BF16
-    indices: torch.Tensor,         # [N_RANKS, T, TOPK] INT32
-    weights: torch.Tensor,         # [N_RANKS, T, TOPK] FP32
+    x_norms: list[torch.Tensor],  # [N_RANKS] of [T, D] BF16
+    indices: torch.Tensor,  # [N_RANKS, T, TOPK] INT32
+    weights: torch.Tensor,  # [N_RANKS, T, TOPK] FP32
 ):
     """Replay dispatch protocol on host -> per-rank
     expected_recv_x[L, R, D]   BF16  (x payload)
@@ -325,6 +325,95 @@ def pack_idx_padded() -> torch.Tensor:
     return out
 
 
+def _verify_recv_outputs(
+    nranks: int,
+    expected_count: list[torch.Tensor],
+    expected_recv_x: list[torch.Tensor],
+    expected_recv_w: list[torch.Tensor],
+    expected_recv_idx: list[torch.Tensor],
+    recv_count_outs: list[torch.Tensor],
+    recv_x_outs: list[torch.Tensor],
+    recv_w_outs: list[torch.Tensor],
+    recv_idx_outs: list[torch.Tensor],
+) -> bool:
+    """Compare dispatch outputs against the host golden, per rank and per expert."""
+    ok = True
+    for r in range(nranks):
+        cnt = expected_count[r]
+        print(f"[ep_dispatch] chip {r}: expected counts per expert = {cnt.tolist()}")
+        # recv_count_out is [L, 1] INT32 per the protocol.
+        got_count = recv_count_outs[r].squeeze(-1)
+        if (got_count - cnt).abs().max().item() != 0:
+            ok = False
+            print(f"[ep_dispatch] chip {r}: recv_count mismatch got={got_count.tolist()} expected={cnt.tolist()}")
+        for e in range(L):
+            n = int(cnt[e].item())
+            if n == 0:
+                continue
+            # Cast BF16 → FP32 for diff math; values are integer ≤ 256 so
+            # the comparison is bit-exact.
+            got_x = recv_x_outs[r][e, :n, :].to(torch.float32)
+            exp_x = expected_recv_x[r][e, :n, :].to(torch.float32)
+            got_w = recv_w_outs[r][e, :n]
+            exp_w = expected_recv_w[r][e, :n]
+            got_idx = recv_idx_outs[r][e, :n]
+            exp_idx = expected_recv_idx[r][e, :n]
+            x_diff = (got_x - exp_x).abs().max().item()
+            w_diff = (got_w - exp_w).abs().max().item()
+            idx_diff = (got_idx - exp_idx).abs().max().item()
+            if x_diff > 0 or w_diff > 1e-5 or idx_diff != 0:
+                ok = False
+                print(
+                    f"[ep_dispatch] chip {r} expert {e}: cnt={n} "
+                    f"x_diff={x_diff:.3e} w_diff={w_diff:.3e} idx_diff={idx_diff}"
+                )
+                if x_diff > 0:
+                    for s in range(min(n, 3)):
+                        print(f"  slot {s}: got x[0]={float(got_x[s, 0])} expected={float(exp_x[s, 0])}")
+                if idx_diff != 0:
+                    for s in range(min(n, 3)):
+                        print(f"  slot {s}: got idx={int(got_idx[s])} expected={int(exp_idx[s])}")
+    return ok
+
+
+def _verify_routed_y(
+    nranks: int,
+    x_norms: list[torch.Tensor],
+    weights: torch.Tensor,
+    routed_y_outs: list[torch.Tensor],
+) -> bool:
+    """Compare combine output routed_y[t, :] against the local-only golden.
+
+    routed_y[t, :] should equal sum_k weights[me, t, k] * x_norms[me][t, :]
+    since local_expert is elementwise x*weight and combine reduces along
+    TOPK. The only BF16 round-trip is local_expert's `cast(x*w, bf16)`;
+    combine's accumulator stays FP32 — mirror that exactly so the model
+    captures every cast and we can assert ~0 diff in steady state.
+    """
+    ok = True
+    for r in range(nranks):
+        expected = torch.zeros(T, D, dtype=torch.float32)
+        for t in range(T):
+            for k in range(TOPK):
+                weighted_fp32 = weights[r, t, k] * x_norms[r][t, :].to(torch.float32)
+                expected[t, :] += weighted_fp32.to(torch.bfloat16).to(torch.float32)
+        diff = (routed_y_outs[r] - expected).abs().max().item()
+        rel_diff = diff / (expected.abs().max().item() + 1e-9)
+        print(f"[ep_dispatch] chip {r}: routed_y max|diff|={diff:.3e} (rel={rel_diff:.3e})")
+        # Allow 1e-3 abs as headroom for any fp32 reorder we missed.
+        if diff > 1e-3:
+            ok = False
+            print(f"[ep_dispatch] chip {r}: routed_y mismatch (tol=1e-3)")
+            per_token_diff = (routed_y_outs[r] - expected).abs().max(dim=1).values
+            for t in range(T):
+                if per_token_diff[t] > 1e-3:
+                    print(
+                        f"  token {t}: got[0]={float(routed_y_outs[r][t, 0]):.4f} "
+                        f"expected[0]={float(expected[t, 0]):.4f}"
+                    )
+    return ok
+
+
 def run(device_ids: list[int]) -> int:
     """Core logic — callable from CLI and pytest."""
     nranks = len(device_ids)
@@ -352,10 +441,7 @@ def run(device_ids: list[int]) -> int:
         for r in range(nranks)
     ]
     weights = torch.tensor(
-        [
-            [[(r + 1) * 0.01 + t * 0.1 + k * 0.001 for k in range(TOPK)] for t in range(T)]
-            for r in range(nranks)
-        ],
+        [[[(r + 1) * 0.01 + t * 0.1 + k * 0.001 for k in range(TOPK)] for t in range(T)] for r in range(nranks)],
         dtype=torch.float32,
     )
 
@@ -389,9 +475,7 @@ def run(device_ids: list[int]) -> int:
     routed_y_outs = [torch.zeros(T, D, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
     print("[ep_dispatch] computing host golden...")
-    expected_recv_x, expected_recv_w, expected_recv_idx, expected_count = compute_golden(
-        x_norms, indices, weights
-    )
+    expected_recv_x, expected_recv_w, expected_recv_idx, expected_count = compute_golden(x_norms, indices, weights)
 
     cfgs = [
         ChipBootstrapConfig(
@@ -467,88 +551,18 @@ def run(device_ids: list[int]) -> int:
         print("[ep_dispatch] running 2-chip dispatch DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
 
-        ok = True
-        for r in range(nranks):
-            cnt = expected_count[r]
-            print(f"[ep_dispatch] chip {r}: expected counts per expert = {cnt.tolist()}")
-            # recv_count_out is [L, 1] INT32 per the protocol.
-            got_count = recv_count_outs[r].squeeze(-1)
-            count_diff = (got_count - cnt).abs().max().item()
-            if count_diff != 0:
-                ok = False
-                print(
-                    f"[ep_dispatch] chip {r}: recv_count mismatch "
-                    f"got={got_count.tolist()} expected={cnt.tolist()}"
-                )
-            for e in range(L):
-                n = int(cnt[e].item())
-                if n == 0:
-                    continue
-                # Cast BF16 → FP32 for diff math; values are integer ≤ 256 so
-                # the comparison is bit-exact.
-                got_x = recv_x_outs[r][e, :n, :].to(torch.float32)
-                exp_x = expected_recv_x[r][e, :n, :].to(torch.float32)
-                got_w = recv_w_outs[r][e, :n]   # [L, R] FP32 directly
-                exp_w = expected_recv_w[r][e, :n]
-                got_idx = recv_idx_outs[r][e, :n]   # [L, R] INT32 directly
-                exp_idx = expected_recv_idx[r][e, :n]
-                x_diff = (got_x - exp_x).abs().max().item()
-                w_diff = (got_w - exp_w).abs().max().item()
-                idx_diff = (got_idx - exp_idx).abs().max().item()
-                if x_diff > 0 or w_diff > 1e-5 or idx_diff != 0:
-                    ok = False
-                    print(
-                        f"[ep_dispatch] chip {r} expert {e}: cnt={n} "
-                        f"x_diff={x_diff:.3e} w_diff={w_diff:.3e} idx_diff={idx_diff}"
-                    )
-                    if x_diff > 0:
-                        for s in range(min(n, 3)):
-                            print(
-                                f"  slot {s}: got x[0]={float(got_x[s, 0])} "
-                                f"expected={float(exp_x[s, 0])}"
-                            )
-                    if idx_diff != 0:
-                        for s in range(min(n, 3)):
-                            print(
-                                f"  slot {s}: got idx={int(got_idx[s])} "
-                                f"expected={int(exp_idx[s])}"
-                            )
-
-        # routed_y golden: routed_y[t, :] should equal
-        #   sum_k weights[me, t, k] * x_norms[me][t, :]
-        # since local_expert is elementwise x*weight and combine reduces
-        # along TOPK. The only BF16 round-trip is local_expert's
-        # `cast(x*w, bf16)`; combine's accumulator stays FP32.
-        for r in range(nranks):
-            # Mirror the device path's BF16 round-trip exactly:
-            #   local_expert: cast((x_bf16 * w_fp32), BF16)        — single round-trip
-            #   combine reduce: BF16 read → cast FP32 → += → store FP32
-            # Per (t, k) the contribution is `bf16(x.f32 * w)`; the per-token
-            # FP32 sum from there should be bit-exact in steady state.
-            expected = torch.zeros(T, D, dtype=torch.float32)
-            for t in range(T):
-                for k in range(TOPK):
-                    weighted_fp32 = weights[r, t, k] * x_norms[r][t, :].to(torch.float32)
-                    weighted_bf16_back = weighted_fp32.to(torch.bfloat16).to(torch.float32)
-                    expected[t, :] += weighted_bf16_back
-            diff = (routed_y_outs[r] - expected).abs().max().item()
-            rel_diff = diff / (expected.abs().max().item() + 1e-9)
-            print(
-                f"[ep_dispatch] chip {r}: routed_y max|diff|={diff:.3e} "
-                f"(rel={rel_diff:.3e})"
-            )
-            # Steady-state expectation: 0 (the model captures every cast).
-            # Allow 1e-3 abs as headroom for any fp32 reorder we missed.
-            if diff > 1e-3:
-                ok = False
-                print(f"[ep_dispatch] chip {r}: routed_y mismatch (tol=1e-3)")
-                per_token_diff = (routed_y_outs[r] - expected).abs().max(dim=1).values
-                for t in range(T):
-                    if per_token_diff[t] > 1e-3:
-                        print(
-                            f"  token {t}: got[0]={float(routed_y_outs[r][t, 0]):.4f} "
-                            f"expected[0]={float(expected[t, 0]):.4f}"
-                        )
+        ok = _verify_recv_outputs(
+            nranks,
+            expected_count,
+            expected_recv_x,
+            expected_recv_w,
+            expected_recv_idx,
+            recv_count_outs,
+            recv_x_outs,
+            recv_w_outs,
+            recv_idx_outs,
+        )
+        ok = _verify_routed_y(nranks, x_norms, weights, routed_y_outs) and ok
 
         if not ok:
             print("[ep_dispatch] golden check FAILED")
