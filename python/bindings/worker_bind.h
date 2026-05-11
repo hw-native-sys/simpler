@@ -98,20 +98,22 @@ inline void bind_worker(nb::module_ &m) {
     nb::class_<Orchestrator>(m, "_Orchestrator")
         .def(
             "submit_next_level",
-            [](Orchestrator &self, uint64_t callable, const TaskArgs &args, const CallConfig &config, int8_t worker) {
-                return self.submit_next_level(callable, args, config, worker);
+            [](Orchestrator &self, int32_t callable_id, const TaskArgs &args, const CallConfig &config, int8_t worker) {
+                return self.submit_next_level(callable_id, args, config, worker);
             },
-            nb::arg("callable"), nb::arg("args"), nb::arg("config"), nb::arg("worker") = int8_t(-1),
-            "Submit a NEXT_LEVEL (chip) task. worker= pins to a specific next-level worker (-1 = any)."
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("worker") = int8_t(-1),
+            "Submit a NEXT_LEVEL (chip) task by registered callable id. "
+            "worker= pins to a specific next-level worker (-1 = any)."
         )
         .def(
             "submit_next_level_group",
-            [](Orchestrator &self, uint64_t callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
-               const std::vector<int8_t> &workers) {
-                return self.submit_next_level_group(callable, args_list, config, workers);
+            [](Orchestrator &self, int32_t callable_id, const std::vector<TaskArgs> &args_list,
+               const CallConfig &config, const std::vector<int8_t> &workers) {
+                return self.submit_next_level_group(callable_id, args_list, config, workers);
             },
-            nb::arg("callable"), nb::arg("args_list"), nb::arg("config"), nb::arg("workers") = std::vector<int8_t>{},
-            "Submit a group of NEXT_LEVEL tasks. workers= per-args affinity (empty = any)."
+            nb::arg("callable_id"), nb::arg("args_list"), nb::arg("config"), nb::arg("workers") = std::vector<int8_t>{},
+            "Submit a group of NEXT_LEVEL tasks by registered callable id. "
+            "workers= per-args affinity (empty = any)."
         )
         .def(
             "submit_sub",

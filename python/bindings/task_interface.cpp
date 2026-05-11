@@ -31,6 +31,7 @@
 
 #include "arg_direction.h"
 #include "callable.h"
+#include "callable_protocol.h"
 #include "chip_worker.h"
 #include "data_type.h"
 #include "worker_bind.h"
@@ -76,6 +77,7 @@ NB_MODULE(_task_interface, m) {
 
     // --- Constants ---
     m.attr("CONTINUOUS_TENSOR_MAX_DIMS") = CONTINUOUS_TENSOR_MAX_DIMS;
+    m.attr("MAX_REGISTERED_CALLABLE_IDS") = MAX_REGISTERED_CALLABLE_IDS;
 
     // --- ContinuousTensor ---
     nb::class_<ContinuousTensor>(m, "ContinuousTensor")
@@ -621,33 +623,75 @@ NB_MODULE(_task_interface, m) {
         )
         .def("finalize", &ChipWorker::finalize)
         .def(
-            "run",
-            [](ChipWorker &self, const PyChipCallable &callable, ChipStorageTaskArgs &args, const CallConfig &config) {
-                self.run(callable.buffer_.data(), &args, config);
+            "prepare_callable",
+            [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
+                self.prepare_callable(callable_id, callable.buffer_.data());
             },
-            nb::arg("callable"), nb::arg("args"), nb::arg("config")
+            nb::arg("callable_id"), nb::arg("callable"),
+            "Stage a ChipCallable under callable_id for cheap repeated launches "
+            "via run_prepared. Variants without per-callable_id support raise."
         )
         .def(
-            "run_raw",
-            [](ChipWorker &self, uint64_t callable, uint64_t args, const CallConfig &config) {
-                self.run(reinterpret_cast<const void *>(callable), reinterpret_cast<const void *>(args), config);
+            "run_prepared",
+            [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config) {
+                self.run_prepared(callable_id, &args, config);
             },
-            nb::arg("callable"), nb::arg("args"), nb::arg("config"),
-            "Run with raw pointer arguments (used from forked chip process)."
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
+            "Launch a callable_id previously staged via prepare_callable."
         )
         .def(
-            "run_from_blob",
-            [](ChipWorker &self, uint64_t callable, uint64_t blob_ptr, const CallConfig &config) {
-                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), MAILBOX_ARGS_CAPACITY);
-                self.run(callable, view, config);
+            "run_prepared",
+            [](ChipWorker &self, int32_t callable_id, TaskArgs &args, const CallConfig &config) {
+                TaskArgsView view = make_view(args);
+                self.run_prepared(callable_id, view, config);
             },
-            nb::arg("callable"), nb::arg("blob_ptr"), nb::arg("config"),
-            "Decode a length-prefixed TaskArgs blob ([T][S][tensors][scalars]) at "
-            "blob_ptr and dispatch to the runtime. Used from forked chip processes "
-            "reading the WorkerThread mailbox."
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
+            "Launch a callable_id from a TaskArgs (used for in-process callers)."
+        )
+        .def(
+            "run_prepared_from_blob",
+            [](ChipWorker &self, int32_t callable_id, uint64_t args_blob_ptr, size_t blob_capacity,
+               const CallConfig &config) {
+                // The mailbox region is the on-wire format `write_blob` produced;
+                // `read_blob` is the matching reader that returns a zero-copy
+                // TaskArgsView into the caller-owned bytes. Forwards to the
+                // existing `run_prepared(cid, view, config)` path so chip-child
+                // loops never re-implement the tensor/scalar layout in Python
+                // (where it has historically dropped fields like child_memory).
+                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
+                self.run_prepared(callable_id, view, config);
+            },
+            nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
+            "Launch a callable_id from a raw mailbox-blob pointer + capacity "
+            "(used by chip-child mailbox loops to avoid Python-side re-deserialisation "
+            "of the per-task tensor/scalar layout). The blob must be in the format "
+            "produced by `write_blob`; read_blob enforces capacity bounds against shm corruption."
+        )
+        .def(
+            "unregister_callable",
+            [](ChipWorker &self, int32_t callable_id) {
+                self.unregister_callable(callable_id);
+            },
+            nb::arg("callable_id"),
+            "Drop the prepared state for callable_id; releases the per-id share "
+            "of the device orch SO buffer (kernel binaries stay resident until "
+            "finalize)."
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
+        .def_prop_ro(
+            "aicpu_dlopen_count", &ChipWorker::aicpu_dlopen_count,
+            "Number of distinct callable_ids the AICPU has dlopened for on the "
+            "bound device. Equals 0 when not initialized or the runtime "
+            "variant lacks per-cid registration. Tests assert this to verify "
+            "prepare_callable + repeated run_prepared do not redundantly dlopen."
+        )
+        .def_prop_ro(
+            "host_dlopen_count", &ChipWorker::host_dlopen_count,
+            "Number of host-side dlopens triggered by prepare_callable on "
+            "host_build_graph variants. Mirrors aicpu_dlopen_count for the "
+            "host-orchestration path; 0 on device-orch variants."
+        )
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))

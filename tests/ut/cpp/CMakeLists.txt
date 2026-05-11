@@ -246,6 +246,26 @@ add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 
+# Per-callable_id orch SO file naming regression (see rtStreamSynchronize
+# 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`
+# against the test source so it runs on no-hw runners too.
+add_executable(test_orch_so_file
+    common/test_orch_so_file.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/onboard/aicpu/orch_so_file.cpp
+)
+target_include_directories(test_orch_so_file PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+)
+target_compile_options(test_orch_so_file PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+target_link_libraries(test_orch_so_file PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_orch_so_file COMMAND test_orch_so_file)
+set_tests_properties(test_orch_so_file PROPERTIES LABELS "no_hardware")
+
 # ---------------------------------------------------------------------------
 # A2A3 tests (src/a2a3/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------

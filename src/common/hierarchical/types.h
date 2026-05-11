@@ -21,10 +21,12 @@
  *   - IWorker: abstract interface implemented by ChipWorker (the in-child
  *              worker invoked from `_chip_process_loop`)
  *
- * IWorker::run takes (callable, TaskArgsView, CallConfig) directly.
- * Dispatch encodes the TaskArgs into the per-WorkerThread shm mailbox with
- * inline std::memcpy of [int32 T][int32 S][ContinuousTensor × T][uint64 × S];
- * the forked child decodes the same layout to rebuild the view.
+ * IWorker::run takes (callable_id, TaskArgsView, CallConfig) — the cid is the
+ * value returned by ``Worker.register()``; the callable must have been
+ * prepared via ``prepare_callable`` before dispatch.  TaskArgs is encoded
+ * into the per-WorkerThread shm mailbox with inline std::memcpy of
+ * [int32 T][int32 S][ContinuousTensor × T][uint64 × S]; the forked child
+ * decodes the same layout to rebuild the view.
  */
 
 #pragma once
@@ -145,9 +147,12 @@ struct TaskSlotState {
 
     // --- Task data (stored on parent heap, lives until slot CONSUMED) ---
     WorkerType worker_type{WorkerType::NEXT_LEVEL};
-    uint64_t callable{0};     // NEXT_LEVEL: ChipCallable buffer ptr; SUB: unused
-    int32_t callable_id{-1};  // SUB: registered callable id
-    CallConfig config{};      // NEXT_LEVEL config (block_dim, aicpu_thread_num, diagnostics sub-features)
+    // Unified callable id: NEXT_LEVEL chip callables and SUB fns share the
+    // same Worker.register() id space. The mailbox wire format writes this
+    // as a uint64 with the cid in the low 32 bits; dispatch_process reads
+    // it identically for both worker types.
+    int32_t callable_id{-1};
+    CallConfig config{};  // NEXT_LEVEL config (block_dim, aicpu_thread_num, diagnostics sub-features)
 
     // Unified task-args storage: `task_args` is the single-task builder;
     // when `is_group_` is true, `task_args_list` carries one TaskArgs per
@@ -224,11 +229,11 @@ public:
     // Execute one task synchronously. Invoked in the forked child process
     // by `_chip_process_loop`, blocking until the task is complete.
     //
-    // For ChipWorker, `callable` is a uint64 holding a ChipCallable buffer
-    // pointer; the implementation builds a ChipStorageTaskArgs POD from
-    // `args` and calls pto2_run_runtime.
+    // `callable_id` is the cid returned by ``Worker.register()``; the
+    // callable must have been prepared via ``prepare_callable()`` before
+    // this call. ChipWorker delegates to ``run_prepared(cid, …)``.
     //
     // slot_id is not a parameter — completion routing is owned by
     // WorkerThread / Scheduler at a higher layer.
-    virtual void run(uint64_t callable, TaskArgsView args, const CallConfig &config) = 0;
+    virtual void run(int32_t callable_id, TaskArgsView args, const CallConfig &config) = 0;
 };

@@ -24,6 +24,7 @@
 
 #include "aicpu/device_time.h"
 #include "aicpu/orch_so_file.h"
+#include "callable_protocol.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -89,6 +90,23 @@ static int32_t read_runtime_status(Runtime *runtime) {
 
 static PTO2Runtime *rt{nullptr};
 
+// Per-callable_id orchestration SO table. The executor dispatches
+// `orch_so_table_[active_callable_id_]` (created on first sighting of
+// that callable_id, kept warm across runs).
+// MAX_REGISTERED_CALLABLE_IDS is the protocol hard cap on callable_id values
+// (mailbox uint32 callable_id, register() returns small ints) and is shared
+// with the host bounds check in DeviceRunner::register_prepared_callable —
+// see src/common/task_interface/callable_protocol.h.
+
+struct OrchSoEntry {
+    bool in_use{false};
+    void *handle{nullptr};
+    char path[256]{};
+    DeviceOrchestrationFunc func{nullptr};
+    DeviceOrchestrationBindRuntimeFunc bind{nullptr};
+    DeviceOrchestrationConfigFunc config_func{nullptr};
+};
+
 struct AicpuExecutor {
     int32_t sched_thread_num_;
     bool orch_to_sched_{false};
@@ -107,15 +125,14 @@ struct AicpuExecutor {
     std::atomic<int32_t> finished_count_{0};
     std::atomic<bool> runtime_init_ready_{false};
 
-    // Orchestration SO handle - defer dlclose until all tasks complete
-    void *orch_so_handle_{nullptr};
-    char orch_so_path_[256]{};  // Path to orchestration SO file for cleanup
-
-    // Shared orchestration function pointer (loaded by first orch thread, used by all)
-    DeviceOrchestrationFunc orch_func_{nullptr};
-    DeviceOrchestrationBindRuntimeFunc orch_bind_runtime_{nullptr};
-    DeviceOrchestrationConfigFunc orch_config_func_{nullptr};
+    // Cached orch args pointer set by the orchestration thread before scheduler
+    // init; consumed by the (*p_func)(*orch_args_cached_) invocation below.
     const ChipStorageTaskArgs *orch_args_cached_{nullptr};
+
+    // Per-callable_id table. Single orch thread today, so first-write/read
+    // race is not possible; if multiple orch threads are ever introduced,
+    // guard the in_use=false→true transition with a mutex.
+    OrchSoEntry orch_so_table_[MAX_REGISTERED_CALLABLE_IDS];
 
     // ===== Scheduler context (owns all dispatch/completion/drain state) =====
     SchedulerContext sched_ctx_;
@@ -126,15 +143,14 @@ struct AicpuExecutor {
     void deinit(Runtime *runtime);
 
     ~AicpuExecutor() {
-        // Process-wide teardown (the single static instance dies here). The
-        // handle is otherwise kept alive across runs for cache-hit reuse.
-        if (orch_so_handle_ != nullptr) {
-            dlclose(orch_so_handle_);
-            orch_so_handle_ = nullptr;
-        }
-        if (orch_so_path_[0] != '\0') {
-            unlink(orch_so_path_);
-            orch_so_path_[0] = '\0';
+        // Process-wide teardown (the single static instance dies here). Every
+        // in-use callable_id slot is dlclose()'d here; each is otherwise kept
+        // alive across runs for cache-hit reuse.
+        for (auto &e : orch_so_table_) {
+            if (!e.in_use) continue;
+            if (e.handle != nullptr) dlclose(e.handle);
+            if (e.path[0] != '\0') unlink(e.path);
+            e = OrchSoEntry{};
         }
     }
 };
@@ -197,29 +213,37 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (runtime->get_orch_built_on_host()) {
             LOG_INFO_V0("Thread %d: Host orchestration mode, no-op", thread_idx);
         } else {
-            // Two paths:
-            //   1) has_new_orch_so == true → host believes the SO identity
-            //      changed, so we drop the cached handle (if any), write the
-            //      new bytes to disk, and dlopen + dlsym a fresh handle.
-            //   2) has_new_orch_so == false → host detected a cache hit, so
-            //      we reuse `orch_so_handle_` / `orch_func_` / `orch_bind_runtime_`
-            //      from the previous run untouched. sm_handle / rt below are
-            //      always recreated because they bind this run's memory.
-            const bool reload_so = runtime->has_new_orch_so();
+            // Per-callable_id dispatch: the orch SO state lives in
+            // `orch_so_table_[callable_id]` keyed by registration order;
+            // reload is governed by `register_new_callable_id_`.
+            const int32_t callable_id = runtime->get_active_callable_id();
+            if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
+                LOG_ERROR(
+                    "Thread %d: invalid callable_id %d (limit=%d)", thread_idx, callable_id, MAX_REGISTERED_CALLABLE_IDS
+                );
+                runtime_init_ready_.store(true, std::memory_order_release);
+                return -1;
+            }
+            void **p_handle = &orch_so_table_[callable_id].handle;
+            char *p_path = orch_so_table_[callable_id].path;
+            DeviceOrchestrationFunc *p_func = &orch_so_table_[callable_id].func;
+            DeviceOrchestrationBindRuntimeFunc *p_bind = &orch_so_table_[callable_id].bind;
+            DeviceOrchestrationConfigFunc *p_config_func = &orch_so_table_[callable_id].config_func;
+            const bool reload_so = runtime->register_new_callable_id();
 
             if (reload_so) {
-                LOG_INFO_V0("Thread %d: New orch SO detected, (re)loading", thread_idx);
-                if (orch_so_handle_ != nullptr) {
-                    dlclose(orch_so_handle_);
-                    orch_so_handle_ = nullptr;
-                    orch_func_ = nullptr;
-                    orch_bind_runtime_ = nullptr;
-                    if (orch_so_path_[0] != '\0') {
+                LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);
+                if (*p_handle != nullptr) {
+                    dlclose(*p_handle);
+                    *p_handle = nullptr;
+                    *p_func = nullptr;
+                    *p_bind = nullptr;
+                    if (p_path[0] != '\0') {
                         // Unlink the old file so the new open() lands on a
                         // fresh inode — protects against SIGBUS / ETXTBSY when
                         // the kernel still has the old mapping pinned.
-                        unlink(orch_so_path_);
-                        orch_so_path_[0] = '\0';
+                        unlink(p_path);
+                        p_path[0] = '\0';
                     }
                 }
 
@@ -242,7 +266,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
 
                 for (int32_t i = 0; i < num_candidates && !file_created; i++) {
-                    int32_t fd = create_orch_so_file(candidate_dirs[i], so_path, sizeof(so_path));
+                    int32_t fd = create_orch_so_file(candidate_dirs[i], callable_id, so_path, sizeof(so_path));
                     if (fd < 0) {
                         LOG_INFO_V0(
                             "Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx, so_path, errno
@@ -280,6 +304,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     return -1;
                 }
                 LOG_INFO_V0("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
+
+                // Unlink the on-disk SO immediately: dlopen has already mmap'd
+                // the image, so the kernel keeps the inode alive until the
+                // matching dlclose / process exit. This prevents stale
+                // libdevice_orch_<pid>_<cid>.so files from accumulating in
+                // /tmp when child processes exit via os._exit(0), which skips
+                // ~AicpuExecutor (worker.py: _sub/_chip/_child loops).
+                unlink(so_path);
 
                 const char *entry_symbol = runtime->get_device_orch_func_name();
                 if (entry_symbol == nullptr || entry_symbol[0] == '\0') {
@@ -333,15 +365,21 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     bind_runtime_func = nullptr;
                 }
 
-                orch_so_handle_ = handle;
-                orch_func_ = orch_func;
-                orch_bind_runtime_ = bind_runtime_func;
-                orch_config_func_ = config_func;
-                snprintf(orch_so_path_, sizeof(orch_so_path_), "%s", so_path);
+                *p_handle = handle;
+                *p_func = orch_func;
+                *p_bind = bind_runtime_func;
+                *p_config_func = config_func;
+                snprintf(p_path, 256, "%s", so_path);
+                orch_so_table_[callable_id].in_use = true;
             } else {
-                LOG_INFO_V0("Thread %d: Reusing cached orch SO handle=%p", thread_idx, orch_so_handle_);
-                if (orch_so_handle_ == nullptr || orch_func_ == nullptr) {
-                    LOG_ERROR("Thread %d: has_new_orch_so=false but no cached SO handle/func", thread_idx);
+                LOG_INFO_V0(
+                    "Thread %d: Reusing cached orch SO handle=%p (callable_id=%d)", thread_idx, *p_handle, callable_id
+                );
+                if (*p_handle == nullptr || *p_func == nullptr) {
+                    LOG_ERROR(
+                        "Thread %d: reload=false but no cached SO handle/func for callable_id=%d", thread_idx,
+                        callable_id
+                    );
                     // Unblock scheduler threads before returning so they don't spin forever.
                     runtime_init_ready_.store(true, std::memory_order_release);
                     return -1;
@@ -349,8 +387,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
             // Validate arg count on every run (reload or cache hit).
-            if (orch_config_func_ != nullptr) {
-                PTO2OrchestrationConfig cfg = orch_config_func_(runtime->get_orch_args());
+            if (*p_config_func != nullptr) {
+                PTO2OrchestrationConfig cfg = (*p_config_func)(runtime->get_orch_args());
                 LOG_INFO_V0("Thread %d: Config: expected_args=%d", thread_idx, cfg.expected_arg_count);
                 if (cfg.expected_arg_count > 0) {
                     const ChipStorageTaskArgs &args_validate = runtime->get_orch_args();
@@ -361,17 +399,18 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                             cfg.expected_arg_count
                         );
                         // Clean up cached state so a subsequent run does a full reload.
-                        if (orch_so_handle_ != nullptr) {
-                            dlclose(orch_so_handle_);
-                            orch_so_handle_ = nullptr;
+                        if (*p_handle != nullptr) {
+                            dlclose(*p_handle);
+                            *p_handle = nullptr;
                         }
-                        if (orch_so_path_[0] != '\0') {
-                            unlink(orch_so_path_);
-                            orch_so_path_[0] = '\0';
+                        if (p_path[0] != '\0') {
+                            unlink(p_path);
+                            p_path[0] = '\0';
                         }
-                        orch_func_ = nullptr;
-                        orch_bind_runtime_ = nullptr;
-                        orch_config_func_ = nullptr;
+                        *p_func = nullptr;
+                        *p_bind = nullptr;
+                        *p_config_func = nullptr;
+                        orch_so_table_[callable_id].in_use = false;
                         // Unblock scheduler threads before returning so they don't spin forever.
                         runtime_init_ready_.store(true, std::memory_order_release);
                         return -1;
@@ -473,11 +512,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
             framework_bind_runtime(rt);
-            if (orch_bind_runtime_ != nullptr) {
-                orch_bind_runtime_(rt);
+            if (*p_bind != nullptr) {
+                (*p_bind)(rt);
             }
             rt_scope_begin(rt);
-            orch_func_(*orch_args_cached_);
+            (*p_func)(*orch_args_cached_);
             rt_scope_end(rt);
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
@@ -637,13 +676,17 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     if (prev_finished + 1 == thread_num_) {
         finished_.store(true, std::memory_order_release);
         // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
-        // always tear them down here, but we keep orch_so_handle_ alive for
-        // the next run's cache-hit reuse (see run() reload_so branch).
+        // always tear them down here, but we keep the per-cid orch SO entries
+        // alive for the next run's cache-hit reuse (see run() reload_so branch).
         if (!runtime->get_orch_built_on_host() && rt != nullptr) {
             // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.
+            const int32_t callable_id = runtime->get_active_callable_id();
             framework_bind_runtime(nullptr);
-            if (orch_bind_runtime_ != nullptr) {
-                orch_bind_runtime_(nullptr);
+            if (callable_id >= 0 && callable_id < MAX_REGISTERED_CALLABLE_IDS) {
+                DeviceOrchestrationBindRuntimeFunc bind = orch_so_table_[callable_id].bind;
+                if (bind != nullptr) {
+                    bind(nullptr);
+                }
             }
             runtime_destroy(rt);
         }
@@ -669,10 +712,9 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     orch_to_sched_ = false;
 
     orch_args_cached_ = nullptr;
-    // orch_so_handle_ / orch_func_ / orch_bind_runtime_ / orch_config_func_ / orch_so_path_ are
-    // intentionally preserved across deinit: the next run reuses them when
-    // has_new_orch_so() == false. The destructor releases them at process
-    // teardown.
+    // orch_so_table_ entries are intentionally preserved across deinit: the
+    // next run reuses cached handles when register_new_callable_id() returns
+    // false. The destructor releases them at process teardown.
 
     // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
     rt = nullptr;

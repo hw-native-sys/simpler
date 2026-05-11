@@ -17,11 +17,11 @@ and passes the handle to the user's orch function::
         a = TaskArgs()
         a.add_tensor(make_tensor_arg(input_tensor),  TensorArgType.INPUT)
         a.add_tensor(make_tensor_arg(output_tensor), TensorArgType.OUTPUT)
-        orch.submit_next_level(chip_callable, a, cfg)
+        orch.submit_next_level(chip_cid, a, cfg)  # cid from Worker.register(chip_callable)
 
         sub_args = TaskArgs()
         sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
-        orch.submit_sub(cid, sub_args)
+        orch.submit_sub(sub_cid, sub_args)
 
     w.run(my_orch, my_args, my_config)
 
@@ -35,6 +35,7 @@ from typing import Any, Optional
 
 from .task_interface import (
     CallConfig,
+    ChipCallable,
     ContinuousTensor,
     DataType,
     TaskArgs,
@@ -44,11 +45,21 @@ from .task_interface import (
 )
 
 
-def _resolve_callable_ptr(callable_: Any) -> int:
-    """Accept either a ChipCallable (has buffer_ptr()) or a raw int pointer."""
-    if hasattr(callable_, "buffer_ptr"):
-        return callable_.buffer_ptr()
-    return int(callable_)
+def _require_cid(callable_or_cid: Any, *, kind: str) -> int:
+    """Coerce a submit argument to a registered cid.
+
+    Raises a clear migration error when the caller still passes a
+    ``ChipCallable`` directly — every chip callable must be registered
+    via ``Worker.register(callable)`` *before* ``init()`` so each chip
+    child can pre-warm it on its own device.
+    """
+    if isinstance(callable_or_cid, ChipCallable) or hasattr(callable_or_cid, "buffer_ptr"):
+        raise TypeError(
+            f"{kind} now takes a registered cid, not a ChipCallable. "
+            "Register the callable before init() via "
+            "`cid = worker.register(chip_callable)` and pass `cid` here."
+        )
+    return int(callable_or_cid)
 
 
 class Orchestrator:
@@ -68,18 +79,21 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def submit_next_level(
-        self, callable_: Any, args: TaskArgs, config: Optional[CallConfig] = None, *, worker: int = -1
+        self, callable_id: Any, args: TaskArgs, config: Optional[CallConfig] = None, *, worker: int = -1
     ):
-        """Submit a NEXT_LEVEL (chip) task. Tags inside ``args`` drive deps.
+        """Submit a NEXT_LEVEL (chip) task by registered callable id.
 
+        ``callable_id`` must be the int returned by
+        ``Worker.register(chip_callable)``. Tags inside ``args`` drive deps.
         ``worker``: logical worker id for affinity (-1 = unconstrained).
         """
         cfg = config if config is not None else CallConfig()
-        return self._o.submit_next_level(_resolve_callable_ptr(callable_), args, cfg, int(worker))
+        cid = _require_cid(callable_id, kind="orch.submit_next_level")
+        return self._o.submit_next_level(cid, args, cfg, int(worker))
 
     def submit_next_level_group(
         self,
-        callable_: Any,
+        callable_id: Any,
         args_list: list,
         config: Optional[CallConfig] = None,
         *,
@@ -91,7 +105,8 @@ class Orchestrator:
         """
         cfg = config if config is not None else CallConfig()
         w = [int(x) for x in workers] if workers else []
-        return self._o.submit_next_level_group(_resolve_callable_ptr(callable_), args_list, cfg, w)
+        cid = _require_cid(callable_id, kind="orch.submit_next_level_group")
+        return self._o.submit_next_level_group(cid, args_list, cfg, w)
 
     def submit_sub(self, callable_id: int, args: Optional[TaskArgs] = None):
         """Submit a SUB task by registered callable id.

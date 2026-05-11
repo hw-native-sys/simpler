@@ -147,6 +147,7 @@ def run(platform: str, device_id: int) -> int:
 
     print(f"[child_memory] compiling kernels for {platform}...")
     chip_callable = build_chip_callable(platform)
+    chip_cid = worker.register(chip_callable)
 
     print("[child_memory] init worker...")
     worker.init()
@@ -172,7 +173,7 @@ def run(platform: str, device_id: int) -> int:
                 a.add_tensor(make_tensor_arg(host_a), TensorArgType.INPUT)
                 a.add_tensor(w_dev, TensorArgType.INPUT)
                 a.add_tensor(make_tensor_arg(out), TensorArgType.OUTPUT_EXISTING)
-                orch.submit_next_level(chip_callable, a, cfg, worker=0)
+                orch.submit_next_level(chip_cid, a, cfg, worker=0)
 
             # dev_w is reclaimed by DeviceRunner::finalize on worker.close() —
             # we don't orch.free it here, that's the whole point of child_memory.

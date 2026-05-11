@@ -54,7 +54,8 @@ Runtime::Runtime() {
     // Initialize device orchestration SO binary
     dev_orch_so_addr_ = 0;
     dev_orch_so_size_ = 0;
-    has_new_orch_so_ = false;
+    active_callable_id_ = -1;
+    register_new_callable_id_ = false;
     device_orch_func_name_[0] = '\0';
     device_orch_config_name_[0] = '\0';
 
@@ -104,18 +105,24 @@ void Runtime::set_slot_states_ptr(void *p) { slot_states_ptr_ = p; }
 void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { orch_args_storage_ = args; }
 
 // Device orchestration SO metadata (bytes live in a separate device buffer
-// owned by DeviceRunner; only the address/size/dirty-flag travels in Runtime).
-void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new) {
+// owned by DeviceRunner; only the address/size travels in Runtime).
+void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
     dev_orch_so_addr_ = dev_addr;
     dev_orch_so_size_ = size;
-    has_new_orch_so_ = is_new;
 }
 
 uint64_t Runtime::get_dev_orch_so_addr() const { return dev_orch_so_addr_; }
 
 uint64_t Runtime::get_dev_orch_so_size() const { return dev_orch_so_size_; }
 
-bool Runtime::has_new_orch_so() const { return has_new_orch_so_; }
+void Runtime::set_active_callable_id(int32_t callable_id, bool is_new) {
+    active_callable_id_ = callable_id;
+    register_new_callable_id_ = is_new;
+}
+
+int32_t Runtime::get_active_callable_id() const { return active_callable_id_; }
+
+bool Runtime::register_new_callable_id() const { return register_new_callable_id_; }
 
 void Runtime::set_device_orch_func_name(const char *name) {
     if (name == nullptr) {
@@ -158,6 +165,14 @@ void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
                 func_id
             );
         }
+    }
+    func_id_to_addr_[func_id] = addr;
+}
+
+void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
+    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
+        LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
+        return;
     }
     func_id_to_addr_[func_id] = addr;
 }

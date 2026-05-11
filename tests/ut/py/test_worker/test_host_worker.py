@@ -16,6 +16,7 @@ import struct
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
+from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
 from simpler.task_interface import DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
@@ -69,6 +70,21 @@ class TestLifecycle:
         with pytest.raises(RuntimeError, match="before init"):
             hw.register(lambda args: None)
         hw.close()
+
+    def test_register_overflow_raises(self):
+        # The AICPU side reserves a fixed-size orch_so_table_[MAX_REGISTERED_CALLABLE_IDS];
+        # Worker.register must surface the bound at register-time, not later when
+        # DeviceRunner::register_prepared_callable rejects the cid.
+        hw = Worker(level=3, num_sub_workers=0)
+        try:
+            for _ in range(MAX_REGISTERED_CALLABLE_IDS):
+                hw.register(lambda args: None)
+            with pytest.raises(RuntimeError, match="MAX_REGISTERED_CALLABLE_IDS"):
+                hw.register(lambda args: None)
+        finally:
+            # init() was never called; close() is still safe (idempotent
+            # against an uninitialised Worker).
+            hw.close()
 
 
 # ---------------------------------------------------------------------------

@@ -194,6 +194,7 @@ def run(device_ids: list[int]) -> int:
         num_sub_workers=0,
         chip_bootstrap_configs=cfgs,
     )
+    chip_cid = worker.register(chip_callable)
 
     try:
         print("[allreduce] init worker (forks chip children + bootstraps HCCL)...")
@@ -227,7 +228,7 @@ def run(device_ids: list[int]) -> int:
                 )
                 chip_args.add_scalar(ctx.nranks)
                 chip_args.add_scalar(ctx.device_ctx)
-                orch.submit_next_level(chip_callable, chip_args, cfg, worker=i)
+                orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
 
         print("[allreduce] running 2-chip allreduce DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())

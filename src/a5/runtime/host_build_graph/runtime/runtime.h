@@ -448,6 +448,16 @@ public:
      */
     void set_function_bin_addr(int func_id, uint64_t addr);
 
+    /**
+     * Replay a previously-uploaded kernel address onto a fresh Runtime
+     * without recording it in registered_kernel_func_ids_. See a2a3 hbg
+     * runtime.h for the full contract.
+     */
+    void replay_function_bin_addr(int func_id, uint64_t addr) {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
+        func_id_to_addr_[func_id] = addr;
+    }
+
     int get_registered_kernel_count() const { return registered_kernel_count_; }
 
     int get_registered_kernel_func_id(int index) const {
@@ -468,15 +478,56 @@ public:
     // Device orchestration SO metadata (see a2a3 host_build_graph runtime.h).
     uint64_t dev_orch_so_addr_{0};
     uint64_t dev_orch_so_size_{0};
-    bool has_new_orch_so_{false};
+    // Per-callable_id dispatch. hbg orch runs on host, so AICPU never reads
+    // `active_callable_id_`; the field exists for parity with the
+    // shared platform layer (DeviceRunner stamps it on every run).
+    int32_t active_callable_id_{-1};
+    bool register_new_callable_id_{false};
     const void *pending_orch_so_data_{nullptr};
     size_t pending_orch_so_size_{0};
 
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size, bool is_new) {
+    // Host-orchestration staging (hbg path). prepare_callable_impl
+    // dlopens the orch SO on the host and parks the handle + entry-symbol
+    // pointer here so DeviceRunner::register_prepared_callable_host_orch can
+    // claim them; bind_prepared_callable_to_runtime restores them onto a fresh
+    // Runtime so bind_prepared_to_runtime_impl can call orch_func without a
+    // second dlopen.
+    void *pending_host_dlopen_handle_{nullptr};
+    void *pending_host_orch_func_ptr_{nullptr};
+
+    // Device-orchestration entry/config symbol names (trb path). Always
+    // empty on this hbg variant — included for API parity so the shared
+    // platform layer can call set_device_orch_func_name unconditionally.
+    char device_orch_func_name_[64]{};
+    char device_orch_config_name_[64]{};
+
+    void set_device_orch_func_name(const char *name) {
+        device_orch_func_name_[0] = '\0';
+        if (name) {
+            strncpy(device_orch_func_name_, name, sizeof(device_orch_func_name_) - 1);
+            device_orch_func_name_[sizeof(device_orch_func_name_) - 1] = '\0';
+        }
+    }
+    const char *get_device_orch_func_name() const { return device_orch_func_name_; }
+    void set_device_orch_config_name(const char *name) {
+        device_orch_config_name_[0] = '\0';
+        if (name) {
+            strncpy(device_orch_config_name_, name, sizeof(device_orch_config_name_) - 1);
+            device_orch_config_name_[sizeof(device_orch_config_name_) - 1] = '\0';
+        }
+    }
+    const char *get_device_orch_config_name() const { return device_orch_config_name_; }
+
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
         dev_orch_so_addr_ = dev_addr;
         dev_orch_so_size_ = size;
-        has_new_orch_so_ = is_new;
     }
+    void set_active_callable_id(int32_t callable_id, bool is_new) {
+        active_callable_id_ = callable_id;
+        register_new_callable_id_ = is_new;
+    }
+    int32_t get_active_callable_id() const { return active_callable_id_; }
+    bool register_new_callable_id() const { return register_new_callable_id_; }
 };
 
 #endif  // SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_

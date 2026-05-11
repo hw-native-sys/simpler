@@ -131,6 +131,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None, pto_isa_commi
         num_sub_workers=0,
         chip_bootstrap_configs=cfgs,
     )
+    chip_cid = worker.register(chip_callable)
     try:
         worker.init()
         contexts: list[ChipContext] = worker.chip_contexts
@@ -151,7 +152,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None, pto_isa_commi
                     TensorArgType.INPUT,
                 )
                 args.add_scalar(ctx.device_ctx)
-                orch.submit_next_level(chip_callable, args, cfg, worker=rank)
+                orch.submit_next_level(chip_cid, args, cfg, worker=rank)
 
         worker.run(orch_fn, args=None, config=CallConfig())
 

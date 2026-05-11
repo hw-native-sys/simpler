@@ -135,8 +135,11 @@ get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, const 
 
 /**
  * Get one flat AIC-then-AIV address array for the requested register kind.
- * Returns a negative code on HAL failure; does NOT generate placeholder
- * addresses (callers must treat failure as fatal for that kind).
+ * For Ctrl kind, falls back to placeholder addresses on HAL failure to
+ * preserve historical behavior on hardware where halMemCtl rejects
+ * ADDR_MAP_TYPE_REG_AIC_CTRL queries (the dispatch path does not actually
+ * dereference these addresses).  For Pmu kind, propagates the HAL error so
+ * the caller can disable PMU collection cleanly.
  */
 static int get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id, AicoreRegKind kind) {
     std::vector<int64_t> aic;
@@ -144,8 +147,19 @@ static int get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id, Aicor
 
     int rc = get_aicore_reg_info(aic, aiv, kind_to_addr_type(kind), device_id);
     if (rc != 0) {
-        LOG_ERROR("get_aicore_regs(%s): halMemCtl failed: %d", kind_to_name(kind), rc);
-        return rc;
+        if (kind == AicoreRegKind::Ctrl) {
+            LOG_ERROR("get_aicore_regs(%s): halMemCtl failed: %d, using placeholder addresses", kind_to_name(kind), rc);
+            aic.clear();
+            aiv.clear();
+            for (uint32_t i = 0; i < DAV_2201::PLATFORM_MAX_PHYSICAL_CORES; i++) {
+                aic.push_back(0xDEADBEEF00000000ULL + (i * 0x800000));
+                aiv.push_back(0xDEADBEEF00000000ULL + (i * 0x800000) + 0x100000);
+                aiv.push_back(0xDEADBEEF00000000ULL + (i * 0x800000) + 0x200000);
+            }
+        } else {
+            LOG_ERROR("get_aicore_regs(%s): halMemCtl failed: %d", kind_to_name(kind), rc);
+            return rc;
+        }
     }
 
     // AIC cores first, then AIV cores

@@ -209,6 +209,8 @@ def run(device_ids: list[int]) -> int:
         num_sub_workers=0,
         chip_bootstrap_configs=cfgs,
     )
+    ffn_cid = worker.register(ffn_local_cc)
+    allreduce_cid = worker.register(allreduce_cc)
 
     try:
         print("[ffn_tp_parallel] init worker (forks chip children + bootstraps HCCL)...")
@@ -231,7 +233,7 @@ def run(device_ids: list[int]) -> int:
                 a1.add_tensor(make_tensor_arg(host_x_shards[i]), TensorArgType.INPUT)
                 a1.add_tensor(make_tensor_arg(host_w_shards[i]), TensorArgType.INPUT)
                 a1.add_tensor(make_tensor_arg(host_partial[i]), TensorArgType.OUTPUT_EXISTING)
-                orch.submit_next_level(ffn_local_cc, a1, cfg, worker=i)
+                orch.submit_next_level(ffn_cid, a1, cfg, worker=i)
 
                 # Stage 2: AIV cross-rank sum. Tagging partial_local INPUT
                 # with the same buffer.addr makes TensorMap auto-link this
@@ -250,7 +252,7 @@ def run(device_ids: list[int]) -> int:
                 )
                 a2.add_scalar(ctx.nranks)
                 a2.add_scalar(ctx.device_ctx)
-                orch.submit_next_level(allreduce_cc, a2, cfg, worker=i)
+                orch.submit_next_level(allreduce_cid, a2, cfg, worker=i)
 
         print("[ffn_tp_parallel] running 2-chip 2-stage DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())

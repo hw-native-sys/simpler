@@ -28,7 +28,6 @@ void TaskSlotState::reset() {
     output_keys.clear();
     fanin_producers.clear();
     worker_type = WorkerType::NEXT_LEVEL;
-    callable = 0;
     callable_id = -1;
     config = CallConfig{};
     task_args.clear();

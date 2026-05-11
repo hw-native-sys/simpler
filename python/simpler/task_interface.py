@@ -237,7 +237,9 @@ class ChipWorker:
 
         worker = ChipWorker()
         worker.init(device_id=0, bins=bins)
-        worker.run(chip_callable, orch_args, block_dim=24)
+        worker.prepare_callable(callable_id=0, callable=chip_callable)
+        worker.run_prepared(callable_id=0, args=orch_args, config=CallConfig(block_dim=24))
+        worker.unregister_callable(callable_id=0)
         worker.finalize()
     """
 
@@ -291,11 +293,20 @@ class ChipWorker:
         """
         self._impl.finalize()
 
-    def run(self, callable, args, config=None, **kwargs):
-        """Execute a callable synchronously.
+    def prepare_callable(self, callable_id, callable):
+        """Stage a ChipCallable under ``callable_id`` for repeated cheap launches.
+
+        Uploads the kernel binaries + the orchestration SO once; subsequent
+        ``run_prepared(callable_id, ...)`` skips that work. ``callable_id``
+        must be in ``[0, 64)``. Requires ``init()``.
+        """
+        self._impl.prepare_callable(int(callable_id), callable)
+
+    def run_prepared(self, callable_id, args, config=None, **kwargs):
+        """Launch a ``callable_id`` previously staged via ``prepare_callable``.
 
         Args:
-            callable: ChipCallable built from orchestration + kernel binaries.
+            callable_id: Stable id passed to a prior ``prepare_callable``.
             args: ChipStorageTaskArgs for this invocation.
             config: Optional CallConfig. If None, a default is created.
             **kwargs: Overrides applied to config (e.g. block_dim=24).
@@ -304,16 +315,21 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
-        self._impl.run(callable, args, config)
+        self._impl.run_prepared(int(callable_id), args, config)
 
-    def run_from_blob(self, callable, blob_ptr, config):
-        """Execute via a serialized args blob in shared memory.
+    def unregister_callable(self, callable_id):
+        """Drop prepared state for ``callable_id`` and release its orch SO share."""
+        self._impl.unregister_callable(int(callable_id))
 
-        Used by `_chip_process_loop` after reading the mailbox: instead of
-        deserializing the args into Python objects, the C++ side parses the
-        POD blob directly at `blob_ptr`.
-        """
-        self._impl.run_from_blob(int(callable), int(blob_ptr), config)
+    @property
+    def aicpu_dlopen_count(self):
+        """Number of distinct callable_ids the AICPU has dlopened for."""
+        return self._impl.aicpu_dlopen_count
+
+    @property
+    def host_dlopen_count(self):
+        """Number of host-side orch SO dlopens (host_build_graph variants)."""
+        return self._impl.host_dlopen_count
 
     def malloc(self, size):
         """Allocate memory. Returns a pointer (uint64)."""
