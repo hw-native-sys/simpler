@@ -9,20 +9,18 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Combine kernel — three-phase pipeline within a single AIV task:
+ * Combine kernel — two-phase pipeline within a single AIV task:
  *
- *   Phase 0: zero-init this rank's routed_y_buf[T, TOPK, D] BF16 +
- *            combine_done_sig.
- *   Phase 1: for each (dst, e):
- *              n       = pub_counts[dst][my_rank][e]
- *              src_off = sum_{s<dst} pub_counts[s][my_rank][e]
- *              for row in [0, n):
- *                r = recv_idx_out[e * R + src_off + row]   // = t * TOPK + k
- *                TPUT recv_y[e * R + src_off + row, :]
- *                  to peer dst's routed_y_buf[r * D : (r+1) * D]
- *            then combine_done barrier.
- *   Phase 2: reduce_sum along the TOPK axis of routed_y_buf into
- *            routed_y[T, D] FP32.
+ *   push:   for each (dst, e):
+ *             n       = pub_counts[dst][my_rank][e]
+ *             src_off = sum_{s<dst} pub_counts[s][my_rank][e]
+ *             for row in [0, n):
+ *               r = recv_idx_out[e * R + src_off + row]   // = t * TOPK + k
+ *               TPUT recv_y[e * R + src_off + row, :]
+ *                 to peer dst's routed_y_buf[r * D : (r+1) * D]
+ *           then combine_done barrier.
+ *   reduce: reduce_sum along the TOPK axis of routed_y_buf into
+ *           routed_y[T, D] FP32.
  *
  *   Inputs:
  *     recv_y          BF16  [L, R, D]   (local_expert OUTPUT_EXISTING)
@@ -69,8 +67,8 @@ static constexpr int R = 32;
 static constexpr int W_PAD = 8;
 static constexpr int IDX_PAD = 8;
 
-// Window offsets — must mirror ep_dispatch_kernel.cpp.
-static constexpr int kPubCountsBytes = 64;
+// Window offsets — must mirror dispatch.cpp.
+static constexpr int kPubCountsBytes = N * N * L * 4;      // N*N*L INT32
 static constexpr int kSignalBytes = 64;
 static constexpr int kRecvXBytes = L * R * D * 2;
 static constexpr int kRecvWBytes = L * R * W_PAD * 4;
@@ -123,48 +121,23 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int my_rank = static_cast<int>(comm_ctx->rankId);
 
     // ------------------------------------------------------------------
-    // Tile types (all use STATIC valid rows/cols — TCVT and TROWSUM seem
-    // to interact poorly with `Tile<..., -1, -1>` dynamic-valid form).
+    // Tile types (all use STATIC valid rows/cols — TCVT seems to interact
+    // poorly with `Tile<..., -1, -1>` dynamic-valid form here).
     // ------------------------------------------------------------------
     using RowBfG = GlobalTensor<bfloat16_t, Shape<1, 1, 1, 1, D>, Stride<D, D, D, D, 1>>;
     using RowFpG = GlobalTensor<float,      Shape<1, 1, 1, 1, D>, Stride<D, D, D, D, 1>>;
     using RowBfTile = Tile<TileType::Vec, bfloat16_t, 1, D, BLayout::RowMajor, 1, D>;
     using RowFpTile = Tile<TileType::Vec, float,      1, D, BLayout::RowMajor, 1, D>;
 
-    using YBufG = GlobalTensor<bfloat16_t, Shape<1, 1, 1, T * TOPK, D>,
-                               Stride<T * TOPK * D, T * TOPK * D, T * TOPK * D, D, 1>>;
-    using YBufTile = Tile<TileType::Vec, bfloat16_t, T * TOPK, D, BLayout::RowMajor, T * TOPK, D>;
-
-    using SignalG = GlobalTensor<int32_t, Shape<1, 1, 1, 1, 8>, Stride<8, 8, 8, 8, 1>>;
-    using SignalTile = Tile<TileType::Vec, int32_t, 1, 8, BLayout::RowMajor, 1, 8>;
-
-    // ------------------------------------------------------------------
-    // Phase 0: zero-init this rank's routed_y_buf and combine_done_sig.
-    //
-    // routed_y_buf:
-    //   "(t, k) slot is 0 unless someone wrote it" is the load-bearing
-    //   invariant for the reduce step. Without it, stale BF16 from prior
-    //   decode steps leaks into the FP32 reduce sum.
-    // combine_done_sig:
-    //   TNOTIFY(AtomicAdd) accumulates across kernel calls — needs a per-call
-    //   zero so a peer's TWAIT does not pass on a stale counter.
-    // ------------------------------------------------------------------
-    YBufTile y_buf_zero;
-    SignalTile sig_zero;
-    TASSIGN(y_buf_zero, 0x0);
-    TASSIGN(sig_zero,   0x10000);
-    TEXPANDS(y_buf_zero, (bfloat16_t)0);
-    TEXPANDS(sig_zero,   (int32_t)0);
-    pipe_barrier(PIPE_ALL);
-
-    YBufG  y_buf_g(routed_y_buf_local);
-    SignalG sig_g(combine_done_sig_local);
-    TSTORE(y_buf_g, y_buf_zero);
-    TSTORE(sig_g, sig_zero);
-    pipe_barrier(PIPE_ALL);
+    // routed_y_buf and combine_done_sig start zero by virtue of HCCL's window
+    // zero-init at allocation time. We deliberately do NOT clear them per
+    // call here: a per-call zero-init would race with the peer's push-phase
+    // TPUT (peer pushes into our routed_y_buf; our zero-init can clobber an
+    // already-arrived push). Multi-step decode would need a cross-rank
+    // barrier between zero-init and the push phase to make the clear safe.
 
     // ------------------------------------------------------------------
-    // Phase 1: push recv_y rows to dst's routed_y_buf[t, k, :].
+    // push: TPUT recv_y rows to dst's routed_y_buf[t, k, :].
     // ------------------------------------------------------------------
     RowBfTile push_tile;
     TASSIGN(push_tile, 0x20000);
@@ -212,7 +185,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
-    // Phase 2: reduce_sum along TOPK -> routed_y[T, D] FP32.
+    // reduce: reduce_sum along TOPK -> routed_y[T, D] FP32.
     //
     // For each token t:
     //   acc_fp32 = 0
@@ -224,7 +197,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     RowFpTile acc_tile;
     RowBfTile add_bf_tile;
     RowFpTile add_fp_tile;
-    // Reuse Phase 0/1 UB slots — barriers above ensure they have drained.
+    // Reuse push-phase UB slots — barriers above ensure they have drained.
     TASSIGN(acc_tile,    0x0);
     TASSIGN(add_bf_tile, 0x10000);
     TASSIGN(add_fp_tile, 0x20000);

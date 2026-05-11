@@ -17,12 +17,13 @@
  * visibility, both still in the shared scratch.
  *
  *   func_id 0  dispatch.cpp        count exchange + 3-channel push
- *                                  + Phase 4 stage out + Phase 2 recv_count
+ *                                  + stage-out + recv_count emission
  *   func_id 1  local_expert.cpp    placeholder for moe_expert:
  *                                  recv_y[e, s, :] = recv_x[e, s, :] * recv_w[e, s]
- *   func_id 2  combine.cpp         zero-init routed_y_buf,
- *                                  TPUT recv_y rows by recv_idx_out, barrier,
- *                                  reduce_sum along TOPK -> routed_y FP32
+ *   func_id 2  combine.cpp         TPUT recv_y rows by recv_idx_out into
+ *                                  routed_y_buf (relies on HCCL window
+ *                                  zero-init), barrier, reduce_sum along
+ *                                  TOPK -> routed_y FP32
  *
  *   tensor(0)  indices            INPUT             [T, TOPK]            INT32
  *   tensor(1)  x_norm             INPUT             [T, D]               BF16

@@ -70,10 +70,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     using XShape = Shape<1, 1, 1, 1, D>;
     using XStride = Stride<D, D, D, D, 1>;
     using XGlobalBF = GlobalTensor<bfloat16_t, XShape, XStride>;
-    // Drop the trailing valid-rows/cols template params entirely — the
-    // 7-arg form lets pto-isa pick its own defaults for TLOAD/TCVT/TSTORE
-    // dispatch, which works correctly. Both the static (1, D) and dynamic
-    // (-1, -1) forms produce the wrong recv_y here.
     using XTileBF = Tile<TileType::Vec, bfloat16_t, 1, D, BLayout::RowMajor>;
     using XTileF = Tile<TileType::Vec, float, 1, D, BLayout::RowMajor>;
 

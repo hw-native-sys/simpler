@@ -15,24 +15,25 @@ shared HCCL window scratch:
   dispatch.cpp      count exchange + 3-channel push + per-channel stage-out
   local_expert.cpp  recv_y[e, s, :] = recv_x[e, s, :] * recv_w[e, s]
                     (placeholder for the production moe_expert)
-  combine.cpp       zero-init routed_y_buf, TPUT recv_y rows by recv_idx_out
-                    into routed_y_buf[t, k, :], barrier, reduce_sum along
+  combine.cpp       TPUT recv_y rows by recv_idx_out into
+                    routed_y_buf[t, k, :] (relies on HCCL window zero-init,
+                    no per-call clear), barrier, reduce_sum along
                     TOPK -> routed_y FP32
 
-Each rank drives the dispatch kernel through 4 phases:
+Each rank drives the dispatch kernel through these phases (0..4):
 
-  Phase 0  scalar histogram + (dst, loc_e)-sorted route table from indices
-  Phase 1  publish full send_counts table to peers via TNOTIFY(AtomicAdd)
-           + count_done barrier
-  Phase 2  local prefix sums over global pub_counts (no comm)
-  Phase 3  for each route: TPUT three independent payload tiles —
-             x      [BF16, 1xD]        x_norm[t, :]
-             weight [FP32, 1xW_PAD]    w_padded[r, :]   = [weight, 0, …, 0]
-             idx    [INT32, 1xIDX_PAD] idx_padded[r, :] = [r, 0, …, 0]
-                                       where r = t * TOPK + k
-           to peer's recv_x[loc_e][slot, :] / recv_w[…] / recv_idx[…]
-           + data_done barrier
-  Phase 4  stage out recv_x / recv_w / recv_idx windows -> host-backed outputs
+  histogram     scalar histogram + (dst, loc_e)-sorted route table from indices
+  publish       publish full send_counts table to peers via TNOTIFY(AtomicAdd)
+                + count_done barrier
+  prefix_sum    local prefix sums over global pub_counts (no comm)
+  payload_push  for each route: TPUT three independent payload tiles —
+                  x      [BF16, 1xD]        x_norm[t, :]
+                  weight [FP32, 1xW_PAD]    w_padded[r, :]   = [weight, 0, …, 0]
+                  idx    [INT32, 1xIDX_PAD] idx_padded[r, :] = [r, 0, …, 0]
+                                            where r = t * TOPK + k
+                to peer's recv_x[loc_e][slot, :] / recv_w[…] / recv_idx[…]
+                + data_done barrier
+  stage_out     stage out recv_x / recv_w / recv_idx windows -> host-backed outputs
 
 Type/shape contract:
   - ``x_norm`` and ``recv_x_out`` are **BF16**. Test inputs use small
@@ -45,7 +46,8 @@ Type/shape contract:
     route, actual r=t*TOPK+k at slot [0]; compacted via scalar copy to
     [L, R] INT32 host output. Combine reads it to address
     routed_y_buf[t, k, :] without a host-built origin_map.
-  - ``recv_count_out`` is [L, 1] INT32 emitted by dispatch's Phase 2.
+  - ``recv_count_out`` is [L, 1] INT32 emitted by dispatch's prefix_sum
+    phase.
 
 Hardware only. Run:
 
@@ -96,8 +98,8 @@ IDX_PAD = 8         # idx tile width   — minimum vector tile (1x8 INT32 = 32 B
 E_GLOBAL = N_RANKS * L
 N_ROUTES = T * TOPK
 
-# Window region byte sizes — mirror kOff*/kScratchBytes in the kernels.
-PUB_COUNTS_BYTES = 64                                   # N*N*L INT32, aligned to 64 B
+# Window region byte sizes — mirror k*Bytes / kOff* in the kernels.
+PUB_COUNTS_BYTES = N_RANKS * N_RANKS * L * 4            # N*N*L INT32
 SIGNAL_BYTES = 64                                       # padded slot per signal area
 RECV_X_BYTES = L * R * D * 2                            # 16 KB (BF16)
 RECV_W_BYTES = L * R * W_PAD * 4                        # 4  KB (FP32; weight at slot 0)
@@ -369,8 +371,8 @@ def run(device_ids: list[int]) -> int:
 
     # Outputs — recv_x_out is BF16 (matches kernel TPUT/TSTORE element type);
     # recv_w_out / recv_idx_out are compacted to [L, R] inside the kernel.
-    # recv_count_out is [L, 1] INT32 — dispatch's Phase 2 fills it from
-    # pub_counts so local_expert can iterate `recv_count[e]` rows per expert.
+    # recv_count_out is [L, 1] INT32 — dispatch's prefix_sum phase fills it
+    # from pub_counts so local_expert can iterate `recv_count[e]` rows per expert.
     recv_x_outs = [torch.zeros(L, R, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
     recv_w_outs = [torch.zeros(L, R, dtype=torch.float32).share_memory_() for _ in range(nranks)]
     recv_idx_outs = [torch.zeros(L, R, dtype=torch.int32).share_memory_() for _ in range(nranks)]
@@ -540,11 +542,13 @@ def run(device_ids: list[int]) -> int:
             if diff > 1e-3:
                 ok = False
                 print(f"[ep_dispatch] chip {r}: routed_y mismatch (tol=1e-3)")
-                for t in range(min(T, 3)):
-                    print(
-                        f"  token {t}: got[0]={float(routed_y_outs[r][t, 0]):.4f} "
-                        f"expected[0]={float(expected[t, 0]):.4f}"
-                    )
+                per_token_diff = (routed_y_outs[r] - expected).abs().max(dim=1).values
+                for t in range(T):
+                    if per_token_diff[t] > 1e-3:
+                        print(
+                            f"  token {t}: got[0]={float(routed_y_outs[r][t, 0]):.4f} "
+                            f"expected[0]={float(expected[t, 0]):.4f}"
+                        )
 
         if not ok:
             print("[ep_dispatch] golden check FAILED")

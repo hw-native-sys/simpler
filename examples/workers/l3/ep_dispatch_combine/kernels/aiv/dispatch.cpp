@@ -16,24 +16,24 @@
  * address routed_y_buf[t, k, :] directly.
  *
  * Pipeline:
- *   Phase 0 (scalar)   build local histogram + (dst, loc_e)-sorted route table
- *                      from indices via scalar GM reads
- *   Phase 1 (TNOTIFY)  publish full send_counts table to every peer via
- *                      TNOTIFY(AtomicAdd) + count_done barrier
- *   Phase 2 (scalar)   local prefix sums over global pub_counts (no comm);
- *                      writes recv_count_out[e] = sum_s pub_counts[s][me][e]
- *   Phase 3 (TPUT)     for each route: TPUT three independent payload tiles
- *                      (x BF16 / weight FP32 / idx INT32) to peer's
- *                      recv_x[loc_e][slot, :] / recv_w[...] / recv_idx[...]
- *                      + data_done barrier
- *   Phase 4 (TLOAD/TSTORE) stage out window -> host outputs.
- *                      recv_x_out is [L, R, D] (per-row 1xD copy);
- *                      recv_w_out is [L, R]    (TROWSUM over [L,R,W_PAD]
- *                                                wide window — sum-along-PAD
- *                                                recovers column-0 values
- *                                                because columns [1, W_PAD)
- *                                                are zero by design);
- *                      recv_idx_out is [L, R]  (scalar copy of column 0)
+ *   histogram     (scalar)   build local histogram + (dst, loc_e)-sorted route
+ *                            table from indices via scalar GM reads
+ *   publish       (TNOTIFY)  publish full send_counts table to every peer via
+ *                            TNOTIFY(AtomicAdd) + count_done barrier
+ *   prefix_sum    (scalar)   local prefix sums over global pub_counts (no comm);
+ *                            writes recv_count_out[e] = sum_s pub_counts[s][me][e]
+ *   payload_push  (TPUT)     for each route: TPUT three independent payload tiles
+ *                            (x BF16 / weight FP32 / idx INT32) to peer's
+ *                            recv_x[loc_e][slot, :] / recv_w[...] / recv_idx[...]
+ *                            + data_done barrier
+ *   stage_out     (TLOAD/TSTORE) stage out window -> host outputs.
+ *                            recv_x_out is [L, R, D] (per-row 1xD copy);
+ *                            recv_w_out is [L, R]    (TROWSUM over [L,R,W_PAD]
+ *                                                      wide window — sum-along-PAD
+ *                                                      recovers column-0 values
+ *                                                      because columns [1, W_PAD)
+ *                                                      are zero by design);
+ *                            recv_idx_out is [L, R]  (scalar copy of column 0)
  *
  * Design notes:
  *   - All cross-rank GM writes go through tile primitives (TPUT). No AIV
@@ -87,7 +87,7 @@ static constexpr int W_PAD = 8;
 // but materialized as [L, R, IDX_PAD] with the actual r=t*TOPK+k at slot [0].
 static constexpr int IDX_PAD = 8;
 
-// Window region byte sizes — mirror SCRATCH_NBYTES_* in main.py.
+// Window region byte sizes — mirror *_BYTES in main.py.
 //
 // Layout:
 //   pub_counts[N][N][L]            INT32   (64 B)
@@ -103,7 +103,7 @@ static constexpr int IDX_PAD = 8;
 //
 // recv_y does NOT live in this window — local_expert and combine pass it
 // as a host-backed device tensor via the orch.
-static constexpr int kPubCountsBytes = 64;
+static constexpr int kPubCountsBytes = N * N * L * 4;      // N*N*L INT32
 static constexpr int kSignalBytes = 64;
 static constexpr int kRecvXBytes = L * R * D * 2;          // BF16
 static constexpr int kRecvWBytes = L * R * W_PAD * 4;
@@ -177,84 +177,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int my_rank = static_cast<int>(comm_ctx->rankId);
 
     // ------------------------------------------------------------------
-    // Phase 0a: zero-init scratch buffers that need a clean slate per call.
-    //
-    // Multi-step decode reuses the same HCCL window across kernel invocations,
-    // so any buffer that is consumed beyond the live `[0, recv_count[e])`
-    // region — or that is updated via AtomicAdd — must be cleared first.
-    //
-    //   pub_counts_local : Phase 1 publishes via TNOTIFY(AtomicAdd); without
-    //                      a per-step zero, stale counts from the previous
-    //                      step accumulate and Phase 2's slot offsets go
-    //                      completely wrong.
-    //   recv_w_local     : the protocol contract requires
-    //                      recv_w[e, cnt[e]:R] = 0  so that the expert
-    //                      kernel's last (partial) tile produces
-    //                      bit-exact 0 in recv_y's padding region. Stale
-    //                      [w_old, 0, …] rows here would feed real-looking
-    //                      weights into the row-0 column we stage out.
-    //   recv_idx_local   : padding rows leak stale (and *valid*) idx values
-    //                      that combine could mis-route into a live
-    //                      routed_y_buf[t, k, :] slot if a slice boundary
-    //                      ever drifts. Cheap to defend against.
-    //
-    //   recv_x_local     : NOT cleared. The protocol says recv_x padding is
-    //                      don't-care; downstream the moe_expert path
-    //                      multiplies by recv_w (which IS zero in padding)
-    //                      so the garbage gets squashed before it can leak
-    //                      into recv_y. Skipping this saves the largest
-    //                      buffer's worth of bandwidth (D=64 here, D=4096
-    //                      in production). If a future expert path includes
-    //                      a per-tile quant step that mixes valid+padding
-    //                      rows BEFORE the weight multiply, this assumption
-    //                      needs to be revisited.
-    //
-    // Using full tile TSTOREs of zero-initialized tiles keeps the pipeline
-    // on the V/MTE3 path and avoids AIV scalar GM stores.
-    // ------------------------------------------------------------------
-    using PubCountsShape  = Shape<1, 1, 1, 1, N * N * L>;
-    using PubCountsStride = Stride<N * N * L, N * N * L, N * N * L, N * N * L, 1>;
-    using PubCountsG      = GlobalTensor<int32_t, PubCountsShape, PubCountsStride>;
-    using PubCountsZeroTile = Tile<TileType::Vec, int32_t, 1, N * N * L, BLayout::RowMajor, -1, -1>;
-
-    using RecvWZeroShape  = Shape<1, 1, 1, L * R, W_PAD>;
-    using RecvWZeroStride = Stride<L * R * W_PAD, L * R * W_PAD, L * R * W_PAD, W_PAD, 1>;
-    using RecvWZeroG      = GlobalTensor<float, RecvWZeroShape, RecvWZeroStride>;
-    using RecvWZeroTile   = Tile<TileType::Vec, float, L * R, W_PAD, BLayout::RowMajor, L * R, W_PAD>;
-
-    using RecvIdxZeroShape  = Shape<1, 1, 1, L * R, IDX_PAD>;
-    using RecvIdxZeroStride = Stride<L * R * IDX_PAD, L * R * IDX_PAD, L * R * IDX_PAD, IDX_PAD, 1>;
-    using RecvIdxZeroG      = GlobalTensor<int32_t, RecvIdxZeroShape, RecvIdxZeroStride>;
-    using RecvIdxZeroTile   = Tile<TileType::Vec, int32_t, L * R, IDX_PAD, BLayout::RowMajor, L * R, IDX_PAD>;
-
-    PubCountsZeroTile pub_zero;
-    RecvWZeroTile     w_zero;
-    RecvIdxZeroTile   idx_zero;
-    TASSIGN(pub_zero, 0x0);
-    TASSIGN(w_zero,   0x10000);
-    TASSIGN(idx_zero, 0x20000);
-    TEXPANDS(pub_zero, (int32_t)0);
-    TEXPANDS(w_zero,   0.0f);
-    TEXPANDS(idx_zero, (int32_t)0);
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-
-    PubCountsG    pub_counts_g(pub_counts_local);
-    RecvWZeroG    recv_w_g(recv_w_local);
-    RecvIdxZeroG  recv_idx_g(recv_idx_local);
-    TSTORE(pub_counts_g, pub_zero);
-    TSTORE(recv_w_g,     w_zero);
-    TSTORE(recv_idx_g,   idx_zero);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    pipe_barrier(PIPE_ALL);
-
-    // ------------------------------------------------------------------
-    // Phase 0: scalar histogram + (dst, loc_e)-sorted route table.
+    // histogram: scalar histogram + (dst, loc_e)-sorted route table.
     //
     // Scalar GM reads of indices[t * TOPK + k] are fine on AIV.
-    // Bucket each route by (dst, loc_e) and stable-sort so Phase 3's cursor
-    // matches each peer's src-major slot_offset rule.
+    // Bucket each route by (dst, loc_e) and stable-sort so the payload_push
+    // cursor matches each peer's src-major slot_offset rule.
     // ------------------------------------------------------------------
     int send_counts[N][L];
     for (int d = 0; d < N; ++d) {
@@ -297,12 +224,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
-    // Phase 1: publish my full send_counts table to every peer.
+    // publish: publish my full send_counts table to every peer.
     //
     // Goal: every rank's local pub_counts[N_src=N][N_dst=N][L] becomes the
     // global view — pub_counts[s][d][e] = how many rows sender s sends to
-    // dst d's local expert e. Phase 2 then computes prefix sums purely from
-    // local reads.
+    // dst d's local expert e. The prefix_sum phase then computes prefix sums
+    // purely from local reads.
     //
     // Self-rank is included in the publish loop so pub_counts[my_rank][:][:]
     // gets populated locally — recv_count_out (= sum_s pub_counts[s][me][e])
@@ -315,7 +242,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // ⚠ The pipe_barrier between the two TNOTIFY groups is load-bearing:
     // without it, count_done can become visible on a peer before the
     // corresponding pub_counts writes drain, so the peer's TWAIT passes
-    // early and Phase 2 reads stale pub_counts → wrong slot offsets.
+    // early and the prefix_sum phase reads stale pub_counts → wrong slot
+    // offsets.
     // ------------------------------------------------------------------
     for (int peer = 0; peer < N; ++peer) {
         for (int d = 0; d < N; ++d) {
@@ -345,11 +273,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
-    // Phase 2: local prefix sums (scalar).
+    // prefix_sum: local prefix sums (scalar).
     //
     // Two outputs from the same pub_counts scan:
     //   my_slot_at_dst[dst][e] = sum_{s<my_rank} pub_counts[s][dst][e]
-    //     — sender's slot offset on each peer's recv area (Phase 3 uses this)
+    //     — sender's slot offset on each peer's recv area (payload_push uses this)
     //   recv_expert_count[e]   = sum_{s<N}       pub_counts[s][my_rank][e]
     //     — total rows arriving at THIS rank's local expert e (host output)
     //
@@ -376,7 +304,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
 
     // ------------------------------------------------------------------
-    // Phase 3: push x / weight / idx payloads via TPUT.
+    // payload_push: push x / weight / idx payloads via TPUT.
     //
     // Each route emits three independent 1xC tiles:
     //   - x   (BF16, 1 x D)         x_norm[t, :]                       -> peer.recv_x[loc_e][slot, :]
@@ -387,8 +315,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // Each channel has its own tile register so dtype changes stay local.
     //
     // Self-rank is *not* skipped: the sender pushes its own routes into its
-    // local recv_x / recv_w / recv_idx windows so Phase 4 can stage everything
-    // out uniformly. CommRemotePtr returns the local addr for peer == my_rank.
+    // local recv_x / recv_w / recv_idx windows so the stage_out phase can
+    // stage everything out uniformly. CommRemotePtr returns the local addr
+    // for peer == my_rank.
     // ------------------------------------------------------------------
     using XShape = Shape<1, 1, 1, 1, D>;
     using XStride = Stride<D, D, D, D, 1>;
@@ -405,8 +334,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     using IGlobal = GlobalTensor<int32_t, IShape, IStride>;
     using ITile = Tile<TileType::Vec, int32_t, 1, IDX_PAD, BLayout::RowMajor, -1, -1>;
 
-    // Reuse three tile registers across Phase 3 (TPUT staging) and Phase 4
-    // (stage-out xfer). The pipe_barrier between phases serializes the two
+    // Reuse three tile registers across payload_push (TPUT staging) and
+    // stage_out (xfer). The pipe_barrier between phases serializes the two
     // uses, so sharing UB slots is safe.
     XTile x_tile(1, D);
     WTile w_tile(1, W_PAD);
@@ -461,7 +390,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
     pipe_barrier(PIPE_ALL);
 
-    // Data-done barrier — payload visibility across ranks. Skip self.
+    // Data-done barrier — payload visibility across ranks.
+    //
+    // Self-rank is skipped here even though payload_push includes a self-push
+    // (loopback into our own recv_x window): the pipe_barrier above already
+    // orders that local TPUT vs. the upcoming stage_out reads on this rank,
+    // so a self-signal would be redundant. Cross-rank payloads are what need
+    // explicit done signals.
     for (int peer = 0; peer < N; ++peer) {
         if (peer == my_rank) continue;
         __gm__ int32_t *remote_done = CommRemotePtr(comm_ctx, data_done_sig_local + my_rank, peer);
@@ -476,7 +411,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
-    // Phase 4: stage out window -> host outputs.
+    // stage_out: stage out window -> host outputs.
     //
     // recv_x_out  is [L, R, D]  BF16  : per-row 1xD TLOAD/TSTORE, L*R rows.
     // recv_w_out  is [L, R]     FP32  : compacted from [L, R, W_PAD] window.
@@ -515,9 +450,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     using ISumG       = GlobalTensor<int32_t, ISumShape, ISumStride, Layout::DN>;
     using ISumTile    = Tile<TileType::Vec, int32_t, R, 1, BLayout::ColMajor, R, 1>;
 
-    // UB allocation. Phase 3's x_tile/w_tile/idx_tile have drained, so we can
-    // reuse those slots. Slot pitch is 64 KB; the largest tile here is
-    // R*W_PAD FP32 = 1 KB or R*IDX_PAD INT32 = 1 KB.
+    // UB allocation. The payload_push phase's x_tile/w_tile/idx_tile have
+    // drained, so we can reuse those slots. Slot pitch is 64 KB; the largest
+    // tile here is R*W_PAD FP32 = 1 KB or R*IDX_PAD INT32 = 1 KB.
     //
     // TROWSUM's tmp tile must be the SAME SHAPE as the source (RxPAD), not
     // the destination (Rx1) — pto-isa uses it as scratch for partial
