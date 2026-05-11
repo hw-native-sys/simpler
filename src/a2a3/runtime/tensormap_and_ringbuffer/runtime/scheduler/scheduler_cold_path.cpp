@@ -33,6 +33,7 @@ static void latch_scheduler_error(PTO2SharedMemoryHeader *header, int32_t thread
     if (header == nullptr || error_code == PTO2_ERROR_NONE) {
         return;
     }
+    // The first error code/thread pair wins; the bitmap cumulatively records all reporting threads.
     int32_t expected = PTO2_ERROR_NONE;
     if (header->sched_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel)) {
         header->sched_error_thread.store(thread_idx, std::memory_order_release);
@@ -63,7 +64,9 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
     int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
     if (sched_err != PTO2_ERROR_NONE) {
         LOG_ERROR("Thread %d: Scheduler fatal error detected (code=%d)", thread_idx, sched_err);
-        completed_.store(true, std::memory_order_release);
+        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+            emergency_shutdown(runtime);
+        }
         return LoopAction::BREAK_LOOP;
     }
 
@@ -113,7 +116,9 @@ SchedulerContext::check_idle_fatal_error(int32_t thread_idx, PTO2SharedMemoryHea
     int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
     if (sched_err != PTO2_ERROR_NONE) {
         LOG_ERROR("Thread %d: Scheduler fatal error detected (code=%d)", thread_idx, sched_err);
-        completed_.store(true, std::memory_order_release);
+        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+            emergency_shutdown(runtime);
+        }
         return LoopAction::BREAK_LOOP;
     }
     return LoopAction::NONE;
