@@ -112,7 +112,7 @@ private:
         int (*)(void *, int32_t, const void *, int, const uint8_t *, size_t, const uint8_t *, size_t);
     using RunPreparedFn = int (*)(
         void *, void *, int32_t, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int,
-        int, int, const char *
+        int, int, int, const char *
     );
     using UnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);

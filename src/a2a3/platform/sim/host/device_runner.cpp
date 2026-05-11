@@ -221,6 +221,19 @@ int DeviceRunner::ensure_binaries_loaded(
             return -1;
         }
 
+        set_platform_dep_gen_base_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_dep_gen_base"));
+        if (set_platform_dep_gen_base_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_dep_gen_base: %s", dlerror());
+            return -1;
+        }
+
+        set_dep_gen_enabled_func_ = reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_dep_gen_enabled"));
+        if (set_dep_gen_enabled_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_dep_gen_enabled: %s", dlerror());
+            return -1;
+        }
+
         // Log config bindings (optional; older SOs without these stay at their
         // compile-time defaults).
         set_log_level_func_ = reinterpret_cast<void (*)(int)>(dlsym(aicpu_so_handle_, "set_log_level"));
@@ -374,6 +387,9 @@ int DeviceRunner::run(
     if (enable_pmu_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
+    if (enable_dep_gen_) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
+    }
     kernel_args_.enable_profiling_flag = enable_profiling_flag;
 
     for (int i = 0; i < num_aicore; i++) {
@@ -432,6 +448,14 @@ int DeviceRunner::run(
         }
     }
 
+    if (enable_dep_gen_) {
+        rc = init_dep_gen(launch_aicpu_num, make_dep_gen_path(output_prefix_), device_id);
+        if (rc != 0) {
+            LOG_ERROR("init_dep_gen failed: %d", rc);
+            return rc;
+        }
+    }
+
     auto perf_cleanup = RAIIScopeGuard([this]() {
         if (l2_perf_collector_.is_initialized()) {
             l2_perf_collector_.stop();
@@ -441,6 +465,9 @@ int DeviceRunner::run(
         }
         if (pmu_collector_.is_initialized()) {
             pmu_collector_.stop();
+        }
+        if (dep_gen_collector_.is_initialized()) {
+            dep_gen_collector_.stop();
         }
     });
 
@@ -521,7 +548,8 @@ int DeviceRunner::run(
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
         set_platform_dump_base_func_ == nullptr || set_dump_tensor_enabled_func_ == nullptr ||
         set_platform_pmu_base_func_ == nullptr || set_platform_pmu_reg_addrs_func_ == nullptr ||
-        set_pmu_enabled_func_ == nullptr) {
+        set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
+        set_dep_gen_enabled_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
@@ -534,6 +562,8 @@ int DeviceRunner::run(
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
     set_platform_pmu_reg_addrs_func_(kernel_args_.pmu_reg_addrs);
     set_pmu_enabled_func_(enable_pmu_);
+    set_platform_dep_gen_base_func_(kernel_args_.dep_gen_data_base);
+    set_dep_gen_enabled_func_(enable_dep_gen_);
 
     // Publish log config to the AICPU SO. Optional dlsym for forward
     // compatibility with pre-log-config SOs.
@@ -558,6 +588,9 @@ int DeviceRunner::run(
     }
     if (enable_pmu_) {
         pmu_collector_.start(thread_factory);
+    }
+    if (enable_dep_gen_) {
+        dep_gen_collector_.start(thread_factory);
     }
 
     // Launch AICPU threads (over-launch for affinity gate)
@@ -631,6 +664,11 @@ int DeviceRunner::run(
         pmu_collector_.reconcile_counters();
     }
 
+    if (enable_dep_gen_) {
+        dep_gen_collector_.stop();
+        dep_gen_collector_.reconcile_counters();
+    }
+
     // Print handshake results at end of run
     print_handshake_results();
 
@@ -678,6 +716,8 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_pmu_base_func_ = nullptr;
         set_platform_pmu_reg_addrs_func_ = nullptr;
         set_pmu_enabled_func_ = nullptr;
+        set_platform_dep_gen_base_func_ = nullptr;
+        set_dep_gen_enabled_func_ = nullptr;
         aicpu_so_loaded_ = false;
     }
     if (!aicpu_so_path_.empty()) {
@@ -946,6 +986,10 @@ int DeviceRunner::finalize() {
         pmu_collector_.finalize(nullptr, free_cb, &mem_alloc_);
     }
 
+    if (dep_gen_collector_.is_initialized()) {
+        dep_gen_collector_.finalize(nullptr, free_cb, &mem_alloc_);
+    }
+
     // Kernel binaries are normally released by validate_runtime_impl on the
     // legacy run() path. The prepared-callable path intentionally leaves
     // them resident across runs and relies on finalize() to reclaim them;
@@ -1196,5 +1240,26 @@ int DeviceRunner::init_pmu(
     }
 
     kernel_args_.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());
+    return 0;
+}
+
+int DeviceRunner::init_dep_gen(int num_threads, const std::string &submit_trace_path, int /*device_id*/) {
+    auto alloc_cb = [](size_t size, void *user_data) -> void * {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->alloc(size);
+    };
+    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->free(dev_ptr);
+    };
+
+    // Sim shares an address space with the AICPU thread, so register_cb is
+    // not needed (mirrors PMU's nullptr in sim).
+    int rc = dep_gen_collector_.init(num_threads, submit_trace_path, alloc_cb, nullptr, free_cb, &mem_alloc_, -1);
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
     return 0;
 }

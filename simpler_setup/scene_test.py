@@ -629,6 +629,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     enable_l2_swimlane,
     enable_dump_tensor,
     enable_pmu,
+    enable_dep_gen,
 ):
     """Execute a pre-filtered list of cases for one class (layers 5-6).
 
@@ -638,7 +639,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     """
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
-    diagnostics_on = enable_l2_swimlane or enable_dump_tensor or enable_pmu
+    diagnostics_on = enable_l2_swimlane or enable_dump_tensor or enable_pmu or enable_dep_gen
     for case in cases:
         case_label = f"{cls_name}_{case['name']}"
         # Per-case directory the runtime writes into. Required (non-empty) when
@@ -656,6 +657,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                enable_dep_gen=enable_dep_gen,
                 output_prefix=str(prefix) if diagnostics_on else "",
             )
         finally:
@@ -828,7 +830,14 @@ class SceneTestCase:
         raise ValueError(f"Unsupported level: {self._st_level}")
 
     def _build_config(
-        self, config_dict, enable_l2_swimlane=False, enable_dump_tensor=False, enable_pmu=0, *, output_prefix=""
+        self,
+        config_dict,
+        enable_l2_swimlane=False,
+        enable_dump_tensor=False,
+        enable_pmu=0,
+        enable_dep_gen=False,
+        *,
+        output_prefix="",
     ):
         from simpler.task_interface import CallConfig  # noqa: PLC0415
 
@@ -838,6 +847,7 @@ class SceneTestCase:
         config.enable_l2_swimlane = enable_l2_swimlane
         config.enable_dump_tensor = enable_dump_tensor
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
+        config.enable_dep_gen = enable_dep_gen
         # `output_prefix` is required by CallConfig::validate() whenever any
         # diagnostic flag is enabled. Caller threads it down from the per-case
         # directory built by _build_output_prefix().
@@ -862,7 +872,7 @@ class SceneTestCase:
     # Run + validate
     # ------------------------------------------------------------------
 
-    def _run_and_validate(
+    def _run_and_validate(  # noqa: PLR0913 -- threads CLI diagnostic flags + case context
         self,
         worker,
         callable_obj,
@@ -873,6 +883,7 @@ class SceneTestCase:
         enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
+        enable_dep_gen=False,
         output_prefix="",
     ):
         if self._st_level == 2:
@@ -885,6 +896,7 @@ class SceneTestCase:
                 enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                enable_dep_gen=enable_dep_gen,
                 output_prefix=output_prefix,
             )
         elif self._st_level == 3:
@@ -898,6 +910,7 @@ class SceneTestCase:
                 enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                enable_dep_gen=enable_dep_gen,
                 output_prefix=output_prefix,
             )
 
@@ -911,6 +924,7 @@ class SceneTestCase:
         enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
+        enable_dep_gen=False,
         output_prefix="",
     ):
         params = case.get("params", {})
@@ -953,6 +967,7 @@ class SceneTestCase:
                 enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                enable_dep_gen=(enable_dep_gen and round_idx == 0),
                 output_prefix=output_prefix,
             )
 
@@ -962,7 +977,7 @@ class SceneTestCase:
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-    def _run_and_validate_l3(
+    def _run_and_validate_l3(  # noqa: PLR0913 -- threads CLI diagnostic flags + L3 ns context
         self,
         worker,
         compiled_callables,
@@ -973,6 +988,7 @@ class SceneTestCase:
         enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
+        enable_dep_gen=False,
         output_prefix="",
     ):
         # Defensive belt-and-braces: the pytest dispatcher and run_module both
@@ -1023,6 +1039,7 @@ class SceneTestCase:
                 enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
+                enable_dep_gen=(enable_dep_gen and round_idx == 0),
                 output_prefix=output_prefix,
             )
 
@@ -1051,6 +1068,7 @@ class SceneTestCase:
         enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=False)
         enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
+        enable_dep_gen = request.config.getoption("--enable-dep-gen", default=False)
         if rounds > 1:
             if enable_l2_swimlane:
                 logger.warning("Profiling disabled: --rounds > 1")
@@ -1061,6 +1079,9 @@ class SceneTestCase:
             if enable_pmu:
                 logger.warning("PMU disabled: --rounds > 1")
                 enable_pmu = 0
+            if enable_dep_gen:
+                logger.warning("dep_gen disabled: --rounds > 1")
+                enable_dep_gen = False
 
         cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
@@ -1111,6 +1132,7 @@ class SceneTestCase:
             enable_l2_swimlane=enable_l2_swimlane,
             enable_dump_tensor=enable_dump_tensor,
             enable_pmu=enable_pmu,
+            enable_dep_gen=enable_dep_gen,
         )
 
     # ------------------------------------------------------------------
@@ -1156,6 +1178,11 @@ class SceneTestCase:
             "--enable-l2-swimlane", action="store_true", help="Enable perf swimlane collection (first round only)"
         )
         parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
+        parser.add_argument(
+            "--enable-dep-gen",
+            action="store_true",
+            help="Enable dep_gen capture (SubmitTrace ring, first round only)",
+        )
         parser.add_argument(
             "--enable-pmu",
             nargs="?",
@@ -1224,6 +1251,9 @@ class SceneTestCase:
         if args.rounds > 1 and args.enable_l2_swimlane:
             logger.warning("Profiling disabled: --rounds > 1")
             args.enable_l2_swimlane = False
+        if args.rounds > 1 and args.enable_dep_gen:
+            logger.warning("dep_gen disabled: --rounds > 1")
+            args.enable_dep_gen = False
 
         from .parallel_scheduler import default_max_parallel, device_range_to_list  # noqa: PLC0415
 
@@ -1362,6 +1392,7 @@ class SceneTestCase:
                                 enable_l2_swimlane=args.enable_l2_swimlane,
                                 enable_dump_tensor=args.dump_tensor,
                                 enable_pmu=args.enable_pmu,
+                                enable_dep_gen=args.enable_dep_gen,
                             )
                             print("PASSED")
                         except Exception as e:  # noqa: BLE001
@@ -1402,6 +1433,8 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common.append("--enable-l2-swimlane")
     if args.dump_tensor:
         common.append("--dump-tensor")
+    if args.enable_dep_gen:
+        common.append("--enable-dep-gen")
     if args.build:
         common.append("--build")
 

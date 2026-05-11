@@ -54,6 +54,7 @@
 #include "host/l2_perf_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
+#include "host/dep_gen_collector.h"
 #include "runtime.h"
 
 /**
@@ -160,6 +161,7 @@ public:
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
+    void set_dep_gen_enabled(bool enable) { enable_dep_gen_ = enable; }
     // Severity floor (0=DEBUG..4=NUL) and INFO verbosity threshold (0..9).
     // Pushed in by the Python layer via run_runtime() and propagated to AICPU
     // through KernelArgs.
@@ -322,6 +324,8 @@ private:
     void (*set_platform_pmu_base_func_)(uint64_t){nullptr};
     void (*set_platform_pmu_reg_addrs_func_)(uint64_t){nullptr};
     void (*set_pmu_enabled_func_)(bool){nullptr};
+    void (*set_platform_dep_gen_base_func_)(uint64_t){nullptr};
+    void (*set_dep_gen_enabled_func_)(bool){nullptr};
     void (*set_log_level_func_)(int){nullptr};
     void (*set_log_info_v_func_)(int){nullptr};
     std::string aicpu_so_path_;
@@ -334,6 +338,8 @@ private:
     TensorDumpCollector dump_collector_;
     // PMU collector (independent of profiling pipeline)
     PmuCollector pmu_collector_;
+    // dep_gen collector — captures orchestrator submit_task inputs for offline replay
+    DepGenCollector dep_gen_collector_;
 
     // Private helper methods
     int ensure_device_initialized(
@@ -368,6 +374,8 @@ private:
     int init_tensor_dump(Runtime &runtime, int device_id);
 
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
+
+    int init_dep_gen(int num_threads, const std::string &submit_trace_path, int device_id);
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use
@@ -375,6 +383,7 @@ private:
     bool enable_l2_swimlane_{false};
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
+    bool enable_dep_gen_{false};
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
     int log_level_{1};                                             // 0=DEBUG..4=NUL; default INFO

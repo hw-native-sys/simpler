@@ -176,6 +176,7 @@ inline double cycles_to_us(uint64_t cycles) {
 #define PROFILING_FLAG_DUMP_TENSOR (1u << 0)
 #define PROFILING_FLAG_L2_SWIMLANE (1u << 1)
 #define PROFILING_FLAG_PMU (1u << 2)
+#define PROFILING_FLAG_DEP_GEN (1u << 3)
 #define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
 #define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
 #define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
@@ -255,6 +256,39 @@ constexpr int PLATFORM_PMU_READYQUEUE_SIZE = PLATFORM_MAX_CORES * PLATFORM_PMU_B
  * Idle timeout duration for PMU collection (seconds)
  */
 constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
+
+// =============================================================================
+// dep_gen (SubmitTrace) Configuration
+// =============================================================================
+
+/**
+ * Number of DepGenRecord entries per DepGenBuffer.
+ * Each DepGenRecord is ~2.3 KB (16 Tensor blobs + small header), so a buffer
+ * of 32 records is ~74 KB — sized to fit a typical example's submit count
+ * (~100-200) in a few buffers.
+ */
+constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 32;
+
+/**
+ * SPSC free_queue slot count for dep_gen buffers (Host→Device hand-off depth).
+ */
+constexpr int PLATFORM_DEP_GEN_SLOT_COUNT = 4;
+
+/**
+ * Pre-allocated DepGenBuffer count per orchestrator instance.
+ */
+constexpr int PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE = 4;
+
+/**
+ * Ready queue capacity for dep_gen (per AICPU thread). dep_gen is single-
+ * instance so headroom over BUFFERS_PER_INSTANCE × num_instances is small.
+ */
+constexpr int PLATFORM_DEP_GEN_READYQUEUE_SIZE = PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE * 2;
+
+/**
+ * Idle timeout duration for dep_gen collection (seconds).
+ */
+constexpr int PLATFORM_DEP_GEN_TIMEOUT_SECONDS = 30;
 
 // =============================================================================
 // Register Communication Configuration

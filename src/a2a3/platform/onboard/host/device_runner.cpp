@@ -563,6 +563,9 @@ int DeviceRunner::run(
     if (enable_pmu_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
+    if (enable_dep_gen_) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
+    }
     kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
     for (int i = 0; i < num_aicore; i++) {
@@ -617,6 +620,14 @@ int DeviceRunner::run(
         }
     }
 
+    if (enable_dep_gen_) {
+        rc = init_dep_gen(launch_aicpu_num, make_dep_gen_path(output_prefix_), device_id);
+        if (rc != 0) {
+            LOG_ERROR("init_dep_gen failed: %d", rc);
+            return rc;
+        }
+    }
+
     auto perf_cleanup = RAIIScopeGuard([this]() {
         if (l2_perf_collector_.is_initialized()) {
             l2_perf_collector_.stop();
@@ -626,6 +637,9 @@ int DeviceRunner::run(
         }
         if (pmu_collector_.is_initialized()) {
             pmu_collector_.stop();
+        }
+        if (dep_gen_collector_.is_initialized()) {
+            dep_gen_collector_.stop();
         }
     });
 
@@ -676,6 +690,9 @@ int DeviceRunner::run(
     }
     if (enable_pmu_) {
         pmu_collector_.start(thread_factory);
+    }
+    if (enable_dep_gen_) {
+        dep_gen_collector_.start(thread_factory);
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServerInit ===");
@@ -752,6 +769,11 @@ int DeviceRunner::run(
     if (enable_pmu_) {
         pmu_collector_.stop();
         pmu_collector_.reconcile_counters();
+    }
+
+    if (enable_dep_gen_) {
+        dep_gen_collector_.stop();
+        dep_gen_collector_.reconcile_counters();
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -1165,6 +1187,23 @@ int DeviceRunner::finalize() {
         pmu_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
     }
 
+    if (dep_gen_collector_.is_initialized()) {
+        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
+            HalHostUnregisterFn fn = get_halHostUnregister();
+            if (fn != nullptr) {
+                return fn(dev_ptr, device_id);
+            }
+            return 0;
+        };
+
+        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+            auto *allocator = static_cast<MemoryAllocator *>(user_data);
+            return allocator->free(dev_ptr);
+        };
+
+        dep_gen_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
 
@@ -1455,5 +1494,39 @@ int DeviceRunner::init_pmu(
     }
 
     kernel_args_.args.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());
+    return 0;
+}
+
+int DeviceRunner::init_dep_gen(int num_threads, const std::string &submit_trace_path, int device_id) {
+    auto alloc_cb = [](size_t size, void *user_data) -> void * {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->alloc(size);
+    };
+
+    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
+        if (load_hal_if_needed() != 0) {
+            LOG_ERROR("Failed to load ascend_hal for dep_gen: %s", dlerror());
+            return -1;
+        }
+        HalHostRegisterFn fn = get_halHostRegister();
+        if (fn == nullptr) {
+            LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
+            return -1;
+        }
+        return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
+    };
+
+    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->free(dev_ptr);
+    };
+
+    int rc =
+        dep_gen_collector_.init(num_threads, submit_trace_path, alloc_cb, register_cb, free_cb, &mem_alloc_, device_id);
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.args.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
     return 0;
 }

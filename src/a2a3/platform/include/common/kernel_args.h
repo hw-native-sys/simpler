@@ -63,12 +63,15 @@ extern "C" {
  *   tensor dump is unused
  * - pmu_data_base: Written by host platform, read by AICPU platform layer;
  *   zero when PMU is unused
+ * - dep_gen_data_base: Written by host platform, read by AICPU platform layer;
+ *   zero when dep_gen capture is unused
  *
  * enable_profiling_flag bit definitions (umbrella bitmask — "profiling" is
  * the umbrella, each bit is a parallel diagnostics sub-feature):
  * - bit0: tensor dump enabled
  * - bit1: L2 swimlane enabled
  * - bit2: PMU enabled
+ * - bit3: dep_gen capture enabled
  *
  * Field Access Patterns:
  *       - AICPU: receives KernelArgs* via DynTileFwkBackendKernelServer
@@ -84,6 +87,7 @@ struct KernelArgs {
     uint64_t l2_perf_data_base{0};      // L2 perf shared memory base address; use explicit flags to detect enablement
     uint64_t pmu_data_base{0};          // PMU shared memory base address; use explicit flags to detect enablement
     uint64_t pmu_reg_addrs{0};          // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
+    uint64_t dep_gen_data_base{0};      // dep_gen shared memory base address; use explicit flags to detect enablement
     uint64_t aicore_ring_addr{0};       // Device ptr to a uint64_t[num_aicore] table holding each core's
                                         // L2PerfAicoreRing address. AICore kernel entry indexes by block_idx
                                         // and forwards into platform set/get state. 0 when L2 swimlane is off.

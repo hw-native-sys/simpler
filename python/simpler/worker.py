@@ -109,10 +109,11 @@ _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
-# 5 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
-# enable_pmu) + 1024-byte NUL-terminated output_prefix. Log config travels
-# separately via ChipWorker.init(log_level, log_info_v) — not on per-task wire.
-_CFG_FMT = struct.Struct("=iiiii1024s")
+# 6 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
+# enable_pmu, enable_dep_gen) + 1024-byte NUL-terminated output_prefix. Log
+# config travels separately via ChipWorker.init(log_level, log_info_v) — not
+# on per-task wire.
+_CFG_FMT = struct.Struct("=iiiiii1024s")
 # Args region starts after CONFIG, rounded up to 8 bytes so the first
 # ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
@@ -549,13 +550,14 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912, PLR0915
 
 def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     """Reconstruct a CallConfig from the unified mailbox layout."""
-    block_dim, aicpu_tn, swl, dt, pmu, prefix_bytes = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
+    block_dim, aicpu_tn, swl, dt, pmu, dep_gen, prefix_bytes = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
     cfg = CallConfig()
     cfg.block_dim = block_dim
     cfg.aicpu_thread_num = aicpu_tn
     cfg.enable_l2_swimlane = bool(swl)
     cfg.enable_dump_tensor = bool(dt)
     cfg.enable_pmu = pmu
+    cfg.enable_dep_gen = bool(dep_gen)
     # NUL-terminated C string in a 1024-byte field.
     cfg.output_prefix = prefix_bytes.split(b"\x00", 1)[0].decode("utf-8")
     return cfg
