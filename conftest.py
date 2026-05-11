@@ -144,6 +144,12 @@ def pytest_addoption(parser):
     )
     parser.addoption("--dump-tensor", action="store_true", default=False, help="Dump per-task tensor I/O at runtime")
     parser.addoption(
+        "--enable-dep-gen",
+        action="store_true",
+        default=False,
+        help="Enable dep_gen capture (SubmitTrace ring, first round only)",
+    )
+    parser.addoption(
         "--enable-pmu",
         nargs="?",
         const=2,

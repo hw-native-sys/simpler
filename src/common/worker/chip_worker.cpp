@@ -328,7 +328,7 @@ void ChipWorker::run_prepared(int32_t callable_id, const void *args, const CallC
     int rc = run_prepared_fn_(
         device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, device_id_, aicpu_binary_.data(),
         aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(), config.enable_l2_swimlane,
-        config.enable_dump_tensor, config.enable_pmu, config.output_prefix
+        config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.output_prefix
     );
     if (rc != 0) {
         throw std::runtime_error("run_prepared failed with code " + std::to_string(rc));

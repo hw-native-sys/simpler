@@ -47,6 +47,7 @@
 #include "host/l2_perf_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
+#include "host/dep_gen_collector.h"
 #include "runtime.h"
 
 /**
@@ -269,6 +270,7 @@ public:
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
+    void set_dep_gen_enabled(bool enable) { enable_dep_gen_ = enable; }
     // Severity floor (0=DEBUG..4=NUL) and INFO verbosity threshold (0..9).
     // Pushed in by the Python layer via run_runtime() and propagated to AICPU
     // through KernelArgs.
@@ -609,6 +611,8 @@ private:
     TensorDumpCollector dump_collector_;
     // PMU collector (independent of profiling pipeline)
     PmuCollector pmu_collector_;
+    // dep_gen collector — captures orchestrator submit_task inputs for offline replay
+    DepGenCollector dep_gen_collector_;
 
     /**
      * Ensure device is initialized (lazy initialization)
@@ -708,6 +712,20 @@ private:
      * @return 0 on success, error code on failure
      */
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
+
+    /**
+     * Initialize dep_gen capture shared memory.
+     *
+     * Allocates DepGenDataHeader + 1 DepGenBufferState + N DepGenBuffers,
+     * registers them via halHostRegister, and stores the header address in
+     * kernel_args.dep_gen_data_base.
+     *
+     * @param num_threads        Number of AICPU scheduling threads
+     * @param submit_trace_path  Output binary file path (.bin)
+     * @param device_id          Device ID for host registration
+     * @return 0 on success, error code on failure
+     */
+    int init_dep_gen(int num_threads, const std::string &submit_trace_path, int device_id);
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use
@@ -715,6 +733,7 @@ private:
     bool enable_l2_swimlane_{false};
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
+    bool enable_dep_gen_{false};
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
     int log_level_{1};                                             // 0=DEBUG..4=NUL; default INFO

@@ -95,6 +95,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
+        enable_dep_gen=False,
         output_prefix="",
     ):
         params = case.get("params", {})

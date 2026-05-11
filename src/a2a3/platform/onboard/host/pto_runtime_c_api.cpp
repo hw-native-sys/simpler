@@ -322,7 +322,8 @@ int prepare_callable(
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, const char *output_prefix
+    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
+    const char *output_prefix
 ) {
     if (ctx == NULL || runtime == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
@@ -372,6 +373,7 @@ int run_prepared(
         runner->set_l2_swimlane_enabled(enable_l2_swimlane != 0);
         runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
         runner->set_pmu_enabled(enable_pmu);
+        runner->set_dep_gen_enabled(enable_dep_gen != 0);
         runner->set_output_prefix(output_prefix);
 
         std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
