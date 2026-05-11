@@ -56,6 +56,7 @@ struct TensorTagMixin {
 
     const TensorTag &tag(int32_t i) const { return tags_[i]; }
     TensorTag &tag(int32_t i) { return tags_[i]; }
+    const TensorTag *tag_data() const { return tags_; }
 };
 
 // Dynamic vector of tags (MaxT == 0, TensorTag != void)
@@ -65,6 +66,7 @@ struct TensorTagMixin<TensorTag, 0> {
 
     const TensorTag &tag(int32_t i) const { return tags_[static_cast<size_t>(i)]; }
     TensorTag &tag(int32_t i) { return tags_[static_cast<size_t>(i)]; }
+    const TensorTag *tag_data() const { return tags_.data(); }
 };
 
 // Empty: TensorTag == void, static (zero overhead)

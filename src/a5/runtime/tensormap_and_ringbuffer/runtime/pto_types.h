@@ -232,6 +232,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     PTO2TaskId explicit_dep(uint32_t index) const { return explicit_deps_.get(index); }
 
+    const PTO2TaskId *explicit_deps_data() const { return explicit_deps_.task_ids; }
+
     /**
      * Add scalar values. Types are deduced per argument; each value is
      * bit-cast to uint64_t for storage. Mixed types are allowed:
