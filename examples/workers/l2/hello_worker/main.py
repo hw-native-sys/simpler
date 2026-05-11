@@ -14,7 +14,7 @@ This is the smallest correct program that drives the Worker API. It proves:
   1. Your venv can import ``simpler.Worker`` (i.e. the nanobind extension is built).
   2. Pre-built runtime binaries exist under ``build/lib/<platform>/tensormap_and_ringbuffer/``
      so that ``RuntimeBuilder`` can find them on ``Worker.init()``.
-  3. ``set_device()`` + ACL init on the chosen platform works end-to-end.
+  3. ``ChipWorker.init(device_id)`` + ACL init on the chosen platform works end-to-end.
 
 If this example runs cleanly, moving on to ``vector_add/`` (which adds a real
 kernel, TaskArgs, and a golden check) is safe.

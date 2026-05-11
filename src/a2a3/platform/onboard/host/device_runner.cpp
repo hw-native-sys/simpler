@@ -1035,7 +1035,7 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
         return 0;
     }
 
-    // Device must be set first (set_device() must be called before upload_kernel_binary())
+    // Run context (streams) must be prepared first.
     if (stream_aicpu_ == nullptr) {
         LOG_ERROR("Run context not prepared before upload_kernel_binary()");
         return 0;

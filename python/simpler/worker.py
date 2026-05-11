@@ -276,8 +276,7 @@ def _chip_process_loop(
 
     try:
         cw = ChipWorker()
-        cw.init(bins, log_level=log_level, log_info_v=log_info_v)
-        cw.set_device(device_id)
+        cw.init(device_id, bins, log_level=log_level, log_info_v=log_info_v)
     except Exception as e:
         _tb.print_exc()
         # Write the message so any parent reader that *does* inspect this
@@ -365,7 +364,7 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
 
     cw = ChipWorker()
     try:
-        cw.init(bins, log_level=log_level, log_info_v=log_info_v)
+        cw.init(device_id, bins, log_level=log_level, log_info_v=log_info_v)
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         channel.write_error(1, f"{type(e).__name__}: chip_worker.init: {e}")
@@ -662,8 +661,7 @@ class Worker:
         binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
 
         self._chip_worker = ChipWorker()
-        self._chip_worker.init(binaries)
-        self._chip_worker.set_device(device_id)
+        self._chip_worker.init(device_id, binaries)
 
     def _init_hierarchical(self) -> None:
         device_ids = self._config.get("device_ids", [])
@@ -687,8 +685,8 @@ class Worker:
             binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
 
             # Stash the full RuntimeBinaries so forked chip children can
-            # construct a ChipWorker with one call (`cw.init(bins)`) instead
-            # of taking ~10 path strings via positional args.  Forked-child
+            # construct a ChipWorker with one call (`cw.init(device_id, bins)`)
+            # instead of taking ~10 path strings via positional args.  Forked-child
             # invocation is `os.fork()` + direct function call, so no pickle
             # barrier — the bins object is just a Python value passed through.
             self._l3_bins = binaries

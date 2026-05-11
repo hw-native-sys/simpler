@@ -230,30 +230,29 @@ class ChipContext:
 class ChipWorker:
     """Unified execution interface wrapping the host runtime C API.
 
-    The runtime library is bound once via init() and cannot be changed.
-    Devices can be set and reset independently.
+    The runtime library and target device are bound once via init() and
+    cannot be changed.
 
     Usage::
 
         worker = ChipWorker()
-        worker.init(host_path="build/lib/.../host.so",
-                    aicpu_path="build/lib/.../aicpu.so",
-                    aicore_path="build/lib/.../aicore.o")
-        worker.set_device(device_id=0)
+        worker.init(device_id=0, bins=bins)
         worker.run(chip_callable, orch_args, block_dim=24)
-        worker.reset_device()
         worker.finalize()
     """
 
     def __init__(self):
         self._impl = _ChipWorker()
 
-    def init(self, bins, log_level=None, log_info_v=None):
-        """Load host runtime library and cache platform binaries.
+    def init(self, device_id, bins, log_level=None, log_info_v=None):
+        """Attach the calling thread to ``device_id``, load the host runtime
+        library, and cache platform binaries.
 
-        Can only be called once — the runtime cannot be changed.
+        Can only be called once — the runtime and device cannot be changed
+        after init.
 
         Args:
+            device_id: NPU device ID to attach the calling thread to.
             bins: A `simpler_setup.runtime_builder.RuntimeBinaries` (or any
                 object exposing host_path / aicpu_path / aicore_path /
                 simpler_log_path / sim_context_path).
@@ -279,24 +278,11 @@ class ChipWorker:
             str(bins.aicpu_path),
             str(bins.aicore_path),
             str(bins.simpler_log_path),
+            int(device_id),
             str(bins.sim_context_path) if bins.sim_context_path else "",
             log_level,
             log_info_v,
         )
-
-    def set_device(self, device_id):
-        """Set the target NPU device.
-
-        Requires init() first. Can be called after reset_device() to switch devices.
-
-        Args:
-            device_id: NPU device ID.
-        """
-        self._impl.set_device(device_id)
-
-    def reset_device(self):
-        """Release device resources. The runtime binding remains intact."""
-        self._impl.reset_device()
 
     def finalize(self):
         """Tear down everything: device resources and runtime library.
@@ -389,8 +375,12 @@ class ChipWorker:
         cfg: ChipBootstrapConfig,
         channel: Optional[ChipBootstrapChannel] = None,
     ) -> ChipBootstrapResult:
-        """One-shot per-chip bootstrap: set device, build communicator, slice window,
+        """One-shot per-chip bootstrap: build communicator, slice window,
         stage inputs from host shared memory, and (optionally) publish the result.
+
+        The target device must already be attached via ``init(bins, device_id)``
+        before invoking this method; ``device_id`` is supplied here only to
+        catch a caller that wired up the wrong device on the wrong worker.
 
         Runs inside a forked chip child.  If ``channel`` is provided (the
         Worker-orchestrated integration path), the result is written as
@@ -428,7 +418,11 @@ class ChipWorker:
                             f"matching HostBufferStaging in host_outputs; none found"
                         ) from None
 
-            self.set_device(device_id)
+            if self.device_id != device_id:
+                raise RuntimeError(
+                    f"bootstrap_context(device_id={device_id}) called on a ChipWorker "
+                    f"already initialized for device_id={self.device_id}"
+                )
 
             device_ctx = 0
             local_base = 0
@@ -517,7 +511,3 @@ class ChipWorker:
     @property
     def initialized(self):
         return self._impl.initialized
-
-    @property
-    def device_set(self):
-        return self._impl.device_set

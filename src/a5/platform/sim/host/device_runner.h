@@ -168,6 +168,20 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
     /**
+     * Attach the calling thread to the simulated device.
+     *
+     * Mirrors the onboard contract: binds the caller's TLS to `device_id`
+     * and idempotently acquires the process-wide sim device registry entry.
+     * Called from `simpler_init` and re-invoked at the top of every device-op
+     * so any caller thread becomes the bound thread for the op without
+     * requiring an explicit pre-attach step.
+     *
+     * @param device_id Device ID (>= 0).
+     * @return 0 on success, negative on invalid id / device-id mismatch.
+     */
+    int attach_current_thread(int device_id);
+
+    /**
      * Print handshake results
      */
     void print_handshake_results();
@@ -209,7 +223,10 @@ public:
     void remove_kernel_binary(int func_id);
 
 private:
-    // Configuration
+    // Configuration. device_id_ is set once in attach_current_thread() during
+    // simpler_init and read by run() / create_thread() afterward — single-
+    // threaded with respect to the user's call sequence, so plain int is
+    // sufficient.
     int device_id_{-1};
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};

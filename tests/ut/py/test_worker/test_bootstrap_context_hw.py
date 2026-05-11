@@ -58,7 +58,7 @@ def _bootstrap_rank_entry(  # noqa: PLR0913
         )
 
         worker = ChipWorker()
-        worker.init(bins)
+        worker.init(device_id, bins)
         result["stage"] = "init"
 
         cfg = ChipBootstrapConfig(

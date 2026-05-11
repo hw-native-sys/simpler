@@ -159,18 +159,15 @@ from simpler_setup.runtime_builder import RuntimeBuilder
 builder = RuntimeBuilder(platform="a2a3sim")
 binaries = builder.get_binaries("tensormap_and_ringbuffer")
 
-# Create worker and initialize with platform binaries
+# Create worker and initialize with platform binaries (attaches the calling
+# thread to device 0 internally — no separate set_device step required)
 worker = ChipWorker()
-worker.init(host_path=str(binaries.host_path),
-            aicpu_path=str(binaries.aicpu_path),
-            aicore_path=str(binaries.aicore_path))
-worker.set_device(device_id=0)
+worker.init(device_id=0, bins=binaries)
 
 # Execute callable on device
 worker.run(chip_callable, orch_args, block_dim=24)
 
 # Cleanup
-worker.reset_device()
 worker.finalize()
 ```
 

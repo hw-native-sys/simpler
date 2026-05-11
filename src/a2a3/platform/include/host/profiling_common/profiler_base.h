@@ -306,12 +306,16 @@ public:
     using ReadyEntry = typename Module::ReadyEntry;
     using ReadyBufferInfo = typename Module::ReadyBufferInfo;
 
-    ProfilerBase() = default;
-    ~ProfilerBase() = default;
-
     ProfilerBase(const ProfilerBase &) = delete;
     ProfilerBase &operator=(const ProfilerBase &) = delete;
 
+private:
+    // CRTP base — only the Derived class may construct/destruct.
+    friend Derived;
+    ProfilerBase() = default;
+    ~ProfilerBase() = default;
+
+public:
     /**
      * Stash the memory context produced by Derived::init(). Must be called on
      * the init() success path; if init aborts before this, start(tf) is a

@@ -107,10 +107,30 @@ std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     });
 }
 
+int DeviceRunner::attach_current_thread(int device_id) {
+    if (device_id < 0) {
+        LOG_ERROR("Invalid device_id: %d", device_id);
+        return -1;
+    }
+    if (device_id_ != -1 && device_id_ != device_id) {
+        LOG_ERROR(
+            "DeviceRunner already initialized on device %d; finalize before switching to device %d", device_id_,
+            device_id
+        );
+        return -1;
+    }
+
+    pto_cpu_sim_bind_device(device_id);
+    pto_cpu_sim_acquire_device(device_id);
+    device_id_ = device_id;
+    return 0;
+}
+
 int DeviceRunner::ensure_device_initialized(
     int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
 ) {
-    device_id_ = device_id;
+    int rc = attach_current_thread(device_id);
+    if (rc != 0) return rc;
     return ensure_binaries_loaded(aicpu_so_binary, aicore_kernel_binary);
 }
 

@@ -115,13 +115,6 @@ void destroy_device_context(DeviceContextHandle ctx) { delete static_cast<Device
 
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
-int set_device(DeviceContextHandle ctx, int device_id) {
-    (void)ctx;
-    pto_cpu_sim_bind_device(device_id);
-    pto_cpu_sim_acquire_device(device_id);
-    return 0;
-}
-
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
     if (ctx == NULL) return NULL;
     try {
@@ -272,14 +265,26 @@ void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, si
     r->record_tensor_pair(host_ptr, dev_ptr, size);
 }
 
-void simpler_init(DeviceContextHandle ctx, int log_level, int log_info_v) {
-    if (ctx == NULL) return;
+int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_info_v) {
+    if (ctx == NULL) return -1;
+
+    // Attach FIRST so that an attach failure (e.g. invalid device_id) does not
+    // leave the process-wide HostLogger singleton mutated.
+    DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
+    int rc;
+    try {
+        rc = runner->attach_current_thread(device_id);
+    } catch (...) {
+        return -1;
+    }
+    if (rc != 0) return rc;
+
     // No CANN dlog on sim.
     HostLogger::get_instance().set_level(static_cast<simpler::log::LogLevel>(log_level));
     HostLogger::get_instance().set_info_v(log_info_v);
-    DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
     runner->set_log_level(log_level);
     runner->set_log_info_v(log_info_v);
+    return 0;
 }
 
 }  // extern "C"

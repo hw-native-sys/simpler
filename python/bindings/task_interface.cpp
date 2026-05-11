@@ -616,11 +616,9 @@ NB_MODULE(_task_interface, m) {
         .def(nb::init<>())
         .def(
             "init", &ChipWorker::init, nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"),
-            nb::arg("simpler_log_lib_path"), nb::arg("sim_context_lib_path") = "", nb::arg("log_level") = 1,
-            nb::arg("log_info_v") = 5
+            nb::arg("simpler_log_lib_path"), nb::arg("device_id"), nb::arg("sim_context_lib_path") = "",
+            nb::arg("log_level") = 1, nb::arg("log_info_v") = 5
         )
-        .def("set_device", &ChipWorker::set_device, nb::arg("device_id"))
-        .def("reset_device", &ChipWorker::reset_device)
         .def("finalize", &ChipWorker::finalize)
         .def(
             "run",
@@ -650,7 +648,6 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
-        .def_prop_ro("device_set", &ChipWorker::device_set)
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
