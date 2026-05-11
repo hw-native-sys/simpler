@@ -37,12 +37,13 @@
 #include "tensor.h"
 #include "tensor_arg.h"
 
-// Task arguments
-#define MAX_TENSOR_ARGS 16         // Maximum tensor arguments per task
-#define MAX_SCALAR_ARGS 32         // Maximum scalar arguments per task
-#define PTO2_MAX_OUTPUTS 16        // Maximum outputs per task
-#define PTO2_MAX_INPUTS 16         // Maximum inputs per task
-#define PTO2_MAX_INOUTS 8          // Maximum in-out args per task
+// Task arguments — alias the common CORE_MAX_* constants (single source of
+// truth in src/common/task_interface/arg_direction.h, transitively included
+// via task_args.h above). Keeping the MAX_TENSOR_ARGS / MAX_SCALAR_ARGS names
+// because they are referenced widely in this runtime (pto_runtime2_types.h,
+// pto2_dispatch_payload.h, intrinsic.h comments).
+#define MAX_TENSOR_ARGS CORE_MAX_TENSOR_ARGS
+#define MAX_SCALAR_ARGS CORE_MAX_SCALAR_ARGS
 #define PTO2_MAX_EXPLICIT_DEPS 16  // Maximum explicit task dependencies per task
 
 typedef enum {
@@ -96,7 +97,7 @@ public:
 
     /// Runtime-internal: append one materialized output Tensor.
     void materialize_output(const Tensor &tensor) {
-        always_assert(output_count_ < PTO2_MAX_OUTPUTS);
+        always_assert(output_count_ < MAX_TENSOR_ARGS);
         tensors_[output_count_++] = &tensor;
     }
 
@@ -107,7 +108,9 @@ public:
 private:
     PTO2TaskId task_id_;
     uint32_t output_count_;
-    const Tensor *tensors_[PTO2_MAX_OUTPUTS];
+    // Upper bound: a task cannot have more outputs than total tensor args
+    // (every OUTPUT/OUTPUT_EXISTING slot is one of the Arg's tensor slots).
+    const Tensor *tensors_[MAX_TENSOR_ARGS];
 };
 
 using TaskSubmitResult = TaskOutputTensors;
