@@ -517,22 +517,31 @@ def _get_device_log_dir(device_id) -> Path:
     return Path.home() / "ascend" / "log" / "debug" / f"device-{device_id}"
 
 
-def _snapshot_device_logs(device_id) -> set[Path]:
-    log_dir = _get_device_log_dir(device_id)
-    return set(log_dir.glob("*.log")) if log_dir.exists() else set()
+def _snapshot_time() -> int:
+    """Record current time as a baseline for detecting device logs written after this point."""
+    import time  # noqa: PLC0415
+
+    return time.time_ns()
 
 
-def _wait_new_device_log(device_id, before: set[Path], timeout: float = 15.0) -> Path | None:
-    """Wait for a new CANN device log; returns the newest new file or None."""
+def _wait_new_device_log(device_id, before_time: int, timeout: float = 15.0) -> Path | None:
+    """Wait for a CANN device log modified after *before_time*; returns it or None."""
     import time  # noqa: PLC0415
 
     log_dir = _get_device_log_dir(device_id)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if log_dir.exists():
-            new = set(log_dir.glob("*.log")) - before
-            if new:
-                return max(new, key=lambda p: p.stat().st_mtime)
+            candidates = []
+            for p in log_dir.glob("*.log"):
+                try:
+                    mtime = p.stat().st_mtime_ns
+                    if mtime > before_time:
+                        candidates.append((p, mtime))
+                except FileNotFoundError:
+                    continue
+            if candidates:
+                return max(candidates, key=lambda x: x[1])[0]
         time.sleep(0.5)
     return None
 
@@ -583,7 +592,7 @@ def _convert_case_swimlane(
     case_label: str,
     output_prefix: Path,
     device_id,
-    before_device: set[Path] | None,
+    log_baseline_time: int | None,
     callable_spec: dict | None = None,
 ) -> None:
     """Post-case: invoke the swimlane converter on the perf file the runtime
@@ -606,8 +615,8 @@ def _convert_case_swimlane(
         func_names_path = _dump_name_map(mapping, output_prefix / f"name_map_{safe_label}.json")
 
     device_log = None
-    if before_device is not None:
-        device_log = _wait_new_device_log(device_id, before_device)
+    if log_baseline_time is not None:
+        device_log = _wait_new_device_log(device_id, log_baseline_time)
         if device_log is None:
             logger.warning(f"[{case_label}] no new device log found; scheduler deep-dive may use stale log")
     _run_swimlane_converter(
@@ -644,7 +653,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         # Per-case directory the runtime writes into. Required (non-empty) when
         # any diagnostic flag is on; CallConfig::validate() throws otherwise.
         prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
-        before_device = _snapshot_device_logs(primary_device_id) if enable_l2_swimlane and is_hardware else None
+        log_baseline_time = _snapshot_time() if enable_l2_swimlane and is_hardware else None
         try:
             cls_inst._run_and_validate(
                 worker,
@@ -664,7 +673,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                     case_label,
                     prefix,
                     primary_device_id,
-                    before_device,
+                    log_baseline_time,
                     callable_spec=callable_spec,
                 )
 
