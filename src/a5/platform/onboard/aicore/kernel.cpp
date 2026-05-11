@@ -14,7 +14,11 @@
 #include "aicore/aicore.h"
 #include "common/core_type.h"
 
-class Runtime;
+// Include the executor header BEFORE the per-subcore #define block_idx /
+// core_type renames below. The header body references `my_hank->core_type`
+// and a parameter named `core_type`; if it saw the macro it would textually
+// rename those tokens and the struct-field access would fail to compile.
+#include "aicore_executor.h"
 
 #ifdef __DAV_VEC__
 #define KERNEL_ENTRY(x) \
@@ -30,8 +34,6 @@ class Runtime;
 
 [[block_local]] int block_idx;
 [[block_local]] CoreType core_type;
-
-extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 
 /**
  * Kernel entry point with control loop

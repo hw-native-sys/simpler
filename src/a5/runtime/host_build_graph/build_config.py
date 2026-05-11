@@ -8,10 +8,20 @@
 # -----------------------------------------------------------------------------------------------------------
 # Runtime build configuration
 # All paths are relative to this file's directory (src/runtime/)
+#
+# "aicore" appears in the include_dirs of both the aicore and host targets:
+# aicore_execute() lives in aicore/aicore_executor.h as an inline __aicore__
+# function so kernel.cpp (legacy AICore launch) and chevron_launch.cpp
+# (chevron launch, compiled into the host SO via bisheng -xcce as a single
+# host+device TU) can each pull it into their own TU without a separate
+# .cpp to co-link.
 
 BUILD_CONFIG = {
-    "aicore": {"include_dirs": ["runtime"], "source_dirs": ["aicore", "runtime"]},
+    "aicore": {"include_dirs": ["runtime", "aicore"], "source_dirs": ["aicore", "runtime"]},
     "aicpu": {"include_dirs": ["runtime"], "source_dirs": ["aicpu", "runtime"]},
-    "host": {"include_dirs": ["runtime", "orchestration"], "source_dirs": ["host", "runtime"]},
+    "host": {
+        "include_dirs": ["runtime", "orchestration", "aicore"],
+        "source_dirs": ["host", "runtime"],
+    },
     "orchestration": {"include_dirs": ["runtime", "orchestration"], "source_dirs": []},
 }

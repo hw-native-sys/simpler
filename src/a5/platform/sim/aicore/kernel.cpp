@@ -21,6 +21,7 @@
 
 #include "inner_kernel.h"
 #include "aicore/aicore.h"
+#include "aicore_executor.h"
 #include "common/core_type.h"
 #include "common/platform_config.h"
 #include "runtime.h"
@@ -55,9 +56,6 @@ extern "C" void set_sim_core_identity_helpers(void *set_subblock_id, void *set_c
     g_set_subblock_id_fn = reinterpret_cast<SimSetUint32Fn>(set_subblock_id);
     g_set_cluster_id_fn = reinterpret_cast<SimSetUint32Fn>(set_cluster_id);
 }
-
-// Declare the original function (defined in aicore_executor.cpp with weak linkage)
-void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 
 // Wrapper with extern "C" for dlsym lookup
 // NOTE: physical_core_id stays in wrapper signature (DeviceRunner passes it for register indexing)

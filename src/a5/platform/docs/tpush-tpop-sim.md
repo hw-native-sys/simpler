@@ -142,7 +142,7 @@ persist until the run ends. The total count is bounded by
 
 ## Runtime Isolation
 
-Runtime code (`aicore_executor.cpp`, `aicpu_executor.cpp`) has **zero
+Runtime code (`aicore_executor.h`, `aicpu_executor.cpp`) has **zero
 simulation awareness**. All sim context setup is handled by the platform layer:
 
 - No `CPU_SIM_SET_*` macros in runtime code

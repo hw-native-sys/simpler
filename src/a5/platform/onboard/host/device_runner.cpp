@@ -18,6 +18,7 @@
 #include "device_runner.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -27,6 +28,12 @@
 #include "utils/elf_build_id.h"
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
+
+// Chevron launch wrapper compiled from aicore/chevron_launch.cpp with
+// bisheng -xcce (classic CCE frontend, host + device in one TU). This is
+// the default a5 launch path; set SIMPLER_USE_LEGACY_LAUNCH=1 to fall
+// back to rtKernelLaunchWithHandleV2.
+extern "C" int launch_aicore_chevron(uint32_t blockDim, void *stream, void *runtime_dev);
 
 // =============================================================================
 // KernelArgsHelper Implementation
@@ -758,6 +765,13 @@ int DeviceRunner::launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, con
 }
 
 int DeviceRunner::launch_aicore_kernel(rtStream_t stream, Runtime *runtime) {
+    static const bool use_legacy = (std::getenv("SIMPLER_USE_LEGACY_LAUNCH") != nullptr);
+    if (!use_legacy) {
+        LOG_INFO_V0("launch_aicore_kernel: using chevron (<<<>>>) launch path");
+        return launch_aicore_chevron(static_cast<uint32_t>(block_dim_), stream, runtime);
+    }
+    LOG_INFO_V0("launch_aicore_kernel: SIMPLER_USE_LEGACY_LAUNCH=1 set, falling back to rtKernelLaunchWithHandleV2");
+
     if (aicore_kernel_binary_.empty()) {
         LOG_ERROR("AICore kernel binary is empty");
         return -1;

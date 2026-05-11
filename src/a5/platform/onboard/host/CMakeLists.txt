@@ -56,6 +56,84 @@ endif()
 list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
 message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
 message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
+
+# =============================================================================
+# Chevron launch object (bisheng -xcce, classic CCE frontend)
+#
+# chevron_launch.cpp is a single translation unit that holds BOTH the AICore
+# kernel definition and the host-side <<<>>> launch site. bisheng with -xcce
+# (plus -Xhost-start/-Xhost-end) compiles it into a fatbin object: the device
+# code is embedded inside the .o, and the <<<>>> call is expanded into the
+# corresponding rtKernelLaunch* host code; bisheng also injects a constructor
+# that registers the embedded fatbin at dlopen time. The mscatter testcase
+# in pto-isa uses the same -xcce path successfully — but mscatter links its
+# kernel .so through bisheng (driver passes --cce-fatobj-link itself);
+# host_runtime.so here is linked by g++, so we don't pass that bisheng-only
+# flag. GNU ld preserves the named ELF section that holds the fatbin, and
+# the registration constructor runs at dlopen, so the chevron launch still
+# wires up correctly.
+#
+# `aicore_execute` lives in the active runtime's aicore_executor.h as an
+# inline __aicore__ function, so chevron_launch.cpp pulls it directly into
+# its own TU via #include — no separate co-link step needed. The runtime's
+# `aicore/` dir is exposed to chevron via build_config.py
+# (host.include_dirs), which lands in CUSTOM_INCLUDE_DIRS / CHEVRON_INCLUDE_FLAGS.
+#
+# This is now the default a5 launch path; `SIMPLER_USE_LEGACY_LAUNCH=1`
+# falls back to rtKernelLaunchWithHandleV2 at runtime. Platforms whose
+# bisheng cannot produce this object (older CANN that rejects -xcce +
+# -Xhost-start/-Xhost-end) are excluded by detect_buildable_platforms() so
+# a5 onboard is not built there at all.
+# =============================================================================
+set(CHEVRON_LAUNCH_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../aicore/chevron_launch.cpp")
+set(CHEVRON_LAUNCH_OBJ "${CMAKE_CURRENT_BINARY_DIR}/chevron_launch.o")
+
+find_program(CHEVRON_BISHENG_CC
+    NAMES bisheng
+    PATHS "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/ccec_compiler/bin"
+    NO_DEFAULT_PATH
+    REQUIRED
+)
+message(STATUS "Chevron launch compiler: ${CHEVRON_BISHENG_CC}")
+
+set(CHEVRON_INCLUDE_FLAGS "")
+foreach(INC_DIR ${CMAKE_CUSTOM_INCLUDE_DIRS})
+    list(APPEND CHEVRON_INCLUDE_FLAGS "-I${INC_DIR}")
+endforeach()
+list(APPEND CHEVRON_INCLUDE_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+list(APPEND CHEVRON_INCLUDE_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}/../aicore")
+list(APPEND CHEVRON_INCLUDE_FLAGS "-I${ASCEND_HOME_PATH}/include")
+list(APPEND CHEVRON_INCLUDE_FLAGS "-I${ASCEND_HOME_PATH}/pkg_inc")
+list(APPEND CHEVRON_INCLUDE_FLAGS "-I${ASCEND_HOME_PATH}/pkg_inc/runtime")
+list(APPEND CHEVRON_INCLUDE_FLAGS "-I${ASCEND_HOME_PATH}/pkg_inc/profiling")
+list(APPEND CHEVRON_INCLUDE_FLAGS "-I${ASCEND_HOME_PATH}/pkg_inc/runtime/runtime")
+
+# Mix-arch (dav-c310) so bisheng emits both AIC and AIV variants of the same
+# source from the __DAV_VEC__ branch in chevron_launch.cpp. -mllvm knobs +
+# -DREGISTER_BASE mirror the mscatter testcase build that is known to work.
+add_custom_command(
+    OUTPUT ${CHEVRON_LAUNCH_OBJ}
+    COMMAND ${CHEVRON_BISHENG_CC}
+        -c -fPIC -O3 -g -std=c++17 -Wall
+        -xcce
+        -Xhost-start -Xhost-end
+        --cce-aicore-arch=dav-c310
+        -mllvm -cce-aicore-stack-size=0x8000
+        -mllvm -cce-aicore-function-stack-size=0x8000
+        -mllvm -cce-aicore-record-overflow=false
+        -mllvm -cce-aicore-addr-transform
+        -mllvm -cce-aicore-dcci-insert-for-scalar=false
+        -DREGISTER_BASE
+        ${CHEVRON_INCLUDE_FLAGS}
+        -o ${CHEVRON_LAUNCH_OBJ} ${CHEVRON_LAUNCH_SRC}
+    DEPENDS ${CHEVRON_LAUNCH_SRC}
+    COMMENT "Compiling chevron_launch.cpp with -xcce (mix dav-c310)"
+    VERBATIM
+)
+
+list(APPEND HOST_RUNTIME_SOURCES ${CHEVRON_LAUNCH_OBJ})
+set_source_files_properties(${CHEVRON_LAUNCH_OBJ} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 
 # C++ standard (applied only to C++ files)
@@ -96,7 +174,14 @@ target_link_directories(host_runtime
 
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
-# when performance profiling is enabled
+# when performance profiling is enabled.
+#
+# Note: host_runtime.so is linked by g++, not bisheng, so we cannot pass
+# bisheng-specific flags like --cce-fatobj-link here. The AICore fatbin
+# embedded in chevron_launch.o by bisheng -xcce lives in a regular ELF
+# section that GNU ld preserves through the shared-library link, and the
+# runtime registers it via the constructor bisheng emitted into the same
+# object — no link-time stitching is required on our side.
 target_link_libraries(host_runtime
     PRIVATE
         runtime

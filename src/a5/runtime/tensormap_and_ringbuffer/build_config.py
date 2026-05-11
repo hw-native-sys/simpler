@@ -17,10 +17,20 @@
 # The "orchestration" directory contains source files compiled into both
 # runtime targets AND the orchestration .so (e.g., tensor methods needed
 # by the Tensor constructor's validation logic).
+#
+# "aicore" appears in the include_dirs of both the aicore and host targets:
+# aicore_execute() lives in aicore/aicore_executor.h as an inline __aicore__
+# function so kernel.cpp (legacy AICore launch) and chevron_launch.cpp
+# (chevron launch, compiled into the host SO via bisheng -xcce as a single
+# host+device TU) can each pull it into their own TU without a separate
+# .cpp to co-link.
 
 BUILD_CONFIG = {
-    "aicore": {"include_dirs": ["runtime", "common"], "source_dirs": ["aicore", "orchestration"]},
+    "aicore": {"include_dirs": ["runtime", "common", "aicore"], "source_dirs": ["aicore", "orchestration"]},
     "aicpu": {"include_dirs": ["runtime", "common"], "source_dirs": ["aicpu", "runtime", "orchestration"]},
-    "host": {"include_dirs": ["runtime", "common"], "source_dirs": ["host", "runtime/shared", "orchestration"]},
+    "host": {
+        "include_dirs": ["runtime", "common", "aicore"],
+        "source_dirs": ["host", "runtime/shared", "orchestration"],
+    },
     "orchestration": {"include_dirs": ["runtime", "orchestration", "common"], "source_dirs": ["orchestration"]},
 }

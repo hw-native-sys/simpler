@@ -8,6 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#ifndef A5_HOST_BUILD_GRAPH_AICORE_EXECUTOR_H
+#define A5_HOST_BUILD_GRAPH_AICORE_EXECUTOR_H
 
 #include "aicore/aicore.h"
 #include "aicore/l2_perf_collector_aicore.h"
@@ -17,9 +19,18 @@
 #include "common/pmu_profiling.h"
 #include "runtime.h"
 
+// Defined inline in this header so both the legacy AICore kernel TU
+// (platform/onboard/aicore/kernel.cpp, compiled with --cce-aicore-only)
+// and the chevron launch TU
+// (platform/onboard/aicore/chevron_launch.cpp, compiled with bisheng
+// -xcce as a host+device single TU) can pull in the same body without a
+// separate .cpp file that needs to be co-linked. Both TUs include this
+// header and get their own instantiation; only one launch path is active
+// per host SO, so the device-side duplication is benign.
+
 typedef void (*KernelFunc)(__gm__ int64_t *);
 
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task *task) {
+__aicore__ __attribute__((always_inline)) inline static void aicore_executor_run_task(__gm__ Task *task) {
     if (task->function_bin_addr == 0) {
         return;
     }
@@ -28,7 +39,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task *
     OUT_OF_ORDER_STORE_BARRIER();
 }
 
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int core_idx, CoreType core_type) {
+inline __aicore__ void aicore_execute(__gm__ Runtime *runtime, int core_idx, CoreType core_type) {
     __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[core_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
@@ -85,7 +96,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 pmu_aicore_begin();
             }
 
-            execute_task(task_ptr);
+            aicore_executor_run_task(task_ptr);
 
             if (pmu_enabled) {
                 pmu_aicore_end();
@@ -117,3 +128,5 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Flush all dirty cache lines to HBM before kernel exit.
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 }
+
+#endif  // A5_HOST_BUILD_GRAPH_AICORE_EXECUTOR_H

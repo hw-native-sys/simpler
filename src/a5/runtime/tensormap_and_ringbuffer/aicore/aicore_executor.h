@@ -8,6 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#ifndef A5_TM_RB_AICORE_EXECUTOR_H
+#define A5_TM_RB_AICORE_EXECUTOR_H
 
 #include "aicore/aicore.h"
 #include "aicore/l2_perf_collector_aicore.h"
@@ -18,50 +20,28 @@
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 
-/**
- * Unified function pointer type for kernel dispatch
- *
- * All kernels follow the same signature: void kernel(__gm__ int64_t* args)
- * This enables simple, switch-free dispatch.
- */
+// Defined inline in this header so both the legacy AICore kernel TU
+// (platform/onboard/aicore/kernel.cpp, compiled with --cce-aicore-only)
+// and the chevron launch TU
+// (platform/onboard/aicore/chevron_launch.cpp, compiled with bisheng
+// -xcce as a host+device single TU) can pull in the same body without a
+// separate .cpp file that needs to be co-linked. Both TUs include this
+// header and get their own instantiation; only one launch path is active
+// per host SO, so the device-side duplication is benign.
+
 typedef void (*UnifiedKernelFunc)(__gm__ int64_t *);
 
-/**
- * Execute task from PTO2DispatchPayload.
- *
- * Reads function_bin_addr and args from the dispatch payload.
- *
- * @param payload Pointer to PTO2DispatchPayload in global memory
- */
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2DispatchPayload *payload) {
+__aicore__ __attribute__((always_inline)) inline static void
+aicore_executor_run_task(__gm__ PTO2DispatchPayload *payload) {
     if (payload == nullptr || payload->function_bin_addr == 0) {
         return;
     }
-
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
     OUT_OF_ORDER_STORE_BARRIER();
 }
 
-/**
- * AICore main execution loop
- *
- * Implements the AICPU-AICore register-based dispatch protocol:
- * 1. Wait for AICPU ready signal via handshake buffer
- * 2. Report physical core ID and core type, signal AICore ready
- * 3. Cache per-core PTO2DispatchPayload pointer from hank->task
- * 4. Poll DATA_MAIN_BASE register for task dispatch until exit signal
- *
- * AICPU writes &s_payload_per_core[i] to hank->task before setting
- * aicpu_ready=1. AICore caches this pointer and reads function_bin_addr +
- * args pointer from it on each dispatch. reg_val is a monotonically
- * increasing task ID used only for dispatch signaling and ACK/FIN protocol.
- *
- * @param runtime Pointer to Runtime in global memory
- * @param s_block_idx Block index (core ID)
- * @param core_type Core type (AIC or AIV)
- */
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int s_block_idx, CoreType core_type) {
+inline __aicore__ void aicore_execute(__gm__ Runtime *runtime, int s_block_idx, CoreType core_type) {
     __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[s_block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
@@ -132,7 +112,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             }
 
             // Execute the task
-            execute_task(exec_payload);
+            aicore_executor_run_task(exec_payload);
 
             if (pmu_enabled) {
                 pmu_aicore_end();
@@ -162,3 +142,5 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Flush all dirty cache lines to HBM before kernel exit.
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 }
+
+#endif  // A5_TM_RB_AICORE_EXECUTOR_H

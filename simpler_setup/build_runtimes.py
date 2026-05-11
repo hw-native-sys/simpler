@@ -56,7 +56,11 @@ def detect_buildable_platforms() -> list:
 
     # Onboard platforms: need ccec + cross-compiler from ASCEND_HOME_PATH.
     # a2a3 and a5 use the same toolchain and produce identical artifacts;
-    # the difference is runtime-only, so always build both.
+    # the difference is runtime-only, so always build both. Toolchain
+    # capability (e.g. bisheng's classic-CCE chevron support for the a5
+    # onboard host SO) is enforced by CMakeLists.txt's find_program(...
+    # REQUIRED) at build time — surface a loud cmake error instead of
+    # silently dropping platforms here.
     has_ccec = shutil.which("ccec") is not None
 
     ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
