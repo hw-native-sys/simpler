@@ -307,11 +307,12 @@ private:
     size_t aicpu_dlopen_total_{0};
     size_t host_dlopen_total_{0};
     // Sticky flag: prepare_callable was called at least once in this
-    // DeviceRunner's lifetime. unregister_prepared_callable clears the maps
-    // above, so we cannot use them at finalize() time to decide whether a
-    // remaining func_id_to_addr_ entry is a legacy-path leak or a kernel
-    // legitimately staged by prepare_callable (which is owned until finalize
-    // by design).
+    // DeviceRunner's lifetime. unregister_prepared_callable clears the
+    // per-cid kernel maps, so we cannot rely on map contents at finalize()
+    // to distinguish a legacy-path leak from a kernel legitimately staged
+    // by prepare_callable (which is owned until finalize by design).
+    // Assumes the legacy non-prepared run path is retired; if it is ever
+    // reintroduced, revisit whether this distinction still holds.
     bool prepared_callable_path_used_{false};
 
     // AICPU executor SO: load-once, matching onboard's binaries_loaded_ pattern.

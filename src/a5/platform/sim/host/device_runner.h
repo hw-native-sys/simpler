@@ -314,6 +314,13 @@ private:
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     size_t aicpu_dlopen_total_{0};
     size_t host_dlopen_total_{0};
+    // Sticky flag: prepare_callable was called at least once in this
+    // DeviceRunner's lifetime. unregister_prepared_callable clears the
+    // per-cid kernel maps, so we cannot rely on map contents at finalize()
+    // to distinguish a legacy-path leak from a kernel legitimately staged
+    // by prepare_callable (which is owned until finalize by design).
+    // Assumes the legacy non-prepared run path is retired; if it is ever
+    // reintroduced, revisit whether this distinction still holds.
     bool prepared_callable_path_used_{false};
 
     // Runtime pointer for print_handshake_results
