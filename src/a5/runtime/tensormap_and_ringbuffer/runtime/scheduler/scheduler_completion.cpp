@@ -363,6 +363,12 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
         return;
     }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+    if (slot_state->next_block_idx == 0) {
+        PTO2TaskState expected = PTO2_TASK_READY;
+        slot_state->task_state.compare_exchange_strong(
+            expected, PTO2_TASK_RUNNING, std::memory_order_acq_rel, std::memory_order_acquire
+        );
+    }
 
     for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
         auto valid = core_trackers_[t].get_idle_core_offset_states(shape);

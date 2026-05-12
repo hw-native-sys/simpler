@@ -19,7 +19,7 @@
  *
  * This file focuses on:
  * - Full lifecycle through src API
- * - Non-profiling ready path behavior (task_state stays PENDING)
+ * - Non-profiling ready path behavior (task_state transitions to READY)
  * - Double subtask completion (counter-model weakness)
  */
 
@@ -93,23 +93,20 @@ TEST_F(TaskStateTest, FullLifecycleThroughAPI) {
 }
 
 // =============================================================================
-// Non-profiling release_fanin does not CAS task_state to READY.
+// Non-profiling release_fanin transitions task_state to READY.
 //
-// Readiness is determined solely by fanin_refcount reaching fanin_count.
-// task_state stays PENDING after the non-profiling ready path. This is
-// correct by design -- the profiling overload adds the CAS only to count
-// atomic operations.
+// Readiness is detected by fanin_refcount reaching fanin_count, then recorded
+// with a PENDING -> READY CAS so the ready notification is exactly once and the
+// task state matches the scheduler state machine in both profiling modes.
 // =============================================================================
-TEST_F(TaskStateTest, NonProfilingReadyPathStaysPending) {
+TEST_F(TaskStateTest, NonProfilingReadyPathMarksReady) {
     alignas(64) PTO2TaskSlotState slot;
     init_slot(slot, PTO2_TASK_PENDING, 1, 1);
 
     bool ready = sched.release_fanin_and_check_ready(slot);
     ASSERT_TRUE(ready) << "Task should be detected as ready via refcount";
 
-    // task_state remains PENDING -- this is correct by design.
-    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_PENDING)
-        << "Non-profiling path intentionally does not transition task_state to READY";
+    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_READY) << "Ready path must publish READY state";
 }
 
 // =============================================================================

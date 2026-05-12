@@ -214,6 +214,16 @@ void SchedulerContext::dispatch_block(
 #endif
 }
 
+namespace {
+inline void mark_task_running_on_first_dispatch(PTO2TaskSlotState &slot_state) {
+    if (slot_state.next_block_idx != 0) return;
+    PTO2TaskState expected = PTO2_TASK_READY;
+    slot_state.task_state.compare_exchange_strong(
+        expected, PTO2_TASK_RUNNING, std::memory_order_acq_rel, std::memory_order_acquire
+    );
+}
+}  // namespace
+
 void SchedulerContext::dispatch_shape(
     int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, PTO2LocalReadyBuffer &local_buf,
     CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
@@ -265,6 +275,7 @@ void SchedulerContext::dispatch_shape(
 #if PTO2_SCHED_PROFILING
             uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
+            mark_task_running_on_first_dispatch(*slot_state);
             do {
                 auto core_offset = cores.pop_first();
                 dispatch_block(thread_idx, core_offset, *slot_state, shape, is_pending);
@@ -547,6 +558,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (made_progress) {
             idle_iterations = 0;
         } else {
+            int32_t global_completed = completed_tasks_.load(std::memory_order_relaxed);
+            if (global_completed != last_progress_count) {
+                last_progress_count = global_completed;
+                idle_iterations = 0;
+                continue;
+            }
             while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
                 int32_t fe =

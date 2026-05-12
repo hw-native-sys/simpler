@@ -565,6 +565,43 @@ struct PTO2SchedulerState {
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
+    bool enqueue_ready_once(PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr) {
+        PTO2TaskState expected = PTO2_TASK_PENDING;
+        if (!slot_state.task_state.compare_exchange_strong(
+                expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            return false;
+        }
+
+        PTO2ResourceShape shape = slot_state.active_mask.to_shape();
+        if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
+            ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
+        }
+        return true;
+    }
+
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+    bool enqueue_ready_once(
+        PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
+        PTO2LocalReadyBuffer *local_bufs = nullptr
+    ) {
+        PTO2TaskState expected = PTO2_TASK_PENDING;
+        if (!slot_state.task_state.compare_exchange_strong(
+                expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            atomic_count += 1;  // failed CAS
+            return false;
+        }
+
+        atomic_count += 1;  // successful CAS
+        PTO2ResourceShape shape = slot_state.active_mask.to_shape();
+        if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
+            ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
+        }
+        return true;
+    }
+#endif
+
     // Wiring subsystem — groups all wiring-related state for cache-line isolation.
     //
     // Three cache-line regions by writer:
@@ -680,11 +717,11 @@ struct PTO2SchedulerState {
             int32_t init_rc = early_finished + 1;
             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
             if (new_rc >= ws->fanin_count) {
-                ready_queues[static_cast<int32_t>(ws->active_mask.to_shape())].push(ws);
+                enqueue_ready_once(*ws);
             }
         } else {
             ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-            ready_queues[static_cast<int32_t>(ws->active_mask.to_shape())].push(ws);
+            enqueue_ready_once(*ws);
         }
 
         ws->dep_pool_mark = rss.dep_pool.top;
@@ -773,13 +810,7 @@ struct PTO2SchedulerState {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
-            // Local-first: try per-CoreType thread-local buffer before global queue
-            // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
-            PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-            if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
-                ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
-            }
-            return true;
+            return enqueue_ready_once(slot_state, local_bufs);
         }
         return false;
     }
@@ -793,18 +824,7 @@ struct PTO2SchedulerState {
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
-            PTO2TaskState expected = PTO2_TASK_PENDING;
-            if (slot_state.task_state.compare_exchange_strong(
-                    expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire
-                )) {
-                atomic_count += 1;  // CAS(task_state PENDING→READY)
-                // Local-first: try per-CoreType thread-local buffer before global queue
-                PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-                if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
-                    ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
-                }
-                return true;
-            }
+            return enqueue_ready_once(slot_state, atomic_count, push_wait, local_bufs);
         }
         return false;
     }
