@@ -205,6 +205,7 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallab
     return ChipCallable.build(
         signature=sig_orch,
         func_name="ep_dispatch_combine_orchestration",
+        config_name="ep_dispatch_combine_orchestration_config",
         binary=orch_bytes,
         children=[
             (0, CoreCallable.build(signature=sig_dispatch, binary=dispatch_bin)),

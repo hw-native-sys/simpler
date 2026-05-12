@@ -115,6 +115,7 @@ def build_ffn_local_callable(platform: str, pto_isa_commit: str | None) -> ChipC
     return ChipCallable.build(
         signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
         func_name="ffn_local_orchestration",
+        config_name="ffn_local_orchestration_config",
         binary=orch_bytes,
         children=[(0, core_callable)],
     )
@@ -145,6 +146,7 @@ def build_allreduce_sum_callable(platform: str, pto_isa_commit: str | None) -> C
     return ChipCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
         func_name="allreduce_sum_orchestration",
+        config_name="allreduce_sum_orchestration_config",
         binary=orch_bytes,
         children=[(1, core_callable)],
     )
