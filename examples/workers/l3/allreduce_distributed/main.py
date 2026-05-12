@@ -122,6 +122,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
     return ChipCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
         func_name="allreduce_orchestration",
+        config_name="allreduce_orchestration_config",
         binary=orch_bytes,
         children=[(0, core_callable)],
     )
