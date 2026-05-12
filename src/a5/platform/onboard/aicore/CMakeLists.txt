@@ -57,6 +57,7 @@ set(AICORE_FLAGS
     -mllvm -cce-aicore-record-overflow=false \
     -mllvm -cce-aicore-addr-transform \
     -mllvm -cce-aicore-dcci-insert-for-scalar=false \
+    -mllvm -cce-dyn-kernel-stack-size=false \
     ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS}"
 )
 separate_arguments(AICORE_FLAGS)
@@ -117,20 +118,6 @@ add_custom_target(aicore_kernel ALL
     COMMAND ${BISHENG_LD} -m aicorelinux -Ttext=0 -static -n
     -o ${AICORE_KERNEL_OBJ} ${COMBINED_AIC_OBJ} ${COMBINED_AIV_OBJ}
 
-    # Step 4: Patch SIMT TLVs that bisheng emits with NO_VF defaults.
-    # See patch_simt_meta.py and kernel.cpp's "SIMT metadata TLV injection"
-    # block for the why. Without this, runtime parses kernelVfType=1
-    # (NO_VF) and shareMemSize=0, and the legacy launch path
-    # (rtKernelLaunchWithHandleV2) fails to allocate UB for SIMT kernels
-    # despite cfg.localMemorySize being set.
-    # ub_size=8192 advertises the compiler-allocated UB share for the
-    # SIMT dispatcher. Runtime's CheckAndGetTotalShareMemorySize sums
-    # shareMemSize + cfg.localMemorySize and checks against the 224 KB
-    # SIMT budget (RT_SIMT_REMAIN_UB_SIZE), so PLATFORM_AICORE_LOCAL_MEMORY_SIZE
-    # is sized at 216 KB to leave room — see platform_config.h.
-    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/patch_simt_meta.py
-            ${AICORE_KERNEL_OBJ} aicore_kernel_0_mix_aiv 8192 3
-
     BYPRODUCTS ${AICORE_KERNEL_OBJ}
-    COMMENT "Linking AICore kernel binary + patching SIMT TLVs"
+    COMMENT "Linking AICore kernel binary"
 )

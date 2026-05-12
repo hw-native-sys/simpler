@@ -47,16 +47,14 @@
 // intrinsics. Our entry is a SU dispatcher (vector ops live in task .o files
 // invoked through aicore_execute), so the compiler cannot tag it.
 //
-// We therefore use a two-pronged approach:
-//   1. Hand-write a SIMT-flavored meta section here (this block).
-//   2. Run a post-build patch (patch_simt_meta.py invoked from CMakeLists.txt)
-//      that rewrites the values inside bisheng's auto-emitted same-named
-//      section. This is required because runtime's parser
-//      (kernelInfoMap[name] = ...) overwrites by section, not merges, so the
-//      auto-emitted section would otherwise win and force kernelVfType=1
-//      (NO_VF) and shareMemSize=0.
-// Keeping (1) makes the intent explicit at the source level even though (2)
-// is what actually flips the values runtime ends up consuming.
+// The CMakeLists.txt build pass `-mllvm -cce-dyn-kernel-stack-size=false`
+// stops bisheng from auto-emitting the per-function meta section, leaving
+// only this hand-written record as the source of TLV 7 / TLV 12 for the
+// AIV variant. Without the flag bisheng would emit a sibling section with
+// kernelVfType=NO_VF (1) and shareMemSize=0; runtime's parser keys
+// kernelInfoMap by section name and overwrites instead of merging, so the
+// auto-emitted section would shadow ours and force the launch back onto
+// the non-SIMT path.
 enum FuncMetaType {
     F_TYPE_COMPILER_ALLOC_UB_SIZE = 7,
     F_TYPE_AIV_TYPE_FLAG = 12,

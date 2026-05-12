@@ -502,9 +502,10 @@ constexpr uint32_t PLATFORM_MAX_PHYSICAL_CORES = PLATFORM_NUM_DIES * PLATFORM_AI
  *
  * The runtime SIMT total budget (RT_SIMT_REMAIN_UB_SIZE) is 224 KB (256 KB
  * UB minus a 32 KB dcache reservation). CheckAndGetTotalShareMemorySize
- * enforces kernel->ShareMemSize_() + cfg.localMemorySize <= 224 KB. We
- * advertise a 8 KB compiler-allocated UB share (see patch_simt_meta.py),
- * so localMemorySize must leave at least 8 KB headroom: 224 - 8 = 216 KB.
+ * enforces kernel->ShareMemSize_() + cfg.localMemorySize <= 224 KB. The
+ * kernel ELF declares an 8 KB compiler-allocated UB share via the SIMT
+ * TLV record in aicore/kernel.cpp, so localMemorySize must leave at
+ * least 8 KB headroom: 224 - 8 = 216 KB.
  */
 constexpr uint32_t PLATFORM_AICORE_LOCAL_MEMORY_SIZE = 221184;  // 216 KB (224 KB SIMT budget - 8 KB shareMemSize)
 
