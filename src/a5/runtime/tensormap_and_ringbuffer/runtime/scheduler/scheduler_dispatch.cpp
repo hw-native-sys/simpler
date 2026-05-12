@@ -44,6 +44,8 @@ const char *SchedulerContext::shape_name(PTO2ResourceShape shape) {
         return "AIV";
     case PTO2ResourceShape::MIX:
         return "MIX";
+    case PTO2ResourceShape::DUMMY:
+        return "DUMMY";
     }
     return "UNKNOWN";
 }
@@ -509,6 +511,49 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_PROFILING
         CYCLE_COUNT_LAP(l2_perf.sched_wiring_cycle);
 #endif
+
+        // Phase 3b: Drain dummy ready queue (thread 0 only).
+        //
+        // Dependency-only tasks bypass AICore dispatch: they go through the
+        // scheduler so fanin/fanout edges stay consistent, but completion is
+        // signalled inline here. Pinned to thread 0 to avoid cross-thread
+        // races and to keep cache hot near the wiring drain above.
+        if (thread_idx == 0) {
+            constexpr int DUMMY_DRAIN_BATCH = 16;
+            PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
+            int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
+            for (int di = 0; di < dummy_got; di++) {
+                PTO2TaskSlotState &dummy_slot = *dummy_batch[di];
+#if PTO2_SCHED_PROFILING
+                sched_->on_mixed_task_complete(dummy_slot, thread_idx, local_bufs);
+#else
+                sched_->on_mixed_task_complete(dummy_slot, local_bufs);
+#endif
+                // Dummy tasks have no subtasks to retire and no fanout pre-conditions
+                // beyond their own producers; release self-reference so the slot can
+                // reach CONSUMED once all consumers drain.
+                deferred_release_slot_states[deferred_release_count++] = &dummy_slot;
+                if (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP) {
+                    while (deferred_release_count > 0) {
+#if PTO2_SCHED_PROFILING
+                        int32_t fe = sched_->on_task_release(
+                            *deferred_release_slot_states[--deferred_release_count], thread_idx
+                        );
+                        l2_perf.fanin_edges_total += fe;
+                        if (fe > l2_perf.fanin_max_degree) l2_perf.fanin_max_degree = fe;
+#else
+                        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+#endif
+                    }
+                }
+                int32_t prev = completed_tasks_.fetch_add(1, std::memory_order_relaxed);
+                last_progress_count = prev + 1;
+                cur_thread_completed++;
+            }
+            if (dummy_got > 0) {
+                made_progress = true;
+            }
+        }
 
         // Phase 4: Two-phase dispatch (idle then pending)
         const PTO2ResourceShape *dispatch_order = get_dispatch_order(thread_idx);

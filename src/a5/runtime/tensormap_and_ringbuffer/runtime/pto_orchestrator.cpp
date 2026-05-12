@@ -507,69 +507,18 @@ void PTO2OrchestratorState::end_scope() {
 // =============================================================================
 // Task Submission
 // =============================================================================
-TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
-    auto *orch = this;
+
+// Shared body for submit_task / submit_dummy_task. Caller has already validated
+// args.has_error, decided active_mask (empty for dummy), and resolved the per-slot
+// kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
+// computation (explicit_deps + auto), output registration, slot init, and pushes
+// to the scheduler wiring queue.
+static TaskOutputTensors submit_task_common(
+    PTO2OrchestratorState *orch, const Arg &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id,
+    int32_t aiv1_kernel_id
+) {
     CYCLE_COUNT_START();
-
     TaskOutputTensors result;
-
-    // Orchestration API should short-circuit after fatal, but keep this entry
-    // robust as a no-op in case a caller reaches it directly.
-    if (orch->fatal) {
-        return result;
-    }
-
-    // Validate Arg construction (errors recorded by add_input/add_output/etc.)
-    if (args.has_error) {
-        LOG_ERROR("========================================");
-        LOG_ERROR("FATAL: Invalid Arg Detected!");
-        LOG_ERROR("========================================");
-        LOG_ERROR("Error: %s", args.error_msg ? args.error_msg : "(unknown)");
-        LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count(), args.scalar_count());
-        LOG_ERROR("This is a bug in the orchestration code.");
-        LOG_ERROR("========================================");
-        orch_mark_fatal(orch, PTO2_ERROR_INVALID_ARGS);
-        return result;
-    }
-    always_assert(orch->scheduler != nullptr);
-    // === Validate submit inputs ===
-    ActiveMask active_mask = mixed_kernels.to_active_mask();
-    always_assert(static_cast<bool>(active_mask) && "MixedKernels must have at least one active slot");
-
-    int16_t block_num = args.launch_spec.core_num();
-    always_assert(block_num >= 1 && "block_num must be >= 1");
-
-    // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move
-    // it to the aiv0 slot.  This guarantees the dispatch path can always use
-    // PTO2SubtaskSlot::AIV0 for single-AIV shapes without inspecting active_mask.
-    // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
-    // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
-    MixedKernels normalized = mixed_kernels;
-    bool has_aic = active_mask.has_mask(PTO2_SUBTASK_MASK_AIC);
-    bool has_aiv0 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV0);
-    bool has_aiv1 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV1);
-    if (!has_aic && has_aiv1 && !has_aiv0) {
-        normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
-        normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
-        active_mask = normalized.to_active_mask();
-    }
-
-    // Encode require_sync_start into active_mask bit 3 (only meaningful for tasks with block_num > 1)
-    if (block_num > 1 && args.launch_spec.require_sync_start()) {
-        // Deadlock check: block_num >= total available slots of the required type.
-        // For MIX/AIC: limit is total_cluster_count (one AIC per cluster).
-        // For AIV:     limit is total_aiv_count.
-        PTO2ResourceShape shape = active_mask.to_shape();
-        int32_t limit = (shape == PTO2ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
-        if (limit > 0 && block_num > limit) {
-            report_fatal(
-                PTO2_ERROR_REQUIRE_SYNC_START_INVALID, __FUNCTION__,
-                "require_sync_start block_num=%d > limit=%d (deadlock guaranteed)", block_num, limit
-            );
-            return result;
-        }
-        active_mask.set_sync_start();
-    }
     PTO2OutputLayout layout = calculate_output_layout(args);
     PTO2PreparedTask prepared;
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, &prepared)) {
@@ -606,7 +555,7 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
     for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
         if (!dep_task_id.is_valid()) {
-            report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.add_dep(...) requires a valid task id");
+            orch->report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.add_dep(...) requires a valid task id");
             return result;
         }
         PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_task_id.ring()];
@@ -652,9 +601,9 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
     // evicted by TensorMap lookup/insert cache pressure.
     __builtin_prefetch(&task, 1, 1);
     task.task_id = task_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = normalized.aic_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
@@ -702,6 +651,99 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
     g_orch_submit_idx++;
 #endif
     return result;
+}
+
+TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
+    auto *orch = this;
+
+    // Orchestration API should short-circuit after fatal, but keep this entry
+    // robust as a no-op in case a caller reaches it directly.
+    if (orch->fatal) {
+        return TaskOutputTensors{};
+    }
+
+    // Validate Arg construction (errors recorded by add_input/add_output/etc.)
+    if (args.has_error) {
+        LOG_ERROR("========================================");
+        LOG_ERROR("FATAL: Invalid Arg Detected!");
+        LOG_ERROR("========================================");
+        LOG_ERROR("Error: %s", args.error_msg ? args.error_msg : "(unknown)");
+        LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count(), args.scalar_count());
+        LOG_ERROR("This is a bug in the orchestration code.");
+        LOG_ERROR("========================================");
+        orch_mark_fatal(orch, PTO2_ERROR_INVALID_ARGS);
+        return TaskOutputTensors{};
+    }
+    always_assert(orch->scheduler != nullptr);
+    // === Validate submit inputs ===
+    ActiveMask active_mask = mixed_kernels.to_active_mask();
+    always_assert(static_cast<bool>(active_mask) && "MixedKernels must have at least one active slot");
+
+    int16_t block_num = args.launch_spec.core_num();
+    always_assert(block_num >= 1 && "block_num must be >= 1");
+
+    // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move
+    // it to the aiv0 slot.  This guarantees the dispatch path can always use
+    // PTO2SubtaskSlot::AIV0 for single-AIV shapes without inspecting active_mask.
+    // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
+    // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
+    MixedKernels normalized = mixed_kernels;
+    bool has_aic = active_mask.has_mask(PTO2_SUBTASK_MASK_AIC);
+    bool has_aiv0 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV0);
+    bool has_aiv1 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV1);
+    if (!has_aic && has_aiv1 && !has_aiv0) {
+        normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
+        normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
+        active_mask = normalized.to_active_mask();
+    }
+
+    // Encode require_sync_start into active_mask bit 3 (only meaningful for tasks with block_num > 1)
+    if (block_num > 1 && args.launch_spec.require_sync_start()) {
+        // Deadlock check: block_num >= total available slots of the required type.
+        // For MIX/AIC: limit is total_cluster_count (one AIC per cluster).
+        // For AIV:     limit is total_aiv_count.
+        PTO2ResourceShape shape = active_mask.to_shape();
+        int32_t limit = (shape == PTO2ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
+        if (limit > 0 && block_num > limit) {
+            report_fatal(
+                PTO2_ERROR_REQUIRE_SYNC_START_INVALID, __FUNCTION__,
+                "require_sync_start block_num=%d > limit=%d (deadlock guaranteed)", block_num, limit
+            );
+            return TaskOutputTensors{};
+        }
+        active_mask.set_sync_start();
+    }
+
+    return submit_task_common(
+        orch, args, active_mask, normalized.aic_kernel_id, normalized.aiv0_kernel_id, normalized.aiv1_kernel_id
+    );
+}
+
+// Submit a dependency-only task: full dependency graph participation
+// (tensormap lookup/insert, explicit_deps, manual_dep, manual_scope) but no
+// AICore dispatch. Empty active_mask routes the slot to the DUMMY ready
+// bucket; dispatch loop short-circuits to completion. Accepts the same Arg
+// shape as submit_task; scalars are permitted but never consumed.
+TaskOutputTensors PTO2OrchestratorState::submit_dummy_task(const Arg &args) {
+    auto *orch = this;
+
+    if (orch->fatal) {
+        return TaskOutputTensors{};
+    }
+
+    if (args.has_error) {
+        LOG_ERROR("========================================");
+        LOG_ERROR("FATAL: Invalid Arg in submit_dummy_task!");
+        LOG_ERROR("========================================");
+        LOG_ERROR("Error: %s", args.error_msg ? args.error_msg : "(unknown)");
+        LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count(), args.scalar_count());
+        LOG_ERROR("========================================");
+        orch_mark_fatal(orch, PTO2_ERROR_INVALID_ARGS);
+        return TaskOutputTensors{};
+    }
+    always_assert(orch->scheduler != nullptr);
+
+    return submit_task_common(orch, args, ActiveMask{}, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID);
 }
 
 TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {

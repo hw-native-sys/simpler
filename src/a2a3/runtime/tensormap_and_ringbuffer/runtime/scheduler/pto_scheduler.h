@@ -565,6 +565,10 @@ struct PTO2SchedulerState {
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
+    // Dependency-only tasks (active_mask is empty, shape == DUMMY). Drained by
+    // the dispatch loop and completed inline -- never goes to AICore.
+    PTO2ReadyQueue dummy_ready_queue;
+
     // Wiring subsystem — groups all wiring-related state for cache-line isolation.
     //
     // Three cache-line regions by writer:
@@ -655,6 +659,20 @@ struct PTO2SchedulerState {
         return wired;
     }
 
+    // Route a ready slot to the right global queue. Dummy tasks (empty
+    // active_mask) live in dummy_ready_queue; everything else goes to the
+    // per-shape ready_queues[]. Used by paths that do not have a thread-local
+    // ready buffer (e.g. wiring). See push_ready_routed_local for the
+    // dispatch-time fast path.
+    void push_ready_routed(PTO2TaskSlotState *slot_state) {
+        PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+        if (shape == PTO2ResourceShape::DUMMY) {
+            dummy_ready_queue.push(slot_state);
+        } else {
+            ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+        }
+    }
+
     /**
      * Wire fanout edges for a single task. Sets fanin_count, acquires each
      * producer's fanout_lock, allocates dep_pool entries for live producers,
@@ -680,11 +698,11 @@ struct PTO2SchedulerState {
             int32_t init_rc = early_finished + 1;
             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
             if (new_rc >= ws->fanin_count) {
-                ready_queues[static_cast<int32_t>(ws->active_mask.to_shape())].push(ws);
+                push_ready_routed(ws);
             }
         } else {
             ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-            ready_queues[static_cast<int32_t>(ws->active_mask.to_shape())].push(ws);
+            push_ready_routed(ws);
         }
 
         ws->dep_pool_mark = rss.dep_pool.top;
@@ -775,8 +793,12 @@ struct PTO2SchedulerState {
         if (new_refcount == slot_state.fanin_count) {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
+            // DUMMY shape is out of range for local_bufs (sized PTO2_NUM_RESOURCE_SHAPES);
+            // dummy slots bypass the local fast path and go straight to dummy_ready_queue.
             PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-            if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
+            if (shape == PTO2ResourceShape::DUMMY) {
+                dummy_ready_queue.push(&slot_state);
+            } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
             }
             return true;
@@ -798,9 +820,14 @@ struct PTO2SchedulerState {
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
-                // Local-first: try per-CoreType thread-local buffer before global queue
+                // Local-first: try per-CoreType thread-local buffer before global queue.
+                // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
+                // and go straight to dummy_ready_queue; use the profiling-aware push so
+                // atomic_count / push_wait stay consistent with the non-dummy path.
                 PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-                if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
+                if (shape == PTO2ResourceShape::DUMMY) {
+                    dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
+                } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                     ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
                 }
                 return true;
