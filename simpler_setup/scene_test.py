@@ -499,12 +499,18 @@ def _build_output_prefix(case_label: str) -> Path:
     under that root with fixed filenames. Two cases of the same name run in
     the same second is not a contemplated scenario (parallel xdist runs differ
     by class+method).
+
+    The directory is created here: the dep_gen host replay (and any other
+    writer) ``fopen``s ``<prefix>/<file>`` directly without an mkdir of its
+    own, so the prefix must exist before the runtime call.
     """
     from datetime import datetime  # noqa: PLC0415
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_label = _sanitize_for_filename(case_label)
-    return _outputs_dir() / f"{safe_label}_{timestamp}"
+    prefix = _outputs_dir() / f"{safe_label}_{timestamp}"
+    prefix.mkdir(parents=True, exist_ok=True)
+    return prefix
 
 
 def _get_device_log_dir(device_id) -> Path:
