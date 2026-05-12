@@ -59,8 +59,10 @@
 constexpr int DEP_GEN_TENSOR_SIZE = 128;
 
 /**
- * Max explicit_dep entries per submit. Mirrors runtime PTO2_MAX_EXPLICIT_DEPS;
- * static_asserted in dep_gen_collector_aicpu.cpp against the runtime header.
+ * Max explicit_dep entries captured per submit by dep_gen replay. This is a
+ * diagnostic-side cap only — the runtime's Arg::set_dependencies has no hard
+ * limit on dep count. Submits exceeding this cap are logged and truncated by
+ * dep_gen_aicpu_record_submit(); runtime correctness is unaffected.
  */
 constexpr int DEP_GEN_MAX_EXPLICIT_DEPS = 16;
 

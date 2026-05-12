@@ -205,7 +205,8 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
                     params_sf.add_output(scalar_ci);
                     params_sf.add_output(scalar_ci);
                     params_sf.add_scalar(scale_value);
-                    params_sf.add_dep(qk_outs.task_id());
+                    PTO2TaskId sf_deps[] = {qk_outs.task_id()};
+                    params_sf.set_dependencies(sf_deps, 1);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     const Tensor &pij_f16 = sf_outs.get_ref(0);
@@ -218,7 +219,8 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
                     params_pv.add_input(pij_f16);
                     params_pv.add_input(vj);
                     params_pv.add_output(tile2d_ci);
-                    params_pv.add_dep(sf_outs.task_id());
+                    PTO2TaskId pv_deps[] = {sf_outs.task_id()};
+                    params_pv.set_dependencies(pv_deps, 1);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_tmp = pv_outs.get_ref(0);
@@ -237,14 +239,17 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
                     params_up.add_inout(li_update);
                     params_up.add_inout(oi);
                     params_up.add_inout(out_view);
-                    params_up.add_dep(pv_outs.task_id());
+                    PTO2TaskId up_deps[3];
+                    uint32_t up_dep_count = 0;
+                    up_deps[up_dep_count++] = pv_outs.task_id();
                     if (prev_update_task.is_valid()) {
-                        params_up.add_dep(prev_update_task);
+                        up_deps[up_dep_count++] = prev_update_task;
                     }
                     // alloc completes inline; this dep only keeps the scratch buffers alive until the last consumer.
                     if (is_last) {
-                        params_up.add_dep(alloc_task);
+                        up_deps[up_dep_count++] = alloc_task;
                     }
+                    params_up.set_dependencies(up_deps, up_dep_count);
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
