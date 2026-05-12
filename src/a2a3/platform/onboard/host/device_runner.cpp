@@ -635,19 +635,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
+    // On any exit from run() — success or early error — release the diagnostics
+    // collectors' shared memory. They are only re-initialized per run(), so a
+    // Worker reused across runs (e.g. a pytest session-scoped worker pool) would
+    // otherwise re-enter init_l2_perf() with stale state still allocated.
     auto perf_cleanup = RAIIScopeGuard([this]() {
-        if (l2_perf_collector_.is_initialized()) {
-            l2_perf_collector_.stop();
-        }
-        if (dump_collector_.is_initialized()) {
-            dump_collector_.stop();
-        }
-        if (pmu_collector_.is_initialized()) {
-            pmu_collector_.stop();
-        }
-        if (dep_gen_collector_.is_initialized()) {
-            dep_gen_collector_.stop();
-        }
+        finalize_collectors();
     });
 
     LOG_INFO_V0("=== Initialize runtime args ===");
@@ -1152,74 +1145,9 @@ int DeviceRunner::finalize() {
     aicpu_seen_callable_ids_.clear();
     aicpu_dlopen_total_ = 0;
 
-    // Cleanup performance profiling
-    if (l2_perf_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        l2_perf_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
-    }
-
-    if (dump_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        dump_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
-    }
-
-    if (pmu_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        pmu_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
-    }
-
-    if (dep_gen_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        dep_gen_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
-    }
+    // Cleanup performance profiling. Normally already done by run()'s
+    // perf_cleanup guard; this is the backstop for the no-run-since-init case.
+    finalize_collectors();
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
@@ -1545,4 +1473,31 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id) {
 
     kernel_args_.args.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
     return 0;
+}
+
+void DeviceRunner::finalize_collectors() {
+    auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
+        HalHostUnregisterFn fn = get_halHostUnregister();
+        if (fn != nullptr) {
+            return fn(dev_ptr, device_id);
+        }
+        return 0;
+    };
+    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->free(dev_ptr);
+    };
+
+    if (l2_perf_collector_.is_initialized()) {
+        l2_perf_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+    if (dump_collector_.is_initialized()) {
+        dump_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+    if (pmu_collector_.is_initialized()) {
+        pmu_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+    if (dep_gen_collector_.is_initialized()) {
+        dep_gen_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
 }

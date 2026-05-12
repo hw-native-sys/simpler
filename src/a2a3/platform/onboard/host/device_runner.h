@@ -731,6 +731,18 @@ private:
      * @return 0 on success, error code on failure
      */
     int init_dep_gen(int num_threads, int device_id);
+
+    /**
+     * Finalize whichever diagnostics collectors are currently initialized,
+     * releasing their device/host shared memory back to mem_alloc_.
+     *
+     * Idempotent and safe to call multiple times: each collector's finalize()
+     * early-outs once its shm has been released. Invoked both at the end of
+     * every run() (so a Worker reused across runs starts each run with the
+     * collectors in a pristine, re-initializable state) and from finalize()
+     * as a backstop before mem_alloc_.finalize().
+     */
+    void finalize_collectors();
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use

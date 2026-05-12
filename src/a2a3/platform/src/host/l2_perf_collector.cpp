@@ -924,6 +924,11 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
     }
 
     perf_shared_mem_dev_ = nullptr;
+    // shm_host_ aliases freed device/host memory now; null it so is_initialized()
+    // reports false, the dtor's "destroyed without finalize()" warning stays
+    // quiet, and a re-entrant finalize() / re-init hits the early-out instead of
+    // walking freed buffer state. Mirrors PMU/DepGen/TensorDump collectors.
+    shm_host_ = nullptr;
     was_registered_ = false;
     collected_perf_records_.clear();
     collected_phase_records_.clear();
