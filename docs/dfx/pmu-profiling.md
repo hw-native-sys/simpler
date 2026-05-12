@@ -297,7 +297,7 @@ shared-memory layout, an `init()` that allocates and pre-fills the free
 queues, an `on_buffer_collected()` callback that appends records to the
 CSV, and `reconcile_counters()` / `finalize()`. The mgmt/poll threading,
 buffer pooling, and `Module` trait pattern are shared with TensorDump
-and L2Perf — see [profiling-framework.md](profiling-framework.md) for
+and L2Perf — see [profiling-framework.md](../profiling-framework.md) for
 the framework reference.
 
 ### 5.3 a5 — streaming with host shadow buffers (DAV_3510, 10 counters)
@@ -551,9 +551,9 @@ collector thread has more headroom to recycle buffers.
 
 ## 9. Related docs
 
-- [profiling-framework.md](profiling-framework.md) — shared host-side
+- [profiling-framework.md](../profiling-framework.md) — shared host-side
   collector framework.
-- [chip-level-arch.md](chip-level-arch.md) — host / AICPU / AICore
+- [chip-level-arch.md](../chip-level-arch.md) — host / AICPU / AICore
   program boundaries the PMU path spans.
-- [task-flow.md](task-flow.md) — where AICPU dispatch and completion
+- [task-flow.md](../task-flow.md) — where AICPU dispatch and completion
   sit in the per-task state machine.

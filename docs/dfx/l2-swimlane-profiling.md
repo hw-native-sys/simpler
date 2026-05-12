@@ -172,7 +172,7 @@ class TestPagedAttention(SceneTestCase):
 
 SceneTest extracts this into `<output_prefix>/name_map_<case>.json`
 and passes it to `swimlane_converter` automatically. See
-[profiling-name-map.md](profiling-name-map.md) for the full
+[profiling-name-map.md](../profiling-name-map.md) for the full
 schema and L3 example.
 
 ## 4. Capabilities
@@ -337,7 +337,7 @@ or per-thread vector, plus `read_phase_header_metadata` /
 `reconcile_counters` / `export_swimlane_json` / `finalize`. The
 mgmt/poll threading and `Module` trait pattern are shared with
 PMU and TensorDump — see
-[profiling-framework.md](profiling-framework.md) for the
+[profiling-framework.md](../profiling-framework.md) for the
 framework reference.
 
 ### 5.3 a5 — bulk rtMemcpy after stream sync
@@ -499,7 +499,7 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_rec
 
 **Tasks show as `func_<id>` instead of human names.** The
 CALLABLE spec lacks `"name"` fields, or
-`name_map_<case>.json` was not produced. See [profiling-name-map.md](profiling-name-map.md).
+`name_map_<case>.json` was not produced. See [profiling-name-map.md](../profiling-name-map.md).
 
 **Some tasks missing from the swimlane.** Likely dropped on device
 because the buffer pool ran out. On a2a3 check
@@ -534,13 +534,13 @@ rules.
 
 ## 9. Related docs
 
-- [profiling-framework.md](profiling-framework.md) — shared
+- [profiling-framework.md](../profiling-framework.md) — shared
   host-side collector framework (a2a3 only).
-- [profiling-name-map.md](profiling-name-map.md) — `func_id` →
+- [profiling-name-map.md](../profiling-name-map.md) — `func_id` →
   human name mapping for swimlane labels.
-- [chip-level-arch.md](chip-level-arch.md) — host / AICPU /
+- [chip-level-arch.md](../chip-level-arch.md) — host / AICPU /
   AICore program boundaries this feature spans.
-- [task-flow.md](task-flow.md) — where AICPU dispatch and
+- [task-flow.md](../task-flow.md) — where AICPU dispatch and
   completion sit in the per-task state machine.
 - `simpler_setup/tools/README.md` — `swimlane_converter` /
   `sched_overhead_analysis` CLI reference.

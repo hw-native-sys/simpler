@@ -24,6 +24,7 @@ class TestCallConfig:
         assert config.enable_l2_swimlane is False
         assert config.enable_dump_tensor is False
         assert config.enable_pmu == 0
+        assert config.enable_dep_gen is False
 
     def test_setters(self):
         config = CallConfig()
@@ -35,19 +36,22 @@ class TestCallConfig:
         assert config.enable_l2_swimlane is True
 
     def test_diagnostics_subfeatures_are_parallel(self):
-        # Guard against drift: the three diagnostics sub-features under the
+        # Guard against drift: the four diagnostics sub-features under the
         # profiling umbrella must all round-trip through the nanobind surface.
         config = CallConfig()
         config.enable_l2_swimlane = True
         config.enable_dump_tensor = True
         config.enable_pmu = 2
+        config.enable_dep_gen = True
         assert config.enable_l2_swimlane is True
         assert config.enable_dump_tensor is True
         assert config.enable_pmu == 2
+        assert config.enable_dep_gen is True
         r = repr(config)
         assert "enable_l2_swimlane=True" in r
         assert "enable_dump_tensor=True" in r
         assert "enable_pmu=2" in r
+        assert "enable_dep_gen=True" in r
 
     def test_repr(self):
         config = CallConfig()

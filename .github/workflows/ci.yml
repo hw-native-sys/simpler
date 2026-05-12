@@ -217,6 +217,35 @@ jobs:
           fi
           exit $rc
 
+      # DFX per-feature smokes — default pytest above passes no --enable-* flag,
+      # so each capture pipeline gets its own fresh pytest invocation here.
+      # Separate processes side-step the L2PerfCollector dup-init guard
+      # (shm_host_ != nullptr) that the shared L2 worker pool would otherwise
+      # trip across consecutive tests in one session.
+      - name: dep_gen smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --enable-dep-gen --clone-protocol https
+
+      - name: l2_swimlane smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/test_l2_swimlane.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --enable-l2-swimlane --clone-protocol https
+
+      - name: PMU smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --enable-pmu 2 --clone-protocol https
+
+      - name: tensor_dump smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --dump-tensor --clone-protocol https
+
   st-sim-a5:
     needs: detect-changes
     if: needs.detect-changes.outputs.a5_changed == 'true'
@@ -346,12 +375,37 @@ jobs:
           fi
           exit $rc
 
-      - name: Run dep_gen smoke (a2a3, fanout ⊆ deps gate)
+      # DFX per-feature smokes — hardware mirror of the st-sim-a2a3 set. The
+      # race window in dep_gen only fires on real timing, so this row is
+      # what would catch onboard-only regressions like the missing kernel.cpp
+      # propagation #742 fixed.
+      - name: dep_gen smoke
         run: |
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dep_gen_capture \
-            --platform a2a3 --device ${DEVICE_RANGE} -v \
-            --enable-dep-gen --enable-l2-swimlane
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --enable-dep-gen --clone-protocol https
+
+      - name: l2_swimlane smoke
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/test_l2_swimlane.py \
+            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --enable-l2-swimlane --clone-protocol https
+
+      - name: PMU smoke
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --enable-pmu 2 --clone-protocol https
+
+      - name: tensor_dump smoke
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
+            --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --dump-tensor --clone-protocol https
 
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------

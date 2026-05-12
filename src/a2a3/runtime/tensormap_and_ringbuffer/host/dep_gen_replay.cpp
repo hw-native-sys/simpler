@@ -42,6 +42,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -171,16 +172,31 @@ extern "C" int dep_gen_replay_emit_deps_json(
     TensorRef tref_buf[CORE_MAX_TENSOR_ARGS];
     TensorArgType atype_buf[CORE_MAX_TENSOR_ARGS];
 
+    // Per-successor dedup of producer task ids. Mirrors the runtime's
+    // PTO2FaninBuilder + append_fanin_or_fail() which dedup STEP 1
+    // (explicit_deps) and STEP 3 (creator retention + tensormap lookup) into
+    // a single per-task fanin list — replay used to emit one edge per call
+    // path, which double-counted (and made swimlane_converter emit duplicate
+    // flow events). Reused across records via clear() to avoid per-record
+    // allocation churn.
+    std::unordered_set<uint64_t> seen_preds;
+
     for (size_t rec_i = 0; rec_i < num_records; rec_i++) {
         const DepGenRecord &rec = records[rec_i];
         PTO2TaskId task_id{rec.task_id};
         bool in_manual_scope = (rec.flags & DEP_GEN_FLAG_IN_MANUAL_SCOPE) != 0;
+        seen_preds.clear();
 
         int32_t tc = static_cast<int32_t>(rec.tensor_count);
         if (tc > CORE_MAX_TENSOR_ARGS) {
             tc = CORE_MAX_TENSOR_ARGS;
         }
         for (int32_t i = 0; i < tc; i++) {
+            // OUTPUT slots have a zeroed 128-byte blob on disk (AICPU writer
+            // never has a real Tensor* for them). Setting tref_buf[i].ptr at
+            // them is safe because compute_task_fanin / register_task_outputs
+            // both bail out on TensorArgType::OUTPUT before dereferencing —
+            // see pto_dep_compute.h's per-tag dispatch.
             tref_buf[i].ptr = reinterpret_cast<const Tensor *>(&rec.tensors[i][0]);
             atype_buf[i] = static_cast<TensorArgType>(rec.arg_types[i]);
         }
@@ -199,14 +215,22 @@ extern "C" int dep_gen_replay_emit_deps_json(
         // explicit_deps. Layout-compatible (PTO2TaskId is verified 8 bytes).
         inputs.explicit_deps = reinterpret_cast<const PTO2TaskId *>(rec.explicit_deps);
 
+        auto emit_unique = [&](uint64_t pred_raw) {
+            if (seen_preds.insert(pred_raw).second) {
+                edges.emplace_back(pred_raw, rec.task_id);
+            }
+        };
+
         // STEP 1: explicit deps — single linear emit, matches runtime call site.
         for (int32_t i = 0; i < dc; i++) {
-            edges.emplace_back(rec.explicit_deps[i], rec.task_id);
+            emit_unique(rec.explicit_deps[i]);
         }
 
-        // STEP 3: creator retention + tensormap lookup.
+        // STEP 3: creator retention + tensormap lookup. Goes through the same
+        // seen_preds set as STEP 1 so an explicit_dep that the tensormap also
+        // surfaces (e.g. through owner_task_id) collapses into a single edge.
         bool ok = compute_task_fanin(inputs, tensor_map, in_manual_scope, [&](PTO2TaskId producer) -> bool {
-            edges.emplace_back(producer.raw, rec.task_id);
+            emit_unique(producer.raw);
             return true;
         });
         if (!ok) {

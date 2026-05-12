@@ -4,9 +4,9 @@ Shared host-side infrastructure under
 [`src/a2a3/platform/include/host/profiling_common/`](../src/a2a3/platform/include/host/profiling_common/)
 that the PMU, L2Perf, and TensorDump collectors are built on. This page is
 the framework reference; the per-collector pages
-([pmu-profiling.md](pmu-profiling.md),
-[l2-swimlane-profiling.md](l2-swimlane-profiling.md),
-[tensor-dump.md](tensor-dump.md))
+([pmu-profiling.md](dfx/pmu-profiling.md),
+[l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md),
+[tensor-dump.md](dfx/tensor-dump.md))
 describe the data they collect and how they enable it on-device.
 
 ## 1. Why a shared framework
@@ -288,10 +288,10 @@ Two things follow:
 Existing collectors are the canonical examples:
 
 - [`PmuCollector`](../src/a2a3/platform/include/host/pmu_collector.h)
-  — single kind, per-core instances. See [pmu-profiling.md](pmu-profiling.md).
+  — single kind, per-core instances. See [pmu-profiling.md](dfx/pmu-profiling.md).
 - [`TensorDumpCollector`](../src/a2a3/platform/include/host/tensor_dump_collector.h)
-  — single kind, per-AICPU-thread instances. See [tensor-dump.md](tensor-dump.md).
+  — single kind, per-AICPU-thread instances. See [tensor-dump.md](dfx/tensor-dump.md).
 - [`L2PerfCollector`](../src/a2a3/platform/include/host/l2_perf_collector.h)
   — two kinds (perf records + phase markers), per-core / per-thread
   instances; the canonical multi-kind example. See
-  [l2-swimlane-profiling.md](l2-swimlane-profiling.md).
+  [l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md).

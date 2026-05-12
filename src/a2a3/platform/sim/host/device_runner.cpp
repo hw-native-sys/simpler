@@ -673,7 +673,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         dep_gen_collector_.stop();
         if (dep_gen_collector_.reconcile_counters()) {
             const auto &records = dep_gen_collector_.records();
-            const std::string deps = output_prefix_ + "/deps.json";
+            const std::string deps = make_deps_json_path(output_prefix_);
             int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str(), nullptr);
             if (rc != 0) {
                 LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
