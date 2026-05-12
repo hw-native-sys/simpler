@@ -83,7 +83,7 @@ class TestDepGenCapture(SceneTestCase):
     CASES = [
         {
             "name": "default",
-            "platforms": ["a2a3sim"],
+            "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "params": {},
         },
@@ -99,6 +99,21 @@ class TestDepGenCapture(SceneTestCase):
 
     def compute_golden(self, args, params):
         args.f[:] = (args.a + args.b + 1) * (args.a + args.b + 2) + (args.a + args.b)
+
+    def test_run(self, st_platform, st_worker, request):
+        # Run the standard scene-test loop, then assert dep_gen output for the
+        # cases that actually ran on this platform. Without this override, the
+        # pytest path silently passes when dep_gen is disabled in the AICPU
+        # build (the trace ring stays empty and deps.json is just `{"edges":[]}`)
+        # — the bug that prompted this PR. Standalone keeps its own validator.
+        # Use the framework helper so the rounds-guard stays consistent with
+        # SceneTestCase.test_run (super() already warned, so warn=False here).
+        super().test_run(st_platform, st_worker, request)
+        if not self._effective_enable_dep_gen(request):
+            return
+        for case in self.CASES:
+            if st_platform in case.get("platforms", []):
+                self._post_validate(case)
 
     def _post_validate(self, case):
         """Hook invoked after the case ran when --enable-dep-gen is in effect.

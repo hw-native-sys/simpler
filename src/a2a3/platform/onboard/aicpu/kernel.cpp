@@ -13,6 +13,7 @@
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
 #include "common/platform_config.h"
+#include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_log.h"
 #include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
@@ -99,6 +100,8 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
     set_platform_pmu_base(k_args->pmu_data_base);
     set_platform_pmu_reg_addrs(k_args->pmu_reg_addrs);
     set_pmu_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_PMU));
+    set_platform_dep_gen_base(k_args->dep_gen_data_base);
+    set_dep_gen_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DEP_GEN));
 
     // Affinity gate: drop excess threads before entering runtime
     if (!platform_aicpu_affinity_gate(runtime->sche_cpu_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
