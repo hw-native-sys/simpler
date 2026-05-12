@@ -814,18 +814,18 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     @classmethod
-    def _get_binaries(cls, platform, build=False):
-        from .runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-        return RuntimeBuilder(platform=platform).get_binaries(cls._st_runtime, build=build)
-
-    @classmethod
     def _create_worker(cls, platform, device_id=0, build=False):
-        from simpler.task_interface import ChipWorker  # noqa: PLC0415
+        """Create the L2 Worker for the standalone path.
 
-        bins = cls._get_binaries(platform, build=build)
-        w = ChipWorker()
-        w.init(device_id, bins)
+        Mirrors the ``st_worker`` pytest fixture, which yields a ``Worker``
+        (not a raw ``ChipWorker``) — ``_run_and_validate_l2`` is shared by both
+        paths and calls ``worker.register(...)`` / ``worker.run(cid, ...)``,
+        which only the ``Worker`` wrapper exposes.
+        """
+        from simpler.worker import Worker  # noqa: PLC0415
+
+        w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime, build=build)
+        w.init()
         return w
 
     # ------------------------------------------------------------------
@@ -1430,10 +1430,7 @@ class SceneTestCase:
                             if args.exitfirst:
                                 raise SystemExit(1) from None
             finally:
-                if level == 2:
-                    worker.finalize()
-                else:
-                    worker.close()
+                worker.close()
 
         sys.exit(0 if ok else 1)
 
