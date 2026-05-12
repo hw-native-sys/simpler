@@ -432,6 +432,51 @@ PTO2_SCOPE(rt) {
 // scope_end: scope reference released from all tasks above
 ```
 
+**Output tensor lifetime — single-scope only.** `submit_task` returns a
+`TaskOutputTensors`, and `get_ref(i)` hands back a `const Tensor&`. Both are
+backed by pointers into the submitting task's `PTO2TaskPayload::tensors[]`,
+which lives in a ring-buffer slot. After `scope_end` the slot becomes
+eligible for reuse; once `advance_ring_pointers` reaches it,
+`reset_for_reuse()` runs and the next `submit_task` overwrites the same
+Tensor storage in place.
+
+Therefore the `TaskOutputTensors` instance, the references it returns, and
+any pointer derived from them MUST NOT outlive the `PTO2_SCOPE` in which
+submit was called. The typical safe pattern is:
+
+```cpp
+PTO2_SCOPE() {
+    TaskOutputTensors outs = rt_submit_aic_task(FUNC_QK, args);
+    const Tensor &y = outs.get_ref(0);
+    // Use y here and in subsequent submits within the same scope.
+}   // outs and y both go out of scope; no dangling references can escape.
+```
+
+Anti-patterns that compile but silently break:
+
+```cpp
+const Tensor *kept = nullptr;
+PTO2_SCOPE() {
+    TaskOutputTensors outs = rt_submit_aic_task(FUNC_QK, args);
+    kept = &outs.get_ref(0);          // escapes the scope
+}
+// `kept` still points at a payload slot. After enough submits in later
+// scopes, the slot is reused and `*kept` aliases an unrelated task's
+// tensor — a wrong-tensor read with no runtime diagnostic.
+
+TaskOutputTensors outs;               // declared in outer scope
+PTO2_SCOPE() {
+    outs = rt_submit_aic_task(FUNC_QK, args);
+}
+const Tensor &t = outs.get_ref(0);    // same hazard: outs survives scope
+```
+
+This invariant is intentionally not runtime-checked. A reused slot carries
+a different but valid `owner_task_id`, so an assertion based on
+`owner_task_id` cannot distinguish "still the original task" from
+"silently aliased to a newer task". Treat the rule as a static contract,
+verified by review.
+
 ---
 
 ## 8. Scheduler

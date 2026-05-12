@@ -63,20 +63,16 @@ extern "C" {
 /**
  * Replay an in-memory DepGenRecord stream and write deps.json.
  *
+ * Per-ring task window sizes are auto-derived from the trace itself so each
+ * ring's window covers its observed max local_id without slot aliasing.
+ *
  * @param records            Pointer to a contiguous DepGenRecord array
  *                           (typically ``DepGenCollector::records().data()``).
  * @param num_records        Number of records in the array.
  * @param deps_json_path     Output path; truncated if it exists.
- * @param task_window_sizes  Per-ring task window sizes (length PTO2_MAX_RING_DEPTH).
- *                           May be null — when null we auto-size from the trace
- *                           itself so each ring's window covers its observed
- *                           max local_id without slot aliasing. Each non-null
- *                           entry is rounded up to the next power of two.
  * @return 0 on success; negative on error (see source for codes).
  */
-int dep_gen_replay_emit_deps_json(
-    const struct DepGenRecord *records, size_t num_records, const char *deps_json_path, const int32_t *task_window_sizes
-);
+int dep_gen_replay_emit_deps_json(const struct DepGenRecord *records, size_t num_records, const char *deps_json_path);
 
 #ifdef __cplusplus
 }  // extern "C"

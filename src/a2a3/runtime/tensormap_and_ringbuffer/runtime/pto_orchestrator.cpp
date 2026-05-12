@@ -684,9 +684,6 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
     auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
         PTO2TaskSlotState *prod_state =
             &orch->sm_header->rings[producer_task_id.ring()].get_slot_state_by_task_id(producer_task_id.local());
-        if (prod_state->task == nullptr || prod_state->task->task_id != producer_task_id) {
-            return true;  // producer slot reused for a different task — dep is moot
-        }
         return append_fanin_or_fail(orch, prod_state, &fanin_builder, ring_id);
     };
 

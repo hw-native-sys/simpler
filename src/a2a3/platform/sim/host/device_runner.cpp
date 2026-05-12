@@ -51,8 +51,7 @@
 // practice, so this path is unreachable for end users — the symbol exists
 // purely to keep the .so loadable.
 extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_deps_json(
-    const struct DepGenRecord * /*records*/, size_t /*num_records*/, const char * /*deps_json_path*/,
-    const int32_t * /*task_window_sizes*/
+    const struct DepGenRecord * /*records*/, size_t /*num_records*/, const char * /*deps_json_path*/
 ) {
     LOG_DEBUG("dep_gen replay not implemented for this runtime — deps.json skipped");
     return -1;
@@ -674,7 +673,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         if (dep_gen_collector_.reconcile_counters()) {
             const auto &records = dep_gen_collector_.records();
             const std::string deps = make_deps_json_path(output_prefix_);
-            int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str(), nullptr);
+            int rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
             if (rc != 0) {
                 LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
             }
