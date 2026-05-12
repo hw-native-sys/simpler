@@ -43,14 +43,14 @@ class TestMultiRoundPagedAttention(SceneTestCase):
             },
             {
                 "func_id": 1,
-                "name": "PV",
+                "name": "SF",
                 "source": f"{_PA_KERNELS}/aiv/aiv_softmax_prepare.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.OUT, D.OUT, D.OUT],
             },
             {
                 "func_id": 2,
-                "name": "SF",
+                "name": "PV",
                 "source": f"{_PA_KERNELS}/aic/aic_pv_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
