@@ -123,6 +123,11 @@ add_custom_target(aicore_kernel ALL
     # (NO_VF) and shareMemSize=0, and the legacy launch path
     # (rtKernelLaunchWithHandleV2) fails to allocate UB for SIMT kernels
     # despite cfg.localMemorySize being set.
+    # ub_size=8192 advertises the compiler-allocated UB share for the
+    # SIMT dispatcher. Runtime's CheckAndGetTotalShareMemorySize sums
+    # shareMemSize + cfg.localMemorySize and checks against the 224 KB
+    # SIMT budget (RT_SIMT_REMAIN_UB_SIZE), so PLATFORM_AICORE_LOCAL_MEMORY_SIZE
+    # is sized at 216 KB to leave room — see platform_config.h.
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/patch_simt_meta.py
             ${AICORE_KERNEL_OBJ} aicore_kernel_0_mix_aiv 8192 3
 
