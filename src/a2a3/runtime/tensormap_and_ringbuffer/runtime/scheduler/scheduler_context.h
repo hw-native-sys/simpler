@@ -200,6 +200,21 @@ private:
     // =========================================================================
 
     static const char *shape_name(PTO2ResourceShape shape);
+
+    // Lower-case rendering of PTO2SubtaskSlot, used by dispatch and stall logs.
+    // Kept lower-case to match the `kernels=[aic:N aiv0:N aiv1:N]` field
+    // convention already established in the stall log family.
+    static inline const char *subslot_name(PTO2SubtaskSlot s) {
+        switch (s) {
+        case PTO2SubtaskSlot::AIC:
+            return "aic";
+        case PTO2SubtaskSlot::AIV0:
+            return "aiv0";
+        case PTO2SubtaskSlot::AIV1:
+            return "aiv1";
+        }
+        return "?";
+    }
     static const PTO2ResourceShape *get_dispatch_order(int32_t thread_idx);
 
     int pop_ready_tasks_batch(
@@ -275,6 +290,11 @@ private:
 
     __attribute__((noinline, cold)) void
     log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
+
+    // Reverse lookup: given a global core_id, find which scheduler thread's
+    // tracker owns it. Returns -1 if not found. Linear scan — only used on
+    // the cold diagnostic path.
+    int32_t find_core_owner_thread(int32_t core_id) const;
 
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
         int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations

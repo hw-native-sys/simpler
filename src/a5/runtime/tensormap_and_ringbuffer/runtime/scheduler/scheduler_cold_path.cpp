@@ -11,6 +11,7 @@
 #include "scheduler_context.h"
 
 #include <cinttypes>
+#include <cstdio>
 
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
@@ -124,82 +125,203 @@ SchedulerContext::check_idle_fatal_error(int32_t thread_idx, PTO2SharedMemoryHea
     return LoopAction::NONE;
 }
 
+// =============================================================================
+// Stall diagnostic log format.
+//
+// Every line is self-contained — when scheduler threads emit concurrently and
+// device_log interleaves their output, each line still carries enough context
+// to identify which thread / iteration / object it belongs to.
+//
+// Prefix on every line:
+//   [STALL thread=N idle_iterations=K] CATEGORY ...
+//
+// All scheduler threads spinning at the same idle rate hit STALL_LOG_INTERVAL
+// together, so lines with the same idle_iterations belong to one diagnostic
+// round; grep "idle_iterations=N" groups one round's output.
+//
+// Categories (and which thread emits them):
+//   SUMMARY  — completed / total counts and scan totals               (thread 0 only)
+//   TASK     — one per non-completed task scanned from shared rings   (thread 0 only)
+//              - state=RUNNING: includes running_on=[...] cross-ref
+//              - state=WAIT:    includes missing_deps=N
+//   CLUSTER  — one per cluster owned by this thread                   (every thread)
+//              - busy slot shows kernel + task_id + cond_reg_state;
+//                ANOMALY suffix when COND register is fin while software
+//                still has the slot marked busy.
+//
+// Reader workflow:
+//   1. grep SUMMARY                          -> overall completion status
+//   2. grep "idle_iterations=N TASK"         -> stuck RUNNING task and which
+//                                               core/thread it is on
+//   3. grep "idle_iterations=N CLUSTER.*task=<id>" -> cross-check via the
+//                                                     cluster line (or just
+//                                                     read running_on in step 2)
+// =============================================================================
+
+namespace {
+
+// Format a core's idle/busy state into a fixed buffer. Used inside CLUSTER lines.
+// Layout (idle):    coreN(idle)
+// Layout (busy):    coreN(busy kernel=K task=T cond_reg_state=ack)
+// Layout (anomaly): coreN(busy kernel=K task=T cond_reg_state=fin ANOMALY)
+//
+// Healthy busy: COND register reports ack (AICore still executing). fin means
+// AICore wrote completion but AICPU hasn't recycled the running slot yet —
+// either a completion-poll bug or the diagnostic raced the recycle.
+void format_core_status(
+    char *buf, size_t buf_size, int32_t core_id, bool idle, const CoreExecState *core_state, uint64_t reg_addr_for_cond
+) {
+    if (idle) {
+        snprintf(buf, buf_size, "core%d(idle)", core_id);
+        return;
+    }
+    int32_t kernel = -1;
+    int64_t task_id_raw = -1;
+    if (core_state && core_state->running_slot_state) {
+        int32_t subslot = static_cast<int32_t>(core_state->running_subslot);
+        kernel = core_state->running_slot_state->task->kernel_id[subslot];
+        task_id_raw = static_cast<int64_t>(core_state->running_slot_state->task->task_id.raw);
+    }
+    uint64_t cond_reg = read_reg(reg_addr_for_cond, RegId::COND);
+    int32_t hw_state = EXTRACT_TASK_STATE(cond_reg);
+    const char *cond_reg_state_str = (hw_state == TASK_ACK_STATE) ? "ack" : "fin";
+    if (hw_state == TASK_ACK_STATE) {
+        snprintf(
+            buf, buf_size, "core%d(busy kernel=%d task=%" PRId64 " cond_reg_state=%s)", core_id, kernel, task_id_raw,
+            cond_reg_state_str
+        );
+    } else {
+        snprintf(
+            buf, buf_size, "core%d(busy kernel=%d task=%" PRId64 " cond_reg_state=%s ANOMALY)", core_id, kernel,
+            task_id_raw, cond_reg_state_str
+        );
+    }
+}
+
+}  // namespace
+
+int32_t SchedulerContext::find_core_owner_thread(int32_t core_id) const {
+    for (int32_t t = 0; t < thread_num_; t++) {
+        const int32_t *ids = core_trackers_[t].core_ids();
+        int32_t n = core_trackers_[t].core_num();
+        for (int32_t i = 0; i < n; i++) {
+            if (ids[i] == core_id) return t;
+        }
+    }
+    return -1;
+}
+
 void SchedulerContext::log_stall_diagnostics(
     int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count
 ) {
-    int32_t c = completed_tasks_.load(std::memory_order_relaxed);
-    LOG_INFO_V9(
-        "PTO2 stall: no progress for %d iterations, completed=%d total=%d (last progress at %d)", idle_iterations, c,
-        task_count, last_progress_count
-    );
     CoreTracker &tracker = core_trackers_[thread_idx];
-    int32_t cnt_ready = 0, cnt_waiting = 0, cnt_inflight = 0;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_states[r].ring;
-        int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
-        for (int32_t si = 0; si < ring_task_count; si++) {
-            PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
-            PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
-            int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
-            int32_t fi = slot_state.fanin_count;
-            int32_t kid = slot_state.task->kernel_id[0];
-            if (st >= PTO2_TASK_COMPLETED) continue;
-            if (st == PTO2_TASK_READY || st == PTO2_TASK_RUNNING) {
-                cnt_inflight++;
-                continue;
-            }
-            if (rc >= fi) {
-                cnt_ready++;
-                if (cnt_ready <= STALL_DUMP_READY_MAX) {
-                    LOG_INFO_V9(
-                        "  STUCK-READY  ring=%d task_id=%" PRId64 " kernel_id=%d refcount=%d fanin=%d state=%d", r,
-                        static_cast<int64_t>(slot_state.task->task_id.raw), kid, rc, fi, static_cast<int32_t>(st)
+
+    // T0 owns the shared-ring scan; printing it from other threads would
+    // produce identical TASK lines once per scheduler thread.
+    if (thread_idx == 0) {
+        int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0, submitted_in_ring = 0;
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_states[r].ring;
+            int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
+            submitted_in_ring += ring_task_count;
+            for (int32_t si = 0; si < ring_task_count; si++) {
+                PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
+                PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
+                int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
+                int32_t fi = slot_state.fanin_count;
+                int32_t kid_aic = slot_state.task->kernel_id[0];
+                int32_t kid_aiv0 = slot_state.task->kernel_id[1];
+                int32_t kid_aiv1 = slot_state.task->kernel_id[2];
+                int64_t task_id = static_cast<int64_t>(slot_state.task->task_id.raw);
+                if (st >= PTO2_TASK_COMPLETED) continue;
+                // task_state's intermediate values (READY / RUNNING) are not
+                // written on the non-profiling hot path, so we cannot rely on
+                // them — classify by the ground truth instead: a slot is
+                // RUNNING iff some core has it as running_slot_state. A task
+                // occupies at most 3 cores (one cluster), all under the same
+                // owner thread by construction of assign_cores_to_threads.
+                char running_on[192] = {0};
+                int32_t owner = -1;
+                int32_t pos = 0;
+                bool is_running = false;
+                for (int32_t cid = 0; cid < cores_total_num_ && pos + 32 < (int32_t)sizeof(running_on); cid++) {
+                    if (core_exec_states_[cid].running_slot_state != &slot_state) continue;
+                    is_running = true;
+                    if (owner < 0) owner = find_core_owner_thread(cid);
+                    const char *sname = subslot_name(core_exec_states_[cid].running_subslot);
+                    int32_t written = snprintf(
+                        running_on + pos, sizeof(running_on) - pos, "%score=%d(%s)", pos == 0 ? "" : " ", cid, sname
                     );
+                    if (written > 0) pos += written;
                 }
-            } else {
+
+                if (is_running) {
+                    cnt_running++;
+                    if (cnt_running > STALL_DUMP_READY_MAX) continue;
+                    LOG_INFO_V9(
+                        "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                        " state=RUNNING fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
+                        "running_on=[owner_thread=%d cores=[%s]]",
+                        thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, owner, running_on
+                    );
+                    continue;
+                }
+                if (rc >= fi) {
+                    cnt_ready++;
+                    if (cnt_ready > STALL_DUMP_READY_MAX) continue;
+                    LOG_INFO_V9(
+                        "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                        " state=READY   fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
+                        thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
+                    );
+                    continue;
+                }
                 cnt_waiting++;
-                if (cnt_waiting <= STALL_DUMP_WAIT_MAX) {
-                    LOG_INFO_V9(
-                        "  STUCK-WAIT   ring=%d task_id=%" PRId64 " kernel_id=%d refcount=%d fanin=%d state=%d", r,
-                        static_cast<int64_t>(slot_state.task->task_id.raw), kid, rc, fi, static_cast<int32_t>(st)
-                    );
-                }
+                if (cnt_waiting > STALL_DUMP_WAIT_MAX) continue;
+                LOG_INFO_V9(
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                    " state=WAIT    fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
+                    thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
+                );
             }
         }
-    }
-    LOG_INFO_V9("  scan result: stuck_ready=%d stuck_waiting=%d in_flight=%d", cnt_ready, cnt_waiting, cnt_inflight);
-    int32_t aic_running = tracker.get_running_count<CoreType::AIC>();
-    int32_t aiv_running = tracker.get_running_count<CoreType::AIV>();
-    int32_t total_running = aic_running + aiv_running;
-    LOG_INFO_V9(
-        "  thread=%d running_cores=%d (AIC=%d AIV=%d) core_num=%d", thread_idx, total_running, aic_running, aiv_running,
-        core_trackers_[thread_idx].core_num()
-    );
-    auto all_running = tracker.get_all_running_cores();
-    int32_t dump_count = 0;
-    int32_t bp;
-    while (dump_count < STALL_DUMP_CORE_MAX && (bp = all_running.pop_first()) >= 0) {
-        dump_count++;
-        int32_t cid = tracker.get_core_id_by_offset(bp);
-        int32_t sw_tid = core_exec_states_[cid].running_reg_task_id;
-        int32_t hw_kernel = -1;
-        if (sw_tid >= 0 && core_exec_states_[cid].running_slot_state) {
-            int32_t diag_slot = static_cast<int32_t>(core_exec_states_[cid].running_subslot);
-            hw_kernel = core_exec_states_[cid].running_slot_state->task->kernel_id[diag_slot];
-        }
-        uint64_t cond_reg = read_reg(core_exec_states_[cid].reg_addr, RegId::COND);
+        int32_t effective_total = task_count > 0 ? task_count : submitted_in_ring;
+        int32_t c = completed_tasks_.load(std::memory_order_relaxed);
         LOG_INFO_V9(
-            "    core=%d cond=0x%x(state=%d,id=%d) exec_id=%d kernel=%d", cid, static_cast<unsigned>(cond_reg),
-            EXTRACT_TASK_STATE(cond_reg), EXTRACT_TASK_ID(cond_reg), sw_tid, hw_kernel
+            "[STALL thread=%d idle_iterations=%d] SUMMARY completed=%d/%d last_progress_iteration=%d "
+            "scan_ready=%d scan_waiting=%d scan_running=%d",
+            thread_idx, idle_iterations, c, effective_total, last_progress_count, cnt_ready, cnt_waiting, cnt_running
         );
     }
+
+    // CLUSTER lines: one per cluster this thread owns.
+    // cluster_id = local_cluster_idx * active_sched_threads_ + thread_idx, matching the
+    // round-robin assignment in assign_cores_to_threads / reassign_cores_for_all_threads.
+    int32_t ast = active_sched_threads_ > 0 ? active_sched_threads_ : thread_num_;
     for (int32_t cli = 0; cli < tracker.get_cluster_count() && cli < STALL_DUMP_CORE_MAX; cli++) {
         int32_t offset = cli * 3;
+        int32_t aic_id = tracker.get_aic_core_id(offset);
+        int32_t aiv0_id = tracker.get_aiv0_core_id(offset);
+        int32_t aiv1_id = tracker.get_aiv1_core_id(offset);
+        bool aic_idle = tracker.is_aic_core_idle(offset);
+        bool aiv0_idle = tracker.is_aiv0_core_idle(offset);
+        bool aiv1_idle = tracker.is_aiv1_core_idle(offset);
+        int32_t cluster_id = cli * ast + thread_idx;
+        char aic_buf[128], aiv0_buf[128], aiv1_buf[128];
+        format_core_status(
+            aic_buf, sizeof(aic_buf), aic_id, aic_idle, &core_exec_states_[aic_id], core_exec_states_[aic_id].reg_addr
+        );
+        format_core_status(
+            aiv0_buf, sizeof(aiv0_buf), aiv0_id, aiv0_idle, &core_exec_states_[aiv0_id],
+            core_exec_states_[aiv0_id].reg_addr
+        );
+        format_core_status(
+            aiv1_buf, sizeof(aiv1_buf), aiv1_id, aiv1_idle, &core_exec_states_[aiv1_id],
+            core_exec_states_[aiv1_id].reg_addr
+        );
         LOG_INFO_V9(
-            "    cluster[%d] aic=%d(%s) aiv0=%d(%s) aiv1=%d(%s)", cli, tracker.get_aic_core_id(offset),
-            tracker.is_aic_core_idle(offset) ? "idle" : "busy", tracker.get_aiv0_core_id(offset),
-            tracker.is_aiv0_core_idle(offset) ? "idle" : "busy", tracker.get_aiv1_core_id(offset),
-            tracker.is_aiv1_core_idle(offset) ? "idle" : "busy"
+            "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d aic=%s aiv0=%s aiv1=%s", thread_idx,
+            idle_iterations, cluster_id, aic_buf, aiv0_buf, aiv1_buf
         );
     }
 }
@@ -211,7 +333,10 @@ int32_t SchedulerContext::handle_timeout_exit(
     uint64_t sched_start_ts
 #endif
 ) {
-    LOG_ERROR("Thread %d: PTO2 timeout after %d idle iterations", thread_idx, idle_iterations);
+    LOG_ERROR(
+        "[STALL thread=%d idle_iterations=%d] TIMEOUT_EXIT after_idle_iterations=%d", thread_idx, idle_iterations,
+        idle_iterations
+    );
     latch_scheduler_error(header, thread_idx, PTO2_ERROR_SCHEDULER_TIMEOUT);
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
         emergency_shutdown(runtime);
