@@ -1058,6 +1058,23 @@ class SceneTestCase:
     # pytest auto test method
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _effective_enable_dep_gen(request, *, warn: bool = False) -> bool:
+        """``--enable-dep-gen`` CLI value after applying the ``--rounds > 1``
+        disable. Single source of truth so the framework's ``test_run`` loop
+        and any subclass override (e.g. ``TestDepGenCapture``'s post-validate
+        hook) can't drift on the gating rule. Pass ``warn=True`` from the
+        framework's first call — it owns the user-facing "disabled because
+        rounds > 1" message; subclass overrides leave ``warn`` off since
+        ``super().test_run()`` already warned."""
+        if not request.config.getoption("--enable-dep-gen", default=False):
+            return False
+        if request.config.getoption("--rounds", default=1) > 1:
+            if warn:
+                logger.warning("dep_gen disabled: --rounds > 1")
+            return False
+        return True
+
     def test_run(self, st_platform, st_worker, request):
         """Auto test method — runs matching cases for the current platform."""
         raw_selectors = request.config.getoption("--case", default=None) or []
@@ -1068,7 +1085,7 @@ class SceneTestCase:
         enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=False)
         enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
-        enable_dep_gen = request.config.getoption("--enable-dep-gen", default=False)
+        enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
         if rounds > 1:
             if enable_l2_swimlane:
                 logger.warning("Profiling disabled: --rounds > 1")
@@ -1079,9 +1096,6 @@ class SceneTestCase:
             if enable_pmu:
                 logger.warning("PMU disabled: --rounds > 1")
                 enable_pmu = 0
-            if enable_dep_gen:
-                logger.warning("dep_gen disabled: --rounds > 1")
-                enable_dep_gen = False
 
         cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)

@@ -106,8 +106,10 @@ class TestDepGenCapture(SceneTestCase):
         # pytest path silently passes when dep_gen is disabled in the AICPU
         # build (the trace ring stays empty and deps.json is just `{"edges":[]}`)
         # — the bug that prompted this PR. Standalone keeps its own validator.
+        # Use the framework helper so the rounds-guard stays consistent with
+        # SceneTestCase.test_run (super() already warned, so warn=False here).
         super().test_run(st_platform, st_worker, request)
-        if not request.config.getoption("--enable-dep-gen", default=False):
+        if not self._effective_enable_dep_gen(request):
             return
         for case in self.CASES:
             if st_platform in case.get("platforms", []):
