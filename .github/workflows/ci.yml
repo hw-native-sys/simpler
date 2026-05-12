@@ -346,6 +346,13 @@ jobs:
           fi
           exit $rc
 
+      - name: Run dep_gen smoke (a2a3, fanout ⊆ deps gate)
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dep_gen_capture \
+            --platform a2a3 --device ${DEVICE_RANGE} -v \
+            --enable-dep-gen --enable-l2-swimlane
+
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------
   detect-changes:
