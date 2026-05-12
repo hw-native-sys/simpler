@@ -19,8 +19,11 @@
  */
 
 #include <cstdint>
+#include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
+#include "common/unified_log.h"
+#include "spin_hint.h"
 
 static uint64_t g_platform_regs = 0;
 
@@ -33,15 +36,23 @@ void platform_init_aicore_regs(uint64_t reg_addr) {
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
 }
 
-void platform_deinit_aicore_regs(uint64_t reg_addr) {
+int32_t platform_deinit_aicore_regs(uint64_t reg_addr) {
     // Send exit signal to AICore
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
 
-    // Wait for AICore to acknowledge exit by writing AICORE_EXITED_VALUE to COND
-    while (read_reg(reg_addr, RegId::COND) != AICORE_EXITED_VALUE) {}
+    // Wait for AICore to acknowledge exit by writing AICORE_EXITED_VALUE to COND.
+    uint64_t t0 = get_sys_cnt_aicpu();
+    while (read_reg(reg_addr, RegId::COND) != AICORE_EXITED_VALUE) {
+        if (get_sys_cnt_aicpu() - t0 > PLATFORM_DEINIT_TIMEOUT_TICKS) {
+            LOG_ERROR("Timed out waiting for AICore exit ack at reg_addr=0x%lx", static_cast<unsigned long>(reg_addr));
+            return -1;
+        }
+        SPIN_WAIT_HINT();
+    }
 
     // Initialize task dispatch register to idle state
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+    return 0;
 }
 
 uint32_t platform_get_physical_cores_count() {

@@ -135,6 +135,14 @@ constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 500000;
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 1000000000;  // 1000 MHz
 
 /**
+ * AICore deinit wait timeout (ticks at PLATFORM_PROF_SYS_CNT_FREQ).
+ * platform_deinit_aicore_regs waits for AICore to acknowledge the exit
+ * signal. If AICore is stuck (STARS-killed op, hardware fault), waiting
+ * forever blocks the AICPU scheduling thread. This timeout bounds the wait.
+ */
+constexpr uint64_t PLATFORM_DEINIT_TIMEOUT_TICKS = PLATFORM_PROF_SYS_CNT_FREQ;  // 1s
+
+/**
  * Timeout duration for performance data collection (seconds)
  */
 constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 30;

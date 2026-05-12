@@ -129,9 +129,9 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
 
     // Scheduler error state (Scheduler → Host, independent of orchestrator)
     // Written by scheduler threads on timeout; read by orchestrator and host.
-    std::atomic<int32_t> sched_error_bitmap;  // Bit X set = thread X had error
-    std::atomic<int32_t> sched_error_code;    // Last scheduler error code (last-writer-wins)
-    std::atomic<int32_t> sched_error_thread;  // Thread index of last error writer
+    std::atomic<uint32_t> sched_error_bitmap;  // Bit X set = thread X had error
+    std::atomic<int32_t> sched_error_code;     // Last scheduler error code (last-writer-wins)
+    std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
 };
 
 static_assert(

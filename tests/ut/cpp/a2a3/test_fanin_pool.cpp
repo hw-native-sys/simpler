@@ -86,6 +86,20 @@ TEST_F(FaninPoolTest, OverflowReturnsNullptr) {
     EXPECT_EQ(error_code.load(), PTO2_ERROR_DEP_POOL_OVERFLOW);
 }
 
+TEST_F(FaninPoolTest, EnsureSpaceDeadlockReturnsFalseAndLatchesError) {
+    for (int i = 0; i < POOL_CAP; i++) {
+        ASSERT_NE(pool.alloc(), nullptr);
+    }
+
+    PTO2SharedMemoryRingHeader ring{};
+    ring.fc.init();
+    ring.fc.current_task_index.store(POOL_CAP + 1, std::memory_order_release);
+    ring.fc.last_task_alive.store(0, std::memory_order_release);
+
+    EXPECT_FALSE(pool.ensure_space(ring, 1));
+    EXPECT_EQ(error_code.load(), PTO2_ERROR_DEP_POOL_OVERFLOW);
+}
+
 TEST_F(FaninPoolTest, AdvanceTailFreesSpace) {
     for (int i = 0; i < 10; i++) {
         pool.alloc();

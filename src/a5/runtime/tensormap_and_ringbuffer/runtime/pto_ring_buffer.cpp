@@ -20,9 +20,16 @@
 #include "pto_ring_buffer.h"
 #include <inttypes.h>
 #include <string.h>
-#include <stdlib.h>  // for exit()
 #include "common/unified_log.h"
 #include "scheduler/pto_scheduler.h"
+
+static void latch_pool_error(std::atomic<int32_t> *error_code_ptr, int32_t error_code) {
+    if (error_code_ptr == nullptr) {
+        return;
+    }
+    int32_t expected = PTO2_ERROR_NONE;
+    error_code_ptr->compare_exchange_strong(expected, error_code, std::memory_order_acq_rel);
+}
 
 // =============================================================================
 // Fanin Spill Pool Implementation
@@ -46,14 +53,14 @@ void PTO2FaninPool::reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_ta
     reclaim_task_cursor = scan_end;
 }
 
-void PTO2FaninPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed) {
-    if (available() >= needed) return;
+bool PTO2FaninPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed) {
+    if (available() >= needed) return true;
 
     int spin_count = 0;
     int32_t prev_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
     while (available() < needed) {
         reclaim(ring, prev_last_alive);
-        if (available() >= needed) return;
+        if (available() >= needed) return true;
 
         spin_count++;
 
@@ -88,10 +95,12 @@ void PTO2FaninPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t neede
             LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
             LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", high_water * 2);
             LOG_ERROR("========================================");
-            exit(1);
+            latch_pool_error(error_code_ptr, PTO2_ERROR_DEP_POOL_OVERFLOW);
+            return false;
         }
         SPIN_WAIT_HINT();
     }
+    return true;
 }
 
 // =============================================================================
@@ -107,14 +116,14 @@ void PTO2DepListPool::reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_
     }
 }
 
-void PTO2DepListPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed) {
-    if (available() >= needed) return;
+bool PTO2DepListPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed) {
+    if (available() >= needed) return true;
 
     int spin_count = 0;
     int32_t prev_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
     while (available() < needed) {
         reclaim(ring, prev_last_alive);
-        if (available() >= needed) return;
+        if (available() >= needed) return true;
 
         spin_count++;
 
@@ -150,8 +159,10 @@ void PTO2DepListPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t nee
             LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
             LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", high_water * 2);
             LOG_ERROR("========================================");
-            exit(1);
+            latch_pool_error(error_code_ptr, PTO2_ERROR_DEP_POOL_OVERFLOW);
+            return false;
         }
         SPIN_WAIT_HINT();
     }
+    return true;
 }

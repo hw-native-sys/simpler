@@ -392,7 +392,7 @@ struct PTO2FaninPool {
 
     void reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive);
 
-    void ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
+    bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
 
     PTO2FaninSpillEntry *alloc() {
         int32_t used = top - tail;
@@ -570,7 +570,7 @@ struct PTO2DepListPool {
      * Ensure dep pool for a specific ring has at least `needed` entries available.
      * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
      */
-    void ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
+    bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)
