@@ -38,6 +38,7 @@
 #include "callable.h"
 #include "callable_protocol.h"
 #include "utils/elf_build_id.h"
+#include "utils/fnv1a_64.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
 
@@ -409,8 +410,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
     }
 
-    // Set function_bin_addr for each task: func_id_to_addr_[] stores CoreCallable
-    // host address; dereference resolved_addr_ for the dlsym function pointer
+    // Set function_bin_addr for each task: Runtime::func_id_to_addr_[] stores
+    // a CoreCallable host address (chip buffer + offset); dereference
+    // resolved_addr_ for the dlsym function pointer.
     LOG_DEBUG("Setting function_bin_addr for Tasks (Simulation)");
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task *task = runtime.get_task(i);
@@ -976,27 +978,19 @@ int DeviceRunner::finalize() {
     // perf_cleanup guard; this is the backstop for the no-run-since-init case.
     finalize_collectors();
 
-    // Kernel binaries are normally released by validate_runtime_impl on the
-    // legacy run() path. The prepared-callable path intentionally leaves
-    // them resident across runs and relies on finalize() to reclaim them;
-    // that is not a leak.
-    if (!func_id_to_addr_.empty()) {
-        const bool prepared_path_used = prepared_callable_path_used_;
-        if (prepared_path_used) {
-            LOG_DEBUG("finalize() releasing %zu kernel binaries staged by prepare_callable", func_id_to_addr_.size());
-        } else {
-            LOG_ERROR("finalize() called with %zu kernel binaries still cached", func_id_to_addr_.size());
+    // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
+    // Pool semantics mirror per-fid binaries: never freed until finalize.
+    for (auto &kv : chip_callable_buffers_) {
+        for (void *h : kv.second.dlopen_handles) {
+            if (h != nullptr) dlclose(h);
         }
-        for (auto &pair : func_id_to_addr_) {
-            MappedKernel &kernel = pair.second;
-            if (kernel.dl_handle != nullptr) {
-                dlclose(kernel.dl_handle);
-                LOG_DEBUG("Closed kernel: func_id=%d", pair.first);
-            }
-            delete[] kernel.callable_buf;
-        }
+        delete[] kv.second.host_scratch;
+        LOG_DEBUG(
+            "Freed chip callable buffer (sim): chip_dev=0x%lx, size=%zu, hash=0x%lx", kv.second.chip_dev,
+            kv.second.total_size, kv.first
+        );
     }
-    func_id_to_addr_.clear();
+    chip_callable_buffers_.clear();
 
     // Release cached orchestration SO buffer.
     if (dev_orch_so_buffer_ != nullptr) {
@@ -1045,116 +1039,104 @@ int DeviceRunner::finalize() {
 }
 
 // =============================================================================
-// Kernel Binary Upload (returns function address for caller to store in Runtime)
+// Chip Callable Buffer Upload (returns host address of ChipCallable header)
 // =============================================================================
 
-uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data, size_t bin_size) {
-    if (bin_data == nullptr || bin_size == 0) {
-        LOG_ERROR("Invalid kernel data");
+uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable) {
+    if (callable == nullptr || callable->child_count() == 0) {
         return 0;
     }
 
-    // Return cached callable address if already uploaded *and* the new bytes
-    // match. With the prepared-callable path, multiple ChipCallables share a
-    // single ChipWorker (and hence DeviceRunner) and can pick distinct
-    // kernel binaries for the same func_id.  Naively reusing the cached
-    // entry hands the AICore the previous callable's kernel and segfaults
-    // at dispatch.
-    auto it = func_id_to_addr_.find(func_id);
-    if (it != func_id_to_addr_.end()) {
-        const auto &cached_callable = *reinterpret_cast<const CoreCallable *>(it->second.callable_buf);
-        const auto *new_callable = reinterpret_cast<const CoreCallable *>(bin_data);
-        if (cached_callable.binary_size() == new_callable->binary_size() &&
-            std::memcmp(cached_callable.binary_data(), new_callable->binary_data(), new_callable->binary_size()) == 0) {
-            LOG_INFO_V0("Kernel func_id=%d already uploaded (matching bytes), returning cached address", func_id);
-            return reinterpret_cast<uint64_t>(it->second.callable_buf);
-        }
-        LOG_INFO_V0("Kernel func_id=%d binary changed, evicting cached entry", func_id);
-        if (it->second.dl_handle != nullptr) dlclose(it->second.dl_handle);
-        delete[] it->second.callable_buf;
-        func_id_to_addr_.erase(it);
+    constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
+    size_t storage_used = static_cast<size_t>(callable->binary_size());
+    for (int32_t i = 0; i < callable->child_count(); ++i) {
+        const CoreCallable &c = callable->child(i);
+        size_t child_total = CoreCallable::binary_data_offset() + static_cast<size_t>(c.binary_size());
+        size_t end = static_cast<size_t>(callable->child_offset(i)) + child_total;
+        if (end > storage_used) storage_used = end;
     }
+    const size_t total_size = kHeaderSize + storage_used;
 
-    // Extract binary from CoreCallable envelope
-    const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(bin_data);
-    const void *kernel_binary = callable->binary_data();
-    size_t kernel_size = callable->binary_size();
-
-    // 1. Generate temp file path
-    std::string tmpfile;
-    if (!create_temp_so_file(
-            "/tmp/kernel_" + std::to_string(func_id) + "_XXXXXX", reinterpret_cast<const uint8_t *>(kernel_binary),
-            kernel_size, &tmpfile
-        )) {
-        LOG_ERROR("Failed to create temp file for kernel func_id=%d", func_id);
-        return 0;
-    }
-
-    LOG_DEBUG("Uploading kernel .so: %s (size=%zu bytes)", tmpfile.c_str(), kernel_size);
-
-    // 3. dlopen to load .so (RTLD_NOW ensures all symbols resolved immediately)
-    void *handle = dlopen(tmpfile.c_str(), RTLD_NOW | RTLD_LOCAL);
-
-    // 4. Remove temp file immediately (.so is already in memory)
-    std::remove(tmpfile.c_str());
-
-    if (!handle) {
-        LOG_ERROR("dlopen failed: %s", dlerror());
-        return 0;
-    }
-
-    // 5. dlsym to get kernel function address (unified entry point: "kernel_entry")
-    void *func = dlsym(handle, "kernel_entry");
-    if (!func) {
-        LOG_ERROR("dlsym failed for 'kernel_entry': %s", dlerror());
-        dlclose(handle);
-        return 0;
-    }
-
-    // 6. Inject pto-isa simulation hooks into the kernel SO.
-    //    Each kernel SO has its own copy of the inline static function pointers
-    //    in cpu_stub.hpp, so every SO must be registered after dlopen.
-    auto register_hooks = reinterpret_cast<void (*)(void *, void *)>(dlsym(handle, "pto_sim_register_hooks"));
-    if (register_hooks != nullptr) {
-        register_hooks(
-            reinterpret_cast<void *>(pto_sim_get_subblock_id), reinterpret_cast<void *>(pto_sim_get_pipe_shared_state)
+    const auto *raw_bytes = reinterpret_cast<const uint8_t *>(callable);
+    const uint64_t hash = simpler::common::utils::fnv1a_64(raw_bytes, total_size);
+    auto it = chip_callable_buffers_.find(hash);
+    if (it != chip_callable_buffers_.end()) {
+        LOG_DEBUG(
+            "Chip callable dedup hit (sim): chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev,
+            it->second.total_size, hash
         );
+        return it->second.chip_dev;
     }
 
-    // 6. Create host-memory copy of CoreCallable with resolved_addr_ = func_ptr
-    uint8_t *copy = new uint8_t[bin_size];
-    std::memcpy(copy, bin_data, bin_size);
-    CoreCallable *callable_copy = reinterpret_cast<CoreCallable *>(copy);
-    callable_copy->set_resolved_addr(reinterpret_cast<uint64_t>(func));
+    // Allocate host scratch (host == device in sim). Plain new[] keeps
+    // ChipCallableBuffer::host_scratch ownership symmetric with finalize().
+    auto *scratch = new uint8_t[total_size];
+    std::memcpy(scratch, raw_bytes, total_size);
 
-    // 7. Store mapping info for cleanup
-    MappedKernel kernel;
-    kernel.dl_handle = handle;
-    kernel.callable_buf = copy;
-    func_id_to_addr_[func_id] = kernel;
+    // dlopen each child binary, dlsym kernel_entry, register pto-sim hooks,
+    // and patch the child's resolved_addr_ to the resulting function pointer.
+    // On any failure mid-loop, dlclose all opened handles + free scratch.
+    std::vector<void *> dlopen_handles;
+    dlopen_handles.reserve(callable->child_count());
+    bool ok = true;
+    for (int32_t i = 0; i < callable->child_count(); ++i) {
+        const uint32_t off = callable->child_offset(i);
+        auto *child_in_scratch = reinterpret_cast<CoreCallable *>(scratch + kHeaderSize + off);
+        const void *kernel_binary = child_in_scratch->binary_data();
+        size_t kernel_size = static_cast<size_t>(child_in_scratch->binary_size());
 
+        std::string tmpfile;
+        if (!create_temp_so_file(
+                "/tmp/kernel_" + std::to_string(callable->child_func_id(i)) + "_XXXXXX",
+                reinterpret_cast<const uint8_t *>(kernel_binary), kernel_size, &tmpfile
+            )) {
+            LOG_ERROR("Failed to create temp file for child kernel #%d", i);
+            ok = false;
+            break;
+        }
+
+        void *handle = dlopen(tmpfile.c_str(), RTLD_NOW | RTLD_LOCAL);
+        std::remove(tmpfile.c_str());
+        if (!handle) {
+            LOG_ERROR("dlopen failed for child kernel #%d: %s", i, dlerror());
+            ok = false;
+            break;
+        }
+
+        void *func = dlsym(handle, "kernel_entry");
+        if (!func) {
+            LOG_ERROR("dlsym failed for child kernel #%d 'kernel_entry': %s", i, dlerror());
+            dlclose(handle);
+            ok = false;
+            break;
+        }
+
+        auto register_hooks = reinterpret_cast<void (*)(void *, void *)>(dlsym(handle, "pto_sim_register_hooks"));
+        if (register_hooks != nullptr) {
+            register_hooks(
+                reinterpret_cast<void *>(pto_sim_get_subblock_id),
+                reinterpret_cast<void *>(pto_sim_get_pipe_shared_state)
+            );
+        }
+
+        child_in_scratch->set_resolved_addr(reinterpret_cast<uint64_t>(func));
+        dlopen_handles.push_back(handle);
+    }
+
+    if (!ok) {
+        for (void *h : dlopen_handles)
+            dlclose(h);
+        delete[] scratch;
+        return 0;
+    }
+
+    const uint64_t chip_dev = reinterpret_cast<uint64_t>(scratch);
+    chip_callable_buffers_.emplace(hash, ChipCallableBuffer{chip_dev, scratch, total_size, std::move(dlopen_handles)});
     LOG_DEBUG(
-        "Registered kernel (dlopen): func_id=%d -> callable=0x%lx, func_addr=0x%lx, handle=%p", func_id,
-        reinterpret_cast<uint64_t>(copy), reinterpret_cast<uint64_t>(func), handle
+        "Uploaded chip callable (sim): chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev, total_size,
+        callable->child_count(), hash
     );
-
-    return reinterpret_cast<uint64_t>(copy);
-}
-
-void DeviceRunner::remove_kernel_binary(int func_id) {
-    auto it = func_id_to_addr_.find(func_id);
-    if (it == func_id_to_addr_.end()) {
-        return;
-    }
-
-    MappedKernel &kernel = it->second;
-    if (kernel.dl_handle != nullptr) {
-        dlclose(kernel.dl_handle);
-        LOG_DEBUG("Removed kernel binary (dlclose): func_id=%d, handle=%p", func_id, kernel.dl_handle);
-    }
-    delete[] kernel.callable_buf;
-
-    func_id_to_addr_.erase(it);
+    return chip_dev;
 }
 
 // =============================================================================

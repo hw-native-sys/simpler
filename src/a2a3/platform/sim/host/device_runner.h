@@ -43,6 +43,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "callable.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -56,17 +57,6 @@
 #include "host/pmu_collector.h"
 #include "host/dep_gen_collector.h"
 #include "runtime.h"
-
-/**
- * Mapped kernel binary loaded via dlopen
- *
- * Stores dlopen handle and function pointer address. This enables
- * proper handling of external symbols (e.g., std::exp) via PLT/GOT.
- */
-struct MappedKernel {
-    void *dl_handle{nullptr};        // dlopen handle
-    uint8_t *callable_buf{nullptr};  // host-memory copy of CoreCallable (owns memory)
-};
 
 /**
  * Device runner for simulated kernel execution
@@ -210,31 +200,21 @@ public:
     int finalize();
 
     /**
-     * Upload a kernel binary and return the function address
+     * Upload an entire ChipCallable buffer (sim path).
      *
-     * Loads the complete kernel .so via dlopen, enabling proper handling
-     * of external symbols (e.g., std::exp, std::log) via PLT/GOT.
-     * Uses dlsym to resolve the unified entry point "kernel_entry".
+     * Copies the ChipCallable buffer into an internal host scratch (host /
+     * device memory is unified in sim), dlopens each child binary as a temp
+     * .so to obtain its function pointer, and writes that pointer into the
+     * child's resolved_addr_ field. Returns the host address of the scratch
+     * (= chip_dev) so callers can compute child addresses as
+     *     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
+     * and store them via runtime->set_function_bin_addr(fid, child_dev).
      *
-     * If the kernel is already uploaded (same func_id), returns the
-     * cached address without re-uploading.
-     *
-     * @param func_id      Function identifier (for caching)
-     * @param bin_data     Complete kernel .so binary data
-     * @param bin_size     Size of binary data in bytes
-     * @return Function pointer address on success, 0 on error
+     * Pool-managed by content hash (FNV-1a 64-bit); identical bytes return
+     * the cached buffer. All chip buffers + their dlopen handles are bulk-
+     * freed in finalize(). Returns 0 on failure or when child_count() == 0.
      */
-    uint64_t upload_kernel_binary(int func_id, const uint8_t *bin_data, size_t bin_size);
-
-    /**
-     * Remove a kernel binary from memory
-     *
-     * Closes the dlopen handle and removes the cached entry.
-     * This should be called during per-case cleanup.
-     *
-     * @param func_id   Function identifier to remove
-     */
-    void remove_kernel_binary(int func_id);
+    uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
 
     int register_prepared_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
@@ -273,8 +253,18 @@ private:
     // Simulation state (no actual device resources)
     KernelArgs kernel_args_;
 
-    // Kernel binary mapping (func_id -> executable memory)
-    std::map<int, MappedKernel> func_id_to_addr_;
+    // Chip-callable buffer pool (sim path). Keyed by FNV-1a 64-bit content
+    // hash of the ChipCallable bytes. Each entry owns a host scratch holding
+    // the ChipCallable with each child's resolved_addr_ fixed up to the
+    // dlopen'd function pointer; chip_dev == (uint64_t)host_scratch. The
+    // dlopen handles in `dlopen_handles` are bulk-dlclose'd in finalize().
+    struct ChipCallableBuffer {
+        uint64_t chip_dev{0};  // (uint64_t)host_scratch
+        uint8_t *host_scratch{nullptr};
+        size_t total_size{0};
+        std::vector<void *> dlopen_handles;
+    };
+    std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
     // Orchestration SO cache (host-resident in sim; see onboard for shape).
     uint64_t cached_orch_so_hash_{0};

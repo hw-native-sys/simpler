@@ -20,9 +20,9 @@ Python process (ChipWorker)
     |     |
     |     +-- dlopen(aicore_sim_XXXXXX, RTLD_NOW | RTLD_LOCAL)   ← AICore SO (temp file)
     |
-    +-- DeviceRunner::upload_kernel_binary()
+    +-- DeviceRunner::upload_chip_callable_buffer()
           |
-          +-- dlopen(kernel_<func_id>_XXXXXX, RTLD_NOW | RTLD_LOCAL)  ← kernel SOs (temp file, per func_id)
+          +-- for each child: dlopen(kernel_<func_id>_XXXXXX, RTLD_NOW | RTLD_LOCAL)  ← kernel SOs (temp file, per child)
 ```
 
 ### Onboard
