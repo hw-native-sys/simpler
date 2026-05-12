@@ -255,6 +255,25 @@ def _sub_worker_loop(buf, registry: dict) -> None:
             break
 
 
+def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id: int) -> None:
+    if cid in prepared:
+        return
+    callable_obj = registry.get(cid)
+    if callable_obj is None:
+        raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
+    if lazy:
+        # Reaching the lazy branch means _CTRL_PREPARE prewarm did not run
+        # for this cid before the first TASK_READY; the child still does
+        # the work, but the resulting H2D + dlopen cost lands on the
+        # first task's latency.  Log so the gap is visible in stderr.
+        sys.stderr.write(
+            f"[chip_process pid={os.getpid()} dev={device_id}] WARN: lazy-prepare cid={cid}; prewarm path missed it\n"
+        )
+        sys.stderr.flush()
+    cw.prepare_callable(cid, callable_obj)
+    prepared.add(cid)
+
+
 def _chip_process_loop(
     buf: memoryview,
     bins,
@@ -303,25 +322,6 @@ def _chip_process_loop(
     # safety net (e.g. registrations that bypassed the prefetch path).
     prepared: set[int] = set()
 
-    def _ensure_prepared(cid: int, *, lazy: bool) -> None:
-        if cid in prepared:
-            return
-        callable_obj = registry.get(cid)
-        if callable_obj is None:
-            raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
-        if lazy:
-            # Reaching the lazy branch means _CTRL_PREPARE prewarm did not run
-            # for this cid before the first TASK_READY; the child still does
-            # the work, but the resulting H2D + dlopen cost lands on the
-            # first task's latency.  Log so the gap is visible in stderr.
-            sys.stderr.write(
-                f"[chip_process pid={os.getpid()} dev={device_id}] "
-                f"WARN: lazy-prepare cid={cid}; prewarm path missed it\n"
-            )
-            sys.stderr.flush()
-        cw.prepare_callable(cid, callable_obj)
-        prepared.add(cid)
-
     while True:
         state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
@@ -331,7 +331,7 @@ def _chip_process_loop(
             code = 0
             msg = ""
             try:
-                _ensure_prepared(cid, lazy=True)
+                _ensure_prepared(cw, registry, prepared, cid, lazy=True, device_id=device_id)
                 # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
                 # the blob layout is what `write_blob` already wrote, so re-parsing
                 # it in Python is N×40B of avoidable work and a permanent
@@ -367,7 +367,7 @@ def _chip_process_loop(
                     cw.copy_from(dst, src, n)
                 elif sub_cmd == _CTRL_PREPARE:
                     cid = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]) & 0xFFFFFFFF
-                    _ensure_prepared(cid, lazy=False)
+                    _ensure_prepared(cw, registry, prepared, cid, lazy=False, device_id=device_id)
             except Exception as e:  # noqa: BLE001
                 code = 1
                 msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
@@ -441,21 +441,6 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912, PLR0915
     # `_chip_process_loop`'s `prepared`.
     prepared: set[int] = set()
 
-    def _ensure_prepared(cid: int, *, lazy: bool) -> None:
-        if cid in prepared:
-            return
-        callable_obj = registry.get(cid)
-        if callable_obj is None:
-            raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
-        if lazy:
-            sys.stderr.write(
-                f"[chip_process pid={os.getpid()} dev={device_id}] "
-                f"WARN: lazy-prepare cid={cid}; prewarm path missed it\n"
-            )
-            sys.stderr.flush()
-        cw.prepare_callable(cid, callable_obj)
-        prepared.add(cid)
-
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
@@ -466,7 +451,7 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912, PLR0915
                 code = 0
                 msg = ""
                 try:
-                    _ensure_prepared(cid, lazy=True)
+                    _ensure_prepared(cw, registry, prepared, cid, lazy=True, device_id=device_id)
                     # Hand the mailbox bytes straight to C++ (zero-copy zero-decode);
                     # see the matching comment in `_chip_process_loop`.
                     cw._impl.run_prepared_from_blob(cid, mailbox_addr + _OFF_ARGS, _MAILBOX_ARGS_CAPACITY, cfg)
@@ -529,7 +514,7 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912, PLR0915
                         cw._impl.copy_from(dst, src, n)
                     elif sub_cmd == _CTRL_PREPARE:
                         cid = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]) & 0xFFFFFFFF
-                        _ensure_prepared(cid, lazy=False)
+                        _ensure_prepared(cw, registry, prepared, cid, lazy=False, device_id=device_id)
                 except Exception as e:  # noqa: BLE001
                     code = 1
                     msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
