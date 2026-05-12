@@ -77,21 +77,17 @@ class TestChipWorkerStateMachine:
         worker = _ChipWorker()
         worker.finalize()
         with pytest.raises(RuntimeError, match="finalized"):
-            worker.init(
-                "/nonexistent/libfoo.so", "/dev/null", "/dev/null", "/nonexistent/libsimpler_log.so", device_id=0
-            )
+            worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null", device_id=0)
 
     def test_init_with_nonexistent_lib_raises(self):
         worker = _ChipWorker()
         with pytest.raises(RuntimeError, match="dlopen"):
-            worker.init(
-                "/nonexistent/libfoo.so", "/dev/null", "/dev/null", "/nonexistent/libsimpler_log.so", device_id=0
-            )
+            worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null", device_id=0)
 
     def test_init_with_negative_device_id_raises(self):
         worker = _ChipWorker()
         with pytest.raises(RuntimeError, match="device_id"):
-            worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null", "/nonexistent/libsimpler_log.so", -1)
+            worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null", -1)
 
     def test_prepare_callable_before_init_raises(self):
         from _task_interface import ChipCallable  # noqa: PLC0415
