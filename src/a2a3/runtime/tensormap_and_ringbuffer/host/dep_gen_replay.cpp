@@ -56,7 +56,7 @@
 
 namespace {
 
-int32_t next_pow2(int32_t v) {
+int32_t ceil_pow2(int32_t v) {
     if (v <= 1) return 1;
     v--;
     v |= v >> 1;
@@ -105,9 +105,8 @@ bool write_deps_json(const char *path, const std::vector<std::pair<uint64_t, uin
 
 }  // namespace
 
-extern "C" int dep_gen_replay_emit_deps_json(
-    const DepGenRecord *records, size_t num_records, const char *deps_json_path, const int32_t *task_window_sizes_in
-) {
+extern "C" int
+dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, const char *deps_json_path) {
     if (deps_json_path == nullptr) {
         LOG_ERROR("dep_gen replay: null deps_json_path");
         return -1;
@@ -119,34 +118,23 @@ extern "C" int dep_gen_replay_emit_deps_json(
     LOG_INFO_V0("dep_gen replay: processing %zu in-memory records", num_records);
 
     // Per-ring task window sizes — tensormap masks slot indices and requires
-    // each to be a power of two. When the caller passes null we auto-size from
-    // the records themselves so each ring's window comfortably covers its
-    // observed max local_id (no slot aliasing during INOUT+COVERED
-    // remove_from_task).
+    // each to be a power of two. Auto-size from the records themselves so each
+    // ring's window comfortably covers its observed max local_id (no slot
+    // aliasing during INOUT+COVERED remove_from_task).
     int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-    if (task_window_sizes_in != nullptr) {
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            int32_t v = task_window_sizes_in[r];
-            if (v < 1) v = 1;
-            if ((v & (v - 1)) != 0) v = next_pow2(v);
-            task_window_sizes[r] = v;
+    uint32_t max_local[PTO2_MAX_RING_DEPTH] = {0};
+    for (size_t i = 0; i < num_records; i++) {
+        PTO2TaskId tid{records[i].task_id};
+        uint8_t ring = tid.ring();
+        uint32_t local = tid.local();
+        if (ring < PTO2_MAX_RING_DEPTH && local > max_local[ring]) {
+            max_local[ring] = local;
         }
-    } else {
-        uint32_t max_local[PTO2_MAX_RING_DEPTH] = {0};
-        for (size_t i = 0; i < num_records; i++) {
-            PTO2TaskId tid{records[i].task_id};
-            uint8_t ring = tid.ring();
-            uint32_t local = tid.local();
-            if (ring < PTO2_MAX_RING_DEPTH && local > max_local[ring]) {
-                max_local[ring] = local;
-            }
-        }
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            // +1 for slot needed by max_local; floor at 16 to avoid tiny allocs.
-            int32_t need = static_cast<int32_t>(max_local[r] + 1);
-            int32_t v = next_pow2(need < 16 ? 16 : need);
-            task_window_sizes[r] = v;
-        }
+    }
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        // +1 for slot needed by max_local; floor at 16 to avoid tiny allocs.
+        int32_t need = static_cast<int32_t>(max_local[r] + 1);
+        task_window_sizes[r] = ceil_pow2(need < 16 ? 16 : need);
     }
 
     int32_t output_count = count_outputs(records, num_records);
@@ -154,15 +142,11 @@ extern "C" int dep_gen_replay_emit_deps_json(
     if (pool_size < PTO2_TENSORMAP_POOL_SIZE) {
         pool_size = PTO2_TENSORMAP_POOL_SIZE;
     }
-    int32_t num_buckets = next_pow2(pool_size / 16);
-    if (num_buckets < PTO2_TENSORMAP_NUM_BUCKETS) {
-        num_buckets = PTO2_TENSORMAP_NUM_BUCKETS;
-    }
 
     PTO2TensorMap tensor_map;
     std::memset(&tensor_map, 0, sizeof(tensor_map));
-    if (!tensor_map.init(num_buckets, pool_size, task_window_sizes)) {
-        LOG_ERROR("dep_gen replay: tensormap.init failed (buckets=%d, pool=%d)", num_buckets, pool_size);
+    if (!tensor_map.init(PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes)) {
+        LOG_ERROR("dep_gen replay: tensormap.init failed (buckets=%d, pool=%d)", PTO2_TENSORMAP_NUM_BUCKETS, pool_size);
         return -3;
     }
 
