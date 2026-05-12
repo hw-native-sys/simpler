@@ -383,6 +383,16 @@ private:
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
 
     int init_dep_gen(int num_threads, int device_id);
+
+    /**
+     * Finalize whichever diagnostics collectors are currently initialized,
+     * releasing their shared memory back to mem_alloc_. Idempotent: each
+     * collector's finalize() early-outs once its shm has been released.
+     * Invoked at the end of every run() so a Worker reused across runs starts
+     * each run with the collectors re-initializable, and from finalize() as a
+     * backstop before mem_alloc_.finalize().
+     */
+    void finalize_collectors();
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use
