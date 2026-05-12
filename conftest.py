@@ -173,6 +173,15 @@ def pytest_addoption(parser):
         choices=["ssh", "https"],
         help="Protocol for cloning pto-isa when --pto-isa-commit is set",
     )
+    parser.addoption(
+        "--require-pto-isa",
+        action="store_true",
+        default=False,
+        help="Abort the session immediately if PTO-ISA can't be resolved/cloned, "
+        "instead of deferring to the per-test lazy path. CI scene-test jobs pass "
+        "this so a transient clone failure fails fast rather than fanning out into "
+        "device subprocesses that each re-clone into a poisoned directory.",
+    )
     # Distinct from pytest-timeout's per-test --timeout (which `.[test]` pulls
     # in on the a2a3 hardware runner); this is session-level.
     parser.addoption(
@@ -294,6 +303,10 @@ def pytest_configure(config):
     # need PTO-ISA (e.g. pytest tests/ut on a runner without SSH keys) must not
     # be aborted when the eager clone fails. If an actual scene test later needs
     # PTO-ISA, scene_test.py's lazy path will re-raise the original error.
+    #
+    # --require-pto-isa flips that: callers that know PTO-ISA is mandatory
+    # (CI scene-test jobs) want the session to die here rather than fan out
+    # into device subprocesses that each re-attempt the clone.
     try:
         root = ensure_pto_isa_root(
             verbose=True,
@@ -302,6 +315,8 @@ def pytest_configure(config):
             update_if_exists=True,
         )
     except OSError as e:
+        if config.getoption("--require-pto-isa"):
+            pytest.exit(f"PTO-ISA required but unavailable: {e}", returncode=pytest.ExitCode.USAGE_ERROR)
         print(f"[pytest] PTO-ISA pre-clone skipped: {e}", file=sys.stderr)
         root = None
     if root:

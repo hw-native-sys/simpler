@@ -22,6 +22,7 @@ Lock file under build/ serializes concurrent clones from parallel processes.
 import fcntl
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -79,6 +80,30 @@ def _run_git(
     )
 
 
+def _discard_incomplete_clone(target: Path, verbose: bool) -> None:
+    """Remove `target` if it exists but isn't a usable clone.
+
+    A timed-out or aborted ``git clone`` leaves a non-empty directory behind;
+    a later attempt then fails with "destination path already exists and is
+    not an empty directory" — poisoning every retry and every parallel device
+    subprocess that re-attempts the clone. Clearing it keeps the failure local
+    to the one attempt that hit the transient error.
+
+    Handles whatever is squatting on the path: a real directory, a plain file,
+    or a (possibly broken) symlink — ``git clone`` rejects all three, but
+    ``Path.exists()`` is False for a broken symlink and ``shutil.rmtree``
+    refuses non-directories, so check ``lexists`` and unlink non-dirs.
+    """
+    if not (target.exists() or target.is_symlink()) or _is_cloned(target):
+        return
+    if verbose:
+        logger.warning(f"Removing incomplete pto-isa clone at {target}")
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target, ignore_errors=True)
+    else:
+        target.unlink(missing_ok=True)
+
+
 def _clone(target: Path, commit: Optional[str], clone_protocol: str, verbose: bool) -> bool:
     """Clone PTO-ISA to `target`, optionally at `commit`. Returns True on success."""
     if not _is_git_available():
@@ -93,6 +118,10 @@ def _clone(target: Path, commit: Optional[str], clone_protocol: str, verbose: bo
             logger.warning(f"Failed to create clone parent dir: {e}")
         return False
 
+    # Clear any half-clone left by a previous failed attempt (this run or an
+    # earlier one) so `git clone` doesn't refuse a non-empty target.
+    _discard_incomplete_clone(target, verbose)
+
     repo_url = _repo_url(clone_protocol)
     logger.info(f"Cloning pto-isa to {target} (first run, may take up to a minute)...")
 
@@ -101,6 +130,7 @@ def _clone(target: Path, commit: Optional[str], clone_protocol: str, verbose: bo
         if result.returncode != 0:
             if verbose:
                 logger.warning(f"Failed to clone pto-isa:\n{result.stderr}")
+            _discard_incomplete_clone(target, verbose)
             return False
 
         if commit:
@@ -117,10 +147,12 @@ def _clone(target: Path, commit: Optional[str], clone_protocol: str, verbose: bo
     except subprocess.TimeoutExpired:
         if verbose:
             logger.warning("Clone operation timed out")
+        _discard_incomplete_clone(target, verbose)
         return False
     except Exception as e:  # noqa: BLE001
         if verbose:
             logger.warning(f"Failed to clone pto-isa: {e}")
+        _discard_incomplete_clone(target, verbose)
         return False
 
 
