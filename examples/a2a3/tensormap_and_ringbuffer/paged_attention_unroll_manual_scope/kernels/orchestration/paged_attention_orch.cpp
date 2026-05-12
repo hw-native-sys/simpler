@@ -278,14 +278,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_up.add_inout(oi);
                     params_up.add_inout(out_view);
                     params_up.add_dep(pv_outs.task_id());
-                    if (is_first) {
-                        params_up.add_dep(alloc_outs.task_id());
-                    }
                     if (!is_first) {
                         params_up.add_dep(pre_task_id);
-                        if (is_last) {
-                            params_up.add_dep(alloc_outs.task_id());
-                        }
+                    }
+                    // alloc completes inline; this dep only keeps the scratch buffers alive until the last consumer.
+                    if (is_last) {
+                        params_up.add_dep(alloc_outs.task_id());
                     }
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
