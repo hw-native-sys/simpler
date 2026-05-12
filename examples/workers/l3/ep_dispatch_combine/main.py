@@ -49,9 +49,9 @@ Type/shape contract:
   - ``recv_count_out`` is [L, 1] INT32 emitted by dispatch's prefix_sum
     phase.
 
-Hardware only. Run:
+Run:
 
-    python examples/workers/l3/ep_dispatch_combine/main.py -d 0-1
+    python examples/workers/l3/ep_dispatch_combine/main.py -p a2a3sim -d 0-1
 """
 
 from __future__ import annotations
@@ -130,14 +130,14 @@ def parse_device_range(spec: str) -> list[int]:
     return ids
 
 
-def build_chip_callable(platform: str) -> ChipCallable:
+def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallable:
     """Compile the dispatch / local_expert / combine AIV kernels + their
     shared C++ orchestration shim into a single ChipCallable with three
     child callables.
     """
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
 
@@ -148,7 +148,9 @@ def build_chip_callable(platform: str) -> ChipCallable:
             pto_isa_root=pto_isa_root,
             extra_include_dirs=kernel_include_dirs,
         )
-        return extract_text_section(b)
+        if not platform.endswith("sim"):
+            b = extract_text_section(b)
+        return b
 
     dispatch_bin = compile_aiv("dispatch.cpp")
     local_expert_bin = compile_aiv("local_expert.cpp")
@@ -414,7 +416,12 @@ def _verify_routed_y(
     return ok
 
 
-def run(device_ids: list[int]) -> int:
+def run(
+    device_ids: list[int],
+    platform: str = "a2a3",
+    pto_isa_commit: str | None = None,
+    build: bool = False,
+) -> int:
     """Core logic — callable from CLI and pytest."""
     nranks = len(device_ids)
     assert nranks == N_RANKS
@@ -427,7 +434,7 @@ def run(device_ids: list[int]) -> int:
     except FileNotFoundError:
         pass
 
-    print(f"[ep_dispatch] devices={device_ids} nranks={nranks}")
+    print(f"[ep_dispatch] platform={platform} devices={device_ids} nranks={nranks}")
 
     # x_norm[r, t, d] = r*100 + t*10 + d  →  max value = 1*100 + 7*10 + 63 = 233.
     # All values are integers ≤ 256, so they fit BF16 exactly (8-bit mantissa
@@ -498,15 +505,16 @@ def run(device_ids: list[int]) -> int:
     ]
 
     print("[ep_dispatch] compiling kernels...")
-    chip_callable = build_chip_callable("a2a3")
+    chip_callable = build_chip_callable(platform, pto_isa_commit)
 
     worker = Worker(
         level=3,
-        platform="a2a3",
+        platform=platform,
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
         chip_bootstrap_configs=cfgs,
+        build=build,
     )
     chip_cid = worker.register(chip_callable)
 
@@ -581,8 +589,15 @@ def run(device_ids: list[int]) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1'. Two chips required.")
+    parser.add_argument("-p", "--platform", default="a2a3", help="Platform backend, e.g. a2a3 or a2a3sim.")
+    parser.add_argument(
+        "--build", action="store_true", help="Rebuild runtime from source instead of using cached libs."
+    )
+    parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
-    return run(parse_device_range(cli.device))
+    return run(
+        parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit, build=cli.build
+    )
 
 
 if __name__ == "__main__":
