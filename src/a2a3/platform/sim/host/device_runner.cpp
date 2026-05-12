@@ -882,7 +882,6 @@ int DeviceRunner::register_prepared_callable(
     state.config_name = (config_name != nullptr) ? config_name : "";
     state.kernel_addrs = std::move(kernel_addrs);
     prepared_callables_.emplace(callable_id, std::move(state));
-    prepared_callable_path_used_ = true;
     return 0;
 }
 
@@ -911,7 +910,6 @@ int DeviceRunner::register_prepared_callable_host_orch(
     state.host_orch_func_ptr = host_orch_func_ptr;
     state.kernel_addrs = std::move(kernel_addrs);
     prepared_callables_.emplace(callable_id, std::move(state));
-    prepared_callable_path_used_ = true;
     ++host_dlopen_total_;
     LOG_INFO_V0("register_prepared_callable_host_orch: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
     return 0;
@@ -1073,12 +1071,18 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
     auto *scratch = new uint8_t[total_size];
     std::memcpy(scratch, raw_bytes, total_size);
 
-    // dlopen each child binary, dlsym kernel_entry, register pto-sim hooks,
-    // and patch the child's resolved_addr_ to the resulting function pointer.
-    // On any failure mid-loop, dlclose all opened handles + free scratch.
+    // Per-child dlopen + dlsym kernel_entry + register pto-sim hooks, then
+    // patch the child's resolved_addr_ to the function pointer. A scope guard
+    // owns scratch and any dlopen'd handles until the success path dismisses
+    // it; every early return unwinds cleanly.
     std::vector<void *> dlopen_handles;
     dlopen_handles.reserve(callable->child_count());
-    bool ok = true;
+    auto cleanup = RAIIScopeGuard([&]() {
+        for (void *h : dlopen_handles)
+            dlclose(h);
+        delete[] scratch;
+    });
+
     for (int32_t i = 0; i < callable->child_count(); ++i) {
         const uint32_t off = callable->child_offset(i);
         auto *child_in_scratch = reinterpret_cast<CoreCallable *>(scratch + kHeaderSize + off);
@@ -1091,24 +1095,21 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
                 reinterpret_cast<const uint8_t *>(kernel_binary), kernel_size, &tmpfile
             )) {
             LOG_ERROR("Failed to create temp file for child kernel #%d", i);
-            ok = false;
-            break;
+            return 0;
         }
 
         void *handle = dlopen(tmpfile.c_str(), RTLD_NOW | RTLD_LOCAL);
         std::remove(tmpfile.c_str());
         if (!handle) {
             LOG_ERROR("dlopen failed for child kernel #%d: %s", i, dlerror());
-            ok = false;
-            break;
+            return 0;
         }
+        dlopen_handles.push_back(handle);
 
         void *func = dlsym(handle, "kernel_entry");
         if (!func) {
             LOG_ERROR("dlsym failed for child kernel #%d 'kernel_entry': %s", i, dlerror());
-            dlclose(handle);
-            ok = false;
-            break;
+            return 0;
         }
 
         auto register_hooks = reinterpret_cast<void (*)(void *, void *)>(dlsym(handle, "pto_sim_register_hooks"));
@@ -1120,16 +1121,9 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
         }
 
         child_in_scratch->set_resolved_addr(reinterpret_cast<uint64_t>(func));
-        dlopen_handles.push_back(handle);
     }
 
-    if (!ok) {
-        for (void *h : dlopen_handles)
-            dlclose(h);
-        delete[] scratch;
-        return 0;
-    }
-
+    cleanup.dismiss();
     const uint64_t chip_dev = reinterpret_cast<uint64_t>(scratch);
     chip_callable_buffers_.emplace(hash, ChipCallableBuffer{chip_dev, scratch, total_size, std::move(dlopen_handles)});
     LOG_DEBUG(

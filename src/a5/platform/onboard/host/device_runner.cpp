@@ -751,7 +751,6 @@ int DeviceRunner::register_prepared_callable(
     state.config_name = (config_name != nullptr) ? config_name : "";
     state.kernel_addrs = std::move(kernel_addrs);
     prepared_callables_.emplace(callable_id, std::move(state));
-    prepared_callable_path_used_ = true;
     return 0;
 }
 
@@ -780,7 +779,6 @@ int DeviceRunner::register_prepared_callable_host_orch(
     state.host_orch_func_ptr = host_orch_func_ptr;
     state.kernel_addrs = std::move(kernel_addrs);
     prepared_callables_.emplace(callable_id, std::move(state));
-    prepared_callable_path_used_ = true;
     ++host_dlopen_total_;
     LOG_INFO_V0("register_prepared_callable_host_orch: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
     return 0;

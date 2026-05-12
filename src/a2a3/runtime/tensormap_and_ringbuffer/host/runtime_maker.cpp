@@ -413,9 +413,8 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     // Clear the per-run dispatch-table entries staged by prepare_callable_impl.
     // The underlying chip-callable device buffer is pool-managed by
     // DeviceRunner (keyed by content hash) and bulk-freed in
-    // DeviceRunner::finalize(), mirroring the per-fid binary pool semantics
-    // PR #710 introduced. The prepared-callable path also relies on this:
-    // re-running the same callable repeatedly should not re-upload.
+    // DeviceRunner::finalize(); re-running the same callable repeatedly
+    // should not re-upload.
     int kernel_count = runtime->get_registered_kernel_count();
     for (int i = 0; i < kernel_count; i++) {
         int func_id = runtime->get_registered_kernel_func_id(i);

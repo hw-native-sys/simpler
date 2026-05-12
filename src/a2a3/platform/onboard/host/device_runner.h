@@ -605,15 +605,6 @@ private:
     // register_prepared_callable_host_orch call; never decremented). Same
     // re-prepare semantics as aicpu_dlopen_total_, but for hbg variants.
     size_t host_dlopen_total_{0};
-    // Sticky flag: prepare_callable was called at least once in this
-    // DeviceRunner's lifetime. unregister_prepared_callable clears the
-    // per-cid kernel maps, so we cannot rely on map contents at finalize()
-    // to distinguish a legacy-path leak from a kernel legitimately staged
-    // by prepare_callable (which is owned until finalize by design).
-    // Assumes the legacy non-prepared run path is retired; if it is ever
-    // reintroduced, revisit whether this distinction still holds.
-    bool prepared_callable_path_used_{false};
-
     // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
     // gates it behind this flag. finalize() drives aclFinalize only if we observed
     // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
