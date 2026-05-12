@@ -14,7 +14,6 @@
 #include <dlfcn.h>
 
 #include <fstream>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -35,46 +34,6 @@ T load_symbol(void *handle, const char *name) {
         throw std::runtime_error(msg);
     }
     return reinterpret_cast<T>(sym);
-}
-
-// Process-wide singleton: libcpu_sim_context.so is loaded once with
-// RTLD_GLOBAL so that host_runtime.so can resolve sim_context_set_* and
-// pto_sim_get_* symbols at runtime.  Never dlclosed.
-std::once_flag g_sim_context_once;
-void *g_sim_context_handle = nullptr;
-
-void ensure_sim_context_loaded(const std::string &path) {
-    std::call_once(g_sim_context_once, [&]() {
-        dlerror();
-        g_sim_context_handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
-        if (!g_sim_context_handle) {
-            std::string err = "dlopen sim_context failed: ";
-            const char *msg = dlerror();
-            err += msg ? msg : "unknown error";
-            throw std::runtime_error(err);
-        }
-    });
-}
-
-// Process-wide singleton: libsimpler_log.so is loaded once with RTLD_GLOBAL
-// so every consumer .so (host_runtime, cpu_sim_context, the binding, sim
-// AICore) shares one HostLogger across the process.  Must be loaded BEFORE
-// any consumer that has unresolved HostLogger / unified_log_* symbols.
-// Never dlclosed.
-std::once_flag g_simpler_log_once;
-void *g_simpler_log_handle = nullptr;
-
-void ensure_simpler_log_loaded(const std::string &path) {
-    std::call_once(g_simpler_log_once, [&]() {
-        dlerror();
-        g_simpler_log_handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
-        if (!g_simpler_log_handle) {
-            std::string err = "dlopen simpler_log failed: ";
-            const char *msg = dlerror();
-            err += msg ? msg : "unknown error";
-            throw std::runtime_error(err);
-        }
-    });
 }
 
 std::vector<uint8_t> read_binary_file(const std::string &path) {
@@ -99,9 +58,7 @@ std::vector<uint8_t> read_binary_file(const std::string &path) {
 ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
-    const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-    const std::string &simpler_log_lib_path, int device_id, const std::string &sim_context_lib_path, int log_level,
-    int log_info_v
+    const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path, int device_id
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -113,32 +70,12 @@ void ChipWorker::init(
         throw std::runtime_error("ChipWorker::init requires a non-negative device_id");
     }
 
-    // Load libsimpler_log FIRST with RTLD_GLOBAL so that subsequent host_runtime
-    // / cpu_sim_context / sim aicore .so loads can resolve their HostLogger and
-    // unified_log_* references against the single process-wide instance.
-    if (simpler_log_lib_path.empty()) {
-        throw std::runtime_error("ChipWorker::init requires simpler_log_lib_path");
-    }
-    ensure_simpler_log_loaded(simpler_log_lib_path);
-
-    // Seed the process-wide HostLogger BEFORE host_runtime.so is dlopen'd, so
-    // any LOG_* macro firing during host_runtime's dlopen-time constructors
-    // already sees the user's chosen filter rather than the C++ static init
-    // default. simpler_log_init lives in libsimpler_log.so.
-    simpler_log_init_fn_ = load_symbol<SimplerLogInitFn>(g_simpler_log_handle, "simpler_log_init");
-    int log_rc = simpler_log_init_fn_(log_level, log_info_v);
-    if (log_rc != 0) {
-        simpler_log_init_fn_ = nullptr;
-        throw std::runtime_error("simpler_log_init failed with code " + std::to_string(log_rc));
-    }
-
-    // Load the sim context SO with RTLD_GLOBAL (once per process) so that
-    // PTO ISA TPUSH/TPOP can resolve pto_sim_get_subblock_id and
-    // pto_sim_get_pipe_shared_state via dlsym(RTLD_DEFAULT).
-    if (!sim_context_lib_path.empty()) {
-        ensure_sim_context_loaded(sim_context_lib_path);
-    }
-
+    // libsimpler_log.so (RTLD_GLOBAL, with HostLogger already seeded via
+    // simpler_log_init) and — on sim — libcpu_sim_context.so (RTLD_GLOBAL) must
+    // already be loaded by the caller; host_runtime.so resolves its undefined
+    // HostLogger / unified_log_* (and, on sim, sim_context_*) symbols against
+    // those globals. The Python `ChipWorker` wrapper does this preload.
+    //
     // Host runtime SO is loaded with RTLD_LOCAL so that different runtimes'
     // identically-named symbols (simpler_init, prepare_callable,
     // run_prepared, etc.) do not collide when switching runtimes within the
@@ -331,7 +268,6 @@ void ChipWorker::finalize() {
     comm_get_window_size_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
-    simpler_log_init_fn_ = nullptr;
     runtime_buf_.clear();
     initialized_ = false;
     device_id_ = -1;

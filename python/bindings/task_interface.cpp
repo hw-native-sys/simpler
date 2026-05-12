@@ -627,8 +627,7 @@ NB_MODULE(_task_interface, m) {
         .def(nb::init<>())
         .def(
             "init", &ChipWorker::init, nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"),
-            nb::arg("simpler_log_lib_path"), nb::arg("device_id"), nb::arg("sim_context_lib_path") = "",
-            nb::arg("log_level") = 1, nb::arg("log_info_v") = 5
+            nb::arg("device_id")
         )
         .def("finalize", &ChipWorker::finalize)
         .def(
