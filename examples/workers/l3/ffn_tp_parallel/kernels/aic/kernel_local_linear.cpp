@@ -21,16 +21,6 @@
  *   tensor(2) = partial_local OUTPUT_EXISTING (M x N, per-rank device mem)
  */
 
-#include <cstdint>
-
-#include <pto/common/constants.hpp>
-#include <pto/common/pto_tile.hpp>
-#include <pto/pto-inst.hpp>
-
-#include "tensor.h"
-
-using namespace pto;
-
 #ifndef __gm__
 #define __gm__
 #endif
@@ -38,6 +28,16 @@ using namespace pto;
 #ifndef __aicore__
 #define __aicore__ [aicore]
 #endif
+
+#include <cstdint>
+
+#include <pto/pto-inst.hpp>
+#include <pto/common/constants.hpp>
+#include <pto/common/pto_tile.hpp>
+
+#include "tensor.h"
+
+using namespace pto;
 
 template <typename T>
 AICORE constexpr inline T CeilAlign(T num_1, T num_2) {

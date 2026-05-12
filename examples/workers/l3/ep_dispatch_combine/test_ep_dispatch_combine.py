@@ -6,17 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Hardware ST for examples/workers/l3/ep_dispatch_combine."""
+"""ST for examples/workers/l3/ep_dispatch_combine."""
 
 import pytest
 
 from .main import run
 
 
-@pytest.mark.requires_hardware
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
-def test_ep_dispatch_combine(st_device_ids):
-    rc = run([int(d) for d in st_device_ids])
+def test_ep_dispatch_combine(st_device_ids, st_platform):
+    rc = run([int(d) for d in st_device_ids], platform=st_platform)
     assert rc == 0

@@ -31,18 +31,6 @@
  *   scalar(1) = CommContext device pointer
  */
 
-#include <cstdint>
-
-#include <pto/comm/comm_types.hpp>
-#include <pto/comm/pto_comm_inst.hpp>
-#include <pto/common/pto_tile.hpp>
-#include <pto/pto-inst.hpp>
-
-#include "platform_comm/comm_context.h"
-#include "tensor.h"
-
-using namespace pto;
-
 #ifndef __gm__
 #define __gm__
 #endif
@@ -50,6 +38,18 @@ using namespace pto;
 #ifndef __aicore__
 #define __aicore__ [aicore]
 #endif
+
+#include <cstdint>
+
+#include <pto/pto-inst.hpp>
+#include <pto/comm/comm_types.hpp>
+#include <pto/comm/pto_comm_inst.hpp>
+#include <pto/common/pto_tile.hpp>
+
+#include "platform_comm/comm_context.h"
+#include "tensor.h"
+
+using namespace pto;
 
 static constexpr int kRows = 64;
 static constexpr int kCols = 64;
@@ -107,8 +107,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         }
         __gm__ float *remote_mailbox_base = CommRemotePtr(comm_ctx, mailbox_ptr, peer);
         __gm__ float *remote_slot_ptr = remote_mailbox_base + my_rank * kElemsPerPartial;
+#if defined(__CPU_SIM)
+        for (int i = 0; i < kElemsPerPartial; ++i) {
+            remote_slot_ptr[i] = partial_local_ptr[i];
+        }
+#else
         MatrixGlobal remote_slot(remote_slot_ptr);
         pto::comm::TPUT(remote_slot, partial_local_global, staging_tile);
+#endif
     }
     pipe_barrier(PIPE_ALL);
 
