@@ -35,6 +35,67 @@
 [[block_local]] int block_idx;
 [[block_local]] CoreType core_type;
 
+// SIMT metadata TLV injection.
+//
+// The legacy launch path (rtKernelLaunchWithHandleV2 + rtRegisterAllKernel)
+// requires the kernel ELF to carry two TLV records that runtime reads at
+// register time (see runtime/src/runtime/core/inc/kernel/elf.hpp:113,115 and
+// elf.cc:576-586):
+//   - FUNC_META_TYPE_COMPILER_ALLOC_UB_SIZE (7)  -> Kernel::shareMemSize_
+//   - FUNC_META_TYPE_AIV_TYPE_FLAG          (12) -> Kernel::kernelVfType_
+// bisheng emits these only when it can statically infer the kernel uses SIMT
+// intrinsics. Our entry is a SU dispatcher (vector ops live in task .o files
+// invoked through aicore_execute), so the compiler cannot tag it.
+//
+// We therefore use a two-pronged approach:
+//   1. Hand-write a SIMT-flavored meta section here (this block).
+//   2. Run a post-build patch (patch_simt_meta.py invoked from CMakeLists.txt)
+//      that rewrites the values inside bisheng's auto-emitted same-named
+//      section. This is required because runtime's parser
+//      (kernelInfoMap[name] = ...) overwrites by section, not merges, so the
+//      auto-emitted section would otherwise win and force kernelVfType=1
+//      (NO_VF) and shareMemSize=0.
+// Keeping (1) makes the intent explicit at the source level even though (2)
+// is what actually flips the values runtime ends up consuming.
+enum FuncMetaType {
+    F_TYPE_COMPILER_ALLOC_UB_SIZE = 7,
+    F_TYPE_AIV_TYPE_FLAG = 12,
+};
+
+enum AIVType {
+    AIV_TYPE_NO_VF = 1,
+    AIV_TYPE_SIMD_VF_ONLY = 2,
+    AIV_TYPE_SIMT_VF_ONLY = 3,
+    AIV_TYPE_SIMD_SIMT_MIX_VF = 4,
+};
+
+struct _base_tlv {
+    unsigned short type;
+    unsigned short len;
+};
+
+struct fun_meta_compiler_ub_size {
+    _base_tlv head;
+    unsigned int ub_size;
+};
+
+struct fun_meta_aiv_type_flag {
+    _base_tlv head;
+    unsigned int aiv_type;
+};
+
+struct fun_level_meta {
+    fun_meta_compiler_ub_size ub_size_meta;
+    fun_meta_aiv_type_flag aiv_type_meta;
+};
+
+#ifdef __DAV_VEC__
+static const fun_level_meta func_simt_section __attribute__((used, section(".ascend.meta.aicore_kernel_0_mix_aiv"))) = {
+    {{F_TYPE_COMPILER_ALLOC_UB_SIZE, sizeof(unsigned int)}, 8192},
+    {{F_TYPE_AIV_TYPE_FLAG, sizeof(unsigned int)}, AIV_TYPE_SIMT_VF_ONLY},
+};
+#endif
+
 /**
  * Kernel entry point with control loop
  *

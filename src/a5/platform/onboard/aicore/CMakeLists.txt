@@ -117,6 +117,15 @@ add_custom_target(aicore_kernel ALL
     COMMAND ${BISHENG_LD} -m aicorelinux -Ttext=0 -static -n
     -o ${AICORE_KERNEL_OBJ} ${COMBINED_AIC_OBJ} ${COMBINED_AIV_OBJ}
 
+    # Step 4: Patch SIMT TLVs that bisheng emits with NO_VF defaults.
+    # See patch_simt_meta.py and kernel.cpp's "SIMT metadata TLV injection"
+    # block for the why. Without this, runtime parses kernelVfType=1
+    # (NO_VF) and shareMemSize=0, and the legacy launch path
+    # (rtKernelLaunchWithHandleV2) fails to allocate UB for SIMT kernels
+    # despite cfg.localMemorySize being set.
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/patch_simt_meta.py
+            ${AICORE_KERNEL_OBJ} aicore_kernel_0_mix_aiv 8192 3
+
     BYPRODUCTS ${AICORE_KERNEL_OBJ}
-    COMMENT "Linking AICore kernel binary"
+    COMMENT "Linking AICore kernel binary + patching SIMT TLVs"
 )
