@@ -105,20 +105,28 @@ The PTO Runtime consists of **three separate programs** that communicate through
 DeviceRunner runner;
 void *ptr = runner.allocate_tensor(bytes);
 runner.copy_to_device(dev_ptr, host_ptr, bytes);
-runner.run(runtime, block_dim, device_id, aicpu_binary, aicore_binary, launch_aicpu_num);
+runner.set_executors(aicpu_binary, aicore_binary);   // once, at init time
+runner.run(runtime, block_dim, launch_aicpu_num);
 runner.finalize();
 ```
 
 ### Layer 2: C API (`src/common/worker/pto_runtime_c_api.h`)
 
 ```c
+// libsimpler_log.so (RTLD_GLOBAL, loaded first):
+simpler_log_init(log_level, log_info_v);              // seed HostLogger once
+
+// host_runtime.so (RTLD_LOCAL, loaded after):
 DeviceContextHandle ctx = create_device_context();
-simpler_init(ctx, device_id, log_level, log_info_v);  // attach + log config
+simpler_init(ctx, device_id,                          // attach + binary takeover
+             aicpu_binary, aicpu_size,
+             aicore_binary, aicore_size);
 size_t size = get_runtime_size();
-run_runtime(ctx, runtime, callable, args, block_dim,
-            aicpu_thread_num, device_id,
-            aicpu_binary, aicpu_size, aicore_binary, aicore_size,
-            enable_l2_swimlane, enable_dump_tensor, enable_pmu);
+prepare_callable(ctx, cid, callable);                 // one-time per callable
+run_prepared(ctx, runtime, cid, args, block_dim,      // per-launch — no binaries
+             aicpu_thread_num,
+             enable_l2_swimlane, enable_dump_tensor, enable_pmu, output_prefix);
+unregister_callable(ctx, cid);
 finalize_device(ctx);
 destroy_device_context(ctx);
 ```
@@ -172,12 +180,16 @@ Python test_*.py (SceneTestCase)
   │
   └─→ ChipWorker()
        └─→ init(host_path, aicpu_path, aicore_path, simpler_log_path, device_id)
+            ├─→ dlopen(libsimpler_log.so) RTLD_GLOBAL
+            ├─→ simpler_log_init(log_level, log_info_v) → HostLogger seeded
             ├─→ dlopen(host.so) → resolve C API symbols via dlsym
             ├─→ create_device_context() → DeviceContextHandle
-            └─→ simpler_init(ctx, device_id, log_level, log_info_v)
-                 └─→ DeviceRunner::attach_current_thread(device_id)
-                      ├─→ rtSetDevice(device_id) on onboard
-                      └─→ pto_cpu_sim_bind+acquire on sim
+            └─→ simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)
+                 ├─→ DeviceRunner::attach_current_thread(device_id)
+                 │    ├─→ rtSetDevice(device_id) on onboard
+                 │    └─→ pto_cpu_sim_bind+acquire on sim
+                 ├─→ DeviceRunner::set_executors(aicpu, aicore)
+                 └─→ (onboard) dlog_setlevel(HostLogger.level())
 ```
 
 ### 2. Initialization Phase

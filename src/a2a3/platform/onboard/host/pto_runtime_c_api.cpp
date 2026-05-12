@@ -46,7 +46,7 @@ int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *o
 int validate_runtime_impl(Runtime *runtime);
 
 /* ===========================================================================
- * Per-thread DeviceRunner binding (set by run_runtime, read by HostApi wrappers)
+ * Per-thread DeviceRunner binding (set by prepare_callable / run_prepared, read by HostApi wrappers)
  * =========================================================================== */
 
 static pthread_key_t g_runner_key;
@@ -208,12 +208,12 @@ void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, si
     r->record_tensor_pair(host_ptr, dev_ptr, size);
 }
 
-int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_info_v) {
+int simpler_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size
+) {
     if (ctx == NULL) return -1;
 
-    // Attach FIRST so that an attach failure does not leave process-wide side
-    // effects (CANN dlog level, HostLogger singleton) mutated. Subsequent
-    // logger writes only happen on the success path.
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
     int rc;
     try {
@@ -223,17 +223,23 @@ int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_
     }
     if (rc != 0) return rc;
 
-    // CANN dlog: derive from simpler logger choice unless ASCEND_GLOBAL_LOG_LEVEL
-    // is externally configured.
-    if (std::getenv("ASCEND_GLOBAL_LOG_LEVEL") == NULL) {
-        dlog_setlevel(-1, log_level, /*enableEvent*/ 0);
+    // Transfer ownership of the executor binaries to the runner. Subsequent
+    // prepare_callable / run_prepared invocations reuse them — no per-run
+    // binary push across the C ABI.
+    try {
+        std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
+        std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
+        runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
+    } catch (...) {
+        return -1;
     }
 
-    HostLogger::get_instance().set_level(static_cast<simpler::log::LogLevel>(log_level));
-    HostLogger::get_instance().set_info_v(log_info_v);
-
-    runner->set_log_level(log_level);
-    runner->set_log_info_v(log_info_v);
+    // CANN dlog: derive from HostLogger (seeded by libsimpler_log.so's
+    // simpler_log_init() earlier in ChipWorker::init) unless
+    // ASCEND_GLOBAL_LOG_LEVEL is externally configured.
+    if (std::getenv("ASCEND_GLOBAL_LOG_LEVEL") == NULL) {
+        dlog_setlevel(-1, HostLogger::get_instance().level(), /*enableEvent*/ 0);
+    }
     return 0;
 }
 
@@ -241,19 +247,9 @@ int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_
  * Per-callable_id preparation
  * =========================================================================== */
 
-int prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, int device_id, const uint8_t *aicpu_binary,
-    size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size
-) {
+int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
     if (ctx == NULL || callable == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
-
-    // AICPU/AICore executor binaries are only consumed by run()/run_prepared();
-    // prepare_callable just uploads kernel + orch SO state.
-    (void)aicpu_binary;
-    (void)aicpu_size;
-    (void)aicore_binary;
-    (void)aicore_size;
 
     pthread_once(&g_runner_key_once, create_runner_key);
     pthread_setspecific(g_runner_key, ctx);
@@ -262,7 +258,7 @@ int prepare_callable(
     });
 
     try {
-        int rc = runner->prepare_run_context(device_id);
+        int rc = runner->prepare_run_context(runner->device_id());
         if (rc != 0) return rc;
         auto run_context_guard = RAIIScopeGuard([runner]() {
             runner->release_run_context();
@@ -321,8 +317,7 @@ int prepare_callable(
 
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
-    int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
+    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
     const char *output_prefix
 ) {
     if (ctx == NULL || runtime == NULL) return -1;
@@ -340,7 +335,7 @@ int run_prepared(
     });
 
     try {
-        int rc = runner->prepare_run_context(device_id);
+        int rc = runner->prepare_run_context(runner->device_id());
         if (rc != 0) return rc;
         auto run_context_guard = RAIIScopeGuard([runner]() {
             runner->release_run_context();
@@ -376,9 +371,7 @@ int run_prepared(
         runner->set_dep_gen_enabled(enable_dep_gen != 0);
         runner->set_output_prefix(output_prefix);
 
-        std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
-        std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
-        rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
+        rc = runner->run(*r, block_dim, aicpu_thread_num);
         if (rc != 0) {
             validate_runtime_impl(r);
             r->~Runtime();

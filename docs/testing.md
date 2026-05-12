@@ -168,11 +168,14 @@ visible by default; lower the threshold (e.g. `--log-level warn`) to hide them.
   formatters writing `%(levelname)s`) accept and emit them.
 - **Snapshot at `Worker.init()`, not per-run**: when a `Worker` is initialised
   it reads the current `simpler` logger level once and forwards it through
-  `ChipWorker.init(..., log_level, log_info_v)` to the platform SO's
-  `simpler_init`, which configures `HostLogger`, the runner's snapshot of the
-  values for AICPU `KernelArgs`, and (onboard) `dlog_setlevel`. **Subsequent
-  `logger.setLevel(...)` calls are not re-pushed to that worker** — recreate
-  the worker if you need to change levels mid-run.
+  `ChipWorker.init(..., log_level, log_info_v)`. ChipWorker then calls
+  libsimpler_log's `simpler_log_init` (which writes the values into the
+  process-wide `HostLogger` singleton) BEFORE `host_runtime.so` is dlopen'd;
+  the platform SO's `simpler_init` reads `HostLogger.level()` to sync CANN
+  `dlog` onboard, and per-launch the runner reads `HostLogger.level() / .info_v()`
+  directly when populating `KernelArgs`. **Subsequent `logger.setLevel(...)`
+  calls are not re-pushed to that worker** — recreate the worker if you need
+  to change levels mid-run.
 - L3 / L4 hierarchical workers fork chip subprocesses; the parent snapshots
   the same `(severity, info_v)` pair before `fork()` and passes it explicitly
   to `_chip_process_loop` so each subprocess starts its own `ChipWorker.init`
@@ -184,9 +187,8 @@ The onboard AICPU library reads severity from CANN's `dlog` (CheckLogLevel),
 not from `KernelArgs.log_level`. Configure it via
 `ASCEND_GLOBAL_LOG_LEVEL=0..4` or `dlog_setlevel(-1, level, 0)`.
 `simpler_init` (called from `ChipWorker::init` in the platform SO) issues
-`dlog_setlevel(-1, severity, 0)` automatically — derived from the snapshotted
-simpler logger level — unless `ASCEND_GLOBAL_LOG_LEVEL` is already set in
-the environment. The INFO **verbosity** sub-tier (V0..V9) is still
+`dlog_setlevel(-1, HostLogger.level(), 0)` automatically — unless
+`ASCEND_GLOBAL_LOG_LEVEL` is already set in the environment. The INFO **verbosity** sub-tier (V0..V9) is still
 controlled through the simpler logger and travels via `KernelArgs.log_info_v`.
 
 ### Behaviour change since the V0..V9 migration

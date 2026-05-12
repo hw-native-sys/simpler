@@ -8,10 +8,12 @@
 # -----------------------------------------------------------------------------------------------------------
 """Simpler runtime — public Python surface.
 
-CANN dlog bootstrap and host-side log filter setup are performed by the
-platform SO's `simpler_init` C entry, called once from `ChipWorker::init()`
-with the snapshot of the `simpler` Python logger level. No Python-side
-ctypes / dlopen is needed here.
+Host-side log filter setup is performed via libsimpler_log.so's
+`simpler_log_init` C entry (seeding the process-wide HostLogger); CANN dlog
+bootstrap is performed by the platform SO's `simpler_init` reading off that
+same HostLogger. Both are driven once from `ChipWorker::init()` with the
+snapshot of the `simpler` Python logger level. No Python-side ctypes /
+dlopen is needed here.
 """
 
 # Importing _log auto-configures the simpler logger to V5 if unset.

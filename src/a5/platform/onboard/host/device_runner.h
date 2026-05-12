@@ -222,15 +222,27 @@ public:
      * @param runtime             Runtime to execute (will be modified to
      * initialize workers)
      * @param block_dim            Number of blocks (1 block = 1 AIC + 2 AIV)
-     * @param device_id            Device ID (0-15)
-     * @param aicpu_so_binary       Binary data of AICPU shared object
-     * @param aicore_kernel_binary  Binary data of AICore kernel
-     * @param launch_aicpu_num      Number of AICPU instances (default: 1)
+     * @param launch_aicpu_num     Number of AICPU instances (default: 1)
      * @return 0 on success, error code on failure
+     *
+     * The bound device id, AICPU/AICore executor binaries, and log filter
+     * are captured once by simpler_init (binaries) / libsimpler_log.so (log)
+     * and read off DeviceRunner state / HostLogger here — no per-run args.
      */
-    int
-    run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
+    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1);
+
+    /**
+     * Take ownership of the AICPU + AICore executor binaries. Called once
+     * by simpler_init at ChipWorker::init time; subsequent run() invocations
+     * read from `aicpu_so_binary_` / `aicore_kernel_binary_`.
+     */
+    void set_executors(std::vector<uint8_t> aicpu_so_binary, std::vector<uint8_t> aicore_kernel_binary) {
+        aicpu_so_binary_ = std::move(aicpu_so_binary);
+        aicore_kernel_binary_ = std::move(aicore_kernel_binary);
+    }
+
+    /** The device id captured by simpler_init's attach_current_thread call. */
+    int device_id() const { return device_id_; }
 
     /**
      * Enablement setters for the three diagnostics sub-features. Called by
@@ -244,11 +256,6 @@ public:
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
-    // Severity floor (0=DEBUG..4=NUL) and INFO verbosity threshold (0..9).
-    // Pushed in by the Python layer via run_runtime() and propagated to AICPU
-    // through KernelArgs.
-    void set_log_level(int log_level) { log_level_ = log_level; }
-    void set_log_info_v(int log_info_v) { log_info_v_ = log_info_v; }
     // Directory under which all diagnostic artifacts (l2_perf_records.json /
     // tensor_dump/ / pmu.csv) land. Required (non-empty) when any diagnostic
     // is enabled; CallConfig::validate() enforces this contract upstream.
@@ -442,6 +449,9 @@ private:
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results in destructor
+    // Executor binaries — populated once via set_executors() during
+    // simpler_init, owned by this runner for the rest of its lifetime.
+    std::vector<uint8_t> aicpu_so_binary_;
     std::vector<uint8_t> aicore_kernel_binary_;
 
     // Memory management
@@ -516,29 +526,20 @@ private:
      * - Load AICPU SO to device memory
      * - Initialize device args
      *
-     * @param device_id            Device ID (0-15)
-     * @param aicpu_so_binary       Binary data of AICPU shared object
-     * @param aicore_kernel_binary  Binary data of AICore kernel
+     * Reads the bound device id and executor binaries from runner state.
      * @return 0 on success, error code on failure
      */
-    int ensure_device_initialized(
-        int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-    );
+    int ensure_device_initialized();
 
     /**
      * Load AICPU SO and initialize device args
      *
-     * Called by run() after prepare_run_context(). Performs:
-     * - Load AICPU SO to device memory
-     * - Initialize device args
+     * Called by run() after prepare_run_context(). Reads aicpu_so_binary_ /
+     * aicore_kernel_binary_ off the runner.
      *
-     * @param aicpu_so_binary       Binary data of AICPU shared object
-     * @param aicore_kernel_binary  Binary data of AICore kernel
      * @return 0 on success, error code on failure
      */
-    int ensure_binaries_loaded(
-        const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-    );
+    int ensure_binaries_loaded();
 
     /**
      * Stage the orchestration SO into a device-resident buffer (with hash
@@ -586,8 +587,6 @@ private:
     bool enable_pmu_{false};
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
-    int log_level_{1};                                             // 0=DEBUG..4=NUL; default INFO
-    int log_info_v_{5};                                            // INFO verbosity threshold; default V5
 
     int init_pmu_buffers(
         int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id

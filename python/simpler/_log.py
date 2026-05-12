@@ -22,9 +22,11 @@ severity and INFO sub-verbosity:
 
 C++ side uses two axes (severity enum, info_v int) — `_split_threshold()`
 converts the Python integer into that pair, which `Worker.init()` forwards
-to `ChipWorker::init(..., log_level, log_info_v)` once. The platform SO's
-`simpler_init()` then propagates that snapshot to HostLogger, runner state,
-and (onboard only) CANN dlog.
+to `ChipWorker::init(..., log_level, log_info_v)` once. `ChipWorker::init`
+calls libsimpler_log.so's `simpler_log_init()` to seed the process-wide
+HostLogger; from then on the platform SO reads back through
+`HostLogger::get_instance()` (populating `KernelArgs.log_level` /
+`log_info_v` and, onboard only, syncing CANN dlog inside `simpler_init`).
 
 This module configures the "simpler" logger at import so that an unconfigured
 user gets the V5 default rather than Python's WARNING root inheritance.
