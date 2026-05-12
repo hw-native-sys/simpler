@@ -82,29 +82,30 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 
 /**
  * One-shot platform-side init. Called once by ChipWorker::init() right
- * after dlopen, before any other entry. Two responsibilities:
+ * after dlopen, before any other entry. Three responsibilities:
  *
  *   1. Attach the calling thread to `device_id` (rtSetDevice on onboard,
  *      pto_cpu_sim_bind_device + pto_cpu_sim_acquire_device on sim) and
  *      record the device id on the DeviceRunner so subsequent device-ops
  *      can re-attach their own caller threads idempotently.
  *
- *   2. Push the user's chosen severity + INFO verbosity into HostLogger
- *      and into runner state (which run_prepared later forwards to AICPU
- *      via KernelArgs).
+ *   2. Take ownership of the AICPU + AICore executor binaries (copied into
+ *      DeviceRunner-owned vectors). All subsequent prepare_callable /
+ *      run_prepared invocations reuse this resident pair — no binary bytes
+ *      cross the C ABI on per-run paths.
  *
- * On onboard, also calls dlog_setlevel(-1, log_level, 0) so CANN's runtime
- * filter matches the simpler logger — unless ASCEND_GLOBAL_LOG_LEVEL was
- * externally configured, in which case CANN keeps the user's explicit choice.
- *
- * On sim, no CANN dlog state to touch — only HostLogger + runner.
- *
- * `log_level` is CANN-aligned: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL.
- * `log_info_v` ∈ [0, 9]; only meaningful when severity is INFO.
+ *   3. (Onboard only) Sync CANN dlog with HostLogger::get_instance().level()
+ *      via dlog_setlevel(-1, level, 0), unless ASCEND_GLOBAL_LOG_LEVEL was
+ *      externally configured, in which case CANN keeps the user's choice.
+ *      The log level itself is owned by libsimpler_log.so (seeded earlier
+ *      by simpler_log_init); it never travels through this ABI.
  *
  * Returns 0 on success, negative on attach failure.
  */
-int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_info_v);
+int simpler_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size
+);
 
 /**
  * Release all device resources held by the context.
@@ -135,20 +136,13 @@ int finalize_device(DeviceContextHandle ctx);
  * one buffer). Subsequent `run_prepared(callable_id, ...)` calls reuse this
  * state.
  *
- * The `device_id`, `aicpu_binary` / `aicpu_size`, `aicore_binary` /
- * `aicore_size` parameters are accepted to keep the signature aligned with
- * `run_prepared` so codegen layers can share a single forwarding shim; the
- * current implementations ignore them (kernel upload uses the ChipCallable
- * payload, and the AICPU / AICore executor binaries are already loaded at
- * `simpler_init`).
+ * `device_id` and the executor binaries are not threaded through this entry
+ * — they were captured by `simpler_init` and live on the DeviceRunner.
  *
  * @return 0 on success, negative on error (NULL ctx, callable_id out of
  *         range, or upload/copy failure).
  */
-int prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, int device_id, const uint8_t *aicpu_binary,
-    size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size
-);
+int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable);
 
 /**
  * Launch a callable previously staged via `prepare_callable`.
@@ -160,12 +154,14 @@ int prepare_callable(
  * first run for a given callable_id sets `register_new_callable_id_` so the
  * AICPU does its one-time dlopen.
  *
+ * `device_id` and the executor binaries are not threaded through this entry
+ * — they were captured by `simpler_init` and live on the DeviceRunner.
+ *
  * @return 0 on success, negative on error (no prep state, NULL ctx, etc.).
  */
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
-    int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
+    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
     const char *output_prefix
 );
 

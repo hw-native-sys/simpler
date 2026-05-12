@@ -44,6 +44,10 @@ void HostLogger::set_info_v(int v) {
     current_info_v_ = v;
 }
 
+int HostLogger::level() const { return static_cast<int>(current_level_); }
+
+int HostLogger::info_v() const { return current_info_v_; }
+
 bool HostLogger::is_severity_enabled(LogLevel level) const {
     // current_level_ is the floor: messages with severity >= floor are kept.
     return static_cast<int>(level) >= static_cast<int>(current_level_) && current_level_ != LogLevel::NUL;
@@ -117,4 +121,29 @@ void HostLogger::log_info_v(int v, const char *func, const char *fmt, ...) {
     va_start(args, fmt);
     vlog_info_v(v, func, fmt, args);
     va_end(args);
+}
+
+// ---------------------------------------------------------------------------
+// C ABI entry — resolved by ChipWorker via dlsym from libsimpler_log.so.
+//
+// Called once early in ChipWorker::init (before host_runtime.so is even
+// dlopen'd) to seed the process-wide HostLogger from the user's
+// `simpler` Python logger snapshot. Consumers that need the current value
+// later (host_runtime.so populating KernelArgs.log_level) read it via
+// HostLogger::get_instance().level() / .info_v() directly; the value never
+// has to travel through any other SO's C ABI.
+//
+// Severity layout matches CANN dlog (0=DEBUG..4=NUL); info_v ∈ [0,9].
+// Returns 0 on success, negative on out-of-range input.
+// ---------------------------------------------------------------------------
+extern "C" int simpler_log_init(int log_level, int log_info_v) {
+    if (log_level < static_cast<int>(LogLevel::DEBUG) || log_level > static_cast<int>(LogLevel::NUL)) {
+        return -1;
+    }
+    if (log_info_v < 0 || log_info_v > 9) {
+        return -1;
+    }
+    HostLogger::get_instance().set_level(static_cast<LogLevel>(log_level));
+    HostLogger::get_instance().set_info_v(log_info_v);
+    return 0;
 }

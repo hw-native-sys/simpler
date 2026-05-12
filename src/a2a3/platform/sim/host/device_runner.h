@@ -139,15 +139,27 @@ public:
      *
      * @param runtime              Runtime to execute
      * @param block_dim            Number of blocks (1 block = 1 AIC + 2 AIV)
-     * @param device_id            Device ID (ignored in simulation)
-     * @param aicpu_so_binary      AICPU binary (ignored in simulation)
-     * @param aicore_kernel_binary AICore binary (ignored in simulation)
      * @param launch_aicpu_num     Number of AICPU threads
      * @return 0 on success
+     *
+     * Bound device id, AICPU/AICore executor binaries, and log filter are
+     * captured once by simpler_init / libsimpler_log.so and read off
+     * DeviceRunner state / HostLogger here — no per-run args.
      */
-    int
-    run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
+    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1);
+
+    /**
+     * Take ownership of the AICPU + AICore executor binaries. Called once
+     * by simpler_init at ChipWorker::init time; subsequent run() invocations
+     * read from `aicpu_so_binary_` / `aicore_kernel_binary_`.
+     */
+    void set_executors(std::vector<uint8_t> aicpu_so_binary, std::vector<uint8_t> aicore_kernel_binary) {
+        aicpu_so_binary_ = std::move(aicpu_so_binary);
+        aicore_kernel_binary_ = std::move(aicore_kernel_binary);
+    }
+
+    /** The device id captured by simpler_init's attach_current_thread call. */
+    int device_id() const { return device_id_; }
 
     /**
      * Enablement setters for the three diagnostics sub-features. Called by
@@ -162,11 +174,6 @@ public:
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
     void set_dep_gen_enabled(bool enable) { enable_dep_gen_ = enable; }
-    // Severity floor (0=DEBUG..4=NUL) and INFO verbosity threshold (0..9).
-    // Pushed in by the Python layer via run_runtime() and propagated to AICPU
-    // through KernelArgs.
-    void set_log_level(int log_level) { log_level_ = log_level; }
-    void set_log_info_v(int log_info_v) { log_info_v_ = log_info_v; }
     // Directory under which all diagnostic artifacts (l2_perf_records.json /
     // tensor_dump/ / pmu.csv) land. Required (non-empty) when any diagnostic
     // is enabled; CallConfig::validate() enforces this contract upstream.
@@ -255,6 +262,10 @@ private:
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};
+    // Executor binaries — populated once via set_executors() during
+    // simpler_init, owned by this runner for the rest of its lifetime.
+    std::vector<uint8_t> aicpu_so_binary_;
+    std::vector<uint8_t> aicore_kernel_binary_;
 
     // Memory management
     MemoryAllocator mem_alloc_;
@@ -326,8 +337,6 @@ private:
     void (*set_pmu_enabled_func_)(bool){nullptr};
     void (*set_platform_dep_gen_base_func_)(uint64_t){nullptr};
     void (*set_dep_gen_enabled_func_)(bool){nullptr};
-    void (*set_log_level_func_)(int){nullptr};
-    void (*set_log_info_v_func_)(int){nullptr};
     std::string aicpu_so_path_;
     std::string aicore_so_path_;
 
@@ -341,13 +350,10 @@ private:
     // dep_gen collector — captures orchestrator submit_task inputs for offline replay
     DepGenCollector dep_gen_collector_;
 
-    // Private helper methods
-    int ensure_device_initialized(
-        int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-    );
-    int ensure_binaries_loaded(
-        const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-    );
+    // Private helper methods — read aicpu_so_binary_ / aicore_kernel_binary_
+    // off the runner (populated by set_executors during simpler_init).
+    int ensure_device_initialized();
+    int ensure_binaries_loaded();
     void unload_executor_binaries();
 
     /**
@@ -386,8 +392,6 @@ private:
     bool enable_dep_gen_{false};
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
-    int log_level_{1};                                             // 0=DEBUG..4=NUL; default INFO
-    int log_info_v_{5};                                            // INFO verbosity threshold; default V5
 };
 
 #endif  // SRC_A2A3_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

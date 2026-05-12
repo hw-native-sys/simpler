@@ -152,23 +152,20 @@ int DeviceRunner::attach_current_thread(int device_id) {
     return 0;
 }
 
-int DeviceRunner::ensure_device_initialized(
-    int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-) {
-    int rc = attach_current_thread(device_id);
+int DeviceRunner::ensure_device_initialized() {
+    // device_id_ was set in attach_current_thread() during simpler_init.
+    int rc = attach_current_thread(device_id_);
     if (rc != 0) return rc;
-    return ensure_binaries_loaded(aicpu_so_binary, aicore_kernel_binary);
+    return ensure_binaries_loaded();
 }
 
-int DeviceRunner::ensure_binaries_loaded(
-    const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
-) {
+int DeviceRunner::ensure_binaries_loaded() {
     // AICPU .so: load-once, matching onboard's binaries_loaded_ pattern.
     // Keeping the DSO alive across runs preserves g_aicpu_executor state
     // (orch_so_handle_ etc.), which is required for the orch-SO cache-hit path.
-    if (!aicpu_so_loaded_ && !aicpu_so_binary.empty()) {
+    if (!aicpu_so_loaded_ && !aicpu_so_binary_.empty()) {
         if (!create_temp_so_file(
-                "/tmp/aicpu_sim_XXXXXX", aicpu_so_binary.data(), aicpu_so_binary.size(), &aicpu_so_path_
+                "/tmp/aicpu_sim_XXXXXX", aicpu_so_binary_.data(), aicpu_so_binary_.size(), &aicpu_so_path_
             )) {
             LOG_ERROR("Failed to create temp file for AICPU SO");
             return -1;
@@ -251,10 +248,9 @@ int DeviceRunner::ensure_binaries_loaded(
             return -1;
         }
 
-        // Log config bindings (optional; older SOs without these stay at their
-        // compile-time defaults).
-        set_log_level_func_ = reinterpret_cast<void (*)(int)>(dlsym(aicpu_so_handle_, "set_log_level"));
-        set_log_info_v_func_ = reinterpret_cast<void (*)(int)>(dlsym(aicpu_so_handle_, "set_log_info_v"));
+        // Log config travels via the RTLD_GLOBAL HostLogger singleton in
+        // libsimpler_log.so — already seeded by simpler_log_init() before the
+        // AICPU sim SO was dlopen'd, so no per-SO setter forwarding is needed.
 
         aicpu_so_loaded_ = true;
         LOG_INFO_V0("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
@@ -273,9 +269,9 @@ int DeviceRunner::ensure_binaries_loaded(
     }
 
     // Write AICore binary to temp file and dlopen
-    if (!aicore_kernel_binary.empty()) {
+    if (!aicore_kernel_binary_.empty()) {
         if (!create_temp_so_file(
-                "/tmp/aicore_sim_XXXXXX", aicore_kernel_binary.data(), aicore_kernel_binary.size(), &aicore_so_path_
+                "/tmp/aicore_sim_XXXXXX", aicore_kernel_binary_.data(), aicore_kernel_binary_.size(), &aicore_so_path_
             )) {
             LOG_ERROR("Failed to create temp file for AICore SO");
             return -1;
@@ -330,10 +326,7 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
     return 0;
 }
 
-int DeviceRunner::run(
-    Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
-) {
+int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     clear_cpu_sim_shared_storage();
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
@@ -372,7 +365,7 @@ int DeviceRunner::run(
     }
 
     // Ensure device is initialized
-    int rc = ensure_device_initialized(device_id, aicpu_so_binary, aicore_kernel_binary);
+    int rc = ensure_device_initialized();
     if (rc != 0) {
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
@@ -441,7 +434,7 @@ int DeviceRunner::run(
 
     // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_perf(num_aicore, device_id);
+        rc = init_l2_perf(num_aicore, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_l2_perf failed: %d", rc);
             return rc;
@@ -450,7 +443,7 @@ int DeviceRunner::run(
 
     if (enable_dump_tensor_) {
         // Initialize tensor dump (independent from profiling)
-        rc = init_tensor_dump(runtime, device_id);
+        rc = init_tensor_dump(runtime, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_tensor_dump failed: %d", rc);
             return rc;
@@ -458,7 +451,7 @@ int DeviceRunner::run(
     }
 
     if (enable_pmu_) {
-        rc = init_pmu(num_aicore, launch_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id);
+        rc = init_pmu(num_aicore, launch_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_pmu failed: %d", rc);
             return rc;
@@ -466,7 +459,7 @@ int DeviceRunner::run(
     }
 
     if (enable_dep_gen_) {
-        rc = init_dep_gen(launch_aicpu_num, device_id);
+        rc = init_dep_gen(launch_aicpu_num, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_dep_gen failed: %d", rc);
             return rc;
@@ -582,14 +575,9 @@ int DeviceRunner::run(
     set_platform_dep_gen_base_func_(kernel_args_.dep_gen_data_base);
     set_dep_gen_enabled_func_(enable_dep_gen_);
 
-    // Publish log config to the AICPU SO. Optional dlsym for forward
-    // compatibility with pre-log-config SOs.
-    if (set_log_level_func_ != nullptr) {
-        set_log_level_func_(log_level_);
-    }
-    if (set_log_info_v_func_ != nullptr) {
-        set_log_info_v_func_(log_info_v_);
-    }
+    // No per-SO log-config push: HostLogger lives in libsimpler_log.so
+    // (RTLD_GLOBAL singleton) and the AICPU sim SO reads it directly via the
+    // same global lookup.
 
     // Start collector mgmt + poll threads now, just before kernels launch.
     // Starting earlier wastes CPU on empty queues and risks tripping

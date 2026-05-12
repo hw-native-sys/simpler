@@ -121,6 +121,17 @@ void ChipWorker::init(
     }
     ensure_simpler_log_loaded(simpler_log_lib_path);
 
+    // Seed the process-wide HostLogger BEFORE host_runtime.so is dlopen'd, so
+    // any LOG_* macro firing during host_runtime's dlopen-time constructors
+    // already sees the user's chosen filter rather than the C++ static init
+    // default. simpler_log_init lives in libsimpler_log.so.
+    simpler_log_init_fn_ = load_symbol<SimplerLogInitFn>(g_simpler_log_handle, "simpler_log_init");
+    int log_rc = simpler_log_init_fn_(log_level, log_info_v);
+    if (log_rc != 0) {
+        simpler_log_init_fn_ = nullptr;
+        throw std::runtime_error("simpler_log_init failed with code " + std::to_string(log_rc));
+    }
+
     // Load the sim context SO with RTLD_GLOBAL (once per process) so that
     // PTO ISA TPUSH/TPOP can resolve pto_sim_get_subblock_id and
     // pto_sim_get_pipe_shared_state via dlsym(RTLD_DEFAULT).
@@ -187,18 +198,56 @@ void ChipWorker::init(
         throw std::runtime_error("create_device_context returned null");
     }
 
-    // Read platform binaries from files
-    aicpu_binary_ = read_binary_file(aicpu_path);
-    aicore_binary_ = read_binary_file(aicore_path);
-
     runtime_buf_.resize(get_runtime_size_fn_());
 
     // One-shot platform-side init: attach the calling thread to `device_id`
-    // (rtSetDevice on onboard, sim bind+acquire on sim) and push the user's
-    // simpler-logger choice into HostLogger + runner state (and CANN dlog
-    // onboard). Subsequent device-ops re-attach their caller threads
-    // idempotently against the recorded device id.
-    int init_rc = simpler_init_fn_(device_ctx_, device_id, log_level, log_info_v);
+    // (rtSetDevice on onboard, sim bind+acquire on sim), transfer ownership
+    // of the executor binaries to the DeviceRunner, and (onboard) sync CANN
+    // dlog from HostLogger. Subsequent device-ops re-attach their caller
+    // threads idempotently against the recorded device id; subsequent
+    // prepare_callable / run_prepared invocations reuse the cached binaries.
+    //
+    // read_binary_file may throw — defer the dlsym/dlclose rollback to the
+    // catch block so the buffers and any partially-resolved handle are torn
+    // down symmetrically.
+    int init_rc = 0;
+    try {
+        std::vector<uint8_t> aicpu_bytes = read_binary_file(aicpu_path);
+        std::vector<uint8_t> aicore_bytes = read_binary_file(aicore_path);
+        init_rc = simpler_init_fn_(
+            device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(), aicore_bytes.size()
+        );
+    } catch (...) {
+        destroy_device_context_fn_(device_ctx_);
+        device_ctx_ = nullptr;
+        dlclose(handle);
+        lib_handle_ = nullptr;
+        create_device_context_fn_ = nullptr;
+        destroy_device_context_fn_ = nullptr;
+        device_malloc_ctx_fn_ = nullptr;
+        device_free_ctx_fn_ = nullptr;
+        copy_to_device_ctx_fn_ = nullptr;
+        copy_from_device_ctx_fn_ = nullptr;
+        get_runtime_size_fn_ = nullptr;
+        simpler_init_fn_ = nullptr;
+        prepare_callable_fn_ = nullptr;
+        run_prepared_fn_ = nullptr;
+        unregister_callable_fn_ = nullptr;
+        get_aicpu_dlopen_count_fn_ = nullptr;
+        get_host_dlopen_count_fn_ = nullptr;
+        finalize_device_fn_ = nullptr;
+        ensure_acl_ready_fn_ = nullptr;
+        create_comm_stream_fn_ = nullptr;
+        destroy_comm_stream_fn_ = nullptr;
+        comm_init_fn_ = nullptr;
+        comm_alloc_windows_fn_ = nullptr;
+        comm_get_local_window_base_fn_ = nullptr;
+        comm_get_window_size_fn_ = nullptr;
+        comm_barrier_fn_ = nullptr;
+        comm_destroy_fn_ = nullptr;
+        runtime_buf_.clear();
+        throw;
+    }
     if (init_rc != 0) {
         // Symmetric teardown: drop the device context, clear all dlsym'd
         // function pointers, dlclose, and discard cached binaries so the
@@ -233,8 +282,6 @@ void ChipWorker::init(
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
         runtime_buf_.clear();
-        aicpu_binary_.clear();
-        aicore_binary_.clear();
         throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
 
@@ -284,9 +331,8 @@ void ChipWorker::finalize() {
     comm_get_window_size_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
+    simpler_log_init_fn_ = nullptr;
     runtime_buf_.clear();
-    aicpu_binary_.clear();
-    aicore_binary_.clear();
     initialized_ = false;
     device_id_ = -1;
     finalized_ = true;
@@ -303,10 +349,7 @@ void ChipWorker::prepare_callable(int32_t callable_id, const void *callable) {
     if (callable == nullptr) {
         throw std::runtime_error("prepare_callable: callable must not be null");
     }
-    int rc = prepare_callable_fn_(
-        device_ctx_, callable_id, callable, device_id_, aicpu_binary_.data(), aicpu_binary_.size(),
-        aicore_binary_.data(), aicore_binary_.size()
-    );
+    int rc = prepare_callable_fn_(device_ctx_, callable_id, callable);
     if (rc != 0) {
         throw std::runtime_error("prepare_callable failed with code " + std::to_string(rc));
     }
@@ -326,8 +369,7 @@ void ChipWorker::run_prepared(int32_t callable_id, const void *args, const CallC
     void *rt = runtime_buf_.data();
 
     int rc = run_prepared_fn_(
-        device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, device_id_, aicpu_binary_.data(),
-        aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(), config.enable_l2_swimlane,
+        device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.enable_l2_swimlane,
         config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.output_prefix
     );
     if (rc != 0) {

@@ -68,6 +68,13 @@ public:
     void set_level(simpler::log::LogLevel level);
     void set_info_v(int v);
 
+    // Raw getters. host_runtime.so reads these via the RTLD_GLOBAL singleton
+    // when populating KernelArgs.log_level / log_info_v at run time — that
+    // way the log configuration only lives in this one place (libsimpler_log.so)
+    // and never has to be pushed across the host_runtime.so C ABI separately.
+    int level() const;  // returns the underlying LogLevel as int (0..4)
+    int info_v() const;
+
     bool is_severity_enabled(simpler::log::LogLevel level) const;
     bool is_info_v_enabled(int v) const;
 

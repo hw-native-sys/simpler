@@ -42,7 +42,7 @@ int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *o
 int validate_runtime_impl(Runtime *runtime);
 
 /* ===========================================================================
- * Per-thread DeviceRunner binding (set by run_runtime, read by HostApi wrappers)
+ * Per-thread DeviceRunner binding (set by prepare_callable / run_prepared, read by HostApi wrappers)
  * =========================================================================== */
 
 static pthread_key_t g_runner_key;
@@ -200,11 +200,12 @@ void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, si
     r->record_tensor_pair(host_ptr, dev_ptr, size);
 }
 
-int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_info_v) {
+int simpler_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size
+) {
     if (ctx == NULL) return -1;
 
-    // Attach FIRST so that an attach failure (e.g. invalid device_id) does not
-    // leave the process-wide HostLogger singleton mutated.
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
     int rc;
     try {
@@ -214,29 +215,29 @@ int simpler_init(DeviceContextHandle ctx, int device_id, int log_level, int log_
     }
     if (rc != 0) return rc;
 
-    // No CANN dlog on sim; only HostLogger + runner state.
-    HostLogger::get_instance().set_level(static_cast<simpler::log::LogLevel>(log_level));
-    HostLogger::get_instance().set_info_v(log_info_v);
-    runner->set_log_level(log_level);
-    runner->set_log_info_v(log_info_v);
+    try {
+        std::vector<uint8_t> aicpu_vec;
+        std::vector<uint8_t> aicore_vec;
+        if (aicpu_binary != NULL && aicpu_size > 0) {
+            aicpu_vec.assign(aicpu_binary, aicpu_binary + aicpu_size);
+        }
+        if (aicore_binary != NULL && aicore_size > 0) {
+            aicore_vec.assign(aicore_binary, aicore_binary + aicore_size);
+        }
+        runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
+    } catch (...) {
+        return -1;
+    }
+    // No CANN dlog on sim. HostLogger is owned by libsimpler_log.so.
     return 0;
 }
 /* ===========================================================================
  * Per-callable_id preparation
  * =========================================================================== */
 
-int prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, int device_id, const uint8_t *aicpu_binary,
-    size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size
-) {
+int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
     if (ctx == NULL || callable == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
-
-    (void)aicpu_binary;
-    (void)aicpu_size;
-    (void)aicore_binary;
-    (void)aicore_size;
-    (void)device_id;
 
     pthread_once(&g_runner_key_once, create_runner_key);
     pthread_setspecific(g_runner_key, ctx);
@@ -289,8 +290,7 @@ int prepare_callable(
 
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
-    int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int /*enable_dep_gen*/,
+    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int /*enable_dep_gen*/,
     const char *output_prefix
 ) {
     if (ctx == NULL || runtime == NULL) return -1;
@@ -334,15 +334,7 @@ int run_prepared(
         runner->set_pmu_enabled(enable_pmu);
         runner->set_output_prefix(output_prefix);
 
-        std::vector<uint8_t> aicpu_vec;
-        std::vector<uint8_t> aicore_vec;
-        if (aicpu_binary != NULL && aicpu_size > 0) {
-            aicpu_vec.assign(aicpu_binary, aicpu_binary + aicpu_size);
-        }
-        if (aicore_binary != NULL && aicore_size > 0) {
-            aicore_vec.assign(aicore_binary, aicore_binary + aicore_size);
-        }
-        rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
+        rc = runner->run(*r, block_dim, aicpu_thread_num);
         if (rc != 0) {
             validate_runtime_impl(r);
             r->~Runtime();

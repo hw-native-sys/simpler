@@ -107,13 +107,15 @@ private:
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
-    using SimplerInitFn = int (*)(void *, int, int, int);
-    using PrepareCallableFn =
-        int (*)(void *, int32_t, const void *, int, const uint8_t *, size_t, const uint8_t *, size_t);
-    using RunPreparedFn = int (*)(
-        void *, void *, int32_t, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int,
-        int, int, int, const char *
-    );
+    // From libsimpler_log.so. Called with (log_level, log_info_v) to seed the
+    // process-wide HostLogger before host_runtime.so is even opened.
+    using SimplerLogInitFn = int (*)(int, int);
+    // From host_runtime.so. Single platform-side init that does (a) thread
+    // attach + device-id record, (b) executor binary takeover, (c) onboard
+    // CANN dlog sync. Reads the current log level off HostLogger itself.
+    using SimplerInitFn = int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t);
+    using PrepareCallableFn = int (*)(void *, int32_t, const void *);
+    using RunPreparedFn = int (*)(void *, void *, int32_t, const void *, int, int, int, int, int, int, const char *);
     using UnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);
@@ -135,6 +137,7 @@ private:
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
+    SimplerLogInitFn simpler_log_init_fn_ = nullptr;  // resolved from libsimpler_log.so
     SimplerInitFn simpler_init_fn_ = nullptr;
     PrepareCallableFn prepare_callable_fn_ = nullptr;
     RunPreparedFn run_prepared_fn_ = nullptr;
@@ -159,8 +162,6 @@ private:
     void *comm_stream_ = nullptr;
 
     std::vector<uint8_t> runtime_buf_;
-    std::vector<uint8_t> aicpu_binary_;
-    std::vector<uint8_t> aicore_binary_;
     // device_id_ is set once in init() and never modified afterward. All
     // ChipWorker callers run on the thread that called init() (the same
     // thread is the only one that subsequently calls malloc / copy_to /

@@ -258,23 +258,28 @@ different tasks have different configurations.
 ### Simulation (in-process, per-task)
 
 ```text
-ChipWorker.init(host_path, aicpu_path, aicore_path, device_id)
-  dlopen(host_runtime.so, RTLD_GLOBAL)
+ChipWorker.init(host_path, aicpu_path, aicore_path, simpler_log_path, device_id)
+  dlopen(libsimpler_log.so, RTLD_GLOBAL)
+  simpler_log_init(log_level, log_info_v)    seeds HostLogger before host_runtime
+  dlopen(host_runtime.so, RTLD_LOCAL)
   dlsym: create_device_context, destroy_device_context, simpler_init,
-         get_runtime_size, run_runtime, finalize_device
+         get_runtime_size, prepare_callable, run_prepared, unregister_callable,
+         finalize_device
   create_device_context() → DeviceContextHandle
-  simpler_init(ctx, device_id, log_level, log_info_v)
+  simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)
     DeviceRunner::attach_current_thread(device_id)
       pto_cpu_sim_bind_device(device_id)
       pto_cpu_sim_acquire_device(device_id)
+    DeviceRunner::set_executors(aicpu, aicore)         binaries owned by runner
 
-ChipWorker.run(callable, args, config)
-  run_runtime(ctx, buf, callable, args, ...)
+ChipWorker.run(cid, args, config)
+  run_prepared(ctx, buf, cid, args, block_dim, aicpu_thread_num, …)
     new (buf) Runtime()
-    init_runtime_impl(r, callable, args)     build graph, upload kernels
-    DeviceRunner::run(r, ...)
+    bind_prepared_callable_to_runtime(r, cid)   restore kernel/orch addrs
+    bind_prepared_to_runtime_impl(r, args)
+    DeviceRunner::run(r, block_dim, aicpu_thread_num)
       clear_cpu_sim_shared_storage()
-      ensure_binaries_loaded()               dlopen aicpu/aicore SOs
+      ensure_binaries_loaded()               dlopen aicpu/aicore SOs once
       launch AICPU + AICore threads
       join all threads
       unload_executor_binaries()             dlclose aicpu/aicore SOs
@@ -292,23 +297,32 @@ ChipWorker.finalize()
 ```text
 device_worker_main(device_id)
   for each runtime_group:
-    ChipWorker.init(host_path, aicpu_path, aicore_path, device_id)
-      dlopen(host_runtime.so, RTLD_GLOBAL)
+    ChipWorker.init(host_path, aicpu_path, aicore_path, simpler_log_path, device_id)
+      dlopen(libsimpler_log.so, RTLD_GLOBAL)
+      simpler_log_init(log_level, log_info_v)
+      dlopen(host_runtime.so, RTLD_LOCAL)
       create_device_context()
-      simpler_init(ctx, device_id, log_level, log_info_v)
+      simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)
         DeviceRunner::attach_current_thread(device_id)  rtSetDevice()
+        DeviceRunner::set_executors(aicpu, aicore)
+        dlog_setlevel(HostLogger.level())               sync CANN dlog
 
-    for each task in group:
-      ChipWorker.run(callable, args, config)
-        run_runtime(ctx, buf, callable, args, ...)
-          new (buf) Runtime()
-          init_runtime_impl()                rtMalloc, rtMemcpy to device
-          DeviceRunner::run()
-            ensure_binaries_loaded()         rtMemcpy AICPU SO to HBM (once)
-            rtAicpuKernelLaunchExWithArgs()   launch on device
-            rtStreamSynchronize()            wait for completion
-            launch_aicore_kernel()           rtRegisterAllKernel + rtKernelLaunch
-          validate_runtime_impl()            rtMemcpy results back to host
+    for each callable:
+      ChipWorker.prepare_callable(cid, callable)
+        prepare_callable(ctx, cid, callable)
+          upload child kernels, copy orch SO to device buffer
+      for each launch with that cid:
+        ChipWorker.run(cid, args, config)
+          run_prepared(ctx, buf, cid, args, block_dim, aicpu_thread_num, …)
+            new (buf) Runtime()
+            bind_prepared_callable_to_runtime()
+            bind_prepared_to_runtime_impl()  rtMalloc, rtMemcpy to device
+            DeviceRunner::run()
+              ensure_binaries_loaded()       rtMemcpy AICPU SO to HBM (once)
+              rtAicpuKernelLaunchExWithArgs() launch on device
+              rtStreamSynchronize()          wait for completion
+              launch_aicore_kernel()         rtRegisterAllKernel + rtKernelLaunch
+            validate_runtime_impl()          rtMemcpy results back to host
 
     ChipWorker.finalize()
       finalize_device(ctx)                     rtDeviceReset()
