@@ -11,7 +11,7 @@ no repo checkout required.
 
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
-- **[perf_to_mermaid](#perf_to_mermaid)** — perf JSON → Mermaid dependency graph
+- **[deps_to_graph](#deps_to_graph)** — `deps.json` (dep_gen) → pan/zoom HTML dependency graph
 - **[dump_viewer](#dump_viewer)** — inspect / export tensor dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
 - **[device_log_resolver](#device_log_resolver)** — shared device-log path resolver library
 
@@ -180,103 +180,83 @@ Output is emitted in three parts:
 
 ---
 
-## perf_to_mermaid
+## deps_to_graph
 
-Convert profiling data into Mermaid flowchart format to visualize task dependencies.
+Render the dep_gen `deps.json` task graph as a self-contained pan/zoom HTML
+page (Graphviz SVG + inline vanilla-JS drag-pan + wheel-zoom). Pairs naturally
+with [`swimlane_converter`](#swimlane_converter): swimlane is the timing view,
+this is the structural view.
 
 ### Overview
 
-`perf_to_mermaid` converts PTO Runtime profiling data (`l2_perf_records_*.json`) into Mermaid flowchart format. The generated Markdown file can be:
+`deps_to_graph` reads `deps.json` produced by the dep_gen replay (see
+[docs/dfx/dep_gen.md](../../docs/dfx/dep_gen.md)) and emits an HTML file
+viewable in any modern browser, no internet needed. Two modes:
 
-- Rendered directly in GitHub/GitLab
-- Viewed at <https://mermaid.live/>
-- Viewed in Mermaid-capable editors (e.g., VS Code with the Mermaid plugin)
+- **Default** — every task is a shape-coded node (AIC blue box / AIV orange
+  ellipse / mix green diamond / alloc dashed grey), edges are bare arrows.
+  Best for "is task X reachable from task Y?" topology questions on dense
+  graphs.
+- **`--show-tensor-info`** — every task is an HTML-table node with input
+  rows on top, identity header in the middle, output rows on the bottom;
+  each slot row shows `arg<i> <TYPE> <Tname>:<dtype>` plus `raw:` / `shape:` /
+  `offset:`. Edges route from `pred:out_<idx>` to `succ:in_<arg>` by
+  matching `tensor_id`, so "which output of X feeds which input of Y" is
+  visually obvious. This is the answer to issue #666's "what slice does
+  this edge carry?" question.
 
 ### Basic Usage
 
 ```bash
-# Auto-detect the latest profiling file under ./outputs/
-python -m simpler_setup.tools.perf_to_mermaid
+# Auto-pick the newest deps.json under ./outputs/
+python -m simpler_setup.tools.deps_to_graph
 
-# Specify an input file
-python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json
+# Specific path
+python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json
 
-# Specify an output file
-python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json -o diagram.md
+# Specify an output HTML path
+python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json -o graph.html
 
-# Load function name mapping from kernel_config.py
-python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json \
-    -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
+# Show per-edge tensor slice info (compartments + matched ports)
+python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json --show-tensor-info
 
-# Use compact style (only task id and function name)
-python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json --style compact
+# Force-directed layout for large graphs (>~1000 nodes)
+python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json --engine sfdp
 
-# Specify flowchart direction (left to right)
-python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json --direction LR
-
-# Verbose mode
-python -m simpler_setup.tools.perf_to_mermaid outputs/<case>_<ts>/l2_perf_records.json -v
+# Override node labels with a func_id -> name mapping
+python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json \
+    --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
 ```
 
 ### Command-Line Options
 
 | Option | Short | Description |
 | ------ | ----- | ----------- |
-| `input` | | Input JSON file (l2_perf_records_*.json). If omitted, the latest file in outputs/ is used |
-| `--output` | `-o` | Output Markdown file (default: outputs/mermaid_diagram_`<timestamp>`.md) |
-| `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
-| `--style` | | Node style: `detailed` (default, includes function name and task id) or `compact` (task id only) |
-| `--direction` | | Flowchart direction: `TD` (top-down, default) or `LR` (left-to-right) |
-| `--verbose` | `-v` | Enable verbose output |
+| `input` | | Path to `deps.json` (default: newest under `./outputs/`) |
+| `--output` | `-o` | Output HTML path (default: same dir as input, `deps_graph.html`) |
+| `--engine` | | Graphviz layout engine: `dot` (default, hierarchical), `sfdp` (force-directed, recommended >1000 nodes), `neato`, `fdp`, `circo`, `twopi` |
+| `--direction` | | Flow direction for hierarchical layouts: `LR` (default) / `TB` / `BT` / `RL`. Ignored by sfdp/neato. |
+| `--func-names` | | JSON file with `callable_id_to_name` (or flat `{func_id: name}`) for node-label enrichment |
+| `--show-tensor-info` | | Render each task as an HTML-table node with input/output slot compartments; route edges between matching ports. Default: off (bare topology). |
 
-### Outputs
+### Dependencies
 
-Generates a Markdown file containing a Mermaid flowchart:
+Requires the Graphviz `dot` binary on PATH:
 
-#### Detailed Style (Default)
-
-```mermaid
-flowchart TD
-
-    Task0["QK(0)"]
-    Task1["SF(1)"]
-    Task2["PV(2)"]
-    Task3["UP(3)"]
-    Task4["QK(4)"]
-    Task5["SF(5)"]
-    Task6["PV(6)"]
-    Task7["UP(7)"]
-    Task8["QK(8)"]
-    Task9["SF(9)"]
-    Task10["PV(10)"]
-    Task11["UP(11)"]
-    Task12["QK(12)"]
-    Task13["SF(13)"]
-    Task14["PV(14)"]
-    Task15["UP(15)"]
-
-    Task0 --> Task1
-    Task1 --> Task2
-    Task2 --> Task3
-    Task3 --> Task7
-    Task4 --> Task5
-    Task5 --> Task6
-    Task6 --> Task7
-    Task8 --> Task9
-    Task9 --> Task10
-    Task10 --> Task11
-    Task11 --> Task15
-    Task12 --> Task13
-    Task13 --> Task14
-    Task14 --> Task15
-
-    %% Styling by core type
-    classDef aicStyle fill:#66A3FF,stroke:#333,stroke-width:2px,color:#000
-    classDef aivStyle fill:#FFB366,stroke:#333,stroke-width:2px,color:#000
-
-    class Task0,Task2,Task4,Task6,Task8,Task10,Task12,Task14 aicStyle
-    class Task1,Task3,Task5,Task7,Task9,Task11,Task13,Task15 aivStyle
+```bash
+brew install graphviz    # macOS
+apt install graphviz     # Debian/Ubuntu
 ```
+
+The HTML viewer is self-contained — no JavaScript or fonts are downloaded
+at view time.
+
+### Browser controls
+
+- **drag** → pan
+- **wheel** → zoom about cursor
+- **f** → fit to view
+- **r** → reset to 1:1
 
 ---
 
@@ -394,30 +374,33 @@ The tools extract the `func_id` to `name` mapping from the `KERNELS` list.
 - Task execution statistics
 - Professional performance analysis and optimization
 
-### Use perf_to_mermaid when you need
+### Use deps_to_graph when you need
 
-- A quick look at task dependencies
-- To embed a dependency graph in documentation
-- To share dependency structure in a code review
-- Only topological structure, without timeline detail
-- Direct viewing in GitHub/GitLab
+- A structural view of task dependencies (who feeds whom)
+- Per-edge tensor slice info — which `(tensor_id, offset, shape)` an edge
+  carries — via `--show-tensor-info`
+- A single-file HTML you can open offline, drag-pan / wheel-zoom in any
+  browser
+- A graph that survives without an associated timing run (deps.json is
+  produced by structural replay, not by hardware profiling)
 
 ### Recommended Workflow
 
 ```bash
-# 1. Run the test to produce profiling data
-python examples/scripts/run_example.py -k ./kernels -g ./golden.py --enable-l2-swimlane
+# 1. Run the test to produce both timing + structural data
+pytest tests/st/... --enable-l2-swimlane --enable-dep-gen
 
-# 2. Generate Perfetto visualization (automatic)
-# -> outputs/merged_swimlane_*.json
+# 2. Perfetto timeline (automatic via SceneTest)
+# -> outputs/<case>_<ts>/merged_swimlane.json
+#    open at https://ui.perfetto.dev/
 
-# 3. Generate Mermaid dependency graph
-python -m simpler_setup.tools.perf_to_mermaid -k ./kernels/kernel_config.py
+# 3. Structural dependency graph (manual)
+python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json
+# -> outputs/<case>_<ts>/deps_graph.html (drag / wheel / f / r)
 
-# 4. Analyze results
-# - Detailed performance analysis: Perfetto (https://ui.perfetto.dev/)
-# - Dependency overview: Mermaid diagram (GitHub/editor)
-# - Statistics summary: console output
+# 4. Same graph with per-edge tensor info
+python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json \
+    --show-tensor-info -o outputs/<case>_<ts>/deps_graph_with_tensors.html
 ```
 
 For batch-run hardware regression, see the dev-only script
@@ -451,11 +434,11 @@ For batch-run hardware regression, see the dev-only script
   2. Re-run `swimlane_converter` or `sched_overhead_analysis`
   3. Verify that each task in the JSON contains `dispatch_time_us` and `finish_time_us`
 
-### Mermaid diagram does not render on GitHub
+### `deps_to_graph` complains that Graphviz `dot` is not on PATH
 
-- Make sure the file has the `.md` extension
-- Check that the Mermaid syntax is correct
-- GitHub sometimes needs a refresh before rendering Mermaid diagrams
+- Install graphviz: `brew install graphviz` (macOS) or `apt install graphviz` (Debian/Ubuntu)
+- Verify with `which dot`; should print a path
+- Use a different layout engine with `--engine sfdp` for very large graphs
 
 ---
 
@@ -463,14 +446,14 @@ For batch-run hardware regression, see the dev-only script
 
 | File | Tool | Purpose | Format |
 | ---- | ---- | ------- | ------ |
-| `l2_perf_records_*.json` | Runtime | Raw profiling data | JSON |
+| `l2_perf_records_*.json` | Runtime | Raw timing profiling data | JSON |
 | `merged_swimlane_*.json` | swimlane_converter | Perfetto visualization | Chrome Trace Event JSON |
-| `mermaid_diagram_*.md` | perf_to_mermaid | Dependency graph | Markdown + Mermaid |
+| `deps.json` | Runtime (dep_gen replay) | Structural task dependency graph + per-edge tensor info | JSON (v2) |
+| `deps_graph.html` | deps_to_graph | Pan/zoom dependency graph viewer | HTML (self-contained) |
 
 ---
 
 ## Related Resources
 
 - [Perfetto Trace Viewer](https://ui.perfetto.dev/)
-- [Mermaid Live Editor](https://mermaid.live/)
-- [Mermaid documentation](https://mermaid.js.org/)
+- [Graphviz documentation](https://graphviz.org/documentation/)

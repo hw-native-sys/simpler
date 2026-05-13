@@ -108,7 +108,7 @@ class TestL2Swimlane(SceneTestCase):
             f"(vector_example issues 5 submit_task calls)"
         )
         # Spot-check a single record's required fields — guards against drift in
-        # the swimlane schema that swimlane_converter.py / perf_to_mermaid.py rely on.
+        # the swimlane schema that swimlane_converter.py / deps_to_graph.py rely on.
         first = tasks[0]
         for key in ("task_id", "func_id", "core_id", "core_type", "start_time_us", "end_time_us", "fanout"):
             assert key in first, f"perf record missing required field '{key}': {first}"

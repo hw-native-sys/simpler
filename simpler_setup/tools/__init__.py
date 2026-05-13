@@ -12,7 +12,7 @@ Invoke via ``python -m simpler_setup.tools.<name>``:
 
 - ``swimlane_converter``   : perf JSON -> Perfetto/Chrome trace
 - ``sched_overhead_analysis``: scheduler overhead deep-dive
-- ``perf_to_mermaid``       : perf JSON -> Mermaid flowchart
+- ``deps_to_graph``         : deps.json -> pan/zoom HTML dependency graph
 - ``dump_viewer``           : inspect tensor dumps
 - ``device_log_resolver``   : shared library used by the converters
 """
