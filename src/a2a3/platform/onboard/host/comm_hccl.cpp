@@ -555,6 +555,7 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *devic
     // time dependency on PTO_ISA_ROOT. Located here so it overlays the
     // comm backend's output -- comm-side flow does not care about
     // workSpace.
+
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     h->sdma_workspace = std::make_unique<pto::comm::sdma::SdmaWorkspaceManager>();
     if (h->sdma_workspace->Init()) {

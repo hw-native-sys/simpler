@@ -31,7 +31,6 @@ from simpler.task_interface import (
     ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
-    ChipContext,
     CommDomain,
     CommDomainPlan,
     ContinuousTensor,
@@ -182,7 +181,7 @@ def run(
     chip_cid = worker.register(chip_callable)
     try:
         worker.init()
-        contexts: list[ChipContext] = worker.chip_contexts
+        contexts = worker.chip_contexts
 
         def orch_fn(orch, _args, cfg):
             for rank, ctx in enumerate(contexts):

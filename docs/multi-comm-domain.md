@@ -1,8 +1,11 @@
 # Multi-Communication-Domain Design
 
-This document describes how Simpler currently wires one communication domain
-from L3 workers down to PTO-ISA kernels, then proposes an extension for
-multiple communication domains.
+This document describes how Simpler wires communication domains from L3
+workers down to PTO-ISA kernels. It records the original single-domain
+model and the multi-domain design implemented in PR 752.
+
+Implementation status and validation results live in
+[`multi-comm-domain-implementation.md`](multi-comm-domain-implementation.md).
 
 The design scope is intentionally narrow:
 
@@ -29,7 +32,7 @@ The design is based on these implementation points:
 | HCCL/HCOMM | CANN HCCL `inc/hccl/` and `src/` |
 
 The PTO-ISA and CANN HCCL source trees are design references only.  The
-proposed Simpler path relies on HCCL/HCOMM setup APIs such as
+Simpler path relies on HCCL/HCOMM setup APIs such as
 `HcclCommInitRootInfo`, `HcomGetCommHandleByGroup`,
 `HcclAllocComResourceByTiling`, and `HcclCreateSubCommConfig`.
 Data movement remains in PTO-ISA kernels through address-based instructions
@@ -474,7 +477,7 @@ routed_y_buf | signals
 All three examples use the same domain mechanism: one `CommContext*`, one
 per-rank window, and kernel-side offset translation.
 
-## Proposed Runtime Model
+## Runtime Model
 
 Keep the split between parent-level planning and per-chip bootstrap explicit.
 The communication-domain plan is a single L3-level object.  It is not copied
@@ -883,7 +886,7 @@ The base HCCL communicator is still an internal backend detail.  It should
 not appear in `ctx.domains` or expose buffers to kernels.  Its window is
 allocated once and sliced into the visible data domains.
 
-## Proposed Python API
+## Python API
 
 The normal public L3 constructor accepts one global domain plan.
 `ChipBootstrapConfig` remains the per-chip object sent to chip children.  It

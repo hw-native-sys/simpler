@@ -245,7 +245,7 @@ Two new L3 examples now cover the multi-domain surface:
 - `domain_rank_map`: a small communication example.  It shows the difference
   from single-domain usage by checking domain-local ranks, absent domains,
   separate slices for overlapping memberships, and one real allreduce per
-  domain.
+  domain.  Revalidated on 2026-05-13 with CANN 8.5 on devices `12,13,14`.
 - `dual_domain_overlap`: a real data example.  It runs two overlapping
   domains, performs domain-local allreduce in both, then runs affine compute
   and checks real outputs against host goldens.
@@ -256,14 +256,33 @@ is expressed through the same API rather than through a compatibility path.
 
 ## Validation Status
 
-Validation date: 2026-05-13.
+Validation date: 2026-05-18.
 
 ### Build And Unit Tests
 
-- Editable build: pass.
+- Editable build after the PR 752 rebase: pass.
 
   ```bash
   pip install --no-build-isolation -e .
+  ```
+
+- Real-device `tests/st` after the PR 752 rebase: pass on `a2a3` devices
+  `2-5`.  Runtime artifacts were rebuilt once serially, then pytest was run
+  without `--build` so parallel workers only loaded stable `build/lib`
+  outputs.
+
+  ```bash
+  python - <<'PY'
+  from simpler_setup.runtime_builder import RuntimeBuilder
+  builder = RuntimeBuilder(platform="a2a3")
+  for runtime in ("host_build_graph", "tensormap_and_ringbuffer"):
+      builder.get_binaries(runtime, build=True)
+  PY
+
+  pytest tests/st --platform a2a3 --device 2-5 -v \
+      --pto-session-timeout 600 \
+      --pto-isa-commit 50d9c806c3e351d5039c9f0f02a267590420b4d9 \
+      --clone-protocol ssh --require-pto-isa
   ```
 
 - Focused unit and sim tests: pass, 30 tests.
@@ -294,10 +313,11 @@ Validation date: 2026-05-13.
 
 ### Example Results
 
-- `examples` excluding `a2a3/sdma_async_completion_demo`
-  - Hardware: pass on a five-device pool.
+- `examples`
+  - Hardware: covered by the real-device CI sweep.
   - This includes the migrated L3 communication examples, the two new
-    multi-domain examples, and the L2 examples.
+    multi-domain examples, the L2 examples, and the SDMA async completion
+    demo.
 
 - `workers/l3/domain_rank_map`
   - Sim: not applicable.
@@ -335,9 +355,14 @@ Validation date: 2026-05-13.
   - Explicit bootstrap plus deferred notify staging.
 
 - `a2a3/sdma_async_completion_demo`
-  - Sim: not run.
-  - Hardware: fail with `-p a2a3 -d 6-7`.
-  - Both chips bootstrap, then `worker.run()` fails with AICPU 507015.
+  - Sim: not applicable.
+  - Hardware: covered by the real-device CI sweep.  The post-rebase fix
+    removes an invalid parent-side prelaunch `CommContext` read.
+  - The demo now uses the kernel output comparison as the SDMA workspace
+    signal.  The previous Python precheck copied a device `CommContext` into
+    a parent-process ctypes buffer through a forked chip child; that copy only
+    updated the child's private address space and therefore falsely reported
+    zero workspace fields.
 
 - `a5/async_notify_demo`
   - Sim: pass with `-p a5sim`.
@@ -349,41 +374,10 @@ Validation date: 2026-05-13.
   - Hardware: not run.
   - A5 sim deferred notify path.
 
-The SDMA failure happens after both chip bootstrap messages are ready.  The
-observed error is `aclrtSynchronizeStreamWithTimeout (AICPU) failed: 507015`,
-followed by 507901 during stream teardown.  This is tracked as a remaining
-SDMA runtime/data-plane issue, not as a communication-domain bootstrap
-failure.
-
-### SDMA 507015 Investigation
-
-The `worker.run()` failure is currently isolated from multi-domain bootstrap:
-
-- Current one-domain and multi-domain L3 communication examples pass on clean
-  devices.
-- The public examples pass on real devices when the SDMA async completion demo
-  is excluded.
-- A stock HCCL allreduce test using root-info initialization passes on the same
-  CANN 8.5 installation.  This confirms basic HCCL root-info communicator
-  setup and collective execution are not generally broken.
-- The PTO-ISA allgather async reference builds, but on this CANN 8.5
-  installation it fails before executing the SDMA async kernels because the
-  installed `libopapi.so` does not export `aclnnShmemSdmaStarsQuery`.
-  Subsequent SDMA resource allocation fails with code 15.  This points to
-  missing or incompatible SDMA async support in the local CANN stack.
-- A local CANN 9.0 beta toolkit exports the SDMA async query symbols and the
-  demo was rerun under that environment with a runtime rebuild.  It still
-  fails with the same AICPU 507015 symptom, so the missing CANN 8.5 symbol is
-  not the only blocker.
-- The pre-PR single-domain checkout is not a valid local baseline in this
-  environment: its L3 hardware bootstrap times out before reaching the SDMA
-  run path.
-
-A broader `examples tests/st` hardware sweep without the SDMA demo found three
-separate `spmd_sync_start*` failures with AICPU stream-sync timeout 507046.
-After that timeout, rerunning those cases on the same device degraded to stream
-creation failure 507899.  Those failures are separate from the SDMA 507015
-symptom: they do not involve communication domains or SDMA async completion.
+The SDMA demo is not tracked as a remaining multi-domain limitation.  Its
+post-rebase failure came from the demo's Python-side inspection path, not from
+communication-domain bootstrap or the derived device `CommContext` consumed by
+the kernel.
 
 ## Grep Gates
 
