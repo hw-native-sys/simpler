@@ -26,6 +26,8 @@
  *                                       reduce_sum -> routed_y.
  *   func_id 37      ffn_add.cpp         ffn_out = routed_y + sh
  *                                       (single-layer spec, model.py:644-645).
+ *   func_id 38      hc_post.cpp         hc_post(ffn_out, x_hc, post_ffn,
+ *                                       comb_ffn) -> y  (next-layer x_hc).
  *
  *   tensor(0)   x_hc              INPUT  (host) [B, S, HC_MULT, D]    BF16
  *   tensor(1)   hc_ffn_fn         INPUT  (host) [MIX_HC, HC_DIM]      FP32
@@ -64,7 +66,8 @@
  *   tensor(34)  sh                OUTPUT_EXISTING [T, D]              BF16
  *   tensor(35)  routed_y          OUTPUT_EXISTING [T, D]              FP32
  *   tensor(36)  ffn_out           OUTPUT_EXISTING [T, D]              BF16   (routed_y + sh)
- *   tensor(37)  scratch           INOUT  HCCL window slot
+ *   tensor(37)  y                 OUTPUT_EXISTING [B, S, HC_MULT, D]  BF16   (hc_post out)
+ *   tensor(38)  scratch           INOUT  HCCL window slot
  *   scalar(0)   nranks
  *   scalar(1)   CommContext device pointer
  */
@@ -83,7 +86,7 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig
 ep_dispatch_combine_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 40,  // 38 tensors + 2 scalars
+        .expected_arg_count = 41,  // 39 tensors + 2 scalars
     };
 }
 
@@ -111,7 +114,8 @@ __attribute__((visibility("default"))) void ep_dispatch_combine_orchestration(co
     Tensor sh = from_tensor_arg(orch_args.tensor(34));
     Tensor routed_y = from_tensor_arg(orch_args.tensor(35));
     Tensor ffn_out = from_tensor_arg(orch_args.tensor(36));
-    Tensor scratch = from_tensor_arg(orch_args.tensor(37));
+    Tensor y = from_tensor_arg(orch_args.tensor(37));
+    Tensor scratch = from_tensor_arg(orch_args.tensor(38));
 
     // Router output names (PyPTO body refs them as ext_*).
     Tensor ext_x_norm = x_norm;
@@ -764,6 +768,53 @@ __attribute__((visibility("default"))) void ep_dispatch_combine_orchestration(co
         p.add_input(sh);
         p.add_output(ffn_out);
         rt_submit_aiv_task(37, p);
+    }
+
+    // ---- func_id 38: hc_post (transplanted PyPTO-generated body) ----
+    // Local aliases for the names the generated body refers to (`ext_x` etc.):
+    //   x        ← ffn_out (the MoE FFN result)
+    //   residual ← ext_x_hc (the router's input x_hc carries through as
+    //              residual per the single-layer spec line 99)
+    //   post / comb ← post_ffn / comb_ffn from the router
+    //   y        ← chip-allocated output tensor (next-layer x_hc)
+    {
+        Tensor ext_x = ffn_out;
+        Tensor ext_residual = ext_x_hc;
+        Tensor ext_post = ext_post_ffn;
+        Tensor ext_comb = ext_comb_ffn;
+        Tensor ext_y = y;
+
+        PTO2_SCOPE() {
+            uint32_t x_flat_inline2_shapes[2] = {16, 4096};
+            Tensor x_flat_inline2 = ext_x.reshape(x_flat_inline2_shapes, 2);
+            uint32_t residual_flat_inline6_shapes[2] = {16, 16384};
+            Tensor residual_flat_inline6 = ext_residual.reshape(residual_flat_inline6_shapes, 2);
+            uint32_t post_flat_inline8_shapes[1] = {64};
+            Tensor post_flat_inline8 = ext_post.reshape(post_flat_inline8_shapes, 1);
+            uint32_t comb_flat_inline9_shapes[1] = {256};
+            Tensor comb_flat_inline9 = ext_comb.reshape(comb_flat_inline9_shapes, 1);
+            uint32_t y_flat_inline7_shapes[2] = {16, 16384};
+            Tensor y_flat_inline7 = ext_y.reshape(y_flat_inline7_shapes, 2);
+            for (int64_t out_h_inline3 = 0; out_h_inline3 < 4; out_h_inline3 += 1) {
+                PTO2_SCOPE() {
+                    for (int64_t t_inline10 = 0; t_inline10 < 1; t_inline10 += 1) {
+                        PTO2_SCOPE() {
+
+                            // Task 38: hc_post
+                            Arg params_t0;
+                            params_t0.add_output(y_flat_inline7);
+                            params_t0.add_input(post_flat_inline8);
+                            params_t0.add_input(x_flat_inline2);
+                            params_t0.add_input(comb_flat_inline9);
+                            params_t0.add_input(residual_flat_inline6);
+                            params_t0.add_scalar((uint64_t)0);
+                            params_t0.add_scalar(out_h_inline3);
+                            rt_submit_aiv_task(38, params_t0);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

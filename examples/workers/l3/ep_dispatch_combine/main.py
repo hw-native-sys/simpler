@@ -160,6 +160,7 @@ KERNELS: list[tuple[int, str, str, str]] = [
     (35, "sh_write", "kernels/aiv/sh_write.cpp", "aiv"),
     (36, "combine", "kernels/aiv/combine.cpp", "aiv"),
     (37, "ffn_add", "kernels/aiv/ffn_add.cpp", "aiv"),
+    (38, "hc_post", "kernels/aiv/hc_post.cpp", "aiv"),
 ]
 
 
@@ -238,9 +239,9 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallab
             sig = []
         children.append((fid, CoreCallable.build(signature=sig, binary=bins[fid])))
 
-    # Orchestration arg view: 24 INs (x_hc..shared_w2_scale), 13 OUTPUT_EXISTING
-    # (x_norm..routed_y, ffn_out), 1 INOUT scratch — 38 tensors + 2 scalars.
-    sig_orch = [ArgDirection.IN] * 24 + [ArgDirection.OUT] * 13 + [ArgDirection.INOUT]
+    # Orchestration arg view: 24 INs (x_hc..shared_w2_scale), 14 OUTPUT_EXISTING
+    # (x_norm..routed_y, ffn_out, y), 1 INOUT scratch — 39 tensors + 2 scalars.
+    sig_orch = [ArgDirection.IN] * 24 + [ArgDirection.OUT] * 14 + [ArgDirection.INOUT]
 
     return ChipCallable.build(
         signature=sig_orch,
@@ -645,6 +646,52 @@ def _verify_routed_y(nranks, route_dest, recv_y_goldens, routed_y_outs) -> bool:
     return ok
 
 
+def _golden_hc_post(x_bf16, residual_bf16, post_fp32, comb_fp32):
+    """Torch port of ``models/deepseek/v4/hc_post.py::golden_hc_post``.
+
+    Inputs:
+      x        [B, S, D]               BF16 (= ffn_out)
+      residual [B, S, HC_MULT, D]      BF16 (= moe_router input x_hc)
+      post     [B, S, HC_MULT]         FP32
+      comb     [B, S, HC_MULT, HC_MULT] FP32
+    Returns y [B, S, HC_MULT, D] BF16."""
+    x = x_bf16.float()
+    residual = residual_bf16.float()
+    post = post_fp32.float()
+    comb = comb_fp32.float()
+    y = torch.zeros(B, S, HC_MULT, D, dtype=torch.float32)
+    for out_h in range(HC_MULT):
+        y_row = x * post[:, :, out_h : out_h + 1]
+        for in_h in range(HC_MULT):
+            y_row = y_row + residual[:, :, in_h, :] * comb[:, :, in_h, out_h : out_h + 1]
+        y[:, :, out_h, :] = y_row
+    return y.to(torch.bfloat16)
+
+
+def _verify_hc_post(nranks, x_hcs, post_ffn_goldens, comb_ffn_goldens,
+                    route_dest, recv_y_goldens, sh_goldens, y_outs) -> bool:
+    """Verify hc_post output. Feed the host-side ffn_out_golden (= routed_y +
+    sh, both golden) through golden_hc_post and compare against chip y."""
+    ok = True
+    # hc_post is a 4×4 linear combination of (x, residual) with FP32 fma then a
+    # single BF16 cast. Noise budget propagates from ffn_out (~5e-2) scaled by
+    # post (~O(1)) plus the residual contribution; cap at ~1e-1.
+    atol = 1e-1
+    rtol = 1e-2
+    for me in range(nranks):
+        routed_golden = _routed_y_golden(route_dest, recv_y_goldens, me)
+        ffn_out_golden = (routed_golden + sh_goldens[me].float()).to(torch.bfloat16)
+        x_bs = ffn_out_golden.view(B, S, D)
+        expected = _golden_hc_post(x_bs, x_hcs[me], post_ffn_goldens[me], comb_ffn_goldens[me]).float()
+        got = y_outs[me].float()
+        diff = (got - expected).abs()
+        print(f"[ep_dispatch] chip {me}: y (hc_post) max|diff|={float(diff.max()):.3e}")
+        if not torch.allclose(got, expected, rtol=rtol, atol=atol):
+            ok = False
+            print(f"[ep_dispatch] chip {me}: hc_post mismatch (rtol={rtol}, atol={atol})")
+    return ok
+
+
 def _verify_ffn_out(nranks, route_dest, recv_y_goldens, sh_goldens, ffn_out_outs) -> bool:
     """ffn_out = (routed_y + sh).to(bf16). chip uses an FP32 add then one
     BF16 cast (CAST_RINT); golden mirrors exactly."""
@@ -749,6 +796,8 @@ def run(
     routed_y_outs = [torch.zeros(T, D, dtype=torch.float32).share_memory_() for _ in range(nranks)]
     # ffn_out = routed_y + sh — final post-MoE add (single-layer spec).
     ffn_out_outs = [torch.zeros(T, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
+    # hc_post output — next-layer x_hc [B, S, HC_MULT, D] BF16.
+    y_outs = [torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
 
     cfgs = [
         ChipBootstrapConfig(
@@ -837,7 +886,8 @@ def run(
                 a.add_tensor(make_tensor_arg(sh_outs[i]), TensorArgType.OUTPUT_EXISTING)
                 a.add_tensor(make_tensor_arg(routed_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
                 a.add_tensor(make_tensor_arg(ffn_out_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                # scratch (37)
+                a.add_tensor(make_tensor_arg(y_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                # scratch (38)
                 a.add_tensor(
                     ContinuousTensor.make(
                         data=ctx.buffer_ptrs["scratch"], shapes=(SCRATCH_NBYTES // 4,),
@@ -871,6 +921,8 @@ def run(
         ok = _verify_expert_outputs(nranks, recv_y_goldens, sh_goldens, expected_count, recv_y_outs, sh_outs) and ok
         ok = _verify_routed_y(nranks, route_dest, recv_y_goldens, routed_y_outs) and ok
         ok = _verify_ffn_out(nranks, route_dest, recv_y_goldens, sh_goldens, ffn_out_outs) and ok
+        ok = _verify_hc_post(nranks, R_in["x_hcs"], post_ffn_goldens, comb_ffn_goldens,
+                             route_dest, recv_y_goldens, sh_goldens, y_outs) and ok
 
         if not ok:
             print("[ep_dispatch] golden check FAILED")
