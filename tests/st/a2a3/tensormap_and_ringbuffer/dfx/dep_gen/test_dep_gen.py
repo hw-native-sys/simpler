@@ -150,8 +150,19 @@ class TestDepGen(SceneTestCase):
             return
         with deps_path.open() as f:
             deps = json.load(f)
-        assert deps.get("version") == 1, f"deps.json version {deps.get('version')} != 1"
-        deps_edges = {(int(e[0]), int(e[1])) for e in deps.get("edges", []) if isinstance(e, list) and len(e) == 2}
+        # v2 is the only supported schema — annotated edges with tasks[] /
+        # tensors[] sidecars. Project annotated edges down to a (pred, succ)
+        # set for the existing structural checks; the annotation sanity check
+        # below verifies the tensor metadata path.
+        assert deps.get("version") == 2, f"deps.json version {deps.get('version')} != 2"
+        raw_edges = deps.get("edges", [])
+        deps_edges = set()
+        for e in raw_edges:
+            assert isinstance(e, dict), f"v2 edge must be an object, got {type(e).__name__}: {e!r}"
+            pred, succ = e.get("pred"), e.get("succ")
+            if pred is None or succ is None:
+                continue
+            deps_edges.add((int(pred), int(succ)))
 
         # example_orchestration.cpp comment block (verified by tracing the source):
         #   t0: ring 0, local 0
@@ -170,6 +181,36 @@ class TestDepGen(SceneTestCase):
         valid_ids = {t0, t1, t2, t3, t4}
         bad = {e for e in deps_edges if e[0] not in valid_ids or e[1] not in valid_ids}
         assert not bad, f"deps.json contains edges referencing unknown task ids: {bad}"
+
+        # ---- v2 annotated-edge sanity ----
+        # Replay always emits the v2 schema with the tensor-info sidecar; the
+        # differential check inside the replay would have failed the run before
+        # we got here if the annotated pass disagreed with compute_task_fanin.
+        # These assertions just confirm the schema actually carries the
+        # expected blocks (so e.g. a future "always write empty arrays" bug
+        # would surface here, not silently in a downstream viewer).
+        tasks = deps.get("tasks", [])
+        tensors = deps.get("tensors", [])
+        task_ids = {int(t["task_id"]) for t in tasks if "task_id" in t}
+        assert valid_ids <= task_ids, f"tasks[] missing expected ids: {valid_ids - task_ids}"
+        # Every non-explicit edge should reference a tensor_id present in
+        # tensors[]. EXPLICIT edges legitimately omit it.
+        tensor_ids = {int(t["tensor_id"]) for t in tensors if "tensor_id" in t}
+        for e in raw_edges:
+            if not isinstance(e, dict):
+                continue
+            source = e.get("source")
+            if source == "explicit":
+                continue
+            tid = e.get("tensor_id")
+            assert tid is not None and int(tid) in tensor_ids, (
+                f"edge {e.get('pred')}->{e.get('succ')} (source={source}) "
+                f"references tensor_id {tid} absent from tensors[]"
+            )
+            # Annotated edges must carry consumer-side slice info.
+            assert "consumer_shape" in e and "consumer_offset" in e, (
+                f"edge {e.get('pred')}->{e.get('succ')} (source={source}) missing consumer_shape/offset"
+            )
 
         # ---- fanout ⊆ deps validation gate ----
         perf = out_dir / "l2_perf_records.json"

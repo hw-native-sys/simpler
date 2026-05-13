@@ -153,8 +153,8 @@ python -m simpler_setup.tools.swimlane_converter \
     outputs/<case>_<ts>/l2_perf_records.json \
     --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
 
-python -m simpler_setup.tools.perf_to_mermaid \
-    outputs/<case>_<ts>/l2_perf_records.json \
+python -m simpler_setup.tools.deps_to_graph \
+    outputs/<case>_<ts>/deps.json \
     --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
 ```
 

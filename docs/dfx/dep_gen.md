@@ -1,4 +1,4 @@
-# dep_gen — Complete Per-Submit Dependency Graph
+# dep_gen — Complete Per-Submit Dependency Graph (v2, Tensor-Annotated)
 
 ## 1. Background & Motivation
 
@@ -41,15 +41,28 @@ appear too.
   the runner. No `submit_trace.bin` lands on disk — the host already
   has the records once the run ends, and going through the filesystem
   would just be extra I/O.
-- **Host replay.** After `reconcile_counters()` confirms a clean trace
-  (no drops, no leftovers), `dep_gen_replay_emit_deps_json` runs every
-  record back through a host-resident `PTO2TensorMap`. Per-record
-  semantics mirror runtime `submit_task` exactly: STEP 1 (explicit
-  deps), STEP 3 (creator retention + tensormap lookup), STEP 4
-  (register outputs). Per-successor dedup matches
-  `PTO2FaninBuilder::append_fanin_or_fail`.
-- **Output.** `<output_prefix>/deps.json` —
-  `{"version":1,"edges":[[pred_raw,succ_raw], ...]}`.
+- **Host replay (dual-pass, self-checking).** After `reconcile_counters()`
+  confirms a clean trace (no drops, no leftovers),
+  `dep_gen_replay_emit_deps_json` runs every record back through *two*
+  parallel host-resident `PTO2TensorMap` instances that evolve in lockstep:
+  - **Oracle pass** drives the canonical `compute_task_fanin` template
+      from `pto_dep_compute.h` and collects the producer-id set the
+      runtime would have emitted.
+  - **Annotated pass** runs an inlined mirror of STEP A
+      (creator retention) + STEP B (tensormap lookup) against the second
+      map, with a wider callback so each edge gets recorded with its
+      tensor metadata (producer/consumer shape + offset, dtype, version).
+  Per-record semantics mirror runtime `submit_task` exactly: STEP 1
+  (explicit deps), STEP 3 (creator retention + tensormap lookup),
+  STEP 4 (register outputs). Per-successor dedup matches
+  `PTO2FaninBuilder::append_fanin_or_fail`. After both passes finish per
+  record, the replay asserts the two producer-id sets are equal; if they
+  diverge, `deps.json` is not written and the function returns non-zero.
+  This is the guarantee against silent shotgun modifications — anyone
+  who changes `compute_task_fanin` semantics will trip the gate
+  immediately and know to update the annotated mirror.
+- **Output.** `<output_prefix>/deps.json` — v2 schema with `tasks[]`,
+  `tensors[]`, and tensor-annotated `edges[]` (see §4).
 
 ---
 
@@ -84,38 +97,91 @@ The standard SceneTest path
 
 ---
 
-## 4. Output: `deps.json`
+## 4. Output: `deps.json` (v2)
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "tasks": [
+    {"task_id": "0",          "scope": "auto"},
+    {"task_id": "4294967296", "scope": "auto"}
+  ],
+  "tensors": [
+    {"tensor_id": "13451765318376212391",
+     "buffer_addr": "29204938752", "version": 0,
+     "dtype": "FLOAT32", "ndims": 1, "raw_shapes": [16384]}
+  ],
   "edges": [
-    [0,           4294967296],
-    [0,           4294967297],
-    [4294967296,  4294967298],
-    [4294967297,  4294967298],
-    [4294967298,  4294967299],
-    [0,           4294967299]
+    {"pred": "0", "succ": "4294967296", "arg": 0, "source": "creator",
+     "tensor_id": "13451765318376212391", "consumer_dtype": "FLOAT32",
+     "consumer_shape": [16384], "consumer_offset": [0]},
+    {"pred": "4294967296", "succ": "4294967298", "arg": 0, "source": "tensormap",
+     "overlap": "covered",
+     "tensor_id": "9514117477438350967", "consumer_dtype": "FLOAT32",
+     "consumer_shape": [16384], "consumer_offset": [0],
+     "producer_shape": [16384], "producer_offset": [0]}
   ]
 }
 ```
 
-Each edge is `[pred_raw, succ_raw]` where the raw uint64 encodes
-`(ring_id << 32) | local_id` — the same layout as `PTO2TaskId::raw`. To
-decode:
+All 64-bit unsigned fields (`task_id`, `tensor_id`, `pred`, `succ`,
+`buffer_addr`) are serialized as JSON **strings**, not numbers. Many
+JavaScript-based JSON parsers can only safely represent integers up to
+`Number.MAX_SAFE_INTEGER` (2^53 − 1); `tensor_id` (FNV-1a hash) and
+`buffer_addr` (hardware address) routinely exceed that limit and would
+silently lose precision if encoded as numbers. Python consumers pass
+these through `int(v)` which accepts either form, so the schema is
+JS-safe without burdening Python.
+
+Task ids encode `(ring_id << 32) | local_id` — the same layout as
+`PTO2TaskId::raw`:
 
 ```python
 ring = (raw >> 32) & 0xFF
 local = raw & 0xFFFFFFFF
 ```
 
-Edges are de-duplicated within a single successor's fanin (matches the
-runtime's `append_fanin_or_fail` contract) but **not** globally —
-distinct successors with the same predecessor each get their own edge.
+### `tasks[]`
 
-`deps.json` can be empty (`"edges":[]`) when the workload's tasks have
-no inter-task data dependencies (e.g. embarrassingly parallel kernels
-under scope_end barriers). That is not an error.
+One entry per task observed in the trace. `scope` is `"manual"` when the
+submit happened inside a manual scope (no automatic dependency wiring)
+and `"auto"` otherwise. Tools that only need task-pair edges can ignore
+this block.
+
+### `tensors[]`
+
+One entry per unique `(buffer_addr, version)` pair touched by the trace.
+`tensor_id` is a stable FNV-1a 64-bit hash of that pair — identical
+inputs across runs yield the same id, making `deps.json` files diffable.
+`raw_shapes` describes the **underlying buffer**, not the slice;
+per-edge slice information lives in the `edges[]` entries.
+
+### `edges[]`
+
+Each edge is `{pred, succ}` plus annotation. Fields:
+
+| Field | Type | When present | Meaning |
+| ----- | ---- | ------------ | ------- |
+| `pred`, `succ` | uint64 (string) | always | `PTO2TaskId::raw` of producer and consumer |
+| `arg` | int32 | always | Consumer's arg-slot index; `-1` for `explicit` source |
+| `source` | string | always | `explicit` (from `explicit_deps[]`), `creator` (`owner_task_id` retention), or `tensormap` (overlap lookup hit) |
+| `overlap` | string | `source=tensormap` | `covered` (producer slice fully contains consumer slice) or `other` |
+| `tensor_id` | uint64 (string) | not `explicit` | Identity of the underlying tensor; cross-references `tensors[]` |
+| `consumer_dtype` | string | not `explicit` | Element type the consumer reads as |
+| `consumer_shape`, `consumer_offset` | uint32 array | not `explicit` | The slice the consumer actually reads |
+| `producer_shape`, `producer_offset` | uint32 array | `source=tensormap` | The slice the producer wrote (recovered from the live tensormap entry) |
+
+A single `(pred, succ)` pair can appear in `edges[]` multiple times if
+the producer drives the consumer through multiple slots, multiple
+sources, or multiple tensormap matches (different slice / version). For
+"is task X a successor of task Y at all?" questions, project edges down
+to the `(pred, succ)` set; for "what specifically did Y feed into X?",
+keep the full annotation.
+
+`deps.json` can have `"edges":[]` when the workload's tasks have no
+inter-task data dependencies (e.g. embarrassingly parallel kernels
+under scope_end barriers). `tasks[]` and `tensors[]` still list every
+observed task and tensor — that is not an error.
 
 ---
 
@@ -135,7 +201,44 @@ python -m simpler_setup.tools.deps_to_graph outputs/.../deps.json
 
 # Big graphs: use force-directed layout (recommended >1000 nodes)
 python -m simpler_setup.tools.deps_to_graph deps.json --engine sfdp
+
+# Show per-edge tensor slice annotations on the arrows.
+# Off by default — the bare task-pair graph stays readable on dense workloads;
+# turn this on when you actually need to inspect which slice an edge carries.
+python -m simpler_setup.tools.deps_to_graph deps.json --show-tensor-info
 ```
+
+`--show-tensor-info` rewrites every task as an HTML-table node with two
+compartments:
+
+- **Top rows (blue)** are the consumed inputs (slots of type `INPUT`
+  and `INOUT`).
+- **Middle header** is the task identity (`(ring, local) · func_name`),
+  background-colored by core_type (aic / aiv / mix / alloc).
+- **Bottom rows (orange)** are the produced outputs (`INOUT`,
+  `OUTPUT_EXISTING`, and `OUTPUT` slots).
+
+Each arg row carries a 4-line block:
+
+```text
+arg<i> <ARG_TYPE>[ ?] <Tname>:<dtype>
+raw:    [...]    # underlying buffer (from tensors[].raw_shapes)
+shape:  [...]    # slice this slot accesses
+offset: [...]    # slice start in the raw buffer
+```
+
+`<Tname>` is `T<idx>` from `tensors[]` order, so two slots referencing
+the same underlying buffer share a name across the whole graph.
+`raw != shape` is a visual cue that the slot accesses a sub-region.
+The trailing `?` on an `OUTPUT` row marks a tensor_id that the viewer
+backfilled from a downstream `creator` edge (the runtime hadn't
+materialized a Tensor at `submit_task` time, so the raw blob was zero).
+
+Edges in this mode route from the producer's `out_<idx>` row directly
+to the consumer's `in_<arg>` row, so "which output of X feeds which
+input of Y" reads off the picture. `explicit`-source edges render as
+dashed grey arrows; `tensormap` edges whose `overlap` is not `covered`
+carry a small red label so partial-overlap cases stand out.
 
 Node visual encoding (legend top-right of the rendered HTML):
 
@@ -167,7 +270,12 @@ for this tool.
 
 ## 6. Relationship to `fanout[]` + Validation Gate
 
-`deps.json` is a **superset** of the fanout edges in
+When checking fanout coverage, project v2 edges down to a
+`{(pred, succ)}` set first — the per-edge annotation distinguishes
+sources / args / slices, so the raw `edges[]` count is a superset of the
+underlying task-pair count.
+
+`deps.json` (projected) is a **superset** of the fanout edges in
 `l2_perf_records.json`:
 
 | Edge source | Captures | Drops on race? |
@@ -196,7 +304,7 @@ dependencies).
 | AICPU writer | `src/a2a3/platform/{include,src}/aicpu/dep_gen_collector_aicpu.{h,cpp}` | Single-instance write path; weak-fallback exported to host build |
 | Host collector | `src/a2a3/platform/{include/host,src/host}/dep_gen_collector.{h,cpp}` | `ProfilerBase<DepGenCollector, DepGenModule>` — drains ring → `records_` vector |
 | Capture call site | `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. Dep-only tasks land in the record stream with valid tensor/dep info but no kernel_id field (the schema does not carry kernel_id), so replay treats them as ordinary dep nodes — viewers do not currently distinguish dummy from real tasks. |
-| Replay | `src/a2a3/runtime/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs `compute_task_fanin` + `register_task_outputs` against a host `PTO2TensorMap` |
+| Replay | `src/a2a3/runtime/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs dual-pass differential replay — `compute_task_fanin` (oracle) + inlined STEP A/B mirror (annotated) against two `PTO2TensorMap` instances. Emits v2 `deps.json` when both passes agree per record. |
 | Device-runner hookup | `src/a2a3/platform/{onboard,sim}/host/device_runner.cpp` | post-`reconcile_counters` calls `dep_gen_replay_emit_deps_json(records.data(), records.size(), deps_path, nullptr)` |
 | Viewer | `simpler_setup/tools/deps_to_graph.py` | `deps.json` → pan/zoom HTML |
 | Test | `tests/st/a2a3/tensormap_and_ringbuffer/dep_gen_capture/test_dep_gen_capture.py` | Smoke test + `fanout ⊆ deps` validation gate |

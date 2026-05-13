@@ -31,16 +31,36 @@
  * so reconstructs the graph the runtime would have built if no producer ever
  * raced ahead.
  *
- * Output format (deps.json):
+ * Output format (deps.json, v2):
  *
- *   {"version":1,"edges":[[pred_raw,succ_raw], ...]}
+ *   {"version":2,
+ *    "tasks":   [{"task_id":<u64>, "scope":"auto|manual"}, ...],
+ *    "tensors": [{"tensor_id":<u64>, "buffer_addr":<u64>, "version":<i32>,
+ *                 "dtype":"FLOAT32", "ndims":<u32>, "raw_shapes":[...]}, ...],
+ *    "edges":   [{"pred":<u64>, "succ":<u64>, "arg":<i32>,
+ *                 "source":"explicit|creator|tensormap",
+ *                 "overlap":"covered|other" (tensormap only),
+ *                 "tensor_id":<u64> (non-explicit),
+ *                 "consumer_dtype":"...", "consumer_shape":[...], "consumer_offset":[...],
+ *                 "producer_shape":[...] (tensormap), "producer_offset":[...] (tensormap)},
+ *                ...]}
  *
- *   - ``pred_raw`` / ``succ_raw`` are ``PTO2TaskId::raw`` values
- *     (``(ring_id << 32) | local_id``).
- *   - Edges are de-duplicated within a single successor's fanin but not
- *     globally: identical (pred, succ) pairs are emitted only once per succ
- *     because compute_task_fanin / register_task_outputs already dedup via
- *     creator-retention + tensormap.
+ *   - All task ids are ``PTO2TaskId::raw`` values (``(ring_id << 32) | local_id``).
+ *   - ``tensor_id`` is a stable FNV-1a hash of ``(buffer_addr, version)``.
+ *   - Distinct producers / arg indices / sources keep their own edges; per-record
+ *     deduplication of producer ids mirrors the runtime
+ *     ``PTO2FaninBuilder::append_fanin_or_fail`` semantics so the set of
+ *     ``(pred, succ)`` pairs in v2 is identical to what the runtime would have
+ *     recorded.
+ *
+ * Self-checking: the replay runs two parallel tensormap instances per record —
+ * an "oracle" map driven by the canonical ``compute_task_fanin`` template, and
+ * an "annotated" map driven by an inlined mirror that captures the per-edge
+ * tensor metadata. If the producer-id set on the two passes ever diverges,
+ * deps.json is NOT written and the function returns a non-zero error code.
+ * This is the guarantee against silent shotgun modifications: anyone who
+ * changes ``compute_task_fanin`` semantics has to mirror the change here too
+ * or the gate fires immediately.
  *
  * The replay is single-threaded and pure CPU: no device handle is required.
  */

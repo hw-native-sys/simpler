@@ -144,14 +144,30 @@ def load_deps_json(perf_records_path):
     edges = data.get("edges")
     if not isinstance(edges, list):
         return None
+    version = data.get("version")
+    if version != 2:
+        print(
+            f"Warning: deps.json version={version!r}; only v2 is supported. Falling back to fanout[].",
+            file=sys.stderr,
+        )
+        return None
+    # The converter only needs flow-event endpoints (not the per-edge tensor
+    # annotations). Project annotated edges down to a (pred, succ) set and
+    # dedup so multiple annotated edges sharing the same pair (distinct arg
+    # / source / overlap) collapse to a single flow event.
     by_pred: dict[int, list[int]] = defaultdict(list)
+    seen: set[tuple[int, int]] = set()
     for edge in edges:
-        if not isinstance(edge, (list, tuple)) or len(edge) != 2:
+        if not isinstance(edge, dict):
             continue
-        pred = normalize_pto2_task_id_int(edge[0])
-        succ = normalize_pto2_task_id_int(edge[1])
+        pred = normalize_pto2_task_id_int(edge.get("pred"))
+        succ = normalize_pto2_task_id_int(edge.get("succ"))
         if pred is None or succ is None:
             continue
+        key = (pred, succ)
+        if key in seen:
+            continue
+        seen.add(key)
         by_pred[pred].append(succ)
     return dict(by_pred)
 
