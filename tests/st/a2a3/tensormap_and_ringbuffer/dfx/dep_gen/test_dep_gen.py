@@ -37,6 +37,8 @@ capture+replay+validation pipeline.
 """
 
 import json
+import shutil
+import subprocess
 import sys
 
 import torch
@@ -229,6 +231,29 @@ class TestDepGen(SceneTestCase):
                 f"This is a replay-side regression — the replay should be a "
                 f"superset of the runtime's fanout view."
             )
+
+        # ---- Tool smoke: deps_to_graph ----
+        # Exit-code-only check; we don't validate the HTML content. A schema
+        # change that breaks the viewer fires here in the same CI step that
+        # produced the artifact, so the failure is attributed to the right
+        # capture. graphviz `dot` is required for rendering; skip on dev
+        # machines without it (CI installs it explicitly).
+        if shutil.which("dot"):
+            for extra in ([], ["--show-tensor-info"]):
+                out_html = out_dir / ("_smoke_deps_with_tensors.html" if extra else "_smoke_deps.html")
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "simpler_setup.tools.deps_to_graph",
+                        str(deps_path),
+                        *extra,
+                        "-o",
+                        str(out_html),
+                    ],
+                    check=True,
+                    timeout=60,
+                )
 
 
 if __name__ == "__main__":

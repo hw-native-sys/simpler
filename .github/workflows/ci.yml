@@ -181,9 +181,15 @@ jobs:
             sudo apt-get install -y ninja-build
             sudo apt-get install -y g++-15 || sudo apt-get install -y g++
             if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+            # graphviz: required by the dep_gen smoke (deps_to_graph -> dot).
+            # Installed unconditionally so both a2a3 and a5 sim jobs stay
+            # uniform — the dep_gen test is a2a3-only today but the cost is
+            # negligible and the alternative branch sprawls the install logic.
+            sudo apt-get install -y graphviz
           else
             brew install ninja
             brew install gcc@15 || brew install gcc
+            brew install graphviz
           fi
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -267,9 +273,15 @@ jobs:
             sudo apt-get install -y ninja-build
             sudo apt-get install -y g++-15 || sudo apt-get install -y g++
             if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+            # graphviz: required by the dep_gen smoke (deps_to_graph -> dot).
+            # Installed unconditionally so both a2a3 and a5 sim jobs stay
+            # uniform — the dep_gen test is a2a3-only today but the cost is
+            # negligible and the alternative branch sprawls the install logic.
+            sudo apt-get install -y graphviz
           else
             brew install ninja
             brew install gcc@15 || brew install gcc
+            brew install graphviz
           fi
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -359,6 +371,13 @@ jobs:
           source .venv/bin/activate
           pip install --upgrade pip
           pip install '.[test]'
+          # Warn if graphviz isn't installed on the runner — the dep_gen
+          # smoke step needs `dot` to render deps_to_graph. The Python
+          # has_binary("dot") guard in the test will skip cleanly without
+          # it, but coverage drops, so flag it loudly here.
+          if ! command -v dot >/dev/null 2>&1; then
+            echo "::warning::graphviz 'dot' not found on PATH; deps_to_graph tool smoke will skip. Install graphviz on this self-hosted runner to restore coverage."
+          fi
 
       - name: Run pytest scene tests (a2a3)
         run: |

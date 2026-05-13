@@ -19,6 +19,9 @@ the assertions are skipped — the test still runs the case so the default
 """
 
 import json
+import re
+import subprocess
+import sys
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -89,9 +92,9 @@ class TestL2Swimlane(SceneTestCase):
             return
         for case in self.CASES:
             if st_platform in case["platforms"]:
-                self._validate_perf_artifact(case)
+                self._validate_perf_artifact(case, st_platform)
 
-    def _validate_perf_artifact(self, case):
+    def _validate_perf_artifact(self, case, st_platform):
         safe_label = _sanitize_for_filename(f"TestL2Swimlane_{case['name']}")
         matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
         if not matches:
@@ -112,6 +115,75 @@ class TestL2Swimlane(SceneTestCase):
         first = tasks[0]
         for key in ("task_id", "func_id", "core_id", "core_type", "start_time_us", "end_time_us", "fanout"):
             assert key in first, f"perf record missing required field '{key}': {first}"
+
+        # ---- Tool smoke: swimlane_converter ----
+        # Exit-code-only check; we don't validate the Perfetto JSON content. A
+        # schema change that breaks the converter fires here in the same CI
+        # step that produced the artifact.
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "simpler_setup.tools.swimlane_converter",
+                str(perf),
+                "-o",
+                str(matches[-1] / "_smoke_swimlane.json"),
+            ],
+            check=True,
+            timeout=60,
+        )
+
+        # ---- Tool smoke: sched_overhead_analysis ----
+        # The analysis joins l2_perf_records.json with AICPU cycle counters
+        # (dispatch_time / finish_time, populated in l2_perf_collector.cpp).
+        # No #ifdef gates the capture — the fields are unconditionally written
+        # when the value is non-zero, so coverage hinges on the AICPU actually
+        # writing real cycle counts. That happens on hardware; on sim the
+        # cycle counters may be 0 or absent.
+        #
+        # Sim: smoke is `--help` — verifies the module imports, argparse is
+        # wired, the entry point hasn't bit-rotted. Cheap, doesn't false-
+        # positive on missing device data.
+        # Hardware: full run with stdout assertions — section headers must
+        # all print AND at least one numeric metric must be non-zero. The
+        # "all zeros" failure mode (e.g., capture path was silently dropped
+        # in a refactor) would print `0.0 us` everywhere; the regex check
+        # below catches that.
+        if st_platform.endswith("sim"):
+            subprocess.run(
+                [sys.executable, "-m", "simpler_setup.tools.sched_overhead_analysis", "--help"],
+                check=True,
+                timeout=10,
+                stdout=subprocess.DEVNULL,
+            )
+        else:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "simpler_setup.tools.sched_overhead_analysis",
+                    "--l2-perf-records-json",
+                    str(perf),
+                ],
+                check=True,
+                timeout=120,
+                capture_output=True,
+                text=True,
+            )
+            for header in ("Part 1:", "Part 2:", "Part 3:"):
+                assert header in result.stdout, (
+                    f"sched_overhead missing section header '{header}'\nstdout:\n{result.stdout}"
+                )
+            # Bad pattern: AICPU didn't capture real cycle counters → tool
+            # "succeeds" but every metric is 0. Match the line that's printed
+            # unconditionally in Part 2 and assert its value is non-zero.
+            m = re.search(r"Avg scheduler loop iteration:\s+([\d.]+)\s+us", result.stdout)
+            assert m, f"sched_overhead stdout missing 'Avg scheduler loop iteration'\nstdout:\n{result.stdout}"
+            assert float(m.group(1)) > 0.0, (
+                f"sched_overhead reports zero loop iteration (avg_loop_us={m.group(1)}). "
+                f"AICPU likely didn't capture dispatch_time/finish_time cycle counters — "
+                f"the L2 perf collector path may have regressed.\nstdout:\n{result.stdout}"
+            )
 
 
 if __name__ == "__main__":
