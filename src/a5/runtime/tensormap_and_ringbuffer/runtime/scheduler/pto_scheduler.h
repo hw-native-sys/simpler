@@ -14,7 +14,7 @@
  *
  * The Scheduler is responsible for:
  * 1. Maintaining per-resource-shape ready queues
- * 2. Tracking task state (PENDING -> READY -> RUNNING -> COMPLETED -> CONSUMED)
+ * 2. Tracking task state (PENDING -> COMPLETED -> CONSUMED)
  * 3. Managing fanin/fanout refcounts for dependency resolution
  * 4. Advancing last_task_alive for heap reclamation
  * 5. Two-stage mixed-task completion (subtask done bits → mixed-task complete)
@@ -815,23 +815,17 @@ struct PTO2SchedulerState {
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
-            PTO2TaskState expected = PTO2_TASK_PENDING;
-            if (slot_state.task_state.compare_exchange_strong(
-                    expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire
-                )) {
-                atomic_count += 1;  // CAS(task_state PENDING→READY)
-                // Local-first: try per-CoreType thread-local buffer before global queue.
-                // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
-                // and go straight to dummy_ready_queue; use the profiling-aware push so
-                // atomic_count / push_wait stay consistent with the non-dummy path.
-                PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-                if (shape == PTO2ResourceShape::DUMMY) {
-                    dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
-                } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
-                    ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
-                }
-                return true;
+            // Local-first: try per-CoreType thread-local buffer before global queue.
+            // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
+            // and go straight to dummy_ready_queue; use the profiling-aware push so
+            // atomic_count / push_wait stay consistent with the non-dummy path.
+            PTO2ResourceShape shape = slot_state.active_mask.to_shape();
+            if (shape == PTO2ResourceShape::DUMMY) {
+                dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
+            } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
+                ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
             }
+            return true;
         }
         return false;
     }
@@ -1086,12 +1080,6 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
     unlock();
     return result;
 }
-
-// =============================================================================
-// Debug Utilities (cold path, defined in pto_scheduler.cpp)
-// =============================================================================
-
-const char *task_state_name(PTO2TaskState state);
 
 // =============================================================================
 // Scheduler Profiling Data

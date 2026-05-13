@@ -348,19 +348,19 @@ When `PTO2OrchestratorState::submit_task` processes parameters:
 ### 6.2 Task State Machine
 
 ```text
-  [0] PENDING ──fanin satisfied──► [1] READY ──dispatch──► [2] RUNNING
-      ▲                                                         │
-      │                                                         ▼
-  slot recycled ◄── [4] CONSUMED ◄──fanout done── [3] COMPLETED
+  [0] PENDING ──worker(s) done──► [1] COMPLETED ──fanout done──► [2] CONSUMED
+      ▲                                                                │
+      │                                                                ▼
+      └──────────────────── slot recycled ◄───────────────────────────┘
 ```
 
 In the scheduler's `task_state[]` array (`std::atomic<PTO2TaskState>`):
 
-- **0 (PENDING)**: waiting for dependencies (`fanin_refcount < fanin_count`)
-- **1 (READY)**: all dependencies satisfied, waiting in ready queue
-- **2 (RUNNING)**: currently executing on a worker
-- **3 (COMPLETED)**: hardware execution complete, output may still be in use
-- **4 (CONSUMED)**: output fully consumed, buffers can be released
+- **0 (PENDING)**: slot is allocated and remains PENDING through "waiting on
+  producers", "queued in ready queue", and "dispatched to a worker"; ready vs
+  running is derived from `fanin_refcount` and per-core `running_slot_state`
+- **1 (COMPLETED)**: hardware execution complete, output may still be in use
+- **2 (CONSUMED)**: output fully consumed, buffers can be released
 
 ---
 

@@ -143,6 +143,7 @@ SchedulerContext::check_idle_fatal_error(int32_t thread_idx, PTO2SharedMemoryHea
 //   SUMMARY  — completed / total counts and scan totals               (thread 0 only)
 //   TASK     — one per non-completed task scanned from shared rings   (thread 0 only)
 //              - state=RUNNING: includes running_on=[...] cross-ref
+//              - state=READY:   fanin satisfied but no idle core yet
 //              - state=WAIT:    includes missing_deps=N
 //   CLUSTER  — one per cluster owned by this thread                   (every thread)
 //              - busy slot shows kernel + task_id + cond_reg_state;
@@ -234,12 +235,12 @@ void SchedulerContext::log_stall_diagnostics(
                 int32_t kid_aiv1 = slot_state.task->kernel_id[2];
                 int64_t task_id = static_cast<int64_t>(slot_state.task->task_id.raw);
                 if (st >= PTO2_TASK_COMPLETED) continue;
-                // task_state's intermediate values (READY / RUNNING) are not
-                // written on the non-profiling hot path, so we cannot rely on
-                // them — classify by the ground truth instead: a slot is
-                // RUNNING iff some core has it as running_slot_state. A task
-                // occupies at most 3 cores (one cluster), all under the same
-                // owner thread by construction of assign_cores_to_threads.
+                // task_state has no intermediate ready/running value — it
+                // stays PENDING until the worker stores COMPLETED. Classify
+                // by the ground truth instead: a slot is RUNNING iff some
+                // core has it as running_slot_state. A task occupies at most
+                // 3 cores (one cluster), all under the same owner thread by
+                // construction of assign_cores_to_threads.
                 char running_on[192] = {0};
                 int32_t owner = -1;
                 int32_t pos = 0;

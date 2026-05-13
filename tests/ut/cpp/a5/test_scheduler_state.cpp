@@ -83,12 +83,12 @@ TEST_F(SchedulerStateTest, ConsumedTransition) {
 
 TEST_F(SchedulerStateTest, ConsumedNotCompletedState) {
     alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_RUNNING, 1, 1);
+    init_slot(slot, PTO2_TASK_PENDING, 1, 1);
     slot.fanout_refcount.store(1);
 
     sched.check_and_handle_consumed(slot);
-    // CAS fails because state is RUNNING, not COMPLETED
-    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_RUNNING);
+    // CAS fails because state is PENDING, not COMPLETED
+    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_PENDING);
 }
 
 TEST_F(SchedulerStateTest, ConsumedIdempotent) {
@@ -130,7 +130,7 @@ TEST_F(SchedulerStateTest, ReleaseProducerTriggersConsumed) {
 
 TEST_F(SchedulerStateTest, SubtaskCompleteSingle) {
     alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_RUNNING, 1, 1);
+    init_slot(slot, PTO2_TASK_PENDING, 1, 1);
     slot.total_required_subtasks = 1;
     slot.completed_subtasks.store(0);
 
@@ -139,7 +139,7 @@ TEST_F(SchedulerStateTest, SubtaskCompleteSingle) {
 
 TEST_F(SchedulerStateTest, SubtaskCompleteMultiBlock) {
     alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_RUNNING, 1, 1);
+    init_slot(slot, PTO2_TASK_PENDING, 1, 1);
     slot.total_required_subtasks = 6;  // 3 cores * 2 blocks
     slot.completed_subtasks.store(0);
 
@@ -176,7 +176,7 @@ TEST_F(SchedulerStateTest, ScopeEndBatchRelease) {
 
 TEST_F(SchedulerStateTest, GetReadyTasksBatchLocalFirst) {
     alignas(64) PTO2TaskSlotState slot_a, slot_b;
-    init_slot(slot_a, PTO2_TASK_READY, 0, 1);
+    init_slot(slot_a, PTO2_TASK_PENDING, 0, 1);
     init_slot(slot_b, PTO2_TASK_PENDING, 1, 1);
 
     PTO2TaskSlotState *local_buf_storage[4];
