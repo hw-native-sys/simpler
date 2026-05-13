@@ -658,16 +658,6 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t /*win_size*/, uint64_t *d
     if (!file_barrier(h->rootinfo_path, h->rank, h->nranks, "hccl_init", h->run_token)) {
         return -1;
     }
-    hret = hccl_barrier(h->hccl_comm, h->stream);
-    if (hret != HCCL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] HcclBarrier before HCCL alloc failed: %d\n", h->rank, static_cast<int>(hret));
-        return -1;
-    }
-    aRet = aclrtSynchronizeStream(h->stream);
-    if (aRet != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] aclrtSynchronizeStream before HCCL alloc failed: %d\n", h->rank, (int)aRet);
-        return -1;
-    }
 
     // Tiling configuration for HcclAllocComResourceByTiling.  This is the
     // offset-list V2 form used by HCCL's MC2 resource allocator; it avoids

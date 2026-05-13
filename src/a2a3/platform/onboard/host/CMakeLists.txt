@@ -125,12 +125,19 @@ endif()
 # CANN 9.x exposes the working non-V2 HCCL entry points through libhcomm.
 # Link it explicitly so comm_hccl.cpp can follow the same initialization path
 # as the pto-isa communication tests.
-find_library(HCOMM_LIB NAMES hcomm PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+find_library(
+    HCOMM_LIB
+    NAMES hcomm
+    PATHS
+        ${ASCEND_HOME_PATH}/lib64
+        ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64
+    NO_DEFAULT_PATH
+)
 if(HCOMM_LIB)
-    set(HCCL_LINK_TARGETS hcomm)
-    message(STATUS "Using HCCL library: hcomm")
+    set(HCCL_LINK_TARGETS ${HCOMM_LIB})
+    message(STATUS "Using HCCL library: ${HCOMM_LIB}")
 else()
-    message(FATAL_ERROR "libhcomm not found under ${ASCEND_HOME_PATH}/lib64")
+    message(FATAL_ERROR "libhcomm not found under ${ASCEND_HOME_PATH}/lib64 or ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64")
 endif()
 
 # Link against CANN runtime libraries

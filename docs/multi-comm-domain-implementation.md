@@ -245,7 +245,7 @@ Two new L3 examples now cover the multi-domain surface:
 - `domain_rank_map`: a small communication example.  It shows the difference
   from single-domain usage by checking domain-local ranks, absent domains,
   separate slices for overlapping memberships, and one real allreduce per
-  domain.
+  domain.  Revalidated on 2026-05-13 with CANN 8.5 on devices `12,13,14`.
 - `dual_domain_overlap`: a real data example.  It runs two overlapping
   domains, performs domain-local allreduce in both, then runs affine compute
   and checks real outputs against host goldens.
@@ -336,8 +336,32 @@ Validation date: 2026-05-13.
 
 - `a2a3/sdma_async_completion_demo`
   - Sim: not run.
-  - Hardware: fail with `-p a2a3 -d 6-7`.
-  - Both chips bootstrap, then `worker.run()` fails with AICPU 507015.
+  - Hardware: still failing.
+  - Earlier CANN 8.5 hardware runs failed with `-p a2a3 -d 6-7`: both chips
+    bootstrap, then `worker.run()` fails with AICPU 507015.
+  - The example now checks the derived domain `CommContext` before launch and
+    fails fast if the host runtime was not built with
+    `SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1`.
+  - Removed an unsafe `HcclBarrier` before `HcclAllocComResourceByTiling` in
+    `comm_alloc_windows`; the existing file barrier is enough for rank
+    rendezvous before HCCL resource allocation.
+  - With CANN 8.5 and `SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1`, SDMA workspace
+    initialization fails because `libopapi.so` lacks
+    `aclnnShmemSdmaStarsQuery`.
+  - The same CANN 8.5 failures reproduce on `origin/main`: workspace enabled
+    fails during SDMA workspace initialization, and workspace disabled
+    bootstraps but fails at `worker.run()` with AICPU 507015 followed by
+    507901 during stream teardown.
+  - The CANN 9.0 beta.2 failure also reproduces on `origin/main`: the original
+    demo fails during `worker.init()` with `comm_alloc_windows failed with
+    code -1` on tested card pairs `10,11`, `12,13`, and `14,15`.
+  - With CANN 9.0 beta.2, the missing-symbol issue is gone, but
+    `HcclAllocComResourceByTiling` still returns 15 on tested card pairs
+    `12,13` and `14,15`.
+  - The same `HcclAllocComResourceByTiling` failure also happens for
+    non-SDMA `domain_rank_map` under CANN 9.0 beta.2, while CANN 8.5 with
+    `SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=OFF` passes `domain_rank_map` on
+    devices `12,13,14`.
 
 - `a5/async_notify_demo`
   - Sim: pass with `-p a5sim`.
@@ -349,11 +373,11 @@ Validation date: 2026-05-13.
   - Hardware: not run.
   - A5 sim deferred notify path.
 
-The SDMA failure happens after both chip bootstrap messages are ready.  The
-observed error is `aclrtSynchronizeStreamWithTimeout (AICPU) failed: 507015`,
-followed by 507901 during stream teardown.  This is tracked as a remaining
-SDMA runtime/data-plane issue, not as a communication-domain bootstrap
-failure.
+The SDMA failure is tracked as a remaining runtime/data-plane issue, not as a
+communication-domain bootstrap failure.  The multi-domain migration reaches
+the same HCCL resource-allocation path as the old single-domain flow; the
+remaining work is to make the SDMA workspace/HCCL resource setup compatible
+with the target CANN environment.
 
 ### SDMA 507015 Investigation
 

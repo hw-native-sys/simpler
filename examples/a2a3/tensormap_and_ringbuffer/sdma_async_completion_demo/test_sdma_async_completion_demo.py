@@ -20,6 +20,7 @@ deferred-release dependency path.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 from multiprocessing.shared_memory import SharedMemory
 
@@ -50,6 +51,19 @@ from simpler_setup.torch_interop import make_tensor_arg
 HERE = os.path.dirname(os.path.abspath(__file__))
 N = 128 * 128
 DTYPE_NBYTES = 4
+COMM_MAX_RANK_NUM = 64
+
+
+class _CommContextStruct(ctypes.Structure):
+    _fields_ = [
+        ("workSpace", ctypes.c_uint64),
+        ("workSpaceSize", ctypes.c_uint64),
+        ("rankId", ctypes.c_uint32),
+        ("rankNum", ctypes.c_uint32),
+        ("winSize", ctypes.c_uint64),
+        ("windowsIn", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
+        ("windowsOut", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
+    ]
 
 
 def parse_device_range(spec: str) -> list[int]:
@@ -102,6 +116,33 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None, clone_protoco
         binary=orch,
         children=children,
     )
+
+
+def read_comm_context(worker: Worker, ctx: ChipContext, domain_name: str) -> _CommContextStruct:
+    domain = ctx.domains[domain_name]
+    host_ctx = _CommContextStruct()
+    worker.copy_from(
+        ctypes.addressof(host_ctx),
+        domain.device_ctx,
+        ctypes.sizeof(host_ctx),
+        worker_id=ctx.worker_index,
+    )
+    return host_ctx
+
+
+def require_sdma_workspace(worker: Worker, contexts: list[ChipContext], domain_name: str) -> None:
+    missing = []
+    for ctx in contexts:
+        host_ctx = read_comm_context(worker, ctx, domain_name)
+        if host_ctx.workSpace == 0 or host_ctx.workSpaceSize == 0:
+            missing.append(ctx.worker_index)
+    if missing:
+        raise RuntimeError(
+            "sdma_async_completion_demo requires an a2a3 host runtime built "
+            "with SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1; missing SDMA workspace "
+            f"on worker indices {missing}. Rebuild with --build after setting "
+            "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1 and PTO_ISA_ROOT."
+        )
 
 
 def run(
@@ -182,6 +223,7 @@ def run(
     try:
         worker.init()
         contexts: list[ChipContext] = worker.chip_contexts
+        require_sdma_workspace(worker, contexts, "default")
 
         def orch_fn(orch, _args, cfg):
             for rank, ctx in enumerate(contexts):
