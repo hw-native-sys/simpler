@@ -193,6 +193,52 @@ def pytest_addoption(parser):
     )
 
 
+def _collect_descendant_pids(pid: int) -> list[int]:
+    """Return all descendant pids of ``pid``, BFS via Linux ``/proc``.
+
+    L3 ``Worker`` forks ChipWorker / SubWorker / next-level children
+    (``python/simpler/worker.py::_start_hierarchical``). When a sim test
+    deadlocks inside one of those forked grandchildren, sending SIGUSR1 only
+    to the dispatched pytest pid is useless — that process is calmly waiting
+    in ``waitpid``; the real deadlock site sees no signal. Walking the tree
+    via ``/proc/<pid>/task/<tid>/children`` lets the timeout handler hit
+    every descendant so faulthandler (which is inherited across ``fork``)
+    fires in the one that's actually stuck.
+
+    Returns ``[]`` on platforms without ``/proc`` (macOS) or if the pid is
+    already gone. Best-effort: races with grandchild exit are silently
+    ignored.
+    """
+    from collections import deque  # noqa: PLC0415 — local import keeps the signal-handler import surface minimal
+
+    out: list[int] = []
+    visited: set[int] = {pid}
+    queue: deque[int] = deque([pid])
+    while queue:
+        cur = queue.popleft()
+        try:
+            task_dir = f"/proc/{cur}/task"
+            tids = os.listdir(task_dir)
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            continue
+        for tid in tids:
+            try:
+                with open(f"{task_dir}/{tid}/children") as f:
+                    raw = f.read()
+            except (FileNotFoundError, PermissionError):
+                continue
+            for tok in raw.split():
+                try:
+                    child = int(tok)
+                except ValueError:
+                    continue
+                if child not in visited:
+                    visited.add(child)
+                    out.append(child)
+                    queue.append(child)
+    return out
+
+
 def _install_session_timeout(timeout_s: int) -> None:
     # Module-level `_ps` import is intentional (rather than a function-local
     # one): doing `from simpler_setup import parallel_scheduler` inside a
@@ -206,30 +252,53 @@ def _install_session_timeout(timeout_s: int) -> None:
         )
 
         # If the dispatcher is mid-flight, surface every stuck child:
-        # 1. SIGUSR1 each pid so its faulthandler dumps all-thread tracebacks
-        #    (Python + C frames) into its own stdout — pumped into output_lines.
-        # 2. Briefly let pumps drain those bytes before we tear everything down.
+        # 1. SIGUSR1 each pid AND its descendants so faulthandler (inherited
+        #    across fork in L3 Worker's ChipWorker/SubWorker children) dumps
+        #    all-thread tracebacks (Python + C frames) into the child's
+        #    stdout — pumped into output_lines.
+        # 2. Briefly let the pump thread drain those bytes (``join`` with a
+        #    short timeout) before reading the tail buffer; otherwise bytes
+        #    sit in the OS pipe and are dropped when SIGTERM closes it.
         # 3. Print each in-flight job's tail buffer in a HUNG group so the log
         #    contains the actual cause, not just the timeout banner.
         # 4. SIGTERM/SIGKILL the children so they don't outlive us as orphans
         #    holding NPU device state.
         state = _ps._active_state
         if state is not None and state.running:
+            descendants: dict[int, list[int]] = {}
             for p in list(state.running):
-                try:
-                    if hasattr(signal, "SIGUSR1"):
-                        p.send_signal(signal.SIGUSR1)
-                except (ProcessLookupError, OSError):
-                    pass
+                kin = _collect_descendant_pids(p.pid) if hasattr(signal, "SIGUSR1") else []
+                descendants[p.pid] = kin
+                if not hasattr(signal, "SIGUSR1"):
+                    continue
+                # Signal the dispatched pytest itself, then every descendant
+                # (in BFS order — closer kin first is fine, ordering doesn't
+                # affect the dump).
+                for target_pid in (p.pid, *kin):
+                    try:
+                        os.kill(target_pid, signal.SIGUSR1)
+                    except (ProcessLookupError, OSError):
+                        pass
 
             time.sleep(2.0)
 
             now = time.monotonic()
             for p, rj in list(state.running.items()):
                 elapsed = now - rj.start_time
+                # The pump thread runs continuously and is the actual drain;
+                # the 2 s sleep above already gave faulthandler bytes time to
+                # land in ``output_lines``. ``join`` here only yields the GIL
+                # so the pump's pending ``output_lines.append`` lands before
+                # we read the list. Short timeout — pump will block on the
+                # next ``readline()`` since the child is still alive.
+                pump = getattr(rj, "pump_thread", None)
+                if pump is not None:
+                    pump.join(timeout=0.05)
                 tail = "".join(rj.output_lines[-200:])
+                kin = descendants.get(p.pid, [])
+                kin_str = f" descendants={kin}" if kin else ""
                 print(
-                    f"::group::HUNG {rj.job.label} pid={p.pid} devices={rj.device_ids} elapsed={elapsed:.1f}s",
+                    f"::group::HUNG {rj.job.label} pid={p.pid} devices={rj.device_ids} elapsed={elapsed:.1f}s{kin_str}",
                     flush=True,
                 )
                 if tail:
