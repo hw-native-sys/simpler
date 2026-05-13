@@ -9,12 +9,12 @@ The host_build_graph runtime builds a static task graph on the host, copies the 
 - `Runtime` owns the task table, handshake buffers, and host-side device APIs. See `src/runtime/host_build_graph/runtime/runtime.h`.
 - `Task` is a fixed-size record that stores `func_id`, argument array, `fanin`, `fanout`, `core_type`, and `function_bin_addr`.
 - `Handshake` is the shared per-core control block used by AICPU and AICore for dispatch and completion.
-- `HostApi` provides device memory ops used by host orchestration (`device_malloc`, `copy_to_device`, `upload_kernel_binary`, etc.).
+- `HostApi` provides device memory ops used by host orchestration (`device_malloc`, `copy_to_device`, `upload_chip_callable_buffer`, etc.).
 
 ## Build And Init Flow
 
 1. Python tooling compiles kernels and orchestration into shared objects.
-2. `init_runtime_impl` loads the orchestration SO from bytes, resolves the entry symbol, and registers kernel binaries with the platform uploader. The resulting GM addresses are stored by `Runtime::set_function_bin_addr`. See `src/runtime/host_build_graph/host/runtime_maker.cpp`.
+2. `prepare_callable_impl` uploads the entire ChipCallable buffer (orch SO + all child kernel binaries) in one shot via `host_api.upload_chip_callable_buffer`, then dlopens the orchestration SO and resolves the entry symbol. For each child, host computes `chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)` and stores it in `Runtime::func_id_to_addr_[child_func_id(i)]` via `Runtime::set_function_bin_addr`. See `src/runtime/host_build_graph/host/runtime_maker.cpp`.
 3. The orchestration function runs on the host and builds the graph. It allocates device buffers, copies input data to device, records output buffers with `record_tensor_pair(runtime, ...)`, adds tasks via `add_task(runtime, ...)`, and adds dependency edges via `add_successor(runtime, ...)`.
 4. The populated `Runtime` is copied to device memory by the platform layer. AICPU then runs the executor with this Runtime snapshot.
 

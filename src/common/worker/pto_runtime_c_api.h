@@ -82,23 +82,26 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 
 /**
  * One-shot platform-side init. Called once by ChipWorker::init() right
- * after dlopen, before any other entry. Three responsibilities:
+ * after dlopen, before any other entry. Three responsibilities, in order:
  *
- *   1. Attach the calling thread to `device_id` (rtSetDevice on onboard,
+ *   1. (Onboard only) Sync CANN dlog with HostLogger::get_instance().level()
+ *      via dlog_setlevel(-1, level, 0), unless ASCEND_GLOBAL_LOG_LEVEL was
+ *      externally configured, in which case CANN keeps the user's choice.
+ *      This must run before step 2 because CANN snapshots the device-side
+ *      log session's level at context-open time (rtSetDevice); a later
+ *      dlog_setlevel would not re-level the already-opened device session.
+ *      The log level itself is owned by libsimpler_log.so (seeded earlier
+ *      by simpler_log_init); it never travels through this ABI.
+ *
+ *   2. Attach the calling thread to `device_id` (rtSetDevice on onboard,
  *      pto_cpu_sim_bind_device + pto_cpu_sim_acquire_device on sim) and
  *      record the device id on the DeviceRunner so subsequent device-ops
  *      can re-attach their own caller threads idempotently.
  *
- *   2. Take ownership of the AICPU + AICore executor binaries (copied into
+ *   3. Take ownership of the AICPU + AICore executor binaries (copied into
  *      DeviceRunner-owned vectors). All subsequent prepare_callable /
  *      run_prepared invocations reuse this resident pair — no binary bytes
  *      cross the C ABI on per-run paths.
- *
- *   3. (Onboard only) Sync CANN dlog with HostLogger::get_instance().level()
- *      via dlog_setlevel(-1, level, 0), unless ASCEND_GLOBAL_LOG_LEVEL was
- *      externally configured, in which case CANN keeps the user's choice.
- *      The log level itself is owned by libsimpler_log.so (seeded earlier
- *      by simpler_log_init); it never travels through this ABI.
  *
  * Returns 0 on success, negative on attach failure.
  */

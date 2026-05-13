@@ -30,13 +30,6 @@
  * happens once per row at `cast(x*w, bf16)`.
  */
 
-#include <cstdint>
-#include <pto/pto-inst.hpp>
-#include "platform_comm/comm_context.h"
-#include "tensor.h"
-
-using namespace pto;
-
 #ifndef __gm__
 #define __gm__
 #endif
@@ -44,6 +37,14 @@ using namespace pto;
 #ifndef __aicore__
 #define __aicore__ [aicore]
 #endif
+
+#include <cstdint>
+
+#include <pto/pto-inst.hpp>
+#include "platform_comm/comm_context.h"
+#include "tensor.h"
+
+using namespace pto;
 
 // Demo dimensions — must match dispatch.cpp / main.py.
 static constexpr int L = 4;

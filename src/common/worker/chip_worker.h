@@ -32,14 +32,15 @@ public:
     /// calling thread to `device_id`. Can only be called once per lifetime —
     /// the runtime and device cannot be changed after init.
     ///
-    /// `log_level` (0=DEBUG..4=NUL) and `log_info_v` (0..9) are pushed into
-    /// HostLogger + runner state and (onboard) into CANN dlog at this point;
-    /// they reflect the user's `simpler` Python logger at Worker.init() time
-    /// and are then fixed for this ChipWorker's lifetime.
+    /// The process-wide RTLD_GLOBAL bootstrap loads (libsimpler_log.so, and on
+    /// sim libcpu_sim_context.so — plus seeding HostLogger via simpler_log_init)
+    /// are the caller's responsibility and must already have happened before
+    /// this call: host_runtime.so resolves its undefined HostLogger /
+    /// unified_log_* (and, on sim, sim_context_*) symbols against those
+    /// globals. The Python `ChipWorker` wrapper does this with `ctypes.CDLL(...,
+    /// mode=RTLD_GLOBAL)`.
     void init(
-        const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-        const std::string &simpler_log_lib_path, int device_id, const std::string &sim_context_lib_path = "",
-        int log_level = 1, int log_info_v = 5
+        const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path, int device_id
     );
 
     /// Tear down everything: device resources and runtime library.
@@ -107,9 +108,6 @@ private:
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
-    // From libsimpler_log.so. Called with (log_level, log_info_v) to seed the
-    // process-wide HostLogger before host_runtime.so is even opened.
-    using SimplerLogInitFn = int (*)(int, int);
     // From host_runtime.so. Single platform-side init that does (a) thread
     // attach + device-id record, (b) executor binary takeover, (c) onboard
     // CANN dlog sync. Reads the current log level off HostLogger itself.
@@ -137,7 +135,6 @@ private:
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
-    SimplerLogInitFn simpler_log_init_fn_ = nullptr;  // resolved from libsimpler_log.so
     SimplerInitFn simpler_init_fn_ = nullptr;
     PrepareCallableFn prepare_callable_fn_ = nullptr;
     RunPreparedFn run_prepared_fn_ = nullptr;

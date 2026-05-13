@@ -118,8 +118,19 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
-    uint64_t (*upload_kernel_binary)(int func_id, const uint8_t *bin_data, size_t bin_size);
-    void (*remove_kernel_binary)(int func_id);
+    // Single-shot upload of the entire ChipCallable buffer. `callable` is a
+    // `const ChipCallable *` (declared void* to avoid pulling task_interface
+    // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
+    // total byte size, allocates device GM once, fixes up each child's
+    // resolved_addr_ in an internal host scratch (onboard: device addr; sim:
+    // dlopen function pointer), H2D's once, and returns the device-side
+    // address of the ChipCallable header. Pool-managed: identical buffer
+    // contents (FNV-1a 64-bit) hit the dedup cache; all chip buffers are
+    // bulk-freed in DeviceRunner::finalize(). Returns 0 on error or when
+    // child_count() == 0. Caller computes child addrs as
+    //     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
+    // and stores them via runtime->set_function_bin_addr(fid, child_dev).
+    uint64_t (*upload_chip_callable_buffer)(const void *callable);
 };
 
 /**
@@ -179,8 +190,6 @@ private:
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
 
-    // Device orchestration: when false, orchestration runs on device (thread 3)
-    bool orch_built_on_host_;
     void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
     void *gm_heap_ptr_;                      // GM heap for orchestrator output buffers (device)
     void *slot_states_ptr_;                  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
@@ -238,11 +247,9 @@ public:
     // Device orchestration (for AICPU thread 3)
     // =========================================================================
 
-    bool get_orch_built_on_host() const;
     void *get_gm_sm_ptr() const;
     void *get_gm_heap_ptr() const;
     const ChipStorageTaskArgs &get_orch_args() const;
-    void set_orch_built_on_host(bool v);
     void set_gm_sm_ptr(void *p);
     void set_gm_heap(void *p);
     void set_slot_states_ptr(void *p);

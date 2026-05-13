@@ -32,6 +32,7 @@
 #include "callable.h"
 #include "callable_protocol.h"
 #include "utils/elf_build_id.h"
+#include "utils/fnv1a_64.h"
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
 
@@ -463,41 +464,45 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
     return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
+int DeviceRunner::validate_block_dim(rtStream_t stream, int block_dim) {
+    if (block_dim < 1) {
+        LOG_ERROR("block_dim (%d) must be >= 1", block_dim);
+        return -1;
+    }
+
+    uint32_t cube_limit = 0, vector_limit = 0;
+    bool got_limits = (aclrtGetStreamResLimit(stream, ACL_RT_DEV_RES_CUBE_CORE, &cube_limit) == ACL_ERROR_NONE) &&
+                      (aclrtGetStreamResLimit(stream, ACL_RT_DEV_RES_VECTOR_CORE, &vector_limit) == ACL_ERROR_NONE) &&
+                      cube_limit > 0 && vector_limit > 0;
+
+    if (got_limits) {
+        int max_bd = static_cast<int>(
+            std::min(cube_limit / PLATFORM_AIC_CORES_PER_BLOCKDIM, vector_limit / PLATFORM_AIV_CORES_PER_BLOCKDIM)
+        );
+        if (block_dim > max_bd) {
+            LOG_ERROR(
+                "block_dim (%d) exceeds available cores (max_block_dim=%d, cube=%u, vector=%u)", block_dim, max_bd,
+                cube_limit, vector_limit
+            );
+            return -1;
+        }
+    } else if (block_dim > PLATFORM_MAX_BLOCKDIM) {
+        // aclrtGetStreamResLimit unavailable (or reported no cores) — fall back
+        // to the static platform capacity so block_dim stays bounded.
+        LOG_ERROR(
+            "aclrtGetStreamResLimit unavailable; block_dim (%d) exceeds static cap PLATFORM_MAX_BLOCKDIM (%d)",
+            block_dim, PLATFORM_MAX_BLOCKDIM
+        );
+        return -1;
+    }
+    return 0;
+}
+
 int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
-    }
-
-    // Validate block_dim
-    if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
-        LOG_ERROR("block_dim (%d) must be in range [1, %d]", block_dim, PLATFORM_MAX_BLOCKDIM);
-        return -1;
-    }
-
-    int scheduler_thread_num = runtime.get_orch_built_on_host() ? launch_aicpu_num : launch_aicpu_num - 1;
-
-    // Validate even core distribution for initial scheduler threads
-    if (scheduler_thread_num > 0) {
-        if (block_dim % scheduler_thread_num != 0) {
-            LOG_ERROR(
-                "block_dim (%d) not evenly divisible by scheduler_thread_num (%d)", block_dim, scheduler_thread_num
-            );
-            return -1;
-        }
-    } else {
-        LOG_INFO_V0(
-            "All %d threads are orchestrators, cores will be assigned after orchestration completes", launch_aicpu_num
-        );
-        // Post-transition: all threads become schedulers
-        if (block_dim % launch_aicpu_num != 0) {
-            LOG_WARN(
-                "block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
-                "some threads will have different core counts after transition",
-                block_dim, launch_aicpu_num
-            );
-        }
     }
 
     // Ensure device is initialized (lazy initialization)
@@ -507,7 +512,11 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return rc;
     }
 
-    // Calculate execution parameters
+    // Validate block_dim against stream resource limits
+    rc = validate_block_dim(stream_aicore_, block_dim);
+    if (rc != 0) {
+        return rc;
+    }
     block_dim_ = block_dim;
 
     int num_aicore = block_dim * cores_per_blockdim_;
@@ -583,8 +592,10 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
     }
 
-    // Set function_bin_addr for all tasks: func_id_to_addr_[] stores CoreCallable
-    // device address; compute binary code address using compile-time offset
+    // Set function_bin_addr for all tasks: Runtime::func_id_to_addr_[] stores
+    // a CoreCallable device address; the binary code address is one
+    // compile-time offset further in. The dispatch path then reads
+    // resolved_addr_ from the on-device CoreCallable header.
     LOG_DEBUG("Setting function_bin_addr for Tasks");
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task *task = runtime.get_task(i);
@@ -635,19 +646,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
+    // On any exit from run() — success or early error — release the diagnostics
+    // collectors' shared memory. They are only re-initialized per run(), so a
+    // Worker reused across runs (e.g. a pytest session-scoped worker pool) would
+    // otherwise re-enter init_l2_perf() with stale state still allocated.
     auto perf_cleanup = RAIIScopeGuard([this]() {
-        if (l2_perf_collector_.is_initialized()) {
-            l2_perf_collector_.stop();
-        }
-        if (dump_collector_.is_initialized()) {
-            dump_collector_.stop();
-        }
-        if (pmu_collector_.is_initialized()) {
-            pmu_collector_.stop();
-        }
-        if (dep_gen_collector_.is_initialized()) {
-            dep_gen_collector_.stop();
-        }
+        finalize_collectors();
     });
 
     LOG_INFO_V0("=== Initialize runtime args ===");
@@ -979,7 +983,6 @@ int DeviceRunner::register_prepared_callable(
     state.config_name = (config_name != nullptr) ? config_name : "";
     state.kernel_addrs = std::move(kernel_addrs);
     prepared_callables_.emplace(callable_id, std::move(state));
-    prepared_callable_path_used_ = true;
     return 0;
 }
 
@@ -1008,7 +1011,6 @@ int DeviceRunner::register_prepared_callable_host_orch(
     state.host_orch_func_ptr = host_orch_func_ptr;
     state.kernel_addrs = std::move(kernel_addrs);
     prepared_callables_.emplace(callable_id, std::move(state));
-    prepared_callable_path_used_ = true;
     ++host_dlopen_total_;
     LOG_INFO_V0("register_prepared_callable_host_orch: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
     return 0;
@@ -1096,28 +1098,18 @@ int DeviceRunner::finalize() {
     // Cleanup AICPU SO
     so_info_.finalize();
 
-    // Kernel binaries are normally released by validate_runtime_impl on the
-    // legacy run() path. The prepared-callable path intentionally leaves
-    // them resident across runs (shared by func_id) and relies on
-    // finalize() to reclaim them; that is not a leak. Emit at DEBUG so the
-    // legacy regression signal is preserved for callers that never went
-    // through prepare_callable.
-    if (!func_id_to_addr_.empty()) {
-        const bool prepared_path_used = prepared_callable_path_used_;
-        if (prepared_path_used) {
-            LOG_DEBUG("finalize() releasing %zu kernel binaries staged by prepare_callable", func_id_to_addr_.size());
-        } else {
-            LOG_ERROR("finalize() called with %zu kernel binaries still cached (memory leak)", func_id_to_addr_.size());
-        }
-        for (const auto &pair : func_id_to_addr_) {
-            void *gm_addr = reinterpret_cast<void *>(pair.second);
-            mem_alloc_.free(gm_addr);
-            LOG_DEBUG("Freed kernel binary: func_id=%d, addr=0x%lx", pair.first, pair.second);
-        }
-    }
-    func_id_to_addr_.clear();
-    func_id_to_hash_.clear();
     binaries_loaded_ = false;
+
+    // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
+    // Pool semantics mirror per-fid binaries: never freed until finalize.
+    for (auto &kv : chip_callable_buffers_) {
+        mem_alloc_.free(reinterpret_cast<void *>(kv.second.chip_dev));
+        LOG_DEBUG(
+            "Freed chip callable buffer: chip_dev=0x%lx, size=%zu, hash=0x%lx", kv.second.chip_dev,
+            kv.second.total_size, kv.first
+        );
+    }
+    chip_callable_buffers_.clear();
 
     // Release the cached orchestration SO buffer.
     if (dev_orch_so_buffer_ != nullptr) {
@@ -1152,74 +1144,9 @@ int DeviceRunner::finalize() {
     aicpu_seen_callable_ids_.clear();
     aicpu_dlopen_total_ = 0;
 
-    // Cleanup performance profiling
-    if (l2_perf_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        l2_perf_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
-    }
-
-    if (dump_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        dump_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
-    }
-
-    if (pmu_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        pmu_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
-    }
-
-    if (dep_gen_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        dep_gen_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
-    }
+    // Cleanup performance profiling. Normally already done by run()'s
+    // perf_cleanup guard; this is the backstop for the no-run-since-init case.
+    finalize_collectors();
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
@@ -1318,89 +1245,76 @@ int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
 }
 
 // =============================================================================
-// Kernel Binary Upload (returns device address for caller to store in Runtime)
+// Chip Callable Buffer Upload (returns device address of ChipCallable header)
 // =============================================================================
 
-uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data, size_t bin_size) {
-    if (bin_data == nullptr || bin_size == 0) {
-        LOG_ERROR("Invalid kernel binary data");
+uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable) {
+    if (callable == nullptr || callable->child_count() == 0) {
         return 0;
     }
-
-    // Run context (streams) must be prepared first.
     if (stream_aicpu_ == nullptr) {
-        LOG_ERROR("Run context not prepared before upload_kernel_binary()");
+        LOG_ERROR("Run context not prepared before upload_chip_callable_buffer()");
         return 0;
     }
 
-    // Return cached callable address if already uploaded *and* the new bytes
-    // match. With the prepared-callable path, multiple ChipCallables share a
-    // single ChipWorker (and DeviceRunner) and can pick distinct kernel
-    // binaries for the same func_id. Naively reusing the cached entry hands
-    // the AICore the previous callable's kernel: dispatch never completes
-    // the new task and the AICPU spins forever.
-    const uint64_t new_hash = simpler::common::utils::elf_build_id_64(bin_data, bin_size);
-    auto it = func_id_to_addr_.find(func_id);
-    if (it != func_id_to_addr_.end()) {
-        auto hash_it = func_id_to_hash_.find(func_id);
-        if (hash_it != func_id_to_hash_.end() && hash_it->second == new_hash) {
-            LOG_INFO_V0("Kernel func_id=%d already uploaded (matching hash), returning cached address", func_id);
-            return it->second;
-        }
-        LOG_INFO_V0("Kernel func_id=%d binary changed, evicting cached entry", func_id);
-        mem_alloc_.free(reinterpret_cast<void *>(it->second));
-        func_id_to_addr_.erase(it);
-        func_id_to_hash_.erase(func_id);
+    // Compute total ChipCallable buffer size from contents (header + storage_
+    // used). Mirrors make_callable<>()'s layout math.
+    constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
+    size_t storage_used = static_cast<size_t>(callable->binary_size());
+    for (int32_t i = 0; i < callable->child_count(); ++i) {
+        const CoreCallable &c = callable->child(i);
+        size_t child_total = CoreCallable::binary_data_offset() + static_cast<size_t>(c.binary_size());
+        size_t end = static_cast<size_t>(callable->child_offset(i)) + child_total;
+        if (end > storage_used) storage_used = end;
+    }
+    const size_t total_size = kHeaderSize + storage_used;
+
+    // Content-hash dedup: identical bytes → return cached chip_dev.
+    const auto *raw_bytes = reinterpret_cast<const uint8_t *>(callable);
+    const uint64_t hash = simpler::common::utils::fnv1a_64(raw_bytes, total_size);
+    auto it = chip_callable_buffers_.find(hash);
+    if (it != chip_callable_buffers_.end()) {
+        LOG_DEBUG(
+            "Chip callable dedup hit: chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev, it->second.total_size,
+            hash
+        );
+        return it->second.chip_dev;
     }
 
-    LOG_DEBUG("Uploading kernel binary: func_id=%d, size=%zu bytes", func_id, bin_size);
-
-    // Allocate device GM memory for kernel binary
-    void *gm_addr = mem_alloc_.alloc(bin_size);
+    void *gm_addr = mem_alloc_.alloc(total_size);
     if (gm_addr == nullptr) {
-        LOG_ERROR("Failed to allocate device GM memory for kernel func_id=%d", func_id);
+        LOG_ERROR("Failed to allocate device GM for ChipCallable buffer (size=%zu)", total_size);
         return 0;
     }
+    const uint64_t chip_dev = reinterpret_cast<uint64_t>(gm_addr);
+    assert((chip_dev & (CALLABLE_ALIGN - 1)) == 0 && "device alloc must be CALLABLE_ALIGN-byte aligned");
 
-    // Set resolved_addr_ in host buffer before copying to device:
-    // AICPU will read this field to get the binary code address for dispatch
-    uint64_t callable_addr = reinterpret_cast<uint64_t>(gm_addr);
-    assert((callable_addr & (CALLABLE_ALIGN - 1)) == 0 && "device alloc must be CALLABLE_ALIGN-byte aligned");
-    uint64_t binary_code_addr = callable_addr + CoreCallable::binary_data_offset();
-    // Write resolved_addr_ into the host-side buffer (the field lives at a fixed offset)
-    CoreCallable *host_callable = reinterpret_cast<CoreCallable *>(const_cast<uint8_t *>(bin_data));
-    host_callable->set_resolved_addr(binary_code_addr);
+    // Build a host scratch with each child's resolved_addr_ fixed up to the
+    // device-side address of that child's binary code (so the AICPU dispatch
+    // path's `reinterpret_cast<CoreCallable*>(addr)->resolved_addr()` lands
+    // on the right device offset).
+    std::vector<uint8_t> scratch(total_size);
+    std::memcpy(scratch.data(), raw_bytes, total_size);
+    for (int32_t i = 0; i < callable->child_count(); ++i) {
+        const uint32_t off = callable->child_offset(i);
+        auto *child_in_scratch = reinterpret_cast<CoreCallable *>(scratch.data() + kHeaderSize + off);
+        uint64_t child_dev = chip_dev + kHeaderSize + off;
+        child_in_scratch->set_resolved_addr(child_dev + CoreCallable::binary_data_offset());
+    }
 
-    // Copy the full CoreCallable (header + binary) to device
-    int rc = rtMemcpy(gm_addr, bin_size, bin_data, bin_size, RT_MEMCPY_HOST_TO_DEVICE);
+    int rc = rtMemcpy(gm_addr, total_size, scratch.data(), total_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
-        LOG_ERROR("rtMemcpy to device failed: %d", rc);
+        LOG_ERROR("rtMemcpy chip callable H2D failed: %d", rc);
         mem_alloc_.free(gm_addr);
         return 0;
     }
 
-    func_id_to_addr_[func_id] = callable_addr;
-    func_id_to_hash_[func_id] = new_hash;
-
-    LOG_DEBUG("  func_id=%d -> callable_addr=0x%lx, binary_code_addr=0x%lx", func_id, callable_addr, binary_code_addr);
-
-    return callable_addr;
-}
-
-void DeviceRunner::remove_kernel_binary(int func_id) {
-    auto it = func_id_to_addr_.find(func_id);
-    if (it == func_id_to_addr_.end()) {
-        return;
-    }
-
-    uint64_t function_bin_addr = it->second;
-    void *gm_addr = reinterpret_cast<void *>(function_bin_addr);
-
-    mem_alloc_.free(gm_addr);
-    func_id_to_addr_.erase(it);
-    func_id_to_hash_.erase(func_id);
-
-    LOG_DEBUG("Removed kernel binary: func_id=%d, addr=0x%lx", func_id, function_bin_addr);
+    chip_callable_buffers_.emplace(hash, ChipCallableBuffer{chip_dev, total_size});
+    LOG_DEBUG(
+        "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev, total_size,
+        callable->child_count(), hash
+    );
+    return chip_dev;
 }
 
 int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
@@ -1545,4 +1459,31 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id) {
 
     kernel_args_.args.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
     return 0;
+}
+
+void DeviceRunner::finalize_collectors() {
+    auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
+        HalHostUnregisterFn fn = get_halHostUnregister();
+        if (fn != nullptr) {
+            return fn(dev_ptr, device_id);
+        }
+        return 0;
+    };
+    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->free(dev_ptr);
+    };
+
+    if (l2_perf_collector_.is_initialized()) {
+        l2_perf_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+    if (dump_collector_.is_initialized()) {
+        dump_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+    if (pmu_collector_.is_initialized()) {
+        pmu_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+    if (dep_gen_collector_.is_initialized()) {
+        dep_gen_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
 }

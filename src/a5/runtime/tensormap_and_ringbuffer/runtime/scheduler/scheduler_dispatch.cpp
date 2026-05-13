@@ -170,6 +170,15 @@ void SchedulerContext::dispatch_subtask_to_core(
     }
 #endif
 
+    LOG_DEBUG(
+        "Thread %d: Dispatched %s %s task %" PRId64 " kernel_id=[%d,%d,%d] block_idx=%d/total_blocks=%d to"
+        " core_offset=%d core_id=%d reg_task_id=%u",
+        thread_idx, to_pending ? "pending" : "idle", subslot_name(subslot),
+        static_cast<int64_t>(slot_state.task->task_id.raw), slot_state.task->kernel_id[0],
+        slot_state.task->kernel_id[1], slot_state.task->kernel_id[2], slot_state.next_block_idx,
+        slot_state.logical_block_num, core_offset, core_id, reg_task_id
+    );
+
     write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
     tracker.set_pending_occupied(core_offset);
 }
@@ -297,12 +306,6 @@ void SchedulerContext::dispatch_shape(
                 auto core_offset = cores.pop_first();
                 dispatch_block(runtime, thread_idx, core_offset, *slot_state, shape, is_pending);
                 slot_state->next_block_idx++;
-                LOG_DEBUG(
-                    "Thread %d: Dispatched %s %s task %" PRId64 " block %d/%d to core_offset %d", thread_idx,
-                    is_pending ? "pending" : "idle", shape_name(shape),
-                    static_cast<int64_t>(slot_state->task->task_id.raw), slot_state->next_block_idx - 1,
-                    slot_state->logical_block_num, core_offset
-                );
             } while (slot_state->next_block_idx < slot_state->logical_block_num && cores.has_value());
 
             if (slot_state->next_block_idx < slot_state->logical_block_num) {
@@ -596,10 +599,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 if (action == LoopAction::BREAK_LOOP) break;
             }
 
-            if (thread_idx == 0 && task_count > 0 && idle_iterations % STALL_LOG_INTERVAL == 0) {
-                log_stall_diagnostics(thread_idx, task_count, idle_iterations, last_progress_count);
+            if (idle_iterations % STALL_LOG_INTERVAL == 0) {
+                log_stall_diagnostics(thread_idx, total_tasks_, idle_iterations, last_progress_count);
             }
-            if (idle_iterations > MAX_IDLE_ITERATIONS) {
+            if (idle_iterations >= MAX_IDLE_ITERATIONS) {
                 return handle_timeout_exit(
                     thread_idx, header, runtime, idle_iterations
 #if PTO2_PROFILING

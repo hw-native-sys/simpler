@@ -14,21 +14,22 @@ Python: logging.getLogger("simpler").setLevel(N)
                   │
                   ▼  Worker.init() snapshots level once, splits into (severity, info_v)
                   │
-       ChipWorker.init(host_lib, aicpu, aicore, simpler_log_lib, sim_ctx_lib, sev, v)
+       ChipWorker.init(device_id, bins, sev, v)            ◀── Python wrapper
                   │
-       1. dlopen libsimpler_log.so   RTLD_GLOBAL  ◀── one HostLogger per process
+       1. ctypes.CDLL(libsimpler_log.so, RTLD_GLOBAL)  ◀── one HostLogger per process
        2. simpler_log_init(sev, v)   ──→ HostLogger.set_level/set_info_v
                                      (seeds HostLogger BEFORE any host_runtime /
                                       sim_context / aicore SO is dlopen'd, so
                                       any LOG_* macro firing during dlopen-time
                                       constructors already sees the right filter)
-       3. dlopen libcpu_sim_context  RTLD_GLOBAL  (sim only)
-       4. dlopen libhost_runtime.so  RTLD_LOCAL   ──→ undefined HostLogger /
-                                                       unified_log_* symbols
-                                                       resolve via (1)
-       5. simpler_init(ctx, device_id, aicpu*, aicore*)
-                                     ──→ attach thread + transfer executor binaries
+       3. ctypes.CDLL(libcpu_sim_context.so, RTLD_GLOBAL)  (sim only)
+       4. _ChipWorker.init(host_lib, aicpu, aicore, device_id)   ◀── C++
+            ├─ dlopen libhost_runtime.so  RTLD_LOCAL   ──→ undefined HostLogger /
+            │                                              unified_log_* symbols
+            │                                              resolve via (1)
+            └─ simpler_init(ctx, device_id, aicpu*, aicore*)
                                      ──→ (onboard) dlog_setlevel(HostLogger.level())
+                                     ──→ attach thread + transfer executor binaries
 
 Per kernel launch:
        runner reads HostLogger.level() / .info_v() ──→ KernelArgs.log_level/info_v
@@ -147,26 +148,34 @@ The host log code lives in **one** `.so` (`libsimpler_log.so`) at
 toolchain is sufficient). Every other `.so` that calls `LOG_*` resolves the
 symbols against this single instance via `RTLD_GLOBAL` load order.
 
-### Load order — `ChipWorker::init`
+### Load order — `ChipWorker.init` (Python wrapper) → `_ChipWorker.init` (C++)
+
+```python
+# python/simpler/task_interface.py — ChipWorker.init(device_id, bins, sev, v)
+_preload_global(bins.simpler_log_path)              # 1: ctypes.CDLL(RTLD_GLOBAL)
+log_handle.simpler_log_init(sev, v)                 # 2: seed HostLogger BEFORE
+                                                    #    any consumer SO is opened
+if bins.sim_context_path:
+    _preload_global(bins.sim_context_path)          # 3: ctypes.CDLL(RTLD_GLOBAL), sim only
+self._impl.init(host_path, aicpu_path, aicore_path, device_id)   # 4: C++ _ChipWorker.init
+```
 
 ```cpp
-void ChipWorker::init(host_lib_path, aicpu_path, aicore_path,
-                      simpler_log_lib_path, sim_context_lib_path, sev, v) {
-    ensure_simpler_log_loaded(simpler_log_lib_path);    // 1: RTLD_NOW | RTLD_GLOBAL
-    simpler_log_init_fn(sev, v);                        // 2: seed HostLogger BEFORE
-                                                        //    any consumer SO is opened
-    if (!sim_context_lib_path.empty())
-        ensure_sim_context_loaded(sim_context_lib_path);// 3: RTLD_NOW | RTLD_GLOBAL
-    handle = dlopen(host_lib_path, RTLD_NOW | RTLD_LOCAL); // 4: undefined HostLogger /
-                                                           //    unified_log_* resolve
-                                                           //    via (1)
-    simpler_init_fn(device_ctx, device_id,
-                    aicpu_bytes, aicpu_size,
-                    aicore_bytes, aicore_size);            // 5: attach thread +
-                                                           //    transfer binaries +
-                                                           //    (onboard) sync dlog
-}
+// src/common/worker/chip_worker.cpp — _ChipWorker.init(...)
+handle = dlopen(host_lib_path, RTLD_NOW | RTLD_LOCAL);  // 4a: undefined HostLogger /
+                                                        //     unified_log_* resolve via (1)
+simpler_init_fn(device_ctx, device_id,
+                aicpu_bytes, aicpu_size,
+                aicore_bytes, aicore_size);             // 4b: attach thread +
+                                                        //     transfer binaries +
+                                                        //     (onboard) sync dlog
 ```
+
+`_preload_global` keeps a process-wide `path → ctypes.CDLL` registry so the
+RTLD_GLOBAL load happens exactly once per path (mirrors the old C++
+`std::once_flag`). `_task_interface.so` itself has no undefined `HostLogger`
+symbols, so the preload only has to precede `_ChipWorker.init`, not module
+import.
 
 Each `.so` that needs the host symbols is built **without** compiling
 `host_log.cpp` / `unified_log_host.cpp`. On macOS this requires
@@ -228,9 +237,10 @@ CANN's level enum has no INFO sub-tiers.
 | ----- | ------ | ------ |
 | Python import | `_log.py` registers `V0..V9` / `NUL` with `logging.addLevelName`; sets `simpler` logger to V5 if untouched | `python/simpler/_log.py` |
 | `Worker.init()` | reads `simpler` logger's effective level, splits via `_split_threshold(t) → (sev, info_v)` | `python/simpler/_log.py:get_current_config()` |
-| `ChipWorker.init()` | dlopen libsimpler_log → `simpler_log_init(sev,v)` (seeds HostLogger) → dlopen libsim_context → libhost_runtime → `simpler_init` | `src/common/worker/chip_worker.cpp` |
+| `ChipWorker.init()` (Python) | `ctypes.CDLL(libsimpler_log.so, RTLD_GLOBAL)` → `simpler_log_init(sev,v)` (seeds HostLogger) → `ctypes.CDLL(libcpu_sim_context.so, RTLD_GLOBAL)` (sim) → `_ChipWorker.init` | `python/simpler/task_interface.py` |
 | `simpler_log_init` | `HostLogger.set_level/set_info_v` — only writer of log filter | `src/common/log/host_log.cpp` |
-| `simpler_init` (per platform) | attach thread, transfer executor binaries to runner; (onboard) `dlog_setlevel(HostLogger.level())` | `src/{arch}/platform/{onboard,sim}/host/pto_runtime_c_api.cpp` |
+| `_ChipWorker.init()` (C++) | `dlopen(host_runtime.so, RTLD_LOCAL)` → dlsym → `simpler_init` | `src/common/worker/chip_worker.cpp` |
+| `simpler_init` (per platform) | (onboard) `dlog_setlevel(HostLogger.level())` — must precede device-context open so CANN snapshots the requested level for the device-side log session; then attach thread, transfer executor binaries to runner | `src/{arch}/platform/{onboard,sim}/host/pto_runtime_c_api.cpp` |
 | Per kernel launch | runner reads `HostLogger.level() / info_v()` directly, writes into `KernelArgs`; AICPU `kernel.cpp` calls `set_log_level/set_log_info_v` on entry | `src/{arch}/platform/onboard/aicpu/kernel.cpp` |
 
 The Python-side level snapshot is **one-shot** at `Worker.init()`. Calling
@@ -252,8 +262,9 @@ the same pattern (one process-global copy, sim builds only).
 | Output path | — | `build/lib/libsimpler_log.so` |
 | Path resolution at runtime | `simpler_setup/runtime_builder.py` | `RuntimeBinaries.simpler_log_path` |
 
-`Worker.init()` reads `binaries.simpler_log_path` from `RuntimeBinaries` and
-threads it through `ChipWorker.init(..., simpler_log_lib_path, ...)`.
+`ChipWorker.init(device_id, bins)` reads `bins.simpler_log_path` (and, on sim,
+`bins.sim_context_path`) from `RuntimeBinaries` and `ctypes.CDLL(..., mode=
+RTLD_GLOBAL)`s them before handing off to the C++ `_ChipWorker.init`.
 
 ## Where to look for what
 

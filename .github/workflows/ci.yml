@@ -217,11 +217,10 @@ jobs:
           fi
           exit $rc
 
-      # DFX per-feature smokes — default pytest above passes no --enable-* flag,
-      # so each capture pipeline gets its own fresh pytest invocation here.
-      # Separate processes side-step the L2PerfCollector dup-init guard
-      # (shm_host_ != nullptr) that the shared L2 worker pool would otherwise
-      # trip across consecutive tests in one session.
+      # DFX per-feature smokes — the default pytest above passes no --enable-*
+      # flag, so each capture pipeline gets its own invocation here. Kept as
+      # separate steps so a failing capture pipeline is attributed to its own
+      # CI step rather than buried in a combined run.
       - name: dep_gen smoke
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \

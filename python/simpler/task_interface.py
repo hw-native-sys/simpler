@@ -20,6 +20,7 @@ Usage:
 """
 
 import ctypes
+import os
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 from typing import Optional
@@ -227,6 +228,27 @@ class ChipContext:
     buffer_ptrs: dict[str, int]
 
 
+# Process-wide RTLD_GLOBAL preload registry. host_runtime.so resolves its
+# undefined HostLogger / unified_log_* (and, on sim, sim_context_*) symbols
+# against these globals, so they must be loaded — exactly once — before any
+# host_runtime.so dlopen. Keyed by path; mirrors the C++ side's old
+# std::once_flag semantics. Never closed.
+_preloaded_globals: dict[str, ctypes.CDLL] = {}
+
+
+def _preload_global(path: str) -> ctypes.CDLL:
+    """dlopen `path` with RTLD_NOW | RTLD_GLOBAL, idempotently (one CDLL per path).
+
+    Eager resolution (RTLD_NOW) mirrors the previous C++ dlopen flags and
+    surfaces any missing-symbol problem at load time rather than first use.
+    """
+    handle = _preloaded_globals.get(path)
+    if handle is None:
+        handle = ctypes.CDLL(path, mode=os.RTLD_NOW | os.RTLD_GLOBAL)
+        _preloaded_globals[path] = handle
+    return handle
+
+
 class ChipWorker:
     """Unified execution interface wrapping the host runtime C API.
 
@@ -253,6 +275,14 @@ class ChipWorker:
         Can only be called once — the runtime and device cannot be changed
         after init.
 
+        Performs the process-wide RTLD_GLOBAL bootstrap (libsimpler_log.so,
+        plus libcpu_sim_context.so on sim platforms) and seeds the HostLogger
+        via ``simpler_log_init`` *before* the C++ ``_ChipWorker.init`` dlopens
+        host_runtime.so — host_runtime.so resolves its undefined HostLogger /
+        unified_log_* (and, on sim, sim_context_*) symbols against those
+        globals, and any LOG_* macro firing during its dlopen-time
+        constructors must already see the right filter.
+
         Args:
             device_id: NPU device ID to attach the calling thread to.
             bins: A `simpler_setup.runtime_builder.RuntimeBinaries` (or any
@@ -275,15 +305,28 @@ class ChipWorker:
                 log_level = sev
             if log_info_v is None:
                 log_info_v = info_v
+
+        # 1. libsimpler_log.so — RTLD_GLOBAL singleton, before host_runtime.so.
+        if not bins.simpler_log_path:
+            raise ValueError("ChipWorker.init: bins.simpler_log_path is required")
+        log_handle = _preload_global(str(bins.simpler_log_path))
+        log_handle.simpler_log_init.argtypes = [ctypes.c_int, ctypes.c_int]
+        log_handle.simpler_log_init.restype = ctypes.c_int
+        rc = log_handle.simpler_log_init(int(log_level), int(log_info_v))
+        if rc != 0:
+            raise RuntimeError(f"simpler_log_init failed with code {rc}")
+
+        # 2. libcpu_sim_context.so — sim platforms only (host_runtime.so's sim
+        #    variant resolves sim_context_set_* / pto_sim_get_* against it).
+        if bins.sim_context_path:
+            _preload_global(str(bins.sim_context_path))
+
+        # 3. host_runtime.so is dlopen'd RTLD_LOCAL inside _impl.init.
         self._impl.init(
             str(bins.host_path),
             str(bins.aicpu_path),
             str(bins.aicore_path),
-            str(bins.simpler_log_path),
             int(device_id),
-            str(bins.sim_context_path) if bins.sim_context_path else "",
-            log_level,
-            log_info_v,
         )
 
     def finalize(self):

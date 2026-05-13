@@ -10,7 +10,7 @@
 """End-to-end distributed allreduce — symmetric 4-phase pattern.
 
 Each rank owns a private input/output tensor; cross-rank communication happens
-strictly inside the kernel, via a HCCL window scratch slot:
+strictly inside the kernel, via a communication window scratch slot:
 
   Phase 1 stage-in      input → my scratch slot (HCCL window)
   Phase 2 device barrier signal matrix cross-rank sync via TNOTIFY/TWAIT
@@ -21,14 +21,11 @@ input / output are plain per-rank ``torch.share_memory_()`` tensors — the
 parent writes inputs before ``init()`` and reads outputs after ``run()``, and
 the framework's TaskArgs path handles H2D / D2H automatically (same as
 ``multi_chip_dispatch``).  Only ``scratch`` uses the chip bootstrap path
-because window buffers can only exist after HCCL ``comm_alloc_windows`` has
+because window buffers can only exist after ``comm_alloc_windows`` has
 run — that's what ``chip_bootstrap_configs`` is for.
 
-Hardware only.  The sim backend's CommRemotePtr uses a different addressing
-scheme; sim support is out of scope for this demo.
-
 Run:
-    python examples/workers/l3/allreduce_distributed/main.py -d 0-1
+    python examples/workers/l3/allreduce_distributed/main.py -p a2a3sim -d 0-1
 """
 
 from __future__ import annotations
@@ -87,7 +84,7 @@ def parse_device_range(spec: str) -> list[int]:
     return ids
 
 
-def build_chip_callable(platform: str) -> ChipCallable:
+def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallable:
     """Compile the AIV allreduce kernel + its C++ orchestration shim.
 
     The orchestration forwards three Tensor args (input / output / scratch)
@@ -96,7 +93,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
     """
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
     include_dirs = kc.get_orchestration_include_dirs(runtime)
 
     # The kernel resolves CommContext from "platform_comm/comm_context.h",
@@ -109,7 +106,8 @@ def build_chip_callable(platform: str) -> ChipCallable:
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
     )
-    kernel_bytes = extract_text_section(kernel_bytes)
+    if not platform.endswith("sim"):
+        kernel_bytes = extract_text_section(kernel_bytes)
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
@@ -122,6 +120,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
     return ChipCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
         func_name="allreduce_orchestration",
+        config_name="allreduce_orchestration_config",
         binary=orch_bytes,
         children=[(0, core_callable)],
     )
@@ -132,11 +131,16 @@ def expected_output(nranks: int) -> list[float]:
     return [float(nranks * i + 100 * nranks * (nranks - 1) // 2) for i in range(ALLREDUCE_COUNT)]
 
 
-def run(device_ids: list[int]) -> int:
+def run(
+    device_ids: list[int],
+    platform: str = "a2a3",
+    pto_isa_commit: str | None = None,
+    build: bool = False,
+) -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
-    # HCCL may round up; only needs to hold SCRATCH_NBYTES.  A 4 KB floor
-    # keeps us clear of any HCCL minimum-window-size quirks.
+    # Backends may round up; only needs to hold SCRATCH_NBYTES.  A 4 KB floor
+    # keeps us clear of minimum-window-size quirks.
     window_size = max(SCRATCH_NBYTES, 4 * 1024)
 
     rootinfo_path = f"/tmp/pto_allreduce_distributed_rootinfo_{os.getpid()}.bin"
@@ -145,7 +149,7 @@ def run(device_ids: list[int]) -> int:
     except FileNotFoundError:
         pass
 
-    print(f"[allreduce] devices={device_ids} nranks={nranks}")
+    print(f"[allreduce] platform={platform} devices={device_ids} nranks={nranks}")
 
     # --- Per-rank host tensors (input/output) via torch.share_memory_().
     # share_memory_() moves the storage into an mmap region that forked
@@ -159,8 +163,8 @@ def run(device_ids: list[int]) -> int:
     ]
     host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
-    # --- Scratch bootstrap: one window buffer per chip.  The window only
-    # exists after HCCL comm_alloc_windows has run, so allocating scratch
+    # --- Scratch bootstrap: one window buffer per chip.  The window exists
+    # only after comm_alloc_windows has run, so allocating scratch
     # during bootstrap is the natural lifecycle — no TaskArgs equivalent
     # covers it.  No host staging is needed for scratch.
     cfgs = [
@@ -184,20 +188,21 @@ def run(device_ids: list[int]) -> int:
     ]
 
     print("[allreduce] compiling kernels...")
-    chip_callable = build_chip_callable("a2a3")
+    chip_callable = build_chip_callable(platform, pto_isa_commit)
 
     worker = Worker(
         level=3,
-        platform="a2a3",
+        platform=platform,
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
         chip_bootstrap_configs=cfgs,
+        build=build,
     )
     chip_cid = worker.register(chip_callable)
 
     try:
-        print("[allreduce] init worker (forks chip children + bootstraps HCCL)...")
+        print("[allreduce] init worker (forks chip children + bootstraps comm backend)...")
         worker.init()
 
         contexts: list[ChipContext] = worker.chip_contexts
@@ -258,9 +263,16 @@ def run(device_ids: list[int]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-p", "--platform", default="a2a3", help="Platform backend, e.g. a2a3 or a2a3sim.")
     parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1'. Two chips required.")
+    parser.add_argument(
+        "--build", action="store_true", help="Rebuild runtime from source instead of using cached libs."
+    )
+    parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
-    return run(parse_device_range(cli.device))
+    return run(
+        parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit, build=cli.build
+    )
 
 
 if __name__ == "__main__":

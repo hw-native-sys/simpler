@@ -49,15 +49,6 @@
  *     this configuration; the L*R = 128 scalar stores are negligible.
  */
 
-#include <cstdint>
-#include <pto/pto-inst.hpp>
-#include "pto/comm/comm_types.hpp"
-#include "pto/comm/pto_comm_inst.hpp"
-#include "platform_comm/comm_context.h"
-#include "tensor.h"
-
-using namespace pto;
-
 #ifndef __gm__
 #define __gm__
 #endif
@@ -65,6 +56,16 @@ using namespace pto;
 #ifndef __aicore__
 #define __aicore__ [aicore]
 #endif
+
+#include <cstdint>
+
+#include <pto/pto-inst.hpp>
+#include "pto/comm/comm_types.hpp"
+#include "pto/comm/pto_comm_inst.hpp"
+#include "platform_comm/comm_context.h"
+#include "tensor.h"
+
+using namespace pto;
 
 // Demo dimensions — must match main.py.
 static constexpr int N = 2;
@@ -365,27 +366,45 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         __gm__ bfloat16_t *x_dst_local = recv_x_local + row * D;
         __gm__ bfloat16_t *x_dst_remote = CommRemotePtr(comm_ctx, x_dst_local, dst);
 
+#if defined(__CPU_SIM)
+        for (int i = 0; i < D; ++i) {
+            x_dst_remote[i] = x_src[i];
+        }
+#else
         XGlobal x_src_g(x_src);
         XGlobal x_dst_g(x_dst_remote);
         pto::comm::TPUT(x_dst_g, x_src_g, x_tile);
+#endif
 
         // Channel 2: weight (FP32, 1xW_PAD); host pre-packed [w, 0, …, 0]
         __gm__ float *w_src = w_padded + r * W_PAD;
         __gm__ float *w_dst_local = recv_w_local + row * W_PAD;
         __gm__ float *w_dst_remote = CommRemotePtr(comm_ctx, w_dst_local, dst);
 
+#if defined(__CPU_SIM)
+        for (int i = 0; i < W_PAD; ++i) {
+            w_dst_remote[i] = w_src[i];
+        }
+#else
         WGlobal w_src_g(w_src);
         WGlobal w_dst_g(w_dst_remote);
         pto::comm::TPUT(w_dst_g, w_src_g, w_tile);
+#endif
 
         // Channel 3: idx (INT32, 1xIDX_PAD); host pre-packed [r, 0, …, 0]
         __gm__ int32_t *idx_src = idx_padded + r * IDX_PAD;
         __gm__ int32_t *idx_dst_local = recv_idx_local + row * IDX_PAD;
         __gm__ int32_t *idx_dst_remote = CommRemotePtr(comm_ctx, idx_dst_local, dst);
 
+#if defined(__CPU_SIM)
+        for (int i = 0; i < IDX_PAD; ++i) {
+            idx_dst_remote[i] = idx_src[i];
+        }
+#else
         IGlobal idx_src_g(idx_src);
         IGlobal idx_dst_g(idx_dst_remote);
         pto::comm::TPUT(idx_dst_g, idx_src_g, idx_tile);
+#endif
     }
     pipe_barrier(PIPE_ALL);
 

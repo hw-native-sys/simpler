@@ -211,9 +211,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         uint64_t orch_cycle_start = 0;
         int32_t submitted_tasks = -1;
 #endif
-        if (runtime->get_orch_built_on_host()) {
-            LOG_INFO_V0("Thread %d: Host orchestration mode, no-op", thread_idx);
-        } else {
+        // Orchestrator thread: load + run the device orchestration SO. The braces
+        // scope the per-callable dlopen / SO-table locals to this block.
+        {
             // Per-callable_id dispatch: the orch SO state lives in
             // `orch_so_table_[callable_id]` keyed by registration order;
             // reload is governed by `register_new_callable_id_`.
@@ -647,11 +647,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     // Scheduler thread (orchestrator threads skip dispatch when orch_to_sched_ is false)
     if (!sched_ctx_.is_completed() && (thread_idx < sched_thread_num_ || orch_to_sched_)) {
-        // Device orchestration: wait for primary orchestrator to initialize SM header
-        if (!runtime->get_orch_built_on_host()) {
-            while (!runtime_init_ready_.load(std::memory_order_acquire)) {
-                SPIN_WAIT_HINT();
-            }
+        // Device orchestration: wait for the primary orchestrator to initialize the SM header
+        while (!runtime_init_ready_.load(std::memory_order_acquire)) {
+            SPIN_WAIT_HINT();
         }
         if (rt == nullptr) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
@@ -684,7 +682,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
         // always tear them down here, but we keep the per-cid orch SO entries
         // alive for the next run's cache-hit reuse (see run() reload_so branch).
-        if (!runtime->get_orch_built_on_host() && rt != nullptr) {
+        if (rt != nullptr) {
             // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.
             const int32_t callable_id = runtime->get_active_callable_id();
             framework_bind_runtime(nullptr);

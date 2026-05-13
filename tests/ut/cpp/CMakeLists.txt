@@ -240,6 +240,26 @@ add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
 # ---------------------------------------------------------------------------
 add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 
+# Contract test for upload_chip_callable_buffer caller-buffer immutability.
+# Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),
+# so it can't use add_task_interface_test as-is.
+add_executable(test_chip_callable_upload_immutable
+    types/test_chip_callable_upload_immutable.cpp
+)
+target_include_directories(test_chip_callable_upload_immutable PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+target_compile_options(test_chip_callable_upload_immutable PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+target_link_libraries(test_chip_callable_upload_immutable PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_chip_callable_upload_immutable COMMAND test_chip_callable_upload_immutable)
+set_tests_properties(test_chip_callable_upload_immutable PROPERTIES LABELS "no_hardware")
+
 # ---------------------------------------------------------------------------
 # Common utilities tests (src/common/utils/)
 # ---------------------------------------------------------------------------

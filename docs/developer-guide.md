@@ -230,7 +230,13 @@ compiler = KernelCompiler(platform="a2a3sim")
 kernel_binary = compiler.compile_incore("path/to/kernel.cpp", core_type="aiv")
 ```
 
-The compiled binary is then uploaded via `DeviceRunner::upload_kernel_binary(func_id, bin_data, bin_size)`, which loads it into device memory and returns the function address for task dispatch.
+The compiled binaries are packed into a `ChipCallable` (orch SO + each
+child `CoreCallable`) and uploaded as a single blob via
+`DeviceRunner::upload_chip_callable_buffer(callable)`, which fixes up each
+child's `resolved_addr_`, H2Ds once, and returns the device address of the
+ChipCallable header. The caller then derives each child's device address
+from that header plus the child's recorded offset and writes it into
+`Runtime::func_id_to_addr_[]` for AICPU dispatch.
 
 ## Features
 

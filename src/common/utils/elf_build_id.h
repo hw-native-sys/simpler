@@ -27,6 +27,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "fnv1a_64.h"
+
 // <elf.h> is Linux-only. On other platforms (macOS, Windows) we embed the
 // minimal subset of ELF64 types needed by this header.
 #if defined(__linux__)
@@ -89,26 +91,11 @@ struct Elf64_Nhdr {
 
 namespace simpler::common::utils {
 
-namespace detail {
-
-inline uint64_t fnv1a_64(const void *data, std::size_t len) {
-    constexpr uint64_t kPrime = 0x00000100000001b3ULL;
-    uint64_t h = 0xcbf29ce484222325ULL;
-    const auto *p = static_cast<const uint8_t *>(data);
-    for (std::size_t i = 0; i < len; ++i) {
-        h ^= p[i];
-        h *= kPrime;
-    }
-    return h;
-}
-
-}  // namespace detail
-
 // Returns a 64-bit identifier derived from the ELF64 GNU Build-ID. Falls
 // back to FNV-1a over the whole buffer when no Build-ID is available.
 inline uint64_t elf_build_id_64(const void *data, std::size_t len) {
     if (data == nullptr || len < sizeof(Elf64_Ehdr)) {
-        return detail::fnv1a_64(data, len);
+        return fnv1a_64(data, len);
     }
     const auto *base = static_cast<const uint8_t *>(data);
     Elf64_Ehdr ehdr{};
@@ -117,15 +104,15 @@ inline uint64_t elf_build_id_64(const void *data, std::size_t len) {
     // Validate ELF magic and 64-bit class; otherwise fall back.
     if (ehdr.e_ident[EI_MAG0] != ELFMAG0 || ehdr.e_ident[EI_MAG1] != ELFMAG1 || ehdr.e_ident[EI_MAG2] != ELFMAG2 ||
         ehdr.e_ident[EI_MAG3] != ELFMAG3 || ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-        return detail::fnv1a_64(data, len);
+        return fnv1a_64(data, len);
     }
     if (ehdr.e_phoff == 0 || ehdr.e_phentsize < sizeof(Elf64_Phdr)) {
-        return detail::fnv1a_64(data, len);
+        return fnv1a_64(data, len);
     }
     // Guard against truncated / malformed inputs.
     std::size_t phdr_end = ehdr.e_phoff + static_cast<std::size_t>(ehdr.e_phnum) * ehdr.e_phentsize;
     if (phdr_end > len) {
-        return detail::fnv1a_64(data, len);
+        return fnv1a_64(data, len);
     }
 
     for (std::size_t i = 0; i < ehdr.e_phnum; ++i) {
@@ -160,7 +147,7 @@ inline uint64_t elf_build_id_64(const void *data, std::size_t len) {
         }
     }
     // No Build-ID found; the SO was likely linked without --build-id.
-    return detail::fnv1a_64(data, len);
+    return fnv1a_64(data, len);
 }
 
 }  // namespace simpler::common::utils

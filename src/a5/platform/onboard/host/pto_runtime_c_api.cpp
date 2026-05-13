@@ -22,6 +22,7 @@
 
 #include <pthread.h>
 
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -92,18 +93,12 @@ static int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     }
 }
 
-static uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t *bin_data, size_t bin_size) {
+static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     try {
-        return current_runner()->upload_kernel_binary(func_id, bin_data, bin_size);
+        return current_runner()->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));
     } catch (...) {
         return 0;
     }
-}
-
-static void remove_kernel_binary_wrapper(int func_id) {
-    try {
-        current_runner()->remove_kernel_binary(func_id);
-    } catch (...) {}
 }
 
 /* ===========================================================================
@@ -247,6 +242,18 @@ int simpler_init(
     if (ctx == NULL) return -1;
 
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
+
+    // CANN dlog must be levelled BEFORE the device context is opened
+    // (rtSetDevice inside attach_current_thread): CANN snapshots the
+    // device-side log session's level at context-open time, so a later
+    // dlog_setlevel is a no-op for the device side. HostLogger is already
+    // seeded here by libsimpler_log.so's simpler_log_init() (runs earlier in
+    // ChipWorker::init). Skipped when ASCEND_GLOBAL_LOG_LEVEL is externally
+    // configured — CANN keeps that.
+    if (std::getenv("ASCEND_GLOBAL_LOG_LEVEL") == NULL) {
+        dlog_setlevel(-1, HostLogger::get_instance().level(), /*enableEvent*/ 0);
+    }
+
     int rc;
     try {
         rc = runner->attach_current_thread(device_id);
@@ -261,13 +268,6 @@ int simpler_init(
         runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
     } catch (...) {
         return -1;
-    }
-
-    // CANN dlog: derive from HostLogger (seeded by libsimpler_log.so's
-    // simpler_log_init() earlier in ChipWorker::init) unless
-    // ASCEND_GLOBAL_LOG_LEVEL is externally configured.
-    if (std::getenv("ASCEND_GLOBAL_LOG_LEVEL") == NULL) {
-        dlog_setlevel(-1, HostLogger::get_instance().level(), /*enableEvent*/ 0);
     }
     return 0;
 }
@@ -300,8 +300,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
-        r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
-        r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
+        r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         rc = prepare_callable_impl(r, reinterpret_cast<const ChipCallable *>(callable));
         if (rc != 0) {
@@ -370,8 +369,7 @@ int run_prepared(
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
-        r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
-        r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
+        r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         // Restore kernel addrs + orch symbol names + active_callable_id
         rc = runner->bind_prepared_callable_to_runtime(*r, callable_id);

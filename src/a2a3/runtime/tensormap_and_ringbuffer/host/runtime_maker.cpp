@@ -112,25 +112,28 @@ extern "C" int prepare_callable_impl(Runtime *runtime, const ChipCallable *calla
         return -1;
     }
 
-    // Register kernel binaries from ChipCallable children
+    // Single-shot upload of the entire ChipCallable buffer. DeviceRunner
+    // computes total size from contents, allocates device GM once, fixes up
+    // each child's resolved_addr_ in an internal host scratch, H2Ds once,
+    // and returns the device-side address of the ChipCallable header.
+    // Callers then compute child device addresses via offset arithmetic and
+    // write them to Runtime::func_id_to_addr_[] for AICPU dispatch.
     if (callable->child_count() > 0) {
         LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
+        uint64_t chip_dev = runtime->host_api.upload_chip_callable_buffer(callable);
+        if (chip_dev == 0) {
+            LOG_ERROR("Failed to upload ChipCallable buffer");
+            return -1;
+        }
+        constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
         for (int32_t i = 0; i < callable->child_count(); i++) {
             int func_id = callable->child_func_id(i);
             if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
                 LOG_ERROR("func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
                 return -1;
             }
-            const auto &kernel = callable->child(i);
-            uint64_t addr = runtime->host_api.upload_kernel_binary(
-                func_id, reinterpret_cast<const uint8_t *>(&kernel),
-                CoreCallable::binary_data_offset() + kernel.binary_size()
-            );
-            if (addr == 0) {
-                LOG_ERROR("Failed to upload kernel binary for func_id=%d", func_id);
-                return -1;
-            }
-            runtime->set_function_bin_addr(func_id, addr);
+            uint64_t child_dev = chip_dev + kHeaderSize + callable->child_offset(i);
+            runtime->set_function_bin_addr(func_id, child_dev);
         }
     }
 
@@ -292,7 +295,6 @@ extern "C" int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorage
     runtime->record_tensor_pair(nullptr, sm_ptr, static_cast<size_t>(sm_size));
 
     // Set up device orchestration state
-    runtime->set_orch_built_on_host(false);
     runtime->set_orch_args(device_args);
 
     LOG_INFO_V0("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
@@ -407,15 +409,18 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     }
     LOG_INFO_V0("Freed %d device allocations", tensor_pair_count);
 
-    // Cleanup kernel binaries
+    // Clear the per-run dispatch-table entries staged by prepare_callable_impl.
+    // The underlying chip-callable device buffer is pool-managed by
+    // DeviceRunner (keyed by content hash) and bulk-freed in
+    // DeviceRunner::finalize(); re-running the same callable repeatedly
+    // should not re-upload.
     int kernel_count = runtime->get_registered_kernel_count();
     for (int i = 0; i < kernel_count; i++) {
         int func_id = runtime->get_registered_kernel_func_id(i);
-        runtime->host_api.remove_kernel_binary(func_id);
         runtime->set_function_bin_addr(func_id, 0);
     }
     if (kernel_count > 0) {
-        LOG_INFO_V0("Freed %d kernel binaries", kernel_count);
+        LOG_INFO_V0("Cleared %d kernel dispatch-table entries", kernel_count);
     }
     runtime->clear_registered_kernels();
 
