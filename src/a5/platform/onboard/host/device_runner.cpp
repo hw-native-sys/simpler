@@ -17,6 +17,7 @@
 
 #include "device_runner.h"
 
+#include "acl/acl.h"
 #include "host_log.h"
 
 #include <dlfcn.h>
@@ -285,40 +286,44 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
     return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
+int DeviceRunner::validate_block_dim(rtStream_t stream, int block_dim) {
+    if (block_dim < 1) {
+        LOG_ERROR("block_dim (%d) must be >= 1", block_dim);
+        return -1;
+    }
+
+    uint32_t cube_limit = 0, vector_limit = 0;
+    bool got_limits = (aclrtGetStreamResLimit(stream, ACL_RT_DEV_RES_CUBE_CORE, &cube_limit) == ACL_ERROR_NONE) &&
+                      (aclrtGetStreamResLimit(stream, ACL_RT_DEV_RES_VECTOR_CORE, &vector_limit) == ACL_ERROR_NONE) &&
+                      cube_limit > 0 && vector_limit > 0;
+
+    if (got_limits) {
+        int max_bd = static_cast<int>(
+            std::min(cube_limit / PLATFORM_AIC_CORES_PER_BLOCKDIM, vector_limit / PLATFORM_AIV_CORES_PER_BLOCKDIM)
+        );
+        if (block_dim > max_bd) {
+            LOG_ERROR(
+                "block_dim (%d) exceeds available cores (max_block_dim=%d, cube=%u, vector=%u)", block_dim, max_bd,
+                cube_limit, vector_limit
+            );
+            return -1;
+        }
+    } else if (block_dim > PLATFORM_MAX_BLOCKDIM) {
+        // aclrtGetStreamResLimit unavailable (or reported no cores) — fall back
+        // to the static platform capacity so block_dim stays bounded.
+        LOG_ERROR(
+            "aclrtGetStreamResLimit unavailable; block_dim (%d) exceeds static cap PLATFORM_MAX_BLOCKDIM (%d)",
+            block_dim, PLATFORM_MAX_BLOCKDIM
+        );
+        return -1;
+    }
+    return 0;
+}
+
 int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
-    }
-
-    // Validate block_dim
-    if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
-        LOG_ERROR("block_dim (%d) must be in range [1, %d]", block_dim, PLATFORM_MAX_BLOCKDIM);
-        return -1;
-    }
-
-    int scheduler_thread_num = runtime.get_orch_built_on_host() ? launch_aicpu_num : launch_aicpu_num - 1;
-
-    // Validate even core distribution for initial scheduler threads
-    if (scheduler_thread_num > 0) {
-        if (block_dim % scheduler_thread_num != 0) {
-            LOG_ERROR(
-                "block_dim (%d) not evenly divisible by scheduler_thread_num (%d)", block_dim, scheduler_thread_num
-            );
-            return -1;
-        }
-    } else {
-        LOG_INFO_V0(
-            "All %d threads are orchestrators, cores will be assigned after orchestration completes", launch_aicpu_num
-        );
-        // Post-transition: all threads become schedulers
-        if (block_dim % launch_aicpu_num != 0) {
-            LOG_WARN(
-                "block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
-                "some threads will have different core counts after transition",
-                block_dim, launch_aicpu_num
-            );
-        }
     }
 
     // Ensure device is initialized (lazy initialization)
@@ -328,7 +333,11 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return rc;
     }
 
-    // Calculate execution parameters
+    // Validate block_dim against stream resource limits
+    rc = validate_block_dim(stream_aicore_, block_dim);
+    if (rc != 0) {
+        return rc;
+    }
     block_dim_ = block_dim;
 
     int num_aicore = block_dim * cores_per_blockdim_;

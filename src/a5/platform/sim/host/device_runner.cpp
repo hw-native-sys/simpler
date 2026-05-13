@@ -292,34 +292,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return -1;
     }
 
-    // Validate block_dim
+    // Validate block_dim. Sim has no stream resource query, so the static
+    // platform capacity is the bound (mirrors the onboard fallback in
+    // DeviceRunner::validate_block_dim). The scheduler assigns cores to
+    // threads cluster-aligned round-robin, so block_dim need not be evenly
+    // divisible by the scheduler thread count.
     if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
         LOG_ERROR("block_dim (%d) must be in range [1, %d]", block_dim, PLATFORM_MAX_BLOCKDIM);
         return -1;
-    }
-
-    int scheduler_thread_num = runtime.get_orch_built_on_host() ? launch_aicpu_num : launch_aicpu_num - 1;
-
-    // Validate even core distribution for initial scheduler threads
-    if (scheduler_thread_num > 0) {
-        if (block_dim % scheduler_thread_num != 0) {
-            LOG_ERROR(
-                "block_dim (%d) not evenly divisible by scheduler_thread_num (%d)", block_dim, scheduler_thread_num
-            );
-            return -1;
-        }
-    } else {
-        LOG_INFO_V0(
-            "All %d threads are orchestrators, cores will be assigned after orchestration completes", launch_aicpu_num
-        );
-        // Post-transition: all threads become schedulers
-        if (block_dim % launch_aicpu_num != 0) {
-            LOG_WARN(
-                "block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
-                "some threads will have different core counts after transition",
-                block_dim, launch_aicpu_num
-            );
-        }
     }
 
     // Ensure device is initialized
