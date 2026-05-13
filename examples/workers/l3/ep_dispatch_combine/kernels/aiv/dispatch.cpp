@@ -181,7 +181,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // ------------------------------------------------------------------
     // histogram: scalar histogram + (dst, loc_e)-sorted route table.
     //
-    // Scalar GM reads of indices[t * TOPK + k] are fine on AIV.
+    // Scalar GM reads of indices[t * TOPK + k] are fine on AIV. The upstream
+    // router task (write_route_outputs) flushes its scalar stores to L2 via
+    // dcci(..., CACHELINE_OUT) + dsb at its own tail, so dispatch picks up
+    // fresh data here without needing a reader-side cache invalidate.
     // Bucket each route by (dst, loc_e) and stable-sort so the payload_push
     // cursor matches each peer's src-major slot_offset rule.
     // ------------------------------------------------------------------
@@ -196,10 +199,17 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int route_loc_e[N_ROUTES];
     int route_r[N_ROUTES];
 
+    // EP routing policy: route slot k of each token goes to peer
+    // (my_rank + k) % N. The router was JIT'd with EP_WORLD_SIZE=1 and writes
+    // local expert IDs in [0, L); we layer the rank component on top here so
+    // the demo spreads tokens across both ranks instead of pinning everything
+    // to rank 0. A production EP system would read a true global ID from the
+    // router output instead.
     for (int r = 0; r < N_ROUTES; ++r) {
-        int eid = indices[r];
-        int dst = eid / L;
-        int loc_e = eid - dst * L;
+        int t = r / TOPK;
+        int k = r - t * TOPK;
+        int dst = (my_rank + k) % N;
+        int loc_e = indices[r];  // local expert id in [0, L)
         send_counts[dst][loc_e] += 1;
         route_dst[r] = dst;
         route_loc_e[r] = loc_e;

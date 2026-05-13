@@ -44,7 +44,7 @@ static __aicore__ inline void ptoas_auto_sync_tail(
 }
 
 static __aicore__ void exp_recv_y_write(__gm__ float* v1, __gm__ bfloat16_t* v2, int32_t v3, int32_t v4) {
-  RoundMode v5 = RoundMode::CAST_ROUND;
+  RoundMode v5 = RoundMode::CAST_RINT;
   unsigned v6 = 0;
   const int32_t v7 = 4096;
   const int32_t v8 = 1;
