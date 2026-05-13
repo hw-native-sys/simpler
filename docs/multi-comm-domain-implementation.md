@@ -153,17 +153,90 @@ Therefore host staging stays on `ChipBootstrapConfig`.  Each staging entry
 that targets a communication buffer includes `domain_name`; the effective key
 is `(domain_name, buffer_name)`, so two domains can both own `"scratch"`.
 
-## Why Sim Was Extended
+## Simulation Backend Extension
 
 The sim backend is not only a compatibility target.  It is the cheapest place
 to validate parent-side derivation, child bootstrap, missing-domain behavior,
-domain rank order, duplicate-name rejection, and host-staging scoping without
-needing hardware.  The sim extension mirrors the same visible contract:
-`ctx.domains[name]` contains a domain-local context and buffer pointers.
+domain rank order, duplicate-name rejection, window slicing, and host-staging
+scoping without needing hardware.
 
-It does not attempt to model HCCL transport performance or collective
-behavior.  It only validates the runtime contract that kernels and
-orchestration code consume.
+The extension uses the same visible contract as onboard execution:
+`ctx.domains[name]` contains a domain-local context and buffer pointers.  The
+difference is only the transport used under that contract.  On hardware, the
+base window comes from HCCL/HCOMM resources.  On sim, the base window is a
+POSIX shared-memory segment mapped by each simulated rank process.
+
+The sim flow is:
+
+```text
+comm_init(base_rank, base_size, rootinfo_path)
+  creates a base handle whose shared-memory identity is derived from
+  rootinfo_path and the parent process id
+
+comm_alloc_windows(base, total_base_window_size)
+  creates or opens one shared-memory segment:
+    [header][rank-0 base window][rank-1 base window]...
+  fills the base CommContext:
+    rankId = base_rank
+    rankNum = base_size
+    winSize = total_base_window_size
+    windowsIn[i] = local process pointer to rank i base window
+    windowsOut[i] = windowsIn[i]
+
+for each visible domain on this chip:
+  comm_derive_context(
+      base,
+      rank_ids=domain worker indices in domain-rank order,
+      domain_rank=this chip's dense domain rank,
+      window_offset=domain slice offset in the base window,
+      window_size=domain window size,
+  )
+```
+
+`comm_derive_context` allocates a new host-resident `CommContext` for the
+domain.  It remaps dense domain ranks onto the selected base ranks and applies
+the domain's slice offset:
+
+```text
+derived.rankId = domain_rank
+derived.rankNum = len(rank_ids)
+derived.winSize = window_size
+derived.windowsIn[d] = base.windowsIn[rank_ids[d]] + window_offset
+derived.windowsOut[d] = base.windowsOut[rank_ids[d]] + window_offset
+```
+
+This is enough for CPU-sim kernels to use the same scalar `device_ctx` shape
+as hardware kernels: the scalar still points to a `CommContext`, and the
+domain-local rank ids still index `windowsIn[]` and `windowsOut[]`.
+
+There is one important address-model difference from hardware.  Hardware
+communication windows are device-visible addresses produced by HCCL/HCOMM.
+Sim windows are process-local pointers into the same shared-memory file.  The
+numeric pointer values may differ between rank processes because each process
+maps the file independently.  This is acceptable because each simulated kernel
+dereferences only the `CommContext` built inside its own process; shared memory
+provides visibility of the underlying bytes.
+
+The sim backend also keeps the old single-domain behavior as a special case of
+the same mechanism: one `CommDomain("default", ...)` derives one visible
+context from the base window.  No old public bootstrap surface is required.
+
+What sim intentionally does not do:
+
+- it does not model HCCL transport performance;
+- it does not run HCCL collective kernels;
+- it does not require cross-process numeric address equality;
+- it does not create independent root-info communicators per domain.
+
+The focused sim tests cover:
+
+- `CommDomainPlan.bootstrap_for_worker` rank derivation and validation;
+- L3 `Worker(..., comm_plan=...)` creation of per-chip bootstrap configs;
+- overlapping domains where one worker has both `tp` and `pp` contexts;
+- different `device_ctx` and buffer pointers for different domains;
+- absent-domain behavior through missing `ctx.domains[name]`;
+- host-staging scoping by `(domain_name, buffer_name)`;
+- bootstrap error propagation and cleanup.
 
 ## Example Coverage
 
@@ -221,44 +294,49 @@ Validation date: 2026-05-13.
 
 ### Example Results
 
+- `examples` excluding `a2a3/sdma_async_completion_demo`
+  - Hardware: pass on a five-device pool.
+  - This includes the migrated L3 communication examples, the two new
+    multi-domain examples, and the L2 examples.
+
 - `workers/l3/domain_rank_map`
   - Sim: not applicable.
-  - Hardware: pass with `-p a2a3 -d 3-5`.
+  - Hardware: pass with `-p a2a3 -d 3-5` and in the examples sweep.
   - New small domain-rank and per-domain communication example.
 
 - `workers/l3/dual_domain_overlap`
   - Sim: not applicable.
-  - Hardware: pass with `-d 3-5`.
+  - Hardware: pass with `-d 3-5` and in the examples sweep.
   - New two-domain data and compute example.
 
 - `workers/l3/allreduce_distributed`
   - Sim: not applicable.
-  - Hardware: pass with `-d 3-4`.
+  - Hardware: pass with `-d 3-4` and in the examples sweep.
   - One-domain baseline through `CommDomainPlan`.
 
 - `workers/l3/ffn_tp_parallel`
   - Sim: not applicable.
-  - Hardware: pass with `-d 3-4`.
+  - Hardware: pass with `-d 3-4` and in the examples sweep.
   - One-domain tensor-parallel compute plus reduce.
 
 - `workers/l3/ep_dispatch_combine`
   - Sim: not applicable.
-  - Hardware: pass with `-d 3-4`.
+  - Hardware: pass with `-d 3-4` and in the examples sweep.
   - One-domain EP dispatch/combine.
 
 - `a2a3/async_notify_demo`
   - Sim: pass with `-p a2a3sim`.
-  - Hardware: not run.
+  - Hardware: pass in the examples sweep.
   - Explicit bootstrap plus host staging.
 
 - `a2a3/deferred_notify_demo`
   - Sim: pass with `-p a2a3sim`.
-  - Hardware: not run.
+  - Hardware: pass in the examples sweep.
   - Explicit bootstrap plus deferred notify staging.
 
 - `a2a3/sdma_async_completion_demo`
   - Sim: not run.
-  - Hardware: fail with `-p a2a3 -d 3-4`.
+  - Hardware: fail with `-p a2a3 -d 6-7`.
   - Both chips bootstrap, then `worker.run()` fails with AICPU 507015.
 
 - `a5/async_notify_demo`
@@ -276,6 +354,36 @@ observed error is `aclrtSynchronizeStreamWithTimeout (AICPU) failed: 507015`,
 followed by 507901 during stream teardown.  This is tracked as a remaining
 SDMA runtime/data-plane issue, not as a communication-domain bootstrap
 failure.
+
+### SDMA 507015 Investigation
+
+The `worker.run()` failure is currently isolated from multi-domain bootstrap:
+
+- Current one-domain and multi-domain L3 communication examples pass on clean
+  devices.
+- The public examples pass on real devices when the SDMA async completion demo
+  is excluded.
+- A stock HCCL allreduce test using root-info initialization passes on the same
+  CANN 8.5 installation.  This confirms basic HCCL root-info communicator
+  setup and collective execution are not generally broken.
+- The PTO-ISA allgather async reference builds, but on this CANN 8.5
+  installation it fails before executing the SDMA async kernels because the
+  installed `libopapi.so` does not export `aclnnShmemSdmaStarsQuery`.
+  Subsequent SDMA resource allocation fails with code 15.  This points to
+  missing or incompatible SDMA async support in the local CANN stack.
+- A local CANN 9.0 beta toolkit exports the SDMA async query symbols and the
+  demo was rerun under that environment with a runtime rebuild.  It still
+  fails with the same AICPU 507015 symptom, so the missing CANN 8.5 symbol is
+  not the only blocker.
+- The pre-PR single-domain checkout is not a valid local baseline in this
+  environment: its L3 hardware bootstrap times out before reaching the SDMA
+  run path.
+
+A broader `examples tests/st` hardware sweep without the SDMA demo found three
+separate `spmd_sync_start*` failures with AICPU stream-sync timeout 507046.
+After that timeout, rerunning those cases on the same device degraded to stream
+creation failure 507899.  Those failures are separate from the SDMA 507015
+symptom: they do not involve communication domains or SDMA async completion.
 
 ## Grep Gates
 
