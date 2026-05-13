@@ -159,6 +159,7 @@ KERNELS: list[tuple[int, str, str, str]] = [
     (34, "sh_w2_dequant", "kernels/aiv/sh_w2_dequant.cpp", "aiv"),
     (35, "sh_write", "kernels/aiv/sh_write.cpp", "aiv"),
     (36, "combine", "kernels/aiv/combine.cpp", "aiv"),
+    (37, "ffn_add", "kernels/aiv/ffn_add.cpp", "aiv"),
 ]
 
 
@@ -224,14 +225,22 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallab
         ArgDirection.INOUT,
     ]
     sig_combine = [ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT]
+    sig_ffn_add = [ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT]
     children: list[tuple[int, CoreCallable]] = []
     for fid, name, _src, _ct in KERNELS:
-        sig = sig_dispatch if name == "dispatch" else sig_combine if name == "combine" else []
+        if name == "dispatch":
+            sig = sig_dispatch
+        elif name == "combine":
+            sig = sig_combine
+        elif name == "ffn_add":
+            sig = sig_ffn_add
+        else:
+            sig = []
         children.append((fid, CoreCallable.build(signature=sig, binary=bins[fid])))
 
-    # Orchestration arg view: 24 INs (x_hc..shared_w2_scale), 12 OUTPUT_EXISTING
-    # (x_norm..routed_y), 1 INOUT scratch — 37 tensors + 2 scalars.
-    sig_orch = [ArgDirection.IN] * 24 + [ArgDirection.OUT] * 12 + [ArgDirection.INOUT]
+    # Orchestration arg view: 24 INs (x_hc..shared_w2_scale), 13 OUTPUT_EXISTING
+    # (x_norm..routed_y, ffn_out), 1 INOUT scratch — 38 tensors + 2 scalars.
+    sig_orch = [ArgDirection.IN] * 24 + [ArgDirection.OUT] * 13 + [ArgDirection.INOUT]
 
     return ChipCallable.build(
         signature=sig_orch,
@@ -607,6 +616,17 @@ def _verify_expert_outputs(nranks, recv_y_goldens, sh_goldens, expected_count, r
     return ok
 
 
+def _routed_y_golden(route_dest, recv_y_goldens, rank: int) -> torch.Tensor:
+    """Reconstruct the golden routed_y[rank] = sum_k recv_y_golden[holder][loc_e, slot, :]
+    in FP32 (mirrors combine's reduce_sum FP32 accumulator)."""
+    out = torch.zeros(T, D, dtype=torch.float32)
+    for t in range(T):
+        for k in range(TOPK):
+            dst, loc_e, slot = route_dest[rank][t][k]
+            out[t, :] += recv_y_goldens[dst][loc_e, slot, :].float()
+    return out
+
+
 def _verify_routed_y(nranks, route_dest, recv_y_goldens, routed_y_outs) -> bool:
     ok = True
     # routed_y is the FP32 sum of TOPK BF16 recv_y rows; each row carries the
@@ -615,17 +635,33 @@ def _verify_routed_y(nranks, route_dest, recv_y_goldens, routed_y_outs) -> bool:
     atol = TOPK * 5e-2 + 1e-2
     rtol = 1e-2
     for me in range(nranks):
-        expected = torch.zeros(T, D, dtype=torch.float32)
-        for t in range(T):
-            for k in range(TOPK):
-                dst, loc_e, slot = route_dest[me][t][k]
-                expected[t, :] += recv_y_goldens[dst][loc_e, slot, :].float()
+        expected = _routed_y_golden(route_dest, recv_y_goldens, me)
         got = routed_y_outs[me]
         diff = (got - expected).abs()
         print(f"[ep_dispatch] chip {me}: routed_y max|diff|={float(diff.max()):.3e}")
         if not torch.allclose(got, expected, rtol=rtol, atol=atol):
             ok = False
             print(f"[ep_dispatch] chip {me}: routed_y mismatch (rtol={rtol}, atol={atol})")
+    return ok
+
+
+def _verify_ffn_out(nranks, route_dest, recv_y_goldens, sh_goldens, ffn_out_outs) -> bool:
+    """ffn_out = (routed_y + sh).to(bf16). chip uses an FP32 add then one
+    BF16 cast (CAST_RINT); golden mirrors exactly."""
+    ok = True
+    # Same noise budget as routed_y plus one BF16 ulp from the final cast — keep
+    # the routed_y bound and let the trailing 1e-2 absorb the cast.
+    atol = TOPK * 5e-2 + 2e-2
+    rtol = 1e-2
+    for me in range(nranks):
+        routed_golden = _routed_y_golden(route_dest, recv_y_goldens, me)
+        expected = (routed_golden + sh_goldens[me].float()).to(torch.bfloat16).float()
+        got = ffn_out_outs[me].float()
+        diff = (got - expected).abs()
+        print(f"[ep_dispatch] chip {me}: ffn_out max|diff|={float(diff.max()):.3e}")
+        if not torch.allclose(got, expected, rtol=rtol, atol=atol):
+            ok = False
+            print(f"[ep_dispatch] chip {me}: ffn_out mismatch (rtol={rtol}, atol={atol})")
     return ok
 
 
@@ -711,6 +747,8 @@ def run(
     recv_y_outs = [torch.zeros(L, R, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
     sh_outs = [torch.zeros(T, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
     routed_y_outs = [torch.zeros(T, D, dtype=torch.float32).share_memory_() for _ in range(nranks)]
+    # ffn_out = routed_y + sh — final post-MoE add (single-layer spec).
+    ffn_out_outs = [torch.zeros(T, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
 
     cfgs = [
         ChipBootstrapConfig(
@@ -785,7 +823,7 @@ def run(
                              "expert_w2", "expert_w2_scale", "shared_w1", "shared_w1_scale",
                              "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale"):
                     a.add_tensor(make_tensor_arg(weight_banks[name]), TensorArgType.INPUT)
-                # 12 chip OUTPUT_EXISTING tensors (24..35)
+                # 13 chip OUTPUT_EXISTING tensors (24..36)
                 a.add_tensor(make_tensor_arg(x_norm_outs[i]), TensorArgType.OUTPUT_EXISTING)
                 a.add_tensor(make_tensor_arg(indices_outs[i]), TensorArgType.OUTPUT_EXISTING)
                 a.add_tensor(make_tensor_arg(weights_outs[i]), TensorArgType.OUTPUT_EXISTING)
@@ -798,7 +836,8 @@ def run(
                 a.add_tensor(make_tensor_arg(recv_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
                 a.add_tensor(make_tensor_arg(sh_outs[i]), TensorArgType.OUTPUT_EXISTING)
                 a.add_tensor(make_tensor_arg(routed_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                # scratch (36)
+                a.add_tensor(make_tensor_arg(ffn_out_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                # scratch (37)
                 a.add_tensor(
                     ContinuousTensor.make(
                         data=ctx.buffer_ptrs["scratch"], shapes=(SCRATCH_NBYTES // 4,),
@@ -831,6 +870,7 @@ def run(
         ) and ok
         ok = _verify_expert_outputs(nranks, recv_y_goldens, sh_goldens, expected_count, recv_y_outs, sh_outs) and ok
         ok = _verify_routed_y(nranks, route_dest, recv_y_goldens, routed_y_outs) and ok
+        ok = _verify_ffn_out(nranks, route_dest, recv_y_goldens, sh_goldens, ffn_out_outs) and ok
 
         if not ok:
             print("[ep_dispatch] golden check FAILED")

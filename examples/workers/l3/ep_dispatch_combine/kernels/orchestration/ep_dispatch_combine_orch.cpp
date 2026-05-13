@@ -24,6 +24,8 @@
  *                                       from host-known tensor(11)).
  *   func_id 36      combine.cpp         TPUT recv_y rows -> routed_y_buf;
  *                                       reduce_sum -> routed_y.
+ *   func_id 37      ffn_add.cpp         ffn_out = routed_y + sh
+ *                                       (single-layer spec, model.py:644-645).
  *
  *   tensor(0)   x_hc              INPUT  (host) [B, S, HC_MULT, D]    BF16
  *   tensor(1)   hc_ffn_fn         INPUT  (host) [MIX_HC, HC_DIM]      FP32
@@ -61,7 +63,8 @@
  *   tensor(33)  recv_y            OUTPUT_EXISTING [L, R, D]           BF16
  *   tensor(34)  sh                OUTPUT_EXISTING [T, D]              BF16
  *   tensor(35)  routed_y          OUTPUT_EXISTING [T, D]              FP32
- *   tensor(36)  scratch           INOUT  HCCL window slot
+ *   tensor(36)  ffn_out           OUTPUT_EXISTING [T, D]              BF16   (routed_y + sh)
+ *   tensor(37)  scratch           INOUT  HCCL window slot
  *   scalar(0)   nranks
  *   scalar(1)   CommContext device pointer
  */
@@ -80,7 +83,7 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig
 ep_dispatch_combine_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 39,  // 37 tensors + 2 scalars
+        .expected_arg_count = 40,  // 38 tensors + 2 scalars
     };
 }
 
@@ -107,7 +110,8 @@ __attribute__((visibility("default"))) void ep_dispatch_combine_orchestration(co
     Tensor recv_y = from_tensor_arg(orch_args.tensor(33));
     Tensor sh = from_tensor_arg(orch_args.tensor(34));
     Tensor routed_y = from_tensor_arg(orch_args.tensor(35));
-    Tensor scratch = from_tensor_arg(orch_args.tensor(36));
+    Tensor ffn_out = from_tensor_arg(orch_args.tensor(36));
+    Tensor scratch = from_tensor_arg(orch_args.tensor(37));
 
     // Router output names (PyPTO body refs them as ext_*).
     Tensor ext_x_norm = x_norm;
@@ -751,6 +755,15 @@ __attribute__((visibility("default"))) void ep_dispatch_combine_orchestration(co
         p.add_scalar(orch_args.scalar(0));  // nranks
         p.add_scalar(orch_args.scalar(1));  // CommContext
         rt_submit_aiv_task(36, p);
+    }
+
+    // ---- func_id 37: ffn_add (ffn_out = routed_y + sh) ----
+    {
+        Arg p;
+        p.add_input(routed_y);
+        p.add_input(sh);
+        p.add_output(ffn_out);
+        rt_submit_aiv_task(37, p);
     }
 }
 
