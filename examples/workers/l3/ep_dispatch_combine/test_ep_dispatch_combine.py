@@ -13,7 +13,9 @@ import pytest
 from .main import run
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim"])
+# Hardware only — the moe_expert path runs D=MOE_INTER=4096 INT8 matmuls that
+# are far too slow under simulation.
+@pytest.mark.platforms(["a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
 def test_ep_dispatch_combine(st_device_ids, st_platform):
