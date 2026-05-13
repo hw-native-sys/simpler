@@ -66,11 +66,11 @@ import torch  # noqa: E402
 from simpler.task_interface import (  # noqa: E402
     ArgDirection,
     CallConfig,
-    ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
-    ChipCommBootstrapConfig,
     ChipContext,
+    CommDomain,
+    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -429,12 +429,6 @@ def run(
 
     window_size = max(SCRATCH_NBYTES, 128 * 1024)
 
-    rootinfo_path = f"/tmp/pto_ep_dispatch_rootinfo_{os.getpid()}.bin"
-    try:
-        os.unlink(rootinfo_path)
-    except FileNotFoundError:
-        pass
-
     print(f"[ep_dispatch] platform={platform} devices={device_ids} nranks={nranks}")
 
     # x_norm[r, t, d] = r*100 + t*10 + d  →  max value = 1*100 + 7*10 + 63 = 233.
@@ -485,25 +479,23 @@ def run(
     print("[ep_dispatch] computing host golden...")
     expected_recv_x, expected_recv_w, expected_recv_idx, expected_count = compute_golden(x_norms, indices, weights)
 
-    cfgs = [
-        ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank,
-                nranks=nranks,
-                rootinfo_path=rootinfo_path,
+    comm_plan = CommDomainPlan(
+        domains=[
+            CommDomain(
+                name="default",
+                worker_indices=list(range(nranks)),
                 window_size=window_size,
-            ),
-            buffers=[
-                ChipBufferSpec(
-                    name="scratch",
-                    dtype="float32",
-                    count=SCRATCH_NBYTES // 4,
-                    nbytes=SCRATCH_NBYTES,
-                ),
-            ],
-        )
-        for rank in range(nranks)
-    ]
+                buffers=[
+                    ChipBufferSpec(
+                        name="scratch",
+                        dtype="float32",
+                        count=SCRATCH_NBYTES // 4,
+                        nbytes=SCRATCH_NBYTES,
+                    ),
+                ],
+            )
+        ]
+    )
 
     print("[ep_dispatch] compiling kernels...")
     chip_callable = build_chip_callable(platform, pto_isa_commit)
@@ -514,8 +506,8 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        chip_bootstrap_configs=cfgs,
         build=build,
+        comm_plan=comm_plan,
     )
     chip_cid = worker.register(chip_callable)
 
@@ -526,14 +518,16 @@ def run(
         contexts: list[ChipContext] = worker.chip_contexts
         assert len(contexts) == nranks
         for i, ctx in enumerate(contexts):
+            domain = ctx.domains["default"]
             print(
-                f"[ep_dispatch] chip {i}: device={ctx.device_id} rank={ctx.rank}/{ctx.nranks} "
-                f"window=[0x{ctx.local_window_base:x} +{ctx.actual_window_size}B] "
-                f"scratch=0x{ctx.buffer_ptrs['scratch']:x}"
+                f"[ep_dispatch] chip {i}: device={ctx.device_id} rank={domain.domain_rank}/{domain.domain_size} "
+                f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
+                f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
             )
 
         def orch_fn(orch, _args, cfg):
             for i, ctx in enumerate(contexts):
+                domain = ctx.domains["default"]
                 chip_args = TaskArgs()
                 chip_args.add_tensor(make_tensor_arg(indices_per_rank[i]), TensorArgType.INPUT)
                 chip_args.add_tensor(make_tensor_arg(x_norms[i]), TensorArgType.INPUT)
@@ -547,15 +541,15 @@ def run(
                 chip_args.add_tensor(make_tensor_arg(routed_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
                 chip_args.add_tensor(
                     ContinuousTensor.make(
-                        data=ctx.buffer_ptrs["scratch"],
+                        data=domain.buffer_ptrs["scratch"],
                         shapes=(SCRATCH_NBYTES // 4,),
                         dtype=DataType.FLOAT32,
                         child_memory=True,
                     ),
                     TensorArgType.INOUT,
                 )
-                chip_args.add_scalar(ctx.nranks)
-                chip_args.add_scalar(ctx.device_ctx)
+                chip_args.add_scalar(domain.domain_size)
+                chip_args.add_scalar(domain.device_ctx)
                 orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
 
         print("[ep_dispatch] running 2-chip dispatch DAG...")
@@ -581,10 +575,6 @@ def run(
         return 0
     finally:
         worker.close()
-        try:
-            os.unlink(rootinfo_path)
-        except FileNotFoundError:
-            pass
 
 
 def main() -> int:

@@ -114,7 +114,7 @@ workers to PTO-ISA kernels.
 
 ```text
 Python L3 user code
-  ChipBootstrapConfig(comm=ChipCommBootstrapConfig(...), buffers=[scratch])
+  Worker(comm_plan=CommDomainPlan([CommDomain("default", ...)]))
         |
         v
 Worker(level=3)
@@ -128,7 +128,10 @@ chip child / ChipWorker
         |
         v
 ChipContext exposed to L3 orchestration
-  rank, nranks, device_ctx, local_window_base, buffer_ptrs["scratch"]
+  domains["default"].domain_rank
+  domains["default"].domain_size
+  domains["default"].device_ctx
+  domains["default"].buffer_ptrs["scratch"]
         |
         v
 TaskArgs to each chip task
@@ -151,9 +154,10 @@ assembled by the kernel and it is not passed field by field:
    `windowsIn[]`, and `windowsOut[]`.
 3. The backend returns the address of that `CommContext` through
    `device_ctx_out`.
-4. `ChipWorker.bootstrap_context()` stores that integer as
-   `ChipContext.device_ctx`.
-5. L3 orchestration passes `ctx.device_ctx` as a scalar task argument.
+4. `ChipWorker.bootstrap_context()` stores that integer in the default
+   domain context.
+5. L3 orchestration passes `ctx.domains["default"].device_ctx` as a scalar
+   task argument.
 6. The AIV/AIC kernel casts that scalar back to `__gm__ CommContext *`.
 
 On hardware, `device_ctx_out` is a real device address.  For MESH topology,
@@ -263,12 +267,14 @@ or synchronize.
 
 ### L3 Integration
 
-Today, L3 owns one `ChipBootstrapConfig` per chip.  Examples such as
-`examples/workers/l3/allreduce_distributed/main.py` declare:
+The previous L3 implementation owned one `ChipBootstrapConfig` per chip.
+The new public surface expresses the same single-domain case as one
+`CommDomain` named `"default"`:
 
-- `ChipCommBootstrapConfig(rank, nranks, rootinfo_path, window_size)`;
-- one or more `ChipBufferSpec` entries, usually a `scratch` window;
-- optional host staging information.
+- `CommDomain(name="default", worker_indices=[0, 1], window_size=...)`;
+- one or more per-domain `ChipBufferSpec` entries, usually a `scratch`
+  window;
+- optional per-chip host staging information keyed by domain name.
 
 Current single-domain window sizing is explicit.  The example computes a
 requested `window_size`, usually `max(sum(buffer nbytes), floor)`, and passes
@@ -285,18 +291,19 @@ An L3 orchestration function consumes a context like this:
 
 ```python
 ctx = worker.chip_contexts[i]
+default = ctx.domains["default"]
 
 chip_args.add_tensor(
     ContinuousTensor.make(
-        data=ctx.buffer_ptrs["scratch"],
+        data=default.buffer_ptrs["scratch"],
         shapes=(scratch_count,),
         dtype=DataType.FLOAT32,
         child_memory=True,
     ),
     TensorArgType.INOUT,
 )
-chip_args.add_scalar(ctx.nranks)
-chip_args.add_scalar(ctx.device_ctx)
+chip_args.add_scalar(default.domain_size)
+chip_args.add_scalar(default.device_ctx)
 orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
 ```
 
@@ -325,8 +332,8 @@ __gm__ float *scratch =
     scratch_tensor->start_offset;
 ```
 
-`ctx.device_ctx` is different: it is not a tensor buffer that participates in
-scheduling, staging, or shape-aware access.  It is only an opaque
+`default.device_ctx` is different: it is not a tensor buffer that participates
+in scheduling, staging, or shape-aware access.  It is only an opaque
 `CommContext*`, so it is passed as a scalar.
 
 ### L2 Integration
@@ -499,10 +506,10 @@ children.
 
 The domain name is the user-facing identity.  L3 orchestration looks up
 domains by name, for example `ctx.domains["tp"]`.  The public plan should not
-expose a numeric domain identifier in the first PR.  If the backend needs
-numeric IDs, the parent can assign them internally from sorted domain names.
-Names only need to be non-empty and unique; the API should not impose
-identifier-style spelling rules.
+expose a numeric domain identifier in the initial implementation.  The parent
+derives internal backend IDs from sorted domain names.  Names only need to be
+non-empty and unique; the API should not impose identifier-style spelling
+rules.
 
 The order of `worker_indices` defines domain rank.  For
 `worker_indices=[2, 3]`, worker `2` is domain rank `0`, and worker `3` is
@@ -520,9 +527,9 @@ named `"scratch"`; callers disambiguate through the domain first, for example
 must be unique.
 
 `window_size` remains explicit, matching the current single-domain behavior.
-The runtime should not derive it from `sum(buffers.nbytes)` in the first PR.
-Bootstrap only validates that the declared buffers fit in the actual allocated
-window.
+The runtime should not derive it from `sum(buffers.nbytes)` in the initial
+implementation.  Bootstrap only validates that the declared buffers fit in the
+actual allocated window.
 
 The parent then derives the per-chip `ChipBootstrapConfig` list internally.
 Each chip child receives only the domains that the chip participates in:
@@ -555,11 +562,12 @@ chip_cfg = ChipBootstrapConfig(
 [
     ChipDomainBootstrapConfig(
         name="tp0",
+        sub_comm_id=0,
         domain_rank=0,
         domain_size=2,
         window_size=...,
         buffers=[...],
-        # backend-only sub-communicator construction metadata,
+        # backend-only base-window derivation metadata,
         # derived by the parent from CommDomainPlan
     ),
 ]
@@ -569,7 +577,8 @@ There should not be a second public domain config that users fill per chip.
 Users should not copy the whole `CommDomainPlan` into every chip config.  The
 parent is the only place that has the full worker list, so it is the right
 place to validate `worker_indices` and derive each chip child's `domain_rank`,
-`domain_size`, window layout, and active domain list.
+`domain_size`, window layout, internal backend identity, and active domain
+list.
 
 Conceptually, `CommDomainPlan` owns the derivation method:
 
@@ -587,47 +596,49 @@ class CommDomainPlan:
 The method filters domains that contain `worker_idx`.  For each match, it
 uses the position of `worker_idx` in `CommDomain.worker_indices` as
 `domain_rank`, uses `len(worker_indices)` as `domain_size`, copies the domain
-window size and symmetric buffer layout, and attaches any backend-only
-sub-communicator construction metadata.  The returned list is what the parent
+window size and symmetric buffer layout, and attaches backend-only
+base-window layout metadata.  The returned list is what the parent
 puts into `ChipBootstrapConfig(comm=...)` for that chip.
 
-If the HCCL sub-communicator backend needs the domain's participant list, that
-list is backend construction metadata in the derived chip config.  It is not a
-kernel-visible rank map and it is not exposed through `ChipCommDomainContext`.
-Kernel code communicates only with dense domain ranks.
+The public domain name is not the backend communicator identity.  The parent
+derives a deterministic internal numeric `sub_comm_id` for each domain, using
+sorted domain-name order.  The initial RMA path mainly needs the same sorted
+order to compute `window_offset`, while `sub_comm_id` remains available as an
+internal backend identity.  `ChipCommDomainContext` exposes the public name
+and domain-local rank information, not `sub_comm_id`.
+
+The domain participant list is backend construction metadata in the derived
+chip config.  It is not a kernel-visible rank map and it is not exposed
+through `ChipCommDomainContext`.  Kernel code communicates only with dense
+domain ranks.
 
 All domains are bootstrapped eagerly during `Worker.init()`.  After init
 returns, every active `ctx.domains[name]` is ready for L3 orchestration.  The
-first PR should not add lazy first-use communicator creation.
+initial implementation should not add lazy first-use communicator creation.
 
 ### Bootstrap Sequence
 
-The handoff from `CommDomainPlan` to chip-worker sub-communicators should be
+The handoff from `CommDomainPlan` to chip-worker domain bootstrap should be
 mechanical and one-way:
 
 ```text
 L3 Worker(comm_plan)
   validate CommDomainPlan against device_ids
-  derive chip_bootstrap_configs[i] =
+  derive internal chip bootstrap config for child i:
       ChipBootstrapConfig(
           comm=comm_plan.bootstrap_for_worker(worker_idx=i)
       )
-  fork chip child i with chip_bootstrap_configs[i]
+  fork chip child i with that derived config
         |
         v
 chip child i / ChipWorker.bootstrap_context()
   create hidden base communicator once, if comm_plan has any domains
       rank      = i
       rank_size = len(device_ids)
-      windows   = none
-  for each ChipDomainBootstrapConfig in sorted domain-name order:
-      sub = create_subcomm(
-          base,
-          rank_ids=domain.worker_indices,
-          sub_comm_rank_id=domain_rank,
-      )
-      device_ctx = comm_alloc_windows(sub, window_size)
-      local_base = comm_get_local_window_base(sub)
+  allocate one base window of base_window_size
+  for each active ChipDomainBootstrapConfig in sorted domain-name order:
+      derive domain CommContext from base context, rank_ids, and window_offset
+      local_base = base_local_window + domain.window_offset
       carve domain buffer_ptrs from local_base
       record ChipCommDomainContext(name, domain_rank, domain_size, ...)
   publish all domain contexts to the parent bootstrap mailbox
@@ -637,18 +648,24 @@ L3 parent _wait_for_bootstrap()
   assemble ChipContext(worker_index=i, domains={name: context})
 ```
 
-`ChipBootstrapConfig(comm=...)` is therefore not user-authored.  It is the
-per-chip, derived execution plan for the chip child.  The public plan remains
-`CommDomainPlan`; the derived config is just how the parent tells one chip
-which sub-communicators and windows to create.
+`ChipBootstrapConfig(comm=...)` is therefore not the public communication
+topology.  It is the per-chip, derived execution plan for the chip child.  In
+ordinary L3 usage the parent authors it internally from `CommDomainPlan`.  In
+explicit bootstrap usage, such as host staging, the caller may still construct
+`ChipBootstrapConfig` manually, but its `comm` list must be derived from the
+same parent plan with `plan.bootstrap_for_worker(worker_idx)`.
 
 The hidden base communicator is a control-plane object.  It has no exposed
 buffers, no `ChipCommDomainContext`, and no entry in `ctx.domains`.  It exists
-only so the backend can derive domain communicators from a common L3 rank
-space.  A chip that is not a member of a particular domain still joins the
-hidden base communicator when the L3 plan has communication domains, but it
-does not create that domain's sub-communicator, allocate that domain's window,
-or receive that domain's buffer metadata.
+only so the backend can expose one common L3 rank space and base window.  A
+chip that is not a member of a particular domain still joins the hidden base
+communicator when the L3 plan has communication domains, but it does not
+allocate that domain's window or receive that domain's buffer metadata.
+
+The visible contract is that non-members do not receive a domain session or a
+`ctx.domains[name]` entry.  They still join the hidden base communicator when
+the plan has any communication domain, because the base communicator is
+created over all chip children.
 
 The parent receives:
 
@@ -679,17 +696,16 @@ ChipCommDomainContext(
 
 `worker_index` is the same logical worker ID already used by
 `orch.submit_next_level(..., worker=i)`.  It also matches the index in
-`device_ids` and `chip_bootstrap_configs`.  The public multi-domain API should
-use this same indexing model instead of introducing a second worker reference
-mechanism.
+`device_ids` and the parent's internally derived bootstrap list.  The public
+multi-domain API should use this same indexing model instead of introducing a
+second worker reference mechanism.
 
 `worker_indices` belongs to the domain specification that the parent validates
 before bootstrap.  It should not be copied into every active domain context
 unless a later API needs to expose membership for host-side introspection.
 
-The old scalar fields on `ChipContext` should be replaced by domain lookups.
-Even single-domain code should use `ctx.domains["default"]` instead of
-`ctx.rank`, `ctx.nranks`, `ctx.device_ctx`, and `ctx.buffer_ptrs` directly.
+`ChipContext` exposes communication state only through domain lookups.  Even
+single-domain code uses `ctx.domains["default"]`.
 
 ## Mechanism 1: Domain Membership and Logical Rank
 
@@ -721,156 +737,132 @@ Host-side use:
 - validate that every participating chip has a unique domain rank;
 - validate that every worker index belongs to this L3 worker;
 - compute `domain_rank` from this worker's position in `worker_indices`;
-- skip sub-communicator and window creation on chips not in the domain.
+- publish no domain context or window on chips not in the domain.
 
 Kernel-side use is intentionally smaller: kernels communicate only in
 domain-rank coordinates.  They use `ctx->rankId`, `ctx->rankNum`, and peer
 domain ranks.  They do not need worker indices or a rank-map buffer.
 
-## Mechanism 2: Per-Domain Windows
+## Mechanism 2: Per-Domain Window Views
 
-Each domain owns its own communicator handle, stream, `CommContext`, and
-window allocation:
+Each domain owns an independent logical window view, not necessarily an
+independent HCCL MC2 allocation.  On hardware the bootstrap allocates one
+hidden base communicator window over all L3 chip children, then derives a
+small `CommContext` for each visible domain:
 
 ```text
-chip child
-  domain "tp0"
-    CommHandle h0
-    stream s0
-    CommContext* ctx0
-    window base b0
-    buffers: scratch, signals
+base CommContext over L3 workers
+  rankId  = worker index
+  rankNum = number of chip children
+  winSize = sum(domain.window_size for all domains)
+  windowsIn[worker] = base window for worker
 
-  domain "ep0"
-    CommHandle h1
-    stream s1
-    CommContext* ctx1
-    window base b1
-    buffers: send, recv, signals
+visible domain "tp0"
+  rankId  = domain_rank
+  rankNum = domain_size
+  winSize = tp0.window_size
+  windowsIn[d] = base.windowsIn[worker_indices[d]] + tp0.window_offset
+  buffers = slices inside the tp0 window view
+
+visible domain "ep0"
+  rankId  = domain_rank
+  rankNum = domain_size
+  winSize = ep0.window_size
+  windowsIn[d] = base.windowsIn[worker_indices[d]] + ep0.window_offset
+  buffers = slices inside the ep0 window view
 ```
 
-Windows should not be multiplexed across domains in the first PR, even when
-two domains have identical `worker_indices`.  Separate windows make these
-invariants simple:
+The offsets are deterministic and symmetric.  The parent sorts domain names
+and assigns each domain a range inside the base window.  All chips reserve
+the same total base-window size, even if a chip does not participate in every
+domain.  Non-participant chips do not publish a `ctx.domains[name]` entry.
 
-- `ctx->windowsIn[ctx->rankId]` is the base for exactly one domain;
-- byte offset `x - local_base` is meaningful only inside that domain;
-- signal slots cannot collide across domains;
-- teardown can release resources domain by domain.
+This keeps the kernel contract exactly domain-local:
+
+- `ctx->windowsIn[ctx->rankId]` is the local base for the selected domain;
+- byte offset `x - local_base` is meaningful only inside that domain view;
+- signal slots cannot collide because each domain occupies a disjoint base
+  window range;
+- each domain has its own device `CommContext*`, rank space, and buffer map.
 
 The Simpler runtime should not define cross-domain concurrency semantics.
-Its job is to pass isolated per-domain handles, contexts, and windows to the
+Its job is to pass isolated per-domain contexts and window slices to the
 kernel.  Whether two active domains make concurrent progress, contend for
 links, or serialize internally is HCCL/HCOMM backend behavior.
 
 The allocation order must be deterministic across ranks.  All chips should
-bootstrap domains in sorted domain-name order.  If a chip does not belong to a
-domain, it omits that domain from `ctx.domains` and does not create that
-domain's sub-communicator or windows.  It also receives no buffer layout
+derive offsets from sorted domain-name order.  If a chip does not belong to a
+domain, it omits that domain from `ctx.domains` and receives no buffer layout
 metadata for that domain.
 
-## Proposed Backend API
+## Backend Path
 
-The current 5-function C ABI is not enough for the sub-communicator path.
-`comm_init()` can still create the hidden base communicator for the L3 chip
-set, but each domain also needs a derived sub-communicator before
-`comm_alloc_windows()` can build a domain-local `CommContext`.
+`comm_init()` creates the hidden base communicator for the L3 chip set.
+`comm_alloc_windows(base, base_window_size)` allocates one base MC2/shared
+window per chip.  `ChipWorker.bootstrap_context()` then derives visible
+domain contexts from the base `CommContext`; it does not call
+`HcclAllocComResourceByTiling` on overlapping domain sub-communicators.
 
-That means Simpler needs one explicit domain-creation step in the backend
-path, either as a new C ABI entry point or as a dedicated method on
-`ChipWorker`.  Conceptually the flow becomes:
+Conceptually the flow is:
 
-```cpp
+```text
 base handle from comm_init()
-  -> per-domain subcomm creation from ChipDomainBootstrapConfig
-  -> comm_alloc_windows(subcomm_handle, window_size)
-  -> CommContext* + local window base
+  -> comm_alloc_windows(base, total_base_window_size)
+  -> copy/read base CommContext on the host
+  -> for each active ChipDomainBootstrapConfig:
+       build domain-local CommContext with dense domain ranks
+       write that CommContext to device memory
+       carve named buffers from base local window + window_offset
 ```
 
-The derived `ChipDomainBootstrapConfig` is the right place to carry the
-backend-only inputs for that step:
+The derived `ChipDomainBootstrapConfig` carries the backend-only inputs for
+that step:
 
 ```cpp
 struct ChipDomainBootstrapConfig {
     std::string name;
+    uint64_t sub_comm_id;             // deterministic domain identity
     std::vector<uint32_t> rank_ids;   // domain membership in L3 worker order
-    uint32_t sub_comm_rank_id;        // this chip's dense rank in the domain
+    uint32_t domain_rank;             // this chip's dense rank in the domain
     size_t window_size;
+    size_t window_offset;             // offset inside the hidden base window
+    size_t base_window_size;          // same on every chip in the L3 plan
     std::vector<ChipBufferSpec> buffers;
 };
 ```
 
-`HcclCreateSubCommConfig` is the backend API that matches this shape best:
-it takes a global communicator, the selected rank list, and the dense
-sub-communicator rank for the local chip.  The HCCL sub-rank-table creation
-path assigns sub-rank IDs from the supplied `rank_ids` order, which matches
-Simpler's rule that `worker_indices` order defines `domain_rank`.  Simpler
-should call this directly rather than routing the design through
-`HcomCreateGroup`, because that helper sorts rank IDs while building group
-metadata.  It is a registry and lookup layer, not the conceptual API for
-user-defined rank ordering.
-
-`ChipWorker` changes from:
-
-```text
-void *comm_stream_;
-one active CommHandle accepted by caller
-```
-
-to:
-
-```text
-std::vector<ActiveCommSession> comm_sessions_;
-lookup by name or returned handle
-```
-
-The C API still returns opaque `CommHandle`s.  The Python-facing bootstrap API
-should not expose raw handles; it should expose domain contexts.  The hidden
-base communicator should never be visible in `ctx.domains`.
-
 The public domain config does not need a `rootinfo_path`.  Root-info files are
 a backend bootstrap transport detail for the hidden base communicator.  The
-multi-domain design should use a sub-communicator path:
+visible domains are derived from the parent `CommDomainPlan`, not from
+independent root-info exchanges.
 
-```text
-internal base HcclComm over the L3 chip children
-  -> HcclCreateSubCommConfig(worker_indices, domain_rank)
-  -> domain subcomm handle
-  -> HcclAllocComResourceByTiling(domain subcomm)
-```
+The implementation still keeps `comm_create_subcomm` available as a low-level
+backend capability because HCCL sub-communicators are useful for future
+collective or resource paths.  The initial PTO-ISA/HCOMM RMA path should not
+allocate MC2 resources on each overlapping sub-communicator because the HCCL
+old AICPU MC2 init path accepts only one active hcomId per process.  Base
+window slicing avoids that limitation while preserving domain-local kernel
+semantics.
 
-This path matches the shape of `CommDomain`: `worker_indices` is exactly a
-group list in the parent communicator, and the position in that list is
-exactly the dense domain rank.  It avoids running an independent root-info
-exchange for every domain, keeps one internal rendezvous for the L3 chip set,
-and matches the ProcessGroup/NCCL style used by NVIDIA stacks.
+Independent root-info communicators and sub-communicators are not needed for
+the first PTO-ISA RMA implementation:
 
-If the backend wants to register the sub-communicator by group name, that
-lookup remains an internal implementation detail.  The design does not depend
-on it.
+- independent root-info would exchange one `HcclRootInfo` per visible domain
+  and create unrelated communicators for overlapping subsets;
+- sub-communicators would derive HCCL group communicators from a base
+  communicator, but would still need a separate MC2 window allocation if used
+  as the visible RMA resource;
+- base-window slicing creates one backend window and then derives
+  kernel-visible domain contexts from rank selection and byte offsets.
 
-Independent root-info communicators and sub-communicators differ only in the
-backend bootstrap route:
-
-- independent root-info: each domain exchanges its own `HcclRootInfo` and
-  creates a standalone communicator whose rank space is already the domain;
-- sub-communicator: the runtime creates one internal base communicator, then
-  asks HCCL to derive group communicators from selected base ranks.
-
-The sub-communicator route is the better first target here because the L3
-parent already knows every chip child and every `CommDomainPlan`.  Repeating
-root-info exchange per domain would recreate global coordination that the
-parent already has, and it would make overlapping domains look unrelated to
-the backend even though they are all subsets of the same L3 chip set.
-
-Both routes would expose the same `ChipCommDomainContext` and `CommContext`
-shape to L3 and PTO-ISA kernels.  Choosing sub-communicators is therefore a
-backend construction decision, not a kernel ABI decision.
+All three routes can produce the same `ChipCommDomainContext` shape.  The
+first implementation chooses base-window slicing because it matches the
+PTO-ISA kernel ABI and avoids repeated overlapping MC2 allocations.
 
 ### Why No Exposed Meta Domain
 
-The first PR should not expose an allocated meta communication domain just to
-mirror PyTorch/NCCL's WORLD process group.
+The initial implementation should not expose an allocated meta communication
+domain just to mirror PyTorch/NCCL's WORLD process group.
 
 NVIDIA's stack needs a global process group because multiple OS processes are
 launched independently and need a rendezvous space before frameworks can make
@@ -887,24 +879,47 @@ A meta domain would add costs without serving the PTO-ISA kernel contract:
 - it would not remove the need to create per-domain windows, because each
   data domain needs independent `CommContext` and buffer layout.
 
-The base HCCL communicator is still an internal backend detail for the
-sub-communicator path, but it should not appear in `ctx.domains`, allocate
-exposed windows, or expose buffers to kernels.  It is only a control-plane
-parent used to derive the real data domains.
+The base HCCL communicator is still an internal backend detail.  It should
+not appear in `ctx.domains` or expose buffers to kernels.  Its window is
+allocated once and sliced into the visible data domains.
 
 ## Proposed Python API
 
-The public L3 constructor should accept one global domain plan, while
-`ChipBootstrapConfig` remains the per-chip object sent to chip children.
+The normal public L3 constructor accepts one global domain plan.
+`ChipBootstrapConfig` remains the per-chip object sent to chip children.  It
+may be derived automatically by the parent from that plan, or supplied
+explicitly when a caller needs per-chip bootstrap details such as host staging.
 
 The user-facing input is a `CommDomainPlan` built from `CommDomain` entries,
-for example `comm_plan=CommDomainPlan(domains=[...])`.  Top-level per-chip
-`buffers=` is removed from the new communication API; each domain declares
-its own symmetric buffers.  The old single-domain
-`ChipCommBootstrapConfig + buffers` shape is not preserved.
+for example `comm_plan=CommDomainPlan(domains=[...])`.  Each domain declares
+only symmetric communication properties: membership, window size, and buffer
+layout.
 
 `comm_plan=None` and `CommDomainPlan(domains=[])` both mean no communication
 domains.  In that mode there are no domain windows and no domain buffers.
+
+### Public Surface Boundary
+
+The new API is one surface, not a compatibility layer around the old
+single-domain bootstrap list.
+
+At L3 and above, the source of truth for communication topology is always
+`CommDomainPlan`.  Users should not write rank IDs, root-info paths, or old
+single-domain bootstrap objects by hand.  `ChipCommBootstrapConfig` is not a
+public API.
+
+There are two valid construction paths:
+
+- `Worker(comm_plan=plan)` for ordinary cases.  The parent derives one
+  `ChipBootstrapConfig` per chip.
+- `Worker(chip_bootstrap_configs=cfgs)` for cases that need per-chip bootstrap
+  data.  Each `cfg.comm` must still come from
+  `plan.bootstrap_for_worker(worker_idx)`.
+
+The explicit path exists for host staging.  `HostBufferStaging` contains a
+concrete `SharedMemory` name, so it is naturally per-chip and sometimes
+asymmetric.  That does not belong in `CommDomain`, which describes symmetric
+domain membership and window layout.
 
 Single-domain spelling:
 
@@ -952,14 +967,83 @@ worker = Worker(
 )
 ```
 
+Host-staged single-domain spelling:
+
+```python
+counter_shm = SharedMemory(create=True, size=4)
+counter_shm.buf[:4] = b"\x00\x00\x00\x00"
+
+plan = CommDomainPlan(
+    domains=[
+        CommDomain(
+            name="default",
+            worker_indices=[0, 1],
+            window_size=window_size,
+            buffers=[
+                ChipBufferSpec(
+                    name="notify_counter",
+                    dtype="int32",
+                    count=1,
+                    nbytes=4,
+                    load_from_host=True,
+                ),
+            ],
+        ),
+    ],
+)
+
+cfg = ChipBootstrapConfig(
+    comm=plan.bootstrap_for_worker(worker_idx=0),
+    host_inputs=[
+        HostBufferStaging(
+            domain_name="default",
+            name="notify_counter",
+            shm_name=counter_shm.name,
+            size=4,
+        ),
+    ],
+)
+```
+
 Inside `Worker.init()`, the parent converts `comm_plan` into one
 `ChipBootstrapConfig` per chip child.  For chip worker `i`, that derived config
 contains a `ChipDomainBootstrapConfig` only for domains whose
 `worker_indices` list contains `i`.  The derived config records this chip's
-`domain_rank`, `domain_size`, window size, and buffer layout.  It may also
-carry backend construction metadata needed to create the HCCL sub-communicator,
-but the chip result published back to the parent should expose only the
-domain-local context.
+`domain_rank`, `domain_size`, window size, buffer layout, and internal
+`sub_comm_id`.  It also carries rank IDs and base-window layout metadata
+needed to derive the domain-local `CommContext`.  The chip result published
+back to the parent exposes only the domain-local context.
+
+If host staging is used for communication-window buffers, staging entries live
+on the per-chip `ChipBootstrapConfig` and must be domain-scoped.  The key is
+`(domain_name, buffer_name)`, not just `buffer_name`, because two domains may
+both define a buffer named `"scratch"`.  The child should match host input and
+output staging against the active `ChipDomainBootstrapConfig` and that
+domain's buffer specs.
+
+Host staging is not a second communication mechanism.  It is parent-to-chip
+initialization and chip-to-parent readback for buffers that live inside a
+communication window.
+
+`load_from_host=True` means:
+
+```text
+parent creates SharedMemory and fills bytes
+  -> child attaches by shm_name during bootstrap
+  -> child copies those bytes into this chip's domain-local window buffer
+```
+
+`store_to_host=True` means:
+
+```text
+kernel writes a domain-local window buffer
+  -> child copies the buffer back to parent SharedMemory after a task
+  -> parent reads the bytes from that SharedMemory
+```
+
+This is useful for examples such as notify-counter initialization or
+window-resident inputs.  Explicit configs are valid only in the new shape:
+`ChipBootstrapConfig(comm=plan.bootstrap_for_worker(i), ...)`.
 
 L3 orchestration chooses the domain explicitly:
 
@@ -984,6 +1068,34 @@ participate in the domain.  If the worker is not a member, normal dictionary
 lookup raises `KeyError`; that is the desired fail-fast behavior.  Code that
 intentionally handles optional participation can use `"tp" in ctx.domains`
 before submitting a TP-domain task.
+
+Overlapping domains show why this API is not just a renamed single-domain
+context:
+
+```python
+comm_plan = CommDomainPlan(
+    domains=[
+        CommDomain(
+            name="tp",
+            worker_indices=[0, 1],
+            window_size=tp_window,
+            buffers=[ChipBufferSpec("scratch", ...)],
+        ),
+        CommDomain(
+            name="pp",
+            worker_indices=[1, 2],
+            window_size=pp_window,
+            buffers=[ChipBufferSpec("scratch", ...)],
+        ),
+    ],
+)
+```
+
+Worker 1 receives both `ctx.domains["tp"]` and `ctx.domains["pp"]`.  It is
+rank 1 in `tp` but rank 0 in `pp`, and each domain has its own
+`device_ctx`, window base, and `"scratch"` pointer.  Worker 0 has only `tp`;
+worker 2 has only `pp`.  Looking up a non-member domain, such as
+`worker0_ctx.domains["pp"]`, raises the normal dictionary `KeyError`.
 
 ## Kernel Contract
 
@@ -1041,11 +1153,11 @@ The parent should validate before forking:
 
 The child should validate during bootstrap:
 
-- the base communicator is created before any domain sub-communicator;
+- the base communicator is created before any domain context is derived;
 - each domain entry in the derived config is active for this chip;
 - non-member chips do not receive that domain entry;
-- sub-communicator creation returns a non-null domain handle;
-- `comm_alloc_windows` returned a non-null `CommContext*`;
+- `comm_alloc_windows` returned a non-null base `CommContext*`;
+- domain context derivation returns a non-null `CommContext*`;
 - every named buffer fits in `actual_window_size`;
 - the returned `ctx->rankId` and `ctx->rankNum` match the derived
   `domain_rank` and domain size.
@@ -1061,9 +1173,8 @@ The kernel should validate cheap invariants:
 Teardown should run in reverse bootstrap order:
 
 ```text
-for domain in reversed(active_domains):
-    comm_destroy(domain.handle)
-    destroy domain stream
+release derived domain contexts
+comm_destroy(base handle)
 finalize ChipWorker
 ```
 
@@ -1083,16 +1194,21 @@ The caller should receive the first error after best-effort cleanup completes.
 4. Update `ChipBootstrapConfig` so its `comm` field contains derived
    per-chip domain bootstrap configs, not public `CommDomain` objects.
 5. Remove top-level `buffers` from the new communication API.
-6. Add backend support for creating HCCL sub-communicators from the hidden
-   base communicator and each domain's `rank_ids` / `sub_comm_rank_id`.
-7. Change `ChipWorker` from one active stream to a session table.
+6. Add backend support for one hidden base window and derived domain
+   `CommContext` objects from each domain's `rank_ids` / `domain_rank`.
+7. Change `ChipWorker` to own one hidden base session plus derived domain
+   contexts.
 8. Extend bootstrap mailboxes/results to publish a map of domain contexts
    instead of one scalar `rank/nranks/device_ctx`.
-9. Update one L3 example to use `ctx.domains["default"]`.
-10. Add a two-domain smoke example where the same worker indices use two
-    windows and kernels prove that data and signals do not cross domains.
-11. Add tests for validation, single-domain migration, sim multi-domain
-    windows, and hardware HCCL context fields.
+9. Migrate every communication-domain example to `comm_plan`, including
+   notification and SDMA examples that use host staging.
+10. Update L3 one-domain examples to use `ctx.domains["default"]`.
+11. Add a tiny multi-domain rank-map example that exercises domain
+    membership, missing-domain lookup, and domain-local ranks.
+12. Add a two-domain data example where overlapping domains run real
+    communication, computation, and golden checks.
+13. Add tests for validation, the one-domain `CommDomainPlan` case, sim
+    multi-domain windows, and hardware HCCL context fields.
 
 ## Open Questions
 

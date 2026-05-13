@@ -40,11 +40,11 @@ import torch  # noqa: E402
 from simpler.task_interface import (  # noqa: E402
     ArgDirection,
     CallConfig,
-    ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
-    ChipCommBootstrapConfig,
     ChipContext,
+    CommDomain,
+    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -171,12 +171,6 @@ def run(
     scratch_nbytes = scratch_count * DTYPE_NBYTES + nranks * 4
     window_size = max(scratch_nbytes, 4 * 1024)
 
-    rootinfo_path = f"/tmp/pto_ffn_tp_parallel_rootinfo_{os.getpid()}.bin"
-    try:
-        os.unlink(rootinfo_path)
-    except FileNotFoundError:
-        pass
-
     print(f"[ffn_tp_parallel] platform={platform} devices={device_ids} nranks={nranks} M={M} K={K} N={N}")
 
     # Per-rank host tensors via torch.share_memory_(): inputs, partial_local
@@ -186,25 +180,23 @@ def run(
     host_partial = [torch.zeros(M, N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
     host_y = [torch.zeros(M, N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
-    cfgs = [
-        ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank,
-                nranks=nranks,
-                rootinfo_path=rootinfo_path,
+    comm_plan = CommDomainPlan(
+        domains=[
+            CommDomain(
+                name="default",
+                worker_indices=list(range(nranks)),
                 window_size=window_size,
-            ),
-            buffers=[
-                ChipBufferSpec(
-                    name="scratch",
-                    dtype="float32",
-                    count=scratch_count,
-                    nbytes=scratch_nbytes,
-                ),
-            ],
-        )
-        for rank in range(nranks)
-    ]
+                buffers=[
+                    ChipBufferSpec(
+                        name="scratch",
+                        dtype="float32",
+                        count=scratch_count,
+                        nbytes=scratch_nbytes,
+                    ),
+                ],
+            )
+        ]
+    )
 
     print("[ffn_tp_parallel] compiling kernels...")
     ffn_local_cc = build_ffn_local_callable(platform, pto_isa_commit)
@@ -216,8 +208,8 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        chip_bootstrap_configs=cfgs,
         build=build,
+        comm_plan=comm_plan,
     )
     ffn_cid = worker.register(ffn_local_cc)
     allreduce_cid = worker.register(allreduce_cc)
@@ -229,14 +221,16 @@ def run(
         contexts: list[ChipContext] = worker.chip_contexts
         assert len(contexts) == nranks
         for i, ctx in enumerate(contexts):
+            domain = ctx.domains["default"]
             print(
-                f"[ffn_tp_parallel] chip {i}: device={ctx.device_id} rank={ctx.rank}/{ctx.nranks} "
-                f"window=[0x{ctx.local_window_base:x} +{ctx.actual_window_size}B] "
-                f"scratch=0x{ctx.buffer_ptrs['scratch']:x}"
+                f"[ffn_tp_parallel] chip {i}: device={ctx.device_id} rank={domain.domain_rank}/{domain.domain_size} "
+                f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
+                f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
             )
 
         def orch_fn(orch, _args, cfg):
             for i, ctx in enumerate(contexts):
+                domain = ctx.domains["default"]
                 # Stage 1: AIC matmul. partial_local is OUTPUT_EXISTING here;
                 # the framework records its buffer.addr as a producer.
                 a1 = TaskArgs()
@@ -253,15 +247,15 @@ def run(
                 a2.add_tensor(make_tensor_arg(host_y[i]), TensorArgType.OUTPUT_EXISTING)
                 a2.add_tensor(
                     ContinuousTensor.make(
-                        data=ctx.buffer_ptrs["scratch"],
+                        data=domain.buffer_ptrs["scratch"],
                         shapes=(scratch_count,),
                         dtype=DataType.FLOAT32,
                         child_memory=True,
                     ),
                     TensorArgType.INOUT,
                 )
-                a2.add_scalar(ctx.nranks)
-                a2.add_scalar(ctx.device_ctx)
+                a2.add_scalar(domain.domain_size)
+                a2.add_scalar(domain.device_ctx)
                 orch.submit_next_level(allreduce_cid, a2, cfg, worker=i)
 
         print("[ffn_tp_parallel] running 2-chip 2-stage DAG...")
@@ -296,10 +290,6 @@ def run(
         return 0
     finally:
         worker.close()
-        try:
-            os.unlink(rootinfo_path)
-        except FileNotFoundError:
-            pass
 
 
 def main() -> int:
