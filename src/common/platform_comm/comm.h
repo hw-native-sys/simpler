@@ -11,8 +11,9 @@
 /**
  * Backend-neutral distributed communication C API.
  *
- * Provides five primitives for multi-rank communication: init, allocate
- * shared windows, query local window base, barrier, and destroy.
+ * Provides primitives for multi-rank communication: init, create
+ * subcommunicators, allocate shared windows, query local window base, barrier,
+ * and destroy.
  *
  * Implementations:
  *   onboard/host/comm_hccl.cpp — HCCL backend (links CANN hccl/hccl_fwk)
@@ -59,6 +60,32 @@ typedef struct CommHandle_ *CommHandle;
 CommHandle comm_init(int rank, int nranks, void *stream, const char *rootinfo_path);
 
 /**
+ * Create a subcommunicator from an existing base communicator.
+ *
+ * The caller provides the base-communicator rank ids that participate in the
+ * subcommunicator and the caller's rank within that subcommunicator.  Members
+ * should call this collectively for the same `sub_comm_id`; non-members do not
+ * need to call it.
+ *
+ * On sim this derives a separate shared-memory identity from the base session
+ * and `sub_comm_id`, so windows and barriers are isolated per domain.  The
+ * returned handle is destroyed with comm_destroy().
+ *
+ * @param base              Existing handle from comm_init().
+ * @param sub_comm_id       Caller-defined domain id under the base session.
+ * @param rank_ids          Base-communicator rank ids in subcommunicator order.
+ * @param rank_count        Number of ranks in rank_ids.
+ * @param sub_comm_rank_id  This caller's rank within the subcommunicator.
+ * @param stream            Caller-owned stream for backends that need one.
+ *                          Sim backend ignores it.
+ * @return Opaque subcommunicator handle, or NULL on failure.
+ */
+CommHandle comm_create_subcomm(
+    CommHandle base, uint64_t sub_comm_id, const uint32_t *rank_ids, size_t rank_count, uint32_t sub_comm_rank_id,
+    void *stream
+);
+
+/**
  * Allocate RDMA / shared-memory windows and populate the device context.
  *
  * On HCCL this calls HcclAllocComResourceByTiling and extracts per-rank
@@ -95,6 +122,29 @@ int comm_get_local_window_base(CommHandle h, uint64_t *base_out);
  * @return 0 on success, non-zero on failure.
  */
 int comm_get_window_size(CommHandle h, size_t *size_out);
+
+/**
+ * Derive a domain-local CommContext from an allocated base communicator.
+ *
+ * The base handle must already have completed comm_alloc_windows().  The
+ * derived context remaps dense domain ranks onto base-communicator ranks and
+ * adds window_offset to each selected base rank window.  The returned
+ * device_ctx_out points to a backend-owned device CommContext that remains
+ * valid until comm_destroy(base).
+ *
+ * @param h                Allocated base communicator handle.
+ * @param rank_ids         Base-communicator rank ids in domain rank order.
+ * @param rank_count       Number of domain ranks.
+ * @param domain_rank      This caller's dense rank in the domain.
+ * @param window_offset    Byte offset of this domain slice in the base window.
+ * @param window_size      Visible per-rank window size for this domain.
+ * @param device_ctx_out   Receives the derived device CommContext pointer.
+ * @return 0 on success, non-zero on failure.
+ */
+int comm_derive_context(
+    CommHandle h, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank, size_t window_offset,
+    size_t window_size, uint64_t *device_ctx_out
+);
 
 /**
  * Synchronize all ranks.

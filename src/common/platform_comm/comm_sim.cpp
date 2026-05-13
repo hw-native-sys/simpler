@@ -77,6 +77,26 @@ struct SharedHeader {
     size_t per_rank_win_size;
 };
 
+// Build a session-scoped shm name component from a caller-controlled id.
+uint32_t hash_id(const char *id) {
+    size_t h = std::hash<std::string>{}(id ? id : "default");
+    return static_cast<uint32_t>(h ^ (h >> 32));
+}
+
+std::string make_shm_name(uint32_t process_tree_id, uint32_t session_id) {
+    char buf[SHM_NAME_LEN + 1];
+    int written = std::snprintf(buf, sizeof(buf), "/simpler_%08x_%08x", process_tree_id, session_id);
+    // Defensive runtime check: snprintf returns -1 only on I/O / encoding
+    // errors, and the static_assert above already pins the upper bound of a
+    // successful write, so this is really an "impossible path" guard for the
+    // libc-misbehaving edge case.
+    if (written < 0 || static_cast<size_t>(written) != SHM_NAME_LEN) {
+        std::fprintf(stderr, "[comm_sim] snprintf produced unexpected length %d for shm name\n", written);
+        return {};
+    }
+    return {buf};
+}
+
 // Build a session-scoped shm name.
 //
 // Hashing only the rootinfo_path produces a stable name across test re-runs
@@ -101,19 +121,12 @@ struct SharedHeader {
 // 32 bits; both are still collision-resistant for the canonical
 // "one driver spawns N ranks" launch pattern.
 std::string make_shm_name(const char *rootinfo_path) {
-    size_t h = std::hash<std::string>{}(rootinfo_path ? rootinfo_path : "default");
-    uint32_t h32 = static_cast<uint32_t>(h ^ (h >> 32));
-    char buf[SHM_NAME_LEN + 1];
-    int written = std::snprintf(buf, sizeof(buf), "/simpler_%08x_%08x", static_cast<uint32_t>(getppid()), h32);
-    // Defensive runtime check: snprintf returns -1 only on I/O / encoding
-    // errors, and the static_assert above already pins the upper bound of a
-    // successful write, so this is really an "impossible path" guard for the
-    // libc-misbehaving edge case.
-    if (written < 0 || static_cast<size_t>(written) != SHM_NAME_LEN) {
-        std::fprintf(stderr, "[comm_sim] snprintf produced unexpected length %d for shm name\n", written);
-        return {};
-    }
-    return {buf};
+    return make_shm_name(static_cast<uint32_t>(getppid()), hash_id(rootinfo_path));
+}
+
+std::string make_subcomm_shm_name(const std::string &base_shm_name, uint64_t sub_comm_id) {
+    std::string id = base_shm_name + ":" + std::to_string(sub_comm_id);
+    return make_shm_name(static_cast<uint32_t>(getppid()), hash_id(id.c_str()));
 }
 
 // Poll `check` until it returns true or the timeout elapses.  Uses steady_clock
@@ -141,6 +154,7 @@ struct CommHandle_ {
     bool is_creator = false;
 
     CommContext host_ctx{};
+    std::vector<CommContext *> derived_contexts;
 };
 
 extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *rootinfo_path) try {
@@ -177,6 +191,78 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     return nullptr;
 } catch (...) {
     std::fprintf(stderr, "[comm_sim rank %d] comm_init: unknown exception\n", rank);
+    return nullptr;
+}
+
+extern "C" CommHandle comm_create_subcomm(
+    CommHandle base, uint64_t sub_comm_id, const uint32_t *rank_ids, size_t rank_count, uint32_t sub_comm_rank_id,
+    void *stream
+) try {
+    (void)stream;  // sim has no ACL / stream concept
+
+    if (base == nullptr) {
+        std::fprintf(stderr, "[comm_sim] comm_create_subcomm: base is null\n");
+        return nullptr;
+    }
+    if (rank_ids == nullptr) {
+        std::fprintf(stderr, "[comm_sim rank %d] comm_create_subcomm: rank_ids is null\n", base->rank);
+        return nullptr;
+    }
+    if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM) {
+        std::fprintf(
+            stderr, "[comm_sim rank %d] comm_create_subcomm: invalid rank_count=%zu (max=%u)\n", base->rank, rank_count,
+            COMM_MAX_RANK_NUM
+        );
+        return nullptr;
+    }
+    if (sub_comm_rank_id >= rank_count) {
+        std::fprintf(
+            stderr, "[comm_sim rank %d] comm_create_subcomm: invalid sub_comm_rank_id=%u rank_count=%zu\n", base->rank,
+            sub_comm_rank_id, rank_count
+        );
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < rank_count; ++i) {
+        if (rank_ids[i] >= static_cast<uint32_t>(base->nranks)) {
+            std::fprintf(
+                stderr, "[comm_sim rank %d] comm_create_subcomm: rank_ids[%zu]=%u out of range [0, %d)\n", base->rank,
+                i, rank_ids[i], base->nranks
+            );
+            return nullptr;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (rank_ids[j] == rank_ids[i]) {
+                std::fprintf(
+                    stderr, "[comm_sim rank %d] comm_create_subcomm: duplicate rank id %u\n", base->rank, rank_ids[i]
+                );
+                return nullptr;
+            }
+        }
+    }
+    if (rank_ids[sub_comm_rank_id] != base->rank) {
+        std::fprintf(
+            stderr, "[comm_sim rank %d] comm_create_subcomm: rank_ids[%u]=%u does not match base rank\n", base->rank,
+            sub_comm_rank_id, rank_ids[sub_comm_rank_id]
+        );
+        return nullptr;
+    }
+
+    auto *h = new (std::nothrow) CommHandle_{};
+    if (h == nullptr) {
+        std::fprintf(stderr, "[comm_sim rank %d] comm_create_subcomm: allocation failed\n", base->rank);
+        return nullptr;
+    }
+
+    h->rank = static_cast<int>(sub_comm_rank_id);
+    h->nranks = static_cast<int>(rank_count);
+    h->shm_name = make_subcomm_shm_name(base->shm_name, sub_comm_id);
+    return h;
+} catch (const std::exception &e) {
+    std::fprintf(stderr, "[comm_sim] comm_create_subcomm: exception: %s\n", e.what());
+    return nullptr;
+} catch (...) {
+    std::fprintf(stderr, "[comm_sim] comm_create_subcomm: unknown exception\n");
     return nullptr;
 }
 
@@ -319,6 +405,63 @@ extern "C" int comm_get_window_size(CommHandle h, size_t *size_out) {
     return 0;
 }
 
+extern "C" int comm_derive_context(
+    CommHandle h, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank, size_t window_offset,
+    size_t window_size, uint64_t *device_ctx_out
+) try {
+    if (h == nullptr || rank_ids == nullptr || device_ctx_out == nullptr) return -1;
+    if (h->mmap_base == nullptr) {
+        std::fprintf(stderr, "[comm_sim rank %d] comm_derive_context: base windows are not allocated\n", h->rank);
+        return -1;
+    }
+    if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count) {
+        std::fprintf(
+            stderr, "[comm_sim rank %d] comm_derive_context: invalid rank_count=%zu domain_rank=%u\n", h->rank,
+            rank_count, domain_rank
+        );
+        return -1;
+    }
+    if (window_offset + window_size > static_cast<size_t>(h->host_ctx.winSize)) {
+        std::fprintf(
+            stderr,
+            "[comm_sim rank %d] comm_derive_context: window range [%zu, %zu) exceeds base window size %llu\n",
+            h->rank, window_offset, window_offset + window_size, static_cast<unsigned long long>(h->host_ctx.winSize)
+        );
+        return -1;
+    }
+
+    auto *ctx = new (std::nothrow) CommContext{};
+    if (ctx == nullptr) return -1;
+    ctx->workSpace = h->host_ctx.workSpace;
+    ctx->workSpaceSize = h->host_ctx.workSpaceSize;
+    ctx->rankId = domain_rank;
+    ctx->rankNum = static_cast<uint32_t>(rank_count);
+    ctx->winSize = window_size;
+    for (size_t i = 0; i < rank_count; ++i) {
+        uint32_t base_rank = rank_ids[i];
+        if (base_rank >= static_cast<uint32_t>(h->nranks)) {
+            std::fprintf(
+                stderr, "[comm_sim rank %d] comm_derive_context: rank_ids[%zu]=%u out of range [0, %d)\n", h->rank,
+                i, base_rank, h->nranks
+            );
+            delete ctx;
+            return -1;
+        }
+        ctx->windowsIn[i] = h->host_ctx.windowsIn[base_rank] + window_offset;
+        ctx->windowsOut[i] = h->host_ctx.windowsOut[base_rank] + window_offset;
+    }
+
+    h->derived_contexts.push_back(ctx);
+    *device_ctx_out = reinterpret_cast<uint64_t>(ctx);
+    return 0;
+} catch (const std::exception &e) {
+    std::fprintf(stderr, "[comm_sim] comm_derive_context: exception: %s\n", e.what());
+    return -1;
+} catch (...) {
+    std::fprintf(stderr, "[comm_sim] comm_derive_context: unknown exception\n");
+    return -1;
+}
+
 extern "C" int comm_barrier(CommHandle h) {
     if (h == nullptr || h->mmap_base == nullptr) return -1;
 
@@ -364,6 +507,10 @@ extern "C" int comm_destroy(CommHandle h) try {
     if (h == nullptr) return -1;
 
     int rc = 0;
+    for (auto *ctx : h->derived_contexts) {
+        delete ctx;
+    }
+    h->derived_contexts.clear();
     if (h->mmap_base != nullptr) {
         auto *hdr = static_cast<SharedHeader *>(h->mmap_base);
         int gone = __atomic_add_fetch(&hdr->destroy_count, 1, __ATOMIC_ACQ_REL);

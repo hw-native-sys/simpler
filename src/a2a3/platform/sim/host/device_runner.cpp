@@ -961,7 +961,7 @@ int DeviceRunner::finalize() {
             MappedKernel &kernel = pair.second;
             if (kernel.dl_handle != nullptr) {
                 dlclose(kernel.dl_handle);
-                LOG_DEBUG("Closed kernel: func_id=%d", pair.first);
+                LOG_DEBUG("Closed kernel: func_id=%d", pair.first.func_id);
             }
             delete[] kernel.callable_buf;
         }
@@ -1030,19 +1030,12 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
     // kernel binaries for the same func_id.  Naively reusing the cached
     // entry hands the AICore the previous callable's kernel and segfaults
     // at dispatch.
-    auto it = func_id_to_addr_.find(func_id);
+    const uint64_t new_hash = simpler::common::utils::elf_build_id_64(bin_data, bin_size);
+    KernelCacheKey key{func_id, new_hash};
+    auto it = func_id_to_addr_.find(key);
     if (it != func_id_to_addr_.end()) {
-        const auto &cached_callable = *reinterpret_cast<const CoreCallable *>(it->second.callable_buf);
-        const auto *new_callable = reinterpret_cast<const CoreCallable *>(bin_data);
-        if (cached_callable.binary_size() == new_callable->binary_size() &&
-            std::memcmp(cached_callable.binary_data(), new_callable->binary_data(), new_callable->binary_size()) == 0) {
-            LOG_INFO_V0("Kernel func_id=%d already uploaded (matching bytes), returning cached address", func_id);
-            return reinterpret_cast<uint64_t>(it->second.callable_buf);
-        }
-        LOG_INFO_V0("Kernel func_id=%d binary changed, evicting cached entry", func_id);
-        if (it->second.dl_handle != nullptr) dlclose(it->second.dl_handle);
-        delete[] it->second.callable_buf;
-        func_id_to_addr_.erase(it);
+        LOG_INFO_V0("Kernel func_id=%d already uploaded (matching bytes), returning cached address", func_id);
+        return reinterpret_cast<uint64_t>(it->second.callable_buf);
     }
 
     // Extract binary from CoreCallable envelope
@@ -1101,7 +1094,7 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
     MappedKernel kernel;
     kernel.dl_handle = handle;
     kernel.callable_buf = copy;
-    func_id_to_addr_[func_id] = kernel;
+    func_id_to_addr_[key] = kernel;
 
     LOG_DEBUG(
         "Registered kernel (dlopen): func_id=%d -> callable=0x%lx, func_addr=0x%lx, handle=%p", func_id,
@@ -1112,19 +1105,19 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
 }
 
 void DeviceRunner::remove_kernel_binary(int func_id) {
-    auto it = func_id_to_addr_.find(func_id);
-    if (it == func_id_to_addr_.end()) {
-        return;
+    for (auto it = func_id_to_addr_.begin(); it != func_id_to_addr_.end();) {
+        if (it->first.func_id != func_id) {
+            ++it;
+            continue;
+        }
+        MappedKernel &kernel = it->second;
+        if (kernel.dl_handle != nullptr) {
+            dlclose(kernel.dl_handle);
+            LOG_DEBUG("Removed kernel binary (dlclose): func_id=%d, handle=%p", func_id, kernel.dl_handle);
+        }
+        delete[] kernel.callable_buf;
+        it = func_id_to_addr_.erase(it);
     }
-
-    MappedKernel &kernel = it->second;
-    if (kernel.dl_handle != nullptr) {
-        dlclose(kernel.dl_handle);
-        LOG_DEBUG("Removed kernel binary (dlclose): func_id=%d, handle=%p", func_id, kernel.dl_handle);
-    }
-    delete[] kernel.callable_buf;
-
-    func_id_to_addr_.erase(it);
 }
 
 // =============================================================================

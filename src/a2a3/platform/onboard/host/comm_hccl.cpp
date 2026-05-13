@@ -55,6 +55,12 @@ static inline HcclResult hccl_get_root_info(HcclRootInfo *ri) { return HcclGetRo
 static inline HcclResult hccl_comm_init_root_info(uint32_t n, const HcclRootInfo *ri, uint32_t r, HcclComm *c) {
     return HcclCommInitRootInfo(n, ri, r, c);
 }
+static inline HcclResult hccl_create_sub_comm_config(
+    HcclComm *base, uint32_t n, uint32_t *rank_ids, uint64_t sub_comm_id, uint32_t sub_comm_rank_id,
+    HcclCommConfig *config, HcclComm *sub_comm
+) {
+    return HcclCreateSubCommConfig(base, n, rank_ids, sub_comm_id, sub_comm_rank_id, config, sub_comm);
+}
 static inline HcclResult hccl_get_comm_name(HcclComm c, char *name) { return HcclGetCommName(c, name); }
 static inline HcclResult hccl_barrier(HcclComm c, aclrtStream s) { return HcclBarrier(c, s); }
 static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(c); }
@@ -77,41 +83,33 @@ static constexpr uint32_t COMM_TOPO_MESH = 0b1u;
 
 namespace {
 
-static constexpr uint32_t MAX_CC_TILING_NUM = 8U;
-static constexpr uint32_t GROUP_NAME_SIZE = 128U;
-static constexpr uint32_t ALG_CONFIG_SIZE = 128U;
-
-struct Mc2InitTilingInner {
-    uint32_t version;
-    uint32_t mc2HcommCnt;
-    uint32_t offset[MAX_CC_TILING_NUM];
-    uint8_t debugMode;
-    uint8_t preparePosition;
-    uint16_t queueNum;
-    uint16_t commBlockNum;
-    uint8_t devType;
-    char reserved[17];
-};
-
-struct Mc2cCTilingInner {
-    uint8_t skipLocalRankCopy;
-    uint8_t skipBufferWindowCopy;
-    uint8_t stepSize;
-    uint8_t version;
-    char reserved[9];
-    uint8_t commEngine;
-    uint8_t srcDataType;
-    uint8_t dstDataType;
-    char groupName[GROUP_NAME_SIZE];
-    char algConfig[ALG_CONFIG_SIZE];
-    uint32_t opType;
-    uint32_t reduceType;
-};
-
 struct Mc2CommConfigV2 {
-    Mc2InitTilingInner init;
-    Mc2cCTilingInner inner;
+    struct Mc2InitTilingInner {
+        uint32_t version;
+        uint32_t mc2HcommCnt;
+        uint32_t offset[8];
+        uint8_t debugMode;
+        uint8_t preparePosition;
+        uint16_t queueNum;
+        uint16_t commBlockNum;
+        uint8_t devType;
+        char reserved[17];
+    } init;
+
+    struct Mc2HcommCfg {
+        uint8_t skipLocalRankCopy;
+        uint8_t skipBufferWindowCopy;
+        uint8_t stepSize;
+        char reserved[13];
+        char groupName[128];
+        char algConfig[128];
+        uint32_t opType;
+        uint32_t reduceType;
+    } inner;
 };
+static_assert(sizeof(Mc2CommConfigV2::Mc2InitTilingInner) == 64, "Mc2InitTilingInner size drift");
+static_assert(sizeof(Mc2CommConfigV2::Mc2HcommCfg) == 280, "Mc2HcommCfg size drift");
+static_assert(offsetof(Mc2CommConfigV2, inner) == 64, "Mc2CommConfigV2 layout drift");
 
 // HCCL compat structs for RING topology parsing
 struct HcclSignalInfo {
@@ -267,16 +265,25 @@ static_assert(offsetof(HcclOpResParam, winSize) == 24, "HcclOpResParam layout dr
 static_assert(offsetof(HcclOpResParam, localWindowsIn) == 32, "HcclOpResParam layout drift");
 static_assert(offsetof(HcclOpResParam, remoteRes) == 2984, "HcclOpResParam layout drift");
 
+static constexpr uint32_t HCCL_MESH_RANK_NUM = 32;
+struct HcclMeshOpParamHead {
+    uint64_t workSpace;
+    uint64_t workSpaceSize;
+    uint32_t rankId;
+    uint32_t rankNum;
+    uint64_t winSize;
+};
+
+static_assert(sizeof(HcclMeshOpParamHead) == 32, "HcclMeshOpParamHead size drift");
+
 // Magic numbers required by HcclAllocComResourceByTiling.  These are CANN
 // internal enum values with no public header; names + comments record intent.
 // Changing any of them changes the semantics of the MC2 resource request.
-static constexpr uint32_t kMc2TilingVersion = 100U;    // Mc2InitTilingInner::version
 static constexpr uint32_t kMc2CommBlockNum = 48U;      // Hardware comm block count (A2/A3 topology)
-static constexpr uint8_t kMc2DevType = 4U;             // devType = Ascend 910B family
-static constexpr uint8_t kMc2InnerVersion = 1U;        // Mc2cCTilingInner::version
-static constexpr uint32_t kMc2OpTypeBatchWrite = 18U;  // opType = BatchWrite (MC2 SDMA path)
-static constexpr uint8_t kMc2CommEngineSdma = 3U;      // commEngine = SDMA
 static constexpr const char *kMc2AlgConfig = "BatchWrite=level0:fullmesh";
+static constexpr uint32_t kMc2TilingVersion = 100U;    // MC2 init tiling V2 path
+static constexpr uint32_t kMc2DevType = 4U;            // 910_93 / A2-A3 MC2 device type
+static constexpr uint32_t kMc2OpTypeBatchWrite = HCCL_CMD_BATCH_WRITE;
 
 }  // anonymous namespace
 
@@ -297,6 +304,7 @@ struct CommHandle_ {
     CommContext host_ctx{};
     CommContext *device_ctx = nullptr;
     bool owns_device_ctx = false;
+    std::vector<CommContext *> derived_contexts;
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
 #endif
@@ -518,61 +526,212 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     return nullptr;
 }
 
+extern "C" CommHandle comm_create_subcomm(
+    CommHandle base, uint64_t sub_comm_id, const uint32_t *rank_ids, size_t rank_count, uint32_t sub_comm_rank_id,
+    void *stream
+) try {
+    if (base == nullptr) {
+        fprintf(stderr, "[comm] comm_create_subcomm: base is null\n");
+        return nullptr;
+    }
+    if (base->hccl_comm == nullptr) {
+        fprintf(stderr, "[comm rank %d] comm_create_subcomm: base HCCL communicator is null\n", base->rank);
+        return nullptr;
+    }
+    if (stream == nullptr) {
+        fprintf(stderr, "[comm rank %d] comm_create_subcomm: caller-supplied stream is null\n", base->rank);
+        return nullptr;
+    }
+    if (rank_ids == nullptr) {
+        fprintf(stderr, "[comm rank %d] comm_create_subcomm: rank_ids is null\n", base->rank);
+        return nullptr;
+    }
+    if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM) {
+        fprintf(
+            stderr, "[comm rank %d] comm_create_subcomm: invalid rank_count=%zu (max=%u)\n", base->rank, rank_count,
+            COMM_MAX_RANK_NUM
+        );
+        return nullptr;
+    }
+    if (sub_comm_rank_id >= rank_count) {
+        fprintf(
+            stderr, "[comm rank %d] comm_create_subcomm: invalid sub_comm_rank_id=%u rank_count=%zu\n", base->rank,
+            sub_comm_rank_id, rank_count
+        );
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < rank_count; ++i) {
+        if (rank_ids[i] >= static_cast<uint32_t>(base->nranks)) {
+            fprintf(
+                stderr, "[comm rank %d] comm_create_subcomm: rank_ids[%zu]=%u out of range [0, %d)\n", base->rank, i,
+                rank_ids[i], base->nranks
+            );
+            return nullptr;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (rank_ids[j] == rank_ids[i]) {
+                fprintf(stderr, "[comm rank %d] comm_create_subcomm: duplicate rank id %u\n", base->rank, rank_ids[i]);
+                return nullptr;
+            }
+        }
+    }
+    if (rank_ids[sub_comm_rank_id] != static_cast<uint32_t>(base->rank)) {
+        fprintf(
+            stderr, "[comm rank %d] comm_create_subcomm: rank_ids[%u]=%u does not match base rank\n", base->rank,
+            sub_comm_rank_id, rank_ids[sub_comm_rank_id]
+        );
+        return nullptr;
+    }
+
+    std::vector<uint32_t> sub_rank_ids(rank_ids, rank_ids + rank_count);
+    HcclCommConfig config{};
+    HcclCommConfigInit(&config);
+
+    HcclComm sub_comm = nullptr;
+    HcclComm base_comm = base->hccl_comm;
+    HcclResult hret = hccl_create_sub_comm_config(
+        &base_comm, static_cast<uint32_t>(sub_rank_ids.size()), sub_rank_ids.data(), sub_comm_id, sub_comm_rank_id,
+        &config, &sub_comm
+    );
+    if (hret != HCCL_SUCCESS || sub_comm == nullptr) {
+        fprintf(
+            stderr, "[comm rank %d] HcclCreateSubCommConfig failed for sub_comm_id=%llu: %d\n", base->rank,
+            static_cast<unsigned long long>(sub_comm_id), static_cast<int>(hret)
+        );
+        return nullptr;
+    }
+
+    auto *h = new (std::nothrow) CommHandle_{};
+    if (!h) {
+        HcclResult destroy_ret = hccl_comm_destroy(sub_comm);
+        if (destroy_ret != HCCL_SUCCESS) {
+            fprintf(
+                stderr, "[comm rank %d] HcclCommDestroy failed after subcomm handle allocation failure: %d\n",
+                base->rank, static_cast<int>(destroy_ret)
+            );
+        }
+        return nullptr;
+    }
+
+    h->rank = static_cast<int>(sub_comm_rank_id);
+    h->nranks = static_cast<int>(rank_count);
+    h->rootinfo_path = base->rootinfo_path + ".subcomm." + std::to_string(sub_comm_id);
+    h->run_token = base->run_token;
+    h->stream = static_cast<aclrtStream>(stream);
+    h->hccl_comm = sub_comm;
+    return h;
+} catch (const std::exception &e) {
+    fprintf(stderr, "[comm] comm_create_subcomm: exception: %s\n", e.what());
+    return nullptr;
+} catch (...) {
+    fprintf(stderr, "[comm] comm_create_subcomm: unknown exception\n");
+    return nullptr;
+}
+
 extern "C" int comm_alloc_windows(CommHandle h, size_t /*win_size*/, uint64_t *device_ctx_out) try {
     if (!h || !device_ctx_out) return -1;
 
+    aclError aRet;
     char group[128] = {};
     HcclResult hret = hccl_get_comm_name(h->hccl_comm, group);
-    if (hret != HCCL_SUCCESS) return -1;
+    if (hret != HCCL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] HcclGetCommName failed: %d\n", h->rank, static_cast<int>(hret));
+        return -1;
+    }
 
     CommTopo topoType = 0;
     hret = hccl_get_l0_topo_type_ex(group, &topoType, COMM_IS_NOT_SET_DEVICE);
-    if (hret != HCCL_SUCCESS) return -1;
+    if (hret != HCCL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] HcomGetL0TopoType failed: %d\n", h->rank, static_cast<int>(hret));
+        return -1;
+    }
 
     HcclComm commHandle = nullptr;
     hret = hccl_get_comm_handle_by_group(group, &commHandle);
-    if (hret != HCCL_SUCCESS) return -1;
+    if (hret != HCCL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] HcomGetCommHandleByGroup failed: %d\n", h->rank, static_cast<int>(hret));
+        return -1;
+    }
 
     // File barrier so all ranks have completed HcclCommInitRootInfo
     if (!file_barrier(h->rootinfo_path, h->rank, h->nranks, "hccl_init", h->run_token)) {
         return -1;
     }
+    hret = hccl_barrier(h->hccl_comm, h->stream);
+    if (hret != HCCL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] HcclBarrier before HCCL alloc failed: %d\n", h->rank, static_cast<int>(hret));
+        return -1;
+    }
+    aRet = aclrtSynchronizeStream(h->stream);
+    if (aRet != ACL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] aclrtSynchronizeStream before HCCL alloc failed: %d\n", h->rank, (int)aRet);
+        return -1;
+    }
 
-    // Tiling configuration for HcclAllocComResourceByTiling.  See
-    // kMc2* constants above for the meaning of each magic value.
+    // Tiling configuration for HcclAllocComResourceByTiling.  This is the
+    // offset-list V2 form used by HCCL's MC2 resource allocator; it avoids
+    // linking the optiling builder symbols into the host runtime.
     Mc2CommConfigV2 tiling{};
     memset(&tiling, 0, sizeof(tiling));
     tiling.init.version = kMc2TilingVersion;
     tiling.init.mc2HcommCnt = 1U;
     tiling.init.commBlockNum = kMc2CommBlockNum;
     tiling.init.devType = kMc2DevType;
-    tiling.init.offset[0] =
-        static_cast<uint32_t>(reinterpret_cast<uint64_t>(&tiling.inner) - reinterpret_cast<uint64_t>(&tiling.init));
+    tiling.init.offset[0] = static_cast<uint32_t>(offsetof(Mc2CommConfigV2, inner));
     tiling.inner.opType = kMc2OpTypeBatchWrite;
-    tiling.inner.commEngine = kMc2CommEngineSdma;
-    tiling.inner.version = kMc2InnerVersion;
-    strncpy(tiling.inner.groupName, group, GROUP_NAME_SIZE - 1);
-    strncpy(tiling.inner.algConfig, kMc2AlgConfig, ALG_CONFIG_SIZE - 1);
+    strncpy(tiling.inner.groupName, group, sizeof(tiling.inner.groupName) - 1);
+    strncpy(tiling.inner.algConfig, kMc2AlgConfig, sizeof(tiling.inner.algConfig) - 1);
 
     void *ctxPtr = nullptr;
     hret = hccl_alloc_com_resource(commHandle, h->stream, &tiling, &ctxPtr);
-    if (hret != HCCL_SUCCESS || ctxPtr == nullptr) return -1;
+    if (hret != HCCL_SUCCESS || ctxPtr == nullptr) {
+        fprintf(
+            stderr, "[comm rank %d] HcclAllocComResourceByTiling failed for group=%s: %d ctx=%p\n", h->rank, group,
+            static_cast<int>(hret), ctxPtr
+        );
+        return -1;
+    }
+    aRet = aclrtSynchronizeStream(h->stream);
+    if (aRet != ACL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] aclrtSynchronizeStream after HCCL alloc failed: %d\n", h->rank, (int)aRet);
+        return -1;
+    }
 
     // Extract CommContext (topology-dependent)
-    aclError aRet;
     if (topoType == COMM_TOPO_MESH) {
         h->device_ctx = reinterpret_cast<CommContext *>(ctxPtr);
-        aRet = aclrtMemcpy(
-            &h->host_ctx, sizeof(h->host_ctx), h->device_ctx, sizeof(h->host_ctx), ACL_MEMCPY_DEVICE_TO_HOST
-        );
+        memset(&h->host_ctx, 0, sizeof(h->host_ctx));
+        HcclMeshOpParamHead head{};
+        aRet = aclrtMemcpy(&head, sizeof(head), ctxPtr, sizeof(head), ACL_MEMCPY_DEVICE_TO_HOST);
         if (aRet != ACL_SUCCESS) return -1;
-        if (h->host_ctx.rankNum == 0 || h->host_ctx.rankNum > COMM_MAX_RANK_NUM) {
+        if (head.rankNum == 0 || head.rankNum > HCCL_MESH_RANK_NUM || head.rankNum > COMM_MAX_RANK_NUM) {
             fprintf(
-                stderr, "[comm rank %d] MESH CommContext.rankNum=%u out of range [1, %u]\n", h->rank,
-                h->host_ctx.rankNum, COMM_MAX_RANK_NUM
+                stderr, "[comm rank %d] MESH rankNum=%u out of range [1, %u]\n", h->rank, head.rankNum,
+                HCCL_MESH_RANK_NUM
             );
             return -1;
         }
+        h->host_ctx.workSpace = head.workSpace;
+        h->host_ctx.workSpaceSize = head.workSpaceSize;
+        h->host_ctx.rankId = head.rankId;
+        h->host_ctx.rankNum = head.rankNum;
+        h->host_ctx.winSize = head.winSize;
+
+        const size_t windowsInOff = sizeof(HcclMeshOpParamHead);
+        const size_t windowsOutOff = windowsInOff + HCCL_MESH_RANK_NUM * sizeof(uint64_t);
+        aRet = aclrtMemcpy(
+            h->host_ctx.windowsIn, head.rankNum * sizeof(uint64_t),
+            reinterpret_cast<uint8_t *>(ctxPtr) + windowsInOff, head.rankNum * sizeof(uint64_t),
+            ACL_MEMCPY_DEVICE_TO_HOST
+        );
+        if (aRet != ACL_SUCCESS) return -1;
+        aRet = aclrtMemcpy(
+            h->host_ctx.windowsOut, head.rankNum * sizeof(uint64_t),
+            reinterpret_cast<uint8_t *>(ctxPtr) + windowsOutOff, head.rankNum * sizeof(uint64_t),
+            ACL_MEMCPY_DEVICE_TO_HOST
+        );
+        if (aRet != ACL_SUCCESS) return -1;
     } else {
         // RING topology: parse HcclOpResParam structure on device
         auto *rawCtx = reinterpret_cast<uint8_t *>(ctxPtr);
@@ -681,6 +840,77 @@ extern "C" int comm_get_window_size(CommHandle h, size_t *size_out) {
     return 0;
 }
 
+extern "C" int comm_derive_context(
+    CommHandle h, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank, size_t window_offset,
+    size_t window_size, uint64_t *device_ctx_out
+) try {
+    if (!h || !rank_ids || !device_ctx_out) return -1;
+    if (h->device_ctx == nullptr || h->host_ctx.rankNum == 0) {
+        fprintf(stderr, "[comm rank %d] comm_derive_context: base windows are not allocated\n", h->rank);
+        return -1;
+    }
+    if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count) {
+        fprintf(
+            stderr, "[comm rank %d] comm_derive_context: invalid rank_count=%zu domain_rank=%u\n", h->rank,
+            rank_count, domain_rank
+        );
+        return -1;
+    }
+    if (window_offset + window_size > static_cast<size_t>(h->host_ctx.winSize)) {
+        fprintf(
+            stderr,
+            "[comm rank %d] comm_derive_context: window range [%zu, %zu) exceeds base window size %llu\n", h->rank,
+            window_offset, window_offset + window_size, static_cast<unsigned long long>(h->host_ctx.winSize)
+        );
+        return -1;
+    }
+
+    CommContext derived{};
+    derived.workSpace = h->host_ctx.workSpace;
+    derived.workSpaceSize = h->host_ctx.workSpaceSize;
+    derived.rankId = domain_rank;
+    derived.rankNum = static_cast<uint32_t>(rank_count);
+    derived.winSize = window_size;
+    for (size_t i = 0; i < rank_count; ++i) {
+        uint32_t base_rank = rank_ids[i];
+        if (base_rank >= h->host_ctx.rankNum) {
+            fprintf(
+                stderr, "[comm rank %d] comm_derive_context: rank_ids[%zu]=%u out of range [0, %u)\n", h->rank, i,
+                base_rank, h->host_ctx.rankNum
+            );
+            return -1;
+        }
+        derived.windowsIn[i] = h->host_ctx.windowsIn[base_rank] + window_offset;
+        derived.windowsOut[i] = h->host_ctx.windowsOut[base_rank] + window_offset;
+    }
+    void *newDevMem = nullptr;
+    aclError aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (aRet != ACL_SUCCESS || newDevMem == nullptr) {
+        fprintf(stderr, "[comm rank %d] comm_derive_context: aclrtMalloc failed: %d\n", h->rank, static_cast<int>(aRet));
+        return -1;
+    }
+
+    aRet = aclrtMemcpy(newDevMem, sizeof(CommContext), &derived, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (aRet != ACL_SUCCESS) {
+        fprintf(
+            stderr, "[comm rank %d] comm_derive_context: aclrtMemcpy H2D failed: %d\n", h->rank, static_cast<int>(aRet)
+        );
+        aclrtFree(newDevMem);
+        return -1;
+    }
+
+    auto *ctx = reinterpret_cast<CommContext *>(newDevMem);
+    h->derived_contexts.push_back(ctx);
+    *device_ctx_out = reinterpret_cast<uint64_t>(ctx);
+    return 0;
+} catch (const std::exception &e) {
+    fprintf(stderr, "[comm] comm_derive_context: exception: %s\n", e.what());
+    return -1;
+} catch (...) {
+    fprintf(stderr, "[comm] comm_derive_context: unknown exception\n");
+    return -1;
+}
+
 extern "C" int comm_barrier(CommHandle h) {
     if (!h) return -1;
     // HcclBarrier is synchronous — it blocks until all ranks arrive.
@@ -711,6 +941,12 @@ extern "C" int comm_destroy(CommHandle h) try {
     if (h->owns_device_ctx && h->device_ctx) {
         aclrtFree(h->device_ctx);
     }
+    for (auto *ctx : h->derived_contexts) {
+        if (ctx) {
+            aclrtFree(ctx);
+        }
+    }
+    h->derived_contexts.clear();
     if (h->hccl_comm) {
         HcclResult hret = hccl_comm_destroy(h->hccl_comm);
         if (hret != HCCL_SUCCESS) {

@@ -220,6 +220,20 @@ int comm_get_window_size(void *handle, size_t *size_out) {
     return -1;
 }
 
+int comm_derive_context(
+    void *handle, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank, size_t window_offset,
+    size_t window_size, uint64_t *device_ctx_out
+) {
+    (void)handle;
+    (void)rank_ids;
+    (void)rank_count;
+    (void)domain_rank;
+    (void)window_offset;
+    (void)window_size;
+    (void)device_ctx_out;
+    return -1;
+}
+
 int comm_barrier(void *handle) {
     (void)handle;
     return -1;

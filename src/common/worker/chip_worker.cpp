@@ -37,6 +37,17 @@ T load_symbol(void *handle, const char *name) {
     return reinterpret_cast<T>(sym);
 }
 
+template <typename T>
+T load_optional_symbol(void *handle, const char *name) {
+    dlerror();  // clear any existing error
+    void *sym = dlsym(handle, name);
+    const char *err = dlerror();
+    if (err) {
+        return nullptr;
+    }
+    return reinterpret_cast<T>(sym);
+}
+
 // Process-wide singleton: libcpu_sim_context.so is loaded once with
 // RTLD_GLOBAL so that host_runtime.so can resolve sim_context_set_* and
 // pto_sim_get_* symbols at runtime.  Never dlclosed.
@@ -168,9 +179,11 @@ void ChipWorker::init(
         create_comm_stream_fn_ = load_symbol<CreateCommStreamFn>(handle, "create_comm_stream_ctx");
         destroy_comm_stream_fn_ = load_symbol<DestroyCommStreamFn>(handle, "destroy_comm_stream_ctx");
         comm_init_fn_ = load_symbol<CommInitFn>(handle, "comm_init");
+        comm_create_subcomm_fn_ = load_optional_symbol<CommCreateSubcommFn>(handle, "comm_create_subcomm");
         comm_alloc_windows_fn_ = load_symbol<CommAllocWindowsFn>(handle, "comm_alloc_windows");
         comm_get_local_window_base_fn_ = load_symbol<CommGetLocalWindowBaseFn>(handle, "comm_get_local_window_base");
         comm_get_window_size_fn_ = load_symbol<CommGetWindowSizeFn>(handle, "comm_get_window_size");
+        comm_derive_context_fn_ = load_symbol<CommDeriveContextFn>(handle, "comm_derive_context");
         comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
         comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
     } catch (...) {
@@ -227,9 +240,11 @@ void ChipWorker::init(
         create_comm_stream_fn_ = nullptr;
         destroy_comm_stream_fn_ = nullptr;
         comm_init_fn_ = nullptr;
+        comm_create_subcomm_fn_ = nullptr;
         comm_alloc_windows_fn_ = nullptr;
         comm_get_local_window_base_fn_ = nullptr;
         comm_get_window_size_fn_ = nullptr;
+        comm_derive_context_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
         runtime_buf_.clear();
@@ -243,13 +258,9 @@ void ChipWorker::init(
 }
 
 void ChipWorker::finalize() {
-    // Defensive: if the user never called comm_destroy, reclaim the stream
-    // before we tear down the device context (otherwise the stream-backing
-    // ACL state outlives its owning context).
-    if (comm_stream_ != nullptr && device_ctx_ != nullptr && destroy_comm_stream_fn_ != nullptr) {
-        destroy_comm_stream_fn_(device_ctx_, comm_stream_);
-    }
-    comm_stream_ = nullptr;
+    // Defensive: if the user never called comm_destroy, reclaim all owned
+    // communicator handles and streams before tearing down the device context.
+    clear_comm_sessions();
 
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
         finalize_device_fn_(device_ctx_);
@@ -279,9 +290,11 @@ void ChipWorker::finalize() {
     create_comm_stream_fn_ = nullptr;
     destroy_comm_stream_fn_ = nullptr;
     comm_init_fn_ = nullptr;
+    comm_create_subcomm_fn_ = nullptr;
     comm_alloc_windows_fn_ = nullptr;
     comm_get_local_window_base_fn_ = nullptr;
     comm_get_window_size_fn_ = nullptr;
+    comm_derive_context_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
     runtime_buf_.clear();
@@ -359,6 +372,105 @@ size_t ChipWorker::host_dlopen_count() const {
     return get_host_dlopen_count_fn_(device_ctx_);
 }
 
+void *ChipWorker::create_comm_stream_checked(const char *op_name) {
+    int rc = ensure_acl_ready_fn_(device_ctx_, device_id_);
+    if (rc != 0) {
+        std::string msg = op_name;
+        msg += ": ensure_acl_ready failed with code ";
+        msg += std::to_string(rc);
+        throw std::runtime_error(msg);
+    }
+    return create_comm_stream_fn_(device_ctx_);
+}
+
+void ChipWorker::destroy_comm_stream_best_effort(void *stream, int *rc) {
+    if (stream == nullptr || device_ctx_ == nullptr || destroy_comm_stream_fn_ == nullptr) {
+        return;
+    }
+    int srv = destroy_comm_stream_fn_(device_ctx_, stream);
+    if (srv != 0 && rc != nullptr && *rc == 0) {
+        *rc = srv;
+    }
+}
+
+ChipWorker::CommSession *ChipWorker::find_comm_session(uint64_t comm_handle) {
+    auto it = comm_session_index_.find(comm_handle);
+    if (it == comm_session_index_.end() || it->second >= comm_sessions_.size()) {
+        return nullptr;
+    }
+    CommSession &session = comm_sessions_[it->second];
+    if (reinterpret_cast<uint64_t>(session.handle) != comm_handle) {
+        return nullptr;
+    }
+    return &session;
+}
+
+ChipWorker::CommSession *ChipWorker::create_comm_session(void *handle, void *stream, bool is_base) {
+    if (handle == nullptr) {
+        return nullptr;
+    }
+    uint64_t key = reinterpret_cast<uint64_t>(handle);
+    if (comm_session_index_.find(key) != comm_session_index_.end()) {
+        return nullptr;
+    }
+    CommSession session{};
+    session.handle = handle;
+    session.stream = stream;
+    session.is_base = is_base;
+    comm_sessions_.push_back(session);
+    size_t index = comm_sessions_.size() - 1;
+    comm_session_index_[key] = index;
+    return &comm_sessions_[index];
+}
+
+int ChipWorker::destroy_comm_session(CommSession &session) {
+    int rc = 0;
+    if (session.handle != nullptr && comm_destroy_fn_ != nullptr) {
+        rc = comm_destroy_fn_(session.handle);
+    }
+    destroy_comm_stream_best_effort(session.stream, &rc);
+    if (reinterpret_cast<uint64_t>(session.handle) == base_comm_handle_) {
+        base_comm_handle_ = 0;
+    }
+    comm_session_index_.erase(reinterpret_cast<uint64_t>(session.handle));
+    session.handle = nullptr;
+    session.stream = nullptr;
+    session.device_ctx = 0;
+    session.local_window_base = 0;
+    session.window_size = 0;
+    return rc;
+}
+
+uint64_t ChipWorker::create_base_comm(int rank, int nranks, const std::string &rootinfo_path) {
+    void *stream = create_comm_stream_checked("comm_init");
+    void *handle = comm_init_fn_(rank, nranks, stream, rootinfo_path.c_str());
+    if (handle == nullptr) {
+        int rc = 0;
+        destroy_comm_stream_best_effort(stream, &rc);
+        throw std::runtime_error("comm_init failed");
+    }
+    CommSession *session = create_comm_session(handle, stream, true);
+    if (session == nullptr) {
+        int rc = comm_destroy_fn_(handle);
+        destroy_comm_stream_best_effort(stream, &rc);
+        throw std::runtime_error("comm_init: duplicate comm handle");
+    }
+    base_comm_handle_ = reinterpret_cast<uint64_t>(handle);
+    return base_comm_handle_;
+}
+
+void ChipWorker::clear_comm_sessions() {
+    for (auto it = comm_sessions_.rbegin(); it != comm_sessions_.rend(); ++it) {
+        if (it->handle == nullptr && it->stream == nullptr) {
+            continue;
+        }
+        destroy_comm_session(*it);
+    }
+    comm_sessions_.clear();
+    comm_session_index_.clear();
+    base_comm_handle_ = 0;
+}
+
 uint64_t ChipWorker::malloc(size_t size) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
@@ -403,39 +515,61 @@ uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
-    if (comm_stream_ != nullptr) {
-        throw std::runtime_error("comm_init: a comm session is already active on this ChipWorker");
+    if (base_comm_handle_ != 0) {
+        return base_comm_handle_;
     }
 
-    // Bring ACL up on the calling thread before stream creation.  Onboard
-    // runs aclInit (idempotent) + per-thread aclrtSetDevice; sim's stub is
-    // a no-op; platforms with no distributed backend (a5 today) also no-op.
-    int rc = ensure_acl_ready_fn_(device_ctx_, device_id_);
-    if (rc != 0) {
-        throw std::runtime_error("ensure_acl_ready failed with code " + std::to_string(rc));
+    return create_base_comm(rank, nranks, rootinfo_path);
+}
+
+uint64_t ChipWorker::comm_create_subcomm(
+    uint64_t base_comm_handle, uint64_t sub_comm_id, const std::vector<uint32_t> &rank_ids, uint32_t sub_comm_rank_id
+) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    if (comm_create_subcomm_fn_ == nullptr) {
+        throw std::runtime_error("comm_create_subcomm is not supported by this runtime");
+    }
+    if (base_comm_handle == 0 || find_comm_session(base_comm_handle) == nullptr) {
+        throw std::runtime_error("comm_create_subcomm: base communicator is not owned by this ChipWorker");
+    }
+    if (rank_ids.empty()) {
+        throw std::runtime_error("comm_create_subcomm: rank_ids must not be empty");
+    }
+    if (sub_comm_rank_id >= rank_ids.size()) {
+        throw std::runtime_error("comm_create_subcomm: sub_comm_rank_id out of range");
     }
 
-    // Create an aclrtStream owned by this ChipWorker.  Sim / a5 stubs
-    // return NULL; their raw comm_init ignores the stream arg.  A NULL
-    // from a runtime that has a real comm backend is a genuine failure —
-    // we can't distinguish "stub returned NULL on purpose" from "onboard
-    // create failed" here, so we defer the check to comm_init's own
-    // return value below (a stub returns NULL from comm_init anyway).
-    void *stream = create_comm_stream_fn_(device_ctx_);
-
-    void *handle = comm_init_fn_(rank, nranks, stream, rootinfo_path.c_str());
+    void *stream = create_comm_stream_checked("comm_create_subcomm");
+    void *handle = comm_create_subcomm_fn_(
+        reinterpret_cast<void *>(base_comm_handle), sub_comm_id, rank_ids.data(), rank_ids.size(), sub_comm_rank_id,
+        stream
+    );
     if (handle == nullptr) {
-        // Roll back the stream we just created — otherwise the ChipWorker
-        // leaks it and the next comm_init attempt trips the
-        // "session already active" guard above.
-        if (stream != nullptr) {
-            destroy_comm_stream_fn_(device_ctx_, stream);
-        }
-        throw std::runtime_error("comm_init failed");
+        int rc = 0;
+        destroy_comm_stream_best_effort(stream, &rc);
+        throw std::runtime_error("comm_create_subcomm failed");
     }
 
-    comm_stream_ = stream;
+    if (create_comm_session(handle, stream, false) == nullptr) {
+        int rc = comm_destroy_fn_(handle);
+        destroy_comm_stream_best_effort(stream, &rc);
+        throw std::runtime_error("comm_create_subcomm: duplicate comm handle");
+    }
+
     return reinterpret_cast<uint64_t>(handle);
+}
+
+uint64_t
+ChipWorker::comm_create_domain(uint64_t sub_comm_id, const std::vector<uint32_t> &rank_ids, uint32_t sub_comm_rank_id) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    if (base_comm_handle_ == 0) {
+        throw std::runtime_error("comm_create_domain: call comm_init to create the base communicator first");
+    }
+    return comm_create_subcomm(base_comm_handle_, sub_comm_id, rank_ids, sub_comm_rank_id);
 }
 
 uint64_t ChipWorker::comm_alloc_windows(uint64_t comm_handle, size_t win_size) {
@@ -443,6 +577,10 @@ uint64_t ChipWorker::comm_alloc_windows(uint64_t comm_handle, size_t win_size) {
     int rc = comm_alloc_windows_fn_(reinterpret_cast<void *>(comm_handle), win_size, &device_ctx);
     if (rc != 0) {
         throw std::runtime_error("comm_alloc_windows failed with code " + std::to_string(rc));
+    }
+    CommSession *session = find_comm_session(comm_handle);
+    if (session != nullptr) {
+        session->device_ctx = device_ctx;
     }
     return device_ctx;
 }
@@ -453,6 +591,10 @@ uint64_t ChipWorker::comm_get_local_window_base(uint64_t comm_handle) {
     if (rc != 0) {
         throw std::runtime_error("comm_get_local_window_base failed with code " + std::to_string(rc));
     }
+    CommSession *session = find_comm_session(comm_handle);
+    if (session != nullptr) {
+        session->local_window_base = base;
+    }
     return base;
 }
 
@@ -462,7 +604,35 @@ size_t ChipWorker::comm_get_window_size(uint64_t comm_handle) {
     if (rc != 0) {
         throw std::runtime_error("comm_get_window_size failed with code " + std::to_string(rc));
     }
+    CommSession *session = find_comm_session(comm_handle);
+    if (session != nullptr) {
+        session->window_size = win_size;
+    }
     return win_size;
+}
+
+uint64_t ChipWorker::comm_derive_context(
+    uint64_t comm_handle, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank, size_t window_offset,
+    size_t window_size
+) {
+    if (comm_derive_context_fn_ == nullptr) {
+        throw std::runtime_error("comm_derive_context is not supported by this runtime");
+    }
+    if (rank_ids.empty()) {
+        throw std::runtime_error("comm_derive_context: rank_ids must not be empty");
+    }
+    uint64_t device_ctx = 0;
+    int rc = comm_derive_context_fn_(
+        reinterpret_cast<void *>(comm_handle), rank_ids.data(), rank_ids.size(), domain_rank, window_offset,
+        window_size, &device_ctx
+    );
+    if (rc != 0) {
+        throw std::runtime_error("comm_derive_context failed with code " + std::to_string(rc));
+    }
+    if (device_ctx == 0) {
+        throw std::runtime_error("comm_derive_context returned null device_ctx");
+    }
+    return device_ctx;
 }
 
 void ChipWorker::comm_barrier(uint64_t comm_handle) {
@@ -473,19 +643,45 @@ void ChipWorker::comm_barrier(uint64_t comm_handle) {
 }
 
 void ChipWorker::comm_destroy(uint64_t comm_handle) {
-    int rc = comm_destroy_fn_(reinterpret_cast<void *>(comm_handle));
-
-    // Destroy our comm-owned stream regardless of the handle-destroy result —
-    // leaking the stream is the worse outcome (it keeps the device attached
-    // and blocks the next session).  We still surface the underlying rc
-    // below so callers see the original failure.
-    if (comm_stream_ != nullptr) {
-        int srv = destroy_comm_stream_fn_(device_ctx_, comm_stream_);
-        if (srv != 0 && rc == 0) rc = srv;
+    CommSession *session = find_comm_session(comm_handle);
+    if (session == nullptr) {
+        int rc = comm_destroy_fn_(reinterpret_cast<void *>(comm_handle));
+        if (rc != 0) {
+            throw std::runtime_error("comm_destroy failed with code " + std::to_string(rc));
+        }
+        return;
     }
-    comm_stream_ = nullptr;
+    if (session->is_base) {
+        comm_destroy_all();
+        return;
+    }
+
+    int rc = destroy_comm_session(*session);
+    while (!comm_sessions_.empty() && comm_sessions_.back().handle == nullptr &&
+           comm_sessions_.back().stream == nullptr) {
+        comm_sessions_.pop_back();
+    }
 
     if (rc != 0) {
         throw std::runtime_error("comm_destroy failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::comm_destroy_all() {
+    int first_rc = 0;
+    for (auto it = comm_sessions_.rbegin(); it != comm_sessions_.rend(); ++it) {
+        if (it->handle == nullptr && it->stream == nullptr) {
+            continue;
+        }
+        int rc = destroy_comm_session(*it);
+        if (rc != 0 && first_rc == 0) {
+            first_rc = rc;
+        }
+    }
+    comm_sessions_.clear();
+    comm_session_index_.clear();
+    base_comm_handle_ = 0;
+    if (first_rc != 0) {
+        throw std::runtime_error("comm_destroy_all failed with code " + std::to_string(first_rc));
     }
 }

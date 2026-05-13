@@ -875,21 +875,20 @@ int DeviceRunner::finalize() {
     // finalize() to reclaim them; that is not a leak. Emit at DEBUG so the
     // legacy regression signal is preserved for callers that never went
     // through prepare_callable.
-    if (!func_id_to_addr_.empty()) {
+    if (!kernel_cache_.empty()) {
         const bool prepared_path_used = prepared_callable_path_used_;
         if (prepared_path_used) {
-            LOG_DEBUG("finalize() releasing %zu kernel binaries staged by prepare_callable", func_id_to_addr_.size());
+            LOG_DEBUG("finalize() releasing %zu kernel binaries staged by prepare_callable", kernel_cache_.size());
         } else {
-            LOG_ERROR("finalize() called with %zu kernel binaries still cached (memory leak)", func_id_to_addr_.size());
+            LOG_ERROR("finalize() called with %zu kernel binaries still cached (memory leak)", kernel_cache_.size());
         }
-        for (const auto &pair : func_id_to_addr_) {
+        for (const auto &pair : kernel_cache_) {
             void *gm_addr = reinterpret_cast<void *>(pair.second);
             mem_alloc_.free(gm_addr);
-            LOG_DEBUG("Freed kernel binary: func_id=%d, addr=0x%lx", pair.first, pair.second);
+            LOG_DEBUG("Freed kernel binary: func_id=%d, addr=0x%lx", pair.first.func_id, pair.second);
         }
     }
-    func_id_to_addr_.clear();
-    func_id_to_hash_.clear();
+    kernel_cache_.clear();
     binaries_loaded_ = false;
 
     if (dev_orch_so_buffer_ != nullptr) {
@@ -1057,17 +1056,11 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
     // the AICore the previous callable's kernel: dispatch never completes
     // the new task and the AICPU spins forever.
     const uint64_t new_hash = simpler::common::utils::elf_build_id_64(bin_data, bin_size);
-    auto it = func_id_to_addr_.find(func_id);
-    if (it != func_id_to_addr_.end()) {
-        auto hash_it = func_id_to_hash_.find(func_id);
-        if (hash_it != func_id_to_hash_.end() && hash_it->second == new_hash) {
-            LOG_INFO_V0("Kernel func_id=%d already uploaded (matching hash), returning cached address", func_id);
-            return it->second;
-        }
-        LOG_INFO_V0("Kernel func_id=%d binary changed, evicting cached entry", func_id);
-        mem_alloc_.free(reinterpret_cast<void *>(it->second));
-        func_id_to_addr_.erase(it);
-        func_id_to_hash_.erase(func_id);
+    KernelCacheKey key{func_id, new_hash};
+    auto it = kernel_cache_.find(key);
+    if (it != kernel_cache_.end()) {
+        LOG_INFO_V0("Kernel func_id=%d already uploaded (matching hash), returning cached address", func_id);
+        return it->second;
     }
 
     LOG_DEBUG("Uploading kernel binary: func_id=%d, size=%zu bytes", func_id, bin_size);
@@ -1096,8 +1089,7 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
         return 0;
     }
 
-    func_id_to_addr_[func_id] = callable_addr;
-    func_id_to_hash_[func_id] = new_hash;
+    kernel_cache_[key] = callable_addr;
 
     LOG_DEBUG("  func_id=%d -> callable_addr=0x%lx, binary_code_addr=0x%lx", func_id, callable_addr, binary_code_addr);
 
@@ -1105,19 +1097,16 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
 }
 
 void DeviceRunner::remove_kernel_binary(int func_id) {
-    auto it = func_id_to_addr_.find(func_id);
-    if (it == func_id_to_addr_.end()) {
-        return;
+    for (auto it = kernel_cache_.begin(); it != kernel_cache_.end();) {
+        if (it->first.func_id != func_id) {
+            ++it;
+            continue;
+        }
+        uint64_t function_bin_addr = it->second;
+        mem_alloc_.free(reinterpret_cast<void *>(function_bin_addr));
+        LOG_DEBUG("Removed kernel binary: func_id=%d, addr=0x%lx", func_id, function_bin_addr);
+        it = kernel_cache_.erase(it);
     }
-
-    uint64_t function_bin_addr = it->second;
-    void *gm_addr = reinterpret_cast<void *>(function_bin_addr);
-
-    mem_alloc_.free(gm_addr);
-    func_id_to_addr_.erase(it);
-    func_id_to_hash_.erase(func_id);
-
-    LOG_DEBUG("Removed kernel binary: func_id=%d, addr=0x%lx", func_id, function_bin_addr);
 }
 
 int DeviceRunner::init_l2_perf_collection(int num_aicore, int device_id) {

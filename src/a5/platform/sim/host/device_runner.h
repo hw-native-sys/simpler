@@ -65,6 +65,16 @@ struct MappedKernel {
     uint8_t *callable_buf{nullptr};  // host-memory copy of CoreCallable (owns memory)
 };
 
+struct KernelCacheKey {
+    int func_id{0};
+    uint64_t hash{0};
+
+    bool operator<(const KernelCacheKey &other) const {
+        if (func_id != other.func_id) return func_id < other.func_id;
+        return hash < other.hash;
+    }
+};
+
 /**
  * Device runner for simulated kernel execution
  *
@@ -271,7 +281,7 @@ private:
     KernelArgs kernel_args_;
 
     // Kernel binary mapping (func_id -> executable memory)
-    std::map<int, MappedKernel> func_id_to_addr_;
+    std::map<KernelCacheKey, MappedKernel> func_id_to_addr_;
 
     // Orchestration SO cache (host-resident in sim).
     uint64_t cached_orch_so_hash_{0};

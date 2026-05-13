@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../task_interface/call_config.h"
@@ -87,14 +88,25 @@ public:
     ///     ensure_acl_ready / aclrtCreateStream surface area).
     ///   - On sim, ACL / stream are no-ops; the stashed stream is null.
     ///
-    /// One active comm session per ChipWorker is supported.  Users needing
-    /// multiple concurrent comms should instantiate multiple ChipWorkers.
+    /// Multi-domain bootstrap owns a hidden base communicator plus one
+    /// sub-communicator per active domain.  The legacy comm_* methods are kept
+    /// as wrappers for the transition and allocate a single "default" domain.
     uint64_t comm_init(int rank, int nranks, const std::string &rootinfo_path);
+    uint64_t comm_create_subcomm(
+        uint64_t base_comm_handle, uint64_t sub_comm_id, const std::vector<uint32_t> &rank_ids,
+        uint32_t sub_comm_rank_id
+    );
+    uint64_t comm_create_domain(uint64_t sub_comm_id, const std::vector<uint32_t> &rank_ids, uint32_t sub_comm_rank_id);
     uint64_t comm_alloc_windows(uint64_t comm_handle, size_t win_size);
     uint64_t comm_get_local_window_base(uint64_t comm_handle);
     size_t comm_get_window_size(uint64_t comm_handle);
+    uint64_t comm_derive_context(
+        uint64_t comm_handle, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank, size_t window_offset,
+        size_t window_size
+    );
     void comm_barrier(uint64_t comm_handle);
     void comm_destroy(uint64_t comm_handle);
+    void comm_destroy_all();
 
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
@@ -121,11 +133,30 @@ private:
     using CreateCommStreamFn = void *(*)(void *);
     using DestroyCommStreamFn = int (*)(void *, void *);
     using CommInitFn = void *(*)(int, int, void *, const char *);
+    using CommCreateSubcommFn = void *(*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, void *);
     using CommAllocWindowsFn = int (*)(void *, size_t, uint64_t *);
     using CommGetLocalWindowBaseFn = int (*)(void *, uint64_t *);
     using CommGetWindowSizeFn = int (*)(void *, size_t *);
+    using CommDeriveContextFn = int (*)(void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
+
+    struct CommSession {
+        void *handle = nullptr;
+        void *stream = nullptr;
+        bool is_base = false;
+        uint64_t device_ctx = 0;
+        uint64_t local_window_base = 0;
+        size_t window_size = 0;
+    };
+
+    void *create_comm_stream_checked(const char *op_name);
+    void destroy_comm_stream_best_effort(void *stream, int *rc);
+    CommSession *find_comm_session(uint64_t comm_handle);
+    CommSession *create_comm_session(void *handle, void *stream, bool is_base);
+    int destroy_comm_session(CommSession &session);
+    uint64_t create_base_comm(int rank, int nranks, const std::string &rootinfo_path);
+    void clear_comm_sessions();
 
     void *lib_handle_ = nullptr;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
@@ -146,17 +177,17 @@ private:
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
     DestroyCommStreamFn destroy_comm_stream_fn_ = nullptr;
     CommInitFn comm_init_fn_ = nullptr;
+    CommCreateSubcommFn comm_create_subcomm_fn_ = nullptr;
     CommAllocWindowsFn comm_alloc_windows_fn_ = nullptr;
     CommGetLocalWindowBaseFn comm_get_local_window_base_fn_ = nullptr;
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
+    CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
     void *device_ctx_ = nullptr;
-    // aclrtStream owned by the currently-active comm session (created inside
-    // comm_init on onboard via DeviceRunner::create_comm_stream, paired with
-    // destroy_comm_stream in comm_destroy).  Null when no comm is active or
-    // when running on a backend without ACL (sim).
-    void *comm_stream_ = nullptr;
+    std::vector<CommSession> comm_sessions_;
+    std::unordered_map<uint64_t, size_t> comm_session_index_;
+    uint64_t base_comm_handle_ = 0;
 
     std::vector<uint8_t> runtime_buf_;
     std::vector<uint8_t> aicpu_binary_;

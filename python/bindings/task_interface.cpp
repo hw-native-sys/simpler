@@ -703,6 +703,15 @@ NB_MODULE(_task_interface, m) {
             "sim ignores both).  Pair with comm_destroy for cleanup."
         )
         .def(
+            "comm_create_subcomm", &ChipWorker::comm_create_subcomm, nb::arg("comm_handle"), nb::arg("sub_comm_id"),
+            nb::arg("rank_ids"), nb::arg("sub_comm_rank_id"),
+            "Create a subcommunicator from an existing base communicator."
+        )
+        .def(
+            "comm_create_domain", &ChipWorker::comm_create_domain, nb::arg("sub_comm_id"), nb::arg("rank_ids"),
+            nb::arg("sub_comm_rank_id"), "Create a subcommunicator from the ChipWorker-owned base communicator."
+        )
+        .def(
             "comm_alloc_windows", &ChipWorker::comm_alloc_windows, nb::arg("comm_handle"), nb::arg("win_size"),
             "Allocate per-rank windows and return the device CommContext pointer."
         )
@@ -714,11 +723,17 @@ NB_MODULE(_task_interface, m) {
             "comm_get_window_size", &ChipWorker::comm_get_window_size, nb::arg("comm_handle"),
             "Return the actual per-rank window size (may differ from the hint)."
         )
+        .def(
+            "comm_derive_context", &ChipWorker::comm_derive_context, nb::arg("comm_handle"), nb::arg("rank_ids"),
+            nb::arg("domain_rank"), nb::arg("window_offset"), nb::arg("window_size"),
+            "Derive a domain-local CommContext from an allocated base communicator."
+        )
         .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"), "Synchronize all ranks.")
         .def(
             "comm_destroy", &ChipWorker::comm_destroy, nb::arg("comm_handle"),
             "Destroy the communicator and release its resources."
-        );
+        )
+        .def("comm_destroy_all", &ChipWorker::comm_destroy_all, "Destroy all owned communicators in LIFO order.");
 
     // --- Standalone blob helpers ---
     m.def(

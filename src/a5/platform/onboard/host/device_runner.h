@@ -455,9 +455,17 @@ private:
     DeviceArgs device_args_;
 
     // Kernel binary management
-    bool binaries_loaded_{false};              // true after AICPU SO loaded
-    std::map<int, uint64_t> func_id_to_addr_;  // func_id -> function_bin_addr (device GM)
-    std::map<int, uint64_t> func_id_to_hash_;  // func_id -> elf_build_id_64(bin_data)
+    bool binaries_loaded_{false};  // true after AICPU SO loaded
+    struct KernelCacheKey {
+        int func_id{0};
+        uint64_t hash{0};
+
+        bool operator<(const KernelCacheKey &other) const {
+            if (func_id != other.func_id) return func_id < other.func_id;
+            return hash < other.hash;
+        }
+    };
+    std::map<KernelCacheKey, uint64_t> kernel_cache_;  // (func_id, binary hash) -> CoreCallable device GM
 
     // Orchestration SO cache (host-tracked, device-resident).
     uint64_t cached_orch_so_hash_{0};

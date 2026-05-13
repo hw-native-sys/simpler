@@ -81,8 +81,9 @@ def _rank_entry(  # noqa: PLR0913
             ChipBootstrapChannel,
             ChipBootstrapConfig,
             ChipBufferSpec,
-            ChipCommBootstrapConfig,
             ChipWorker,
+            CommDomain,
+            CommDomainPlan,
             HostBufferStaging,
         )
 
@@ -90,16 +91,24 @@ def _rank_entry(  # noqa: PLR0913
         worker.init(rank, bins)
         result["stage"] = "init"
 
-        cfg = ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank,
-                nranks=nranks,
-                rootinfo_path=rootinfo_path,
-                window_size=window_size,
-            ),
-            buffers=[ChipBufferSpec(**s) for s in buffer_specs],
-            host_inputs=[HostBufferStaging(**s) for s in host_input_specs],
+        plan = CommDomainPlan(
+            domains=[
+                CommDomain(
+                    name="default",
+                    worker_indices=list(range(nranks)),
+                    window_size=window_size,
+                    buffers=[ChipBufferSpec(**s) for s in buffer_specs],
+                )
+            ]
         )
+        cfg = ChipBootstrapConfig(
+            comm=plan.bootstrap_for_worker(rank),
+            host_inputs=[HostBufferStaging(domain_name="default", **s) for s in host_input_specs],
+        )
+        cfg.base_rank = rank
+        cfg.base_size = nranks
+        cfg.rootinfo_path = rootinfo_path
+        cfg.base_window_size = plan.base_window_size()
 
         channel: ChipBootstrapChannel | None = None
         shm_attach: SharedMemory | None = None
@@ -109,18 +118,19 @@ def _rank_entry(  # noqa: PLR0913
 
         try:
             res = worker.bootstrap_context(device_id=rank, cfg=cfg, channel=channel)
+            domain = res.domains["default"]
             result["stage"] = "bootstrap"
-            result["device_ctx"] = int(res.device_ctx)
-            result["local_window_base"] = int(res.local_window_base)
-            result["actual_window_size"] = int(res.actual_window_size)
-            result["buffer_ptrs"] = list(res.buffer_ptrs)
+            result["device_ctx"] = int(domain.device_ctx)
+            result["local_window_base"] = int(domain.local_window_base)
+            result["actual_window_size"] = int(domain.actual_window_size)
+            result["buffer_ptrs"] = list(domain.buffer_ptrs.values())
 
             # Read back the first buffer if the test asked for it.  Uses the
             # worker's device-to-host DMA so the test can assert on what
             # ``load_from_host`` actually wrote at ``buffer_ptrs[0]``.
-            if readback_nbytes > 0 and res.buffer_ptrs:
+            if readback_nbytes > 0 and domain.buffer_ptrs:
                 host_buf = (ctypes.c_char * readback_nbytes)()
-                worker.copy_from(ctypes.addressof(host_buf), res.buffer_ptrs[0], readback_nbytes)
+                worker.copy_from(ctypes.addressof(host_buf), next(iter(domain.buffer_ptrs.values())), readback_nbytes)
                 result["readback"] = bytes(host_buf)
 
             # shutdown_bootstrap + finalize — matches the Worker bootstrap
@@ -219,6 +229,111 @@ class TestBootstrapContextHappyPath:
             assert r["actual_window_size"] >= 4096
             # Single buffer at window base — the 1:1 contract ChipContext relies on.
             assert r["buffer_ptrs"] == [r["local_window_base"]]
+
+
+# ---------------------------------------------------------------------------
+# 1b. Multi-domain path — overlapping subcommunicators get independent windows.
+# ---------------------------------------------------------------------------
+
+
+def _multi_domain_rank_entry(
+    worker_idx: int,
+    nranks: int,
+    rootinfo_path: str,
+    bins,
+    result_queue: mp.Queue,  # type: ignore[type-arg]
+) -> None:
+    result: dict[str, object] = {"rank": worker_idx, "ok": False}
+    try:
+        from simpler.task_interface import ChipBootstrapConfig, ChipBufferSpec, ChipWorker, CommDomain, CommDomainPlan
+
+        plan = CommDomainPlan(
+            domains=[
+                CommDomain(
+                    name="tp",
+                    worker_indices=[0, 1],
+                    window_size=4096,
+                    buffers=[ChipBufferSpec(name="scratch", dtype="float32", count=16, nbytes=64)],
+                ),
+                CommDomain(
+                    name="pp",
+                    worker_indices=[1, 2],
+                    window_size=4096,
+                    buffers=[ChipBufferSpec(name="scratch", dtype="float32", count=16, nbytes=64)],
+                ),
+            ]
+        )
+        cfg = ChipBootstrapConfig(comm=plan.bootstrap_for_worker(worker_idx))
+        cfg.base_rank = worker_idx
+        cfg.base_size = nranks
+        cfg.rootinfo_path = rootinfo_path
+
+        worker = ChipWorker()
+        worker.init(worker_idx, bins)
+        try:
+            res = worker.bootstrap_context(device_id=worker_idx, cfg=cfg)
+            result["domains"] = {
+                name: {
+                    "domain_rank": domain.domain_rank,
+                    "domain_size": domain.domain_size,
+                    "device_ctx": int(domain.device_ctx),
+                    "local_window_base": int(domain.local_window_base),
+                    "actual_window_size": int(domain.actual_window_size),
+                    "buffer_ptrs": dict(domain.buffer_ptrs),
+                }
+                for name, domain in res.domains.items()
+            }
+            result["ok"] = True
+        finally:
+            worker.shutdown_bootstrap()
+            worker.finalize()
+    except Exception:  # noqa: BLE001
+        result["error"] = traceback.format_exc()
+    finally:
+        result_queue.put(result)
+
+
+class TestBootstrapContextMultiDomain:
+    def test_overlapping_domains_create_independent_sim_windows(self):
+        bins = _sim_binaries()
+        rootinfo_path = f"/tmp/pto_bootstrap_sim_{os.getpid()}_multi_domain.bin"
+        ctx = mp.get_context("fork")
+        result_queue: mp.Queue = ctx.Queue()  # type: ignore[type-arg]
+        procs = []
+        for worker_idx in range(3):
+            p = ctx.Process(
+                target=_multi_domain_rank_entry,
+                args=(worker_idx, 3, rootinfo_path, bins, result_queue),
+                daemon=False,
+            )
+            p.start()
+            procs.append(p)
+
+        results: dict[int, dict] = {}
+        for _ in range(3):
+            r = result_queue.get(timeout=180)
+            results[int(r["rank"])] = r
+        for p in procs:
+            p.join(timeout=60)
+        try:
+            os.unlink(rootinfo_path)
+        except FileNotFoundError:
+            pass
+
+        for rank in range(3):
+            assert results[rank].get("ok"), f"rank {rank} failed: {results[rank].get('error')}"
+
+        assert set(results[0]["domains"]) == {"tp"}
+        assert set(results[1]["domains"]) == {"pp", "tp"}
+        assert set(results[2]["domains"]) == {"pp"}
+
+        assert results[1]["domains"]["tp"]["domain_rank"] == 1
+        assert results[1]["domains"]["pp"]["domain_rank"] == 0
+        assert results[1]["domains"]["tp"]["device_ctx"] != results[1]["domains"]["pp"]["device_ctx"]
+        assert (
+            results[1]["domains"]["tp"]["buffer_ptrs"]["scratch"]
+            != results[1]["domains"]["pp"]["buffer_ptrs"]["scratch"]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -337,38 +452,52 @@ def _store_rank_entry(  # noqa: PLR0913
         from simpler.task_interface import (
             ChipBootstrapConfig,
             ChipBufferSpec,
-            ChipCommBootstrapConfig,
             ChipWorker,
+            CommDomain,
+            CommDomainPlan,
             HostBufferStaging,
         )
 
         worker = ChipWorker()
         worker.init(rank, bins)
 
-        cfg = ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank,
-                nranks=nranks,
-                rootinfo_path=rootinfo_path,
-                window_size=window_size,
-            ),
-            buffers=[ChipBufferSpec(**s) for s in buffer_specs],
-            host_outputs=[HostBufferStaging(**s) for s in host_output_specs],
+        domain_buffers = [ChipBufferSpec(**s) for s in buffer_specs]
+        plan = CommDomainPlan(
+            domains=[
+                CommDomain(
+                    name="default",
+                    worker_indices=list(range(nranks)),
+                    window_size=window_size,
+                    buffers=domain_buffers,
+                )
+            ]
         )
+        cfg = ChipBootstrapConfig(
+            comm=plan.bootstrap_for_worker(rank),
+            host_outputs=[HostBufferStaging(domain_name="default", **s) for s in host_output_specs],
+        )
+        cfg.base_rank = rank
+        cfg.base_size = nranks
+        cfg.rootinfo_path = rootinfo_path
+        cfg.base_window_size = plan.base_window_size()
 
         res = worker.bootstrap_context(device_id=rank, cfg=cfg)
+        domain = res.domains["default"]
 
-        if payload is not None and res.buffer_ptrs:
+        if payload is not None and domain.buffer_ptrs:
             src = (ctypes.c_char * len(payload)).from_buffer_copy(payload)
-            worker.copy_to(res.buffer_ptrs[0], ctypes.addressof(src), len(payload))
+            first_ptr = next(iter(domain.buffer_ptrs.values()))
+            worker.copy_to(first_ptr, ctypes.addressof(src), len(payload))
 
             # Manually run the same flush logic worker.py uses on TASK_DONE,
             # so this test covers the exact D2H handshake without needing a
             # full dispatch loop.
-            for spec, ptr in zip(cfg.buffers, res.buffer_ptrs):
+            domain_cfg = cfg.domain_bootstrap_configs()[0]
+            for spec in domain_cfg.buffers:
                 if not spec.store_to_host or spec.nbytes == 0:
                     continue
-                staging = cfg.output_staging(spec.name)
+                ptr = domain.buffer_ptrs[spec.name]
+                staging = domain_cfg.output_staging(spec.name)
                 shm = SharedMemory(name=staging.shm_name)
                 try:
                     shm_buf = shm.buf
@@ -541,6 +670,7 @@ def _missing_output_staging_rank_entry(
             ChipBootstrapChannel,
             ChipBootstrapConfig,
             ChipBufferSpec,
+            ChipDomainBootstrapConfig,
             ChipWorker,
         )
 
@@ -552,14 +682,23 @@ def _missing_output_staging_rank_entry(
             channel = ChipBootstrapChannel(_shm_addr(shm), max_buffer_count=376)
 
             cfg = ChipBootstrapConfig(
-                comm=None,
-                buffers=[
-                    ChipBufferSpec(
-                        name="y",
-                        dtype="float32",
-                        count=1,
-                        nbytes=4,
-                        store_to_host=True,
+                comm=[
+                    ChipDomainBootstrapConfig(
+                        name="default",
+                        sub_comm_id=0,
+                        domain_rank=0,
+                        domain_size=1,
+                        rank_ids=[0],
+                        window_size=4096,
+                        buffers=[
+                            ChipBufferSpec(
+                                name="y",
+                                dtype="float32",
+                                count=1,
+                                nbytes=4,
+                                store_to_host=True,
+                            )
+                        ],
                     )
                 ],
                 host_outputs=[],

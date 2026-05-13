@@ -232,11 +232,29 @@ inline void bind_worker(nb::module_ &m) {
 
     // --- ChipBootstrapChannel ---
     m.attr("CHIP_BOOTSTRAP_MAILBOX_SIZE") = static_cast<int>(CHIP_BOOTSTRAP_MAILBOX_SIZE);
+    m.attr("CHIP_BOOTSTRAP_MAX_DOMAINS") = static_cast<int>(CHIP_BOOTSTRAP_MAX_DOMAINS);
+    m.attr("CHIP_BOOTSTRAP_DOMAIN_NAME_SIZE") = static_cast<int>(CHIP_BOOTSTRAP_DOMAIN_NAME_SIZE);
+    m.attr("CHIP_BOOTSTRAP_PTR_CAPACITY") = static_cast<int>(CHIP_BOOTSTRAP_PTR_CAPACITY);
 
     nb::enum_<ChipBootstrapMailboxState>(m, "ChipBootstrapMailboxState")
         .value("IDLE", ChipBootstrapMailboxState::IDLE)
         .value("SUCCESS", ChipBootstrapMailboxState::SUCCESS)
         .value("ERROR", ChipBootstrapMailboxState::ERROR);
+
+    nb::class_<ChipBootstrapDomainResult>(m, "ChipBootstrapDomainResult")
+        .def(nb::init<>())
+        .def(
+            nb::init<std::string, int32_t, int32_t, uint64_t, uint64_t, uint64_t, std::vector<uint64_t>>(),
+            nb::arg("name"), nb::arg("domain_rank"), nb::arg("domain_size"), nb::arg("device_ctx"),
+            nb::arg("local_window_base"), nb::arg("actual_window_size"), nb::arg("buffer_ptrs")
+        )
+        .def_rw("name", &ChipBootstrapDomainResult::name)
+        .def_rw("domain_rank", &ChipBootstrapDomainResult::domain_rank)
+        .def_rw("domain_size", &ChipBootstrapDomainResult::domain_size)
+        .def_rw("device_ctx", &ChipBootstrapDomainResult::device_ctx)
+        .def_rw("local_window_base", &ChipBootstrapDomainResult::local_window_base)
+        .def_rw("actual_window_size", &ChipBootstrapDomainResult::actual_window_size)
+        .def_rw("buffer_ptrs", &ChipBootstrapDomainResult::buffer_ptrs);
 
     nb::class_<ChipBootstrapChannel>(m, "ChipBootstrapChannel")
         .def(
@@ -256,6 +274,13 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("device_ctx"), nb::arg("local_window_base"), nb::arg("actual_window_size"), nb::arg("buffer_ptrs")
         )
         .def(
+            "write_success_domains",
+            [](ChipBootstrapChannel &self, const std::vector<ChipBootstrapDomainResult> &domains) {
+                self.write_success_domains(domains);
+            },
+            nb::arg("domains")
+        )
+        .def(
             "write_error",
             [](ChipBootstrapChannel &self, int32_t error_code, const std::string &message) {
                 self.write_error(error_code, message);
@@ -264,6 +289,9 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def_prop_ro("state", &ChipBootstrapChannel::state)
         .def_prop_ro("error_code", &ChipBootstrapChannel::error_code)
+        .def_prop_ro("domain_count", &ChipBootstrapChannel::domain_count)
+        .def_prop_ro("domains", &ChipBootstrapChannel::domains)
+        .def("domain", &ChipBootstrapChannel::domain, nb::arg("name"))
         .def_prop_ro("device_ctx", &ChipBootstrapChannel::device_ctx)
         .def_prop_ro("local_window_base", &ChipBootstrapChannel::local_window_base)
         .def_prop_ro("actual_window_size", &ChipBootstrapChannel::actual_window_size)

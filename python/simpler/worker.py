@@ -81,9 +81,11 @@ from .task_interface import (
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     CallConfig,
+    ChipCommDomainContext,
     ChipBootstrapConfig,
     ChipCallable,
     ChipContext,
+    CommDomainPlan,
     ChipWorker,
     TaskArgs,
     _Worker,
@@ -427,9 +429,13 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912, PLR0915
     # so the parent can read results from SharedMemory without a cross-fork
     # host-pointer copy_from (which is broken across processes).
     _store_to_host: list[tuple[int, object]] = []
-    for spec, ptr in zip(bootstrap_cfg.buffers, result.buffer_ptrs):
-        if spec.store_to_host:
-            _store_to_host.append((ptr, bootstrap_cfg.output_staging(spec.name)))
+    for domain_cfg in ChipWorker._domain_bootstrap_configs(bootstrap_cfg):
+        domain_ctx = result.domains.get(domain_cfg.name)
+        if domain_ctx is None:
+            continue
+        for spec in domain_cfg.buffers:
+            if spec.store_to_host:
+                _store_to_host.append((domain_ctx.buffer_ptrs[spec.name], domain_cfg.output_staging(spec.name)))
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
     state_addr = mailbox_addr + _OFF_STATE
@@ -618,9 +624,17 @@ class Worker:
     def __init__(
         self,
         level: int,
-        chip_bootstrap_configs: Optional[list[ChipBootstrapConfig]] = None,
+        comm_plan: Optional[CommDomainPlan] = None,
         **config,
     ) -> None:
+        explicit_chip_bootstrap_configs = config.pop("chip_bootstrap_configs", None)
+        if comm_plan is not None and explicit_chip_bootstrap_configs is not None:
+            raise TypeError("pass either comm_plan or chip_bootstrap_configs, not both")
+        if explicit_chip_bootstrap_configs is not None:
+            self._validate_explicit_chip_bootstrap_configs(explicit_chip_bootstrap_configs)
+        if comm_plan is not None and not isinstance(comm_plan, CommDomainPlan):
+            raise TypeError("comm_plan must be a CommDomainPlan or None")
+
         self.level = level
         self._config = config
         self._callable_registry: dict[int, Any] = {}
@@ -642,22 +656,57 @@ class Worker:
         self._next_level_shms: list[SharedMemory] = []
         self._next_level_pids: list[int] = []
 
-        # Per-chip bootstrap: one `ChipBootstrapConfig` per device_id plus a
-        # matching shared-memory mailbox the child publishes its
-        # `ChipBootstrapResult` into.  The `ChipContext` list is populated by
-        # `_start_hierarchical` once every chip reports SUCCESS.
-        if chip_bootstrap_configs is not None:
+        # Per-chip bootstrap is lower-level state derived from `comm_plan`.
+        # Each derived `ChipBootstrapConfig` has a matching shared-memory
+        # mailbox where the chip child publishes its `ChipBootstrapResult`.
+        # The `ChipContext` list is populated by `_start_hierarchical` once
+        # every chip reports SUCCESS.
+        chip_bootstrap_configs: Optional[list[ChipBootstrapConfig]] = explicit_chip_bootstrap_configs
+        if comm_plan is not None:
             if level < 3:
-                raise ValueError(f"chip_bootstrap_configs requires level >= 3 (got level={level})")
+                raise ValueError(f"comm_plan requires level >= 3 (got level={level})")
+            device_ids = config.get("device_ids", [])
+            comm_plan.validate(worker_count=len(device_ids))
+            if comm_plan.domains:
+                chip_bootstrap_configs = []
+                rootinfo_path = self._comm_plan_rootinfo_path()
+                for worker_idx, _device_id in enumerate(device_ids):
+                    cfg = ChipBootstrapConfig(comm=comm_plan.bootstrap_for_worker(worker_idx))
+                    cfg.base_rank = worker_idx
+                    cfg.base_size = len(device_ids)
+                    cfg.rootinfo_path = rootinfo_path
+                    cfg.base_window_size = comm_plan.base_window_size()
+                    chip_bootstrap_configs.append(cfg)
+
+        if chip_bootstrap_configs is not None:
             device_ids = config.get("device_ids", [])
             if len(chip_bootstrap_configs) != len(device_ids):
                 raise ValueError(
                     f"chip_bootstrap_configs length ({len(chip_bootstrap_configs)}) "
                     f"must equal device_ids length ({len(device_ids)})"
                 )
+            if explicit_chip_bootstrap_configs is not None and any(cfg.comm for cfg in chip_bootstrap_configs):
+                rootinfo_path = self._comm_plan_rootinfo_path()
+                for worker_idx, cfg in enumerate(chip_bootstrap_configs):
+                    cfg.base_rank = worker_idx
+                    cfg.base_size = len(device_ids)
+                    cfg.rootinfo_path = rootinfo_path
         self._chip_bootstrap_configs: Optional[list[ChipBootstrapConfig]] = chip_bootstrap_configs
         self._bootstrap_shms: list[SharedMemory] = []
         self._chip_contexts: list[ChipContext] = []
+
+    @staticmethod
+    def _validate_explicit_chip_bootstrap_configs(cfgs: object) -> None:
+        if not isinstance(cfgs, list):
+            raise TypeError("chip_bootstrap_configs must be a list of ChipBootstrapConfig")
+        for idx, cfg in enumerate(cfgs):
+            if not isinstance(cfg, ChipBootstrapConfig):
+                raise TypeError(f"chip_bootstrap_configs[{idx}] must be ChipBootstrapConfig")
+            cfg.domain_bootstrap_configs()
+
+    def _comm_plan_rootinfo_path(self) -> str:
+        tag = f"pto_multi_comm_{os.getpid()}_{id(self):x}.bin"
+        return os.path.join("/tmp", tag)
 
     # ------------------------------------------------------------------
     # Callable registration (before init)
@@ -735,7 +784,7 @@ class Worker:
             self._init_level2()
         elif self.level >= 3:
             self._init_hierarchical()
-            # When the caller passes chip_bootstrap_configs, bring up every
+            # When `comm_plan` derives chip bootstrap configs, bring up every
             # chip child *during* init — the parent must be able to consume
             # `worker.chip_contexts` before the first `run()`.  Any bootstrap
             # failure is surfaced as a RuntimeError; the helper does its own
@@ -852,9 +901,9 @@ class Worker:
             else:
                 self._sub_pids.append(pid)
 
-        # Fork ChipWorker processes (L3 with device_ids).  When
-        # chip_bootstrap_configs is provided the child runs a variant loop
-        # that publishes `bootstrap_context` on a dedicated mailbox *before*
+        # Fork ChipWorker processes (L3 with device_ids).  When `comm_plan`
+        # derived chip bootstrap configs, the child runs a variant loop that
+        # publishes `bootstrap_context` on a dedicated mailbox *before*
         # entering the normal task/control loop.
         bootstrap_configs = self._chip_bootstrap_configs
         use_bootstrap = bootstrap_configs is not None
@@ -870,7 +919,7 @@ class Worker:
                     assert buf is not None
                     if bootstrap_configs is not None:
                         bootstrap_cfg = bootstrap_configs[idx]
-                        max_buffer_count = len(bootstrap_cfg.buffers)
+                        max_buffer_count = self._bootstrap_buffer_count(bootstrap_cfg)
                         bootstrap_buf = self._bootstrap_shms[idx].buf
                         assert bootstrap_buf is not None
                         bootstrap_addr = ctypes.addressof(ctypes.c_char.from_buffer(bootstrap_buf))
@@ -915,7 +964,7 @@ class Worker:
             else:
                 self._next_level_pids.append(pid)
 
-        # When chip_bootstrap_configs was provided, block here until every
+        # When chip bootstrap configs were derived, block here until every
         # chip child publishes its result on its bootstrap mailbox.  We wait
         # *before* registering the chip mailboxes with the scheduler so a
         # failed bring-up never reaches `dw.init()`; the abort path below
@@ -982,7 +1031,7 @@ class Worker:
         channels: list[ChipBootstrapChannel] = []
         for shm, cfg in zip(self._bootstrap_shms, self._chip_bootstrap_configs):
             addr = _mailbox_addr(shm)
-            channels.append(ChipBootstrapChannel(addr, max(len(cfg.buffers), 0)))
+            channels.append(ChipBootstrapChannel(addr, max(self._bootstrap_buffer_count(cfg), 0)))
 
         pending = set(range(len(channels)))
         contexts: list[Optional[ChipContext]] = [None] * len(channels)
@@ -1002,34 +1051,84 @@ class Worker:
                     raise RuntimeError(f"chip {idx} bootstrap failed: {channels[idx].error_message}")
                 # SUCCESS — assemble the ChipContext from the published fields.
                 cfg = self._chip_bootstrap_configs[idx]
-                comm = cfg.comm
-                rank = comm.rank if comm is not None else 0
-                nranks = comm.nranks if comm is not None else 1
-                ptrs = channels[idx].buffer_ptrs
-                # zip() silently truncates on mismatch, which would hide a
-                # child/parent buffer-count disagreement behind a short
-                # ChipContext — verify explicitly so the caller sees the real
-                # fault instead of a surprising missing key at orch time.
-                if len(ptrs) != len(cfg.buffers):
-                    raise RuntimeError(
-                        f"chip {idx} bootstrap success but buffer count mismatch: "
-                        f"expected {len(cfg.buffers)}, got {len(ptrs)}"
-                    )
-                buffer_ptrs = {spec.name: ptr for spec, ptr in zip(cfg.buffers, ptrs)}
+                domains = self._read_bootstrap_domains(channels[idx], cfg, chip_idx=idx)
                 contexts[idx] = ChipContext(
                     device_id=device_ids[idx],
-                    rank=rank,
-                    nranks=nranks,
-                    device_ctx=channels[idx].device_ctx,
-                    local_window_base=channels[idx].local_window_base,
-                    actual_window_size=channels[idx].actual_window_size,
-                    buffer_ptrs=buffer_ptrs,
+                    worker_index=idx,
+                    domains=domains,
                 )
                 pending.discard(idx)
             if pending:
                 time.sleep(_BOOTSTRAP_POLL_INTERVAL_S)
 
         self._chip_contexts = [c for c in contexts if c is not None]
+
+    @staticmethod
+    def _bootstrap_buffer_count(cfg: ChipBootstrapConfig) -> int:
+        total = 0
+        for domain in ChipWorker._domain_bootstrap_configs(cfg):
+            total += len(domain.buffers)
+        return total
+
+    @staticmethod
+    def _read_bootstrap_domains(
+        channel: ChipBootstrapChannel,
+        cfg: ChipBootstrapConfig,
+        *,
+        chip_idx: int,
+    ) -> dict[str, ChipCommDomainContext]:
+        if hasattr(channel, "domains"):
+            raw_domains = channel.domains
+            domains: dict[str, ChipCommDomainContext] = {}
+            expected = {d.name: d for d in ChipWorker._domain_bootstrap_configs(cfg)}
+            for raw in raw_domains:
+                name = str(raw.name)
+                domain_cfg = expected.get(name)
+                if domain_cfg is None:
+                    raise RuntimeError(f"chip {chip_idx} published unexpected domain {name!r}")
+                ptrs = list(raw.buffer_ptrs)
+                if len(ptrs) != len(domain_cfg.buffers):
+                    raise RuntimeError(
+                        f"chip {chip_idx} domain {name!r} buffer count mismatch: "
+                        f"expected {len(domain_cfg.buffers)}, got {len(ptrs)}"
+                    )
+                domains[name] = ChipCommDomainContext(
+                    name=name,
+                    domain_rank=int(raw.domain_rank),
+                    domain_size=int(raw.domain_size),
+                    device_ctx=int(raw.device_ctx),
+                    local_window_base=int(raw.local_window_base),
+                    actual_window_size=int(raw.actual_window_size),
+                    buffer_ptrs={spec.name: ptr for spec, ptr in zip(domain_cfg.buffers, ptrs)},
+                )
+            missing = sorted(set(expected) - set(domains))
+            if missing:
+                raise RuntimeError(f"chip {chip_idx} did not publish expected domains: {missing}")
+            return domains
+
+        domain_cfgs = ChipWorker._domain_bootstrap_configs(cfg)
+        if not domain_cfgs:
+            return {}
+        if len(domain_cfgs) != 1:
+            raise RuntimeError("multi-domain bootstrap requires domain-aware ChipBootstrapChannel")
+        domain_cfg = domain_cfgs[0]
+        ptrs = channel.buffer_ptrs
+        if len(ptrs) != len(domain_cfg.buffers):
+            raise RuntimeError(
+                f"chip {chip_idx} bootstrap success but buffer count mismatch: "
+                f"expected {len(domain_cfg.buffers)}, got {len(ptrs)}"
+            )
+        return {
+            domain_cfg.name: ChipCommDomainContext(
+                name=domain_cfg.name,
+                domain_rank=domain_cfg.domain_rank,
+                domain_size=domain_cfg.domain_size,
+                device_ctx=channel.device_ctx,
+                local_window_base=channel.local_window_base,
+                actual_window_size=channel.actual_window_size,
+                buffer_ptrs={spec.name: ptr for spec, ptr in zip(domain_cfg.buffers, ptrs)},
+            )
+        }
 
     def _abort_hierarchical(self) -> None:
         """Tear down all forked children + shms after a bootstrap failure.

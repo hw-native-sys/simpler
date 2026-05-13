@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: PLC0415
-"""Hardware smoke test for `Worker(chip_bootstrap_configs=...)` on 2 Ascend devices.
+"""Hardware smoke test for `Worker(comm_plan=...)` on 2 Ascend devices.
 
 End-to-end equivalent of ``test_bootstrap_context_hw.py`` but driven through
 the top-level ``Worker`` class so the bootstrap happens inside forked chip
@@ -21,8 +21,6 @@ GVA-visible window.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 
@@ -30,35 +28,32 @@ import pytest
 @pytest.mark.platforms(["a2a3"])
 @pytest.mark.device_count(2)
 def test_worker_chip_bootstrap(st_device_ids):
-    from simpler.task_interface import ChipBootstrapConfig, ChipBufferSpec, ChipCommBootstrapConfig
+    from simpler.task_interface import ChipBufferSpec, CommDomain, CommDomainPlan
     from simpler.worker import Worker
 
     assert len(st_device_ids) >= 2, "device_count(2) fixture must yield >= 2 ids"
     device_ids = [int(st_device_ids[0]), int(st_device_ids[1])]
     nranks = len(device_ids)
-    rootinfo_path = f"/tmp/pto_worker_l6_hw_rootinfo_{os.getpid()}.bin"
     window_size = 4096
     buffer_nbytes = 64
 
-    cfgs = [
-        ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank,
-                nranks=nranks,
-                rootinfo_path=rootinfo_path,
+    comm_plan = CommDomainPlan(
+        domains=[
+            CommDomain(
+                name="default",
+                worker_indices=list(range(nranks)),
                 window_size=window_size,
-            ),
-            buffers=[
-                ChipBufferSpec(
-                    name="x",
-                    dtype="float32",
-                    count=buffer_nbytes // 4,
-                    nbytes=buffer_nbytes,
-                )
-            ],
-        )
-        for rank in range(nranks)
-    ]
+                buffers=[
+                    ChipBufferSpec(
+                        name="x",
+                        dtype="float32",
+                        count=buffer_nbytes // 4,
+                        nbytes=buffer_nbytes,
+                    )
+                ],
+            )
+        ]
+    )
 
     worker = Worker(
         level=3,
@@ -66,7 +61,7 @@ def test_worker_chip_bootstrap(st_device_ids):
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        chip_bootstrap_configs=cfgs,
+        comm_plan=comm_plan,
     )
     try:
         worker.init()
@@ -75,19 +70,16 @@ def test_worker_chip_bootstrap(st_device_ids):
         assert len(ctxs) == nranks
         for rank, ctx in enumerate(ctxs):
             assert ctx.device_id == device_ids[rank]
-            assert ctx.rank == rank
-            assert ctx.nranks == nranks
-            assert ctx.device_ctx != 0, f"rank {rank}: device_ctx is 0 (HCCL alloc failed)"
-            assert ctx.local_window_base != 0, f"rank {rank}: local_window_base is 0"
-            assert ctx.actual_window_size >= window_size, (
-                f"rank {rank}: actual_window_size={ctx.actual_window_size} < requested {window_size}"
+            domain = ctx.domains["default"]
+            assert domain.domain_rank == rank
+            assert domain.domain_size == nranks
+            assert domain.device_ctx != 0, f"rank {rank}: device_ctx is 0 (HCCL alloc failed)"
+            assert domain.local_window_base != 0, f"rank {rank}: local_window_base is 0"
+            assert domain.actual_window_size >= window_size, (
+                f"rank {rank}: actual_window_size={domain.actual_window_size} < requested {window_size}"
             )
             # The single buffer spec carves offset 0, matching the
             # ChipContext.buffer_ptrs → local_window_base invariant.
-            assert ctx.buffer_ptrs == {"x": ctx.local_window_base}
+            assert domain.buffer_ptrs == {"x": domain.local_window_base}
     finally:
         worker.close()
-        try:
-            os.unlink(rootinfo_path)
-        except FileNotFoundError:
-            pass
