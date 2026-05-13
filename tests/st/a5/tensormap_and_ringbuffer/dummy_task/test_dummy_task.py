@@ -22,10 +22,11 @@ The orchestration submits one of three scenes, controlled by params["case"]:
     and consumer. Looks after the dummy_ready_queue + dispatch-loop drain
     when several dummies sit on the critical path back-to-back.
 
-  case=3 (explicit add_dep barrier):
+  case=3 (explicit set_dependencies barrier):
     Two independent producers (writing X and W); a dummy_T uses
-    add_dep(A, B) as a many-to-one barrier; the consumer add_deps on dummy
-    and reads X. Verifies dummy_task participates in explicit_dep wiring.
+    set_dependencies({A, B}, 2) as a many-to-one barrier; the consumer
+    set_dependencies({dummy}, 1) and reads X. Verifies dummy_task
+    participates in explicit_dep wiring.
 """
 
 import torch

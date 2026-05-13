@@ -26,11 +26,11 @@
  *     consumer copies X -> Y
  *     expect Y[0] = 42.0 (no dummy runs a kernel; X must be undisturbed)
  *
- *   case=3: Dummy as many-to-one barrier via explicit add_dep.
+ *   case=3: Dummy as many-to-one barrier via explicit set_dependencies.
  *     producer_A writes X[0] = 42.0
  *     producer_B writes W[0] = 7.0
- *     dummy_T explicit add_dep(A.id, B.id)  // no tensor args, pure barrier
- *     consumer explicit add_dep(dummy.id), copies X -> Y
+ *     dummy_T explicit set_dependencies({A.id, B.id}, 2)  // pure barrier
+ *     consumer explicit set_dependencies({dummy.id}, 1), copies X -> Y
  *     expect Y[0] = 42.0 (consumer waits on dummy which waits on A+B)
  *
  * Args layout: [X, Y, W]
@@ -126,13 +126,15 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         PTO2TaskId dummy_id;
         {
             Arg args;
-            args.add_dep(a_id, b_id);
+            PTO2TaskId barrier_deps[] = {a_id, b_id};
+            args.set_dependencies(barrier_deps, 2);
             dummy_id = rt_submit_dummy_task(args).task_id();
         }
         // consumer: explicit dep on dummy, reads X
         {
             Arg args;
-            args.add_dep(dummy_id);
+            PTO2TaskId consumer_deps[] = {dummy_id};
+            args.set_dependencies(consumer_deps, 1);
             args.add_input(ext_X);
             args.add_inout(ext_Y);
             rt_submit_aic_task(FUNC_COPY_FIRST, args);

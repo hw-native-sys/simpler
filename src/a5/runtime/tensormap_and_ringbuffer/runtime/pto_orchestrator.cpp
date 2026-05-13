@@ -555,7 +555,9 @@ static TaskOutputTensors submit_task_common(
     for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
         if (!dep_task_id.is_valid()) {
-            orch->report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.add_dep(...) requires a valid task id");
+            orch->report_fatal(
+                PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
+            );
             return result;
         }
         PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_task_id.ring()];

@@ -44,7 +44,6 @@
 // pto2_dispatch_payload.h, intrinsic.h comments).
 #define MAX_TENSOR_ARGS CORE_MAX_TENSOR_ARGS
 #define MAX_SCALAR_ARGS CORE_MAX_SCALAR_ARGS
-#define PTO2_MAX_EXPLICIT_DEPS 16  // Maximum explicit task dependencies per task
 
 typedef enum {
     PTO2_ASYNC_ENGINE_SDMA = 0,
@@ -181,7 +180,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         clear();
         has_error = false;
         error_msg = nullptr;
-        explicit_deps_.reset();
+        explicit_deps_ = nullptr;
+        explicit_dep_count_ = 0;
     }
 
     void set_error(const char *msg) {
@@ -231,24 +231,50 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
     }
 
-    template <typename... TaskIds>
-    void add_dep(TaskIds... task_ids) {
-        static_assert(sizeof...(TaskIds) >= 1, "add_dep: at least one task id is required");
-        static_assert(
-            (std::is_same_v<std::decay_t<TaskIds>, PTO2TaskId> && ...), "add_dep: all arguments must be PTO2TaskId"
-        );
-        if (explicit_deps_.size() + sizeof...(TaskIds) > PTO2_MAX_EXPLICIT_DEPS) {
-            set_error("Too many explicit deps (exceeds explicit dependency capacity=16)");
+    /**
+     * Attach an explicit dependency array. The Arg stores (ptr, count) without
+     * copying — the caller's array must outlive the submit (same lifetime rule
+     * as add_input/add_output, which also store pointers).
+     *
+     * count == 0 is a valid "set empty" — it clears any previously stored deps
+     * and returns. This lets callers that build the dep set conditionally pass
+     * the result through unguarded, including in the no-dep branch:
+     *   PTO2TaskId deps[3];
+     *   uint32_t n = 0;
+     *   if (have_prev) deps[n++] = prev;
+     *   if (is_last)   deps[n++] = alloc;
+     *   args.set_dependencies(deps, n);    // safe even if n == 0
+     *
+     * For count > 0, the call is single-shot: a second non-empty call after
+     * deps are already set will fail with set_error(). Use count == 0 first
+     * if you need to re-set.
+     */
+    void set_dependencies(const PTO2TaskId *deps, uint32_t count) {
+        if (count == 0) {
+            explicit_deps_ = nullptr;
+            explicit_dep_count_ = 0;
             return;
         }
-        (explicit_deps_.add(task_ids), ...);
+        if (deps == nullptr) {
+            set_error("set_dependencies: deps must not be null when count > 0");
+            return;
+        }
+        if (explicit_deps_ != nullptr) {
+            set_error("set_dependencies: may be called at most once per Arg");
+            return;
+        }
+        explicit_deps_ = deps;
+        explicit_dep_count_ = count;
     }
 
-    uint32_t explicit_dep_count() const { return explicit_deps_.size(); }
+    uint32_t explicit_dep_count() const { return explicit_dep_count_; }
 
-    PTO2TaskId explicit_dep(uint32_t index) const { return explicit_deps_.get(index); }
+    PTO2TaskId explicit_dep(uint32_t index) const {
+        always_assert(index < explicit_dep_count_);
+        return explicit_deps_[index];
+    }
 
-    const PTO2TaskId *explicit_deps_data() const { return explicit_deps_.task_ids; }
+    const PTO2TaskId *explicit_deps_data() const { return explicit_deps_; }
 
     /**
      * Add scalar values. Types are deduced per argument; each value is
@@ -327,29 +353,9 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     }
 
 private:
-    struct ExplicitDepStorage {
-        PTO2TaskId task_ids[PTO2_MAX_EXPLICIT_DEPS]{};
-        uint32_t count{0};
-
-        void reset() { count = 0; }
-
-        bool add(PTO2TaskId task_id) {
-            if (count >= PTO2_MAX_EXPLICIT_DEPS) {
-                return false;
-            }
-            task_ids[count++] = task_id;
-            return true;
-        }
-
-        uint32_t size() const { return count; }
-
-        PTO2TaskId get(uint32_t index) const {
-            always_assert(index < count);
-            return task_ids[index];
-        }
-    };
-
-    ExplicitDepStorage explicit_deps_;
+    // Caller-owned dependency array; lifetime must extend through submit.
+    const PTO2TaskId *explicit_deps_{nullptr};
+    uint32_t explicit_dep_count_{0};
 
     template <bool is_output, typename... Args>
     bool check_add_tensor_valid(Args &&...) {

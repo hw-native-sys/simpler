@@ -5,7 +5,7 @@
 Keep manual scope small and explicit:
 
 - same submit API family as AUTO mode
-- explicit task-to-task deps via `Arg.add_dep(task_id)`
+- explicit task-to-task deps via `Arg.set_dependencies(deps, count)`
 - publish at submit time, same as AUTO mode
 - support allocation-as-task through `alloc_tensors(...).task_id()`
 
@@ -16,7 +16,7 @@ The v0 design keeps these rules:
 1. `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` opts a scope into manual mode.
 2. `MANUAL` nested inside active `MANUAL` is allowed.
 3. `AUTO` nested inside active `MANUAL` is rejected.
-4. Manual deps are attached before submit through `Arg.add_dep(...)`.
+4. Manual deps are attached before submit through `Arg.set_dependencies(...)`.
 5. No post-submit `add_dependency(...)` API exists.
 6. `alloc_tensors(...)` remains output-only and returns a task id.
 7. Scope handling stays close to upstream AUTO mode.
@@ -46,17 +46,26 @@ auto out = rt_submit_task(mixed_kernels, args);
 ```cpp
 Arg args;
 args.add_input(tensor);
-args.add_dep(prev_task_id);
+PTO2TaskId deps[] = {prev_task_id};
+args.set_dependencies(deps, 1);
 ```
 
 Rules:
 
-- `add_dep(...)` must refer to an earlier producer task id
-- if that producer task is already retired when the consumer is submitted, the
-  runtime skips the edge without reporting an error
+- `set_dependencies(...)` may be called at most once per Arg with `count > 0`;
+  build the full dep set on the caller's stack (or any buffer that outlives the
+  submit) and pass `(ptr, count)` in a single call
+- `count == 0` is a valid "set empty" — it clears any previously stored deps,
+  so callers that build the dep set conditionally can pass the result through
+  unguarded even when no branch matched
+- the dependency array is stored by pointer (no copy); it must remain valid
+  until `rt_submit_*_task(...)` returns
+- every entry must refer to an earlier producer task id; if a producer is
+  already retired when the consumer is submitted, the runtime skips the
+  edge without reporting an error
 - explicit deps become ordinary fanins immediately at submit time
-- this applies uniformly in AUTO and MANUAL submits; the task id already carries
-  the ring needed for slot lookup
+- this applies uniformly in AUTO and MANUAL submits; the task id already
+  carries the ring needed for slot lookup
 
 ### Allocation task ids
 
@@ -76,7 +85,7 @@ the producer that later tasks must explicitly depend on.
 Manual scope v0 is:
 
 - AUTO-style submit and publish
-- plus explicit fanins from `Arg.add_dep(...)`
+- plus explicit fanins from `Arg.set_dependencies(...)`
 - plus full TensorMap lookup / insert bypass for tasks submitted inside manual
   scope
 
@@ -114,7 +123,7 @@ The rule is submit-scoped, not tensor-scoped:
 
 For a submitted task:
 
-- explicit `add_dep(...)` edges are always checked first
+- explicit `set_dependencies(...)` edges are always checked first
 - retired explicit-dep producers are skipped as already satisfied
 - if the task is inside manual scope, TensorMap lookup / insert is skipped
 - if the task is outside manual scope, normal AUTO TensorMap behavior is used
@@ -128,33 +137,41 @@ PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
     Arg qk;
     qk.add_input(qi, kj);
     qk.add_output(sij_ci);
-    qk.add_dep(alloc.task_id());
+    PTO2TaskId qk_deps[] = {alloc.task_id()};
+    qk.set_dependencies(qk_deps, 1);
     auto qk_out = rt_submit_aic_task(FUNC_QK, qk);
 
     Arg sf;
     sf.add_input(qk_out.get_ref(0));
     sf.add_output(pij_ci, li_ci, mi_ci);
-    sf.add_dep(qk_out.task_id());
+    PTO2TaskId sf_deps[] = {qk_out.task_id()};
+    sf.set_dependencies(sf_deps, 1);
     auto sf_out = rt_submit_aiv_task(FUNC_SF, sf);
 
     Arg up;
     up.add_input(sf_out.get_ref(1), sf_out.get_ref(2), pv_out.get_ref(0));
     up.add_inout(mi, li, out_view, tmp);
-    up.add_dep(sf_out.task_id());
-    up.add_dep(pv_out.task_id());
+    PTO2TaskId up_deps[] = {sf_out.task_id(), pv_out.task_id()};
+    up.set_dependencies(up_deps, 2);
     auto up_out = rt_submit_aiv_task(FUNC_UP, up);
 }
 ```
 
-Repeated zero-output updater chains must explicitly thread the returned task id:
+Repeated zero-output updater chains must explicitly thread the returned task id.
+When the dep set is conditional, build the array up first and call
+`set_dependencies` once — `count == 0` is a valid "set empty", so no guard is
+needed on the first iteration:
 
 ```cpp
 PTO2TaskId prev_update = PTO2TaskId::invalid();
 for (...) {
     Arg up = ...;
+    PTO2TaskId up_deps[1];
+    uint32_t up_dep_count = 0;
     if (prev_update.is_valid()) {
-        up.add_dep(prev_update);
+        up_deps[up_dep_count++] = prev_update;
     }
+    up.set_dependencies(up_deps, up_dep_count);
     prev_update = rt_submit_aiv_task(FUNC_UP, up).task_id();
 }
 ```
@@ -166,5 +183,5 @@ The a5 port uses the same manual-scope v0 runtime model as a2a3:
 - same `manual_begin_depth` state model
 - same `MANUAL`-inside-`MANUAL` behavior
 - same rejection of `AUTO` inside active `MANUAL`
-- same submit-time explicit dependency model through `Arg.add_dep(...)`
+- same submit-time explicit dependency model through `Arg.set_dependencies(...)`
 - same submit-time TensorMap bypass for tasks submitted inside manual scope

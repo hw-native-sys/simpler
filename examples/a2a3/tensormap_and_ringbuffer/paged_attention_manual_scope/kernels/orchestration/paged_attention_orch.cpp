@@ -200,12 +200,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     PROF_INC(prof_view_count, 1);
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
+                    // --- Primitive dep API (Arg + set_dependencies) ---
+                    // Caller owns the deps buffer; Arg stores (ptr, count).
+                    // Suited for codegen and for cases with a fixed dep set.
                     Arg params_sf;
                     params_sf.add_input(sij_valid);
                     params_sf.add_output(pij_f16_ci);
                     params_sf.add_output(scalar_ci);
                     params_sf.add_output(scalar_ci);
-                    params_sf.add_dep(qk_outs.task_id());
+                    PTO2TaskId sf_deps[] = {qk_outs.task_id()};
+                    params_sf.set_dependencies(sf_deps, 1);
                     params_sf.add_scalar(scale_value);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
@@ -219,7 +223,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_pv.add_input(pij_f16);
                     params_pv.add_input(vj);
                     params_pv.add_output(tile2d_ci);
-                    params_pv.add_dep(sf_outs.task_id());
+                    PTO2TaskId pv_deps[] = {sf_outs.task_id()};
+                    params_pv.set_dependencies(pv_deps, 1);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_tmp = pv_outs.get_ref(0);
@@ -230,7 +235,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
                     CYCLE_COUNT_LAP(prof_param_extract);
 
-                    Arg params_up;
+                    // --- Convenience dep API (ArgWithDeps + add_dep) ---
+                    // Wrapper owns a stack-sized deps buffer and accepts
+                    // incremental add_dep() calls; the submit overload binds
+                    // them to the underlying Arg via set_dependencies(...).
+                    // Suited for hand-written orch where the dep set is
+                    // assembled conditionally across branches.
+                    ArgWithDeps<> params_up;
                     params_up.add_input(mi);
                     params_up.add_input(li);
                     params_up.add_input(oi_tmp);

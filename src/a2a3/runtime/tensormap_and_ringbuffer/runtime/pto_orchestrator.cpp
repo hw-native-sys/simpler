@@ -40,10 +40,10 @@
 // Tensor layout. The platform header defines DEP_GEN_TENSOR_SIZE without
 // including runtime/tensor.h, so this check lives at the orch callsite.
 static_assert(sizeof(Tensor) == DEP_GEN_TENSOR_SIZE, "DepGenRecord::tensors slot size out of sync with sizeof(Tensor)");
-static_assert(
-    PTO2_MAX_EXPLICIT_DEPS == DEP_GEN_MAX_EXPLICIT_DEPS,
-    "DepGenRecord::explicit_deps array length out of sync with PTO2_MAX_EXPLICIT_DEPS"
-);
+// DEP_GEN_MAX_EXPLICIT_DEPS is a diagnostic-side capture cap only; the runtime
+// imposes no hard cap on explicit dep count. If a submit exceeds this cap,
+// dep_gen_aicpu_record_submit() logs and truncates — runtime correctness is
+// unaffected, only the captured replay record is truncated.
 
 // Weak fallbacks: dep_gen_collector_aicpu.cpp provides the strong symbols in
 // AICPU builds. Host builds (host_build_graph runtime, future dep_gen replay)
@@ -609,7 +609,9 @@ static TaskOutputTensors submit_task_common(
     for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
         if (!dep_task_id.is_valid()) {
-            orch->report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.add_dep(...) requires a valid task id");
+            orch->report_fatal(
+                PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
+            );
             return result;
         }
         PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_task_id.ring()];
