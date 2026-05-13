@@ -86,12 +86,14 @@ from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Demo dimensions — must mirror constants at the top of the kernel.
+# Demo dimensions — must mirror constants at the top of the kernels. Sized to
+# match the production moe_expert decode config (D = hidden_size = 4096,
+# L = N_LOCAL_EXPERTS = 8, T = decode tokens per rank = 16, R = RECV_MAX = 32).
 N_RANKS = 2
-T = 8
+T = 16
 TOPK = 2
-D = 64
-L = 4  # N_LOCAL_EXPERTS per rank
+D = 4096
+L = 8  # N_LOCAL_EXPERTS per rank
 R = 32  # RECV_MAX (single-expert receive upper bound)
 W_PAD = 8  # weight tile width — minimum vector tile (1x8 FP32 = 32 B)
 IDX_PAD = 8  # idx tile width   — minimum vector tile (1x8 INT32 = 32 B)
@@ -101,10 +103,10 @@ N_ROUTES = T * TOPK
 # Window region byte sizes — mirror k*Bytes / kOff* in the kernels.
 PUB_COUNTS_BYTES = N_RANKS * N_RANKS * L * 4  # N*N*L INT32
 SIGNAL_BYTES = 64  # padded slot per signal area
-RECV_X_BYTES = L * R * D * 2  # 16 KB (BF16)
-RECV_W_BYTES = L * R * W_PAD * 4  # 4  KB (FP32; weight at slot 0)
-RECV_IDX_BYTES = L * R * IDX_PAD * 4  # 4  KB (INT32; r at slot 0)
-ROUTED_Y_BUF_BYTES = T * TOPK * D * 2  # 2  KB (BF16; combine push dest)
+RECV_X_BYTES = L * R * D * 2  # 2 MiB (BF16)
+RECV_W_BYTES = L * R * W_PAD * 4  # 8  KB (FP32; weight at slot 0)
+RECV_IDX_BYTES = L * R * IDX_PAD * 4  # 8  KB (INT32; r at slot 0)
+ROUTED_Y_BUF_BYTES = T * TOPK * D * 2  # 256 KB (BF16; combine push dest)
 SCRATCH_NBYTES = (
     PUB_COUNTS_BYTES
     + SIGNAL_BYTES  # count_done_sig
@@ -379,6 +381,17 @@ def _verify_recv_outputs(
     return ok
 
 
+def _local_expert_route_golden(weights_rtk: torch.Tensor, x_row_fp32: torch.Tensor) -> torch.Tensor:
+    """Golden for one (t, k) route: ``cast(weight * x_row, bf16)`` as FP32 —
+    mirrors local_expert (FP32 multiply, then a single BF16 cast).
+
+    The kernel's ``TCVT`` casts use ``RoundMode::CAST_RINT`` (round to nearest,
+    ties to even), which is exactly what ``torch.Tensor.to(torch.bfloat16)``
+    does — so the plain torch cast keeps the comparison bit-exact even when a
+    product lands on an exact BF16 midpoint (e.g. ``75 * 1.51`` → ``113.25``)."""
+    return (weights_rtk.to(torch.float32) * x_row_fp32).to(torch.bfloat16).to(torch.float32)
+
+
 def _verify_routed_y(
     nranks: int,
     x_norms: list[torch.Tensor],
@@ -387,19 +400,18 @@ def _verify_routed_y(
 ) -> bool:
     """Compare combine output routed_y[t, :] against the local-only golden.
 
-    routed_y[t, :] should equal sum_k weights[me, t, k] * x_norms[me][t, :]
-    since local_expert is elementwise x*weight and combine reduces along
-    TOPK. The only BF16 round-trip is local_expert's `cast(x*w, bf16)`;
-    combine's accumulator stays FP32 — mirror that exactly so the model
-    captures every cast and we can assert ~0 diff in steady state.
+    routed_y[t, :] should equal sum_k cast(weights[me, t, k] * x_norms[me][t, :], bf16)
+    since local_expert is an elementwise BF16 x*weight and combine reduces along
+    TOPK with an FP32 accumulator. We mirror every cast (BF16 round-to-nearest-
+    even via the kernel's CAST_RINT, FP32 accumulate) so the assertion stays
+    bit-exact.
     """
     ok = True
     for r in range(nranks):
         expected = torch.zeros(T, D, dtype=torch.float32)
         for t in range(T):
             for k in range(TOPK):
-                weighted_fp32 = weights[r, t, k] * x_norms[r][t, :].to(torch.float32)
-                expected[t, :] += weighted_fp32.to(torch.bfloat16).to(torch.float32)
+                expected[t, :] += _local_expert_route_golden(weights[r, t, k], x_norms[r][t, :].to(torch.float32))
         diff = (routed_y_outs[r] - expected).abs().max().item()
         rel_diff = diff / (expected.abs().max().item() + 1e-9)
         print(f"[ep_dispatch] chip {r}: routed_y max|diff|={diff:.3e} (rel={rel_diff:.3e})")
@@ -437,13 +449,14 @@ def run(
 
     print(f"[ep_dispatch] platform={platform} devices={device_ids} nranks={nranks}")
 
-    # x_norm[r, t, d] = r*100 + t*10 + d  →  max value = 1*100 + 7*10 + 63 = 233.
+    # x_norm[r, t, d] = r*80 + t*5 + (d % 16)  →  max = 1*80 + 15*5 + 15 = 170.
     # All values are integers ≤ 256, so they fit BF16 exactly (8-bit mantissa
     # with hidden bit = exact integers up to 2^8). The host can compare BF16
-    # outputs bit-for-bit against this golden.
+    # outputs bit-for-bit against this golden. (d is reduced mod 16 because the
+    # bumped D=4096 would otherwise overflow the exact-integer range.)
     x_norms = [
         torch.tensor(
-            [[r * 100 + t * 10 + d for d in range(D)] for t in range(T)],
+            [[r * 80 + t * 5 + (d % 16) for d in range(D)] for t in range(T)],
             dtype=torch.bfloat16,
         ).share_memory_()
         for r in range(nranks)

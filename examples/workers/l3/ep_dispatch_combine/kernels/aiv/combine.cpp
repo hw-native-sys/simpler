@@ -60,10 +60,10 @@ using namespace pto;
 
 // Demo dimensions — must match dispatch.cpp / main.py.
 static constexpr int N = 2;
-static constexpr int T = 8;
+static constexpr int T = 16;
 static constexpr int TOPK = 2;
-static constexpr int D = 64;
-static constexpr int L = 4;
+static constexpr int D = 4096;
+static constexpr int L = 8;
 static constexpr int R = 32;
 static constexpr int W_PAD = 8;
 static constexpr int IDX_PAD = 8;
@@ -218,7 +218,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             TLOAD(add_bf_tile, src_g);
             pipe_barrier(PIPE_ALL);
 
-            TCVT(add_fp_tile, add_bf_tile, RoundMode::CAST_ROUND);
+            TCVT(add_fp_tile, add_bf_tile, RoundMode::CAST_RINT);
             pipe_barrier(PIPE_V);
             TADD(acc_tile, acc_tile, add_fp_tile);
             pipe_barrier(PIPE_V);

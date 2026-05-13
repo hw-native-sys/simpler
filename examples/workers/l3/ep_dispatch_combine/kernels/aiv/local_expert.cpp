@@ -47,9 +47,9 @@
 using namespace pto;
 
 // Demo dimensions — must match dispatch.cpp / main.py.
-static constexpr int L = 4;
+static constexpr int L = 8;
 static constexpr int R = 32;
-static constexpr int D = 64;
+static constexpr int D = 4096;
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *recv_x_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
@@ -93,11 +93,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-            TCVT(x_f, x_bf, RoundMode::CAST_ROUND);
+            TCVT(x_f, x_bf, RoundMode::CAST_RINT);
             pipe_barrier(PIPE_V);
             TMULS(x_f, x_f, w);
             pipe_barrier(PIPE_V);
-            TCVT(x_bf, x_f, RoundMode::CAST_ROUND);
+            TCVT(x_bf, x_f, RoundMode::CAST_RINT);
             pipe_barrier(PIPE_V);
 
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);

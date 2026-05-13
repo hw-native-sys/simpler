@@ -67,14 +67,16 @@
 
 using namespace pto;
 
-// Demo dimensions — must match main.py.
+// Demo dimensions — must match main.py. Sized to mirror the production
+// moe_expert decode config (D = hidden_size = 4096, L = N_LOCAL_EXPERTS = 8,
+// T = decode tokens per rank = 16, R = RECV_MAX = 32).
 static constexpr int N = 2;
-static constexpr int T = 8;
+static constexpr int T = 16;
 static constexpr int TOPK = 2;
-static constexpr int D = 64;
-static constexpr int L = 4;
+static constexpr int D = 4096;
+static constexpr int L = 8;
 static constexpr int R = 32;
-static constexpr int N_ROUTES = T * TOPK;  // 16
+static constexpr int N_ROUTES = T * TOPK;  // 32
 
 // Weight payload tile width. The protocol contract is one FP32 weight per
 // (e, slot) — recv_w[L, R] FP32. AIV vector tiles have a hardware minimum
@@ -90,15 +92,15 @@ static constexpr int IDX_PAD = 8;
 
 // Window region byte sizes — mirror *_BYTES in main.py.
 //
-// Layout:
-//   pub_counts[N][N][L]            INT32   (64 B)
+// Layout (sizes for the D=4096 / L=8 / T=16 / R=32 demo config):
+//   pub_counts[N][N][L]            INT32   (256 B)
 //   count_done_sig[N]              INT32   (padded slot, 64 B)
-//   recv_x[L][R][D]                BF16    (16 KB)
-//   recv_w[L][R][W_PAD]            FP32    (4  KB; weight at slot [0], rest = 0)
-//   recv_idx[L][R][IDX_PAD]        INT32   (4  KB; r=t*TOPK+k at slot [0], rest = 0)
+//   recv_x[L][R][D]                BF16    (2 MiB)
+//   recv_w[L][R][W_PAD]            FP32    (8  KB; weight at slot [0], rest = 0)
+//   recv_idx[L][R][IDX_PAD]        INT32   (8  KB; r=t*TOPK+k at slot [0], rest = 0)
 //   data_done_sig[N]               INT32   (padded slot, 64 B)
 // ---- Cross-rank visible regions consumed by combine.cpp ----
-//   routed_y_buf[T][TOPK][D]       BF16    (2  KB demo; combine push destination,
+//   routed_y_buf[T][TOPK][D]       BF16    (256 KB; combine push destination,
 //                                            addressed directly by (t, k))
 //   combine_done_sig[N]            INT32   (padded slot, 64 B)
 //
@@ -106,10 +108,10 @@ static constexpr int IDX_PAD = 8;
 // as a host-backed device tensor via the orch.
 static constexpr int kPubCountsBytes = N * N * L * 4;  // N*N*L INT32
 static constexpr int kSignalBytes = 64;
-static constexpr int kRecvXBytes = L * R * D * 2;  // BF16
+static constexpr int kRecvXBytes = L * R * D * 2;  // BF16, 2 MiB
 static constexpr int kRecvWBytes = L * R * W_PAD * 4;
 static constexpr int kRecvIdxBytes = L * R * IDX_PAD * 4;
-static constexpr int kRoutedYBufBytes = T * TOPK * D * 2;  // BF16
+static constexpr int kRoutedYBufBytes = T * TOPK * D * 2;  // BF16, 256 KiB
 
 static constexpr int kOffPubCounts = 0;
 static constexpr int kOffCountDone = kOffPubCounts + kPubCountsBytes;
