@@ -19,7 +19,7 @@
  *
  * This file focuses on:
  * - Full lifecycle through src API
- * - Non-profiling ready path behavior (task_state stays PENDING)
+ * - Ready-path behavior (task_state stays PENDING through dispatch)
  * - Double subtask completion (counter-model weakness)
  */
 
@@ -67,7 +67,7 @@ protected:
 };
 
 // =============================================================================
-// Full lifecycle through src API: PENDING -> (fanin) -> READY-equivalent
+// Full lifecycle through src API: PENDING -> (fanin) -> (queued + dispatched)
 // -> (subtask) -> COMPLETED -> (fanout) -> CONSUMED
 // =============================================================================
 TEST_F(TaskStateTest, FullLifecycleThroughAPI) {
@@ -93,23 +93,21 @@ TEST_F(TaskStateTest, FullLifecycleThroughAPI) {
 }
 
 // =============================================================================
-// Non-profiling release_fanin does not CAS task_state to READY.
+// release_fanin does not write task_state.
 //
 // Readiness is determined solely by fanin_refcount reaching fanin_count.
-// task_state stays PENDING after the non-profiling ready path. This is
-// correct by design -- the profiling overload adds the CAS only to count
-// atomic operations.
+// task_state stays PENDING from submit through "queued in ready_queue" and
+// "dispatched to a worker" until the worker stores COMPLETED.
 // =============================================================================
-TEST_F(TaskStateTest, NonProfilingReadyPathStaysPending) {
+TEST_F(TaskStateTest, ReadyPathStaysPending) {
     alignas(64) PTO2TaskSlotState slot;
     init_slot(slot, PTO2_TASK_PENDING, 1, 1);
 
     bool ready = sched.release_fanin_and_check_ready(slot);
     ASSERT_TRUE(ready) << "Task should be detected as ready via refcount";
 
-    // task_state remains PENDING -- this is correct by design.
-    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_PENDING)
-        << "Non-profiling path intentionally does not transition task_state to READY";
+    // task_state remains PENDING -- there is no intermediate ready/running state.
+    EXPECT_EQ(slot.task_state.load(), PTO2_TASK_PENDING) << "release_fanin_and_check_ready must not write task_state";
 }
 
 // =============================================================================
@@ -158,7 +156,7 @@ TEST_F(TaskStateTest, ConcurrentSubtaskCompletion) {
 
     for (int round = 0; round < ROUNDS; round++) {
         alignas(64) PTO2TaskSlotState slot;
-        init_slot(slot, PTO2_TASK_RUNNING, 1, 1);
+        init_slot(slot, PTO2_TASK_PENDING, 1, 1);
         slot.total_required_subtasks = 3;
         slot.completed_subtasks.store(0);
         std::atomic<int> done_count{0};
@@ -187,7 +185,7 @@ TEST_F(TaskStateTest, ConcurrentSubtaskCompletion) {
 // =============================================================================
 TEST_F(TaskStateTest, DoubleSubtaskCompletionCounterWeakness) {
     alignas(64) PTO2TaskSlotState slot;
-    init_slot(slot, PTO2_TASK_RUNNING, 1, 1);
+    init_slot(slot, PTO2_TASK_PENDING, 1, 1);
     slot.total_required_subtasks = 2;
     slot.completed_subtasks.store(0);
 

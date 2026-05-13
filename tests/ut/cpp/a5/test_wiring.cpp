@@ -155,9 +155,9 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
     memset(&payload, 0, sizeof(payload));
     PTO2TaskDescriptor desc{};
 
-    // Producers are RUNNING (not yet completed)
+    // Producers are PENDING (not yet completed)
     for (int i = 0; i < 2; i++) {
-        init_slot(producer_slots[i], PTO2_TASK_RUNNING, 1, 2);
+        init_slot(producer_slots[i], PTO2_TASK_PENDING, 1, 2);
     }
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
@@ -200,7 +200,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
     PTO2TaskDescriptor desc{};
 
     init_slot(producers[0], PTO2_TASK_COMPLETED, 1, 2);  // early finished
-    init_slot(producers[1], PTO2_TASK_RUNNING, 1, 2);    // still running
+    init_slot(producers[1], PTO2_TASK_PENDING, 1, 2);    // in flight (< COMPLETED)
     init_slot(producers[2], PTO2_TASK_CONSUMED, 1, 2);   // early finished (>= COMPLETED)
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
@@ -237,8 +237,8 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     memset(&prod_payload, 0, sizeof(prod_payload));
     PTO2TaskDescriptor desc{};
 
-    // Set up producer in RUNNING state with 2 consumers in fanout chain
-    init_slot(producer, PTO2_TASK_RUNNING, 1, 1);
+    // Producer in flight (PENDING, not yet COMPLETED) with 2 consumers in fanout chain
+    init_slot(producer, PTO2_TASK_PENDING, 1, 1);
     producer.payload = &prod_payload;
     producer.task = &desc;
 

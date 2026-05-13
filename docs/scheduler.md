@@ -198,7 +198,8 @@ void Scheduler::dispatch_ready() {
                 q->push(slot);   // put back; try again after a completion
                 break;
             }
-            s.state.store(TaskState::RUNNING);
+            // Slot stays in PENDING through dispatch; running-vs-idle is
+            // tracked via the worker's running_slot_state pointer.
             for (int i = 0; i < N; i++) {
                 workers[i]->dispatch({slot, i});
             }
@@ -339,8 +340,8 @@ by completion-handling cost.
 1. **Scheduler is single-threaded**: all three phase handlers run in the
    Scheduler's own thread. Atomics/mutexes on slot state are only needed for
    Orch/WorkerThread ↔ Scheduler coordination.
-2. **Slot transitions are monotonic**: `FREE → PENDING → READY → RUNNING →
-   COMPLETED → CONSUMED` never reverses within one allocation.
+2. **Slot transitions are monotonic**: `FREE → PENDING → COMPLETED →
+   CONSUMED` never reverses within one allocation.
 3. **Dispatch consumes one ready entry**: every `ready_queue.push` is
    matched by exactly one `pick_idle + dispatch`. Group tasks push once,
    dispatch N times via `pick_n_idle`.

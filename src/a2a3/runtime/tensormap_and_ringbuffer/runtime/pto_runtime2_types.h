@@ -144,18 +144,21 @@ constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
  * Task state enumeration
  *
  * State transitions:
- *   PENDING -> READY -> RUNNING -> COMPLETED -> CONSUMED
+ *   PENDING -> COMPLETED -> CONSUMED
+ *
+ * The slot stays in PENDING from submit through "ready in queue" and "running
+ * on a worker"; readiness and running-vs-idle are derived from fanin_refcount
+ * and per-core running_slot_state respectively, not from task_state itself.
  *
  * Conditions:
- *   PENDING->READY:     fanin_refcount == fanin_count
- *   COMPLETED->CONSUMED: fanout_refcount == fanout_count && state == COMPLETED
+ *   PENDING->COMPLETED:   all subtasks finish (set by scheduler) or task is a
+ *                         hidden alloc completed inline by the orchestrator
+ *   COMPLETED->CONSUMED:  fanout_refcount == fanout_count && state == COMPLETED
  */
 typedef enum {
-    PTO2_TASK_PENDING = 0,    // Waiting for dependencies (fanin_refcount < fanin_count)
-    PTO2_TASK_READY = 1,      // All dependencies satisfied, waiting in ready queue
-    PTO2_TASK_RUNNING = 2,    // Currently executing on a worker
-    PTO2_TASK_COMPLETED = 3,  // Execution finished, output may still be in use
-    PTO2_TASK_CONSUMED = 4    // Output fully consumed, buffers can be released
+    PTO2_TASK_PENDING = 0,    // Submitted; awaiting fanin, queued, or dispatched
+    PTO2_TASK_COMPLETED = 1,  // Execution finished, output may still be in use
+    PTO2_TASK_CONSUMED = 2    // Output fully consumed, buffers can be released
 } PTO2TaskState;
 
 /**
@@ -323,7 +326,7 @@ struct alignas(64) PTO2TaskSlotState {
     PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
 
     // Task state (completion, consumed check, ready check)
-    std::atomic<PTO2TaskState> task_state;  // PENDING/READY/RUNNING/COMPLETED/CONSUMED
+    std::atomic<PTO2TaskState> task_state;  // PENDING/COMPLETED/CONSUMED
 
     // Fanin (accessed together in release_fanin_and_check_ready)
     std::atomic<int32_t> fanin_refcount;  // Dynamic: counts completed producers

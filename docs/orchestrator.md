@@ -426,9 +426,9 @@ state machine).
 
 `scope_end` walks the scope's tasks and bumps each one's `fanout_released`
 counter, then returns. A task whose `fanout_released` now meets the
-threshold transitions to CONSUMED inline; others stay COMPLETED / RUNNING /
-PENDING until the scheduler and consumers finish their own releases. This
-mirrors L2's `pto2_scope_end`.
+threshold transitions to CONSUMED inline; others stay COMPLETED or PENDING
+until the scheduler and consumers finish their own releases. This mirrors
+L2's `pto2_scope_end`.
 
 Users who need a synchronous wait for *all* in-flight tasks must call
 `drain()` (or let `Worker::run` finish — its outer `scope_end` is followed
@@ -486,29 +486,29 @@ concurrent hash map can replace it.
 Each `TaskSlotState.state` progresses through:
 
 ```text
-FREE ──► PENDING ──► READY ──► RUNNING ──► COMPLETED ──► CONSUMED ──► FREE
- ↑         │           │          │            │             │
- │       submit       fanin=0   Scheduler    worker        all refs
- │       has fanin    (submit   dispatches   done          released
- │                    or fanout  to WT                     (scope +
- │                    release)                              fanout)
- │                                                          │
- └──────────────────── ring.release(sid) ◄─────────────────┘
+FREE ──► PENDING ──► COMPLETED ──► CONSUMED ──► FREE
+ ↑         │            │             │
+ │       submit      worker(s)     all refs
+ │                   done          released
+ │                                 (scope + fanout)
+ │                                     │
+ └──────── ring.release(sid) ◄─────────┘
 ```
 
 - **FREE**: slot in the ring pool, not allocated
-- **PENDING**: allocated, `fanin_count > 0`, waiting on producers
-- **READY**: pushed to ready_queue (will be dispatched)
-- **RUNNING**: Scheduler has dispatched to a WorkerThread; for group tasks,
-  `sub_complete_count < group_size`
+- **PENDING**: allocated; remains PENDING through "waiting on producers",
+  "queued in ready_queue", and "dispatched to a worker"
 - **COMPLETED**: worker(s) done; may still be referenced by fanout / scope
 - **CONSUMED**: all references released; Scheduler calls `ring.release(sid)`
   and the slot returns to FREE
 
-State transitions are driven by atomic CAS operations:
+There is no separate READY or RUNNING state — readiness is derived from
+`fanin_refcount == fanin_count` and running-vs-idle from the per-core
+`running_slot_state` pointer. State transitions are driven by atomic
+operations:
 
-- Orch: FREE → PENDING/READY at submit time
-- Scheduler: READY → RUNNING → COMPLETED → CONSUMED during dispatch/completion
+- Orch: FREE → PENDING at submit time
+- Scheduler: PENDING → COMPLETED → CONSUMED during completion
 
 ### Fanout-release threshold
 

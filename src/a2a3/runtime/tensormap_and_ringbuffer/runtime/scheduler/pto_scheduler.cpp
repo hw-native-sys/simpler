@@ -62,27 +62,6 @@ PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
 #endif
 
 // =============================================================================
-// Task State Names
-// =============================================================================
-
-const char *task_state_name(PTO2TaskState state) {
-    switch (state) {
-    case PTO2_TASK_PENDING:
-        return "PENDING";
-    case PTO2_TASK_READY:
-        return "READY";
-    case PTO2_TASK_RUNNING:
-        return "RUNNING";
-    case PTO2_TASK_COMPLETED:
-        return "COMPLETED";
-    case PTO2_TASK_CONSUMED:
-        return "CONSUMED";
-    default:
-        return "UNKNOWN";
-    }
-}
-
-// =============================================================================
 // Ready Queue Implementation
 // =============================================================================
 
