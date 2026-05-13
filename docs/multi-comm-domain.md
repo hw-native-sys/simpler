@@ -1203,8 +1203,9 @@ The caller should receive the first error after best-effort cleanup completes.
 9. Migrate every communication-domain example to `comm_plan`, including
    notification and SDMA examples that use host staging.
 10. Update L3 one-domain examples to use `ctx.domains["default"]`.
-11. Add a tiny multi-domain rank-map example that exercises domain
-    membership, missing-domain lookup, and domain-local ranks.
+11. Add a small multi-domain rank-map example that exercises domain
+    membership, missing-domain lookup, domain-local ranks, and real
+    per-domain communication.
 12. Add a two-domain data example where overlapping domains run real
     communication, computation, and golden checks.
 13. Add tests for validation, the one-domain `CommDomainPlan` case, sim

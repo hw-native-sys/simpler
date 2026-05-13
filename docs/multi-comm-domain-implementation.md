@@ -169,9 +169,10 @@ orchestration code consume.
 
 Two new L3 examples now cover the multi-domain surface:
 
-- `domain_rank_map`: a tiny bootstrap-only example.  It shows the difference
-  from single-domain usage by checking domain-local ranks, absent domains, and
-  separate slices for overlapping memberships.
+- `domain_rank_map`: a small communication example.  It shows the difference
+  from single-domain usage by checking domain-local ranks, absent domains,
+  separate slices for overlapping memberships, and one real allreduce per
+  domain.
 - `dual_domain_overlap`: a real data example.  It runs two overlapping
   domains, performs domain-local allreduce in both, then runs affine compute
   and checks real outputs against host goldens.
@@ -221,9 +222,9 @@ Validation date: 2026-05-13.
 ### Example Results
 
 - `workers/l3/domain_rank_map`
-  - Sim: pass with `-p a2a3sim -d 0-2`.
+  - Sim: not applicable.
   - Hardware: pass with `-p a2a3 -d 3-5`.
-  - New tiny domain-rank example.
+  - New small domain-rank and per-domain communication example.
 
 - `workers/l3/dual_domain_overlap`
   - Sim: not applicable.

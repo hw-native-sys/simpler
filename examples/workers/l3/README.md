@@ -66,7 +66,7 @@ Two things to know before reading the example:
 | [`allreduce_distributed/`](allreduce_distributed/) | One communication domain declared with `CommDomainPlan`, with PTO-ISA remote reads over the domain window. |
 | [`ffn_tp_parallel/`](ffn_tp_parallel/) | Local compute followed by one-domain cross-rank reduction through a domain scratch window. |
 | [`ep_dispatch_combine/`](ep_dispatch_combine/) | MoE-style dispatch/combine over a one-domain communication window. |
-| [`domain_rank_map/`](domain_rank_map/) | Minimal two-domain bootstrap example showing domain-local ranks, missing-domain `KeyError`, and separate window slices. |
+| [`domain_rank_map/`](domain_rank_map/) | Small two-domain example showing domain-local ranks, missing-domain `KeyError`, separate window slices, and real per-domain allreduce. |
 | [`dual_domain_overlap/`](dual_domain_overlap/) | Two overlapping communication domains where worker 1 participates in both and kernels use explicit `ctx.domains[name]` contexts. |
 
 ## Prerequisites
