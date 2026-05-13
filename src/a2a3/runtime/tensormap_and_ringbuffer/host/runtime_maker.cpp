@@ -295,7 +295,6 @@ extern "C" int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorage
     runtime->record_tensor_pair(nullptr, sm_ptr, static_cast<size_t>(sm_size));
 
     // Set up device orchestration state
-    runtime->set_orch_built_on_host(false);
     runtime->set_orch_args(device_args);
 
     LOG_INFO_V0("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);

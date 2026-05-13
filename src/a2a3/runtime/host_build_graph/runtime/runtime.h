@@ -244,9 +244,6 @@ public:
      */
     Runtime();
 
-    // Orchestration is always built on the host for this runtime
-    bool get_orch_built_on_host() const { return true; }
-
     // =========================================================================
     // Task Management
     // =========================================================================
