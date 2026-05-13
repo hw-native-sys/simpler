@@ -37,6 +37,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "callable.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
 #include "common/l2_perf_profiling.h"
@@ -334,35 +335,27 @@ public:
     int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
 
     /**
-     * Upload a kernel binary to device memory
+     * Upload an entire ChipCallable buffer to device memory in one shot.
+     * Walks child_offsets_ to compute total byte size, allocates device GM
+     * once, fixes up each child's resolved_addr_ in an internal host scratch
+     * (= device-side address of that child's binary code), H2D's once, and
+     * returns the device-side address of the ChipCallable header.
      *
-     * IMPORTANT: prepare_run_context() must be called before this function.
-     * Kernels are immediately copied to device memory.
+     * Pool-managed: identical buffer bytes (FNV-1a 64-bit content hash) hit
+     * the dedup cache and return the cached chip_dev without reallocating.
+     * All chip buffers are bulk-freed in finalize() — there is no explicit
+     * free API, mirroring the per-fid binary pool semantics.
      *
-     * Receives pre-extracted .text section binary data,
-     * allocates device GM memory, copies the binary to device,
-     * and returns the device GM address. The caller is responsible
-     * for storing this address (typically in Runtime::func_id_to_addr_[]).
+     * Callers compute child addresses as
+     *     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
+     * and write them to Runtime::func_id_to_addr_[fid] via
+     * Runtime::set_function_bin_addr().
      *
-     * If the kernel is already uploaded (same func_id), returns the
-     * cached address without re-uploading.
-     *
-     * @param func_id   Function identifier (0, 1, 2, ...) for caching
-     * @param bin_data  Kernel .text section binary data
-     * @param bin_size  Size of binary data in bytes
-     * @return Device GM address of kernel on success, 0 on error
+     * @param callable  Host-side ChipCallable pointer.
+     * @return Device GM address of the ChipCallable header, or 0 on failure
+     *         (also returns 0 when callable->child_count() == 0).
      */
-    uint64_t upload_kernel_binary(int func_id, const uint8_t *bin_data, size_t bin_size);
-
-    /**
-     * Remove a kernel binary from device memory
-     *
-     * Frees the device memory allocated for the kernel and removes the
-     * cached entry. This should be called during per-case cleanup.
-     *
-     * @param func_id   Function identifier to remove
-     */
-    void remove_kernel_binary(int func_id);
+    uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
 
     /**
      * Attach the current host thread to the target device.
@@ -549,12 +542,20 @@ private:
     DeviceArgs device_args_;
 
     // Kernel binary management
-    bool binaries_loaded_{false};              // true after AICPU SO loaded
-    std::map<int, uint64_t> func_id_to_addr_;  // func_id -> function_bin_addr (device GM)
-    // Parallel hash map for upload_kernel_binary() to detect when the same
-    // func_id is re-uploaded with different binary bytes (different
-    // ChipCallable sharing the same func_id under the per-callable_id path).
-    std::map<int, uint64_t> func_id_to_hash_;
+    bool binaries_loaded_{false};  // true after AICPU SO loaded
+
+    // Chip-callable buffer pool. Keyed by FNV-1a 64-bit content hash of the
+    // ChipCallable bytes. Each entry owns one device GM allocation holding
+    // the entire ChipCallable buffer (header + storage_, with each child's
+    // resolved_addr_ fixed up to its post-H2D device address). Pool-managed:
+    // identical buffer bytes share one entry across cids; the map is bulk-
+    // freed in finalize(). No explicit free API (mirrors per-fid binary pool
+    // semantics today).
+    struct ChipCallableBuffer {
+        uint64_t chip_dev{0};  // device GM address of the ChipCallable header
+        size_t total_size{0};  // byte size of the device allocation
+    };
+    std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
     // Orchestration SO cache. `cached_orch_so_hash_ == 0` means "no cache".
     // The device buffer grows monotonically — cache miss with a larger SO
@@ -604,15 +605,6 @@ private:
     // register_prepared_callable_host_orch call; never decremented). Same
     // re-prepare semantics as aicpu_dlopen_total_, but for hbg variants.
     size_t host_dlopen_total_{0};
-    // Sticky flag: prepare_callable was called at least once in this
-    // DeviceRunner's lifetime. unregister_prepared_callable clears the
-    // per-cid kernel maps, so we cannot rely on map contents at finalize()
-    // to distinguish a legacy-path leak from a kernel legitimately staged
-    // by prepare_callable (which is owned until finalize by design).
-    // Assumes the legacy non-prepared run path is retired; if it is ever
-    // reintroduced, revisit whether this distinction still holds.
-    bool prepared_callable_path_used_{false};
-
     // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
     // gates it behind this flag. finalize() drives aclFinalize only if we observed
     // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.

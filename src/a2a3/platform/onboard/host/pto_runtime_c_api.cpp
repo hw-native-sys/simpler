@@ -93,18 +93,12 @@ static int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     }
 }
 
-static uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t *bin_data, size_t bin_size) {
+static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     try {
-        return current_runner()->upload_kernel_binary(func_id, bin_data, bin_size);
+        return current_runner()->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));
     } catch (...) {
         return 0;
     }
-}
-
-static void remove_kernel_binary_wrapper(int func_id) {
-    try {
-        current_runner()->remove_kernel_binary(func_id);
-    } catch (...) {}
 }
 
 /* ===========================================================================
@@ -278,8 +272,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
-        r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
-        r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
+        r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         rc = prepare_callable_impl(r, reinterpret_cast<const ChipCallable *>(callable));
         if (rc != 0) {
@@ -352,8 +345,7 @@ int run_prepared(
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
-        r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
-        r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
+        r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         // Restore kernel addrs + orch symbol names + active_callable_id
         rc = runner->bind_prepared_callable_to_runtime(*r, callable_id);

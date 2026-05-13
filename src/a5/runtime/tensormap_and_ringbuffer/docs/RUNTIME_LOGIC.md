@@ -79,7 +79,7 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 | `device_runner.cpp` | Uses `std::thread` to simulate AICPU/AICore |
 | `memory_allocator.cpp` | Wraps `malloc`/`free` |
 | `aicore/kernel.cpp` | `aicore_execute_wrapper` sets `g_sim_reg_base` per core |
-| `upload_kernel_binary` | `dlopen` kernel SO, `dlsym` entry point |
+| `upload_chip_callable_buffer` | Copy ChipCallable bytes to a host scratch, `dlopen` each child SO, `dlsym` "kernel_entry", patch the scratch's `resolved_addr_` with the function pointer |
 
 ### 2.3 Platform Constants (`platform_config.h`)
 
@@ -614,9 +614,16 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 ### 10.1 Kernel Binary Loading
 
 1. **Host** compiles each kernel source (`.cpp`) into a binary (`.o` or `.so`)
-2. `host_api.upload_kernel_binary(func_id, binary, size)` uploads to GM
-3. The returned GM address is stored in `Runtime.func_id_to_addr_[func_id]`
-4. When dispatching, the scheduler copies this address into `PTO2DispatchPayload.function_bin_addr`
+   and packs all children into a single `ChipCallable` buffer alongside the
+   orchestration SO.
+2. `host_api.upload_chip_callable_buffer(callable)` H2Ds the whole buffer
+   once and returns the device address of the ChipCallable header.
+3. For each child, host computes
+   `chip_dev + offsetof(ChipCallable, storage_) + callable->child_offset(i)`
+   and stores it in `Runtime.func_id_to_addr_[child_func_id(i)]`.
+4. When dispatching, the scheduler reads `func_id_to_addr_[fid]`, casts to
+   `const CoreCallable*`, reads `resolved_addr_`, and copies that into
+   `PTO2DispatchPayload.function_bin_addr`.
 
 ### 10.2 Orchestration SO Loading
 

@@ -207,7 +207,8 @@ worker.run(callable, args, CallConfig(block_dim, aicpu_thread_num))
   │
   └─→ run_runtime(ctx, runtime, callable, args, ...)
        │
-       ├─→ Upload kernel binaries (upload_kernel_binary per func_id)
+       ├─→ Upload the entire ChipCallable buffer (upload_chip_callable_buffer)
+       │      then fill func_id_to_addr_[fid] = chip_dev + storage_offset + child_offset(i)
        ├─→ Allocate device tensors via MemoryAllocator
        ├─→ Copy input data to device
        ├─→ Build task graph with dependencies
