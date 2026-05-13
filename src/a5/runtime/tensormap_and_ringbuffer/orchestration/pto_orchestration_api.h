@@ -24,8 +24,7 @@
  * full PTO2Runtime struct with all internal fields).
  */
 
-#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_ORCHESTRATION_PTO_ORCHESTRATION_API_H_
-#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_ORCHESTRATION_PTO_ORCHESTRATION_API_H_
+#pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -422,4 +421,8 @@ struct PTO2OrchestrationConfig {
 };
 #endif
 
-#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_ORCHESTRATION_PTO_ORCHESTRATION_API_H_
+// Convenience layer (ArgWithDeps<N> + matching rt_submit_*_task overloads).
+// Pulled in at the bottom so the wrapper sees Arg, MixedKernels, and the
+// rt_submit_*_task primitives defined above. Orchestration sources include
+// only this single header to access both the primitive and convenience APIs.
+#include "pto_arg_with_deps.h"  // NOLINT(build/include_subdir)

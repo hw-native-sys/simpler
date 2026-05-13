@@ -200,6 +200,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     PROF_INC(prof_view_count, 1);
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
+                    // --- Primitive dep API (Arg + set_dependencies) ---
+                    // Caller owns the deps buffer; Arg stores (ptr, count).
+                    // Suited for codegen and for cases with a fixed dep set.
                     Arg params_sf;
                     params_sf.add_input(sij_valid);
                     params_sf.add_output(pij_f16_ci);
@@ -232,7 +235,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
                     CYCLE_COUNT_LAP(prof_param_extract);
 
-                    Arg params_up;
+                    // --- Convenience dep API (ArgWithDeps + add_dep) ---
+                    // Wrapper owns a stack-sized deps buffer and accepts
+                    // incremental add_dep() calls; the submit overload binds
+                    // them to the underlying Arg via set_dependencies(...).
+                    // Suited for hand-written orch where the dep set is
+                    // assembled conditionally across branches.
+                    ArgWithDeps<> params_up;
                     params_up.add_input(mi);
                     params_up.add_input(li);
                     params_up.add_input(oi_tmp);
@@ -241,17 +250,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_up.add_inout(oi);
                     params_up.add_inout(out_view);
                     // UP reads SF's mi/li, but SF -> PV -> UP already orders it; only the PV edge is explicit.
-                    PTO2TaskId up_deps[3];
-                    uint32_t up_dep_count = 0;
-                    up_deps[up_dep_count++] = pv_outs.task_id();
+                    params_up.add_dep(pv_outs.task_id());
                     if (prev_update_task.is_valid()) {
-                        up_deps[up_dep_count++] = prev_update_task;
+                        params_up.add_dep(prev_update_task);
                     }
                     // alloc completes inline; this dep only keeps the scratch buffers alive until the last consumer.
                     if (is_last) {
-                        up_deps[up_dep_count++] = alloc_task;
+                        params_up.add_dep(alloc_task);
                     }
-                    params_up.set_dependencies(up_deps, up_dep_count);
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
