@@ -1017,6 +1017,7 @@ int DeviceRunner::launch_aicore_kernel(rtStream_t stream, Runtime *runtime) {
 
     rtTaskCfgInfo_t cfg = {};
     cfg.schemMode = RT_SCHEM_MODE_BATCH;
+    cfg.localMemorySize = PLATFORM_AICORE_LOCAL_MEMORY_SIZE;
 
     rc = rtKernelLaunchWithHandleV2(bin_handle, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
     if (rc != RT_ERROR_NONE) {
