@@ -51,13 +51,21 @@ inline constexpr uint8_t PTO2_SUBTASK_FLAG_SYNC_START = (1u << 3);  // 0x8: all 
  * requires a fully-idle cluster (1 AIC + 2 AIV).  The actual cores used
  * are determined at dispatch time by active_mask — unused cores in the
  * cluster remain idle and available for single-core tasks.
+ *
+ * DUMMY is a synthetic shape for dep-only tasks (no AICore dispatch). Tasks
+ * with an empty core_mask route to a dedicated DUMMY ready queue and are
+ * completed inline by the scheduler dispatch loop, bypassing core allocation.
  */
 enum class PTO2ResourceShape : uint8_t {
-    AIC = 0,  // Single AIC
-    AIV = 1,  // Single AIV
-    MIX = 2,  // Full cluster (dispatch uses active_mask)
+    AIC = 0,    // Single AIC
+    AIV = 1,    // Single AIV
+    MIX = 2,    // Full cluster (dispatch uses active_mask)
+    DUMMY = 3,  // Dependency-only (no AICore dispatch)
 };
 
+// Number of *dispatchable* resource shapes (AIC, AIV, MIX). DUMMY does not
+// allocate a per-shape ready_queue entry / local buffer — it lives in a
+// dedicated queue inside PTO2SchedulerState.
 inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 3;
 
 /**
@@ -79,6 +87,7 @@ public:
 
     PTO2ResourceShape to_shape() const {
         uint8_t cmask = core_mask();
+        if (cmask == 0) return PTO2ResourceShape::DUMMY;
         int bit_count = __builtin_popcount(cmask);
         if (bit_count >= 2) return PTO2ResourceShape::MIX;
         if (cmask & PTO2_SUBTASK_MASK_AIC) return PTO2ResourceShape::AIC;

@@ -126,6 +126,7 @@ struct PTO2OrchestratorState {
     void begin_scope(PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
     void end_scope();
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const Arg &args);
+    TaskOutputTensors submit_dummy_task(const Arg &args);
     TaskOutputTensors alloc_tensors(const Arg &args);
     void mark_done();
 };

@@ -136,6 +136,7 @@ typedef struct PTO2RuntimeOps {
         PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
+    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const Arg &args);
 } PTO2RuntimeOps;
 
 /**
@@ -231,6 +232,21 @@ static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, const Arg 
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt_submit_task(mk, args);
+}
+
+/**
+ * Submit a dependency-only task. Accepts the same Arg shape as rt_submit_task
+ * (inputs, outputs, inouts, explicit_deps, scalars) but does not run any
+ * AICore kernel. The task still participates in the dependency graph: it
+ * waits on its fanin and notifies its fanout. Useful as a synchronization
+ * barrier or as a placeholder producer for tests / dep-graph wiring.
+ */
+static inline TaskOutputTensors rt_submit_dummy_task(const Arg &args) {
+    PTO2Runtime *rt = current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return TaskOutputTensors{};
+    }
+    return rt->ops->submit_dummy_task(rt, args);
 }
 
 static inline void rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {

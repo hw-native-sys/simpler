@@ -46,6 +46,10 @@ static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
     return rt->orchestrator.alloc_tensors(args);
 }
 
+static TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const Arg &args) {
+    return rt->orchestrator.submit_dummy_task(args);
+}
+
 void rt_scope_begin(PTO2Runtime *rt) {
     PTO2ScopeMode mode = rt->pending_scope_mode;
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
@@ -241,6 +245,7 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .get_tensor_data = get_tensor_data,
     .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
+    .submit_dummy_task = submit_dummy_task_impl,
 };
 
 // =============================================================================

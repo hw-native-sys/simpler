@@ -195,7 +195,7 @@ dependencies).
 | Shared-mem layout | `src/a2a3/platform/include/common/dep_gen.h` | `DepGenRecord` (2240 B, cache-line aligned) + SPSC ring + per-thread ready queue |
 | AICPU writer | `src/a2a3/platform/{include,src}/aicpu/dep_gen_collector_aicpu.{h,cpp}` | Single-instance write path; weak-fallback exported to host build |
 | Host collector | `src/a2a3/platform/{include/host,src/host}/dep_gen_collector.{h,cpp}` | `ProfilerBase<DepGenCollector, DepGenModule>` — drains ring → `records_` vector |
-| Capture call site | `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `submit_task` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()` |
+| Capture call site | `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. Dep-only tasks land in the record stream with valid tensor/dep info but no kernel_id field (the schema does not carry kernel_id), so replay treats them as ordinary dep nodes — viewers do not currently distinguish dummy from real tasks. |
 | Replay | `src/a2a3/runtime/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs `compute_task_fanin` + `register_task_outputs` against a host `PTO2TensorMap` |
 | Device-runner hookup | `src/a2a3/platform/{onboard,sim}/host/device_runner.cpp` | post-`reconcile_counters` calls `dep_gen_replay_emit_deps_json(records.data(), records.size(), deps_path, nullptr)` |
 | Viewer | `simpler_setup/tools/deps_to_graph.py` | `deps.json` → pan/zoom HTML |

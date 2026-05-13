@@ -211,6 +211,10 @@ public:
             return ((core_states_ >> 1) | (core_states_ >> 2)) & aic_mask_;
         case PTO2ResourceShape::MIX:
             return (core_states_ >> 1) & (core_states_ >> 2) & core_states_ & aic_mask_;
+        case PTO2ResourceShape::DUMMY:
+            // DUMMY tasks never reach the core-tracker dispatch path; they are
+            // completed inline by resolve_and_dispatch via dummy_ready_queue.
+            return BitStates(0ULL);
         }
         return BitStates(0ULL);
     }
