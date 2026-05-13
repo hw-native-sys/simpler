@@ -12,16 +12,15 @@
 Each rank stages its input inside the HCCL window.  The deferred producer
 TGET_ASYNCs the peer rank's input into local ``out`` and registers the PTO
 AsyncEvent through ``defer_pto_async_event``.  The consumer depends on the
-producer output and writes ``result = out + 1``.  Correct ``out`` and ``result``
-therefore validate both the SDMA completion polling and the deferred-release
-dependency path.
+producer output and writes ``result = out + 1``.  Correct ``out`` and
+``result`` therefore validate both the SDMA completion polling and the
+deferred-release dependency path.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import tempfile
 from multiprocessing.shared_memory import SharedMemory
 
 import torch
@@ -31,8 +30,9 @@ from simpler.task_interface import (
     ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
-    ChipCommBootstrapConfig,
     ChipContext,
+    CommDomain,
+    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -120,11 +120,6 @@ def run(
 
     input_nbytes = N * DTYPE_NBYTES
     window_size = max(input_nbytes, 4 * 1024)
-    rootinfo_path = os.path.join(tempfile.gettempdir(), f"pto_sdma_async_completion_rootinfo_{os.getpid()}.bin")
-    try:
-        os.unlink(rootinfo_path)
-    except FileNotFoundError:
-        pass
 
     inputs = [
         torch.tensor([float(rank * 1000 + (i % 251)) / 10.0 for i in range(N)], dtype=torch.float32)
@@ -140,24 +135,35 @@ def run(
             raise RuntimeError("SharedMemory buffer is unavailable")
         buf[:input_nbytes] = inputs[rank].numpy().tobytes()
 
+    comm_plan = CommDomainPlan(
+        domains=[
+            CommDomain(
+                name="default",
+                worker_indices=list(range(nranks)),
+                window_size=window_size,
+                buffers=[
+                    ChipBufferSpec(
+                        name="input_window",
+                        dtype="float32",
+                        count=N,
+                        nbytes=input_nbytes,
+                        load_from_host=True,
+                    ),
+                ],
+            )
+        ]
+    )
     cfgs = [
         ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank,
-                nranks=nranks,
-                rootinfo_path=rootinfo_path,
-                window_size=window_size,
-            ),
-            buffers=[
-                ChipBufferSpec(
+            comm=comm_plan.bootstrap_for_worker(rank),
+            host_inputs=[
+                HostBufferStaging(
+                    domain_name="default",
                     name="input_window",
-                    dtype="float32",
-                    count=N,
-                    nbytes=input_nbytes,
-                    load_from_host=True,
-                ),
+                    shm_name=input_shms[rank].name,
+                    size=input_nbytes,
+                )
             ],
-            host_inputs=[HostBufferStaging(name="input_window", shm_name=input_shms[rank].name, size=input_nbytes)],
         )
         for rank in range(nranks)
     ]
@@ -179,10 +185,11 @@ def run(
 
         def orch_fn(orch, _args, cfg):
             for rank, ctx in enumerate(contexts):
+                domain = ctx.domains["default"]
                 args = TaskArgs()
                 args.add_tensor(
                     ContinuousTensor.make(
-                        data=ctx.buffer_ptrs["input_window"],
+                        data=domain.buffer_ptrs["input_window"],
                         shapes=(N,),
                         dtype=DataType.FLOAT32,
                         child_memory=True,
@@ -191,7 +198,7 @@ def run(
                 )
                 args.add_tensor(make_tensor_arg(out[rank]), TensorArgType.OUTPUT_EXISTING)
                 args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
-                args.add_scalar(ctx.device_ctx)
+                args.add_scalar(domain.device_ctx)
                 orch.submit_next_level(chip_cid, args, cfg, worker=rank)
 
         worker.run(orch_fn, args=None, config=CallConfig())
@@ -208,10 +215,6 @@ def run(
         return 0 if ok else 1
     finally:
         worker.close()
-        try:
-            os.unlink(rootinfo_path)
-        except FileNotFoundError:
-            pass
         for shm in input_shms:
             shm.close()
             shm.unlink()

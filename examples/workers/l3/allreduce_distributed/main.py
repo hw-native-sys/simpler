@@ -20,9 +20,9 @@ strictly inside the kernel, via a HCCL window scratch slot:
 input / output are plain per-rank ``torch.share_memory_()`` tensors — the
 parent writes inputs before ``init()`` and reads outputs after ``run()``, and
 the framework's TaskArgs path handles H2D / D2H automatically (same as
-``multi_chip_dispatch``).  Only ``scratch`` uses the chip bootstrap path
-because window buffers can only exist after HCCL ``comm_alloc_windows`` has
-run — that's what ``chip_bootstrap_configs`` is for.
+``multi_chip_dispatch``).  Only ``scratch`` is declared in the communication
+domain because window buffers can only exist after HCCL
+``comm_alloc_windows`` has run.
 
 Hardware only.  The sim backend's CommRemotePtr uses a different addressing
 scheme; sim support is out of scope for this demo.
@@ -46,11 +46,11 @@ import torch  # noqa: E402
 from simpler.task_interface import (  # noqa: E402
     ArgDirection,
     CallConfig,
-    ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
-    ChipCommBootstrapConfig,
     ChipContext,
+    CommDomain,
+    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -139,12 +139,6 @@ def run(device_ids: list[int]) -> int:
     # keeps us clear of any HCCL minimum-window-size quirks.
     window_size = max(SCRATCH_NBYTES, 4 * 1024)
 
-    rootinfo_path = f"/tmp/pto_allreduce_distributed_rootinfo_{os.getpid()}.bin"
-    try:
-        os.unlink(rootinfo_path)
-    except FileNotFoundError:
-        pass
-
     print(f"[allreduce] devices={device_ids} nranks={nranks}")
 
     # --- Per-rank host tensors (input/output) via torch.share_memory_().
@@ -159,29 +153,25 @@ def run(device_ids: list[int]) -> int:
     ]
     host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
-    # --- Scratch bootstrap: one window buffer per chip.  The window only
-    # exists after HCCL comm_alloc_windows has run, so allocating scratch
-    # during bootstrap is the natural lifecycle — no TaskArgs equivalent
-    # covers it.  No host staging is needed for scratch.
-    cfgs = [
-        ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank,
-                nranks=nranks,
-                rootinfo_path=rootinfo_path,
+    # --- Scratch communication domain: one window buffer per chip.  No host
+    # staging is needed for scratch.
+    comm_plan = CommDomainPlan(
+        domains=[
+            CommDomain(
+                name="default",
+                worker_indices=list(range(nranks)),
                 window_size=window_size,
-            ),
-            buffers=[
-                ChipBufferSpec(
-                    name="scratch",
-                    dtype="float32",
-                    count=ALLREDUCE_COUNT,
-                    nbytes=SCRATCH_NBYTES,
-                ),
-            ],
-        )
-        for rank in range(nranks)
-    ]
+                buffers=[
+                    ChipBufferSpec(
+                        name="scratch",
+                        dtype="float32",
+                        count=ALLREDUCE_COUNT,
+                        nbytes=SCRATCH_NBYTES,
+                    ),
+                ],
+            )
+        ]
+    )
 
     print("[allreduce] compiling kernels...")
     chip_callable = build_chip_callable("a2a3")
@@ -192,7 +182,7 @@ def run(device_ids: list[int]) -> int:
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        chip_bootstrap_configs=cfgs,
+        comm_plan=comm_plan,
     )
     chip_cid = worker.register(chip_callable)
 
@@ -203,14 +193,16 @@ def run(device_ids: list[int]) -> int:
         contexts: list[ChipContext] = worker.chip_contexts
         assert len(contexts) == nranks
         for i, ctx in enumerate(contexts):
+            domain = ctx.domains["default"]
             print(
-                f"[allreduce] chip {i}: device={ctx.device_id} rank={ctx.rank}/{ctx.nranks} "
-                f"window=[0x{ctx.local_window_base:x} +{ctx.actual_window_size}B] "
-                f"scratch=0x{ctx.buffer_ptrs['scratch']:x}"
+                f"[allreduce] chip {i}: device={ctx.device_id} rank={domain.domain_rank}/{domain.domain_size} "
+                f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
+                f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
             )
 
         def orch_fn(orch, _args, cfg):
             for i, ctx in enumerate(contexts):
+                domain = ctx.domains["default"]
                 chip_args = TaskArgs()
                 chip_args.add_tensor(make_tensor_arg(host_inputs[i]), TensorArgType.INPUT)
                 chip_args.add_tensor(make_tensor_arg(host_outputs[i]), TensorArgType.OUTPUT_EXISTING)
@@ -219,15 +211,15 @@ def run(device_ids: list[int]) -> int:
                 # to skip the runtime's H2D path.
                 chip_args.add_tensor(
                     ContinuousTensor.make(
-                        data=ctx.buffer_ptrs["scratch"],
+                        data=domain.buffer_ptrs["scratch"],
                         shapes=(ALLREDUCE_COUNT,),
                         dtype=DataType.FLOAT32,
                         child_memory=True,
                     ),
                     TensorArgType.INOUT,
                 )
-                chip_args.add_scalar(ctx.nranks)
-                chip_args.add_scalar(ctx.device_ctx)
+                chip_args.add_scalar(domain.domain_size)
+                chip_args.add_scalar(domain.device_ctx)
                 orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
 
         print("[allreduce] running 2-chip allreduce DAG...")
@@ -250,10 +242,6 @@ def run(device_ids: list[int]) -> int:
         return 0
     finally:
         worker.close()
-        try:
-            os.unlink(rootinfo_path)
-        except FileNotFoundError:
-            pass
 
 
 def main() -> int:

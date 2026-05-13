@@ -13,17 +13,16 @@ from __future__ import annotations
 
 import argparse
 import os
-import tempfile
 
 import torch
 from simpler.task_interface import (
     ArgDirection,
     CallConfig,
-    ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
-    ChipCommBootstrapConfig,
     ChipContext,
+    CommDomain,
+    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -106,12 +105,6 @@ def run(
     if nranks != 2:
         raise ValueError(f"async_notify_demo needs exactly 2 devices, got {device_ids}")
 
-    rootinfo_path = os.path.join(tempfile.gettempdir(), f"pto_async_notify_rootinfo_{os.getpid()}.bin")
-    try:
-        os.unlink(rootinfo_path)
-    except FileNotFoundError:
-        pass
-
     inp = [
         torch.tensor([float(i % 251) / 10.0 for i in range(N)], dtype=torch.float32).share_memory_()
         for _ in range(nranks)
@@ -119,13 +112,16 @@ def run(
     out = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
     result = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
-    cfgs = [
-        ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(rank=rank, nranks=nranks, rootinfo_path=rootinfo_path, window_size=4 * 1024),
-            buffers=[ChipBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=4)],
-        )
-        for rank in range(nranks)
-    ]
+    comm_plan = CommDomainPlan(
+        domains=[
+            CommDomain(
+                name="default",
+                worker_indices=list(range(nranks)),
+                window_size=4 * 1024,
+                buffers=[ChipBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=4)],
+            )
+        ]
+    )
 
     chip_callable = build_chip_callable(platform, pto_isa_commit, "https")
     worker = Worker(
@@ -134,7 +130,7 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        chip_bootstrap_configs=cfgs,
+        comm_plan=comm_plan,
         build=build,
     )
     chip_cid = worker.register(chip_callable)
@@ -144,20 +140,21 @@ def run(
 
         def orch_fn(orch, _args, cfg):
             for rank, ctx in enumerate(contexts):
+                domain = ctx.domains["default"]
                 args = TaskArgs()
                 args.add_tensor(make_tensor_arg(inp[rank]), TensorArgType.INPUT)
                 args.add_tensor(make_tensor_arg(out[rank]), TensorArgType.OUTPUT_EXISTING)
                 args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
                 args.add_tensor(
                     ContinuousTensor.make(
-                        data=ctx.buffer_ptrs["notify_counter"],
+                        data=domain.buffer_ptrs["notify_counter"],
                         shapes=(1,),
                         dtype=DataType.INT32,
                         child_memory=True,
                     ),
                     TensorArgType.INPUT,
                 )
-                args.add_scalar(ctx.device_ctx)
+                args.add_scalar(domain.device_ctx)
                 orch.submit_next_level(chip_cid, args, cfg, worker=rank)
 
         worker.run(orch_fn, args=None, config=CallConfig())
@@ -173,10 +170,6 @@ def run(
         return 0 if ok else 1
     finally:
         worker.close()
-        try:
-            os.unlink(rootinfo_path)
-        except FileNotFoundError:
-            pass
 
 
 def test_async_notify_demo() -> None:

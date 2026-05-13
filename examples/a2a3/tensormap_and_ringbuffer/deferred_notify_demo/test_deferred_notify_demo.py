@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import tempfile
 from multiprocessing.shared_memory import SharedMemory
 
 import torch
@@ -23,8 +22,9 @@ from simpler.task_interface import (
     ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
-    ChipCommBootstrapConfig,
     ChipContext,
+    CommDomain,
+    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -112,11 +112,6 @@ def run(
     mailbox_nbytes = N * DTYPE_NBYTES
     counter_nbytes = 4
     window_size = max(mailbox_nbytes + counter_nbytes, 4 * 1024)
-    rootinfo_path = os.path.join(tempfile.gettempdir(), f"pto_deferred_notify_rootinfo_{os.getpid()}.bin")
-    try:
-        os.unlink(rootinfo_path)
-    except FileNotFoundError:
-        pass
 
     partial = [torch.full((N,), float(rank + 1), dtype=torch.float32).share_memory_() for rank in range(nranks)]
     result = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
@@ -127,23 +122,35 @@ def run(
             raise RuntimeError("SharedMemory buffer is unavailable")
         buf[:counter_nbytes] = b"\x00" * counter_nbytes
 
+    comm_plan = CommDomainPlan(
+        domains=[
+            CommDomain(
+                name="default",
+                worker_indices=list(range(nranks)),
+                window_size=window_size,
+                buffers=[
+                    ChipBufferSpec(name="mailbox", dtype="float32", count=N, nbytes=mailbox_nbytes),
+                    ChipBufferSpec(
+                        name="notify_counter",
+                        dtype="int32",
+                        count=1,
+                        nbytes=counter_nbytes,
+                        load_from_host=True,
+                    ),
+                ],
+            )
+        ]
+    )
     cfgs = [
         ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank, nranks=nranks, rootinfo_path=rootinfo_path, window_size=window_size
-            ),
-            buffers=[
-                ChipBufferSpec(name="mailbox", dtype="float32", count=N, nbytes=mailbox_nbytes),
-                ChipBufferSpec(
-                    name="notify_counter",
-                    dtype="int32",
-                    count=1,
-                    nbytes=counter_nbytes,
-                    load_from_host=True,
-                ),
-            ],
+            comm=comm_plan.bootstrap_for_worker(rank),
             host_inputs=[
-                HostBufferStaging(name="notify_counter", shm_name=counter_init_shms[rank].name, size=counter_nbytes)
+                HostBufferStaging(
+                    domain_name="default",
+                    name="notify_counter",
+                    shm_name=counter_init_shms[rank].name,
+                    size=counter_nbytes,
+                )
             ],
         )
         for rank in range(nranks)
@@ -166,11 +173,12 @@ def run(
 
         def orch_fn(orch, _args, cfg):
             for rank, ctx in enumerate(contexts):
+                domain = ctx.domains["default"]
                 args = TaskArgs()
                 args.add_tensor(make_tensor_arg(partial[rank]), TensorArgType.INPUT)
                 args.add_tensor(
                     ContinuousTensor.make(
-                        data=ctx.buffer_ptrs["mailbox"],
+                        data=domain.buffer_ptrs["mailbox"],
                         shapes=(N,),
                         dtype=DataType.FLOAT32,
                         child_memory=True,
@@ -180,14 +188,14 @@ def run(
                 args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
                 args.add_tensor(
                     ContinuousTensor.make(
-                        data=ctx.buffer_ptrs["notify_counter"],
+                        data=domain.buffer_ptrs["notify_counter"],
                         shapes=(1,),
                         dtype=DataType.INT32,
                         child_memory=True,
                     ),
                     TensorArgType.INPUT,
                 )
-                args.add_scalar(ctx.device_ctx)
+                args.add_scalar(domain.device_ctx)
                 orch.submit_next_level(chip_cid, args, cfg, worker=rank)
 
         worker.run(orch_fn, args=None, config=CallConfig())
@@ -201,10 +209,6 @@ def run(
         return 0 if ok else 1
     finally:
         worker.close()
-        try:
-            os.unlink(rootinfo_path)
-        except FileNotFoundError:
-            pass
         for shm in counter_init_shms:
             shm.close()
             shm.unlink()
