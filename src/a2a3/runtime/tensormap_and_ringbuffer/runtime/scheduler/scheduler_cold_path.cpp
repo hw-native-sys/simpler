@@ -840,8 +840,8 @@ int32_t SchedulerContext::init(
     }
     completed_tasks_.store(0, std::memory_order_release);
 
-    // Host orchestration: graph already built; device orch: orchestrator sets it.
-    orchestrator_done_ = runtime->get_orch_built_on_host();
+    // Device orchestration: the orchestrator thread flips this when the graph is built.
+    orchestrator_done_ = false;
 
     // Clear per-core dispatch payloads
     memset(payload_per_core_, 0, sizeof(payload_per_core_));

@@ -179,8 +179,6 @@ private:
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
 
-    // Device orchestration: when false, orchestration runs on device (thread 3)
-    bool orch_built_on_host_;
     void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
     void *gm_heap_ptr_;                      // GM heap for orchestrator output buffers (device)
     void *slot_states_ptr_;                  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
@@ -238,11 +236,9 @@ public:
     // Device orchestration (for AICPU thread 3)
     // =========================================================================
 
-    bool get_orch_built_on_host() const;
     void *get_gm_sm_ptr() const;
     void *get_gm_heap_ptr() const;
     const ChipStorageTaskArgs &get_orch_args() const;
-    void set_orch_built_on_host(bool v);
     void set_gm_sm_ptr(void *p);
     void set_gm_heap(void *p);
     void set_slot_states_ptr(void *p);
