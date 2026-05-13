@@ -53,37 +53,45 @@ def _bootstrap_rank_entry(  # noqa: PLR0913
         from simpler.task_interface import (
             ChipBootstrapConfig,
             ChipBufferSpec,
-            ChipCommBootstrapConfig,
             ChipWorker,
+            CommDomain,
+            CommDomainPlan,
         )
 
         worker = ChipWorker()
         worker.init(device_id, bins)
         result["stage"] = "init"
 
-        cfg = ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank,
-                nranks=nranks,
-                rootinfo_path=rootinfo_path,
-                window_size=window_size,
-            ),
-            buffers=[
-                ChipBufferSpec(
-                    name="x",
-                    dtype="float32",
-                    count=buffer_nbytes // 4,
-                    nbytes=buffer_nbytes,
+        plan = CommDomainPlan(
+            domains=[
+                CommDomain(
+                    name="default",
+                    worker_indices=list(range(nranks)),
+                    window_size=window_size,
+                    buffers=[
+                        ChipBufferSpec(
+                            name="x",
+                            dtype="float32",
+                            count=buffer_nbytes // 4,
+                            nbytes=buffer_nbytes,
+                        )
+                    ],
                 )
-            ],
+            ]
         )
+        cfg = ChipBootstrapConfig(comm=plan.bootstrap_for_worker(rank))
+        cfg.base_rank = rank
+        cfg.base_size = nranks
+        cfg.rootinfo_path = rootinfo_path
+        cfg.base_window_size = plan.base_window_size()
 
         res = worker.bootstrap_context(device_id=device_id, cfg=cfg)
+        domain = res.domains["default"]
         result["stage"] = "bootstrap"
-        result["device_ctx"] = int(res.device_ctx)
-        result["local_window_base"] = int(res.local_window_base)
-        result["actual_window_size"] = int(res.actual_window_size)
-        result["buffer_ptrs"] = list(res.buffer_ptrs)
+        result["device_ctx"] = int(domain.device_ctx)
+        result["local_window_base"] = int(domain.local_window_base)
+        result["actual_window_size"] = int(domain.actual_window_size)
+        result["buffer_ptrs"] = list(domain.buffer_ptrs.values())
 
         # Teardown mirrors the Worker bootstrap loop ordering: shutdown_bootstrap
         # (releases the HCCL comm handle) then finalize (releases ACL / unloads

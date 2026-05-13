@@ -74,6 +74,7 @@ struct CommHandle_ {
     CommContext host_ctx{};
     CommContext *device_ctx = nullptr;
     bool owns_device_ctx = false;
+    std::vector<CommContext *> derived_contexts;
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
 #endif
@@ -599,6 +600,78 @@ extern "C" int comm_get_window_size(CommHandle h, size_t *size_out) {
     return 0;
 }
 
+extern "C" int comm_derive_context(
+    CommHandle h, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank, size_t window_offset,
+    size_t window_size, uint64_t *device_ctx_out
+) try {
+    if (!h || !rank_ids || !device_ctx_out) return -1;
+    if (h->host_ctx.rankNum == 0) {
+        fprintf(stderr, "[comm rank %d] comm_derive_context: base windows are not allocated\n", h->rank);
+        return -1;
+    }
+    if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count) {
+        fprintf(
+            stderr, "[comm rank %d] comm_derive_context: invalid rank_count=%zu domain_rank=%u\n", h->rank, rank_count,
+            domain_rank
+        );
+        return -1;
+    }
+    if (window_offset + window_size > static_cast<size_t>(h->host_ctx.winSize)) {
+        fprintf(
+            stderr, "[comm rank %d] comm_derive_context: window range [%zu, %zu) exceeds base window size %llu\n",
+            h->rank, window_offset, window_offset + window_size, static_cast<unsigned long long>(h->host_ctx.winSize)
+        );
+        return -1;
+    }
+
+    CommContext ctx{};
+    ctx.workSpace = h->host_ctx.workSpace;
+    ctx.workSpaceSize = h->host_ctx.workSpaceSize;
+    ctx.rankId = domain_rank;
+    ctx.rankNum = static_cast<uint32_t>(rank_count);
+    ctx.winSize = window_size;
+    for (size_t i = 0; i < rank_count; ++i) {
+        uint32_t base_rank = rank_ids[i];
+        if (base_rank >= static_cast<uint32_t>(h->nranks)) {
+            fprintf(
+                stderr, "[comm rank %d] comm_derive_context: rank_ids[%zu]=%u out of range [0, %d)\n", h->rank, i,
+                base_rank, h->nranks
+            );
+            return -1;
+        }
+        ctx.windowsIn[i] = h->host_ctx.windowsIn[base_rank] + window_offset;
+        ctx.windowsOut[i] = h->host_ctx.windowsOut[base_rank] + window_offset;
+    }
+
+    void *newDevMem = nullptr;
+    aclError aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (aRet != ACL_SUCCESS) {
+        fprintf(
+            stderr, "[comm rank %d] comm_derive_context: aclrtMalloc failed: %d\n", h->rank, static_cast<int>(aRet)
+        );
+        return -1;
+    }
+    aRet = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (aRet != ACL_SUCCESS) {
+        fprintf(
+            stderr, "[comm rank %d] comm_derive_context: aclrtMemcpy H2D failed: %d\n", h->rank, static_cast<int>(aRet)
+        );
+        aclrtFree(newDevMem);
+        return -1;
+    }
+
+    auto *derived = reinterpret_cast<CommContext *>(newDevMem);
+    h->derived_contexts.push_back(derived);
+    *device_ctx_out = reinterpret_cast<uint64_t>(derived);
+    return 0;
+} catch (const std::exception &e) {
+    fprintf(stderr, "[comm] comm_derive_context: exception: %s\n", e.what());
+    return -1;
+} catch (...) {
+    fprintf(stderr, "[comm] comm_derive_context: unknown exception\n");
+    return -1;
+}
+
 extern "C" int comm_barrier(CommHandle h) {
     if (!h) return -1;
     // HcclBarrier is synchronous — it blocks until all ranks arrive.
@@ -629,6 +702,12 @@ extern "C" int comm_destroy(CommHandle h) try {
     if (h->owns_device_ctx && h->device_ctx) {
         aclrtFree(h->device_ctx);
     }
+    for (CommContext *ctx : h->derived_contexts) {
+        if (ctx != nullptr) {
+            aclrtFree(ctx);
+        }
+    }
+    h->derived_contexts.clear();
     if (h->hccl_comm) {
         HcclResult hret = hccl_comm_destroy(h->hccl_comm);
         if (hret != HCCL_SUCCESS) {
