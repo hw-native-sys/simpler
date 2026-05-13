@@ -31,8 +31,8 @@
 #include "ascend_hal.h"
 #include "callable.h"
 #include "callable_protocol.h"
+#include "chip_callable_layout.h"
 #include "utils/elf_build_id.h"
-#include "utils/fnv1a_64.h"
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
 
@@ -1257,33 +1257,21 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
         return 0;
     }
 
-    // Compute total ChipCallable buffer size from contents (header + storage_
-    // used). Mirrors make_callable<>()'s layout math.
-    constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
-    size_t storage_used = static_cast<size_t>(callable->binary_size());
-    for (int32_t i = 0; i < callable->child_count(); ++i) {
-        const CoreCallable &c = callable->child(i);
-        size_t child_total = CoreCallable::binary_data_offset() + static_cast<size_t>(c.binary_size());
-        size_t end = static_cast<size_t>(callable->child_offset(i)) + child_total;
-        if (end > storage_used) storage_used = end;
-    }
-    const size_t total_size = kHeaderSize + storage_used;
+    const ChipCallableLayout layout = compute_chip_callable_layout(callable);
 
     // Content-hash dedup: identical bytes → return cached chip_dev.
-    const auto *raw_bytes = reinterpret_cast<const uint8_t *>(callable);
-    const uint64_t hash = simpler::common::utils::fnv1a_64(raw_bytes, total_size);
-    auto it = chip_callable_buffers_.find(hash);
+    auto it = chip_callable_buffers_.find(layout.content_hash);
     if (it != chip_callable_buffers_.end()) {
         LOG_DEBUG(
             "Chip callable dedup hit: chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev, it->second.total_size,
-            hash
+            layout.content_hash
         );
         return it->second.chip_dev;
     }
 
-    void *gm_addr = mem_alloc_.alloc(total_size);
+    void *gm_addr = mem_alloc_.alloc(layout.total_size);
     if (gm_addr == nullptr) {
-        LOG_ERROR("Failed to allocate device GM for ChipCallable buffer (size=%zu)", total_size);
+        LOG_ERROR("Failed to allocate device GM for ChipCallable buffer (size=%zu)", layout.total_size);
         return 0;
     }
     const uint64_t chip_dev = reinterpret_cast<uint64_t>(gm_addr);
@@ -1293,26 +1281,21 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
     // device-side address of that child's binary code (so the AICPU dispatch
     // path's `reinterpret_cast<CoreCallable*>(addr)->resolved_addr()` lands
     // on the right device offset).
-    std::vector<uint8_t> scratch(total_size);
-    std::memcpy(scratch.data(), raw_bytes, total_size);
-    for (int32_t i = 0; i < callable->child_count(); ++i) {
-        const uint32_t off = callable->child_offset(i);
-        auto *child_in_scratch = reinterpret_cast<CoreCallable *>(scratch.data() + kHeaderSize + off);
-        uint64_t child_dev = chip_dev + kHeaderSize + off;
-        child_in_scratch->set_resolved_addr(child_dev + CoreCallable::binary_data_offset());
-    }
+    std::vector<uint8_t> scratch(layout.total_size);
+    std::memcpy(scratch.data(), callable, layout.total_size);
+    patch_chip_callable_scratch_for_device(callable, layout, chip_dev, scratch.data());
 
-    int rc = rtMemcpy(gm_addr, total_size, scratch.data(), total_size, RT_MEMCPY_HOST_TO_DEVICE);
+    int rc = rtMemcpy(gm_addr, layout.total_size, scratch.data(), layout.total_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy chip callable H2D failed: %d", rc);
         mem_alloc_.free(gm_addr);
         return 0;
     }
 
-    chip_callable_buffers_.emplace(hash, ChipCallableBuffer{chip_dev, total_size});
+    chip_callable_buffers_.emplace(layout.content_hash, ChipCallableBuffer{chip_dev, layout.total_size});
     LOG_DEBUG(
-        "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev, total_size,
-        callable->child_count(), hash
+        "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev, layout.total_size,
+        callable->child_count(), layout.content_hash
     );
     return chip_dev;
 }

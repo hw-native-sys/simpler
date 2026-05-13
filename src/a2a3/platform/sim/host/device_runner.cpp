@@ -37,10 +37,10 @@
 #include "aicpu/platform_aicpu_affinity.h"
 #include "callable.h"
 #include "callable_protocol.h"
-#include "utils/elf_build_id.h"
-#include "utils/fnv1a_64.h"
+#include "chip_callable_layout.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
+#include "utils/elf_build_id.h"
 
 // dep_gen_replay_emit_deps_json: strong symbol provided by
 // runtime/tensormap_and_ringbuffer/host/dep_gen_replay.cpp when that runtime is
@@ -1025,31 +1025,21 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
         return 0;
     }
 
-    constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
-    size_t storage_used = static_cast<size_t>(callable->binary_size());
-    for (int32_t i = 0; i < callable->child_count(); ++i) {
-        const CoreCallable &c = callable->child(i);
-        size_t child_total = CoreCallable::binary_data_offset() + static_cast<size_t>(c.binary_size());
-        size_t end = static_cast<size_t>(callable->child_offset(i)) + child_total;
-        if (end > storage_used) storage_used = end;
-    }
-    const size_t total_size = kHeaderSize + storage_used;
+    const ChipCallableLayout layout = compute_chip_callable_layout(callable);
 
-    const auto *raw_bytes = reinterpret_cast<const uint8_t *>(callable);
-    const uint64_t hash = simpler::common::utils::fnv1a_64(raw_bytes, total_size);
-    auto it = chip_callable_buffers_.find(hash);
+    auto it = chip_callable_buffers_.find(layout.content_hash);
     if (it != chip_callable_buffers_.end()) {
         LOG_DEBUG(
             "Chip callable dedup hit (sim): chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev,
-            it->second.total_size, hash
+            it->second.total_size, layout.content_hash
         );
         return it->second.chip_dev;
     }
 
     // Allocate host scratch (host == device in sim). Plain new[] keeps
     // ChipCallableBuffer::host_scratch ownership symmetric with finalize().
-    auto *scratch = new uint8_t[total_size];
-    std::memcpy(scratch, raw_bytes, total_size);
+    auto *scratch = new uint8_t[layout.total_size];
+    std::memcpy(scratch, callable, layout.total_size);
 
     // Per-child dlopen + dlsym kernel_entry + register pto-sim hooks, then
     // patch the child's resolved_addr_ to the function pointer. A scope guard
@@ -1065,7 +1055,7 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
 
     for (int32_t i = 0; i < callable->child_count(); ++i) {
         const uint32_t off = callable->child_offset(i);
-        auto *child_in_scratch = reinterpret_cast<CoreCallable *>(scratch + kHeaderSize + off);
+        auto *child_in_scratch = reinterpret_cast<CoreCallable *>(scratch + layout.header_size + off);
         const void *kernel_binary = child_in_scratch->binary_data();
         size_t kernel_size = static_cast<size_t>(child_in_scratch->binary_size());
 
@@ -1105,10 +1095,12 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
 
     cleanup.dismiss();
     const uint64_t chip_dev = reinterpret_cast<uint64_t>(scratch);
-    chip_callable_buffers_.emplace(hash, ChipCallableBuffer{chip_dev, scratch, total_size, std::move(dlopen_handles)});
+    chip_callable_buffers_.emplace(
+        layout.content_hash, ChipCallableBuffer{chip_dev, scratch, layout.total_size, std::move(dlopen_handles)}
+    );
     LOG_DEBUG(
-        "Uploaded chip callable (sim): chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev, total_size,
-        callable->child_count(), hash
+        "Uploaded chip callable (sim): chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev,
+        layout.total_size, callable->child_count(), layout.content_hash
     );
     return chip_dev;
 }
