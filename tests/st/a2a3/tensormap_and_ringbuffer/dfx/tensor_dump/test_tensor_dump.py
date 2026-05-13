@@ -18,6 +18,8 @@ least one entry was captured.
 """
 
 import json
+import subprocess
+import sys
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -108,6 +110,16 @@ class TestTensorDump(SceneTestCase):
         # vector_example reads/writes ≥1 tensor and the manifest can't be empty
         # if anything was captured. Robust to schema add/remove of new fields.
         assert bin_path.stat().st_size > 0, "tensor_dump.bin is empty"
+
+        # ---- Tool smoke: dump_viewer ----
+        # Exit-code-only check; the no-filter default lists every captured
+        # tensor without exporting. A schema change that breaks the viewer
+        # fires here in the same CI step that produced the dump.
+        subprocess.run(
+            [sys.executable, "-m", "simpler_setup.tools.dump_viewer", str(dump_dir)],
+            check=True,
+            timeout=60,
+        )
 
 
 if __name__ == "__main__":
