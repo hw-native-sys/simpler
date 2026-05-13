@@ -536,6 +536,14 @@ private:
     int ensure_device_initialized();
 
     /**
+     * Validate block_dim against the stream's CUBE/VECTOR core limits
+     * (aclrtGetStreamResLimit). When that query is unavailable or reports no
+     * cores, falls back to the static PLATFORM_MAX_BLOCKDIM cap.
+     * Returns 0 if block_dim fits, -1 otherwise (or if block_dim < 1).
+     */
+    int validate_block_dim(rtStream_t stream, int block_dim);
+
+    /**
      * Load AICPU SO and initialize device args
      *
      * Called by run() after prepare_run_context(). Reads aicpu_so_binary_ /
