@@ -22,6 +22,7 @@
 
 #include <pthread.h>
 
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -247,6 +248,18 @@ int simpler_init(
     if (ctx == NULL) return -1;
 
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
+
+    // CANN dlog must be levelled BEFORE the device context is opened
+    // (rtSetDevice inside attach_current_thread): CANN snapshots the
+    // device-side log session's level at context-open time, so a later
+    // dlog_setlevel is a no-op for the device side. HostLogger is already
+    // seeded here by libsimpler_log.so's simpler_log_init() (runs earlier in
+    // ChipWorker::init). Skipped when ASCEND_GLOBAL_LOG_LEVEL is externally
+    // configured — CANN keeps that.
+    if (std::getenv("ASCEND_GLOBAL_LOG_LEVEL") == NULL) {
+        dlog_setlevel(-1, HostLogger::get_instance().level(), /*enableEvent*/ 0);
+    }
+
     int rc;
     try {
         rc = runner->attach_current_thread(device_id);
@@ -261,13 +274,6 @@ int simpler_init(
         runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
     } catch (...) {
         return -1;
-    }
-
-    // CANN dlog: derive from HostLogger (seeded by libsimpler_log.so's
-    // simpler_log_init() earlier in ChipWorker::init) unless
-    // ASCEND_GLOBAL_LOG_LEVEL is externally configured.
-    if (std::getenv("ASCEND_GLOBAL_LOG_LEVEL") == NULL) {
-        dlog_setlevel(-1, HostLogger::get_instance().level(), /*enableEvent*/ 0);
     }
     return 0;
 }
