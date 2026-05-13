@@ -41,6 +41,7 @@
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "prepare_callable_common.h"
 
 // Helper: return current time in milliseconds
 static int64_t _now_ms() {
@@ -112,29 +113,18 @@ extern "C" int prepare_callable_impl(Runtime *runtime, const ChipCallable *calla
         return -1;
     }
 
-    // Single-shot upload of the entire ChipCallable buffer. DeviceRunner
-    // computes total size from contents, allocates device GM once, fixes up
-    // each child's resolved_addr_ in an internal host scratch, H2Ds once,
-    // and returns the device-side address of the ChipCallable header.
-    // Callers then compute child device addresses via offset arithmetic and
-    // write them to Runtime::func_id_to_addr_[] for AICPU dispatch.
-    if (callable->child_count() > 0) {
-        LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
-        uint64_t chip_dev = runtime->host_api.upload_chip_callable_buffer(callable);
-        if (chip_dev == 0) {
-            LOG_ERROR("Failed to upload ChipCallable buffer");
+    LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
+    std::vector<ChildKernelAddr> child_addrs;
+    if (upload_and_collect_child_addrs(callable, runtime->host_api.upload_chip_callable_buffer, &child_addrs) != 0) {
+        LOG_ERROR("Failed to upload ChipCallable buffer");
+        return -1;
+    }
+    for (const ChildKernelAddr &c : child_addrs) {
+        if (c.func_id < 0 || c.func_id >= RUNTIME_MAX_FUNC_ID) {
+            LOG_ERROR("func_id=%d is out of range [0, %d)", c.func_id, RUNTIME_MAX_FUNC_ID);
             return -1;
         }
-        constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
-        for (int32_t i = 0; i < callable->child_count(); i++) {
-            int func_id = callable->child_func_id(i);
-            if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-                LOG_ERROR("func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
-                return -1;
-            }
-            uint64_t child_dev = chip_dev + kHeaderSize + callable->child_offset(i);
-            runtime->set_function_bin_addr(func_id, child_dev);
-        }
+        runtime->set_function_bin_addr(c.func_id, c.device_addr);
     }
 
     const uint8_t *orch_so_binary = static_cast<const uint8_t *>(callable->binary_data());
