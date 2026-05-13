@@ -495,7 +495,15 @@ public:
      *
      * @return 0 on success, -1 if the cid is not registered.
      */
-    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    /**
+     * Replay a previously-registered callable's state onto a fresh Runtime
+     * for a per-run binding. Writes back kernel addrs, orch entry-symbol
+     * names, and active_callable_id; hands back the host orch function
+     * pointer (hbg path only) via `out_host_orch_func_ptr` for the caller
+     * to pass into bind_prepared_to_runtime_impl. trb path leaves the
+     * out-pointer at nullptr.
+     */
+    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id, void **out_host_orch_func_ptr);
 
     /**
      * Number of distinct callable_ids the AICPU has been asked to dlopen for.

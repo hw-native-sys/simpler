@@ -103,43 +103,43 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
  * @param callable  ChipCallable carrying the orch SO + child kernel binaries
  * @return 0 on success, -1 on failure
  */
-extern "C" int prepare_callable_impl(Runtime *runtime, const ChipCallable *callable) {
-    if (runtime == nullptr) {
-        LOG_ERROR("Runtime pointer is null");
-        return -1;
-    }
+extern "C" int prepare_callable_impl(
+    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), PreparedCallableArtifacts *out
+) {
     if (callable == nullptr) {
         LOG_ERROR("Callable pointer is null");
         return -1;
     }
+    if (upload_fn == nullptr || out == nullptr) {
+        LOG_ERROR("upload_fn or out is null");
+        return -1;
+    }
+    *out = PreparedCallableArtifacts{};
 
     LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
-    std::vector<ChildKernelAddr> child_addrs;
-    if (upload_and_collect_child_addrs(callable, runtime->host_api.upload_chip_callable_buffer, &child_addrs) != 0) {
+    if (upload_and_collect_child_addrs(callable, upload_fn, &out->kernel_addrs) != 0) {
         LOG_ERROR("Failed to upload ChipCallable buffer");
         return -1;
     }
-    for (const ChildKernelAddr &c : child_addrs) {
+    for (const ChildKernelAddr &c : out->kernel_addrs) {
         if (c.func_id < 0 || c.func_id >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("func_id=%d is out of range [0, %d)", c.func_id, RUNTIME_MAX_FUNC_ID);
             return -1;
         }
-        runtime->set_function_bin_addr(c.func_id, c.device_addr);
     }
 
     const uint8_t *orch_so_binary = static_cast<const uint8_t *>(callable->binary_data());
     size_t orch_so_size = callable->binary_size();
-    runtime->set_device_orch_func_name(callable->func_name());
-    runtime->set_device_orch_config_name(callable->config_name());
 
     if (orch_so_binary == nullptr || orch_so_size == 0) {
         LOG_ERROR("Orchestration SO binary is required for device orchestration");
         return -1;
     }
 
-    // Stage the orchestration SO for DeviceRunner::prepare_orch_so to consume.
-    runtime->pending_orch_so_data_ = orch_so_binary;
-    runtime->pending_orch_so_size_ = orch_so_size;
+    out->orch_so_data = orch_so_binary;
+    out->orch_so_size = orch_so_size;
+    out->func_name = callable->func_name();
+    out->config_name = callable->config_name();
     LOG_INFO_V0("Orchestration SO: %zu bytes staged (host-only)", orch_so_size);
     return 0;
 }
@@ -158,13 +158,21 @@ extern "C" int prepare_callable_impl(Runtime *runtime, const ChipCallable *calla
  * @param orch_args  Separated tensor/scalar arguments for this run
  * @return 0 on success, -1 on failure
  */
-extern "C" int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args) {
+extern "C" int
+bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
     }
     if (orch_args == nullptr) {
         LOG_ERROR("orch_args pointer is null");
+        return -1;
+    }
+    // trb runs orchestration on the device — there is no host-side orch
+    // function pointer to invoke. The c_api signature accepts one for
+    // symmetry with hbg; assert the trb-side invariant here.
+    if (host_orch_func_ptr != nullptr) {
+        LOG_ERROR("bind_prepared_to_runtime_impl: trb does not accept a host_orch_func_ptr");
         return -1;
     }
 

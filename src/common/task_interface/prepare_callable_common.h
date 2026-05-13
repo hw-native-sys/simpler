@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "callable.h"
@@ -31,6 +32,35 @@
 struct ChildKernelAddr {
     int func_id;
     uint64_t device_addr;
+};
+
+/**
+ * Output bundle from a runtime's prepare_callable_impl() — everything the
+ * platform layer needs to register a callable_id with its DeviceRunner.
+ *
+ * Replaces the per-field Runtime::pending_* sidecar that earlier callsites
+ * used as a "C ABI struggling with multiple return values" hack. Each
+ * runtime variant fills only the subset it produces:
+ *
+ *   - host_build_graph: kernel_addrs + host_dlopen_handle + host_orch_func_ptr
+ *                       (orch_so_* stay null since orch SO never crosses
+ *                       host/device on this runtime)
+ *   - tensormap_and_ringbuffer: kernel_addrs + orch_so_data + orch_so_size
+ *                       + func_name + config_name (orch SO is uploaded to
+ *                       device by DeviceRunner; host does no dlopen)
+ *
+ * func_name / config_name are non-empty only for the trb path; the hbg path
+ * resolves its entry symbol during prepare_callable_impl and stores the
+ * resulting function pointer in host_orch_func_ptr directly.
+ */
+struct PreparedCallableArtifacts {
+    std::vector<ChildKernelAddr> kernel_addrs;
+    void *host_dlopen_handle{nullptr};  // hbg only
+    void *host_orch_func_ptr{nullptr};  // hbg only
+    const void *orch_so_data{nullptr};  // trb only
+    size_t orch_so_size{0};             // trb only
+    std::string func_name;              // trb only (orch entry symbol)
+    std::string config_name;            // trb only (orch config symbol)
 };
 
 /**

@@ -18,12 +18,13 @@
 #include "pto_runtime_c_api.h"
 
 #include "callable.h"
+#include "prepare_callable_common.h"
 #include "task_args.h"
 
 #include <new>
 #include <pthread.h>
 
-#include <memory>
+#include <utility>
 #include <vector>
 
 #include "common/unified_log.h"
@@ -37,8 +38,10 @@ extern "C" {
 /* ===========================================================================
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
-int prepare_callable_impl(Runtime *runtime, const ChipCallable *callable);
-int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args);
+int prepare_callable_impl(
+    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), PreparedCallableArtifacts *out
+);
+int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr);
 int validate_runtime_impl(Runtime *runtime);
 
 /* ===========================================================================
@@ -238,42 +241,31 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
     pthread_setspecific(g_runner_key, ctx);
 
     try {
-        // Heap-allocate the temp Runtime — sizeof(Runtime) is in the tens of MB
-        // for hbg variants (RUNTIME_MAX_TASKS=131072), well past the stack
-        // budget. unique_ptr keeps the cleanup symmetric on every exit.
-        std::unique_ptr<Runtime> r_owner = std::make_unique<Runtime>();
-        Runtime *r = r_owner.get();
-        r->host_api.device_malloc = device_malloc;
-        r->host_api.device_free = device_free;
-        r->host_api.copy_to_device = copy_to_device;
-        r->host_api.copy_from_device = copy_from_device;
-        r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
-
-        int rc = prepare_callable_impl(r, reinterpret_cast<const ChipCallable *>(callable));
+        PreparedCallableArtifacts artifacts;
+        int rc = prepare_callable_impl(
+            reinterpret_cast<const ChipCallable *>(callable), upload_chip_callable_buffer_wrapper, &artifacts
+        );
         if (rc != 0) {
             pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
 
+        // Re-pack ChildKernelAddr -> std::pair to match the existing
+        // register_prepared_callable* signature.
         std::vector<std::pair<int, uint64_t>> kernel_addrs;
-        int kcount = r->get_registered_kernel_count();
-        kernel_addrs.reserve(kcount);
-        for (int i = 0; i < kcount; i++) {
-            int fid = r->get_registered_kernel_func_id(i);
-            kernel_addrs.emplace_back(fid, r->get_function_bin_addr(fid));
+        kernel_addrs.reserve(artifacts.kernel_addrs.size());
+        for (const ChildKernelAddr &c : artifacts.kernel_addrs) {
+            kernel_addrs.emplace_back(c.func_id, c.device_addr);
         }
-        r->clear_registered_kernels();
 
-        if (r->pending_host_dlopen_handle_ != nullptr) {
+        if (artifacts.host_dlopen_handle != nullptr) {
             rc = runner->register_prepared_callable_host_orch(
-                callable_id, r->pending_host_dlopen_handle_, r->pending_host_orch_func_ptr_, std::move(kernel_addrs)
+                callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs)
             );
-            r->pending_host_dlopen_handle_ = nullptr;
-            r->pending_host_orch_func_ptr_ = nullptr;
         } else {
             rc = runner->register_prepared_callable(
-                callable_id, r->pending_orch_so_data_, r->pending_orch_so_size_, r->get_device_orch_func_name(),
-                r->get_device_orch_config_name(), std::move(kernel_addrs)
+                callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
+                artifacts.config_name.c_str(), std::move(kernel_addrs)
             );
         }
         pthread_setspecific(g_runner_key, nullptr);
@@ -308,14 +300,15 @@ int run_prepared(
         r->host_api.copy_from_device = copy_from_device;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
-        int rc = runner->bind_prepared_callable_to_runtime(*r, callable_id);
+        void *host_orch_func_ptr = nullptr;
+        int rc = runner->bind_prepared_callable_to_runtime(*r, callable_id, &host_orch_func_ptr);
         if (rc != 0) {
             r->~Runtime();
             pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
 
-        rc = bind_prepared_to_runtime_impl(r, reinterpret_cast<const ChipStorageTaskArgs *>(args));
+        rc = bind_prepared_to_runtime_impl(r, reinterpret_cast<const ChipStorageTaskArgs *>(args), host_orch_func_ptr);
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
             validate_runtime_impl(r);

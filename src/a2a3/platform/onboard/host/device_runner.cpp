@@ -823,98 +823,41 @@ void DeviceRunner::print_handshake_results() {
 }
 
 int DeviceRunner::prepare_orch_so(Runtime &runtime) {
-    // Per-callable_id path: when run_prepared bound a known callable_id,
-    // the SO bytes were already H2D'd at prepare_callable time.
-    // We just stamp dev_orch_so on the runtime, plus mark `is_new` based on
-    // whether the AICPU has seen this id since registration.
+    // Prepared-callable flow only: the SO bytes were already H2D'd at
+    // prepare_callable time. Stamp dev_orch_so on the runtime and mark
+    // `is_new` based on whether the AICPU has seen this cid since
+    // registration.
     const int32_t cid = runtime.get_active_callable_id();
-    if (cid >= 0) {
-        auto it = prepared_callables_.find(cid);
-        if (it == prepared_callables_.end()) {
-            LOG_ERROR("prepare_orch_so: callable_id=%d not registered", cid);
-            return -1;
-        }
-        const auto &state = it->second;
-        // hbg variant: orch SO never crosses the host/device boundary, so the
-        // AICPU does no per-cid dlopen. Skip the orch_so_table_ bookkeeping
-        // (and the AICPU dlopen counter) and clear the device-orch metadata.
-        if (state.host_dlopen_handle != nullptr) {
-            runtime.set_dev_orch_so(0, 0);
-            runtime.set_active_callable_id(cid, /*is_new=*/false);
-            return 0;
-        }
-        const bool first_sighting = aicpu_seen_callable_ids_.insert(cid).second;
-        if (first_sighting) {
-            ++aicpu_dlopen_total_;
-        }
-        runtime.set_dev_orch_so(state.dev_orch_so_addr, state.dev_orch_so_size);
-        // The c_api caller passed is_new=false; refresh with the authoritative
-        // first_sighting flag before AICPU consumes register_new_callable_id_.
-        runtime.set_active_callable_id(cid, first_sighting);
-        // Pending fields must be empty in the prepared path — runtime_maker's
-        // bind_prepared_to_runtime_impl never stages them. Defensive clear:
-        runtime.pending_orch_so_data_ = nullptr;
-        runtime.pending_orch_so_size_ = 0;
-        LOG_INFO_V0(
-            "Orch SO prepared cid=%d hash=0x%lx %zu bytes (is_new=%d)", cid, state.hash, state.dev_orch_so_size,
-            first_sighting ? 1 : 0
-        );
-        return 0;
+    if (cid < 0) {
+        LOG_ERROR("prepare_orch_so: no active callable_id; prepared-callable flow required");
+        return -1;
     }
-
-    const void *host_so_data = runtime.pending_orch_so_data_;
-    const size_t host_so_size = runtime.pending_orch_so_size_;
-    runtime.pending_orch_so_data_ = nullptr;
-    runtime.pending_orch_so_size_ = 0;
-
-    if (host_so_data == nullptr || host_so_size == 0) {
-        // Host-orchestration mode (no device SO needed).
+    auto it = prepared_callables_.find(cid);
+    if (it == prepared_callables_.end()) {
+        LOG_ERROR("prepare_orch_so: callable_id=%d not registered", cid);
+        return -1;
+    }
+    const auto &state = it->second;
+    // hbg variant: orch SO never crosses the host/device boundary, so the
+    // AICPU does no per-cid dlopen. Skip the orch_so_table_ bookkeeping
+    // (and the AICPU dlopen counter) and clear the device-orch metadata.
+    if (state.host_dlopen_handle != nullptr) {
         runtime.set_dev_orch_so(0, 0);
+        runtime.set_active_callable_id(cid, /*is_new=*/false);
         return 0;
     }
-
-    const uint64_t new_hash = simpler::common::utils::elf_build_id_64(host_so_data, host_so_size);
-
-    if (new_hash == cached_orch_so_hash_ && dev_orch_so_buffer_ != nullptr) {
-        LOG_INFO_V0("Orch SO cache hit (hash=0x%lx, %zu bytes)", new_hash, host_so_size);
-        runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size);
-        return 0;
+    const bool first_sighting = aicpu_seen_callable_ids_.insert(cid).second;
+    if (first_sighting) {
+        ++aicpu_dlopen_total_;
     }
-
-    if (host_so_size > dev_orch_so_capacity_) {
-        if (dev_orch_so_buffer_ != nullptr) {
-            mem_alloc_.free(dev_orch_so_buffer_);
-            dev_orch_so_buffer_ = nullptr;
-            dev_orch_so_capacity_ = 0;
-        }
-        dev_orch_so_buffer_ = mem_alloc_.alloc(host_so_size);
-        if (dev_orch_so_buffer_ == nullptr) {
-            LOG_ERROR("Failed to allocate %zu bytes for orchestration SO buffer", host_so_size);
-            cached_orch_so_hash_ = 0;
-            return -1;
-        }
-        dev_orch_so_capacity_ = host_so_size;
-    }
-
-    // Persist a host-side copy so the rtMemcpy source is independent from
-    // any Python ctypes buffer the caller may release as soon as run()
-    // returns. This is also what runtime_maker hands us by reference.
-    host_orch_so_copy_.assign(
-        static_cast<const uint8_t *>(host_so_data), static_cast<const uint8_t *>(host_so_data) + host_so_size
+    runtime.set_dev_orch_so(state.dev_orch_so_addr, state.dev_orch_so_size);
+    // The c_api caller passed is_new=false; refresh with the authoritative
+    // first_sighting flag before AICPU consumes register_new_callable_id_.
+    runtime.set_active_callable_id(cid, first_sighting);
+    LOG_INFO_V0(
+        "Orch SO prepared cid=%d hash=0x%lx %zu bytes (is_new=%d)", cid, state.hash, state.dev_orch_so_size,
+        first_sighting ? 1 : 0
     );
-
-    int rc = rtMemcpy(
-        dev_orch_so_buffer_, dev_orch_so_capacity_, host_orch_so_copy_.data(), host_so_size, RT_MEMCPY_HOST_TO_DEVICE
-    );
-    if (rc != 0) {
-        LOG_ERROR("rtMemcpy for orchestration SO failed: %d", rc);
-        cached_orch_so_hash_ = 0;
-        return rc;
-    }
-
-    cached_orch_so_hash_ = new_hash;
-    runtime.set_dev_orch_so(reinterpret_cast<uint64_t>(dev_orch_so_buffer_), host_so_size);
-    LOG_INFO_V0("Orch SO cache miss (hash=0x%lx, %zu bytes uploaded)", new_hash, host_so_size);
     return 0;
 }
 
@@ -1045,7 +988,15 @@ bool DeviceRunner::has_prepared_callable(int32_t callable_id) const {
     return prepared_callables_.count(callable_id) != 0;
 }
 
-int DeviceRunner::bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id) {
+int DeviceRunner::bind_prepared_callable_to_runtime(
+    Runtime &runtime, int32_t callable_id, void **out_host_orch_func_ptr
+) {
+    if (out_host_orch_func_ptr == nullptr) {
+        LOG_ERROR("bind_prepared_callable_to_runtime: out_host_orch_func_ptr is null");
+        return -1;
+    }
+    *out_host_orch_func_ptr = nullptr;
+
     auto it = prepared_callables_.find(callable_id);
     if (it == prepared_callables_.end()) {
         LOG_ERROR("bind_prepared_callable_to_runtime: callable_id=%d not registered", callable_id);
@@ -1064,13 +1015,10 @@ int DeviceRunner::bind_prepared_callable_to_runtime(Runtime &runtime, int32_t ca
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
     }
-    // Replay both paths unconditionally — the runtime carries staging fields
-    // for both trb (device-side dlopen via entry-symbol names) and hbg (host-
-    // side dlopen handle + fn ptr). Whichever set was populated by
-    // register_prepared_callable / register_prepared_callable_host_orch wins;
-    // the other set stays at its initial value (empty string / nullptr).
-    runtime.pending_host_dlopen_handle_ = state.host_dlopen_handle;
-    runtime.pending_host_orch_func_ptr_ = state.host_orch_func_ptr;
+    // hbg path: host_orch_func_ptr travels back to the c_api caller, which
+    // hands it to bind_prepared_to_runtime_impl. trb path: stays null and
+    // the device-side orch SO is resolved from the symbol names below.
+    *out_host_orch_func_ptr = state.host_orch_func_ptr;
     runtime.set_device_orch_func_name(state.func_name.c_str());
     runtime.set_device_orch_config_name(state.config_name.c_str());
     // Stamp callable_id with is_new=false; prepare_orch_so refreshes the flag

@@ -317,20 +317,6 @@ public:
     // Host API function pointers for device memory operations
     // NOTE: Placed at end of class to avoid affecting device memory layout
     HostApi host_api;
-
-    // Host-only staging for orchestration SO. runtime_maker publishes the
-    // callable-owned pointer here; DeviceRunner consumes it before launching
-    // the device-side execution and replaces it with the device-resident
-    // buffer metadata (dev_orch_so_addr_, dev_orch_so_size_).
-    const void *pending_orch_so_data_{nullptr};
-    size_t pending_orch_so_size_{0};
-
-    // Host-orchestration staging (hbg path). Always nullptr on this trb
-    // variant — included for API parity with host_build_graph so the
-    // shared platform layer can branch on `pending_host_dlopen_handle_ !=
-    // nullptr` at runtime instead of via a build-time macro.
-    void *pending_host_dlopen_handle_{nullptr};
-    void *pending_host_orch_func_ptr_{nullptr};
 };
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

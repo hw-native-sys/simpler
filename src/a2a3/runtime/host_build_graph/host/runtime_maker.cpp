@@ -279,34 +279,35 @@ extern "C" {
 /**
  * Stage the per-callable resources for the host_build_graph variant: upload
  * kernel binaries and dlopen the orchestration SO on the host. The dlopen
- * handle and resolved entry-symbol pointer are parked on the runtime via
- * `pending_host_dlopen_handle_` / `pending_host_orch_func_ptr_` so the
- * platform layer can hoist them into PreparedCallableState. Splitting this
- * out of init_runtime_impl is what the hbg prepare_callable / run_prepared
- * path rests on — the dlopen runs once per cid instead of every run.
+ * handle and resolved entry-symbol pointer are returned via
+ * PreparedCallableArtifacts so the platform layer can hoist them into its
+ * PreparedCallableState. Splitting this out of init_runtime_impl is what
+ * the hbg prepare_callable / run_prepared path rests on — the dlopen runs
+ * once per cid instead of every run.
  */
-int prepare_callable_impl(Runtime *runtime, const ChipCallable *callable) {
-    if (runtime == nullptr) {
-        LOG_ERROR("Runtime pointer is null");
-        return -1;
-    }
+int prepare_callable_impl(
+    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), PreparedCallableArtifacts *out
+) {
     if (callable == nullptr) {
         LOG_ERROR("Callable pointer is null");
         return -1;
     }
+    if (upload_fn == nullptr || out == nullptr) {
+        LOG_ERROR("upload_fn or out is null");
+        return -1;
+    }
+    *out = PreparedCallableArtifacts{};
 
     LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
-    std::vector<ChildKernelAddr> child_addrs;
-    if (upload_and_collect_child_addrs(callable, runtime->host_api.upload_chip_callable_buffer, &child_addrs) != 0) {
+    if (upload_and_collect_child_addrs(callable, upload_fn, &out->kernel_addrs) != 0) {
         LOG_ERROR("Failed to upload ChipCallable buffer");
         return -1;
     }
-    for (const ChildKernelAddr &c : child_addrs) {
+    for (const ChildKernelAddr &c : out->kernel_addrs) {
         if (c.func_id < 0 || c.func_id >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("func_id=%d is out of range [0, %d)", c.func_id, RUNTIME_MAX_FUNC_ID);
             return -1;
         }
-        runtime->set_function_bin_addr(c.func_id, c.device_addr);
     }
 
     const uint8_t *orch_so_binary = static_cast<const uint8_t *>(callable->binary_data());
@@ -345,25 +346,19 @@ int prepare_callable_impl(Runtime *runtime, const ChipCallable *callable) {
 
     LOG_INFO_V0("Loaded orchestration function: %s", orch_func_name);
 
-    runtime->pending_host_dlopen_handle_ = handle;
-    runtime->pending_host_orch_func_ptr_ = reinterpret_cast<void *>(orch_func);
-    // hbg never uploads orch SO bytes to the device; clear the trb staging
-    // fields so DeviceRunner::register_prepared_callable cannot mistake this
-    // for a trb-shaped registration.
-    runtime->pending_orch_so_data_ = nullptr;
-    runtime->pending_orch_so_size_ = 0;
+    out->host_dlopen_handle = handle;
+    out->host_orch_func_ptr = reinterpret_cast<void *>(orch_func);
     return 0;
 }
 
 /**
  * Per-run binding for hbg: invoke the previously-resolved orchestration entry
  * point against the supplied args, then upload tensor info / allocation
- * storage. Assumes prepare_callable_impl populated
- * `pending_host_orch_func_ptr_` (either freshly during prepare_callable, or
- * via DeviceRunner::bind_prepared_callable_to_runtime when run_prepared
- * replays a prepared cid onto a fresh Runtime).
+ * storage. The c_api caller passes `host_orch_func_ptr` straight through from
+ * DeviceRunner::bind_prepared_callable_to_runtime (which read it from
+ * PreparedCallableState for this run's callable_id).
  */
-int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args) {
+int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -372,7 +367,7 @@ int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *o
         LOG_ERROR("orch_args pointer is null");
         return -1;
     }
-    OrchestrationFunc orch_func = reinterpret_cast<OrchestrationFunc>(runtime->pending_host_orch_func_ptr_);
+    OrchestrationFunc orch_func = reinterpret_cast<OrchestrationFunc>(host_orch_func_ptr);
     if (orch_func == nullptr) {
         LOG_ERROR("bind_prepared_to_runtime_impl: host orch_func pointer is null");
         return -1;
