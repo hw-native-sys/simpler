@@ -306,9 +306,9 @@ device_worker_main(device_id)
         dlopen(host_runtime.so, RTLD_LOCAL)
         create_device_context()
         simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)
+          dlog_setlevel(HostLogger.level())               sync CANN dlog before context open
           DeviceRunner::attach_current_thread(device_id)  rtSetDevice()
           DeviceRunner::set_executors(aicpu, aicore)
-          dlog_setlevel(HostLogger.level())               sync CANN dlog
 
     for each callable:
         ChipWorker.prepare_callable(cid, callable)

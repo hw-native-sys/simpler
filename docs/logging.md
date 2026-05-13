@@ -28,8 +28,8 @@ Python: logging.getLogger("simpler").setLevel(N)
             │                                              unified_log_* symbols
             │                                              resolve via (1)
             └─ simpler_init(ctx, device_id, aicpu*, aicore*)
-                                     ──→ attach thread + transfer executor binaries
                                      ──→ (onboard) dlog_setlevel(HostLogger.level())
+                                     ──→ attach thread + transfer executor binaries
 
 Per kernel launch:
        runner reads HostLogger.level() / .info_v() ──→ KernelArgs.log_level/info_v
@@ -240,7 +240,7 @@ CANN's level enum has no INFO sub-tiers.
 | `ChipWorker.init()` (Python) | `ctypes.CDLL(libsimpler_log.so, RTLD_GLOBAL)` → `simpler_log_init(sev,v)` (seeds HostLogger) → `ctypes.CDLL(libcpu_sim_context.so, RTLD_GLOBAL)` (sim) → `_ChipWorker.init` | `python/simpler/task_interface.py` |
 | `simpler_log_init` | `HostLogger.set_level/set_info_v` — only writer of log filter | `src/common/log/host_log.cpp` |
 | `_ChipWorker.init()` (C++) | `dlopen(host_runtime.so, RTLD_LOCAL)` → dlsym → `simpler_init` | `src/common/worker/chip_worker.cpp` |
-| `simpler_init` (per platform) | attach thread, transfer executor binaries to runner; (onboard) `dlog_setlevel(HostLogger.level())` | `src/{arch}/platform/{onboard,sim}/host/pto_runtime_c_api.cpp` |
+| `simpler_init` (per platform) | (onboard) `dlog_setlevel(HostLogger.level())` — must precede device-context open so CANN snapshots the requested level for the device-side log session; then attach thread, transfer executor binaries to runner | `src/{arch}/platform/{onboard,sim}/host/pto_runtime_c_api.cpp` |
 | Per kernel launch | runner reads `HostLogger.level() / info_v()` directly, writes into `KernelArgs`; AICPU `kernel.cpp` calls `set_log_level/set_log_info_v` on entry | `src/{arch}/platform/onboard/aicpu/kernel.cpp` |
 
 The Python-side level snapshot is **one-shot** at `Worker.init()`. Calling

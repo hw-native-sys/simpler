@@ -186,11 +186,11 @@ Python test_*.py (SceneTestCase)
                  ├─→ dlopen(host.so, RTLD_LOCAL) → resolve C API symbols via dlsym
                  ├─→ create_device_context() → DeviceContextHandle
                  └─→ simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)
+                      ├─→ (onboard) dlog_setlevel(HostLogger.level())   # before context open
                       ├─→ DeviceRunner::attach_current_thread(device_id)
                       │    ├─→ rtSetDevice(device_id) on onboard
                       │    └─→ pto_cpu_sim_bind+acquire on sim
-                      ├─→ DeviceRunner::set_executors(aicpu, aicore)
-                      └─→ (onboard) dlog_setlevel(HostLogger.level())
+                      └─→ DeviceRunner::set_executors(aicpu, aicore)
 ```
 
 ### 2. Initialization Phase
