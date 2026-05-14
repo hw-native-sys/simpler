@@ -55,12 +55,15 @@ Usage::
 """
 
 import ctypes
+import itertools
 import os
 import signal
 import struct
 import sys
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Optional
 
@@ -143,6 +146,17 @@ _CTRL_COPY_FROM = 3
 # not pay the H2D upload cost.  Sent from the parent right after init()
 # (or whenever a new ChipCallable cid is registered).
 _CTRL_PREPARE = 4
+# Dynamic post-init register of a ChipCallable. Parent stages the bytes
+# in a per-register POSIX shm and writes (cid, shm_name) into the mailbox;
+# the child mmaps the shm and calls prepare_callable_from_blob(cid, addr).
+# See docs/callable-ipc-dynamic-register.md for the design.
+_CTRL_REGISTER = 5
+
+# Reserved 32-byte region at the start of OFF_ARGS used by _CTRL_REGISTER to
+# carry the NUL-terminated POSIX shm name. POSIX shm names on Linux are
+# bounded well below this, but the on-wire field is fixed-width to keep
+# the layout simple.
+_CTRL_SHM_NAME_BYTES = 32
 
 # Control args layout (reuses task mailbox fields when state == _CONTROL_*):
 #   offset  8 (_OFF_CALLABLE):  uint64  sub-command
@@ -201,6 +215,22 @@ def _read_error_msg(buf) -> str:
 
 def _format_exc(prefix: str, exc: BaseException) -> str:
     return f"{prefix}: {type(exc).__name__}: {exc}"
+
+
+# Process-wide monotonic counter for _CTRL_REGISTER shm names. itertools.count()
+# is atomic under the GIL (single C ++ on tp_next), so no extra locking is
+# needed at the call site.
+_shm_name_counter = itertools.count()
+
+
+def _make_callable_shm_name(pid: int, cid: int) -> str:
+    """Build a unique POSIX shm name for one dynamic-register broadcast.
+
+    The pid prefix prevents collisions across simpler instances on the same
+    host; the monotonic counter disambiguates registers within one process.
+    Asserted to fit in ``_CTRL_SHM_NAME_BYTES`` including NUL at the caller.
+    """
+    return f"simpler-cb-{pid}-{cid}-{next(_shm_name_counter)}"
 
 
 def _read_args_from_mailbox(buf) -> TaskArgs:
@@ -274,7 +304,7 @@ def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id:
     prepared.add(cid)
 
 
-def _run_chip_main_loop(
+def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands + SHUTDOWN form the unified state machine; cannot collapse without obscuring dispatch
     cw: ChipWorker,
     buf: memoryview,
     mailbox_addr: int,
@@ -359,9 +389,37 @@ def _run_chip_main_loop(
                 elif sub_cmd == _CTRL_PREPARE:
                     cid = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]) & 0xFFFFFFFF
                     _ensure_prepared(cw, registry, prepared, cid, lazy=False, device_id=device_id)
+                elif sub_cmd == _CTRL_REGISTER:
+                    cid = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]) & 0xFFFFFFFF
+                    if cid >= MAX_REGISTERED_CALLABLE_IDS:
+                        raise RuntimeError(f"register cid={cid} chip={device_id}: cid out of range")
+                    raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
+                    nul = raw.find(b"\x00")
+                    shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+                    shm = SharedMemory(name=shm_name)
+                    try:
+                        shm_buf = shm.buf
+                        assert shm_buf is not None
+                        addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
+                        cw._impl.prepare_callable_from_blob(int(cid), addr)
+                    finally:
+                        # Release the local mmap as soon as prepare returns;
+                        # prepare_callable has already H2D-copied the bytes to
+                        # device GM, so the child no longer needs the shm.
+                        shm.close()
+                    prepared.add(int(cid))
             except Exception as e:  # noqa: BLE001
                 code = 1
-                msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
+                if sub_cmd == _CTRL_REGISTER:
+                    # Docs §6 mandates `register cid=<N> chip=<id>: <reason>`
+                    # so the parent can pinpoint failures across many chips.
+                    try:
+                        cid_v = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]) & 0xFFFFFFFF
+                    except Exception:  # noqa: BLE001
+                        cid_v = -1
+                    msg = _format_exc(f"register cid={cid_v} chip={device_id}", e)
+                else:
+                    msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
             _write_error(buf, code, msg)
             _mailbox_store_i32(state_addr, _CONTROL_DONE)
         elif state == _SHUTDOWN:
@@ -588,6 +646,13 @@ class Worker:
         self._callable_registry: dict[int, Any] = {}
         self._initialized = False
 
+        # Serializes Worker.register against itself and against Worker.run.
+        # `_orch_in_flight` is bumped inside Worker.run under this lock so
+        # dynamic register can refuse mid-run calls (see docs §5: the
+        # scheduler is provably idle outside Worker.run).
+        self._register_lock = threading.Lock()
+        self._orch_in_flight = 0
+
         # Level-2 internals
         self._chip_worker: Optional[ChipWorker] = None
 
@@ -635,40 +700,135 @@ class Worker:
         ``orch.submit_sub(cid, …)``.
 
         Timing constraints:
-          - L3+: must be called **before** ``init()`` so the COW-inherited
-            registry is visible to forked chip / sub children.  ChipCallables
-            are pre-warmed by pushing ``_CTRL_PREPARE`` to every chip child
-            during ``init()``.
+          - L3+: Python callables (sub fn / orch fn) must be registered
+            **before** ``init()`` so the COW-inherited registry is visible to
+            forked chip / sub children. ChipCallables may be registered either
+            before init (pre-warmed via ``_CTRL_PREPARE`` during ``init()``)
+            or after init (broadcast to chip children via ``_CTRL_REGISTER``;
+            see docs/callable-ipc-dynamic-register.md). Post-init register at
+            L3+ is ChipCallable-only and must run in a quiescent state
+            (no concurrent ``Worker.run``).
           - L2: may be called either before or after ``init()`` (no fork,
             no COW constraint).  When called post-init, ChipCallables are
             prepared on the device immediately; pre-init registrations are
             batched and prepared at the end of ``init()``.
+          - L4+: post-init ChipCallable register is not yet implemented
+            (deferred to the L4 cascade commit).
         """
-        if self.level >= 3 and self._initialized:
-            raise RuntimeError(
-                "Worker.register() at level >= 3 must be called before init() "
-                "(forked children inherit the registry via COW)"
-            )
-        if len(self._callable_registry) >= MAX_REGISTERED_CALLABLE_IDS:
-            # The AICPU side keeps a fixed-size orch_so_table_ keyed by cid;
-            # raise here so the failure surfaces at register-time with a
-            # protocol-aware message, not later from
-            # DeviceRunner::register_prepared_callable with a generic
-            # "out of range" log.
-            raise RuntimeError(
-                "Worker.register: cid space exhausted "
-                f"(MAX_REGISTERED_CALLABLE_IDS={MAX_REGISTERED_CALLABLE_IDS}); "
-                "unregister unused callables before registering more"
-            )
-        cid = len(self._callable_registry)
-        self._callable_registry[cid] = target
+        with self._register_lock:
+            if self.level >= 3 and self._initialized:
+                # L3+ post-init: only ChipCallable is supported (Python
+                # callables cannot cross the process boundary).
+                if not isinstance(target, ChipCallable):
+                    raise NotImplementedError(
+                        "Worker.register() at level >= 3 must be called before init() "
+                        "for non-ChipCallable targets; only ChipCallable is supported "
+                        "post-init (see docs/callable-ipc-dynamic-register.md)"
+                    )
+                if self.level >= 4:
+                    raise NotImplementedError(
+                        "Post-init Worker.register(ChipCallable) at level >= 4 is not "
+                        "yet implemented (L4 cascade is a separate commit)"
+                    )
+                if self._orch_in_flight > 0:
+                    raise RuntimeError(
+                        "Worker.register() cannot be called while Worker.run() is "
+                        "executing; serialize register/run on the same thread"
+                    )
+            if len(self._callable_registry) >= MAX_REGISTERED_CALLABLE_IDS:
+                # The AICPU side keeps a fixed-size orch_so_table_ keyed by cid;
+                # raise here so the failure surfaces at register-time with a
+                # protocol-aware message, not later from
+                # DeviceRunner::register_prepared_callable with a generic
+                # "out of range" log.
+                raise RuntimeError(
+                    "Worker.register: cid space exhausted "
+                    f"(MAX_REGISTERED_CALLABLE_IDS={MAX_REGISTERED_CALLABLE_IDS}); "
+                    "unregister unused callables before registering more"
+                )
+            cid = len(self._callable_registry)
+            self._callable_registry[cid] = target
 
-        # L2 post-init: pre-warm immediately so the very first
-        # `Worker.run(cid, …)` is a clean cache hit.
-        if self.level == 2 and self._initialized and isinstance(target, ChipCallable):
-            assert self._chip_worker is not None
-            self._chip_worker.prepare_callable(cid, target)
-        return cid
+            # L3 post-init ChipCallable: broadcast to chip children via shm.
+            # On failure we pop the registry entry so a retry gets a fresh cid.
+            if self.level == 3 and self._initialized and isinstance(target, ChipCallable):
+                try:
+                    self._post_init_register(cid, target)
+                except Exception:
+                    self._callable_registry.pop(cid, None)
+                    raise
+                return cid
+
+            # L2 post-init: pre-warm immediately so the very first
+            # `Worker.run(cid, …)` is a clean cache hit.
+            if self.level == 2 and self._initialized and isinstance(target, ChipCallable):
+                assert self._chip_worker is not None
+                self._chip_worker.prepare_callable(cid, target)
+            return cid
+
+    def _post_init_register(self, cid: int, target: ChipCallable) -> None:
+        """Broadcast a new ChipCallable to every chip child via _CTRL_REGISTER.
+
+        Stages the ChipCallable bytes into a per-register POSIX shm, then
+        broadcasts the (cid, shm_name) tuple to every chip child in parallel
+        via ``concurrent.futures.ThreadPoolExecutor``. Each child mmaps the
+        shm and calls ``_ChipWorker.prepare_callable_from_blob`` (eager
+        prepare per docs §4). Parent unlinks the shm after all ACKs.
+
+        On any child failure, the parent raises ``RuntimeError`` without
+        rolling back already-ACKed children — the resulting partial state
+        is inert garbage that is overwritten on cid reuse (docs §5).
+        """
+        # Chip children are forked lazily on the first Worker.run() via
+        # _start_hierarchical; before that point the chip mailboxes have
+        # no reader and a CTRL_REGISTER broadcast would deadlock. In that
+        # pre-fork window, just leave the cid in the parent's registry —
+        # _start_hierarchical's prewarm loop will _CTRL_PREPARE it for
+        # every chip child once they come up (the entry is CoW-inherited).
+        if not getattr(self, "_hierarchical_started", False):
+            return
+        blob_ptr = target.buffer_ptr()
+        blob_size = target.buffer_size()
+        shm_name = _make_callable_shm_name(os.getpid(), cid)
+        # +1 for the NUL terminator the child slice-decodes against.
+        assert len(shm_name.encode("utf-8")) + 1 <= _CTRL_SHM_NAME_BYTES, (
+            f"shm name too long for mailbox field: {shm_name!r}"
+        )
+        shm = SharedMemory(create=True, size=blob_size, name=shm_name)
+        try:
+            shm_buf = shm.buf
+            assert shm_buf is not None
+            ctypes.memmove(
+                ctypes.addressof(ctypes.c_char.from_buffer(shm_buf)),
+                blob_ptr,
+                blob_size,
+            )
+            n = len(self._chip_shms)
+            if n == 0:
+                # Degenerate L3 with no chip children: nothing to broadcast.
+                return
+            errors: list[str] = []
+            with ThreadPoolExecutor(max_workers=n) as ex:
+                futures = {ex.submit(self._chip_control_register, wid, cid, shm_name): wid for wid in range(n)}
+                # Don't break on first failure — let every child's mailbox
+                # return to IDLE before we unlink the shm.
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(str(exc))
+            if errors:
+                raise RuntimeError(
+                    f"Worker.register(cid={cid}) failed; {len(errors)} of {n} chips "
+                    f"reported errors. First error: {errors[0]}. "
+                    f"{len(errors) - 1} additional error(s) suppressed."
+                )
+        finally:
+            shm.close()
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
 
     def add_worker(self, worker: "Worker") -> None:
         """Add a lower-level Worker as a NEXT_LEVEL child. Must be called before init().
@@ -1082,6 +1242,41 @@ class Worker:
         _mailbox_store_i32(state_addr, _IDLE)
         return result
 
+    def _chip_control_register(self, worker_id: int, cid: int, shm_name: str) -> None:
+        """Send _CTRL_REGISTER (cid + shm name) to chip child *worker_id*.
+
+        Separate from ``_chip_control`` because it writes an extra payload
+        (shm name) into the OFF_ARGS region rather than a single uint64
+        result; the wire shapes are different enough that one helper would
+        muddle both contracts.
+        """
+        if worker_id < 0 or worker_id >= len(self._chip_shms):
+            raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
+        shm = self._chip_shms[worker_id]
+        buf = shm.buf
+        assert buf is not None
+        state_addr = _buffer_field_addr(buf, _OFF_STATE)
+        _write_error(buf, 0, "")
+        struct.pack_into("Q", buf, _OFF_CALLABLE, _CTRL_REGISTER)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG0, cid)
+        encoded = shm_name.encode("utf-8")
+        assert len(encoded) + 1 <= _CTRL_SHM_NAME_BYTES, f"shm name too long: {shm_name!r}"
+        buf[_OFF_ARGS : _OFF_ARGS + len(encoded)] = encoded
+        # Zero-pad the rest of the name field so a stale name from a
+        # previous control op never leaks into this register.
+        buf[_OFF_ARGS + len(encoded) : _OFF_ARGS + _CTRL_SHM_NAME_BYTES] = b"\x00" * (
+            _CTRL_SHM_NAME_BYTES - len(encoded)
+        )
+        _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
+        while _mailbox_load_i32(state_addr) != _CONTROL_DONE:
+            pass
+        error = struct.unpack_from("i", buf, _OFF_ERROR)[0]
+        if error != 0:
+            err_msg = _read_error_msg(buf)
+            _mailbox_store_i32(state_addr, _IDLE)
+            raise RuntimeError(f"chip {worker_id}: {err_msg}")
+        _mailbox_store_i32(state_addr, _IDLE)
+
     def malloc(self, size: int, worker_id: int = 0) -> int:
         """Allocate memory on next-level worker *worker_id*. Returns a pointer."""
         if self.level == 2:
@@ -1132,31 +1327,43 @@ class Worker:
         assert self._initialized, "Worker not initialized; call init() first"
         cfg = config if config is not None else CallConfig()
 
-        if self.level == 2:
-            assert self._chip_worker is not None
-            self._chip_worker.run_prepared(int(callable), args, cfg)
-        else:
-            self._start_hierarchical()
-            assert self._orch is not None
-            assert self._worker is not None
-            # Drop any error stashed by a previous run() so this call starts
-            # clean. drain() rethrows on the way out; every successful run()
-            # leaves the error slot empty, but an unrelated caller may have
-            # poked it.
-            self._orch._clear_error()
-            self._orch._scope_begin()
-            try:
-                callable(self._orch, args, cfg)
-            finally:
-                # Always release scope refs and drain so ring slots aren't
-                # stranded when the orch fn raises mid-DAG. drain() also
-                # rethrows the first dispatch failure for this run — that
-                # is how child-task exceptions surface to the caller of
-                # Worker.run(). scope_end deliberately does NOT throw: if
-                # it did, released refs would be incomplete and drain
-                # would hang on in-flight tasks.
-                self._orch._scope_end()
-                self._orch._drain()
+        # Bump the in-flight counter so a concurrent Worker.register() can
+        # refuse and surface a clear error instead of writing CTRL_REQUEST
+        # over a TASK_READY mailbox that the C++ scheduler is mid-dispatch
+        # on. The counter is only meaningful at L3+, but keeping it
+        # unconditional keeps the lock discipline simple.
+        with self._register_lock:
+            self._orch_in_flight += 1
+        try:
+            if self.level == 2:
+                assert self._chip_worker is not None
+                self._chip_worker.run_prepared(int(callable), args, cfg)
+            else:
+                self._start_hierarchical()
+                assert self._orch is not None
+                assert self._worker is not None
+                # Drop any error stashed by a previous run() so this call
+                # starts clean. drain() rethrows on the way out; every
+                # successful run() leaves the error slot empty, but an
+                # unrelated caller may have poked it.
+                self._orch._clear_error()
+                self._orch._scope_begin()
+                try:
+                    callable(self._orch, args, cfg)
+                finally:
+                    # Always release scope refs and drain so ring slots
+                    # aren't stranded when the orch fn raises mid-DAG.
+                    # drain() also rethrows the first dispatch failure
+                    # for this run — that is how child-task exceptions
+                    # surface to the caller of Worker.run().  scope_end
+                    # deliberately does NOT throw: if it did, released
+                    # refs would be incomplete and drain would hang on
+                    # in-flight tasks.
+                    self._orch._scope_end()
+                    self._orch._drain()
+        finally:
+            with self._register_lock:
+                self._orch_in_flight -= 1
 
     def prepare_callable(self, callable_id: int, callable) -> None:
         """L2 only: pre-stage a callable under ``callable_id`` (see

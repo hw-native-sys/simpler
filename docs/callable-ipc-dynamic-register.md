@@ -222,12 +222,17 @@ is inert garbage and is overwritten when the cid is reused.
 ### Concurrency
 
 - A `self._register_lock` (`threading.Lock`) serializes register calls
-  across parent threads.
-- Register and TASK_READY must serialize on the same per-mailbox mutex.
-  The Python `_chip_control` path holds `mailbox_mu_`; the C++
-  scheduler holds the same mutex when posting TASK_READY. **The
-  implementation must verify this is literally the same lock**; if not,
-  bridging them is a prerequisite to this feature.
+  across parent threads. It also gates `Worker.run` entry/exit, which
+  increments and decrements a `_orch_in_flight` counter.
+- **Register is quiescent-state-only.** The Python `_chip_control` path
+  is **unlocked** with respect to the C++ scheduler's `mailbox_mu_` —
+  the two paths do not share a mutex. Safety relies on the scheduler
+  being provably idle outside `Worker.run()`: no orch fn → no submits
+  → no `dispatch_process`. The parent enforces this by checking
+  `_orch_in_flight == 0` under `_register_lock` and raising
+  `RuntimeError` if a register races a run. This matches the existing
+  Python-only model of `_CTRL_PREPARE`, which is also issued only at
+  init-time.
 - Same-level broadcast runs in parallel. Parent writes CTRL_REQUEST
   concurrently to every chip mailbox and waits for all ACKs. Latency
   drops from `N × prepare_cost` to `1 × prepare_cost`. Parallel
@@ -288,6 +293,11 @@ For the broader callable / task data flow, see
   responsible for not unregistering a cid with outstanding work.
 - Path to raising `MAX_REGISTERED_CALLABLE_IDS` beyond 64. Requires
   AICPU-side changes to `orch_so_table_` and is out of scope here.
+- Lifting the quiescent-state constraint to support register during
+  `Worker.run()` would require a C++-side `WorkerThread::control_register`
+  method (mirror `control_malloc`) that acquires `mailbox_mu_` and
+  serializes against `dispatch_process`. No production use case
+  demands this today; deferred.
 
 ---
 

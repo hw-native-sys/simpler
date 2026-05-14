@@ -13,12 +13,13 @@ Each test verifies a distinct aspect of the L3 scheduling pipeline.
 """
 
 import struct
+import threading
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
-from simpler.task_interface import DataType, TaskArgs, TensorArgType
-from simpler.worker import Worker
+from simpler.task_interface import ChipCallable, DataType, TaskArgs, TensorArgType
+from simpler.worker import Worker, _make_callable_shm_name
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,12 +65,90 @@ class TestLifecycle:
             hw.register(lambda args: None)
         # close() called by __exit__, no exception
 
-    def test_register_after_init_raises(self):
+    def test_register_python_fn_after_init_raises(self):
+        # Post-init register of a non-ChipCallable (lambda / sub fn) is
+        # rejected because Python callables cannot cross the fork boundary.
+        # ChipCallable is the only post-init target — see the next test.
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
-        with pytest.raises(RuntimeError, match="before init"):
+        with pytest.raises(NotImplementedError, match="only ChipCallable is supported post-init"):
             hw.register(lambda args: None)
         hw.close()
+
+    def test_register_chip_callable_after_init_no_chips_succeeds(self):
+        # With no chip children (device_ids unset), the dynamic register
+        # broadcast loop iterates over zero mailboxes — exercises the
+        # facade path (lock, _post_init_register, shm create/unlink,
+        # registry insertion) end-to-end without needing an NPU.
+        hw = Worker(level=3, num_sub_workers=0)
+        hw.init()
+        try:
+            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+            cid = hw.register(callable_obj)
+            assert isinstance(cid, int)
+            assert cid >= 0
+        finally:
+            hw.close()
+
+    def test_register_chip_callable_at_cid_overflow_raises(self):
+        # cid budget is enforced under the new dynamic-register path too:
+        # pre-fill registry with lambdas pre-init, init, then attempt one
+        # post-init ChipCallable register and observe the existing
+        # MAX_REGISTERED_CALLABLE_IDS RuntimeError.
+        hw = Worker(level=3, num_sub_workers=0)
+        try:
+            for _ in range(MAX_REGISTERED_CALLABLE_IDS):
+                hw.register(lambda args: None)
+            hw.init()
+            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+            with pytest.raises(RuntimeError, match="MAX_REGISTERED_CALLABLE_IDS"):
+                hw.register(callable_obj)
+        finally:
+            hw.close()
+
+    def test_register_chip_callable_during_run_raises(self):
+        # The quiescent-state guard: a register call that races a Worker.run
+        # must surface a clear RuntimeError instead of deadlocking on a
+        # CONTROL_REQUEST that overlaps an in-flight TASK_READY. The orch fn
+        # signals once it is in flight (which is also after Worker.run() has
+        # bumped _orch_in_flight under _register_lock); the side thread
+        # waits for that signal before attempting register.
+        hw = Worker(level=3, num_sub_workers=1)
+        hw.register(lambda args: None)
+        hw.init()
+        try:
+            run_started = threading.Event()
+            release = threading.Event()
+            register_err: list[BaseException] = []
+
+            def orch(orch_handle, _args, _cfg):
+                run_started.set()
+                release.wait(timeout=5.0)
+
+            def try_register():
+                # Wait until orch fn is in flight (guarantees _orch_in_flight
+                # was bumped to 1 before our register attempts to acquire
+                # _register_lock).
+                assert run_started.wait(timeout=5.0), "orch never started"
+                try:
+                    callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+                    hw.register(callable_obj)
+                except BaseException as e:  # noqa: BLE001
+                    register_err.append(e)
+                finally:
+                    release.set()
+
+            t = threading.Thread(target=try_register)
+            t.start()
+            try:
+                hw.run(orch)
+            finally:
+                t.join(timeout=5.0)
+            assert register_err, "expected register to raise during run"
+            assert isinstance(register_err[0], RuntimeError)
+            assert "Worker.run() is executing" in str(register_err[0])
+        finally:
+            hw.close()
 
     def test_register_overflow_raises(self):
         # The AICPU side reserves a fixed-size orch_so_table_[MAX_REGISTERED_CALLABLE_IDS];
@@ -489,3 +568,23 @@ class TestSubCallableArgs:
         finally:
             result_shm.close()
             result_shm.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Test: _CTRL_REGISTER shm name helper
+# ---------------------------------------------------------------------------
+
+
+class TestCallableShmName:
+    def test_make_callable_shm_name_unique(self):
+        # Consecutive calls with the same (pid, cid) must produce different
+        # names — the monotonic counter is the disambiguator that lets
+        # multiple registers coexist without POSIX shm name collisions.
+        a = _make_callable_shm_name(1234, 7)
+        b = _make_callable_shm_name(1234, 7)
+        assert a != b
+        # Both must fit in the on-wire field with a NUL terminator (32 B).
+        assert len(a.encode("utf-8")) + 1 <= 32
+        assert len(b.encode("utf-8")) + 1 <= 32
+        assert a.startswith("simpler-cb-1234-7-")
+        assert b.startswith("simpler-cb-1234-7-")
