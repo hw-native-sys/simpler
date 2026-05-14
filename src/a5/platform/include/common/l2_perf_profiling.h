@@ -262,10 +262,15 @@ enum class AicpuPhaseId : uint32_t {
 };
 
 /**
- * Single AICPU scheduler phase record (32 bytes)
+ * Single AICPU scheduler phase record (40 bytes)
  *
  * Records one phase within one loop iteration of a scheduler thread.
  * No thread_id field: identity is derived from array index (position = identity).
+ *
+ * extra1 / extra2 carry phase-specific stats; meaning is keyed by phase_id:
+ *   SCHED_DISPATCH: extra1 = pop_hit delta since last emit
+ *                   extra2 = pop_miss delta since last emit
+ *   All other phases: extras are 0 (reserved for future per-phase metrics).
  */
 struct AicpuPhaseRecord {
     uint64_t start_time;    // Phase start timestamp
@@ -277,7 +282,10 @@ struct AicpuPhaseRecord {
                                    // (ring_id << 32) | local_id for cross-view correlation.
         uint64_t tasks_processed;  // Scheduler phases: number of tasks processed in this batch
     };
+    uint32_t extra1;  // Phase-specific delta (e.g. SCHED_DISPATCH = pop_hit)
+    uint32_t extra2;  // Phase-specific delta (e.g. SCHED_DISPATCH = pop_miss)
 };
+static_assert(sizeof(AicpuPhaseRecord) == 40, "AicpuPhaseRecord layout drift");
 
 /**
  * AICPU orchestrator cumulative summary

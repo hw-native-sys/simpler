@@ -384,17 +384,12 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
             cycles_to_us(sched_total), cur_thread_completed
         );
 
-        double notify_avg =
-            cur_thread_completed > 0 ? static_cast<double>(l2_perf.notify_edges_total) / cur_thread_completed : 0.0;
-        double fanin_avg =
-            cur_thread_completed > 0 ? static_cast<double>(l2_perf.fanin_edges_total) / cur_thread_completed : 0.0;
+        // fanout / fanin per-thread aggregates live in
+        // sched_overhead_analysis.compute_dag_stats_from_deps (deps.json edges
+        // × core_to_thread).
         LOG_INFO_V9(
-            "Thread %d:   complete       : %.3fus (%.1f%%)  [fanout: edges=%" PRIu64
-            ", max_degree=%d, avg=%.1f]  [fanin: "
-            "edges=%" PRIu64 ", max_degree=%d, avg=%.1f]",
-            thread_idx, cycles_to_us(l2_perf.sched_complete_cycle), l2_perf.sched_complete_cycle * 100.0 / sched_total,
-            static_cast<uint64_t>(l2_perf.notify_edges_total), l2_perf.notify_max_degree, notify_avg,
-            static_cast<uint64_t>(l2_perf.fanin_edges_total), l2_perf.fanin_max_degree, fanin_avg
+            "Thread %d:   complete       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_perf.sched_complete_cycle),
+            l2_perf.sched_complete_cycle * 100.0 / sched_total
         );
 
         uint64_t c_parent = l2_perf.sched_complete_cycle > 0 ? l2_perf.sched_complete_cycle : 1;
@@ -436,12 +431,12 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
             cycles_to_us(l2_perf.sched_complete_perf_cycle), l2_perf.sched_complete_perf_cycle * 100.0 / c_parent
         );
 
-        uint64_t pop_total = l2_perf.pop_hit + l2_perf.pop_miss;
-        double pop_hit_rate = pop_total > 0 ? l2_perf.pop_hit * 100.0 / pop_total : 0.0;
+        // pop_hit / pop_miss per-emit deltas live in each v2 JSON dispatch
+        // record's extras; sum-of-deltas equals the run-cumulative tracked
+        // in this struct (final-drain emit covers the trailing-idle tail).
         LOG_INFO_V9(
-            "Thread %d:   dispatch       : %.3fus (%.1f%%)  [pop: hit=%" PRIu64 ", miss=%" PRIu64 ", hit_rate=%.1f%%]",
-            thread_idx, cycles_to_us(l2_perf.sched_dispatch_cycle), l2_perf.sched_dispatch_cycle * 100.0 / sched_total,
-            static_cast<uint64_t>(l2_perf.pop_hit), static_cast<uint64_t>(l2_perf.pop_miss), pop_hit_rate
+            "Thread %d:   dispatch       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_perf.sched_dispatch_cycle),
+            l2_perf.sched_dispatch_cycle * 100.0 / sched_total
         );
         uint64_t global_dispatch_count = l2_perf.pop_hit - l2_perf.local_dispatch_count;
         uint64_t total_dispatched = l2_perf.local_dispatch_count + global_dispatch_count;

@@ -127,10 +127,13 @@ void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads);
  * @param tasks_processed Number of tasks processed in this batch (scheduler phases), or
  *                        full PTO2 task_id encoding (ring_id << 32) | local_id (orchestrator
  *                        phases in tensormap_and_ringbuffer)
+ * @param extra1, extra2  Phase-specific delta counters (see AicpuPhaseRecord doc).
+ *                        SCHED_DISPATCH uses extra1=pop_hit, extra2=pop_miss; other
+ *                        phases pass 0.
  */
 void l2_perf_aicpu_record_phase(
     int thread_idx, AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint64_t tasks_processed
+    uint64_t tasks_processed, uint32_t extra1 = 0, uint32_t extra2 = 0
 );
 
 /**

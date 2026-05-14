@@ -148,14 +148,14 @@ Thread 1: Scheduler summary: total_time=168.620us, loops=3880, tasks_scheduled=9
 
 ```text
 Thread X: === Scheduler Phase Breakdown: total=XXXus, XXX tasks ===
-Thread X:   complete       : XXXus (XX.X%)  [fanout: edges=XXX, max_degree=X, avg=X.X]  [fanin: edges=XXX, max_degree=X, avg=X.X]
+Thread X:   complete       : XXXus (XX.X%)
 Thread X:     poll         : XXXus (XX.X%)  hit=XXX, miss=XXX, hit_rate=XX.X%
 Thread X:     otc_lock     : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
 Thread X:     otc_fanout   : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
 Thread X:     otc_fanin    : XXXus (XX.X%)  atomics=XXX
 Thread X:     otc_self     : XXXus (XX.X%)  atomics=XXX
 Thread X:     perf         : XXXus (XX.X%)
-Thread X:   dispatch       : XXXus (XX.X%)  [pop: hit=XXX, miss=XXX, hit_rate=XX.X%]
+Thread X:   dispatch       : XXXus (XX.X%)
 Thread X:     poll         : XXXus (XX.X%)
 Thread X:     pop          : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
 Thread X:     setup        : XXXus (XX.X%)
@@ -164,6 +164,10 @@ Thread X:   idle           : XXXus (XX.X%)
 Thread X:   avg/complete   : XXXus
 Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 ```
+
+Per-thread fanout / fanin edge counts and ready-queue pop hit / miss
+stats live in the v2 JSON `aicpu_scheduler_phases[]` and `deps.json`;
+consume them via `simpler_setup/tools/sched_overhead_analysis.py`.
 
 ---
 

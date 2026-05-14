@@ -349,17 +349,17 @@ struct alignas(64) SchedL2PerfCounters {
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
     uint32_t phase_dispatch_count{0};
+    // Run-cumulative pop counters; the v2 JSON dispatch-record emitter writes
+    // per-emit deltas computed as (current - pop_*_at_last_emit) and the
+    // end-of-run cold-path log reads the cumulatives directly.
+    uint64_t pop_hit{0};
+    uint64_t pop_miss{0};
+    uint64_t pop_hit_at_last_emit{0};
+    uint64_t pop_miss_at_last_emit{0};
 #if PTO2_SCHED_PROFILING
     uint32_t phase_wiring_count{0};
     uint64_t complete_probe_count{0};
     uint64_t complete_hit_count{0};
-    uint64_t notify_edges_total{0};
-    int32_t notify_max_degree{0};
-    uint64_t notify_tasks_enqueued{0};
-    uint64_t fanin_edges_total{0};
-    int32_t fanin_max_degree{0};
-    uint64_t pop_hit{0};
-    uint64_t pop_miss{0};
     uint64_t local_dispatch_count{0};
     uint64_t local_overflow_count{0};
     uint64_t sched_complete_perf_cycle{0};
