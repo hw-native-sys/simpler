@@ -180,10 +180,10 @@ class TestLifecycle:
 
                 monkeypatch.setattr(simpler.worker, "_make_callable_shm_name", capture_shm_name)
 
-                def fail_broadcast(self, worker_id, cid, shm_name):
-                    raise RuntimeError(f"chip {worker_id}: register cid={cid} chip=0: simulated")
+                def fail_broadcast(self, mailbox, label, cid, shm_name):
+                    raise RuntimeError(f"{label}: register cid={cid} chip=0: simulated")
 
-                monkeypatch.setattr(Worker, "_chip_control_register", fail_broadcast)
+                monkeypatch.setattr(Worker, "_mailbox_control_register", fail_broadcast)
 
                 callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
                 registry_size_before = len(hw._callable_registry)
@@ -292,10 +292,10 @@ class TestLifecycle:
             hw._hierarchical_started = True
             try:
 
-                def fail_unregister(self, worker_id, cid):
-                    raise RuntimeError(f"chip {worker_id}: unregister cid={cid} chip=0: simulated")
+                def fail_unregister(self, mailbox, label, cid):
+                    raise RuntimeError(f"{label}: unregister cid={cid} chip=0: simulated")
 
-                monkeypatch.setattr(Worker, "_chip_control_unregister", fail_unregister)
+                monkeypatch.setattr(Worker, "_mailbox_control_unregister", fail_unregister)
 
                 hw.unregister(cid)  # must NOT raise — best-effort
                 assert cid not in hw._callable_registry

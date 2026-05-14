@@ -440,6 +440,29 @@ NB_MODULE(_task_interface, m) {
             "Build a ChipCallable from signature, func_name, binary, and list of (func_id, CoreCallable) children."
         )
 
+        .def_static(
+            "from_bytes",
+            [](nb::bytes raw) -> PyChipCallable {
+                // Reconstruct a ChipCallable wrapper from the contiguous
+                // serialised representation produced by `buffer_ptr()` /
+                // `buffer_size()`. Used by the L4 cascade in
+                // _child_worker_loop, which receives CTRL_REGISTER bytes
+                // through shared memory and needs a typed ChipCallable to
+                // hand to inner_worker.register; see
+                // docs/callable-ipc-dynamic-register.md.
+                std::vector<uint8_t> buf(
+                    reinterpret_cast<const uint8_t *>(raw.c_str()),
+                    reinterpret_cast<const uint8_t *>(raw.c_str()) + raw.size()
+                );
+                return PyChipCallable{std::move(buf)};
+            },
+            nb::arg("raw"),
+            "Reconstruct a ChipCallable from the contiguous bytes that "
+            "buffer_ptr() points to (size buffer_size()). Inverse of the "
+            "serialisation used to ship a ChipCallable across the L4 "
+            "cascade IPC channel."
+        )
+
         .def(
             "sig",
             [](const PyChipCallable &self, int32_t i) -> ArgDirection {
