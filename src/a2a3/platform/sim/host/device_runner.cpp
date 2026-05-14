@@ -878,33 +878,24 @@ bool DeviceRunner::has_prepared_callable(int32_t callable_id) const {
     return prepared_callables_.count(callable_id) != 0;
 }
 
-int DeviceRunner::bind_prepared_callable_to_runtime(
-    Runtime &runtime, int32_t callable_id, void **out_host_orch_func_ptr
-) {
-    if (out_host_orch_func_ptr == nullptr) {
-        LOG_ERROR("bind_prepared_callable_to_runtime: out_host_orch_func_ptr is null");
-        return -1;
-    }
-    *out_host_orch_func_ptr = nullptr;
-
+BindPreparedCallableResult DeviceRunner::bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id) {
     auto it = prepared_callables_.find(callable_id);
     if (it == prepared_callables_.end()) {
         LOG_ERROR("bind_prepared_callable_to_runtime: callable_id=%d not registered", callable_id);
-        return -1;
+        return {-1, nullptr};
     }
     const auto &state = it->second;
     for (const auto &kv : state.kernel_addrs) {
         if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("bind_prepared_callable_to_runtime: func_id=%d out of range", kv.first);
-            return -1;
+            return {-1, nullptr};
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
     }
-    *out_host_orch_func_ptr = state.host_orch_func_ptr;
     runtime.set_device_orch_func_name(state.func_name.c_str());
     runtime.set_device_orch_config_name(state.config_name.c_str());
     runtime.set_active_callable_id(callable_id, /*is_new=*/false);
-    return 0;
+    return {0, state.host_orch_func_ptr};
 }
 
 int DeviceRunner::finalize() {

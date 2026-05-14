@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "callable.h"
+#include "prepare_callable_common.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
 #include "common/l2_perf_profiling.h"
@@ -498,12 +499,11 @@ public:
     /**
      * Replay a previously-registered callable's state onto a fresh Runtime
      * for a per-run binding. Writes back kernel addrs, orch entry-symbol
-     * names, and active_callable_id; hands back the host orch function
-     * pointer (hbg path only) via `out_host_orch_func_ptr` for the caller
-     * to pass into bind_prepared_to_runtime_impl. trb path leaves the
-     * out-pointer at nullptr.
+     * names, and active_callable_id; returns the hbg `host_orch_func_ptr`
+     * (or nullptr on trb / on error) inside a `BindPreparedCallableResult`
+     * so the caller can destructure with structured bindings.
      */
-    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id, void **out_host_orch_func_ptr);
+    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
 
     /**
      * Number of distinct callable_ids the AICPU has been asked to dlopen for.

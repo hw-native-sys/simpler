@@ -334,13 +334,13 @@ int run_prepared(
         r->host_api.copy_from_device = copy_from_device;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
-        // Restore kernel addrs + orch symbol names + active_callable_id, and
-        // (hbg only) hand back the host_orch_func_ptr saved at prepare time.
-        void *host_orch_func_ptr = nullptr;
-        rc = runner->bind_prepared_callable_to_runtime(*r, callable_id, &host_orch_func_ptr);
-        if (rc != 0) {
+        // Restore kernel addrs + orch symbol names + active_callable_id; the
+        // returned host_orch_func_ptr is non-null only on the hbg path and is
+        // handed straight into bind_prepared_to_runtime_impl below.
+        auto [bind_rc, host_orch_func_ptr] = runner->bind_prepared_callable_to_runtime(*r, callable_id);
+        if (bind_rc != 0) {
             r->~Runtime();
-            return rc;
+            return bind_rc;
         }
 
         // Per-run binding (tensor args, GM heap, SM alloc)

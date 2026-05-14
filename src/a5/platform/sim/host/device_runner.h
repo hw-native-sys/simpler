@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "callable.h"
+#include "prepare_callable_common.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -225,7 +226,7 @@ public:
     bool has_prepared_callable(int32_t callable_id) const;
 
     /** Replay prepared state onto a freshly-constructed Runtime. */
-    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id, void **out_host_orch_func_ptr);
+    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
 
     /** Monotonic AICPU dlopen counter (first-sighting only; never decremented). */
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }

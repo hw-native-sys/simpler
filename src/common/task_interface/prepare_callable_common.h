@@ -64,6 +64,25 @@ struct PreparedCallableArtifacts {
 };
 
 /**
+ * Result of DeviceRunner::bind_prepared_callable_to_runtime — what the c_api
+ * needs to pass on to bind_prepared_to_runtime_impl for a per-run binding.
+ *
+ * Returning a struct (rather than a `void**` out-parameter) keeps the caller
+ * site idiomatic — destructure with C++17 structured bindings:
+ *
+ *     auto [rc, host_orch_func_ptr] =
+ *         runner->bind_prepared_callable_to_runtime(*r, callable_id);
+ *
+ * `host_orch_func_ptr` is type-erased as `void *` (rather than the concrete
+ * OrchestrationFunc) so this header stays runtime-agnostic; only the hbg path
+ * sets it. trb leaves it null and bind_prepared_to_runtime_impl asserts so.
+ */
+struct BindPreparedCallableResult {
+    int rc{0};
+    void *host_orch_func_ptr{nullptr};
+};
+
+/**
  * Upload the ChipCallable buffer via `upload_fn` and compute the device-side
  * address of every child kernel.
  *

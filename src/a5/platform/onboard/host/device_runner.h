@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "callable.h"
+#include "prepare_callable_common.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
 #include "common/l2_perf_profiling.h"
@@ -413,7 +414,7 @@ public:
      * Replay the prepared state for `callable_id` onto a freshly-constructed
      * Runtime. See a2a3 onboard documentation for full contract.
      */
-    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id, void **out_host_orch_func_ptr);
+    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
 
     /**
      * Number of distinct callable_ids the AICPU has been asked to dlopen for.

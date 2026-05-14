@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "callable.h"
+#include "prepare_callable_common.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -229,7 +230,7 @@ public:
     );
     int unregister_prepared_callable(int32_t callable_id);
     bool has_prepared_callable(int32_t callable_id) const;
-    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id, void **out_host_orch_func_ptr);
+    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
