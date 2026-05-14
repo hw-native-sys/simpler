@@ -150,6 +150,58 @@ class TestLifecycle:
         finally:
             hw.close()
 
+    def test_register_chip_callable_broadcast_failure_rolls_back(self, monkeypatch):
+        # Forces _post_init_register down the CTRL_REGISTER broadcast path
+        # (hierarchical_started=True + a fake chip mailbox), then makes the
+        # broadcast helper raise. Verifies the parent rolls back cleanly:
+        # registry entry popped, shm unlinked, RuntimeError surfaced. This
+        # is the only test that exercises the failure path end-to-end on
+        # the facade — the ST suite cannot stage a deterministic
+        # prepare-time fault in the chip child.
+        import simpler.worker  # noqa: PLC0415
+
+        hw = Worker(level=3, num_sub_workers=0)
+        hw.register(lambda args: None)
+        hw.init()
+        try:
+            # Splice a placeholder mailbox so the broadcast loop iterates
+            # once; the monkeypatched helper never reads it.
+            fake_mailbox = SharedMemory(create=True, size=4096)
+            hw._chip_shms.append(fake_mailbox)
+            hw._hierarchical_started = True
+            try:
+                captured_shm_names: list[str] = []
+                real_make = simpler.worker._make_callable_shm_name
+
+                def capture_shm_name(pid, cid):
+                    name = real_make(pid, cid)
+                    captured_shm_names.append(name)
+                    return name
+
+                monkeypatch.setattr(simpler.worker, "_make_callable_shm_name", capture_shm_name)
+
+                def fail_broadcast(self, worker_id, cid, shm_name):
+                    raise RuntimeError(f"chip {worker_id}: register cid={cid} chip=0: simulated")
+
+                monkeypatch.setattr(Worker, "_chip_control_register", fail_broadcast)
+
+                callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+                registry_size_before = len(hw._callable_registry)
+                with pytest.raises(RuntimeError, match=r"failed; 1 of 1 chips reported errors"):
+                    hw.register(callable_obj)
+                # cid was popped — registry size is unchanged.
+                assert len(hw._callable_registry) == registry_size_before
+                # The shm the parent staged for the broadcast was unlinked.
+                assert len(captured_shm_names) == 1
+                with pytest.raises(FileNotFoundError):
+                    SharedMemory(name=captured_shm_names[0])
+            finally:
+                hw._chip_shms.pop()
+                fake_mailbox.close()
+                fake_mailbox.unlink()
+        finally:
+            hw.close()
+
     def test_register_overflow_raises(self):
         # The AICPU side reserves a fixed-size orch_so_table_[MAX_REGISTERED_CALLABLE_IDS];
         # Worker.register must surface the bound at register-time, not later when
