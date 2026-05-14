@@ -13,7 +13,7 @@ import pytest
 from .main import run
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(3)
 def test_domain_rank_map(st_platform, st_device_ids, capsys):

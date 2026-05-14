@@ -13,7 +13,7 @@ import pytest
 from .main import run
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
 def test_ep_dispatch_combine(st_platform, st_device_ids):
