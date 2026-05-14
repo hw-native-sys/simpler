@@ -640,6 +640,19 @@ NB_MODULE(_task_interface, m) {
             "via run_prepared. Variants without per-callable_id support raise."
         )
         .def(
+            "prepare_callable_from_blob",
+            [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr) {
+                self.prepare_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
+            },
+            nb::arg("callable_id"), nb::arg("blob_ptr"),
+            "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
+            "post-fork dynamic register handlers that receive the ChipCallable "
+            "bytes via shared memory; see docs/callable-ipc-dynamic-register.md). "
+            "Equivalent to prepare_callable(cid, ChipCallable) but accepts the "
+            "ChipCallable layout pointer directly so chip-child loops can prepare "
+            "from shm without rebuilding a PyChipCallable wrapper."
+        )
+        .def(
             "run_prepared",
             [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config) {
                 self.run_prepared(callable_id, &args, config);
