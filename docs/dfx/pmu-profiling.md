@@ -447,32 +447,28 @@ the collector thread drains buffers concurrently with kernel execution.
 On a5 the copy hooks add `rtMemcpy` round-trips that a2a3's shared
 memory avoids, but these overlap with device execution.
 
-For meaningful per-task numbers on a2a3, also rebuild the runtime with
-`PTO2_DISABLE_DUAL_ISSUE=1` (see §7.1) — this serialization itself
-costs throughput, so keep dual-issue settings consistent across runs
-being compared.
+For meaningful per-task numbers on a2a3 the runtime collapses to
+single-issue dispatch automatically whenever `--enable-pmu` is set (see
+§7.1) — this serialization itself costs throughput, so PMU-on
+measurements are not comparable to PMU-off baselines.
 
 ## 7. Limitations
 
 ### 7.1 a2a3
 
 PMU collection assumes each logical AICore has at most one in-flight
-task. The default dual-issue dispatch can preload a pending task while
+task. The default dual-issue dispatch preloads a pending task while
 another task is still running on the same core, so per-core PMU
-registers can carry overlapping task windows. For accurate per-task
-counters, rebuild the runtime with:
-
-```text
-PTO2_DISABLE_DUAL_ISSUE=1
-```
+registers can carry overlapping task windows. To keep counters scoped
+to a single task, `--enable-pmu` automatically collapses dispatch to
+single-issue at runtime — both `host_build_graph` and
+`tensormap_and_ringbuffer` runtimes branch on `is_pmu_enabled()` in
+their dispatch path. No separate flag or rebuild is required.
 
 Notes on this constraint:
 
-- `--enable-pmu` enables collection; the dual-issue toggle is a
-  separate compile-time flag in the runtime headers
-  (`host_build_graph` and `tensormap_and_ringbuffer`).
-- Keep PMU comparisons consistent by using the same dual-issue
-  setting across all runs being compared.
+- PMU-on runs serialize dispatch per core, so throughput is lower than
+  PMU-off baselines. The two are not directly comparable.
 - `a2a3sim` exercises the export pipeline; counter values come from
   the simulation backend, not real hardware, so they are not suitable
   for performance analysis.
@@ -525,8 +521,11 @@ group does not populate the columns shown — check the `event_type`
 column and the per-architecture event table in §3.3.
 
 **Counter values look polluted on a2a3.** Dual-issue dispatch is
-overlapping tasks on the same core. Rebuild the runtime with
-`PTO2_DISABLE_DUAL_ISSUE=1` (§7.1).
+overlapping tasks on the same core. `--enable-pmu` should already
+collapse dispatch to single-issue at runtime (§7.1); if pollution
+persists, verify that `is_pmu_enabled()` returns true on every AICPU
+thread and that the dispatch loop branch in `scheduler_dispatch.cpp`
+and `aicpu_executor.cpp` hasn't been bypassed.
 
 **`record count mismatch (... diff=M)` on a5.** Slot-mismatch loss —
 this should be 0 on DAV_3510. Treat as a regression: see §7.2 for the

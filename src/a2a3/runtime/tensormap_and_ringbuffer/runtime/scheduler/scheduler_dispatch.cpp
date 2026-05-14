@@ -28,6 +28,10 @@
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
 // =============================================================================
 // Dispatch helpers
 // =============================================================================
@@ -372,6 +376,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
     bool cores_released = false;
 
+    // PMU runs require single-issue dispatch — overlapping in-flight tasks
+    // pollute per-task PMU counters, so skip the PENDING pre-load phase.
+    // Cached at function scope: is_pmu_enabled() is extern "C" and the
+    // compiler cannot hoist it across the dispatch loop on its own.
+    const bool pmu_active = is_pmu_enabled();
+
 #if PTO2_PROFILING
     l2_perf.sched_start_ts = get_sys_cnt_aicpu();
 #endif
@@ -545,11 +555,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES && !entered_drain; si++) {
             PTO2ResourceShape shape = dispatch_order[si];
-#if PTO2_DISABLE_DUAL_ISSUE
-            for (auto phase : {CoreTracker::DispatchPhase::IDLE}) {
-#else
             for (auto phase : {CoreTracker::DispatchPhase::IDLE, CoreTracker::DispatchPhase::PENDING}) {
-#endif
+                if (phase == CoreTracker::DispatchPhase::PENDING && unlikely(pmu_active)) break;
                 dispatch_shape(
                     thread_idx, shape, phase, local_bufs[static_cast<int32_t>(shape)], tracker, entered_drain,
                     made_progress, try_pushed

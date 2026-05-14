@@ -28,6 +28,10 @@
 #include "runtime.h"
 #include "spin_hint.h"
 
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
 constexpr int MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 constexpr int MAX_CORES = PLATFORM_MAX_CORES;
@@ -671,6 +675,11 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
     int verification_warning_count = 0;
     const int MAX_VERIFICATION_WARNINGS = 10;
     bool l2_perf_enabled = is_l2_swimlane_enabled();
+    // PMU runs require single-issue dispatch — overlapping in-flight tasks
+    // pollute per-task PMU counters. Cached at function scope:
+    // is_pmu_enabled() is extern "C" and the compiler cannot hoist it
+    // across the dispatch loop on its own.
+    const bool pmu_active = is_pmu_enabled();
 
     // Extract array pointers as local variables for better readability and performance
     int *cur_ready_queue_aic = cur_ready_queue_aic_[thread_idx];
@@ -931,14 +940,11 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 }
             }
 
-            // Case 4: Dispatch new task if pending slot is available
-            // With PTO2_DISABLE_DUAL_ISSUE=1, additionally require the running
-            // slot to be empty so each core has at most one outstanding task.
-#if PTO2_DISABLE_DUAL_ISSUE
-            if (pending_task_ids_[core_id] == AICPU_TASK_INVALID && running_task_ids_[core_id] == AICPU_TASK_INVALID) {
-#else
-            if (pending_task_ids_[core_id] == AICPU_TASK_INVALID) {
-#endif
+            // Case 4: Dispatch new task if pending slot is available. When PMU
+            // is active we additionally require the running slot to be empty —
+            // see pmu_active comment above the dispatch loop.
+            if (pending_task_ids_[core_id] == AICPU_TASK_INVALID &&
+                (!unlikely(pmu_active) || running_task_ids_[core_id] == AICPU_TASK_INVALID)) {
                 if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                     if (try_dispatch_task(
                             core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
