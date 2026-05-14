@@ -180,9 +180,10 @@ Three layers cooperate; the split is the same across architectures:
   shared region.
 - **AICPU** programs the PMU event group at init, starts/stops the
   counters via `PMU_CTRL_0/1`, observes per-task FIN, and commits one
-  `PmuRecord` per task. Stamps `PmuBufferState::owning_thread_id` with
-  the AICPU scheduler thread that drives the core (per-buffer, stable
-  for a run).
+  `PmuRecord` per task. The owning AICPU scheduler thread index is
+  carried out of band on the ready-queue entry (its per-thread queue
+  index in `PmuDataHeader::queues[thread][...]`) and threaded through
+  to the CSV row as `thread_id`.
 - **AICore** brackets the counting window around the kernel body via
   `CTRL` SPR bit 0.
 
@@ -193,9 +194,8 @@ end-to-end; §5.4 is a side-by-side comparison.
 ### 5.1 Common interfaces
 
 `kernel_args.pmu_data_base` is the single device-side handle host
-publishes for the run. Its target struct shape differs per
-architecture (a2a3 uses `PmuDataHeader`; a5 uses `PmuSetupHeader`),
-but in both cases it carries:
+publishes for the run. Its target struct is `PmuDataHeader` on both
+architectures; in both cases it carries:
 
 - `num_cores` — number of AICore instances in use
 - `event_type` — `PmuEventType` value the host wrote at init time
@@ -203,10 +203,14 @@ but in both cases it carries:
 AICPU reads it on init to find per-core state. On every task FIN it
 commits a `PmuRecord` and increments `PmuBufferState::total_record_count`.
 On the drop path it increments `PmuBufferState::dropped_record_count`
-instead. Host uses these two counters at finalize for the cross-check:
+instead. a5 also tracks `PmuBufferState::mismatch_record_count` for
+records lost to ring-slot `task_id` mismatch (a hard invariant
+violation, distinct from capacity drops). Host uses these counters at
+finalize for the cross-check:
 
 ```text
-collected_on_host + dropped == total
+collected_on_host + dropped + mismatch == total   (a5, 3 buckets)
+collected_on_host + dropped == total              (a2a3, 2 buckets)
 ```
 
 ### 5.2 a2a3 — shared-memory streaming (DAV_2201, 8 counters)
@@ -300,48 +304,78 @@ buffer pooling, and `Module` trait pattern are shared with TensorDump
 and L2Perf — see [profiling-framework.md](../profiling-framework.md) for
 the framework reference.
 
-### 5.3 a5 — streaming with host shadow buffers (DAV_3510, 10 counters)
+### 5.3 a5 — same framework, host-shadow transport (DAV_3510, 10 counters)
 
 AICore reads the 10 PMU counters via the `ld_dev` MMIO load intrinsic
 into a per-core dual-issue staging slot indexed by `reg_task_id & 1`.
 AICPU, on observing FIN, validates the slot's recorded `task_id`
 against the register token, copies the record into
 `PmuBuffer::records[count]`, fills `func_id` / `core_type`, and
-advances `count`. When a buffer is full, AICPU switches to a new
+advances `count`. When a buffer fills up, AICPU switches to a new
 buffer via the SPSC free queue / ready queue protocol (identical to
 a2a3). At shutdown, AICPU flushes any partially-filled buffers via
-`pmu_aicpu_flush_buffers()`. The host runs a dedicated collector
-thread that polls ready queues via `rtMemcpy`, writes records to CSV,
-and recycles buffers back into SPSC free queues.
+`pmu_aicpu_flush_buffers()`.
+
+a5's `PmuCollector` derives from
+`ProfilerBase<PmuCollector, PmuModule>` and shares the mgmt + poll
+thread structure with a2a3. The single behavioral deviation from
+§5.2 is the **transport channel**: a5 has no `halHostRegister`, so
+each device buffer is paired with a host-shadow `malloc()` and the
+mgmt loop synchronizes the two via `profiling_copy.h` (`rtMemcpy`
+onboard, `memcpy` in sim). `MemoryOps` therefore carries five
+callbacks (`alloc` / `reg` / `free_` / `copy_to_device` /
+`copy_from_device`); the mgmt loop mirrors the entire shm region
+(`PmuDataHeader` + per-core `PmuBufferState`) device → host at the
+top of every tick, then pushes back only the fields host modified
+(advanced `queue_heads[q]`, refilled `free_queue.tail` and
+`buffer_ptrs[slot]`) via `BufferPoolManager::write_range_to_device`.
+The bulk `mirror_shm_to_device` is **not** called from the mgmt
+loop: it would race with AICPU writes to device-only fields
+(`current_buf_ptr`, `total/dropped` counters, `queue_tails`,
+`free_queue.head`) and roll them back. Each popped `PmuBuffer` is
+still pulled on demand inside
+`ProfilerAlgorithms::process_entry`.
 
 ```text
         HOST                                         DEVICE
 ┌──────────────────────────┐               ┌──────────────────────────┐
 │ PmuCollector             │               │ AICore                   │
+│   : ProfilerBase<...>    │               │                          │
 │                          │               │                          │
-│ init()                   │  alloc +      │ per-task end:            │
-│   rtMalloc data region   │──copy────────>│   ld_dev 10 PMU_CNTs +   │
-│   pre-fill free queues   │               │     PMU_CNT_TOTAL        │
-│   build PmuDataHeader    │               │   write into             │
-│                          │               │   dual_issue_slots[      │
-│ start(tf)                │               │     reg_task_id & 1]     │
-│   ┌────────────────────┐ │               │                          │
-│   │ collector thread   │ │               │ AICPU thread             │
-│   │ poll_and_collect() │ │               │ on FIN:                  │
-│   │  poll ready queues │ │  rtMemcpy     │   match slot's task_id   │
-│   │  via copy hooks    │<┼──(shadow)────<│     vs reg_task_id       │
-│   │  write CSV         │ │               │   copy into              │
-│   │  recycle → free_q  │─┼──copy hook──>│     records[count]       │
-│   └────────────────────┘ │               │   fill func_id/core_type │
-│                          │               │   ++count                │
-│                          │               │   if buffer full:        │
-│                          │  SPSC ready   │     push ready entry,    │
-│                          │<──queues─────<│     pop next from free_q │
+│ init()                   │  alloc + reg  │ per-task end:            │
+│   rtMalloc data region   │──+ shadow────>│   ld_dev 10 PMU_CNTs +   │
+│   per-core PmuBuffers    │   memset 0    │     PMU_CNT_TOTAL        │
+│   register_mapping(s)    │   + push 0s   │   write into             │
+│   build PmuDataHeader    │               │   dual_issue_slots[      │
+│                          │               │     reg_task_id & 1]     │
+│ start(thread_factory)    │               │                          │
+│   mgmt_thread starts     │               │ AICPU thread             │
+│   poll_thread starts     │               │ on FIN:                  │
+│                          │               │   match slot's task_id   │
+│ mgmt every 10us tick:    │               │     vs reg_task_id       │
+│   copy_from_device(shm)  │<──memcpy─────<│   copy into              │
+│   for each ready entry:  │               │     records[count]       │
+│     copy buf from device │<──memcpy─────<│   fill func_id/core_type │
+│     resolve host ptr     │               │   ++count                │
+│     push to L2 ready_q   │               │   if buffer full:        │
+│   advance queue_heads,   │               │     push ready entry,    │
+│     refill free_queues   │               │     pop next from free_q │
+│   write_range_to_device  │──memcpy──────>│                          │
+│     for each modified    │               │ pmu_aicpu_flush():       │
+│     field                │               │   push remaining full    │
+│                          │               │   buffers to ready_q     │
+│ poll thread:             │               │                          │
+│   wait_pop_ready         │               │                          │
+│   on_buffer_collected →  │               │                          │
+│     write_buffer_to_csv  │               │                          │
+│   notify_copy_done       │               │                          │
 │                          │               │                          │
-│ rtStreamSynchronize      │               │ pmu_aicpu_flush():       │
-│ drain_remaining_buffers()│               │   push remaining full    │
-│   final sync + drain     │               │   buffers to ready_q     │
+│ rtStreamSynchronize      │               │                          │
+│ stop()                   │               │                          │
+│   join mgmt + poll       │               │                          │
 │ reconcile_counters()     │               │                          │
+│   sanity-check leftovers │               │                          │
+│   + cross-check          │               │                          │
 │ finalize(free)           │               │                          │
 └──────────────────────────┘               └──────────────────────────┘
 ```
@@ -357,47 +391,54 @@ Device memory layout:
 
 [PmuBufferState[num_cores]]             (per-core state)
 ├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
-├── current_buf_ptr          (AICPU active buffer)
+├── current_buf_ptr            (AICPU active buffer)
+├── aicore_ring_ptr            (stable PmuAicoreRing*, host writes once)
 ├── current_buf_seq
-├── dropped_record_count
 ├── total_record_count
-└── owning_thread_id
+├── dropped_record_count
+└── mismatch_record_count      (ring slot / task_id invariant violations)
+
+PmuAicoreRing[num_cores]                (stable AICore staging, never rotated)
+└── PmuRecord dual_issue_slots[PLATFORM_PMU_AICORE_RING_SIZE]
 
 PmuBuffer pool (rotated)                (BUFFERS_PER_CORE per core)
-├── count                 (header, 64 B)
-├── dual_issue_slots[2]   (AICore staging, indexed task_id & 1)
-└── records[RECORDS_PER_BUFFER]
+└── PmuRecord records[RECORDS_PER_BUFFER] + count
 ```
 
 `halHostRegister` is not supported on DAV_3510, so the a5 collector
-maintains separate host shadow buffers and synchronizes via `rtMemcpy`
-(onboard) or `memcpy` (sim). The platform copy hooks
-`pmu_platform_copy_to/from_device` abstract this difference.
+maintains a paired host-shadow `malloc()` per device buffer and
+synchronizes via `rtMemcpy` (onboard) / `memcpy` (sim). The framework
+copy hooks `profiling_copy_to_device` / `profiling_copy_from_device`
+(in [`profiling_copy.h`](../../src/a5/platform/include/host/profiling_copy.h))
+abstract this difference.
 
-Each `Handshake` carries `pmu_buffer_addr` and `pmu_reg_base` so each
-AICore worker locates its `PmuBuffer` and the PMU MMIO register block.
+Each AICore worker reads its PMU MMIO base from
+`KernelArgs::pmu_reg_addrs[block_idx]` (filled by AICPU
+`pmu_aicpu_init` after handshake) and its `PmuAicoreRing` from
+`KernelArgs::aicore_pmu_ring_addrs[block_idx]` (filled by the host
+in `PmuCollector::init`). Both addresses are forwarded by `KERNEL_ENTRY`
+into platform-owned per-core slots
+([`aicore_profiling_state.h`](../src/a5/platform/include/aicore/aicore_profiling_state.h));
+the runtime `Handshake` carries no profiling fields.
 
 **Lifecycle** (`device_runner.cpp`):
 
 ```text
-init()
+init_pmu()
   pmu_collector_.init(num_aicore, num_threads, csv_path, event_type, ...)
-  kernel_args_.args.pmu_data_base = pmu_collector_.get_pmu_shm_device_ptr()
-                                      → AICPU programs PMU event group,
-                                        publishes (pmu_buffer_addr,
-                                        pmu_reg_base) into Handshakes
-start(tf)                       ← spawn collector thread
-                                  (poll_and_collect: drain AICPU ready
-                                  queues via copy hooks, write CSV,
-                                  recycle buffers into free queues)
+  kernel_args_.args.pmu_data_base             = pmu_collector_.get_pmu_shm_device_ptr()
+  kernel_args_.args.aicore_pmu_ring_addrs = pmu_collector_.get_aicore_ring_addrs_device_ptr()
+  kernel_args_.args.pmu_reg_addrs  = pmu_collector_.get_pmu_reg_addrs_device_ptr()
+                                      → AICPU pmu_aicpu_init() fills
+                                        pmu_reg_addrs[i] =
+                                          regs[physical_core_ids[i]]
+                                        and caches state->aicore_ring_ptr
+pmu_collector_.start(thread_factory)   ← mgmt + poll threads
 launch AICPU / AICore
 rtStreamSynchronize
-stop()                          ← signal_execution_complete, join thread
-drain_remaining_buffers()       ← final sync: drain remaining ready
-                                  queue entries + scan current_buf_ptr
-                                  for partially-filled buffers
-reconcile_counters()            ← assert collected + dropped == total
-finalize(free)
+pmu_collector_.stop()                  ← join mgmt + poll, drain final batch
+pmu_collector_.reconcile_counters()    ← collected + dropped + mismatch == device_total
+pmu_collector_.finalize(free)
 ```
 
 **Slot match key vs logical `task_id`.** `pmu_aicpu_complete_record`
@@ -414,12 +455,20 @@ adjacent dispatches from colliding (the runtime's `dispatch_seq++`
 guarantees neighboring register tokens differ by 1 → different slots).
 
 [`PmuCollector`](../src/a5/platform/include/host/pmu_collector.h) on
-a5 uses the same streaming lifecycle as a2a3 — `init` / `start` /
-`stop` / `drain_remaining_buffers` / `reconcile_counters` / `finalize`.
-The collector thread runs `poll_and_collect()` concurrently with kernel
-execution. The only architectural difference from a2a3 is the memory
-transport: host shadow buffers + `rtMemcpy` copy hooks instead of
-`halHostRegister` shared memory.
+a5 inherits the same CRTP base
+([`profiling_common::ProfilerBase`](../src/a5/platform/include/host/profiling_common/profiler_base.h))
+as a2a3 and parameterizes
+[`BufferPoolManager`](../src/a5/platform/include/host/profiling_common/buffer_pool_manager.h)
+with `PmuModule`. The only a5-specific glue is the 5-callback
+`MemoryOps` and the per-tick shm mirror.
+
+a5's per-thread AICPU flush (`pmu_aicpu_flush_buffers`) is the only
+data path on the records side — host never reads from
+`current_buf_ptr` to recover records. `reconcile_counters` is purely
+passive: it logs an error if any `current_buf_ptr` is non-zero with
+a non-empty buffer (a device-flush bug), then runs the three-bucket
+cross-check `collected + dropped + mismatch == device_total` against
+device-side counters.
 
 ### 5.4 a2a3 vs a5 at a glance
 
@@ -428,11 +477,13 @@ transport: host shadow buffers + `rtMemcpy` copy hooks instead of
 | HW counter slots | 8 (DAV_2201) | 10 (DAV_3510) |
 | Counter readout | AICPU MMIO `read_reg` | AICore MMIO `ld_dev` |
 | Per-core staging | direct write into `records[count]` | dual-issue slots, AICPU commits on FIN |
-| Host transport | `halHostRegister` shared memory | host shadow buffers + `rtMemcpy` copy hooks |
-| Buffer model | rotating pool (free + ready queues) | rotating pool (free + ready queues, same SPSC protocol) |
-| Host threads | mgmt + poll, streams during execution | collector thread, streams during execution |
-| Host-class shape | `ProfilerBase` subclass (mgmt + poll thread + `BufferPoolManager<PmuModule>`) | streaming `init`/`start`/`stop`/`drain`/`finalize` |
-| Lifecycle | `init` → `start` → `stop` → `reconcile_counters` → `finalize` | `init` → `start` → `stop` → `drain_remaining_buffers` → `reconcile_counters` → `finalize` |
+| Buffer model | rotating pool (free + ready queues, SPSC protocol) | identical |
+| Host threads | mgmt + poll, streams during execution | identical |
+| Host-class shape | `ProfilerBase<PmuCollector, PmuModule>` | identical |
+| Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
+| `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
+| `reconcile_counters` | passive cross-check (collected + dropped == device_total) | passive cross-check with mismatch bucket (collected + dropped + mismatch == device_total); leftover non-empty `current_buf_ptr` logged as a device flush bug |
+| Lifecycle | `init` → `start` → `stop` → `reconcile_counters` → `finalize` | identical |
 
 ## 6. Overhead
 

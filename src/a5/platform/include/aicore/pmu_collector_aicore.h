@@ -17,15 +17,16 @@
  *     and restores them at finalize.
  *   - AICore gates counting around each kernel execution via CTRL SPR bit 0
  *     (pmu_aicore_begin / pmu_aicore_end), reads the 10 PMU counters +
- *     PMU_CNT_TOTAL via MMIO using the handshake-supplied reg_base, and
- *     writes the snapshot into PmuBuffer::dual_issue_slots[task_id & 1].
+ *     PMU_CNT_TOTAL via MMIO using the per-core reg_base obtained from
+ *     `get_aicore_pmu_reg_base()`, and writes the snapshot into
+ *     PmuAicoreRing::dual_issue_slots[task_id % RING_SIZE].
  *   - AICPU, on COND FIN, validates the slot and copies it into
  *     PmuBuffer::records[count] while filling func_id / core_type
  *     (pmu_aicpu_complete_record).
  *
- * The two dual_issue_slots exist because AICore's dual-issue dispatch
- * can have up to two tasks in flight per core — the parity task_id & 1
- * keeps N and N+1 from colliding.
+ * PLATFORM_PMU_AICORE_RING_SIZE dual-issue slots exist because AICore's
+ * dual-issue dispatch can have up to two tasks in flight per core — the
+ * parity task_id % RING_SIZE keeps N and N+1 from colliding.
  */
 
 #ifndef PLATFORM_AICORE_PMU_COLLECTOR_AICORE_H_
@@ -53,25 +54,25 @@ __aicore__ __attribute__((always_inline)) static inline void pmu_aicore_end() {
 }
 
 /**
- * Record PMU counters for one completed task into the dual-issue slot
- * (AICore-side producer half of the PMU record path).
+ * Record PMU counters for one completed task into the per-core staging-ring
+ * dual-issue slot (AICore-side producer half of the PMU record path).
  *
  * Must be called after pmu_aicore_end() has frozen the counters.
  * AICPU picks up the slot and commits it via pmu_aicpu_complete_record.
  *
  * Leaves func_id and core_type untouched — those are AICPU-owned fields.
  *
- * @param buf       Per-core PmuBuffer (from Handshake.pmu_buffer_addr)
- * @param reg_base  Per-core PMU MMIO base (from Handshake.pmu_reg_base)
+ * @param ring      Per-core PmuAicoreRing (from get_aicore_pmu_ring())
+ * @param reg_base  Per-core PMU MMIO base (from get_aicore_pmu_reg_base())
  * @param task_id   Register dispatch token (DATA_MAIN_BASE value for this task)
  */
 __aicore__ __attribute__((always_inline)) static inline void
-pmu_aicore_record_task(__gm__ PmuBuffer *buf, uint64_t reg_base, uint32_t task_id) {
-    if (buf == nullptr || reg_base == 0) {
+pmu_aicore_record_task(__gm__ PmuAicoreRing *ring, uint64_t reg_base, uint32_t task_id) {
+    if (ring == nullptr || reg_base == 0) {
         return;
     }
 
-    __gm__ PmuRecord *slot = &buf->dual_issue_slots[task_id & 1u];
+    __gm__ PmuRecord *slot = &ring->dual_issue_slots[task_id % PLATFORM_PMU_AICORE_RING_SIZE];
 
     // Read the 10 event counters + 64-bit cycle counter via the AICore MMIO
     // load intrinsic ld_dev(base, offset) — the only legal way for AICore to

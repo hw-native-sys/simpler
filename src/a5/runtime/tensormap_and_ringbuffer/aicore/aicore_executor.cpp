@@ -10,6 +10,7 @@
  */
 
 #include "aicore/aicore.h"
+#include "aicore/aicore_profiling_state.h"
 #include "aicore/l2_perf_collector_aicore.h"
 #include "aicore/pmu_collector_aicore.h"
 #include "common/l2_perf_profiling.h"
@@ -90,9 +91,15 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Cache per-core dispatch payload pointer (set by AICPU before aicpu_ready)
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
-    bool l2_perf_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    bool dump_tensor_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    bool pmu_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_PMU);
+    // Cache profiling state once after Phase 3. The L2 / PMU rings are
+    // stable for the entire run; pmu_reg_base is read per-record (see
+    // host_build_graph executor for why).
+    uint32_t profiling_flag = get_aicore_profiling_flag();
+    bool l2_perf_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+    bool dump_tensor_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    bool pmu_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_PMU);
+    __gm__ L2PerfAicoreRing *l2_perf_ring = l2_perf_enabled ? get_aicore_l2_perf_ring() : nullptr;
+    __gm__ PmuAicoreRing *pmu_ring = pmu_enabled ? get_aicore_pmu_ring() : nullptr;
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
@@ -136,11 +143,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             if (pmu_enabled) {
                 pmu_aicore_end();
-                // Read pmu_buffer_addr / pmu_reg_base per-task (mirrors how
-                // perf_records_addr is read below): by the time AICPU dispatches
-                // a real task_id, pmu_aicpu_init has already published these.
-                __gm__ PmuBuffer *pmu_buf = reinterpret_cast<__gm__ PmuBuffer *>(my_hank->pmu_buffer_addr);
-                pmu_aicore_record_task(pmu_buf, my_hank->pmu_reg_base, task_id);
+                pmu_aicore_record_task(pmu_ring, get_aicore_pmu_reg_base(), task_id);
             }
 
             if (dump_tensor_enabled) {
@@ -150,8 +153,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // Performance profiling: record task execution
             if (l2_perf_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                __gm__ L2PerfBuffer *l2_perf_buf = (__gm__ L2PerfBuffer *)my_hank->l2_perf_records_addr;
-                l2_perf_aicore_record_task(l2_perf_buf, task_id, start_time, end_time);
+                l2_perf_aicore_record_task(l2_perf_ring, task_id, start_time, end_time);
             }
 
             last_reg_val = reg_val;

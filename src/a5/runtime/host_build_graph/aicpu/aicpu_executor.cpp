@@ -354,14 +354,14 @@ int AicpuExecutor::init(Runtime *runtime) {
         dispatch_timestamps_[i] = 0;
     }
     if (is_l2_swimlane_enabled()) {
-        l2_perf_aicpu_init_profiling(runtime);
+        l2_perf_aicpu_init(runtime->worker_count);
     }
 #if PTO2_PROFILING
     if (is_dump_tensor_enabled()) {
         dump_tensor_init(thread_num_);
     }
     if (is_pmu_enabled()) {
-        pmu_aicpu_init(runtime->workers, physical_core_ids_, cores_total_num_);
+        pmu_aicpu_init(physical_core_ids_, cores_total_num_);
         LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
     }
 #endif
@@ -730,7 +730,6 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 // pending task's record to maintain buffer ordering.
                 if (l2_perf_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
-                    L2PerfBuffer *l2_perf_buf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
 
                     if (prev_running_id != AICPU_TASK_INVALID) {
                         Task *prev_task = &runtime.tasks[prev_running_id];
@@ -739,9 +738,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                             fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
                         }
                         if (l2_perf_aicpu_complete_record(
-                                l2_perf_buf, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
-                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
+                                core_id, static_cast<uint32_t>(prev_running_id), static_cast<uint64_t>(prev_running_id),
+                                prev_task->func_id, h->core_type, dispatch_timestamps_[core_id], finish_ts, fanout_arr,
+                                prev_task->fanout_count
                             ) != 0) {
                             LOG_ERROR(
                                 "Core %d: l2_perf_aicpu_complete_record failed for implicit task %d", core_id,
@@ -758,9 +757,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
                     }
                     if (l2_perf_aicpu_complete_record(
-                            l2_perf_buf, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
-                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
+                            core_id, static_cast<uint32_t>(completed_task_id), static_cast<uint64_t>(completed_task_id),
+                            task->func_id, h->core_type, dispatch_timestamps_[core_id], finish_ts, fanout_arr,
+                            task->fanout_count
                         ) != 0) {
                         LOG_ERROR(
                             "Core %d: l2_perf_aicpu_complete_record failed for task %d", core_id, completed_task_id
@@ -842,16 +841,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     // Profiling: complete the implicit task's AICore record
                     if (l2_perf_enabled) {
                         uint64_t finish_ts = get_sys_cnt_aicpu();
-                        L2PerfBuffer *l2_perf_buf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
                         Task *prev_task = &runtime.tasks[prev_running_id];
                         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
                         for (int i = 0; i < prev_task->fanout_count; i++) {
                             fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
                         }
                         if (l2_perf_aicpu_complete_record(
-                                l2_perf_buf, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
-                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
+                                core_id, static_cast<uint32_t>(prev_running_id), static_cast<uint64_t>(prev_running_id),
+                                prev_task->func_id, h->core_type, dispatch_timestamps_[core_id], finish_ts, fanout_arr,
+                                prev_task->fanout_count
                             ) != 0) {
                             LOG_ERROR(
                                 "Core %d: l2_perf_aicpu_complete_record failed for implicit task %d", core_id,
@@ -888,16 +886,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 if (l2_perf_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
-                    L2PerfBuffer *l2_perf_buf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
                     Task *task = &runtime.tasks[completed_task_id];
                     uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
                     for (int i = 0; i < task->fanout_count; i++) {
                         fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
                     }
                     if (l2_perf_aicpu_complete_record(
-                            l2_perf_buf, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
-                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
+                            core_id, static_cast<uint32_t>(completed_task_id), static_cast<uint64_t>(completed_task_id),
+                            task->func_id, h->core_type, dispatch_timestamps_[core_id], finish_ts, fanout_arr,
+                            task->fanout_count
                         ) != 0) {
                         LOG_ERROR(
                             "Core %d: l2_perf_aicpu_complete_record failed for task %d", core_id, completed_task_id

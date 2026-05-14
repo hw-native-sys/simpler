@@ -153,40 +153,39 @@ struct PmuRecord {
 } __attribute__((aligned(64)));
 
 // =============================================================================
+// PmuAicoreRing - Stable AICore→AICPU Staging Ring (per core, never rotated)
+// =============================================================================
+
+/**
+ * Per-core PMU staging ring written exclusively by AICore.
+ *
+ * AICore reads PMU MMIO itself (via ld_dev) and stores each task's snapshot
+ * in `dual_issue_slots[reg_task_id % PLATFORM_PMU_AICORE_RING_SIZE]`.
+ * The ring is allocated once by the host and addressed through
+ * `PmuBufferState[block_idx].aicore_ring_ptr` (also published into the
+ * `KernelArgs::aicore_pmu_ring_addrs` the AICore kernel entry forwards
+ * into `set_aicore_pmu_ring()`); its address is never reassigned, so AICore
+ * writes are decoupled from AICPU's PmuBuffer rotation.
+ */
+struct PmuAicoreRing {
+    PmuRecord dual_issue_slots[PLATFORM_PMU_AICORE_RING_SIZE];
+} __attribute__((aligned(64)));
+
+// =============================================================================
 // PMU Streaming Buffer Structures (mirrors a2a3 pmu_profiling.h)
 // =============================================================================
 
 /**
  * Fixed-capacity PMU record buffer.
- * Allocated by Host, pushed into per-core free_queue.
- *
- * a5-specific: dual_issue_slots[2] exist because AICore reads PMU MMIO
- * itself (via ld_dev) and writes the snapshot here. AICPU validates and
- * commits into records[] on COND FIN. Parity task_id & 1 picks the slot
- * so adjacent dual-issue dispatches never collide.
+ * Allocated by Host, pushed into per-core free_queue, rotated by AICPU when
+ * full. Owned and written exclusively by AICPU: AICore never touches this
+ * memory. AICPU reads the snapshot from PmuAicoreRing::dual_issue_slots and
+ * commits into records[count++] on COND FIN.
  */
 struct PmuBuffer {
-    // Header (first 64 bytes) — host copies this alone first to learn count.
-    volatile uint32_t count;  // Number of valid records
-    uint32_t pad[15];         // Pad count to 64 bytes; isolates count's cache line from
-                              // dual_issue_slots (AICore writer) to avoid false sharing.
-
-    // Dual-issue staging slots — AICore writes a PmuRecord here after
-    // each task, then AICPU copies it into records[count] and fills
-    // func_id / core_type on FIN. Index = task_id & 1.
-    PmuRecord dual_issue_slots[2];
-
-    // Records (flexible-size, up to PLATFORM_PMU_RECORDS_PER_BUFFER)
     PmuRecord records[PLATFORM_PMU_RECORDS_PER_BUFFER];
+    volatile uint32_t count;
 } __attribute__((aligned(64)));
-
-static_assert(
-    offsetof(PmuBuffer, dual_issue_slots) == 64, "PmuBuffer header must be exactly 64 bytes before dual_issue_slots"
-);
-static_assert(
-    offsetof(PmuBuffer, records) == 64 + 2 * sizeof(PmuRecord),
-    "PmuBuffer records must follow header + 2 dual_issue_slots"
-);
 
 /**
  * SPSC lock-free queue for free PmuBuffer management.
@@ -211,26 +210,32 @@ static_assert(sizeof(PmuFreeQueue) == 128, "PmuFreeQueue must be 128 bytes");
  * Per-core PMU buffer state.
  *
  * Writers:
- *   free_queue.tail:        Host writes (pushes new/recycled buffers)
- *   free_queue.head:        Device writes (pops buffers)
- *   current_buf_ptr:        Device writes (after pop), Host reads (for collect/drain)
- *   current_buf_seq:        Device writes (monotonic counter)
- *   dropped_record_count:   Device writes (tasks whose PmuRecord was never handed
- *                           to the host, e.g. free_queue empty, ready_queue full,
- *                           no active buffer)
- *   total_record_count:     Device writes — monotonic count of every task the
- *                           AICPU attempted to record (success + dropped)
+ *   free_queue.tail:           Host writes (pushes new/recycled buffers)
+ *   free_queue.head:           Device writes (pops buffers)
+ *   current_buf_ptr:           Device writes (after pop), Host reads (for collect/drain)
+ *   aicore_ring_ptr:           Host writes once at init, AICPU reads
+ *   current_buf_seq:           Device writes (monotonic counter)
+ *   total_record_count:        Device writes — monotonic count of every task the
+ *                              AICPU attempted to record (collected + dropped + mismatch)
+ *   dropped_record_count:      Device writes (tasks whose PmuRecord was never handed
+ *                              to the host: free_queue empty, ready_queue full,
+ *                              no active buffer)
+ *   mismatch_record_count:     Device writes — slots where AICore had not yet
+ *                              published the expected reg_task_id (hard invariant
+ *                              violation, distinct from capacity drops)
  *
- * Host reads dropped / total at finalize time to cross-check:
- *   collected_on_host + sum(dropped) == sum(total)
+ * Host reads dropped / mismatch / total at finalize time to cross-check:
+ *   collected_on_host + sum(dropped) + sum(mismatch) == sum(total)
  */
 struct PmuBufferState {
-    PmuFreeQueue free_queue;                 // SPSC queue of free PmuBuffer addresses
-    volatile uint64_t current_buf_ptr;       // Current active PmuBuffer (0 = none)
-    volatile uint32_t current_buf_seq;       // Sequence number for ordering
-    volatile uint32_t dropped_record_count;  // Tasks whose record was dropped on device
-    volatile uint32_t total_record_count;    // Total tasks the AICPU attempted to record
-    uint32_t pad[11];                        // Pad to 192 bytes
+    PmuFreeQueue free_queue;                  // SPSC queue of free PmuBuffer addresses
+    volatile uint64_t current_buf_ptr;        // Current active PmuBuffer (0 = none)
+    volatile uint64_t aicore_ring_ptr;        // Stable AICore staging ring (PmuAicoreRing*)
+    volatile uint32_t current_buf_seq;        // Sequence number for ordering
+    volatile uint32_t total_record_count;     // Total tasks the AICPU attempted to record
+    volatile uint32_t dropped_record_count;   // Tasks whose record was dropped on device
+    volatile uint32_t mismatch_record_count;  // Tasks lost to ring/task_id invariant violation
+    uint32_t pad[8];                          // Pad to 192 bytes
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(PmuBufferState) == 192, "PmuBufferState must be 192 bytes");

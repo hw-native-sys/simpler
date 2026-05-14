@@ -21,8 +21,11 @@
 
 #include "inner_kernel.h"
 #include "aicore/aicore.h"
+#include "aicore/aicore_profiling_state.h"
 #include "common/core_type.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
+#include "common/pmu_profiling.h"
 #include "runtime.h"
 
 // Per-thread simulated register state — use pthread TLS instead of C++
@@ -30,17 +33,63 @@
 // with RTLD_LOCAL on aarch64.
 static pthread_key_t g_reg_base_key;
 static pthread_key_t g_core_id_key;
+static pthread_key_t g_block_idx_key;
+static pthread_key_t g_aicore_profiling_flag_key;
+static pthread_key_t g_aicore_l2_perf_ring_key;
+static pthread_key_t g_aicore_pmu_ring_key;
+static pthread_key_t g_pmu_reg_addrs_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
 static void create_tls_keys() {
     pthread_key_create(&g_reg_base_key, nullptr);
     pthread_key_create(&g_core_id_key, nullptr);
+    pthread_key_create(&g_block_idx_key, nullptr);
+    pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
+    pthread_key_create(&g_aicore_l2_perf_ring_key, nullptr);
+    pthread_key_create(&g_aicore_pmu_ring_key, nullptr);
+    pthread_key_create(&g_pmu_reg_addrs_key, nullptr);
 }
 
 volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key)); }
 
 uint32_t sim_get_physical_core_id() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_core_id_key)));
+}
+
+// Per-core profiling state setters/getters. Same contract as the onboard
+// [[block_local]] backing in src/a5/platform/onboard/aicore/kernel.cpp —
+// AICore never reaches into the runtime's Handshake for profiling, runtime's
+// aicore_execute keeps its original signature, and adding profiling fields
+// only touches KernelArgs + this state surface.
+__aicore__ void set_aicore_profiling_flag(uint32_t flag) {
+    pthread_setspecific(g_aicore_profiling_flag_key, reinterpret_cast<void *>(static_cast<uintptr_t>(flag)));
+}
+__aicore__ uint32_t get_aicore_profiling_flag() {
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
+}
+
+__aicore__ void set_aicore_l2_perf_ring(__gm__ L2PerfAicoreRing *ring) {
+    pthread_setspecific(g_aicore_l2_perf_ring_key, reinterpret_cast<void *>(ring));
+}
+__aicore__ __gm__ L2PerfAicoreRing *get_aicore_l2_perf_ring() {
+    return reinterpret_cast<__gm__ L2PerfAicoreRing *>(pthread_getspecific(g_aicore_l2_perf_ring_key));
+}
+
+__aicore__ void set_aicore_pmu_ring(__gm__ PmuAicoreRing *ring) {
+    pthread_setspecific(g_aicore_pmu_ring_key, reinterpret_cast<void *>(ring));
+}
+__aicore__ __gm__ PmuAicoreRing *get_aicore_pmu_ring() {
+    return reinterpret_cast<__gm__ PmuAicoreRing *>(pthread_getspecific(g_aicore_pmu_ring_key));
+}
+
+__aicore__ void set_aicore_pmu_reg_addrs(__gm__ uint64_t *table) {
+    pthread_setspecific(g_pmu_reg_addrs_key, reinterpret_cast<void *>(table));
+}
+__aicore__ uint64_t get_aicore_pmu_reg_base() {
+    auto *table = reinterpret_cast<__gm__ uint64_t *>(pthread_getspecific(g_pmu_reg_addrs_key));
+    if (table == nullptr) return 0;
+    int block_idx = static_cast<int>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_block_idx_key)));
+    return table[block_idx];
 }
 
 // Core identity setter function pointers — set by DeviceRunner after dlopen.
@@ -59,10 +108,14 @@ extern "C" void set_sim_core_identity_helpers(void *set_subblock_id, void *set_c
 // Declare the original function (defined in aicore_executor.cpp with weak linkage)
 void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 
-// Wrapper with extern "C" for dlsym lookup
-// NOTE: physical_core_id stays in wrapper signature (DeviceRunner passes it for register indexing)
+// Wrapper with extern "C" for dlsym lookup. Mirrors the onboard kernel.cpp
+// KERNEL_ENTRY: receives launch arguments straight from the host, populates
+// the per-thread profiling slots via set_aicore_*(), then invokes the runtime
+// executor with its original signature.
 extern "C" void aicore_execute_wrapper(
-    __gm__ Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs
+    __gm__ Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
+    uint32_t enable_profiling_flag, uint64_t aicore_l2_perf_ring_addrs, uint64_t aicore_pmu_ring_addrs,
+    uint64_t pmu_reg_addrs
 ) {
     pthread_once(&g_tls_once, create_tls_keys);
 
@@ -75,6 +128,26 @@ extern "C" void aicore_execute_wrapper(
     }
 
     pthread_setspecific(g_core_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(physical_core_id)));
+    // block_idx is required by get_aicore_pmu_reg_base() to index into the
+    // PMU reg-addr table; stash it in TLS so the getter can resolve it
+    // without an extra parameter.
+    pthread_setspecific(g_block_idx_key, reinterpret_cast<void *>(static_cast<uintptr_t>(block_idx)));
+
+    // Publish per-core profiling state before the executor runs.
+    set_aicore_profiling_flag(enable_profiling_flag);
+    if ((enable_profiling_flag & PROFILING_FLAG_L2_SWIMLANE) && aicore_l2_perf_ring_addrs != 0) {
+        uint64_t *ring_table = reinterpret_cast<uint64_t *>(aicore_l2_perf_ring_addrs);
+        set_aicore_l2_perf_ring(reinterpret_cast<__gm__ L2PerfAicoreRing *>(ring_table[block_idx]));
+    } else {
+        set_aicore_l2_perf_ring(nullptr);
+    }
+    if ((enable_profiling_flag & PROFILING_FLAG_PMU) && aicore_pmu_ring_addrs != 0) {
+        uint64_t *pmu_ring_table = reinterpret_cast<uint64_t *>(aicore_pmu_ring_addrs);
+        set_aicore_pmu_ring(reinterpret_cast<__gm__ PmuAicoreRing *>(pmu_ring_table[block_idx]));
+    } else {
+        set_aicore_pmu_ring(nullptr);
+    }
+    set_aicore_pmu_reg_addrs(reinterpret_cast<__gm__ uint64_t *>(pmu_reg_addrs));
 
     // Set core identity for pto-isa TPUSH/TPOP simulation.
     // Core layout in sim DeviceRunner:

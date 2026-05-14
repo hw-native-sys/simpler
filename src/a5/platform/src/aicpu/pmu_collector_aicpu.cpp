@@ -11,7 +11,7 @@
 
 /**
  * @file pmu_collector_aicpu.cpp
- * @brief AICPU-side PMU init/finalize + record commit from AICore slot (a5)
+ * @brief AICPU-side PMU init/finalize + record commit from AICore staging-ring slot (a5)
  *
  * Buffer switching mirrors a2a3 pmu_collector_aicpu.cpp:
  *   - SPSC free_queue: Host pushes free PmuBuffers, AICPU pops when switching.
@@ -19,8 +19,12 @@
  *   - On free_queue empty or ready_queue full: overwrite current buffer (data lost,
  *     same policy as a2a3 — avoids blocking the AICPU dispatch loop).
  *
- * a5-specific: AICore writes PMU counters into dual_issue_slots[] via ld_dev;
- * AICPU validates the slot and commits into records[] on COND FIN.
+ * a5-specific: AICore reads PMU MMIO itself (via ld_dev) and writes the
+ * snapshot into a per-core stable PmuAicoreRing
+ * (state.aicore_ring_ptr); AICPU validates the slot and commits into
+ * records[] on COND FIN. The ring address is set once by the host and
+ * never reassigned, so the AICore writer is decoupled from the AICPU
+ * PmuBuffer rotation.
  */
 
 #include "aicpu/pmu_collector_aicpu.h"
@@ -34,6 +38,11 @@
 
 static uint64_t g_platform_pmu_base = 0;
 static bool g_enable_pmu = false;
+// Device-resident `pmu_reg_addrs` (uint64_t[num_aicore]). The
+// host pre-allocates the buffer in init_pmu() and stashes its
+// device pointer here via set_platform_pmu_reg_addrs(); pmu_aicpu_init
+// fills the entries from regs[physical_core_ids[i]] after handshake.
+static uint64_t g_platform_pmu_reg_addrs = 0;
 
 // Saved CTRL register state per core, indexed by logical core_id.
 // Populated by pmu_aicpu_init(), consumed by pmu_aicpu_finalize().
@@ -43,6 +52,12 @@ static uint32_t g_pmu_saved_ctrl1[PLATFORM_MAX_CORES];
 // Per-core cached PmuBufferState pointer and PMU header pointer.
 static PmuBufferState *s_pmu_buffer_states[PLATFORM_MAX_CORES];
 static PmuDataHeader *s_pmu_header = nullptr;
+
+// Per-core cached PmuAicoreRing pointer (the stable AICore staging ring).
+// Populated by pmu_aicpu_init() from state->aicore_ring_ptr (host-published
+// at SHM init); read by complete_record. Never reassigned during the run.
+// AICPU treats these as plain pointers (no __gm__ on AICPU).
+static PmuAicoreRing *s_pmu_aicore_rings[PLATFORM_MAX_CORES];
 
 // Per-core resolved PMU MMIO base address, keyed by logical core_id.
 // Populated by pmu_aicpu_init(); 0 means "no PMU for this core" (sim).
@@ -55,6 +70,9 @@ extern "C" uint64_t get_platform_pmu_base() { return g_platform_pmu_base; }
 extern "C" void set_pmu_enabled(bool enable) { g_enable_pmu = enable; }
 
 extern "C" bool is_pmu_enabled() { return g_enable_pmu; }
+
+extern "C" void set_platform_pmu_reg_addrs(uint64_t table) { g_platform_pmu_reg_addrs = table; }
+extern "C" uint64_t get_platform_pmu_reg_addrs() { return g_platform_pmu_reg_addrs; }
 
 // ---------------------------------------------------------------------------
 // Low-level MMIO helpers (internal use only)
@@ -114,7 +132,8 @@ static int enqueue_pmu_ready_buffer(int thread_idx, uint32_t core_index, uint64_
 }
 
 // ---------------------------------------------------------------------------
-// Internal: switch the current buffer for one core
+// Internal: switch the current buffer for one core (called from
+// complete_record when records[count] hits PLATFORM_PMU_RECORDS_PER_BUFFER)
 // ---------------------------------------------------------------------------
 
 static void pmu_switch_buffer(int core_id, int thread_idx) {
@@ -165,6 +184,7 @@ static void pmu_switch_buffer(int core_id, int thread_idx) {
 
     PmuBuffer *new_buf = reinterpret_cast<PmuBuffer *>(new_buf_ptr);
     new_buf->count = 0;
+    wmb();
 
     LOG_INFO_V0("Thread %d: Core %d switched to new PMU buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
 }
@@ -173,14 +193,14 @@ static void pmu_switch_buffer(int core_id, int thread_idx) {
 // High-level interface
 // ---------------------------------------------------------------------------
 
-void pmu_aicpu_init(Handshake *handshakes, const uint32_t *physical_core_ids, int num_cores) {
+void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
     void *pmu_base = reinterpret_cast<void *>(get_platform_pmu_base());
     if (pmu_base == nullptr) {
         LOG_ERROR("pmu_aicpu_init: pmu_data_base is NULL");
         return;
     }
-    if (handshakes == nullptr) {
-        LOG_ERROR("pmu_aicpu_init: handshakes is NULL");
+    if (physical_core_ids == nullptr) {
+        LOG_ERROR("pmu_aicpu_init: physical_core_ids is NULL");
         return;
     }
     s_pmu_header = reinterpret_cast<PmuDataHeader *>(pmu_base);
@@ -190,15 +210,25 @@ void pmu_aicpu_init(Handshake *handshakes, const uint32_t *physical_core_ids, in
     // Resolve per-core PMU MMIO base from physical_core_ids. 0 means "no PMU
     // for this core" (sim or misconfigured) — subsequent record/stop become no-ops.
     uint64_t *regs_array = reinterpret_cast<uint64_t *>(get_platform_regs());
+    uint64_t *aicore_pmu_reg_table = reinterpret_cast<uint64_t *>(g_platform_pmu_reg_addrs);
     for (int i = 0; i < num_cores; i++) {
         if (i >= PLATFORM_MAX_CORES) {
             LOG_ERROR("pmu_aicpu_init: num_cores %d exceeds PLATFORM_MAX_CORES %d", num_cores, PLATFORM_MAX_CORES);
             break;
         }
-        s_pmu_reg_addrs[i] = regs_array ? regs_array[physical_core_ids[i]] : 0;
+        uint64_t reg_addr = regs_array ? regs_array[physical_core_ids[i]] : 0;
+        s_pmu_reg_addrs[i] = reg_addr;
         g_pmu_saved_ctrl0[i] = 0;
         g_pmu_saved_ctrl1[i] = 0;
+        // Publish the resolved PMU reg base into the AICore-visible table so
+        // the AICore-side `get_aicore_pmu_reg_base()` lazy getter resolves
+        // the correct value. The table lives in device memory and is also
+        // visible to AICore via KernelArgs::pmu_reg_addrs.
+        if (aicore_pmu_reg_table != nullptr) {
+            aicore_pmu_reg_table[i] = reg_addr;
+        }
     }
+    wmb();
 
     // Program event selectors and start PMU counters
     const PmuEventConfig *evt = pmu_resolve_event_config_a5(static_cast<PmuEventType>(pmu_event_type));
@@ -215,10 +245,12 @@ void pmu_aicpu_init(Handshake *handshakes, const uint32_t *physical_core_ids, in
         pmu_start(reg_addr, g_pmu_saved_ctrl0[i], g_pmu_saved_ctrl1[i]);
     }
 
-    // Pop initial PmuBuffer from each core's free_queue
+    // Pop initial PmuBuffer from each core's free_queue and cache the stable
+    // AICore staging ring pointer.
     for (int i = 0; i < num_cores; i++) {
         PmuBufferState *state = get_pmu_buffer_state(pmu_base, i);
         s_pmu_buffer_states[i] = state;
+        s_pmu_aicore_rings[i] = reinterpret_cast<PmuAicoreRing *>(state->aicore_ring_ptr);
 
         rmb();
         uint32_t head = state->free_queue.head;
@@ -242,13 +274,6 @@ void pmu_aicpu_init(Handshake *handshakes, const uint32_t *physical_core_ids, in
         }
     }
 
-    // Publish per-core (pmu_buffer_addr, pmu_reg_base) into the matching Handshake
-    for (int i = 0; i < num_cores; i++) {
-        PmuBuffer *buf = reinterpret_cast<PmuBuffer *>(s_pmu_buffer_states[i]->current_buf_ptr);
-        handshakes[i].pmu_buffer_addr = reinterpret_cast<uint64_t>(buf);
-        handshakes[i].pmu_reg_base = s_pmu_reg_addrs[i];
-    }
-
     LOG_INFO_V0("PMU initialized: %d cores, event_type=%u", num_cores, pmu_event_type);
 }
 
@@ -265,8 +290,26 @@ void pmu_aicpu_complete_record(
     }
 
     // Account the task *before* any drop path so total reflects every task the
-    // AICPU tried to record. total == collected + dropped invariant on host.
+    // AICPU tried to record. collected + dropped + mismatch == total invariant on host.
     state->total_record_count += 1;
+
+    // Read AICore-published PmuRecord from the stable per-core staging ring.
+    PmuAicoreRing *ring = s_pmu_aicore_rings[core_id];
+    if (ring == nullptr) {
+        state->dropped_record_count += 1;
+        wmb();
+        return;
+    }
+    PmuRecord *slot = &ring->dual_issue_slots[reg_task_id % PLATFORM_PMU_AICORE_RING_SIZE];
+    cache_invalidate_range(slot, sizeof(PmuRecord));
+
+    if (static_cast<uint32_t>(slot->task_id) != reg_task_id) {
+        // AICore hasn't published this slot yet — hard invariant violation,
+        // separate from capacity drops.
+        state->mismatch_record_count += 1;
+        wmb();
+        return;
+    }
 
     rmb();
     uint64_t cur_ptr = state->current_buf_ptr;
@@ -277,7 +320,7 @@ void pmu_aicpu_complete_record(
     }
     PmuBuffer *buf = reinterpret_cast<PmuBuffer *>(cur_ptr);
 
-    // Switch buffer if full
+    // Switch buffer if full (internal — ring address is unchanged)
     if (buf->count >= static_cast<uint32_t>(PLATFORM_PMU_RECORDS_PER_BUFFER)) {
         pmu_switch_buffer(core_id, thread_idx);
         rmb();
@@ -291,15 +334,6 @@ void pmu_aicpu_complete_record(
     }
 
     uint32_t idx = buf->count;
-
-    // Fetch AICore's writes into the dual-issue slot
-    PmuRecord *slot = &buf->dual_issue_slots[reg_task_id & 1u];
-    cache_invalidate_range(slot, sizeof(PmuRecord));
-
-    if (static_cast<uint32_t>(slot->task_id) != reg_task_id) {
-        // AICore hasn't published this slot yet — bail out defensively
-        return;
-    }
 
     PmuRecord *rec = &buf->records[idx];
     rec->task_id = task_id;
@@ -358,11 +392,16 @@ void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int co
             state->current_buf_ptr = 0;
             wmb();
         } else {
+            // ready_queue full at end-of-run: account the loss and clear the
+            // buffer so host reconcile sees a clean state (current_buf_ptr=0)
+            // and dropped == flush failures rather than silent leftover.
             LOG_ERROR(
-                "Thread %d: Core %d failed to flush PMU buffer (ready_queue full), data lost!", thread_idx, core_id
+                "Thread %d: Core %d failed to flush PMU buffer (ready_queue full), %u records lost!", thread_idx,
+                core_id, buf->count
             );
             state->dropped_record_count += buf->count;
             buf->count = 0;
+            state->current_buf_ptr = 0;
             wmb();
         }
     }

@@ -202,24 +202,32 @@ What the swimlane shows:
 
 `kernel_args.l2_perf_data_base` is the single device-side handle
 host publishes for the run. The shared region carries a fixed
-header plus per-core / per-thread state:
+`L2PerfDataHeader` plus per-core / per-thread state (same struct
+shape on both architectures):
 
 ```text
-L2PerfDataHeader / L2PerfSetupHeader            (host init, device R/W)
-├── num_cores
-└── (a2a3) per-thread ready queues
-    (a5)  per-core / per-thread buffer pointers
+L2PerfDataHeader                                (host init, device R/W)
+├── queues  [MAX_AICPU_THREADS][READYQUEUE_SIZE]
+├── queue_heads / queue_tails (per-thread)
+└── num_cores
 
 L2PerfBufferState[num_cores]                    (per-core perf state)
-├── free_queue (a2a3 only)
-├── current_buf_ptr (a2a3) / fixed buffer (a5)
+├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
+├── current_buf_ptr           (AICPU active L2PerfBuffer*)
+├── aicore_ring_ptr           (stable L2PerfAicoreRing*, host writes once)
 ├── total_record_count
-└── dropped_record_count
+├── dropped_record_count
+└── mismatch_record_count     (ring slot / task_id invariant violations)
+
+[L2PerfAicoreRing[num_cores]]                   (stable AICore staging)
+└── L2PerfRecord dual_issue_slots[PLATFORM_L2_AICORE_RING_SIZE]
 
 [AicpuPhaseHeader + PhaseBufferState[num_threads]]  (optional)
 ├── magic / num_sched_threads
 ├── orch_summary  (cumulative orchestrator cycles)
-└── per-thread phase buffers
+└── per-thread phase buffers (PhaseBufferState aliases L2PerfBufferState;
+                              `aicore_ring_ptr` / `mismatch_record_count`
+                              unused for PHASE)
 ```
 
 The records themselves are identical across architectures:
@@ -235,9 +243,11 @@ both architectures' output unchanged.
 **Producer/consumer protocol on AICore.** AICore writes per-task
 timing into a stable per-core `L2PerfAicoreRing` at
 `dual_issue_slots[reg_task_id % PLATFORM_L2_AICORE_RING_SIZE]`.
-The ring address is published once via
-`Handshake::l2_perf_aicore_ring_addr` and never reassigned, so AICore
-is fully decoupled from any AICPU-side records-buffer rotation. AICPU,
+The ring address is published once via a per-core table on
+`KernelArgs` (a2a3: `aicore_ring_addr`; a5:
+`aicore_l2_perf_ring_addrs`), forwarded by `KERNEL_ENTRY` into
+platform-owned AICore state, and never reassigned — so AICore is
+fully decoupled from any AICPU-side records-buffer rotation. AICPU,
 on observing FIN, validates the slot's register token, copies the slot
 record into the current `L2PerfBuffer::records[count]`, fills
 `func_id` / `core_type` / `dispatch_time` / `finish_time` / `fanout`,
@@ -340,50 +350,93 @@ PMU and TensorDump — see
 [profiling-framework.md](../profiling-framework.md) for the
 framework reference.
 
-### 5.3 a5 — bulk rtMemcpy after stream sync
+### 5.3 a5 — same framework, host-shadow transport
 
-`L2PerfCollector` allocates one `L2PerfBuffer` per core and one
-`PhaseBuffer` per AICPU thread on device, plus a single
-`L2PerfSetupHeader` that stores all buffer pointers and the
-`AicpuPhaseHeader`. AICore writes timing into per-task WIP slots
-and AICPU completes records + writes phase data directly into
-device memory; when a buffer fills up, records are silently
-dropped (AICPU-side early return) and accounted in
-`PmuBufferState`-style counters. Collection is a single bulk
-pass after `rtStreamSynchronize`: copy `L2PerfSetupHeader` back,
-then for each per-core / per-thread buffer copy the 64-byte
-header, read `count`, and copy `count*sizeof(record)` bytes.
+a5's `L2PerfCollector` derives from
+`ProfilerBase<L2PerfCollector, L2PerfModule>` and shares the
+mgmt + poll thread structure with a2a3. The single behavioral
+deviation from §5.2 is the **transport channel**: a5 has no
+`halHostRegister`, so each device buffer is paired with a
+host-shadow `malloc()` and the mgmt loop synchronizes the two via
+`profiling_copy.h` (`rtMemcpy` onboard, plain `memcpy` in sim).
+
+The AICore-side write target is a per-core, **stable**
+`L2PerfAicoreRing` (`dual_issue_slots[PLATFORM_L2_AICORE_RING_SIZE]`)
+allocated once by the host and addressed via
+`L2PerfBufferState::aicore_ring_ptr` (AICPU side) and
+`KernelArgs::aicore_l2_perf_ring_addrs[block_idx]` forwarded into
+`set_aicore_l2_perf_ring()` by `KERNEL_ENTRY` (AICore side). The ring
+address never changes during a run, so AICore's write address is
+decoupled from the AICPU's rotating `L2PerfBuffer`. Buffer rotation is
+internal to `l2_perf_aicpu_complete_record` when `records[count]` hits
+`PLATFORM_PROF_BUFFER_SIZE`. The runtime `Handshake` carries no
+profiling fields.
+
+The framework's `MemoryOps` therefore carries five callbacks on
+a5 (`alloc` / `reg` / `free_` / `copy_to_device` /
+`copy_from_device`); the mgmt loop mirrors the entire shm region
+(`L2PerfDataHeader` + per-core `L2PerfBufferState` + per-thread
+`PhaseBufferState`) device → host at the top of every tick, then
+pushes back only the fields host actually modified (advanced
+`queue_heads[q]`, refilled `free_queue.tail` and
+`buffer_ptrs[slot]`) via `BufferPoolManager::write_range_to_device`.
+The bulk `mirror_shm_to_device` is deliberately **not** called from
+the mgmt loop: it would race with AICPU writes to device-only
+fields (`current_buf_ptr`, `total/dropped/mismatch` counters,
+`queue_tails`, `free_queue.head`, `AicpuPhaseHeader::magic`,
+`orch_summary`, `core_to_thread[]`) and roll them back to whatever
+the host shadow held at the start of the tick. Per-buffer
+payloads (`L2PerfBuffer` / `PhaseBuffer`) are pulled on demand
+inside `ProfilerAlgorithms::process_entry` after a popped
+ready-entry resolves to its host shadow. `BufferPoolManager`'s
+`release_owned_buffers` frees the device pointer via the
+collector's `release_fn` and the paired shadow via `std::free()`.
 
 ```text
         HOST                                         DEVICE
 ┌──────────────────────────┐               ┌──────────────────────────┐
 │ L2PerfCollector          │               │ AICPU + AICore           │
+│   : ProfilerBase<...>    │               │                          │
 │                          │               │                          │
-│ initialize()             │  alloc +      │ AICore on task end:      │
-│   rtMalloc setup region  │──copy────────>│   write timing into      │
-│   one L2PerfBuffer per   │               │   wip[task_id & 1]       │
-│     core                 │               │                          │
-│   one PhaseBuffer per    │               │ AICPU on FIN:            │
-│     scheduler thread     │               │   commit wip slot →      │
-│                          │               │     records[count],      │
-│ ── kernel execution ──   │               │   fill func_id /         │
-│                          │               │   dispatch / finish /    │
-│                          │               │   fanout                 │
+│ initialize()             │  alloc + reg  │ AICore on task end:      │
+│   rtMalloc shm           │──+ shadow────>│   write timing into      │
+│   per-core L2PerfBuffer  │   memset 0    │   per-core ring slot     │
+│   per-core AicoreRing    │   + push 0s   │   dual_issue_slots[      │
+│   per-thread PhaseBuffer │               │     task_id & 1]         │
+│   register_mapping(s)    │               │                          │
+│   set_memory_context     │               │ AICPU on FIN:            │
+│                          │               │   read ring slot →       │
+│                          │               │   commit into records[]  │
+│ start(thread_factory)    │               │                          │
+│   mgmt_thread starts     │               │ AICPU per-thread flush   │
+│   poll_thread starts     │               │   on exit: enqueue       │
+│                          │               │   current_buf_ptr →      │
+│ mgmt every 10us tick:    │               │   ready_queue            │
+│   copy_from_device(shm)  │<──memcpy─────<│                          │
+│   for each ready entry:  │               │                          │
+│     copy buf from device │<──memcpy─────<│                          │
+│     resolve host ptr     │               │                          │
+│     push to L2 ready_q   │               │                          │
+│   advance queue_heads,   │               │                          │
+│     refill free_queues   │               │                          │
+│   write_range_to_device  │──memcpy──────>│                          │
+│     for each modified    │               │                          │
+│     field                │               │                          │
 │                          │               │                          │
-│                          │               │ AICPU scheduler thread:  │
-│                          │               │   per-loop-iter:         │
-│                          │               │     write AicpuPhase-    │
-│                          │               │     Record               │
+│ poll thread:             │               │                          │
+│   wait_pop_ready          │               │                          │
+│   on_buffer_collected →  │               │                          │
+│     copy_perf/phase      │               │                          │
+│   notify_copy_done       │               │                          │
 │                          │               │                          │
 │ rtStreamSynchronize      │               │                          │
-│ collect_all()            │  batch        │                          │
-│   memcpy setup region    │<──memcpy─────<│                          │
-│   per core/thread:       │               │                          │
-│     copy buffer hdr →    │               │                          │
-│     read count           │               │                          │
-│     copy count*record    │               │                          │
+│ stop()                   │               │                          │
+│   join mgmt + poll       │               │                          │
+│ read_phase_header_meta   │               │                          │
+│ reconcile_counters       │               │                          │
+│   sanity-check leftovers │               │                          │
+│   + 3-bucket cross-check │               │                          │
 │ export_swimlane_json()   │               │                          │
-│   → l2_perf_records.json │               │                          │
 │ finalize(free)           │               │                          │
 └──────────────────────────┘               └──────────────────────────┘
 ```
@@ -391,22 +444,37 @@ header, read `count`, and copy `count*sizeof(record)` bytes.
 **Lifecycle** (`device_runner.cpp`):
 
 ```text
-initialize()
-  l2_perf_collector_.initialize(num_aicore, ...)
+init_l2_perf()
+  l2_perf_collector_.initialize(num_aicore, ..., output_prefix_)
   kernel_args_.args.l2_perf_data_base = l2_perf_collector_.get_l2_perf_setup_device_ptr()
+  kernel_args_.args.aicore_l2_perf_ring_addrs =
+      l2_perf_collector_.get_aicore_ring_addrs_device_ptr()
+l2_perf_collector_.start(thread_factory)   ← mgmt + poll threads
 launch AICPU / AICore
 rtStreamSynchronize
-collect_all()                      ← rtMemcpy setup region back, then per-core
-                                     and per-thread buffers (header → records)
-export_swimlane_json(output_prefix)
-finalize()
+l2_perf_collector_.stop()                  ← join mgmt + poll, drain final batch
+l2_perf_collector_.read_phase_header_metadata()
+l2_perf_collector_.reconcile_counters()    ← sanity-check + 3-bucket cross-check
+l2_perf_collector_.export_swimlane_json()
+l2_perf_collector_.finalize()
 ```
 
 [`L2PerfCollector`](../src/a5/platform/include/host/l2_perf_collector.h)
-on a5 is self-contained — `initialize` / `collect_all` /
-`export_swimlane_json` / `finalize`. There are no helper threads
-to coordinate, so the a5 collector does not derive from
-`ProfilerBase`.
+on a5 inherits the same CRTP base
+([`profiling_common::ProfilerBase`](../src/a5/platform/include/host/profiling_common/profiler_base.h))
+as a2a3 and parameterizes
+[`BufferPoolManager`](../src/a5/platform/include/host/profiling_common/buffer_pool_manager.h)
+with `L2PerfModule` (`kBufferKinds = 2`). The only a5-specific
+glue is the 5-callback `MemoryOps` and the per-tick shm mirror.
+
+a5's per-thread AICPU flush hooks (`l2_perf_aicpu_flush_buffers` /
+`l2_perf_aicpu_flush_phase_buffers`) are the only data path on the
+records side — host never reads from `current_buf_ptr` to recover
+records. `reconcile_counters` is purely passive: it logs an error if
+any `current_buf_ptr` is non-zero with a non-empty buffer (a
+device-flush bug), then runs the three-bucket cross-check
+`collected + dropped + mismatch == device_total` per pool (PERF +
+PHASE), same shape as a2a3.
 
 ### 5.4 a2a3 vs a5 at a glance
 
@@ -415,12 +483,14 @@ to coordinate, so the a5 collector does not derive from
 | Record shape | identical (`L2PerfRecord` / `AicpuPhaseRecord` / `AicpuOrchSummary`) | |
 | AICore WIP-slot protocol | identical | |
 | AICPU commit on FIN | identical | |
-| Host transport | `halHostRegister` shared memory | `rtMemcpy` after `rtStreamSynchronize` |
-| Buffer model | rotating pool (free + ready queues) per kind | one `L2PerfBuffer` per core + one `PhaseBuffer` per thread |
-| Ready queue | per-AICPU-thread, multiplexes PERF + PHASE via `is_phase` | none (all buffers pre-allocated) |
-| Host threads | mgmt + poll, streams during execution | drain after sync |
-| Host-class shape | `ProfilerBase` subclass (mgmt + poll thread + `BufferPoolManager<L2PerfModule>`, `kBufferKinds = 2`) | self-contained `initialize`/`collect_all`/`finalize` |
-| Lifecycle | `initialize` → `start` → `stop` → `read_phase_header_metadata` → `reconcile_counters` → `export_swimlane_json` → `finalize` | `initialize` → `collect_all` → `export_swimlane_json` → `finalize` |
+| Buffer model | rotating pool (free + ready queues) per kind | identical |
+| Ready queue | per-AICPU-thread, multiplexes PERF + PHASE via `is_phase` | identical |
+| Host threads | mgmt + poll, streams during execution | identical |
+| Host-class shape | `ProfilerBase<L2PerfCollector, L2PerfModule>` (`kBufferKinds = 2`) | identical |
+| Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
+| `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
+| `reconcile_counters` | passive cross-check (collected + dropped + mismatch == device_total) | identical |
+| Lifecycle | `initialize` → `start` → `stop` → `read_phase_header_metadata` → `reconcile_counters` → `export_swimlane_json` → `finalize` | identical |
 
 ## 6. Overhead
 
@@ -437,9 +507,10 @@ When enabled, the dominant per-task overhead is:
 
 Per scheduler-loop iteration, AICPU also writes a 32-byte
 `AicpuPhaseRecord` per phase (4 phases × 32 B = 128 B per
-iteration). Streaming (a2a3) drains both kinds of buffers
-concurrently with execution; bulk drain (a5) defers the host-side
-cost to after `rtStreamSynchronize`.
+iteration). Both architectures drain buffers concurrently with
+execution via the mgmt + poll thread pair; a5 additionally pays
+per-tick `rtMemcpy`/`memcpy` round-trips to keep the host shadow in
+sync, which overlap with device execution.
 
 `--rounds > 1` collects only on the first round so the steady-state
 benchmark is not perturbed.

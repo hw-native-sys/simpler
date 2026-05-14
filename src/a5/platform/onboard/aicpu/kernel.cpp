@@ -88,16 +88,18 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
     set_log_level(static_cast<int>(k_args->log_level));
     set_log_info_v(static_cast<int>(k_args->log_info_v));
 
-    // Store platform regs before calling aicpu_execute
-    // Dump enable is an execution control flag propagated via handshake.
-    // The dump base address is only the backing storage location.
+    // Store platform regs before calling aicpu_execute. Profiling enable
+    // bits live on KernelArgs::enable_profiling_flag now (no longer
+    // mirrored into Handshake), so decode the umbrella bitmask once and
+    // hand it to the existing platform-state setters.
     set_platform_regs(k_args->regs);
     set_platform_dump_base(k_args->dump_data_base);
-    set_dump_tensor_enabled(GET_PROFILING_FLAG(runtime->workers[0].enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
+    set_dump_tensor_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
     set_platform_l2_perf_base(k_args->l2_perf_data_base);
-    set_l2_swimlane_enabled(GET_PROFILING_FLAG(runtime->workers[0].enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
+    set_l2_swimlane_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
-    set_pmu_enabled(GET_PROFILING_FLAG(runtime->workers[0].enable_profiling_flag, PROFILING_FLAG_PMU));
+    set_pmu_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_PMU));
+    set_platform_pmu_reg_addrs(k_args->pmu_reg_addrs);
 
     // Affinity gate: drop excess threads before entering runtime
     if (!platform_aicpu_affinity_gate(runtime->sche_cpu_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {

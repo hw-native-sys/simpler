@@ -1,13 +1,19 @@
 # Profiling Framework
 
-Shared host-side infrastructure under
-[`src/a2a3/platform/include/host/profiling_common/`](../src/a2a3/platform/include/host/profiling_common/)
-that the PMU, L2Perf, and TensorDump collectors are built on. This page is
-the framework reference; the per-collector pages
+Shared host-side infrastructure that the PMU, L2Perf, and TensorDump
+collectors are built on. Each architecture maintains its own copy of the
+framework headers under `src/<arch>/platform/include/host/profiling_common/`
+([a2a3](../src/a2a3/platform/include/host/profiling_common/),
+[a5](../src/a5/platform/include/host/profiling_common/)) — the two copies
+are kept byte-for-byte structurally aligned so reviewers can diff them, but
+each arch is free to evolve independently. This page describes the shape;
+§8 covers the a5-specific deviations driven by transport differences.
+
+The per-collector pages
 ([pmu-profiling.md](dfx/pmu-profiling.md),
 [l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md),
 [tensor-dump.md](dfx/tensor-dump.md))
-describe the data they collect and how they enable it on-device.
+describe the data each subsystem collects and how it enables it on-device.
 
 ## 1. Why a shared framework
 
@@ -295,3 +301,96 @@ Existing collectors are the canonical examples:
   — two kinds (perf records + phase markers), per-core / per-thread
   instances; the canonical multi-kind example. See
   [l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md).
+
+## 8. a5 specifics — host-shadow transport
+
+a5's framework headers (under
+[`src/a5/platform/include/host/profiling_common/`](../src/a5/platform/include/host/profiling_common/))
+mirror a2a3's class shapes — same `ProfilerBase<Derived, Module>` /
+`BufferPoolManager<Module>` / `ProfilerAlgorithms<Module>` decomposition,
+same Module concept contract, same start/stop lifecycle. The only
+behavioral deviation is the **transport channel**: a5 has no
+`halHostRegister`, so device↔host synchronization goes through
+`profiling_copy.h` (`rtMemcpy` onboard, `memcpy` in sim) against a
+host-shadow `malloc()` paired with each device buffer. Three mechanical
+changes capture that:
+
+1. **`MemoryOps` carries 5 callbacks instead of 3.** In addition to
+   `alloc` / `reg` / `free_`, a5 adds `copy_to_device` and
+   `copy_from_device`. `reg` allocates the paired host shadow (instead of
+   mapping a HAL view onto the device pointer); a default
+   `default_host_shadow_register` (`malloc + memset 0 + copy_to_device`)
+   is installed when the collector passes `nullptr` for `register_cb`.
+2. **The mgmt loop mirrors the shm region into the host shadow per tick,
+   then writes back only the fields it modified.** At the top of every
+   tick the loop calls `manager_.mirror_shm_from_device()` to pull the
+   `DataHeader` (with its `queue_tails`) and all `BufferState`s into the
+   host shadow. As host advances `queue_heads[q]` or refills a
+   `free_queue.tail` / `buffer_ptrs[slot]`, those individual fields are
+   pushed back to device with `manager_.write_range_to_device(&field,
+   sizeof(field))`. The bulk `mirror_shm_to_device` is deliberately
+   **not** called from the mgmt loop — it would race with AICPU writes
+   to device-only fields (`current_buf_ptr`, `total/dropped/mismatch`
+   counters, `queue_tails`, `free_queue.head`,
+   `AicpuPhaseHeader::magic`, `orch_summary`, `core_to_thread[]`),
+   rolling them back to whatever the host shadow had at the start of
+   the tick. Per-buffer payloads (`L2PerfBuffer` / `PmuBuffer` /
+   `DumpMetaBuffer`) are still pulled on demand inside
+   `ProfilerAlgorithms::process_entry` after resolving the host pointer
+   for a popped ready entry. The bulk `mirror_shm_to_device` is kept
+   for init/teardown where AICPU is not yet running or has exited.
+3. **`release_owned_buffers` frees the paired host shadow.** When the
+   framework recycles a device buffer at finalize time, it also frees the
+   `malloc()`'d shadow tracked in `dev_to_host_`. `clear_mappings()` does
+   the same for any remaining mappings (per-state buffers and the shm
+   region itself).
+
+Each collector's `reconcile_counters` is purely passive — same shape as
+a2a3. It pulls the post-`stop()` `BufferState`s, logs an error if any
+`current_buf_ptr` still references a non-empty buffer (a device flush
+bug, since AICPU is the only writer that can clear it), and runs the
+three-bucket cross-check
+`collected_on_host + dropped + mismatch == device_total` against
+device-side counters per pool. Host never reads from `current_buf_ptr`
+to recover records — recovering would mask AICPU flush bugs.
+
+### 8.1 Profiling state lives on `KernelArgs`, not `Handshake`
+
+a5 carries the same "profiling out of the runtime synchronization protocol"
+design as a2a3 (PR #714) plus the AICore-side rings of PR #709. The runtime
+`Handshake` struct contains **no profiling fields** — enablement bits and
+per-core ring/reg addresses travel through `KernelArgs`:
+
+| `KernelArgs` field | Producer | Consumer |
+| ------------------ | -------- | -------- |
+| `enable_profiling_flag` (bitmask) | host (DeviceRunner) | AICPU `kernel.cpp` → `set_l2_swimlane_enabled` / `set_pmu_enabled` / `set_dump_tensor_enabled`; AICore `KERNEL_ENTRY` → `set_aicore_profiling_flag` |
+| `aicore_l2_perf_ring_addrs` (table) | host (`L2PerfCollector::initialize`) | AICore `KERNEL_ENTRY` indexes `table[block_idx]` → `set_aicore_l2_perf_ring` |
+| `aicore_pmu_ring_addrs` (table) | host (`PmuCollector::init`) | AICore `KERNEL_ENTRY` → `set_aicore_pmu_ring` |
+| `pmu_reg_addrs` (table) | host alloc; AICPU `pmu_aicpu_init` fills entries | AICore `KERNEL_ENTRY` → `set_pmu_reg_addrs`; AICore `aicore_execute` reads `get_aicore_pmu_reg_base()` per-record |
+
+AICore's per-core profiling slots live in
+[`aicore/aicore_profiling_state.h`](../src/a5/platform/include/aicore/aicore_profiling_state.h)
+— `[[block_local]]` static on onboard, `pthread_key_t` TLS in sim. The
+runtime `aicore_execute(runtime, block_idx, core_type)` signature is
+unchanged; adding a new profiling field touches `KernelArgs` and this
+state surface, never the runtime protocol.
+
+### 8.2 Stable AICore staging ring (decouples AICore write from AICPU buffer rotation)
+
+L2Perf and PMU on a5 both use the "AICore writes, AICPU commits" model.
+The AICore-side write target is a per-core
+[`L2PerfAicoreRing`](../src/a5/platform/include/common/l2_perf_profiling.h) /
+[`PmuAicoreRing`](../src/a5/platform/include/common/pmu_profiling.h) of
+`PLATFORM_{L2,PMU}_AICORE_RING_SIZE` (= 2, dual-issue) slots, allocated
+once by the host and addressed by
+`BufferState::aicore_ring_ptr` (AICPU-visible) and the per-core
+`aicore_*_ring_addrs[block_idx]` (AICore-visible). The address is
+never reassigned, so AICore's write target is stable across AICPU's
+rotating `L2PerfBuffer` / `PmuBuffer` flips — flipping is now
+fully internal to `*_complete_record` and never crosses into Handshake.
+
+Everything else — Module concept contract, alloc policy
+(1-in/1-out + proactive replenish), `kIdleTimeoutSec` / `kSubsystemName`
+contract, mgmt-then-poll start/stop ordering, buffer-pool sizing
+constants — matches a2a3 exactly. New collectors should be reviewed
+against both arches when added.
