@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Hardware ST for examples/workers/l3/ffn_tp_parallel."""
+"""ST for examples/workers/l3/ffn_tp_parallel."""
 
 import os
 from importlib.machinery import SourceFileLoader
@@ -17,10 +17,9 @@ _main = SourceFileLoader("ffn_tp_parallel_main", os.path.join(os.path.dirname(__
 run = _main.run
 
 
-@pytest.mark.requires_hardware
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
-def test_ffn_tp_parallel(st_device_ids):
-    rc = run([int(d) for d in st_device_ids])
+def test_ffn_tp_parallel(st_platform, st_device_ids):
+    rc = run(st_platform, [int(d) for d in st_device_ids])
     assert rc == 0

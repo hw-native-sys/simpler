@@ -21,8 +21,9 @@ edge automatically — no manual barriers in Python.  Cross-rank exchange in
 stage 2 still goes through a per-chip ``scratch`` HCCL-window buffer (laid
 out as ``[mailbox: nranks * M*N floats | signal tail: nranks int32 slots]``).
 
-Hardware only.  Run:
-    python examples/workers/l3/ffn_tp_parallel/main.py -d 0-1
+Run:
+    python examples/workers/l3/ffn_tp_parallel/main.py -p a2a3sim -d 0-1
+    python examples/workers/l3/ffn_tp_parallel/main.py -p a2a3    -d 0-1
 """
 
 from __future__ import annotations
@@ -101,7 +102,8 @@ def build_ffn_local_callable(platform: str) -> ChipCallable:
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
     )
-    kernel_bytes = extract_text_section(kernel_bytes)
+    if not platform.endswith("sim"):
+        kernel_bytes = extract_text_section(kernel_bytes)
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
@@ -130,7 +132,8 @@ def build_allreduce_sum_callable(platform: str) -> ChipCallable:
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
     )
-    kernel_bytes = extract_text_section(kernel_bytes)
+    if not platform.endswith("sim"):
+        kernel_bytes = extract_text_section(kernel_bytes)
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
@@ -155,14 +158,14 @@ def make_rank_inputs(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
     return x, w
 
 
-def run(device_ids: list[int]) -> int:
+def run(platform: str, device_ids: list[int]) -> int:
     nranks = len(device_ids)
     # scratch = mailbox(nranks * M*N floats) + signal tail (nranks int32).
     scratch_count = nranks * M * N
     scratch_nbytes = scratch_count * DTYPE_NBYTES + nranks * 4
     window_size = max(scratch_nbytes, 4 * 1024)
 
-    print(f"[ffn_tp_parallel] devices={device_ids} nranks={nranks} M={M} K={K} N={N}")
+    print(f"[ffn_tp_parallel] platform={platform} devices={device_ids} nranks={nranks} M={M} K={K} N={N}")
 
     # Per-rank host tensors via torch.share_memory_(): inputs, partial_local
     # (stage1 output / stage2 input), and final y (stage2 output).
@@ -190,12 +193,12 @@ def run(device_ids: list[int]) -> int:
     )
 
     print("[ffn_tp_parallel] compiling kernels...")
-    ffn_local_cc = build_ffn_local_callable("a2a3")
-    allreduce_cc = build_allreduce_sum_callable("a2a3")
+    ffn_local_cc = build_ffn_local_callable(platform)
+    allreduce_cc = build_allreduce_sum_callable(platform)
 
     worker = Worker(
         level=3,
-        platform="a2a3",
+        platform=platform,
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
@@ -284,9 +287,10 @@ def run(device_ids: list[int]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-p", "--platform", required=True, choices=["a2a3sim", "a2a3"])
     parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1'. Two chips required.")
     cli = parser.parse_args()
-    return run(parse_device_range(cli.device))
+    return run(cli.platform, parse_device_range(cli.device))
 
 
 if __name__ == "__main__":

@@ -13,12 +13,11 @@ import pytest
 from .main import run
 
 
-@pytest.mark.requires_hardware
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(3)
-def test_domain_rank_map(st_device_ids, capsys):
-    rc = run("a2a3", [int(d) for d in st_device_ids])
+def test_domain_rank_map(st_platform, st_device_ids, capsys):
+    rc = run(st_platform, [int(d) for d in st_device_ids])
     out = capsys.readouterr().out
     assert rc == 0
     assert "even worker 0: max_diff=" in out

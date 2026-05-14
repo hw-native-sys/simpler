@@ -22,10 +22,9 @@
  */
 
 #include <cstdint>
-
+#include <pto/pto-inst.hpp>
 #include <pto/common/constants.hpp>
 #include <pto/common/pto_tile.hpp>
-#include <pto/pto-inst.hpp>
 
 #include "tensor.h"
 

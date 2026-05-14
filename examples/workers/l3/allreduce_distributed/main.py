@@ -24,11 +24,9 @@ the framework's TaskArgs path handles H2D / D2H automatically (same as
 domain because window buffers can only exist after HCCL
 ``comm_alloc_windows`` has run.
 
-Hardware only.  The sim backend's CommRemotePtr uses a different addressing
-scheme; sim support is out of scope for this demo.
-
 Run:
-    python examples/workers/l3/allreduce_distributed/main.py -d 0-1
+    python examples/workers/l3/allreduce_distributed/main.py -p a2a3sim -d 0-1
+    python examples/workers/l3/allreduce_distributed/main.py -p a2a3    -d 0-1
 """
 
 from __future__ import annotations
@@ -109,7 +107,8 @@ def build_chip_callable(platform: str) -> ChipCallable:
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
     )
-    kernel_bytes = extract_text_section(kernel_bytes)
+    if not platform.endswith("sim"):
+        kernel_bytes = extract_text_section(kernel_bytes)
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
@@ -132,14 +131,14 @@ def expected_output(nranks: int) -> list[float]:
     return [float(nranks * i + 100 * nranks * (nranks - 1) // 2) for i in range(ALLREDUCE_COUNT)]
 
 
-def run(device_ids: list[int]) -> int:
+def run(platform: str, device_ids: list[int]) -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
     # HCCL may round up; only needs to hold SCRATCH_NBYTES.  A 4 KB floor
     # keeps us clear of any HCCL minimum-window-size quirks.
     window_size = max(SCRATCH_NBYTES, 4 * 1024)
 
-    print(f"[allreduce] devices={device_ids} nranks={nranks}")
+    print(f"[allreduce] platform={platform} devices={device_ids} nranks={nranks}")
 
     # --- Per-rank host tensors (input/output) via torch.share_memory_().
     # share_memory_() moves the storage into an mmap region that forked
@@ -174,11 +173,11 @@ def run(device_ids: list[int]) -> int:
     )
 
     print("[allreduce] compiling kernels...")
-    chip_callable = build_chip_callable("a2a3")
+    chip_callable = build_chip_callable(platform)
 
     worker = Worker(
         level=3,
-        platform="a2a3",
+        platform=platform,
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
@@ -246,9 +245,10 @@ def run(device_ids: list[int]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-p", "--platform", required=True, choices=["a2a3sim", "a2a3"])
     parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1'. Two chips required.")
     cli = parser.parse_args()
-    return run(parse_device_range(cli.device))
+    return run(cli.platform, parse_device_range(cli.device))
 
 
 if __name__ == "__main__":

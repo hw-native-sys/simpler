@@ -19,8 +19,9 @@ contexts.  The L3 orchestration submits communication in both domains and
 then submits affine compute tasks that depend only on their own domain's
 reduced tensor.
 
-Hardware only.  Run:
-    python examples/workers/l3/dual_domain_overlap/main.py -d 0-2
+Run:
+    python examples/workers/l3/dual_domain_overlap/main.py -p a2a3sim -d 0-2
+    python examples/workers/l3/dual_domain_overlap/main.py -p a2a3    -d 0-2
 """
 
 from __future__ import annotations
@@ -97,7 +98,8 @@ def build_allreduce_callable(platform: str) -> ChipCallable:
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
     )
-    kernel_bytes = extract_text_section(kernel_bytes)
+    if not platform.endswith("sim"):
+        kernel_bytes = extract_text_section(kernel_bytes)
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
         source_path=os.path.join(HERE, "kernels/orchestration/domain_allreduce_orch.cpp"),
@@ -123,7 +125,8 @@ def build_affine_callable(platform: str) -> ChipCallable:
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
     )
-    kernel_bytes = extract_text_section(kernel_bytes)
+    if not platform.endswith("sim"):
+        kernel_bytes = extract_text_section(kernel_bytes)
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
         source_path=os.path.join(HERE, "kernels/orchestration/affine_orch.cpp"),
@@ -185,10 +188,10 @@ def _add_domain_scratch(args: TaskArgs, domain: ChipCommDomainContext) -> None:
     args.add_scalar(domain.device_ctx)
 
 
-def run(device_ids: list[int]) -> int:
+def run(platform: str, device_ids: list[int]) -> int:
     nranks = len(device_ids)
     assert nranks == 3
-    print(f"[dual_domain_overlap] devices={device_ids}")
+    print(f"[dual_domain_overlap] platform={platform} devices={device_ids}")
 
     host_x = [
         torch.tensor([rank * 100 + i for i in range(COUNT)], dtype=torch.float32).share_memory_()
@@ -202,12 +205,12 @@ def run(device_ids: list[int]) -> int:
     affine_out = _domain_tensor_map()
 
     print("[dual_domain_overlap] compiling kernels...")
-    allreduce_cc = build_allreduce_callable("a2a3")
-    affine_cc = build_affine_callable("a2a3")
+    allreduce_cc = build_allreduce_callable(platform)
+    affine_cc = build_affine_callable(platform)
 
     worker = Worker(
         level=3,
-        platform="a2a3",
+        platform=platform,
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
@@ -291,9 +294,10 @@ def run(device_ids: list[int]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-p", "--platform", required=True, choices=["a2a3sim", "a2a3"])
     parser.add_argument("-d", "--device", default="0-2", help="Device range, e.g. '0-2'. Three chips required.")
     cli = parser.parse_args()
-    return run(parse_device_range(cli.device))
+    return run(cli.platform, parse_device_range(cli.device))
 
 
 if __name__ == "__main__":

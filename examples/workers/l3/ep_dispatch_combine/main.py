@@ -49,9 +49,10 @@ Type/shape contract:
   - ``recv_count_out`` is [L, 1] INT32 emitted by dispatch's prefix_sum
     phase.
 
-Hardware only. Run:
+Run:
 
-    python examples/workers/l3/ep_dispatch_combine/main.py -d 0-1
+    python examples/workers/l3/ep_dispatch_combine/main.py -p a2a3sim -d 0-1
+    python examples/workers/l3/ep_dispatch_combine/main.py -p a2a3    -d 0-1
 """
 
 from __future__ import annotations
@@ -148,7 +149,9 @@ def build_chip_callable(platform: str) -> ChipCallable:
             pto_isa_root=pto_isa_root,
             extra_include_dirs=kernel_include_dirs,
         )
-        return extract_text_section(b)
+        if not platform.endswith("sim"):
+            return extract_text_section(b)
+        return b
 
     dispatch_bin = compile_aiv("dispatch.cpp")
     local_expert_bin = compile_aiv("local_expert.cpp")
@@ -414,14 +417,14 @@ def _verify_routed_y(
     return ok
 
 
-def run(device_ids: list[int]) -> int:
+def run(platform: str, device_ids: list[int]) -> int:
     """Core logic — callable from CLI and pytest."""
     nranks = len(device_ids)
     assert nranks == N_RANKS
 
     window_size = max(SCRATCH_NBYTES, 128 * 1024)
 
-    print(f"[ep_dispatch] devices={device_ids} nranks={nranks}")
+    print(f"[ep_dispatch] platform={platform} devices={device_ids} nranks={nranks}")
 
     # x_norm[r, t, d] = r*100 + t*10 + d  →  max value = 1*100 + 7*10 + 63 = 233.
     # All values are integers ≤ 256, so they fit BF16 exactly (8-bit mantissa
@@ -490,11 +493,11 @@ def run(device_ids: list[int]) -> int:
     )
 
     print("[ep_dispatch] compiling kernels...")
-    chip_callable = build_chip_callable("a2a3")
+    chip_callable = build_chip_callable(platform)
 
     worker = Worker(
         level=3,
-        platform="a2a3",
+        platform=platform,
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
@@ -546,18 +549,22 @@ def run(device_ids: list[int]) -> int:
         print("[ep_dispatch] running 2-chip dispatch DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
 
-        ok = _verify_recv_outputs(
-            nranks,
-            expected_count,
-            expected_recv_x,
-            expected_recv_w,
-            expected_recv_idx,
-            recv_count_outs,
-            recv_x_outs,
-            recv_w_outs,
-            recv_idx_outs,
-        )
-        ok = _verify_routed_y(nranks, x_norms, weights, routed_y_outs) and ok
+        if platform.endswith("sim"):
+            # Sim keeps intermediate child outputs device-local when they feed later child tasks.
+            ok = _verify_routed_y(nranks, x_norms, weights, routed_y_outs)
+        else:
+            ok = _verify_recv_outputs(
+                nranks,
+                expected_count,
+                expected_recv_x,
+                expected_recv_w,
+                expected_recv_idx,
+                recv_count_outs,
+                recv_x_outs,
+                recv_w_outs,
+                recv_idx_outs,
+            )
+            ok = _verify_routed_y(nranks, x_norms, weights, routed_y_outs) and ok
 
         if not ok:
             print("[ep_dispatch] golden check FAILED")
@@ -570,9 +577,10 @@ def run(device_ids: list[int]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-p", "--platform", required=True, choices=["a2a3sim", "a2a3"])
     parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1'. Two chips required.")
     cli = parser.parse_args()
-    return run(parse_device_range(cli.device))
+    return run(cli.platform, parse_device_range(cli.device))
 
 
 if __name__ == "__main__":

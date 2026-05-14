@@ -24,6 +24,7 @@ that:
   * each domain transfers data only among its own participants.
 
 Run:
+    python examples/workers/l3/domain_rank_map/main.py -p a2a3sim -d 0-2
     python examples/workers/l3/domain_rank_map/main.py -p a2a3    -d 0-2
 """
 
@@ -113,7 +114,8 @@ def build_allreduce_callable(platform: str) -> ChipCallable:
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
     )
-    kernel_bytes = extract_text_section(kernel_bytes)
+    if not platform.endswith("sim"):
+        kernel_bytes = extract_text_section(kernel_bytes)
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
         source_path=os.path.join(OVERLAP_DIR, "kernels/orchestration/domain_allreduce_orch.cpp"),
@@ -153,9 +155,6 @@ def _check_missing(ctx_domains: dict, name: str) -> bool:
 
 
 def run(platform: str, device_ids: list[int]) -> int:
-    if platform != "a2a3":
-        raise ValueError("domain_rank_map uses PTO-ISA remote-window kernels and requires a2a3 hardware")
-
     print(f"[domain_rank_map] platform={platform} devices={device_ids}")
     host_inputs = {
         worker_idx: torch.tensor(
@@ -263,7 +262,7 @@ def run(platform: str, device_ids: list[int]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-p", "--platform", required=True, choices=["a2a3"])
+    parser.add_argument("-p", "--platform", required=True, choices=["a2a3sim", "a2a3"])
     parser.add_argument("-d", "--device", default="0-2", help="Device range, e.g. '0-2'. Three chips required.")
     cli = parser.parse_args()
     return run(cli.platform, parse_device_range(cli.device))
