@@ -42,243 +42,14 @@
 #include "pto/npu/comm/async/sdma/sdma_workspace_manager.hpp"
 #endif
 
-using CommTopo = uint32_t;
-
-// Internal HCCL helpers are exported by libhcomm on CANN 9.x.  The public
-// HCCL APIs below intentionally use the standard, non-V2 entry points to match
-// the working pto-isa initialization sequence.
-extern "C" HcclResult HcclAllocComResourceByTiling(HcclComm comm, void *stream, void *mc2Tiling, void **commContext);
-extern "C" HcclResult HcomGetCommHandleByGroup(const char *group, HcclComm *commHandle);
-extern "C" HcclResult HcomGetL0TopoTypeEx(const char *group, CommTopo *topoType, uint32_t isSetDevice);
-
+// Thin wrappers around the HCCL public APIs we use. Kept as a translation
+// layer in case we need to swap (e.g., InitConfig variant) later.
 static inline HcclResult hccl_get_root_info(HcclRootInfo *ri) { return HcclGetRootInfo(ri); }
 static inline HcclResult hccl_comm_init_root_info(uint32_t n, const HcclRootInfo *ri, uint32_t r, HcclComm *c) {
     return HcclCommInitRootInfo(n, ri, r, c);
 }
-static inline HcclResult hccl_get_comm_name(HcclComm c, char *name) { return HcclGetCommName(c, name); }
 static inline HcclResult hccl_barrier(HcclComm c, aclrtStream s) { return HcclBarrier(c, s); }
 static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(c); }
-static inline HcclResult hccl_alloc_com_resource(HcclComm c, void *s, void *t, void **ctx) {
-    return HcclAllocComResourceByTiling(c, s, t, ctx);
-}
-static inline HcclResult hccl_get_comm_handle_by_group(const char *g, HcclComm *c) {
-    return HcomGetCommHandleByGroup(g, c);
-}
-static inline HcclResult hccl_get_l0_topo_type_ex(const char *g, CommTopo *t, uint32_t f) {
-    return HcomGetL0TopoTypeEx(g, t, f);
-}
-
-static constexpr uint32_t COMM_IS_NOT_SET_DEVICE = 0;
-static constexpr uint32_t COMM_TOPO_MESH = 0b1u;
-
-// ============================================================================
-// HCCL tiling structures (required by HcclAllocComResourceByTiling)
-// ============================================================================
-
-namespace {
-
-static constexpr uint32_t MAX_CC_TILING_NUM = 8U;
-static constexpr uint32_t GROUP_NAME_SIZE = 128U;
-static constexpr uint32_t ALG_CONFIG_SIZE = 128U;
-
-struct Mc2InitTilingInner {
-    uint32_t version;
-    uint32_t mc2HcommCnt;
-    uint32_t offset[MAX_CC_TILING_NUM];
-    uint8_t debugMode;
-    uint8_t preparePosition;
-    uint16_t queueNum;
-    uint16_t commBlockNum;
-    uint8_t devType;
-    char reserved[17];
-};
-
-struct Mc2cCTilingInner {
-    uint8_t skipLocalRankCopy;
-    uint8_t skipBufferWindowCopy;
-    uint8_t stepSize;
-    uint8_t version;
-    char reserved[9];
-    uint8_t commEngine;
-    uint8_t srcDataType;
-    uint8_t dstDataType;
-    char groupName[GROUP_NAME_SIZE];
-    char algConfig[ALG_CONFIG_SIZE];
-    uint32_t opType;
-    uint32_t reduceType;
-};
-
-struct Mc2CommConfigV2 {
-    Mc2InitTilingInner init;
-    Mc2cCTilingInner inner;
-};
-
-// HCCL compat structs for RING topology parsing
-struct HcclSignalInfo {
-    uint64_t resId;
-    uint64_t addr;
-    uint32_t devId;
-    uint32_t tsId;
-    uint32_t rankId;
-    uint32_t flag;
-};
-
-struct HcclStreamInfo {
-    int32_t streamIds;
-    uint32_t sqIds;
-    uint32_t cqIds;
-    uint32_t logicCqids;
-};
-
-struct ListCommon {
-    uint64_t nextHost;
-    uint64_t preHost;
-    uint64_t nextDevice;
-    uint64_t preDevice;
-};
-
-static constexpr uint32_t COMPAT_LOCAL_NOTIFY_MAX_NUM = 64;
-static constexpr uint32_t COMPAT_LOCAL_STREAM_MAX_NUM = 19;
-static constexpr uint32_t COMPAT_AICPU_OP_NOTIFY_MAX_NUM = 2;
-
-struct LocalResInfoV2 {
-    uint32_t streamNum;
-    uint32_t signalNum;
-    HcclSignalInfo localSignals[COMPAT_LOCAL_NOTIFY_MAX_NUM];
-    HcclStreamInfo streamInfo[COMPAT_LOCAL_STREAM_MAX_NUM];
-    HcclStreamInfo mainStreamInfo;
-    HcclSignalInfo aicpuOpNotify[COMPAT_AICPU_OP_NOTIFY_MAX_NUM];
-    ListCommon nextTagRes;
-};
-
-struct AlgoTopoInfo {
-    uint32_t userRank;
-    uint32_t userRankSize;
-    int32_t deviceLogicId;
-    bool isSingleMeshAggregation;
-    uint32_t deviceNumPerAggregation;
-    uint32_t superPodNum;
-    uint32_t devicePhyId;
-    uint32_t topoType;
-    uint32_t deviceType;
-    uint32_t serverNum;
-    uint32_t meshAggregationRankSize;
-    uint32_t multiModuleDiffDeviceNumMode;
-    uint32_t multiSuperPodDiffServerNumMode;
-    uint32_t realUserRank;
-    bool isDiffDeviceModule;
-    bool isDiffDeviceType;
-    uint32_t gcdDeviceNumPerAggregation;
-    uint32_t moduleNum;
-    uint32_t isUsedRdmaRankPairNum;
-    uint64_t isUsedRdmaRankPair;
-    uint32_t pairLinkCounterNum;
-    uint64_t pairLinkCounter;
-    uint32_t nicNum;
-    uint64_t nicList;
-    uint64_t complanRankLength;
-    uint64_t complanRank;
-    uint64_t bridgeRankNum;
-    uint64_t bridgeRank;
-    uint64_t serverAndsuperPodRankLength;
-    uint64_t serverAndsuperPodRank;
-};
-
-struct HcclOpConfig {
-    uint8_t deterministic;
-    uint8_t retryEnable;
-    uint8_t highPerfEnable;
-    uint8_t padding[5];
-    uint8_t linkTimeOut[8];
-    uint64_t notifyWaitTime;
-    uint32_t retryHoldTime;
-    uint32_t retryIntervalTime;
-    bool interXLinkDisable;
-    uint32_t floatOverflowMode;
-    uint32_t multiQpThreshold;
-};
-
-struct RemoteResPtr {
-    uint64_t nextHostPtr;
-    uint64_t nextDevicePtr;
-};
-
-struct HcclMC2WorkSpace {
-    uint64_t workspace;
-    uint64_t workspaceSize;
-};
-
-struct HcclRankRelationResV2 {
-    uint32_t remoteUsrRankId;
-    uint32_t remoteWorldRank;
-    uint64_t windowsIn;
-    uint64_t windowsOut;
-    uint64_t windowsExp;
-    ListCommon nextTagRes;
-};
-
-struct HcclOpResParamHead {
-    uint32_t localUsrRankId;
-    uint32_t rankSize;
-    uint64_t winSize;
-    uint64_t localWindowsIn;
-    uint64_t localWindowsOut;
-    char hcomId[128];
-    uint64_t winExpSize;
-    uint64_t localWindowsExp;
-};
-
-struct HcclOpResParam {
-    HcclMC2WorkSpace mc2WorkSpace;
-    uint32_t localUsrRankId;
-    uint32_t rankSize;
-    uint64_t winSize;
-    uint64_t localWindowsIn;
-    uint64_t localWindowsOut;
-    char hcomId[128];
-    uint64_t winExpSize;
-    uint64_t localWindowsExp;
-    uint32_t rWinStart;
-    uint32_t rWinOffset;
-    uint64_t version;
-    LocalResInfoV2 localRes;
-    AlgoTopoInfo topoInfo;
-    HcclOpConfig config;
-    uint64_t hostStateInfo;
-    uint64_t aicpuStateInfo;
-    uint64_t lockAddr;
-    uint32_t rsv[16];
-    uint32_t notifysize;
-    uint32_t remoteResNum;
-    RemoteResPtr remoteRes[1];
-};
-
-// Layout contract with CANN 9.x libhcomm.  These asserts convert a silent
-// "field offset shifted -> we read garbage from aclrtMemcpy" failure mode
-// into a compile error.  If CANN upgrades change any of these, re-verify
-// the struct against the new libhcomm source before bumping the numbers.
-static_assert(sizeof(HcclRankRelationResV2) == 64, "HcclRankRelationResV2 size drift");
-static_assert(offsetof(HcclRankRelationResV2, windowsIn) == 8, "HcclRankRelationResV2 layout drift");
-static_assert(sizeof(LocalResInfoV2) == 2472, "LocalResInfoV2 size drift");
-static_assert(sizeof(HcclOpResParam) == 3000, "HcclOpResParam size drift");
-static_assert(offsetof(HcclOpResParam, localUsrRankId) == 16, "HcclOpResParam layout drift");
-static_assert(offsetof(HcclOpResParam, rankSize) == 20, "HcclOpResParam layout drift");
-static_assert(offsetof(HcclOpResParam, winSize) == 24, "HcclOpResParam layout drift");
-static_assert(offsetof(HcclOpResParam, localWindowsIn) == 32, "HcclOpResParam layout drift");
-static_assert(offsetof(HcclOpResParam, remoteRes) == 2984, "HcclOpResParam layout drift");
-
-// Magic numbers required by HcclAllocComResourceByTiling.  These are CANN
-// internal enum values with no public header; names + comments record intent.
-// Changing any of them changes the semantics of the MC2 resource request.
-static constexpr uint32_t kMc2TilingVersion = 100U;    // Mc2InitTilingInner::version
-static constexpr uint32_t kMc2CommBlockNum = 48U;      // Hardware comm block count (A2/A3 topology)
-static constexpr uint8_t kMc2DevType = 4U;             // devType = Ascend 910B family
-static constexpr uint8_t kMc2InnerVersion = 1U;        // Mc2cCTilingInner::version
-static constexpr uint32_t kMc2OpTypeBatchWrite = 18U;  // opType = BatchWrite (MC2 SDMA path)
-static constexpr uint8_t kMc2CommEngineSdma = 3U;      // commEngine = SDMA
-static constexpr const char *kMc2AlgConfig = "BatchWrite=level0:fullmesh";
-
-}  // anonymous namespace
 
 // ============================================================================
 // Internal state
@@ -518,147 +289,267 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     return nullptr;
 }
 
+namespace {
+
+// Path D: build the per-rank symmetric pool ourselves via the legacy ACL
+// IPC primitives (aclrtMalloc + aclrtIpcMemGetExportKey + SetImportPid +
+// ImportByKey), gated by env var SIMPLER_COMM_USE_IPC=1. This mirrors
+// HCCL's own internal cross-rank IPC pattern (refs/hcomm
+// adapter_rts.cc::hrtIpc* + p2p_mgmt.cc::EnableP2P) so we depend only on
+// stable ACL surface, no HCCL-private struct ABI. Spike-validated in
+// hw-native-sys/comm-spike; see project memory for the full story.
+
+constexpr uint64_t kIpcWinSize = 200ULL * 1024 * 1024;
+constexpr size_t kIpcNameLen = 65;
+constexpr uint64_t kIpcAnnounceMagic = 0x49504344334d4549ULL;  // "IPCD3MEI"
+
+struct IpcAnnounceFile {
+    uint64_t magic;
+    int32_t pid;
+    uint32_t rank;
+    int32_t device_id;  // ACL logic device id this rank is bound to.
+    char name[kIpcNameLen];
+    char pad[3];  // keep struct size a multiple of 8
+};
+
+static std::string ipc_announce_path(const std::string &rootinfo, int rank, uint64_t run_token) {
+    return rootinfo + ".ipc." + run_token_hex(run_token) + "." + std::to_string(rank);
+}
+
+static bool ipc_write_announce(
+    const std::string &rootinfo, int rank, uint64_t run_token, int32_t pid, int32_t device_id, const char *name
+) {
+    IpcAnnounceFile a{};
+    a.magic = kIpcAnnounceMagic;
+    a.pid = pid;
+    a.rank = static_cast<uint32_t>(rank);
+    a.device_id = device_id;
+    memcpy(a.name, name, kIpcNameLen);
+    std::string p = ipc_announce_path(rootinfo, rank, run_token);
+    std::string tmp = p + ".tmp." + std::to_string(getpid());
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char *>(&a), sizeof(a));
+        if (!f.good()) {
+            std::remove(tmp.c_str());
+            return false;
+        }
+    }
+    if (std::rename(tmp.c_str(), p.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool ipc_read_announce(
+    const std::string &rootinfo, int peer, uint64_t run_token, IpcAnnounceFile *out, int timeout_sec = 60
+) {
+    std::string p = ipc_announce_path(rootinfo, peer, run_token);
+    for (int i = 0; i < timeout_sec * 10; ++i) {
+        std::ifstream f(p, std::ios::binary);
+        if (f.good()) {
+            IpcAnnounceFile a{};
+            f.read(reinterpret_cast<char *>(&a), sizeof(a));
+            if (f.good() && a.magic == kIpcAnnounceMagic && a.rank == static_cast<uint32_t>(peer)) {
+                *out = a;
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+}
+
+// Drop-in alternative to the MC2 reverse path. Fills h->host_ctx with
+// rankId/rankNum/winSize/windowsIn[] (windowsOut stays zero -- no kernel
+// reads it).
+static int alloc_windows_via_ipc(CommHandle h) {
+    const int rank = h->rank;
+    const int nranks = h->nranks;
+    const std::string &rootinfo = h->rootinfo_path;
+    const uint64_t run_token = h->run_token;
+
+    // Discover our own device id. Rank != device in general (e.g. simpler's
+    // chip_process spawns rank N on whatever device the resource pool gives
+    // it). We need real device ids before any cross-rank ACL setup --
+    // EnablePeerAccess takes a peer DEVICE id, not a peer rank.
+    int32_t myDevice = -1;
+    if (aclrtGetDevice(&myDevice) != ACL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] ipc: aclrtGetDevice failed\n", rank);
+        return -1;
+    }
+
+    // Allocate local buffer + export its IPC name.
+    void *localBuf = nullptr;
+    aclError aret = aclrtMalloc(&localBuf, kIpcWinSize, ACL_MEM_MALLOC_HUGE_FIRST);
+    if (aret != ACL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] ipc: aclrtMalloc -> %d\n", rank, static_cast<int>(aret));
+        return -1;
+    }
+    char myName[kIpcNameLen]{};
+    aret = aclrtIpcMemGetExportKey(localBuf, kIpcWinSize, myName, kIpcNameLen, 0);
+    if (aret != ACL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] ipc: GetExportKey -> %d\n", rank, static_cast<int>(aret));
+        aclrtFree(localBuf);
+        return -1;
+    }
+
+    // Announce (pid, device, name) and read every peer's announcement.
+    const int32_t myPid = static_cast<int32_t>(getpid());
+    if (!ipc_write_announce(rootinfo, rank, run_token, myPid, myDevice, myName)) {
+        fprintf(stderr, "[comm rank %d] ipc: write_announce failed\n", rank);
+        aclrtFree(localBuf);
+        return -1;
+    }
+    std::vector<IpcAnnounceFile> peers(nranks);
+    for (int p = 0; p < nranks; ++p) {
+        if (p == rank) {
+            peers[p].magic = kIpcAnnounceMagic;
+            peers[p].pid = myPid;
+            peers[p].rank = static_cast<uint32_t>(rank);
+            peers[p].device_id = myDevice;
+            memcpy(peers[p].name, myName, kIpcNameLen);
+            continue;
+        }
+        if (!ipc_read_announce(rootinfo, p, run_token, &peers[p])) {
+            fprintf(stderr, "[comm rank %d] ipc: read_announce(peer=%d) timed out\n", rank, p);
+            aclrtFree(localBuf);
+            return -1;
+        }
+    }
+
+    // Now we know every peer's device id. Enable cross-card P2P and poll
+    // until ENABLED. Mirrors hcomm/.../p2p_mgmt.cc::EnableP2P + WaitP2PEnabled.
+    for (int p = 0; p < nranks; ++p) {
+        if (p == rank) continue;
+        aclError r = aclrtDeviceEnablePeerAccess(peers[p].device_id, 0);
+        if (r != ACL_SUCCESS) {
+            // Non-fatal: may already be enabled from a prior init in this process.
+            fprintf(
+                stderr, "[comm rank %d] ipc: EnablePeerAccess(peer_dev=%d) -> %d (continuing)\n", rank,
+                peers[p].device_id, static_cast<int>(r)
+            );
+        }
+    }
+    for (int p = 0; p < nranks; ++p) {
+        if (p == rank) continue;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (true) {
+            int32_t status = 0;
+            aclError r = aclrtDevicePeerAccessStatus(myDevice, peers[p].device_id, &status);
+            if (r != ACL_SUCCESS) {
+                fprintf(
+                    stderr, "[comm rank %d] ipc: PeerAccessStatus(local_dev=%d peer_dev=%d) -> %d\n", rank, myDevice,
+                    peers[p].device_id, static_cast<int>(r)
+                );
+                aclrtFree(localBuf);
+                return -1;
+            }
+            if (status == 1) break;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                fprintf(
+                    stderr, "[comm rank %d] ipc: P2P enable timeout peer=%d peer_dev=%d status=%d\n", rank, p,
+                    peers[p].device_id, status
+                );
+                aclrtFree(localBuf);
+                return -1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    // Barrier so every rank has finished its outbound P2P enable+wait.
+    if (!file_barrier(rootinfo, rank, nranks, "ipc_p2p_ready", run_token)) {
+        aclrtFree(localBuf);
+        return -1;
+    }
+
+    // Authorize every peer's pid against MY name (batched).
+    std::vector<int32_t> peerPids;
+    peerPids.reserve(nranks - 1);
+    for (int p = 0; p < nranks; ++p) {
+        if (p == rank) continue;
+        peerPids.push_back(peers[p].pid);
+    }
+    aret = aclrtIpcMemSetImportPid(myName, peerPids.data(), peerPids.size());
+    if (aret != ACL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] ipc: SetImportPid -> %d\n", rank, static_cast<int>(aret));
+        aclrtFree(localBuf);
+        return -1;
+    }
+    if (!file_barrier(rootinfo, rank, nranks, "ipc_auth_done", run_token)) {
+        aclrtFree(localBuf);
+        return -1;
+    }
+
+    // Import every peer's buffer into our local VA space.
+    memset(&h->host_ctx, 0, sizeof(h->host_ctx));
+    h->host_ctx.rankId = static_cast<uint32_t>(rank);
+    h->host_ctx.rankNum = static_cast<uint32_t>(nranks);
+    h->host_ctx.winSize = kIpcWinSize;
+    h->host_ctx.windowsIn[rank] = reinterpret_cast<uint64_t>(localBuf);
+
+    for (int p = 0; p < nranks; ++p) {
+        if (p == rank) continue;
+        void *peerVa = nullptr;
+        aret = aclrtIpcMemImportByKey(&peerVa, peers[p].name, 0);
+        if (aret != ACL_SUCCESS) {
+            fprintf(
+                stderr, "[comm rank %d] ipc: ImportByKey(peer=%d pid=%d) -> %d\n", rank, p, peers[p].pid,
+                static_cast<int>(aret)
+            );
+            aclrtFree(localBuf);
+            return -1;
+        }
+        h->host_ctx.windowsIn[p] = reinterpret_cast<uint64_t>(peerVa);
+    }
+
+    return 0;
+}
+
+}  // namespace
+
 extern "C" int comm_alloc_windows(CommHandle h, size_t /*win_size*/, uint64_t *device_ctx_out) try {
     if (!h || !device_ctx_out) return -1;
 
-    char group[128] = {};
-    HcclResult hret = hccl_get_comm_name(h->hccl_comm, group);
-    if (hret != HCCL_SUCCESS) return -1;
+    // Path D: DIY symmetric pool on stable ACL IPC + EnablePeerAccess.
+    // Replaced the prior HcclAllocComResourceByTiling reverse-parse path
+    // (broken on CANN 9.0 due to HcclOpResParam ABI drift; see project
+    // history). One backend, works on 8.5 and 9.0 unchanged.
+    if (alloc_windows_via_ipc(h) != 0) return -1;
 
-    CommTopo topoType = 0;
-    hret = hccl_get_l0_topo_type_ex(group, &topoType, COMM_IS_NOT_SET_DEVICE);
-    if (hret != HCCL_SUCCESS) return -1;
-
-    HcclComm commHandle = nullptr;
-    hret = hccl_get_comm_handle_by_group(group, &commHandle);
-    if (hret != HCCL_SUCCESS) return -1;
-
-    // File barrier so all ranks have completed HcclCommInitRootInfo
-    if (!file_barrier(h->rootinfo_path, h->rank, h->nranks, "hccl_init", h->run_token)) {
-        return -1;
-    }
-
-    // Tiling configuration for HcclAllocComResourceByTiling.  See
-    // kMc2* constants above for the meaning of each magic value.
-    Mc2CommConfigV2 tiling{};
-    memset(&tiling, 0, sizeof(tiling));
-    tiling.init.version = kMc2TilingVersion;
-    tiling.init.mc2HcommCnt = 1U;
-    tiling.init.commBlockNum = kMc2CommBlockNum;
-    tiling.init.devType = kMc2DevType;
-    tiling.init.offset[0] =
-        static_cast<uint32_t>(reinterpret_cast<uint64_t>(&tiling.inner) - reinterpret_cast<uint64_t>(&tiling.init));
-    tiling.inner.opType = kMc2OpTypeBatchWrite;
-    tiling.inner.commEngine = kMc2CommEngineSdma;
-    tiling.inner.version = kMc2InnerVersion;
-    strncpy(tiling.inner.groupName, group, GROUP_NAME_SIZE - 1);
-    strncpy(tiling.inner.algConfig, kMc2AlgConfig, ALG_CONFIG_SIZE - 1);
-
-    void *ctxPtr = nullptr;
-    hret = hccl_alloc_com_resource(commHandle, h->stream, &tiling, &ctxPtr);
-    if (hret != HCCL_SUCCESS || ctxPtr == nullptr) return -1;
-
-    // Extract CommContext (topology-dependent)
-    aclError aRet;
-    if (topoType == COMM_TOPO_MESH) {
-        h->device_ctx = reinterpret_cast<CommContext *>(ctxPtr);
-        aRet = aclrtMemcpy(
-            &h->host_ctx, sizeof(h->host_ctx), h->device_ctx, sizeof(h->host_ctx), ACL_MEMCPY_DEVICE_TO_HOST
-        );
-        if (aRet != ACL_SUCCESS) return -1;
-        if (h->host_ctx.rankNum == 0 || h->host_ctx.rankNum > COMM_MAX_RANK_NUM) {
-            fprintf(
-                stderr, "[comm rank %d] MESH CommContext.rankNum=%u out of range [1, %u]\n", h->rank,
-                h->host_ctx.rankNum, COMM_MAX_RANK_NUM
-            );
-            return -1;
-        }
-    } else {
-        // RING topology: parse HcclOpResParam structure on device
-        auto *rawCtx = reinterpret_cast<uint8_t *>(ctxPtr);
-
-        HcclOpResParamHead head{};
-        const size_t headOff = offsetof(HcclOpResParam, localUsrRankId);
-        aRet = aclrtMemcpy(&head, sizeof(head), rawCtx + headOff, sizeof(head), ACL_MEMCPY_DEVICE_TO_HOST);
-        if (aRet != ACL_SUCCESS) return -1;
-
-        // rankSize comes from device memory; cap against our static windowsIn
-        // buffer (COMM_MAX_RANK_NUM) before using it to index or size.
-        if (head.rankSize == 0 || head.rankSize > COMM_MAX_RANK_NUM) {
-            fprintf(
-                stderr, "[comm rank %d] HcclOpResParam.rankSize=%u out of range [1, %u]\n", h->rank, head.rankSize,
-                COMM_MAX_RANK_NUM
-            );
-            return -1;
-        }
-
-        const size_t remoteResOff = offsetof(HcclOpResParam, remoteRes);
-        const size_t remoteResBytes = head.rankSize * sizeof(RemoteResPtr);
-        std::vector<RemoteResPtr> remoteResArr(head.rankSize);
-        aRet = aclrtMemcpy(
-            remoteResArr.data(), remoteResBytes, rawCtx + remoteResOff, remoteResBytes, ACL_MEMCPY_DEVICE_TO_HOST
-        );
-        if (aRet != ACL_SUCCESS) return -1;
-
-        memset(&h->host_ctx, 0, sizeof(h->host_ctx));
-
-        uint64_t wsFields[2] = {0, 0};
-        aRet = aclrtMemcpy(wsFields, sizeof(wsFields), rawCtx, sizeof(wsFields), ACL_MEMCPY_DEVICE_TO_HOST);
-        if (aRet != ACL_SUCCESS) return -1;
-        h->host_ctx.workSpace = wsFields[0];
-        h->host_ctx.workSpaceSize = wsFields[1];
-        h->host_ctx.rankId = head.localUsrRankId;
-        h->host_ctx.rankNum = head.rankSize;
-        h->host_ctx.winSize = head.winSize;
-
-        for (uint32_t i = 0; i < head.rankSize; ++i) {
-            if (i == head.localUsrRankId) {
-                h->host_ctx.windowsIn[i] = head.localWindowsIn;
-                h->host_ctx.windowsOut[i] = head.localWindowsOut;
-                continue;
-            }
-            uint64_t devPtr = remoteResArr[i].nextDevicePtr;
-            if (devPtr == 0) return -1;
-
-            HcclRankRelationResV2 remoteInfo{};
-            aRet = aclrtMemcpy(
-                &remoteInfo, sizeof(remoteInfo), reinterpret_cast<void *>(devPtr), sizeof(remoteInfo),
-                ACL_MEMCPY_DEVICE_TO_HOST
-            );
-            if (aRet != ACL_SUCCESS) return -1;
-            h->host_ctx.windowsIn[i] = remoteInfo.windowsIn;
-            h->host_ctx.windowsOut[i] = remoteInfo.windowsOut;
-        }
-    }
-
-    bool need_device_ctx_copy = topoType != COMM_TOPO_MESH;
+    // Optional PTO-ISA async SDMA workspace pre-allocation. This is a
+    // CANN 9.0+ feature at runtime: aclnnShmemSdmaStarsQuery does not
+    // exist in libopapi.so on 8.5, so SdmaWorkspaceManager::Init() fails
+    // at dlsym and we fall back to workSpace == 0 (demos that need this
+    // field check it and skip). The macro itself only gates the build-
+    // time dependency on PTO_ISA_ROOT. Located here so it overlays the
+    // comm backend's output -- comm-side flow does not care about
+    // workSpace.
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     h->sdma_workspace = std::make_unique<pto::comm::sdma::SdmaWorkspaceManager>();
-    if (!h->sdma_workspace->Init()) {
-        fprintf(stderr, "[comm rank %d] SDMA workspace initialization failed\n", h->rank);
+    if (h->sdma_workspace->Init()) {
+        h->host_ctx.workSpace = reinterpret_cast<uint64_t>(h->sdma_workspace->GetWorkspaceAddr());
+        h->host_ctx.workSpaceSize = 16 * 1024;
+    } else {
+        // On CANN 8.5 the dlsym for the aclnn ops fails by design; demote
+        // to "no SDMA workspace" rather than failing the whole comm init.
+        // Demos that require workSpace != 0 will skip themselves.
         h->sdma_workspace.reset();
-        return -1;
     }
-    h->host_ctx.workSpace = reinterpret_cast<uint64_t>(h->sdma_workspace->GetWorkspaceAddr());
-    h->host_ctx.workSpaceSize = 16 * 1024;
-    need_device_ctx_copy = true;
 #endif
 
-    if (need_device_ctx_copy) {
-        void *newDevMem = nullptr;
-        aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-        if (aRet != ACL_SUCCESS) return -1;
-
-        aRet =
-            aclrtMemcpy(newDevMem, sizeof(CommContext), &h->host_ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-        if (aRet != ACL_SUCCESS) {
-            aclrtFree(newDevMem);
-            return -1;
-        }
-        h->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
-        h->owns_device_ctx = true;
+    void *newDevMem = nullptr;
+    aclError aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (aRet != ACL_SUCCESS) return -1;
+    aRet = aclrtMemcpy(newDevMem, sizeof(CommContext), &h->host_ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (aRet != ACL_SUCCESS) {
+        aclrtFree(newDevMem);
+        return -1;
     }
-
+    h->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
+    h->owns_device_ctx = true;
     *device_ctx_out = reinterpret_cast<uint64_t>(h->device_ctx);
     return 0;
 } catch (const std::exception &e) {
