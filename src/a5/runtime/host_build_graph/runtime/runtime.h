@@ -491,17 +491,6 @@ public:
     // shared platform layer (DeviceRunner stamps it on every run).
     int32_t active_callable_id_{-1};
     bool register_new_callable_id_{false};
-    const void *pending_orch_so_data_{nullptr};
-    size_t pending_orch_so_size_{0};
-
-    // Host-orchestration staging (hbg path). prepare_callable_impl
-    // dlopens the orch SO on the host and parks the handle + entry-symbol
-    // pointer here so DeviceRunner::register_prepared_callable_host_orch can
-    // claim them; bind_prepared_callable_to_runtime restores them onto a fresh
-    // Runtime so bind_prepared_to_runtime_impl can call orch_func without a
-    // second dlopen.
-    void *pending_host_dlopen_handle_{nullptr};
-    void *pending_host_orch_func_ptr_{nullptr};
 
     // Device-orchestration entry/config symbol names (trb path). Always
     // empty on this hbg variant — included for API parity so the shared

@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "callable.h"
+#include "prepare_callable_common.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
 #include "common/l2_perf_profiling.h"
@@ -495,7 +496,14 @@ public:
      *
      * @return 0 on success, -1 if the cid is not registered.
      */
-    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    /**
+     * Replay a previously-registered callable's state onto a fresh Runtime
+     * for a per-run binding. Writes back kernel addrs, orch entry-symbol
+     * names, and active_callable_id; returns the hbg `host_orch_func_ptr`
+     * (or nullptr on trb / on error) inside a `BindPreparedCallableResult`
+     * so the caller can destructure with structured bindings.
+     */
+    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
 
     /**
      * Number of distinct callable_ids the AICPU has been asked to dlopen for.
@@ -556,15 +564,6 @@ private:
         size_t total_size{0};  // byte size of the device allocation
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
-
-    // Orchestration SO cache. `cached_orch_so_hash_ == 0` means "no cache".
-    // The device buffer grows monotonically — cache miss with a larger SO
-    // reallocates, a smaller SO reuses the existing capacity. The host copy
-    // insulates us from Python ctypes array lifetimes.
-    uint64_t cached_orch_so_hash_{0};
-    void *dev_orch_so_buffer_{nullptr};
-    size_t dev_orch_so_capacity_{0};
-    std::vector<uint8_t> host_orch_so_copy_;
 
     // Per-callable_id prepared state.
     //
@@ -653,14 +652,12 @@ private:
     int ensure_binaries_loaded();
 
     /**
-     * Populate runtime.{dev_orch_so_addr_, dev_orch_so_size_} from
-     * `runtime.pending_orch_so_data_` / `_size_`.
-     *
-     * The host tracks the SO identity via a 64-bit hash derived from the ELF
-     * GNU Build-ID. When the hash matches the previous run, the device-side
-     * AICPU thread reuses its cached dlopen handle and we skip the rtMemcpy
-     * entirely. On a miss we allocate (or grow) a device-resident buffer,
-     * copy the SO bytes once, and update the cached hash.
+     * Stamp `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` from the
+     * PreparedCallableState for `runtime.get_active_callable_id()`. The orch
+     * SO bytes were already H2D'd at `register_prepared_callable` time and
+     * are shared via `orch_so_dedup_` across cids; this method only refreshes
+     * the device-SO metadata onto the per-run Runtime and bumps the AICPU
+     * first-sighting counter when the cid is new since registration.
      *
      * @param runtime  Runtime whose device-SO metadata will be rewritten.
      * @return 0 on success, non-zero on failure.

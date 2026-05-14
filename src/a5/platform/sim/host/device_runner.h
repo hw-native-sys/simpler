@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "callable.h"
+#include "prepare_callable_common.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -225,7 +226,7 @@ public:
     bool has_prepared_callable(int32_t callable_id) const;
 
     /** Replay prepared state onto a freshly-constructed Runtime. */
-    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
 
     /** Monotonic AICPU dlopen counter (first-sighting only; never decremented). */
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
@@ -263,12 +264,6 @@ private:
         std::vector<void *> dlopen_handles;
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
-
-    // Orchestration SO cache (host-resident in sim).
-    uint64_t cached_orch_so_hash_{0};
-    void *dev_orch_so_buffer_{nullptr};
-    size_t dev_orch_so_capacity_{0};
-    std::vector<uint8_t> host_orch_so_copy_;
 
     // Per-callable_id prepared state. Mirrors onboard.
     struct PreparedCallableState {

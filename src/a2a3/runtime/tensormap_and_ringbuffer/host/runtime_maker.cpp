@@ -41,6 +41,7 @@
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "prepare_callable_common.h"
 
 // Helper: return current time in milliseconds
 static int64_t _now_ms() {
@@ -102,54 +103,43 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
  * @param callable  ChipCallable carrying the orch SO + child kernel binaries
  * @return 0 on success, -1 on failure
  */
-extern "C" int prepare_callable_impl(Runtime *runtime, const ChipCallable *callable) {
-    if (runtime == nullptr) {
-        LOG_ERROR("Runtime pointer is null");
-        return -1;
-    }
+extern "C" int prepare_callable_impl(
+    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), PreparedCallableArtifacts *out
+) {
     if (callable == nullptr) {
         LOG_ERROR("Callable pointer is null");
         return -1;
     }
+    if (upload_fn == nullptr || out == nullptr) {
+        LOG_ERROR("upload_fn or out is null");
+        return -1;
+    }
+    *out = PreparedCallableArtifacts{};
 
-    // Single-shot upload of the entire ChipCallable buffer. DeviceRunner
-    // computes total size from contents, allocates device GM once, fixes up
-    // each child's resolved_addr_ in an internal host scratch, H2Ds once,
-    // and returns the device-side address of the ChipCallable header.
-    // Callers then compute child device addresses via offset arithmetic and
-    // write them to Runtime::func_id_to_addr_[] for AICPU dispatch.
-    if (callable->child_count() > 0) {
-        LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
-        uint64_t chip_dev = runtime->host_api.upload_chip_callable_buffer(callable);
-        if (chip_dev == 0) {
-            LOG_ERROR("Failed to upload ChipCallable buffer");
+    LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
+    if (upload_and_collect_child_addrs(callable, upload_fn, &out->kernel_addrs) != 0) {
+        LOG_ERROR("Failed to upload ChipCallable buffer");
+        return -1;
+    }
+    for (const ChildKernelAddr &c : out->kernel_addrs) {
+        if (c.func_id < 0 || c.func_id >= RUNTIME_MAX_FUNC_ID) {
+            LOG_ERROR("func_id=%d is out of range [0, %d)", c.func_id, RUNTIME_MAX_FUNC_ID);
             return -1;
-        }
-        constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
-        for (int32_t i = 0; i < callable->child_count(); i++) {
-            int func_id = callable->child_func_id(i);
-            if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-                LOG_ERROR("func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
-                return -1;
-            }
-            uint64_t child_dev = chip_dev + kHeaderSize + callable->child_offset(i);
-            runtime->set_function_bin_addr(func_id, child_dev);
         }
     }
 
     const uint8_t *orch_so_binary = static_cast<const uint8_t *>(callable->binary_data());
     size_t orch_so_size = callable->binary_size();
-    runtime->set_device_orch_func_name(callable->func_name());
-    runtime->set_device_orch_config_name(callable->config_name());
 
     if (orch_so_binary == nullptr || orch_so_size == 0) {
         LOG_ERROR("Orchestration SO binary is required for device orchestration");
         return -1;
     }
 
-    // Stage the orchestration SO for DeviceRunner::prepare_orch_so to consume.
-    runtime->pending_orch_so_data_ = orch_so_binary;
-    runtime->pending_orch_so_size_ = orch_so_size;
+    out->orch_so_data = orch_so_binary;
+    out->orch_so_size = orch_so_size;
+    out->func_name = callable->func_name();
+    out->config_name = callable->config_name();
     LOG_INFO_V0("Orchestration SO: %zu bytes staged (host-only)", orch_so_size);
     return 0;
 }
@@ -168,13 +158,21 @@ extern "C" int prepare_callable_impl(Runtime *runtime, const ChipCallable *calla
  * @param orch_args  Separated tensor/scalar arguments for this run
  * @return 0 on success, -1 on failure
  */
-extern "C" int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args) {
+extern "C" int
+bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
     }
     if (orch_args == nullptr) {
         LOG_ERROR("orch_args pointer is null");
+        return -1;
+    }
+    // trb runs orchestration on the device — there is no host-side orch
+    // function pointer to invoke. The c_api signature accepts one for
+    // symmetry with hbg; assert the trb-side invariant here.
+    if (host_orch_func_ptr != nullptr) {
+        LOG_ERROR("bind_prepared_to_runtime_impl: trb does not accept a host_orch_func_ptr");
         return -1;
     }
 

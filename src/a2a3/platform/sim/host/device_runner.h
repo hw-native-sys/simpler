@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "callable.h"
+#include "prepare_callable_common.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -229,7 +230,7 @@ public:
     );
     int unregister_prepared_callable(int32_t callable_id);
     bool has_prepared_callable(int32_t callable_id) const;
-    int bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
@@ -265,12 +266,6 @@ private:
         std::vector<void *> dlopen_handles;
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
-
-    // Orchestration SO cache (host-resident in sim; see onboard for shape).
-    uint64_t cached_orch_so_hash_{0};
-    void *dev_orch_so_buffer_{nullptr};
-    size_t dev_orch_so_capacity_{0};
-    std::vector<uint8_t> host_orch_so_copy_;
 
     // Per-callable_id prepared state. Mirrors onboard.
     struct PreparedCallableState {
@@ -339,11 +334,10 @@ private:
     void unload_executor_binaries();
 
     /**
-     * Stage the orchestration SO bytes into a host-resident buffer that
-     * `aicpu_executor` can dlopen. Identical contract to the onboard
-     * version: `runtime.pending_orch_so_data_/size_` are consumed and
-     * `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` are populated with
-     * the cache-aware result.
+     * Stamp `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` from the
+     * PreparedCallableState for `runtime.get_active_callable_id()`. Identical
+     * contract to the onboard version: bytes were staged at
+     * `register_prepared_callable` time, so this is metadata-only — no copy.
      */
     int prepare_orch_so(Runtime &runtime);
 
