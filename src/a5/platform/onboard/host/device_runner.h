@@ -468,12 +468,6 @@ private:
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
-    // Orchestration SO cache (host-tracked, device-resident).
-    uint64_t cached_orch_so_hash_{0};
-    void *dev_orch_so_buffer_{nullptr};
-    size_t dev_orch_so_capacity_{0};
-    std::vector<uint8_t> host_orch_so_copy_;
-
     // Per-callable_id prepared state. See a2a3 onboard device_runner.h for
     // the full design narrative; mirrored here so a5 shares the same
     // dispatch surface.

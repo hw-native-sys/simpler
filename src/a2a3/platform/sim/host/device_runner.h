@@ -266,12 +266,6 @@ private:
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
-    // Orchestration SO cache (host-resident in sim; see onboard for shape).
-    uint64_t cached_orch_so_hash_{0};
-    void *dev_orch_so_buffer_{nullptr};
-    size_t dev_orch_so_capacity_{0};
-    std::vector<uint8_t> host_orch_so_copy_;
-
     // Per-callable_id prepared state. Mirrors onboard.
     struct PreparedCallableState {
         // trb path
@@ -339,11 +333,10 @@ private:
     void unload_executor_binaries();
 
     /**
-     * Stage the orchestration SO bytes into a host-resident buffer that
-     * `aicpu_executor` can dlopen. Identical contract to the onboard
-     * version: `runtime.pending_orch_so_data_/size_` are consumed and
-     * `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` are populated with
-     * the cache-aware result.
+     * Stamp `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` from the
+     * PreparedCallableState for `runtime.get_active_callable_id()`. Identical
+     * contract to the onboard version: bytes were staged at
+     * `register_prepared_callable` time, so this is metadata-only — no copy.
      */
     int prepare_orch_so(Runtime &runtime);
 

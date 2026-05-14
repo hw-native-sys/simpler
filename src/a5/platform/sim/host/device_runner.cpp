@@ -873,16 +873,6 @@ int DeviceRunner::finalize() {
     }
     chip_callable_buffers_.clear();
 
-    // Release cached orchestration SO buffer.
-    if (dev_orch_so_buffer_ != nullptr) {
-        mem_alloc_.free(dev_orch_so_buffer_);
-        dev_orch_so_buffer_ = nullptr;
-    }
-    dev_orch_so_capacity_ = 0;
-    cached_orch_so_hash_ = 0;
-    host_orch_so_copy_.clear();
-    host_orch_so_copy_.shrink_to_fit();
-
     // Release any prepared-callable orch SO buffers callers forgot to drop.
     for (auto &kv : orch_so_dedup_) {
         if (kv.second.dev_addr != nullptr) {

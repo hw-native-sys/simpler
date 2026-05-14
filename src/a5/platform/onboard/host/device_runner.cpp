@@ -838,15 +838,6 @@ int DeviceRunner::finalize() {
     }
     chip_callable_buffers_.clear();
 
-    if (dev_orch_so_buffer_ != nullptr) {
-        mem_alloc_.free(dev_orch_so_buffer_);
-        dev_orch_so_buffer_ = nullptr;
-    }
-    dev_orch_so_capacity_ = 0;
-    cached_orch_so_hash_ = 0;
-    host_orch_so_copy_.clear();
-    host_orch_so_copy_.shrink_to_fit();
-
     // Release any prepared-callable orch SO buffers that callers forgot to
     // unregister. Refcounts no longer matter at this point — the device is
     // about to be reset.

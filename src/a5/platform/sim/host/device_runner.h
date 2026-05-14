@@ -264,12 +264,6 @@ private:
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
-    // Orchestration SO cache (host-resident in sim).
-    uint64_t cached_orch_so_hash_{0};
-    void *dev_orch_so_buffer_{nullptr};
-    size_t dev_orch_so_capacity_{0};
-    std::vector<uint8_t> host_orch_so_copy_;
-
     // Per-callable_id prepared state. Mirrors onboard.
     struct PreparedCallableState {
         // trb path
