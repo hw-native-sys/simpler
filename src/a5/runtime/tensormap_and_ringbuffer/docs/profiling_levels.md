@@ -6,6 +6,21 @@ This document describes the profiling macro hierarchy and logging control in the
 
 PTO Runtime2 uses a hierarchical profiling system with compile-time macros to control profiling code compilation and log output. The `enable_l2_swimlane` runtime flag controls data collection (performance buffers, shared memory writes) but does NOT control log output.
 
+### CI coverage
+
+The default CI build leaves `PTO2_PROFILING=1` (base) and the three sub-flags (`PTO2_ORCH_PROFILING`, `PTO2_SCHED_PROFILING`, `PTO2_TENSORMAP_PROFILING`) at `0`. The `profiling-flags-smoke` job in `.github/workflows/ci.yml` exercises the non-default combinations and runs the smallest full-pipeline example (`examples/<arch>/tensormap_and_ringbuffer/vector_example/`) against the rebuilt binaries:
+
+| Combo | `CXX` defines |
+| ----- | ------------- |
+| `pto2-off` | `-DPTO2_PROFILING=0` |
+| `orch` | `-DPTO2_ORCH_PROFILING=1` |
+| `orch-tensormap` | `-DPTO2_ORCH_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1` |
+| `sched` | `-DPTO2_SCHED_PROFILING=1` |
+| `orch-sched` | `-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1` |
+| `all-on` | `-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1` |
+
+Each combo runs sequentially on both `a2a3sim` and `a5sim` inside a single CI job (12 iterations total in one bash loop, not a matrix — apt/python/pip setup is paid once instead of 12 times). Failures across iterations are accumulated and reported together at the end. Compile failures, format-string mismatches, runtime crashes, or output-shape regressions in any individually gated code path show up there with the failing leg attributing the specific switch.
+
 ## Profiling Macro Hierarchy
 
 ```text

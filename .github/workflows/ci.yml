@@ -315,6 +315,138 @@ jobs:
           fi
           exit $rc
 
+  # ---------- Profiling sub-flags smoke (compile + run) ----------
+  # PTO2_PROFILING / PTO2_ORCH_PROFILING / PTO2_SCHED_PROFILING /
+  # PTO2_TENSORMAP_PROFILING are compile-time gates in src/{a2a3,a5}/runtime/
+  # tensormap_and_ringbuffer/runtime/pto_runtime2_types.h. The defaults
+  # (PTO2_PROFILING=1, sub-flags=0) are exercised by every CI job, but the
+  # non-default branches are dead coverage today — a developer flipping any
+  # of them for perf debugging or to minimize logging overhead had no gate
+  # protecting the gated code from drift (renamed fields, changed signatures,
+  # format-string mismatches in LOG_INFO summaries, dead parameters caught
+  # only by -Wunused-parameter -Werror).
+  #
+  # All combos run sequentially in a single job (not a matrix) so the
+  # apt/python/pip setup cost is paid once, not 12×. Failures across combos
+  # are accumulated and reported together at the end — first failure does
+  # not abort the rest.
+  #
+  # Combos walk the macro hierarchy explicitly (not just "all on" or "all
+  # off") so log scrubbing the failing leg pinpoints the specific gate:
+  #
+  #   PTO2_PROFILING (default=1, covered by every other CI job)
+  #   ├── pto2-off:         -DPTO2_PROFILING=0   (no profiling at all)
+  #   ├── orch:             -DPTO2_ORCH_PROFILING=1
+  #   │   └── orch-tensormap:  + -DPTO2_TENSORMAP_PROFILING=1
+  #   ├── sched:            -DPTO2_SCHED_PROFILING=1
+  #   ├── orch-sched:       ORCH=1 + SCHED=1   (both sub-flags on, tensormap off)
+  #   └── all-on:           ORCH=1 + SCHED=1 + TENSORMAP=1
+  #
+  # Each combo rebuilds the sim runtime with its CXXFLAGS and runs the
+  # smallest full-pipeline example (vector_example) — exercises orchestrator,
+  # scheduler, AICore dispatch, and completion paths gated by the macros.
+  #
+  # Verified locally that each combo's compile_commands.json contains *only*
+  # its declared -D flags, the resulting libaicpu_kernel.so contains *only*
+  # the matching profiling log strings, and pytest output emits *only* the
+  # corresponding profiling block — no cross-contamination from cmake cache.
+  profiling-flags-smoke:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up C++ compiler
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+          if ! command -v g++-15; then sudo ln -s "$(which g++)" /usr/local/bin/g++-15; fi
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Cache pip packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies (editable so simpler_setup always resolves to source tree)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Editable install (`-e .`) avoids a cwd-dependent footgun: with a
+          # plain wheel install, `import simpler_setup` from a non-source-tree
+          # cwd resolves to the wheel-internal copy (PROJECT_ROOT = _assets/),
+          # silently reading runtime .so files from the wheel instead of the
+          # build/lib/ that our combo loop overwrites. With editable mode the
+          # shim always redirects to source-tree paths, regardless of cwd.
+          # pyproject.toml sets editable.rebuild=false so import-time auto
+          # rebuilds cannot clobber our profiling-on binaries.
+          #
+          # Build isolation (pip default, no --no-build-isolation) pulls
+          # scikit-build-core into a throwaway env automatically — matches the
+          # `pre-commit` job's `pip install .` pattern and works on a fresh
+          # CI runner that has no build deps pre-installed.
+          pip install -e '.[test]'
+
+      - name: Run all profiling flag combos × 2 arches
+        run: |
+          # Combo names paired with their CXX defines. Parallel arrays (not
+          # an associative array) so the loop iteration order is deterministic
+          # and the log reads top-to-bottom in hierarchy order.
+          COMBO_NAMES=(pto2-off orch orch-tensormap sched orch-sched all-on)
+          COMBO_DEFS=(
+            "-DPTO2_PROFILING=0"
+            "-DPTO2_ORCH_PROFILING=1"
+            "-DPTO2_ORCH_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1"
+            "-DPTO2_SCHED_PROFILING=1"
+            "-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1"
+            "-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1"
+          )
+          ARCHES=(a2a3sim a5sim)
+          FAIL=()
+
+          for ARCH in "${ARCHES[@]}"; do
+            ARCH_DIR=${ARCH%sim}
+            for i in "${!COMBO_NAMES[@]}"; do
+              NAME=${COMBO_NAMES[$i]}
+              DEFS=${COMBO_DEFS[$i]}
+              echo "::group::$ARCH / $NAME — CXX defines: $DEFS"
+              if ! CXX="g++ $DEFS" python simpler_setup/build_runtimes.py --platforms "$ARCH"; then
+                echo "::error::Build failed: $ARCH / $NAME"
+                FAIL+=("$ARCH/$NAME (build)")
+                echo "::endgroup::"
+                continue
+              fi
+              if ! python -m pytest \
+                   "examples/${ARCH_DIR}/tensormap_and_ringbuffer/vector_example/test_vector_example.py" \
+                   --platform "$ARCH" --device 0-1 -p no:xdist \
+                   --pto-session-timeout 600 --clone-protocol https; then
+                echo "::error::Smoke failed: $ARCH / $NAME"
+                FAIL+=("$ARCH/$NAME (pytest)")
+              fi
+              echo "::endgroup::"
+            done
+          done
+
+          echo ""
+          echo "==== SUMMARY ===="
+          if [ ${#FAIL[@]} -gt 0 ]; then
+            printf 'FAILED: %s\n' "${FAIL[@]}"
+            exit 1
+          fi
+          echo "All $((${#COMBO_NAMES[@]} * ${#ARCHES[@]})) combos passed."
+
   # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
   ut-a2a3:
     runs-on: [self-hosted, a2a3]

@@ -67,9 +67,9 @@ SlotTransition SchedulerContext::decide_slot_transition(
 
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
 void SchedulerContext::complete_slot_task(
-    PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
-    int32_t core_id, Handshake *hank, int32_t &completed_this_turn, PTO2TaskSlotState *deferred_release_slot_states[],
-    int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
+    PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
+    int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
+    PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
     ,
     uint64_t dispatch_ts
