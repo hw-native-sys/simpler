@@ -202,6 +202,113 @@ class TestLifecycle:
         finally:
             hw.close()
 
+    def test_unregister_unknown_cid_raises(self):
+        # Symmetric to register: unregister must fail loud if the caller
+        # confuses cid for an unrelated integer or unregisters twice.
+        hw = Worker(level=3, num_sub_workers=0)
+        hw.init()
+        try:
+            with pytest.raises(KeyError, match="cid=999 not registered"):
+                hw.unregister(999)
+        finally:
+            hw.close()
+
+    def test_unregister_chip_callable_after_init_no_chips_succeeds(self):
+        # Mirrors test_register_chip_callable_after_init_no_chips_succeeds:
+        # with zero chip mailboxes the broadcast loop is a no-op, so the
+        # facade path (lock, registry pop, return) is exercised end-to-end
+        # without an NPU. Also verifies cid reuse — unregistering frees the
+        # slot for a subsequent register.
+        hw = Worker(level=3, num_sub_workers=0)
+        hw.init()
+        try:
+            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+            cid_a = hw.register(callable_obj)
+            assert cid_a in hw._callable_registry
+            hw.unregister(cid_a)
+            assert cid_a not in hw._callable_registry
+            # Slot can be reused. The next cid is allocated by len(registry),
+            # so freeing cid_a does not immediately reuse its index, but the
+            # registry can still grow up to MAX_REGISTERED_CALLABLE_IDS again.
+            cid_b = hw.register(callable_obj)
+            assert cid_b in hw._callable_registry
+        finally:
+            hw.close()
+
+    def test_unregister_chip_callable_during_run_raises(self):
+        # Quiescent-state guard: same shape as the register-during-run test,
+        # validates that unregister also refuses to write CTRL_UNREGISTER
+        # over an in-flight TASK_READY.
+        hw = Worker(level=3, num_sub_workers=1)
+        hw.register(lambda args: None)
+        hw.init()
+        try:
+            run_started = threading.Event()
+            release = threading.Event()
+            unregister_err: list[BaseException] = []
+
+            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+            cid_chip = hw.register(callable_obj)
+
+            def orch(orch_handle, _args, _cfg):
+                run_started.set()
+                release.wait(timeout=5.0)
+
+            def try_unregister():
+                assert run_started.wait(timeout=5.0), "orch never started"
+                try:
+                    hw.unregister(cid_chip)
+                except BaseException as e:  # noqa: BLE001
+                    unregister_err.append(e)
+                finally:
+                    release.set()
+
+            t = threading.Thread(target=try_unregister)
+            t.start()
+            try:
+                hw.run(orch)
+            finally:
+                t.join(timeout=5.0)
+            assert unregister_err, "expected unregister to raise during run"
+            assert isinstance(unregister_err[0], RuntimeError)
+            assert "Worker.run() is executing" in str(unregister_err[0])
+        finally:
+            hw.close()
+
+    def test_unregister_chip_callable_broadcast_warns_and_still_pops(self, monkeypatch, capsys):
+        # Best-effort failure semantics (docs section 8): a broadcast error
+        # must NOT prevent the registry pop. We monkeypatch the broadcast
+        # helper to raise, then verify the cid is gone from the registry
+        # and a warning hit stderr.
+
+        hw = Worker(level=3, num_sub_workers=0)
+        hw.init()
+        try:
+            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+            cid = hw.register(callable_obj)
+
+            fake_mailbox = SharedMemory(create=True, size=4096)
+            hw._chip_shms.append(fake_mailbox)
+            hw._hierarchical_started = True
+            try:
+
+                def fail_unregister(self, worker_id, cid):
+                    raise RuntimeError(f"chip {worker_id}: unregister cid={cid} chip=0: simulated")
+
+                monkeypatch.setattr(Worker, "_chip_control_unregister", fail_unregister)
+
+                hw.unregister(cid)  # must NOT raise — best-effort
+                assert cid not in hw._callable_registry
+                err_msg = capsys.readouterr().err
+                assert f"Worker.unregister(cid={cid})" in err_msg
+                assert "1 of 1 chips reported errors" in err_msg
+            finally:
+                hw._chip_shms.pop()
+                fake_mailbox.close()
+                fake_mailbox.unlink()
+        finally:
+            hw.close()
+
     def test_register_overflow_raises(self):
         # The AICPU side reserves a fixed-size orch_so_table_[MAX_REGISTERED_CALLABLE_IDS];
         # Worker.register must surface the bound at register-time, not later when

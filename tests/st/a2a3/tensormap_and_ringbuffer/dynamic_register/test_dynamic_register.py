@@ -284,6 +284,81 @@ def test_register_cid_overflow_post_init(st_platform, st_device_ids):
         worker.close()
 
 
+@pytest.mark.platforms(["a2a3sim"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime(_RUNTIME)
+def test_register_unregister_register_runs_each_time(st_platform, st_device_ids):
+    """register → run → unregister → register again → run.
+
+    Proves the IPC unregister path works end-to-end: after CTRL_UNREGISTER
+    propagates to the chip child, the cid slot is freed and a subsequent
+    dynamic register on a fresh cid prepares + dispatches correctly.
+    """
+    chip_callable = _build_vector_callable(st_platform)
+    worker = Worker(
+        level=3,
+        device_ids=[int(st_device_ids[0])],
+        num_sub_workers=0,
+        platform=st_platform,
+        runtime=_RUNTIME,
+    )
+    cid_pre = worker.register(chip_callable)
+
+    a, b = 2.0, 3.0
+    expected = _golden(a, b)
+    # Three runs total — preallocate three args bundles BEFORE init() so
+    # the share_memory_ mappings are inherited by the forked chip child.
+    args_one = _make_args(a, b)
+    args_two = _make_args(a, b)
+    args_three = _make_args(a, b)
+    chip_args_one, _ = _build_l3_task_args(args_one, _ORCH_SIG)
+    chip_args_two, _ = _build_l3_task_args(args_two, _ORCH_SIG)
+    chip_args_three, _ = _build_l3_task_args(args_three, _ORCH_SIG)
+
+    worker.init()
+    try:
+        config = CallConfig()
+        config.block_dim = 3
+        config.aicpu_thread_num = 4
+
+        # 1. Trigger fork via cid_pre to put the chip child into the main loop.
+        def orch_one(o, _args, _cfg):
+            o.submit_next_level(cid_pre, chip_args_one, config)
+
+        worker.run(orch_one)
+        assert torch.allclose(args_one.f, torch.full_like(args_one.f, expected), rtol=1e-5, atol=1e-5)
+
+        # 2. Dynamic register a second cid, run it.
+        cid_dyn = worker.register(chip_callable)
+
+        def orch_two(o, _args, _cfg):
+            o.submit_next_level(cid_dyn, chip_args_two, config)
+
+        worker.run(orch_two)
+        assert torch.allclose(args_two.f, torch.full_like(args_two.f, expected), rtol=1e-5, atol=1e-5)
+
+        # 3. Unregister cid_dyn — CTRL_UNREGISTER hits the chip child,
+        #    which calls cw.unregister_callable(cid_dyn).
+        worker.unregister(cid_dyn)
+        assert cid_dyn not in worker._callable_registry
+
+        # 4. Re-register and run again. The freed slot is reused — cid
+        #    allocation is `len(registry)` and the unregister popped one
+        #    entry, so the next register lands on the same index as the
+        #    just-unregistered cid. This is the slot-recycling property
+        #    that unregister exists for.
+        cid_again = worker.register(chip_callable)
+        assert cid_again == cid_dyn, "unregister should free the cid slot for reuse"
+
+        def orch_three(o, _args, _cfg):
+            o.submit_next_level(cid_again, chip_args_three, config)
+
+        worker.run(orch_three)
+        assert torch.allclose(args_three.f, torch.full_like(args_three.f, expected), rtol=1e-5, atol=1e-5)
+    finally:
+        worker.close()
+
+
 if __name__ == "__main__":
     import sys
 

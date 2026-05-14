@@ -151,6 +151,9 @@ _CTRL_PREPARE = 4
 # the child mmaps the shm and calls prepare_callable_from_blob(cid, addr).
 # See docs/callable-ipc-dynamic-register.md for the design.
 _CTRL_REGISTER = 5
+# Symmetric unregister: drop the cid from chip-child state so the AICPU
+# orch_so_table_ slot can be reused. Payload is just the cid; no shm.
+_CTRL_UNREGISTER = 6
 
 # Reserved 32-byte region at the start of OFF_ARGS used by _CTRL_REGISTER to
 # carry the NUL-terminated POSIX shm name. POSIX shm names on Linux are
@@ -408,16 +411,24 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                         # device GM, so the child no longer needs the shm.
                         shm.close()
                     prepared.add(int(cid))
+                elif sub_cmd == _CTRL_UNREGISTER:
+                    cid = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]) & 0xFFFFFFFF
+                    cw.unregister_callable(int(cid))
+                    # Drop from the prepared set so a future CTRL_REGISTER /
+                    # CTRL_PREPARE for the same cid is treated as a fresh
+                    # registration (re-runs the H2D upload / AICPU dlopen).
+                    prepared.discard(int(cid))
             except Exception as e:  # noqa: BLE001
                 code = 1
-                if sub_cmd == _CTRL_REGISTER:
+                if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
                     # Docs §6 mandates `register cid=<N> chip=<id>: <reason>`
                     # so the parent can pinpoint failures across many chips.
+                    op = "register" if sub_cmd == _CTRL_REGISTER else "unregister"
                     try:
                         cid_v = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]) & 0xFFFFFFFF
                     except Exception:  # noqa: BLE001
                         cid_v = -1
-                    msg = _format_exc(f"register cid={cid_v} chip={device_id}", e)
+                    msg = _format_exc(f"{op} cid={cid_v} chip={device_id}", e)
                 else:
                     msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
             _write_error(buf, code, msg)
@@ -829,6 +840,78 @@ class Worker:
                 shm.unlink()
             except FileNotFoundError:
                 pass
+
+    def unregister(self, cid: int) -> None:
+        """Drop *cid* from the registry and propagate to chip children.
+
+        Symmetric to ``Worker.register`` for the dynamic post-init path.
+        The cid slot becomes reusable for the next ``register`` call — the
+        only practical way to keep a long-running worker under the
+        ``MAX_REGISTERED_CALLABLE_IDS`` ceiling when JIT or plugin code
+        churns through callables.
+
+        Timing constraints mirror ``register``:
+          - L3+: must be called when no ``Worker.run`` is in flight
+            (quiescent-state contract; see docs section 5). Violation
+            raises ``RuntimeError`` before any broadcast is issued.
+          - L2: directly forwards to ``ChipWorker.unregister_callable``.
+
+        Failure semantics (docs section 8): unregister is best-effort.
+        If any chip child reports an error, the parent **warns and still
+        pops the registry entry** — orch_so_table_ on the AICPU side will
+        be overwritten on cid reuse, and refusing to release a known-bad
+        cid would just exhaust the slot space faster.
+
+        Raises:
+          KeyError: cid was never registered.
+          NotImplementedError: called at L4+ (cascade unregister deferred).
+          RuntimeError: called while ``Worker.run`` is executing.
+        """
+        with self._register_lock:
+            if cid not in self._callable_registry:
+                raise KeyError(f"Worker.unregister: cid={cid} not registered")
+            if self.level >= 3 and self._initialized:
+                if self.level >= 4:
+                    raise NotImplementedError(
+                        "Worker.unregister at level >= 4 is not yet implemented (L4 cascade is a separate commit)"
+                    )
+                if self._orch_in_flight > 0:
+                    raise RuntimeError(
+                        "Worker.unregister() cannot be called while Worker.run() is "
+                        "executing; serialize unregister/run on the same thread"
+                    )
+                if getattr(self, "_hierarchical_started", False):
+                    self._broadcast_unregister(cid)
+            elif self.level == 2 and self._initialized:
+                assert self._chip_worker is not None
+                self._chip_worker.unregister_callable(cid)
+            # Drop the registry entry unconditionally — even if a chip child
+            # reported an error, holding the slot would just waste cid budget.
+            self._callable_registry.pop(cid, None)
+
+    def _broadcast_unregister(self, cid: int) -> None:
+        """Broadcast _CTRL_UNREGISTER to every chip child in parallel.
+
+        Best-effort: chips that fail are logged to stderr; the parent still
+        proceeds to pop the registry entry (see ``unregister`` docstring).
+        """
+        n = len(self._chip_shms)
+        if n == 0:
+            return
+        errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            futures = {ex.submit(self._chip_control_unregister, wid, cid): wid for wid in range(n)}
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(str(exc))
+        if errors:
+            sys.stderr.write(
+                f"Worker.unregister(cid={cid}): {len(errors)} of {n} chips reported errors "
+                f"(continuing best-effort). First error: {errors[0]}\n"
+            )
+            sys.stderr.flush()
 
     def add_worker(self, worker: "Worker") -> None:
         """Add a lower-level Worker as a NEXT_LEVEL child. Must be called before init().
@@ -1267,6 +1350,33 @@ class Worker:
         buf[_OFF_ARGS + len(encoded) : _OFF_ARGS + _CTRL_SHM_NAME_BYTES] = b"\x00" * (
             _CTRL_SHM_NAME_BYTES - len(encoded)
         )
+        _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
+        while _mailbox_load_i32(state_addr) != _CONTROL_DONE:
+            pass
+        error = struct.unpack_from("i", buf, _OFF_ERROR)[0]
+        if error != 0:
+            err_msg = _read_error_msg(buf)
+            _mailbox_store_i32(state_addr, _IDLE)
+            raise RuntimeError(f"chip {worker_id}: {err_msg}")
+        _mailbox_store_i32(state_addr, _IDLE)
+
+    def _chip_control_unregister(self, worker_id: int, cid: int) -> None:
+        """Send _CTRL_UNREGISTER (cid only) to chip child *worker_id*.
+
+        Mirror of ``_chip_control_register`` minus the shm name payload —
+        unregister has no bytes to transport. Raises ``RuntimeError`` on
+        non-zero child error code; callers may catch and ``warn`` rather
+        than abort because docs section 8 marks unregister as best-effort.
+        """
+        if worker_id < 0 or worker_id >= len(self._chip_shms):
+            raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
+        shm = self._chip_shms[worker_id]
+        buf = shm.buf
+        assert buf is not None
+        state_addr = _buffer_field_addr(buf, _OFF_STATE)
+        _write_error(buf, 0, "")
+        struct.pack_into("Q", buf, _OFF_CALLABLE, _CTRL_UNREGISTER)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG0, cid)
         _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
         while _mailbox_load_i32(state_addr) != _CONTROL_DONE:
             pass
