@@ -67,14 +67,16 @@
 
 using namespace pto;
 
-// Demo dimensions — must match main.py.
+// Demo dimensions — must match main.py. Sized to mirror the production
+// moe_expert decode config (D = hidden_size = 4096, L = N_LOCAL_EXPERTS = 8,
+// T = decode tokens per rank = 16, R = RECV_MAX = 32).
 static constexpr int N = 2;
-static constexpr int T = 8;
+static constexpr int T = 16;
 static constexpr int TOPK = 2;
-static constexpr int D = 64;
-static constexpr int L = 4;
+static constexpr int D = 4096;
+static constexpr int L = 8;
 static constexpr int R = 32;
-static constexpr int N_ROUTES = T * TOPK;  // 16
+static constexpr int N_ROUTES = T * TOPK;  // 32
 
 // Weight payload tile width. The protocol contract is one FP32 weight per
 // (e, slot) — recv_w[L, R] FP32. AIV vector tiles have a hardware minimum
@@ -90,15 +92,15 @@ static constexpr int IDX_PAD = 8;
 
 // Window region byte sizes — mirror *_BYTES in main.py.
 //
-// Layout:
-//   pub_counts[N][N][L]            INT32   (64 B)
+// Layout (sizes for the D=4096 / L=8 / T=16 / R=32 demo config):
+//   pub_counts[N][N][L]            INT32   (256 B)
 //   count_done_sig[N]              INT32   (padded slot, 64 B)
-//   recv_x[L][R][D]                BF16    (16 KB)
-//   recv_w[L][R][W_PAD]            FP32    (4  KB; weight at slot [0], rest = 0)
-//   recv_idx[L][R][IDX_PAD]        INT32   (4  KB; r=t*TOPK+k at slot [0], rest = 0)
+//   recv_x[L][R][D]                BF16    (2 MiB)
+//   recv_w[L][R][W_PAD]            FP32    (8  KB; weight at slot [0], rest = 0)
+//   recv_idx[L][R][IDX_PAD]        INT32   (8  KB; r=t*TOPK+k at slot [0], rest = 0)
 //   data_done_sig[N]               INT32   (padded slot, 64 B)
 // ---- Cross-rank visible regions consumed by combine.cpp ----
-//   routed_y_buf[T][TOPK][D]       BF16    (2  KB demo; combine push destination,
+//   routed_y_buf[T][TOPK][D]       BF16    (256 KB; combine push destination,
 //                                            addressed directly by (t, k))
 //   combine_done_sig[N]            INT32   (padded slot, 64 B)
 //
@@ -106,10 +108,10 @@ static constexpr int IDX_PAD = 8;
 // as a host-backed device tensor via the orch.
 static constexpr int kPubCountsBytes = N * N * L * 4;  // N*N*L INT32
 static constexpr int kSignalBytes = 64;
-static constexpr int kRecvXBytes = L * R * D * 2;  // BF16
+static constexpr int kRecvXBytes = L * R * D * 2;  // BF16, 2 MiB
 static constexpr int kRecvWBytes = L * R * W_PAD * 4;
 static constexpr int kRecvIdxBytes = L * R * IDX_PAD * 4;
-static constexpr int kRoutedYBufBytes = T * TOPK * D * 2;  // BF16
+static constexpr int kRoutedYBufBytes = T * TOPK * D * 2;  // BF16, 256 KiB
 
 static constexpr int kOffPubCounts = 0;
 static constexpr int kOffCountDone = kOffPubCounts + kPubCountsBytes;
@@ -179,7 +181,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // ------------------------------------------------------------------
     // histogram: scalar histogram + (dst, loc_e)-sorted route table.
     //
-    // Scalar GM reads of indices[t * TOPK + k] are fine on AIV.
+    // Scalar GM reads of indices[t * TOPK + k] are fine on AIV. The upstream
+    // router task (write_route_outputs) flushes its scalar stores to L2 via
+    // dcci(..., CACHELINE_OUT) + dsb at its own tail, so dispatch picks up
+    // fresh data here without needing a reader-side cache invalidate.
     // Bucket each route by (dst, loc_e) and stable-sort so the payload_push
     // cursor matches each peer's src-major slot_offset rule.
     // ------------------------------------------------------------------
@@ -194,10 +199,17 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int route_loc_e[N_ROUTES];
     int route_r[N_ROUTES];
 
+    // EP routing policy: route slot k of each token goes to peer
+    // (my_rank + k) % N. The router was JIT'd with EP_WORLD_SIZE=1 and writes
+    // local expert IDs in [0, L); we layer the rank component on top here so
+    // the demo spreads tokens across both ranks instead of pinning everything
+    // to rank 0. A production EP system would read a true global ID from the
+    // router output instead.
     for (int r = 0; r < N_ROUTES; ++r) {
-        int eid = indices[r];
-        int dst = eid / L;
-        int loc_e = eid - dst * L;
+        int t = r / TOPK;
+        int k = r - t * TOPK;
+        int dst = (my_rank + k) % N;
+        int loc_e = indices[r];  // local expert id in [0, L)
         send_counts[dst][loc_e] += 1;
         route_dst[r] = dst;
         route_loc_e[r] = loc_e;
