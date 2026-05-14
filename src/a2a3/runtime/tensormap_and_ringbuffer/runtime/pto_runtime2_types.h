@@ -74,15 +74,6 @@
 #define PTO2_TENSORMAP_PROFILING 0
 #endif
 
-// Disable dual-issue (pipelined) AICPU->AICore dispatch. When 1, the
-// scheduler only loads the running slot and never pre-loads the pending
-// slot, so each core has at most one outstanding task at any time.
-// Orthogonal to PTO2_PROFILING / PMU: PMU users must set this explicitly,
-// since overlapping in-flight tasks pollute PMU registers.
-#ifndef PTO2_DISABLE_DUAL_ISSUE
-#define PTO2_DISABLE_DUAL_ISSUE 0
-#endif
-
 #if PTO2_ORCH_PROFILING && !PTO2_PROFILING
 #error "PTO2_ORCH_PROFILING requires PTO2_PROFILING=1"
 #endif

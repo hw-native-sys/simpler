@@ -20,13 +20,4 @@
 #define PTO2_PROFILING 1
 #endif
 
-// Disable dual-issue (pipelined) AICPU->AICore dispatch. When 1, the
-// scheduler only dispatches to a core when both the running and pending
-// slots are empty, so each core has at most one outstanding task at any
-// time. Orthogonal to PTO2_PROFILING / PMU: PMU users must set this
-// explicitly, since overlapping in-flight tasks pollute PMU registers.
-#ifndef PTO2_DISABLE_DUAL_ISSUE
-#define PTO2_DISABLE_DUAL_ISSUE 0
-#endif
-
 #endif  // SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_
