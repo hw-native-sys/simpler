@@ -42,11 +42,6 @@
 #include "pto_shared_memory.h"
 #include "common/unified_log.h"
 
-// Set to 1 to enable periodic BLOCKED/Unblocked messages during spin-wait.
-#ifndef PTO2_SPIN_VERBOSE_LOGGING
-#define PTO2_SPIN_VERBOSE_LOGGING 1
-#endif
-
 // Block notification interval (in spin counts)
 #define PTO2_BLOCK_NOTIFY_INTERVAL 10000
 // Alloc spin limit - after this, report deadlock and exit
@@ -146,7 +141,6 @@ public:
                 spin_count = 0;
                 prev_last_alive = last_alive;
             } else {
-#if PTO2_SPIN_VERBOSE_LOGGING
                 if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0) {
                     LOG_WARN(
                         "[TaskAllocator] BLOCKED: tasks=%d/%d, heap=%" PRIu64 "/%" PRIu64 ", on=%s, spins=%d",
@@ -154,7 +148,6 @@ public:
                         blocked_on_heap ? "heap" : "task", spin_count
                     );
                 }
-#endif
                 if (spin_count >= PTO2_ALLOC_SPIN_LIMIT) {
                     report_deadlock(output_size, blocked_on_heap);
                     return {-1, -1, nullptr, nullptr};
