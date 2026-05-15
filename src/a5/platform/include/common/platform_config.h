@@ -77,6 +77,18 @@ constexpr int PLATFORM_MAX_AIV_PER_THREAD = PLATFORM_MAX_BLOCKDIM * PLATFORM_AIV
 
 constexpr int PLATFORM_MAX_CORES_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD + PLATFORM_MAX_AIV_PER_THREAD;  // 108
 
+// AICore UB reservation for the legacy SIMT launch path.
+//
+// rtKernelLaunchWithHandleV2 + rtRegisterAllKernel checks
+// kernel->ShareMemSize_() + cfg.localMemorySize against
+// RT_SIMT_REMAIN_UB_SIZE (224 KB = 256 KB UB − 32 KB dcache). The kernel
+// advertises PLATFORM_AICORE_SHARE_MEM_SIZE via the SIMT TLV record
+// injected in onboard/aicore/kernel.cpp; the host passes
+// PLATFORM_AICORE_LOCAL_MEMORY_SIZE through cfg.localMemorySize. They sum
+// to exactly 224 KB; runtime's check is strict >, so equality is accepted.
+constexpr uint32_t PLATFORM_AICORE_SHARE_MEM_SIZE = 8 * 1024;       // 8 KB
+constexpr uint32_t PLATFORM_AICORE_LOCAL_MEMORY_SIZE = 216 * 1024;  // 216 KB
+
 // =============================================================================
 // Performance Profiling Configuration
 // =============================================================================

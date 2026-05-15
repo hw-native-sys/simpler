@@ -13,6 +13,8 @@
  */
 #include "aicore/aicore.h"
 #include "common/core_type.h"
+#include "common/platform_config.h"
+#include "simt_meta.h"
 
 class Runtime;
 
@@ -32,6 +34,20 @@ class Runtime;
 [[block_local]] CoreType core_type;
 
 extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
+
+// Derive the section name from the same KERNEL_ENTRY macro that mangles the
+// entry symbol, so the meta section name cannot drift if the suffix scheme
+// changes. STRINGIFY needs two levels to expand the macro before stringizing.
+#define SIMPLER_STRINGIFY_(x) #x
+#define SIMPLER_STRINGIFY(x) SIMPLER_STRINGIFY_(x)
+#define KERNEL_META_SECTION(func) ".ascend.meta." SIMPLER_STRINGIFY(KERNEL_ENTRY(func))
+
+#ifdef __DAV_VEC__
+static const FuncLevelMeta func_simt_section __attribute__((used, section(KERNEL_META_SECTION(aicore_kernel)))) = {
+    {{F_TYPE_COMPILER_ALLOC_UB_SIZE, sizeof(unsigned int)}, PLATFORM_AICORE_SHARE_MEM_SIZE},
+    {{F_TYPE_AIV_TYPE_FLAG, sizeof(unsigned int)}, AIV_TYPE_SIMD_SIMT_MIX_VF},
+};
+#endif
 
 /**
  * Kernel entry point with control loop
