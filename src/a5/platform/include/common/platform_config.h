@@ -221,6 +221,31 @@ constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 constexpr int PLATFORM_PMU_RECORDS_PER_BUFFER = 512;
 
 /**
+ * Per-core L2Perf staging ring depth (AICore-side WIP slots).
+ *
+ * Must be ≥ the maximum number of in-flight tasks per core (today's
+ * dual-issue dispatch keeps this at 2). The ring lives outside the
+ * rotating L2PerfBuffer so AICore's write address never changes mid-run.
+ *
+ * Indexing uses `task_id % PLATFORM_L2_AICORE_RING_SIZE` (see
+ * `l2_perf_aicore_record_task`), so non-power-of-two values are correct
+ * but compile to an integer divide on the AICore hot path. Prefer a power
+ * of two so the compiler reduces the modulo to a mask.
+ */
+constexpr int PLATFORM_L2_AICORE_RING_SIZE = 2;
+
+/**
+ * Per-core PMU staging ring depth (AICore-side dual-issue slots).
+ *
+ * Same constraints as PLATFORM_L2_AICORE_RING_SIZE: ≥ in-flight task
+ * depth on a single core, and ideally a power of two so the
+ * `task_id % RING_SIZE` slot index compiles to a mask. Decoupled from
+ * the rotating PmuBuffer so the AICore write address is stable across
+ * buffer flips.
+ */
+constexpr int PLATFORM_PMU_AICORE_RING_SIZE = 2;
+
+/**
  * SPSC free-queue slot count per core (Host pushes, AICPU pops).
  */
 constexpr int PLATFORM_PMU_SLOT_COUNT = 4;

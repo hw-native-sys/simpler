@@ -45,7 +45,9 @@
 // Function pointer types for dynamically loaded executors
 typedef int (*aicpu_execute_func_t)(Runtime *runtime);
 typedef void (*aicore_execute_func_t)(
-    Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs
+    Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
+    uint32_t enable_profiling_flag, uint64_t aicore_l2_perf_ring_addrs, uint64_t aicore_pmu_ring_addrs,
+    uint64_t pmu_reg_addrs
 );
 typedef void (*set_platform_regs_func_t)(uint64_t regs);
 
@@ -97,6 +99,16 @@ bool create_temp_so_file(const std::string &path_template, const uint8_t *data, 
 // =============================================================================
 // DeviceRunner Implementation
 // =============================================================================
+
+// malloc / free wrappers shared by all three profiling subsystems.
+// `user_data` is unused in sim but kept in the signature to match the
+// framework's canonical alloc/free callback shape.
+static void *prof_alloc_cb(size_t size, void * /*user_data*/) { return std::malloc(size); }
+
+static int prof_free_cb(void *dev_ptr, void * /*user_data*/) {
+    std::free(dev_ptr);
+    return 0;
+}
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
@@ -200,6 +212,13 @@ int DeviceRunner::ensure_binaries_loaded() {
             return -1;
         }
 
+        set_platform_pmu_reg_addrs_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_pmu_reg_addrs"));
+        if (set_platform_pmu_reg_addrs_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_pmu_reg_addrs: %s", dlerror());
+            return -1;
+        }
+
         set_pmu_enabled_func_ = reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_pmu_enabled"));
         if (set_pmu_enabled_func_ == nullptr) {
             LOG_ERROR("dlsym failed for set_pmu_enabled: %s", dlerror());
@@ -241,9 +260,8 @@ int DeviceRunner::ensure_binaries_loaded() {
             return -1;
         }
 
-        aicore_execute_func_ = reinterpret_cast<void (*)(Runtime *, int, CoreType, uint32_t, uint64_t)>(
-            dlsym(aicore_so_handle_, "aicore_execute_wrapper")
-        );
+        aicore_execute_func_ =
+            reinterpret_cast<aicore_execute_func_t>(dlsym(aicore_so_handle_, "aicore_execute_wrapper"));
         if (aicore_execute_func_ == nullptr) {
             LOG_ERROR("dlsym failed for aicore_execute_wrapper: %s", dlerror());
             return -1;
@@ -343,8 +361,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         runtime.workers[i].task = 0;
         // First 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
-        runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
     }
+    // Profiling state lives on KernelArgs now (no longer mirrored into Handshake).
+    kernel_args_.enable_profiling_flag = enable_profiling_flag;
 
     // Set function_bin_addr for each task: Runtime::func_id_to_addr_[] stores
     // a CoreCallable host address (chip buffer + offset); dereference
@@ -369,33 +388,26 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Store runtime pointer for print_handshake_results
     last_runtime_ = &runtime;
 
-    // Initialize performance profiling if enabled
+    // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_perf_collection(num_aicore, device_id_);
+        rc = init_l2_perf(num_aicore, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_l2_perf_collection failed: %d", rc);
+            LOG_ERROR("init_l2_perf failed: %d", rc);
             return rc;
         }
-        // Start memory management thread
-        l2_perf_collector_.start_memory_manager([this](std::function<void()> fn) {
-            return create_thread(std::move(fn));
-        });
     }
 
     if (enable_dump_tensor_) {
         // Initialize tensor dump (independent from profiling)
-        rc = init_tensor_dump(runtime, num_aicore, device_id_);
+        rc = init_tensor_dump(runtime, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_tensor_dump failed: %d", rc);
             return rc;
         }
-        dump_collector_.start_memory_manager();
     }
 
     if (enable_pmu_) {
-        rc = init_pmu_buffers(
-            num_aicore, launch_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id_
-        );
+        rc = init_pmu(num_aicore, launch_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id_);
         if (rc != 0) {
             LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
             kernel_args_.pmu_data_base = 0;
@@ -403,11 +415,11 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
+    // Cleanup guard for early returns: stops all started collectors so
+    // their mgmt + poll threads exit cleanly. stop() is idempotent and a
+    // no-op on collectors that never started.
     auto perf_cleanup = RAIIScopeGuard([this]() {
-        bool was_initialized = l2_perf_collector_.is_initialized();
-        if (was_initialized) {
-            l2_perf_collector_.stop_memory_manager();
-        }
+        finalize_collectors();
     });
 
     // Allocate simulated register blocks for all AICore cores
@@ -450,7 +462,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Check if executors are loaded
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
         set_platform_dump_base_func_ == nullptr || set_dump_tensor_enabled_func_ == nullptr ||
-        set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr) {
+        set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
+        set_platform_pmu_reg_addrs_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
@@ -461,11 +474,29 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     set_platform_l2_perf_base_func_(kernel_args_.l2_perf_data_base);
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
+    set_platform_pmu_reg_addrs_func_(kernel_args_.pmu_reg_addrs);
     set_pmu_enabled_func_(enable_pmu_);
 
     // No per-SO log-config push: HostLogger lives in libsimpler_log.so
     // (RTLD_GLOBAL singleton) and the AICPU sim SO reads it directly via the
     // same global lookup.
+
+    // Start collector mgmt + poll threads now, just before kernels launch.
+    // Starting earlier wastes CPU on empty queues and risks tripping
+    // ProfilerBase's poll-loop idle-timeout if the AICPU SO is slow to come
+    // up.
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+    if (enable_l2_swimlane_) {
+        l2_perf_collector_.start(thread_factory);
+    }
+    if (enable_dump_tensor_) {
+        dump_collector_.start(thread_factory);
+    }
+    if (enable_pmu_) {
+        pmu_collector_.start(thread_factory);
+    }
 
     // Launch AICPU threads (over-launch for affinity gate)
     constexpr int over_launch = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
@@ -493,61 +524,19 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         CoreType core_type = runtime.workers[i].core_type;
         uint32_t physical_core_id = static_cast<uint32_t>(i);
         aicore_threads.push_back(create_thread([this, &runtime, i, core_type, physical_core_id]() {
-            aicore_execute_func_(&runtime, i, core_type, physical_core_id, kernel_args_.regs);
+            aicore_execute_func_(
+                &runtime, i, core_type, physical_core_id, kernel_args_.regs, kernel_args_.enable_profiling_flag,
+                kernel_args_.aicore_l2_perf_ring_addrs, kernel_args_.aicore_pmu_ring_addrs, kernel_args_.pmu_reg_addrs
+            );
         }));
     }
 
-    // Poll and collect performance data during execution (if enabled)
-    std::thread collector_thread;
-    if (enable_l2_swimlane_) {
-        collector_thread = create_thread([this, &runtime]() {
-            l2_perf_collector_.poll_and_collect(runtime.get_task_count());
-        });
-    }
-
-    std::thread dump_collector_thread;
-    if (enable_dump_tensor_) {
-        dump_collector_thread = std::thread([this]() {
-            dump_collector_.poll_and_collect(output_prefix_);
-        });
-    }
-
-    std::thread pmu_collector_thread;
-    if (enable_pmu_) {
-        pmu_collector_thread = std::thread([this]() {
-            pmu_collector_.poll_and_collect();
-        });
-    }
-
-    // Wait for all AICPU and AICore threads to complete
     LOG_INFO_V0("Waiting for threads to complete");
     for (auto &t : aicpu_threads) {
         t.join();
     }
     for (auto &t : aicore_threads) {
         t.join();
-    }
-
-    // Signal all collectors that device execution is complete
-    if (enable_l2_swimlane_) {
-        l2_perf_collector_.signal_execution_complete();
-    }
-    if (enable_dump_tensor_) {
-        dump_collector_.signal_execution_complete();
-    }
-    if (enable_pmu_) {
-        pmu_collector_.signal_execution_complete();
-    }
-
-    // Wait for all collector threads
-    if (collector_thread.joinable()) {
-        collector_thread.join();
-    }
-    if (dump_collector_thread.joinable()) {
-        dump_collector_thread.join();
-    }
-    if (pmu_collector_thread.joinable()) {
-        pmu_collector_thread.join();
     }
 
     LOG_INFO_V0("All threads completed");
@@ -558,25 +547,27 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return runtime_rc;
     }
 
-    // Diagnostic exports use the per-task `output_prefix_` directory the user
-    // set on CallConfig (CallConfig::validate() enforces non-empty upstream).
+    // Tear down collectors. stop() joins mgmt then collector in the only
+    // safe order (mgmt's final-drain pass into L2 has poll as its
+    // consumer). Diagnostic exports use the per-task `output_prefix_`
+    // directory the user set on CallConfig (validate() enforces non-empty
+    // upstream).
     if (enable_l2_swimlane_) {
-        l2_perf_collector_.stop_memory_manager();
-        l2_perf_collector_.drain_remaining_buffers();
-        l2_perf_collector_.scan_remaining_perf_buffers();
-        l2_perf_collector_.collect_phase_data();
-        l2_perf_collector_.export_swimlane_json(output_prefix_);
+        l2_perf_collector_.stop();
+        l2_perf_collector_.read_phase_header_metadata();
+        l2_perf_collector_.reconcile_counters();
+        l2_perf_collector_.export_swimlane_json();
     }
 
     if (enable_dump_tensor_) {
-        dump_collector_.stop_memory_manager();
-        dump_collector_.drain_remaining_buffers();
-        dump_collector_.scan_remaining_dump_buffers();
+        dump_collector_.stop();
+        dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();
     }
 
-    if (enable_pmu_ && pmu_collector_.is_initialized()) {
-        pmu_collector_.drain_remaining_buffers();
+    if (enable_pmu_) {
+        pmu_collector_.stop();
+        pmu_collector_.reconcile_counters();
     }
 
     // Print handshake results at end of run
@@ -624,6 +615,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_l2_perf_base_func_ = nullptr;
         set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
+        set_platform_pmu_reg_addrs_func_ = nullptr;
         set_pmu_enabled_func_ = nullptr;
         aicpu_so_loaded_ = false;
     }
@@ -820,34 +812,15 @@ int DeviceRunner::finalize() {
         return 0;
     }
 
-    // Cleanup performance profiling
+    // Cleanup all profiling subsystems.
     if (l2_perf_collector_.is_initialized()) {
-        auto free_cb = [](void *dev_ptr) -> int {
-            free(dev_ptr);
-            return 0;
-        };
-
-        l2_perf_collector_.finalize(nullptr, free_cb);
+        l2_perf_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr);
     }
-
-    // Cleanup tensor dump
     if (dump_collector_.is_initialized()) {
-        auto free_cb = [](void *dev_ptr) -> int {
-            free(dev_ptr);
-            return 0;
-        };
-
-        dump_collector_.finalize(nullptr, free_cb);
+        dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr);
     }
-
     if (pmu_collector_.is_initialized()) {
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            (void)user_data;
-            free(dev_ptr);
-            return 0;
-        };
-
-        pmu_collector_.finalize(nullptr, free_cb, nullptr);
+        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr);
     }
 
     // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
@@ -999,41 +972,38 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
 // Performance Profiling Implementation
 // =============================================================================
 
-int DeviceRunner::init_l2_perf_collection(int num_aicore, int device_id) {
-    // Define allocation callback (a5sim: use malloc)
-    auto alloc_cb = [](size_t size) -> void * {
-        return malloc(size);
-    };
+void DeviceRunner::finalize_collectors() {
+    if (l2_perf_collector_.is_initialized()) {
+        l2_perf_collector_.stop();
+    }
+    if (dump_collector_.is_initialized()) {
+        dump_collector_.stop();
+    }
+    if (pmu_collector_.is_initialized()) {
+        pmu_collector_.stop();
+    }
+}
 
-    // Define free callback (a5sim: use free)
-    auto free_cb = [](void *dev_ptr) -> int {
-        free(dev_ptr);
-        return 0;
-    };
-
-    // Simulation: no registration needed (pass nullptr)
-    int rc = l2_perf_collector_.initialize(num_aicore, device_id, alloc_cb, nullptr, free_cb);
+int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
+    int rc = l2_perf_collector_.initialize(
+        num_aicore, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr,
+        output_prefix_
+    );
     if (rc == 0) {
         kernel_args_.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
+        kernel_args_.aicore_l2_perf_ring_addrs =
+            reinterpret_cast<uint64_t>(l2_perf_collector_.get_aicore_ring_addrs_device_ptr());
     }
     return rc;
 }
 
-int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_id) {
-    (void)num_aicore;
+int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.sche_cpu_num;
 
-    auto alloc_cb = [](size_t size) -> void * {
-        return malloc(size);
-    };
-
-    auto free_cb = [](void *dev_ptr) -> int {
-        free(dev_ptr);
-        return 0;
-    };
-
-    // Simulation: no registration needed (dev == host)
-    int rc = dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, nullptr, free_cb);
+    int rc = dump_collector_.initialize(
+        num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr,
+        output_prefix_
+    );
     if (rc != 0) {
         return rc;
     }
@@ -1042,23 +1012,18 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
     return 0;
 }
 
-int DeviceRunner::init_pmu_buffers(
+int DeviceRunner::init_pmu(
     int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int /*device_id*/
 ) {
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        (void)user_data;
-        return malloc(size);
-    };
-
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        (void)user_data;
-        free(dev_ptr);
-        return 0;
-    };
-
-    // Simulation: no halHostRegister needed (dev == host)
     int rc = pmu_collector_.init(
-        num_cores, num_threads, &kernel_args_.pmu_data_base, csv_path, event_type, alloc_cb, free_cb, nullptr, -1
+        num_cores, num_threads, csv_path, event_type, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb,
+        /*user_data=*/nullptr, /*device_id=*/-1
     );
+    if (rc == 0) {
+        kernel_args_.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());
+        kernel_args_.aicore_pmu_ring_addrs =
+            reinterpret_cast<uint64_t>(pmu_collector_.get_aicore_ring_addrs_device_ptr());
+        kernel_args_.pmu_reg_addrs = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_reg_addrs_device_ptr());
+    }
     return rc;
 }
