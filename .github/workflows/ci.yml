@@ -644,6 +644,7 @@ jobs:
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a5)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure"
 
   st-onboard-a5:
+  #test A5
     needs: detect-changes
     if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: [self-hosted, a5]
