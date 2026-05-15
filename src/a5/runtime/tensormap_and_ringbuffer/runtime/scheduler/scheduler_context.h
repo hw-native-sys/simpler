@@ -127,7 +127,7 @@ private:
     // the same runtime lifetime as payload_per_core_, but is kept out of the
     // dispatch payload so normal task dispatch layout and cache footprint stay
     // unchanged.
-    PTO2DeferredCompletionIngressBuffer deferred_ingress_per_core_[RUNTIME_MAX_WORKER][2];
+    DeferredCompletionIngressBuffer deferred_ingress_per_core_[RUNTIME_MAX_WORKER][2];
 
     // sync_start drain coordination
     SyncStartDrainState drain_state_;

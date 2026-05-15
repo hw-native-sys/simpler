@@ -59,5 +59,5 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 #endif
 
     __gm__ int32_t *peer_counter = comm_remote_ptr(ctx, local_counter, peer_rank);
-    pto2_send_notification(peer_counter, 1, pto::comm::NotifyOp::AtomicAdd);
+    send_notification(peer_counter, 1, pto::comm::NotifyOp::AtomicAdd);
 }

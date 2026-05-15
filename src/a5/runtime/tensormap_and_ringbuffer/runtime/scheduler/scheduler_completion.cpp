@@ -83,18 +83,18 @@ void SchedulerContext::complete_slot_task(
     bool mixed_complete = sched_->on_subtask_complete(slot_state);
     if (slot_state.payload != nullptr) {
         int32_t reg_err = PTO2_ERROR_NONE;
-        PTO2AsyncWaitList::RegisterResult reg_result;
-        volatile PTO2DeferredCompletionIngressBuffer *deferred_ingress =
+        AsyncWaitList::RegisterResult reg_result;
+        volatile DeferredCompletionIngressBuffer *deferred_ingress =
             &deferred_ingress_per_core_[core_id][expected_reg_task_id & 1];
         AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_ingress);
         do {
             reg_result = sched_->async_wait_list.register_deferred(slot_state, async_ctx, mixed_complete, reg_err);
-            if (reg_result == PTO2AsyncWaitList::RegisterResult::Skipped) {
+            if (reg_result == AsyncWaitList::RegisterResult::Skipped) {
                 SPIN_WAIT_HINT();
             }
-        } while (reg_result == PTO2AsyncWaitList::RegisterResult::Skipped);
+        } while (reg_result == AsyncWaitList::RegisterResult::Skipped);
 
-        if (reg_result == PTO2AsyncWaitList::RegisterResult::Error) {
+        if (reg_result == AsyncWaitList::RegisterResult::Error) {
             int32_t expected = PTO2_ERROR_NONE;
             sched_->sm_header->sched_error_code.compare_exchange_strong(
                 expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
@@ -103,7 +103,7 @@ void SchedulerContext::complete_slot_task(
             return;
         }
 
-        if (mixed_complete && reg_result == PTO2AsyncWaitList::RegisterResult::Registered) {
+        if (mixed_complete && reg_result == AsyncWaitList::RegisterResult::Registered) {
             return;
         }
     }
@@ -122,7 +122,7 @@ void SchedulerContext::complete_slot_task(
         }
 #endif
 #if PTO2_SCHED_PROFILING
-        PTO2CompletionStats cstats = sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
+        CompletionStats cstats = sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
         l2_perf.notify_edges_total += cstats.fanout_edges;
         if (cstats.fanout_edges > l2_perf.notify_max_degree) l2_perf.notify_max_degree = cstats.fanout_edges;
         l2_perf.notify_tasks_enqueued += cstats.tasks_enqueued;

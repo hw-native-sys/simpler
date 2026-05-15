@@ -78,7 +78,7 @@ inline __aicore__ bool register_completion_condition(AsyncCtx &ctx, const Comple
         return false;
     }
 
-    volatile __gm__ PTO2DeferredCompletionEntry *slot = &ctx.completion_entries[idx];
+    volatile __gm__ DeferredCompletionEntry *slot = &ctx.completion_entries[idx];
     slot->addr = token.addr;
     slot->expected_value = token.expected_value;
     slot->engine = token.engine;
@@ -102,15 +102,15 @@ inline __aicore__ void defer_condition(
 
 inline __aicore__ void defer_counter(AsyncCtx &ctx, volatile __gm__ void *counter_addr, uint32_t expected) {
     defer_condition(
-        ctx, reinterpret_cast<uint64_t>(counter_addr), expected, PTO2_COMPLETION_ENGINE_SDMA,
-        PTO2_COMPLETION_TYPE_COUNTER
+        ctx, reinterpret_cast<uint64_t>(counter_addr), expected, COMPLETION_ENGINE_SDMA,
+        COMPLETION_TYPE_COUNTER
     );
 }
 
 inline __aicore__ void defer_sdma_event_record(AsyncCtx &ctx, volatile __gm__ void *record_addr) {
     defer_condition(
-        ctx, reinterpret_cast<uint64_t>(record_addr), 0, PTO2_COMPLETION_ENGINE_SDMA,
-        PTO2_COMPLETION_TYPE_SDMA_EVENT_RECORD
+        ctx, reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA,
+        COMPLETION_TYPE_SDMA_EVENT_RECORD
     );
 }
 
@@ -180,7 +180,7 @@ inline __aicore__ void defer_flush(AsyncCtx &ctx) {
         flush_bytes += static_cast<uint32_t>(sizeof(*ctx.completion_error_code));
     }
     if (ctx.completion_entries != nullptr) {
-        flush_bytes += count * static_cast<uint32_t>(sizeof(PTO2DeferredCompletionEntry));
+        flush_bytes += count * static_cast<uint32_t>(sizeof(DeferredCompletionEntry));
     }
     defer_flush_range(ctx.completion_count, flush_bytes);
 #if defined(__CPU_SIM)
@@ -196,7 +196,7 @@ inline __aicore__ void defer_flush(AsyncCtx &ctx) {
 }
 
 inline __aicore__ void
-pto2_send_notification(volatile __gm__ void *remote_counter_addr, int32_t value, pto::comm::NotifyOp notify_op) {
+send_notification(volatile __gm__ void *remote_counter_addr, int32_t value, pto::comm::NotifyOp notify_op) {
     __gm__ int32_t *counter = reinterpret_cast<__gm__ int32_t *>(const_cast<__gm__ void *>(remote_counter_addr));
     pto::comm::Signal signal(counter);
     pto::comm::TNOTIFY(signal, value, notify_op);
@@ -204,7 +204,7 @@ pto2_send_notification(volatile __gm__ void *remote_counter_addr, int32_t value,
 
 inline __aicore__ void
 save_expected_notification_counter(AsyncCtx &ctx, volatile __gm__ void *counter_addr, uint32_t expected_value) {
-    defer_condition(ctx, counter_addr, expected_value, PTO2_COMPLETION_ENGINE_SDMA, PTO2_COMPLETION_TYPE_COUNTER);
+    defer_condition(ctx, counter_addr, expected_value, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER);
     defer_flush(ctx);
 }
 

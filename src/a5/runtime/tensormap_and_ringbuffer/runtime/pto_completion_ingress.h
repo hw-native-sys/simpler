@@ -17,24 +17,24 @@
 #include "pto_constants.h"
 #include "pto_task_id.h"
 
-#define PTO2_COMPLETION_INGRESS_CAPACITY 4096u
-#define PTO2_COMPLETION_INGRESS_MASK (PTO2_COMPLETION_INGRESS_CAPACITY - 1u)
+#define COMPLETION_INGRESS_CAPACITY 4096u
+#define COMPLETION_INGRESS_MASK (COMPLETION_INGRESS_CAPACITY - 1u)
 
 static_assert(
-    (PTO2_COMPLETION_INGRESS_CAPACITY & (PTO2_COMPLETION_INGRESS_CAPACITY - 1u)) == 0,
-    "PTO2_COMPLETION_INGRESS_CAPACITY must be a power of two"
+    (COMPLETION_INGRESS_CAPACITY & (COMPLETION_INGRESS_CAPACITY - 1u)) == 0,
+    "COMPLETION_INGRESS_CAPACITY must be a power of two"
 );
 
-inline constexpr int32_t PTO2_MAX_COMPLETIONS_PER_TASK = 64;
+inline constexpr int32_t MAX_COMPLETIONS_PER_TASK = 64;
 
-#define PTO2_COMPLETION_ENGINE_SDMA 0u
-#define PTO2_COMPLETION_ENGINE_ROCE 1u
-#define PTO2_COMPLETION_ENGINE_URMA 2u
-#define PTO2_COMPLETION_ENGINE_CCU 3u
+#define COMPLETION_ENGINE_SDMA 0u
+#define COMPLETION_ENGINE_ROCE 1u
+#define COMPLETION_ENGINE_URMA 2u
+#define COMPLETION_ENGINE_CCU 3u
 
-#define PTO2_COMPLETION_TYPE_COUNTER 0
+#define COMPLETION_TYPE_COUNTER 0
 
-struct PTO2CompletionIngressEntry {
+struct CompletionIngressEntry {
     volatile uint64_t seq;
     PTO2TaskId task_token;
     uint64_t addr;
@@ -44,9 +44,9 @@ struct PTO2CompletionIngressEntry {
     uint32_t _pad[6];
 };
 
-static_assert(sizeof(PTO2CompletionIngressEntry) == PTO2_ALIGN_SIZE, "PTO2CompletionIngressEntry layout drift");
+static_assert(sizeof(CompletionIngressEntry) == PTO2_ALIGN_SIZE, "CompletionIngressEntry layout drift");
 
-struct PTO2DeferredCompletionEntry {
+struct DeferredCompletionEntry {
     uint64_t addr;
     uint32_t expected_value;
     uint32_t engine;
@@ -54,30 +54,30 @@ struct PTO2DeferredCompletionEntry {
     uint32_t _pad;
 };
 
-static_assert(sizeof(PTO2DeferredCompletionEntry) == 24, "PTO2DeferredCompletionEntry layout drift");
+static_assert(sizeof(DeferredCompletionEntry) == 24, "DeferredCompletionEntry layout drift");
 
-struct alignas(PTO2_ALIGN_SIZE) PTO2DeferredCompletionIngressBuffer {
+struct alignas(PTO2_ALIGN_SIZE) DeferredCompletionIngressBuffer {
     volatile uint32_t count;
     volatile int32_t error_code;
-    PTO2DeferredCompletionEntry entries[PTO2_MAX_COMPLETIONS_PER_TASK];
+    DeferredCompletionEntry entries[MAX_COMPLETIONS_PER_TASK];
 };
 
 static_assert(
-    sizeof(PTO2DeferredCompletionIngressBuffer) % PTO2_ALIGN_SIZE == 0,
-    "PTO2DeferredCompletionIngressBuffer size must preserve array element cache-line boundaries"
+    sizeof(DeferredCompletionIngressBuffer) % PTO2_ALIGN_SIZE == 0,
+    "DeferredCompletionIngressBuffer size must preserve array element cache-line boundaries"
 );
 
-struct PTO2CompletionIngressQueue {
+struct CompletionIngressQueue {
     alignas(PTO2_ALIGN_SIZE) volatile uint64_t head;
     uint8_t _head_pad[PTO2_ALIGN_SIZE - sizeof(uint64_t)];
     alignas(PTO2_ALIGN_SIZE) volatile uint64_t tail;
     uint8_t _tail_pad[PTO2_ALIGN_SIZE - sizeof(uint64_t)];
-    alignas(PTO2_ALIGN_SIZE) PTO2CompletionIngressEntry entries[PTO2_COMPLETION_INGRESS_CAPACITY];
+    alignas(PTO2_ALIGN_SIZE) CompletionIngressEntry entries[COMPLETION_INGRESS_CAPACITY];
 };
 
 static_assert(
-    sizeof(PTO2CompletionIngressQueue) % PTO2_ALIGN_SIZE == 0,
-    "PTO2CompletionIngressQueue size must be cache-line aligned"
+    sizeof(CompletionIngressQueue) % PTO2_ALIGN_SIZE == 0,
+    "CompletionIngressQueue size must be cache-line aligned"
 );
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_COMPLETION_INGRESS_H_

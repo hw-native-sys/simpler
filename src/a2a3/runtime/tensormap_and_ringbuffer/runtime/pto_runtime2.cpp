@@ -311,7 +311,7 @@ runtime_create_custom(PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t 
     // Connect orchestrator to scheduler (for simulated mode)
     rt->orchestrator.set_scheduler(&rt->scheduler);
 
-    rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
+    rt->completion_ingress = static_cast<CompletionIngressQueue *>(calloc(1, sizeof(CompletionIngressQueue)));
     if (!rt->completion_ingress) {
         rt->scheduler.destroy();
         rt->orchestrator.destroy();
@@ -354,7 +354,7 @@ PTO2Runtime *runtime_create_from_sm(
 
     rt->orchestrator.set_scheduler(&rt->scheduler);
 
-    rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
+    rt->completion_ingress = static_cast<CompletionIngressQueue *>(calloc(1, sizeof(CompletionIngressQueue)));
     if (!rt->completion_ingress) {
         rt->scheduler.destroy();
         rt->orchestrator.destroy();

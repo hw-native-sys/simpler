@@ -23,12 +23,12 @@
 
 struct PTO2SchedulerState;
 struct PTO2LocalReadyBuffer;
-struct PTO2CompletionStats;
+struct CompletionStats;
 
-inline constexpr int32_t PTO2_MAX_ASYNC_WAITS = 64;
-inline constexpr int32_t PTO2_MAX_PENDING_COMPLETIONS = 128;
+inline constexpr int32_t MAX_ASYNC_WAITS = 64;
+inline constexpr int32_t MAX_PENDING_COMPLETIONS = 128;
 
-inline bool completion_ingress_has_pending(volatile PTO2CompletionIngressQueue *completion_ingress) {
+inline bool completion_ingress_has_pending(volatile CompletionIngressQueue *completion_ingress) {
     if (completion_ingress == nullptr) return false;
     uint64_t head = __atomic_load_n(&completion_ingress->head, __ATOMIC_ACQUIRE);
     uint64_t tail = __atomic_load_n(&completion_ingress->tail, __ATOMIC_ACQUIRE);
@@ -39,14 +39,14 @@ inline uintptr_t completion_ingress_cache_line(const volatile void *addr) {
     return reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
 }
 
-enum class PTO2CompletionPollState : uint8_t {
+enum class CompletionPollState : uint8_t {
     PENDING = 0,
     READY = 1,
     FAILED = 2,
 };
 
-struct PTO2CompletionPollResult {
-    PTO2CompletionPollState state{PTO2CompletionPollState::PENDING};
+struct CompletionPollResult {
+    CompletionPollState state{CompletionPollState::PENDING};
     int32_t error_code{PTO2_ERROR_NONE};
 };
 
@@ -54,30 +54,30 @@ struct PTO2CompletionPollResult {
 // detail into backend/sdma/. The poll/retire helpers below are the legacy
 // inline implementations; the new table-driven dispatch goes through the ops
 // table further down.
-struct PTO2SdmaEventRecord {
+struct SdmaEventRecord {
     uint32_t flag;
     uint32_t sq_tail;
     uint64_t channel_info;
 };
 
-static_assert(sizeof(PTO2SdmaEventRecord) == 16, "SDMA event record ABI drift");
-static_assert(offsetof(PTO2SdmaEventRecord, sq_tail) == 4, "SDMA event record ABI drift");
+static_assert(sizeof(SdmaEventRecord) == 16, "SDMA event record ABI drift");
+static_assert(offsetof(SdmaEventRecord, sq_tail) == 4, "SDMA event record ABI drift");
 
-inline PTO2CompletionPollResult poll_sdma_event_record(uint64_t record_addr) {
+inline CompletionPollResult poll_sdma_event_record(uint64_t record_addr) {
     if (record_addr == 0) {
-        return {PTO2CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
+        return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
     }
-    volatile PTO2SdmaEventRecord *record =
-        reinterpret_cast<volatile PTO2SdmaEventRecord *>(static_cast<uintptr_t>(record_addr));
+    volatile SdmaEventRecord *record =
+        reinterpret_cast<volatile SdmaEventRecord *>(static_cast<uintptr_t>(record_addr));
     cache_invalidate_range(reinterpret_cast<const void *>(completion_ingress_cache_line(record)), PTO2_ALIGN_SIZE);
     uint32_t flag = __atomic_load_n(&record->flag, __ATOMIC_ACQUIRE);
-    return {flag != 0 ? PTO2CompletionPollState::READY : PTO2CompletionPollState::PENDING, PTO2_ERROR_NONE};
+    return {flag != 0 ? CompletionPollState::READY : CompletionPollState::PENDING, PTO2_ERROR_NONE};
 }
 
 inline void retire_sdma_event_record(uint64_t record_addr) {
     if (record_addr == 0) return;
-    volatile PTO2SdmaEventRecord *record =
-        reinterpret_cast<volatile PTO2SdmaEventRecord *>(static_cast<uintptr_t>(record_addr));
+    volatile SdmaEventRecord *record =
+        reinterpret_cast<volatile SdmaEventRecord *>(static_cast<uintptr_t>(record_addr));
     cache_invalidate_range(reinterpret_cast<const void *>(completion_ingress_cache_line(record)), PTO2_ALIGN_SIZE);
     uint32_t completed_tail = __atomic_load_n(&record->sq_tail, __ATOMIC_ACQUIRE);
     uint64_t channel_info_addr = __atomic_load_n(&record->channel_info, __ATOMIC_ACQUIRE);
@@ -93,123 +93,123 @@ inline void retire_sdma_event_record(uint64_t record_addr) {
     cache_flush_range(const_cast<const void *>(reinterpret_cast<volatile void *>(channel_info)), sizeof(uint64_t));
 }
 
-struct PTO2CompletionCondition;
+struct CompletionCondition;
 
-using PTO2CompletionPollFn = PTO2CompletionPollResult (*)(const PTO2CompletionCondition &);
-using PTO2CompletionRetireFn = void (*)(PTO2CompletionCondition &);
+using CompletionPollFn = CompletionPollResult (*)(const CompletionCondition &);
+using CompletionRetireFn = void (*)(CompletionCondition &);
 
-struct PTO2CompletionBackendOps {
-    PTO2CompletionPollFn poll;
-    PTO2CompletionRetireFn retire;
+struct CompletionBackendOps {
+    CompletionPollFn poll;
+    CompletionRetireFn retire;
 };
 
-struct PTO2CompletionCondition {
-    PTO2AsyncEngine engine{PTO2_ASYNC_ENGINE_SDMA};
-    int32_t completion_type{PTO2_COMPLETION_TYPE_COUNTER};
+struct CompletionCondition {
+    AsyncEngine engine{ASYNC_ENGINE_SDMA};
+    int32_t completion_type{COMPLETION_TYPE_COUNTER};
     bool satisfied{false};
     bool retired{false};
     volatile uint32_t *counter_addr{nullptr};
     uint64_t addr{0};
     uint32_t expected_value{0};
 
-    PTO2CompletionPollResult test() const;
+    CompletionPollResult test() const;
     void retire();
 };
 
 // Per-completion-type ops. PR-B moves SDMA_EVENT_RECORD ops out to
 // backend/sdma/; COUNTER stays here because it has no backend detail.
-inline PTO2CompletionPollResult counter_poll_op(const PTO2CompletionCondition &cond) {
+inline CompletionPollResult counter_poll_op(const CompletionCondition &cond) {
     if (cond.counter_addr == nullptr) {
-        return {PTO2CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
+        return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
     }
     return {
-        *cond.counter_addr >= cond.expected_value ? PTO2CompletionPollState::READY : PTO2CompletionPollState::PENDING,
+        *cond.counter_addr >= cond.expected_value ? CompletionPollState::READY : CompletionPollState::PENDING,
         PTO2_ERROR_NONE
     };
 }
 
-inline void counter_retire_op(PTO2CompletionCondition & /*cond*/) {}
+inline void counter_retire_op(CompletionCondition & /*cond*/) {}
 
-inline PTO2CompletionPollResult sdma_event_record_poll_op(const PTO2CompletionCondition &cond) {
+inline CompletionPollResult sdma_event_record_poll_op(const CompletionCondition &cond) {
     return poll_sdma_event_record(cond.addr);
 }
 
-inline void sdma_event_record_retire_op(PTO2CompletionCondition &cond) {
+inline void sdma_event_record_retire_op(CompletionCondition &cond) {
     retire_sdma_event_record(cond.addr);
 }
 
-inline const PTO2CompletionBackendOps *completion_backend_ops_for(int completion_type) {
-    static const PTO2CompletionBackendOps kOps[] = {
-        {counter_poll_op, counter_retire_op},                      // PTO2_COMPLETION_TYPE_COUNTER = 0
-        {sdma_event_record_poll_op, sdma_event_record_retire_op},  // PTO2_COMPLETION_TYPE_SDMA_EVENT_RECORD = 1
+inline const CompletionBackendOps *completion_backend_ops_for(int completion_type) {
+    static const CompletionBackendOps kOps[] = {
+        {counter_poll_op, counter_retire_op},                      // COMPLETION_TYPE_COUNTER = 0
+        {sdma_event_record_poll_op, sdma_event_record_retire_op},  // COMPLETION_TYPE_SDMA_EVENT_RECORD = 1
     };
     constexpr int kOpsCount = static_cast<int>(sizeof(kOps) / sizeof(kOps[0]));
     if (completion_type < 0 || completion_type >= kOpsCount) return nullptr;
     return &kOps[completion_type];
 }
 
-inline PTO2CompletionPollResult PTO2CompletionCondition::test() const {
+inline CompletionPollResult CompletionCondition::test() const {
     if (satisfied) {
-        return {PTO2CompletionPollState::READY, PTO2_ERROR_NONE};
+        return {CompletionPollState::READY, PTO2_ERROR_NONE};
     }
-    const PTO2CompletionBackendOps *ops = completion_backend_ops_for(completion_type);
+    const CompletionBackendOps *ops = completion_backend_ops_for(completion_type);
     if (ops == nullptr || ops->poll == nullptr) {
-        return {PTO2CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
+        return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
     }
     return ops->poll(*this);
 }
 
-inline void PTO2CompletionCondition::retire() {
+inline void CompletionCondition::retire() {
     if (retired) return;
-    const PTO2CompletionBackendOps *ops = completion_backend_ops_for(completion_type);
+    const CompletionBackendOps *ops = completion_backend_ops_for(completion_type);
     if (ops != nullptr && ops->retire != nullptr) {
         ops->retire(*this);
     }
     retired = true;
 }
 
-struct PTO2AsyncWaitEntry {
+struct AsyncWaitEntry {
     PTO2TaskSlotState *slot_state{nullptr};
     PTO2TaskId task_token{PTO2TaskId::invalid()};
-    PTO2CompletionCondition conditions[PTO2_MAX_COMPLETIONS_PER_TASK];
+    CompletionCondition conditions[MAX_COMPLETIONS_PER_TASK];
     int32_t condition_count{0};
     int32_t waiting_completion_count{0};
     bool normal_done{false};
 };
 
-struct PTO2PendingCompletion {
+struct PendingCompletion {
     PTO2TaskId task_token{PTO2TaskId::invalid()};
     uint64_t addr{0};
     uint32_t expected_value{0};
-    PTO2AsyncEngine engine{PTO2_ASYNC_ENGINE_SDMA};
+    AsyncEngine engine{ASYNC_ENGINE_SDMA};
 };
 
-struct PTO2AsyncPollResult {
+struct AsyncPollResult {
     int32_t completed{0};
     int32_t error_code{PTO2_ERROR_NONE};
     PTO2TaskSlotState *failed_slot_state{nullptr};
 };
 
-inline const char *async_engine_name(PTO2AsyncEngine engine) {
+inline const char *async_engine_name(AsyncEngine engine) {
     switch (engine) {
-    case PTO2_ASYNC_ENGINE_SDMA:
+    case ASYNC_ENGINE_SDMA:
         return "SDMA";
-    case PTO2_ASYNC_ENGINE_ROCE:
+    case ASYNC_ENGINE_ROCE:
         return "ROCE";
-    case PTO2_ASYNC_ENGINE_URMA:
+    case ASYNC_ENGINE_URMA:
         return "URMA";
-    case PTO2_ASYNC_ENGINE_CCU:
+    case ASYNC_ENGINE_CCU:
         return "CCU";
     default:
         return "UNKNOWN";
     }
 }
 
-struct PTO2AsyncWaitList {
+struct AsyncWaitList {
     std::atomic<int32_t> busy{0};
-    PTO2AsyncWaitEntry entries[PTO2_MAX_ASYNC_WAITS];
+    AsyncWaitEntry entries[MAX_ASYNC_WAITS];
     int32_t count{0};
-    PTO2PendingCompletion pending_completions[PTO2_MAX_PENDING_COMPLETIONS];
+    PendingCompletion pending_completions[MAX_PENDING_COMPLETIONS];
     int32_t pending_completion_count{0};
 
     bool try_lock() {
@@ -219,7 +219,7 @@ struct PTO2AsyncWaitList {
 
     void unlock() { busy.store(0, std::memory_order_release); }
 
-    PTO2AsyncWaitEntry *find_entry_by_token(PTO2TaskId token) {
+    AsyncWaitEntry *find_entry_by_token(PTO2TaskId token) {
         for (int32_t i = 0; i < count; i++) {
             if (entries[i].task_token == token) return &entries[i];
         }
@@ -227,7 +227,7 @@ struct PTO2AsyncWaitList {
     }
 
     int32_t
-    drain_completion_ingress_locked(volatile PTO2CompletionIngressQueue *completion_ingress, int32_t &error_code) {
+    drain_completion_ingress_locked(volatile CompletionIngressQueue *completion_ingress, int32_t &error_code) {
         error_code = PTO2_ERROR_NONE;
         if (completion_ingress == nullptr) return 0;
 
@@ -238,8 +238,8 @@ struct PTO2AsyncWaitList {
             if (tail >= head_snapshot) break;
 
             while (tail < head_snapshot) {
-                volatile PTO2CompletionIngressEntry *slot =
-                    &completion_ingress->entries[tail & PTO2_COMPLETION_INGRESS_MASK];
+                volatile CompletionIngressEntry *slot =
+                    &completion_ingress->entries[tail & COMPLETION_INGRESS_MASK];
                 uint64_t expected_seq = tail + 1;
                 uint64_t seq = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
                 if (seq != expected_seq) return drained;
@@ -247,22 +247,22 @@ struct PTO2AsyncWaitList {
                 PTO2TaskId token{slot->task_token.raw};
                 uint64_t addr = slot->addr;
                 uint32_t expected_value = slot->expected_value;
-                PTO2AsyncEngine engine = static_cast<PTO2AsyncEngine>(slot->engine);
+                AsyncEngine engine = static_cast<AsyncEngine>(slot->engine);
 
                 __atomic_store_n(&slot->seq, 0, __ATOMIC_RELEASE);
                 __atomic_store_n(&completion_ingress->tail, tail + 1, __ATOMIC_RELEASE);
                 drained++;
                 tail++;
 
-                PTO2AsyncWaitEntry *entry = find_entry_by_token(token);
+                AsyncWaitEntry *entry = find_entry_by_token(token);
                 if (entry != nullptr) {
-                    if (entry->condition_count >= PTO2_MAX_COMPLETIONS_PER_TASK) {
+                    if (entry->condition_count >= MAX_COMPLETIONS_PER_TASK) {
                         error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
                         return drained;
                     }
-                    PTO2CompletionCondition &cond = entry->conditions[entry->condition_count++];
+                    CompletionCondition &cond = entry->conditions[entry->condition_count++];
                     cond.engine = engine;
-                    cond.completion_type = PTO2_COMPLETION_TYPE_COUNTER;
+                    cond.completion_type = COMPLETION_TYPE_COUNTER;
                     cond.satisfied = false;
                     cond.retired = false;
                     cond.addr = addr;
@@ -272,11 +272,11 @@ struct PTO2AsyncWaitList {
                     continue;
                 }
 
-                if (pending_completion_count >= PTO2_MAX_PENDING_COMPLETIONS) {
+                if (pending_completion_count >= MAX_PENDING_COMPLETIONS) {
                     error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
                     return drained;
                 }
-                PTO2PendingCompletion &pending = pending_completions[pending_completion_count++];
+                PendingCompletion &pending = pending_completions[pending_completion_count++];
                 pending.task_token = token;
                 pending.addr = addr;
                 pending.expected_value = expected_value;
@@ -286,14 +286,14 @@ struct PTO2AsyncWaitList {
         return drained;
     }
 
-    void absorb_pending_completions_locked(PTO2AsyncWaitEntry &entry) {
+    void absorb_pending_completions_locked(AsyncWaitEntry &entry) {
         int32_t write = 0;
         for (int32_t i = 0; i < pending_completion_count; i++) {
             if (pending_completions[i].task_token == entry.task_token) {
-                if (entry.condition_count < PTO2_MAX_COMPLETIONS_PER_TASK) {
-                    PTO2CompletionCondition &cond = entry.conditions[entry.condition_count++];
+                if (entry.condition_count < MAX_COMPLETIONS_PER_TASK) {
+                    CompletionCondition &cond = entry.conditions[entry.condition_count++];
                     cond.engine = pending_completions[i].engine;
-                    cond.completion_type = PTO2_COMPLETION_TYPE_COUNTER;
+                    cond.completion_type = COMPLETION_TYPE_COUNTER;
                     cond.satisfied = false;
                     cond.retired = false;
                     cond.addr = pending_completions[i].addr;
@@ -313,20 +313,20 @@ struct PTO2AsyncWaitList {
     enum class RegisterResult { Registered, NotDeferred, Skipped, Error };
 
     bool append_condition_locked(
-        PTO2AsyncWaitEntry &entry, uint64_t addr, uint32_t expected_value, PTO2AsyncEngine engine,
+        AsyncWaitEntry &entry, uint64_t addr, uint32_t expected_value, AsyncEngine engine,
         int32_t completion_type, int32_t &error_code
     ) {
-        if (entry.condition_count >= PTO2_MAX_COMPLETIONS_PER_TASK) {
+        if (entry.condition_count >= MAX_COMPLETIONS_PER_TASK) {
             error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
             return false;
         }
-        PTO2CompletionCondition &cond = entry.conditions[entry.condition_count++];
+        CompletionCondition &cond = entry.conditions[entry.condition_count++];
         cond.engine = engine;
         cond.completion_type = completion_type;
         cond.satisfied = false;
         cond.retired = false;
         cond.addr = addr;
-        cond.counter_addr = completion_type == PTO2_COMPLETION_TYPE_COUNTER ?
+        cond.counter_addr = completion_type == COMPLETION_TYPE_COUNTER ?
                                 reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(addr)) :
                                 nullptr;
         cond.expected_value = expected_value;
@@ -366,13 +366,13 @@ struct PTO2AsyncWaitList {
                 return RegisterResult::Error;
             }
         }
-        PTO2AsyncWaitEntry *entry = find_entry_by_token(slot_state.task->task_id);
+        AsyncWaitEntry *entry = find_entry_by_token(slot_state.task->task_id);
         if (entry == nullptr && deferred_count == 0) {
             unlock();
             return RegisterResult::NotDeferred;
         }
         if (entry == nullptr) {
-            if (count >= PTO2_MAX_ASYNC_WAITS) {
+            if (count >= MAX_ASYNC_WAITS) {
                 error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
                 unlock();
                 return RegisterResult::Error;
@@ -389,8 +389,8 @@ struct PTO2AsyncWaitList {
         }
 
         for (uint32_t i = 0; i < deferred_count; ++i) {
-            volatile PTO2DeferredCompletionEntry *deferred = &async_ctx.completion_entries[i];
-            if (deferred->completion_type == PTO2_COMPLETION_TYPE_COUNTER) {
+            volatile DeferredCompletionEntry *deferred = &async_ctx.completion_entries[i];
+            if (deferred->completion_type == COMPLETION_TYPE_COUNTER) {
                 volatile uint32_t *counter =
                     reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(deferred->addr));
                 cache_invalidate_range(
@@ -398,7 +398,7 @@ struct PTO2AsyncWaitList {
                 );
             }
             if (!append_condition_locked(
-                    *entry, deferred->addr, deferred->expected_value, static_cast<PTO2AsyncEngine>(deferred->engine),
+                    *entry, deferred->addr, deferred->expected_value, static_cast<AsyncEngine>(deferred->engine),
                     deferred->completion_type, error_code
                 )) {
                 unlock();
@@ -412,8 +412,8 @@ struct PTO2AsyncWaitList {
     }
 
     template <bool Profiling>
-    PTO2AsyncPollResult poll_and_complete(
-        volatile PTO2CompletionIngressQueue *completion_ingress, PTO2SchedulerState *sched,
+    AsyncPollResult poll_and_complete(
+        volatile CompletionIngressQueue *completion_ingress, PTO2SchedulerState *sched,
         PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states,
         int32_t &deferred_release_count, int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING

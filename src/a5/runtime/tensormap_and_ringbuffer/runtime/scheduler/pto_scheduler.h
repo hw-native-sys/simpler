@@ -504,7 +504,7 @@ static_assert(sizeof(PTO2SpscQueue) == 256, "PTO2SpscQueue must be exactly 4 cac
 /**
  * Statistics returned by mixed-task completion processing
  */
-struct PTO2CompletionStats {
+struct CompletionStats {
     int32_t fanout_edges;       // Number of fanout edges traversed (notify consumers)
     int32_t tasks_enqueued;     // Number of consumers that became READY
     int32_t fanin_edges;        // Number of fanin edges traversed (release producers)
@@ -597,7 +597,7 @@ struct PTO2SchedulerState {
     );
     static_assert(sizeof(WiringState) == 576, "WiringState must be exactly 9 cache lines (576B)");
 
-    alignas(64) PTO2AsyncWaitList async_wait_list;
+    alignas(64) AsyncWaitList async_wait_list;
 
     // Statistics (cold path, isolated from hot-path fields)
 #if PTO2_SCHED_PROFILING
@@ -901,7 +901,7 @@ struct PTO2SchedulerState {
      * Handles fanout notification, fanin release, and self-consumption check.
      */
 #if PTO2_SCHED_PROFILING
-    PTO2CompletionStats
+    CompletionStats
 #else
     void
 #endif
@@ -914,7 +914,7 @@ struct PTO2SchedulerState {
         PTO2LocalReadyBuffer *local_bufs = nullptr
     ) {
 #if PTO2_SCHED_PROFILING
-        PTO2CompletionStats stats = {0, 0, 0, true};
+        CompletionStats stats = {0, 0, 0, true};
 #endif
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
@@ -1018,8 +1018,8 @@ struct PTO2SchedulerState {
 // See init()/destroy()/print_stats()/print_queues() below the struct definition.
 
 template <bool Profiling>
-inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
-    volatile PTO2CompletionIngressQueue *completion_ingress, PTO2SchedulerState *sched,
+inline AsyncPollResult AsyncWaitList::poll_and_complete(
+    volatile CompletionIngressQueue *completion_ingress, PTO2SchedulerState *sched,
     PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
     int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING
@@ -1027,7 +1027,7 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
     int thread_idx
 #endif
 ) {
-    PTO2AsyncPollResult result;
+    AsyncPollResult result;
     if (!try_lock()) return result;
 
     int32_t drain_err = PTO2_ERROR_NONE;
@@ -1039,18 +1039,18 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
     }
 
     for (int32_t i = count - 1; i >= 0; --i) {
-        PTO2AsyncWaitEntry &entry = entries[i];
+        AsyncWaitEntry &entry = entries[i];
         for (int32_t c = 0; c < entry.condition_count; c++) {
-            PTO2CompletionCondition &cond = entry.conditions[c];
+            CompletionCondition &cond = entry.conditions[c];
             if (cond.satisfied) continue;
-            PTO2CompletionPollResult poll = cond.test();
-            if (poll.state == PTO2CompletionPollState::FAILED) {
+            CompletionPollResult poll = cond.test();
+            if (poll.state == CompletionPollState::FAILED) {
                 result.error_code = poll.error_code;
                 result.failed_slot_state = entry.slot_state;
                 unlock();
                 return result;
             }
-            if (poll.state == PTO2CompletionPollState::READY) {
+            if (poll.state == CompletionPollState::READY) {
                 cond.satisfied = true;
                 entry.waiting_completion_count--;
             }

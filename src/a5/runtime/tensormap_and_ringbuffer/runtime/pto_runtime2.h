@@ -106,7 +106,7 @@ struct PTO2Runtime {
     PTO2SharedMemoryHandle *sm_handle;
     PTO2OrchestratorState orchestrator;
     PTO2SchedulerState scheduler;
-    PTO2CompletionIngressQueue *completion_ingress;
+    CompletionIngressQueue *completion_ingress;
 
     // GM Heap for output buffers
     void *gm_heap;
