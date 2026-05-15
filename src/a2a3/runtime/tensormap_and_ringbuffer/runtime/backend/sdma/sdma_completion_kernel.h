@@ -28,49 +28,6 @@
 #define __gm__
 #endif
 
-// SDMA backend kernel-side helpers. Public entry point is the
-// send_request_entry overload below; the defer_* helpers are kept exposed
-// only because the deferred-event demo still references them directly.
-// PR-E will privatize them once all callers move to send_request_entry.
-inline __aicore__ void defer_sdma_event_record(AsyncCtx &ctx, volatile __gm__ void *record_addr) {
-    defer_condition(
-        ctx, reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA,
-        COMPLETION_TYPE_SDMA_EVENT_RECORD
-    );
-}
-
-template <typename PtoAsyncEvent, typename PtoAsyncSession>
-inline __aicore__ void
-defer_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session) {
-    if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
-        (void)event.Wait(session);
-        return;
-    }
-    if (event.handle == 0) {
-        return;
-    }
-
-    const uint32_t engine = static_cast<uint32_t>(event.engine);
-    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::SDMA)) {
-        defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
-        return;
-    }
-
-    ::pto::comm::sdma::detail::UbTmpBuf tmp_buf;
-    uint32_t sync_id = 0;
-    __gm__ uint8_t *recv_workspace = nullptr;
-    uint32_t queue_num = 0;
-    if (!::pto::comm::sdma::detail::PrepareEventCheck(
-            session.sdmaSession, tmp_buf, sync_id, recv_workspace, queue_num
-        )) {
-        defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
-        return;
-    }
-    for (uint32_t queue_id = 0; queue_id < queue_num; ++queue_id) {
-        defer_sdma_event_record(ctx, ::pto::comm::sdma::detail::GetEventRecord(recv_workspace, queue_id));
-    }
-}
-
 // Re-exposed PTO-ISA constant so examples / callers don't need to include
 // <pto/npu/comm/async/sdma/sdma_types.hpp> just to spell their scratch tile.
 inline constexpr uint32_t SDMA_SCRATCH_ALIGNMENT = pto::comm::sdma::UB_ALIGN_SIZE;
@@ -83,8 +40,8 @@ enum class SdmaOp : uint8_t {
 // SdmaRequestDescriptor bundles everything send_request_entry needs to drive
 // one SDMA transfer + completion registration. It is a template because the
 // destination / source / scratch types carry tensor shape & stride at compile
-// time; CTAD or the SdmaTget()/SdmaTput() helpers below avoid spelling them
-// out at the call site.
+// time; the SdmaTget() / SdmaTput() helpers below let callers skip the
+// template arguments.
 //
 // sync_id selects which event-record slot inside the workspace the engine
 // writes into. Concurrent dispatches must use distinct sync_ids; today every
@@ -119,6 +76,48 @@ inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> Sdma
                                                                      sync_id};
 }
 
+namespace pto2::detail {
+
+inline __aicore__ void register_sdma_event_record(AsyncCtx &ctx, volatile __gm__ void *record_addr) {
+    CompletionToken token{reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA,
+                          COMPLETION_TYPE_SDMA_EVENT_RECORD, 0};
+    (void)register_completion_condition(ctx, token);
+}
+
+template <typename PtoAsyncEvent, typename PtoAsyncSession>
+inline __aicore__ void
+register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session) {
+    if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
+        (void)event.Wait(session);
+        return;
+    }
+    if (event.handle == 0) {
+        return;
+    }
+
+    const uint32_t engine = static_cast<uint32_t>(event.engine);
+    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::SDMA)) {
+        defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
+        return;
+    }
+
+    ::pto::comm::sdma::detail::UbTmpBuf tmp_buf;
+    uint32_t sync_id = 0;
+    __gm__ uint8_t *recv_workspace = nullptr;
+    uint32_t queue_num = 0;
+    if (!::pto::comm::sdma::detail::PrepareEventCheck(
+            session.sdmaSession, tmp_buf, sync_id, recv_workspace, queue_num
+        )) {
+        defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
+        return;
+    }
+    for (uint32_t queue_id = 0; queue_id < queue_num; ++queue_id) {
+        register_sdma_event_record(ctx, ::pto::comm::sdma::detail::GetEventRecord(recv_workspace, queue_id));
+    }
+}
+
+}  // namespace pto2::detail
+
 // SDMA overload of the runtime's send_request_entry. Submits the descriptor
 // to PTO-ISA, then registers the resulting AsyncEvent's GM flag(s) into the
 // AsyncCtx deferred-wait slab and flushes. Returns false on submit/session
@@ -130,7 +129,7 @@ inline __aicore__ bool send_request_entry(
     ScratchTileT scratch = desc.scratch;
     pto::comm::AsyncSession session;
     if (!pto::comm::BuildAsyncSession(scratch, desc.workspace, session, desc.sync_id)) {
-        defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
 
@@ -142,8 +141,8 @@ inline __aicore__ bool send_request_entry(
     } else {
         event = pto::comm::TPUT_ASYNC(dst, src, session);
     }
-    defer_pto_async_event(ctx, event, session);
-    defer_flush(ctx);
+    pto2::detail::register_pto_async_event(ctx, event, session);
+    pto2::detail::defer_flush(ctx);
     return true;
 }
 
