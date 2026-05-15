@@ -74,6 +74,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
 
     __gm__ int32_t *remote_counter = comm_remote_ptr(comm_ctx, local_counter, peer_rank);
-    pto2_send_notification(remote_counter, 1, pto::comm::NotifyOp::AtomicAdd);
+    send_notification(remote_counter, 1, pto::comm::NotifyOp::AtomicAdd);
     pipe_barrier(PIPE_ALL);
 }

@@ -7,12 +7,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""SDMA TGET_ASYNC deferred completion smoke test for onboard a2a3.
+"""SDMA deferred completion smoke test for onboard a2a3.
 
 Each rank stages its input inside the HCCL window.  The deferred producer
-TGET_ASYNCs the peer rank's input into local ``out`` and registers the PTO
-AsyncEvent through ``defer_pto_async_event``.  The consumer depends on the
-producer output and writes ``result = out + 1``.  Correct ``out`` and ``result``
+builds an ``SdmaRequestDescriptor`` via ``SdmaTget`` and submits it through
+``send_request_entry``, which registers the resulting AsyncEvent's GM flag(s)
+on the task's deferred-wait slab.  The consumer depends on the producer
+output and writes ``result = out + 1``.  Correct ``out`` and ``result``
 therefore validate both the SDMA completion polling and the deferred-release
 dependency path.
 """

@@ -311,8 +311,8 @@ runtime_create_custom(PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t 
     // Connect orchestrator to scheduler (for simulated mode)
     rt->orchestrator.set_scheduler(&rt->scheduler);
 
-    rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
-    if (!rt->completion_ingress) {
+    rt->aicore_mailbox = static_cast<AICoreCompletionMailbox *>(calloc(1, sizeof(AICoreCompletionMailbox)));
+    if (!rt->aicore_mailbox) {
         rt->scheduler.destroy();
         rt->orchestrator.destroy();
         free(rt->gm_heap);
@@ -354,8 +354,8 @@ PTO2Runtime *runtime_create_from_sm(
 
     rt->orchestrator.set_scheduler(&rt->scheduler);
 
-    rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
-    if (!rt->completion_ingress) {
+    rt->aicore_mailbox = static_cast<AICoreCompletionMailbox *>(calloc(1, sizeof(AICoreCompletionMailbox)));
+    if (!rt->aicore_mailbox) {
         rt->scheduler.destroy();
         rt->orchestrator.destroy();
         free(rt);
@@ -371,7 +371,7 @@ void runtime_destroy(PTO2Runtime *rt) {
     rt->scheduler.destroy();
     rt->orchestrator.destroy();
 
-    free(rt->completion_ingress);
+    free(rt->aicore_mailbox);
 
     if (rt->gm_heap_owned && rt->gm_heap) {
         free(rt->gm_heap);

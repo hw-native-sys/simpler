@@ -838,7 +838,7 @@ int32_t SchedulerContext::init(
 
     // Clear per-core dispatch payloads
     memset(payload_per_core_, 0, sizeof(payload_per_core_));
-    memset(deferred_ingress_per_core_, 0, sizeof(deferred_ingress_per_core_));
+    memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_));
 
     // Initialize per-core GlobalContext (sub_block_id) based on cluster position.
     // This is done once at startup and never modified afterwards.
@@ -870,7 +870,7 @@ void SchedulerContext::deinit() {
 
     // Clear per-core dispatch payloads
     memset(payload_per_core_, 0, sizeof(payload_per_core_));
-    memset(deferred_ingress_per_core_, 0, sizeof(deferred_ingress_per_core_));
+    memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_));
 
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
     // would otherwise leave dirty pending/elected/ack state for the next reuse.

@@ -16,7 +16,7 @@
 
 #include "scheduler/pto_scheduler.h"
 
-#include "pto_completion_ingress.h"
+#include "aicore_completion_mailbox.h"
 #include "pto2_dispatch_payload.h"
 
 // These macros are defined in runtime.h, but we cannot include it here
@@ -128,7 +128,7 @@ private:
     // the same runtime lifetime as payload_per_core_, but is kept out of the
     // dispatch payload so normal task dispatch layout and cache footprint stay
     // unchanged.
-    PTO2DeferredCompletionIngressBuffer deferred_ingress_per_core_[RUNTIME_MAX_WORKER][2];
+    DeferredCompletionSlab deferred_slab_per_core_[RUNTIME_MAX_WORKER][2];
 
     // sync_start drain coordination
     SyncStartDrainState drain_state_;

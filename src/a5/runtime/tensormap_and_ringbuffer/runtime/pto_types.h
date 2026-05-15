@@ -48,14 +48,14 @@
 #define MAX_SCALAR_ARGS CORE_MAX_SCALAR_ARGS
 
 typedef enum {
-    PTO2_ASYNC_ENGINE_SDMA = 0,
-    PTO2_ASYNC_ENGINE_ROCE = 1,
-    PTO2_ASYNC_ENGINE_URMA = 2,
-    PTO2_ASYNC_ENGINE_CCU = 3,
-    PTO2_NUM_ASYNC_ENGINES = 4,
-} PTO2AsyncEngine;
+    ASYNC_ENGINE_SDMA = 0,
+    ASYNC_ENGINE_ROCE = 1,
+    ASYNC_ENGINE_URMA = 2,
+    ASYNC_ENGINE_CCU = 3,
+    NUM_ASYNC_ENGINES = 4,
+} AsyncEngine;
 
-enum class PTO2CompletionType : int32_t {
+enum class CompletionType : int32_t {
     COUNTER = 0,
 };
 

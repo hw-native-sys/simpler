@@ -42,7 +42,7 @@
 #include "pto_tensormap.h"
 #include "scheduler/pto_scheduler.h"
 #include "pto_orchestrator.h"
-#include "pto_completion_ingress.h"
+#include "aicore_completion_mailbox.h"
 
 // =============================================================================
 // Runtime Context
@@ -106,7 +106,7 @@ struct PTO2Runtime {
     PTO2SharedMemoryHandle *sm_handle;
     PTO2OrchestratorState orchestrator;
     PTO2SchedulerState scheduler;
-    PTO2CompletionIngressQueue *completion_ingress;
+    AICoreCompletionMailbox *aicore_mailbox;
 
     // GM Heap for output buffers
     void *gm_heap;

@@ -52,7 +52,7 @@
 
 #include <stdint.h>
 
-#include "pto_completion_ingress.h"
+#include "aicore_completion_mailbox.h"
 #include "pto_task_id.h"
 
 #ifndef __gm__
@@ -91,11 +91,11 @@ struct GlobalContext {
 struct AsyncCtx {
     volatile __gm__ uint32_t *completion_count;
     volatile __gm__ int32_t *completion_error_code;
-    volatile __gm__ PTO2DeferredCompletionEntry *completion_entries;
+    volatile __gm__ DeferredCompletionEntry *completion_entries;
     uint32_t completion_capacity;
     PTO2TaskId task_token;
 
-    static inline AsyncCtx make(PTO2TaskId task_token, volatile __gm__ PTO2DeferredCompletionIngressBuffer *buffer) {
+    static inline AsyncCtx make(PTO2TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {
         AsyncCtx ctx{};
         ctx.task_token = task_token;
         if (buffer == nullptr) {
@@ -105,7 +105,7 @@ struct AsyncCtx {
         ctx.completion_count = &buffer->count;
         ctx.completion_error_code = &buffer->error_code;
         ctx.completion_entries = &buffer->entries[0];
-        ctx.completion_capacity = PTO2_MAX_COMPLETIONS_PER_TASK;
+        ctx.completion_capacity = MAX_COMPLETIONS_PER_TASK;
         return ctx;
     }
 };

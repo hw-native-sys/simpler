@@ -136,10 +136,10 @@ void SchedulerContext::dispatch_subtask_to_core(
 
     uint32_t buf_idx = reg_task_id & 1u;
     PTO2DispatchPayload &payload = payload_per_core_[core_id][buf_idx];
-    PTO2DeferredCompletionIngressBuffer *deferred_ingress = &deferred_ingress_per_core_[core_id][buf_idx];
-    deferred_ingress->count = 0;
-    deferred_ingress->error_code = PTO2_ERROR_NONE;
-    AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_ingress);
+    DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][buf_idx];
+    deferred_slab->count = 0;
+    deferred_slab->error_code = PTO2_ERROR_NONE;
+    AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
     build_payload(payload, slot_state, subslot, async_ctx);
 
     if (to_pending) {
@@ -448,10 +448,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
         }
 
-        if (rt_ != nullptr && rt_->completion_ingress != nullptr &&
+        if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || sched_->async_wait_list.pending_completion_count > 0)) {
-            PTO2AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
-                rt_->completion_ingress, sched_, local_bufs, deferred_release_slot_states, deferred_release_count,
+            AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
+                rt_->aicore_mailbox, sched_, local_bufs, deferred_release_slot_states, deferred_release_count,
                 PTO2_DEFERRED_RELEASE_CAP
 #if PTO2_SCHED_PROFILING
                 ,
