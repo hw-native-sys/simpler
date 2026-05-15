@@ -85,9 +85,9 @@ Each of the 3 scheduler threads (Thread 0, 1, 2) prints its own summary after co
 ```text
 Thread 0: completed=352 tasks in 3477.420us (147 loops, 2.4 tasks/loop)
 Thread 0: --- Phase Breakdown ---
-Thread 0:   complete:    1485.020us (42.7%)  [fanout: edges=432, max_degree=2, avg=1.2]  [fanin: edges=320, max_degree=3, avg=0.9]
+Thread 0:   complete:    1485.020us (42.7%)
 Thread 0:   scan:        14.400us (0.4%)
-Thread 0:   dispatch:    1973.060us (56.7%)  [pop: hit=352, miss=3043, hit_rate=10.4%]
+Thread 0:   dispatch:    1973.060us (56.7%)
 Thread 0:   idle:        4.940us (0.1%)
 ```
 

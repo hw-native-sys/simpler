@@ -121,16 +121,15 @@ void SchedulerContext::complete_slot_task(
         }
 #endif
 #if PTO2_SCHED_PROFILING
-        CompletionStats cstats = sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
-        l2_perf.notify_edges_total += cstats.fanout_edges;
-        if (cstats.fanout_edges > l2_perf.notify_max_degree) l2_perf.notify_max_degree = cstats.fanout_edges;
-        l2_perf.notify_tasks_enqueued += cstats.tasks_enqueued;
-        l2_perf.phase_complete_count++;
+        // SCHED_PROFILING variant takes thread_idx for its per-thread atomic
+        // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
+        // by the otc_* log lines). Its return value is unused.
+        (void)sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
 #else
         sched_->on_mixed_task_complete(slot_state, local_bufs);
+#endif
 #if PTO2_PROFILING
         l2_perf.phase_complete_count++;
-#endif
 #endif
         if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
@@ -138,10 +137,9 @@ void SchedulerContext::complete_slot_task(
             LOG_INFO_V9("Thread %d: release", thread_idx);
             while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
-                int32_t fe =
-                    sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-                l2_perf.fanin_edges_total += fe;
-                if (fe > l2_perf.fanin_max_degree) l2_perf.fanin_max_degree = fe;
+                // SCHED_PROFILING variant takes thread_idx for the per-thread
+                // atomic counter side-effects. The return value is unused.
+                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else
                 sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif

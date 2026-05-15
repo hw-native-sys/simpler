@@ -488,7 +488,7 @@ static void switch_phase_buffer(int thread_idx) {
 
 void l2_perf_aicpu_record_phase(
     int thread_idx, AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint64_t tasks_processed
+    uint64_t tasks_processed, uint32_t extra1, uint32_t extra2
 ) {
     if (s_phase_header == nullptr) {
         return;
@@ -554,6 +554,8 @@ void l2_perf_aicpu_record_phase(
     record->loop_iter = loop_iter;
     record->phase_id = phase_id;
     record->task_id = tasks_processed;
+    record->extra1 = extra1;
+    record->extra2 = extra2;
 
     buf->count = idx + 1;
 }

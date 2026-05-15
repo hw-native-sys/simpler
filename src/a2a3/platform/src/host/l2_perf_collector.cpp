@@ -716,8 +716,14 @@ int L2PerfCollector::export_swimlane_json() {
                 outfile << "      {\"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
                         << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ", \"phase\": \""
                         << sched_phase_name(pr.phase_id) << "\""
-                        << ", \"loop_iter\": " << pr.loop_iter << ", \"tasks_processed\": " << pr.tasks_processed
-                        << "}";
+                        << ", \"loop_iter\": " << pr.loop_iter << ", \"tasks_processed\": " << pr.tasks_processed;
+                // Phase-specific deltas (currently only SCHED_DISPATCH carries
+                // pop_hit / pop_miss). Other phases pass zero extras; omitting
+                // them keeps the JSON terse per record.
+                if (pr.phase_id == AicpuPhaseId::SCHED_DISPATCH) {
+                    outfile << ", \"pop_hit\": " << pr.extra1 << ", \"pop_miss\": " << pr.extra2;
+                }
+                outfile << "}";
                 first = false;
             }
             if (!first) outfile << "\n";

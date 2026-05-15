@@ -67,8 +67,9 @@ const PTO2ResourceShape *SchedulerContext::get_dispatch_order(int32_t thread_idx
 int SchedulerContext::pop_ready_tasks_batch(
     PTO2ResourceShape shape, int32_t thread_idx, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count
 ) {
-#if PTO2_SCHED_PROFILING
+#if PTO2_PROFILING
     auto &l2_perf = sched_l2_perf_[thread_idx];
+#if PTO2_SCHED_PROFILING
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
@@ -76,6 +77,11 @@ int SchedulerContext::pop_ready_tasks_batch(
         l2_perf.local_dispatch_count
     );
     l2_perf.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
+#else
+    int count = sched_->get_ready_tasks_batch(shape, local_buf, out, max_count);
+#endif
+    // pop_hit / pop_miss are PTO2_PROFILING-gated (not the inner verbose tier)
+    // so the v2 JSON dispatch records carry queue-health stats on default builds.
     if (count > 0) {
         l2_perf.pop_hit += count;
     } else {
@@ -539,11 +545,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 if (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP) {
                     while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
-                        int32_t fe = sched_->on_task_release(
+                        (void)sched_->on_task_release(
                             *deferred_release_slot_states[--deferred_release_count], thread_idx
                         );
-                        l2_perf.fanin_edges_total += fe;
-                        if (fe > l2_perf.fanin_max_degree) l2_perf.fanin_max_degree = fe;
 #else
                         sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
@@ -592,12 +596,19 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         } else {
             CYCLE_COUNT_LAP(l2_perf.sched_dispatch_cycle);
             if (l2_perf.l2_perf_enabled && l2_perf.phase_dispatch_count > 0) {
+                // Per-emit pop deltas via snapshot diff; the cumulative
+                // pop_hit / pop_miss stay intact for the cold-path log.
+                uint64_t pop_hit_delta = l2_perf.pop_hit - l2_perf.pop_hit_at_last_emit;
+                uint64_t pop_miss_delta = l2_perf.pop_miss - l2_perf.pop_miss_at_last_emit;
                 l2_perf_aicpu_record_phase(
                     thread_idx, AicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, l2_perf.sched_loop_count,
-                    l2_perf.phase_dispatch_count
+                    l2_perf.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
+                    static_cast<uint32_t>(pop_miss_delta)
                 );
                 _t0_phase = _t1;
                 l2_perf.phase_dispatch_count = 0;
+                l2_perf.pop_hit_at_last_emit = l2_perf.pop_hit;
+                l2_perf.pop_miss_at_last_emit = l2_perf.pop_miss;
             }
         }
 #endif
@@ -612,10 +623,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         } else {
             while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
-                int32_t fe =
-                    sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-                l2_perf.fanin_edges_total += fe;
-                if (fe > l2_perf.fanin_max_degree) l2_perf.fanin_max_degree = fe;
+                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else
                 sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
@@ -654,6 +662,23 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     }
 
 #if PTO2_PROFILING
+    // Final-drain: emit any pop_hit / pop_miss accrued since the last
+    // dispatch emit (typically the trailing idle loops while waiting for
+    // orchestrator_done_) as a zero-duration synthetic dispatch record so
+    // sum(record.pop_*) reconciles with the run-cumulative counter.
+    if (l2_perf.l2_perf_enabled) {
+        uint64_t final_pop_hit_delta = l2_perf.pop_hit - l2_perf.pop_hit_at_last_emit;
+        uint64_t final_pop_miss_delta = l2_perf.pop_miss - l2_perf.pop_miss_at_last_emit;
+        if (final_pop_hit_delta != 0 || final_pop_miss_delta != 0) {
+            uint64_t t_now = get_sys_cnt_aicpu();
+            l2_perf_aicpu_record_phase(
+                thread_idx, AicpuPhaseId::SCHED_DISPATCH, t_now, t_now, l2_perf.sched_loop_count, 0,
+                static_cast<uint32_t>(final_pop_hit_delta), static_cast<uint32_t>(final_pop_miss_delta)
+            );
+            l2_perf.pop_hit_at_last_emit = l2_perf.pop_hit;
+            l2_perf.pop_miss_at_last_emit = l2_perf.pop_miss;
+        }
+    }
     log_l2_perf_summary(thread_idx, cur_thread_completed);
 #endif
 
