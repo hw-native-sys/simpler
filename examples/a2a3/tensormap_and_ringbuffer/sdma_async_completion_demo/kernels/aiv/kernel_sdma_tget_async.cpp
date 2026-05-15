@@ -18,8 +18,6 @@
 #define __aicore__ [aicore]
 #endif
 
-#include <pto/comm/pto_comm_inst.hpp>
-#include <pto/npu/comm/async/sdma/sdma_types.hpp>
 #include <pto/pto-inst.hpp>
 
 #include "backend/sdma/sdma_completion_kernel.h"
@@ -56,7 +54,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     using FlatShape = Shape<1, 1, 1, 1, kElems>;
     using FlatStride = Stride<kElems, kElems, kElems, kElems, 1>;
     using GlobalData = GlobalTensor<float, FlatShape, FlatStride>;
-    using ScratchTile = Tile<TileType::Vec, uint8_t, 1, pto::comm::sdma::UB_ALIGN_SIZE>;
+    using ScratchTile = Tile<TileType::Vec, uint8_t, 1, SDMA_SCRATCH_ALIGNMENT>;
 
     __gm__ float *remote_in = comm_remote_ptr(comm_ctx, local_in, peer_rank);
     GlobalData remote_global(remote_in);
@@ -65,15 +63,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     ScratchTile scratch_tile;
     TASSIGN(scratch_tile, 0x0);
 
-    pto::comm::AsyncSession session;
-    __gm__ uint8_t *sdma_workspace = reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace);
-    if (!pto::comm::BuildAsyncSession(scratch_tile, sdma_workspace, session, 0)) {
-        pipe_barrier(PIPE_ALL);
-        return;
-    }
-
-    pto::comm::AsyncEvent event = pto::comm::TGET_ASYNC(local_global, remote_global, session);
     AsyncCtx async_ctx = get_async_ctx(args);
-    defer_pto_async_event(async_ctx, event, session);
-    defer_flush(async_ctx);
+    send_request_entry(
+        async_ctx,
+        SdmaTget(local_global, remote_global, scratch_tile,
+                 reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace))
+    );
 }

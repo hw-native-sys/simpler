@@ -71,6 +71,10 @@ defer_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncS
     }
 }
 
+// Re-exposed PTO-ISA constant so examples / callers don't need to include
+// <pto/npu/comm/async/sdma/sdma_types.hpp> just to spell their scratch tile.
+inline constexpr uint32_t SDMA_SCRATCH_ALIGNMENT = pto::comm::sdma::UB_ALIGN_SIZE;
+
 enum class SdmaOp : uint8_t {
     TGET = 0,
     TPUT = 1,
