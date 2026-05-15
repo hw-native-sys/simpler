@@ -107,52 +107,6 @@ inline __aicore__ void defer_counter(AsyncCtx &ctx, volatile __gm__ void *counte
     );
 }
 
-inline __aicore__ void defer_sdma_event_record(AsyncCtx &ctx, volatile __gm__ void *record_addr) {
-    defer_condition(
-        ctx, reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA,
-        COMPLETION_TYPE_SDMA_EVENT_RECORD
-    );
-}
-
-#if defined(PTO_COMM_ASYNC_COMMON_ASYNC_EVENT_IMPL_HPP)
-template <typename PtoAsyncEvent, typename PtoAsyncSession>
-inline __aicore__ void
-defer_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session) {
-    if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
-        (void)event.Wait(session);
-        return;
-    }
-    if (event.handle == 0) {
-        return;
-    }
-
-    const uint32_t engine = static_cast<uint32_t>(event.engine);
-    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::SDMA)) {
-        defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
-        return;
-    }
-
-    ::pto::comm::sdma::detail::UbTmpBuf tmp_buf;
-    uint32_t sync_id = 0;
-    __gm__ uint8_t *recv_workspace = nullptr;
-    uint32_t queue_num = 0;
-    if (!::pto::comm::sdma::detail::PrepareEventCheck(
-            session.sdmaSession, tmp_buf, sync_id, recv_workspace, queue_num
-        )) {
-        defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
-        return;
-    }
-    for (uint32_t queue_id = 0; queue_id < queue_num; ++queue_id) {
-        defer_sdma_event_record(ctx, ::pto::comm::sdma::detail::GetEventRecord(recv_workspace, queue_id));
-    }
-}
-#else
-template <typename PtoAsyncEvent, typename PtoAsyncSession>
-inline __aicore__ void defer_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &, const PtoAsyncSession &) {
-    defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
-}
-#endif
-
 inline __aicore__ void defer_flush_range(volatile __gm__ void *addr, uint32_t size_bytes) {
     if (addr == nullptr || size_bytes == 0) return;
 #if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)

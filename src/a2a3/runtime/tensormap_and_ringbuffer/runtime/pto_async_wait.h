@@ -17,8 +17,10 @@
 #include <cstdint>
 
 #include "aicpu/platform_regs.h"
+#include "backend/sdma/sdma_completion_scheduler.h"
 #include "intrinsic.h"
 #include "pto_completion_ingress.h"
+#include "pto_completion_token.h"
 #include "pto_runtime2_types.h"
 
 struct PTO2SchedulerState;
@@ -37,60 +39,6 @@ inline bool completion_ingress_has_pending(volatile CompletionIngressQueue *comp
 
 inline uintptr_t completion_ingress_cache_line(const volatile void *addr) {
     return reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
-}
-
-enum class CompletionPollState : uint8_t {
-    PENDING = 0,
-    READY = 1,
-    FAILED = 2,
-};
-
-struct CompletionPollResult {
-    CompletionPollState state{CompletionPollState::PENDING};
-    int32_t error_code{PTO2_ERROR_NONE};
-};
-
-// SdmaEventRecord layout mirror — kept here until PR-B relocates SDMA backend
-// detail into backend/sdma/. The poll/retire helpers below are the legacy
-// inline implementations; the new table-driven dispatch goes through the ops
-// table further down.
-struct SdmaEventRecord {
-    uint32_t flag;
-    uint32_t sq_tail;
-    uint64_t channel_info;
-};
-
-static_assert(sizeof(SdmaEventRecord) == 16, "SDMA event record ABI drift");
-static_assert(offsetof(SdmaEventRecord, sq_tail) == 4, "SDMA event record ABI drift");
-
-inline CompletionPollResult poll_sdma_event_record(uint64_t record_addr) {
-    if (record_addr == 0) {
-        return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
-    }
-    volatile SdmaEventRecord *record =
-        reinterpret_cast<volatile SdmaEventRecord *>(static_cast<uintptr_t>(record_addr));
-    cache_invalidate_range(reinterpret_cast<const void *>(completion_ingress_cache_line(record)), PTO2_ALIGN_SIZE);
-    uint32_t flag = __atomic_load_n(&record->flag, __ATOMIC_ACQUIRE);
-    return {flag != 0 ? CompletionPollState::READY : CompletionPollState::PENDING, PTO2_ERROR_NONE};
-}
-
-inline void retire_sdma_event_record(uint64_t record_addr) {
-    if (record_addr == 0) return;
-    volatile SdmaEventRecord *record =
-        reinterpret_cast<volatile SdmaEventRecord *>(static_cast<uintptr_t>(record_addr));
-    cache_invalidate_range(reinterpret_cast<const void *>(completion_ingress_cache_line(record)), PTO2_ALIGN_SIZE);
-    uint32_t completed_tail = __atomic_load_n(&record->sq_tail, __ATOMIC_ACQUIRE);
-    uint64_t channel_info_addr = __atomic_load_n(&record->channel_info, __ATOMIC_ACQUIRE);
-
-    volatile uint64_t *record_head = reinterpret_cast<volatile uint64_t *>(record);
-    __atomic_store_n(record_head, 0ULL, __ATOMIC_RELEASE);
-    cache_flush_range(const_cast<const void *>(reinterpret_cast<volatile void *>(record_head)), sizeof(uint64_t));
-
-    if (channel_info_addr == 0) return;
-    uint64_t packed = (static_cast<uint64_t>(completed_tail) << 32) | static_cast<uint64_t>(completed_tail);
-    volatile uint64_t *channel_info = reinterpret_cast<volatile uint64_t *>(static_cast<uintptr_t>(channel_info_addr));
-    __atomic_store_n(channel_info, packed, __ATOMIC_RELEASE);
-    cache_flush_range(const_cast<const void *>(reinterpret_cast<volatile void *>(channel_info)), sizeof(uint64_t));
 }
 
 struct CompletionCondition;
@@ -116,8 +64,9 @@ struct CompletionCondition {
     void retire();
 };
 
-// Per-completion-type ops. PR-B moves SDMA_EVENT_RECORD ops out to
-// backend/sdma/; COUNTER stays here because it has no backend detail.
+// Per-completion-type ops. SDMA_EVENT_RECORD detail lives in
+// backend/sdma/sdma_completion_scheduler.h; the op wrappers below are thin
+// glue mapping CompletionCondition.addr into the backend's raw-addr helpers.
 inline CompletionPollResult counter_poll_op(const CompletionCondition &cond) {
     if (cond.counter_addr == nullptr) {
         return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};

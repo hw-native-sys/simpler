@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "pto_completion_ingress.h"
+#include "pto_runtime_status.h"
 
 // CompletionToken is the runtime-internal POD that backend submit handlers
 // produce and the generic register_completion_condition() consumes. It is the
@@ -28,6 +29,17 @@ struct CompletionToken {
     uint32_t engine;
     int32_t completion_type;
     uint64_t backend_cookie;
+};
+
+enum class CompletionPollState : uint8_t {
+    PENDING = 0,
+    READY = 1,
+    FAILED = 2,
+};
+
+struct CompletionPollResult {
+    CompletionPollState state{CompletionPollState::PENDING};
+    int32_t error_code{PTO2_ERROR_NONE};
 };
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_COMPLETION_TOKEN_H_
