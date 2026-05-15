@@ -278,7 +278,10 @@ public:
      * corresponding `enable_*_` members directly. Moved off the generic
      * Runtime struct / run() arg list so all three travel the same way.
      */
-    void set_l2_swimlane_enabled(bool enable) { enable_l2_swimlane_ = enable; }
+    void set_l2_swimlane_enabled(int level) {
+        enable_l2_swimlane_ = (level > 0);
+        l2_swimlane_perf_level_ = level;
+    }
     void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
@@ -748,6 +751,7 @@ private:
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
     bool enable_dep_gen_{false};
+    int l2_swimlane_perf_level_{0};                                // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
 };

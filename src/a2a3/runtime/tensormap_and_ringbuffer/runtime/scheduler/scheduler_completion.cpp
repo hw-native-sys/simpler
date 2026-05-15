@@ -157,14 +157,17 @@ void SchedulerContext::complete_slot_task(
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        uint64_t finish_ts = get_sys_cnt_aicpu();
-
+        uint64_t finish_ts = 0;
         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
         int32_t fanout_n = 0;
-        PTO2DepListEntry *cur = slot_state.fanout_head;
-        while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
-            fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
-            cur = cur->next;
+
+        if (l2_swimlane_perf_level_ >= 2) {
+            finish_ts = get_sys_cnt_aicpu();
+            PTO2DepListEntry *cur = slot_state.fanout_head;
+            while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
+                fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
+                cur = cur->next;
+            }
         }
 
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);

@@ -583,6 +583,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
     }
     kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
+    kernel_args_.args.l2_swimlane_perf_level = static_cast<uint32_t>(l2_swimlane_perf_level_);
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -1254,7 +1255,7 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     };
 
     int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, output_prefix_
+        num_aicore, device_id, l2_swimlane_perf_level_, alloc_cb, register_cb, free_cb, &mem_alloc_, output_prefix_
     );
     if (rc != 0) {
         return rc;

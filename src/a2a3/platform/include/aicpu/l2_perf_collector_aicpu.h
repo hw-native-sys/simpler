@@ -35,8 +35,8 @@
  */
 extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base);
 extern "C" uint64_t get_platform_l2_perf_base();
-extern "C" void set_l2_swimlane_enabled(bool enable);
-extern "C" bool is_l2_swimlane_enabled();
+extern "C" void set_l2_swimlane_perf_level(int level);
+extern "C" int get_l2_swimlane_perf_level();
 
 /**
  * Initialize performance profiling

@@ -34,7 +34,7 @@
 
 // Per-core profiling state. Populated once by KERNEL_ENTRY from KernelArgs;
 // read by aicore_execute and profiling helpers via the getters below. This
-// mirrors the AICPU-side set_l2_swimlane_enabled / set_pmu_enabled pattern,
+// mirrors the AICPU-side set_l2_swimlane_perf_level / set_pmu_enabled pattern,
 // keeping profiling fields out of runtime's Handshake and out of
 // aicore_execute's signature.
 //

@@ -244,21 +244,29 @@ public:
      * BufferStates), pre-allocates initial L2PerfBuffers and PhaseBuffers,
      * and seeds the per-pool free_queues + the framework's recycled pools.
      *
-     * @param num_aicore     Number of AICore instances
-     * @param device_id      Device ID (forwarded to register_cb)
-     * @param alloc_cb       Device memory allocation callback
-     * @param register_cb    Memory registration callback (nullptr for simulation)
-     * @param free_cb        Device memory free callback
-     * @param user_data      Opaque pointer forwarded to callbacks
-     * @param output_prefix  Per-task directory; l2_perf_records.json lands here.
-     *                       Stored on the collector and consumed by
-     *                       export_swimlane_json(). Required (non-empty);
-     *                       CallConfig::validate() enforces this upstream.
+     * @param num_aicore               Number of AICore instances
+     * @param device_id                Device ID (forwarded to register_cb)
+     * @param l2_swimlane_perf_level   Collection granularity (0=off, 1=AICore
+     *                                 timing, 2=+dispatch/fanout, 3=+sched
+     *                                 phases, 4=+orch phases). Cached on the
+     *                                 collector and consumed by
+     *                                 export_swimlane_json() to gate phase
+     *                                 sections and stamp the JSON `version`.
+     * @param alloc_cb                 Device memory allocation callback
+     * @param register_cb              Memory registration callback (nullptr for
+     *                                 simulation)
+     * @param free_cb                  Device memory free callback
+     * @param user_data                Opaque pointer forwarded to callbacks
+     * @param output_prefix            Per-task directory; l2_perf_records.json
+     *                                 lands here. Required (non-empty);
+     *                                 CallConfig::validate() enforces this
+     *                                 upstream.
      * @return 0 on success, error code on failure
      */
     int initialize(
-        int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfRegisterCallback register_cb,
-        L2PerfFreeCallback free_cb, void *user_data, const std::string &output_prefix
+        int num_aicore, int device_id, int l2_swimlane_perf_level, L2PerfAllocCallback alloc_cb,
+        L2PerfRegisterCallback register_cb, L2PerfFreeCallback free_cb, void *user_data,
+        const std::string &output_prefix
     );
 
     /**
@@ -347,6 +355,7 @@ private:
     void *aicore_ring_addr_table_dev_{nullptr};
 
     int num_aicore_{0};
+    int l2_swimlane_perf_level_{0};
 
     // Per-task output directory captured at initialize() time. Consumed by
     // export_swimlane_json() to build <prefix>/l2_perf_records.json.
