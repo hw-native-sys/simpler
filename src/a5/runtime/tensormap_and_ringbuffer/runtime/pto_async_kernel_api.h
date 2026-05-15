@@ -19,6 +19,7 @@
 
 #include "intrinsic.h"
 #include "pto_completion_ingress.h"
+#include "pto_completion_token.h"
 #include "pto_runtime_status.h"
 
 #ifndef __aicore__
@@ -46,11 +47,14 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
     return ctx;
 }
 
-inline __aicore__ void defer_condition(
-    AsyncCtx &ctx, volatile __gm__ void *addr, uint32_t expected, uint32_t engine, int32_t completion_type
-) {
+// Canonical writer: backend submit handlers build a CompletionToken and pass
+// it here. Writes one DeferredCompletionEntry to the AsyncCtx ingress slab and
+// bumps completion_count. Returns false on overflow (also stores
+// PTO2_ERROR_ASYNC_WAIT_OVERFLOW in ctx.completion_error_code) or when ctx is
+// not currently a deferred context.
+inline __aicore__ bool register_completion_condition(AsyncCtx &ctx, const CompletionToken &token) {
     if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
-        return;
+        return false;
     }
 
     uint32_t idx = *ctx.completion_count;
@@ -58,16 +62,24 @@ inline __aicore__ void defer_condition(
         if (ctx.completion_error_code != nullptr) {
             *ctx.completion_error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
         }
-        return;
+        return false;
     }
 
     volatile __gm__ PTO2DeferredCompletionEntry *slot = &ctx.completion_entries[idx];
-    slot->addr = reinterpret_cast<uint64_t>(addr);
-    slot->expected_value = expected;
-    slot->engine = engine;
-    slot->completion_type = completion_type;
+    slot->addr = token.addr;
+    slot->expected_value = token.expected_value;
+    slot->engine = token.engine;
+    slot->completion_type = token.completion_type;
     slot->_pad = 0;
     *ctx.completion_count = idx + 1;
+    return true;
+}
+
+inline __aicore__ void defer_condition(
+    AsyncCtx &ctx, volatile __gm__ void *addr, uint32_t expected, uint32_t engine, int32_t completion_type
+) {
+    CompletionToken token{reinterpret_cast<uint64_t>(addr), expected, engine, completion_type, 0};
+    (void)register_completion_condition(ctx, token);
 }
 
 inline __aicore__ void defer_flush_range(volatile __gm__ void *addr, uint32_t size_bytes) {

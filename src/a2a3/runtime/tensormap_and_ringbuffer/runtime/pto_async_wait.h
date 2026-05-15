@@ -50,6 +50,10 @@ struct PTO2CompletionPollResult {
     int32_t error_code{PTO2_ERROR_NONE};
 };
 
+// SdmaEventRecord layout mirror — kept here until PR-B relocates SDMA backend
+// detail into backend/sdma/. The poll/retire helpers below are the legacy
+// inline implementations; the new table-driven dispatch goes through the ops
+// table further down.
 struct PTO2SdmaEventRecord {
     uint32_t flag;
     uint32_t sq_tail;
@@ -89,6 +93,16 @@ inline void retire_sdma_event_record(uint64_t record_addr) {
     cache_flush_range(const_cast<const void *>(reinterpret_cast<volatile void *>(channel_info)), sizeof(uint64_t));
 }
 
+struct PTO2CompletionCondition;
+
+using PTO2CompletionPollFn = PTO2CompletionPollResult (*)(const PTO2CompletionCondition &);
+using PTO2CompletionRetireFn = void (*)(PTO2CompletionCondition &);
+
+struct PTO2CompletionBackendOps {
+    PTO2CompletionPollFn poll;
+    PTO2CompletionRetireFn retire;
+};
+
 struct PTO2CompletionCondition {
     PTO2AsyncEngine engine{PTO2_ASYNC_ENGINE_SDMA};
     int32_t completion_type{PTO2_COMPLETION_TYPE_COUNTER};
@@ -98,33 +112,61 @@ struct PTO2CompletionCondition {
     uint64_t addr{0};
     uint32_t expected_value{0};
 
-    PTO2CompletionPollResult test() const {
-        if (satisfied) {
-            return {PTO2CompletionPollState::READY, PTO2_ERROR_NONE};
-        }
-        if (completion_type == PTO2_COMPLETION_TYPE_COUNTER) {
-            if (counter_addr == nullptr) {
-                return {PTO2CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
-            }
-            return {
-                *counter_addr >= expected_value ? PTO2CompletionPollState::READY : PTO2CompletionPollState::PENDING,
-                PTO2_ERROR_NONE
-            };
-        }
-        if (completion_type == PTO2_COMPLETION_TYPE_SDMA_EVENT_RECORD) {
-            return poll_sdma_event_record(addr);
-        }
+    PTO2CompletionPollResult test() const;
+    void retire();
+};
+
+// Per-completion-type ops. PR-B moves SDMA_EVENT_RECORD ops out to
+// backend/sdma/; COUNTER stays here because it has no backend detail.
+inline PTO2CompletionPollResult counter_poll_op(const PTO2CompletionCondition &cond) {
+    if (cond.counter_addr == nullptr) {
         return {PTO2CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
     }
+    return {
+        *cond.counter_addr >= cond.expected_value ? PTO2CompletionPollState::READY : PTO2CompletionPollState::PENDING,
+        PTO2_ERROR_NONE
+    };
+}
 
-    void retire() {
-        if (retired) return;
-        if (completion_type == PTO2_COMPLETION_TYPE_SDMA_EVENT_RECORD) {
-            retire_sdma_event_record(addr);
-        }
-        retired = true;
+inline void counter_retire_op(PTO2CompletionCondition & /*cond*/) {}
+
+inline PTO2CompletionPollResult sdma_event_record_poll_op(const PTO2CompletionCondition &cond) {
+    return poll_sdma_event_record(cond.addr);
+}
+
+inline void sdma_event_record_retire_op(PTO2CompletionCondition &cond) {
+    retire_sdma_event_record(cond.addr);
+}
+
+inline const PTO2CompletionBackendOps *completion_backend_ops_for(int completion_type) {
+    static const PTO2CompletionBackendOps kOps[] = {
+        {counter_poll_op, counter_retire_op},                      // PTO2_COMPLETION_TYPE_COUNTER = 0
+        {sdma_event_record_poll_op, sdma_event_record_retire_op},  // PTO2_COMPLETION_TYPE_SDMA_EVENT_RECORD = 1
+    };
+    constexpr int kOpsCount = static_cast<int>(sizeof(kOps) / sizeof(kOps[0]));
+    if (completion_type < 0 || completion_type >= kOpsCount) return nullptr;
+    return &kOps[completion_type];
+}
+
+inline PTO2CompletionPollResult PTO2CompletionCondition::test() const {
+    if (satisfied) {
+        return {PTO2CompletionPollState::READY, PTO2_ERROR_NONE};
     }
-};
+    const PTO2CompletionBackendOps *ops = completion_backend_ops_for(completion_type);
+    if (ops == nullptr || ops->poll == nullptr) {
+        return {PTO2CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
+    }
+    return ops->poll(*this);
+}
+
+inline void PTO2CompletionCondition::retire() {
+    if (retired) return;
+    const PTO2CompletionBackendOps *ops = completion_backend_ops_for(completion_type);
+    if (ops != nullptr && ops->retire != nullptr) {
+        ops->retire(*this);
+    }
+    retired = true;
+}
 
 struct PTO2AsyncWaitEntry {
     PTO2TaskSlotState *slot_state{nullptr};
