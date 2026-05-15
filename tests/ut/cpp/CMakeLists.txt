@@ -333,14 +333,65 @@ add_test(NAME test_host_log_off COMMAND test_host_log_off)
 # this flag, so nothing here is compiled there — this is the structural
 # invariant that lets future hw tests freely link against CANN libraries
 # without breaking the no-hw build.
-#
-# The previous `test_hccl_comm` test was deleted along with the MC2 reverse
-# path: it was specifically a canary for HcclOpResParam ABI drift in the
-# reverse-parse code, which the Path D (DIY IPC) rewrite eliminates.
-# Hardware coverage now comes from the kernel-MTE2 examples under
-# `examples/workers/l3/{allreduce_distributed,ep_dispatch_combine,...}`.
 if(SIMPLER_ENABLE_HARDWARE_TESTS)
-    # Reserved for future hardware UTs. Add `add_executable` + `add_test`
-    # calls here; gate on the `requires_hardware_a2a3` ctest label so the
-    # CI matrix can pick by runtime role.
+    # libhost_runtime.so is loaded via dlopen at runtime — it is the
+    # subject under test and mirrors how ChipWorker selects a runtime
+    # backend in production.  libascendcl.so, by contrast, is generic
+    # CANN infrastructure: we link it directly so the test code uses
+    # <acl/acl.h> types and values normally instead of going through
+    # dlsym boilerplate.
+    #
+    # ctest label still gates execution via
+    #   -L "^requires_hardware(_a2a3)?$"
+    # so we can both (a) only build on hw runners, and (b) still filter
+    # by runtime role when multiple hw tests coexist.
+    set(PROJECT_ROOT "${CMAKE_SOURCE_DIR}/../../..")
+    set(HOST_RUNTIME_LIB
+        "${PROJECT_ROOT}/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so"
+    )
+    # libsimpler_log.so must be loaded RTLD_GLOBAL before host_runtime dlopen
+    # so undefined HostLogger / unified_log_* symbols in host_runtime resolve.
+    # Mirrors what ChipWorker::init does in production. The library is
+    # process-global (one .so per host toolchain, not per arch/variant).
+    set(SIMPLER_LOG_LIB
+        "${PROJECT_ROOT}/build/lib/libsimpler_log.so"
+    )
+
+    if(NOT DEFINED ENV{ASCEND_HOME_PATH})
+        message(FATAL_ERROR
+            "SIMPLER_ENABLE_HARDWARE_TESTS=ON requires ASCEND_HOME_PATH to be set "
+            "(usually via `source $ASCEND_HOME_PATH/bin/setenv.bash`)")
+    endif()
+    set(ASCEND_HOME_PATH "$ENV{ASCEND_HOME_PATH}")
+    find_library(ASCENDCL_LIB ascendcl
+        PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH REQUIRED)
+
+    # Black-box lifecycle UT for the comm_* C API on Path D. See the file
+    # header for the contract it pins down.
+    add_executable(test_comm_lifecycle hardware/test_comm_lifecycle.cpp)
+    target_include_directories(test_comm_lifecycle PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${PROJECT_ROOT}/src/a2a3/platform/include
+        # Shared platform_comm headers (comm.h / comm_context.h) live under
+        # src/common so both a2a3 HCCL and a5/a2a3 sim can use them.
+        ${PROJECT_ROOT}/src/common
+        ${ASCEND_HOME_PATH}/include
+    )
+    target_compile_options(test_comm_lifecycle PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_compile_definitions(test_comm_lifecycle PRIVATE
+        PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}"
+        SIMPLER_LOG_LIB_PATH="${SIMPLER_LOG_LIB}"
+    )
+    target_link_libraries(test_comm_lifecycle PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        ${ASCENDCL_LIB}
+        pthread
+        dl
+    )
+    add_test(NAME test_comm_lifecycle COMMAND test_comm_lifecycle)
+    set_tests_properties(test_comm_lifecycle PROPERTIES
+        LABELS "requires_hardware_a2a3"
+        RESOURCE_GROUPS "2,npus:1"
+    )
 endif()

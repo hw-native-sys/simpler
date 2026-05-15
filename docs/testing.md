@@ -572,7 +572,7 @@ CTest passes allocated device ids via environment variables:
 - `CTEST_RESOURCE_GROUP_COUNT` — number of groups
 - `CTEST_RESOURCE_GROUP_<n>_NPUS` — `"id:<device_id>,slots:1"` per group
 
-Tests read these to determine which devices to use. Parse `CTEST_RESOURCE_GROUP_<n>_NPUS` strings of the form `"id:<N>,slots:<M>;..."` to extract device ids.
+Tests read these to determine which devices to use. See `test_comm_lifecycle.cpp::read_ctest_devices()` for the parsing pattern.
 
 ### New Scene Test
 

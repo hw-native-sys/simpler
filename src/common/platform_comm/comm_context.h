@@ -12,14 +12,26 @@
  * CommContext — device-side distributed communication context.
  *
  * This struct is the ABI contract between host (comm_hccl.cpp / comm_sim.cpp)
- * and device kernels.  PTO communication instructions (TREDUCE, TGET, TPUT)
+ * and device kernels. PTO communication instructions (TREDUCE, TGET, TPUT)
  * access remote data through the GVA addresses in windowsIn[]/windowsOut[]
  * via MTE2 DMA.
  *
- * On HCCL MESH topology the struct layout matches what HCCL returns directly.
- * On RING topology the host builds it by extracting remote RDMA addresses
- * from HcclOpResParam's remoteRes array.
- * On simulation the host fills it with malloc'd pointers.
+ * Host fills the struct from scratch:
+ *   - comm_hccl.cpp (Path D): allocates a per-rank symmetric pool via the
+ *     public ACL IPC primitives (aclrtMalloc + aclrtIpcMemGetExportKey +
+ *     SetImportPid + ImportByKey), then writes rankId / rankNum / winSize /
+ *     windowsIn[]. No HCCL-private struct is reinterpret_cast'd here; the
+ *     layout is owned end-to-end by simpler.
+ *   - comm_sim.cpp: same shape, filled with malloc'd host pointers.
+ *
+ * The earlier "HCCL MESH reinterpret_cast / RING reverse-parse of
+ * HcclOpResParam" paths have been deleted along with their internal-ABI
+ * coupling -- see .docs/28.l3-comm/ext.01.pr-774-review.md for context.
+ *
+ * Long-term private-ization of this struct (decouple from the pto-isa
+ * HcclDeviceContext parallel declaration) is tracked as F4 in the same
+ * doc; this file is intentionally left at the current shared layout
+ * until that decision lands.
  */
 
 #pragma once
@@ -45,20 +57,20 @@ struct CommContext {
 // is that this layout is consumed by *two* out-of-band parties that never see
 // this header at the same time:
 //
-//   1. HCCL MESH topology: comm_hccl.cpp reinterpret_cast's HCCL's returned
-//      device-context pointer as CommContext*. The cast is only sound
-//      as long as our layout happens to match HCCL's internal MESH struct
-//      (verified by hand against CANN 9.x). Any accidental insert/reorder
-//      breaks that implicit match and device DMA reads silently garble.
+//   1. The pto-isa repo carries a parallel declaration (HcclDeviceContext)
+//      that must be byte-equivalent to this struct -- pto-isa kernels read
+//      windowsIn[]/winSize/rankId via that mirror. Any insert/reorder here
+//      that is not matched in pto-isa silently shifts the device-side field
+//      offsets and corrupts MTE2 reads. The locks below pin our side; the
+//      pto-isa side should add its own mirror asserts.
 //
 //   2. Device kernels (AICore / AICPU) compiled with CCEC may apply slightly
 //      different alignment rules than host gcc. A host-side sizeof/offset
-//      lock is a necessary-but-not-sufficient guard; device side should add
-//      its own mirror asserts when it starts consuming this struct.
+//      lock is a necessary-but-not-sufficient guard.
 //
 // Treat the numbers below as a tripwire: changing them is a deliberate act
-// that forces the editor to re-verify both assumptions above, not a routine
-// "oh I just added a field" edit.
+// that forces the editor to coordinate the matching change on the pto-isa
+// side, not a routine "oh I just added a field" edit.
 static_assert(sizeof(CommContext) == 1056, "CommContext size shifted");
 static_assert(offsetof(CommContext, workSpace) == 0, "CommContext layout drift");
 static_assert(offsetof(CommContext, workSpaceSize) == 8, "CommContext layout drift");

@@ -12,8 +12,14 @@
  * HCCL backend for the comm_* distributed communication API.
  *
  * Implements the five functions declared in host/comm.h using Ascend
- * HCCL (bundled with CANN).  Handles both MESH and RING topologies
- * when extracting per-rank RDMA window addresses.
+ * HCCL (bundled with CANN) for the bootstrap / barrier / teardown plane
+ * and the public ACL IPC primitives (aclrtIpcMem* + EnablePeerAccess)
+ * for the per-rank symmetric window pool (Path D).
+ *
+ * Scope: L3 single-host multi-card only. aclrtIpcMem* is host-local, so
+ * cross-host (L4) deployments need a different windows backend -- see
+ * .docs/28.l3-comm/ext.01.pr-774-review.md F2 / 05.plan.zh.md for the
+ * channel-API direction.
  */
 
 #include "platform_comm/comm.h"
@@ -291,15 +297,17 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
 
 namespace {
 
-// Path D: build the per-rank symmetric pool ourselves via the legacy ACL
+// Path D: build the per-rank symmetric pool ourselves via the public ACL
 // IPC primitives (aclrtMalloc + aclrtIpcMemGetExportKey + SetImportPid +
-// ImportByKey), gated by env var SIMPLER_COMM_USE_IPC=1. This mirrors
-// HCCL's own internal cross-rank IPC pattern (refs/hcomm
-// adapter_rts.cc::hrtIpc* + p2p_mgmt.cc::EnableP2P) so we depend only on
-// stable ACL surface, no HCCL-private struct ABI. Spike-validated in
-// hw-native-sys/comm-spike; see project memory for the full story.
+// ImportByKey). This mirrors HCCL's own internal cross-rank IPC pattern
+// (refs/hcomm adapter_rts.cc::hrtIpc* + p2p_mgmt.cc::EnableP2P) so we
+// depend only on stable ACL surface, no HCCL-private struct ABI.
+// Spike-validated in hw-native-sys/comm-spike; see project memory.
 
-constexpr uint64_t kIpcWinSize = 200ULL * 1024 * 1024;
+// Default per-rank symmetric pool size when comm_alloc_windows is called
+// with win_size == 0. Picked to match the HCCL_BUFFSIZE default of the
+// pre-Path-D backend so existing callers see no behavioural change.
+constexpr uint64_t kDefaultIpcWinSize = 200ULL * 1024 * 1024;
 constexpr size_t kIpcNameLen = 65;
 constexpr uint64_t kIpcAnnounceMagic = 0x49504344334d4549ULL;  // "IPCD3MEI"
 
@@ -312,8 +320,12 @@ struct IpcAnnounceFile {
     char pad[3];  // keep struct size a multiple of 8
 };
 
+// Announce file path shares the `barrier_<prefix>_..._<rank>.ready` shape so
+// cleanup_handshake_files picks it up alongside the file_barrier markers.
+// Without this convention these files would accumulate across re-runs.
 static std::string ipc_announce_path(const std::string &rootinfo, int rank, uint64_t run_token) {
-    return rootinfo + ".ipc." + run_token_hex(run_token) + "." + std::to_string(rank);
+    return handshake_dir(rootinfo) + "/barrier_" + handshake_prefix(rootinfo) + "_ipc_announce_" +
+           run_token_hex(run_token) + "_" + std::to_string(rank) + ".ready";
 }
 
 static bool ipc_write_announce(
@@ -361,10 +373,19 @@ static bool ipc_read_announce(
     return false;
 }
 
-// Drop-in alternative to the MC2 reverse path. Fills h->host_ctx with
-// rankId/rankNum/winSize/windowsIn[] (windowsOut stays zero -- no kernel
-// reads it).
-static int alloc_windows_via_ipc(CommHandle h) {
+// Fills h->host_ctx with rankId/rankNum/winSize/windowsIn[] via DIY IPC.
+// `win_size` is the per-rank pool byte size requested by the caller
+// (kDefaultIpcWinSize when 0).
+//
+// On failure or normal exit, the device-side resources allocated here
+// (localBuf via aclrtMalloc, the IPC export key, peer imports, and any
+// P2P routes enabled) are NOT explicitly released. DeviceRunner::finalize
+// calls aclrtResetDevice at Worker teardown, which reclaims all of the
+// above. simpler's current usage is one comm_init/destroy per Worker
+// lifetime, so the absence of explicit cleanup does not accumulate
+// across runs. If a future caller starts cycling comm contexts within a
+// single Worker, explicit teardown will need to land here.
+static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
     const int rank = h->rank;
     const int nranks = h->nranks;
     const std::string &rootinfo = h->rootinfo_path;
@@ -382,13 +403,13 @@ static int alloc_windows_via_ipc(CommHandle h) {
 
     // Allocate local buffer + export its IPC name.
     void *localBuf = nullptr;
-    aclError aret = aclrtMalloc(&localBuf, kIpcWinSize, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclError aret = aclrtMalloc(&localBuf, win_size, ACL_MEM_MALLOC_HUGE_FIRST);
     if (aret != ACL_SUCCESS) {
         fprintf(stderr, "[comm rank %d] ipc: aclrtMalloc -> %d\n", rank, static_cast<int>(aret));
         return -1;
     }
     char myName[kIpcNameLen]{};
-    aret = aclrtIpcMemGetExportKey(localBuf, kIpcWinSize, myName, kIpcNameLen, 0);
+    aret = aclrtIpcMemGetExportKey(localBuf, win_size, myName, kIpcNameLen, 0);
     if (aret != ACL_SUCCESS) {
         fprintf(stderr, "[comm rank %d] ipc: GetExportKey -> %d\n", rank, static_cast<int>(aret));
         aclrtFree(localBuf);
@@ -484,10 +505,15 @@ static int alloc_windows_via_ipc(CommHandle h) {
     }
 
     // Import every peer's buffer into our local VA space.
+    // windowsOut[] is intentionally left zero by the memset below: no kernel
+    // path reads it (verified by grep across simpler + pto-isa). The field
+    // is kept in CommContext only to preserve byte-equivalence with pto-isa's
+    // parallel HcclDeviceContext declaration; removing it is gated on the
+    // F4 private-ization decision (see .docs/28.l3-comm/ext.01.pr-774-review.md).
     memset(&h->host_ctx, 0, sizeof(h->host_ctx));
     h->host_ctx.rankId = static_cast<uint32_t>(rank);
     h->host_ctx.rankNum = static_cast<uint32_t>(nranks);
-    h->host_ctx.winSize = kIpcWinSize;
+    h->host_ctx.winSize = win_size;
     h->host_ctx.windowsIn[rank] = reinterpret_cast<uint64_t>(localBuf);
 
     for (int p = 0; p < nranks; ++p) {
@@ -510,14 +536,15 @@ static int alloc_windows_via_ipc(CommHandle h) {
 
 }  // namespace
 
-extern "C" int comm_alloc_windows(CommHandle h, size_t /*win_size*/, uint64_t *device_ctx_out) try {
+extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *device_ctx_out) try {
     if (!h || !device_ctx_out) return -1;
 
     // Path D: DIY symmetric pool on stable ACL IPC + EnablePeerAccess.
     // Replaced the prior HcclAllocComResourceByTiling reverse-parse path
     // (broken on CANN 9.0 due to HcclOpResParam ABI drift; see project
     // history). One backend, works on 8.5 and 9.0 unchanged.
-    if (alloc_windows_via_ipc(h) != 0) return -1;
+    const uint64_t effective_win_size = win_size != 0 ? static_cast<uint64_t>(win_size) : kDefaultIpcWinSize;
+    if (alloc_windows_via_ipc(h, effective_win_size) != 0) return -1;
 
     // Optional PTO-ISA async SDMA workspace pre-allocation. This is a
     // CANN 9.0+ feature at runtime: aclnnShmemSdmaStarsQuery does not
