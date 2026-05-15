@@ -513,49 +513,8 @@ def _build_output_prefix(case_label: str) -> Path:
     return prefix
 
 
-def _get_device_log_dir(device_id) -> Path:
-    """Return CANN device log directory (matches device_log_resolver)."""
-    ascend_work_path = os.environ.get("ASCEND_WORK_PATH")
-    if ascend_work_path:
-        root = Path(ascend_work_path).expanduser() / "log" / "debug"
-        if root.exists():
-            return root / f"device-{device_id}"
-    return Path.home() / "ascend" / "log" / "debug" / f"device-{device_id}"
-
-
-def _snapshot_time() -> int:
-    """Record current time as a baseline for detecting device logs written after this point."""
-    import time  # noqa: PLC0415
-
-    return time.time_ns()
-
-
-def _wait_new_device_log(device_id, before_time: int, timeout: float = 15.0) -> Path | None:
-    """Wait for a CANN device log modified after *before_time*; returns it or None."""
-    import time  # noqa: PLC0415
-
-    log_dir = _get_device_log_dir(device_id)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if log_dir.exists():
-            candidates = []
-            for p in log_dir.glob("*.log"):
-                try:
-                    mtime = p.stat().st_mtime_ns
-                    if mtime > before_time:
-                        candidates.append((p, mtime))
-                except FileNotFoundError:
-                    continue
-            if candidates:
-                return max(candidates, key=lambda x: x[1])[0]
-        time.sleep(0.5)
-    return None
-
-
 def _run_swimlane_converter(
     input_path: Path | None = None,
-    device_id=None,
-    device_log: Path | None = None,
     func_names_path: Path | None = None,
 ) -> None:
     """Invoke the bundled swimlane converter as a subprocess.
@@ -573,10 +532,6 @@ def _run_swimlane_converter(
         cmd.append(str(input_path))
     if func_names_path is not None:
         cmd += ["--func-names", str(func_names_path)]
-    if device_log is not None:
-        cmd += ["--device-log", str(device_log)]
-    elif device_id is not None:
-        cmd += ["-d", str(device_id)]
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         if result.stdout:
@@ -597,8 +552,6 @@ def _sanitize_for_filename(s: str) -> str:
 def _convert_case_swimlane(
     case_label: str,
     output_prefix: Path,
-    device_id,
-    log_baseline_time: int | None,
     callable_spec: dict | None = None,
 ) -> None:
     """Post-case: invoke the swimlane converter on the perf file the runtime
@@ -620,14 +573,7 @@ def _convert_case_swimlane(
         safe_label = _sanitize_for_filename(case_label)
         func_names_path = _dump_name_map(mapping, output_prefix / f"name_map_{safe_label}.json")
 
-    device_log = None
-    if log_baseline_time is not None:
-        device_log = _wait_new_device_log(device_id, log_baseline_time)
-        if device_log is None:
-            logger.warning(f"[{case_label}] no new device log found; scheduler deep-dive may use stale log")
-    _run_swimlane_converter(
-        input_path=perf_file, device_id=device_id, device_log=device_log, func_names_path=func_names_path
-    )
+    _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path)
 
 
 def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI surface
@@ -637,8 +583,6 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     *,
     callable_obj,
     sub_ids,
-    primary_device_id,
-    is_hardware,
     rounds,
     skip_golden,
     enable_l2_swimlane,
@@ -660,7 +604,6 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         # Per-case directory the runtime writes into. Required (non-empty) when
         # any diagnostic flag is on; CallConfig::validate() throws otherwise.
         prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
-        log_baseline_time = _snapshot_time() if enable_l2_swimlane and is_hardware else None
         try:
             cls_inst._run_and_validate(
                 worker,
@@ -677,13 +620,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
             )
         finally:
             if enable_l2_swimlane:
-                _convert_case_swimlane(
-                    case_label,
-                    prefix,
-                    primary_device_id,
-                    log_baseline_time,
-                    callable_spec=callable_spec,
-                )
+                _convert_case_swimlane(case_label, prefix, callable_spec=callable_spec)
 
 
 def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
@@ -1121,15 +1058,6 @@ class SceneTestCase:
         if self._st_level == 3 and chip_cids:
             callable_obj = {**chip_cids}
 
-        # Primary device id: prefer the one actually allocated by st_worker
-        # (each test class can hold a different slot from DevicePool); fall back
-        # to the first id in --device if the fixture didn't stash it.
-        primary_device_id = getattr(st_worker, "_st_device_id", None)
-        if primary_device_id is None:
-            raw_device = request.config.getoption("--device", default="0")
-            primary_device_id = raw_device.split("-", 1)[0] if "-" in raw_device else raw_device
-        is_hardware = not st_platform.endswith("sim")
-
         matched = []
         for case in self.CASES:
             if st_platform not in case["platforms"]:
@@ -1154,8 +1082,6 @@ class SceneTestCase:
             matched,
             callable_obj=callable_obj,
             sub_ids=sub_ids,
-            primary_device_id=primary_device_id,
-            is_hardware=is_hardware,
             rounds=rounds,
             skip_golden=skip_golden,
             enable_l2_swimlane=enable_l2_swimlane,
@@ -1380,14 +1306,6 @@ class SceneTestCase:
         for cls in selected_by_cls:
             by_rt_level.setdefault((cls._st_runtime, cls._st_level), []).append(cls)
 
-        is_hardware = not args.platform.endswith("sim")
-        if args.enable_l2_swimlane and is_hardware and "-d" not in sys.argv and "--device" not in sys.argv:
-            print(
-                f"WARNING: --enable-l2-swimlane on hardware platform '{args.platform}' without explicit "
-                "-d/--device; defaulting to device 0 may point scheduler deep-dive at the wrong log.",
-                file=sys.stderr,
-            )
-
         ok = True
         for (runtime, level), group in by_rt_level.items():
             print(f"\n=== Runtime: {runtime}  Level: {level} ===")
@@ -1414,8 +1332,6 @@ class SceneTestCase:
                                 [case],
                                 callable_obj=callable_obj,
                                 sub_ids=sub_ids,
-                                primary_device_id=args.device,
-                                is_hardware=is_hardware,
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
                                 enable_l2_swimlane=args.enable_l2_swimlane,

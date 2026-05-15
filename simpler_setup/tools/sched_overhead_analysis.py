@@ -9,27 +9,23 @@
 # -----------------------------------------------------------------------------------------------------------
 """Scheduler overhead analysis for PTO2.
 
-Analyzes scheduling overhead from two sources:
-  1. Per-task perf profiling data (l2_perf_records_*.json)
-  2. AICPU scheduler loop breakdown:
-     - From perf JSON Phase data (version >= 2, preferred)
-     - From device log (fallback for older data or PTO2_SCHED_PROFILING=1 details)
+Inputs:
+  1. Per-task perf profiling data (l2_perf_records_*.json), v2 schema with
+     ``aicpu_scheduler_phases`` populated by ``--enable-l2-swimlane``.
+  2. deps.json (optional, dep_gen replay output) colocated with the perf JSON,
+     used to derive per-thread fanout / fanin DAG stats.
 
 Usage:
     python -m simpler_setup.tools.sched_overhead_analysis                   # auto-select latest files
     python -m simpler_setup.tools.sched_overhead_analysis --l2-perf-records-json <path>
-    python -m simpler_setup.tools.sched_overhead_analysis --device-log <path>
-    python -m simpler_setup.tools.sched_overhead_analysis --l2-perf-records-json <path> -d 0
+    python -m simpler_setup.tools.sched_overhead_analysis --l2-perf-records-json <path> --deps-json <path>
 """
 
 import argparse
 import json
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-
-from .device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
 
 
 def _to_uint64(v):
@@ -163,8 +159,9 @@ def parse_scheduler_from_json_phases(data):
     from aicpu_scheduler_phases records.
 
     Returns:
-        dict: Thread data keyed by thread index, same schema as parse_scheduler_threads.
-              Returns empty dict if Phase data not available.
+        dict: Thread data keyed by thread index, with per-phase us / pct,
+              pop_hit / pop_miss, loops, completed, tasks_per_loop. Returns
+              empty dict if phase data is not available.
     """
     if data.get("version", 1) < 2:
         return {}
@@ -234,112 +231,6 @@ def parse_scheduler_from_json_phases(data):
     return threads
 
 
-def parse_scheduler_threads(log_path):
-    """Parse device log for PTO2 scheduler stats per thread.
-
-    Recognized line formats (any combination present in the log is fine):
-
-    1. Two-level tree (PTO2_SCHED_PROFILING=1) — header + per-phase timing:
-        Thread N: === Scheduler Phase Breakdown: total=Xus, Y tasks ===
-        Thread N:   complete       : Xus (Y%)
-        Thread N:   dispatch       : Xus (Y%)
-        Thread N:   scan           : Xus (Y%)
-        Thread N:   idle           : Xus (Y%)
-
-    2. Summary line (always emitted, regardless of SCHED_PROFILING):
-        Thread N: Scheduler summary: total_time=Xus, loops=Y, tasks_scheduled=Z
-
-    Per-thread fanout / fanin / pop aggregates are not parsed from the log;
-    they live in the v2 JSON phase records (see ``parse_scheduler_from_json_phases``)
-    and ``deps.json`` (see ``compute_dag_stats_from_deps``).
-    """
-    threads = {}
-    with open(log_path, errors="ignore") as f:
-        for line in f:
-            # New format: Thread N: === Scheduler Phase Breakdown: total=Xus, Y tasks ===
-            m = re.search(r"Thread (\d+): === Scheduler Phase Breakdown: total=([\d.]+)us, (\d+) tasks ===", line)
-            if m:
-                tid = int(m.group(1))
-                threads[tid] = {
-                    "completed": int(m.group(3)),
-                    "total_us": float(m.group(2)),
-                    "format": "two-level",
-                }
-
-            # Summary format: Thread N: Scheduler summary: total_time=Xus, loops=Y, tasks_scheduled=Z
-            m = re.search(
-                r"Thread (\d+): Scheduler summary: total_time=([\d.]+)us, loops=(\d+), tasks_scheduled=(\d+)", line
-            )
-            if m:
-                tid = int(m.group(1))
-                total_us = float(m.group(2))
-                loops = int(m.group(3))
-                completed = int(m.group(4))
-                tasks_per_loop = completed / loops if loops > 0 else 0.0
-                if tid in threads:
-                    # Enrich existing entry (e.g. two-level) with loop stats
-                    threads[tid]["loops"] = loops
-                    threads[tid]["tasks_per_loop"] = tasks_per_loop
-                else:
-                    threads[tid] = {
-                        "completed": completed,
-                        "total_us": total_us,
-                        "loops": loops,
-                        "tasks_per_loop": tasks_per_loop,
-                        "format": "summary",
-                    }
-
-            # Per-phase timing line (any of complete / dispatch / scan / idle).
-            # Current device log carries only us / % per phase; fanout / fanin /
-            # pop live in v2 JSON phase records and deps.json (see
-            # parse_scheduler_from_json_phases / compute_dag_stats_from_deps).
-            m = re.search(r"Thread (\d+):\s+(complete|dispatch|scan|idle)\s+:\s+([\d.]+)us \(\s*([\d.]+)%\)", line)
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    phase = m.group(2)
-                    threads[tid][f"{phase}_us"] = float(m.group(3))
-                    threads[tid][f"{phase}_pct"] = float(m.group(4))
-                continue
-
-            # Legacy bracketed sub-stats from pre-cleanup PTO2_SCHED_PROFILING=1
-            # logs. Recognized so an old log file still produces a complete
-            # Part 2 / Part 3 report; fresh runs do not emit these lines.
-            m = re.search(
-                r"Thread (\d+):\s+complete\s+:\s+([\d.]+)us \(\s*([\d.]+)%\)"
-                r"\s+\[fanout: edges=(\d+), max_degree=(\d+), avg=([\d.]+)\]"
-                r"\s+\[fanin: edges=(\d+), max_degree=(\d+), avg=([\d.]+)\]",
-                line,
-            )
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]["complete_us"] = float(m.group(2))
-                    threads[tid]["complete_pct"] = float(m.group(3))
-                    threads[tid]["fanout_edges"] = int(m.group(4))
-                    threads[tid]["fanout_max_degree"] = int(m.group(5))
-                    threads[tid]["fanin_edges"] = int(m.group(7))
-                    threads[tid]["fanin_max_degree"] = int(m.group(8))
-                continue
-
-            m = re.search(
-                r"Thread (\d+):\s+dispatch\s+:\s+([\d.]+)us \(\s*([\d.]+)%\)"
-                r"\s+\[pop: hit=(\d+), miss=(\d+), hit_rate=([\d.]+)%\]",
-                line,
-            )
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]["dispatch_us"] = float(m.group(2))
-                    threads[tid]["dispatch_pct"] = float(m.group(3))
-                    threads[tid]["pop_hit"] = int(m.group(4))
-                    threads[tid]["pop_miss"] = int(m.group(5))
-                    threads[tid]["pop_hit_rate"] = float(m.group(6))
-                continue
-
-    return threads
-
-
 def validate_perf_tasks_for_overhead_analysis(tasks):
     """Validate required per-task fields for overhead deep-dive analysis.
 
@@ -392,9 +283,7 @@ def validate_perf_tasks_for_overhead_analysis(tasks):
 
 def run_analysis(  # noqa: PLR0912, PLR0915
     l2_perf_records_path,
-    log_path,
     print_sources=True,
-    selection_strategy=None,
     deps_json_path=None,
     perf_data=None,
 ):
@@ -402,42 +291,32 @@ def run_analysis(  # noqa: PLR0912, PLR0915
 
     Args:
         l2_perf_records_path: Path to l2_perf_records_*.json.
-        log_path: Path to selected device log file, or None when running on
-            v2 perf JSON that carries its own phase data.
         print_sources: Whether to print selected input files.
-        selection_strategy: Optional human-readable device-log selection strategy.
         perf_data: Optional pre-parsed perf JSON dict. When provided, skip
             re-reading from disk — main() already parses the file to probe
             for v2 phase data, so passing the result through saves a second
             load on large artifacts.
         deps_json_path: Optional deps.json (dep_gen replay output) co-located
-            with the perf JSON. When present and the JSON-phases path is
-            used, per-thread fanout / fanin aggregates are derived from it.
+            with the perf JSON. When present, per-thread fanout / fanin
+            aggregates are derived from it.
 
     Returns:
         int: 0 on success, non-zero on failure.
     """
     l2_perf_records_path = Path(l2_perf_records_path)
-    log_path = Path(log_path) if log_path is not None else None
 
     if not l2_perf_records_path.exists():
         print(f"Error: Perf JSON not found: {l2_perf_records_path}", file=sys.stderr)
         return 1
-    if log_path is not None and not log_path.exists():
-        print(f"Error: Device log not found: {log_path}", file=sys.stderr)
-        return 1
+
+    # Auto-discover deps.json sibling when caller didn't specify one.
+    if deps_json_path is None:
+        sibling = l2_perf_records_path.parent / "deps.json"
+        if sibling.exists():
+            deps_json_path = sibling
 
     if print_sources:
         print(f"Perf data:  {l2_perf_records_path}")
-        if log_path is not None:
-            print(f"Device log: {log_path}")
-            if selection_strategy:
-                print(f"Selection:  {selection_strategy}")
-            inferred_device_id = infer_device_id_from_log_path(log_path)
-            if inferred_device_id is not None:
-                print(f"Device ID:  {inferred_device_id}")
-        else:
-            print("Device log: (not used — v2 JSON carries phase data)")
         if deps_json_path is not None:
             print(f"Deps JSON:  {deps_json_path}")
 
@@ -505,30 +384,20 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     print()
 
     # === Part 2: AICPU scheduler loop breakdown ===
-    # Prefer v2 JSON phase data; fall back to device log when the caller
-    # supplied one. The JSON path is self-contained, so sim runs without a
-    # device log are first-class.
     threads = parse_scheduler_from_json_phases(data)
-    phase_source = "perf JSON phase data"
     if not threads:
-        if log_path is not None:
-            threads = parse_scheduler_threads(log_path)
-            phase_source = "device log"
-        else:
-            print(
-                "Error: No JSON phase data found and no device log provided — "
-                "rerun with --enable-l2-swimlane (so phase data is captured) "
-                "or pass --device-log for a fallback path.",
-                file=sys.stderr,
-            )
-            return 1
+        print(
+            "Error: perf JSON has no aicpu_scheduler_phases — rerun the case "
+            "with --enable-l2-swimlane so phase data is captured.",
+            file=sys.stderr,
+        )
+        return 1
 
-    # Annotate per-thread fanout / fanin from deps.json when both inputs are
-    # available (the JSON-phases path + a colocated deps.json). Without that,
+    # Per-thread fanout / fanin come from deps.json when colocated. Without it
     # the report still prints Part 2 phase timings but suppresses the DAG-stats
     # rows so missing-artifact zeros are not mistaken for measured values.
     dag_stats_available = False
-    if deps_json_path is not None and phase_source == "perf JSON phase data":
+    if deps_json_path is not None:
         try:
             with open(deps_json_path) as df:
                 deps_data = json.load(df)
@@ -536,15 +405,11 @@ def run_analysis(  # noqa: PLR0912, PLR0915
             dag_stats_available = True
         except (OSError, ValueError) as ex:
             print(f"Warning: failed to load deps.json for DAG stats: {ex}", file=sys.stderr)
-    elif phase_source == "device log":
-        # Legacy log format may have populated fanout_edges / fanin_edges /
-        # pop_* directly via parse_scheduler_threads.
-        dag_stats_available = any("fanout_edges" in t or "pop_hit" in t for t in threads.values())
 
     n_threads = len(threads)
 
     print("=" * 90)
-    print("Part 2: AICPU scheduler loop breakdown (from " + phase_source + ")")
+    print("Part 2: AICPU scheduler loop breakdown")
     print(f"  {n_threads} scheduler threads")
     print("=" * 90)
     print()
@@ -589,9 +454,8 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     print()
 
     # DAG stats (fanout / fanin) — populated only when deps.json was
-    # available (JSON path) or the device log carried legacy bracketed
-    # sub-stats. When neither input is present, suppress the rows so
-    # missing-artifact zeros aren't mistaken for measurements.
+    # provided. When absent, suppress the rows so missing-artifact zeros
+    # aren't mistaken for measurements.
     if dag_stats_available:
         fanout_edges = sum(t.get("fanout_edges", 0) for t in threads.values())
         fanout_max = max((t.get("fanout_max_degree", 0) for t in threads.values()), default=0)
@@ -613,7 +477,7 @@ def run_analysis(  # noqa: PLR0912, PLR0915
         print("  Fanout / Fanin: (deps.json not provided — pass --deps-json or rerun with --enable-dep-gen)")
     print()
 
-    # Pop stats (per-emit dispatch deltas from v2 JSON, or legacy log brackets).
+    # Pop stats (per-emit dispatch deltas summed across all dispatch records).
     if any("pop_hit" in t for t in threads.values()):
         pop_hit = sum(t.get("pop_hit", 0) for t in threads.values())
         pop_miss = sum(t.get("pop_miss", 0) for t in threads.values())
@@ -691,8 +555,7 @@ def main():
 Examples:
   %(prog)s                                          # auto-select latest files
   %(prog)s --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json
-  %(prog)s --device-log ~/ascend/log/debug/device-0/device-*.log
-  %(prog)s --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json -d 0
+  %(prog)s --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json --deps-json outputs/<case>_<ts>/deps.json
         """,
     )
     parser.add_argument(
@@ -700,15 +563,11 @@ Examples:
         help="Path to l2_perf_records_*.json file. If not specified, uses the latest in outputs/",
     )
     parser.add_argument(
-        "--device-log", help="Path to device log file/path/glob. Overrides auto-resolution when provided"
-    )
-    parser.add_argument("-d", "--device-id", help="Device id for auto-selection from device-<id>")
-    parser.add_argument(
         "--deps-json",
         help=(
-            "Path to deps.json (dep_gen replay output). When provided and the "
-            "JSON-phases path is used, fanout / fanin per-thread aggregates "
-            "are computed from it. Defaults to deps.json next to the perf JSON."
+            "Path to deps.json (dep_gen replay output). When provided, "
+            "fanout / fanin per-thread aggregates are computed from it. "
+            "Defaults to deps.json next to the perf JSON."
         ),
     )
     args = parser.parse_args()
@@ -726,64 +585,20 @@ Examples:
         print(f"Error: Perf JSON not found: {l2_perf_records_path}", file=sys.stderr)
         return 1
 
-    # Probe perf JSON: if it's v2 with non-empty aicpu_scheduler_phases, the
-    # device log becomes optional — phase data is self-contained, fanout / fanin
-    # come from deps.json. Required only when v2 phases are absent (older data
-    # / capture path regressed / build without PTO2_PROFILING=1).
     # Single load — pass the parsed dict to run_analysis() so it doesn't
     # reread the file (large artifacts hit JSON parsing twice otherwise).
-    perf_data = None
-    has_json_phases = False
     try:
         with open(l2_perf_records_path) as _f:
             perf_data = json.load(_f)
-        has_json_phases = perf_data.get("version", 1) >= 2 and any(
-            thr for thr in perf_data.get("aicpu_scheduler_phases", [])
-        )
-    except (OSError, ValueError):
-        pass
-
-    log_path = None
-    strategy = None
-    resolved_log, resolved_strategy = resolve_device_log_path(
-        device_id=args.device_id,
-        device_log=args.device_log,
-        l2_perf_records_path=l2_perf_records_path,
-    )
-    explicit_log_requested = args.device_log is not None or args.device_id is not None
-    if resolved_log is not None and resolved_log.exists():
-        log_path = resolved_log
-        strategy = resolved_strategy
-    elif explicit_log_requested:
-        # Caller explicitly named a log via --device-log or --device-id and we
-        # couldn't honor that. Falling through to the JSON-only path would
-        # silently analyze a different source than they asked for — bad UX
-        # when debugging log-vs-JSON discrepancies. Fail loud regardless of
-        # whether v2 phase data exists.
-        if resolved_log is None:
-            print(f"Error: Failed to resolve device log ({resolved_strategy})", file=sys.stderr)
-        else:
-            print(f"Error: Device log not found: {resolved_log}", file=sys.stderr)
-        return 1
-    elif not has_json_phases:
-        # No explicit request, auto-resolution failed, and no JSON phases to
-        # fall back on. Need a log to reconstruct Part 2/3 — fail loud.
-        if resolved_log is None:
-            print(f"Error: Failed to resolve device log ({resolved_strategy})", file=sys.stderr)
-        else:
-            print(f"Error: Device log not found: {resolved_log}", file=sys.stderr)
+    except (OSError, ValueError) as e:
+        print(f"Error: failed to read perf JSON {l2_perf_records_path}: {e}", file=sys.stderr)
         return 1
 
-    # Auto-discover deps.json sibling when not explicitly given.
-    deps_json_path = Path(args.deps_json) if args.deps_json else (l2_perf_records_path.parent / "deps.json")
-    if not deps_json_path.exists():
-        deps_json_path = None
+    deps_json_path = Path(args.deps_json) if args.deps_json else None
 
     return run_analysis(
         l2_perf_records_path,
-        log_path,
         print_sources=True,
-        selection_strategy=strategy,
         deps_json_path=deps_json_path,
         perf_data=perf_data,
     )

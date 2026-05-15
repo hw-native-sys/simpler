@@ -13,7 +13,6 @@ no repo checkout required.
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[deps_to_graph](#deps_to_graph)** — `deps.json` (dep_gen) → pan/zoom HTML dependency graph
 - **[dump_viewer](#dump_viewer)** — inspect / export tensor dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
-- **[device_log_resolver](#device_log_resolver)** — shared device-log path resolver library
 
 Auto-detection paths (`outputs/*/l2_perf_records.json`, `outputs/*/tensor_dump/`)
 are resolved relative to the **current working directory** — run these from the
@@ -28,7 +27,7 @@ Convert performance profiling JSON files into Chrome Trace Event format for visu
 
 ### Overview
 
-Converts PTO Runtime profiling data (`l2_perf_records_*.json`) into the format used by the Perfetto trace viewer (<https://ui.perfetto.dev/>). It also produces a task execution statistics summary grouped by function, and emits a scheduler overhead deep-dive report when a device log is resolved.
+Converts PTO Runtime profiling data (`l2_perf_records_*.json`) into the format used by the Perfetto trace viewer (<https://ui.perfetto.dev/>). It also produces a task execution statistics summary grouped by function and a scheduler overhead deep-dive report (the same one `sched_overhead_analysis` emits).
 
 ### Basic Usage
 
@@ -46,9 +45,6 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_rec
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json \
     -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
-# Select the device log automatically using a specific device id (device-<id>)
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json -d 0
-
 # Verbose mode (for debugging)
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json -v
 ```
@@ -60,22 +56,8 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_rec
 | `input` | | Input JSON file (l2_perf_records_*.json). If omitted, the latest file in outputs/ is used |
 | `--output` | `-o` | Output JSON file (default: outputs/merged_swimlane_`<timestamp>`.json) |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
-| `--device-log` | | Device log file/directory/glob that overrides inputs (highest priority) |
-| `--device-id` | `-d` | Device id used to auto-select the log from the `device-<id>` directory |
+| `--func-names` | | Path to func_id_names_*.json (SceneTest format) for function name mapping |
 | `--verbose` | `-v` | Enable verbose output |
-
-### Device Log Selection Priority
-
-`swimlane_converter` and `sched_overhead_analysis` share the same resolution rules (from `device_log_resolver`):
-
-1. `--device-log` (file/directory/glob) explicit override
-2. `-d/--device-id` maps to the `device-<id>` directory
-3. Auto-scan `device-*`, selecting the `.log` closest to the perf timestamp
-
-Log root resolution order:
-
-- `$ASCEND_WORK_PATH/log/debug/`
-- `~/ascend/log/debug/` (fallback)
 
 ### Outputs
 
@@ -97,15 +79,17 @@ A statistics summary grouped by function (printed to the console), including Exe
 - **Head/Tail OH**: scheduling head/tail overhead
 - **Exec_%**: Exec / Latency percentage (kernel utilization)
 
-When the device log is resolved, Sched CPU (actual CPU time of the AICPU scheduler thread per task) and the Exec/Sched_CPU ratio are also printed.
-
 #### 3. Scheduler Overhead Deep-Dive (Automatic)
 
-When the device log is successfully resolved, `swimlane_converter` invokes the `sched_overhead_analysis` logic directly and emits in the same run:
+`swimlane_converter` invokes `sched_overhead_analysis` directly on the same
+perf JSON and emits, in the same run:
 
 - Part 1: Per-task time breakdown
-- Part 2: AICPU scheduler loop breakdown
+- Part 2: AICPU scheduler loop breakdown (from `aicpu_scheduler_phases`)
 - Part 3: Tail OH distribution & cause analysis
+
+When `deps.json` is colocated (produced by `--enable-dep-gen`), Part 2 also
+prints per-thread fanout / fanin aggregates.
 
 ### Integration with run_example.py
 
@@ -123,10 +107,8 @@ After the test passes, the tool will:
 
 1. Auto-detect the latest `l2_perf_records_*.json` in outputs/
 2. Load function names from the kernel_config.py specified via `-k`
-3. Propagate the effective runtime device id (`-d`) to `swimlane_converter`
-4. Resolve the device log automatically and print the selection strategy
-5. Produce `merged_swimlane_*.json` for visualization
-6. Print the task statistics and scheduler overhead deep-dive report to the console
+3. Produce `merged_swimlane_*.json` for visualization
+4. Print the task statistics and scheduler overhead deep-dive report to the console
 
 ---
 
@@ -136,30 +118,25 @@ Analyze AICPU scheduler overhead and quantitatively decompose the sources of Tai
 
 ### Overview
 
-`sched_overhead_analysis` analyzes two data sources:
+`sched_overhead_analysis` reads two artifacts produced by the runtime:
 
-1. **Perf profiling data** (`l2_perf_records_*.json`): extracts per-task Exec / Head OH / Tail OH time breakdowns
-2. **Device log**: parses the AICPU scheduler thread's loop breakdown (scan / complete / dispatch / idle), lock contention, and fanout statistics
-
-Three device log formats are supported:
-
-1. **New two-level tree** (`PTO2_SCHED_PROFILING=1`): `=== Scheduler Phase Breakdown: total=Xus, Y tasks ===` followed by per-phase lines
-2. **Legacy detailed** (`PTO2_SCHED_PROFILING=1`): `completed=X tasks in Yus (Z loops, W tasks/loop)` followed by `--- Phase Breakdown ---` with phase lines carrying fanout/fanin/pop statistics
-3. **Summary** (`PTO2_SCHED_PROFILING=0`): `Scheduler summary: total_time=Xus, loops=Y, tasks_scheduled=Z`
+1. **Perf profiling data** (`l2_perf_records_*.json`, v2): per-task Exec / Head OH / Tail OH time breakdowns plus `aicpu_scheduler_phases` — per-thread, per-loop-iteration phase records carrying scan / complete / dispatch / idle timings and per-emit pop_hit / pop_miss deltas.
+2. **`deps.json`** (optional, dep_gen replay output): structural task DAG. When colocated with the perf JSON, Part 2 prints per-thread fanout / fanin aggregates derived from it.
 
 ### Basic Usage
 
 ```bash
-# Auto-pick the latest perf data and device log
+# Auto-pick the latest perf data under ./outputs/ (deps.json sibling is auto-detected)
 python -m simpler_setup.tools.sched_overhead_analysis
 
-# Use a specific device id to auto-pick the device-<id> log
-python -m simpler_setup.tools.sched_overhead_analysis --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json -d 0
+# Specify the perf JSON explicitly
+python -m simpler_setup.tools.sched_overhead_analysis \
+    --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json
 
-# Specify files explicitly
+# Override the deps.json location
 python -m simpler_setup.tools.sched_overhead_analysis \
     --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json \
-    --device-log ~/ascend/log/debug/device-0/device-*.log
+    --deps-json outputs/<case>_<ts>/deps.json
 ```
 
 ### Command-Line Options
@@ -167,16 +144,17 @@ python -m simpler_setup.tools.sched_overhead_analysis \
 | Option | Description |
 | ------ | ----------- |
 | `--l2-perf-records-json` | Path to the l2_perf_records_*.json file. If omitted, the latest file in outputs/ is auto-selected |
-| `--device-log` | Device log file/directory/glob that overrides inputs (highest priority) |
-| `-d, --device-id` | Device id used to auto-pick the log from `device-<id>` |
+| `--deps-json` | Path to deps.json (dep_gen replay output) for fanout / fanin aggregates. Defaults to the deps.json sibling of the perf JSON. |
 
 ### Outputs
 
 Output is emitted in three parts:
 
-- **Part 1: Per-task time breakdown** - Exec / Head OH / Tail OH percentages of Latency
-- **Part 2: AICPU scheduler loop breakdown** - per-scheduler-thread loop statistics, per-phase (scan / complete / dispatch / idle) time ratios, lock contention, and fanout/fanin/pop statistics
-- **Part 3: Tail OH distribution & cause analysis** - Tail OH quantile distribution (P10-P99), correlation between scheduler loop iteration time and Tail OH, and data-driven insights into the dominant phase
+- **Part 1: Per-task time breakdown** — Exec / Head OH / Tail OH percentages of Latency
+- **Part 2: AICPU scheduler loop breakdown** — per-scheduler-thread loop statistics, per-phase (scan / complete / dispatch / idle) time ratios, pop_hit / pop_miss totals, and (when deps.json is available) per-thread fanout / fanin aggregates
+- **Part 3: Tail OH distribution & cause analysis** — Tail OH quantile distribution (P10–P99), correlation between scheduler loop iteration time and Tail OH, and data-driven insights into the dominant phase
+
+The perf JSON must be a v2 capture with non-empty `aicpu_scheduler_phases` (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
 
 ---
 
@@ -280,38 +258,6 @@ python -m simpler_setup.tools.dump_viewer --func 3 --stage before --role input -
 
 # Export a specific tensor by index (always exports)
 python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump/ --index 42
-```
-
----
-
-## device_log_resolver
-
-Device log path resolution library, shared by `swimlane_converter` and `sched_overhead_analysis`. Not a standalone CLI — imported as a module.
-
-### Main Functions
-
-| Function | Description |
-| -------- | ----------- |
-| `get_log_root()` | Returns the log root path (`$ASCEND_WORK_PATH/log/debug/` or `~/ascend/log/debug/`) |
-| `infer_device_id_from_log_path(log_path)` | Infers the device id from a path (e.g., `device-0`) |
-| `resolve_device_log_path(device_id, device_log, l2_perf_records_path)` | Resolves the device log path by priority, returning `(Path, strategy_string)` |
-
-### Resolution priority
-
-1. **Explicit path** (`--device-log`): supports file, directory, and glob patterns
-2. **Device ID** (`--device-id`): selects the latest `.log` from `<log_root>/device-<id>/`
-3. **Auto-scan**: iterates all `device-*` directories and selects the `.log` closest to the perf timestamp
-
-### Usage
-
-```python
-from simpler_setup.tools.device_log_resolver import resolve_device_log_path
-
-log_path, strategy = resolve_device_log_path(
-    device_id="0",
-    device_log=None,
-    l2_perf_records_path=Path("outputs/<case>_<ts>/l2_perf_records.json"),
-)
 ```
 
 ---

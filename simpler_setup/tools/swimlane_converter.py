@@ -30,8 +30,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
-from .sched_overhead_analysis import parse_scheduler_threads
 from .sched_overhead_analysis import run_analysis as run_sched_overhead_analysis
 
 
@@ -243,48 +241,7 @@ def load_func_names_json(json_path):
     return data.get("callable_id_to_name", {}), data.get("orchestrator_name")
 
 
-def parse_sched_cpu_from_device_log(log_path, task_count):
-    """Parse device log for PTO2 scheduler stats and return scheduler CPU time per task (us).
-
-    Looks for lines like: "Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)"
-    Sums the 'total_us' values (one per scheduler thread, typically 3) and divides by task_count.
-
-    Returns:
-        float: scheduler_us_per_task, or None if parsing failed / file missing
-    """
-    path = Path(log_path)
-    if not path.exists() or task_count <= 0:
-        return None
-
-    try:
-        threads = parse_scheduler_threads(path)
-    except Exception:
-        return None
-
-    if not threads:
-        return None
-
-    total_sched_cpu_us = sum(t.get("total_us", 0.0) for t in threads.values())
-    if total_sched_cpu_us <= 0:
-        return None
-
-    total_completed = sum(t.get("completed", 0) for t in threads.values())
-    if task_count > 0 and total_completed > 0 and abs(total_completed - task_count) / task_count > 0.5:
-        print(
-            f"Warning: device log has {total_completed} completed tasks "
-            f"but perf JSON has {task_count}; skipping Sched CPU metric "
-            f"(device log may be from a different run)",
-            file=sys.stderr,
-        )
-        return None
-
-    return {
-        "us_per_task": total_sched_cpu_us / task_count,
-        "num_sched_threads": len(threads),
-    }
-
-
-def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
+def print_task_statistics(tasks, func_id_to_name=None):
     """Print task statistics grouped by func_id.
 
     Exec = kernel execution time (end_time_us - start_time_us) on AICore.
@@ -296,8 +253,6 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
     Args:
         tasks: List of task dicts
         func_id_to_name: Optional dict mapping func_id to function name
-        sched_info: Optional dict with 'us_per_task' (float) and 'num_sched_threads' (int),
-            parsed from device log by parse_sched_cpu_from_device_log()
     """
     # Group tasks by func_id with extended metrics
     func_stats: defaultdict[Any, dict[str, Any]] = defaultdict(
@@ -419,23 +374,7 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
             f"Avg Latency (dispatch->finish) = {avg_latency_us:.2f} us,  "
             f"Exec/Latency = {exec_latency_ratio_pct:.2f}%"
         )
-        if sched_info is not None:
-            sched_cpu = sched_info["us_per_task"]
-            num_cores = len(set(t["core_id"] for t in tasks))
-            exec_sched_ratio = (avg_exec_us / sched_cpu * 100) if sched_cpu > 0 else 0
-            per_core_exec = avg_exec_us / num_cores if num_cores > 0 else 0
-            per_core_ratio = (per_core_exec / sched_cpu * 100) if sched_cpu > 0 else 0
-            num_threads = sched_info["num_sched_threads"]
-            print(
-                f"  Sched CPU (from device log): {sched_cpu:.2f} us/task  "
-                f"(Exec/Sched = {exec_sched_ratio:.1f}%, PerCore/Sched = {per_core_ratio:.1f}%)"
-            )
-            print(
-                f"  (Latency = dispatch→finish; Sched CPU = scheduler thread CPU per task; "
-                f"PerCore = avg_exec/{num_cores}_cores vs sched_cpu, {num_threads} sched threads)"
-            )
-        else:
-            print("  (Latency = dispatch→finish; Sched CPU = scheduler thread CPU per task)")
+        print("  (Latency = dispatch→finish; Exec = AICore kernel time per task)")
 
     print("=" * 110)
 
@@ -1197,7 +1136,6 @@ Examples:
   %(prog)s l2_perf_records_20260210_143526.json   # Output: outputs/merged_swimlane_20260210_143526.json
   %(prog)s l2_perf_records_20260210_143526.json -o custom_output.json
   %(prog)s l2_perf_records_20260210_143526.json -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
-  %(prog)s l2_perf_records_20260210_143526.json -d 0
   %(prog)s l2_perf_records_20260210_143526.json -v
         """,
     )
@@ -1216,8 +1154,6 @@ Examples:
         "--func-names",
         help="Path to func_id_names_*.json (SceneTest format) for func_id to function name mapping",
     )
-    parser.add_argument("--device-log", help="Device log file/path/glob override used for scheduler analysis")
-    parser.add_argument("-d", "--device-id", help="Device id for auto-selection from device-<id>")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     return parser
 
@@ -1286,19 +1222,6 @@ def _print_verbose_data_info(data, verbose):
         print(f"  Core-to-thread mapping: {len(core_to_thread)} cores")
 
 
-def _report_device_log(resolved_device_log, log_strategy):
-    """Print device log resolution result."""
-    if resolved_device_log is not None:
-        print(f"\nDevice log: {resolved_device_log}")
-        print(f"Selection: {log_strategy}")
-        inferred_device_id = infer_device_id_from_log_path(resolved_device_log)
-        if inferred_device_id is not None:
-            print(f"Inferred Device ID: {inferred_device_id}")
-    else:
-        print("\nDevice log: (not resolved)")
-        print(f"Selection: {log_strategy}")
-
-
 def _load_func_names(args):
     """Load func_id→name mapping from --func-names JSON or -k kernel_config.py.
 
@@ -1349,12 +1272,6 @@ def main():
 
         output_path = _resolve_output_path(args, input_path)
 
-        resolved_device_log, log_strategy = resolve_device_log_path(
-            device_id=args.device_id,
-            device_log=args.device_log,
-            l2_perf_records_path=input_path,
-        )
-
         deps_edges = load_deps_json(input_path)
         if args.verbose and deps_edges is not None:
             print(f"  Using deps.json edges ({sum(len(v) for v in deps_edges.values())} total)")
@@ -1377,33 +1294,23 @@ def main():
         print(f"  Output: {output_path}")
         print(f"\nTo visualize: Open https://ui.perfetto.dev/ and drag in {output_path}")
 
-        _report_device_log(resolved_device_log, log_strategy)
+        print_task_statistics(data["tasks"], func_names)
 
-        sched_info = None
-        if resolved_device_log is not None:
-            sched_info = parse_sched_cpu_from_device_log(resolved_device_log, len(data["tasks"]))
-            if args.verbose and sched_info is not None:
-                print(f"  Parsed sched CPU from device log: {sched_info['us_per_task']:.2f} us/task")
-
-        print_task_statistics(data["tasks"], func_names, sched_info=sched_info)
-
-        if resolved_device_log is not None:
-            print("\n=== Scheduler Overhead Deep Dive ===")
-            deep_dive_rc = run_sched_overhead_analysis(
-                input_path,
-                resolved_device_log,
-                print_sources=True,
-                selection_strategy=log_strategy,
+        # The deep-dive reads only the perf JSON and (optionally) the colocated
+        # deps.json — sibling auto-discovery happens inside run_sched_overhead_analysis.
+        print("\n=== Scheduler Overhead Deep Dive ===")
+        deep_dive_rc = run_sched_overhead_analysis(
+            input_path,
+            print_sources=True,
+            perf_data=data,
+        )
+        if deep_dive_rc != 0:
+            print(
+                "Warning: Scheduler overhead deep-dive failed; conversion output is still available. "
+                "Check the detailed error above for root cause and fix route "
+                "(typically missing aicpu_scheduler_phases — rerun with --enable-l2-swimlane).",
+                file=sys.stderr,
             )
-            if deep_dive_rc != 0:
-                print(
-                    "Warning: Scheduler overhead deep-dive failed; conversion output is still available. "
-                    "Check the detailed error above for root cause and fix route "
-                    "(typically missing dispatch_time_us/finish_time_us in perf JSON).",
-                    file=sys.stderr,
-                )
-        else:
-            print("\n[Info] Scheduler overhead deep-dive skipped (no device log resolved).")
 
         return 0
 

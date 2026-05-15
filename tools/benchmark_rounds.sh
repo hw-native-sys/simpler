@@ -155,7 +155,7 @@ case "$RUNTIME" in
 esac
 
 # ---------------------------------------------------------------------------
-# Resolve device log directory (mirrors simpler_setup/device_log_resolver.py)
+# Resolve CANN device log directory: $ASCEND_WORK_PATH/log/debug or ~/ascend/log/debug
 # ---------------------------------------------------------------------------
 if [[ -n "${ASCEND_WORK_PATH:-}" ]]; then
     LOG_ROOT="$ASCEND_WORK_PATH/log/debug"
