@@ -111,6 +111,20 @@ class RuntimeCompiler:
     def _init_a2a3(self):
         """Initialize toolchains for real a2a3 hardware."""
         env_manager.ensure("ASCEND_HOME_PATH")
+        # a2a3 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
+        # aclnn syms (cf. src/a2a3/platform/onboard/host/CMakeLists.txt
+        # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). PTO_ISA_ROOT must be
+        # populated by the caller — no auto-clone fallback here. Resolved by:
+        #   - pip install: top-level CMakeLists invokes
+        #     simpler_setup/build_runtimes.py --clone-protocol <proto> which
+        #     calls ensure_pto_isa_root() and sets os.environ.
+        #   - pytest:      conftest.py::pytest_configure does the same, with
+        #     the --clone-protocol pytest flag.
+        #   - Direct callers (e.g. CI `python -c "RuntimeBuilder('a2a3')..."`
+        #     or `python examples/.../test_*.py` standalone) must export
+        #     PTO_ISA_ROOT in env before constructing this RuntimeCompiler;
+        #     CI workflows propagate it via $GITHUB_ENV after the install step.
+        env_manager.ensure("PTO_ISA_ROOT")
 
         # AICore: Bisheng CCE compiler
         ccec = CCECToolchain(platform="a2a3")

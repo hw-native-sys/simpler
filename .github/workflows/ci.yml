@@ -339,6 +339,10 @@ jobs:
       - name: Build and run C++ hardware unit tests
         run: |
           source .venv/bin/activate
+          # pip install's build_runtimes.py already cloned pto-isa into
+          # build/pto-isa; point this step's RuntimeBuilder at it so
+          # _init_a2a3's PTO_ISA_ROOT check passes without re-cloning.
+          export PTO_ISA_ROOT="$(pwd)/build/pto-isa"
           python -c "from simpler_setup.runtime_builder import RuntimeBuilder; RuntimeBuilder('a2a3').get_binaries('tensormap_and_ringbuffer', build=True)"
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
           cmake --build tests/ut/cpp/build
@@ -383,12 +387,12 @@ jobs:
         run: |
           set +e
           source .venv/bin/activate
-          python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v --pto-session-timeout 600 --clone-protocol https --require-pto-isa
+          python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v --pto-session-timeout 600 --clone-protocol ssh --require-pto-isa
           rc=$?
           if [ $rc -ne 0 ]; then
             echo "pytest failed with rc=$rc; retrying with pinned PTO-ISA commit"
             python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v \
-              --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https --require-pto-isa
+              --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol ssh --require-pto-isa
             rc=$?
           fi
           exit $rc
@@ -402,28 +406,28 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --enable-dep-gen --clone-protocol https
+            --enable-dep-gen --clone-protocol ssh
 
       - name: l2_swimlane smoke
         run: |
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/test_l2_swimlane.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --enable-l2-swimlane --clone-protocol https
+            --enable-l2-swimlane --clone-protocol ssh
 
       - name: PMU smoke
         run: |
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --enable-pmu 2 --clone-protocol https
+            --enable-pmu 2 --clone-protocol ssh
 
       - name: tensor_dump smoke
         run: |
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --dump-tensor --clone-protocol https
+            --dump-tensor --clone-protocol ssh
 
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------
@@ -528,5 +532,5 @@ jobs:
         run: |
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --clone-protocol https --require-pto-isa"
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "set +e; $PYTEST --pto-session-timeout 1200; rc=\$?; if [ \$rc -ne 0 ]; then echo \"pytest failed with rc=\$rc; retrying with pinned PTO-ISA commit\"; $PYTEST --pto-session-timeout 1200 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https; rc=\$?; fi; exit \$rc"
+          PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --clone-protocol ssh --require-pto-isa"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "set +e; $PYTEST --pto-session-timeout 1200; rc=\$?; if [ \$rc -ne 0 ]; then echo \"pytest failed with rc=\$rc; retrying with pinned PTO-ISA commit\"; $PYTEST --pto-session-timeout 1200 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol ssh; rc=\$?; fi; exit \$rc"

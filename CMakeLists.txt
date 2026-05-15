@@ -28,12 +28,21 @@ find_package(nanobind CONFIG REQUIRED)
 # Include Python bindings
 add_subdirectory(python/bindings)
 
+# Protocol used by `build_runtimes.py` when an onboard a2a3 build needs to
+# clone pto-isa and PTO_ISA_ROOT is not pre-set. Default `ssh` matches
+# conftest's default and self-hosted CI runners' deploy-key setup. Override
+# at `pip install` time via
+#   pip install --config-settings=cmake.define.SIMPLER_PTO_CLONE_PROTOCOL=https .
+set(SIMPLER_PTO_CLONE_PROTOCOL "ssh" CACHE STRING
+    "Protocol for cloning pto-isa during install (ssh or https)")
+
 # Pre-build runtime binaries (persistent build dirs for incremental compilation)
 add_custom_target(build_runtimes ALL
     COMMAND ${Python_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/simpler_setup/build_runtimes.py
         --lib-dir ${CMAKE_SOURCE_DIR}/build/lib
         --cache-dir ${CMAKE_SOURCE_DIR}/build/cache
+        --clone-protocol ${SIMPLER_PTO_CLONE_PROTOCOL}
     COMMENT "Building runtime binaries (incremental)..."
 )
 

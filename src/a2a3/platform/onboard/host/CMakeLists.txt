@@ -29,21 +29,20 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build Host runtime")
 endif()
 
-set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE_DEFAULT OFF)
-if(DEFINED ENV{SIMPLER_ENABLE_PTO_SDMA_WORKSPACE} AND "$ENV{SIMPLER_ENABLE_PTO_SDMA_WORKSPACE}" STREQUAL "1")
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE_DEFAULT ON)
+# SIMPLER_ENABLE_PTO_SDMA_WORKSPACE: marker for an outstanding architectural
+# issue. The SDMA workspace init in comm_hccl.cpp pulls in pto-isa
+# headers and CANN-9.0-only aclnn symbols (aclnnShmemSdmaStarsQuery*),
+# even though it is logically orthogonal to HCCL comm bootstrap and only
+# needed by the sdma_async_completion_demo. Until that coupling is
+# refactored away, the macro is forced ON: PTO_ISA_ROOT and CANN 9.0+ are
+# hard build/runtime preconditions for a2a3 onboard.
+set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
+if(NOT DEFINED ENV{PTO_ISA_ROOT})
+    message(FATAL_ERROR
+        "a2a3 onboard host_runtime requires PTO_ISA_ROOT "
+        "(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is forced ON; needs pto-isa headers + CANN 9.0+)")
 endif()
-option(
-    SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    "Enable PTO-ISA SDMA workspace support for async SDMA completion"
-    ${SIMPLER_ENABLE_PTO_SDMA_WORKSPACE_DEFAULT}
-)
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
-    if(NOT DEFINED ENV{PTO_ISA_ROOT})
-        message(FATAL_ERROR "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE requires PTO_ISA_ROOT")
-    endif()
-    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
-endif()
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
 
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
