@@ -28,9 +28,10 @@
 #define __gm__
 #endif
 
-// SDMA backend kernel-side helpers. PR-D rewrites the example to use the
-// merged send_request_entry overload instead of these lower-level helpers;
-// they remain here for the transitional commit.
+// SDMA backend kernel-side helpers. Public entry point is the
+// send_request_entry overload below; the defer_* helpers are kept exposed
+// only because the deferred-event demo still references them directly.
+// PR-E will privatize them once all callers move to send_request_entry.
 inline __aicore__ void defer_sdma_event_record(AsyncCtx &ctx, volatile __gm__ void *record_addr) {
     defer_condition(
         ctx, reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA,
@@ -68,6 +69,78 @@ defer_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncS
     for (uint32_t queue_id = 0; queue_id < queue_num; ++queue_id) {
         defer_sdma_event_record(ctx, ::pto::comm::sdma::detail::GetEventRecord(recv_workspace, queue_id));
     }
+}
+
+enum class SdmaOp : uint8_t {
+    TGET = 0,
+    TPUT = 1,
+};
+
+// SdmaRequestDescriptor bundles everything send_request_entry needs to drive
+// one SDMA transfer + completion registration. It is a template because the
+// destination / source / scratch types carry tensor shape & stride at compile
+// time; CTAD or the SdmaTget()/SdmaTput() helpers below avoid spelling them
+// out at the call site.
+//
+// sync_id selects which event-record slot inside the workspace the engine
+// writes into. Concurrent dispatches must use distinct sync_ids; today every
+// caller submits one request per kernel invocation so passing 0 is safe.
+// Future work (see .docs/25.comm-api-refactor/03.implementation-plan.md §5.2)
+// will fold sync_id allocation into the adapter.
+template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
+struct SdmaRequestDescriptor {
+    SdmaOp op;
+    DstTensor dst;
+    SrcTensor src;
+    ScratchTileT scratch;
+    __gm__ uint8_t *workspace;
+    uint32_t sync_id;
+};
+
+template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
+inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> SdmaTget(
+    const DstTensor &dst, const SrcTensor &src, const ScratchTileT &scratch, __gm__ uint8_t *workspace,
+    uint32_t sync_id = 0
+) {
+    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TGET, dst, src, scratch, workspace,
+                                                                     sync_id};
+}
+
+template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
+inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> SdmaTput(
+    const DstTensor &dst, const SrcTensor &src, const ScratchTileT &scratch, __gm__ uint8_t *workspace,
+    uint32_t sync_id = 0
+) {
+    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TPUT, dst, src, scratch, workspace,
+                                                                     sync_id};
+}
+
+// SDMA overload of the runtime's send_request_entry. Submits the descriptor
+// to PTO-ISA, then registers the resulting AsyncEvent's GM flag(s) into the
+// AsyncCtx deferred-wait slab and flushes. Returns false on submit/session
+// failure (also records the error in ctx.completion_error_code).
+template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
+inline __aicore__ bool send_request_entry(
+    AsyncCtx &ctx, const SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> &desc
+) {
+    ScratchTileT scratch = desc.scratch;
+    pto::comm::AsyncSession session;
+    if (!pto::comm::BuildAsyncSession(scratch, desc.workspace, session, desc.sync_id)) {
+        defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
+
+    DstTensor dst = desc.dst;
+    SrcTensor src = desc.src;
+    pto::comm::AsyncEvent event;
+    if (desc.op == SdmaOp::TGET) {
+        event = pto::comm::TGET_ASYNC(dst, src, session);
+    } else {
+        event = pto::comm::TPUT_ASYNC(dst, src, session);
+    }
+    defer_pto_async_event(ctx, event, session);
+    defer_flush(ctx);
+    return true;
 }
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_SDMA_SDMA_COMPLETION_KERNEL_H_
