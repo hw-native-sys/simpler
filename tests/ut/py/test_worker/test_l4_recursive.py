@@ -104,6 +104,77 @@ class TestL4Validation:
         child.close()
         w4.close()
 
+    def test_malloc_on_l4_raises_index_error(self):
+        # L4 has no chip mailboxes — `Worker.malloc` must surface IndexError
+        # rather than silently dispatch CTRL_MALLOC to a next_level (L3 worker)
+        # child whose `_child_worker_loop` doesn't recognise CTRL_MALLOC and
+        # would return a garbage pointer from an uninitialised mailbox result
+        # slot.
+        l3_child = Worker(level=3, num_sub_workers=0)
+        w4 = Worker(level=4, num_sub_workers=0)
+        w4.add_worker(l3_child)
+        w4.init()
+        try:
+            with pytest.raises(IndexError, match="out of range"):
+                w4.malloc(1024, worker_id=0)
+            with pytest.raises(IndexError, match="out of range"):
+                w4.free(0xDEADBEEF, worker_id=0)
+            with pytest.raises(IndexError, match="out of range"):
+                w4.copy_to(0xDEAD, 0xBEEF, 64, worker_id=0)
+            with pytest.raises(IndexError, match="out of range"):
+                w4.copy_from(0xDEAD, 0xBEEF, 64, worker_id=0)
+        finally:
+            w4.close()
+
+
+class TestL4DynamicRegister:
+    """Cascade of CTRL_REGISTER / CTRL_UNREGISTER through an L4 → L3 worker tree.
+
+    The L3 child is sub-only (no chip device) so the cascade hits zero
+    chip mailboxes inside the L3 child — but exercises the full path
+    from L4 parent → next_level mailbox → ``_child_worker_loop`` CONTROL
+    handler → ``inner_worker._register_at`` recursively. NPU not required.
+    """
+
+    def test_l4_register_chip_callable_after_init_succeeds(self):
+        from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+        l3 = Worker(level=3, num_sub_workers=1)
+        l3.register(lambda args: None)  # at least one cid so L3 init is happy
+
+        w4 = Worker(level=4, num_sub_workers=0)
+        w4.register(lambda orch, args, config: None)
+        w4.add_worker(l3)
+        w4.init()
+        try:
+            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+            cid = w4.register(callable_obj)
+            assert isinstance(cid, int)
+            assert cid >= 0
+        finally:
+            w4.close()
+
+    def test_l4_register_then_unregister_recycles_cid(self):
+        from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+        l3 = Worker(level=3, num_sub_workers=1)
+        l3.register(lambda args: None)
+
+        w4 = Worker(level=4, num_sub_workers=0)
+        w4.register(lambda orch, args, config: None)
+        w4.add_worker(l3)
+        w4.init()
+        try:
+            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+            cid_a = w4.register(callable_obj)
+            w4.unregister(cid_a)
+            assert cid_a not in w4._callable_registry
+            # Slot is freed; the next register reuses it.
+            cid_b = w4.register(callable_obj)
+            assert cid_b == cid_a
+        finally:
+            w4.close()
+
 
 # ---------------------------------------------------------------------------
 # Test: L4 → L3 PROCESS mode — single dispatch

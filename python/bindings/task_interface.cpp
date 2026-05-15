@@ -440,6 +440,30 @@ NB_MODULE(_task_interface, m) {
             "Build a ChipCallable from signature, func_name, binary, and list of (func_id, CoreCallable) children."
         )
 
+        .def_static(
+            "from_bytes",
+            [](nb::bytes raw) -> PyChipCallable {
+                // Reconstruct a ChipCallable wrapper from the contiguous
+                // serialised representation produced by `buffer_ptr()` /
+                // `buffer_size()`. Used by the L4 cascade in
+                // _child_worker_loop, which receives CTRL_REGISTER bytes
+                // through shared memory and needs a typed ChipCallable to
+                // hand to inner_worker._register_at (the cid is dictated
+                // by the outer cascade, not freshly allocated); see
+                // docs/callable-ipc-dynamic-register.md.
+                std::vector<uint8_t> buf(
+                    reinterpret_cast<const uint8_t *>(raw.c_str()),
+                    reinterpret_cast<const uint8_t *>(raw.c_str()) + raw.size()
+                );
+                return PyChipCallable{std::move(buf)};
+            },
+            nb::arg("raw"),
+            "Reconstruct a ChipCallable from the contiguous bytes that "
+            "buffer_ptr() points to (size buffer_size()). Inverse of the "
+            "serialisation used to ship a ChipCallable across the L4 "
+            "cascade IPC channel."
+        )
+
         .def(
             "sig",
             [](const PyChipCallable &self, int32_t i) -> ArgDirection {
@@ -638,6 +662,19 @@ NB_MODULE(_task_interface, m) {
             nb::arg("callable_id"), nb::arg("callable"),
             "Stage a ChipCallable under callable_id for cheap repeated launches "
             "via run_prepared. Variants without per-callable_id support raise."
+        )
+        .def(
+            "prepare_callable_from_blob",
+            [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr) {
+                self.prepare_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
+            },
+            nb::arg("callable_id"), nb::arg("blob_ptr"),
+            "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
+            "post-fork dynamic register handlers that receive the ChipCallable "
+            "bytes via shared memory; see docs/callable-ipc-dynamic-register.md). "
+            "Equivalent to prepare_callable(cid, ChipCallable) but accepts the "
+            "ChipCallable layout pointer directly so chip-child loops can prepare "
+            "from shm without rebuilding a PyChipCallable wrapper."
         )
         .def(
             "run_prepared",

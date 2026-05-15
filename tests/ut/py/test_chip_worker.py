@@ -101,6 +101,18 @@ class TestChipWorkerStateMachine:
         with pytest.raises(RuntimeError, match="not initialized"):
             worker.prepare_callable(0, callable_obj)
 
+    def test_prepare_callable_from_blob_before_init_raises(self):
+        # The from_blob overload shares the underlying ChipWorker::prepare_callable
+        # entrypoint with the typed overload, so it must enforce the same
+        # initialization guard. This protects the dynamic-register IPC handler
+        # (which is the sole caller) from silently no-op'ing on a stale worker.
+        from _task_interface import ChipCallable  # noqa: PLC0415
+
+        worker = _ChipWorker()
+        callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.prepare_callable_from_blob(0, callable_obj.buffer_ptr())
+
     def test_run_prepared_before_init_raises(self):
         from _task_interface import ChipStorageTaskArgs  # noqa: PLC0415
 
