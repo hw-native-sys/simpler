@@ -10,31 +10,38 @@
  */
 
 /*
- * Hardware UT guarding the CANN/HCCL-private ABI coupling in comm_hccl.cpp.
+ * Hardware UT for the comm_* C API end-to-end lifecycle on a2a3 onboard.
  *
- * The call chain (dlopen -> create_device_context -> ensure_acl_ready_ctx ->
- * aclrtCreateStream -> comm_init -> comm_alloc_windows -> ...) is not the
- * interesting part -- the interesting part is *what's inside* CommContext
- * after comm_alloc_windows returns.  That struct comes from one of:
+ * Drives the full call chain
+ *   dlopen -> create_device_context -> ensure_acl_ready_ctx ->
+ *   aclrtCreateStream -> comm_init -> comm_alloc_windows ->
+ *   comm_get_local_window_base / comm_get_window_size ->
+ *   comm_barrier -> comm_destroy
+ * and then copies the device-side CommContext back to host to assert the
+ * Path D backend populated it correctly:
  *
- *   - MESH topology: `reinterpret_cast<CommContext*>(HCCL's return ptr)` --
- *     our layout is *assumed* to match HCCL's internal MESH context.
- *   - RING topology: our parser reads HcclOpResParam / HcclRankRelationResV2
- *     field-by-field using offsetof against reverse-engineered struct defs.
- *
- * Both paths silently break if CANN (or libhcomm.so specifically) shifts
- * any of those internal layouts.  The happy-path "six functions return 0"
- * check cannot catch that, because the calls succeed with garbage fields.
- *
- * This test copies the populated CommContext back to host and asserts:
- *   rankId      == (this process's rank)
- *   rankNum     == (nranks we passed to comm_init)
- *   winSize     == comm_get_window_size(h)    (cross-API consistency)
+ *   rankId          == (this process's rank)
+ *   rankNum         == (nranks we passed to comm_init)
+ *   winSize         == comm_get_window_size(h)          (cross-API consistency)
  *   windowsIn[rank] == comm_get_local_window_base(h)
- *   windowsIn[0..nranks-1] all non-zero       (every peer GVA populated)
+ *   windowsIn[0..nranks-1] all non-zero                 (every peer GVA populated)
  *
- * A CANN upgrade that moves any of these fields lands here as EXIT_CTX_FIELDS
- * rather than silently producing wrong device DMA addresses.
+ * What this guards in the Path D world:
+ *
+ *   - ipc_read_announce timing out on a peer but the function still returning
+ *     0 -- the windowsIn[peer]==0 assertion would catch the resulting empty
+ *     slot.
+ *   - comm_get_window_size / winSize implementation drift -- the cross-API
+ *     consistency check pins them together.
+ *   - aclrtDeviceEnablePeerAccess silently failing but the warning being
+ *     fprintf'd and continuing (alloc_windows_via_ipc does this on
+ *     "already enabled" returns) -- a peer slot can still get populated with
+ *     an unmapped VA; host-side byte-level memcpy of the device ctx catches
+ *     a wholly null slot.
+ *
+ * This is *not* an HCCL-private ABI canary (that role died with the MC2
+ * reverse-parse code); it is a black-box lifecycle test of the comm_*
+ * C API and the device-side CommContext it produces.
  *
  * Hardware classification: requires_hardware_a2a3 (ctest label) + CMake
  * gate SIMPLER_ENABLE_HARDWARE_TESTS.  Device allocation is driven by
@@ -118,11 +125,10 @@ constexpr int EXIT_INIT = 20;
 constexpr int EXIT_ALLOC = 30;
 constexpr int EXIT_WINDOW_BASE = 40;
 constexpr int EXIT_WINDOW_SIZE = 50;
-// EXIT_CTX_{MEMCPY,FIELDS} gate the real purpose of this test: verifying that
-// the CommContext returned by HCCL (MESH reinterpret_cast) or built by our
-// RING parser actually contains the fields we expect at the offsets we
-// expect.  Failure here means our reverse-engineered CANN ABI disagrees with
-// the live HCCL build -- the CANN-coupling fragility this test is here for.
+// EXIT_CTX_{MEMCPY,FIELDS} guard the device-side CommContext that Path D
+// fills in alloc_windows_via_ipc: cross-API consistency between
+// comm_get_window_size / winSize, and every peer's windowsIn slot
+// actually getting a non-zero GVA.
 constexpr int EXIT_CTX_MEMCPY = 55;
 constexpr int EXIT_CTX_FIELDS = 56;
 constexpr int EXIT_BARRIER = 60;
@@ -198,16 +204,11 @@ int run_rank(int rank, int nranks, int device_id, const char *rootinfo_path) {
                 if (api.comm_get_window_size(h, &win_size) != 0 || win_size < 4096) {
                     stage = EXIT_WINDOW_SIZE;
                 } else {
-                    // ABI guard: pull the CommContext that HCCL's MESH path
-                    // reinterpret_casts back to us (or that our RING parser
-                    // built field-by-field) and check every consumed field
-                    // against the inputs we fed to comm_init / alloc_windows.
-                    //
-                    // This is the concrete check that our CANN-private ABI
-                    // assumptions (field offsets, struct layout, windowsIn
-                    // indexing by rank) still match the live HCCL build.  A
-                    // CANN upgrade that silently moves HcclOpResParam or the
-                    // MESH context layout lands here.
+                    // Black-box contract check on the device-side CommContext
+                    // produced by Path D: cross-API consistency (winSize ==
+                    // comm_get_window_size), every peer's windowsIn slot
+                    // populated, and the local slot matching
+                    // comm_get_local_window_base.
                     CommContext host_ctx{};
                     aclError mc_rc = aclrtMemcpy(
                         &host_ctx, sizeof(host_ctx), reinterpret_cast<void *>(device_ctx_ptr), sizeof(host_ctx),
@@ -224,7 +225,7 @@ int run_rank(int rank, int nranks, int device_id, const char *rootinfo_path) {
                                host_ctx.windowsIn[rank] != local_base) {
                         fprintf(
                             stderr,
-                            "[rank %d] CommContext field mismatch -- CANN ABI drift?\n"
+                            "[rank %d] CommContext field mismatch\n"
                             "  got:      rankId=%u rankNum=%u winSize=%lu windowsIn[%d]=0x%lx\n"
                             "  expected: rankId=%d rankNum=%d winSize=%zu windowsIn[%d]=0x%lx\n",
                             rank, host_ctx.rankId, host_ctx.rankNum, static_cast<unsigned long>(host_ctx.winSize), rank,
@@ -234,8 +235,9 @@ int run_rank(int rank, int nranks, int device_id, const char *rootinfo_path) {
                         stage = EXIT_CTX_FIELDS;
                     } else {
                         // Every peer's window GVA must be non-zero.  A zero
-                        // entry means RING parsing read the wrong offset or
-                        // MESH didn't populate a peer slot.
+                        // entry means ipc_read_announce / ImportByKey didn't
+                        // populate that slot but the function still returned
+                        // success.
                         for (int i = 0; i < nranks; ++i) {
                             if (host_ctx.windowsIn[i] == 0) {
                                 fprintf(
@@ -300,7 +302,7 @@ std::vector<int> read_ctest_devices() {
 
 }  // namespace
 
-class HcclCommTest : public ::testing::Test {
+class CommLifecycleTest : public ::testing::Test {
 protected:
     void SetUp() override {
         // Paths are baked in by tests/ut/cpp/CMakeLists.txt; the only way they
@@ -317,13 +319,13 @@ protected:
     }
 };
 
-TEST_F(HcclCommTest, TwoRankInitAllocBarrierDestroy) {
+TEST_F(CommLifecycleTest, TwoRankInitAllocBarrierDestroy) {
     constexpr int kNranks = 2;
     auto devices = read_ctest_devices();
     ASSERT_GE(devices.size(), static_cast<size_t>(kNranks))
         << "need " << kNranks << " NPU devices; run with --resource-spec-file";
 
-    const std::string rootinfo_path = "/tmp/pto_hccl_ut_rootinfo_" + std::to_string(getpid()) + ".bin";
+    const std::string rootinfo_path = "/tmp/pto_comm_ut_rootinfo_" + std::to_string(getpid()) + ".bin";
 
     std::vector<pid_t> pids;
     pids.reserve(kNranks);

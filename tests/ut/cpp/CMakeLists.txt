@@ -53,7 +53,7 @@ find_library(GTEST_MAIN_LIB gtest_main PATHS ${GTEST_SEARCH_PATHS})
 if(NOT GTEST_LIB OR NOT GTEST_MAIN_LIB)
     message(STATUS "System GoogleTest not found — fetching via FetchContent")
     # Match the ABI the tests themselves compile with
-    # (-D_GLIBCXX_USE_CXX11_ABI=0 — see add_hierarchical_test / add_comm_api_test).
+    # (-D_GLIBCXX_USE_CXX11_ABI=0 — see add_hierarchical_test).
     # Without this the FetchContent-built libgtest.a ends up with the default
     # cxx11 ABI and link fails against our tests.
     add_compile_options(-D_GLIBCXX_USE_CXX11_ABI=0)
@@ -334,8 +334,6 @@ add_test(NAME test_host_log_off COMMAND test_host_log_off)
 # invariant that lets future hw tests freely link against CANN libraries
 # without breaking the no-hw build.
 if(SIMPLER_ENABLE_HARDWARE_TESTS)
-    # Hardware-only UT for the HCCL backend of the comm_* C API.
-    #
     # libhost_runtime.so is loaded via dlopen at runtime — it is the
     # subject under test and mirrors how ChipWorker selects a runtime
     # backend in production.  libascendcl.so, by contrast, is generic
@@ -368,34 +366,32 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     find_library(ASCENDCL_LIB ascendcl
         PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH REQUIRED)
 
-    function(add_comm_api_test name src)
-        add_executable(${name} ${src})
-        target_include_directories(${name} PRIVATE
-            ${GTEST_INCLUDE_DIRS}
-            ${PROJECT_ROOT}/src/a2a3/platform/include
-            # Shared platform_comm headers (comm.h / comm_context.h) moved
-            # under src/common so both a2a3 HCCL and a5/a2a3 sim can use them.
-            ${PROJECT_ROOT}/src/common
-            ${ASCEND_HOME_PATH}/include
-        )
-        target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
-        target_compile_definitions(${name} PRIVATE
-            PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}"
-            SIMPLER_LOG_LIB_PATH="${SIMPLER_LOG_LIB}"
-        )
-        target_link_libraries(${name} PRIVATE
-            ${GTEST_MAIN_LIB}
-            ${GTEST_LIB}
-            ${ASCENDCL_LIB}
-            pthread
-            dl
-        )
-        add_test(NAME ${name} COMMAND ${name})
-        set_tests_properties(${name} PROPERTIES
-            LABELS "requires_hardware_a2a3"
-            RESOURCE_GROUPS "2,npus:1"
-        )
-    endfunction()
-
-    add_comm_api_test(test_hccl_comm hardware/test_hccl_comm.cpp)
+    # Black-box lifecycle UT for the comm_* C API on Path D. See the file
+    # header for the contract it pins down.
+    add_executable(test_comm_lifecycle hardware/test_comm_lifecycle.cpp)
+    target_include_directories(test_comm_lifecycle PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${PROJECT_ROOT}/src/a2a3/platform/include
+        # Shared platform_comm headers (comm.h / comm_context.h) live under
+        # src/common so both a2a3 HCCL and a5/a2a3 sim can use them.
+        ${PROJECT_ROOT}/src/common
+        ${ASCEND_HOME_PATH}/include
+    )
+    target_compile_options(test_comm_lifecycle PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_compile_definitions(test_comm_lifecycle PRIVATE
+        PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}"
+        SIMPLER_LOG_LIB_PATH="${SIMPLER_LOG_LIB}"
+    )
+    target_link_libraries(test_comm_lifecycle PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        ${ASCENDCL_LIB}
+        pthread
+        dl
+    )
+    add_test(NAME test_comm_lifecycle COMMAND test_comm_lifecycle)
+    set_tests_properties(test_comm_lifecycle PROPERTIES
+        LABELS "requires_hardware_a2a3"
+        RESOURCE_GROUPS "2,npus:1"
+    )
 endif()
