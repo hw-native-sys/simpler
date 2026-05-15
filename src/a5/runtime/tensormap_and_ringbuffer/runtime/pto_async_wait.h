@@ -59,8 +59,7 @@ struct CompletionCondition {
             return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
         }
         return {
-            *counter_addr >= expected_value ? CompletionPollState::READY : CompletionPollState::PENDING,
-            PTO2_ERROR_NONE
+            *counter_addr >= expected_value ? CompletionPollState::READY : CompletionPollState::PENDING, PTO2_ERROR_NONE
         };
     }
 };
@@ -291,9 +290,9 @@ struct AsyncWaitList {
 
     template <bool Profiling>
     AsyncPollResult poll_and_complete(
-        volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched,
-        PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states,
-        int32_t &deferred_release_count, int32_t deferred_release_capacity
+        volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
+        PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
+        int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING
         ,
         int thread_idx

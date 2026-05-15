@@ -128,8 +128,9 @@ send_notification(volatile __gm__ void *remote_counter_addr, int32_t value, pto:
 
 inline __aicore__ void
 save_expected_notification_counter(AsyncCtx &ctx, volatile __gm__ void *counter_addr, uint32_t expected_value) {
-    CompletionToken token{reinterpret_cast<uint64_t>(counter_addr), expected_value, COMPLETION_ENGINE_SDMA,
-                          COMPLETION_TYPE_COUNTER, 0};
+    CompletionToken token{
+        reinterpret_cast<uint64_t>(counter_addr), expected_value, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
+    };
     (void)register_completion_condition(ctx, token);
     pto2::detail::defer_flush(ctx);
 }

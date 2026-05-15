@@ -83,9 +83,7 @@ inline CompletionPollResult sdma_event_record_poll_op(const CompletionCondition 
     return poll_sdma_event_record(cond.addr);
 }
 
-inline void sdma_event_record_retire_op(CompletionCondition &cond) {
-    retire_sdma_event_record(cond.addr);
-}
+inline void sdma_event_record_retire_op(CompletionCondition &cond) { retire_sdma_event_record(cond.addr); }
 
 inline const CompletionBackendOps *completion_backend_ops_for(int completion_type) {
     static const CompletionBackendOps kOps[] = {
@@ -262,8 +260,8 @@ struct AsyncWaitList {
     enum class RegisterResult { Registered, NotDeferred, Skipped, Error };
 
     bool append_condition_locked(
-        AsyncWaitEntry &entry, uint64_t addr, uint32_t expected_value, AsyncEngine engine,
-        int32_t completion_type, int32_t &error_code
+        AsyncWaitEntry &entry, uint64_t addr, uint32_t expected_value, AsyncEngine engine, int32_t completion_type,
+        int32_t &error_code
     ) {
         if (entry.condition_count >= MAX_COMPLETIONS_PER_TASK) {
             error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
@@ -342,9 +340,7 @@ struct AsyncWaitList {
             if (deferred->completion_type == COMPLETION_TYPE_COUNTER) {
                 volatile uint32_t *counter =
                     reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(deferred->addr));
-                cache_invalidate_range(
-                    reinterpret_cast<const void *>(mailbox_cache_line(counter)), sizeof(uint32_t)
-                );
+                cache_invalidate_range(reinterpret_cast<const void *>(mailbox_cache_line(counter)), sizeof(uint32_t));
             }
             if (!append_condition_locked(
                     *entry, deferred->addr, deferred->expected_value, static_cast<AsyncEngine>(deferred->engine),
@@ -362,9 +358,9 @@ struct AsyncWaitList {
 
     template <bool Profiling>
     AsyncPollResult poll_and_complete(
-        volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched,
-        PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states,
-        int32_t &deferred_release_count, int32_t deferred_release_capacity
+        volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
+        PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
+        int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING
         ,
         int thread_idx

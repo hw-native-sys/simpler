@@ -76,8 +76,7 @@ struct AICoreCompletionMailbox {
 };
 
 static_assert(
-    sizeof(AICoreCompletionMailbox) % PTO2_ALIGN_SIZE == 0,
-    "AICoreCompletionMailbox size must be cache-line aligned"
+    sizeof(AICoreCompletionMailbox) % PTO2_ALIGN_SIZE == 0, "AICoreCompletionMailbox size must be cache-line aligned"
 );
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_AICORE_COMPLETION_MAILBOX_H_

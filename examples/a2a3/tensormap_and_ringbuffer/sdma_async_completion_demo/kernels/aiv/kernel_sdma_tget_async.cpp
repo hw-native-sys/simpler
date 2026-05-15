@@ -66,7 +66,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     AsyncCtx async_ctx = get_async_ctx(args);
     send_request_entry(
         async_ctx,
-        SdmaTget(local_global, remote_global, scratch_tile,
-                 reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace))
+        SdmaTget(local_global, remote_global, scratch_tile, reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace))
     );
 }

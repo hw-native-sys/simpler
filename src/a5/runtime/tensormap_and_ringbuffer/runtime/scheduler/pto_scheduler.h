@@ -1019,9 +1019,8 @@ struct PTO2SchedulerState {
 
 template <bool Profiling>
 inline AsyncPollResult AsyncWaitList::poll_and_complete(
-    volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched,
-    PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
-    int32_t deferred_release_capacity
+    volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
+    PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count, int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING
     ,
     int thread_idx

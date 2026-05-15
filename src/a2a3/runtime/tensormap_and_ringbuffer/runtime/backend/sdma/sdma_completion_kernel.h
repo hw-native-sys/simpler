@@ -63,8 +63,8 @@ inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> Sdma
     const DstTensor &dst, const SrcTensor &src, const ScratchTileT &scratch, __gm__ uint8_t *workspace,
     uint32_t sync_id = 0
 ) {
-    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TGET, dst, src, scratch, workspace,
-                                                                     sync_id};
+    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TGET, dst,       src,
+                                                                     scratch,      workspace, sync_id};
 }
 
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
@@ -72,15 +72,16 @@ inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> Sdma
     const DstTensor &dst, const SrcTensor &src, const ScratchTileT &scratch, __gm__ uint8_t *workspace,
     uint32_t sync_id = 0
 ) {
-    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TPUT, dst, src, scratch, workspace,
-                                                                     sync_id};
+    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TPUT, dst,       src,
+                                                                     scratch,      workspace, sync_id};
 }
 
 namespace pto2::detail {
 
 inline __aicore__ void register_sdma_event_record(AsyncCtx &ctx, volatile __gm__ void *record_addr) {
-    CompletionToken token{reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA,
-                          COMPLETION_TYPE_SDMA_EVENT_RECORD, 0};
+    CompletionToken token{
+        reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD, 0
+    };
     (void)register_completion_condition(ctx, token);
 }
 
@@ -123,23 +124,19 @@ register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsy
 // AsyncCtx deferred-wait slab and flushes. Returns false on submit/session
 // failure (also records the error in ctx.completion_error_code).
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
-inline __aicore__ bool send_request_entry(
-    AsyncCtx &ctx, const SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> &desc
-) {
-    ScratchTileT scratch = desc.scratch;
+inline __aicore__ bool
+send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> desc) {
     pto::comm::AsyncSession session;
-    if (!pto::comm::BuildAsyncSession(scratch, desc.workspace, session, desc.sync_id)) {
+    if (!pto::comm::BuildAsyncSession(desc.scratch, desc.workspace, session, desc.sync_id)) {
         pto2::detail::defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
 
-    DstTensor dst = desc.dst;
-    SrcTensor src = desc.src;
     pto::comm::AsyncEvent event;
     if (desc.op == SdmaOp::TGET) {
-        event = pto::comm::TGET_ASYNC(dst, src, session);
+        event = pto::comm::TGET_ASYNC(desc.dst, desc.src, session);
     } else {
-        event = pto::comm::TPUT_ASYNC(dst, src, session);
+        event = pto::comm::TPUT_ASYNC(desc.dst, desc.src, session);
     }
     pto2::detail::register_pto_async_event(ctx, event, session);
     pto2::detail::defer_flush(ctx);
