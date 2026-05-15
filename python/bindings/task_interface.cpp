@@ -448,7 +448,8 @@ NB_MODULE(_task_interface, m) {
                 // `buffer_size()`. Used by the L4 cascade in
                 // _child_worker_loop, which receives CTRL_REGISTER bytes
                 // through shared memory and needs a typed ChipCallable to
-                // hand to inner_worker.register; see
+                // hand to inner_worker._register_at (the cid is dictated
+                // by the outer cascade, not freshly allocated); see
                 // docs/callable-ipc-dynamic-register.md.
                 std::vector<uint8_t> buf(
                     reinterpret_cast<const uint8_t *>(raw.c_str()),

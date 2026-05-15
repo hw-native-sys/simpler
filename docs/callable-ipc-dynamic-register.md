@@ -250,6 +250,17 @@ Partial state left in successful children — an entry in the AICPU
 `orch_so_table_` that will never receive a TASK_READY for this cid —
 is inert garbage and is overwritten when the cid is reused.
 
+The self-heal path has a compound failure mode worth noting: if
+`cw.unregister_callable` (the defensive cleanup) raises *and* the
+follow-up `prepare_callable_from_blob` also raises, the child publishes
+`OFF_ERROR=1` and the parent pops the registry, but C++-side
+`prepared_callables_` / AICPU `orch_so_table_` may stay populated. That
+residue is the same flavour of inert garbage discussed above: the next
+attempt to register the same cid re-enters self-heal (because the
+child's `prepared` set still holds it) and gives `unregister_callable`
+another chance; if the cid is never reused, the entry sits until
+`DeviceRunner::finalize` clears the slot at process exit.
+
 ### Concurrency
 
 - `Worker.register` / `Worker.unregister` are driven through C++

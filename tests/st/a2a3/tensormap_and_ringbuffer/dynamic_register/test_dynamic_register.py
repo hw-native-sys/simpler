@@ -342,11 +342,10 @@ def test_register_unregister_register_runs_each_time(st_platform, st_device_ids)
         worker.unregister(cid_dyn)
         assert cid_dyn not in worker._callable_registry
 
-        # 4. Re-register and run again. The freed slot is reused — cid
-        #    allocation is `len(registry)` and the unregister popped one
-        #    entry, so the next register lands on the same index as the
-        #    just-unregistered cid. This is the slot-recycling property
-        #    that unregister exists for.
+        # 4. Re-register and run again. `_allocate_cid` returns the
+        #    smallest unused integer, so the freed slot is reused
+        #    immediately. This is the slot-recycling property that
+        #    unregister exists for.
         cid_again = worker.register(chip_callable)
         assert cid_again == cid_dyn, "unregister should free the cid slot for reuse"
 

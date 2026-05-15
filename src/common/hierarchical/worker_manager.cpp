@@ -369,9 +369,8 @@ void WorkerThread::control_prepare(int32_t cid) {
 
 void WorkerThread::control_register(int32_t cid, const char *shm_name) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    int32_t zero_err = 0;
-    std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
-    std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
+    // OFF_ERROR / OFF_ERROR_MSG are cleared by run_control_command — no
+    // prelude memset needed (matches the other control_* methods).
     uint64_t sub_cmd = CTRL_REGISTER;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     uint64_t cid_v = static_cast<uint32_t>(cid);
