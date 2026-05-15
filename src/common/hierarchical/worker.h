@@ -40,6 +40,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "ring.h"
 #include "orchestrator.h"
@@ -82,6 +84,20 @@ public:
     // Accessor: the Orchestrator handle used by the user's orch fn. Valid
     // only between init() and close().
     Orchestrator &get_orchestrator() { return orchestrator_; }
+
+    // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker (prewarm path
+    // used by the Python facade at end of _start_hierarchical).
+    void control_prepare(int worker_id, int32_t cid) { manager_.control_prepare(worker_id, cid); }
+
+    // Broadcast CTRL_REGISTER / CTRL_UNREGISTER for a ChipCallable cid to
+    // every NEXT_LEVEL child in parallel. `blob_ptr`/`blob_size` describe
+    // the contiguous ChipCallable bytes (see PyChipCallable::buffer_ptr /
+    // buffer_size). Throws on any child error for register; unregister is
+    // best-effort and returns the per-child error list.
+    void broadcast_register_all(int32_t cid, uint64_t blob_ptr, uint64_t blob_size) {
+        manager_.broadcast_register_all(cid, reinterpret_cast<const void *>(blob_ptr), static_cast<size_t>(blob_size));
+    }
+    std::vector<std::string> broadcast_unregister_all(int32_t cid) { return manager_.broadcast_unregister_all(cid); }
 
 private:
     int32_t level_;

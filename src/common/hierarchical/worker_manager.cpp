@@ -11,9 +11,19 @@
 
 #include "worker_manager.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "ring.h"
 
@@ -351,6 +361,38 @@ uint64_t WorkerThread::control_malloc(size_t size) {
     return read_control_result(mbox());
 }
 
+void WorkerThread::control_prepare(int32_t cid) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_PREPARE, static_cast<uint64_t>(static_cast<uint32_t>(cid)));
+    run_control_command("control_prepare");
+}
+
+void WorkerThread::control_register(int32_t cid, const char *shm_name) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    int32_t zero_err = 0;
+    std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
+    std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
+    uint64_t sub_cmd = CTRL_REGISTER;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    uint64_t cid_v = static_cast<uint32_t>(cid);
+    std::memcpy(mbox() + CTRL_OFF_ARG0, &cid_v, sizeof(uint64_t));
+    // Stage the NUL-terminated shm name in the args region. Pad with zeros so
+    // stale bytes from a prior control op cannot leak into the child's decode.
+    size_t name_len = std::strlen(shm_name);
+    if (name_len + 1 > CTRL_SHM_NAME_BYTES) {
+        throw std::runtime_error(std::string("control_register: shm name too long: ") + shm_name);
+    }
+    std::memcpy(mbox() + MAILBOX_OFF_ARGS, shm_name, name_len);
+    std::memset(mbox() + MAILBOX_OFF_ARGS + name_len, 0, CTRL_SHM_NAME_BYTES - name_len);
+    run_control_command("control_register");
+}
+
+void WorkerThread::control_unregister(int32_t cid) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_UNREGISTER, static_cast<uint64_t>(static_cast<uint32_t>(cid)));
+    run_control_command("control_unregister");
+}
+
 void WorkerThread::control_free(uint64_t ptr) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_FREE, ptr);
@@ -375,4 +417,174 @@ bool WorkerManager::any_busy() const {
     for (auto &wt : sub_threads_)
         if (!wt->idle()) return true;
     return false;
+}
+
+// =============================================================================
+// Dynamic register/unregister broadcast (POSIX shm staging + parallel fan-out)
+// =============================================================================
+
+namespace {
+
+// Process-wide monotonic counter so concurrent broadcasts to the same cid
+// don't collide on shm name. Atomic increment is enough — no need to lock.
+std::atomic<uint64_t> g_shm_counter{0};
+
+// Build the per-broadcast POSIX shm name. The name itself does NOT carry the
+// leading '/' that shm_open requires (Python's multiprocessing.SharedMemory
+// uses the same convention, so the child Python side reads the field as a
+// plain name). Caller adds '/' when opening.
+std::string make_shm_name(int32_t cid) {
+    char buf[CTRL_SHM_NAME_BYTES];
+    int pid = static_cast<int>(getpid());
+    uint64_t counter = g_shm_counter.fetch_add(1, std::memory_order_relaxed);
+    int n = std::snprintf(
+        buf, sizeof(buf), "simpler-cb-%d-%d-%llu", pid, static_cast<int>(cid), static_cast<unsigned long long>(counter)
+    );
+    if (n < 0 || static_cast<size_t>(n) >= sizeof(buf)) {
+        throw std::runtime_error("broadcast_register: shm name overflow");
+    }
+    return std::string(buf);
+}
+
+// Strip the outer "<op_name> failed on child: " prefix that
+// run_control_command prepends to every control failure, so the broadcast
+// caller can surface the child-side message (`register cid=<N>
+// chip=<id>: <reason>` per docs §6) directly under its own one-line
+// Worker.{register,unregister}(cid=N) prefix.
+std::string strip_control_prefix(const std::string &msg, const std::string &op_name) {
+    const std::string needle = op_name + " failed on child: ";
+    if (msg.compare(0, needle.size(), needle) == 0) {
+        return msg.substr(needle.size());
+    }
+    return msg;
+}
+
+// RAII guard for a POSIX shm segment: create on construction, unlink on
+// destruction. mmaps the region so the staged blob can be memcpy'd in
+// place; the mmap is released in the destructor as well. The shm is only
+// unlinked once — children open by name *before* this guard is destroyed.
+class PosixShmHolder {
+public:
+    PosixShmHolder(const std::string &name, size_t size) :
+        name_(name),
+        size_(size) {
+        std::string full_name = "/" + name_;
+        fd_ = shm_open(full_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
+        if (fd_ < 0) {
+            throw std::runtime_error(
+                std::string("broadcast_register: shm_open(") + full_name + ") failed: " + std::strerror(errno)
+            );
+        }
+        if (ftruncate(fd_, static_cast<off_t>(size)) != 0) {
+            int err = errno;
+            ::close(fd_);
+            shm_unlink(full_name.c_str());
+            throw std::runtime_error(std::string("broadcast_register: ftruncate failed: ") + std::strerror(err));
+        }
+        addr_ = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        if (addr_ == MAP_FAILED) {
+            int err = errno;
+            ::close(fd_);
+            shm_unlink(full_name.c_str());
+            addr_ = nullptr;
+            throw std::runtime_error(std::string("broadcast_register: mmap failed: ") + std::strerror(err));
+        }
+    }
+    ~PosixShmHolder() {
+        if (addr_ != nullptr) munmap(addr_, size_);
+        if (fd_ >= 0) ::close(fd_);
+        std::string full_name = "/" + name_;
+        shm_unlink(full_name.c_str());
+    }
+    PosixShmHolder(const PosixShmHolder &) = delete;
+    PosixShmHolder &operator=(const PosixShmHolder &) = delete;
+
+    void *addr() { return addr_; }
+    const std::string &name() const { return name_; }
+
+private:
+    std::string name_;
+    size_t size_{0};
+    int fd_{-1};
+    void *addr_{nullptr};
+};
+
+}  // namespace
+
+void WorkerManager::control_prepare(int worker_id, int32_t cid) {
+    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_prepare: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_prepare(cid);
+}
+
+void WorkerManager::broadcast_register_all(int32_t cid, const void *blob_ptr, size_t blob_size) {
+    if (next_level_threads_.empty()) return;
+
+    std::string shm_name = make_shm_name(cid);
+    PosixShmHolder shm(shm_name, blob_size);
+    std::memcpy(shm.addr(), blob_ptr, blob_size);
+
+    // Fan out to every WorkerThread in parallel. Per-WorkerThread mailbox_mu_
+    // is independent, so N control_register calls run concurrently — latency
+    // is 1 × prepare_cost instead of N × prepare_cost.
+    std::vector<std::exception_ptr> errors(next_level_threads_.size(), nullptr);
+    std::vector<std::thread> workers;
+    workers.reserve(next_level_threads_.size());
+    for (size_t i = 0; i < next_level_threads_.size(); ++i) {
+        workers.emplace_back([this, i, cid, name = shm.name(), &errors]() {
+            try {
+                next_level_threads_[i]->control_register(cid, name.c_str());
+            } catch (...) {
+                errors[i] = std::current_exception();
+            }
+        });
+    }
+    for (auto &t : workers)
+        t.join();
+
+    // shm is unlinked when `shm` goes out of scope. Children opened it by
+    // name during control_register and have already closed their mappings
+    // before publishing CONTROL_DONE — see python/simpler/worker.py.
+
+    for (size_t i = 0; i < errors.size(); ++i) {
+        if (errors[i]) {
+            try {
+                std::rethrow_exception(errors[i]);
+            } catch (const std::exception &e) {
+                std::string msg = strip_control_prefix(e.what(), "control_register");
+                throw std::runtime_error(
+                    std::string("Worker.register(cid=") + std::to_string(cid) + ") failed on next_level " +
+                    std::to_string(i) + ": " + msg
+                );
+            }
+        }
+    }
+}
+
+std::vector<std::string> WorkerManager::broadcast_unregister_all(int32_t cid) {
+    std::vector<std::string> errors;
+    if (next_level_threads_.empty()) return errors;
+
+    std::vector<std::string> per_worker(next_level_threads_.size());
+    std::vector<std::thread> workers;
+    workers.reserve(next_level_threads_.size());
+    for (size_t i = 0; i < next_level_threads_.size(); ++i) {
+        workers.emplace_back([this, i, cid, &per_worker]() {
+            try {
+                next_level_threads_[i]->control_unregister(cid);
+            } catch (const std::exception &e) {
+                std::string msg = strip_control_prefix(e.what(), "control_unregister");
+                per_worker[i] = std::string("next_level ") + std::to_string(i) + ": " + msg;
+            }
+        });
+    }
+    for (auto &t : workers)
+        t.join();
+
+    for (auto &msg : per_worker) {
+        if (!msg.empty()) errors.push_back(std::move(msg));
+    }
+    return errors;
 }

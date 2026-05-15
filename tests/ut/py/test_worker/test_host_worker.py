@@ -19,7 +19,7 @@ from multiprocessing.shared_memory import SharedMemory
 import pytest
 from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
 from simpler.task_interface import ChipCallable, DataType, TaskArgs, TensorArgType
-from simpler.worker import Worker, _make_callable_shm_name
+from simpler.worker import Worker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,10 +76,10 @@ class TestLifecycle:
         hw.close()
 
     def test_register_chip_callable_after_init_no_chips_succeeds(self):
-        # With no chip children (device_ids unset), the dynamic register
-        # broadcast loop iterates over zero mailboxes — exercises the
-        # facade path (lock, _post_init_register, shm create/unlink,
-        # registry insertion) end-to-end without needing an NPU.
+        # With no chip children (device_ids unset), the C++ broadcast is a
+        # no-op (next_level_threads_ is empty) — exercises the facade path
+        # (registry lock, cid allocation, broadcast call, return) end-to-end
+        # without needing an NPU.
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
@@ -106,102 +106,6 @@ class TestLifecycle:
         finally:
             hw.close()
 
-    def test_register_chip_callable_during_run_raises(self):
-        # The quiescent-state guard: a register call that races a Worker.run
-        # must surface a clear RuntimeError instead of deadlocking on a
-        # CONTROL_REQUEST that overlaps an in-flight TASK_READY. The orch fn
-        # signals once it is in flight (which is also after Worker.run() has
-        # bumped _orch_in_flight under _register_lock); the side thread
-        # waits for that signal before attempting register.
-        hw = Worker(level=3, num_sub_workers=1)
-        hw.register(lambda args: None)
-        hw.init()
-        try:
-            run_started = threading.Event()
-            release = threading.Event()
-            register_err: list[BaseException] = []
-
-            def orch(orch_handle, _args, _cfg):
-                run_started.set()
-                release.wait(timeout=5.0)
-
-            def try_register():
-                # Wait until orch fn is in flight (guarantees _orch_in_flight
-                # was bumped to 1 before our register attempts to acquire
-                # _register_lock).
-                assert run_started.wait(timeout=5.0), "orch never started"
-                try:
-                    callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
-                    hw.register(callable_obj)
-                except BaseException as e:  # noqa: BLE001
-                    register_err.append(e)
-                finally:
-                    release.set()
-
-            t = threading.Thread(target=try_register)
-            t.start()
-            try:
-                hw.run(orch)
-            finally:
-                t.join(timeout=5.0)
-            assert register_err, "expected register to raise during run"
-            assert isinstance(register_err[0], RuntimeError)
-            assert "Worker.run() is executing" in str(register_err[0])
-        finally:
-            hw.close()
-
-    def test_register_chip_callable_broadcast_failure_rolls_back(self, monkeypatch):
-        # Forces _post_init_register down the CTRL_REGISTER broadcast path
-        # (hierarchical_started=True + a fake chip mailbox), then makes the
-        # broadcast helper raise. Verifies the parent rolls back cleanly:
-        # registry entry popped, shm unlinked, RuntimeError surfaced. This
-        # is the only test that exercises the failure path end-to-end on
-        # the facade — the ST suite cannot stage a deterministic
-        # prepare-time fault in the chip child.
-        import simpler.worker  # noqa: PLC0415
-
-        hw = Worker(level=3, num_sub_workers=0)
-        hw.register(lambda args: None)
-        hw.init()
-        try:
-            # Splice a placeholder mailbox so the broadcast loop iterates
-            # once; the monkeypatched helper never reads it.
-            fake_mailbox = SharedMemory(create=True, size=4096)
-            hw._chip_shms.append(fake_mailbox)
-            hw._hierarchical_started = True
-            try:
-                captured_shm_names: list[str] = []
-                real_make = simpler.worker._make_callable_shm_name
-
-                def capture_shm_name(pid, cid):
-                    name = real_make(pid, cid)
-                    captured_shm_names.append(name)
-                    return name
-
-                monkeypatch.setattr(simpler.worker, "_make_callable_shm_name", capture_shm_name)
-
-                def fail_broadcast(self, mailbox, label, cid, shm_name):
-                    raise RuntimeError(f"{label}: register cid={cid} chip=0: simulated")
-
-                monkeypatch.setattr(Worker, "_mailbox_control_register", fail_broadcast)
-
-                callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
-                registry_size_before = len(hw._callable_registry)
-                with pytest.raises(RuntimeError, match=r"failed; 1 of 1 chips reported errors"):
-                    hw.register(callable_obj)
-                # cid was popped — registry size is unchanged.
-                assert len(hw._callable_registry) == registry_size_before
-                # The shm the parent staged for the broadcast was unlinked.
-                assert len(captured_shm_names) == 1
-                with pytest.raises(FileNotFoundError):
-                    SharedMemory(name=captured_shm_names[0])
-            finally:
-                hw._chip_shms.pop()
-                fake_mailbox.close()
-                fake_mailbox.unlink()
-        finally:
-            hw.close()
-
     def test_unregister_unknown_cid_raises(self):
         # Symmetric to register: unregister must fail loud if the caller
         # confuses cid for an unrelated integer or unregisters twice.
@@ -214,11 +118,11 @@ class TestLifecycle:
             hw.close()
 
     def test_unregister_chip_callable_after_init_no_chips_succeeds(self):
-        # Mirrors test_register_chip_callable_after_init_no_chips_succeeds:
-        # with zero chip mailboxes the broadcast loop is a no-op, so the
-        # facade path (lock, registry pop, return) is exercised end-to-end
-        # without an NPU. Also verifies cid reuse — unregistering frees the
-        # slot for a subsequent register.
+        # With zero chip mailboxes the C++ broadcast is a no-op, so the
+        # facade path (registry lock, broadcast, registry pop) is exercised
+        # end-to-end without an NPU. Also verifies cid reuse — unregistering
+        # frees the slot and the next register reuses the same cid via
+        # `_allocate_cid` (smallest-unused-integer).
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
@@ -227,85 +131,32 @@ class TestLifecycle:
             assert cid_a in hw._callable_registry
             hw.unregister(cid_a)
             assert cid_a not in hw._callable_registry
-            # Slot can be reused. The next cid is allocated by len(registry),
-            # so freeing cid_a does not immediately reuse its index, but the
-            # registry can still grow up to MAX_REGISTERED_CALLABLE_IDS again.
             cid_b = hw.register(callable_obj)
-            assert cid_b in hw._callable_registry
+            assert cid_b == cid_a, "smallest-unused-cid policy should reuse the freed slot"
         finally:
             hw.close()
 
-    def test_unregister_chip_callable_during_run_raises(self):
-        # Quiescent-state guard: same shape as the register-during-run test,
-        # validates that unregister also refuses to write CTRL_UNREGISTER
-        # over an in-flight TASK_READY.
-        hw = Worker(level=3, num_sub_workers=1)
-        hw.register(lambda args: None)
-        hw.init()
-        try:
-            run_started = threading.Event()
-            release = threading.Event()
-            unregister_err: list[BaseException] = []
-
-            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
-            cid_chip = hw.register(callable_obj)
-
-            def orch(orch_handle, _args, _cfg):
-                run_started.set()
-                release.wait(timeout=5.0)
-
-            def try_unregister():
-                assert run_started.wait(timeout=5.0), "orch never started"
-                try:
-                    hw.unregister(cid_chip)
-                except BaseException as e:  # noqa: BLE001
-                    unregister_err.append(e)
-                finally:
-                    release.set()
-
-            t = threading.Thread(target=try_unregister)
-            t.start()
-            try:
-                hw.run(orch)
-            finally:
-                t.join(timeout=5.0)
-            assert unregister_err, "expected unregister to raise during run"
-            assert isinstance(unregister_err[0], RuntimeError)
-            assert "Worker.run() is executing" in str(unregister_err[0])
-        finally:
-            hw.close()
-
-    def test_unregister_chip_callable_broadcast_warns_and_still_pops(self, monkeypatch, capsys):
-        # Best-effort failure semantics (docs section 8): a broadcast error
-        # must NOT prevent the registry pop. We monkeypatch the broadcast
-        # helper to raise, then verify the cid is gone from the registry
-        # and a warning hit stderr.
-
+    def test_unregister_middle_cid_reuses_hole(self):
+        # `_allocate_cid` must fill the smallest hole, not append at
+        # len(registry). The bug it guards against: register 0/1/2,
+        # unregister 1, next register would silently overwrite the
+        # existing cid=2 under a `len(registry)` policy.
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
-            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
-            cid = hw.register(callable_obj)
-
-            fake_mailbox = SharedMemory(create=True, size=4096)
-            hw._chip_shms.append(fake_mailbox)
-            hw._hierarchical_started = True
-            try:
-
-                def fail_unregister(self, mailbox, label, cid):
-                    raise RuntimeError(f"{label}: unregister cid={cid} chip=0: simulated")
-
-                monkeypatch.setattr(Worker, "_mailbox_control_unregister", fail_unregister)
-
-                hw.unregister(cid)  # must NOT raise — best-effort
-                assert cid not in hw._callable_registry
-                err_msg = capsys.readouterr().err
-                assert f"Worker.unregister(cid={cid})" in err_msg
-                assert "1 of 1 chips reported errors" in err_msg
-            finally:
-                hw._chip_shms.pop()
-                fake_mailbox.close()
-                fake_mailbox.unlink()
+            cb = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+            cid0 = hw.register(cb)
+            cid1 = hw.register(cb)
+            cid2 = hw.register(cb)
+            assert (cid0, cid1, cid2) == (0, 1, 2)
+            hw.unregister(cid1)
+            cid_reused = hw.register(cb)
+            assert cid_reused == 1, "hole at cid=1 should be reused before appending"
+            # cid=2 entry must still be the original callable, not silently overwritten.
+            assert hw._callable_registry[cid2] is cb
+            # Next register fills cid=3 since 0..2 are all occupied.
+            cid_next = hw.register(cb)
+            assert cid_next == 3
         finally:
             hw.close()
 
@@ -730,20 +581,202 @@ class TestSubCallableArgs:
 
 
 # ---------------------------------------------------------------------------
-# Test: _CTRL_REGISTER shm name helper
+# Test: _CTRL_REGISTER self-heal on cid reuse
 # ---------------------------------------------------------------------------
 
 
-class TestCallableShmName:
-    def test_make_callable_shm_name_unique(self):
-        # Consecutive calls with the same (pid, cid) must produce different
-        # names — the monotonic counter is the disambiguator that lets
-        # multiple registers coexist without POSIX shm name collisions.
-        a = _make_callable_shm_name(1234, 7)
-        b = _make_callable_shm_name(1234, 7)
-        assert a != b
-        # Both must fit in the on-wire field with a NUL terminator (32 B).
-        assert len(a.encode("utf-8")) + 1 <= 32
-        assert len(b.encode("utf-8")) + 1 <= 32
-        assert a.startswith("simpler-cb-1234-7-")
-        assert b.startswith("simpler-cb-1234-7-")
+class TestChipMainLoopRegisterSelfHeal:
+    """Direct white-box tests on the _run_chip_main_loop self-heal branch.
+
+    Drives the loop in a background thread with a MagicMock ChipWorker and
+    a real shm mailbox. Each test simulates the parent by writing a control
+    command, waiting for the child to publish _CONTROL_DONE, resetting the
+    state to _IDLE, and finally writing _SHUTDOWN. This exercises the
+    actual state-machine code path including the self-heal block; injecting
+    `prepared = {cid}` directly is not possible because the set is a local
+    in the loop function — the seed comes from a real prior CTRL_REGISTER.
+    """
+
+    @staticmethod
+    def _build_mailbox():
+        from simpler.task_interface import MAILBOX_SIZE  # noqa: PLC0415
+        from simpler.worker import _IDLE, _OFF_STATE, _buffer_field_addr, _mailbox_store_i32  # noqa: PLC0415
+
+        shm = SharedMemory(create=True, size=MAILBOX_SIZE)
+        buf = shm.buf
+        assert buf is not None
+        # Loop reads the state field via a raw address (atomic_int32 in C++),
+        # so we hand it the absolute address and let it cast back inside.
+        state_addr = _buffer_field_addr(buf, _OFF_STATE)
+        _mailbox_store_i32(state_addr, _IDLE)
+        # `mailbox_addr` is only consumed by the TASK_READY branch, which we
+        # never reach in these tests; passing 0 keeps the harness lean.
+        return shm, buf, state_addr
+
+    @staticmethod
+    def _send_ctrl_register(buf, state_addr, cid: int, shm_name: str):
+        """Stage a CTRL_REGISTER request and flip the state to CONTROL_REQUEST."""
+        from simpler.worker import (  # noqa: PLC0415
+            _CONTROL_REQUEST,
+            _CTRL_OFF_ARG0,
+            _CTRL_REGISTER,
+            _CTRL_SHM_NAME_BYTES,
+            _OFF_ARGS,
+            _OFF_CALLABLE,
+            _mailbox_store_i32,
+        )
+
+        struct.pack_into("Q", buf, _OFF_CALLABLE, _CTRL_REGISTER)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG0, cid)
+        encoded = shm_name.encode("utf-8")
+        assert len(encoded) + 1 <= _CTRL_SHM_NAME_BYTES
+        buf[_OFF_ARGS : _OFF_ARGS + len(encoded)] = encoded
+        buf[_OFF_ARGS + len(encoded) : _OFF_ARGS + _CTRL_SHM_NAME_BYTES] = b"\x00" * (
+            _CTRL_SHM_NAME_BYTES - len(encoded)
+        )
+        _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
+
+    @staticmethod
+    def _wait_for_done_and_reset(buf, state_addr, timeout: float = 5.0):
+        """Block until the loop publishes _CONTROL_DONE, then read the error
+        code and reset the mailbox to _IDLE so the next round can start."""
+        import time  # noqa: PLC0415
+
+        from simpler.worker import (  # noqa: PLC0415
+            _CONTROL_DONE,
+            _IDLE,
+            _OFF_ERROR,
+            _mailbox_load_i32,
+            _mailbox_store_i32,
+        )
+
+        deadline = time.monotonic() + timeout
+        while _mailbox_load_i32(state_addr) != _CONTROL_DONE:
+            if time.monotonic() > deadline:
+                raise TimeoutError("loop did not publish CONTROL_DONE")
+            time.sleep(0.001)
+        err_code = struct.unpack_from("i", buf, _OFF_ERROR)[0]
+        _mailbox_store_i32(state_addr, _IDLE)
+        return err_code
+
+    @staticmethod
+    def _shutdown(state_addr):
+        from simpler.worker import _SHUTDOWN, _mailbox_store_i32  # noqa: PLC0415
+
+        _mailbox_store_i32(state_addr, _SHUTDOWN)
+
+    @staticmethod
+    def _spawn_loop(cw, buf, state_addr):
+        from simpler.worker import _run_chip_main_loop  # noqa: PLC0415
+
+        t = threading.Thread(
+            target=_run_chip_main_loop,
+            args=(cw, buf, 0, state_addr, 0, {}),
+            daemon=True,
+        )
+        t.start()
+        return t
+
+    def test_no_self_heal_when_prepared_clean(self):
+        # First CTRL_REGISTER on a fresh loop: `prepared` starts empty, so the
+        # self-heal branch must be skipped — no extra unregister_callable call.
+        # Locks in the zero-cost happy path.
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        cw = MagicMock()
+        cw.unregister_callable = MagicMock()
+        cw._impl.prepare_callable_from_blob = MagicMock()
+
+        payload_shm = SharedMemory(create=True, size=64)
+        shm, buf, state_addr = self._build_mailbox()
+        try:
+            t = self._spawn_loop(cw, buf, state_addr)
+            try:
+                self._send_ctrl_register(buf, state_addr, cid=7, shm_name=payload_shm.name)
+                err = self._wait_for_done_and_reset(buf, state_addr)
+                assert err == 0
+                # Critical assertion: no self-heal cleanup on a fresh slot.
+                assert cw.unregister_callable.call_count == 0
+                assert cw._impl.prepare_callable_from_blob.call_count == 1
+            finally:
+                self._shutdown(state_addr)
+                t.join(timeout=2.0)
+        finally:
+            shm.close()
+            shm.unlink()
+            payload_shm.close()
+            payload_shm.unlink()
+
+    def test_self_heal_triggers_on_repeat_register(self):
+        # Second CTRL_REGISTER on the same cid: after the first round
+        # `prepared` holds 7, so the loop must self-heal — call
+        # unregister_callable to clear host-side residue before re-preparing.
+        # This is the scenario a best-effort unregister failure leaves behind.
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        cw = MagicMock()
+        cw.unregister_callable = MagicMock()
+        cw._impl.prepare_callable_from_blob = MagicMock()
+
+        payload_shm = SharedMemory(create=True, size=64)
+        shm, buf, state_addr = self._build_mailbox()
+        try:
+            t = self._spawn_loop(cw, buf, state_addr)
+            try:
+                # Round 1: seed `prepared = {7}`.
+                self._send_ctrl_register(buf, state_addr, cid=7, shm_name=payload_shm.name)
+                assert self._wait_for_done_and_reset(buf, state_addr) == 0
+                assert cw.unregister_callable.call_count == 0
+                # Round 2: cid=7 already in `prepared` -> self-heal fires.
+                self._send_ctrl_register(buf, state_addr, cid=7, shm_name=payload_shm.name)
+                assert self._wait_for_done_and_reset(buf, state_addr) == 0
+                # Self-heal called unregister_callable exactly once, then
+                # prepare_callable_from_blob ran on the cleaned slot.
+                assert cw.unregister_callable.call_count == 1
+                cw.unregister_callable.assert_called_with(7)
+                assert cw._impl.prepare_callable_from_blob.call_count == 2
+            finally:
+                self._shutdown(state_addr)
+                t.join(timeout=2.0)
+        finally:
+            shm.close()
+            shm.unlink()
+            payload_shm.close()
+            payload_shm.unlink()
+
+    def test_self_heal_tolerates_unregister_exception(self):
+        # The self-heal try/except must swallow exceptions from
+        # unregister_callable so a flaky cleanup does not block the new
+        # registration. The follow-on prepare_callable_from_blob still runs
+        # and the mailbox publishes a clean (code=0) CONTROL_DONE.
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        cw = MagicMock()
+        # First call: succeeds (seed phase has no self-heal invocation).
+        # Second call (self-heal): raises — must be swallowed.
+        cw.unregister_callable = MagicMock(side_effect=[RuntimeError("simulated")])
+        cw._impl.prepare_callable_from_blob = MagicMock()
+
+        payload_shm = SharedMemory(create=True, size=64)
+        shm, buf, state_addr = self._build_mailbox()
+        try:
+            t = self._spawn_loop(cw, buf, state_addr)
+            try:
+                # Round 1: no self-heal, prepared seeded with {7}.
+                self._send_ctrl_register(buf, state_addr, cid=7, shm_name=payload_shm.name)
+                assert self._wait_for_done_and_reset(buf, state_addr) == 0
+                # Round 2: self-heal fires; unregister_callable raises but is
+                # caught; prepare_callable_from_blob still runs.
+                self._send_ctrl_register(buf, state_addr, cid=7, shm_name=payload_shm.name)
+                err = self._wait_for_done_and_reset(buf, state_addr)
+                assert err == 0, "self-heal exception leaked into mailbox error code"
+                assert cw.unregister_callable.call_count == 1
+                assert cw._impl.prepare_callable_from_blob.call_count == 2
+            finally:
+                self._shutdown(state_addr)
+                t.join(timeout=2.0)
+        finally:
+            shm.close()
+            shm.unlink()
+            payload_shm.close()
+            payload_shm.unlink()

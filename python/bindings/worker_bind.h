@@ -221,6 +221,30 @@ inline void bind_worker(nb::module_ &m) {
         .def(
             "get_orchestrator", &Worker::get_orchestrator, nb::rv_policy::reference_internal,
             "Return the Orchestrator handle (lifetime tied to this Worker)."
+        )
+
+        // --- Mailbox control plane (parent side) ---
+        // These hold the per-WorkerThread mailbox_mu_ inside C++, so they
+        // serialize against dispatch_process without any Python-side lock.
+        // Release the GIL during the spin-poll wait so other Python threads
+        // (e.g. a concurrent Worker.run) can keep running.
+        .def(
+            "control_prepare", &Worker::control_prepare, nb::arg("worker_id"), nb::arg("cid"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Prewarm a NEXT_LEVEL child for `cid` by sending CTRL_PREPARE. "
+            "Blocks until the child publishes CONTROL_DONE."
+        )
+        .def(
+            "broadcast_register_all", &Worker::broadcast_register_all, nb::arg("cid"), nb::arg("blob_ptr"),
+            nb::arg("blob_size"), nb::call_guard<nb::gil_scoped_release>(),
+            "Stage `blob_size` bytes from `blob_ptr` into a POSIX shm and broadcast "
+            "CTRL_REGISTER to every NEXT_LEVEL child in parallel. Throws on any failure."
+        )
+        .def(
+            "broadcast_unregister_all", &Worker::broadcast_unregister_all, nb::arg("cid"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Best-effort broadcast of CTRL_UNREGISTER to every NEXT_LEVEL child in parallel. "
+            "Returns a list of per-child error strings (empty on full success)."
         );
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);

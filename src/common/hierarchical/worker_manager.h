@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -98,9 +99,17 @@ static constexpr uint64_t CTRL_MALLOC = 0;
 static constexpr uint64_t CTRL_FREE = 1;
 static constexpr uint64_t CTRL_COPY_TO = 2;
 static constexpr uint64_t CTRL_COPY_FROM = 3;
+// Pre-warm a chip child for cid=arg0 by calling prepare_callable in the child;
+// issued at end of init() so the first run_prepared does not pay the H2D cost.
+static constexpr uint64_t CTRL_PREPARE = 4;
+// Dynamic post-init register/unregister of a ChipCallable. CTRL_REGISTER carries
+// (cid, shm_name) with bytes staged in POSIX shm by the parent;
+// CTRL_UNREGISTER carries only the cid.
+static constexpr uint64_t CTRL_REGISTER = 5;
+static constexpr uint64_t CTRL_UNREGISTER = 6;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
-//   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy)
+//   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy; cid for register)
 //   offset 24: uint64 arg1 (src for copy)
 //   offset 32: uint64 arg2 (nbytes for copy)
 //   offset 40: uint64 result (returned ptr from malloc)
@@ -108,6 +117,11 @@ static constexpr ptrdiff_t CTRL_OFF_ARG0 = 16;
 static constexpr ptrdiff_t CTRL_OFF_ARG1 = 24;
 static constexpr ptrdiff_t CTRL_OFF_ARG2 = 32;
 static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
+
+// CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS.
+// Fixed-width so the wire layout stays simple; well above the encoded length
+// of "simpler-cb-<pid>-<cid>-<counter>" with pid < 32-bit max.
+static constexpr size_t CTRL_SHM_NAME_BYTES = 32;
 
 // =============================================================================
 // WorkerDispatch — per-dispatch handle handed to a WorkerThread.
@@ -172,6 +186,19 @@ public:
     void control_copy_to(uint64_t dst, uint64_t src, size_t size);
     void control_copy_from(uint64_t dst, uint64_t src, size_t size);
 
+    // Pre-warm a chip child by triggering prepare_callable for `cid` in the
+    // child via CTRL_PREPARE. Issued from the parent at end of init() so the
+    // first run_prepared does not pay the H2D upload cost.
+    void control_prepare(int32_t cid);
+
+    // Dynamic post-init register/unregister of a ChipCallable for `cid`.
+    // `shm_name` is the (NUL-terminated, ≤ CTRL_SHM_NAME_BYTES-1) POSIX shm
+    // name where the ChipCallable bytes are staged. Both methods hold
+    // mailbox_mu_, so a CTRL_REGISTER concurrent with dispatch_process waits
+    // for the in-flight TASK_DONE before claiming the mailbox.
+    void control_register(int32_t cid, const char *shm_name);
+    void control_unregister(int32_t cid);
+
 private:
     Ring *ring_{nullptr};
     WorkerManager *manager_{nullptr};
@@ -229,6 +256,25 @@ public:
     WorkerThread *pick_idle_excluding(WorkerType type, const std::vector<WorkerThread *> &exclude) const;
 
     bool any_busy() const;
+
+    // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker. Thin wrapper
+    // over WorkerThread::control_prepare; exposed at manager level so the
+    // Python facade can prewarm without reaching into individual WorkerThreads.
+    void control_prepare(int worker_id, int32_t cid);
+
+    // Broadcast CTRL_REGISTER for `cid` to every NEXT_LEVEL worker in
+    // parallel. Stages `blob_size` bytes from `blob_ptr` into a per-call
+    // POSIX shm under name "simpler-cb-<pid>-<cid>-<counter>", spawns one
+    // std::thread per WorkerThread, and joins. Throws on any child failure
+    // (with no reverse rollback to ACKed children — partial state is inert
+    // garbage and is overwritten on cid reuse). The shm is unlinked when
+    // every leaf has ACKed (success or failure).
+    void broadcast_register_all(int32_t cid, const void *blob_ptr, size_t blob_size);
+
+    // Best-effort: broadcast CTRL_UNREGISTER for `cid` to every NEXT_LEVEL
+    // worker in parallel. Returns a vector of per-worker error strings
+    // (empty on full success). Caller decides whether to log / surface.
+    std::vector<std::string> broadcast_unregister_all(int32_t cid);
 
     // Write SHUTDOWN to every registered mailbox.
     void shutdown_children();

@@ -104,6 +104,28 @@ class TestL4Validation:
         child.close()
         w4.close()
 
+    def test_malloc_on_l4_raises_index_error(self):
+        # L4 has no chip mailboxes — `Worker.malloc` must surface IndexError
+        # rather than silently dispatch CTRL_MALLOC to a next_level (L3 worker)
+        # child whose `_child_worker_loop` doesn't recognise CTRL_MALLOC and
+        # would return a garbage pointer from an uninitialised mailbox result
+        # slot.
+        l3_child = Worker(level=3, num_sub_workers=0)
+        w4 = Worker(level=4, num_sub_workers=0)
+        w4.add_worker(l3_child)
+        w4.init()
+        try:
+            with pytest.raises(IndexError, match="out of range"):
+                w4.malloc(1024, worker_id=0)
+            with pytest.raises(IndexError, match="out of range"):
+                w4.free(0xDEADBEEF, worker_id=0)
+            with pytest.raises(IndexError, match="out of range"):
+                w4.copy_to(0xDEAD, 0xBEEF, 64, worker_id=0)
+            with pytest.raises(IndexError, match="out of range"):
+                w4.copy_from(0xDEAD, 0xBEEF, 64, worker_id=0)
+        finally:
+            w4.close()
+
 
 class TestL4DynamicRegister:
     """Cascade of CTRL_REGISTER / CTRL_UNREGISTER through an L4 → L3 worker tree.

@@ -188,9 +188,9 @@ def test_register_after_init_parallel_broadcast(st_platform, st_device_ids):
     """Two chip children, post-init register broadcasts to both in parallel.
 
     Asserts that the registered cid runs successfully on each chip — proving
-    the parallel ThreadPoolExecutor broadcast delivers the bytes to every
-    chip's mailbox and each prepare_callable_from_blob runs without racing
-    against the others.
+    the C++ broadcast (one std::thread per WorkerThread) delivers the bytes
+    to every chip's mailbox and each prepare_callable_from_blob runs without
+    racing against the others.
     """
     chip_callable = _build_vector_callable(st_platform)
     device_ids = [int(d) for d in st_device_ids[:2]]
