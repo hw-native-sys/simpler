@@ -1019,7 +1019,7 @@ struct PTO2SchedulerState {
 
 template <bool Profiling>
 inline AsyncPollResult AsyncWaitList::poll_and_complete(
-    volatile CompletionIngressQueue *completion_ingress, PTO2SchedulerState *sched,
+    volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched,
     PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
     int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING
@@ -1031,7 +1031,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
     if (!try_lock()) return result;
 
     int32_t drain_err = PTO2_ERROR_NONE;
-    drain_completion_ingress_locked(completion_ingress, drain_err);
+    drain_aicore_completion_mailbox_locked(aicore_mailbox, drain_err);
     if (drain_err != PTO2_ERROR_NONE) {
         result.error_code = drain_err;
         unlock();

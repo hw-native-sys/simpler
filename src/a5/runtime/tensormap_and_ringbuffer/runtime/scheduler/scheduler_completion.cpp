@@ -84,9 +84,9 @@ void SchedulerContext::complete_slot_task(
     if (slot_state.payload != nullptr) {
         int32_t reg_err = PTO2_ERROR_NONE;
         AsyncWaitList::RegisterResult reg_result;
-        volatile DeferredCompletionIngressBuffer *deferred_ingress =
-            &deferred_ingress_per_core_[core_id][expected_reg_task_id & 1];
-        AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_ingress);
+        volatile DeferredCompletionSlab *deferred_slab =
+            &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
+        AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
         do {
             reg_result = sched_->async_wait_list.register_deferred(slot_state, async_ctx, mixed_complete, reg_err);
             if (reg_result == AsyncWaitList::RegisterResult::Skipped) {

@@ -34,7 +34,7 @@
 #include "pto_constants.h"
 #include "pto_runtime_status.h"
 #include "pto2_dispatch_payload.h"
-#include "pto_completion_ingress.h"
+#include "aicore_completion_mailbox.h"
 #include "pto_submit_types.h"
 #include "pto_task_id.h"
 #include "pto_types.h"

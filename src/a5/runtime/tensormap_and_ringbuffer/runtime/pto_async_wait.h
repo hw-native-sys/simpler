@@ -17,7 +17,7 @@
 #include <cstdint>
 
 #include "intrinsic.h"
-#include "pto_completion_ingress.h"
+#include "aicore_completion_mailbox.h"
 #include "pto_runtime2_types.h"
 
 struct PTO2SchedulerState;
@@ -27,10 +27,10 @@ struct CompletionStats;
 inline constexpr int32_t MAX_ASYNC_WAITS = 64;
 inline constexpr int32_t MAX_PENDING_COMPLETIONS = 128;
 
-inline bool completion_ingress_has_pending(volatile CompletionIngressQueue *completion_ingress) {
-    if (completion_ingress == nullptr) return false;
-    uint64_t head = __atomic_load_n(&completion_ingress->head, __ATOMIC_ACQUIRE);
-    uint64_t tail = __atomic_load_n(&completion_ingress->tail, __ATOMIC_ACQUIRE);
+inline bool aicore_completion_mailbox_has_pending(volatile AICoreCompletionMailbox *aicore_mailbox) {
+    if (aicore_mailbox == nullptr) return false;
+    uint64_t head = __atomic_load_n(&aicore_mailbox->head, __ATOMIC_ACQUIRE);
+    uint64_t tail = __atomic_load_n(&aicore_mailbox->tail, __ATOMIC_ACQUIRE);
     return tail < head;
 }
 
@@ -124,19 +124,19 @@ struct AsyncWaitList {
     }
 
     int32_t
-    drain_completion_ingress_locked(volatile CompletionIngressQueue *completion_ingress, int32_t &error_code) {
+    drain_aicore_completion_mailbox_locked(volatile AICoreCompletionMailbox *aicore_mailbox, int32_t &error_code) {
         error_code = PTO2_ERROR_NONE;
-        if (completion_ingress == nullptr) return 0;
+        if (aicore_mailbox == nullptr) return 0;
 
         int32_t drained = 0;
         while (true) {
-            uint64_t tail = __atomic_load_n(&completion_ingress->tail, __ATOMIC_ACQUIRE);
-            uint64_t head_snapshot = __atomic_load_n(&completion_ingress->head, __ATOMIC_ACQUIRE);
+            uint64_t tail = __atomic_load_n(&aicore_mailbox->tail, __ATOMIC_ACQUIRE);
+            uint64_t head_snapshot = __atomic_load_n(&aicore_mailbox->head, __ATOMIC_ACQUIRE);
             if (tail >= head_snapshot) break;
 
             while (tail < head_snapshot) {
-                volatile CompletionIngressEntry *slot =
-                    &completion_ingress->entries[tail & COMPLETION_INGRESS_MASK];
+                volatile AICoreCompletionMailboxMessage *slot =
+                    &aicore_mailbox->entries[tail & AICORE_COMPLETION_MAILBOX_MASK];
                 uint64_t expected_seq = tail + 1;
                 uint64_t seq = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
                 if (seq != expected_seq) return drained;
@@ -147,7 +147,7 @@ struct AsyncWaitList {
                 AsyncEngine engine = static_cast<AsyncEngine>(slot->engine);
 
                 __atomic_store_n(&slot->seq, 0, __ATOMIC_RELEASE);
-                __atomic_store_n(&completion_ingress->tail, tail + 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&aicore_mailbox->tail, tail + 1, __ATOMIC_RELEASE);
                 drained++;
                 tail++;
 
@@ -291,7 +291,7 @@ struct AsyncWaitList {
 
     template <bool Profiling>
     AsyncPollResult poll_and_complete(
-        volatile CompletionIngressQueue *completion_ingress, PTO2SchedulerState *sched,
+        volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched,
         PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states,
         int32_t &deferred_release_count, int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING

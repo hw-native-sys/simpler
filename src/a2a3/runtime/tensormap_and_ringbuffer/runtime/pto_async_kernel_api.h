@@ -18,7 +18,7 @@
 #include <pto/comm/pto_comm_inst.hpp>
 
 #include "intrinsic.h"
-#include "pto_completion_ingress.h"
+#include "aicore_completion_mailbox.h"
 #include "pto_completion_token.h"
 #include "pto_runtime_status.h"
 
@@ -35,7 +35,7 @@
 // pto2::detail and is reserved for backend adapters / internal use.
 namespace pto2::detail {
 
-inline __aicore__ void defer_load_ingress(AsyncCtx &ctx) {
+inline __aicore__ void defer_load_slab(AsyncCtx &ctx) {
     if (ctx.completion_count == nullptr) return;
 #if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
     uintptr_t line = reinterpret_cast<uintptr_t>(ctx.completion_count) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
@@ -104,14 +104,14 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
     ctx.completion_entries = lc->async_ctx.completion_entries;
     ctx.completion_capacity = lc->async_ctx.completion_capacity;
     ctx.task_token.raw = lc->async_ctx.task_token.raw;
-    pto2::detail::defer_load_ingress(ctx);
+    pto2::detail::defer_load_slab(ctx);
     return ctx;
 }
 
 inline __aicore__ bool async_ctx_is_deferred(const AsyncCtx &ctx) { return ctx.task_token.is_valid(); }
 
 // Canonical writer: backend submit handlers build a CompletionToken and pass
-// it here. Writes one DeferredCompletionEntry to the AsyncCtx ingress slab and
+// it here. Writes one DeferredCompletionEntry to the AsyncCtx slab and
 // bumps completion_count. Returns false on overflow (also stores
 // PTO2_ERROR_ASYNC_WAIT_OVERFLOW in ctx.completion_error_code) or when ctx is
 // not currently a deferred context.

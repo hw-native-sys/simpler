@@ -18,7 +18,7 @@
 #include <pto/comm/pto_comm_inst.hpp>
 
 #include "intrinsic.h"
-#include "pto_completion_ingress.h"
+#include "aicore_completion_mailbox.h"
 #include "pto_completion_token.h"
 #include "pto_runtime_status.h"
 
@@ -34,7 +34,7 @@
 // lives in pto2::detail and is reserved for backend adapters / internal use.
 namespace pto2::detail {
 
-inline __aicore__ void defer_load_ingress(AsyncCtx &ctx) {
+inline __aicore__ void defer_load_slab(AsyncCtx &ctx) {
     if (ctx.completion_count == nullptr) return;
 #if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
     uintptr_t line = reinterpret_cast<uintptr_t>(ctx.completion_count) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
@@ -92,7 +92,7 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
     __gm__ LocalContext *lc =
         reinterpret_cast<__gm__ LocalContext *>(static_cast<uintptr_t>(args[PAYLOAD_LOCAL_CONTEXT_INDEX]));
     AsyncCtx ctx = lc->async_ctx;
-    pto2::detail::defer_load_ingress(ctx);
+    pto2::detail::defer_load_slab(ctx);
     return ctx;
 }
 
