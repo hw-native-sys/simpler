@@ -239,7 +239,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
 // Try to dispatch a task from thread-local queue to a core
 inline bool AicpuExecutor::try_dispatch_task(
     int core_id, uint64_t reg_addr, CoreType core_type, int thread_idx, int *local_queue, int &head, int &ready_count,
-    bool l2_perf_enabled, Runtime &runtime
+    bool l2_perf_enabled, [[maybe_unused]] Runtime &runtime
 ) {
     if (ready_count <= 0) {
         return false;
