@@ -41,7 +41,10 @@ extern "C" {
 int prepare_callable_impl(
     const ChipCallable *callable, uint64_t (*upload_fn)(const void *), PreparedCallableArtifacts *out
 );
-int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr);
+int bind_prepared_to_runtime_impl(
+    Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
+    int sig_count
+);
 int validate_runtime_impl(Runtime *runtime);
 
 /* ===========================================================================
@@ -187,16 +190,6 @@ int destroy_comm_stream_ctx(DeviceContextHandle ctx, void *stream) {
     return 0;
 }
 
-/* ===========================================================================
- * Internal helpers called from runtime_maker.cpp via Runtime.host_api
- * =========================================================================== */
-
-void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, size_t size) {
-    if (runtime == NULL) return;
-    Runtime *r = static_cast<Runtime *>(runtime);
-    r->record_tensor_pair(host_ptr, dev_ptr, size);
-}
-
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size
@@ -257,12 +250,13 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
 
         if (artifacts.host_dlopen_handle != nullptr) {
             rc = runner->register_prepared_callable_host_orch(
-                callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs)
+                callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
+                std::move(artifacts.signature)
             );
         } else {
             rc = runner->register_prepared_callable(
                 callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
-                artifacts.config_name.c_str(), std::move(kernel_addrs)
+                artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
             );
         }
         pthread_setspecific(g_runner_key, nullptr);
@@ -297,14 +291,18 @@ int run_prepared(
         r->host_api.copy_from_device = copy_from_device;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
-        auto [rc, host_orch_func_ptr] = runner->bind_prepared_callable_to_runtime(*r, callable_id);
+        auto bind_result = runner->bind_prepared_callable_to_runtime(*r, callable_id);
+        int rc = bind_result.rc;
         if (rc != 0) {
             r->~Runtime();
             pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
 
-        rc = bind_prepared_to_runtime_impl(r, reinterpret_cast<const ChipStorageTaskArgs *>(args), host_orch_func_ptr);
+        rc = bind_prepared_to_runtime_impl(
+            r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
+            bind_result.signature, bind_result.sig_count
+        );
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
             validate_runtime_impl(r);

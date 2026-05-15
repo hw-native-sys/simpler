@@ -219,14 +219,14 @@ public:
 
     int register_prepared_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
-        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs
+        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
     // Host-orchestration sibling of register_prepared_callable; see
     // src/a2a3/platform/onboard/host/device_runner.h for the contract. Sim
     // shares the host-only dlopen path verbatim (no AICPU side effects).
     int register_prepared_callable_host_orch(
         int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
-        std::vector<std::pair<int, uint64_t>> kernel_addrs
+        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
     int unregister_prepared_callable(int32_t callable_id);
     bool has_prepared_callable(int32_t callable_id) const;
@@ -277,6 +277,7 @@ private:
         std::string config_name;
         // common
         std::vector<std::pair<int, uint64_t>> kernel_addrs;
+        std::vector<ArgDirection> signature;
         // hbg path
         void *host_dlopen_handle{nullptr};
         void *host_orch_func_ptr{nullptr};

@@ -34,6 +34,8 @@
 #include <stdio.h>   // for fprintf, printf
 #include <string.h>  // for memset
 
+#include <vector>
+
 #include "common/core_type.h"
 #include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
@@ -46,7 +48,6 @@
 
 #define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER 72  // 24 AIC + 48 AIV cores
-#define RUNTIME_MAX_TENSOR_PAIRS 64
 #define RUNTIME_MAX_FUNC_ID 1024
 #define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
@@ -182,10 +183,6 @@ public:
     bool orch_to_sched;
 
 private:
-    // Tensor pairs for host-device memory tracking
-    TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
-    int tensor_pair_count;
-
     // Kernel binary tracking for cleanup
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
@@ -214,30 +211,6 @@ public:
      * Constructor - zero-initialize all arrays
      */
     Runtime();
-
-    // =========================================================================
-    // Tensor Pair Management
-    // =========================================================================
-
-    /**
-     * Record a host-device tensor pair for copy-back during finalize.
-     */
-    void record_tensor_pair(void *host_ptr, void *dev_ptr, size_t size);
-
-    /**
-     * Get pointer to tensor pairs array.
-     */
-    TensorPair *get_tensor_pairs();
-
-    /**
-     * Get number of recorded tensor pairs.
-     */
-    int get_tensor_pair_count() const;
-
-    /**
-     * Clear all recorded tensor pairs.
-     */
-    void clear_tensor_pairs();
 
     // =========================================================================
     // Performance Profiling
@@ -303,6 +276,14 @@ public:
     // Host API function pointers for device memory operations
     // NOTE: Placed at end of class to avoid affecting device memory layout
     HostApi host_api;
+
+    // Host-side tensor ledger for D2H copy-back at finalize. Populated by
+    // runtime_maker.cpp from orch_args at bind time, then iterated in
+    // validate_runtime_impl. Not read by AICPU/AICore — the device-side
+    // Runtime image carries the std::vector control block as harmless
+    // garbage, identical to host_api above. No fixed cap — grows with the
+    // chip-level entry-tensor count.
+    std::vector<TensorPair> tensor_pairs_;
 };
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

@@ -45,7 +45,6 @@ Runtime::Runtime() {
     initial_ready_count = 0;
     worker_count = 0;
     sche_cpu_num = 1;
-    tensor_pair_count = 0;
     tensor_info_storage_ = nullptr;
     tensor_info_storage_bytes_ = 0;
     tensor_allocation_storage_ = nullptr;
@@ -208,28 +207,6 @@ void Runtime::print_runtime() const {
 
     LOG_DEBUG("========================================================================");
 }
-
-// =============================================================================
-// Tensor Pair Management
-// =============================================================================
-
-void Runtime::record_tensor_pair(void *host_ptr, void *dev_ptr, size_t size) {
-    if (tensor_pair_count >= RUNTIME_MAX_TENSOR_PAIRS) {
-        LOG_ERROR("[Runtime] Tensor pairs full (max=%d)", RUNTIME_MAX_TENSOR_PAIRS);
-        return;
-    }
-    tensor_pairs[tensor_pair_count].host_ptr = host_ptr;
-    tensor_pairs[tensor_pair_count].dev_ptr = dev_ptr;
-    tensor_pairs[tensor_pair_count].size = size;
-    tensor_pair_count++;
-    LOG_DEBUG("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
-}
-
-TensorPair *Runtime::get_tensor_pairs() { return tensor_pairs; }
-
-int Runtime::get_tensor_pair_count() const { return tensor_pair_count; }
-
-void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }
 
 // =============================================================================
 // Kernel Binary Address Management

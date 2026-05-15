@@ -115,6 +115,7 @@ extern "C" int prepare_callable_impl(
         return -1;
     }
     *out = PreparedCallableArtifacts{};
+    out->signature.assign(callable->signature_, callable->signature_ + callable->sig_count());
 
     LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
     if (upload_and_collect_child_addrs(callable, upload_fn, &out->kernel_addrs) != 0) {
@@ -158,8 +159,10 @@ extern "C" int prepare_callable_impl(
  * @param orch_args  Separated tensor/scalar arguments for this run
  * @return 0 on success, -1 on failure
  */
-extern "C" int
-bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr) {
+extern "C" int bind_prepared_to_runtime_impl(
+    Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
+    const ArgDirection * /*signature*/, int /*sig_count*/
+) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -210,7 +213,7 @@ bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_
             runtime->host_api.device_free(dev_ptr);
             return -1;
         }
-        runtime->record_tensor_pair(host_ptr, dev_ptr, size);
+        runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size});
         LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         t.data = reinterpret_cast<uint64_t>(dev_ptr);
@@ -277,7 +280,7 @@ bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_
         LOG_ERROR("Failed to allocate GM heap");
         return -1;
     }
-    runtime->record_tensor_pair(nullptr, gm_heap, total_heap_size);
+    runtime->tensor_pairs_.push_back({nullptr, gm_heap, total_heap_size});
     runtime->set_gm_heap(gm_heap);
 
     // Allocate PTO2 shared memory
@@ -290,7 +293,7 @@ bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_
         return -1;
     }
     runtime->set_gm_sm_ptr(sm_ptr);
-    runtime->record_tensor_pair(nullptr, sm_ptr, static_cast<size_t>(sm_size));
+    runtime->tensor_pairs_.push_back({nullptr, sm_ptr, static_cast<size_t>(sm_size)});
 
     // Set up device orchestration state
     runtime->set_orch_args(device_args);
@@ -328,8 +331,8 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     LOG_INFO_V0("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    TensorPair *tensor_pairs = runtime->get_tensor_pairs();
-    int tensor_pair_count = runtime->get_tensor_pair_count();
+    TensorPair *tensor_pairs = runtime->tensor_pairs_.data();
+    int tensor_pair_count = static_cast<int>(runtime->tensor_pairs_.size());
 
     LOG_INFO_V0("Tensor pairs to process: %d", tensor_pair_count);
 
@@ -422,7 +425,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     runtime->clear_registered_kernels();
 
     // Clear tensor pairs
-    runtime->clear_tensor_pairs();
+    runtime->tensor_pairs_.clear();
 
     LOG_INFO_V0("=== Finalize Complete ===");
 

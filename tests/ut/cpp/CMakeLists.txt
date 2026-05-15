@@ -239,6 +239,7 @@ add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
 # Types / task_interface tests (src/common/task_interface/)
 # ---------------------------------------------------------------------------
 add_task_interface_test(test_child_memory types/test_child_memory.cpp)
+add_task_interface_test(test_chip_max_tensor_args types/test_chip_max_tensor_args.cpp)
 
 # Contract test for upload_chip_callable_buffer caller-buffer immutability.
 # Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),

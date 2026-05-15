@@ -33,6 +33,12 @@ typedef struct OrchestrationRuntimeOps {
         OrchestrationRuntime *runtime, int task_id, const TensorInfo *tensor_info, int tensor_count
     );
     void (*add_successor)(OrchestrationRuntime *runtime, int from_task, int to_task);
+    // Host-build-graph orch owns its entry-tensor H2D (the orch runs on host
+    // and may need host-side pointers for control tensors). This call
+    // registers a host<->device mapping so runtime_maker's validate path can
+    // D2H copy-back and free at finalize. TMARB has no equivalent — its
+    // runtime_maker handles tensor uploads directly because its orch is
+    // device-side.
     void (*record_tensor_pair)(OrchestrationRuntime *runtime, void *host_ptr, void *dev_ptr, size_t size);
     int (*get_task_count)(OrchestrationRuntime *runtime);
     void (*print_runtime)(OrchestrationRuntime *runtime);

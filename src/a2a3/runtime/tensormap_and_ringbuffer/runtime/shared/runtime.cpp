@@ -39,9 +39,6 @@ Runtime::Runtime() {
     dep_pool_size = 0;
     orch_to_sched = false;
 
-    // Initialize tensor pairs
-    tensor_pair_count = 0;
-
     // Initialize device orchestration state
     gm_sm_ptr_ = nullptr;
     gm_heap_ptr_ = nullptr;
@@ -64,28 +61,6 @@ Runtime::Runtime() {
         func_id_to_addr_[i] = 0;
     }
 }
-
-// =============================================================================
-// Tensor Pair Management
-// =============================================================================
-
-void Runtime::record_tensor_pair(void *host_ptr, void *dev_ptr, size_t size) {
-    if (tensor_pair_count >= RUNTIME_MAX_TENSOR_PAIRS) {
-        LOG_ERROR("[Runtime] Tensor pairs full (max=%d)", RUNTIME_MAX_TENSOR_PAIRS);
-        return;
-    }
-    tensor_pairs[tensor_pair_count].host_ptr = host_ptr;
-    tensor_pairs[tensor_pair_count].dev_ptr = dev_ptr;
-    tensor_pairs[tensor_pair_count].size = size;
-    tensor_pair_count++;
-    LOG_INFO_V0("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
-}
-
-TensorPair *Runtime::get_tensor_pairs() { return tensor_pairs; }
-
-int Runtime::get_tensor_pair_count() const { return tensor_pair_count; }
-
-void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }
 
 // =============================================================================
 // Device orchestration

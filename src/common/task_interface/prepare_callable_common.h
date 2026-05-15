@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "arg_direction.h"
 #include "callable.h"
 
 struct ChildKernelAddr {
@@ -55,6 +56,11 @@ struct ChildKernelAddr {
  */
 struct PreparedCallableArtifacts {
     std::vector<ChildKernelAddr> kernel_addrs;
+    // Chip-level entry-tensor directions, copied from ChipCallable::signature_[].
+    // Scalars are also present (ArgDirection::SCALAR) and follow the tensor
+    // entries. Consumed at bind time to decide H2D/D2H per tensor — see
+    // runtime_maker.cpp.
+    std::vector<ArgDirection> signature;
     void *host_dlopen_handle{nullptr};  // hbg only
     void *host_orch_func_ptr{nullptr};  // hbg only
     const void *orch_so_data{nullptr};  // trb only
@@ -80,6 +86,11 @@ struct PreparedCallableArtifacts {
 struct BindPreparedCallableResult {
     int rc{0};
     void *host_orch_func_ptr{nullptr};
+    // Pointer into PreparedCallableState's cached signature vector — valid
+    // until the callable_id is unregistered. Nullptr + 0 when the callable
+    // had no recorded signature (legacy path).
+    const ArgDirection *signature{nullptr};
+    int sig_count{0};
 };
 
 /**
