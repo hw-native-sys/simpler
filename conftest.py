@@ -138,9 +138,13 @@ def pytest_addoption(parser):
     )
     parser.addoption(
         "--enable-l2-swimlane",
-        action="store_true",
-        default=False,
-        help="Enable perf swimlane collection (first round only)",
+        nargs="?",
+        const=4,
+        default=0,
+        type=int,
+        metavar="PERF_LEVEL",
+        help="Enable L2 swimlane. Bare flag=level 4 (full). "
+        "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
     parser.addoption("--dump-tensor", action="store_true", default=False, help="Dump per-task tensor I/O at runtime")
     parser.addoption(
@@ -522,7 +526,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
     # that all write l2_perf_records_<ts>.json to the same directory with
     # second-precision timestamps, so they trample each other. Block the
     # combination up front; waiting for a proper device-id-in-filename fix.
-    if config.getoption("--enable-l2-swimlane", default=False):
+    if config.getoption("--enable-l2-swimlane", default=0):
         l3_items = [
             i
             for i in items

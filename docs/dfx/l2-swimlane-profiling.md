@@ -50,21 +50,47 @@ python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane
 
 ### 3.1 Enable L2 swimlane
 
-```bash
-# Standalone runner
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane
-python tests/st/<case>/test_<name>.py -p a5sim --enable-l2-swimlane
+`--enable-l2-swimlane` accepts an optional integer **perf_level**
+(0–4). A bare flag defaults to level 4 (full collection,
+backward-compatible with the old boolean behavior).
 
-# pytest
-pytest tests/st/<case> --platform a2a3 -d 0 --enable-l2-swimlane
-pytest examples/a5/host_build_graph/vector_example --platform a5sim --enable-l2-swimlane
+| Level | Collects | Notes |
+| ----- | -------- | ----- |
+| 0 | Nothing (disabled) | Default when flag is absent |
+| 1 | AICore timing only (start/end/task_id/func_id/core_type) | No AICPU timestamps, no fanout |
+| 2 | + dispatch_time, finish_time, fanout | Full per-task record |
+| 3 | + Scheduler phases (`SCHED_*`) | Skips orchestrator phases |
+| 4 | + Orchestrator phases + `AicpuOrchSummary` | Full collection |
+
+```bash
+# Standalone runner — full collection (level 4)
+python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane
+
+# Standalone runner — AICore timing only (level 1)
+python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane 1
+
+# Standalone runner — per-task with dispatch/fanout (level 2)
+python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane 2
+
+# pytest — scheduler phases (level 3)
+pytest tests/st/<case> --platform a2a3 -d 0 --enable-l2-swimlane 3
+
+# a5sim (level semantics apply the same way)
+python tests/st/<case>/test_<name>.py -p a5sim --enable-l2-swimlane
 ```
 
-The flag flips `CallConfig::enable_l2_swimlane`. The host then
-allocates the per-core / per-thread shared region and publishes
-its base address through `kernel_args.l2_perf_data_base`. AICore
-writes timing into per-task WIP slots; AICPU commits the records
-on FIN and emits its own per-iteration phase records.
+The flag sets `CallConfig::enable_l2_swimlane` to the chosen
+level. The host then allocates the per-core / per-thread shared
+region and publishes its base address through
+`kernel_args.l2_perf_data_base`. AICore writes timing into
+per-task WIP slots; AICPU commits the records on FIN. Per-task
+dispatch/finish timestamps and fanout are recorded only at
+level >= 2, scheduler phase records only at level >= 3, and
+orchestrator phases + summary only at level >= 4.
+
+The JSON output `"version"` field directly reflects the
+perf_level: `1` = AICore timing only, `2` = +dispatch/fanout,
+`3` = +scheduler phases, `4` = +orchestrator phases + summary.
 
 `--rounds > 1` collects only on the **first** round so warm-up
 runs are not double-counted.

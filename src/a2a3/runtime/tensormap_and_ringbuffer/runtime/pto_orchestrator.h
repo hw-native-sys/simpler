@@ -76,8 +76,8 @@ struct PTO2OrchestratorState {
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
 #if PTO2_PROFILING
-    // Runtime profiling switch copied from Runtime::enable_l2_swimlane.
-    bool enable_l2_swimlane;
+    // L2 swimlane perf_level (0-4) copied from get_l2_swimlane_perf_level().
+    int l2_swimlane_perf_level{0};
 #endif
 
     // === GM HEAP (for output buffers) ===

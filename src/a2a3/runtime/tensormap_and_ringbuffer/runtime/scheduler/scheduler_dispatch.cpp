@@ -120,9 +120,6 @@ void SchedulerContext::dispatch_subtask_to_core(
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto core_id = tracker.get_core_id_by_offset(core_offset);
-#if PTO2_PROFILING
-    auto &l2_perf = sched_l2_perf_[thread_idx];
-#endif
     CoreExecState &core_exec_state = core_exec_states_[core_id];
     core_exec_state.dispatch_seq++;
     uint32_t reg_task_id = core_exec_state.dispatch_seq & TASK_ID_MASK;
@@ -147,7 +144,7 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
 #if PTO2_PROFILING
-        if (l2_perf.l2_perf_enabled) {
+        if (l2_swimlane_perf_level_ >= 2) {
             core_exec_state.pending_dispatch_timestamp = get_sys_cnt_aicpu();
         }
 #endif
@@ -156,7 +153,7 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
 #if PTO2_PROFILING
-        if (l2_perf.l2_perf_enabled) {
+        if (l2_swimlane_perf_level_ >= 2) {
             core_exec_state.running_dispatch_timestamp = get_sys_cnt_aicpu();
         }
 #endif
@@ -362,7 +359,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_PROFILING
     auto &l2_perf = sched_l2_perf_[thread_idx];
     l2_perf.reset();
-    l2_perf.l2_perf_enabled = is_l2_swimlane_enabled();
+    l2_perf.l2_perf_enabled = (l2_swimlane_perf_level_ > 0);
 #endif
 
     constexpr int LOCAL_READY_CAP_PER_TYPE = 64;
@@ -473,7 +470,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
         } else {
             CYCLE_COUNT_LAP(l2_perf.sched_complete_cycle);
-            if (l2_perf.l2_perf_enabled && l2_perf.phase_complete_count > 0) {
+            if (l2_swimlane_perf_level_ >= 3 && l2_perf.phase_complete_count > 0) {
                 l2_perf_aicpu_record_phase(
                     thread_idx, AicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, l2_perf.sched_loop_count,
                     l2_perf.phase_complete_count
@@ -583,7 +580,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
         } else {
             CYCLE_COUNT_LAP(l2_perf.sched_dispatch_cycle);
-            if (l2_perf.l2_perf_enabled && l2_perf.phase_dispatch_count > 0) {
+            if (l2_swimlane_perf_level_ >= 3 && l2_perf.phase_dispatch_count > 0) {
                 l2_perf_aicpu_record_phase(
                     thread_idx, AicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, l2_perf.sched_loop_count,
                     l2_perf.phase_dispatch_count
@@ -635,7 +632,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
 #if PTO2_PROFILING
             CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
-            if (l2_perf.l2_perf_enabled) {
+            if (l2_swimlane_perf_level_ >= 3) {
                 l2_perf_aicpu_record_phase(
                     thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, l2_perf.sched_loop_count, 0
                 );
@@ -654,7 +651,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         l2_perf_aicpu_flush_buffers(
             thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
         );
-        l2_perf_aicpu_flush_phase_buffers(thread_idx);
+        if (l2_swimlane_perf_level_ >= 3) {
+            l2_perf_aicpu_flush_phase_buffers(thread_idx);
+        }
     }
 #endif
 #if PTO2_PROFILING

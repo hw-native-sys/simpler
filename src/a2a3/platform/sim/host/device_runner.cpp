@@ -208,10 +208,10 @@ int DeviceRunner::ensure_binaries_loaded() {
             return -1;
         }
 
-        set_l2_swimlane_enabled_func_ =
-            reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_l2_swimlane_enabled"));
-        if (set_l2_swimlane_enabled_func_ == nullptr) {
-            LOG_ERROR("dlsym failed for set_l2_swimlane_enabled: %s", dlerror());
+        set_l2_swimlane_perf_level_func_ =
+            reinterpret_cast<void (*)(int)>(dlsym(aicpu_so_handle_, "set_l2_swimlane_perf_level"));
+        if (set_l2_swimlane_perf_level_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_l2_swimlane_perf_level: %s", dlerror());
             return -1;
         }
 
@@ -381,6 +381,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
     }
     kernel_args_.enable_profiling_flag = enable_profiling_flag;
+    kernel_args_.l2_swimlane_perf_level = static_cast<uint32_t>(l2_swimlane_perf_level_);
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -542,7 +543,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
     set_dump_tensor_enabled_func_(enable_dump_tensor_);
     set_platform_l2_perf_base_func_(kernel_args_.l2_perf_data_base);
-    set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
+    set_l2_swimlane_perf_level_func_(l2_swimlane_perf_level_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
     set_platform_pmu_reg_addrs_func_(kernel_args_.pmu_reg_addrs);
     set_pmu_enabled_func_(enable_pmu_);
@@ -698,7 +699,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_dump_base_func_ = nullptr;
         set_dump_tensor_enabled_func_ = nullptr;
         set_platform_l2_perf_base_func_ = nullptr;
-        set_l2_swimlane_enabled_func_ = nullptr;
+        set_l2_swimlane_perf_level_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
         set_platform_pmu_reg_addrs_func_ = nullptr;
         set_pmu_enabled_func_ = nullptr;
@@ -1062,8 +1063,9 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     };
 
     // Simulation: dev pointer is directly host-accessible, no register pass-through.
-    int rc =
-        l2_perf_collector_.initialize(num_aicore, device_id, alloc_cb, nullptr, free_cb, &mem_alloc_, output_prefix_);
+    int rc = l2_perf_collector_.initialize(
+        num_aicore, device_id, l2_swimlane_perf_level_, alloc_cb, nullptr, free_cb, &mem_alloc_, output_prefix_
+    );
     if (rc != 0) {
         return rc;
     }

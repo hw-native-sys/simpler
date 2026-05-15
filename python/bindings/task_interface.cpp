@@ -554,8 +554,6 @@ NB_MODULE(_task_interface, m) {
         });
 
     // --- CallConfig ---
-    // The two enable_* fields are stored as int32 on the wire (see call_config.h).
-    // Expose them as Python `bool` via def_property so user-facing API is unchanged.
     nb::class_<CallConfig>(m, "CallConfig")
         .def(nb::init<>())
         .def_rw("block_dim", &CallConfig::block_dim)
@@ -563,10 +561,18 @@ NB_MODULE(_task_interface, m) {
         .def_prop_rw(
             "enable_l2_swimlane",
             [](const CallConfig &c) {
-                return static_cast<bool>(c.enable_l2_swimlane);
+                return c.enable_l2_swimlane;
             },
-            [](CallConfig &c, bool v) {
-                c.enable_l2_swimlane = v ? 1 : 0;
+            // Accept either an int perf_level (0-4) or a Python bool. `True` maps to
+            // level 4 (full collection) to preserve the pre-perf_level semantics for
+            // callers that still pass a boolean; `False` maps to 0.
+            [](CallConfig &c, nb::object v) {
+                if (PyBool_Check(v.ptr())) {
+                    c.enable_l2_swimlane = nb::cast<bool>(v) ? 4 : 0;
+                } else {
+                    int level = nb::cast<int>(v);
+                    c.enable_l2_swimlane = (level < 0) ? 0 : (level > 4) ? 4 : level;
+                }
             }
         )
         .def_prop_rw(
@@ -607,7 +613,7 @@ NB_MODULE(_task_interface, m) {
         .def("__repr__", [](const CallConfig &self) -> std::string {
             std::ostringstream os;
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
-               << ", enable_l2_swimlane=" << (self.enable_l2_swimlane ? "True" : "False")
+               << ", enable_l2_swimlane=" << self.enable_l2_swimlane
                << ", enable_dump_tensor=" << (self.enable_dump_tensor ? "True" : "False")
                << ", enable_pmu=" << self.enable_pmu << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False");
             if (self.output_prefix_set()) {

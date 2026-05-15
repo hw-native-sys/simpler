@@ -88,7 +88,7 @@ class TestL2Swimlane(SceneTestCase):
 
     def test_run(self, st_platform, st_worker, request):
         super().test_run(st_platform, st_worker, request)
-        if not request.config.getoption("--enable-l2-swimlane", default=False):
+        if not request.config.getoption("--enable-l2-swimlane", default=0):
             return
         for case in self.CASES:
             if st_platform in case["platforms"]:
@@ -103,7 +103,7 @@ class TestL2Swimlane(SceneTestCase):
         assert perf.exists(), f"l2_perf_records.json missing under {matches[-1]} — swimlane capture failed?"
         with perf.open() as f:
             data = json.load(f)
-        assert data.get("version") in (1, 2), f"unexpected version: {data.get('version')}"
+        assert data.get("version") in (1, 2, 3, 4), f"unexpected version: {data.get('version')}"
         tasks = data.get("tasks")
         assert isinstance(tasks, list), "tasks field missing or not a list"
         assert len(tasks) == _EXPECTED_TASK_COUNT, (

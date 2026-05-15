@@ -847,7 +847,7 @@ class SceneTestCase:
     def _build_config(
         self,
         config_dict,
-        enable_l2_swimlane=False,
+        enable_l2_swimlane=0,
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -895,7 +895,7 @@ class SceneTestCase:
         sub_ids=None,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=False,
+        enable_l2_swimlane=0,
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -936,7 +936,7 @@ class SceneTestCase:
         case,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=False,
+        enable_l2_swimlane=0,
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -979,7 +979,7 @@ class SceneTestCase:
 
             config = self._build_config(
                 config_dict,
-                enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
+                enable_l2_swimlane=(enable_l2_swimlane if round_idx == 0 else 0),
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=(enable_dep_gen and round_idx == 0),
@@ -1000,7 +1000,7 @@ class SceneTestCase:
         case,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=False,
+        enable_l2_swimlane=0,
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -1051,7 +1051,7 @@ class SceneTestCase:
 
             config = self._build_config(
                 config_dict,
-                enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
+                enable_l2_swimlane=(enable_l2_swimlane if round_idx == 0 else 0),
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=(enable_dep_gen and round_idx == 0),
@@ -1097,14 +1097,14 @@ class SceneTestCase:
         manual_mode = request.config.getoption("--manual", default="exclude")
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
-        enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=False)
+        enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=0)
         enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
         if rounds > 1:
             if enable_l2_swimlane:
                 logger.warning("Profiling disabled: --rounds > 1")
-                enable_l2_swimlane = False
+                enable_l2_swimlane = 0
             if enable_dump_tensor:
                 logger.warning("Dump tensor disabled: --rounds > 1")
                 enable_dump_tensor = False
@@ -1204,7 +1204,14 @@ class SceneTestCase:
         parser.add_argument("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
         parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
         parser.add_argument(
-            "--enable-l2-swimlane", action="store_true", help="Enable perf swimlane collection (first round only)"
+            "--enable-l2-swimlane",
+            nargs="?",
+            const=4,
+            default=0,
+            type=int,
+            metavar="PERF_LEVEL",
+            help="Enable L2 swimlane. Bare flag=level 4 (full). "
+            "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
         )
         parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
         parser.add_argument(
@@ -1279,7 +1286,7 @@ class SceneTestCase:
 
         if args.rounds > 1 and args.enable_l2_swimlane:
             logger.warning("Profiling disabled: --rounds > 1")
-            args.enable_l2_swimlane = False
+            args.enable_l2_swimlane = 0
         if args.rounds > 1 and args.enable_dep_gen:
             logger.warning("dep_gen disabled: --rounds > 1")
             args.enable_dep_gen = False
@@ -1456,7 +1463,7 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
     if args.skip_golden:
         common.append("--skip-golden")
     if args.enable_l2_swimlane:
-        common.append("--enable-l2-swimlane")
+        common += ["--enable-l2-swimlane", str(args.enable_l2_swimlane)]
     if args.dump_tensor:
         common.append("--dump-tensor")
     if args.enable_dep_gen:

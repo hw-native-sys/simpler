@@ -12,7 +12,7 @@
  * @file aicore_profiling_state.h
  * @brief AICore-side per-core profiling state set/get interface.
  *
- * Mirrors the AICPU-side `set_l2_swimlane_enabled` / `set_pmu_enabled` / etc.
+ * Mirrors the AICPU-side `set_l2_swimlane_perf_level` / `set_pmu_enabled` / etc.
  * setters: the platform owns a per-core slot for profiling state, populated
  * once by the AICore kernel entry from `KernelArgs`, and read by
  * `aicore_execute` via getters. Runtime never touches the underlying storage,

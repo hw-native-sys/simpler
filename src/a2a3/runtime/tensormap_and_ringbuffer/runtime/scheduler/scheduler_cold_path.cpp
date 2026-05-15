@@ -811,10 +811,12 @@ int32_t SchedulerContext::init(
     regs_ = regs_base;
 
 #if PTO2_PROFILING
-    if (is_l2_swimlane_enabled()) {
+    l2_swimlane_perf_level_ = get_l2_swimlane_perf_level();
+    if (l2_swimlane_perf_level_ > 0) {
         l2_perf_aicpu_init(runtime->worker_count);
-        l2_perf_aicpu_init_phase(runtime->worker_count, sched_thread_num_);
-        l2_perf_aicpu_set_orch_thread_idx(sched_thread_num_);
+        if (l2_swimlane_perf_level_ >= 3) {
+            l2_perf_aicpu_init_phase(runtime->worker_count, sched_thread_num_);
+        }
     }
 #endif
 
@@ -938,7 +940,7 @@ void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
 #if PTO2_PROFILING
-    if (is_l2_swimlane_enabled()) {
+    if (l2_swimlane_perf_level_ >= 3) {
         // Flush orchestrator's phase record buffer
         l2_perf_aicpu_flush_phase_buffers(thread_idx);
     }
@@ -993,7 +995,7 @@ void SchedulerContext::on_orchestration_done(
     // Write core-to-thread mapping AFTER reassignment so the profiling data
     // reflects the final distribution (all active_sched_threads_, including
     // former orchestrator threads when orch_to_sched_ is enabled).
-    if (is_l2_swimlane_enabled()) {
+    if (l2_swimlane_perf_level_ >= 3) {
         l2_perf_aicpu_init_core_assignments(cores_total_num_);
         for (int32_t t = 0; t < active_sched_threads_; t++) {
             l2_perf_aicpu_write_core_assignments_for_thread(

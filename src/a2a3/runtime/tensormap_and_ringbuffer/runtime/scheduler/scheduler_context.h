@@ -135,6 +135,8 @@ private:
 
 #if PTO2_PROFILING
     SchedL2PerfCounters sched_l2_perf_[MAX_AICPU_THREADS];
+    // Cached once at init() from get_l2_swimlane_perf_level().
+    int l2_swimlane_perf_level_{0};
 #endif
 
     // --- Task-execution tracking ---

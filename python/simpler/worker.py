@@ -514,7 +514,7 @@ def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     cfg = CallConfig()
     cfg.block_dim = block_dim
     cfg.aicpu_thread_num = aicpu_tn
-    cfg.enable_l2_swimlane = bool(swl)
+    cfg.enable_l2_swimlane = swl
     cfg.enable_dump_tensor = bool(dt)
     cfg.enable_pmu = pmu
     cfg.enable_dep_gen = bool(dep_gen)
