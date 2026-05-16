@@ -127,7 +127,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
     )
 
 
-def _run(worker: Worker, chip_cid: int) -> None:
+def _run(worker: Worker, chip_cid: int):
     """Allocate device memory, copy inputs, execute, copy outputs back, verify."""
     # --- 1. Prepare host arrays ---
     torch.manual_seed(42)
@@ -155,7 +155,8 @@ def _run(worker: Worker, chip_cid: int) -> None:
     # --- 4. Run. CallConfig() defaults are fine for this kernel. ---
     config = CallConfig()
     print("[vector_add] running on device...")
-    worker.run(chip_cid, args, config)
+    timing = worker.run(chip_cid, args, config)
+    print(f"[vector_add] {timing}")
 
     # --- 5. D2H copy back + verify ---
     worker.copy_from(host_out.data_ptr(), dev_out, NBYTES)
@@ -169,6 +170,7 @@ def _run(worker: Worker, chip_cid: int) -> None:
     print(f"[vector_add] max |host_out - expected| = {max_diff:.3e}")
     assert torch.allclose(host_out, expected, rtol=1e-5, atol=1e-5)
     print("[vector_add] golden check PASSED")
+    return timing
 
 
 def run(platform: str, device_id: int) -> int:

@@ -325,6 +325,59 @@ def _temporary_env(env_updates):
                 os.environ[k] = v
 
 
+def _log_round_timings(timings):
+    """Print per-round + summary host/device wall (µs) for multi-round runs.
+
+    Replaces the device-log scraping that ``tools/benchmark_rounds.sh`` used to
+    do — Worker.run now returns the timing directly, so the per-round table
+    can be emitted by the framework without grep+awk over device logs.
+
+    Output goes to ``print`` (not ``logger.info``) because benchmark numbers
+    are a user-facing artifact and the project's default log level suppresses
+    INFO in standalone test_*.py runs.
+
+    ``timings`` is a list of (host_wall_us, device_wall_us) tuples. The device
+    column reports 0 when the runtime was built without PTO2_PROFILING, when
+    --enable-l2-swimlane was off (orch_summary lives in the L2 perf region),
+    or when an L3+ DAG is in use (per-task device cycles aren't aggregated).
+    """
+    if not timings:
+        return
+    n = len(timings)
+    host_vals = sorted(t[0] for t in timings)
+    dev_vals = sorted(t[1] for t in timings)
+    host_avg = sum(host_vals) / n
+    dev_avg = sum(dev_vals) / n
+    show_device = any(v > 0.0 for v in dev_vals)
+
+    header = f"  {'Round':<6}  {'Host (us)':>12}"
+    if show_device:
+        header += f"  {'Device (us)':>12}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for i, (h, d) in enumerate(timings):
+        line = f"  {i:<6d}  {h:>12.1f}"
+        if show_device:
+            line += f"  {d:>12.1f}"
+        print(line)
+    summary = f"  Avg Host: {host_avg:.1f} us"
+    if show_device:
+        summary += f"  |  Avg Device: {dev_avg:.1f} us"
+    summary += f"  ({n} rounds)"
+    print(summary)
+
+    trim = 10
+    if n > 2 * trim:
+        tc = n - 2 * trim
+        host_trim = sum(host_vals[trim:-trim]) / tc
+        msg = f"  Trimmed Avg Host: {host_trim:.1f} us"
+        if show_device:
+            dev_trim = sum(dev_vals[trim:-trim]) / tc
+            msg += f"  |  Trimmed Avg Device: {dev_trim:.1f} us"
+        msg += f"  (dropped {trim} low + {trim} high, {tc} rounds used)"
+        print(msg)
+
+
 def _resolve_callable_paths(cls, cls_dir):
     """Resolve relative source paths in CALLABLE against cls_dir."""
     callable_spec = cls.CALLABLE
@@ -909,6 +962,7 @@ class SceneTestCase:
                 initial_outputs[name] = getattr(test_args, name).clone()
 
         # Execute rounds
+        timings = []  # populated only when rounds > 1
         for round_idx in range(rounds):
             if round_idx > 0:
                 for name, initial in initial_outputs.items():
@@ -924,10 +978,15 @@ class SceneTestCase:
             )
 
             with _temporary_env(self._resolve_env()):
-                worker.run(cid, chip_args, config=config)
+                timing = worker.run(cid, chip_args, config=config)
+            if rounds > 1 and timing is not None:
+                timings.append((timing.host_wall_us, timing.device_wall_us))
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+
+        if timings:
+            _log_round_timings(timings)
 
     def _run_and_validate_l3(  # noqa: PLR0913 -- threads CLI diagnostic flags + L3 ns context
         self,
@@ -981,6 +1040,7 @@ class SceneTestCase:
         orch_fn = self.CALLABLE["orchestration"]
 
         # Execute rounds
+        timings = []
         for round_idx in range(rounds):
             if round_idx > 0:
                 for name, initial in initial_tensors.items():
@@ -1001,10 +1061,17 @@ class SceneTestCase:
                 orch_fn(orch, _ns, _test_args, _config)
 
             with _temporary_env(self._resolve_env()):
-                worker.run(task_orch)
+                timing = worker.run(task_orch)
+            if rounds > 1 and timing is not None:
+                # L3+ DAGs surface host wall only; device_wall_us is 0 because
+                # per-task device cycles aren't aggregated up to Worker.run.
+                timings.append((timing.host_wall_us, timing.device_wall_us))
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
+
+        if timings:
+            _log_round_timings(timings)
 
     # ------------------------------------------------------------------
     # pytest auto test method

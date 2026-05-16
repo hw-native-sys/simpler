@@ -646,6 +646,57 @@ NB_MODULE(_task_interface, m) {
     // one, change the other.
     m.attr("DEFAULT_LOG_THRESHOLD") = 20;  // V5 = Python INFO
 
+    // --- RunTiming ---
+    // Returned by ChipWorker.run_prepared* / Worker.run. Cycles → ns conversion
+    // happens on the platform side (frequency known there); units exposed to
+    // Python are µs as floats to match historical benchmark_rounds.sh output.
+    nb::class_<RunTiming>(m, "RunTiming")
+        .def(nb::init<>())
+        .def(
+            "__init__",
+            [](RunTiming *self, uint64_t host_wall_ns, uint64_t device_wall_ns) {
+                new (self) RunTiming{host_wall_ns, device_wall_ns};
+            },
+            nb::arg("host_wall_ns"), nb::arg("device_wall_ns") = 0,
+            "Construct with explicit ns values (used by the Python Worker.run "
+            "wrapper to surface host-side timing for L3+ DAGs)."
+        )
+        .def_prop_ro(
+            "host_wall_us",
+            [](const RunTiming &t) {
+                return t.host_wall_ns / 1000.0;
+            },
+            "Host steady-clock wall around the dispatch, in microseconds."
+        )
+        .def_prop_ro(
+            "device_wall_us",
+            [](const RunTiming &t) {
+                return t.device_wall_ns / 1000.0;
+            },
+            "On-NPU wall (orch end - orch start), in microseconds. Zero unless the runtime "
+            "was built with PTO2_PROFILING and the call had enable_l2_swimlane=1 — the "
+            "orch_summary lives in the L2 perf shared region and the AICPU only writes it "
+            "when that region is allocated."
+        )
+        .def_prop_ro(
+            "host_wall_ns",
+            [](const RunTiming &t) {
+                return t.host_wall_ns;
+            }
+        )
+        .def_prop_ro(
+            "device_wall_ns",
+            [](const RunTiming &t) {
+                return t.device_wall_ns;
+            }
+        )
+        .def("__repr__", [](const RunTiming &t) {
+            std::ostringstream os;
+            os << "RunTiming(host_wall_us=" << t.host_wall_ns / 1000.0
+               << ", device_wall_us=" << t.device_wall_ns / 1000.0 << ")";
+            return os.str();
+        });
+
     // --- ChipWorker ---
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())
@@ -679,19 +730,21 @@ NB_MODULE(_task_interface, m) {
         .def(
             "run_prepared",
             [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config) {
-                self.run_prepared(callable_id, &args, config);
+                return self.run_prepared(callable_id, &args, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
-            "Launch a callable_id previously staged via prepare_callable."
+            "Launch a callable_id previously staged via prepare_callable. "
+            "Returns RunTiming with host/device wall."
         )
         .def(
             "run_prepared",
             [](ChipWorker &self, int32_t callable_id, TaskArgs &args, const CallConfig &config) {
                 TaskArgsView view = make_view(args);
-                self.run_prepared(callable_id, view, config);
+                return self.run_prepared(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
-            "Launch a callable_id from a TaskArgs (used for in-process callers)."
+            "Launch a callable_id from a TaskArgs (used for in-process callers). "
+            "Returns RunTiming."
         )
         .def(
             "run_prepared_from_blob",
@@ -704,7 +757,7 @@ NB_MODULE(_task_interface, m) {
                 // loops never re-implement the tensor/scalar layout in Python
                 // (where it has historically dropped fields like child_memory).
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
-                self.run_prepared(callable_id, view, config);
+                return self.run_prepared(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
             "Launch a callable_id from a raw mailbox-blob pointer + capacity "

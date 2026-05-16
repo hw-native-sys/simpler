@@ -265,6 +265,12 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
     /**
+     * On-NPU wall (ns) of the most recently completed run(); zero when
+     * PTO2_PROFILING was off in the runtime build (no orch_summary captured).
+     */
+    uint64_t last_device_wall_ns() const { return l2_perf_collector_.last_orch_wall_ns(); }
+
+    /**
      * Print handshake results from device
      *
      * Copies handshake buffers from device and prints their status.

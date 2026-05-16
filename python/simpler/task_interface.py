@@ -353,12 +353,14 @@ class ChipWorker:
             args: ChipStorageTaskArgs for this invocation.
             config: Optional CallConfig. If None, a default is created.
             **kwargs: Overrides applied to config (e.g. block_dim=24).
+
+        Returns a :class:`RunTiming` with host + device wall.
         """
         if config is None:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
-        self._impl.run_prepared(int(callable_id), args, config)
+        return self._impl.run_prepared(int(callable_id), args, config)
 
     def unregister_callable(self, callable_id):
         """Drop prepared state for ``callable_id`` and release its orch SO share."""

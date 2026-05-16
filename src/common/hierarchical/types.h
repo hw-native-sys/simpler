@@ -222,6 +222,16 @@ private:
 // IWorker — abstract interface
 // =============================================================================
 
+// Wall-clock breakdown returned by IWorker::run. host_wall_ns is the steady
+// clock delta wrapping the dispatch; device_wall_ns is on-NPU wall (only
+// populated when the runtime is built with PTO2_PROFILING; zero otherwise).
+// Mirrors PtoRunTiming in src/common/worker/pto_runtime_c_api.h so the value
+// flows through unchanged from the dlsym ABI up to the Python binding.
+struct RunTiming {
+    uint64_t host_wall_ns = 0;
+    uint64_t device_wall_ns = 0;
+};
+
 class IWorker {
 public:
     virtual ~IWorker() = default;
@@ -235,5 +245,7 @@ public:
     //
     // slot_id is not a parameter — completion routing is owned by
     // WorkerThread / Scheduler at a higher layer.
-    virtual void run(int32_t callable_id, TaskArgsView args, const CallConfig &config) = 0;
+    //
+    // Returns the wall-clock breakdown for this dispatch.
+    virtual RunTiming run(int32_t callable_id, TaskArgsView args, const CallConfig &config) = 0;
 };
