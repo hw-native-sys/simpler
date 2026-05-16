@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -320,6 +321,15 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return rc;
     }
 
+    // Lazy-allocate the 8-byte device_wall buffer on first run.
+    if (device_wall_dev_ptr_ == nullptr) {
+        device_wall_dev_ptr_ = allocate_tensor(sizeof(uint64_t));
+        if (device_wall_dev_ptr_ != nullptr) {
+            kernel_args_.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
+            *static_cast<uint64_t *>(device_wall_dev_ptr_) = 0;
+        }
+    }
+
     // Calculate execution parameters
     block_dim_ = block_dim;
     int num_aicore = block_dim * cores_per_blockdim_;
@@ -494,8 +504,17 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     std::vector<std::thread> aicpu_threads;
     aicpu_threads.reserve(over_launch);
     std::atomic<int> aicpu_rc{0};
+
+    // Sim "device wall" capture — see a2a3 sim/onboard kernel.cpp for the
+    // shape. Writes via device_wall_data_base (sim's "device pointer" is a
+    // host malloc'd uint64).
+    if (kernel_args_.device_wall_data_base != 0) {
+        *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = 0;
+    }
+    const auto sim_t0 = std::chrono::steady_clock::now();
+
     for (int i = 0; i < over_launch; i++) {
-        aicpu_threads.push_back(create_thread([this, &runtime, launch_aicpu_num, over_launch, &aicpu_rc]() {
+        aicpu_threads.push_back(create_thread([this, &runtime, launch_aicpu_num, over_launch, &aicpu_rc, sim_t0]() {
             if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
                 return;
             }
@@ -503,6 +522,11 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
             if (rc != 0) {
                 int expected = 0;
                 aicpu_rc.compare_exchange_strong(expected, rc, std::memory_order_acq_rel);
+            }
+            if (kernel_args_.device_wall_data_base != 0) {
+                const auto t1 = std::chrono::steady_clock::now();
+                *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) =
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sim_t0).count());
             }
         }));
     }
@@ -530,6 +554,13 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
 
     LOG_INFO_V0("All threads completed");
+
+    // Snapshot device_wall buffer into device_wall_ns_ (sim: single deref,
+    // no DMA — mirrors onboard's post-sync rtMemcpy D2H).
+    device_wall_ns_ = 0;
+    if (device_wall_dev_ptr_ != nullptr) {
+        device_wall_ns_ = *static_cast<uint64_t *>(device_wall_dev_ptr_);
+    }
 
     int runtime_rc = aicpu_rc.load(std::memory_order_acquire);
     if (runtime_rc != 0) {
@@ -859,6 +890,11 @@ int DeviceRunner::finalize() {
     mem_alloc_.finalize();
     clear_cpu_sim_shared_storage();
 
+    // Free the 8-byte device_wall buffer (allocated lazily in run()).
+    if (device_wall_dev_ptr_ != nullptr) {
+        free_tensor(device_wall_dev_ptr_);
+        device_wall_dev_ptr_ = nullptr;
+    }
     device_id_ = -1;
     worker_count_ = 0;
     last_runtime_ = nullptr;

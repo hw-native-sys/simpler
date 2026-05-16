@@ -295,6 +295,14 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
     /**
+     * Device-side wall (ns) from the most recently completed run, written
+     * by the platform AICPU entry (onboard: kernel.cpp; sim: lambda in
+     * run()). Returns 0 before any run completes. Independent of any
+     * profiling / swimlane subsystem.
+     */
+    uint64_t last_device_wall_ns() const { return device_wall_ns_; }
+
+    /**
      * Print handshake results from device
      *
      * Copies handshake buffers from device and prints their status.
@@ -550,6 +558,15 @@ private:
     rtStream_t stream_aicore_{nullptr};
     AicpuSoInfo so_info_;
     KernelArgsHelper kernel_args_;
+
+    // Platform-level device wall buffer: 8-byte device-resident slot whose
+    // address rides on KernelArgs.device_wall_data_base. AICPU writes the
+    // run wall (ns) through that pointer; this DeviceRunner pulls it back
+    // via copy_from_device after stream sync and caches it for
+    // last_device_wall_ns(). Allocated once at simpler_init, freed in
+    // finalize.
+    void *device_wall_dev_ptr_{nullptr};
+    uint64_t device_wall_ns_{0};
     DeviceArgs device_args_;
 
     // Kernel binary management

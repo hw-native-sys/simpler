@@ -95,6 +95,19 @@ struct KernelArgs {
     uint32_t log_info_v{5};             // INFO verbosity threshold (0..9); default V5
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
     uint32_t _pad{0};                   // Alignment padding
+
+    // Device pointer to an 8-byte buffer that the platform AICPU entry writes
+    // the run-wall (ns) into. Allocated once at simpler_init, kept resident.
+    // Onboard AICPU receives KernelArgs as a CANN-private copy (see
+    // rtAicpuKernelLaunchExWithArgs in launch_aicpu_kernel), so an inline
+    // field on KernelArgs is write-only from AICPU — host has no way to read
+    // it back. The dedicated device buffer is host-allocated and the address
+    // travels via this field; AICPU writes `*(uint64_t*)device_wall_data_base
+    // = wall_ns`, host pulls the 8 bytes via rtMemcpy(... DEVICE_TO_HOST)
+    // after stream sync. Sim's "device pointer" is a host malloc'd uint64
+    // (no special-casing — write-through works because sim AICPU and host
+    // share memory). Zero when the buffer was not allocated.
+    uint64_t device_wall_data_base{0};
 };
 
 #ifdef __cplusplus

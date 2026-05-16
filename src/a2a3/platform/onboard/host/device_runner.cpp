@@ -22,6 +22,7 @@
 #include <dlfcn.h>
 
 #include <cassert>
+#include <cstddef>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -512,6 +513,19 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return rc;
     }
 
+    // Lazy-allocate the 8-byte device_wall buffer on first run. AICPU writes
+    // the run wall (ns) into this buffer via KernelArgs::device_wall_data_base;
+    // host pulls it back via rtMemcpy D2H after stream sync (see post-sync
+    // block below). Kept resident across runs; freed in finalize.
+    if (device_wall_dev_ptr_ == nullptr) {
+        device_wall_dev_ptr_ = allocate_tensor(sizeof(uint64_t));
+        if (device_wall_dev_ptr_ != nullptr) {
+            kernel_args_.args.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
+            uint64_t zero = 0;
+            (void)copy_to_device(device_wall_dev_ptr_, &zero, sizeof(uint64_t));
+        }
+    }
+
     // Validate block_dim against stream resource limits
     rc = validate_block_dim(stream_aicore_, block_dim);
     if (rc != 0) {
@@ -761,6 +775,23 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (rc != 0) {
         LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
         return rc;
+    }
+
+    // Pull the platform-level device wall (ns) back from the 8-byte device
+    // buffer that AICPU writes through via KernelArgs::device_wall_data_base.
+    // (We can't use the device_k_args_ shadow here — CANN's
+    // rtAicpuKernelLaunchExWithArgs copies KernelArgs into AICPU-private
+    // memory at launch, so AICPU's writes to its local copy don't propagate
+    // to device_k_args_.) Failure path is a soft warn — wall stays zero.
+    device_wall_ns_ = 0;
+    if (device_wall_dev_ptr_ != nullptr) {
+        int wall_rc = rtMemcpy(
+            &device_wall_ns_, sizeof(uint64_t), device_wall_dev_ptr_, sizeof(uint64_t), RT_MEMCPY_DEVICE_TO_HOST
+        );
+        if (wall_rc != 0) {
+            LOG_WARN("rtMemcpy(device_wall_ns) D2H failed: %d", wall_rc);
+            device_wall_ns_ = 0;
+        }
     }
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
@@ -1102,6 +1133,11 @@ int DeviceRunner::finalize() {
         acl_ready_ = false;
     }
 
+    // Free the 8-byte device_wall buffer (allocated lazily in run()).
+    if (device_wall_dev_ptr_ != nullptr) {
+        free_tensor(device_wall_dev_ptr_);
+        device_wall_dev_ptr_ = nullptr;
+    }
     device_id_ = -1;
     block_dim_ = 0;
     worker_count_ = 0;

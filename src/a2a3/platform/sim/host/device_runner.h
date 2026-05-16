@@ -175,6 +175,14 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
     /**
+     * Device-side wall (ns) from the most recently completed run, written
+     * by the platform AICPU entry (onboard: kernel.cpp; sim: lambda in
+     * run()). Returns 0 before any run completes. Independent of any
+     * profiling / swimlane subsystem.
+     */
+    uint64_t last_device_wall_ns() const { return device_wall_ns_; }
+
+    /**
      * Attach the calling thread to the simulated device.
      *
      * Mirrors the onboard contract: binds the caller's TLS to `device_id`
@@ -256,6 +264,15 @@ private:
 
     // Simulation state (no actual device resources)
     KernelArgs kernel_args_;
+
+    // Platform-level device wall buffer: 8-byte device-resident slot whose
+    // address rides on KernelArgs.device_wall_data_base. AICPU writes the
+    // run wall (ns) through that pointer; this DeviceRunner pulls it back
+    // via copy_from_device after stream sync and caches it for
+    // last_device_wall_ns(). Allocated once at simpler_init, freed in
+    // finalize.
+    void *device_wall_dev_ptr_{nullptr};
+    uint64_t device_wall_ns_{0};
 
     // Chip-callable buffer pool (sim path). Keyed by FNV-1a 64-bit content
     // hash of the ChipCallable bytes. Each entry owns a host scratch holding

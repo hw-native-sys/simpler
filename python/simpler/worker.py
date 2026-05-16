@@ -70,6 +70,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     ChipBootstrapChannel,
     ChipBootstrapMailboxState,
+    RunTiming,
     _mailbox_load_i32,
     _mailbox_store_i32,
     read_args_from_blob,
@@ -1444,7 +1445,7 @@ class Worker:
     # run — uniform entry point
     # ------------------------------------------------------------------
 
-    def run(self, callable, args=None, config=None) -> None:
+    def run(self, callable, args=None, config=None) -> RunTiming:
         """Execute one task (L2) or one DAG (L3+) synchronously.
 
         Dispatch:
@@ -1455,35 +1456,48 @@ class Worker:
 
         ``args``  : TaskArgs (optional)
         ``config``: CallConfig (optional, default-constructed if None)
+
+        Returns a :class:`RunTiming` with ``host_wall_us`` (Python wall-clock
+        around the dispatch) and ``device_wall_us`` (on-NPU orchestrator wall,
+        populated whenever the runtime was built with ``PTO2_PROFILING`` —
+        the default build has it on). For L3+ DAGs, ``host_wall_us`` covers
+        the whole orch fn and ``device_wall_us`` is unset (0) — per-task
+        device timings are not aggregated here.
         """
         assert self._initialized, "Worker not initialized; call init() first"
         cfg = config if config is not None else CallConfig()
 
         if self.level == 2:
             assert self._chip_worker is not None
-            self._chip_worker.run(int(callable), args, cfg)
-        else:
-            self._start_hierarchical()
-            assert self._orch is not None
-            assert self._worker is not None
-            # Drop any error stashed by a previous run() so this call starts
-            # clean. drain() rethrows on the way out; every successful run()
-            # leaves the error slot empty, but an unrelated caller may have
-            # poked it.
-            self._orch._clear_error()
-            self._orch._scope_begin()
-            try:
-                callable(self._orch, args, cfg)
-            finally:
-                # Always release scope refs and drain so ring slots aren't
-                # stranded when the orch fn raises mid-DAG. drain() also
-                # rethrows the first dispatch failure for this run — that
-                # is how child-task exceptions surface to the caller of
-                # Worker.run(). scope_end deliberately does NOT throw: if
-                # it did, released refs would be incomplete and drain
-                # would hang on in-flight tasks.
-                self._orch._scope_end()
-                self._orch._drain()
+            return self._chip_worker.run(int(callable), args, cfg)
+
+        self._start_hierarchical()
+        assert self._orch is not None
+        assert self._worker is not None
+        # Drop any error stashed by a previous run() so this call starts
+        # clean. drain() rethrows on the way out; every successful run()
+        # leaves the error slot empty, but an unrelated caller may have
+        # poked it.
+        self._orch._clear_error()
+        self._orch._scope_begin()
+        t_start = time.perf_counter_ns()
+        try:
+            callable(self._orch, args, cfg)
+        finally:
+            # Always release scope refs and drain so ring slots aren't
+            # stranded when the orch fn raises mid-DAG. drain() also
+            # rethrows the first dispatch failure for this run — that
+            # is how child-task exceptions surface to the caller of
+            # Worker.run(). scope_end deliberately does NOT throw: if
+            # it did, released refs would be incomplete and drain
+            # would hang on in-flight tasks.
+            self._orch._scope_end()
+            self._orch._drain()
+        # device_wall stays 0 for L3+: aggregating per-task device cycles
+        # across a DAG isn't implemented here (would need accumulation in the
+        # ring scheduler). Callers wanting per-task device wall should issue
+        # individual run calls.
+        return RunTiming(time.perf_counter_ns() - t_start, 0)
 
     def prepare_callable(self, callable_id: int, callable) -> None:
         """L2 only: pre-stage a callable under ``callable_id`` (see

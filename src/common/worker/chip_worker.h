@@ -19,6 +19,7 @@
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
+#include "pto_runtime_c_api.h"
 #include "types.h"
 
 class ChipWorker {
@@ -50,12 +51,14 @@ public:
 
     // Launch a cid previously staged via prepare_callable.
     // Materializes a ChipStorageTaskArgs from `args` (one memcpy of T*40B + S*8B
-    // into a stack POD), then delegates to the overload below.
-    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config);
+    // into a stack POD), then delegates to the overload below. Returns
+    // RunTiming with host wall (steady_clock around dispatch) + device wall
+    // (KernelArgs::device_wall_ns captured by the platform AICPU entry).
+    RunTiming run(int32_t callable_id, TaskArgsView args, const CallConfig &config);
     // Same launch, but the caller already holds the runtime.so-ABI POD —
     // skip the view→storage memcpy and hand the pointer straight to the C ABI.
     // Used by the ChipStorageTaskArgs path in the nanobind binding.
-    void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
+    RunTiming run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
@@ -128,7 +131,8 @@ private:
     // CANN dlog sync. Reads the current log level off HostLogger itself.
     using SimplerInitFn = int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t);
     using PrepareCallableFn = int (*)(void *, int32_t, const void *);
-    using RunPreparedFn = int (*)(void *, void *, int32_t, const void *, int, int, int, int, int, int, const char *);
+    using RunPreparedFn =
+        int (*)(void *, void *, int32_t, const void *, int, int, int, int, int, int, const char *, PtoRunTiming *);
     using UnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);

@@ -15,12 +15,22 @@
 #include "common/platform_config.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_log.h"
+#include "aicpu/device_time.h"
 #include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "runtime.h"
+
+// Run-wall capture: g_device_start_cycle is set once in
+// DynTileFwkBackendKernelServerInit (single-threaded launch); each thread
+// of the multi-threaded DynTileFwkBackendKernelServer writes the converted
+// (end - start) into KernelArgs.device_wall_ns on exit. Plain stores —
+// last-writer-wins is fine for wall measurement (concurrent exiting threads'
+// `my_end` values differ by µs, the final overwrite is within benchmark
+// noise of the true max-end - min-start).
+static uint64_t g_device_start_cycle = 0;
 
 // Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp)
 extern "C" int aicpu_execute(Runtime *arg);
@@ -54,6 +64,15 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
     auto k_args = (KernelArgs *)arg;
     set_log_level(static_cast<int>(k_args->log_level));
     set_log_info_v(static_cast<int>(k_args->log_info_v));
+
+    // Init is launched single-threaded (block_dim=1), so the race-free spot
+    // to capture run start and reset the wall accumulator. Subsequent
+    // DynTileFwkBackendKernelServer threads stamp end on their way out, via
+    // the device-resident 8-byte buffer addressed by device_wall_data_base.
+    g_device_start_cycle = get_sys_cnt_aicpu();
+    if (k_args->device_wall_data_base != 0) {
+        *reinterpret_cast<uint64_t *>(k_args->device_wall_data_base) = 0;
+    }
 
     LOG_INFO_V0("%s", "Runtime Executor Init: Initializing AICPU kernel");
     return 0;
@@ -116,6 +135,15 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
         return rc;
     }
     LOG_INFO_V0("%s", "DynTileFwkBackendKernelServer: aicpu_execute completed successfully");
+
+    // Stamp end into the device_wall buffer (addressed via
+    // device_wall_data_base). Last-writer-wins across threads — wall
+    // measurements are µs-scale tolerant, see g_device_start_cycle comment.
+    uint64_t my_end = get_sys_cnt_aicpu();
+    if (k_args->device_wall_data_base != 0 && my_end > g_device_start_cycle) {
+        *reinterpret_cast<uint64_t *>(k_args->device_wall_data_base) =
+            static_cast<uint64_t>(cycles_to_us(my_end - g_device_start_cycle) * 1000.0);
+    }
 
     return rc;
 }
