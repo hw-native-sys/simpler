@@ -661,6 +661,19 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
     }
 
+    // Drain any entries left in the deferred-release batch. The in-loop flush
+    // only fires on idle iterations and on buffer-full; a loop exit while the
+    // last iteration made progress can leave entries un-released. Drop them
+    // here so every consumed producer slot completes its on_task_release
+    // regardless of which loop-exit path fired.
+    while (deferred_release_count > 0) {
+#if PTO2_SCHED_PROFILING
+        (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
+#else
+        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+#endif
+    }
+
 #if PTO2_PROFILING
     // Final-drain: emit any pop_hit / pop_miss accrued since the last
     // dispatch emit (typically the trailing idle loops while waiting for
