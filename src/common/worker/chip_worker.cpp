@@ -274,8 +274,8 @@ void ChipWorker::finalize() {
     finalized_ = true;
 }
 
-void ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
-    run_prepared(callable_id, args, config);
+RunTiming ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
+    return run_prepared(callable_id, args, config);
 }
 
 void ChipWorker::prepare_callable(int32_t callable_id, const void *callable) {
@@ -291,12 +291,12 @@ void ChipWorker::prepare_callable(int32_t callable_id, const void *callable) {
     }
 }
 
-void ChipWorker::run_prepared(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
+RunTiming ChipWorker::run_prepared(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
     ChipStorageTaskArgs chip_storage = view_to_chip_storage(args);
-    run_prepared(callable_id, &chip_storage, config);
+    return run_prepared(callable_id, &chip_storage, config);
 }
 
-void ChipWorker::run_prepared(int32_t callable_id, const void *args, const CallConfig &config) {
+RunTiming ChipWorker::run_prepared(int32_t callable_id, const void *args, const CallConfig &config) {
     config.validate();
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
@@ -304,13 +304,15 @@ void ChipWorker::run_prepared(int32_t callable_id, const void *args, const CallC
 
     void *rt = runtime_buf_.data();
 
+    PtoRunTiming timing{0, 0};
     int rc = run_prepared_fn_(
         device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.enable_l2_swimlane,
-        config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.output_prefix
+        config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.output_prefix, &timing
     );
     if (rc != 0) {
         throw std::runtime_error("run_prepared failed with code " + std::to_string(rc));
     }
+    return RunTiming{timing.host_wall_ns, timing.device_wall_ns};
 }
 
 void ChipWorker::unregister_callable(int32_t callable_id) {

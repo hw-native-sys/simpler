@@ -18,6 +18,7 @@
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
+#include "pto_runtime_c_api.h"
 #include "types.h"
 
 class ChipWorker : public IWorker {
@@ -49,13 +50,13 @@ public:
 
     // IWorker: dispatch the prepared cid by delegating to run_prepared.
     // The cid must already have been prepared via prepare_callable.
-    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config) override;
+    RunTiming run(int32_t callable_id, TaskArgsView args, const CallConfig &config) override;
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
     void prepare_callable(int32_t callable_id, const void *callable);
-    void run_prepared(int32_t callable_id, TaskArgsView args, const CallConfig &config);
-    void run_prepared(int32_t callable_id, const void *args, const CallConfig &config);
+    RunTiming run_prepared(int32_t callable_id, TaskArgsView args, const CallConfig &config);
+    RunTiming run_prepared(int32_t callable_id, const void *args, const CallConfig &config);
     void unregister_callable(int32_t callable_id);
 
     /// Number of distinct callable_ids the AICPU has been asked to dlopen for
@@ -113,7 +114,8 @@ private:
     // CANN dlog sync. Reads the current log level off HostLogger itself.
     using SimplerInitFn = int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t);
     using PrepareCallableFn = int (*)(void *, int32_t, const void *);
-    using RunPreparedFn = int (*)(void *, void *, int32_t, const void *, int, int, int, int, int, int, const char *);
+    using RunPreparedFn =
+        int (*)(void *, void *, int32_t, const void *, int, int, int, int, int, int, const char *, PtoRunTiming *);
     using UnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);

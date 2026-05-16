@@ -23,6 +23,7 @@
 
 #include <pthread.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <utility>
 #include <vector>
@@ -320,8 +321,12 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int /*enable_dep_gen*/,
-    const char *output_prefix
+    const char *output_prefix, PtoRunTiming *out_timing
 ) {
+    if (out_timing != NULL) {
+        out_timing->host_wall_ns = 0;
+        out_timing->device_wall_ns = 0;
+    }
     if (ctx == NULL || runtime == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
 
@@ -335,6 +340,8 @@ int run_prepared(
     auto tsd_guard = RAIIScopeGuard([]() {
         pthread_setspecific(g_runner_key, nullptr);
     });
+
+    const auto host_t0 = std::chrono::steady_clock::now();
 
     try {
         int rc = runner->prepare_run_context(runner->device_id());
@@ -388,6 +395,12 @@ int run_prepared(
 
         rc = validate_runtime_impl(r);
         r->~Runtime();
+        if (out_timing != NULL) {
+            const auto host_t1 = std::chrono::steady_clock::now();
+            out_timing->host_wall_ns =
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(host_t1 - host_t0).count());
+            out_timing->device_wall_ns = runner->last_device_wall_ns();
+        }
         return rc;
     } catch (...) {
         return -1;

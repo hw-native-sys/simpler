@@ -335,6 +335,22 @@ public:
      */
     const std::vector<std::vector<L2PerfRecord>> &get_records() const { return collected_perf_records_; }
 
+    /**
+     * On-NPU wall (in nanoseconds) of the most recently completed orch phase:
+     * cycles_to_us(end_time - start_time) * 1000, rounded. Zero when no orch
+     * summary was captured (PTO2_PROFILING off, runtime that doesn't emit
+     * orch records, or read_phase_header_metadata() not yet called).
+     *
+     * Used by run_prepared() to populate PtoRunTiming::device_wall_ns without
+     * exposing the raw cycle/frequency machinery to the C ABI.
+     */
+    uint64_t last_orch_wall_ns() const {
+        if (collected_orch_summary_.magic != AICPU_PHASE_MAGIC) return 0;
+        if (collected_orch_summary_.end_time <= collected_orch_summary_.start_time) return 0;
+        const uint64_t cycles = collected_orch_summary_.end_time - collected_orch_summary_.start_time;
+        return static_cast<uint64_t>(cycles_to_us(cycles) * 1000.0);
+    }
+
 private:
     // Shared memory pointers. shm_host_ / device_id_ live on ProfilerBase
     // (set via set_memory_context in initialize()).

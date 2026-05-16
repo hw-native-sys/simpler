@@ -172,6 +172,14 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
     /**
+     * On-NPU wall (ns) of the most recently completed run(); zero when
+     * PTO2_PROFILING was off in the runtime build. See the onboard
+     * counterpart for the full contract — the implementation is shared
+     * via the L2PerfCollector's orch_summary capture.
+     */
+    uint64_t last_device_wall_ns() const { return l2_perf_collector_.last_orch_wall_ns(); }
+
+    /**
      * Attach the calling thread to the simulated device.
      *
      * Mirrors the onboard contract: binds the caller's TLS to `device_id`
