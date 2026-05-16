@@ -131,7 +131,7 @@ void runtime_add_successor(OrchestrationRuntime *runtime, int from_task, int to_
 }
 
 void runtime_record_tensor_pair(OrchestrationRuntime *runtime, void *host_ptr, void *dev_ptr, size_t size) {
-    unwrap_runtime(runtime)->record_tensor_pair(host_ptr, dev_ptr, size);
+    unwrap_runtime(runtime)->tensor_pairs_.push_back({host_ptr, dev_ptr, size});
 }
 
 int runtime_get_task_count(OrchestrationRuntime *runtime) { return unwrap_runtime(runtime)->get_task_count(); }
@@ -297,6 +297,7 @@ int prepare_callable_impl(
         return -1;
     }
     *out = PreparedCallableArtifacts{};
+    out->signature.assign(callable->signature_, callable->signature_ + callable->sig_count());
 
     LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
     if (upload_and_collect_child_addrs(callable, upload_fn, &out->kernel_addrs) != 0) {
@@ -358,7 +359,10 @@ int prepare_callable_impl(
  * DeviceRunner::bind_prepared_callable_to_runtime (which read it from
  * PreparedCallableState for this run's callable_id).
  */
-int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr) {
+int bind_prepared_to_runtime_impl(
+    Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
+    int sig_count
+) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -373,7 +377,7 @@ int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *o
         return -1;
     }
 
-    runtime->clear_tensor_pairs();
+    runtime->tensor_pairs_.clear();
 
     LOG_INFO_V0("=== Calling Orchestration Function ===");
     LOG_DEBUG(
@@ -387,17 +391,25 @@ int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *o
         &k_orchestration_runtime_ops, runtime, &tensor_info_builder, &tensor_allocation_builder
     };
 
+    // hbg orch runs on the host, so it may legitimately need to dereference
+    // entry-tensor host pointers (e.g. to drive per-block dispatch from a
+    // control tensor). Unlike TMARB, runtime_maker cannot pre-upload entry
+    // tensors here without breaking that pattern — the orch keeps ownership
+    // of H2D decisions and uses record_tensor_pair to register outputs for
+    // copy-back. signature is plumbed for future use but unused on this path.
+    (void)signature;
+    (void)sig_count;
     int rc = orch_func(reinterpret_cast<OrchestrationRuntime *>(&orchestration_runtime), *orch_args);
     if (rc != 0) {
         LOG_ERROR("Orchestration function failed with code %d", rc);
-        runtime->clear_tensor_pairs();
+        runtime->tensor_pairs_.clear();
         return rc;
     }
 
     rc = upload_tensor_allocation_storage(runtime, tensor_allocation_builder);
     if (rc != 0) {
         LOG_ERROR("Failed to upload tensor allocations: %d", rc);
-        runtime->clear_tensor_pairs();
+        runtime->tensor_pairs_.clear();
         return rc;
     }
 
@@ -408,7 +420,7 @@ int bind_prepared_to_runtime_impl(Runtime *runtime, const ChipStorageTaskArgs *o
             runtime->host_api.device_free(runtime->get_tensor_allocation_storage());
             runtime->clear_tensor_allocation_storage();
         }
-        runtime->clear_tensor_pairs();
+        runtime->tensor_pairs_.clear();
         return rc;
     }
 
@@ -438,8 +450,8 @@ int validate_runtime_impl(Runtime *runtime) {
     LOG_INFO_V0("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    TensorPair *tensor_pairs = runtime->get_tensor_pairs();
-    int tensor_pair_count = runtime->get_tensor_pair_count();
+    TensorPair *tensor_pairs = runtime->tensor_pairs_.data();
+    int tensor_pair_count = static_cast<int>(runtime->tensor_pairs_.size());
 
     for (int i = 0; i < tensor_pair_count; i++) {
         const TensorPair &pair = tensor_pairs[i];
@@ -486,7 +498,7 @@ int validate_runtime_impl(Runtime *runtime) {
     }
 
     // Clear tensor pairs
-    runtime->clear_tensor_pairs();
+    runtime->tensor_pairs_.clear();
 
     LOG_INFO_V0("=== Finalize Complete ===");
 

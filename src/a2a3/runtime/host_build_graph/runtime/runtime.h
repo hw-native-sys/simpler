@@ -35,6 +35,7 @@
 #include <string.h>  // for memset
 
 #include <atomic>
+#include <vector>
 
 #include "common/core_type.h"
 #include "common/l2_perf_profiling.h"
@@ -63,10 +64,6 @@
 
 #ifndef RUNTIME_MAX_WORKER
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES_PER_THREAD
-#endif
-
-#ifndef RUNTIME_MAX_TENSOR_PAIRS
-#define RUNTIME_MAX_TENSOR_PAIRS 64
 #endif
 
 #ifndef RUNTIME_MAX_FUNC_ID
@@ -216,10 +213,6 @@ private:
     int initial_ready_tasks[RUNTIME_MAX_TASKS];
     int initial_ready_count;
 
-    // Tensor pairs for host-device memory tracking
-    TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
-    int tensor_pair_count;
-
     // Function address mapping (for API compatibility with rt2)
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
@@ -312,38 +305,6 @@ public:
      * Shows task table with fanin/fanout information.
      */
     void print_runtime() const;
-
-    // =========================================================================
-    // Tensor Pair Management
-    // =========================================================================
-
-    /**
-     * Record a host-device tensor pair for copy-back during finalize.
-     *
-     * @param host_ptr  Host memory pointer (destination for copy-back)
-     * @param dev_ptr   Device memory pointer (source for copy-back)
-     * @param size     Size of tensor in bytes
-     */
-    void record_tensor_pair(void *host_ptr, void *dev_ptr, size_t size);
-
-    /**
-     * Get pointer to tensor pairs array.
-     *
-     * @return Pointer to tensor pairs array
-     */
-    TensorPair *get_tensor_pairs();
-
-    /**
-     * Get number of recorded tensor pairs.
-     *
-     * @return Number of tensor pairs
-     */
-    int get_tensor_pair_count() const;
-
-    /**
-     * Clear all recorded tensor pairs.
-     */
-    void clear_tensor_pairs();
 
     // =========================================================================
     // Tensor Info Metadata
@@ -519,6 +480,13 @@ public:
     }
     int32_t get_active_callable_id() const { return active_callable_id_; }
     bool register_new_callable_id() const { return register_new_callable_id_; }
+
+    // Host-side tensor ledger for D2H copy-back at finalize. Populated by
+    // runtime_maker.cpp from orch_args at bind time; iterated in
+    // validate_runtime_impl. Not read by AICPU/AICore — the device-side
+    // Runtime image carries the std::vector control block as harmless
+    // garbage, identical to host_api above. No fixed cap.
+    std::vector<TensorPair> tensor_pairs_;
 };
 
 #endif  // SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_

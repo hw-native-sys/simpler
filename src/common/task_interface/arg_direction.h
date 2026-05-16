@@ -27,7 +27,11 @@ enum class ArgDirection : int32_t {
 };
 
 inline constexpr int CORE_MAX_TENSOR_ARGS = 16;
-inline constexpr int CHIP_MAX_TENSOR_ARGS = 64;
+// Chip-level entry-tensor cap. Sizes ChipCallable::signature_[] and
+// ChipStorageTaskArgs::tensors_[], both of which cross the host->device wire
+// as fixed POD — raising this is an additive ABI change (existing callers
+// still fit; transient storage grows by 64 * sizeof(ContinuousTensor)).
+inline constexpr int CHIP_MAX_TENSOR_ARGS = 128;
 inline constexpr int CORE_MAX_SCALAR_ARGS = 32;
 inline constexpr int CHIP_MAX_SCALAR_ARGS = 128;
 inline constexpr uint32_t CALLABLE_ALIGN = 64;
