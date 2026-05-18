@@ -162,15 +162,6 @@ void SchedulerContext::dispatch_subtask_to_core(
 #endif
         tracker.change_core_state(core_offset);
     }
-#if PTO2_PROFILING
-    if (l2_perf.l2_perf_enabled) {
-        if (core_exec_state.dispatch_count >= PLATFORM_PROF_BUFFER_SIZE) {
-            l2_perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
-            core_exec_state.dispatch_count = 0;
-        }
-        core_exec_state.dispatch_count++;
-    }
-#endif
 
     LOG_DEBUG(
         "Thread %d: Dispatched %s %s task %" PRId64 " kernel_id=[%d,%d,%d] block_idx=%d/total_blocks=%d to"
@@ -347,8 +338,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
         if (is_l2_swimlane_enabled()) {
-            l2_perf_aicpu_init_profiling(runtime);
-            l2_perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
+            l2_perf_aicpu_init(runtime->worker_count);
+            l2_perf_aicpu_init_phase(runtime->worker_count, sched_thread_num_);
             l2_perf_aicpu_set_orch_thread_idx(sched_thread_num_);
         }
 #endif
@@ -357,7 +348,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
         }
         if (is_pmu_enabled()) {
-            pmu_aicpu_init(runtime->workers, physical_core_ids_, cores_total_num_);
+            pmu_aicpu_init(physical_core_ids_, cores_total_num_);
             LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
         }
 #endif

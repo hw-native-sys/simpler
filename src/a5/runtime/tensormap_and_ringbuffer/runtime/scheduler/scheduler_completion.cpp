@@ -157,9 +157,7 @@ void SchedulerContext::complete_slot_task(
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        Handshake *h = &hank[core_id];
         uint64_t finish_ts = get_sys_cnt_aicpu();
-        L2PerfBuffer *pbuf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
 
         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
         int32_t fanout_n = 0;
@@ -171,7 +169,7 @@ void SchedulerContext::complete_slot_task(
 
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_perf_aicpu_complete_record(
-                pbuf, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
+                core_id, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
                 slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
                 fanout_n
             ) != 0) {

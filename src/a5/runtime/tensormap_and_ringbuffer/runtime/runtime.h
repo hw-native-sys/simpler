@@ -35,7 +35,6 @@
 #include <string.h>  // for memset
 
 #include "common/core_type.h"
-#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"
@@ -83,34 +82,29 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * The structure is cache-line aligned (64 bytes) to prevent false sharing
  * between cores and optimize cache coherency operations.
  *
- * enable_profiling_flag bit definitions (umbrella bitmask — "profiling"
- * is the umbrella, each bit is a parallel diagnostics sub-feature):
- * - bit0: tensor dump enabled
- * - bit1: L2 swimlane enabled
- * - bit2: PMU enabled (reserved on a5; a2a3 wires through device_runner)
+ * Profiling state lives outside this struct: enablement bits and per-core
+ * ring/reg addresses travel through `KernelArgs::enable_profiling_flag` +
+ * `KernelArgs::aicore_* per-core address arrays`, which the AICore kernel entry
+ * forwards into platform-owned per-core slots
+ * (`aicore/aicore_profiling_state.h`). Adding a profiling sub-feature does
+ * not require touching this struct anymore.
  *
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
  * - aicore_done: Written by AICore, read by AICPU
- * - task: Written by AICPU, read by AICore (0 = not ready, non-zero = PTO2DispatchPayload*)
+ * - task: Written by AICPU, read by AICore (Init: PTO2DispatchPayload*; runtime: unused)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
- * - enable_profiling_flag: Written by host/AICPU init, read by AICore (bitmask)
- * - pmu_buffer_addr: Written by AICPU at PMU init (before aicpu_regs_ready=1), read by AICore
- * - pmu_reg_base: Written by AICPU at PMU init (before aicpu_regs_ready=1), read by AICore
+ * - physical_core_id: Written by AICore (Phase 2), read by AICPU
+ * - aicpu_regs_ready / aicore_regs_ready: handshake sequence flags
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;           // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;           // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;                  // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
-    volatile CoreType core_type;             // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t l2_perf_records_addr;  // Performance records address
-    volatile uint32_t physical_core_id;      // Physical core ID
-    volatile uint32_t aicpu_regs_ready;      // AICPU register init done: 0=pending, 1=done
-    volatile uint32_t aicore_regs_ready;     // AICore ID reported: 0=pending, 1=done
-    volatile uint32_t
-        enable_profiling_flag;          // Generic profiling-related flags; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
-    volatile uint64_t pmu_buffer_addr;  // Per-core PmuBuffer device address (for AICore-side PMU record)
-    volatile uint64_t pmu_reg_base;     // Per-core PMU MMIO base (for AICore-side PMU register reads)
+    volatile uint32_t aicpu_ready;        // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;        // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;               // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
+    volatile CoreType core_type;          // Core type: CoreType::AIC or CoreType::AIV
+    volatile uint32_t physical_core_id;   // Physical core ID
+    volatile uint32_t aicpu_regs_ready;   // AICPU register init done: 0=pending, 1=done
+    volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
 /**

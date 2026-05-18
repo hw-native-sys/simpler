@@ -460,24 +460,30 @@ void dump_tensor_flush(int thread_idx) {
     }
 
     DumpMetaBuffer *buf = s_current_dump_buf[thread_idx];
-    if (buf != nullptr && buf->count > 0) {
+    DumpBufferState *state = s_dump_states[thread_idx];
+    if (buf != nullptr && buf->count > 0 && state != nullptr) {
         uint64_t buf_addr = reinterpret_cast<uint64_t>(buf);
-        uint32_t seq = s_dump_states[thread_idx]->current_buf_seq;
-        if (enqueue_dump_ready_buffer(thread_idx, buf_addr, seq) != 0) {
-            account_dropped_records(s_dump_states[thread_idx], buf->count);
-            buf->count = 0;
+        uint32_t seq = state->current_buf_seq;
+        if (enqueue_dump_ready_buffer(thread_idx, buf_addr, seq) == 0) {
+            s_current_dump_buf[thread_idx] = nullptr;
+            state->current_buf_ptr = 0;
             wmb();
-            if (!s_logged_ready_queue_full[thread_idx]) {
-                s_logged_ready_queue_full[thread_idx] = true;
-                LOG_WARN(
-                    "Tensor dump ready queue is full on thread %d, so the current metadata buffer will be "
-                    "overwritten. Increase PLATFORM_DUMP_READYQUEUE_SIZE.",
-                    thread_idx
-                );
-            }
+        } else {
+            // ready_queue full at end-of-run: account the loss and clear the
+            // buffer so host reconcile sees a clean state (current_buf_ptr=0)
+            // and dropped == flush failures rather than silent leftover.
+            // Bounded to one per thread per run (unlike the hot-path
+            // dump_tensor_record site), so no spam guard is needed here.
+            LOG_ERROR(
+                "Thread %d: failed to flush tensor-dump buffer (ready_queue full), %u records lost!", thread_idx,
+                buf->count
+            );
+            account_dropped_records(state, buf->count);
+            buf->count = 0;
+            s_current_dump_buf[thread_idx] = nullptr;
+            state->current_buf_ptr = 0;
+            wmb();
         }
-        s_current_dump_buf[thread_idx] = nullptr;
-        s_dump_states[thread_idx]->current_buf_ptr = 0;
     }
 
     s_buffers_flushed[thread_idx]++;

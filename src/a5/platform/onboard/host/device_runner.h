@@ -78,6 +78,7 @@ struct DeviceArgs {
 struct KernelArgsHelper {
     KernelArgs args;
     MemoryAllocator *allocator_{nullptr};
+    KernelArgs *device_k_args_{nullptr};  // Device pointer (populated by init_device_kernel_args)
 
     /**
      * Initialize device arguments by allocating device memory and copying data
@@ -110,6 +111,20 @@ struct KernelArgsHelper {
      * @return 0 on success, error code on failure
      */
     int finalize_runtime_args();
+
+    /**
+     * Allocate device memory for the host-resident KernelArgs and copy the
+     * struct over. AICore's KERNEL_ENTRY expects a KernelArgs* (not a
+     * Runtime*) so it can read the profiling enablement bits + ring address
+     * tables and forward them into AICore platform state. Call this after
+     * every kernel_args.args.* field is populated for the run.
+     */
+    int init_device_kernel_args(MemoryAllocator &allocator);
+
+    /**
+     * Free device memory allocated for the device-resident KernelArgs copy.
+     */
+    int finalize_device_kernel_args();
 
     /**
      * Implicit conversion operators for seamless use with runtime APIs
@@ -273,17 +288,6 @@ public:
     void print_handshake_results();
 
     /**
-     * Poll and collect performance data from the memory manager's queue
-     *
-     * Runs on a dedicated collector thread. Pulls ready buffers from
-     * ProfMemoryManager, copies records to host vectors, and notifies
-     * the manager to free old device buffers.
-     *
-     * @param expected_tasks Expected total number of tasks
-     */
-    void poll_and_collect_performance_data(int expected_tasks);
-
-    /**
      * Cleanup all resources
      *
      * Frees all device memory, destroys streams, and resets state.
@@ -311,13 +315,15 @@ public:
      * Launch an AICore kernel
      *
      * Internal method used by run(). Can be called directly for custom
-     * workflows.
+     * workflows. Receives the device-resident KernelArgs pointer, which the
+     * AICore KERNEL_ENTRY uses to forward profiling state into platform
+     * slots before calling aicore_execute(runtime_args, ...).
      *
      * @param stream  AICore stream
-     * @param runtime   Pointer to device runtime
+     * @param k_args  Device pointer to the populated KernelArgs
      * @return 0 on success, error code on failure
      */
-    int launch_aicore_kernel(rtStream_t stream, Runtime *runtime);
+    int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
 
     /**
      * Upload an entire ChipCallable buffer to device memory in one shot.
@@ -556,7 +562,7 @@ private:
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
-    int init_l2_perf_collection(int num_aicore, int device_id);
+    int init_l2_perf(int num_aicore, int device_id);
 
     /**
      * Initialize tensor dump device buffers.
@@ -566,7 +572,7 @@ private:
      * @param device_id Device ID for allocations
      * @return 0 on success, error code on failure
      */
-    int init_tensor_dump(Runtime &runtime, int num_aicore, int device_id);
+    int init_tensor_dump(Runtime &runtime, int device_id);
 
     /**
      * Initialize PMU profiling device buffers.
@@ -585,9 +591,13 @@ private:
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
 
-    int init_pmu_buffers(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
-    );
+    int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
+
+    // Per-run collector teardown: stops mgmt + poll threads on every collector
+    // whose init succeeded, in the only safe order (stop() joins mgmt before
+    // poll). Idempotent — collectors that never initialized are skipped.
+    // Does not release device memory; full release happens in finalize().
+    void finalize_collectors();
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H

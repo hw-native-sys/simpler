@@ -218,24 +218,23 @@ Both architectures share the same device-side layout, published via
 `kernel_args.dump_data_base`:
 
 ```text
-DumpSetupHeader                                 (host init, AICPU reads)
+DumpDataHeader                                  (host init, AICPU reads)
+├── queues  [MAX_AICPU_THREADS][READYQUEUE_SIZE]
+├── queue_heads / queue_tails (per-thread)
 ├── num_dump_threads
 ├── records_per_buffer
-├── magic = 0x44554D50 ("DUMP")
-├── dump_buffer_ptrs  [MAX_AICPU_THREADS]  ──> DumpBuffer    (per-thread)
-├── arena_header_ptrs [MAX_AICPU_THREADS]  ──> DumpArenaHeader
-├── arena_data_ptrs   [MAX_AICPU_THREADS]  ──> arena bytes
-└── arena_sizes       [MAX_AICPU_THREADS]
+└── magic = 0x44554D50 ("DUMP")
 
-DumpBuffer (per-thread, 64 B header + records[])
-  ├── count          (AICPU writes)
-  ├── capacity       (host sets)
-  ├── dropped_count  (AICPU increments when full)
-  └── TensorDumpRecord records[capacity]      ← 128 B each
+DumpBufferState[num_dump_threads]               (per-thread)
+├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
+├── current_buf_ptr            (AICPU active DumpMetaBuffer*)
+├── current_buf_seq
+├── arena_base / arena_size    (per-thread arena pointers)
+├── arena_write_offset         (AICPU monotonic cursor)
+└── dropped_record_count
 
-DumpArenaHeader (per-thread)
-  ├── write_offset   (AICPU monotonic cursor)
-  └── arena_size     (host sets)
+DumpMetaBuffer pool (rotated)                   (BUFFERS_PER_THREAD per thread)
+└── TensorDumpRecord records[RECORDS_PER_BUFFER] + count   ← 128 B each
 
 arena_data (per-thread, circular byte buffer)
   default = BUFFERS_PER_THREAD × RECORDS_PER_BUFFER × AVG_TENSOR_BYTES
@@ -247,10 +246,10 @@ These structs are binary-identical between a2a3 and a5
 `KernelArgs`, not `Runtime` — AICPU reads it from
 `k_args->dump_data_base` in `kernel.cpp` and passes it to
 `set_platform_dump_base()`. Dump enablement is propagated
-separately via the per-worker handshake field
-`enable_profiling_flag` (`bit0 = PROFILING_FLAG_DUMP_TENSOR`), so
-device-side code does not infer "dump enabled" from
-`dump_data_base != 0`.
+separately via the umbrella bitmask `KernelArgs::enable_profiling_flag`
+(`bit0 = PROFILING_FLAG_DUMP_TENSOR`); the AICPU kernel entry calls
+`set_dump_tensor_enabled()` with the decoded bit, so device-side
+code does not infer "dump enabled" from `dump_data_base != 0`.
 
 Each record is fixed at 128 B (two cache lines) — see
 `TensorDumpRecord` in
@@ -337,7 +336,7 @@ poll thread that drains the L2 hand-off queue into
 │ TensorDumpCollector      │               │ AICPU thread             │
 │                          │               │                          │
 │ initialize()             │  alloc +      │ dump_tensor_init()       │
-│   rtMalloc + halRegister │──register────>│   read DumpSetupHeader   │
+│   rtMalloc + halRegister │──register────>│   read DumpDataHeader    │
 │   build DumpDataHeader   │              │   cache per-thread ptrs  │
 │                          │               │                          │
 │ start()                  │               │ per-task run loop:       │
@@ -400,75 +399,126 @@ trait pattern are shared with PMU and L2Perf — see
 [profiling-framework.md](../profiling-framework.md) for the
 framework reference.
 
-### 5.5 a5 — bulk rtMemcpy after stream sync
+### 5.5 a5 — same framework, host-shadow transport
 
-`TensorDumpCollector` allocates the per-thread `DumpBuffer`s and
-arenas on device once, publishes the setup header, and lets the
-device write to them through the run. Collection is a single bulk
-pass driven from the host after `rtStreamSynchronize`: per-thread,
-copy the `DumpBuffer` header to learn the record count, then copy
-`count` records plus the corresponding arena slice in one shot.
+a5's `TensorDumpCollector` derives from
+`ProfilerBase<TensorDumpCollector, DumpModule>` and shares the
+mgmt + poll thread structure with a2a3. The single behavioral
+deviation from §5.4 is the **transport channel**: a5 has no
+`halHostRegister`, so each device buffer is paired with a
+host-shadow `malloc()` and the mgmt loop synchronizes the two via
+`profiling_copy.h` (`rtMemcpy` onboard, `memcpy` in sim).
+`MemoryOps` therefore carries five callbacks (`alloc` / `reg` /
+`free_` / `copy_to_device` / `copy_from_device`); the mgmt loop
+mirrors the entire shm region (`DumpDataHeader` + per-thread
+`DumpBufferState`) device → host at the top of every tick, then
+pushes back only the fields host modified (advanced
+`queue_heads[q]`, refilled `free_queue.tail` and
+`buffer_ptrs[slot]`) via `BufferPoolManager::write_range_to_device`.
+The bulk `mirror_shm_to_device` is **not** called from the mgmt
+loop: it would race with AICPU writes to device-only fields
+(`current_buf_ptr`, `total/dropped` counters, `queue_tails`,
+`free_queue.head`) and roll them back. Each popped
+`DumpMetaBuffer` is still pulled on demand inside
+`ProfilerAlgorithms::process_entry`. The per-thread arena lives
+outside the shm region, so `on_buffer_collected` issues an
+additional `copy_from_device` for the arena bytes referenced by
+the buffer's records.
 
 ```text
         HOST                                         DEVICE
 ┌──────────────────────────┐               ┌──────────────────────────┐
 │ TensorDumpCollector      │               │ AICPU thread             │
+│   : ProfilerBase<...>    │               │                          │
 │                          │               │                          │
-│ initialize()             │  alloc +      │ dump_tensor_init()       │
-│   rtMalloc / malloc      │──copy────────>│   read DumpSetupHeader   │
-│   build DumpSetupHeader  │               │   cache per-thread ptrs  │
-│   copy to device         │               │                          │
-│                          │               │ per-task run loop:       │
-│                          │               │   BEFORE_DISPATCH        │
+│ initialize()             │  alloc + reg  │ dump_tensor_init()       │
+│   rtMalloc shm           │──+ shadow────>│   read DumpDataHeader    │
+│   per-thread arenas      │   memset 0    │   cache per-thread ptrs  │
+│   per-thread             │   + push 0s   │                          │
+│   DumpMetaBuffers        │               │ per-task run loop:       │
+│   register_mapping(s)    │               │   BEFORE_DISPATCH        │
 │                          │               │     dump_tensor_record() │
-│ ── kernel execution ──   │               │   dispatch kernel        │
-│                          │               │   wait FIN               │
-│ rtStreamSynchronize      │               │   AFTER_COMPLETION       │
+│ start(thread_factory)    │               │   dispatch kernel        │
+│   mgmt_thread starts     │               │   wait FIN               │
+│   poll_thread starts     │               │   AFTER_COMPLETION       │
 │                          │               │     dump_tensor_record() │
-│ collect_all()            │  batch        │                          │
-│   2-step per thread:     │<──memcpy─────<│ dump_tensor_flush()      │
-│   1. copy DumpBuffer hdr │               │   log per-thread stats   │
-│      read count          │               └──────────────────────────┘
-│   2. copy records+arena  │
-│                          │
-│ export_dump_files()      │
-│   → <output_prefix>/     │
-│     tensor_dump/         │
-│       tensor_dump.json   │
-│       tensor_dump.bin    │
-└──────────────────────────┘
+│ mgmt every 10us tick:    │               │   if buffer full:        │
+│   copy_from_device(shm)  │<──memcpy─────<│     push ready entry,    │
+│   for each ready entry:  │               │     pop next from free_q │
+│     copy buf from device │<──memcpy─────<│                          │
+│     resolve host ptr     │               │ dump_tensor_flush():     │
+│     push to L2 ready_q   │               │   push remaining buffers │
+│   advance queue_heads,   │               │   to ready_q             │
+│     refill free_queues   │               │                          │
+│   write_range_to_device  │──memcpy──────>│                          │
+│     for each modified    │               │                          │
+│     field                │               │                          │
+│                          │               │                          │
+│ poll thread:             │               │                          │
+│   wait_pop_ready          │               │                          │
+│   on_buffer_collected →  │               │                          │
+│     copy arena slice     │<──memcpy─────<│                          │
+│     extract DumpedTensors│               │                          │
+│     queue to writer thrd │               │                          │
+│   notify_copy_done       │               │                          │
+│                          │               │                          │
+│ rtStreamSynchronize      │               │                          │
+│ stop()                   │               │                          │
+│   join mgmt + poll       │               │                          │
+│ reconcile_counters()     │               │                          │
+│   sanity-check leftovers │               │                          │
+│   + dropped accounting   │               │                          │
+│ export_dump_files()      │               │                          │
+│   → <output_prefix>/     │               │                          │
+│     tensor_dump/...      │               │                          │
+└──────────────────────────┘               └──────────────────────────┘
 ```
 
 **Lifecycle** (`device_runner.cpp`):
 
 ```text
 init_tensor_dump()
-  dump_collector_.initialize(...)
-  kernel_args_.args.dump_data_base = dump_collector_.get_dump_setup_device_ptr()
+  dump_collector_.initialize(num_dump_threads, ..., output_prefix_)
+  kernel_args_.args.dump_data_base = dump_collector_.get_dump_shm_device_ptr()
+dump_collector_.start(thread_factory)   ← mgmt + poll threads
 launch AICPU / AICore
-rtStreamSynchronize                ← wait for kernel completion
-collect_all()                      ← batch memcpy all buffers back
-export_dump_files()
+rtStreamSynchronize
+dump_collector_.stop()                  ← join mgmt + poll, drain final batch
+dump_collector_.reconcile_counters()    ← sanity-check + dropped accounting
+dump_collector_.export_dump_files()
+dump_collector_.finalize()
 ```
 
 [`TensorDumpCollector`](../src/a5/platform/include/host/tensor_dump_collector.h)
-on a5 is self-contained — `initialize` / `collect_all` /
-`export_dump_files` / `finalize`. `collect_all()` is the
-synchronous batch drain after stream sync; there are no helper
-threads to coordinate, so the a5 collector does not derive from
-`ProfilerBase`.
+on a5 inherits the same CRTP base
+([`profiling_common::ProfilerBase`](../src/a5/platform/include/host/profiling_common/profiler_base.h))
+as a2a3 and parameterizes
+[`BufferPoolManager`](../src/a5/platform/include/host/profiling_common/buffer_pool_manager.h)
+with `DumpModule`. The only a5-specific glue is the 5-callback
+`MemoryOps`, the per-tick shm mirror, and the on-demand arena copy
+inside `on_buffer_collected`.
+
+a5's per-thread AICPU flush (`dump_tensor_flush`) is the only data
+path on the records side — host never reads from `current_buf_ptr`
+to recover records. `reconcile_counters` is purely passive: it logs
+an error if any `current_buf_ptr` is non-zero with a non-empty buffer
+(a device-flush bug), then accumulates each thread's
+`dropped_record_count` for the final anomaly report.
 
 ### 5.6 a2a3 vs a5 at a glance
 
 | Aspect | a2a3 | a5 |
 | ------ | ---- | -- |
-| Device-side layout | identical (same `DumpSetupHeader` / `DumpBuffer` / `DumpArenaHeader`, `static_assert`-checked) | |
+| Device-side layout | identical (same `DumpDataHeader` / `DumpMetaBuffer` / arena shape, `static_assert`-checked) | |
 | AICPU recording logic | identical | |
-| Host transport | `halHostRegister` shared memory | `rtMemcpy` after `rtStreamSynchronize` |
-| Buffer model | rotating pool (free + ready queues per thread) | one `DumpBuffer` + arena per thread |
-| Host threads | mgmt + poll, streams during execution | drain after sync |
-| Host-class shape | `ProfilerBase` subclass (mgmt + poll thread + `BufferPoolManager<DumpModule>`) | self-contained `initialize`/`collect_all`/`finalize` |
-| Lifecycle | `initialize` → `start` → `stop` → `reconcile_counters` → `export_dump_files` → `finalize` | `initialize` → `collect_all` → `export_dump_files` → `finalize` |
+| Buffer model | rotating pool (free + ready queues per thread) | identical |
+| Host threads | mgmt + poll, streams during execution | identical |
+| Host-class shape | `ProfilerBase<TensorDumpCollector, DumpModule>` | identical |
+| Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
+| `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
+| Arena access | direct via SVM | `copy_from_device` inside `on_buffer_collected` |
+| `reconcile_counters` | passive sanity check + dropped accounting | identical |
+| Lifecycle | `initialize` → `start` → `stop` → `reconcile_counters` → `export_dump_files` → `finalize` | identical |
 
 ## 6. Overhead
 

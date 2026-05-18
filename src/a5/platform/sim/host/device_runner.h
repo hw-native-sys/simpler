@@ -297,7 +297,7 @@ private:
     bool aicpu_so_loaded_{false};  // true after AICPU SO is dlopen'd; load-once across runs.
     void *aicore_so_handle_{nullptr};
     int (*aicpu_execute_func_)(Runtime *){nullptr};
-    void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t){nullptr};
+    void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t){nullptr};
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_platform_pmu_base_func_)(uint64_t){nullptr};
@@ -339,19 +339,18 @@ private:
      * @param device_id Device ID (ignored in simulation)
      * @return 0 on success, error code on failure
      */
-    int init_l2_perf_collection(int num_aicore, int device_id);
+    int init_l2_perf(int num_aicore, int device_id);
 
     /**
      * Initialize tensor dump for simulation.
      */
-    int init_tensor_dump(Runtime &runtime, int num_aicore, int device_id);
+    int init_tensor_dump(Runtime &runtime, int device_id);
 
     /**
      * Initialize PMU profiling buffers for simulation.
      *
      * Allocates PmuDataHeader + per-core PmuBuffer on host memory, publishes
-     * the header pointer into kernel_args.pmu_data_base. pmu_reg_addrs
-     * stays 0 on sim (no hardware PMU model).
+     * the header pointer into kernel_args.pmu_data_base.
      * Signature matches a2a3 for cross-platform consistency.
      */
     // Enablement for the three diagnostics sub-features. Written by the c_api
@@ -364,9 +363,11 @@ private:
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
 
-    int init_pmu_buffers(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
-    );
+    int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
+
+    // Per-run collector teardown: stops mgmt + poll threads on every collector
+    // whose init succeeded. Idempotent. Mirrors the onboard helper.
+    void finalize_collectors();
 };
 
 #endif  // SRC_A5_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_
