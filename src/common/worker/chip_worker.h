@@ -19,6 +19,7 @@
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
+#include "host_device_channel.h"
 #include "pto_runtime_c_api.h"
 #include "types.h"
 
@@ -80,6 +81,18 @@ public:
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
+    uint64_t open_channel(const HostDeviceChannelConfig &cfg);
+    void close_channel(uint64_t ch);
+    void channel_send(uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us);
+    std::vector<uint8_t> channel_recv(
+        uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *out_route, uint64_t *out_correlation_id
+    );
+    void channel_send_l2_for_test(
+        uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
+    );
+    std::vector<uint8_t> channel_recv_l2_for_test(
+        uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *out_route, uint64_t *out_correlation_id
+    );
 
     /// Distributed communication primitives (optional — only available when
     /// the bound runtime exports comm_*).  Wraps the backend-neutral C API
@@ -134,6 +147,10 @@ private:
     using DeviceFreeCtxFn = void (*)(void *, void *);
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
+    using OpenHostDeviceChannelCtxFn = void *(*)(void *, const HostDeviceChannelConfig *);
+    using CloseHostDeviceChannelCtxFn = int (*)(void *, void *);
+    using HostDeviceSendCtxFn = int (*)(void *, void *, uint32_t, const void *, size_t, uint64_t, uint32_t);
+    using HostDeviceRecvCtxFn = int (*)(void *, void *, void *, size_t, size_t *, uint64_t *, uint32_t *, uint32_t);
     using GetRuntimeSizeFn = size_t (*)();
     // From host_runtime.so. Single platform-side init that does (a) thread
     // attach + device-id record, (b) executor binary takeover, (c) onboard
@@ -183,6 +200,10 @@ private:
     DeviceFreeCtxFn device_free_ctx_fn_ = nullptr;
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
+    OpenHostDeviceChannelCtxFn open_host_device_channel_ctx_fn_ = nullptr;
+    CloseHostDeviceChannelCtxFn close_host_device_channel_ctx_fn_ = nullptr;
+    HostDeviceSendCtxFn host_device_send_ctx_fn_ = nullptr;
+    HostDeviceRecvCtxFn host_device_recv_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     SimplerInitFn simpler_init_fn_ = nullptr;
     PrepareCallableFn prepare_callable_fn_ = nullptr;

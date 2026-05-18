@@ -21,6 +21,7 @@
 #include "prepare_callable_common.h"
 #include "task_args.h"
 
+#include <dlfcn.h>
 #include <pthread.h>
 
 #include <chrono>
@@ -30,6 +31,7 @@
 
 #include "common/unified_log.h"
 #include "device_runner.h"
+#include "host_device_channel.h"
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
@@ -38,6 +40,31 @@
 // require CANN's toolchain include path on the host build. Resolved at link
 // time against libunified_dlog.so / libascendalog.so.
 extern "C" int dlog_setlevel(int moduleId, int level, int enableEvent);
+
+namespace {
+void *g_hdch_hal_handle = nullptr;
+constexpr unsigned int HDCH_DEV_SVM_MAP_HOST = 2U;
+
+using HdchHalHostRegisterFn = int (*)(void *dev_ptr, size_t size, unsigned int flags, int device_id, void **host_ptr);
+using HdchHalHostUnregisterFn = int (*)(void *host_ptr, int device_id);
+
+int hdch_load_hal_if_needed() {
+    if (g_hdch_hal_handle != nullptr) return 0;
+    g_hdch_hal_handle = dlopen("libascend_hal.so", RTLD_NOW | RTLD_LOCAL);
+    return g_hdch_hal_handle == nullptr ? -1 : 0;
+}
+
+HdchHalHostRegisterFn hdch_get_halHostRegister() {
+    if (g_hdch_hal_handle == nullptr) return nullptr;
+    return reinterpret_cast<HdchHalHostRegisterFn>(dlsym(g_hdch_hal_handle, "halHostRegister"));
+}
+
+HdchHalHostUnregisterFn hdch_get_halHostUnregister() {
+    if (g_hdch_hal_handle == nullptr) return nullptr;
+    return reinterpret_cast<HdchHalHostUnregisterFn>(dlsym(g_hdch_hal_handle, "halHostUnregister"));
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -213,6 +240,82 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
     } catch (...) {
         return -1;
     }
+}
+
+HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg) {
+    if (ctx == NULL) return NULL;
+    size_t bytes = host_device_channel_required_bytes(cfg);
+    if (bytes == 0) return NULL;
+    auto *runner = static_cast<DeviceRunner *>(ctx);
+    void *dev_ptr = nullptr;
+    void *host_ptr = nullptr;
+    try {
+        dev_ptr = runner->allocate_tensor(bytes);
+        if (dev_ptr == nullptr) return NULL;
+        if (hdch_load_hal_if_needed() != 0) {
+            runner->free_tensor(dev_ptr);
+            return NULL;
+        }
+        HdchHalHostRegisterFn fn = hdch_get_halHostRegister();
+        if (fn == nullptr || fn(dev_ptr, bytes, HDCH_DEV_SVM_MAP_HOST, runner->device_id(), &host_ptr) != 0 ||
+            host_ptr == nullptr) {
+            runner->free_tensor(dev_ptr);
+            return NULL;
+        }
+        HostDeviceChannel *ch = host_device_channel_wrap(dev_ptr, host_ptr, bytes, cfg, 0, nullptr);
+        if (ch == nullptr) {
+            HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+            if (unreg != nullptr) unreg(host_ptr, runner->device_id());
+            runner->free_tensor(dev_ptr);
+            return NULL;
+        }
+        return static_cast<HostDeviceChannelHandle>(ch);
+    } catch (...) {
+        if (host_ptr != nullptr) {
+            HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+            if (unreg != nullptr) unreg(host_ptr, runner->device_id());
+        }
+        if (dev_ptr != nullptr) runner->free_tensor(dev_ptr);
+        return NULL;
+    }
+}
+
+int close_host_device_channel_ctx(DeviceContextHandle ctx, HostDeviceChannelHandle raw_ch) {
+    if (ctx == NULL || raw_ch == NULL) return HDCH_ERR_INVALID;
+    auto *runner = static_cast<DeviceRunner *>(ctx);
+    auto *ch = static_cast<HostDeviceChannel *>(raw_ch);
+    try {
+        HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+        if (unreg != nullptr && ch->host_base != nullptr) {
+            unreg(ch->host_base, runner->device_id());
+        }
+        void *dev_ptr = ch->device_base;
+        host_device_channel_destroy(ch);
+        if (dev_ptr != nullptr) runner->free_tensor(dev_ptr);
+        return HDCH_OK;
+    } catch (...) {
+        return HDCH_ERR_BACKEND;
+    }
+}
+
+int host_device_send_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, uint32_t route, const void *data, size_t nbytes,
+    uint64_t correlation_id, uint32_t timeout_us
+) {
+    (void)ctx;
+    return host_device_channel_send_cpu(
+        static_cast<HostDeviceChannel *>(ch), route, data, nbytes, correlation_id, timeout_us
+    );
+}
+
+int host_device_recv_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, void *dst, size_t dst_capacity, size_t *out_nbytes,
+    uint64_t *out_correlation_id, uint32_t *out_route, uint32_t timeout_us
+) {
+    (void)ctx;
+    return host_device_channel_recv_cpu(
+        static_cast<HostDeviceChannel *>(ch), dst, dst_capacity, out_nbytes, out_correlation_id, out_route, timeout_us
+    );
 }
 
 int finalize_device(DeviceContextHandle ctx) {

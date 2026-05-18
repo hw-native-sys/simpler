@@ -30,6 +30,7 @@
 
 #include "common/unified_log.h"
 #include "device_runner.h"
+#include "host_device_channel.h"
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
@@ -180,6 +181,47 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
     } catch (...) {
         return -1;
     }
+}
+
+HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg) {
+    (void)ctx;
+    (void)cfg;
+    return NULL;
+}
+
+int close_host_device_channel_ctx(DeviceContextHandle ctx, HostDeviceChannelHandle ch) {
+    (void)ctx;
+    (void)ch;
+    return HDCH_ERR_BACKEND;
+}
+
+int host_device_send_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, uint32_t route, const void *data, size_t nbytes,
+    uint64_t correlation_id, uint32_t timeout_us
+) {
+    (void)ctx;
+    (void)ch;
+    (void)route;
+    (void)data;
+    (void)nbytes;
+    (void)correlation_id;
+    (void)timeout_us;
+    return HDCH_ERR_BACKEND;
+}
+
+int host_device_recv_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, void *dst, size_t dst_capacity, size_t *out_nbytes,
+    uint64_t *out_correlation_id, uint32_t *out_route, uint32_t timeout_us
+) {
+    (void)ctx;
+    (void)ch;
+    (void)dst;
+    (void)dst_capacity;
+    (void)out_nbytes;
+    (void)out_correlation_id;
+    (void)out_route;
+    (void)timeout_us;
+    return HDCH_ERR_BACKEND;
 }
 
 int finalize_device(DeviceContextHandle ctx) {

@@ -47,6 +47,15 @@ extern "C" {
 
 typedef void *RuntimeHandle;
 typedef void *DeviceContextHandle;
+typedef void *HostDeviceChannelHandle;
+
+typedef struct {
+    uint32_t lane_count_cpu_to_l2;
+    uint32_t lane_count_l2_to_cpu;
+    uint32_t lane_depth;
+    uint32_t max_message_bytes;
+    uint32_t flags;
+} HostDeviceChannelConfig;
 
 /**
  * Timing breakdown for a single run_prepared() invocation.
@@ -104,6 +113,26 @@ int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_
 
 /** Copy device memory to a host pointer within the given device context. */
 int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size);
+
+/** Open a bounded host/device message channel backed by host-mapped device memory. */
+HostDeviceChannelHandle open_host_device_channel_ctx(
+    DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg
+);
+
+/** Close a channel returned by open_host_device_channel_ctx. */
+int close_host_device_channel_ctx(DeviceContextHandle ctx, HostDeviceChannelHandle ch);
+
+/** Send one inline message from L3 CPU toward L2. */
+int host_device_send_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, uint32_t route, const void *data, size_t nbytes,
+    uint64_t correlation_id, uint32_t timeout_us
+);
+
+/** Receive one inline message from L2 toward L3 CPU. */
+int host_device_recv_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, void *dst, size_t dst_capacity, size_t *out_nbytes,
+    uint64_t *out_correlation_id, uint32_t *out_route, uint32_t timeout_us
+);
 
 /**
  * One-shot platform-side init. Called once by ChipWorker::init() right

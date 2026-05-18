@@ -232,6 +232,47 @@ class Orchestrator:
         """Copy *size* bytes from worker *src* to host *dst*."""
         self._o.copy_from(int(worker_id), int(dst), int(src), int(size))
 
+    def open_channel(
+        self,
+        worker_id: int,
+        cpu_to_l2_lanes: int = 1,
+        l2_to_cpu_lanes: int = 1,
+        lane_depth: int = 64,
+        max_message_bytes: int = 256,
+    ) -> int:
+        """Open a bounded L3/L2 message channel on next-level worker *worker_id*."""
+        return int(
+            self._o.open_channel(
+                int(worker_id),
+                int(cpu_to_l2_lanes),
+                int(l2_to_cpu_lanes),
+                int(lane_depth),
+                int(max_message_bytes),
+            )
+        )
+
+    def close_channel(self, worker_id: int, channel: int) -> None:
+        """Close a channel returned by ``open_channel``."""
+        self._o.close_channel(int(worker_id), int(channel))
+
+    def channel_send(
+        self,
+        worker_id: int,
+        channel: int,
+        route: int,
+        data: bytes,
+        correlation_id: int = 0,
+    ) -> None:
+        """Send one inline message from L3 CPU toward L2."""
+        self._o.channel_send(int(worker_id), int(channel), int(route), bytes(data), int(correlation_id))
+
+    def channel_recv(self, worker_id: int, channel: int, capacity: int = 256, timeout_us: int = 0) -> tuple[bytes, int, int]:
+        """Receive one inline message from L2 toward L3 CPU."""
+        data, route, correlation_id = self._o.channel_recv(
+            int(worker_id), int(channel), int(capacity), int(timeout_us)
+        )
+        return bytes(data), int(route), int(correlation_id)
+
     def alloc(self, shape: Sequence[int], dtype: DataType) -> ContinuousTensor:
         """Allocate a runtime-managed intermediate buffer.
 

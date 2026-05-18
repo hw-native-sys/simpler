@@ -54,6 +54,37 @@ void Orchestrator::copy_from(int worker_id, uint64_t dst, uint64_t src, size_t s
     wt->control_copy_from(dst, src, size);
 }
 
+uint64_t Orchestrator::open_channel(
+    int worker_id, uint32_t cpu_to_l2_lanes, uint32_t l2_to_cpu_lanes, uint32_t lane_depth,
+    uint32_t max_message_bytes
+) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::open_channel: invalid worker_id");
+    return wt->control_open_channel(cpu_to_l2_lanes, l2_to_cpu_lanes, lane_depth, max_message_bytes);
+}
+
+void Orchestrator::close_channel(int worker_id, uint64_t ch) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::close_channel: invalid worker_id");
+    wt->control_close_channel(ch);
+}
+
+void Orchestrator::channel_send(
+    int worker_id, uint64_t ch, uint32_t route, const std::vector<uint8_t> &data, uint64_t correlation_id
+) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::channel_send: invalid worker_id");
+    wt->control_channel_send(ch, route, data.data(), data.size(), correlation_id);
+}
+
+std::vector<uint8_t> Orchestrator::channel_recv(
+    int worker_id, uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *route, uint64_t *correlation_id
+) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::channel_recv: invalid worker_id");
+    return wt->control_channel_recv(ch, capacity, timeout_us, route, correlation_id);
+}
+
 TaskSlotState &Orchestrator::slot_state(TaskSlot s) {
     TaskSlotState *p = allocator_->slot_state(s);
     if (!p) throw std::runtime_error("Orchestrator::slot_state: invalid slot id");

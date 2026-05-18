@@ -99,6 +99,12 @@ void ChipWorker::init(
         device_free_ctx_fn_ = load_symbol<DeviceFreeCtxFn>(handle, "device_free_ctx");
         copy_to_device_ctx_fn_ = load_symbol<CopyToDeviceCtxFn>(handle, "copy_to_device_ctx");
         copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
+        open_host_device_channel_ctx_fn_ =
+            load_symbol<OpenHostDeviceChannelCtxFn>(handle, "open_host_device_channel_ctx");
+        close_host_device_channel_ctx_fn_ =
+            load_symbol<CloseHostDeviceChannelCtxFn>(handle, "close_host_device_channel_ctx");
+        host_device_send_ctx_fn_ = load_symbol<HostDeviceSendCtxFn>(handle, "host_device_send_ctx");
+        host_device_recv_ctx_fn_ = load_symbol<HostDeviceRecvCtxFn>(handle, "host_device_recv_ctx");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
         prepare_callable_fn_ = load_symbol<PrepareCallableFn>(handle, "prepare_callable");
@@ -169,6 +175,10 @@ void ChipWorker::init(
         device_free_ctx_fn_ = nullptr;
         copy_to_device_ctx_fn_ = nullptr;
         copy_from_device_ctx_fn_ = nullptr;
+        open_host_device_channel_ctx_fn_ = nullptr;
+        close_host_device_channel_ctx_fn_ = nullptr;
+        host_device_send_ctx_fn_ = nullptr;
+        host_device_recv_ctx_fn_ = nullptr;
         get_runtime_size_fn_ = nullptr;
         simpler_init_fn_ = nullptr;
         prepare_callable_fn_ = nullptr;
@@ -207,6 +217,10 @@ void ChipWorker::init(
         device_free_ctx_fn_ = nullptr;
         copy_to_device_ctx_fn_ = nullptr;
         copy_from_device_ctx_fn_ = nullptr;
+        open_host_device_channel_ctx_fn_ = nullptr;
+        close_host_device_channel_ctx_fn_ = nullptr;
+        host_device_send_ctx_fn_ = nullptr;
+        host_device_recv_ctx_fn_ = nullptr;
         get_runtime_size_fn_ = nullptr;
         simpler_init_fn_ = nullptr;
         prepare_callable_fn_ = nullptr;
@@ -257,6 +271,10 @@ void ChipWorker::finalize() {
     device_free_ctx_fn_ = nullptr;
     copy_to_device_ctx_fn_ = nullptr;
     copy_from_device_ctx_fn_ = nullptr;
+    open_host_device_channel_ctx_fn_ = nullptr;
+    close_host_device_channel_ctx_fn_ = nullptr;
+    host_device_send_ctx_fn_ = nullptr;
+    host_device_recv_ctx_fn_ = nullptr;
     get_runtime_size_fn_ = nullptr;
     prepare_callable_fn_ = nullptr;
     run_prepared_fn_ = nullptr;
@@ -480,6 +498,95 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
     if (rc != 0) {
         throw std::runtime_error("copy_from failed with code " + std::to_string(rc));
     }
+}
+
+uint64_t ChipWorker::open_channel(const HostDeviceChannelConfig &cfg) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    void *ch = open_host_device_channel_ctx_fn_(device_ctx_, &cfg);
+    if (ch == nullptr) {
+        throw std::runtime_error("open_channel failed");
+    }
+    return reinterpret_cast<uint64_t>(ch);
+}
+
+void ChipWorker::close_channel(uint64_t ch) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = close_host_device_channel_ctx_fn_(device_ctx_, reinterpret_cast<void *>(ch));
+    if (rc != 0) {
+        throw std::runtime_error("close_channel failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::channel_send(
+    uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
+) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = host_device_send_ctx_fn_(
+        device_ctx_, reinterpret_cast<void *>(ch), route, data, nbytes, correlation_id, timeout_us
+    );
+    if (rc != 0) {
+        throw std::runtime_error("channel_send failed with code " + std::to_string(rc));
+    }
+}
+
+std::vector<uint8_t> ChipWorker::channel_recv(
+    uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *out_route, uint64_t *out_correlation_id
+) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    std::vector<uint8_t> buf(capacity);
+    size_t out_nbytes = 0;
+    uint64_t correlation_id = 0;
+    uint32_t route = 0;
+    int rc = host_device_recv_ctx_fn_(
+        device_ctx_, reinterpret_cast<void *>(ch), buf.data(), buf.size(), &out_nbytes, &correlation_id, &route,
+        timeout_us
+    );
+    if (rc != 0) {
+        throw std::runtime_error("channel_recv failed with code " + std::to_string(rc));
+    }
+    buf.resize(out_nbytes);
+    if (out_route != nullptr) *out_route = route;
+    if (out_correlation_id != nullptr) *out_correlation_id = correlation_id;
+    return buf;
+}
+
+void ChipWorker::channel_send_l2_for_test(
+    uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
+) {
+    int rc = host_device_channel_send_l2_for_test(
+        reinterpret_cast<HostDeviceChannel *>(ch), route, data, nbytes, correlation_id, timeout_us
+    );
+    if (rc != 0) {
+        throw std::runtime_error("channel_send_l2_for_test failed with code " + std::to_string(rc));
+    }
+}
+
+std::vector<uint8_t> ChipWorker::channel_recv_l2_for_test(
+    uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *out_route, uint64_t *out_correlation_id
+) {
+    std::vector<uint8_t> buf(capacity);
+    size_t out_nbytes = 0;
+    uint64_t correlation_id = 0;
+    uint32_t route = 0;
+    int rc = host_device_channel_recv_l2_for_test(
+        reinterpret_cast<HostDeviceChannel *>(ch), buf.data(), buf.size(), &out_nbytes, &correlation_id, &route,
+        timeout_us
+    );
+    if (rc != 0) {
+        throw std::runtime_error("channel_recv_l2_for_test failed with code " + std::to_string(rc));
+    }
+    buf.resize(out_nbytes);
+    if (out_route != nullptr) *out_route = route;
+    if (out_correlation_id != nullptr) *out_correlation_id = correlation_id;
+    return buf;
 }
 
 uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo_path) {

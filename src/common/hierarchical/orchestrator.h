@@ -91,6 +91,14 @@ public:
     void free(int worker_id, uint64_t ptr);
     void copy_to(int worker_id, uint64_t dst, uint64_t src, size_t size);
     void copy_from(int worker_id, uint64_t dst, uint64_t src, size_t size);
+    uint64_t open_channel(
+        int worker_id, uint32_t cpu_to_l2_lanes, uint32_t l2_to_cpu_lanes, uint32_t lane_depth,
+        uint32_t max_message_bytes
+    );
+    void close_channel(int worker_id, uint64_t ch);
+    void channel_send(int worker_id, uint64_t ch, uint32_t route, const std::vector<uint8_t> &data, uint64_t correlation_id);
+    std::vector<uint8_t>
+    channel_recv(int worker_id, uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *route, uint64_t *correlation_id);
 
     // Submit a NEXT_LEVEL task. `callable_id` is a cid registered via
     // Worker.register(): the chip child looks it up in its COW-inherited

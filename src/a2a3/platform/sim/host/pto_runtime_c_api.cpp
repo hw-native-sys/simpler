@@ -32,6 +32,7 @@
 #include "host_log.h"
 #include "cpu_sim_context.h"
 #include "device_runner.h"
+#include "host_device_channel.h"
 #include "runtime.h"
 
 extern "C" {
@@ -175,6 +176,46 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
     } catch (...) {
         return -1;
     }
+}
+
+HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg) {
+    (void)ctx;
+    size_t bytes = host_device_channel_required_bytes(cfg);
+    if (bytes == 0) return NULL;
+    void *base = NULL;
+    if (posix_memalign(&base, 64, bytes) != 0) return NULL;
+    HostDeviceChannel *ch = host_device_channel_wrap(base, base, bytes, cfg, 1, free);
+    if (ch == nullptr) {
+        free(base);
+        return NULL;
+    }
+    return static_cast<HostDeviceChannelHandle>(ch);
+}
+
+int close_host_device_channel_ctx(DeviceContextHandle ctx, HostDeviceChannelHandle ch) {
+    (void)ctx;
+    host_device_channel_destroy(static_cast<HostDeviceChannel *>(ch));
+    return HDCH_OK;
+}
+
+int host_device_send_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, uint32_t route, const void *data, size_t nbytes,
+    uint64_t correlation_id, uint32_t timeout_us
+) {
+    (void)ctx;
+    return host_device_channel_send_cpu(
+        static_cast<HostDeviceChannel *>(ch), route, data, nbytes, correlation_id, timeout_us
+    );
+}
+
+int host_device_recv_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, void *dst, size_t dst_capacity, size_t *out_nbytes,
+    uint64_t *out_correlation_id, uint32_t *out_route, uint32_t timeout_us
+) {
+    (void)ctx;
+    return host_device_channel_recv_cpu(
+        static_cast<HostDeviceChannel *>(ch), dst, dst_capacity, out_nbytes, out_correlation_id, out_route, timeout_us
+    );
 }
 
 int finalize_device(DeviceContextHandle ctx) {

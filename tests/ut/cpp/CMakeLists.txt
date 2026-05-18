@@ -164,7 +164,6 @@ function(add_a2a3_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     )
-    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
@@ -227,6 +226,25 @@ function(add_common_utils_test name src)
     set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
 endfunction()
 
+function(add_common_worker_test name src)
+    add_executable(${name}
+        ${src}
+        ${CMAKE_SOURCE_DIR}/../../../src/common/worker/host_device_channel.cpp
+    )
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+    )
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=1)
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
 enable_testing()
 
 # ---------------------------------------------------------------------------
@@ -270,6 +288,7 @@ set_tests_properties(test_chip_callable_upload_immutable PROPERTIES LABELS "no_h
 add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
+add_common_worker_test(test_host_device_channel common/test_host_device_channel.cpp)
 
 # Per-callable_id orch SO file naming regression (see rtStreamSynchronize
 # 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`

@@ -167,6 +167,10 @@ _CTRL_COMM_INIT = 9
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
 assert _COMM_INIT_HEADER.size == 8
+_CTRL_OPEN_CHANNEL = 10
+_CTRL_CLOSE_CHANNEL = 11
+_CTRL_CHANNEL_SEND = 12
+_CTRL_CHANNEL_RECV = 13
 
 # Reserved 32-byte region at the start of OFF_ARGS used by _CTRL_REGISTER to
 # carry the NUL-terminated POSIX shm name. POSIX shm names on Linux are
@@ -202,6 +206,10 @@ _CTRL_OFF_ARG0 = 16
 _CTRL_OFF_ARG1 = 24
 _CTRL_OFF_ARG2 = 32
 _CTRL_OFF_RESULT = 40
+_CTRL_OFF_ARG3 = 48
+_CTRL_OFF_ARG4 = 56
+_CTRL_OFF_PAYLOAD = 64
+_CTRL_PAYLOAD_CAPACITY = MAILBOX_SIZE - _CTRL_OFF_PAYLOAD - MAILBOX_ERROR_MSG_SIZE
 
 
 def _mailbox_addr(shm: SharedMemory) -> int:
@@ -575,6 +583,31 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     _handle_ctrl_release_domain(cw, buf)
                 elif sub_cmd == _CTRL_COMM_INIT:
                     _handle_ctrl_comm_init(cw, buf)
+                elif sub_cmd == _CTRL_OPEN_CHANNEL:
+                    c2l = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0])
+                    l2c = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    depth = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    max_bytes = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0])
+                    ch = cw.open_channel(c2l, l2c, depth, max_bytes)
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ch)
+                elif sub_cmd == _CTRL_CLOSE_CHANNEL:
+                    ch = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    cw.close_channel(ch)
+                elif sub_cmd == _CTRL_CHANNEL_SEND:
+                    ch = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    route = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    n = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    cid = struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0]
+                    cw.channel_send(ch, route, bytes(buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + n]), cid)
+                elif sub_cmd == _CTRL_CHANNEL_RECV:
+                    ch = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    capacity = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    timeout_us = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    data, route, cid = cw.channel_recv(ch, capacity, timeout_us)
+                    buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + len(data)] = data
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, len(data))
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG3, route)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG4, cid)
             except Exception as e:  # noqa: BLE001
                 code = 1
                 if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
@@ -1614,6 +1647,51 @@ class Worker:
         if worker_id < 0 or worker_id >= len(self._chip_shms):
             raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
 
+    def _chip_control_payload(
+        self,
+        worker_id: int,
+        sub_cmd: int,
+        arg0: int = 0,
+        arg1: int = 0,
+        arg2: int = 0,
+        arg3: int = 0,
+        payload: bytes = b"",
+        recv_capacity: int = 0,
+    ) -> tuple[int, bytes, int, int]:
+        """Send a control command with a mailbox payload. Returns result, payload, arg3, arg4."""
+        if worker_id < 0 or worker_id >= len(self._chip_shms):
+            raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
+        if len(payload) > _CTRL_PAYLOAD_CAPACITY:
+            raise ValueError(f"control payload too large: {len(payload)} > {_CTRL_PAYLOAD_CAPACITY}")
+        if recv_capacity > _CTRL_PAYLOAD_CAPACITY:
+            raise ValueError(f"recv capacity too large: {recv_capacity} > {_CTRL_PAYLOAD_CAPACITY}")
+        shm = self._chip_shms[worker_id]
+        buf = shm.buf
+        assert buf is not None
+        state_addr = _buffer_field_addr(buf, _OFF_STATE)
+        _write_error(buf, 0, "")
+        struct.pack_into("Q", buf, _OFF_CALLABLE, sub_cmd)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG0, arg0)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG1, arg1)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG2, arg2)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG3, arg3)
+        if payload:
+            buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + len(payload)] = payload
+        _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
+        while _mailbox_load_i32(state_addr) != _CONTROL_DONE:
+            pass
+        error = struct.unpack_from("i", buf, _OFF_ERROR)[0]
+        if error != 0:
+            err_msg = _read_error_msg(buf)
+            _mailbox_store_i32(state_addr, _IDLE)
+            raise RuntimeError(f"chip control command {sub_cmd} failed on worker {worker_id}: {err_msg}")
+        result = struct.unpack_from("Q", buf, _CTRL_OFF_RESULT)[0]
+        out_arg3 = struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0]
+        out_arg4 = struct.unpack_from("Q", buf, _CTRL_OFF_ARG4)[0]
+        out_payload = bytes(buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + min(int(result), recv_capacity)])
+        _mailbox_store_i32(state_addr, _IDLE)
+        return int(result), out_payload, int(out_arg3), int(out_arg4)
+
     def malloc(self, size: int, worker_id: int = 0) -> int:
         """Allocate memory on next-level chip worker *worker_id*. Returns a pointer."""
         if self.level == 2:
@@ -1652,6 +1730,74 @@ class Worker:
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
         self._orch.copy_from(worker_id, dst, src, size)
+
+    def open_channel(
+        self,
+        worker_id: int = 0,
+        cpu_to_l2_lanes: int = 1,
+        l2_to_cpu_lanes: int = 1,
+        lane_depth: int = 64,
+        max_message_bytes: int = 256,
+    ) -> int:
+        """Open a bounded L3/L2 message channel on next-level worker *worker_id*."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.open_channel(cpu_to_l2_lanes, l2_to_cpu_lanes, lane_depth, max_message_bytes)
+        return self._chip_control_payload(
+            worker_id,
+            _CTRL_OPEN_CHANNEL,
+            arg0=cpu_to_l2_lanes,
+            arg1=l2_to_cpu_lanes,
+            arg2=lane_depth,
+            arg3=max_message_bytes,
+        )[0]
+
+    def close_channel(self, channel: int, worker_id: int = 0) -> None:
+        """Close a channel returned by ``open_channel``."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.close_channel(channel)
+            return
+        self._chip_control(worker_id, _CTRL_CLOSE_CHANNEL, arg0=channel)
+
+    def channel_send(
+        self,
+        channel: int,
+        route: int,
+        data: bytes,
+        correlation_id: int = 0,
+        worker_id: int = 0,
+    ) -> None:
+        """Send one inline message from L3 CPU toward L2."""
+        payload = bytes(data)
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.channel_send(channel, route, payload, correlation_id)
+            return
+        self._chip_control_payload(
+            worker_id,
+            _CTRL_CHANNEL_SEND,
+            arg0=channel,
+            arg1=route,
+            arg2=len(payload),
+            arg3=correlation_id,
+            payload=payload,
+        )
+
+    def channel_recv(self, channel: int, capacity: int = 256, timeout_us: int = 0, worker_id: int = 0) -> tuple[bytes, int, int]:
+        """Receive one inline message from L2 toward L3 CPU."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.channel_recv(channel, capacity, timeout_us)
+        nbytes, payload, route, correlation_id = self._chip_control_payload(
+            worker_id,
+            _CTRL_CHANNEL_RECV,
+            arg0=channel,
+            arg1=capacity,
+            arg2=timeout_us,
+            recv_capacity=capacity,
+        )
+        return payload[:nbytes], route, correlation_id
 
     # ------------------------------------------------------------------
     # run — uniform entry point

@@ -30,6 +30,8 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "ring.h"
 #include "orchestrator.h"
@@ -158,6 +160,47 @@ inline void bind_worker(nb::module_ &m) {
                 self.copy_from(worker_id, dst, src, size);
             },
             nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("size"), "Copy worker src to host dst."
+        )
+        .def(
+            "open_channel",
+            [](Orchestrator &self, int worker_id, uint32_t cpu_to_l2_lanes, uint32_t l2_to_cpu_lanes,
+               uint32_t lane_depth, uint32_t max_message_bytes) {
+                return self.open_channel(worker_id, cpu_to_l2_lanes, l2_to_cpu_lanes, lane_depth, max_message_bytes);
+            },
+            nb::arg("worker_id"), nb::arg("cpu_to_l2_lanes") = 1, nb::arg("l2_to_cpu_lanes") = 1,
+            nb::arg("lane_depth") = 64, nb::arg("max_message_bytes") = 256,
+            "Open a host/device message channel on a next-level worker."
+        )
+        .def(
+            "close_channel",
+            [](Orchestrator &self, int worker_id, uint64_t channel) {
+                self.close_channel(worker_id, channel);
+            },
+            nb::arg("worker_id"), nb::arg("channel"), "Close a host/device message channel."
+        )
+        .def(
+            "channel_send",
+            [](Orchestrator &self, int worker_id, uint64_t channel, uint32_t route, nb::bytes data,
+               uint64_t correlation_id) {
+                std::string payload(data.c_str(), data.size());
+                std::vector<uint8_t> bytes(payload.begin(), payload.end());
+                self.channel_send(worker_id, channel, route, bytes, correlation_id);
+            },
+            nb::arg("worker_id"), nb::arg("channel"), nb::arg("route"), nb::arg("data"),
+            nb::arg("correlation_id") = 0, "Send a message through a host/device channel."
+        )
+        .def(
+            "channel_recv",
+            [](Orchestrator &self, int worker_id, uint64_t channel, size_t capacity, uint32_t timeout_us) {
+                uint32_t route = 0;
+                uint64_t correlation_id = 0;
+                auto data = self.channel_recv(worker_id, channel, capacity, timeout_us, &route, &correlation_id);
+                return nb::make_tuple(
+                    nb::bytes(reinterpret_cast<const char *>(data.data()), data.size()), route, correlation_id
+                );
+            },
+            nb::arg("worker_id"), nb::arg("channel"), nb::arg("capacity") = 256, nb::arg("timeout_us") = 0,
+            "Receive a message through a host/device channel."
         )
         .def(
             "alloc",

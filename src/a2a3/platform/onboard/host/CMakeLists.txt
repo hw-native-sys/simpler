@@ -58,6 +58,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/dep_gen_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/worker/host_device_channel.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})

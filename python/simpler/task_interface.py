@@ -424,6 +424,61 @@ class ChipWorker:
         """Copy *size* bytes from worker *src* to host *dst*."""
         self._impl.copy_from(int(dst), int(src), int(size))
 
+    def open_channel(
+        self,
+        cpu_to_l2_lanes: int = 1,
+        l2_to_cpu_lanes: int = 1,
+        lane_depth: int = 64,
+        max_message_bytes: int = 256,
+        flags: int = 0,
+    ) -> int:
+        """Open a bounded L3/L2 host-device message channel."""
+        return int(
+            self._impl.open_channel(
+                int(cpu_to_l2_lanes),
+                int(l2_to_cpu_lanes),
+                int(lane_depth),
+                int(max_message_bytes),
+                int(flags),
+            )
+        )
+
+    def close_channel(self, channel: int) -> None:
+        """Close a channel returned by ``open_channel``."""
+        self._impl.close_channel(int(channel))
+
+    def channel_send(
+        self,
+        channel: int,
+        route: int,
+        data: bytes,
+        correlation_id: int = 0,
+        timeout_us: int = 0,
+    ) -> None:
+        """Send one inline message from L3 CPU toward L2."""
+        self._impl.channel_send(int(channel), int(route), bytes(data), int(correlation_id), int(timeout_us))
+
+    def channel_recv(self, channel: int, capacity: int = 256, timeout_us: int = 0) -> tuple[bytes, int, int]:
+        """Receive one inline message from L2 toward L3 CPU."""
+        data, route, correlation_id = self._impl.channel_recv(int(channel), int(capacity), int(timeout_us))
+        return bytes(data), int(route), int(correlation_id)
+
+    def channel_send_l2_for_test(
+        self,
+        channel: int,
+        route: int,
+        data: bytes,
+        correlation_id: int = 0,
+        timeout_us: int = 0,
+    ) -> None:
+        """Sim/test helper that injects a message from the L2 side."""
+        self._impl.channel_send_l2_for_test(int(channel), int(route), bytes(data), int(correlation_id), int(timeout_us))
+
+    def channel_recv_l2_for_test(self, channel: int, capacity: int = 256, timeout_us: int = 0) -> tuple[bytes, int, int]:
+        """Sim/test helper that receives a CPU-to-L2 message from the L2 side."""
+        data, route, correlation_id = self._impl.channel_recv_l2_for_test(int(channel), int(capacity), int(timeout_us))
+        return bytes(data), int(route), int(correlation_id)
+
     def comm_init(self, rank: int, nranks: int, rootinfo_path: str) -> int:
         """Initialize a distributed communicator for this rank.
 

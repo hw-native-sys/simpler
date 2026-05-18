@@ -121,6 +121,10 @@ static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
 // Caches the comm handle on the chip's ChipWorker so subsequent
 // CTRL_ALLOC_DOMAIN calls can find it.
 static constexpr uint64_t CTRL_COMM_INIT = 9;
+static constexpr uint64_t CTRL_OPEN_CHANNEL = 10;
+static constexpr uint64_t CTRL_CLOSE_CHANNEL = 11;
+static constexpr uint64_t CTRL_CHANNEL_SEND = 12;
+static constexpr uint64_t CTRL_CHANNEL_RECV = 13;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy; cid for register)
@@ -131,6 +135,11 @@ static constexpr ptrdiff_t CTRL_OFF_ARG0 = 16;
 static constexpr ptrdiff_t CTRL_OFF_ARG1 = 24;
 static constexpr ptrdiff_t CTRL_OFF_ARG2 = 32;
 static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
+static constexpr ptrdiff_t CTRL_OFF_ARG3 = 48;
+static constexpr ptrdiff_t CTRL_OFF_ARG4 = 56;
+static constexpr ptrdiff_t CTRL_OFF_PAYLOAD = 64;
+static constexpr size_t CTRL_PAYLOAD_CAPACITY =
+    MAILBOX_SIZE - static_cast<size_t>(CTRL_OFF_PAYLOAD) - MAILBOX_ERROR_MSG_SIZE;
 
 // CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS.
 // Fixed-width so the wire layout stays simple; well above the encoded length
@@ -200,6 +209,10 @@ public:
     void control_free(uint64_t ptr);
     void control_copy_to(uint64_t dst, uint64_t src, size_t size);
     void control_copy_from(uint64_t dst, uint64_t src, size_t size);
+    uint64_t control_open_channel(uint32_t cpu_to_l2_lanes, uint32_t l2_to_cpu_lanes, uint32_t lane_depth, uint32_t max_message_bytes);
+    void control_close_channel(uint64_t ch);
+    void control_channel_send(uint64_t ch, uint32_t route, const void *data, size_t size, uint64_t correlation_id);
+    std::vector<uint8_t> control_channel_recv(uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *route, uint64_t *correlation_id);
 
     // Pre-warm a chip child by triggering prepare_callable for `cid` in the
     // child via CTRL_PREPARE. Issued from the parent at end of init() so the

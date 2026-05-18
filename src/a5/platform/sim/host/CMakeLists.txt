@@ -50,6 +50,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../aicpu/platform_aicpu_affinity.cpp"
     # Shared POSIX-shm sim comm backend (same source as a2a3 sim).
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/comm_sim.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/worker/host_device_channel.cpp"
 )
 
 if(DEFINED CUSTOM_SOURCE_DIRS)

@@ -320,11 +320,16 @@ WorkerThread *WorkerManager::pick_idle_excluding(WorkerType type, const std::vec
 // WorkerThread — memory control (orch thread, concurrent with worker thread)
 // =============================================================================
 
-static void write_control_args(char *mbox, uint64_t sub_cmd, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0) {
+static void write_control_args(
+    char *mbox, uint64_t sub_cmd, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0,
+    uint64_t a4 = 0
+) {
     std::memcpy(mbox + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     std::memcpy(mbox + CTRL_OFF_ARG0, &a0, sizeof(uint64_t));
     std::memcpy(mbox + CTRL_OFF_ARG1, &a1, sizeof(uint64_t));
     std::memcpy(mbox + CTRL_OFF_ARG2, &a2, sizeof(uint64_t));
+    std::memcpy(mbox + CTRL_OFF_ARG3, &a3, sizeof(uint64_t));
+    std::memcpy(mbox + CTRL_OFF_ARG4, &a4, sizeof(uint64_t));
 }
 
 static uint64_t read_control_result(const char *mbox) {
@@ -458,6 +463,51 @@ void WorkerThread::control_comm_init(const char *request_shm_name) {
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     write_shm_name_pair(mbox(), request_shm_name, "");
     run_control_command("control_comm_init");
+}
+
+uint64_t WorkerThread::control_open_channel(
+    uint32_t cpu_to_l2_lanes, uint32_t l2_to_cpu_lanes, uint32_t lane_depth, uint32_t max_message_bytes
+) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_OPEN_CHANNEL, cpu_to_l2_lanes, l2_to_cpu_lanes, lane_depth, max_message_bytes);
+    run_control_command("control_open_channel");
+    return read_control_result(mbox());
+}
+
+void WorkerThread::control_close_channel(uint64_t ch) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_CLOSE_CHANNEL, ch);
+    run_control_command("control_close_channel");
+}
+
+void WorkerThread::control_channel_send(
+    uint64_t ch, uint32_t route, const void *data, size_t size, uint64_t correlation_id
+) {
+    if (data == nullptr && size != 0) throw std::invalid_argument("control_channel_send: data is null");
+    if (size > CTRL_PAYLOAD_CAPACITY) throw std::invalid_argument("control_channel_send: payload too large");
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    if (size != 0) std::memcpy(mbox() + CTRL_OFF_PAYLOAD, data, size);
+    write_control_args(mbox(), CTRL_CHANNEL_SEND, ch, route, size, correlation_id);
+    run_control_command("control_channel_send");
+}
+
+std::vector<uint8_t> WorkerThread::control_channel_recv(
+    uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *route, uint64_t *correlation_id
+) {
+    if (capacity > CTRL_PAYLOAD_CAPACITY) throw std::invalid_argument("control_channel_recv: capacity too large");
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_CHANNEL_RECV, ch, capacity, timeout_us);
+    run_control_command("control_channel_recv");
+    uint64_t nbytes = read_control_result(mbox());
+    uint64_t r = 0;
+    uint64_t cid = 0;
+    std::memcpy(&r, mbox() + CTRL_OFF_ARG3, sizeof(uint64_t));
+    std::memcpy(&cid, mbox() + CTRL_OFF_ARG4, sizeof(uint64_t));
+    std::vector<uint8_t> out(static_cast<size_t>(nbytes));
+    if (nbytes != 0) std::memcpy(out.data(), mbox() + CTRL_OFF_PAYLOAD, static_cast<size_t>(nbytes));
+    if (route != nullptr) *route = static_cast<uint32_t>(r);
+    if (correlation_id != nullptr) *correlation_id = cid;
+    return out;
 }
 
 bool WorkerManager::any_busy() const {
