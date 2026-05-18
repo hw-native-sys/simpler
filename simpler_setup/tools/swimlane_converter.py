@@ -385,7 +385,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     func_id_to_name=None,
     verbose=False,
     scheduler_phases=None,
-    orchestrator_data=None,
     orchestrator_phases=None,
     core_to_thread=None,
     orchestrator_name=None,
@@ -404,7 +403,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         func_id_to_name: Optional dict mapping func_id to function name
         verbose: Print progress information
         scheduler_phases: Optional list of per-thread phase record lists (version 2)
-        orchestrator_data: Optional dict with orchestrator summary (version 2)
         orchestrator_phases: Optional list of per-task orchestrator phase records (version 2)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
 
@@ -764,7 +762,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 events.append(event)
 
     # AICPU Orchestrator event (version 2)
-    if orchestrator_phases or orchestrator_data:
+    #
+    # Per-event AicpuPhaseRecord[] are the single source of truth. The
+    # cumulative aicpu_orchestrator summary still ships start/end_time and
+    # submit_count but no per-phase breakdown — anything that needs phase
+    # totals derives them by bucketing per-event entries on phase_id.
+    if orchestrator_phases:
         # Process metadata
         orch_process_label = f"AICPU {orchestrator_name}" if orchestrator_name else "AICPU Orchestrator"
         events.append(
@@ -774,30 +777,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             {"args": {"sort_index": 1}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 4}
         )
 
-        # Normalize orchestrator_phases: support both per-thread nested format
-        # (list of lists) and legacy flat format (list of dicts)
-        orch_threads = orchestrator_phases if orchestrator_phases else []
-
         # Thread name metadata for each orchestrator thread
-        for orch_idx in range(len(orch_threads)):
+        for orch_idx in range(len(orchestrator_phases)):
             tid = 4000 + orch_idx
             name = f"Orch_{orch_idx}"
             events.append(
                 {"args": {"name": name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 4, "tid": tid}
             )
-        if not orch_threads and orchestrator_data:
-            events.append(
-                {
-                    "args": {"name": orchestrator_name or "Orchestrator"},
-                    "cat": "__metadata",
-                    "name": "thread_name",
-                    "ph": "M",
-                    "pid": 4,
-                    "tid": 4000,
-                }
-            )
 
-    if orchestrator_phases:
         # Per-task orchestrator phase bars
         orch_phase_colors = {
             "orch_sync": "thread_state_iowait",  # orange
@@ -811,7 +798,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             "orch_scope_end": "generic_work",
         }
 
-        for orch_idx, thread_records in enumerate(orch_threads):
+        for orch_idx, thread_records in enumerate(orchestrator_phases):
             tid = 4000 + orch_idx
             for record in thread_records:
                 phase = record.get("phase", "unknown")
@@ -842,39 +829,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     "dur": dur,
                 }
                 events.append(event)
-
-    elif orchestrator_data:
-        # Fallback: cumulative summary as single bar
-        orch_start = orchestrator_data["start_time_us"]
-        orch_end = orchestrator_data["end_time_us"]
-        orch_dur = orch_end - orch_start
-        phase_us = orchestrator_data.get("phase_us", {})
-
-        # Build args with phase breakdown (cumulative totals, shown in detail panel)
-        orch_args = {
-            "submit_count": orchestrator_data.get("submit_count", 0),
-        }
-        total_phase_us = sum(phase_us.values())
-        if total_phase_us > 0:
-            for phase_name, dur in phase_us.items():
-                if dur > 0:
-                    pct = dur / total_phase_us * 100
-                    orch_args[f"{phase_name}_us"] = round(dur, 3)
-                    orch_args[f"{phase_name}_%"] = round(pct, 1)
-
-        # Total orchestrator bar
-        events.append(
-            {
-                "args": orch_args,
-                "cat": "orchestrator",
-                "name": f"Orchestrator({orchestrator_data.get('submit_count', 0)} tasks)",
-                "ph": "X",
-                "pid": 4,
-                "tid": 4000,
-                "ts": orch_start,
-                "dur": orch_dur,
-            }
-        )
 
     # AICPU View fanout arrows (duplicate AICore View flow events using AICPU timestamps)
     if has_aicpu_data:
@@ -1045,7 +999,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     if orchestrator_phases and scheduler_phases:
         orch_fanin_by_task = {}
         orch_params_by_task = {}
-        for orch_idx, thread_records in enumerate(orch_threads):
+        for orch_idx, thread_records in enumerate(orchestrator_phases):
             for record in thread_records:
                 phase = record.get("phase")
                 task_id = record.get("task_id", -1)
@@ -1283,7 +1237,6 @@ def main():
             args.verbose,
             orchestrator_name=orchestrator_name,
             scheduler_phases=data.get("aicpu_scheduler_phases"),
-            orchestrator_data=data.get("aicpu_orchestrator"),
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             core_to_thread=data.get("core_to_thread"),
             deps_edges=deps_edges,

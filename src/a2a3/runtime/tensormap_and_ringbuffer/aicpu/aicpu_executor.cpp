@@ -572,10 +572,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
             );
             LOG_INFO_V9(
-                "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "",
-                thread_idx, cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
-                cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle),
-                static_cast<uint64_t>(p.fanin_atomic_count)
+                "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus", thread_idx,
+                cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
+                cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle)
             );
             LOG_INFO_V9(
                 "Thread %d:   avg/task       : %.3fus", thread_idx,
@@ -601,31 +600,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0
             );
 #endif
+#endif  // PTO2_ORCH_PROFILING
 
-#if PTO2_PROFILING
-            // Write orchestrator summary to shared memory for host-side export (only if profiling enabled)
-            if (is_l2_swimlane_enabled()) {
-                AicpuOrchSummary orch_summary = {};
-                orch_summary.start_time = orch_cycle_start;
-                orch_summary.end_time = orch_cycle_end;
-                orch_summary.sync_cycle = p.sync_cycle;
-                orch_summary.alloc_cycle = p.alloc_cycle;
-                orch_summary.args_cycle = p.args_cycle;
-                orch_summary.lookup_cycle = p.lookup_cycle;
-                orch_summary.heap_cycle = 0;  // Now included in alloc_cycle
-                orch_summary.insert_cycle = p.insert_cycle;
-                orch_summary.fanin_cycle = p.fanin_cycle;
-                orch_summary.scope_end_cycle = p.scope_end_cycle;
-                orch_summary.submit_count = p.submit_count;
-                l2_perf_aicpu_write_orch_summary(&orch_summary);
-            }
-#endif
-#endif
-
-            // Signal completion to the orchestrator state machine
-            rt_orchestration_done(rt);
-
-            // Latch task count from PTO2 shared memory
+            // Latch task count from PTO2 shared memory (used both by the
+            // swimlane orch_summary below and passed on to the scheduler).
             int32_t total_tasks = 0;
             if (rt->orchestrator.sm_header) {
                 for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -633,9 +611,24 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         rt->orchestrator.sm_header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
                 }
             }
+
 #if PTO2_PROFILING
             pto2_submitted_tasks = total_tasks;
+            // Write the orchestrator run window to swimlane shared memory.
+            // Per-phase breakdown is derived host-side from AicpuPhaseRecord[]
+            // (collected via l2_perf_aicpu_record_orch_phase under PTO2_PROFILING,
+            // independent of PTO2_ORCH_PROFILING), so it does NOT live here.
+            if (is_l2_swimlane_enabled()) {
+                AicpuOrchSummary orch_summary = {};
+                orch_summary.start_time = orch_cycle_start;
+                orch_summary.end_time = orch_cycle_end;
+                orch_summary.submit_count = total_tasks;
+                l2_perf_aicpu_write_orch_summary(&orch_summary);
+            }
 #endif
+
+            // Signal completion to the orchestrator state machine
+            rt_orchestration_done(rt);
 
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);
         }

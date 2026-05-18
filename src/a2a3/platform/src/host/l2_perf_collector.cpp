@@ -735,31 +735,17 @@ int L2PerfCollector::export_swimlane_json() {
 
         // AICPU orchestrator summary
         if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC) {
+            // Per-phase breakdown is no longer reported here; consumers that
+            // want it derive it from the aicpu_orchestrator_phases array by
+            // bucketing entries on phase_id, keeping per-event records as the
+            // single source of truth.
             double orch_start_us = cycles_to_us(collected_orch_summary_.start_time - base_time_cycles);
             double orch_end_us = cycles_to_us(collected_orch_summary_.end_time - base_time_cycles);
 
             outfile << ",\n  \"aicpu_orchestrator\": {\n";
             outfile << "    \"start_time_us\": " << std::fixed << std::setprecision(3) << orch_start_us << ",\n";
             outfile << "    \"end_time_us\": " << std::fixed << std::setprecision(3) << orch_end_us << ",\n";
-            outfile << "    \"submit_count\": " << collected_orch_summary_.submit_count << ",\n";
-            outfile << "    \"phase_us\": {\n";
-            outfile << "      \"sync\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.sync_cycle) << ",\n";
-            outfile << "      \"alloc\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.alloc_cycle) << ",\n";
-            outfile << "      \"params\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.args_cycle) << ",\n";
-            outfile << "      \"lookup\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.lookup_cycle) << ",\n";
-            outfile << "      \"heap\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.heap_cycle) << ",\n";
-            outfile << "      \"insert\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.insert_cycle) << ",\n";
-            outfile << "      \"fanin\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.fanin_cycle) << ",\n";
-            outfile << "      \"scope_end\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.scope_end_cycle) << "\n";
-            outfile << "    }\n";
+            outfile << "    \"submit_count\": " << collected_orch_summary_.submit_count << "\n";
             outfile << "  }";
         }
 

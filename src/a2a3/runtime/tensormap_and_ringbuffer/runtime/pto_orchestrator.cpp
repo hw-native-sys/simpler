@@ -92,8 +92,6 @@ uint64_t g_orch_alloc_wait_cycle = 0;
 uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
-uint64_t g_orch_fanin_atomic_count = 0;
-uint64_t g_orch_finalize_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc)       \
@@ -936,8 +934,6 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.fanin_wait_cycle = g_orch_fanin_wait_cycle;
     d.alloc_atomic_count = g_orch_alloc_atomic_count;
     d.args_atomic_count = g_orch_args_atomic_count;
-    d.fanin_atomic_count = g_orch_fanin_atomic_count;
-    d.finalize_atomic_count = g_orch_finalize_atomic_count;
     d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
 
     // Reset
@@ -950,8 +946,6 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     g_orch_fanin_wait_cycle = 0;
     g_orch_alloc_atomic_count = 0;
     g_orch_args_atomic_count = 0;
-    g_orch_fanin_atomic_count = 0;
-    g_orch_finalize_atomic_count = 0;
     g_orch_scope_end_atomic_count = 0;
     return d;
 }

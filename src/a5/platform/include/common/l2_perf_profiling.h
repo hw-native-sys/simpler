@@ -324,25 +324,20 @@ struct AicpuPhaseRecord {
 static_assert(sizeof(AicpuPhaseRecord) == 40, "AicpuPhaseRecord layout drift");
 
 /**
- * AICPU orchestrator cumulative summary
+ * AICPU orchestrator run summary
  *
- * Contains accumulated cycle counts from the orchestrator thread.
- * Written once after orchestration completes.
+ * Captures the orchestrator's overall run window. Per-phase breakdown is
+ * derived host-side by aggregating AicpuPhaseRecord entries filtered by
+ * phase_id, so per-phase cycle fields are not duplicated here. The
+ * device-side aggregate path under PTO2_ORCH_PROFILING (g_orch_*_cycle +
+ * LOG_INFO_V9) is independent and emits to the device log only.
  */
 struct AicpuOrchSummary {
-    uint64_t start_time;       // Orchestrator start timestamp
-    uint64_t end_time;         // Orchestrator end timestamp
-    uint64_t sync_cycle;       // sync_tensormap phase
-    uint64_t alloc_cycle;      // task_ring_alloc phase
-    uint64_t args_cycle;       // param_copy phase
-    uint64_t lookup_cycle;     // lookup+dep phase
-    uint64_t heap_cycle;       // heap_alloc phase
-    uint64_t insert_cycle;     // tensormap_insert phase
-    uint64_t fanin_cycle;      // fanin+ready phase
-    uint64_t scope_end_cycle;  // scope_end phase
-    int64_t submit_count;      // Total tasks submitted
-    uint32_t magic;            // Validation magic (AICPU_PHASE_MAGIC)
-    uint32_t padding;          // Alignment padding
+    uint64_t start_time;   // Orchestrator start timestamp
+    uint64_t end_time;     // Orchestrator end timestamp
+    int64_t submit_count;  // Total tasks submitted
+    uint32_t magic;        // Validation magic (AICPU_PHASE_MAGIC)
+    uint32_t padding;      // Alignment padding
 } __attribute__((aligned(64)));
 
 constexpr uint32_t AICPU_PHASE_MAGIC = 0x41435048;  // "ACPH"
