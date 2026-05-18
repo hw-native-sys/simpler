@@ -351,7 +351,6 @@ private:
     // Shared memory pointers. shm_host_ / device_id_ live on ProfilerBase
     // (set via set_memory_context in initialize()).
     void *perf_shared_mem_dev_{nullptr};
-    bool was_registered_{false};
 
     // Standalone uint64_t[num_aicore] table holding per-core L2PerfAicoreRing
     // addresses. Allocated in initialize(), freed in finalize(). AICore reads
@@ -381,6 +380,16 @@ private:
 
     // Allocate a single buffer (L2PerfBuffer or PhaseBuffer) and register it
     void *alloc_single_buffer(size_t size, void **host_ptr_out);
+
+    // RAII counterpart of ``alloc_single_buffer``: unregister the host
+    // mapping (if there is one) then release the device memory. Every
+    // release site in ``finalize`` funnels through here so each
+    // ``halHostRegister`` call has a matching ``halHostUnregister`` — when
+    // a session-scoped Worker re-enters ``initialize`` for a second test,
+    // the Ascend HAL's per-device registration table is empty again.
+    void release_one_buffer(
+        void *dev_ptr, L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb, void *user_data
+    );
 
     // Per-buffer-kind handlers used by on_buffer_collected.
     void copy_perf_buffer(const ReadyBufferInfo &info);
