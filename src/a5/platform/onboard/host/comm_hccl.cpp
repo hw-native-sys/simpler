@@ -45,6 +45,9 @@
 #include "acl/acl.h"
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+#include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
+#endif
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
 // layer in case we need to swap (e.g., InitConfig variant) later.
@@ -87,6 +90,9 @@ struct CommHandle_ {
     bool owns_device_ctx = false;
     std::vector<CommContext *> derived_contexts;
     std::unordered_map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
+#endif
 };
 
 // ============================================================================
@@ -843,9 +849,7 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *devic
     if (alloc_windows_via_ipc(h, effective_win_size) != 0) return -1;
 
     // Optional PTO-ISA async SDMA workspace pre-allocation (overlays the comm
-    // backend's output; comm-side flow does not care about workSpace).  No-op
-    // when SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is undefined (this PR ships A
-    // without the macro; the overlay PR turns it on).
+    // backend's output; comm-side flow does not care about workSpace).
     ensure_sdma_workspace(h);
 
     void *newDevMem = nullptr;
