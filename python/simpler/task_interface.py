@@ -260,7 +260,7 @@ class ChipWorker:
         worker = ChipWorker()
         worker.init(device_id=0, bins=bins)
         worker.prepare_callable(callable_id=0, callable=chip_callable)
-        worker.run_prepared(callable_id=0, args=orch_args, config=CallConfig(block_dim=24))
+        worker.run(callable_id=0, args=orch_args, config=CallConfig(block_dim=24))
         worker.unregister_callable(callable_id=0)
         worker.finalize()
     """
@@ -340,12 +340,12 @@ class ChipWorker:
         """Stage a ChipCallable under ``callable_id`` for repeated cheap launches.
 
         Uploads the kernel binaries + the orchestration SO once; subsequent
-        ``run_prepared(callable_id, ...)`` skips that work. ``callable_id``
+        ``run(callable_id, ...)`` skips that work. ``callable_id``
         must be in ``[0, 64)``. Requires ``init()``.
         """
         self._impl.prepare_callable(int(callable_id), callable)
 
-    def run_prepared(self, callable_id, args, config=None, **kwargs):
+    def run(self, callable_id, args, config=None, **kwargs):
         """Launch a ``callable_id`` previously staged via ``prepare_callable``.
 
         Args:
@@ -358,7 +358,7 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
-        self._impl.run_prepared(int(callable_id), args, config)
+        self._impl.run(int(callable_id), args, config)
 
     def unregister_callable(self, callable_id):
         """Drop prepared state for ``callable_id`` and release its orch SO share."""

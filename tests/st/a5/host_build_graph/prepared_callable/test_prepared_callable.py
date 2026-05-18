@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end test for ChipWorker.prepare_callable / run_prepared on a5/host_build_graph.
+"""End-to-end test for ChipWorker.prepare_callable / run on a5/host_build_graph.
 
 Mirrors tests/st/a2a3/host_build_graph/prepared_callable for the a5 variant.
 Reuses the dump_tensor example kernels (a + b + 1) since a5/hbg has no
@@ -31,7 +31,7 @@ _CID_SECONDARY = 1
 
 @scene_test(level=2, runtime="host_build_graph")
 class TestPreparedCallableHbgA5(SceneTestCase):
-    """Exercise prepare_callable / run_prepared / unregister_callable on a5/hbg.
+    """Exercise prepare_callable / run / unregister_callable on a5/hbg.
 
     Requires an isolated L2 ``Worker`` (cid table starts empty); this is
     provided by the directory-local ``conftest.py`` overriding ``st_worker``
@@ -113,7 +113,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-            worker.run_prepared(_CID_PRIMARY, chip_args, config=config)
+            worker.run(_CID_PRIMARY, chip_args, config=config)
             _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         test_args = self.generate_args(params)
@@ -121,7 +121,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
 
-        worker.run_prepared(_CID_SECONDARY, chip_args, config=config)
+        worker.run(_CID_SECONDARY, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         worker.unregister_callable(_CID_PRIMARY)
@@ -140,7 +140,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
-        worker.run_prepared(cid, chip_args, config=config)
+        worker.run(cid, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     def test_dlopen_count_same_cid_repeated_runs(self, st_platform, st_worker):

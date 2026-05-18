@@ -140,7 +140,7 @@ _CTRL_FREE = 1
 _CTRL_COPY_TO = 2
 _CTRL_COPY_FROM = 3
 # Pre-warm a chip child for cid=arg0 by calling
-# `prepare_callable(cid, registry[cid])` so the first run_prepared() does
+# `prepare_callable(cid, registry[cid])` so the first run() does
 # not pay the H2D upload cost.  Sent from the parent right after init()
 # (or whenever a new ChipCallable cid is registered).
 _CTRL_PREPARE = 4
@@ -224,7 +224,7 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     Used by the Python-targeted child loops (sub_worker, nested L4+ child)
     where the destination of `args` is a Python callable that needs a
     typed TaskArgs object.  The chip-child loops that immediately forward
-    to C++ run_prepared use the zero-copy `run_prepared_from_blob` path
+    to C++ run use the zero-copy `run_prepared_from_blob` path
     instead — see those loops for the matching comment.
 
     Delegates to the nanobind helper so the ContinuousTensor layout is
@@ -314,7 +314,7 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
     Per-callable_id dispatch: TASK_READY carries a cid in OFF_CALLABLE;
     the child looks the cid up in the COW-inherited Python ``registry``
     to get the ChipCallable, calls ``cw.prepare_callable(cid, callable)``
-    once, then ``cw.run_prepared(cid, args, cfg)``. ``_CTRL_PREPARE`` is
+    once, then ``cw.run(cid, args, cfg)``. ``_CTRL_PREPARE`` is
     the explicit pre-warm path (parent pushes after init() to amortise
     the first H2D upload); TASK_READY also lazy-prepares as a safety net.
     """
@@ -1350,7 +1350,7 @@ class Worker:
 
         Dispatch:
           - L2: ``callable`` is a cid returned by ``Worker.register(chip_callable)``.
-            Routes to ``_chip_worker.run_prepared(cid, args, cfg)``.
+            Routes to ``_chip_worker.run(cid, args, cfg)``.
           - L3+: ``callable`` is a Python orch fn invoked with the
             ``Orchestrator`` handle.
 
@@ -1362,7 +1362,7 @@ class Worker:
 
         if self.level == 2:
             assert self._chip_worker is not None
-            self._chip_worker.run_prepared(int(callable), args, cfg)
+            self._chip_worker.run(int(callable), args, cfg)
         else:
             self._start_hierarchical()
             assert self._orch is not None
@@ -1388,7 +1388,7 @@ class Worker:
 
     def prepare_callable(self, callable_id: int, callable) -> None:
         """L2 only: pre-stage a callable under ``callable_id`` (see
-        ``ChipWorker.prepare_callable``). Subsequent ``run_prepared`` skips
+        ``ChipWorker.prepare_callable``). Subsequent ``run`` skips
         per-run kernel/orch SO upload.
         """
         assert self._initialized, "Worker not initialized; call init() first"
@@ -1396,15 +1396,6 @@ class Worker:
             raise NotImplementedError("prepare_callable is L2-only")
         assert self._chip_worker is not None
         self._chip_worker.prepare_callable(callable_id, callable)
-
-    def run_prepared(self, callable_id: int, args=None, config=None) -> None:
-        """L2 only: launch a callable previously staged via ``prepare_callable``."""
-        assert self._initialized, "Worker not initialized; call init() first"
-        if self.level != 2:
-            raise NotImplementedError("run_prepared is L2-only")
-        assert self._chip_worker is not None
-        cfg = config if config is not None else CallConfig()
-        self._chip_worker.run_prepared(callable_id, args, cfg)
 
     def unregister_callable(self, callable_id: int) -> None:
         """L2 only: drop the prepared state for ``callable_id``.

@@ -113,14 +113,14 @@ class TestChipWorkerStateMachine:
         with pytest.raises(RuntimeError, match="not initialized"):
             worker.prepare_callable_from_blob(0, callable_obj.buffer_ptr())
 
-    def test_run_prepared_before_init_raises(self):
+    def test_run_before_init_raises(self):
         from _task_interface import ChipStorageTaskArgs  # noqa: PLC0415
 
         worker = _ChipWorker()
         config = CallConfig()
         args = ChipStorageTaskArgs()
         with pytest.raises(RuntimeError, match="not initialized"):
-            worker.run_prepared(0, args, config)
+            worker.run(0, args, config)
 
     def test_unregister_callable_before_init_raises(self):
         worker = _ChipWorker()

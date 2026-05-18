@@ -7,12 +7,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end test for ChipWorker.prepare_callable / run_prepared on host_build_graph.
+"""End-to-end test for ChipWorker.prepare_callable / run on host_build_graph.
 
 Mirrors tests/st/a2a3/tensormap_and_ringbuffer/prepared_callable for the hbg
 variant: instead of the AICPU dlopening the orch SO once per cid, hbg dlopens
 on the host inside prepare_callable and replays the cached handle/fn pointer
-on every run_prepared. The dlopen counter to assert is `host_dlopen_count`,
+on every run. The dlopen counter to assert is `host_dlopen_count`,
 not `aicpu_dlopen_count` (which stays 0 — AICPU never sees the orch SO).
 """
 
@@ -35,7 +35,7 @@ _CID_SECONDARY = 1
 
 @scene_test(level=2, runtime="host_build_graph")
 class TestPreparedCallableHbg(SceneTestCase):
-    """Exercise prepare_callable / run_prepared / unregister_callable on hbg.
+    """Exercise prepare_callable / run / unregister_callable on hbg.
 
     Requires an isolated L2 ``Worker`` (cid table starts empty); this is
     provided by the directory-local ``conftest.py`` overriding ``st_worker``
@@ -124,7 +124,7 @@ class TestPreparedCallableHbg(SceneTestCase):
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-            worker.run_prepared(_CID_PRIMARY, chip_args, config=config)
+            worker.run(_CID_PRIMARY, chip_args, config=config)
             _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         test_args = self.generate_args(params)
@@ -132,7 +132,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
 
-        worker.run_prepared(_CID_SECONDARY, chip_args, config=config)
+        worker.run(_CID_SECONDARY, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         worker.unregister_callable(_CID_PRIMARY)
@@ -143,7 +143,7 @@ class TestPreparedCallableHbg(SceneTestCase):
     #
     # hbg increments host_dlopen_count on every register_prepared_callable_host_orch
     # invocation (i.e. each `prepare_callable` call), independent of how many
-    # times run_prepared is invoked afterwards. AICPU never dlopens the orch
+    # times run is invoked afterwards. AICPU never dlopens the orch
     # SO on this variant, so aicpu_dlopen_count stays at 0.
     # ------------------------------------------------------------------
 
@@ -160,7 +160,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
-        worker.run_prepared(cid, chip_args, config=config)
+        worker.run(cid, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     def test_dlopen_count_same_cid_repeated_runs(self, st_platform, st_worker):

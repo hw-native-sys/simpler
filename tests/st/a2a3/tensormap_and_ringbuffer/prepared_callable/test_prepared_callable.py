@@ -7,10 +7,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end test for ChipWorker.prepare_callable / run_prepared / unregister_callable.
+"""End-to-end test for ChipWorker.prepare_callable / run / unregister_callable.
 
 Reuses the vector_example orchestration + AIV kernels. Exercises:
-  - prepare_callable once, then run_prepared twice (second run proves the
+  - prepare_callable once, then run twice (second run proves the
     AICPU-side dlopen cache / host-side orch SO dedup is working — no re-upload).
   - Two distinct callable_ids sharing the same orch SO binary: verifies both
     produce correct output independently.
@@ -38,7 +38,7 @@ _CID_SECONDARY = 1
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestPreparedCallable(SceneTestCase):
-    """Exercise prepare_callable / run_prepared / unregister_callable ABI.
+    """Exercise prepare_callable / run / unregister_callable ABI.
 
     Requires an isolated L2 ``Worker`` (cid table starts empty); this is
     provided by the directory-local ``conftest.py`` overriding ``st_worker``
@@ -120,23 +120,23 @@ class TestPreparedCallable(SceneTestCase):
         worker.prepare_callable(_CID_PRIMARY, callable_obj)
         worker.prepare_callable(_CID_SECONDARY, callable_obj)
 
-        # 2) run_prepared primary cid twice (second run proves dedup/cache hit)
+        # 2) run primary cid twice (second run proves dedup/cache hit)
         for _ in range(2):
             test_args = self.generate_args(params)
             chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-            worker.run_prepared(_CID_PRIMARY, chip_args, config=config)
+            worker.run(_CID_PRIMARY, chip_args, config=config)
             _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-        # 3) run_prepared secondary cid — different slot, same SO, must also work
+        # 3) run secondary cid — different slot, same SO, must also work
         test_args = self.generate_args(params)
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
 
-        worker.run_prepared(_CID_SECONDARY, chip_args, config=config)
+        worker.run(_CID_SECONDARY, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         # 4) unregister both — should not raise
@@ -168,7 +168,7 @@ class TestPreparedCallable(SceneTestCase):
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
-        worker.run_prepared(cid, chip_args, config=config)
+        worker.run(cid, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     def test_dlopen_count_same_cid_repeated_runs(self, st_platform, st_worker):

@@ -231,7 +231,7 @@ public:
     //
     // `callable_id` is the cid returned by ``Worker.register()``; the
     // callable must have been prepared via ``prepare_callable()`` before
-    // this call. ChipWorker delegates to ``run_prepared(cid, …)``.
+    // this call.
     //
     // slot_id is not a parameter — completion routing is owned by
     // WorkerThread / Scheduler at a higher layer.

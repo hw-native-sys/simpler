@@ -274,10 +274,6 @@ void ChipWorker::finalize() {
     finalized_ = true;
 }
 
-void ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
-    run_prepared(callable_id, args, config);
-}
-
 void ChipWorker::prepare_callable(int32_t callable_id, const void *callable) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
@@ -291,12 +287,12 @@ void ChipWorker::prepare_callable(int32_t callable_id, const void *callable) {
     }
 }
 
-void ChipWorker::run_prepared(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
+void ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
     ChipStorageTaskArgs chip_storage = view_to_chip_storage(args);
-    run_prepared(callable_id, &chip_storage, config);
+    run(callable_id, &chip_storage, config);
 }
 
-void ChipWorker::run_prepared(int32_t callable_id, const void *args, const CallConfig &config) {
+void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config) {
     config.validate();
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");

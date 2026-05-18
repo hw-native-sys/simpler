@@ -47,21 +47,24 @@ public:
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
-    // IWorker: dispatch the prepared cid by delegating to run_prepared.
-    // The cid must already have been prepared via prepare_callable.
+    // IWorker: launch a cid previously staged via prepare_callable.
+    // Materializes a ChipStorageTaskArgs from `args` (one memcpy of T*40B + S*8B
+    // into a stack POD), then delegates to the overload below.
     void run(int32_t callable_id, TaskArgsView args, const CallConfig &config) override;
+    // Same launch, but the caller already holds the runtime.so-ABI POD —
+    // skip the view→storage memcpy and hand the pointer straight to the C ABI.
+    // Used by the ChipStorageTaskArgs path in the nanobind binding.
+    void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
     void prepare_callable(int32_t callable_id, const void *callable);
-    void run_prepared(int32_t callable_id, TaskArgsView args, const CallConfig &config);
-    void run_prepared(int32_t callable_id, const void *args, const CallConfig &config);
     void unregister_callable(int32_t callable_id);
 
     /// Number of distinct callable_ids the AICPU has been asked to dlopen for
     /// on the bound device. Returns 0 when not initialized or the runtime
     /// variant has no per-cid registration support. Used by tests to assert
-    /// that prepare_callable + repeated run_prepared do not trigger redundant
+    /// that prepare_callable + repeated run do not trigger redundant
     /// AICPU dlopens.
     size_t aicpu_dlopen_count() const;
 

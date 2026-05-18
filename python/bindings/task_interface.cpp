@@ -661,7 +661,7 @@ NB_MODULE(_task_interface, m) {
             },
             nb::arg("callable_id"), nb::arg("callable"),
             "Stage a ChipCallable under callable_id for cheap repeated launches "
-            "via run_prepared. Variants without per-callable_id support raise."
+            "via run. Variants without per-callable_id support raise."
         )
         .def(
             "prepare_callable_from_blob",
@@ -677,18 +677,18 @@ NB_MODULE(_task_interface, m) {
             "from shm without rebuilding a PyChipCallable wrapper."
         )
         .def(
-            "run_prepared",
+            "run",
             [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config) {
-                self.run_prepared(callable_id, &args, config);
+                self.run(callable_id, &args, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
             "Launch a callable_id previously staged via prepare_callable."
         )
         .def(
-            "run_prepared",
+            "run",
             [](ChipWorker &self, int32_t callable_id, TaskArgs &args, const CallConfig &config) {
                 TaskArgsView view = make_view(args);
-                self.run_prepared(callable_id, view, config);
+                self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
             "Launch a callable_id from a TaskArgs (used for in-process callers)."
@@ -700,11 +700,11 @@ NB_MODULE(_task_interface, m) {
                 // The mailbox region is the on-wire format `write_blob` produced;
                 // `read_blob` is the matching reader that returns a zero-copy
                 // TaskArgsView into the caller-owned bytes. Forwards to the
-                // existing `run_prepared(cid, view, config)` path so chip-child
+                // existing `run(cid, view, config)` path so chip-child
                 // loops never re-implement the tensor/scalar layout in Python
                 // (where it has historically dropped fields like child_memory).
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
-                self.run_prepared(callable_id, view, config);
+                self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
             "Launch a callable_id from a raw mailbox-blob pointer + capacity "
@@ -729,7 +729,7 @@ NB_MODULE(_task_interface, m) {
             "Number of distinct callable_ids the AICPU has dlopened for on the "
             "bound device. Equals 0 when not initialized or the runtime "
             "variant lacks per-cid registration. Tests assert this to verify "
-            "prepare_callable + repeated run_prepared do not redundantly dlopen."
+            "prepare_callable + repeated run do not redundantly dlopen."
         )
         .def_prop_ro(
             "host_dlopen_count", &ChipWorker::host_dlopen_count,
