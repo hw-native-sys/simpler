@@ -75,6 +75,55 @@ enum class TensorDumpStage : uint8_t {
 };
 
 // =============================================================================
+// DumpRecordKind - Logical record type carried by the dump channel
+// =============================================================================
+
+enum class DumpRecordKind : uint8_t {
+    TENSOR = 0,
+    ARGS = 1,
+};
+
+// =============================================================================
+// Args dump payload schema
+// =============================================================================
+
+constexpr uint32_t ARGS_DUMP_PAYLOAD_VERSION = 1;
+
+struct ArgsDumpPayloadHeader {
+    uint32_t version;
+    uint32_t tensor_count;
+    uint32_t scalar_count;
+    uint32_t tensor_entry_size;
+    uint32_t scalar_entry_size;
+    uint32_t reserved;
+};
+
+struct ArgsDumpTensorEntry {
+    uint64_t buffer_addr;
+    uint64_t buffer_size;
+    uint64_t owner_task_id;
+    uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];
+    uint32_t raw_shapes[PLATFORM_DUMP_MAX_DIMS];
+    uint32_t offsets[PLATFORM_DUMP_MAX_DIMS];
+    uint32_t ndims;
+    uint8_t dtype;
+    uint8_t is_contiguous;
+    uint8_t is_all_offset_zero;
+    uint8_t reserved;
+};
+
+struct ArgsDumpInfo {
+    uint64_t task_id;
+    uint8_t subtask_id;
+    TensorDumpStage stage;
+    uint32_t func_id;
+    uint32_t tensor_count;
+    uint32_t scalar_count;
+    const ArgsDumpTensorEntry *tensors;
+    const uint64_t *scalars;
+};
+
+// =============================================================================
 // TensorDumpRecord - Single Tensor Dump Entry (128B = 2 cache lines)
 // =============================================================================
 
@@ -96,7 +145,7 @@ struct alignas(64) TensorDumpRecord {
     uint8_t dtype;            // DataType raw enum value
     uint8_t truncated;        // 1 if payload was truncated (tensor > arena capacity)
     uint8_t is_contiguous;    // 1 when source view is already contiguous
-    uint8_t pad0_align;       // Explicit alignment before 64-bit payload offsets
+    uint8_t kind;             // DumpRecordKind; defaults to tensor for legacy records
     uint64_t payload_offset;  // Monotonic byte offset into thread arena
     uint64_t payload_size;    // Bytes actually copied (may be < full tensor bytes)
     uint8_t pad0[24];         // Preserve 64B cache-line layout

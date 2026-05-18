@@ -163,6 +163,68 @@ collect_task_tensor_buffer_addrs(const Runtime &runtime, const Task &task, uint6
     }
     return found;
 }
+
+static uint64_t tensor_info_nbytes(const TensorInfo &info) {
+    uint64_t elements = 1;
+    for (uint32_t d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
+        elements *= info.shapes[d];
+    }
+    return elements * get_element_size(info.dtype);
+}
+
+static void dump_task_args_record(
+    int thread_idx, const Task &task, const CoreCallable &callable, const TensorInfo *tensor_info,
+    int tensor_info_count, const uint64_t *buffer_addrs, int buffer_count
+) {
+    ArgsDumpTensorEntry tensor_entries[RUNTIME_MAX_ARGS] = {};
+    uint64_t scalar_values[RUNTIME_MAX_ARGS] = {};
+    int tensor_arg_index = 0;
+    int recorded_tensor_count = 0;
+    int scalar_count = 0;
+    int sig_count = callable.sig_count();
+    for (int32_t sig_idx = 0; sig_idx < sig_count && sig_idx < task.num_args; sig_idx++) {
+        ArgDirection dir = callable.sig(sig_idx);
+        if (dir == ArgDirection::SCALAR) {
+            scalar_values[scalar_count++] = task.args[sig_idx];
+            continue;
+        }
+        if (tensor_arg_index < tensor_info_count && tensor_arg_index < buffer_count && tensor_arg_index < RUNTIME_MAX_ARGS) {
+            const TensorInfo &src = tensor_info[tensor_arg_index];
+            ArgsDumpTensorEntry &entry = tensor_entries[tensor_arg_index];
+            entry.buffer_addr = buffer_addrs[tensor_arg_index];
+            entry.buffer_size = tensor_info_nbytes(src);
+            entry.owner_task_id = UINT64_MAX;
+            entry.ndims = src.ndims;
+            entry.dtype = static_cast<uint8_t>(src.dtype);
+            entry.is_contiguous = 1;
+            entry.is_all_offset_zero = 1;
+            for (uint32_t d = 0; d < src.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
+                entry.shapes[d] = src.shapes[d];
+                entry.raw_shapes[d] = src.raw_shapes[d];
+                entry.offsets[d] = src.offsets[d];
+                if (src.shapes[d] != src.raw_shapes[d]) {
+                    entry.is_contiguous = 0;
+                }
+                if (src.offsets[d] != 0) {
+                    entry.is_all_offset_zero = 0;
+                }
+            }
+            recorded_tensor_count++;
+        }
+        tensor_arg_index++;
+    }
+
+    ArgsDumpInfo info = {};
+    info.task_id = static_cast<uint64_t>(task.task_id);
+    info.subtask_id = 0;
+    info.stage = TensorDumpStage::BEFORE_DISPATCH;
+    info.func_id = static_cast<uint32_t>(task.func_id);
+    info.tensor_count = static_cast<uint32_t>(recorded_tensor_count);
+    info.scalar_count = static_cast<uint32_t>(scalar_count);
+    info.tensors = tensor_entries;
+    info.scalars = scalar_values;
+    dump_args_record(thread_idx, info);
+}
 #endif
 
 // ===== Helper Function Implementations =====
@@ -272,6 +334,10 @@ inline bool AicpuExecutor::try_dispatch_task(
                 uint64_t tensor_buffer_addrs[RUNTIME_MAX_ARGS] = {};
                 int tensor_buffer_count =
                     collect_task_tensor_buffer_addrs(*runtime_, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
+                dump_task_args_record(
+                    thread_idx, *task, *callable, tensor_info, tensor_info_count, tensor_buffer_addrs,
+                    tensor_buffer_count
+                );
                 dump_tensors_for_task(
                     thread_idx, static_cast<uint64_t>(task_id), 0, task->num_args, task->func_id, *callable,
                     tensor_info, tensor_info_count, tensor_buffer_addrs, tensor_buffer_count,

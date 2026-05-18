@@ -236,6 +236,52 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
 
     for (uint32_t i = 0; i < count; i++) {
         const TensorDumpRecord &rec = buf->records[i];
+        if (static_cast<DumpRecordKind>(rec.kind) == DumpRecordKind::ARGS) {
+            DumpedArgs da;
+            da.task_id = rec.task_id;
+            da.subtask_id = rec.subtask_id;
+            da.func_id = rec.func_id;
+            da.stage = static_cast<TensorDumpStage>(rec.stage);
+            da.tensor_count = rec.shapes[0];
+            da.scalar_count = rec.shapes[1];
+            da.payload_size = rec.payload_size;
+            da.overwritten = false;
+
+            if (thread_idx < static_cast<int>(arenas_.size())) {
+                ArenaInfo &ai = arenas_[thread_idx];
+                char *arena_host = reinterpret_cast<char *>(ai.host_ptr);
+                uint64_t arena_sz = ai.size;
+                uint64_t high_water = ai.high_water;
+                if (high_water > arena_sz && rec.payload_offset < high_water - arena_sz) {
+                    da.overwritten = true;
+                    if (++total_overwrite_count_ == 1) {
+                        LOG_WARN(
+                            "Dump args overwrite detected: host drain was slower than arena reuse. "
+                            "Increase PLATFORM_DUMP_BUFFERS_PER_THREAD."
+                        );
+                    }
+                }
+                if (!da.overwritten && rec.payload_size > 0) {
+                    da.bytes.resize(rec.payload_size);
+                    uint64_t pos = rec.payload_offset % arena_sz;
+                    if (pos + rec.payload_size <= arena_sz) {
+                        memcpy(da.bytes.data(), arena_host + pos, rec.payload_size);
+                    } else {
+                        uint64_t first = arena_sz - pos;
+                        memcpy(da.bytes.data(), arena_host + pos, first);
+                        memcpy(da.bytes.data() + first, arena_host, rec.payload_size - first);
+                    }
+                }
+                uint64_t end_offset = rec.payload_offset + rec.payload_size;
+                if (end_offset > ai.high_water) {
+                    ai.high_water = end_offset;
+                }
+            }
+
+            std::lock_guard<std::mutex> lock(collected_mutex_);
+            collected_args_.push_back(std::move(da));
+            continue;
+        }
 
         DumpedTensor dt;
         dt.task_id = rec.task_id;
@@ -428,6 +474,40 @@ static std::string dims_to_string(const uint32_t dims[], int ndims) {
     return ss.str();
 }
 
+static ArgsDumpPayloadHeader read_args_payload_header(const DumpedArgs &da) {
+    ArgsDumpPayloadHeader header = {};
+    if (da.bytes.size() >= sizeof(header)) {
+        memcpy(&header, da.bytes.data(), sizeof(header));
+    }
+    return header;
+}
+
+static bool read_args_tensor_entry(const DumpedArgs &da, const ArgsDumpPayloadHeader &header, uint32_t index, ArgsDumpTensorEntry *out) {
+    if (header.tensor_entry_size != sizeof(ArgsDumpTensorEntry)) {
+        return false;
+    }
+    size_t offset = sizeof(ArgsDumpPayloadHeader) + static_cast<size_t>(index) * sizeof(ArgsDumpTensorEntry);
+    if (offset + sizeof(ArgsDumpTensorEntry) > da.bytes.size()) {
+        return false;
+    }
+    memcpy(out, da.bytes.data() + offset, sizeof(ArgsDumpTensorEntry));
+    return true;
+}
+
+static bool read_args_scalar(const DumpedArgs &da, const ArgsDumpPayloadHeader &header, uint32_t index, uint64_t *out) {
+    if (header.tensor_entry_size != sizeof(ArgsDumpTensorEntry) || header.scalar_entry_size != sizeof(uint64_t)) {
+        return false;
+    }
+    size_t offset = sizeof(ArgsDumpPayloadHeader) +
+                    static_cast<size_t>(header.tensor_count) * sizeof(ArgsDumpTensorEntry) +
+                    static_cast<size_t>(index) * sizeof(uint64_t);
+    if (offset + sizeof(uint64_t) > da.bytes.size()) {
+        return false;
+    }
+    memcpy(out, da.bytes.data() + offset, sizeof(uint64_t));
+    return true;
+}
+
 static std::string get_dtype_name_from_raw(uint8_t dtype) { return get_dtype_name(static_cast<DataType>(dtype)); }
 
 static uint64_t get_num_elements(const DumpedTensor &dt) {
@@ -496,8 +576,8 @@ int TensorDumpCollector::export_dump_files() {
         );
     }
 
-    if (collected_.empty()) {
-        LOG_WARN("No tensor dump data to export");
+    if (collected_.empty() && collected_args_.empty()) {
+        LOG_WARN("No dump data to export");
         writer_started_ = false;
         return 0;
     }
@@ -511,8 +591,14 @@ int TensorDumpCollector::export_dump_files() {
         if (a.arg_index != b.arg_index) return a.arg_index < b.arg_index;
         return static_cast<uint8_t>(a.role) < static_cast<uint8_t>(b.role);
     });
+    std::sort(collected_args_.begin(), collected_args_.end(), [](const DumpedArgs &a, const DumpedArgs &b) {
+        if (a.task_id != b.task_id) return a.task_id < b.task_id;
+        if (a.subtask_id != b.subtask_id) return a.subtask_id < b.subtask_id;
+        if (a.func_id != b.func_id) return a.func_id < b.func_id;
+        return static_cast<uint8_t>(a.stage) < static_cast<uint8_t>(b.stage);
+    });
 
-    LOG_INFO_V0("Writing JSON manifest for %zu tensors...", collected_.size());
+    LOG_INFO_V0("Writing JSON manifest for %zu tensors and %zu args records...", collected_.size(), collected_args_.size());
 
     uint32_t num_before_dispatch = 0;
     uint32_t num_after_completion = 0;
@@ -547,6 +633,7 @@ int TensorDumpCollector::export_dump_files() {
     json << "    \"byte_order\": \"little_endian\"\n";
     json << "  },\n";
     json << "  \"total_tensors\": " << collected_.size() << ",\n";
+    json << "  \"total_args\": " << collected_args_.size() << ",\n";
     json << "  \"before_dispatch\": " << num_before_dispatch << ",\n";
     json << "  \"after_completion\": " << num_after_completion << ",\n";
     json << "  \"input_tensors\": " << num_input_tensors << ",\n";
@@ -583,6 +670,46 @@ int TensorDumpCollector::export_dump_files() {
              << ", \"overwritten\": " << (dt.overwritten ? "true" : "false") << "}";
     }
 
+    json << "\n  ],\n";
+    json << "  \"args\": [\n";
+
+    for (size_t i = 0; i < collected_args_.size(); i++) {
+        const DumpedArgs &da = collected_args_[i];
+        ArgsDumpPayloadHeader header = read_args_payload_header(da);
+        if (i > 0) json << ",\n";
+        json << "    {\"task_id\": \"0x" << std::hex << std::setfill('0') << std::setw(16) << da.task_id << std::dec
+             << "\", \"subtask_id\": " << static_cast<uint32_t>(da.subtask_id) << ", \"func_id\": " << da.func_id
+             << ", \"stage\": \"" << tensor_dump_stage_name(da.stage) << "\", \"tensor_count\": " << da.tensor_count
+             << ", \"scalar_count\": " << da.scalar_count << ", \"payload_size\": " << da.payload_size
+             << ", \"overwritten\": " << (da.overwritten ? "true" : "false") << ", \"tensors\": [";
+        for (uint32_t t = 0; t < header.tensor_count; t++) {
+            ArgsDumpTensorEntry entry = {};
+            if (!read_args_tensor_entry(da, header, t, &entry)) {
+                break;
+            }
+            if (t > 0) json << ", ";
+            json << "{\"arg_index\": " << t << ", \"buffer_addr\": \"0x" << std::hex << entry.buffer_addr << std::dec
+                 << "\", \"buffer_size\": " << entry.buffer_size << ", \"owner_task_id\": \"0x" << std::hex
+                 << entry.owner_task_id << std::dec << "\", \"dtype\": \""
+                 << get_dtype_name_from_raw(entry.dtype) << "\", \"shape\": "
+                 << dims_to_string(entry.shapes, static_cast<int>(entry.ndims)) << ", \"raw_shape\": "
+                 << dims_to_string(entry.raw_shapes, static_cast<int>(entry.ndims)) << ", \"offsets\": "
+                 << dims_to_string(entry.offsets, static_cast<int>(entry.ndims)) << ", \"is_contiguous\": "
+                 << (entry.is_contiguous ? "true" : "false") << ", \"is_all_offset_zero\": "
+                 << (entry.is_all_offset_zero ? "true" : "false") << "}";
+        }
+        json << "], \"scalars\": [";
+        for (uint32_t s = 0; s < header.scalar_count; s++) {
+            uint64_t value = 0;
+            if (!read_args_scalar(da, header, s, &value)) {
+                break;
+            }
+            if (s > 0) json << ", ";
+            json << "\"0x" << std::hex << value << std::dec << "\"";
+        }
+        json << "]}";
+    }
+
     json << "\n  ]\n}\n";
     json.close();
 
@@ -599,6 +726,8 @@ int TensorDumpCollector::export_dump_files() {
 
     // Clear state so subsequent runs don't accumulate data from previous runs
     collected_.clear();
+    collected_args_.clear();
+    processed_buffers_.clear();
     total_dropped_record_count_ = 0;
     total_truncated_count_ = 0;
     total_overwrite_count_ = 0;
@@ -683,6 +812,7 @@ int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, DumpFree
     // Reset state
     num_dump_threads_ = 0;
     collected_.clear();
+    collected_args_.clear();
     total_dropped_record_count_ = 0;
     total_truncated_count_ = 0;
     total_overwrite_count_ = 0;

@@ -176,6 +176,18 @@ struct DumpedTensor {
     std::vector<uint8_t> bytes;
 };
 
+struct DumpedArgs {
+    uint64_t task_id;
+    uint8_t subtask_id;
+    uint32_t func_id;
+    TensorDumpStage stage;
+    uint32_t tensor_count;
+    uint32_t scalar_count;
+    uint64_t payload_size;
+    bool overwritten;
+    std::vector<uint8_t> bytes;
+};
+
 class TensorDumpCollector : public profiling_common::ProfilerBase<TensorDumpCollector, DumpModule> {
 public:
     TensorDumpCollector() = default;
@@ -283,6 +295,7 @@ private:
 
     // Collected dump tensors
     std::vector<DumpedTensor> collected_;
+    std::vector<DumpedArgs> collected_args_;
     std::mutex collected_mutex_;
 
     // Stats

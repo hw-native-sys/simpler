@@ -327,6 +327,23 @@ static inline void write_tensor_dump_logical_prefix(
     gather_tensor_dump_dim(writer, info, elem_sz, 0, 0, &remaining_bytes);
 }
 
+static DumpMetaBuffer *ensure_dump_record_slot(int thread_idx) {
+    if (s_dump_header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
+        return nullptr;
+    }
+    DumpMetaBuffer *buf = s_current_dump_buf[thread_idx];
+    if (buf == nullptr) {
+        return nullptr;
+    }
+    if (buf->count >= PLATFORM_DUMP_RECORDS_PER_BUFFER) {
+        if (switch_dump_meta_buffer(thread_idx) != 0) {
+            return nullptr;
+        }
+        buf = s_current_dump_buf[thread_idx];
+    }
+    return buf;
+}
+
 void dump_tensor_init(int num_dump_threads) {
     void *dump_base = reinterpret_cast<void *>(get_platform_dump_base());
     if (dump_base == nullptr) {
@@ -374,28 +391,11 @@ void dump_tensor_init(int num_dump_threads) {
 }
 
 int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
-    if (s_dump_header == nullptr) {
+    DumpMetaBuffer *buf = ensure_dump_record_slot(thread_idx);
+    DumpBufferState *state =
+        (thread_idx >= 0 && thread_idx < PLATFORM_MAX_AICPU_THREADS) ? s_dump_states[thread_idx] : nullptr;
+    if (state == nullptr || buf == nullptr) {
         return -1;
-    }
-    if (thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
-        return -1;
-    }
-
-    DumpBufferState *state = s_dump_states[thread_idx];
-    DumpMetaBuffer *buf = s_current_dump_buf[thread_idx];
-    if (buf == nullptr) {
-        return -1;
-    }
-
-    // Switch metadata buffer if full
-    if (buf->count >= PLATFORM_DUMP_RECORDS_PER_BUFFER) {
-        if (switch_dump_meta_buffer(thread_idx) != 0) {
-            return -1;  // No free buffer
-        }
-        buf = s_current_dump_buf[thread_idx];
-        if (buf == nullptr) {
-            return -1;
-        }
     }
 
     // Reserve space in arena
@@ -436,6 +436,7 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     rec->ndims = info.ndims;
     rec->dtype = info.dtype;
     rec->truncated = truncated ? 1 : 0;
+    rec->kind = static_cast<uint8_t>(DumpRecordKind::TENSOR);
     rec->payload_offset = offset;
     rec->payload_size = copy_bytes;
     for (int d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
@@ -448,6 +449,61 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
 
     s_records_written[thread_idx]++;
 
+    return 0;
+}
+
+int dump_args_record(int thread_idx, const ArgsDumpInfo &info) {
+    DumpMetaBuffer *buf = ensure_dump_record_slot(thread_idx);
+    DumpBufferState *state =
+        (thread_idx >= 0 && thread_idx < PLATFORM_MAX_AICPU_THREADS) ? s_dump_states[thread_idx] : nullptr;
+    if (state == nullptr || buf == nullptr) {
+        return -1;
+    }
+
+    uint64_t payload_size = sizeof(ArgsDumpPayloadHeader) +
+                            static_cast<uint64_t>(info.tensor_count) * sizeof(ArgsDumpTensorEntry) +
+                            static_cast<uint64_t>(info.scalar_count) * sizeof(uint64_t);
+    if (payload_size > state->arena_size) {
+        account_dropped_records(state, 1);
+        return 0;
+    }
+
+    uint64_t offset = state->arena_write_offset;
+    state->arena_write_offset = offset + payload_size;
+
+    char *arena = reinterpret_cast<char *>(state->arena_base);
+    CircularArenaWriter writer = {arena, state->arena_size, offset, 0};
+    ArgsDumpPayloadHeader header = {};
+    header.version = ARGS_DUMP_PAYLOAD_VERSION;
+    header.tensor_count = info.tensor_count;
+    header.scalar_count = info.scalar_count;
+    header.tensor_entry_size = sizeof(ArgsDumpTensorEntry);
+    header.scalar_entry_size = sizeof(uint64_t);
+    writer.write(&header, sizeof(header));
+    if (info.tensor_count > 0 && info.tensors != nullptr) {
+        writer.write(info.tensors, static_cast<uint64_t>(info.tensor_count) * sizeof(ArgsDumpTensorEntry));
+    }
+    if (info.scalar_count > 0 && info.scalars != nullptr) {
+        writer.write(info.scalars, static_cast<uint64_t>(info.scalar_count) * sizeof(uint64_t));
+    }
+    wmb();
+
+    uint32_t idx = buf->count;
+    TensorDumpRecord *rec = &buf->records[idx];
+    memset(rec, 0, sizeof(*rec));
+    rec->task_id = info.task_id;
+    rec->subtask_id = info.subtask_id;
+    rec->func_id = info.func_id;
+    rec->stage = static_cast<uint8_t>(info.stage);
+    rec->kind = static_cast<uint8_t>(DumpRecordKind::ARGS);
+    rec->payload_offset = offset;
+    rec->payload_size = payload_size;
+    rec->shapes[0] = info.tensor_count;
+    rec->shapes[1] = info.scalar_count;
+    buf->count = idx + 1;
+    wmb();
+
+    s_records_written[thread_idx]++;
     return 0;
 }
 

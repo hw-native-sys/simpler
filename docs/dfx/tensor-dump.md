@@ -15,6 +15,13 @@ execution, and the host exports a JSON manifest plus a binary payload.
 The result is a stable, replayable record of every tensor a kernel
 saw, without the timing distortion of inline printing.
 
+The same device-to-host dump channel also carries task argument
+descriptors. When tensor dump is enabled, AICPU records the runtime
+args it sees at dispatch time: tensor buffer descriptors plus scalar
+values. These `args` entries share the tensor dump lifecycle, queues,
+arena, and output directory so they can be correlated with swimlane
+and PMU task ids without opening a second DFX path.
+
 ## 2. Overview
 
 - **Per-task input/output capture.** Inputs snapshotted before
@@ -26,6 +33,9 @@ saw, without the timing distortion of inline printing.
 - **Manifest + binary payload.** A single JSON manifest plus one
   `.bin` payload per run; each manifest entry has `bin_offset` /
   `bin_size` into the payload.
+- **Args descriptors.** The manifest also includes an `args` array
+  with per-dispatch tensor descriptors and scalar values observed on
+  device.
 - **Cross-architecture.** Same `--dump-tensor` flag, same on-disk
   format on `a2a3` and `a5`. Both runtimes are wired through.
 
@@ -90,6 +100,7 @@ Example manifest (one input tensor captured before dispatch):
     "byte_order": "little_endian"
   },
   "total_tensors": 1,
+  "total_args": 1,
   "before_dispatch": 1,
   "after_completion": 0,
   "input_tensors": 1,
@@ -99,6 +110,32 @@ Example manifest (one input tensor captured before dispatch):
   "dropped_records": 0,
   "dropped_overwrite": 0,
   "bin_file": "tensor_dump.bin",
+  "args": [
+    {
+      "task_id": "0x0000000200000a00",
+      "subtask_id": 0,
+      "func_id": 0,
+      "stage": "before_dispatch",
+      "tensor_count": 1,
+      "scalar_count": 1,
+      "payload_size": 128,
+      "overwritten": false,
+      "tensors": [
+        {
+          "arg_index": 0,
+          "buffer_addr": "0x100000",
+          "buffer_size": 65536,
+          "dtype": "float32",
+          "shape": [16384],
+          "raw_shape": [16384],
+          "offsets": [0],
+          "is_contiguous": true,
+          "is_all_offset_zero": true
+        }
+      ],
+      "scalars": ["0x40"]
+    }
+  ],
   "tensors": [
     {
       "task_id": "0x0000000200000a00",
@@ -154,6 +191,9 @@ python -m simpler_setup.tools.dump_viewer --func 0 --stage before --role input -
 
 # Export one specific entry by its manifest index
 python -m simpler_setup.tools.dump_viewer --index 42
+
+# List dumped task args in the latest run
+python -m simpler_setup.tools.dump_viewer --args
 
 # Pin to a specific dump directory
 python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump \

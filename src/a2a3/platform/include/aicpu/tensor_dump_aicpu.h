@@ -75,6 +75,58 @@ int32_t count_callable_tensor_args(const CoreCallable &callable);
 bool should_dump_tensor_at_stage(TensorDumpRole role, TensorDumpStage stage);
 bool try_log_tensor_dump_layout_mismatch();
 int dump_tensor_record(int thread_idx, const TensorDumpInfo &info);
+int dump_args_record(int thread_idx, const ArgsDumpInfo &info);
+
+template <int MaxTensorArgs, int MaxScalarArgs, typename PayloadT>
+inline void dump_args_for_payload(
+    int32_t thread_idx, uint64_t task_id, uint8_t subtask_id, int32_t func_id, const PayloadT &payload,
+    TensorDumpStage stage
+) {
+    ArgsDumpTensorEntry tensor_entries[MaxTensorArgs] = {};
+    int32_t tensor_count = payload.tensor_count;
+    if (tensor_count < 0) {
+        tensor_count = 0;
+    }
+    if (tensor_count > MaxTensorArgs) {
+        tensor_count = MaxTensorArgs;
+    }
+    int32_t scalar_count = payload.scalar_count;
+    if (scalar_count < 0) {
+        scalar_count = 0;
+    }
+    if (scalar_count > MaxScalarArgs) {
+        scalar_count = MaxScalarArgs;
+    }
+
+    for (int32_t i = 0; i < tensor_count; i++) {
+        const auto &t = payload.tensors[i];
+        ArgsDumpTensorEntry &entry = tensor_entries[i];
+        entry.buffer_addr = t.buffer.addr;
+        entry.buffer_size = t.buffer.size;
+        entry.owner_task_id = t.owner_task_id.raw;
+        entry.ndims = t.ndims;
+        entry.dtype = static_cast<uint8_t>(t.dtype);
+        entry.is_contiguous = t.is_raw_eq_shapes ? 1 : 0;
+        entry.is_all_offset_zero = t.is_all_offset_zero ? 1 : 0;
+        const uint32_t *raw_shapes = t.get_raw_shapes();
+        for (uint32_t d = 0; d < t.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
+            entry.shapes[d] = t.shapes[d];
+            entry.offsets[d] = t.is_all_offset_zero ? 0 : t.offsets[d];
+            entry.raw_shapes[d] = raw_shapes[d];
+        }
+    }
+
+    ArgsDumpInfo info = {};
+    info.task_id = task_id;
+    info.subtask_id = subtask_id;
+    info.stage = stage;
+    info.func_id = static_cast<uint32_t>(func_id);
+    info.tensor_count = static_cast<uint32_t>(tensor_count);
+    info.scalar_count = static_cast<uint32_t>(scalar_count);
+    info.tensors = tensor_entries;
+    info.scalars = payload.scalars;
+    dump_args_record(thread_idx, info);
+}
 
 template <int MaxSubtaskSlots, typename SlotStateT, typename IsSubtaskActiveFn, typename GetFunctionBinAddrFn>
 inline void dump_tensors_for_task(
@@ -260,6 +312,14 @@ void dump_tensor_init(int num_dump_threads);
  * @return 0 on success or intentional drop, -1 only when dump state is unavailable
  */
 int dump_tensor_record(int thread_idx, const TensorDumpInfo &info);
+
+/**
+ * Record a task's runtime argument descriptors.
+ *
+ * Copies an ArgsDumpPayloadHeader, ArgsDumpTensorEntry array, and raw scalar
+ * values into the existing dump arena, then appends an ARGS metadata record.
+ */
+int dump_args_record(int thread_idx, const ArgsDumpInfo &info);
 
 /**
  * Flush remaining tensor dump data for a thread.

@@ -38,7 +38,17 @@
 
 namespace {
 inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
+
+int32_t first_active_subtask_slot(const PTO2TaskSlotState &slot_state) {
+    for (int32_t slot = 0; slot < PTO2_SUBTASK_SLOT_COUNT; slot++) {
+        if (slot_state.active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(slot)) &&
+            slot_state.task->kernel_id[slot] != INVALID_KERNEL_ID) {
+            return slot;
+        }
+    }
+    return -1;
 }
+}  // namespace
 
 const char *SchedulerContext::shape_name(PTO2ResourceShape shape) {
     switch (shape) {
@@ -212,6 +222,13 @@ void SchedulerContext::dispatch_block(
 ) {
 #if PTO2_PROFILING
     if (is_dump_tensor_enabled()) {
+        int32_t args_slot = first_active_subtask_slot(slot_state);
+        if (args_slot >= 0) {
+            dump_args_for_payload<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>(
+                thread_idx, slot_state.task->task_id.raw, static_cast<uint8_t>(args_slot),
+                slot_state.task->kernel_id[args_slot], *slot_state.payload, TensorDumpStage::BEFORE_DISPATCH
+            );
+        }
         dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
             thread_idx, slot_state, TensorDumpStage::BEFORE_DISPATCH,
             [](ActiveMask active_mask, int raw_subtask_id) {

@@ -15,6 +15,7 @@ Filters (freely combinable):
     --stage  Filter by stage (before / after)
     --role   Filter by role (input / output / inout)
     --arg    Filter by arg_index (int)
+    --args   List dumped task args instead of tensors
 
 With no filters: lists all tensors.
 With filters: lists matching tensors. Add --export to save them to txt.
@@ -194,6 +195,20 @@ def list_tensors(tensors: list):
         )
 
 
+def list_args(args_records: list):
+    print(
+        f"{'idx':>6}  {'task_id':>18}  {'s':>1}  {'stage':>15}  {'func':>4}"
+        f"  {'tensors':>7}  {'scalars':>7}  {'overwritten':>11}"
+    )
+    print("-" * 92)
+    for i, rec in enumerate(args_records):
+        print(
+            f"{i:>6}  {rec['task_id']:>18}  {rec['subtask_id']:>1}  {rec['stage']:>15}"
+            f"  {rec['func_id']:>4}  {rec['tensor_count']:>7}  {rec['scalar_count']:>7}"
+            f"  {str(rec.get('overwritten', False)):>11}"
+        )
+
+
 def _resolve_dump_dir(dump_dir_arg: str | None) -> Path:
     if dump_dir_arg is not None:
         return Path(dump_dir_arg)
@@ -267,6 +282,7 @@ def main():
     parser.add_argument("--stage", "-s", help="Filter by stage (before / after)")
     parser.add_argument("--role", "-r", help="Filter by role (input / output / inout)")
     parser.add_argument("--arg", "-a", type=int, help="Filter by arg_index")
+    parser.add_argument("--args", action="store_true", help="List dumped task args instead of tensors")
     parser.add_argument("--index", "-i", type=int, help="Select tensor by index in manifest")
     parser.add_argument("--export", "-e", action="store_true", help="Export filtered tensors to txt")
     args = parser.parse_args()
@@ -282,6 +298,14 @@ def main():
 
     bin_path = dump_dir / manifest.get("bin_file", "tensors.bin")
     tensors = manifest["tensors"]
+
+    if args.args:
+        args_records = manifest.get("args", [])
+        if not args_records:
+            print("No args records found in manifest.", file=sys.stderr)
+            sys.exit(1)
+        list_args(args_records)
+        return
 
     filtered = _apply_filters(tensors, args)
 
