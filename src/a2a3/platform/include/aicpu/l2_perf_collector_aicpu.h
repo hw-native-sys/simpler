@@ -137,16 +137,6 @@ void l2_perf_aicpu_record_phase(
 );
 
 /**
- * Write orchestrator cumulative summary
- *
- * Writes the orchestrator's accumulated profiling data to shared memory
- * for host-side collection.
- *
- * @param src Pointer to populated AicpuOrchSummary (magic field is set internally)
- */
-void l2_perf_aicpu_write_orch_summary(const AicpuOrchSummary *src);
-
-/**
  * Set orchestrator thread index for per-task phase recording
  *
  * Must be called once from the orchestrator thread before any

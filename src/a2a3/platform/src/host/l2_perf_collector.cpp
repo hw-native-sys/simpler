@@ -496,28 +496,9 @@ void L2PerfCollector::read_phase_header_metadata() {
         }
     }
 
-    // Orchestrator summary (header-resident; not buffered).
-    collected_orch_summary_ = phase_header->orch_summary;
-    bool orch_valid = (collected_orch_summary_.magic == AICPU_PHASE_MAGIC);
-    if (orch_valid) {
-        LOG_INFO_V0(
-            "  Orchestrator: %" PRId64 " tasks, %.3fus", static_cast<int64_t>(collected_orch_summary_.submit_count),
-            cycles_to_us(collected_orch_summary_.end_time - collected_orch_summary_.start_time)
-        );
-    } else {
-        LOG_INFO_V0("  Orchestrator: no summary data");
-    }
-
-    bool has_accumulated = has_phase_data_;
-    if (!has_accumulated) {
-        for (const auto &v : collected_phase_records_) {
-            if (!v.empty()) {
-                has_accumulated = true;
-                break;
-            }
-        }
-    }
-    has_phase_data_ = (orch_valid || has_accumulated);
+    // has_phase_data_ is set by copy_phase_buffer() during the drain — every
+    // push into collected_phase_records_ goes through that single call site
+    // and toggles the flag. No re-scan needed here.
 
     // Core-to-thread mapping (header-resident; not buffered).
     int num_cores = static_cast<int>(phase_header->num_cores);
@@ -526,7 +507,7 @@ void L2PerfCollector::read_phase_header_metadata() {
         LOG_INFO_V0("  Core-to-thread mapping: %d cores", num_cores);
     }
 
-    LOG_INFO_V0("Phase metadata collection complete: orch_summary=%s", orch_valid ? "yes" : "no");
+    LOG_INFO_V0("Phase metadata collection complete: has_phase_data=%s", has_phase_data_ ? "yes" : "no");
 }
 
 int L2PerfCollector::export_swimlane_json() {
@@ -594,10 +575,6 @@ int L2PerfCollector::export_swimlane_json() {
                     base_time_cycles = pr.start_time;
                 }
             }
-        }
-        if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC && collected_orch_summary_.start_time > 0 &&
-            collected_orch_summary_.start_time < base_time_cycles) {
-            base_time_cycles = collected_orch_summary_.start_time;
         }
     }
 
@@ -733,21 +710,11 @@ int L2PerfCollector::export_swimlane_json() {
         }
         outfile << "  ]";
 
-        // AICPU orchestrator summary
-        if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC) {
-            // Per-phase breakdown is no longer reported here; consumers that
-            // want it derive it from the aicpu_orchestrator_phases array by
-            // bucketing entries on phase_id, keeping per-event records as the
-            // single source of truth.
-            double orch_start_us = cycles_to_us(collected_orch_summary_.start_time - base_time_cycles);
-            double orch_end_us = cycles_to_us(collected_orch_summary_.end_time - base_time_cycles);
-
-            outfile << ",\n  \"aicpu_orchestrator\": {\n";
-            outfile << "    \"start_time_us\": " << std::fixed << std::setprecision(3) << orch_start_us << ",\n";
-            outfile << "    \"end_time_us\": " << std::fixed << std::setprecision(3) << orch_end_us << ",\n";
-            outfile << "    \"submit_count\": " << collected_orch_summary_.submit_count << "\n";
-            outfile << "  }";
-        }
+        // Orchestrator timing is no longer emitted as a separate aggregate
+        // block. Per-event AicpuPhaseRecord[] entries (emitted as
+        // aicpu_orchestrator_phases below) are the single source of truth;
+        // the run-window envelope is still visible in the device-side
+        // LOG_INFO_V9 "Thread N: orch_start=… orch_end=… orch_cost=…" line.
 
         // Per-task orchestrator phase records (filtered from unified collected_phase_records_)
         bool has_orch_phases = false;

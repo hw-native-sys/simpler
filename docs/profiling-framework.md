@@ -332,9 +332,8 @@ changes capture that:
    **not** called from the mgmt loop — it would race with AICPU writes
    to device-only fields (`current_buf_ptr`, `total/dropped/mismatch`
    counters, `queue_tails`, `free_queue.head`,
-   `AicpuPhaseHeader::magic`, `orch_summary`, `core_to_thread[]`),
-   rolling them back to whatever the host shadow had at the start of
-   the tick. Per-buffer payloads (`L2PerfBuffer` / `PmuBuffer` /
+   `AicpuPhaseHeader::magic`, `core_to_thread[]`), rolling them back
+   to whatever the host shadow had at the start of the tick. Per-buffer payloads (`L2PerfBuffer` / `PmuBuffer` /
    `DumpMetaBuffer`) are still pulled on demand inside
    `ProfilerAlgorithms::process_entry` after resolving the host pointer
    for a popped ready entry. The bulk `mirror_shm_to_device` is kept

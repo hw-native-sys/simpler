@@ -206,7 +206,7 @@ using L2PerfFreeCallback = int (*)(void *dev_ptr, void *user_data);
  *   4. stop()                      — joins both threads in the correct
  *                                    order (mgmt first so its final-drain
  *                                    entries have a consumer).
- *   5. read_phase_header_metadata() — single-shot read of orch_summary +
+ *   5. read_phase_header_metadata() — single-shot read of the
  *                                    core→thread mapping from the
  *                                    AicpuPhaseHeader.
  *   6. reconcile_counters()        — leftover-active sanity check (a5 lacks
@@ -304,8 +304,9 @@ public:
 
     /**
      * Read AICPU phase metadata that lives in AicpuPhaseHeader (not on the
-     * buffer pipeline): the orchestrator summary and core→thread mapping.
-     * Single-shot — must be called after stop() so orch_summary has settled.
+     * buffer pipeline): the core→thread mapping plus a has-data signal
+     * derived from accumulated per-event records. Single-shot — must be
+     * called after stop() so the shm region has settled.
      * The shm region was last mirrored to host shadow at the end of mgmt's
      * final-drain pass.
      */
@@ -352,7 +353,6 @@ private:
 
     // AICPU phase profiling data (per-thread, mixed sched + orch records)
     std::vector<std::vector<AicpuPhaseRecord>> collected_phase_records_;
-    AicpuOrchSummary collected_orch_summary_{};
     bool has_phase_data_{false};
 
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)

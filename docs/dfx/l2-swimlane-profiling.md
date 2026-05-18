@@ -224,7 +224,7 @@ L2PerfBufferState[num_cores]                    (per-core perf state)
 
 [AicpuPhaseHeader + PhaseBufferState[num_threads]]  (optional)
 ├── magic / num_sched_threads
-├── orch_summary  (cumulative orchestrator cycles)
+├── core_to_thread[]  (core_id → scheduler thread index)
 └── per-thread phase buffers (PhaseBufferState aliases L2PerfBufferState;
                               `aicore_ring_ptr` / `mismatch_record_count`
                               unused for PHASE)
@@ -235,10 +235,13 @@ The records themselves are identical across architectures:
 - `L2PerfRecord` — per-task timing + fanout, 64-byte aligned.
 - `AicpuPhaseRecord` — per-iteration scheduler / orchestrator
   phase, 32 bytes.
-- `AicpuOrchSummary` — one-shot cumulative orchestrator cycles.
 
 This is the key reason a single `swimlane_converter` consumes
-both architectures' output unchanged.
+both architectures' output unchanged. Orchestrator timing is carried
+entirely by per-task `AicpuPhaseRecord` entries (ORCH_SYNC, ORCH_ALLOC,
+…); there is no separate shared-memory aggregate. The run-window
+envelope is emitted to device log via `LOG_INFO_V9
+"orch_start=… orch_end=… orch_cost=…"`.
 
 **Producer/consumer protocol on AICore.** AICore writes per-task
 timing into a stable per-core `L2PerfAicoreRing` at
@@ -323,7 +326,7 @@ start(tf)                          ← spawn mgmt + poll threads
 launch AICPU / AICore
 rtStreamSynchronize
 stop()                             ← join mgmt → join poll
-read_phase_header_metadata()       ← single-shot read of orch_summary +
+read_phase_header_metadata()       ← single-shot read of the
                                      core→thread mapping
 reconcile_counters()               ← three-bucket accounting for both
                                      PERF and PHASE pools (total /
@@ -384,8 +387,8 @@ The bulk `mirror_shm_to_device` is deliberately **not** called from
 the mgmt loop: it would race with AICPU writes to device-only
 fields (`current_buf_ptr`, `total/dropped/mismatch` counters,
 `queue_tails`, `free_queue.head`, `AicpuPhaseHeader::magic`,
-`orch_summary`, `core_to_thread[]`) and roll them back to whatever
-the host shadow held at the start of the tick. Per-buffer
+`core_to_thread[]`) and roll them back to whatever the host shadow
+held at the start of the tick. Per-buffer
 payloads (`L2PerfBuffer` / `PhaseBuffer`) are pulled on demand
 inside `ProfilerAlgorithms::process_entry` after a popped
 ready-entry resolves to its host shadow. `BufferPoolManager`'s
@@ -480,7 +483,7 @@ PHASE), same shape as a2a3.
 
 | Aspect | a2a3 | a5 |
 | ------ | ---- | -- |
-| Record shape | identical (`L2PerfRecord` / `AicpuPhaseRecord` / `AicpuOrchSummary`) | |
+| Record shape | identical (`L2PerfRecord` / `AicpuPhaseRecord`) | |
 | AICore WIP-slot protocol | identical | |
 | AICPU commit on FIN | identical | |
 | Buffer model | rotating pool (free + ready queues) per kind | identical |

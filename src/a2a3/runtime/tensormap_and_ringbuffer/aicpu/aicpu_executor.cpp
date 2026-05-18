@@ -602,8 +602,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #endif
 #endif  // PTO2_ORCH_PROFILING
 
-            // Latch task count from PTO2 shared memory (used both by the
-            // swimlane orch_summary below and passed on to the scheduler).
+            // Latch task count from PTO2 shared memory to hand off to the
+            // scheduler. The orchestrator's run window (start_time / end_time /
+            // submit_count) is no longer published to shared memory — the
+            // device LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…" line
+            // below carries the same envelope info for debugging, and
+            // host-side swimlane derives per-phase timing from the per-event
+            // AicpuPhaseRecord[] stream that already covers everything inside
+            // submit_task().
             int32_t total_tasks = 0;
             if (rt->orchestrator.sm_header) {
                 for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -614,17 +620,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             pto2_submitted_tasks = total_tasks;
-            // Write the orchestrator run window to swimlane shared memory.
-            // Per-phase breakdown is derived host-side from AicpuPhaseRecord[]
-            // (collected via l2_perf_aicpu_record_orch_phase under PTO2_PROFILING,
-            // independent of PTO2_ORCH_PROFILING), so it does NOT live here.
-            if (is_l2_swimlane_enabled()) {
-                AicpuOrchSummary orch_summary = {};
-                orch_summary.start_time = orch_cycle_start;
-                orch_summary.end_time = orch_cycle_end;
-                orch_summary.submit_count = total_tasks;
-                l2_perf_aicpu_write_orch_summary(&orch_summary);
-            }
 #endif
 
             // Signal completion to the orchestrator state machine

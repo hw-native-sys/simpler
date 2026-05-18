@@ -761,12 +761,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 }
                 events.append(event)
 
-    # AICPU Orchestrator event (version 2)
+    # AICPU Orchestrator lane (version 2)
     #
-    # Per-event AicpuPhaseRecord[] are the single source of truth. The
-    # cumulative aicpu_orchestrator summary still ships start/end_time and
-    # submit_count but no per-phase breakdown — anything that needs phase
-    # totals derives them by bucketing per-event entries on phase_id.
+    # Per-event AicpuPhaseRecord[] is the single source of truth for
+    # orchestrator timing. There is no separate aggregate summary — the
+    # device-side LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…" log
+    # line covers the run-window envelope for debugging without swimlane.
     if orchestrator_phases:
         # Process metadata
         orch_process_label = f"AICPU {orchestrator_name}" if orchestrator_name else "AICPU Orchestrator"
@@ -1161,17 +1161,18 @@ def _print_verbose_data_info(data, verbose):
     if data["version"] != 2:
         return
     scheduler_phases = data.get("aicpu_scheduler_phases")
-    orchestrator_data = data.get("aicpu_orchestrator")
     orchestrator_phases = data.get("aicpu_orchestrator_phases")
     core_to_thread = data.get("core_to_thread")
     if scheduler_phases:
         print(f"  Scheduler threads: {len(scheduler_phases)}")
         print(f"  Total phase records: {sum(len(t) for t in scheduler_phases)}")
-    if orchestrator_data:
-        print(f"  Orchestrator: {orchestrator_data.get('submit_count', 0)} tasks")
     if orchestrator_phases:
         print(f"  Orchestrator threads: {len(orchestrator_phases)}")
         print(f"  Total orchestrator phase records: {sum(len(t) for t in orchestrator_phases)}")
+        # submit_count is derivable as the number of orch_fanin records (one per submit).
+        submit_count = sum(1 for thread in orchestrator_phases for r in thread if r.get("phase") == "orch_fanin")
+        if submit_count:
+            print(f"  Orchestrator: {submit_count} tasks submitted")
     if core_to_thread:
         print(f"  Core-to-thread mapping: {len(core_to_thread)} cores")
 

@@ -33,7 +33,7 @@
  * ├─────────────────────────────────────────────────────────────┤
  * │ AicpuPhaseHeader (optional, present when phase profiling)   │
  * │  - magic, num_sched_threads, records_per_thread             │
- * │  - orch_summary                                             │
+ * │  - core_to_thread mapping                                   │
  * ├─────────────────────────────────────────────────────────────┤
  * │ PhaseBufferState[thread0]                                   │
  * │  - free_queue: SPSC queue of available buffer pointers      │
@@ -332,23 +332,6 @@ struct AicpuPhaseRecord {
 };
 static_assert(sizeof(AicpuPhaseRecord) == 40, "AicpuPhaseRecord layout drift");
 
-/**
- * AICPU orchestrator run summary
- *
- * Captures the orchestrator's overall run window. Per-phase breakdown is
- * derived host-side by aggregating AicpuPhaseRecord entries filtered by
- * phase_id, so per-phase cycle fields are not duplicated here. The
- * device-side aggregate path under PTO2_ORCH_PROFILING (g_orch_*_cycle +
- * LOG_INFO_V9) is independent and emits to the device log only.
- */
-struct AicpuOrchSummary {
-    uint64_t start_time;   // Orchestrator start timestamp
-    uint64_t end_time;     // Orchestrator end timestamp
-    int64_t submit_count;  // Total tasks submitted
-    uint32_t magic;        // Validation magic (AICPU_PHASE_MAGIC)
-    uint32_t padding;      // Alignment padding
-} __attribute__((aligned(64)));
-
 constexpr uint32_t AICPU_PHASE_MAGIC = 0x41435048;        // "ACPH"
 constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 16384;  // ~512KB per thread
 
@@ -375,7 +358,6 @@ struct AicpuPhaseHeader {
     uint32_t records_per_thread;                // Max records per PhaseBuffer
     uint32_t num_cores;                         // Total number of cores with valid assignments
     int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
-    AicpuOrchSummary orch_summary;              // Orchestrator cumulative data
 } __attribute__((aligned(64)));
 
 // =============================================================================
