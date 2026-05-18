@@ -11,8 +11,9 @@
 /**
  * Backend-neutral distributed communication C API.
  *
- * Provides five primitives for multi-rank communication: init, allocate
- * shared windows, query local window base, barrier, and destroy.
+ * Provides six primitives for multi-rank communication: init, allocate
+ * shared windows, query local window base, query window size, barrier,
+ * and destroy.
  *
  * Implementations:
  *   onboard/host/comm_hccl.cpp — HCCL backend (links CANN hccl/hccl_fwk)
@@ -50,8 +51,8 @@ typedef struct CommHandle_ *CommHandle;
  * @param rank           This process's rank (0-based).
  * @param nranks         Total number of ranks.
  * @param stream         Caller-owned aclrtStream (passed as void*) used for
- *                       HCCL operations like HcclBarrier and
- *                       HcclAllocComResourceByTiling.  Sim backend ignores it.
+ *                       HCCL operations like HcclBarrier.  Sim backend
+ *                       ignores it.
  * @param rootinfo_path  Filesystem path used to exchange root info between
  *                       ranks (rank 0 writes, others read).
  * @return Opaque handle, or NULL on failure.
@@ -61,9 +62,10 @@ CommHandle comm_init(int rank, int nranks, void *stream, const char *rootinfo_pa
 /**
  * Allocate RDMA / shared-memory windows and populate the device context.
  *
- * On HCCL this calls HcclAllocComResourceByTiling and extracts per-rank
- * window addresses (MESH or RING topology).  On sim it mallocs a shared
- * region and partitions it.
+ * On HCCL this builds a per-rank symmetric pool via the public ACL IPC
+ * primitives (aclrtMalloc + aclrtIpcMemGetExportKey / SetImportPid /
+ * ImportByKey) and enables cross-card P2P via aclrtDeviceEnablePeerAccess.
+ * On sim it mallocs a shared region and partitions it.
  *
  * @param h               Handle from comm_init().
  * @param win_size        Window size hint (bytes per rank).  The backend
