@@ -54,6 +54,8 @@
 
 // Default ready queue shards: one shard per worker thread (total minus orchestrator)
 constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
+constexpr int RUNTIME_DEFAULT_WARMUP_ITERATION_COUNT = 0;
+constexpr int RUNTIME_DEFAULT_TIMING_ITERATION_COUNT = 0;
 
 // =============================================================================
 // Data Structures
@@ -167,6 +169,10 @@ public:
     int sche_cpu_num;        // Number of AICPU threads for scheduling
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
+    // Timing parameters (for precise performance estimation)
+    int warmup_iteration_count;
+    int timing_iteration_count;
+
     // Ring buffer size overrides (0 = use compile-time defaults)
     uint64_t task_window_size;
     uint64_t heap_size;
@@ -215,6 +221,9 @@ public:
     // =========================================================================
     // Performance Profiling
     // =========================================================================
+
+    inline int32_t get_warmup_iteration_count() const { return warmup_iteration_count; };
+    inline int32_t get_timing_iteration_count() const { return timing_iteration_count; };
 
     // =========================================================================
     // Device orchestration (for AICPU thread 3)

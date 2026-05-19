@@ -224,6 +224,42 @@ extern "C" int bind_prepared_to_runtime_impl(
     }
     int64_t t_args_end = _now_ms();
 
+    // (Timing) Specify whether to perform warmup runs inside the aicpu executor
+    {
+        const char *env_warmup_iterations = std::getenv("PTO2_WARMUP_ITERATION_COUNT");
+        if (env_warmup_iterations) {
+            char *endptr;
+            int64_t val = strtol(env_warmup_iterations, &endptr, 10);
+            if (endptr != env_warmup_iterations && *endptr == '\0') {
+                runtime->warmup_iteration_count = static_cast<int>(val);
+            } else {
+                LOG_WARN(
+                    "PTO2_WARMUP_ITERATION_COUNT=%s is invalid, using default %d", env_warmup_iterations, RUNTIME_DEFAULT_WARMUP_ITERATION_COUNT
+                );
+                runtime->warmup_iteration_count = RUNTIME_DEFAULT_WARMUP_ITERATION_COUNT;
+            }
+        }
+        LOG_INFO_V0("Warmup iteration count: %d", runtime->warmup_iteration_count);
+    }
+
+    // (Timing) Specify whether to perform timing runs inside the aicpu executor
+    {
+        const char *env_timing_iterations = std::getenv("PTO2_TIMING_ITERATION_COUNT");
+        if (env_timing_iterations) {
+            char *endptr;
+            int64_t val = strtol(env_timing_iterations, &endptr, 10);
+            if (endptr != env_timing_iterations && *endptr == '\0') {
+                runtime->timing_iteration_count = static_cast<int>(val);
+            } else {
+                LOG_WARN(
+                    "PTO2_TIMING_ITERATION_COUNT=%s is invalid, using default %d", env_timing_iterations, RUNTIME_DEFAULT_TIMING_ITERATION_COUNT
+                );
+                runtime->timing_iteration_count = RUNTIME_DEFAULT_TIMING_ITERATION_COUNT;
+            }
+        }
+        LOG_INFO_V0("Warmup iteration count: %d", runtime->timing_iteration_count);
+    }
+
     // Read ready queue shard count from environment for AICPU scheduler
     {
         const char *env_shards = std::getenv("PTO2_READY_QUEUE_SHARDS");
