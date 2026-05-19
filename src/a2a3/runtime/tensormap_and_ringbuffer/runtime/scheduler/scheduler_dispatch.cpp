@@ -12,6 +12,8 @@
 
 #include <cinttypes>
 
+#include "common.h"  // debug_assert
+
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
@@ -589,6 +591,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // pop_hit / pop_miss stay intact for the cold-path log.
                 uint64_t pop_hit_delta = l2_perf.pop_hit - l2_perf.pop_hit_at_last_emit;
                 uint64_t pop_miss_delta = l2_perf.pop_miss - l2_perf.pop_miss_at_last_emit;
+                // AicpuPhaseRecord's extras are uint32 — a delta that overflows means
+                // an emit was missed for ~4 billion pops, which is well outside any
+                // realistic dispatch cadence and silently truncates without this guard.
+                debug_assert(pop_hit_delta < (1ULL << 32));
+                debug_assert(pop_miss_delta < (1ULL << 32));
                 l2_perf_aicpu_record_phase(
                     thread_idx, AicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, l2_perf.sched_loop_count,
                     l2_perf.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
@@ -673,6 +680,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
         uint64_t final_pop_hit_delta = l2_perf.pop_hit - l2_perf.pop_hit_at_last_emit;
         uint64_t final_pop_miss_delta = l2_perf.pop_miss - l2_perf.pop_miss_at_last_emit;
+        debug_assert(final_pop_hit_delta < (1ULL << 32));
+        debug_assert(final_pop_miss_delta < (1ULL << 32));
         if (final_pop_hit_delta != 0 || final_pop_miss_delta != 0) {
             uint64_t t_now = get_sys_cnt_aicpu();
             l2_perf_aicpu_record_phase(
