@@ -9,12 +9,12 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Tile-based Matrix Multiplication Kernel (Cube Core)
+ * Batched Matrix Multiplication Kernel (Cube Core)
  *
  * Computes: output = input_a @ input_b (batched matrix multiplication of size matrix_size)
  * Uses TMATMUL instruction
  *
- * Tile size is determined by golden.py configuration and passed through
+ * Batch size and matrix size are determined by golden.py configuration and passed through
  * tensor shapes from orchestration.
  *
  * Args (Tensor*):
