@@ -19,10 +19,7 @@ from simpler.task_interface import (
     ArgDirection,
     CallConfig,
     ChipCallable,
-    ChipContext,
     CommBufferSpec,
-    CommDomain,
-    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -112,17 +109,6 @@ def run(
     out = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
     result = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
-    comm_plan = CommDomainPlan(
-        domains=[
-            CommDomain(
-                name="default",
-                worker_indices=list(range(nranks)),
-                window_size=4 * 1024,
-                buffers=[CommBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=4)],
-            )
-        ]
-    )
-
     chip_callable = build_chip_callable(platform, pto_isa_commit, "https")
     worker = Worker(
         level=3,
@@ -130,32 +116,36 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        comm_plan=comm_plan,
         build=build,
     )
     chip_cid = worker.register(chip_callable)
     try:
         worker.init()
-        contexts: list[ChipContext] = worker.chip_contexts
 
         def orch_fn(orch, _args, cfg):
-            for rank, ctx in enumerate(contexts):
-                domain = ctx.domains["default"]
-                args = TaskArgs()
-                args.add_tensor(make_tensor_arg(inp[rank]), TensorArgType.INPUT)
-                args.add_tensor(make_tensor_arg(out[rank]), TensorArgType.OUTPUT_EXISTING)
-                args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
-                args.add_tensor(
-                    ContinuousTensor.make(
-                        data=domain.buffer_ptrs["notify_counter"],
-                        shapes=(1,),
-                        dtype=DataType.INT32,
-                        child_memory=True,
-                    ),
-                    TensorArgType.INPUT,
-                )
-                args.add_scalar(domain.device_ctx)
-                orch.submit_next_level(chip_cid, args, cfg, worker=rank)
+            with orch.allocate_domain(
+                name="default",
+                workers=list(range(nranks)),
+                window_size=4 * 1024,
+                buffers=[CommBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=4)],
+            ) as handle:
+                for rank in range(nranks):
+                    domain = handle[rank]
+                    args = TaskArgs()
+                    args.add_tensor(make_tensor_arg(inp[rank]), TensorArgType.INPUT)
+                    args.add_tensor(make_tensor_arg(out[rank]), TensorArgType.OUTPUT_EXISTING)
+                    args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
+                    args.add_tensor(
+                        ContinuousTensor.make(
+                            data=domain.buffer_ptrs["notify_counter"],
+                            shapes=(1,),
+                            dtype=DataType.INT32,
+                            child_memory=True,
+                        ),
+                        TensorArgType.INPUT,
+                    )
+                    args.add_scalar(domain.device_ctx)
+                    orch.submit_next_level(chip_cid, args, cfg, worker=rank)
 
         worker.run(orch_fn, args=None, config=CallConfig())
 

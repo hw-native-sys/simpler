@@ -122,6 +122,76 @@ int comm_derive_context(
 );
 
 /**
+ * Allocate a fresh per-rank symmetric window pool for a subset of ranks.
+ *
+ * Unlike comm_alloc_windows() which allocates the single base pool once at
+ * bootstrap, this allocates an additional pool for a dynamically-derived
+ * domain (a subset of the base communicator).  Multiple concurrent
+ * allocations are disambiguated by `allocation_id`, which is mixed into
+ * every internal handshake / barrier filename so a second allocation
+ * does not collide with the first.
+ *
+ * This is a collective operation across the subset only: every
+ * participating chip must call this with matching arguments; non-members
+ * of the subset do NOT call it.  Internal file barriers synchronise the
+ * subset, so the parent (orchestrator) only needs to dispatch and wait
+ * for completion — it does not need to broker the cross-rank handshake.
+ *
+ * On HCCL this performs aclrtMalloc + the same Path-D IPC pattern as
+ * comm_alloc_windows but on a fresh per-allocation buffer.  On sim it
+ * shm_opens a fresh POSIX shm scoped by `allocation_id`.
+ *
+ * Resources allocated here remain owned by the base handle; either an
+ * explicit comm_release_domain_windows() or final comm_destroy(base)
+ * frees them.
+ *
+ * @param h                       Base handle from comm_init().
+ * @param allocation_id           Caller-assigned unique id; scopes the
+ *                                handshake / barrier filenames.  Must be
+ *                                unique among currently-live allocations
+ *                                on this handle.
+ * @param rank_ids                Base-communicator rank ids in dense
+ *                                domain order (length rank_count).
+ * @param rank_count              Number of subset members.
+ * @param domain_rank             This caller's dense rank in the subset.
+ * @param window_size             Bytes per rank.  Backend must allocate
+ *                                exactly this size; no auto-rounding.
+ * @param device_ctx_out          Receives a device pointer to a new
+ *                                CommContext for the subset.
+ * @param local_window_base_out   Receives this rank's local window start
+ *                                address (for buffer carving on the
+ *                                caller side).
+ * @return 0 on success, non-zero on failure.
+ */
+int comm_alloc_domain_windows(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+);
+
+/**
+ * Collectively release a domain window pool allocated by
+ * comm_alloc_domain_windows().
+ *
+ * Frees the per-rank buffer (HCCL: aclrtFree; sim: munmap + shm_unlink)
+ * and the device-side CommContext.  Synchronises subset members via a
+ * release barrier scoped by `allocation_id` + the caller's `domain_rank`
+ * within the subset.  `rank_count` is the subset size — used only to
+ * size the barrier wait, not the rank list (which was already established
+ * during alloc).
+ *
+ * IPC import refs and EnablePeerAccess routes are NOT explicitly torn
+ * down — they get reclaimed by aclrtResetDevice at DeviceRunner::finalize.
+ * Mirrors the lifetime contract of comm_alloc_windows on HCCL.
+ *
+ * @param h               Base handle from comm_init().
+ * @param allocation_id   Same id passed to comm_alloc_domain_windows.
+ * @param rank_count      Number of subset members (for barrier sizing).
+ * @param domain_rank     This caller's dense rank in the subset.
+ * @return 0 on success, non-zero on failure.
+ */
+int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
+
+/**
  * Synchronize all ranks.
  *
  * Blocks until every rank in the communicator has called comm_barrier().

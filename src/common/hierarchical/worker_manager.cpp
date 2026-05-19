@@ -410,6 +410,56 @@ void WorkerThread::control_copy_from(uint64_t dst, uint64_t src, size_t size) {
     run_control_command("control_copy_from");
 }
 
+// Stage two NUL-terminated shm names at MAILBOX_OFF_ARGS: request first
+// (CTRL_SHM_NAME_BYTES wide) then reply (CTRL_SHM_NAME_BYTES wide).  Pads each
+// slot with zeros so stale bytes from a prior op cannot leak into the child's
+// decode.  `reply_shm_name` may be empty (NUL byte) for release.
+static void write_shm_name_pair(char *mbox, const char *request_shm_name, const char *reply_shm_name) {
+    auto write_one = [&](char *dst, const char *name) {
+        size_t n = name ? std::strlen(name) : 0;
+        if (n + 1 > CTRL_SHM_NAME_BYTES) {
+            throw std::runtime_error(std::string("control: shm name too long: ") + (name ? name : "(null)"));
+        }
+        if (n > 0) std::memcpy(dst, name, n);
+        std::memset(dst + n, 0, CTRL_SHM_NAME_BYTES - n);
+    };
+    write_one(mbox + MAILBOX_OFF_ARGS, request_shm_name);
+    write_one(mbox + MAILBOX_OFF_ARGS + CTRL_SHM_NAME_BYTES, reply_shm_name);
+}
+
+void WorkerThread::control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) {
+    if (!request_shm_name || !*request_shm_name || !reply_shm_name || !*reply_shm_name) {
+        throw std::runtime_error("control_alloc_domain: request and reply shm names must be non-empty");
+    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    uint64_t sub_cmd = CTRL_ALLOC_DOMAIN;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    write_shm_name_pair(mbox(), request_shm_name, reply_shm_name);
+    run_control_command("control_alloc_domain");
+}
+
+void WorkerThread::control_release_domain(const char *request_shm_name) {
+    if (!request_shm_name || !*request_shm_name) {
+        throw std::runtime_error("control_release_domain: request shm name must be non-empty");
+    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    uint64_t sub_cmd = CTRL_RELEASE_DOMAIN;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    write_shm_name_pair(mbox(), request_shm_name, "");
+    run_control_command("control_release_domain");
+}
+
+void WorkerThread::control_comm_init(const char *request_shm_name) {
+    if (!request_shm_name || !*request_shm_name) {
+        throw std::runtime_error("control_comm_init: request shm name must be non-empty");
+    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    uint64_t sub_cmd = CTRL_COMM_INIT;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    write_shm_name_pair(mbox(), request_shm_name, "");
+    run_control_command("control_comm_init");
+}
+
 bool WorkerManager::any_busy() const {
     for (auto &wt : next_level_threads_)
         if (!wt->idle()) return true;
@@ -516,6 +566,30 @@ void WorkerManager::control_prepare(int worker_id, int32_t cid) {
         throw std::runtime_error("control_prepare: invalid worker_id " + std::to_string(worker_id));
     }
     wt->control_prepare(cid);
+}
+
+void WorkerManager::control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name) {
+    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_alloc_domain: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_alloc_domain(request_shm_name, reply_shm_name);
+}
+
+void WorkerManager::control_release_domain(int worker_id, const char *request_shm_name) {
+    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_release_domain: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_release_domain(request_shm_name);
+}
+
+void WorkerManager::control_comm_init(int worker_id, const char *request_shm_name) {
+    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_comm_init: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_comm_init(request_shm_name);
 }
 
 void WorkerManager::broadcast_register_all(int32_t cid, const void *blob_ptr, size_t blob_size) {

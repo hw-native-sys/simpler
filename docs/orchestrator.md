@@ -687,3 +687,5 @@ instead of stalling forever. Default timeout: 10 s.
   onto the wiring queue
 - [task-flow.md](task-flow.md) — the data (Callable / TaskArgs / CallConfig)
   being moved by `submit_*`
+- [comm-domain.md](comm-domain.md) — `orch.allocate_domain` dynamic
+  communication-domain allocation, lifetime model, and backends

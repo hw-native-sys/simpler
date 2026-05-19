@@ -823,6 +823,24 @@ NB_MODULE(_task_interface, m) {
             nb::arg("domain_rank"), nb::arg("window_offset"), nb::arg("window_size"),
             "Derive a domain-local CommContext from an allocated base communicator."
         )
+        .def(
+            "comm_alloc_domain_windows",
+            [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids,
+               uint32_t domain_rank, size_t window_size) {
+                auto [device_ctx, local_window_base] =
+                    self.comm_alloc_domain_windows(comm_handle, allocation_id, rank_ids, domain_rank, window_size);
+                return nb::make_tuple(device_ctx, local_window_base);
+            },
+            nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
+            nb::arg("window_size"),
+            "Collectively allocate a fresh per-rank pool for a subset; returns "
+            "(device_ctx, local_window_base) for this rank."
+        )
+        .def(
+            "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
+            nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
+            "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
+        )
         .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"), "Synchronize all ranks.")
         .def(
             "comm_destroy", &ChipWorker::comm_destroy, nb::arg("comm_handle"),

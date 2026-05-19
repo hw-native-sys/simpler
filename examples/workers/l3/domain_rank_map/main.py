@@ -9,18 +9,18 @@
 # -----------------------------------------------------------------------------------------------------------
 """Small L3 multi-communication-domain communication demo.
 
-Three chip workers declare two overlapping domains:
+Three chip workers use two overlapping domains, allocated on demand from
+inside the orch function:
 
   even = workers [0, 2]
   tail = workers [1, 2]
 
-The example bootstraps the worker, prints the domain-local rank view seen by
-each chip child, then runs one small allreduce in each domain.  It verifies
-that:
+The example allocates each domain via ``orch.allocate_domain`` and runs one
+small allreduce in each.  It verifies that:
 
-  * non-member domains are absent and raise KeyError through ctx.domains;
-  * worker_indices order defines the dense domain_rank;
-  * overlapping domains have separate buffer pointers.
+  * a non-member chip is absent from a domain handle (indexing raises KeyError);
+  * the ``workers`` list order defines the dense ``domain_rank``;
+  * overlapping domains have separate buffer pointers;
   * each domain transfers data only among its own participants.
 
 Run:
@@ -43,8 +43,6 @@ from simpler.task_interface import (  # noqa: E402
     ChipCallable,
     ChipDomainContext,
     CommBufferSpec,
-    CommDomain,
-    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -81,25 +79,11 @@ def parse_device_range(spec: str) -> list[int]:
     return ids
 
 
-def _make_comm_plan() -> CommDomainPlan:
-    return CommDomainPlan(
-        domains=[
-            CommDomain(
-                name=name,
-                worker_indices=worker_indices,
-                window_size=max(SCRATCH_NBYTES, 4096),
-                buffers=[
-                    CommBufferSpec(
-                        name="scratch",
-                        dtype="float32",
-                        count=COUNT,
-                        nbytes=SCRATCH_NBYTES,
-                    ),
-                ],
-            )
-            for name, worker_indices in DOMAINS.items()
-        ]
-    )
+WINDOW_SIZE = max(SCRATCH_NBYTES, 4096)
+
+
+def _scratch_buffers() -> list[CommBufferSpec]:
+    return [CommBufferSpec(name="scratch", dtype="float32", count=COUNT, nbytes=SCRATCH_NBYTES)]
 
 
 def build_allreduce_callable(platform: str) -> ChipCallable:
@@ -146,14 +130,6 @@ def _add_domain_scratch(args: TaskArgs, domain: ChipDomainContext) -> None:
     args.add_scalar(domain.device_ctx)
 
 
-def _check_missing(ctx_domains: dict, name: str) -> bool:
-    try:
-        _ = ctx_domains[name]
-    except KeyError:
-        return True
-    return False
-
-
 def run(platform: str, device_ids: list[int]) -> int:
     print(f"[domain_rank_map] platform={platform} devices={device_ids}")
     host_inputs = {
@@ -174,72 +150,90 @@ def run(platform: str, device_ids: list[int]) -> int:
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        comm_plan=_make_comm_plan(),
     )
     print("[domain_rank_map] compiling communication kernel...")
     allreduce_cid = worker.register(build_allreduce_callable(platform))
 
-    try:
-        print("[domain_rank_map] init worker...")
-        worker.init()
-        contexts = worker.chip_contexts
+    # `ok` is mutated by the orch closures; wrap in a list for nonlocal write.
+    state = {"ok": True}
+    # workers order → expected dense domain_rank, per domain.
+    expected_rank = {
+        "even": {0: 0, 2: 1},
+        "tail": {1: 0, 2: 1},
+    }
 
-        expected = {
-            0: {"even": 0},
-            1: {"tail": 0},
-            2: {"even": 1, "tail": 1},
-        }
-        ok = len(contexts) == 3
+    def verify_orch_fn(orch, _args, _cfg):
+        """Allocate both overlapping domains at once and verify the rank map.
 
-        for worker_idx, ctx in enumerate(contexts):
-            actual_names = sorted(ctx.domains)
-            print(f"[domain_rank_map] worker {worker_idx}: domains={actual_names}")
+        Submits no tasks — purely inspects the handles, then releases.  Both
+        live simultaneously so we can assert chip 2's two domains carve
+        distinct scratch pointers.
+        """
+        even = orch.allocate_domain(
+            name="even", workers=DOMAINS["even"], window_size=WINDOW_SIZE, buffers=_scratch_buffers()
+        )
+        tail = orch.allocate_domain(
+            name="tail", workers=DOMAINS["tail"], window_size=WINDOW_SIZE, buffers=_scratch_buffers()
+        )
+        try:
+            for name, handle in (("even", even), ("tail", tail)):
+                for chip_idx in DOMAINS[name]:
+                    domain = handle[chip_idx]
+                    print(
+                        f"[domain_rank_map] {name} chip {chip_idx}: domain_rank={domain.domain_rank} "
+                        f"domain_size={domain.domain_size} scratch=0x{domain.buffer_ptrs['scratch']:x}"
+                    )
+                    if domain.domain_rank != expected_rank[name][chip_idx] or domain.domain_size != 2:
+                        state["ok"] = False
+                    if domain.device_ctx == 0 or domain.buffer_ptrs["scratch"] == 0:
+                        state["ok"] = False
+            # A non-member chip is absent from the domain handle.
+            try:
+                _ = tail[0]  # chip 0 is not in `tail`
+                print("[domain_rank_map] chip 0 unexpectedly present in tail domain")
+                state["ok"] = False
+            except KeyError:
+                pass
+            # Chip 2's two domains carve distinct scratch slices.
+            if even[2].buffer_ptrs["scratch"] == tail[2].buffer_ptrs["scratch"]:
+                print("[domain_rank_map] chip 2 domains share a scratch pointer")
+                state["ok"] = False
+        finally:
+            tail.release()
+            even.release()
 
-            expected_names = sorted(expected[worker_idx])
-            if actual_names != expected_names:
-                print(f"  expected domains {expected_names}, got {actual_names}")
-                ok = False
-
-            for name, expected_rank in expected[worker_idx].items():
-                domain = ctx.domains[name]
-                print(
-                    f"  {name}: domain_rank={domain.domain_rank} "
-                    f"domain_size={domain.domain_size} "
-                    f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
-                )
-                if domain.domain_rank != expected_rank or domain.domain_size != 2:
-                    ok = False
-                if domain.device_ctx == 0 or domain.buffer_ptrs["scratch"] == 0:
-                    ok = False
-
-        if not _check_missing(contexts[0].domains, "tail"):
-            print("[domain_rank_map] worker 0 unexpectedly has tail domain")
-            ok = False
-        if not _check_missing(contexts[1].domains, "even"):
-            print("[domain_rank_map] worker 1 unexpectedly has even domain")
-            ok = False
-
-        worker2 = contexts[2]
-        if worker2.domains["even"].buffer_ptrs["scratch"] == worker2.domains["tail"].buffer_ptrs["scratch"]:
-            print("[domain_rank_map] worker 2 domains share a scratch pointer")
-            ok = False
-
-        def reduce_orch_fn(domain_name: str):
-            def _orch_fn(orch, _args, cfg):
+    def reduce_orch_fn(domain_name: str):
+        def _orch_fn(orch, _args, cfg):
+            with orch.allocate_domain(
+                name=domain_name,
+                workers=DOMAINS[domain_name],
+                window_size=WINDOW_SIZE,
+                buffers=_scratch_buffers(),
+            ) as handle:
                 for worker_idx in DOMAINS[domain_name]:
-                    domain = contexts[worker_idx].domains[domain_name]
+                    domain = handle[worker_idx]
                     args = TaskArgs()
                     args.add_tensor(make_tensor_arg(host_inputs[worker_idx]), TensorArgType.INPUT)
                     args.add_tensor(make_tensor_arg(outputs[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING)
                     _add_domain_scratch(args, domain)
                     orch.submit_next_level(allreduce_cid, args, cfg, worker=worker_idx)
 
-            return _orch_fn
+        return _orch_fn
 
+    try:
+        print("[domain_rank_map] init worker...")
+        worker.init()
+
+        print("[domain_rank_map] verifying domain rank map...")
+        worker.run(verify_orch_fn, args=None, config=CallConfig())
+
+        # Run each domain's allreduce in its own DAG (separate runs keep the
+        # overlapping chip 2 from juggling two collectives concurrently).
         print("[domain_rank_map] running one allreduce per domain...")
         for domain_name in DOMAINS:
             worker.run(reduce_orch_fn(domain_name), args=None, config=CallConfig())
 
+        ok = state["ok"]
         for domain_name, worker_indices in DOMAINS.items():
             expected_tensor = sum(host_inputs[worker_idx] for worker_idx in worker_indices)
             for worker_idx in worker_indices:

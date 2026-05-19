@@ -105,6 +105,21 @@ public:
         uint64_t comm_handle, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank, size_t window_offset,
         size_t window_size
     );
+    /// Collectively allocate a fresh per-rank symmetric pool for a subset of
+    /// ranks.  Multiple concurrent allocations are disambiguated by
+    /// `allocation_id`.  Returns (device_ctx, local_window_base).  Only
+    /// participating ranks call this; non-members of the subset must not.
+    std::pair<uint64_t, uint64_t> comm_alloc_domain_windows(
+        uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
+        size_t window_size
+    );
+    /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
+    /// pool and the device CommContext, then drop the allocation record.
+    /// `rank_count` + `domain_rank` size the subset barrier; the rank list
+    /// itself is not needed (the alloc-time identity is already cached
+    /// inside the backend's per-allocation record).
+    void
+    comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
     void comm_barrier(uint64_t comm_handle);
     void comm_destroy(uint64_t comm_handle);
     void comm_destroy_all();
@@ -138,6 +153,9 @@ private:
     using CommGetLocalWindowBaseFn = int (*)(void *, uint64_t *);
     using CommGetWindowSizeFn = int (*)(void *, size_t *);
     using CommDeriveContextFn = int (*)(void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *);
+    using CommAllocDomainWindowsFn =
+        int (*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint64_t *, uint64_t *);
+    using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
 
@@ -181,6 +199,8 @@ private:
     CommGetLocalWindowBaseFn comm_get_local_window_base_fn_ = nullptr;
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
+    CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
+    CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
     void *device_ctx_ = nullptr;

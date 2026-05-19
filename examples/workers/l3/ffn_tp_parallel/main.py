@@ -42,10 +42,7 @@ from simpler.task_interface import (  # noqa: E402
     ArgDirection,
     CallConfig,
     ChipCallable,
-    ChipContext,
     CommBufferSpec,
-    CommDomain,
-    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -181,24 +178,6 @@ def run(
     host_partial = [torch.zeros(M, N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
     host_y = [torch.zeros(M, N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
-    comm_plan = CommDomainPlan(
-        domains=[
-            CommDomain(
-                name="default",
-                worker_indices=list(range(nranks)),
-                window_size=window_size,
-                buffers=[
-                    CommBufferSpec(
-                        name="scratch",
-                        dtype="float32",
-                        count=scratch_count,
-                        nbytes=scratch_nbytes,
-                    ),
-                ],
-            )
-        ]
-    )
-
     print("[ffn_tp_parallel] compiling kernels...")
     ffn_local_cc = build_ffn_local_callable(platform, pto_isa_commit)
     allreduce_cc = build_allreduce_sum_callable(platform, pto_isa_commit)
@@ -210,54 +189,54 @@ def run(
         device_ids=device_ids,
         num_sub_workers=0,
         build=build,
-        comm_plan=comm_plan,
     )
     ffn_cid = worker.register(ffn_local_cc)
     allreduce_cid = worker.register(allreduce_cc)
 
     try:
-        print("[ffn_tp_parallel] init worker (forks chip children + bootstraps comm backend)...")
+        print("[ffn_tp_parallel] init worker (forks chip children; base comm is lazy)...")
         worker.init()
 
-        contexts: list[ChipContext] = worker.chip_contexts
-        assert len(contexts) == nranks
-        for i, ctx in enumerate(contexts):
-            domain = ctx.domains["default"]
-            print(
-                f"[ffn_tp_parallel] chip {i}: device={ctx.device_id} rank={domain.domain_rank}/{domain.domain_size} "
-                f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
-                f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
-            )
-
         def orch_fn(orch, _args, cfg):
-            for i, ctx in enumerate(contexts):
-                domain = ctx.domains["default"]
-                # Stage 1: AIC matmul. partial_local is OUTPUT_EXISTING here;
-                # the framework records its buffer.addr as a producer.
-                a1 = TaskArgs()
-                a1.add_tensor(make_tensor_arg(host_x_shards[i]), TensorArgType.INPUT)
-                a1.add_tensor(make_tensor_arg(host_w_shards[i]), TensorArgType.INPUT)
-                a1.add_tensor(make_tensor_arg(host_partial[i]), TensorArgType.OUTPUT_EXISTING)
-                orch.submit_next_level(ffn_cid, a1, cfg, worker=i)
+            with orch.allocate_domain(
+                name="default",
+                workers=list(range(nranks)),
+                window_size=window_size,
+                buffers=[CommBufferSpec(name="scratch", dtype="float32", count=scratch_count, nbytes=scratch_nbytes)],
+            ) as handle:
+                for i in range(nranks):
+                    domain = handle[i]
+                    print(
+                        f"[ffn_tp_parallel] chip {i}: rank={domain.domain_rank}/{domain.domain_size} "
+                        f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
+                        f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
+                    )
+                    # Stage 1: AIC matmul. partial_local is OUTPUT_EXISTING here;
+                    # the framework records its buffer.addr as a producer.
+                    a1 = TaskArgs()
+                    a1.add_tensor(make_tensor_arg(host_x_shards[i]), TensorArgType.INPUT)
+                    a1.add_tensor(make_tensor_arg(host_w_shards[i]), TensorArgType.INPUT)
+                    a1.add_tensor(make_tensor_arg(host_partial[i]), TensorArgType.OUTPUT_EXISTING)
+                    orch.submit_next_level(ffn_cid, a1, cfg, worker=i)
 
-                # Stage 2: AIV cross-rank sum. Tagging partial_local INPUT
-                # with the same buffer.addr makes TensorMap auto-link this
-                # task as a consumer of stage 1, no explicit barrier needed.
-                a2 = TaskArgs()
-                a2.add_tensor(make_tensor_arg(host_partial[i]), TensorArgType.INPUT)
-                a2.add_tensor(make_tensor_arg(host_y[i]), TensorArgType.OUTPUT_EXISTING)
-                a2.add_tensor(
-                    ContinuousTensor.make(
-                        data=domain.buffer_ptrs["scratch"],
-                        shapes=(scratch_count,),
-                        dtype=DataType.FLOAT32,
-                        child_memory=True,
-                    ),
-                    TensorArgType.INOUT,
-                )
-                a2.add_scalar(domain.domain_size)
-                a2.add_scalar(domain.device_ctx)
-                orch.submit_next_level(allreduce_cid, a2, cfg, worker=i)
+                    # Stage 2: AIV cross-rank sum. Tagging partial_local INPUT
+                    # with the same buffer.addr makes TensorMap auto-link this
+                    # task as a consumer of stage 1, no explicit barrier needed.
+                    a2 = TaskArgs()
+                    a2.add_tensor(make_tensor_arg(host_partial[i]), TensorArgType.INPUT)
+                    a2.add_tensor(make_tensor_arg(host_y[i]), TensorArgType.OUTPUT_EXISTING)
+                    a2.add_tensor(
+                        ContinuousTensor.make(
+                            data=domain.buffer_ptrs["scratch"],
+                            shapes=(scratch_count,),
+                            dtype=DataType.FLOAT32,
+                            child_memory=True,
+                        ),
+                        TensorArgType.INOUT,
+                    )
+                    a2.add_scalar(domain.domain_size)
+                    a2.add_scalar(domain.device_ctx)
+                    orch.submit_next_level(allreduce_cid, a2, cfg, worker=i)
 
         print("[ffn_tp_parallel] running 2-chip 2-stage DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())

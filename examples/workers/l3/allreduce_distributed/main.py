@@ -45,10 +45,7 @@ from simpler.task_interface import (  # noqa: E402
     ArgDirection,
     CallConfig,
     ChipCallable,
-    ChipContext,
     CommBufferSpec,
-    CommDomain,
-    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -150,33 +147,12 @@ def run(
     # share_memory_() moves the storage into an mmap region that forked
     # children see at the same virtual address, so ``chip_args.add_tensor``
     # with TensorArgType.INPUT / OUTPUT_EXISTING can hand the kernel a host
-    # pointer and the framework handles H2D/D2H transparently — no manual
-    # SharedMemory / HostBufferStaging plumbing.
+    # pointer and the framework handles H2D/D2H transparently.
     host_inputs = [
         torch.tensor([i + rank * 100 for i in range(ALLREDUCE_COUNT)], dtype=torch.float32).share_memory_()
         for rank in range(nranks)
     ]
     host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
-
-    # --- Scratch communication domain: one window buffer per chip.  No host
-    # staging is needed for scratch.
-    comm_plan = CommDomainPlan(
-        domains=[
-            CommDomain(
-                name="default",
-                worker_indices=list(range(nranks)),
-                window_size=window_size,
-                buffers=[
-                    CommBufferSpec(
-                        name="scratch",
-                        dtype="float32",
-                        count=ALLREDUCE_COUNT,
-                        nbytes=SCRATCH_NBYTES,
-                    ),
-                ],
-            )
-        ]
-    )
 
     print("[allreduce] compiling kernels...")
     chip_callable = build_chip_callable(platform, pto_isa_commit)
@@ -188,45 +164,47 @@ def run(
         device_ids=device_ids,
         num_sub_workers=0,
         build=build,
-        comm_plan=comm_plan,
     )
     chip_cid = worker.register(chip_callable)
 
     try:
-        print("[allreduce] init worker (forks chip children + bootstraps comm backend)...")
+        print("[allreduce] init worker (forks chip children; base comm is lazy)...")
         worker.init()
 
-        contexts: list[ChipContext] = worker.chip_contexts
-        assert len(contexts) == nranks
-        for i, ctx in enumerate(contexts):
-            domain = ctx.domains["default"]
-            print(
-                f"[allreduce] chip {i}: device={ctx.device_id} rank={domain.domain_rank}/{domain.domain_size} "
-                f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
-                f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
-            )
-
         def orch_fn(orch, _args, cfg):
-            for i, ctx in enumerate(contexts):
-                domain = ctx.domains["default"]
-                chip_args = TaskArgs()
-                chip_args.add_tensor(make_tensor_arg(host_inputs[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(host_outputs[i]), TensorArgType.OUTPUT_EXISTING)
-                # Scratch is a device pointer into the HCCL window — not a
-                # host tensor — so wrap it manually with child_memory=True
-                # to skip the runtime's H2D path.
-                chip_args.add_tensor(
-                    ContinuousTensor.make(
-                        data=domain.buffer_ptrs["scratch"],
-                        shapes=(ALLREDUCE_COUNT,),
-                        dtype=DataType.FLOAT32,
-                        child_memory=True,
-                    ),
-                    TensorArgType.INOUT,
-                )
-                chip_args.add_scalar(domain.domain_size)
-                chip_args.add_scalar(domain.device_ctx)
-                orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
+            # One scratch domain spanning every chip, allocated on demand.
+            # No host staging is needed for scratch.
+            with orch.allocate_domain(
+                name="default",
+                workers=list(range(nranks)),
+                window_size=window_size,
+                buffers=[CommBufferSpec(name="scratch", dtype="float32", count=ALLREDUCE_COUNT, nbytes=SCRATCH_NBYTES)],
+            ) as handle:
+                for i in range(nranks):
+                    domain = handle[i]
+                    print(
+                        f"[allreduce] chip {i}: rank={domain.domain_rank}/{domain.domain_size} "
+                        f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
+                        f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
+                    )
+                    chip_args = TaskArgs()
+                    chip_args.add_tensor(make_tensor_arg(host_inputs[i]), TensorArgType.INPUT)
+                    chip_args.add_tensor(make_tensor_arg(host_outputs[i]), TensorArgType.OUTPUT_EXISTING)
+                    # Scratch is a device pointer into the HCCL window — not a
+                    # host tensor — so wrap it manually with child_memory=True
+                    # to skip the runtime's H2D path.
+                    chip_args.add_tensor(
+                        ContinuousTensor.make(
+                            data=domain.buffer_ptrs["scratch"],
+                            shapes=(ALLREDUCE_COUNT,),
+                            dtype=DataType.FLOAT32,
+                            child_memory=True,
+                        ),
+                        TensorArgType.INOUT,
+                    )
+                    chip_args.add_scalar(domain.domain_size)
+                    chip_args.add_scalar(domain.device_ctx)
+                    orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
 
         print(f"[allreduce] running {nranks}-chip allreduce DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())

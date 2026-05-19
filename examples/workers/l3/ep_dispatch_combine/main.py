@@ -68,10 +68,7 @@ from simpler.task_interface import (  # noqa: E402
     ArgDirection,
     CallConfig,
     ChipCallable,
-    ChipContext,
     CommBufferSpec,
-    CommDomain,
-    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -480,24 +477,6 @@ def run(
     print("[ep_dispatch] computing host golden...")
     expected_recv_x, expected_recv_w, expected_recv_idx, expected_count = compute_golden(x_norms, indices, weights)
 
-    comm_plan = CommDomainPlan(
-        domains=[
-            CommDomain(
-                name="default",
-                worker_indices=list(range(nranks)),
-                window_size=window_size,
-                buffers=[
-                    CommBufferSpec(
-                        name="scratch",
-                        dtype="float32",
-                        count=SCRATCH_NBYTES // 4,
-                        nbytes=SCRATCH_NBYTES,
-                    ),
-                ],
-            )
-        ]
-    )
-
     print("[ep_dispatch] compiling kernels...")
 
     chip_callable = build_chip_callable(platform, pto_isa_commit)
@@ -509,50 +488,57 @@ def run(
         device_ids=device_ids,
         num_sub_workers=0,
         build=build,
-        comm_plan=comm_plan,
     )
     chip_cid = worker.register(chip_callable)
 
     try:
-        print("[ep_dispatch] init worker (forks chip children + bootstraps HCCL)...")
+        print("[ep_dispatch] init worker (forks chip children; base comm is lazy)...")
         worker.init()
 
-        contexts: list[ChipContext] = worker.chip_contexts
-        assert len(contexts) == nranks
-        for i, ctx in enumerate(contexts):
-            domain = ctx.domains["default"]
-            print(
-                f"[ep_dispatch] chip {i}: device={ctx.device_id} rank={domain.domain_rank}/{domain.domain_size} "
-                f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
-                f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
-            )
-
         def orch_fn(orch, _args, cfg):
-            for i, ctx in enumerate(contexts):
-                domain = ctx.domains["default"]
-                chip_args = TaskArgs()
-                chip_args.add_tensor(make_tensor_arg(indices_per_rank[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(x_norms[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(w_padded_list[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(idx_padded_list[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(recv_x_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(make_tensor_arg(recv_w_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(make_tensor_arg(recv_idx_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(make_tensor_arg(recv_count_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(make_tensor_arg(recv_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(make_tensor_arg(routed_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(
-                    ContinuousTensor.make(
-                        data=domain.buffer_ptrs["scratch"],
-                        shapes=(SCRATCH_NBYTES // 4,),
-                        dtype=DataType.FLOAT32,
-                        child_memory=True,
-                    ),
-                    TensorArgType.INOUT,
-                )
-                chip_args.add_scalar(domain.domain_size)
-                chip_args.add_scalar(domain.device_ctx)
-                orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
+            with orch.allocate_domain(
+                name="default",
+                workers=list(range(nranks)),
+                window_size=window_size,
+                buffers=[
+                    CommBufferSpec(
+                        name="scratch",
+                        dtype="float32",
+                        count=SCRATCH_NBYTES // 4,
+                        nbytes=SCRATCH_NBYTES,
+                    )
+                ],
+            ) as handle:
+                for i in range(nranks):
+                    domain = handle[i]
+                    print(
+                        f"[ep_dispatch] chip {i}: rank={domain.domain_rank}/{domain.domain_size} "
+                        f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
+                        f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
+                    )
+                    chip_args = TaskArgs()
+                    chip_args.add_tensor(make_tensor_arg(indices_per_rank[i]), TensorArgType.INPUT)
+                    chip_args.add_tensor(make_tensor_arg(x_norms[i]), TensorArgType.INPUT)
+                    chip_args.add_tensor(make_tensor_arg(w_padded_list[i]), TensorArgType.INPUT)
+                    chip_args.add_tensor(make_tensor_arg(idx_padded_list[i]), TensorArgType.INPUT)
+                    chip_args.add_tensor(make_tensor_arg(recv_x_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(make_tensor_arg(recv_w_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(make_tensor_arg(recv_idx_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(make_tensor_arg(recv_count_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(make_tensor_arg(recv_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(make_tensor_arg(routed_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(
+                        ContinuousTensor.make(
+                            data=domain.buffer_ptrs["scratch"],
+                            shapes=(SCRATCH_NBYTES // 4,),
+                            dtype=DataType.FLOAT32,
+                            child_memory=True,
+                        ),
+                        TensorArgType.INOUT,
+                    )
+                    chip_args.add_scalar(domain.domain_size)
+                    chip_args.add_scalar(domain.device_ctx)
+                    orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
 
         print("[ep_dispatch] running 2-chip dispatch DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())

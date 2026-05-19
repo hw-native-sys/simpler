@@ -5,7 +5,7 @@ Two platform backends under `src/a2a3/platform/`, providing different execution 
 ## Comparison
 
 | Feature | onboard | sim |
-|---------|---------|-----|
+| ------- | ------- | --- |
 | Execution | Real Ascend hardware | Thread-based host simulation |
 | Requirements | CANN toolkit, `ccec`, aarch64 cross-compiler | gcc/g++ only |
 | AICore compilation | `ccec` (Bisheng CCE compiler) | g++ with `-D__CPU_SIM` |
@@ -17,11 +17,13 @@ Two platform backends under `src/a2a3/platform/`, providing different execution 
 ## onboard
 
 Real hardware backend. Requires:
+
 - `ASCEND_HOME_PATH` environment variable pointing to the Ascend toolkit
 - `ccec` compiler for AICore kernels
 - aarch64 cross-compiler for AICPU code
 
 Key directories:
+
 - `src/a2a3/platform/onboard/host/` — Host runtime library (device_runner, memory_allocator)
 - `src/a2a3/platform/onboard/aicpu/` — AICPU kernel entry and platform registers
 - `src/a2a3/platform/onboard/aicore/` — AICore kernel build (ccec + ld.lld)
@@ -31,6 +33,7 @@ Key directories:
 Thread-based simulation. No hardware or SDK required. Each AICore/AICPU "device" runs as a host thread.
 
 Key directories:
+
 - `src/a2a3/platform/sim/host/` — Simulated device runner and memory
 - `src/a2a3/platform/sim/aicpu/` — Simulated AICPU executor
 - `src/a2a3/platform/sim/aicore/` — Simulated AICore executor
@@ -38,6 +41,7 @@ Key directories:
 ## Shared Interface
 
 Platform-agnostic headers live in `src/a2a3/platform/include/`, split by target:
+
 - `host/` — Host-side platform API
 - `aicpu/` — AICPU platform API (registers, timing)
 - `aicore/` — AICore platform API

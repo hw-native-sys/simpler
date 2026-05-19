@@ -107,6 +107,20 @@ static constexpr uint64_t CTRL_PREPARE = 4;
 // CTRL_UNREGISTER carries only the cid.
 static constexpr uint64_t CTRL_REGISTER = 5;
 static constexpr uint64_t CTRL_UNREGISTER = 6;
+// Dynamic per-orch CommDomain allocation/release.  Both carry a pair of
+// NUL-terminated POSIX shm names at MAILBOX_OFF_ARGS — first the request shm
+// (parent → child: header + rank_ids + buffer_nbytes), second the reply shm
+// (child → parent: device_ctx + local_window_base + buffer_ptrs).  RELEASE
+// uses only the request shm; no payload comes back beyond status.
+static constexpr uint64_t CTRL_ALLOC_DOMAIN = 7;
+static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
+// Establish the base HCCL/sim communicator on this chip.  Driven lazily by
+// the orch facade on the first ``allocate_domain`` call.  Payload is a single
+// NUL-terminated shm name at MAILBOX_OFF_ARGS that points to a small request
+// shm containing (rank: u32, nranks: u32, rootinfo_path: NUL-terminated).
+// Caches the comm handle on the chip's ChipWorker so subsequent
+// CTRL_ALLOC_DOMAIN calls can find it.
+static constexpr uint64_t CTRL_COMM_INIT = 9;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy; cid for register)
@@ -200,6 +214,19 @@ public:
     void control_register(int32_t cid, const char *shm_name);
     void control_unregister(int32_t cid);
 
+    // Dynamic CommDomain allocate / release.  `request_shm_name` carries the
+    // request payload (header + rank_ids + buffer_nbytes); for alloc the child
+    // writes its (device_ctx, local_window_base, buffer_ptrs) into
+    // `reply_shm_name`.  Both names are NUL-terminated and ≤
+    // CTRL_SHM_NAME_BYTES-1.  Holds mailbox_mu_ so it serialises with task
+    // dispatch on the same chip mailbox.
+    void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
+    void control_release_domain(const char *request_shm_name);
+
+    // Lazy comm_init driver — payload shm carries (rank, nranks, rootinfo_path).
+    // Caller dispatches in parallel to every chip; child runs cw.comm_init.
+    void control_comm_init(const char *request_shm_name);
+
 private:
     Ring *ring_{nullptr};
     WorkerManager *manager_{nullptr};
@@ -263,6 +290,14 @@ public:
     // over WorkerThread::control_prepare; exposed at manager level so the
     // Python facade can prewarm without reaching into individual WorkerThreads.
     void control_prepare(int worker_id, int32_t cid);
+
+    // Forward CTRL_ALLOC_DOMAIN / CTRL_RELEASE_DOMAIN to a specific NEXT_LEVEL
+    // worker.  Used by the Python orch facade to drive collective domain
+    // allocation across a subset of chips — caller dispatches to each
+    // participating chip and joins on completion.
+    void control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name);
+    void control_release_domain(int worker_id, const char *request_shm_name);
+    void control_comm_init(int worker_id, const char *request_shm_name);
 
     // Broadcast CTRL_REGISTER for `cid` to every NEXT_LEVEL worker in
     // parallel. Stages `blob_size` bytes from `blob_ptr` into a per-call

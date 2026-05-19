@@ -37,11 +37,8 @@ from simpler.task_interface import (  # noqa: E402
     ArgDirection,
     CallConfig,
     ChipCallable,
-    ChipContext,
     ChipDomainContext,
     CommBufferSpec,
-    CommDomain,
-    CommDomainPlan,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -149,26 +146,11 @@ def _domain_tensor_map(fill_value: float = 0.0) -> dict[str, dict[int, torch.Ten
     }
 
 
-def _make_comm_plan() -> CommDomainPlan:
-    window_size = max(SCRATCH_NBYTES, 4 * 1024)
-    return CommDomainPlan(
-        domains=[
-            CommDomain(
-                name=name,
-                worker_indices=worker_indices,
-                window_size=window_size,
-                buffers=[
-                    CommBufferSpec(
-                        name="scratch",
-                        dtype="float32",
-                        count=COUNT,
-                        nbytes=SCRATCH_NBYTES,
-                    ),
-                ],
-            )
-            for name, worker_indices in DOMAINS.items()
-        ]
-    )
+WINDOW_SIZE = max(SCRATCH_NBYTES, 4 * 1024)
+
+
+def _scratch_buffers() -> list[CommBufferSpec]:
+    return [CommBufferSpec(name="scratch", dtype="float32", count=COUNT, nbytes=SCRATCH_NBYTES)]
 
 
 def _add_domain_scratch(args: TaskArgs, domain: ChipDomainContext) -> None:
@@ -209,7 +191,6 @@ def run(platform: str, device_ids: list[int]) -> int:
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        comm_plan=_make_comm_plan(),
     )
     allreduce_cid = worker.register(allreduce_cc)
     affine_cid = worker.register(affine_cc)
@@ -217,27 +198,30 @@ def run(platform: str, device_ids: list[int]) -> int:
     try:
         print("[dual_domain_overlap] init worker...")
         worker.init()
-        contexts: list[ChipContext] = worker.chip_contexts
-        assert len(contexts) == nranks
-        for worker_idx, ctx in enumerate(contexts):
-            names = ", ".join(sorted(ctx.domains))
-            print(f"[dual_domain_overlap] worker {worker_idx}: device={ctx.device_id} domains={names}")
-            for name, domain in sorted(ctx.domains.items()):
-                print(
-                    f"  {name}: rank={domain.domain_rank}/{domain.domain_size} "
-                    f"scratch=0x{domain.buffer_ptrs['scratch']:x} ctx=0x{domain.device_ctx:x}"
-                )
 
         def reduce_orch_fn(domain_name: str):
             def _orch_fn(orch, _args, cfg):
                 worker_indices = DOMAINS[domain_name]
-                for worker_idx in worker_indices:
-                    domain = contexts[worker_idx].domains[domain_name]
-                    args = TaskArgs()
-                    args.add_tensor(make_tensor_arg(host_x[worker_idx]), TensorArgType.INPUT)
-                    args.add_tensor(make_tensor_arg(reduce_out[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING)
-                    _add_domain_scratch(args, domain)
-                    orch.submit_next_level(allreduce_cid, args, cfg, worker=worker_idx)
+                with orch.allocate_domain(
+                    name=domain_name,
+                    workers=worker_indices,
+                    window_size=WINDOW_SIZE,
+                    buffers=_scratch_buffers(),
+                ) as handle:
+                    for worker_idx in worker_indices:
+                        domain = handle[worker_idx]
+                        print(
+                            f"[dual_domain_overlap] {domain_name} chip {worker_idx}: "
+                            f"rank={domain.domain_rank}/{domain.domain_size} "
+                            f"scratch=0x{domain.buffer_ptrs['scratch']:x} ctx=0x{domain.device_ctx:x}"
+                        )
+                        args = TaskArgs()
+                        args.add_tensor(make_tensor_arg(host_x[worker_idx]), TensorArgType.INPUT)
+                        args.add_tensor(
+                            make_tensor_arg(reduce_out[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING
+                        )
+                        _add_domain_scratch(args, domain)
+                        orch.submit_next_level(allreduce_cid, args, cfg, worker=worker_idx)
 
             return _orch_fn
 

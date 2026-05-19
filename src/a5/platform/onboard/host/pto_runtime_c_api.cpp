@@ -252,6 +252,29 @@ int comm_derive_context(
     return -1;
 }
 
+int comm_alloc_domain_windows(
+    void *handle, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+) {
+    (void)handle;
+    (void)allocation_id;
+    (void)rank_ids;
+    (void)rank_count;
+    (void)domain_rank;
+    (void)window_size;
+    (void)device_ctx_out;
+    (void)local_window_base_out;
+    return -1;
+}
+
+int comm_release_domain_windows(void *handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) {
+    (void)handle;
+    (void)allocation_id;
+    (void)rank_count;
+    (void)domain_rank;
+    return -1;
+}
+
 int comm_barrier(void *handle) {
     (void)handle;
     return -1;

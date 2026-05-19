@@ -21,20 +21,15 @@ Usage:
 
 import ctypes
 import os
-from dataclasses import dataclass, field
-from multiprocessing.shared_memory import SharedMemory
-from typing import Optional
+from dataclasses import dataclass
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
-    CHIP_BOOTSTRAP_MAILBOX_SIZE,
     CONTINUOUS_TENSOR_MAX_DIMS,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     ArgDirection,
     CallConfig,
-    ChipBootstrapChannel,
-    ChipBootstrapMailboxState,
     ChipCallable,
     ChipStorageTaskArgs,
     ContinuousTensor,
@@ -80,20 +75,10 @@ __all__ = [
     "MAILBOX_OFF_ERROR_MSG",
     "MAILBOX_ERROR_MSG_SIZE",
     "read_args_from_blob",
-    # Chip bootstrap
-    "CHIP_BOOTSTRAP_MAILBOX_SIZE",
-    "ChipBootstrapChannel",
-    "ChipBootstrapMailboxState",
-    "CommDomain",
-    "CommDomainPlan",
-    "ChipDomainBootstrapConfig",
+    # Dynamic CommDomain allocation (orch-only API)
     "CommBufferSpec",
-    "HostBufferStaging",
-    "ChipBootstrapConfig",
     "ChipDomainContext",
-    "ChipBootstrapResult",
-    # Worker-level chip bootstrap orchestration
-    "ChipContext",
+    "CommDomainHandle",
 ]
 
 COMM_MAX_RANK_NUM = 64
@@ -144,9 +129,9 @@ class CommBufferSpec:
     """A named slice of the per-rank communicator window.
 
     Buffers are placed sequentially inside the window in declaration order —
-    ``ChipBootstrapResult.buffer_ptrs`` is 1:1 aligned with the ``buffers``
-    list so downstream code (the Worker's ``ChipContext``) can build a
-    ``name → ptr`` dict by zipping the two.
+    Buffers are placed sequentially inside the window in declaration order.
+    The ``CommDomainHandle.contexts[chip_idx].buffer_ptrs`` dict returned by
+    ``Orchestrator.allocate_domain`` is keyed by ``CommBufferSpec.name``.
     """
 
     name: str
@@ -155,226 +140,6 @@ class CommBufferSpec:
     nbytes: int
     load_from_host: bool = False
     store_to_host: bool = False
-
-
-@dataclass
-class HostBufferStaging:
-    """A POSIX shared-memory region staged by the parent for one named buffer.
-
-    The parent creates the ``SharedMemory`` object and fills it with the input
-    bytes *before* forking; the child attaches read-only via
-    ``SharedMemory(name=shm_name)`` and does not unlink it.
-    """
-
-    name: str
-    shm_name: str
-    size: int
-    domain_name: Optional[str] = None
-
-
-@dataclass
-class CommDomain:
-    """Parent-level communication domain specification.
-
-    `worker_indices` are L3 child worker indices.  Their order defines dense
-    domain ranks, so `worker_indices[0]` is domain rank 0.
-    """
-
-    name: str
-    worker_indices: list[int]
-    window_size: int
-    buffers: list[CommBufferSpec] = field(default_factory=list)
-
-
-@dataclass
-class ChipDomainBootstrapConfig:
-    """Per-chip derived domain config consumed by `bootstrap_context`."""
-
-    name: str
-    sub_comm_id: int
-    domain_rank: int
-    domain_size: int
-    rank_ids: list[int]
-    window_size: int
-    window_offset: int = 0
-    base_window_size: int = 0
-    buffers: list[CommBufferSpec] = field(default_factory=list)
-    host_inputs: list[HostBufferStaging] = field(default_factory=list)
-    host_outputs: list[HostBufferStaging] = field(default_factory=list)
-
-    def input_staging(self, buffer_name: str) -> HostBufferStaging:
-        for s in self.host_inputs:
-            if s.name == buffer_name and (s.domain_name is None or s.domain_name == self.name):
-                return s
-        raise KeyError(buffer_name)
-
-    def output_staging(self, buffer_name: str) -> HostBufferStaging:
-        for s in self.host_outputs:
-            if s.name == buffer_name and (s.domain_name is None or s.domain_name == self.name):
-                return s
-        raise KeyError(buffer_name)
-
-
-@dataclass
-class CommDomainPlan:
-    """L3-level source of truth for all communication domains."""
-
-    domains: list[CommDomain] = field(default_factory=list)
-
-    def validate(self, *, worker_count: int) -> None:
-        seen_names: set[str] = set()
-        for domain in self.domains:
-            if not domain.name:
-                raise ValueError("CommDomain.name must be non-empty")
-            if domain.name in seen_names:
-                raise ValueError(f"duplicate communication domain name {domain.name!r}")
-            seen_names.add(domain.name)
-            if not domain.worker_indices:
-                raise ValueError(f"CommDomain({domain.name!r}) worker_indices must be non-empty")
-            if len(set(domain.worker_indices)) != len(domain.worker_indices):
-                raise ValueError(f"CommDomain({domain.name!r}) worker_indices contains duplicates")
-            for idx in domain.worker_indices:
-                if idx < 0 or idx >= worker_count:
-                    raise ValueError(f"CommDomain({domain.name!r}) worker index {idx} outside [0, {worker_count})")
-            if len(domain.worker_indices) > COMM_MAX_RANK_NUM:
-                raise ValueError(
-                    f"CommDomain({domain.name!r}) size {len(domain.worker_indices)} exceeds "
-                    f"COMM_MAX_RANK_NUM={COMM_MAX_RANK_NUM}"
-                )
-            if domain.window_size <= 0:
-                raise ValueError(f"CommDomain({domain.name!r}) window_size must be positive")
-            buffer_names = [b.name for b in domain.buffers]
-            if len(set(buffer_names)) != len(buffer_names):
-                raise ValueError(f"CommDomain({domain.name!r}) buffers contain duplicate names")
-
-    def window_offsets(self) -> dict[str, int]:
-        offsets: dict[str, int] = {}
-        offset = 0
-        for domain in sorted(self.domains, key=lambda d: d.name):
-            offsets[domain.name] = offset
-            offset += domain.window_size
-        return offsets
-
-    def base_window_size(self) -> int:
-        return sum(domain.window_size for domain in self.domains)
-
-    def bootstrap_for_worker(self, worker_idx: int) -> list[ChipDomainBootstrapConfig]:
-        sub_comm_ids = {name: idx for idx, name in enumerate(sorted(d.name for d in self.domains))}
-        window_offsets = self.window_offsets()
-        base_window_size = self.base_window_size()
-        configs: list[ChipDomainBootstrapConfig] = []
-        for domain in self.domains:
-            if worker_idx not in domain.worker_indices:
-                continue
-            rank = domain.worker_indices.index(worker_idx)
-            configs.append(
-                ChipDomainBootstrapConfig(
-                    name=domain.name,
-                    sub_comm_id=sub_comm_ids[domain.name],
-                    domain_rank=rank,
-                    domain_size=len(domain.worker_indices),
-                    rank_ids=list(domain.worker_indices),
-                    window_size=domain.window_size,
-                    window_offset=window_offsets[domain.name],
-                    base_window_size=base_window_size,
-                    buffers=list(domain.buffers),
-                )
-            )
-        configs.sort(key=lambda c: c.name)
-        return configs
-
-
-@dataclass
-class ChipBootstrapConfig:
-    """Inputs to `ChipWorker.bootstrap_context` for one chip child."""
-
-    comm: Optional[list[ChipDomainBootstrapConfig]] = None
-    host_inputs: list[HostBufferStaging] = field(default_factory=list)
-    host_outputs: list[HostBufferStaging] = field(default_factory=list)
-
-    def input_staging(self, buffer_name: str) -> HostBufferStaging:
-        for s in self.host_inputs:
-            if s.name == buffer_name:
-                return s
-        raise KeyError(buffer_name)
-
-    def output_staging(self, buffer_name: str) -> HostBufferStaging:
-        for s in self.host_outputs:
-            if s.name == buffer_name:
-                return s
-        raise KeyError(buffer_name)
-
-    def domain_bootstrap_configs(self) -> list[ChipDomainBootstrapConfig]:
-        if self.comm is None:
-            # Host staging is keyed by `(domain_name, buffer_name)`, so without a
-            # `comm` plan there is no domain to attach it to and the staging
-            # would silently be dropped by `bootstrap_context`. Surface this
-            # mismatch at config-construction time instead of after the chip
-            # child is already forked.
-            if self.host_inputs:
-                raise ValueError(
-                    "ChipBootstrapConfig.host_inputs requires a comm plan (cfg.comm is None); "
-                    f"got {len(self.host_inputs)} entries that would never be staged"
-                )
-            if self.host_outputs:
-                raise ValueError(
-                    "ChipBootstrapConfig.host_outputs requires a comm plan (cfg.comm is None); "
-                    f"got {len(self.host_outputs)} entries that would never be flushed"
-                )
-            return []
-        if not isinstance(self.comm, list):
-            raise TypeError("ChipBootstrapConfig.comm must be a list of ChipDomainBootstrapConfig or None")
-
-        for idx, domain in enumerate(self.comm):
-            if not isinstance(domain, ChipDomainBootstrapConfig):
-                raise TypeError(f"ChipBootstrapConfig.comm[{idx}] must be ChipDomainBootstrapConfig")
-        domains = [self._attach_staging_to_domain(domain) for domain in self.comm]
-        self._validate_staging_consumed(domains, self.host_inputs, label="host_inputs")
-        self._validate_staging_consumed(domains, self.host_outputs, label="host_outputs")
-        return domains
-
-    def _attach_staging_to_domain(self, domain: ChipDomainBootstrapConfig) -> ChipDomainBootstrapConfig:
-        host_inputs = list(domain.host_inputs) + self._domain_staging(self.host_inputs, domain.name)
-        host_outputs = list(domain.host_outputs) + self._domain_staging(self.host_outputs, domain.name)
-        return ChipDomainBootstrapConfig(
-            name=domain.name,
-            sub_comm_id=domain.sub_comm_id,
-            domain_rank=domain.domain_rank,
-            domain_size=domain.domain_size,
-            rank_ids=list(domain.rank_ids),
-            window_size=domain.window_size,
-            window_offset=domain.window_offset,
-            base_window_size=domain.base_window_size,
-            buffers=list(domain.buffers),
-            host_inputs=host_inputs,
-            host_outputs=host_outputs,
-        )
-
-    @staticmethod
-    def _domain_staging(items: list[HostBufferStaging], domain_name: str) -> list[HostBufferStaging]:
-        return [s for s in items if s.domain_name == domain_name]
-
-    @staticmethod
-    def _validate_staging_consumed(
-        domains: list[ChipDomainBootstrapConfig],
-        items: list[HostBufferStaging],
-        *,
-        label: str,
-    ) -> None:
-        domain_names = {d.name for d in domains}
-        seen: set[tuple[str, str]] = set()
-        for s in items:
-            if not s.domain_name:
-                raise ValueError(f"{label} entry {s.name!r} requires domain_name in explicit ChipBootstrapConfig")
-            if s.domain_name not in domain_names:
-                raise ValueError(
-                    f"{label} entry {s.name!r} has domain_name={s.domain_name!r}, "
-                    "but this chip config has no such domain"
-                )
-            key = (s.domain_name, s.name)
-            if key in seen:
-                raise ValueError(f"duplicate {label} staging entry for {key}")
-            seen.add(key)
 
 
 @dataclass
@@ -388,27 +153,111 @@ class ChipDomainContext:
     buffer_ptrs: dict[str, int]
 
 
-@dataclass
-class ChipBootstrapResult:
-    """Return value of `ChipWorker.bootstrap_context`."""
+class CommDomainHandle:
+    """User-facing handle for one dynamically-allocated CommDomain.
 
-    domains: dict[str, ChipDomainContext] = field(default_factory=dict)
+    Returned by ``Orchestrator.allocate_domain(...)``.  Acts as a context
+    manager: ``with`` exit *marks* the handle for release and prevents
+    further use; the actual backend free runs **after** ``Worker.run`` has
+    drained any tasks the orch function submitted using this domain.  This
+    is required because ``submit_*`` only enqueues to the DAG — freeing
+    before drain would create a use-after-free on the chip side.
 
+    Lifecycle states::
 
-@dataclass
-class ChipContext:
-    """Per-chip view of a successful bootstrap, exposed to L3+ orch functions.
+        live           — allocated, indexable, can be passed to submit_*
+        released       — release() called; further indexing raises;
+                          backend memory still alive until Worker.run drain
+        freed          — backend release_domain has executed, memory gone
 
-    Built by the parent `Worker` in `_start_hierarchical` from the
-    `ChipBootstrapConfig` it forwarded to the chip child and the
-    `ChipBootstrapResult` the child published via its `ChipBootstrapChannel`.
-    Orchestration code addresses communication state through
-    `domains[domain_name]`.
+    Most users only see ``released``; the ``live → released`` transition
+    happens at ``with`` exit (or explicit ``release()``), and the
+    ``released → freed`` transition is the runtime's job at end-of-run.
     """
 
-    device_id: int
-    worker_index: int
-    domains: dict[str, ChipDomainContext] = field(default_factory=dict)
+    __slots__ = ("name", "workers", "contexts", "allocation_id", "_release_fn", "_released", "_freed")
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        workers: tuple[int, ...],
+        contexts: dict[int, "ChipDomainContext"],
+        allocation_id: int,
+        _release_fn,
+    ) -> None:
+        self.name = name
+        self.workers = tuple(workers)
+        # Frozen dict-ish — we don't expose mutation
+        self.contexts: dict[int, ChipDomainContext] = dict(contexts)
+        self.allocation_id = int(allocation_id)
+        self._release_fn = _release_fn
+        self._released = False
+        self._freed = False
+
+    def __getitem__(self, chip_idx: int) -> "ChipDomainContext":
+        if self._released:
+            raise RuntimeError(
+                f"CommDomainHandle({self.name!r}) already released; do not pass it to submit_* "
+                "after release(). Submitted tasks that captured device_ctx / buffer_ptrs before "
+                "release will still see live memory until Worker.run drains."
+            )
+        return self.contexts[chip_idx]
+
+    @property
+    def released(self) -> bool:
+        """True once ``release()`` (or ``with`` exit) has been called.
+
+        Backend memory may still be alive — it is freed by the Worker after
+        DAG drain at end-of-run.  Use this to gate further indexing /
+        submission, not to assert physical teardown (use ``freed`` for that).
+        """
+        return self._released
+
+    @property
+    def freed(self) -> bool:
+        """True once the backend ``comm_release_domain_windows`` has executed.
+
+        Only flips after the owning ``Worker.run`` drains and processes the
+        pending-release queue.  An ``orch_fn`` will never observe ``True``
+        for a handle it released within the same ``run`` call.
+        """
+        return self._freed
+
+    def release(self) -> None:
+        """Mark this handle for collective release.  Idempotent.
+
+        Inside an orch function, this is a non-blocking mark — the actual
+        backend ``comm_release_domain_windows`` runs after
+        ``Worker.run.drain()`` so that any tasks already submitted with
+        this domain's ``device_ctx`` see live memory through execution.
+
+        After this returns, the handle is treated as released for the
+        user's purposes: ``__getitem__`` raises, repeated ``release()`` is
+        a no-op, and the orch function must not pass it to further
+        ``submit_*`` calls.
+        """
+        if self._released:
+            return
+        self._released = True
+        # _release_fn is owned by Worker; it queues the actual backend
+        # release and runs it after drain.  Worker also flips _freed.
+        self._release_fn(self)
+
+    def __enter__(self) -> "CommDomainHandle":
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+    def __repr__(self) -> str:
+        if self._freed:
+            state = "freed"
+        elif self._released:
+            state = "released-pending-free"
+        else:
+            state = "live"
+        return f"CommDomainHandle(name={self.name!r}, workers={self.workers}, {state})"
 
 
 # Process-wide RTLD_GLOBAL preload registry. host_runtime.so resolves its
@@ -635,261 +484,6 @@ class ChipWorker:
     def comm_destroy_all(self) -> None:
         """Destroy all communicators owned by this worker."""
         self._impl.comm_destroy_all()
-
-    def bootstrap_context(  # noqa: PLR0912 -- config validation + comm setup + window carving + H2D staging in one linear flow; splitting would obscure the ordered failure semantics
-        self,
-        device_id: int,
-        cfg: ChipBootstrapConfig,
-        channel: Optional[ChipBootstrapChannel] = None,
-    ) -> ChipBootstrapResult:
-        """One-shot per-chip bootstrap: build communicator, slice window,
-        stage inputs from host shared memory, and (optionally) publish the result.
-
-        The target device must already be attached via ``init(bins, device_id)``
-        before invoking this method; ``device_id`` is supplied here only to
-        catch a caller that wired up the wrong device on the wrong worker.
-
-        Runs inside a forked chip child.  If ``channel`` is provided (the
-        Worker-orchestrated integration path), the result is written as
-        SUCCESS or — on any exception — as ERROR (code=1,
-        ``"<ExceptionType>: <message>"``) before the exception is re-raised.
-        Standalone callers can pass ``channel=None`` and consume the return
-        value directly.
-
-        Communication handles produced by bootstrap are stashed on
-        ``self._comm_handles`` so ``shutdown_bootstrap()`` can release them
-        later; ``finalize()`` is intentionally *not* wired to these handles — teardown
-        ordering is the caller's responsibility.
-        """
-        try:
-            domain_cfgs = self._domain_bootstrap_configs(cfg)
-            # Validate host-staging symmetry up-front — before any device or
-            # communicator state is touched — so a missing staging entry
-            # surfaces as a clean ValueError on the channel rather than a
-            # KeyError from deep inside the flush/H2D loop (which would leave
-            # the parent waiting on a silent chip child).
-            for domain in domain_cfgs:
-                for spec in domain.buffers:
-                    if spec.load_from_host:
-                        try:
-                            domain.input_staging(spec.name)
-                        except KeyError:
-                            raise ValueError(
-                                f"CommBufferSpec(domain={domain.name!r}, name={spec.name!r}, "
-                                "load_from_host=True) requires matching HostBufferStaging in host_inputs; none found"
-                            ) from None
-                    if spec.store_to_host:
-                        try:
-                            domain.output_staging(spec.name)
-                        except KeyError:
-                            raise ValueError(
-                                f"CommBufferSpec(domain={domain.name!r}, name={spec.name!r}, "
-                                "store_to_host=True) requires matching HostBufferStaging in host_outputs; none found"
-                            ) from None
-
-            if self.device_id != device_id:
-                raise RuntimeError(
-                    f"bootstrap_context(device_id={device_id}) called on a ChipWorker "
-                    f"already initialized for device_id={self.device_id}"
-                )
-            handles: list[int] = []
-            self._comm_handles = handles
-            domains: dict[str, ChipDomainContext] = {}
-            if cfg.comm == []:
-                base_rank, base_size, rootinfo_path = self._base_comm_params(cfg)
-                base = self.comm_init(base_rank, base_size, rootinfo_path)
-                if base == 0:
-                    raise RuntimeError("comm_init returned 0 handle for hidden base communicator")
-                handles.append(base)
-                base_window_size = getattr(cfg, "base_window_size", 0)
-                if base_window_size:
-                    base_device_ctx = self.comm_alloc_windows(base, int(base_window_size))
-                    if base_device_ctx == 0:
-                        raise RuntimeError("comm_alloc_windows returned null device_ctx for hidden base communicator")
-                    base_local = self.comm_get_local_window_base(base)
-                    actual_base_size = self.comm_get_window_size(base)
-                    self._zero_device_memory(base_local, actual_base_size)
-            elif domain_cfgs:
-                base_rank, base_size, rootinfo_path = self._base_comm_params(cfg)
-                base = self.comm_init(base_rank, base_size, rootinfo_path)
-                if base == 0:
-                    raise RuntimeError("comm_init returned 0 handle for hidden base communicator")
-                handles.append(base)
-                base_window_size = self._base_window_size(domain_cfgs)
-                if base_window_size <= 0:
-                    raise ValueError("multi-domain base window size must be positive")
-                base_device_ctx = self.comm_alloc_windows(base, base_window_size)
-                if base_device_ctx == 0:
-                    raise RuntimeError("comm_alloc_windows returned null device_ctx for hidden base communicator")
-                base_local = self.comm_get_local_window_base(base)
-                actual_base_size = self.comm_get_window_size(base)
-                self._zero_device_memory(base_local, actual_base_size)
-                for domain in domain_cfgs:
-                    self._validate_domain_window(domain, actual_base_size)
-                    device_ctx = self.comm_derive_context(
-                        base,
-                        domain.rank_ids,
-                        domain.domain_rank,
-                        domain.window_offset,
-                        domain.window_size,
-                    )
-                    local_base = base_local + domain.window_offset
-                    actual_size = domain.window_size
-                    buffer_ptrs = self._carve_domain_buffers(domain, local_base, actual_size)
-                    self._stage_domain_inputs(domain, buffer_ptrs)
-                    domains[domain.name] = ChipDomainContext(
-                        name=domain.name,
-                        domain_rank=domain.domain_rank,
-                        domain_size=domain.domain_size,
-                        device_ctx=device_ctx,
-                        local_window_base=local_base,
-                        actual_window_size=actual_size,
-                        buffer_ptrs=buffer_ptrs,
-                    )
-            result = ChipBootstrapResult(domains=domains)
-            if channel is not None:
-                if hasattr(channel, "write_success_domains"):
-                    from _task_interface import ChipDomainBootstrapResult  # pyright: ignore[reportMissingImports]
-
-                    channel.write_success_domains(
-                        [
-                            ChipDomainBootstrapResult(
-                                d.name,
-                                d.domain_rank,
-                                d.domain_size,
-                                d.device_ctx,
-                                d.local_window_base,
-                                d.actual_window_size,
-                                list(d.buffer_ptrs.values()),
-                            )
-                            for d in result.domains.values()
-                        ]
-                    )
-                else:
-                    raise RuntimeError("domain-aware ChipBootstrapChannel is required")
-            return result
-        except Exception as e:
-            if channel is not None:
-                channel.write_error(1, f"{type(e).__name__}: {e}")
-            raise
-
-    @staticmethod
-    def _rootinfo_path(cfg: ChipBootstrapConfig) -> str:
-        # Worker-derived multi-domain configs attach this private attribute.
-        return getattr(cfg, "rootinfo_path", "")
-
-    @staticmethod
-    def _base_comm_params(cfg: ChipBootstrapConfig) -> tuple[int, int, str]:
-        rank = getattr(cfg, "base_rank", None)
-        size = getattr(cfg, "base_size", None)
-        rootinfo_path = getattr(cfg, "rootinfo_path", None)
-        if rank is None or size is None or rootinfo_path is None:
-            raise ValueError("multi-domain ChipBootstrapConfig requires base_rank, base_size, and rootinfo_path")
-        return int(rank), int(size), str(rootinfo_path)
-
-    @staticmethod
-    def _domain_bootstrap_configs(cfg: ChipBootstrapConfig) -> list[ChipDomainBootstrapConfig]:
-        return cfg.domain_bootstrap_configs()
-
-    @staticmethod
-    def _base_window_size(domains: list[ChipDomainBootstrapConfig]) -> int:
-        declared = {d.base_window_size for d in domains if d.base_window_size > 0}
-        if len(declared) > 1:
-            raise ValueError(f"inconsistent base_window_size values: {sorted(declared)}")
-        if declared:
-            return declared.pop()
-        return max((d.window_offset + d.window_size for d in domains), default=0)
-
-    @staticmethod
-    def _validate_domain_window(domain: ChipDomainBootstrapConfig, actual_base_size: int) -> None:
-        if domain.domain_size <= 0 or domain.domain_size > COMM_MAX_RANK_NUM:
-            raise ValueError(f"domain {domain.name!r} has invalid size {domain.domain_size}")
-        if len(domain.rank_ids) != domain.domain_size:
-            raise ValueError(f"domain {domain.name!r} rank_ids length does not match domain_size")
-        if domain.domain_rank < 0 or domain.domain_rank >= domain.domain_size:
-            raise ValueError(f"domain {domain.name!r} has invalid domain_rank {domain.domain_rank}")
-        if domain.window_offset < 0:
-            raise ValueError(f"domain {domain.name!r} window_offset must be non-negative")
-        if domain.window_size <= 0:
-            raise ValueError(f"domain {domain.name!r} window_size must be positive")
-        if domain.window_offset + domain.window_size > actual_base_size:
-            raise ValueError(
-                f"domain {domain.name!r} window range "
-                f"[{domain.window_offset}, {domain.window_offset + domain.window_size}) "
-                f"overflows base window size {actual_base_size}"
-            )
-
-    @staticmethod
-    def _carve_domain_buffers(
-        domain: ChipDomainBootstrapConfig,
-        local_base: int,
-        actual_size: int,
-    ) -> dict[str, int]:
-        offset = 0
-        buffer_ptrs: dict[str, int] = {}
-        for spec in domain.buffers:
-            if offset + spec.nbytes > actual_size:
-                raise ValueError(
-                    f"domain {domain.name!r} buffer {spec.name!r} (nbytes={spec.nbytes}) at offset={offset} "
-                    f"overflows window size {actual_size}"
-                )
-            buffer_ptrs[spec.name] = local_base + offset
-            offset += spec.nbytes
-        return buffer_ptrs
-
-    def _stage_domain_inputs(
-        self,
-        domain: ChipDomainBootstrapConfig,
-        buffer_ptrs: dict[str, int],
-    ) -> None:
-        for spec in domain.buffers:
-            if not spec.load_from_host:
-                continue
-            staging = domain.input_staging(spec.name)
-            if staging.size != spec.nbytes:
-                raise ValueError(
-                    f"host_inputs[{domain.name!r}, {spec.name!r}].size={staging.size} != buffer.nbytes={spec.nbytes}"
-                )
-            if staging.size == 0:
-                continue
-            shm = SharedMemory(name=staging.shm_name)
-            try:
-                buf = shm.buf
-                assert buf is not None
-                host_ptr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-                self.copy_to(buffer_ptrs[spec.name], host_ptr, staging.size)
-            finally:
-                shm.close()
-
-    def _zero_device_memory(self, dev_ptr: int, nbytes: int) -> None:
-        if nbytes <= 0:
-            return
-        zeros = (ctypes.c_char * nbytes)()
-        self.copy_to(dev_ptr, ctypes.addressof(zeros), nbytes)
-
-    def shutdown_bootstrap(self) -> None:
-        """Release the communicator handle stashed by ``bootstrap_context``.
-
-        Idempotent — safe to call multiple times, and safe to call if
-        ``bootstrap_context`` was never invoked.  ``finalize()`` does *not*
-        chain into this method, so callers (e.g. the Worker's chip child
-        loop) must call ``shutdown_bootstrap()`` before ``finalize()`` (or
-        after, if the comm handle was already destroyed — the zero-handle
-        guard makes a second call a no-op).
-        """
-        handles = list(getattr(self, "_comm_handles", []))
-        first_error: Optional[BaseException] = None
-        for handle in reversed(handles):
-            if handle == 0:
-                continue
-            try:
-                self.comm_destroy(handle)
-            except BaseException as e:  # noqa: BLE001
-                if first_error is None:
-                    first_error = e
-        self._comm_handles = []
-        if first_error is not None:
-            raise first_error
 
     @property
     def device_id(self):
