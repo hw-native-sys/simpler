@@ -152,33 +152,16 @@ struct PmuModule {
 // Memory operation callbacks (injected by DeviceRunner)
 // ---------------------------------------------------------------------------
 
-/**
- * Allocate device memory.
- *
- * @param size       Bytes to allocate
- * @param user_data  Opaque allocator context
- * @return Device pointer, or nullptr on failure
- */
-using PmuAllocCallback = void *(*)(size_t size, void *user_data);
-
-/**
- * Register device memory for host-visible access. nullptr on a5 — the
- * framework allocates a paired host shadow via malloc + memset 0 +
- * copy_to_device. Stateless: HAL state is global, so no user_data is
- * threaded through.
- */
-using PmuRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
-
-/**
- * Unregister a previously registered host-visible mapping. May be nullptr.
- * Stateless (see register_cb).
- */
-using PmuUnregisterCallback = int (*)(void *dev_ptr, int device_id);
-
-/**
- * Free device memory.
- */
-using PmuFreeCallback = int (*)(void *dev_ptr, void *user_data);
+// Memory callbacks — thin aliases for the canonical profiling_common shapes.
+// alloc / free are std::function so callers bind their MemoryAllocator via
+// lambda capture; register / unregister stay as plain function pointers
+// because they wrap stateless HAL globals. On a5 onboard the runner passes
+// register_cb=nullptr and the framework installs a malloc-shadow + DMA
+// fallback (default_host_shadow_register).
+using PmuAllocCallback = profiling_common::ProfAllocCallback;
+using PmuRegisterCallback = profiling_common::ProfRegisterCallback;
+using PmuUnregisterCallback = profiling_common::ProfUnregisterCallback;
+using PmuFreeCallback = profiling_common::ProfFreeCallback;
 
 // ---------------------------------------------------------------------------
 // PmuCollector
@@ -219,8 +202,8 @@ public:
      * @return 0 on success, non-zero on failure
      */
     int init(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, PmuAllocCallback alloc_cb,
-        PmuRegisterCallback register_cb, PmuFreeCallback free_cb, void *user_data, int device_id
+        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type,
+        const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb, const PmuFreeCallback &free_cb, int device_id
     );
 
     /**
@@ -258,7 +241,7 @@ public:
     /**
      * Free all device memory and unregister mappings. Idempotent.
      */
-    void finalize(PmuUnregisterCallback unregister_cb, PmuFreeCallback free_cb, void *user_data);
+    void finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCallback &free_cb);
 
     /**
      * @return true if init() succeeded and finalize() has not run.

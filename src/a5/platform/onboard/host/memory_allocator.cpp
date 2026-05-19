@@ -31,7 +31,7 @@ void *MemoryAllocator::alloc(size_t size) {
         return nullptr;
     }
 
-    std::lock_guard<std::mutex> lk(mu_);
+    std::scoped_lock<std::mutex> lk(mu_);
     ptr_set_.insert(ptr);
     return ptr;
 }
@@ -41,7 +41,7 @@ int MemoryAllocator::free(void *ptr) {
         return 0;
     }
 
-    std::lock_guard<std::mutex> lk(mu_);
+    std::scoped_lock<std::mutex> lk(mu_);
     auto it = ptr_set_.find(ptr);
     if (it == ptr_set_.end()) {
         return 0;
@@ -58,7 +58,7 @@ int MemoryAllocator::free(void *ptr) {
 }
 
 int MemoryAllocator::finalize() {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::scoped_lock<std::mutex> lk(mu_);
     int last_error = 0;
     for (void *ptr : ptr_set_) {
         int rc = rtFree(ptr);

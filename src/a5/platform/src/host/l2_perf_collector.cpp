@@ -63,7 +63,7 @@ L2PerfCollector::~L2PerfCollector() {
 }
 
 void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size, user_data_);
+    void *dev_ptr = alloc_cb_(size);
     if (dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate buffer (%zu bytes)", size);
         if (host_ptr_out) *host_ptr_out = nullptr;
@@ -75,7 +75,7 @@ void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
         int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
         if (rc != 0 || host_ptr == nullptr) {
             LOG_ERROR("Buffer registration failed: %d", rc);
-            free_cb_(dev_ptr, user_data_);
+            free_cb_(dev_ptr);
             if (host_ptr_out) *host_ptr_out = nullptr;
             return nullptr;
         }
@@ -84,7 +84,7 @@ void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
         host_ptr = std::malloc(size);
         if (host_ptr == nullptr) {
             LOG_ERROR("Host shadow alloc failed for %zu bytes", size);
-            free_cb_(dev_ptr, user_data_);
+            free_cb_(dev_ptr);
             if (host_ptr_out) *host_ptr_out = nullptr;
             return nullptr;
         }
@@ -99,8 +99,8 @@ void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
 }
 
 int L2PerfCollector::initialize(
-    int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfRegisterCallback register_cb,
-    L2PerfFreeCallback free_cb, void *user_data, const std::string &output_prefix
+    int num_aicore, int device_id, const L2PerfAllocCallback &alloc_cb, L2PerfRegisterCallback register_cb,
+    const L2PerfFreeCallback &free_cb, const std::string &output_prefix
 ) {
     if (shm_host_ != nullptr) {
         LOG_ERROR("L2PerfCollector already initialized");
@@ -120,12 +120,12 @@ int L2PerfCollector::initialize(
     total_phase_collected_ = 0;
 
     // Stash the memory context on the base up-front so alloc_single_buffer
-    // (which reads alloc_cb_/register_cb_/free_cb_/user_data_/device_id_)
+    // (which reads alloc_cb_/register_cb_/free_cb_/device_id_)
     // sees consistent values during init. shm_host_ stays nullptr until the
     // shm allocation succeeds — that nullptr guard makes a post-failure
     // start(tf) a no-op.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, user_data, /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        alloc_cb, register_cb, free_cb, /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
     // Step 1: Calculate shared memory size (slot arrays only, no actual buffers)
@@ -186,7 +186,7 @@ int L2PerfCollector::initialize(
 
         // Allocate the per-core staging ring (no host shadow needed: AICore
         // writes, AICPU reads — host never touches the ring directly).
-        void *ring_dev = alloc_cb(sizeof(L2PerfAicoreRing), user_data);
+        void *ring_dev = alloc_cb(sizeof(L2PerfAicoreRing));
         if (ring_dev == nullptr) {
             LOG_ERROR("Failed to allocate L2PerfAicoreRing for core %d", i);
             return -1;
@@ -251,7 +251,7 @@ int L2PerfCollector::initialize(
 
     // Step 7: Publish shm pointers on the base now that the region is ready.
     perf_shared_mem_dev_ = perf_dev_ptr;
-    set_memory_context(alloc_cb, register_cb, free_cb, user_data, perf_dev_ptr, perf_host_ptr, total_size, device_id);
+    set_memory_context(alloc_cb, register_cb, free_cb, perf_dev_ptr, perf_host_ptr, total_size, device_id);
 
     collected_perf_records_.assign(num_aicore_, {});
     collected_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
@@ -757,7 +757,7 @@ int L2PerfCollector::export_swimlane_json() {
 // finalize
 // ---------------------------------------------------------------------------
 
-int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb, void *user_data) {
+int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, const L2PerfFreeCallback &free_cb) {
     if (shm_host_ == nullptr) return 0;
 
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
@@ -766,13 +766,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
     LOG_DEBUG("Cleaning up performance profiling resources");
 
     auto release_dev = [&](void *p) {
-        if (p == nullptr) return;
-        if (unregister_cb != nullptr) {
-            unregister_cb(p, device_id_);
-        }
-        if (free_cb != nullptr) {
-            free_cb(p, user_data);
-        }
+        release_one_buffer(p, unregister_cb, free_cb);
     };
 
     // Free buffers still parked in per-core / per-thread free_queues and as

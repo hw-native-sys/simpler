@@ -99,12 +99,12 @@ bool create_temp_so_file(const std::string &path_template, const uint8_t *data, 
 // DeviceRunner Implementation
 // =============================================================================
 
-// malloc / free wrappers shared by all three profiling subsystems.
-// `user_data` is unused in sim but kept in the signature to match the
-// framework's canonical alloc/free callback shape.
-static void *prof_alloc_cb(size_t size, void * /*user_data*/) { return std::malloc(size); }
+// malloc / free wrappers shared by all three profiling subsystems. Plain
+// function pointers convert implicitly into the framework's std::function
+// alloc / free shapes.
+static void *prof_alloc_cb(size_t size) { return std::malloc(size); }
 
-static int prof_free_cb(void *dev_ptr, void * /*user_data*/) {
+static int prof_free_cb(void *dev_ptr) {
     std::free(dev_ptr);
     return 0;
 }
@@ -808,13 +808,13 @@ int DeviceRunner::finalize() {
 
     // Cleanup all profiling subsystems.
     if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr);
+        l2_perf_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (dump_collector_.is_initialized()) {
-        dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr);
+        dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (pmu_collector_.is_initialized()) {
-        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr);
+        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
 
     // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
@@ -980,8 +980,7 @@ void DeviceRunner::finalize_collectors() {
 
 int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr,
-        output_prefix_
+        num_aicore, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
         kernel_args_.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
@@ -995,8 +994,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.sche_cpu_num;
 
     int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr,
-        output_prefix_
+        num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc != 0) {
         return rc;
@@ -1011,7 +1009,7 @@ int DeviceRunner::init_pmu(
 ) {
     int rc = pmu_collector_.init(
         num_cores, num_threads, csv_path, event_type, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb,
-        /*user_data=*/nullptr, /*device_id=*/-1
+        /*device_id=*/-1
     );
     if (rc == 0) {
         kernel_args_.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());

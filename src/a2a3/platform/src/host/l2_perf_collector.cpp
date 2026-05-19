@@ -55,7 +55,7 @@ L2PerfCollector::~L2PerfCollector() {
 }
 
 void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size, user_data_);
+    void *dev_ptr = alloc_cb_(size);
     if (dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate buffer (%zu bytes)", size);
         *host_ptr_out = nullptr;
@@ -80,26 +80,9 @@ void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
     return dev_ptr;
 }
 
-void L2PerfCollector::release_one_buffer(
-    void *dev_ptr, L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb, void *user_data
-) {
-    if (dev_ptr == nullptr) {
-        return;
-    }
-    if (unregister_cb != nullptr) {
-        int rc = unregister_cb(dev_ptr, device_id_);
-        if (rc != 0) {
-            LOG_ERROR("halHostUnregister failed for dev_ptr %p: %d", dev_ptr, rc);
-        }
-    }
-    if (free_cb != nullptr) {
-        free_cb(dev_ptr, user_data);
-    }
-}
-
 int L2PerfCollector::initialize(
-    int num_aicore, int device_id, L2PerfLevel l2_perf_level, L2PerfAllocCallback alloc_cb,
-    L2PerfRegisterCallback register_cb, L2PerfFreeCallback free_cb, void *user_data, const std::string &output_prefix
+    int num_aicore, int device_id, L2PerfLevel l2_perf_level, const L2PerfAllocCallback &alloc_cb,
+    L2PerfRegisterCallback register_cb, const L2PerfFreeCallback &free_cb, const std::string &output_prefix
 ) {
     if (shm_host_ != nullptr) {
         LOG_ERROR("L2PerfCollector already initialized");
@@ -122,7 +105,7 @@ int L2PerfCollector::initialize(
     // sees consistent values during init. shm_host_ stays nullptr until the
     // shm allocation succeeds — the nullptr guard makes a post-failure
     // start(tf) a no-op.
-    set_memory_context(alloc_cb, register_cb, free_cb, user_data, /*shm_host=*/nullptr, device_id);
+    set_memory_context(alloc_cb, register_cb, free_cb, /*shm_host=*/nullptr, device_id);
 
     // Step 1: Calculate shared memory size (slot arrays only, no actual buffers)
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
@@ -136,7 +119,7 @@ int L2PerfCollector::initialize(
     LOG_DEBUG("  Total shared memory:  %zu bytes (%zu KB)", total_size, total_size / 1024);
 
     // Step 2: Allocate shared memory for slot arrays
-    void *perf_dev_ptr = alloc_cb(total_size, user_data);
+    void *perf_dev_ptr = alloc_cb(total_size);
     if (perf_dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate shared memory (%zu bytes)", total_size);
         return -1;
@@ -796,7 +779,7 @@ int L2PerfCollector::export_swimlane_json() {
     return 0;
 }
 
-int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb, void *user_data) {
+int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, const L2PerfFreeCallback &free_cb) {
     if (shm_host_ == nullptr) {
         return 0;
     }
@@ -815,12 +798,12 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
     // a reused Worker fail at rc=8 from halHostRegister.
 
     // Free standalone aicore_ring_addr table
-    release_one_buffer(aicore_ring_addr_table_dev_, unregister_cb, free_cb, user_data);
+    release_one_buffer(aicore_ring_addr_table_dev_, unregister_cb, free_cb);
     aicore_ring_addr_table_dev_ = nullptr;
 
     // Release framework-owned buffers (recycled pools, done_queue, ready_queue).
-    manager_.release_owned_buffers([this, unregister_cb, free_cb, user_data](void *p) {
-        release_one_buffer(p, unregister_cb, free_cb, user_data);
+    manager_.release_owned_buffers([this, unregister_cb, free_cb](void *p) {
+        release_one_buffer(p, unregister_cb, free_cb);
     });
 
     // Per-core: current buffer + staging ring + free_queue slots — these
@@ -828,10 +811,10 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
     for (int i = 0; i < num_aicore_; i++) {
         L2PerfBufferState *state = get_perf_buffer_state(shm_host_, i);
 
-        release_one_buffer(reinterpret_cast<void *>(state->current_buf_ptr), unregister_cb, free_cb, user_data);
+        release_one_buffer(reinterpret_cast<void *>(state->current_buf_ptr), unregister_cb, free_cb);
         state->current_buf_ptr = 0;
 
-        release_one_buffer(reinterpret_cast<void *>(state->aicore_ring_ptr), unregister_cb, free_cb, user_data);
+        release_one_buffer(reinterpret_cast<void *>(state->aicore_ring_ptr), unregister_cb, free_cb);
         state->aicore_ring_ptr = 0;
 
         rmb();
@@ -843,9 +826,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
         }
         for (uint32_t k = 0; k < queued; k++) {
             uint32_t slot = (head + k) % PLATFORM_PROF_SLOT_COUNT;
-            release_one_buffer(
-                reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]), unregister_cb, free_cb, user_data
-            );
+            release_one_buffer(reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]), unregister_cb, free_cb);
             state->free_queue.buffer_ptrs[slot] = 0;
         }
         state->free_queue.head = tail;
@@ -855,7 +836,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
     for (int t = 0; t < num_phase_threads; t++) {
         PhaseBufferState *state = get_phase_buffer_state(shm_host_, num_aicore_, t);
 
-        release_one_buffer(reinterpret_cast<void *>(state->current_buf_ptr), unregister_cb, free_cb, user_data);
+        release_one_buffer(reinterpret_cast<void *>(state->current_buf_ptr), unregister_cb, free_cb);
         state->current_buf_ptr = 0;
 
         rmb();
@@ -867,9 +848,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
         }
         for (uint32_t k = 0; k < queued; k++) {
             uint32_t slot = (head + k) % PLATFORM_PROF_SLOT_COUNT;
-            release_one_buffer(
-                reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]), unregister_cb, free_cb, user_data
-            );
+            release_one_buffer(reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]), unregister_cb, free_cb);
             state->free_queue.buffer_ptrs[slot] = 0;
         }
         state->free_queue.head = tail;
@@ -879,7 +858,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
     // ProfilerBase's set_memory_context handed register_cb == nullptr iff the
     // caller doesn't intend to register, so checking unregister_cb inside
     // release_one_buffer is sufficient — no separate ``was_registered_`` flag.
-    release_one_buffer(perf_shared_mem_dev_, unregister_cb, free_cb, user_data);
+    release_one_buffer(perf_shared_mem_dev_, unregister_cb, free_cb);
     LOG_DEBUG("Main shm released");
 
     perf_shared_mem_dev_ = nullptr;

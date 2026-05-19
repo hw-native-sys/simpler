@@ -40,7 +40,7 @@
 TensorDumpCollector::~TensorDumpCollector() { stop(); }
 
 void *TensorDumpCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size, user_data_);
+    void *dev_ptr = alloc_cb_(size);
     if (dev_ptr == nullptr) {
         return nullptr;
     }
@@ -49,7 +49,7 @@ void *TensorDumpCollector::alloc_single_buffer(size_t size, void **host_ptr_out)
     if (register_cb_ != nullptr) {
         int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
         if (rc != 0) {
-            free_cb_(dev_ptr, user_data_);
+            free_cb_(dev_ptr);
             return nullptr;
         }
     }
@@ -61,18 +61,18 @@ void *TensorDumpCollector::alloc_single_buffer(size_t size, void **host_ptr_out)
 }
 
 int TensorDumpCollector::initialize(
-    int num_dump_threads, int device_id, DumpAllocCallback alloc_cb, DumpRegisterCallback register_cb,
-    DumpFreeCallback free_cb, void *user_data, const std::string &output_prefix
+    int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
+    const DumpFreeCallback &free_cb, const std::string &output_prefix
 ) {
     num_dump_threads_ = num_dump_threads;
     output_prefix_ = output_prefix;
 
     // Stash the memory context on the base up-front so alloc_single_buffer (and
-    // any other helper that reads alloc_cb_/register_cb_/free_cb_/user_data_)
+    // any other helper that reads alloc_cb_/register_cb_/free_cb_)
     // sees consistent values during init. shm_host_ stays nullptr until the
     // shm allocation succeeds — that nullptr guard makes a post-failure
     // start(tf) a no-op without further bookkeeping.
-    set_memory_context(alloc_cb, register_cb, free_cb, user_data, /*shm_host=*/nullptr, device_id);
+    set_memory_context(alloc_cb, register_cb, free_cb, /*shm_host=*/nullptr, device_id);
 
     // Allocate dump shared memory (header + buffer states)
     size_t shm_size = calc_dump_data_size(num_dump_threads);
@@ -242,14 +242,14 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         DumpedTensor meta = dt;
         meta.bytes.clear();
         {
-            std::lock_guard<std::mutex> lock(collected_mutex_);
+            std::scoped_lock<std::mutex> lock(collected_mutex_);
             collected_.push_back(std::move(meta));
         }
 
         // Enqueue full tensor (with payload) to writer thread
         if (has_payload) {
             {
-                std::lock_guard<std::mutex> lock(write_mutex_);
+                std::scoped_lock<std::mutex> lock(write_mutex_);
                 write_queue_.push(std::move(dt));
             }
             write_cv_.notify_one();
@@ -564,21 +564,19 @@ int TensorDumpCollector::export_dump_files() {
     return 0;
 }
 
-int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, DumpFreeCallback free_cb, void *user_data) {
+int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const DumpFreeCallback &free_cb) {
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
     stop();
 
+    // DumpMetaBuffers appear in multiple lists (per-thread free_queues,
+    // recycled pool); dedup so each dev_ptr funnels through the shared
+    // ProfilerBase RAII helper exactly once.
     std::unordered_set<void *> released_meta_buffers;
     auto release_meta_buffer = [&](void *ptr) {
         if (ptr == nullptr || !released_meta_buffers.insert(ptr).second) {
             return;
         }
-        if (was_registered_ && unregister_cb) {
-            unregister_cb(ptr, device_id_);
-        }
-        if (free_cb) {
-            free_cb(ptr, user_data);
-        }
+        release_one_buffer(ptr, was_registered_ ? unregister_cb : nullptr, free_cb);
     };
 
     // Free DumpMetaBuffers still in free_queues and current_buf_ptr
@@ -613,29 +611,19 @@ int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, DumpFree
     });
     manager_.clear_mappings();
 
-    // Free arenas
+    // Free arenas through the shared RAII helper.
     for (auto &ai : arenas_) {
         if (ai.dev_ptr) {
-            if (unregister_cb) {
-                unregister_cb(ai.dev_ptr, device_id_);
-            }
-            if (free_cb) {
-                free_cb(ai.dev_ptr, user_data);
-            }
+            release_one_buffer(ai.dev_ptr, unregister_cb, free_cb);
             ai.dev_ptr = nullptr;
             ai.host_ptr = nullptr;
         }
     }
     arenas_.clear();
 
-    // Free shared memory
+    // Free shared memory through the same helper.
     if (dump_shared_mem_dev_) {
-        if (was_registered_ && unregister_cb) {
-            unregister_cb(dump_shared_mem_dev_, device_id_);
-        }
-        if (free_cb) {
-            free_cb(dump_shared_mem_dev_, user_data);
-        }
+        release_one_buffer(dump_shared_mem_dev_, was_registered_ ? unregister_cb : nullptr, free_cb);
         dump_shared_mem_dev_ = nullptr;
         shm_host_ = nullptr;
     }

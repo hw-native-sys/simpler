@@ -46,7 +46,7 @@
 TensorDumpCollector::~TensorDumpCollector() { stop(); }
 
 void *TensorDumpCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size, user_data_);
+    void *dev_ptr = alloc_cb_(size);
     if (dev_ptr == nullptr) {
         if (host_ptr_out) *host_ptr_out = nullptr;
         return nullptr;
@@ -57,7 +57,7 @@ void *TensorDumpCollector::alloc_single_buffer(size_t size, void **host_ptr_out)
         int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
         if (rc != 0 || host_ptr == nullptr) {
             LOG_ERROR("TensorDumpCollector: register failed: %d", rc);
-            free_cb_(dev_ptr, user_data_);
+            free_cb_(dev_ptr);
             if (host_ptr_out) *host_ptr_out = nullptr;
             return nullptr;
         }
@@ -67,7 +67,7 @@ void *TensorDumpCollector::alloc_single_buffer(size_t size, void **host_ptr_out)
         host_ptr = std::malloc(size);
         if (host_ptr == nullptr) {
             LOG_ERROR("TensorDumpCollector: host shadow alloc failed for %zu bytes", size);
-            free_cb_(dev_ptr, user_data_);
+            free_cb_(dev_ptr);
             if (host_ptr_out) *host_ptr_out = nullptr;
             return nullptr;
         }
@@ -80,8 +80,8 @@ void *TensorDumpCollector::alloc_single_buffer(size_t size, void **host_ptr_out)
 }
 
 int TensorDumpCollector::initialize(
-    int num_dump_threads, int device_id, DumpAllocCallback alloc_cb, DumpRegisterCallback register_cb,
-    DumpFreeCallback free_cb, void *user_data, const std::string &output_prefix
+    int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
+    const DumpFreeCallback &free_cb, const std::string &output_prefix
 ) {
     if (shm_host_ != nullptr) {
         LOG_ERROR("TensorDumpCollector already initialized");
@@ -92,12 +92,12 @@ int TensorDumpCollector::initialize(
     output_prefix_ = output_prefix;
 
     // Stash the memory context on the base up-front so alloc_single_buffer
-    // (which reads alloc_cb_/register_cb_/free_cb_/user_data_/device_id_)
+    // (which reads alloc_cb_/register_cb_/free_cb_/device_id_)
     // sees consistent values during init. shm_host_ stays nullptr until the
     // shm allocation succeeds — that nullptr guard makes a post-failure
     // start(tf) a no-op without further bookkeeping.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, user_data, /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        alloc_cb, register_cb, free_cb, /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
     // Allocate dump shared memory (header + buffer states)
@@ -175,7 +175,7 @@ int TensorDumpCollector::initialize(
     // gates on shm_host_ being non-null, so this re-set_memory_context call
     // is the moment the collector becomes startable.
     dump_shared_mem_dev_ = shm_dev_local;
-    set_memory_context(alloc_cb, register_cb, free_cb, user_data, shm_dev_local, shm_host_local, shm_size, device_id);
+    set_memory_context(alloc_cb, register_cb, free_cb, shm_dev_local, shm_host_local, shm_size, device_id);
 
     LOG_INFO_V0(
         "Tensor dump initialized: %d threads, arena=%lu MB/thread, %d buffers/thread", num_dump_threads,
@@ -304,14 +304,14 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         DumpedTensor meta = dt;
         meta.bytes.clear();
         {
-            std::lock_guard<std::mutex> lock(collected_mutex_);
+            std::scoped_lock<std::mutex> lock(collected_mutex_);
             collected_.push_back(std::move(meta));
         }
 
         // Enqueue full tensor (with payload) to writer thread
         if (has_payload) {
             {
-                std::lock_guard<std::mutex> lock(write_mutex_);
+                std::scoped_lock<std::mutex> lock(write_mutex_);
                 write_queue_.push(std::move(dt));
             }
             write_cv_.notify_one();
@@ -609,20 +609,14 @@ int TensorDumpCollector::export_dump_files() {
     return 0;
 }
 
-int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, DumpFreeCallback free_cb, void *user_data) {
+int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const DumpFreeCallback &free_cb) {
     if (shm_host_ == nullptr) return 0;
 
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
     stop();
 
     auto release_dev = [&](void *p) {
-        if (p == nullptr) return;
-        if (unregister_cb != nullptr) {
-            unregister_cb(p, device_id_);
-        }
-        if (free_cb != nullptr) {
-            free_cb(p, user_data);
-        }
+        release_one_buffer(p, unregister_cb, free_cb);
     };
 
     // Free DumpMetaBuffers still in per-thread free_queues / current_buf_ptr.

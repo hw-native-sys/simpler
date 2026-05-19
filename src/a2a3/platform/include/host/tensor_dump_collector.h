@@ -116,38 +116,14 @@ struct DumpModule {
 // Memory operation callbacks (injected by DeviceRunner)
 // ---------------------------------------------------------------------------
 
-/**
- * Allocate device memory.
- *
- * @param size       Bytes to allocate
- * @param user_data  Opaque allocator context
- * @return Device pointer, or nullptr on failure
- */
-using DumpAllocCallback = void *(*)(size_t size, void *user_data);
-
-/**
- * Register device memory for host-visible access. nullptr in sim mode
- * (dev pointer is directly host-accessible). Stateless: HAL state is global,
- * so no user_data is threaded through.
- *
- * @param dev_ptr        Device memory pointer
- * @param size           Bytes
- * @param device_id      Device ID
- * @param[out] host_ptr  Host-mapped pointer
- * @return 0 on success, error code on failure
- */
-using DumpRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
-
-/**
- * Unregister a previously registered host-visible mapping. May be nullptr.
- * Stateless (see register_cb).
- */
-using DumpUnregisterCallback = int (*)(void *dev_ptr, int device_id);
-
-/**
- * Free device memory.
- */
-using DumpFreeCallback = int (*)(void *dev_ptr, void *user_data);
+// Memory callbacks — thin aliases for the canonical profiling_common shapes.
+// alloc / free are std::function so callers bind their MemoryAllocator via
+// lambda capture; register / unregister stay as plain function pointers
+// because they wrap stateless HAL globals (halHost*).
+using DumpAllocCallback = profiling_common::ProfAllocCallback;
+using DumpRegisterCallback = profiling_common::ProfRegisterCallback;
+using DumpUnregisterCallback = profiling_common::ProfUnregisterCallback;
+using DumpFreeCallback = profiling_common::ProfFreeCallback;
 
 // =============================================================================
 // TensorDumpCollector
@@ -213,8 +189,8 @@ public:
      * @return 0 on success, error code on failure
      */
     int initialize(
-        int num_dump_threads, int device_id, DumpAllocCallback alloc_cb, DumpRegisterCallback register_cb,
-        DumpFreeCallback free_cb, void *user_data, const std::string &output_prefix
+        int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
+        const DumpFreeCallback &free_cb, const std::string &output_prefix
     );
 
     /**
@@ -248,7 +224,7 @@ public:
      * DumpMetaBuffers held by the framework or still in per-pool free
      * queues). Idempotent on a collector that was never initialized.
      */
-    int finalize(DumpUnregisterCallback unregister_cb, DumpFreeCallback free_cb, void *user_data);
+    int finalize(DumpUnregisterCallback unregister_cb, const DumpFreeCallback &free_cb);
 
     /**
      * @return true if initialize() succeeded and finalize() has not run.

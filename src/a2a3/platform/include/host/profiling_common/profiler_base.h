@@ -84,7 +84,7 @@
  *
  * Lifecycle (the only correct teardown order):
  *   1. Derived::init() — on the success path, calls set_memory_context() to
- *      stash the alloc/reg/free callbacks, user_data, shm_host pointer and
+ *      stash the alloc/reg/free callbacks, shm_host pointer and
  *      device_id on the base. If init aborts before that, start(tf) becomes
  *      a no-op (shm_host_ stays nullptr).
  *   2. start(tf) — atomically: (a) assembles a MemoryOps from the stashed
@@ -137,12 +137,19 @@
 
 namespace profiling_common {
 
-// Common subsystem callback signatures. All three collectors (PMU / TensorDump
-// / L2Perf) used to declare their own typedefs with identical shapes; these
-// are the canonical types stashed in ProfilerBase via set_memory_context().
-using ProfAllocCallback = void *(*)(size_t size, void *user_data);
+// Common subsystem callback signatures. All four collectors (PMU / TensorDump
+// / L2Perf / DepGen) used to declare their own typedefs with identical
+// shapes; these are the canonical types stashed in ProfilerBase via
+// set_memory_context().
+//
+// Alloc / free use std::function so callers can bind state (e.g. their
+// MemoryAllocator) directly via lambda capture. Register / unregister stay
+// as plain function pointers — they wrap stateless HAL globals (halHost*),
+// so the captureless C-callback shape matches their actual nature.
+using ProfAllocCallback = std::function<void *(size_t size)>;
 using ProfRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr_out);
-using ProfFreeCallback = int (*)(void *dev_ptr, void *user_data);
+using ProfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
+using ProfFreeCallback = std::function<int(void *dev_ptr)>;
 
 // Result of Module::resolve_entry. Carries everything the unified
 // process_entry algorithm needs to (a) refill the originating pool's free
@@ -322,13 +329,12 @@ public:
      * no-op.
      */
     void set_memory_context(
-        ProfAllocCallback alloc_cb, ProfRegisterCallback register_cb, ProfFreeCallback free_cb, void *user_data,
+        const ProfAllocCallback &alloc_cb, ProfRegisterCallback register_cb, const ProfFreeCallback &free_cb,
         void *shm_host, int device_id
     ) {
         alloc_cb_ = alloc_cb;
         register_cb_ = register_cb;
         free_cb_ = free_cb;
-        user_data_ = user_data;
         shm_host_ = shm_host;
         device_id_ = device_id;
     }
@@ -341,7 +347,6 @@ public:
         alloc_cb_ = nullptr;
         register_cb_ = nullptr;
         free_cb_ = nullptr;
-        user_data_ = nullptr;
         shm_host_ = nullptr;
         device_id_ = -1;
     }
@@ -361,12 +366,8 @@ public:
         if (shm_host_ == nullptr) return;
 
         MemoryOps ops;
-        ops.alloc = [cb = alloc_cb_, ud = user_data_](size_t size) {
-            return cb(size, ud);
-        };
-        ops.free_ = [cb = free_cb_, ud = user_data_](void *dev_ptr) {
-            return cb(dev_ptr, ud);
-        };
+        ops.alloc = alloc_cb_;
+        ops.free_ = free_cb_;
         if (register_cb_ != nullptr) {
             ops.reg = register_cb_;
         } else {
@@ -426,9 +427,35 @@ protected:
     ProfAllocCallback alloc_cb_{nullptr};
     ProfRegisterCallback register_cb_{nullptr};
     ProfFreeCallback free_cb_{nullptr};
-    void *user_data_{nullptr};
     void *shm_host_{nullptr};
     int device_id_{-1};
+
+    /**
+     * RAII counterpart of ``alloc_single_buffer``: unregister the host
+     * mapping (if there is one) then release the device memory. Each
+     * Derived's ``finalize()`` funnels every release site through here so
+     * the framework never frees a dev_ptr without first taking down the
+     * matching ``halHostRegister`` slot — leak in a session-scoped Worker
+     * that re-enters ``init`` would otherwise blow the per-device
+     * registration table.
+     *
+     * Caller still gates by whatever per-Derived flag tracks "did this
+     * collector actually register" (e.g. PMU's ``buffers_registered_``)
+     * by passing nullptr for ``unregister_cb`` when no registration was
+     * installed at init.
+     */
+    void release_one_buffer(void *dev_ptr, ProfUnregisterCallback unregister_cb, const ProfFreeCallback &free_cb) {
+        if (dev_ptr == nullptr) return;
+        if (unregister_cb != nullptr) {
+            int rc = unregister_cb(dev_ptr, device_id_);
+            if (rc != 0) {
+                LOG_ERROR("halHostUnregister failed for dev_ptr %p: %d", dev_ptr, rc);
+            }
+        }
+        if (free_cb) {
+            free_cb(dev_ptr);
+        }
+    }
 
 private:
     /**

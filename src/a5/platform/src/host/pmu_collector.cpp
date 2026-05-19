@@ -39,7 +39,7 @@
 PmuCollector::~PmuCollector() { stop(); }
 
 void *PmuCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size, user_data_);
+    void *dev_ptr = alloc_cb_(size);
     if (dev_ptr == nullptr) {
         if (host_ptr_out) *host_ptr_out = nullptr;
         return nullptr;
@@ -50,7 +50,7 @@ void *PmuCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
         int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
         if (rc != 0 || host_ptr == nullptr) {
             LOG_ERROR("PmuCollector: register failed: %d", rc);
-            free_cb_(dev_ptr, user_data_);
+            free_cb_(dev_ptr);
             if (host_ptr_out) *host_ptr_out = nullptr;
             return nullptr;
         }
@@ -58,7 +58,7 @@ void *PmuCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
         host_ptr = std::malloc(size);
         if (host_ptr == nullptr) {
             LOG_ERROR("PmuCollector: host shadow alloc failed for %zu bytes", size);
-            free_cb_(dev_ptr, user_data_);
+            free_cb_(dev_ptr);
             if (host_ptr_out) *host_ptr_out = nullptr;
             return nullptr;
         }
@@ -76,8 +76,8 @@ void *PmuCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
 // ---------------------------------------------------------------------------
 
 int PmuCollector::init(
-    int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, PmuAllocCallback alloc_cb,
-    PmuRegisterCallback register_cb, PmuFreeCallback free_cb, void *user_data, int device_id
+    int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type,
+    const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb, const PmuFreeCallback &free_cb, int device_id
 ) {
     if (num_cores <= 0 || num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
         LOG_ERROR("PmuCollector::init: invalid arguments");
@@ -102,7 +102,7 @@ int PmuCollector::init(
     // consistent values during init. shm_host_ stays nullptr until the shm
     // allocation succeeds — start(tf) gates on shm_host_.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, user_data, /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        alloc_cb, register_cb, free_cb, /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
     // ---- Allocate shared header + buffer-state region ----
@@ -139,7 +139,7 @@ int PmuCollector::init(
         PmuBufferState *state = get_pmu_buffer_state(shm_host_local, c);
 
         // Allocate the per-core stable PmuAicoreRing (no host shadow needed).
-        void *ring_dev = alloc_cb(sizeof(PmuAicoreRing), user_data);
+        void *ring_dev = alloc_cb(sizeof(PmuAicoreRing));
         if (ring_dev == nullptr) {
             LOG_ERROR("PmuCollector: failed to allocate PmuAicoreRing for core %d", c);
             return -1;
@@ -199,7 +199,7 @@ int PmuCollector::init(
     // Re-set_memory_context now that the shm region is ready. start(tf)
     // gates on shm_host_ being non-null, so this is the moment the
     // collector becomes startable.
-    set_memory_context(alloc_cb, register_cb, free_cb, user_data, shm_dev_local, shm_host_local, shm_size, device_id);
+    set_memory_context(alloc_cb, register_cb, free_cb, shm_dev_local, shm_host_local, shm_size, device_id);
 
     LOG_INFO_V0(
         "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
@@ -230,7 +230,7 @@ void PmuCollector::write_buffer_to_csv(int core_id, int thread_idx, const void *
     }
     if (n == 0) return;
 
-    std::lock_guard<std::mutex> lock(csv_mutex_);
+    std::scoped_lock<std::mutex> lock(csv_mutex_);
     ensure_csv_open_unlocked();
     if (!csv_file_.is_open()) return;
     total_collected_ += n;
@@ -379,7 +379,7 @@ void PmuCollector::reconcile_counters() {
 // finalize
 // ---------------------------------------------------------------------------
 
-void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, PmuFreeCallback free_cb, void *user_data) {
+void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCallback &free_cb) {
     if (!initialized_) return;
 
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
@@ -390,13 +390,7 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, PmuFreeCallback
     }
 
     auto release_dev = [&](void *p) {
-        if (p == nullptr) return;
-        if (unregister_cb != nullptr) {
-            unregister_cb(p, device_id_);
-        }
-        if (free_cb != nullptr) {
-            free_cb(p, user_data);
-        }
+        release_one_buffer(p, unregister_cb, free_cb);
     };
 
     // Free buffers still parked in per-core free_queues / current_buf_ptr.
