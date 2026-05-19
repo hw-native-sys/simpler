@@ -273,6 +273,37 @@ class Orchestrator:
         )
         return bytes(data), int(route), int(correlation_id)
 
+    def open_shared_memory(self, worker_id: int, data_bytes: int, signal_count: int = 2, flags: int = 0) -> int:
+        """Open a host/device shared-memory region on next-level worker *worker_id*."""
+        return int(self._o.open_shared_memory(int(worker_id), int(data_bytes), int(signal_count), int(flags)))
+
+    def close_shared_memory(self, worker_id: int, memory: int) -> None:
+        """Close a shared-memory region returned by ``open_shared_memory``."""
+        self._o.close_shared_memory(int(worker_id), int(memory))
+
+    def shared_memory_info(self, worker_id: int, memory: int) -> tuple[int, int, int, int, int]:
+        """Return ``(host_ptr, device_ptr, data_bytes, signal_count, flags)``."""
+        host_ptr, device_ptr, data_bytes, signal_count, flags = self._o.shared_memory_info(int(worker_id), int(memory))
+        return int(host_ptr), int(device_ptr), int(data_bytes), int(signal_count), int(flags)
+
+    def shared_memory_read(self, worker_id: int, memory: int, offset: int, nbytes: int) -> bytes:
+        """Read bytes from a shared-memory data region."""
+        return bytes(self._o.shared_memory_read(int(worker_id), int(memory), int(offset), int(nbytes)))
+
+    def shared_memory_write(self, worker_id: int, memory: int, offset: int, data: bytes) -> None:
+        """Write bytes into a shared-memory data region."""
+        self._o.shared_memory_write(int(worker_id), int(memory), int(offset), bytes(data))
+
+    def shared_memory_notify(self, worker_id: int, memory: int, signal_id: int, value: int) -> None:
+        """Publish a software signal value for a shared-memory region."""
+        self._o.shared_memory_notify(int(worker_id), int(memory), int(signal_id), int(value))
+
+    def shared_memory_wait(
+        self, worker_id: int, memory: int, signal_id: int, target: int, timeout_us: int = 0
+    ) -> None:
+        """Wait until a shared-memory software signal reaches ``target``."""
+        self._o.shared_memory_wait(int(worker_id), int(memory), int(signal_id), int(target), int(timeout_us))
+
     def alloc(self, shape: Sequence[int], dtype: DataType) -> ContinuousTensor:
         """Allocate a runtime-managed intermediate buffer.
 

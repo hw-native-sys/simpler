@@ -45,6 +45,7 @@
 #include "scope.h"
 #include "tensormap.h"
 #include "types.h"
+#include "../worker/pto_runtime_c_api.h"
 
 class WorkerManager;
 
@@ -99,6 +100,13 @@ public:
     void channel_send(int worker_id, uint64_t ch, uint32_t route, const std::vector<uint8_t> &data, uint64_t correlation_id);
     std::vector<uint8_t>
     channel_recv(int worker_id, uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *route, uint64_t *correlation_id);
+    uint64_t open_shared_memory(int worker_id, uint64_t data_bytes, uint32_t signal_count, uint32_t flags);
+    void close_shared_memory(int worker_id, uint64_t mem);
+    HostDeviceMemoryInfo shared_memory_info(int worker_id, uint64_t mem);
+    std::vector<uint8_t> shared_memory_read(int worker_id, uint64_t mem, uint64_t offset, size_t nbytes);
+    void shared_memory_write(int worker_id, uint64_t mem, uint64_t offset, const std::vector<uint8_t> &data);
+    void shared_memory_notify(int worker_id, uint64_t mem, uint32_t signal_id, uint64_t value);
+    void shared_memory_wait(int worker_id, uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us);
 
     // Submit a NEXT_LEVEL task. `callable_id` is a cid registered via
     // Worker.register(): the chip child looks it up in its COW-inherited

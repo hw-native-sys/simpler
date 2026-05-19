@@ -22,6 +22,7 @@
 #include "task_args.h"
 
 #include <new>
+#include <cstdlib>
 #include <pthread.h>
 
 #include <chrono>
@@ -33,6 +34,7 @@
 #include "cpu_sim_context.h"
 #include "device_runner.h"
 #include "host_device_channel.h"
+#include "host_device_memory.h"
 #include "runtime.h"
 
 extern "C" {
@@ -216,6 +218,58 @@ int host_device_recv_ctx(
     return host_device_channel_recv_cpu(
         static_cast<HostDeviceChannel *>(ch), dst, dst_capacity, out_nbytes, out_correlation_id, out_route, timeout_us
     );
+}
+
+
+HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, const HostDeviceMemoryConfig *cfg) {
+    (void)ctx;
+    size_t bytes = host_device_memory_required_bytes(cfg);
+    if (bytes == 0) return NULL;
+    void *base = NULL;
+    if (posix_memalign(&base, 64, bytes) != 0) return NULL;
+    HostDeviceMemory *mem = host_device_memory_wrap(base, base, bytes, cfg, 1, free);
+    if (mem == nullptr) {
+        free(base);
+        return NULL;
+    }
+    return static_cast<HostDeviceMemoryHandle>(mem);
+}
+
+int close_host_device_memory_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem) {
+    (void)ctx;
+    host_device_memory_destroy(static_cast<HostDeviceMemory *>(mem));
+    return HDMEM_OK;
+}
+
+int host_device_memory_info_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, HostDeviceMemoryInfo *info) {
+    (void)ctx;
+    return host_device_memory_info(static_cast<HostDeviceMemory *>(mem), info);
+}
+
+int host_device_memory_read_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, void *dst, size_t nbytes
+) {
+    (void)ctx;
+    return host_device_memory_read(static_cast<HostDeviceMemory *>(mem), offset, dst, nbytes);
+}
+
+int host_device_memory_write_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, const void *src, size_t nbytes
+) {
+    (void)ctx;
+    return host_device_memory_write(static_cast<HostDeviceMemory *>(mem), offset, src, nbytes);
+}
+
+int host_device_memory_notify_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value) {
+    (void)ctx;
+    return host_device_memory_notify(static_cast<HostDeviceMemory *>(mem), signal_id, value);
+}
+
+int host_device_memory_wait_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
+) {
+    (void)ctx;
+    return host_device_memory_wait(static_cast<HostDeviceMemory *>(mem), signal_id, target, timeout_us);
 }
 
 int finalize_device(DeviceContextHandle ctx) {

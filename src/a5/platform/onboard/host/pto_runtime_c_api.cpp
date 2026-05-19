@@ -31,6 +31,7 @@
 #include "common/unified_log.h"
 #include "device_runner.h"
 #include "host_device_channel.h"
+#include "host_device_memory.h"
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
@@ -222,6 +223,67 @@ int host_device_recv_ctx(
     (void)out_route;
     (void)timeout_us;
     return HDCH_ERR_BACKEND;
+}
+
+
+HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, const HostDeviceMemoryConfig *cfg) {
+    (void)ctx;
+    (void)cfg;
+    return NULL;
+}
+
+int close_host_device_memory_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem) {
+    (void)ctx;
+    (void)mem;
+    return HDMEM_ERR_BACKEND;
+}
+
+int host_device_memory_info_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, HostDeviceMemoryInfo *info) {
+    (void)ctx;
+    (void)mem;
+    (void)info;
+    return HDMEM_ERR_BACKEND;
+}
+
+int host_device_memory_read_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, void *dst, size_t nbytes
+) {
+    (void)ctx;
+    (void)mem;
+    (void)offset;
+    (void)dst;
+    (void)nbytes;
+    return HDMEM_ERR_BACKEND;
+}
+
+int host_device_memory_write_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, const void *src, size_t nbytes
+) {
+    (void)ctx;
+    (void)mem;
+    (void)offset;
+    (void)src;
+    (void)nbytes;
+    return HDMEM_ERR_BACKEND;
+}
+
+int host_device_memory_notify_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value) {
+    (void)ctx;
+    (void)mem;
+    (void)signal_id;
+    (void)value;
+    return HDMEM_ERR_BACKEND;
+}
+
+int host_device_memory_wait_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
+) {
+    (void)ctx;
+    (void)mem;
+    (void)signal_id;
+    (void)target;
+    (void)timeout_us;
+    return HDMEM_ERR_BACKEND;
 }
 
 int finalize_device(DeviceContextHandle ctx) {

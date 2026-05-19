@@ -48,6 +48,7 @@ extern "C" {
 typedef void *RuntimeHandle;
 typedef void *DeviceContextHandle;
 typedef void *HostDeviceChannelHandle;
+typedef void *HostDeviceMemoryHandle;
 
 typedef struct {
     uint32_t lane_count_cpu_to_l2;
@@ -56,6 +57,20 @@ typedef struct {
     uint32_t max_message_bytes;
     uint32_t flags;
 } HostDeviceChannelConfig;
+
+typedef struct {
+    uint64_t data_bytes;
+    uint32_t signal_count;
+    uint32_t flags;
+} HostDeviceMemoryConfig;
+
+typedef struct {
+    uint64_t host_ptr;
+    uint64_t device_ptr;
+    uint64_t data_bytes;
+    uint32_t signal_count;
+    uint32_t flags;
+} HostDeviceMemoryInfo;
 
 /**
  * Timing breakdown for a single run_prepared() invocation.
@@ -132,6 +147,33 @@ int host_device_send_ctx(
 int host_device_recv_ctx(
     DeviceContextHandle ctx, HostDeviceChannelHandle ch, void *dst, size_t dst_capacity, size_t *out_nbytes,
     uint64_t *out_correlation_id, uint32_t *out_route, uint32_t timeout_us
+);
+
+/** Open a host/device shared-memory region with software signal slots. */
+HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, const HostDeviceMemoryConfig *cfg);
+
+/** Close a memory region returned by open_host_device_memory_ctx. */
+int close_host_device_memory_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem);
+
+/** Return host/device data pointers and region metadata for a shared-memory region. */
+int host_device_memory_info_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, HostDeviceMemoryInfo *info);
+
+/** Copy from shared-memory data region into host dst. */
+int host_device_memory_read_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, void *dst, size_t nbytes
+);
+
+/** Copy from host src into shared-memory data region. */
+int host_device_memory_write_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, const void *src, size_t nbytes
+);
+
+/** Publish a software signal value after caller-visible writes. */
+int host_device_memory_notify_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value);
+
+/** Wait until a software signal value reaches target, or return -EAGAIN/-EWOULDBLOCK style error. */
+int host_device_memory_wait_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
 );
 
 /**

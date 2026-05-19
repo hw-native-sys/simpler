@@ -230,6 +230,7 @@ function(add_common_worker_test name src)
     add_executable(${name}
         ${src}
         ${CMAKE_SOURCE_DIR}/../../../src/common/worker/host_device_channel.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/worker/host_device_memory.cpp
     )
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
@@ -289,6 +290,7 @@ add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 add_common_worker_test(test_host_device_channel common/test_host_device_channel.cpp)
+add_common_worker_test(test_host_device_memory common/test_host_device_memory.cpp)
 
 # Per-callable_id orch SO file naming regression (see rtStreamSynchronize
 # 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`

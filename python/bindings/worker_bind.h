@@ -203,6 +203,62 @@ inline void bind_worker(nb::module_ &m) {
             "Receive a message through a host/device channel."
         )
         .def(
+            "open_shared_memory",
+            [](Orchestrator &self, int worker_id, uint64_t data_bytes, uint32_t signal_count, uint32_t flags) {
+                return self.open_shared_memory(worker_id, data_bytes, signal_count, flags);
+            },
+            nb::arg("worker_id"), nb::arg("data_bytes"), nb::arg("signal_count") = 2, nb::arg("flags") = 0,
+            "Open a host/device shared-memory region on a next-level worker."
+        )
+        .def(
+            "close_shared_memory",
+            [](Orchestrator &self, int worker_id, uint64_t memory) {
+                self.close_shared_memory(worker_id, memory);
+            },
+            nb::arg("worker_id"), nb::arg("memory"), "Close a host/device shared-memory region."
+        )
+        .def(
+            "shared_memory_info",
+            [](Orchestrator &self, int worker_id, uint64_t memory) {
+                HostDeviceMemoryInfo info = self.shared_memory_info(worker_id, memory);
+                return nb::make_tuple(info.host_ptr, info.device_ptr, info.data_bytes, info.signal_count, info.flags);
+            },
+            nb::arg("worker_id"), nb::arg("memory")
+        )
+        .def(
+            "shared_memory_read",
+            [](Orchestrator &self, int worker_id, uint64_t memory, uint64_t offset, size_t nbytes) {
+                auto data = self.shared_memory_read(worker_id, memory, offset, nbytes);
+                return nb::bytes(reinterpret_cast<const char *>(data.data()), data.size());
+            },
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("offset"), nb::arg("nbytes")
+        )
+        .def(
+            "shared_memory_write",
+            [](Orchestrator &self, int worker_id, uint64_t memory, uint64_t offset, nb::bytes data) {
+                std::string payload(data.c_str(), data.size());
+                std::vector<uint8_t> bytes(payload.begin(), payload.end());
+                self.shared_memory_write(worker_id, memory, offset, bytes);
+            },
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("offset"), nb::arg("data")
+        )
+        .def(
+            "shared_memory_notify",
+            [](Orchestrator &self, int worker_id, uint64_t memory, uint32_t signal_id, uint64_t value) {
+                self.shared_memory_notify(worker_id, memory, signal_id, value);
+            },
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("signal_id"), nb::arg("value")
+        )
+        .def(
+            "shared_memory_wait",
+            [](Orchestrator &self, int worker_id, uint64_t memory, uint32_t signal_id, uint64_t target,
+               uint32_t timeout_us) {
+                self.shared_memory_wait(worker_id, memory, signal_id, target, timeout_us);
+            },
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("signal_id"), nb::arg("target"),
+            nb::arg("timeout_us") = 0
+        )
+        .def(
             "alloc",
             [](Orchestrator &self, const std::vector<uint32_t> &shape, DataType dtype) {
                 return self.alloc(shape, dtype);

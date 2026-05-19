@@ -855,6 +855,72 @@ NB_MODULE(_task_interface, m) {
             nb::arg("channel"), nb::arg("capacity") = HDCH_MAX_INLINE_BYTES, nb::arg("timeout_us") = 0
         )
         .def(
+            "open_shared_memory",
+            [](ChipWorker &self, uint64_t data_bytes, uint32_t signal_count, uint32_t flags) {
+                HostDeviceMemoryConfig cfg{data_bytes, signal_count, flags};
+                return self.open_shared_memory(cfg);
+            },
+            nb::arg("data_bytes"), nb::arg("signal_count") = 2, nb::arg("flags") = 0,
+            "Open a host/device shared-memory region."
+        )
+        .def("close_shared_memory", &ChipWorker::close_shared_memory, nb::arg("memory"))
+        .def(
+            "shared_memory_info",
+            [](ChipWorker &self, uint64_t mem) {
+                HostDeviceMemoryInfo info = self.shared_memory_info(mem);
+                return nb::make_tuple(info.host_ptr, info.device_ptr, info.data_bytes, info.signal_count, info.flags);
+            },
+            nb::arg("memory")
+        )
+        .def(
+            "shared_memory_read",
+            [](ChipWorker &self, uint64_t mem, uint64_t offset, size_t nbytes) {
+                auto data = self.shared_memory_read(mem, offset, nbytes);
+                return nb::bytes(reinterpret_cast<const char *>(data.data()), data.size());
+            },
+            nb::arg("memory"), nb::arg("offset"), nb::arg("nbytes")
+        )
+        .def(
+            "shared_memory_write",
+            [](ChipWorker &self, uint64_t mem, uint64_t offset, nb::bytes data) {
+                std::string payload(data.c_str(), data.size());
+                self.shared_memory_write(mem, offset, payload.data(), payload.size());
+            },
+            nb::arg("memory"), nb::arg("offset"), nb::arg("data")
+        )
+        .def(
+            "shared_memory_notify", &ChipWorker::shared_memory_notify, nb::arg("memory"), nb::arg("signal_id"),
+            nb::arg("value")
+        )
+        .def(
+            "shared_memory_wait", &ChipWorker::shared_memory_wait, nb::arg("memory"), nb::arg("signal_id"),
+            nb::arg("target"), nb::arg("timeout_us") = 0
+        )
+        .def(
+            "shared_memory_read_l2_for_test",
+            [](ChipWorker &self, uint64_t mem, uint64_t offset, size_t nbytes) {
+                auto data = self.shared_memory_read_l2_for_test(mem, offset, nbytes);
+                return nb::bytes(reinterpret_cast<const char *>(data.data()), data.size());
+            },
+            nb::arg("memory"), nb::arg("offset"), nb::arg("nbytes")
+        )
+        .def(
+            "shared_memory_write_l2_for_test",
+            [](ChipWorker &self, uint64_t mem, uint64_t offset, nb::bytes data) {
+                std::string payload(data.c_str(), data.size());
+                self.shared_memory_write_l2_for_test(mem, offset, payload.data(), payload.size());
+            },
+            nb::arg("memory"), nb::arg("offset"), nb::arg("data")
+        )
+        .def(
+            "shared_memory_notify_l2_for_test", &ChipWorker::shared_memory_notify_l2_for_test,
+            nb::arg("memory"), nb::arg("signal_id"), nb::arg("value")
+        )
+        .def(
+            "shared_memory_wait_l2_for_test", &ChipWorker::shared_memory_wait_l2_for_test,
+            nb::arg("memory"), nb::arg("signal_id"), nb::arg("target"), nb::arg("timeout_us") = 0
+        )
+        .def(
             "comm_init", &ChipWorker::comm_init, nb::arg("rank"), nb::arg("nranks"), nb::arg("rootinfo_path"),
             "Initialize a communicator for this rank.  ChipWorker owns ACL + stream "
             "lifetime internally (onboard drives ensure_acl_ready + aclrtCreateStream; "

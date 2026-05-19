@@ -41,6 +41,7 @@
 
 #include "../task_interface/call_config.h"
 #include "types.h"
+#include "../worker/pto_runtime_c_api.h"
 
 class Ring;  // forward decl — owns the slot state pool
 class WorkerManager;
@@ -125,6 +126,13 @@ static constexpr uint64_t CTRL_OPEN_CHANNEL = 10;
 static constexpr uint64_t CTRL_CLOSE_CHANNEL = 11;
 static constexpr uint64_t CTRL_CHANNEL_SEND = 12;
 static constexpr uint64_t CTRL_CHANNEL_RECV = 13;
+static constexpr uint64_t CTRL_OPEN_SHARED_MEMORY = 14;
+static constexpr uint64_t CTRL_CLOSE_SHARED_MEMORY = 15;
+static constexpr uint64_t CTRL_SHARED_MEMORY_INFO = 16;
+static constexpr uint64_t CTRL_SHARED_MEMORY_READ = 17;
+static constexpr uint64_t CTRL_SHARED_MEMORY_WRITE = 18;
+static constexpr uint64_t CTRL_SHARED_MEMORY_NOTIFY = 19;
+static constexpr uint64_t CTRL_SHARED_MEMORY_WAIT = 20;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy; cid for register)
@@ -213,6 +221,13 @@ public:
     void control_close_channel(uint64_t ch);
     void control_channel_send(uint64_t ch, uint32_t route, const void *data, size_t size, uint64_t correlation_id);
     std::vector<uint8_t> control_channel_recv(uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *route, uint64_t *correlation_id);
+    uint64_t control_open_shared_memory(uint64_t data_bytes, uint32_t signal_count, uint32_t flags);
+    void control_close_shared_memory(uint64_t mem);
+    HostDeviceMemoryInfo control_shared_memory_info(uint64_t mem);
+    std::vector<uint8_t> control_shared_memory_read(uint64_t mem, uint64_t offset, size_t nbytes);
+    void control_shared_memory_write(uint64_t mem, uint64_t offset, const void *data, size_t nbytes);
+    void control_shared_memory_notify(uint64_t mem, uint32_t signal_id, uint64_t value);
+    void control_shared_memory_wait(uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us);
 
     // Pre-warm a chip child by triggering prepare_callable for `cid` in the
     // child via CTRL_PREPARE. Issued from the parent at end of init() so the

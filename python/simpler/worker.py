@@ -171,6 +171,13 @@ _CTRL_OPEN_CHANNEL = 10
 _CTRL_CLOSE_CHANNEL = 11
 _CTRL_CHANNEL_SEND = 12
 _CTRL_CHANNEL_RECV = 13
+_CTRL_OPEN_SHARED_MEMORY = 14
+_CTRL_CLOSE_SHARED_MEMORY = 15
+_CTRL_SHARED_MEMORY_INFO = 16
+_CTRL_SHARED_MEMORY_READ = 17
+_CTRL_SHARED_MEMORY_WRITE = 18
+_CTRL_SHARED_MEMORY_NOTIFY = 19
+_CTRL_SHARED_MEMORY_WAIT = 20
 
 # Reserved 32-byte region at the start of OFF_ARGS used by _CTRL_REGISTER to
 # carry the NUL-terminated POSIX shm name. POSIX shm names on Linux are
@@ -608,6 +615,46 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     struct.pack_into("Q", buf, _CTRL_OFF_RESULT, len(data))
                     struct.pack_into("Q", buf, _CTRL_OFF_ARG3, route)
                     struct.pack_into("Q", buf, _CTRL_OFF_ARG4, cid)
+                elif sub_cmd == _CTRL_OPEN_SHARED_MEMORY:
+                    data_bytes = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0])
+                    signal_count = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    flags = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    mem = cw.open_shared_memory(data_bytes, signal_count, flags)
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, mem)
+                elif sub_cmd == _CTRL_CLOSE_SHARED_MEMORY:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    cw.close_shared_memory(mem)
+                elif sub_cmd == _CTRL_SHARED_MEMORY_INFO:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    host_ptr, device_ptr, data_bytes, signal_count, flags = cw.shared_memory_info(mem)
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, host_ptr)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG1, device_ptr)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG2, data_bytes)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG3, signal_count)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG4, flags)
+                elif sub_cmd == _CTRL_SHARED_MEMORY_READ:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    offset = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    n = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    data = cw.shared_memory_read(mem, offset, n)
+                    buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + len(data)] = data
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, len(data))
+                elif sub_cmd == _CTRL_SHARED_MEMORY_WRITE:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    offset = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    n = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    cw.shared_memory_write(mem, offset, bytes(buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + n]))
+                elif sub_cmd == _CTRL_SHARED_MEMORY_NOTIFY:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    signal_id = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    value = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    cw.shared_memory_notify(mem, signal_id, value)
+                elif sub_cmd == _CTRL_SHARED_MEMORY_WAIT:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    signal_id = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    target = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    timeout_us = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0])
+                    cw.shared_memory_wait(mem, signal_id, target, timeout_us)
             except Exception as e:  # noqa: BLE001
                 code = 1
                 if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
@@ -1647,6 +1694,12 @@ class Worker:
         if worker_id < 0 or worker_id >= len(self._chip_shms):
             raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
 
+    def _chip_control(
+        self, worker_id: int, sub_cmd: int, arg0: int = 0, arg1: int = 0, arg2: int = 0, arg3: int = 0
+    ) -> int:
+        """Send a control command without payload. Returns the uint64 result field."""
+        return self._chip_control_payload(worker_id, sub_cmd, arg0=arg0, arg1=arg1, arg2=arg2, arg3=arg3)[0]
+
     def _chip_control_payload(
         self,
         worker_id: int,
@@ -1657,8 +1710,8 @@ class Worker:
         arg3: int = 0,
         payload: bytes = b"",
         recv_capacity: int = 0,
-    ) -> tuple[int, bytes, int, int]:
-        """Send a control command with a mailbox payload. Returns result, payload, arg3, arg4."""
+    ) -> tuple[int, bytes, int, int, int, int]:
+        """Send a control command with a mailbox payload. Returns result, payload, arg1, arg2, arg3, arg4."""
         if worker_id < 0 or worker_id >= len(self._chip_shms):
             raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
         if len(payload) > _CTRL_PAYLOAD_CAPACITY:
@@ -1686,11 +1739,13 @@ class Worker:
             _mailbox_store_i32(state_addr, _IDLE)
             raise RuntimeError(f"chip control command {sub_cmd} failed on worker {worker_id}: {err_msg}")
         result = struct.unpack_from("Q", buf, _CTRL_OFF_RESULT)[0]
+        out_arg1 = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+        out_arg2 = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
         out_arg3 = struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0]
         out_arg4 = struct.unpack_from("Q", buf, _CTRL_OFF_ARG4)[0]
         out_payload = bytes(buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + min(int(result), recv_capacity)])
         _mailbox_store_i32(state_addr, _IDLE)
-        return int(result), out_payload, int(out_arg3), int(out_arg4)
+        return int(result), out_payload, int(out_arg1), int(out_arg2), int(out_arg3), int(out_arg4)
 
     def malloc(self, size: int, worker_id: int = 0) -> int:
         """Allocate memory on next-level chip worker *worker_id*. Returns a pointer."""
@@ -1789,7 +1844,7 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             return self._chip_worker.channel_recv(channel, capacity, timeout_us)
-        nbytes, payload, route, correlation_id = self._chip_control_payload(
+        nbytes, payload, _arg1, _arg2, route, correlation_id = self._chip_control_payload(
             worker_id,
             _CTRL_CHANNEL_RECV,
             arg0=channel,
@@ -1798,6 +1853,88 @@ class Worker:
             recv_capacity=capacity,
         )
         return payload[:nbytes], route, correlation_id
+
+    def open_shared_memory(self, data_bytes: int, signal_count: int = 2, flags: int = 0, worker_id: int = 0) -> int:
+        """Open a host/device shared-memory region on next-level worker *worker_id*."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.open_shared_memory(data_bytes, signal_count, flags)
+        return self._chip_control_payload(
+            worker_id,
+            _CTRL_OPEN_SHARED_MEMORY,
+            arg0=data_bytes,
+            arg1=signal_count,
+            arg2=flags,
+        )[0]
+
+    def close_shared_memory(self, memory: int, worker_id: int = 0) -> None:
+        """Close a shared-memory region returned by ``open_shared_memory``."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.close_shared_memory(memory)
+            return
+        self._chip_control(worker_id, _CTRL_CLOSE_SHARED_MEMORY, arg0=memory)
+
+    def shared_memory_info(self, memory: int, worker_id: int = 0) -> tuple[int, int, int, int, int]:
+        """Return ``(host_ptr, device_ptr, data_bytes, signal_count, flags)``."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.shared_memory_info(memory)
+        host_ptr, _payload, device_ptr, data_bytes, signal_count, flags = self._chip_control_payload(
+            worker_id, _CTRL_SHARED_MEMORY_INFO, arg0=memory
+        )
+        return int(host_ptr), int(device_ptr), int(data_bytes), int(signal_count), int(flags)
+
+    def shared_memory_read(self, memory: int, offset: int, nbytes: int, worker_id: int = 0) -> bytes:
+        """Read bytes from a shared-memory data region."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.shared_memory_read(memory, offset, nbytes)
+        out_nbytes, payload, _arg1, _arg2, _arg3, _arg4 = self._chip_control_payload(
+            worker_id,
+            _CTRL_SHARED_MEMORY_READ,
+            arg0=memory,
+            arg1=offset,
+            arg2=nbytes,
+            recv_capacity=nbytes,
+        )
+        return payload[:out_nbytes]
+
+    def shared_memory_write(self, memory: int, offset: int, data: bytes, worker_id: int = 0) -> None:
+        """Write bytes into a shared-memory data region."""
+        payload = bytes(data)
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.shared_memory_write(memory, offset, payload)
+            return
+        self._chip_control_payload(
+            worker_id,
+            _CTRL_SHARED_MEMORY_WRITE,
+            arg0=memory,
+            arg1=offset,
+            arg2=len(payload),
+            payload=payload,
+        )
+
+    def shared_memory_notify(self, memory: int, signal_id: int, value: int, worker_id: int = 0) -> None:
+        """Publish a software signal value for a shared-memory region."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.shared_memory_notify(memory, signal_id, value)
+            return
+        self._chip_control(worker_id, _CTRL_SHARED_MEMORY_NOTIFY, arg0=memory, arg1=signal_id, arg2=value)
+
+    def shared_memory_wait(
+        self, memory: int, signal_id: int, target: int, timeout_us: int = 0, worker_id: int = 0
+    ) -> None:
+        """Wait until a shared-memory software signal reaches ``target``."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.shared_memory_wait(memory, signal_id, target, timeout_us)
+            return
+        self._chip_control(
+            worker_id, _CTRL_SHARED_MEMORY_WAIT, arg0=memory, arg1=signal_id, arg2=target, arg3=timeout_us
+        )
 
     # ------------------------------------------------------------------
     # run — uniform entry point

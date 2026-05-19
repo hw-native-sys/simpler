@@ -510,6 +510,69 @@ std::vector<uint8_t> WorkerThread::control_channel_recv(
     return out;
 }
 
+
+uint64_t WorkerThread::control_open_shared_memory(uint64_t data_bytes, uint32_t signal_count, uint32_t flags) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_OPEN_SHARED_MEMORY, data_bytes, signal_count, flags);
+    run_control_command("control_open_shared_memory");
+    return read_control_result(mbox());
+}
+
+void WorkerThread::control_close_shared_memory(uint64_t mem) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_CLOSE_SHARED_MEMORY, mem);
+    run_control_command("control_close_shared_memory");
+}
+
+HostDeviceMemoryInfo WorkerThread::control_shared_memory_info(uint64_t mem) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_SHARED_MEMORY_INFO, mem);
+    run_control_command("control_shared_memory_info");
+    HostDeviceMemoryInfo info{};
+    info.host_ptr = read_control_result(mbox());
+    std::memcpy(&info.device_ptr, mbox() + CTRL_OFF_ARG1, sizeof(uint64_t));
+    std::memcpy(&info.data_bytes, mbox() + CTRL_OFF_ARG2, sizeof(uint64_t));
+    uint64_t signal_count = 0;
+    uint64_t flags = 0;
+    std::memcpy(&signal_count, mbox() + CTRL_OFF_ARG3, sizeof(uint64_t));
+    std::memcpy(&flags, mbox() + CTRL_OFF_ARG4, sizeof(uint64_t));
+    info.signal_count = static_cast<uint32_t>(signal_count);
+    info.flags = static_cast<uint32_t>(flags);
+    return info;
+}
+
+std::vector<uint8_t> WorkerThread::control_shared_memory_read(uint64_t mem, uint64_t offset, size_t nbytes) {
+    if (nbytes > CTRL_PAYLOAD_CAPACITY) throw std::invalid_argument("control_shared_memory_read: nbytes too large");
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_SHARED_MEMORY_READ, mem, offset, static_cast<uint64_t>(nbytes));
+    run_control_command("control_shared_memory_read");
+    uint64_t out_nbytes = read_control_result(mbox());
+    std::vector<uint8_t> out(static_cast<size_t>(out_nbytes));
+    if (out_nbytes != 0) std::memcpy(out.data(), mbox() + CTRL_OFF_PAYLOAD, static_cast<size_t>(out_nbytes));
+    return out;
+}
+
+void WorkerThread::control_shared_memory_write(uint64_t mem, uint64_t offset, const void *data, size_t nbytes) {
+    if (data == nullptr && nbytes != 0) throw std::invalid_argument("control_shared_memory_write: data is null");
+    if (nbytes > CTRL_PAYLOAD_CAPACITY) throw std::invalid_argument("control_shared_memory_write: payload too large");
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    if (nbytes != 0) std::memcpy(mbox() + CTRL_OFF_PAYLOAD, data, nbytes);
+    write_control_args(mbox(), CTRL_SHARED_MEMORY_WRITE, mem, offset, static_cast<uint64_t>(nbytes));
+    run_control_command("control_shared_memory_write");
+}
+
+void WorkerThread::control_shared_memory_notify(uint64_t mem, uint32_t signal_id, uint64_t value) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_SHARED_MEMORY_NOTIFY, mem, signal_id, value);
+    run_control_command("control_shared_memory_notify");
+}
+
+void WorkerThread::control_shared_memory_wait(uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_SHARED_MEMORY_WAIT, mem, signal_id, target, timeout_us);
+    run_control_command("control_shared_memory_wait");
+}
+
 bool WorkerManager::any_busy() const {
     for (auto &wt : next_level_threads_)
         if (!wt->idle()) return true;

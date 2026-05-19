@@ -32,6 +32,7 @@
 #include "common/unified_log.h"
 #include "device_runner.h"
 #include "host_device_channel.h"
+#include "host_device_memory.h"
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
@@ -316,6 +317,94 @@ int host_device_recv_ctx(
     return host_device_channel_recv_cpu(
         static_cast<HostDeviceChannel *>(ch), dst, dst_capacity, out_nbytes, out_correlation_id, out_route, timeout_us
     );
+}
+
+
+HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, const HostDeviceMemoryConfig *cfg) {
+    if (ctx == NULL) return NULL;
+    size_t bytes = host_device_memory_required_bytes(cfg);
+    if (bytes == 0) return NULL;
+    auto *runner = static_cast<DeviceRunner *>(ctx);
+    void *dev_ptr = nullptr;
+    void *host_ptr = nullptr;
+    try {
+        dev_ptr = runner->allocate_tensor(bytes);
+        if (dev_ptr == nullptr) return NULL;
+        if (hdch_load_hal_if_needed() != 0) {
+            runner->free_tensor(dev_ptr);
+            return NULL;
+        }
+        HdchHalHostRegisterFn fn = hdch_get_halHostRegister();
+        if (fn == nullptr || fn(dev_ptr, bytes, HDCH_DEV_SVM_MAP_HOST, runner->device_id(), &host_ptr) != 0 ||
+            host_ptr == nullptr) {
+            runner->free_tensor(dev_ptr);
+            return NULL;
+        }
+        HostDeviceMemory *mem = host_device_memory_wrap(dev_ptr, host_ptr, bytes, cfg, 0, nullptr);
+        if (mem == nullptr) {
+            HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+            if (unreg != nullptr) unreg(host_ptr, runner->device_id());
+            runner->free_tensor(dev_ptr);
+            return NULL;
+        }
+        return static_cast<HostDeviceMemoryHandle>(mem);
+    } catch (...) {
+        if (host_ptr != nullptr) {
+            HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+            if (unreg != nullptr) unreg(host_ptr, runner->device_id());
+        }
+        if (dev_ptr != nullptr) runner->free_tensor(dev_ptr);
+        return NULL;
+    }
+}
+
+int close_host_device_memory_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle raw_mem) {
+    if (ctx == NULL || raw_mem == NULL) return HDMEM_ERR_INVALID;
+    auto *runner = static_cast<DeviceRunner *>(ctx);
+    auto *mem = static_cast<HostDeviceMemory *>(raw_mem);
+    try {
+        HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+        if (unreg != nullptr && mem->host_base != nullptr) {
+            unreg(mem->host_base, runner->device_id());
+        }
+        void *dev_ptr = mem->device_base;
+        host_device_memory_destroy(mem);
+        if (dev_ptr != nullptr) runner->free_tensor(dev_ptr);
+        return HDMEM_OK;
+    } catch (...) {
+        return HDMEM_ERR_BACKEND;
+    }
+}
+
+int host_device_memory_info_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, HostDeviceMemoryInfo *info) {
+    (void)ctx;
+    return host_device_memory_info(static_cast<HostDeviceMemory *>(mem), info);
+}
+
+int host_device_memory_read_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, void *dst, size_t nbytes
+) {
+    (void)ctx;
+    return host_device_memory_read(static_cast<HostDeviceMemory *>(mem), offset, dst, nbytes);
+}
+
+int host_device_memory_write_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, const void *src, size_t nbytes
+) {
+    (void)ctx;
+    return host_device_memory_write(static_cast<HostDeviceMemory *>(mem), offset, src, nbytes);
+}
+
+int host_device_memory_notify_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value) {
+    (void)ctx;
+    return host_device_memory_notify(static_cast<HostDeviceMemory *>(mem), signal_id, value);
+}
+
+int host_device_memory_wait_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
+) {
+    (void)ctx;
+    return host_device_memory_wait(static_cast<HostDeviceMemory *>(mem), signal_id, target, timeout_us);
 }
 
 int finalize_device(DeviceContextHandle ctx) {

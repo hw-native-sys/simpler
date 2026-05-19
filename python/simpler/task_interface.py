@@ -479,6 +479,51 @@ class ChipWorker:
         data, route, correlation_id = self._impl.channel_recv_l2_for_test(int(channel), int(capacity), int(timeout_us))
         return bytes(data), int(route), int(correlation_id)
 
+    def open_shared_memory(self, data_bytes: int, signal_count: int = 2, flags: int = 0) -> int:
+        """Open a host/device shared-memory region."""
+        return int(self._impl.open_shared_memory(int(data_bytes), int(signal_count), int(flags)))
+
+    def close_shared_memory(self, memory: int) -> None:
+        """Close a shared-memory region returned by ``open_shared_memory``."""
+        self._impl.close_shared_memory(int(memory))
+
+    def shared_memory_info(self, memory: int) -> tuple[int, int, int, int, int]:
+        """Return ``(host_ptr, device_ptr, data_bytes, signal_count, flags)``."""
+        host_ptr, device_ptr, data_bytes, signal_count, flags = self._impl.shared_memory_info(int(memory))
+        return int(host_ptr), int(device_ptr), int(data_bytes), int(signal_count), int(flags)
+
+    def shared_memory_read(self, memory: int, offset: int, nbytes: int) -> bytes:
+        """Read bytes from a shared-memory data region."""
+        return bytes(self._impl.shared_memory_read(int(memory), int(offset), int(nbytes)))
+
+    def shared_memory_write(self, memory: int, offset: int, data: bytes) -> None:
+        """Write bytes into a shared-memory data region."""
+        self._impl.shared_memory_write(int(memory), int(offset), bytes(data))
+
+    def shared_memory_notify(self, memory: int, signal_id: int, value: int) -> None:
+        """Publish a software signal value for a shared-memory region."""
+        self._impl.shared_memory_notify(int(memory), int(signal_id), int(value))
+
+    def shared_memory_wait(self, memory: int, signal_id: int, target: int, timeout_us: int = 0) -> None:
+        """Wait until a shared-memory software signal reaches ``target``."""
+        self._impl.shared_memory_wait(int(memory), int(signal_id), int(target), int(timeout_us))
+
+    def shared_memory_read_l2_for_test(self, memory: int, offset: int, nbytes: int) -> bytes:
+        """Sim/test helper that reads the shared-memory region from the L2 side."""
+        return bytes(self._impl.shared_memory_read_l2_for_test(int(memory), int(offset), int(nbytes)))
+
+    def shared_memory_write_l2_for_test(self, memory: int, offset: int, data: bytes) -> None:
+        """Sim/test helper that writes the shared-memory region from the L2 side."""
+        self._impl.shared_memory_write_l2_for_test(int(memory), int(offset), bytes(data))
+
+    def shared_memory_notify_l2_for_test(self, memory: int, signal_id: int, value: int) -> None:
+        """Sim/test helper that publishes an L2-side software signal."""
+        self._impl.shared_memory_notify_l2_for_test(int(memory), int(signal_id), int(value))
+
+    def shared_memory_wait_l2_for_test(self, memory: int, signal_id: int, target: int, timeout_us: int = 0) -> None:
+        """Sim/test helper that waits on a shared-memory signal from the L2 side."""
+        self._impl.shared_memory_wait_l2_for_test(int(memory), int(signal_id), int(target), int(timeout_us))
+
     def comm_init(self, rank: int, nranks: int, rootinfo_path: str) -> int:
         """Initialize a distributed communicator for this rank.
 
