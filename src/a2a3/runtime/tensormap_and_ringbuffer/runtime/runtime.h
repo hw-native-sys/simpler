@@ -119,6 +119,13 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
+    // Acquire a pooled per-Worker device buffer for the PTO2 GM heap / shared
+    // memory. The platform layer keeps the allocation alive across runs and
+    // grows it on demand; the returned pointer must NOT be passed to
+    // device_free or recorded in `tensor_pairs_`, because it is owned by the
+    // DeviceRunner and freed in `DeviceRunner::finalize()`.
+    void *(*acquire_pooled_gm_heap)(size_t size);
+    void *(*acquire_pooled_gm_sm)(size_t size);
     // Single-shot upload of the entire ChipCallable buffer. `callable` is a
     // `const ChipCallable *` (declared void* to avoid pulling task_interface
     // headers into runtime.h). DeviceRunner walks child_offsets_ to compute

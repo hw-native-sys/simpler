@@ -107,6 +107,22 @@ static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     }
 }
 
+static void *acquire_pooled_gm_heap_wrapper(size_t size) {
+    try {
+        return current_runner()->acquire_pooled_gm_heap(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+static void *acquire_pooled_gm_sm_wrapper(size_t size) {
+    try {
+        return current_runner()->acquire_pooled_gm_sm(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 /* ===========================================================================
  * Public C API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
@@ -362,6 +378,8 @@ int run_prepared(
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
+        r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
+        r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         // Restore kernel addrs + orch symbol names + active_callable_id; the

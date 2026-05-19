@@ -44,6 +44,7 @@
 #include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "pto_runtime2/device_pool.h"
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
 #include "host/l2_perf_collector.h"
@@ -190,8 +191,32 @@ struct AicpuSoInfo {
  */
 class DeviceRunner {
 public:
-    DeviceRunner() = default;
+    DeviceRunner() :
+        gm_heap_pool_(
+            [this](size_t n) {
+                return mem_alloc_.alloc(n);
+            },
+            [this](void *p) {
+                mem_alloc_.free(p);
+            }
+        ),
+        gm_sm_pool_(
+            [this](size_t n) {
+                return mem_alloc_.alloc(n);
+            },
+            [this](void *p) {
+                mem_alloc_.free(p);
+            }
+        ) {}
     ~DeviceRunner();
+
+    /**
+     * Per-Worker pooled GM heap / shared-memory buffer acquisition.
+     * Grows on demand, never shrinks; backed by `mem_alloc_` so the
+     * underlying allocations are released in `finalize()`.
+     */
+    void *acquire_pooled_gm_heap(size_t size) { return gm_heap_pool_.acquire(size); }
+    void *acquire_pooled_gm_sm(size_t size) { return gm_sm_pool_.acquire(size); }
 
     /**
      * Create a thread bound to this device.
@@ -544,6 +569,12 @@ private:
 
     // Memory management
     MemoryAllocator mem_alloc_;
+
+    // Per-Worker pooled PTO2 GM heap and shared-memory buffers. Constructed
+    // with closures bound to mem_alloc_; released explicitly in finalize()
+    // before mem_alloc_.finalize() so they do not free pointers a second time.
+    pto_runtime2::DevicePool gm_heap_pool_;
+    pto_runtime2::DevicePool gm_sm_pool_;
 
     // Device resources
     rtStream_t stream_aicpu_{nullptr};

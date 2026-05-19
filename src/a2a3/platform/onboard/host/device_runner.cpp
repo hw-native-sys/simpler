@@ -1082,6 +1082,11 @@ int DeviceRunner::finalize() {
     // perf_cleanup guard; this is the backstop for the no-run-since-init case.
     finalize_collectors();
 
+    // Release per-Worker pooled GM heap / SM. Must precede mem_alloc_.finalize()
+    // so the pool frees through the still-live allocator, not after it.
+    gm_heap_pool_.release();
+    gm_sm_pool_.release();
+
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
 

@@ -855,6 +855,11 @@ int DeviceRunner::finalize() {
     // Close executor .so files (typically already closed by run(), this is a safety net)
     unload_executor_binaries();
 
+    // Release per-Worker pooled GM heap / SM. Must precede mem_alloc_.finalize()
+    // so the pool frees through the still-live allocator, not after it.
+    gm_heap_pool_.release();
+    gm_sm_pool_.release();
+
     // Free all remaining allocations
     mem_alloc_.finalize();
     clear_cpu_sim_shared_storage();
