@@ -124,11 +124,6 @@ std::string make_shm_name(const char *rootinfo_path) {
     return make_shm_name(static_cast<uint32_t>(getppid()), hash_id(rootinfo_path));
 }
 
-std::string make_subcomm_shm_name(const std::string &base_shm_name, uint64_t sub_comm_id) {
-    std::string id = base_shm_name + ":" + std::to_string(sub_comm_id);
-    return make_shm_name(static_cast<uint32_t>(getppid()), hash_id(id.c_str()));
-}
-
 // Poll `check` until it returns true or the timeout elapses.  Uses steady_clock
 // so wall-clock NTP adjustments cannot desynchronize the wait.
 bool wait_until(const std::function<bool()> &check, int timeout_seconds, int poll_interval_us) {
@@ -191,78 +186,6 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     return nullptr;
 } catch (...) {
     std::fprintf(stderr, "[comm_sim rank %d] comm_init: unknown exception\n", rank);
-    return nullptr;
-}
-
-extern "C" CommHandle comm_create_subcomm(
-    CommHandle base, uint64_t sub_comm_id, const uint32_t *rank_ids, size_t rank_count, uint32_t sub_comm_rank_id,
-    void *stream
-) try {
-    (void)stream;  // sim has no ACL / stream concept
-
-    if (base == nullptr) {
-        std::fprintf(stderr, "[comm_sim] comm_create_subcomm: base is null\n");
-        return nullptr;
-    }
-    if (rank_ids == nullptr) {
-        std::fprintf(stderr, "[comm_sim rank %d] comm_create_subcomm: rank_ids is null\n", base->rank);
-        return nullptr;
-    }
-    if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM) {
-        std::fprintf(
-            stderr, "[comm_sim rank %d] comm_create_subcomm: invalid rank_count=%zu (max=%u)\n", base->rank, rank_count,
-            COMM_MAX_RANK_NUM
-        );
-        return nullptr;
-    }
-    if (sub_comm_rank_id >= rank_count) {
-        std::fprintf(
-            stderr, "[comm_sim rank %d] comm_create_subcomm: invalid sub_comm_rank_id=%u rank_count=%zu\n", base->rank,
-            sub_comm_rank_id, rank_count
-        );
-        return nullptr;
-    }
-
-    for (size_t i = 0; i < rank_count; ++i) {
-        if (rank_ids[i] >= static_cast<uint32_t>(base->nranks)) {
-            std::fprintf(
-                stderr, "[comm_sim rank %d] comm_create_subcomm: rank_ids[%zu]=%u out of range [0, %d)\n", base->rank,
-                i, rank_ids[i], base->nranks
-            );
-            return nullptr;
-        }
-        for (size_t j = 0; j < i; ++j) {
-            if (rank_ids[j] == rank_ids[i]) {
-                std::fprintf(
-                    stderr, "[comm_sim rank %d] comm_create_subcomm: duplicate rank id %u\n", base->rank, rank_ids[i]
-                );
-                return nullptr;
-            }
-        }
-    }
-    if (rank_ids[sub_comm_rank_id] != base->rank) {
-        std::fprintf(
-            stderr, "[comm_sim rank %d] comm_create_subcomm: rank_ids[%u]=%u does not match base rank\n", base->rank,
-            sub_comm_rank_id, rank_ids[sub_comm_rank_id]
-        );
-        return nullptr;
-    }
-
-    auto *h = new (std::nothrow) CommHandle_{};
-    if (h == nullptr) {
-        std::fprintf(stderr, "[comm_sim rank %d] comm_create_subcomm: allocation failed\n", base->rank);
-        return nullptr;
-    }
-
-    h->rank = static_cast<int>(sub_comm_rank_id);
-    h->nranks = static_cast<int>(rank_count);
-    h->shm_name = make_subcomm_shm_name(base->shm_name, sub_comm_id);
-    return h;
-} catch (const std::exception &e) {
-    std::fprintf(stderr, "[comm_sim] comm_create_subcomm: exception: %s\n", e.what());
-    return nullptr;
-} catch (...) {
-    std::fprintf(stderr, "[comm_sim] comm_create_subcomm: unknown exception\n");
     return nullptr;
 }
 

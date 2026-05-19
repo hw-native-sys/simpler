@@ -576,38 +576,6 @@ class ChipWorker:
         """
         return int(self._impl.comm_init(int(rank), int(nranks), str(rootinfo_path)))
 
-    def comm_create_subcomm(
-        self,
-        comm_handle: int,
-        sub_comm_id: int,
-        rank_ids: list[int],
-        sub_comm_rank_id: int,
-    ) -> int:
-        """Create a domain communicator from a hidden base communicator."""
-        return int(
-            self._impl.comm_create_subcomm(
-                int(comm_handle),
-                int(sub_comm_id),
-                [int(x) for x in rank_ids],
-                int(sub_comm_rank_id),
-            )
-        )
-
-    def comm_create_domain(
-        self,
-        sub_comm_id: int,
-        rank_ids: list[int],
-        sub_comm_rank_id: int,
-    ) -> int:
-        """Create a domain communicator from the ChipWorker-owned base communicator."""
-        return int(
-            self._impl.comm_create_domain(
-                int(sub_comm_id),
-                [int(x) for x in rank_ids],
-                int(sub_comm_rank_id),
-            )
-        )
-
     def comm_alloc_windows(self, comm_handle: int, win_size: int) -> int:
         """Allocate per-rank windows. Returns a device CommContext pointer (uint64)."""
         return int(self._impl.comm_alloc_windows(int(comm_handle), int(win_size)))

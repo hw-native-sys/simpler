@@ -36,17 +36,6 @@ T load_symbol(void *handle, const char *name) {
     return reinterpret_cast<T>(sym);
 }
 
-template <typename T>
-T load_optional_symbol(void *handle, const char *name) {
-    dlerror();  // clear any existing error
-    void *sym = dlsym(handle, name);
-    const char *err = dlerror();
-    if (err) {
-        return nullptr;
-    }
-    return reinterpret_cast<T>(sym);
-}
-
 std::vector<uint8_t> read_binary_file(const std::string &path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
@@ -127,7 +116,6 @@ void ChipWorker::init(
         create_comm_stream_fn_ = load_symbol<CreateCommStreamFn>(handle, "create_comm_stream_ctx");
         destroy_comm_stream_fn_ = load_symbol<DestroyCommStreamFn>(handle, "destroy_comm_stream_ctx");
         comm_init_fn_ = load_symbol<CommInitFn>(handle, "comm_init");
-        comm_create_subcomm_fn_ = load_optional_symbol<CommCreateSubcommFn>(handle, "comm_create_subcomm");
         comm_alloc_windows_fn_ = load_symbol<CommAllocWindowsFn>(handle, "comm_alloc_windows");
         comm_get_local_window_base_fn_ = load_symbol<CommGetLocalWindowBaseFn>(handle, "comm_get_local_window_base");
         comm_get_window_size_fn_ = load_symbol<CommGetWindowSizeFn>(handle, "comm_get_window_size");
@@ -226,7 +214,6 @@ void ChipWorker::init(
         create_comm_stream_fn_ = nullptr;
         destroy_comm_stream_fn_ = nullptr;
         comm_init_fn_ = nullptr;
-        comm_create_subcomm_fn_ = nullptr;
         comm_alloc_windows_fn_ = nullptr;
         comm_get_local_window_base_fn_ = nullptr;
         comm_get_window_size_fn_ = nullptr;
@@ -274,7 +261,6 @@ void ChipWorker::finalize() {
     create_comm_stream_fn_ = nullptr;
     destroy_comm_stream_fn_ = nullptr;
     comm_init_fn_ = nullptr;
-    comm_create_subcomm_fn_ = nullptr;
     comm_alloc_windows_fn_ = nullptr;
     comm_get_local_window_base_fn_ = nullptr;
     comm_get_window_size_fn_ = nullptr;
@@ -494,56 +480,6 @@ uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo
     }
 
     return create_base_comm(rank, nranks, rootinfo_path);
-}
-
-uint64_t ChipWorker::comm_create_subcomm(
-    uint64_t base_comm_handle, uint64_t sub_comm_id, const std::vector<uint32_t> &rank_ids, uint32_t sub_comm_rank_id
-) {
-    if (!initialized_) {
-        throw std::runtime_error("ChipWorker not initialized; call init() first");
-    }
-    if (comm_create_subcomm_fn_ == nullptr) {
-        throw std::runtime_error("comm_create_subcomm is not supported by this runtime");
-    }
-    if (base_comm_handle == 0 || find_comm_session(base_comm_handle) == nullptr) {
-        throw std::runtime_error("comm_create_subcomm: base communicator is not owned by this ChipWorker");
-    }
-    if (rank_ids.empty()) {
-        throw std::runtime_error("comm_create_subcomm: rank_ids must not be empty");
-    }
-    if (sub_comm_rank_id >= rank_ids.size()) {
-        throw std::runtime_error("comm_create_subcomm: sub_comm_rank_id out of range");
-    }
-
-    void *stream = create_comm_stream_checked("comm_create_subcomm");
-    void *handle = comm_create_subcomm_fn_(
-        reinterpret_cast<void *>(base_comm_handle), sub_comm_id, rank_ids.data(), rank_ids.size(), sub_comm_rank_id,
-        stream
-    );
-    if (handle == nullptr) {
-        int rc = 0;
-        destroy_comm_stream_best_effort(stream, &rc);
-        throw std::runtime_error("comm_create_subcomm failed");
-    }
-
-    if (create_comm_session(handle, stream, false) == nullptr) {
-        int rc = comm_destroy_fn_(handle);
-        destroy_comm_stream_best_effort(stream, &rc);
-        throw std::runtime_error("comm_create_subcomm: duplicate comm handle");
-    }
-
-    return reinterpret_cast<uint64_t>(handle);
-}
-
-uint64_t
-ChipWorker::comm_create_domain(uint64_t sub_comm_id, const std::vector<uint32_t> &rank_ids, uint32_t sub_comm_rank_id) {
-    if (!initialized_) {
-        throw std::runtime_error("ChipWorker not initialized; call init() first");
-    }
-    if (base_comm_handle_ == 0) {
-        throw std::runtime_error("comm_create_domain: call comm_init to create the base communicator first");
-    }
-    return comm_create_subcomm(base_comm_handle_, sub_comm_id, rank_ids, sub_comm_rank_id);
 }
 
 uint64_t ChipWorker::comm_alloc_windows(uint64_t comm_handle, size_t win_size) {

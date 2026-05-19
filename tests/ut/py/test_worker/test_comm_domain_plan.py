@@ -201,6 +201,5 @@ class TestChipWorkerCommDomainBindings:
     def test_native_worker_exposes_multi_domain_comm_methods(self):
         worker = _ChipWorker()
 
-        assert hasattr(worker, "comm_create_subcomm")
-        assert hasattr(worker, "comm_create_domain")
+        assert hasattr(worker, "comm_derive_context")
         assert hasattr(worker, "comm_destroy_all")

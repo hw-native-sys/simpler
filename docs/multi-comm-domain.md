@@ -839,20 +839,19 @@ a backend bootstrap transport detail for the hidden base communicator.  The
 visible domains are derived from the parent `CommDomainPlan`, not from
 independent root-info exchanges.
 
-The implementation still keeps `comm_create_subcomm` available as a low-level
-backend capability because HCCL sub-communicators are useful for future
-collective or resource paths.  The initial PTO-ISA/HCOMM RMA path should not
-allocate MC2 resources on each overlapping sub-communicator because the HCCL
-old AICPU MC2 init path accepts only one active hcomId per process.  Base
-window slicing avoids that limitation while preserving domain-local kernel
-semantics.
+The implementation only relies on `comm_derive_context` to materialise
+domain-local views into one hidden base communicator's symmetric window
+pool.  The initial PTO-ISA/HCOMM RMA path must not allocate MC2 resources on
+each overlapping subset because the HCCL old AICPU MC2 init path accepts only
+one active hcomId per process.  Base-window slicing avoids that limitation
+while preserving domain-local kernel semantics.
 
-Independent root-info communicators and sub-communicators are not needed for
-the first PTO-ISA RMA implementation:
+Independent root-info communicators and HCCL sub-communicators are not needed
+for the first PTO-ISA RMA implementation:
 
 - independent root-info would exchange one `HcclRootInfo` per visible domain
   and create unrelated communicators for overlapping subsets;
-- sub-communicators would derive HCCL group communicators from a base
+- HCCL sub-communicators would derive group communicators from a base
   communicator, but would still need a separate MC2 window allocation if used
   as the visible RMA resource;
 - base-window slicing creates one backend window and then derives

@@ -92,15 +92,9 @@ public:
     ///     ensure_acl_ready / aclrtCreateStream surface area).
     ///   - On sim, ACL / stream are no-ops; the stashed stream is null.
     ///
-    /// Multi-domain bootstrap owns a hidden base communicator plus one
-    /// sub-communicator per active domain.  The legacy comm_* methods are kept
-    /// as wrappers for the transition and allocate a single "default" domain.
+    /// Multi-domain bootstrap allocates a hidden base communicator plus one
+    /// symmetric pool, then derives per-domain views with comm_derive_context.
     uint64_t comm_init(int rank, int nranks, const std::string &rootinfo_path);
-    uint64_t comm_create_subcomm(
-        uint64_t base_comm_handle, uint64_t sub_comm_id, const std::vector<uint32_t> &rank_ids,
-        uint32_t sub_comm_rank_id
-    );
-    uint64_t comm_create_domain(uint64_t sub_comm_id, const std::vector<uint32_t> &rank_ids, uint32_t sub_comm_rank_id);
     uint64_t comm_alloc_windows(uint64_t comm_handle, size_t win_size);
     uint64_t comm_get_local_window_base(uint64_t comm_handle);
     size_t comm_get_window_size(uint64_t comm_handle);
@@ -136,7 +130,6 @@ private:
     using CreateCommStreamFn = void *(*)(void *);
     using DestroyCommStreamFn = int (*)(void *, void *);
     using CommInitFn = void *(*)(int, int, void *, const char *);
-    using CommCreateSubcommFn = void *(*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, void *);
     using CommAllocWindowsFn = int (*)(void *, size_t, uint64_t *);
     using CommGetLocalWindowBaseFn = int (*)(void *, uint64_t *);
     using CommGetWindowSizeFn = int (*)(void *, size_t *);
@@ -180,7 +173,6 @@ private:
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
     DestroyCommStreamFn destroy_comm_stream_fn_ = nullptr;
     CommInitFn comm_init_fn_ = nullptr;
-    CommCreateSubcommFn comm_create_subcomm_fn_ = nullptr;
     CommAllocWindowsFn comm_alloc_windows_fn_ = nullptr;
     CommGetLocalWindowBaseFn comm_get_local_window_base_fn_ = nullptr;
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;

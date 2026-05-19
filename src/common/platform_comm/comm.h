@@ -60,32 +60,6 @@ typedef struct CommHandle_ *CommHandle;
 CommHandle comm_init(int rank, int nranks, void *stream, const char *rootinfo_path);
 
 /**
- * Create a subcommunicator from an existing base communicator.
- *
- * The caller provides the base-communicator rank ids that participate in the
- * subcommunicator and the caller's rank within that subcommunicator.  Members
- * should call this collectively for the same `sub_comm_id`; non-members do not
- * need to call it.
- *
- * On sim this derives a separate shared-memory identity from the base session
- * and `sub_comm_id`, so windows and barriers are isolated per domain.  The
- * returned handle is destroyed with comm_destroy().
- *
- * @param base              Existing handle from comm_init().
- * @param sub_comm_id       Caller-defined domain id under the base session.
- * @param rank_ids          Base-communicator rank ids in subcommunicator order.
- * @param rank_count        Number of ranks in rank_ids.
- * @param sub_comm_rank_id  This caller's rank within the subcommunicator.
- * @param stream            Caller-owned stream for backends that need one.
- *                          Sim backend ignores it.
- * @return Opaque subcommunicator handle, or NULL on failure.
- */
-CommHandle comm_create_subcomm(
-    CommHandle base, uint64_t sub_comm_id, const uint32_t *rank_ids, size_t rank_count, uint32_t sub_comm_rank_id,
-    void *stream
-);
-
-/**
  * Allocate RDMA / shared-memory windows and populate the device context.
  *
  * On HCCL this builds a per-rank symmetric pool via the public ACL IPC
