@@ -31,8 +31,8 @@ from .environment import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
-_PTO_ISA_HTTPS = "https://github.com/PTO-ISA/pto-isa.git"
-_PTO_ISA_SSH = "git@github.com:PTO-ISA/pto-isa.git"
+_PTO_ISA_HTTPS = "https://github.com/hw-native-sys/pto-isa.git"
+_PTO_ISA_SSH = "git@github.com:hw-native-sys/pto-isa.git"
 
 
 def get_pto_isa_clone_path() -> Path:

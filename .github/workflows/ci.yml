@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PTO_ISA_COMMIT: 50d9c806c3e351d5039c9f0f02a267590420b4d9
+  PTO_ISA_COMMIT: ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8
 
 jobs:
   # ---------- Pre-commit hooks (format, lint, clang-tidy) ----------
