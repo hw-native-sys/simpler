@@ -80,8 +80,8 @@ def _rank_entry(  # noqa: PLR0913
         from simpler.task_interface import (
             ChipBootstrapChannel,
             ChipBootstrapConfig,
-            ChipBufferSpec,
             ChipWorker,
+            CommBufferSpec,
             CommDomain,
             CommDomainPlan,
             HostBufferStaging,
@@ -97,7 +97,7 @@ def _rank_entry(  # noqa: PLR0913
                     name="default",
                     worker_indices=list(range(nranks)),
                     window_size=window_size,
-                    buffers=[ChipBufferSpec(**s) for s in buffer_specs],
+                    buffers=[CommBufferSpec(**s) for s in buffer_specs],
                 )
             ]
         )
@@ -245,7 +245,7 @@ def _multi_domain_rank_entry(
 ) -> None:
     result: dict[str, object] = {"rank": worker_idx, "ok": False}
     try:
-        from simpler.task_interface import ChipBootstrapConfig, ChipBufferSpec, ChipWorker, CommDomain, CommDomainPlan
+        from simpler.task_interface import ChipBootstrapConfig, ChipWorker, CommBufferSpec, CommDomain, CommDomainPlan
 
         plan = CommDomainPlan(
             domains=[
@@ -253,13 +253,13 @@ def _multi_domain_rank_entry(
                     name="tp",
                     worker_indices=[0, 1],
                     window_size=4096,
-                    buffers=[ChipBufferSpec(name="scratch", dtype="float32", count=16, nbytes=64)],
+                    buffers=[CommBufferSpec(name="scratch", dtype="float32", count=16, nbytes=64)],
                 ),
                 CommDomain(
                     name="pp",
                     worker_indices=[1, 2],
                     window_size=4096,
-                    buffers=[ChipBufferSpec(name="scratch", dtype="float32", count=16, nbytes=64)],
+                    buffers=[CommBufferSpec(name="scratch", dtype="float32", count=16, nbytes=64)],
                 ),
             ]
         )
@@ -451,8 +451,8 @@ def _store_rank_entry(  # noqa: PLR0913
     try:
         from simpler.task_interface import (
             ChipBootstrapConfig,
-            ChipBufferSpec,
             ChipWorker,
+            CommBufferSpec,
             CommDomain,
             CommDomainPlan,
             HostBufferStaging,
@@ -461,7 +461,7 @@ def _store_rank_entry(  # noqa: PLR0913
         worker = ChipWorker()
         worker.init(rank, bins)
 
-        domain_buffers = [ChipBufferSpec(**s) for s in buffer_specs]
+        domain_buffers = [CommBufferSpec(**s) for s in buffer_specs]
         plan = CommDomainPlan(
             domains=[
                 CommDomain(
@@ -669,9 +669,9 @@ def _missing_output_staging_rank_entry(
         from simpler.task_interface import (
             ChipBootstrapChannel,
             ChipBootstrapConfig,
-            ChipBufferSpec,
             ChipDomainBootstrapConfig,
             ChipWorker,
+            CommBufferSpec,
         )
 
         worker = ChipWorker()
@@ -691,7 +691,7 @@ def _missing_output_staging_rank_entry(
                         rank_ids=[0],
                         window_size=4096,
                         buffers=[
-                            ChipBufferSpec(
+                            CommBufferSpec(
                                 name="y",
                                 dtype="float32",
                                 count=1,

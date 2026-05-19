@@ -15,7 +15,7 @@ runtime on 2 Ascend devices.  The critical assertions are:
   1. ``bootstrap_context`` returns a non-null ``device_ctx`` and
      ``local_window_base`` (HCCL actually allocated GVA-visible windows).
   2. ``actual_window_size`` is at least the requested size.
-  3. A single ``ChipBufferSpec`` slices the window so
+  3. A single ``CommBufferSpec`` slices the window so
      ``buffer_ptrs[0] == local_window_base``.
 
 Deliberately **no** ``comm_barrier``.  The paired ``comm_*`` UT
@@ -52,8 +52,8 @@ def _bootstrap_rank_entry(  # noqa: PLR0913
     try:
         from simpler.task_interface import (
             ChipBootstrapConfig,
-            ChipBufferSpec,
             ChipWorker,
+            CommBufferSpec,
             CommDomain,
             CommDomainPlan,
         )
@@ -69,7 +69,7 @@ def _bootstrap_rank_entry(  # noqa: PLR0913
                     worker_indices=list(range(nranks)),
                     window_size=window_size,
                     buffers=[
-                        ChipBufferSpec(
+                        CommBufferSpec(
                             name="x",
                             dtype="float32",
                             count=buffer_nbytes // 4,

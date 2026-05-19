@@ -36,10 +36,10 @@ import torch  # noqa: E402
 from simpler.task_interface import (  # noqa: E402
     ArgDirection,
     CallConfig,
-    ChipBufferSpec,
     ChipCallable,
-    ChipCommDomainContext,
     ChipContext,
+    ChipDomainContext,
+    CommBufferSpec,
     CommDomain,
     CommDomainPlan,
     ContinuousTensor,
@@ -158,7 +158,7 @@ def _make_comm_plan() -> CommDomainPlan:
                 worker_indices=worker_indices,
                 window_size=window_size,
                 buffers=[
-                    ChipBufferSpec(
+                    CommBufferSpec(
                         name="scratch",
                         dtype="float32",
                         count=COUNT,
@@ -171,7 +171,7 @@ def _make_comm_plan() -> CommDomainPlan:
     )
 
 
-def _add_domain_scratch(args: TaskArgs, domain: ChipCommDomainContext) -> None:
+def _add_domain_scratch(args: TaskArgs, domain: ChipDomainContext) -> None:
     args.add_tensor(
         ContinuousTensor.make(
             data=domain.buffer_ptrs["scratch"],

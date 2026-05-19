@@ -89,7 +89,7 @@ The useful mapping for Simpler is:
 | ------------ | ---------------- |
 | global rank from launcher | L3 `worker=i` index |
 | Megatron TP/DP/PP group | `CommDomain(name, worker_indices)` |
-| PyTorch `ProcessGroup` | `ChipCommDomainContext` exposed to L3 |
+| PyTorch `ProcessGroup` | `ChipDomainContext` exposed to L3 |
 | NCCL communicator | HCCL/HCOMM communicator handle |
 | NCCL group-local rank | `CommContext.rankId` / `domain_rank` |
 | NCCL group size | `CommContext.rankNum` / `domain_size` |
@@ -275,7 +275,7 @@ The new public surface expresses the same single-domain case as one
 `CommDomain` named `"default"`:
 
 - `CommDomain(name="default", worker_indices=[0, 1], window_size=...)`;
-- one or more per-domain `ChipBufferSpec` entries, usually a `scratch`
+- one or more per-domain `CommBufferSpec` entries, usually a `scratch`
   window;
 - optional per-chip host staging information keyed by domain name.
 
@@ -494,8 +494,8 @@ comm_plan = CommDomainPlan(
             worker_indices=[0, 1],
             window_size=...,
             buffers=[
-                ChipBufferSpec(name="scratch", nbytes=...),
-                ChipBufferSpec(name="signals", nbytes=...),
+                CommBufferSpec(name="scratch", nbytes=...),
+                CommBufferSpec(name="signals", nbytes=...),
             ],
         ),
     ],
@@ -607,12 +607,12 @@ The public domain name is not the backend communicator identity.  The parent
 derives a deterministic internal numeric `sub_comm_id` for each domain, using
 sorted domain-name order.  The initial RMA path mainly needs the same sorted
 order to compute `window_offset`, while `sub_comm_id` remains available as an
-internal backend identity.  `ChipCommDomainContext` exposes the public name
+internal backend identity.  `ChipDomainContext` exposes the public name
 and domain-local rank information, not `sub_comm_id`.
 
 The domain participant list is backend construction metadata in the derived
 chip config.  It is not a kernel-visible rank map and it is not exposed
-through `ChipCommDomainContext`.  Kernel code communicates only with dense
+through `ChipDomainContext`.  Kernel code communicates only with dense
 domain ranks.
 
 All domains are bootstrapped eagerly during `Worker.init()`.  After init
@@ -643,7 +643,7 @@ chip child i / ChipWorker.bootstrap_context()
       derive domain CommContext from base context, rank_ids, and window_offset
       local_base = base_local_window + domain.window_offset
       carve domain buffer_ptrs from local_base
-      record ChipCommDomainContext(name, domain_rank, domain_size, ...)
+      record ChipDomainContext(name, domain_rank, domain_size, ...)
   publish all domain contexts to the parent bootstrap mailbox
         |
         v
@@ -659,7 +659,7 @@ explicit bootstrap usage, such as host staging, the caller may still construct
 same parent plan with `plan.bootstrap_for_worker(worker_idx)`.
 
 The hidden base communicator is a control-plane object.  It has no exposed
-buffers, no `ChipCommDomainContext`, and no entry in `ctx.domains`.  It exists
+buffers, no `ChipDomainContext`, and no entry in `ctx.domains`.  It exists
 only so the backend can expose one common L3 rank space and base window.  A
 chip that is not a member of a particular domain still joins the hidden base
 communicator when the L3 plan has communication domains, but it does not
@@ -677,8 +677,8 @@ ChipContext(
     device_id=...,
     worker_index=...,
     domains={
-        "tp0": ChipCommDomainContext(...),
-        "ep0": ChipCommDomainContext(...),
+        "tp0": ChipDomainContext(...),
+        "ep0": ChipDomainContext(...),
     },
 )
 ```
@@ -686,7 +686,7 @@ ChipContext(
 A domain context should contain:
 
 ```python
-ChipCommDomainContext(
+ChipDomainContext(
     name: str,
     domain_rank: int,
     domain_size: int,
@@ -830,7 +830,7 @@ struct ChipDomainBootstrapConfig {
     size_t window_size;
     size_t window_offset;             // offset inside the hidden base window
     size_t base_window_size;          // same on every chip in the L3 plan
-    std::vector<ChipBufferSpec> buffers;
+    std::vector<CommBufferSpec> buffers;
 };
 ```
 
@@ -858,7 +858,7 @@ the first PTO-ISA RMA implementation:
 - base-window slicing creates one backend window and then derives
   kernel-visible domain contexts from rank selection and byte offsets.
 
-All three routes can produce the same `ChipCommDomainContext` shape.  The
+All three routes can produce the same `ChipDomainContext` shape.  The
 first implementation chooses base-window slicing because it matches the
 PTO-ISA kernel ABI and avoids repeated overlapping MC2 allocations.
 
@@ -936,7 +936,7 @@ worker = Worker(
                 name="default",
                 worker_indices=list(range(len(device_ids))),
                 window_size=window_size,
-                buffers=[ChipBufferSpec("scratch", ...)],
+                buffers=[CommBufferSpec("scratch", ...)],
             ),
         ],
     ),
@@ -952,13 +952,13 @@ comm_plan = CommDomainPlan(
             name="tp",
             worker_indices=[0, 1],
             window_size=tp_window,
-            buffers=[ChipBufferSpec("tp_scratch", ...)],
+            buffers=[CommBufferSpec("tp_scratch", ...)],
         ),
         CommDomain(
             name="ep",
             worker_indices=[0, 2],
             window_size=ep_window,
-            buffers=[ChipBufferSpec("ep_scratch", ...)],
+            buffers=[CommBufferSpec("ep_scratch", ...)],
         ),
     ],
 )
@@ -983,7 +983,7 @@ plan = CommDomainPlan(
             worker_indices=[0, 1],
             window_size=window_size,
             buffers=[
-                ChipBufferSpec(
+                CommBufferSpec(
                     name="notify_counter",
                     dtype="int32",
                     count=1,
@@ -1082,13 +1082,13 @@ comm_plan = CommDomainPlan(
             name="tp",
             worker_indices=[0, 1],
             window_size=tp_window,
-            buffers=[ChipBufferSpec("scratch", ...)],
+            buffers=[CommBufferSpec("scratch", ...)],
         ),
         CommDomain(
             name="pp",
             worker_indices=[1, 2],
             window_size=pp_window,
-            buffers=[ChipBufferSpec("scratch", ...)],
+            buffers=[CommBufferSpec("scratch", ...)],
         ),
     ],
 )
@@ -1187,7 +1187,7 @@ The caller should receive the first error after best-effort cleanup completes.
 ## Implementation Slices
 
 1. Add dataclasses for public `CommDomainPlan`, public `CommDomain`,
-   returned `ChipCommDomainContext`, plus an internal derived
+   returned `ChipDomainContext`, plus an internal derived
    `ChipDomainBootstrapConfig`.
 2. Change L3 worker construction to accept `comm_plan` as the single
    parent-level domain plan.

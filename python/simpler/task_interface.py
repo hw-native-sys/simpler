@@ -87,10 +87,10 @@ __all__ = [
     "CommDomain",
     "CommDomainPlan",
     "ChipDomainBootstrapConfig",
-    "ChipBufferSpec",
+    "CommBufferSpec",
     "HostBufferStaging",
     "ChipBootstrapConfig",
-    "ChipCommDomainContext",
+    "ChipDomainContext",
     "ChipBootstrapResult",
     # Worker-level chip bootstrap orchestration
     "ChipContext",
@@ -140,7 +140,7 @@ def scalar_to_uint64(value) -> int:
 
 
 @dataclass
-class ChipBufferSpec:
+class CommBufferSpec:
     """A named slice of the per-rank communicator window.
 
     Buffers are placed sequentially inside the window in declaration order —
@@ -183,7 +183,7 @@ class CommDomain:
     name: str
     worker_indices: list[int]
     window_size: int
-    buffers: list[ChipBufferSpec] = field(default_factory=list)
+    buffers: list[CommBufferSpec] = field(default_factory=list)
 
 
 @dataclass
@@ -198,7 +198,7 @@ class ChipDomainBootstrapConfig:
     window_size: int
     window_offset: int = 0
     base_window_size: int = 0
-    buffers: list[ChipBufferSpec] = field(default_factory=list)
+    buffers: list[CommBufferSpec] = field(default_factory=list)
     host_inputs: list[HostBufferStaging] = field(default_factory=list)
     host_outputs: list[HostBufferStaging] = field(default_factory=list)
 
@@ -363,7 +363,7 @@ class ChipBootstrapConfig:
 
 
 @dataclass
-class ChipCommDomainContext:
+class ChipDomainContext:
     name: str
     domain_rank: int
     domain_size: int
@@ -377,7 +377,7 @@ class ChipCommDomainContext:
 class ChipBootstrapResult:
     """Return value of `ChipWorker.bootstrap_context`."""
 
-    domains: dict[str, ChipCommDomainContext] = field(default_factory=dict)
+    domains: dict[str, ChipDomainContext] = field(default_factory=dict)
 
 
 @dataclass
@@ -393,7 +393,7 @@ class ChipContext:
 
     device_id: int
     worker_index: int
-    domains: dict[str, ChipCommDomainContext] = field(default_factory=dict)
+    domains: dict[str, ChipDomainContext] = field(default_factory=dict)
 
 
 # Process-wide RTLD_GLOBAL preload registry. host_runtime.so resolves its
@@ -690,7 +690,7 @@ class ChipWorker:
                             domain.input_staging(spec.name)
                         except KeyError:
                             raise ValueError(
-                                f"ChipBufferSpec(domain={domain.name!r}, name={spec.name!r}, "
+                                f"CommBufferSpec(domain={domain.name!r}, name={spec.name!r}, "
                                 "load_from_host=True) requires matching HostBufferStaging in host_inputs; none found"
                             ) from None
                     if spec.store_to_host:
@@ -698,7 +698,7 @@ class ChipWorker:
                             domain.output_staging(spec.name)
                         except KeyError:
                             raise ValueError(
-                                f"ChipBufferSpec(domain={domain.name!r}, name={spec.name!r}, "
+                                f"CommBufferSpec(domain={domain.name!r}, name={spec.name!r}, "
                                 "store_to_host=True) requires matching HostBufferStaging in host_outputs; none found"
                             ) from None
 
@@ -709,7 +709,7 @@ class ChipWorker:
                 )
             handles: list[int] = []
             self._comm_handles = handles
-            domains: dict[str, ChipCommDomainContext] = {}
+            domains: dict[str, ChipDomainContext] = {}
             if cfg.comm == []:
                 base_rank, base_size, rootinfo_path = self._base_comm_params(cfg)
                 base = self.comm_init(base_rank, base_size, rootinfo_path)
@@ -752,7 +752,7 @@ class ChipWorker:
                     actual_size = domain.window_size
                     buffer_ptrs = self._carve_domain_buffers(domain, local_base, actual_size)
                     self._stage_domain_inputs(domain, buffer_ptrs)
-                    domains[domain.name] = ChipCommDomainContext(
+                    domains[domain.name] = ChipDomainContext(
                         name=domain.name,
                         domain_rank=domain.domain_rank,
                         domain_size=domain.domain_size,
@@ -764,11 +764,11 @@ class ChipWorker:
             result = ChipBootstrapResult(domains=domains)
             if channel is not None:
                 if hasattr(channel, "write_success_domains"):
-                    from _task_interface import ChipBootstrapDomainResult  # pyright: ignore[reportMissingImports]
+                    from _task_interface import ChipDomainBootstrapResult  # pyright: ignore[reportMissingImports]
 
                     channel.write_success_domains(
                         [
-                            ChipBootstrapDomainResult(
+                            ChipDomainBootstrapResult(
                                 d.name,
                                 d.domain_rank,
                                 d.domain_size,

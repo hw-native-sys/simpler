@@ -72,7 +72,7 @@ def _make_comm_plan(nranks: int, window_size: int = 4096):
     The buffer carves the window at offset 0, so we get a deterministic
     `buffer_ptrs["x"] == local_window_base` invariant to assert on.
     """
-    from simpler.task_interface import ChipBufferSpec, CommDomain, CommDomainPlan
+    from simpler.task_interface import CommBufferSpec, CommDomain, CommDomainPlan
 
     return CommDomainPlan(
         domains=[
@@ -81,7 +81,7 @@ def _make_comm_plan(nranks: int, window_size: int = 4096):
                 worker_indices=list(range(nranks)),
                 window_size=window_size,
                 buffers=[
-                    ChipBufferSpec(
+                    CommBufferSpec(
                         name="x",
                         dtype="float32",
                         count=16,
@@ -94,7 +94,7 @@ def _make_comm_plan(nranks: int, window_size: int = 4096):
 
 
 def _make_bad_store_plan(nranks: int):
-    from simpler.task_interface import ChipBufferSpec, CommDomain, CommDomainPlan
+    from simpler.task_interface import CommBufferSpec, CommDomain, CommDomainPlan
 
     return CommDomainPlan(
         domains=[
@@ -105,7 +105,7 @@ def _make_bad_store_plan(nranks: int):
                 # Missing matching host_outputs intentionally exercises the
                 # bootstrap_context staging-symmetry error path.
                 buffers=[
-                    ChipBufferSpec(name="x", dtype="float32", count=1, nbytes=4, store_to_host=True),
+                    CommBufferSpec(name="x", dtype="float32", count=1, nbytes=4, store_to_host=True),
                 ],
             )
         ]
@@ -113,7 +113,7 @@ def _make_bad_store_plan(nranks: int):
 
 
 def _make_store_plan(nranks: int):
-    from simpler.task_interface import ChipBufferSpec, CommDomain, CommDomainPlan
+    from simpler.task_interface import CommBufferSpec, CommDomain, CommDomainPlan
 
     return CommDomainPlan(
         domains=[
@@ -122,7 +122,7 @@ def _make_store_plan(nranks: int):
                 worker_indices=list(range(nranks)),
                 window_size=4096,
                 buffers=[
-                    ChipBufferSpec(name="x", dtype="float32", count=1, nbytes=4, store_to_host=True),
+                    CommBufferSpec(name="x", dtype="float32", count=1, nbytes=4, store_to_host=True),
                 ],
             )
         ]

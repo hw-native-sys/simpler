@@ -28,7 +28,7 @@ import pytest
 @pytest.mark.platforms(["a2a3"])
 @pytest.mark.device_count(2)
 def test_worker_chip_bootstrap(st_device_ids):
-    from simpler.task_interface import ChipBufferSpec, CommDomain, CommDomainPlan
+    from simpler.task_interface import CommBufferSpec, CommDomain, CommDomainPlan
     from simpler.worker import Worker
 
     assert len(st_device_ids) >= 2, "device_count(2) fixture must yield >= 2 ids"
@@ -44,7 +44,7 @@ def test_worker_chip_bootstrap(st_device_ids):
                 worker_indices=list(range(nranks)),
                 window_size=window_size,
                 buffers=[
-                    ChipBufferSpec(
+                    CommBufferSpec(
                         name="x",
                         dtype="float32",
                         count=buffer_nbytes // 4,

@@ -67,9 +67,9 @@ import torch  # noqa: E402
 from simpler.task_interface import (  # noqa: E402
     ArgDirection,
     CallConfig,
-    ChipBufferSpec,
     ChipCallable,
     ChipContext,
+    CommBufferSpec,
     CommDomain,
     CommDomainPlan,
     ContinuousTensor,
@@ -487,7 +487,7 @@ def run(
                 worker_indices=list(range(nranks)),
                 window_size=window_size,
                 buffers=[
-                    ChipBufferSpec(
+                    CommBufferSpec(
                         name="scratch",
                         dtype="float32",
                         count=SCRATCH_NBYTES // 4,

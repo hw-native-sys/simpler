@@ -18,7 +18,7 @@ comm_plan = CommDomainPlan(
             worker_indices=[0, 1],
             window_size=tp_window_size,
             buffers=[
-                ChipBufferSpec("scratch", "float32", count, nbytes),
+                CommBufferSpec("scratch", "float32", count, nbytes),
             ],
         ),
     ],
@@ -69,7 +69,7 @@ Implemented:
 - Symmetric buffer layout: every participant in one domain receives the same
   named buffer layout.
 - Multiple domains per chip: a chip can publish more than one
-  `ChipCommDomainContext`.
+  `ChipDomainContext`.
 - Overlapping domains: the same chip may have independent ranks in different
   domains.
 - `ChipBootstrapConfig.comm`: takes the derived list from

@@ -106,7 +106,7 @@ size_t checked_buffer_count(int32_t raw_count, size_t max_buffer_count) {
 // ChipBootstrapChannel
 // =============================================================================
 
-ChipBootstrapDomainResult::ChipBootstrapDomainResult(
+ChipDomainBootstrapResult::ChipDomainBootstrapResult(
     std::string domain_name, int32_t rank, int32_t size, uint64_t ctx, uint64_t window_base, uint64_t window_size,
     std::vector<uint64_t> ptrs
 ) :
@@ -141,13 +141,13 @@ void ChipBootstrapChannel::write_success(
     if (buffer_ptrs.size() > max_buffer_count_) {
         throw std::invalid_argument("buffer_ptrs exceeds max_buffer_count");
     }
-    ChipBootstrapDomainResult domain(
+    ChipDomainBootstrapResult domain(
         "default", 0, 1, device_ctx, local_window_base, actual_window_size, std::vector<uint64_t>(buffer_ptrs)
     );
     write_success_domains({domain});
 }
 
-void ChipBootstrapChannel::write_success_domains(const std::vector<ChipBootstrapDomainResult> &domains) {
+void ChipBootstrapChannel::write_success_domains(const std::vector<ChipDomainBootstrapResult> &domains) {
     if (domains.size() > CHIP_BOOTSTRAP_MAX_DOMAINS) {
         throw std::invalid_argument("domain count exceeds CHIP_BOOTSTRAP_MAX_DOMAINS");
     }
@@ -254,10 +254,10 @@ int32_t ChipBootstrapChannel::domain_count() const {
     return count;
 }
 
-std::vector<ChipBootstrapDomainResult> ChipBootstrapChannel::domains() const {
+std::vector<ChipDomainBootstrapResult> ChipBootstrapChannel::domains() const {
     auto *base = static_cast<const char *>(mailbox_);
     int32_t count = domain_count();
-    std::vector<ChipBootstrapDomainResult> results;
+    std::vector<ChipDomainBootstrapResult> results;
     results.reserve(static_cast<size_t>(count));
     std::unordered_set<std::string> names;
     names.reserve(static_cast<size_t>(count));
@@ -296,7 +296,7 @@ std::vector<ChipBootstrapDomainResult> ChipBootstrapChannel::domains() const {
             );
         }
 
-        ChipBootstrapDomainResult result(
+        ChipDomainBootstrapResult result(
             name, read_i32(record + DOMAIN_OFF_DOMAIN_RANK), read_i32(record + DOMAIN_OFF_DOMAIN_SIZE),
             read_u64(record + DOMAIN_OFF_DEVICE_CTX), read_u64(record + DOMAIN_OFF_LOCAL_WINDOW_BASE),
             read_u64(record + DOMAIN_OFF_ACTUAL_WINDOW_SIZE), std::move(ptrs)
@@ -310,7 +310,7 @@ std::vector<ChipBootstrapDomainResult> ChipBootstrapChannel::domains() const {
     return results;
 }
 
-ChipBootstrapDomainResult ChipBootstrapChannel::domain(const std::string &name) const {
+ChipDomainBootstrapResult ChipBootstrapChannel::domain(const std::string &name) const {
     for (auto &domain : domains()) {
         if (domain.name == name) {
             return domain;

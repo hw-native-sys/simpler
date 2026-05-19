@@ -29,8 +29,8 @@ from simpler.task_interface import (
     ArgDirection,
     CallConfig,
     ChipBootstrapConfig,
-    ChipBufferSpec,
     ChipCallable,
+    CommBufferSpec,
     CommDomain,
     CommDomainPlan,
     ContinuousTensor,
@@ -142,7 +142,7 @@ def run(
                 worker_indices=list(range(nranks)),
                 window_size=window_size,
                 buffers=[
-                    ChipBufferSpec(
+                    CommBufferSpec(
                         name="input_window",
                         dtype="float32",
                         count=N,

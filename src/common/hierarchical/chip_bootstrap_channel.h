@@ -62,7 +62,7 @@ enum class ChipBootstrapMailboxState : int32_t {
     ERROR = 2,
 };
 
-struct ChipBootstrapDomainResult {
+struct ChipDomainBootstrapResult {
     std::string name;
     int32_t domain_rank = 0;
     int32_t domain_size = 0;
@@ -71,8 +71,8 @@ struct ChipBootstrapDomainResult {
     uint64_t actual_window_size = 0;
     std::vector<uint64_t> buffer_ptrs;
 
-    ChipBootstrapDomainResult() = default;
-    ChipBootstrapDomainResult(
+    ChipDomainBootstrapResult() = default;
+    ChipDomainBootstrapResult(
         std::string domain_name, int32_t rank, int32_t size, uint64_t ctx, uint64_t window_base, uint64_t window_size,
         std::vector<uint64_t> ptrs
     );
@@ -88,15 +88,15 @@ public:
         uint64_t device_ctx, uint64_t local_window_base, uint64_t actual_window_size,
         const std::vector<uint64_t> &buffer_ptrs
     );
-    void write_success_domains(const std::vector<ChipBootstrapDomainResult> &domains);
+    void write_success_domains(const std::vector<ChipDomainBootstrapResult> &domains);
     void write_error(int32_t error_code, const std::string &message);
 
     // Read side (parent process).
     ChipBootstrapMailboxState state() const;
     int32_t error_code() const;
     int32_t domain_count() const;
-    std::vector<ChipBootstrapDomainResult> domains() const;
-    ChipBootstrapDomainResult domain(const std::string &name) const;
+    std::vector<ChipDomainBootstrapResult> domains() const;
+    ChipDomainBootstrapResult domain(const std::string &name) const;
     uint64_t device_ctx() const;
     uint64_t local_window_base() const;
     uint64_t actual_window_size() const;

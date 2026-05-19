@@ -265,20 +265,20 @@ inline void bind_worker(nb::module_ &m) {
         .value("SUCCESS", ChipBootstrapMailboxState::SUCCESS)
         .value("ERROR", ChipBootstrapMailboxState::ERROR);
 
-    nb::class_<ChipBootstrapDomainResult>(m, "ChipBootstrapDomainResult")
+    nb::class_<ChipDomainBootstrapResult>(m, "ChipDomainBootstrapResult")
         .def(nb::init<>())
         .def(
             nb::init<std::string, int32_t, int32_t, uint64_t, uint64_t, uint64_t, std::vector<uint64_t>>(),
             nb::arg("name"), nb::arg("domain_rank"), nb::arg("domain_size"), nb::arg("device_ctx"),
             nb::arg("local_window_base"), nb::arg("actual_window_size"), nb::arg("buffer_ptrs")
         )
-        .def_rw("name", &ChipBootstrapDomainResult::name)
-        .def_rw("domain_rank", &ChipBootstrapDomainResult::domain_rank)
-        .def_rw("domain_size", &ChipBootstrapDomainResult::domain_size)
-        .def_rw("device_ctx", &ChipBootstrapDomainResult::device_ctx)
-        .def_rw("local_window_base", &ChipBootstrapDomainResult::local_window_base)
-        .def_rw("actual_window_size", &ChipBootstrapDomainResult::actual_window_size)
-        .def_rw("buffer_ptrs", &ChipBootstrapDomainResult::buffer_ptrs);
+        .def_rw("name", &ChipDomainBootstrapResult::name)
+        .def_rw("domain_rank", &ChipDomainBootstrapResult::domain_rank)
+        .def_rw("domain_size", &ChipDomainBootstrapResult::domain_size)
+        .def_rw("device_ctx", &ChipDomainBootstrapResult::device_ctx)
+        .def_rw("local_window_base", &ChipDomainBootstrapResult::local_window_base)
+        .def_rw("actual_window_size", &ChipDomainBootstrapResult::actual_window_size)
+        .def_rw("buffer_ptrs", &ChipDomainBootstrapResult::buffer_ptrs);
 
     nb::class_<ChipBootstrapChannel>(m, "ChipBootstrapChannel")
         .def(
@@ -299,7 +299,7 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "write_success_domains",
-            [](ChipBootstrapChannel &self, const std::vector<ChipBootstrapDomainResult> &domains) {
+            [](ChipBootstrapChannel &self, const std::vector<ChipDomainBootstrapResult> &domains) {
                 self.write_success_domains(domains);
             },
             nb::arg("domains")

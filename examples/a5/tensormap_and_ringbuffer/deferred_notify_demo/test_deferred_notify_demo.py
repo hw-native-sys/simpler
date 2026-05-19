@@ -20,9 +20,9 @@ from simpler.task_interface import (
     ArgDirection,
     CallConfig,
     ChipBootstrapConfig,
-    ChipBufferSpec,
     ChipCallable,
     ChipContext,
+    CommBufferSpec,
     CommDomain,
     CommDomainPlan,
     ContinuousTensor,
@@ -129,8 +129,8 @@ def run(
                 worker_indices=list(range(nranks)),
                 window_size=window_size,
                 buffers=[
-                    ChipBufferSpec(name="mailbox", dtype="float32", count=N, nbytes=mailbox_nbytes),
-                    ChipBufferSpec(
+                    CommBufferSpec(name="mailbox", dtype="float32", count=N, nbytes=mailbox_nbytes),
+                    CommBufferSpec(
                         name="notify_counter",
                         dtype="int32",
                         count=1,

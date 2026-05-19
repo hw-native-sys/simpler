@@ -11,9 +11,9 @@ import pytest
 from _task_interface import _ChipWorker
 from simpler.task_interface import (
     ChipBootstrapConfig,
-    ChipBufferSpec,
-    ChipCommDomainContext,
     ChipContext,
+    ChipDomainContext,
+    CommBufferSpec,
     CommDomain,
     CommDomainPlan,
     HostBufferStaging,
@@ -21,7 +21,7 @@ from simpler.task_interface import (
 
 
 def _buffer(name: str = "scratch"):
-    return ChipBufferSpec(name=name, dtype="float32", count=4, nbytes=16)
+    return CommBufferSpec(name=name, dtype="float32", count=4, nbytes=16)
 
 
 class TestCommDomainPlan:
@@ -171,7 +171,7 @@ class TestCommDomainPlan:
             device_id=1,
             worker_index=1,
             domains={
-                "tp": ChipCommDomainContext(
+                "tp": ChipDomainContext(
                     name="tp",
                     domain_rank=1,
                     domain_size=2,
@@ -180,7 +180,7 @@ class TestCommDomainPlan:
                     actual_window_size=4096,
                     buffer_ptrs={"scratch": 0x2000},
                 ),
-                "pp": ChipCommDomainContext(
+                "pp": ChipDomainContext(
                     name="pp",
                     domain_rank=0,
                     domain_size=2,

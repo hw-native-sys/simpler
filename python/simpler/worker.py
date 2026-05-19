@@ -84,8 +84,8 @@ from .task_interface import (
     CallConfig,
     ChipBootstrapConfig,
     ChipCallable,
-    ChipCommDomainContext,
     ChipContext,
+    ChipDomainContext,
     ChipWorker,
     CommDomainPlan,
     TaskArgs,
@@ -1268,10 +1268,10 @@ class Worker:
         cfg: ChipBootstrapConfig,
         *,
         chip_idx: int,
-    ) -> dict[str, ChipCommDomainContext]:
+    ) -> dict[str, ChipDomainContext]:
         if hasattr(channel, "domains"):
             raw_domains = channel.domains
-            domains: dict[str, ChipCommDomainContext] = {}
+            domains: dict[str, ChipDomainContext] = {}
             expected = {d.name: d for d in ChipWorker._domain_bootstrap_configs(cfg)}
             for raw in raw_domains:
                 name = str(raw.name)
@@ -1284,7 +1284,7 @@ class Worker:
                         f"chip {chip_idx} domain {name!r} buffer count mismatch: "
                         f"expected {len(domain_cfg.buffers)}, got {len(ptrs)}"
                     )
-                domains[name] = ChipCommDomainContext(
+                domains[name] = ChipDomainContext(
                     name=name,
                     domain_rank=int(raw.domain_rank),
                     domain_size=int(raw.domain_size),
@@ -1311,7 +1311,7 @@ class Worker:
                 f"expected {len(domain_cfg.buffers)}, got {len(ptrs)}"
             )
         return {
-            domain_cfg.name: ChipCommDomainContext(
+            domain_cfg.name: ChipDomainContext(
                 name=domain_cfg.name,
                 domain_rank=domain_cfg.domain_rank,
                 domain_size=domain_cfg.domain_size,

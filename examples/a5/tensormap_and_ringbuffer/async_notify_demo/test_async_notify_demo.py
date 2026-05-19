@@ -18,9 +18,9 @@ import torch
 from simpler.task_interface import (
     ArgDirection,
     CallConfig,
-    ChipBufferSpec,
     ChipCallable,
     ChipContext,
+    CommBufferSpec,
     CommDomain,
     CommDomainPlan,
     ContinuousTensor,
@@ -113,7 +113,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None, pto_isa_commi
                 name="default",
                 worker_indices=list(range(nranks)),
                 window_size=4 * 1024,
-                buffers=[ChipBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=4)],
+                buffers=[CommBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=4)],
             )
         ]
     )
