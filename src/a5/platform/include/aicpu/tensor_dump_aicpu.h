@@ -131,11 +131,10 @@ inline void dump_tensors_for_task(
                 info.buffer_addr = t.buffer.addr;
                 info.dtype = static_cast<uint8_t>(t.dtype);
                 info.ndims = static_cast<uint8_t>(t.ndims);
-                const uint32_t *raw_shapes = t.get_raw_shapes();
+                info.start_offset = t.start_offset;
                 for (uint32_t d = 0; d < t.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
                     info.shapes[d] = t.shapes[d];
-                    info.offsets[d] = t.is_all_offset_zero ? 0 : t.offsets[d];
-                    info.raw_shapes[d] = raw_shapes[d];
+                    info.strides[d] = t.strides[d];
                 }
                 info.task_id = slot_state.task->task_id.raw;
                 info.subtask_id = raw_subtask_id;
@@ -224,11 +223,20 @@ inline void dump_tensors_for_task(
         info.func_id = static_cast<uint32_t>(func_id);
         info.arg_index = static_cast<uint32_t>(tensor_arg_index);
         info.buffer_addr = buffer_addrs[tensor_arg_index];
-        for (uint32_t d = 0; d < t.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
+        // TensorInfo (host_build_graph) still carries (raw_shapes, offsets)
+        // implicitly describing a row-major-aligned sub-region. Translate to
+        // (start_offset, strides[]) on the fly:
+        //   strides[d] = prod(raw_shapes[d+1..])
+        //   start_offset = Σ offsets[d] · strides[d]
+        uint64_t s = 1;
+        uint64_t start = 0;
+        for (int32_t d = static_cast<int32_t>(t.ndims) - 1; d >= 0 && d < PLATFORM_DUMP_MAX_DIMS; --d) {
             info.shapes[d] = t.shapes[d];
-            info.offsets[d] = t.offsets[d];
-            info.raw_shapes[d] = t.raw_shapes[d];
+            info.strides[d] = static_cast<int32_t>(s);
+            start += static_cast<uint64_t>(t.offsets[d]) * s;
+            s *= t.raw_shapes[d];
         }
+        info.start_offset = start;
         dump_tensor_record(thread_idx, info);
         tensor_arg_index++;
     }

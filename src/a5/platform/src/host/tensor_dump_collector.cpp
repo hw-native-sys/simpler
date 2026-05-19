@@ -252,9 +252,9 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         if (dt.truncated && ++total_truncated_count_ == 1) {
             LOG_WARN("Tensor dump truncation detected. Increase PLATFORM_DUMP_AVG_TENSOR_BYTES.");
         }
-        std::memcpy(dt.raw_shapes, rec.raw_shapes, sizeof(dt.raw_shapes));
+        dt.start_offset = rec.start_offset;
         std::memcpy(dt.shapes, rec.shapes, sizeof(dt.shapes));
-        std::memcpy(dt.offsets, rec.offsets, sizeof(dt.offsets));
+        std::memcpy(dt.strides, rec.strides, sizeof(dt.strides));
 
         if (thread_idx >= 0 && thread_idx < static_cast<int>(arenas_.size())) {
             ArenaInfo &ai = arenas_[thread_idx];
@@ -566,8 +566,7 @@ int TensorDumpCollector::export_dump_files() {
         uint64_t numel = get_num_elements(dt);
 
         std::string shape_str = dims_to_string(dt.shapes, dt.ndims);
-        std::string raw_shape_str = dims_to_string(dt.raw_shapes, dt.ndims);
-        std::string offsets_str = dims_to_string(dt.offsets, dt.ndims);
+        std::string strides_str = dims_to_string(dt.strides, dt.ndims);
 
         if (!first_entry) json << ",\n";
         first_entry = false;
@@ -577,9 +576,10 @@ int TensorDumpCollector::export_dump_files() {
              << ", \"role\": \"" << tensor_dump_role_name(dt.role) << "\", \"stage\": \""
              << tensor_dump_stage_name(dt.stage) << "\", \"arg_index\": " << dt.arg_index << ", \"dtype\": \""
              << dtype_name << "\", \"is_contiguous\": " << (dt.is_contiguous ? "true" : "false")
-             << ", \"shape\": " << shape_str << ", \"raw_shape\": " << raw_shape_str << ", \"offsets\": " << offsets_str
-             << ", \"numel\": " << numel << ", \"bin_offset\": " << dt.bin_offset
-             << ", \"bin_size\": " << dt.payload_size << ", \"truncated\": " << (dt.truncated ? "true" : "false")
+             << ", \"shape\": " << shape_str << ", \"strides\": " << strides_str
+             << ", \"start_offset\": " << dt.start_offset << ", \"numel\": " << numel
+             << ", \"bin_offset\": " << dt.bin_offset << ", \"bin_size\": " << dt.payload_size
+             << ", \"truncated\": " << (dt.truncated ? "true" : "false")
              << ", \"overwritten\": " << (dt.overwritten ? "true" : "false") << "}";
     }
 
