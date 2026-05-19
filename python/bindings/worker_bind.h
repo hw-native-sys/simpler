@@ -291,14 +291,6 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def("reset", &ChipBootstrapChannel::reset)
         .def(
-            "write_success",
-            [](ChipBootstrapChannel &self, uint64_t device_ctx, uint64_t local_window_base, uint64_t actual_window_size,
-               const std::vector<uint64_t> &buffer_ptrs) {
-                self.write_success(device_ctx, local_window_base, actual_window_size, buffer_ptrs);
-            },
-            nb::arg("device_ctx"), nb::arg("local_window_base"), nb::arg("actual_window_size"), nb::arg("buffer_ptrs")
-        )
-        .def(
             "write_success_domains",
             [](ChipBootstrapChannel &self, const std::vector<ChipDomainBootstrapResult> &domains) {
                 self.write_success_domains(domains);
@@ -317,10 +309,6 @@ inline void bind_worker(nb::module_ &m) {
         .def_prop_ro("domain_count", &ChipBootstrapChannel::domain_count)
         .def_prop_ro("domains", &ChipBootstrapChannel::domains)
         .def("domain", &ChipBootstrapChannel::domain, nb::arg("name"))
-        .def_prop_ro("device_ctx", &ChipBootstrapChannel::device_ctx)
-        .def_prop_ro("local_window_base", &ChipBootstrapChannel::local_window_base)
-        .def_prop_ro("actual_window_size", &ChipBootstrapChannel::actual_window_size)
-        .def_prop_ro("buffer_ptrs", &ChipBootstrapChannel::buffer_ptrs)
         .def_prop_ro("error_message", &ChipBootstrapChannel::error_message);
 
     // Private mailbox acquire/release helpers — only for simpler.worker. The

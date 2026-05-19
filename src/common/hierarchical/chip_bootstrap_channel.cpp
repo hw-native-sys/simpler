@@ -134,19 +134,6 @@ void ChipBootstrapChannel::reset() {
     write_state(mailbox_, ChipBootstrapMailboxState::IDLE);
 }
 
-void ChipBootstrapChannel::write_success(
-    uint64_t device_ctx, uint64_t local_window_base, uint64_t actual_window_size,
-    const std::vector<uint64_t> &buffer_ptrs
-) {
-    if (buffer_ptrs.size() > max_buffer_count_) {
-        throw std::invalid_argument("buffer_ptrs exceeds max_buffer_count");
-    }
-    ChipDomainBootstrapResult domain(
-        "default", 0, 1, device_ctx, local_window_base, actual_window_size, std::vector<uint64_t>(buffer_ptrs)
-    );
-    write_success_domains({domain});
-}
-
 void ChipBootstrapChannel::write_success_domains(const std::vector<ChipDomainBootstrapResult> &domains) {
     if (domains.size() > CHIP_BOOTSTRAP_MAX_DOMAINS) {
         throw std::invalid_argument("domain count exceeds CHIP_BOOTSTRAP_MAX_DOMAINS");
@@ -318,14 +305,6 @@ ChipDomainBootstrapResult ChipBootstrapChannel::domain(const std::string &name) 
     }
     throw std::out_of_range("bootstrap domain not found: " + name);
 }
-
-uint64_t ChipBootstrapChannel::device_ctx() const { return domain("default").device_ctx; }
-
-uint64_t ChipBootstrapChannel::local_window_base() const { return domain("default").local_window_base; }
-
-uint64_t ChipBootstrapChannel::actual_window_size() const { return domain("default").actual_window_size; }
-
-std::vector<uint64_t> ChipBootstrapChannel::buffer_ptrs() const { return domain("default").buffer_ptrs; }
 
 std::string ChipBootstrapChannel::error_message() const {
     auto *base = static_cast<const char *>(mailbox_);

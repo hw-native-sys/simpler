@@ -84,10 +84,6 @@ public:
 
     // Write side (child process).
     void reset();
-    void write_success(
-        uint64_t device_ctx, uint64_t local_window_base, uint64_t actual_window_size,
-        const std::vector<uint64_t> &buffer_ptrs
-    );
     void write_success_domains(const std::vector<ChipDomainBootstrapResult> &domains);
     void write_error(int32_t error_code, const std::string &message);
 
@@ -97,10 +93,6 @@ public:
     int32_t domain_count() const;
     std::vector<ChipDomainBootstrapResult> domains() const;
     ChipDomainBootstrapResult domain(const std::string &name) const;
-    uint64_t device_ctx() const;
-    uint64_t local_window_base() const;
-    uint64_t actual_window_size() const;
-    std::vector<uint64_t> buffer_ptrs() const;
     std::string error_message() const;
 
 private:

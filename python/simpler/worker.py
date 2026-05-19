@@ -1269,58 +1269,33 @@ class Worker:
         *,
         chip_idx: int,
     ) -> dict[str, ChipDomainContext]:
-        if hasattr(channel, "domains"):
-            raw_domains = channel.domains
-            domains: dict[str, ChipDomainContext] = {}
-            expected = {d.name: d for d in ChipWorker._domain_bootstrap_configs(cfg)}
-            for raw in raw_domains:
-                name = str(raw.name)
-                domain_cfg = expected.get(name)
-                if domain_cfg is None:
-                    raise RuntimeError(f"chip {chip_idx} published unexpected domain {name!r}")
-                ptrs = list(raw.buffer_ptrs)
-                if len(ptrs) != len(domain_cfg.buffers):
-                    raise RuntimeError(
-                        f"chip {chip_idx} domain {name!r} buffer count mismatch: "
-                        f"expected {len(domain_cfg.buffers)}, got {len(ptrs)}"
-                    )
-                domains[name] = ChipDomainContext(
-                    name=name,
-                    domain_rank=int(raw.domain_rank),
-                    domain_size=int(raw.domain_size),
-                    device_ctx=int(raw.device_ctx),
-                    local_window_base=int(raw.local_window_base),
-                    actual_window_size=int(raw.actual_window_size),
-                    buffer_ptrs={spec.name: ptr for spec, ptr in zip(domain_cfg.buffers, ptrs)},
+        raw_domains = channel.domains
+        domains: dict[str, ChipDomainContext] = {}
+        expected = {d.name: d for d in ChipWorker._domain_bootstrap_configs(cfg)}
+        for raw in raw_domains:
+            name = str(raw.name)
+            domain_cfg = expected.get(name)
+            if domain_cfg is None:
+                raise RuntimeError(f"chip {chip_idx} published unexpected domain {name!r}")
+            ptrs = list(raw.buffer_ptrs)
+            if len(ptrs) != len(domain_cfg.buffers):
+                raise RuntimeError(
+                    f"chip {chip_idx} domain {name!r} buffer count mismatch: "
+                    f"expected {len(domain_cfg.buffers)}, got {len(ptrs)}"
                 )
-            missing = sorted(set(expected) - set(domains))
-            if missing:
-                raise RuntimeError(f"chip {chip_idx} did not publish expected domains: {missing}")
-            return domains
-
-        domain_cfgs = ChipWorker._domain_bootstrap_configs(cfg)
-        if not domain_cfgs:
-            return {}
-        if len(domain_cfgs) != 1:
-            raise RuntimeError("multi-domain bootstrap requires domain-aware ChipBootstrapChannel")
-        domain_cfg = domain_cfgs[0]
-        ptrs = channel.buffer_ptrs
-        if len(ptrs) != len(domain_cfg.buffers):
-            raise RuntimeError(
-                f"chip {chip_idx} bootstrap success but buffer count mismatch: "
-                f"expected {len(domain_cfg.buffers)}, got {len(ptrs)}"
-            )
-        return {
-            domain_cfg.name: ChipDomainContext(
-                name=domain_cfg.name,
-                domain_rank=domain_cfg.domain_rank,
-                domain_size=domain_cfg.domain_size,
-                device_ctx=channel.device_ctx,
-                local_window_base=channel.local_window_base,
-                actual_window_size=channel.actual_window_size,
+            domains[name] = ChipDomainContext(
+                name=name,
+                domain_rank=int(raw.domain_rank),
+                domain_size=int(raw.domain_size),
+                device_ctx=int(raw.device_ctx),
+                local_window_base=int(raw.local_window_base),
+                actual_window_size=int(raw.actual_window_size),
                 buffer_ptrs={spec.name: ptr for spec, ptr in zip(domain_cfg.buffers, ptrs)},
             )
-        }
+        missing = sorted(set(expected) - set(domains))
+        if missing:
+            raise RuntimeError(f"chip {chip_idx} did not publish expected domains: {missing}")
+        return domains
 
     def _abort_hierarchical(self) -> None:
         """Tear down all forked children + shms after a bootstrap failure.

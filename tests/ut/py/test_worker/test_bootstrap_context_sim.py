@@ -638,10 +638,11 @@ class TestBootstrapContextChannel:
 
                 channel = ChipBootstrapChannel(_shm_addr(channels_shm[rank]), max_buffer_count=376)
                 assert channel.state == ChipBootstrapMailboxState.SUCCESS
-                assert channel.device_ctx == r["device_ctx"]
-                assert channel.local_window_base == r["local_window_base"]
-                assert channel.actual_window_size == r["actual_window_size"]
-                assert channel.buffer_ptrs == r["buffer_ptrs"]
+                d = channel.domain("default")
+                assert d.device_ctx == r["device_ctx"]
+                assert d.local_window_base == r["local_window_base"]
+                assert d.actual_window_size == r["actual_window_size"]
+                assert d.buffer_ptrs == r["buffer_ptrs"]
         finally:
             for shm in channels_shm.values():
                 shm.close()

@@ -20,7 +20,28 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CHIP_BOOTSTRAP_MAILBOX_SIZE,
     ChipBootstrapChannel,
     ChipBootstrapMailboxState,
+    ChipDomainBootstrapResult,
 )
+
+
+def _single_domain(device_ctx, local_window_base, actual_window_size, buffer_ptrs, *, name="default"):
+    """Build a one-domain payload matching the legacy single-domain wire shape.
+
+    The single-domain accessors (`channel.device_ctx` / `local_window_base` /
+    `actual_window_size` / `buffer_ptrs`) were removed alongside
+    `write_success`; the equivalent today is one `ChipDomainBootstrapResult`
+    fed through `write_success_domains`.  This helper keeps the test bodies
+    short while pinning the same fields.
+    """
+    return ChipDomainBootstrapResult(
+        name,
+        0,
+        1,
+        device_ctx,
+        local_window_base,
+        actual_window_size,
+        list(buffer_ptrs),
+    )
 
 
 def _mailbox_addr(shm: SharedMemory) -> int:
@@ -43,22 +64,27 @@ class TestBootstrapChannel:
             shm.unlink()
 
     def test_write_success_fields(self):
-        """write_success stores all fields and parent reads them back."""
+        """write_success_domains stores all fields and parent reads them back."""
         shm = SharedMemory(create=True, size=CHIP_BOOTSTRAP_MAILBOX_SIZE)
         try:
             ch = ChipBootstrapChannel(_mailbox_addr(shm), max_buffer_count=376)
             ch.reset()
-            ch.write_success(
-                device_ctx=0xDEADBEEFCAFE1234,
-                local_window_base=0xAABBCCDD00112233,
-                actual_window_size=65536,
-                buffer_ptrs=[0x1000, 0x2000, 0x3000],
+            ch.write_success_domains(
+                [
+                    _single_domain(
+                        device_ctx=0xDEADBEEFCAFE1234,
+                        local_window_base=0xAABBCCDD00112233,
+                        actual_window_size=65536,
+                        buffer_ptrs=[0x1000, 0x2000, 0x3000],
+                    )
+                ]
             )
             assert ch.state == ChipBootstrapMailboxState.SUCCESS
-            assert ch.device_ctx == 0xDEADBEEFCAFE1234
-            assert ch.local_window_base == 0xAABBCCDD00112233
-            assert ch.actual_window_size == 65536
-            assert ch.buffer_ptrs == [0x1000, 0x2000, 0x3000]
+            d = ch.domain("default")
+            assert d.device_ctx == 0xDEADBEEFCAFE1234
+            assert d.local_window_base == 0xAABBCCDD00112233
+            assert d.actual_window_size == 65536
+            assert d.buffer_ptrs == [0x1000, 0x2000, 0x3000]
         finally:
             shm.close()
             shm.unlink()
@@ -78,12 +104,12 @@ class TestBootstrapChannel:
             shm.unlink()
 
     def test_state_machine_reset(self):
-        """write_success -> SUCCESS, reset -> IDLE."""
+        """write_success_domains -> SUCCESS, reset -> IDLE."""
         shm = SharedMemory(create=True, size=CHIP_BOOTSTRAP_MAILBOX_SIZE)
         try:
             ch = ChipBootstrapChannel(_mailbox_addr(shm), max_buffer_count=376)
             ch.reset()
-            ch.write_success(0, 0, 0, [])
+            ch.write_success_domains([_single_domain(0, 0, 0, [])])
             assert ch.state == ChipBootstrapMailboxState.SUCCESS
             ch.reset()
             assert ch.state == ChipBootstrapMailboxState.IDLE
@@ -101,11 +127,15 @@ class TestBootstrapChannel:
                 # Child: wrap same shm and write success.
                 ch = ChipBootstrapChannel(addr, max_buffer_count=376)
                 ch.reset()
-                ch.write_success(
-                    device_ctx=0x1111222233334444,
-                    local_window_base=0x5555666677778888,
-                    actual_window_size=128,
-                    buffer_ptrs=[0xA, 0xB, 0xC, 0xD],
+                ch.write_success_domains(
+                    [
+                        _single_domain(
+                            device_ctx=0x1111222233334444,
+                            local_window_base=0x5555666677778888,
+                            actual_window_size=128,
+                            buffer_ptrs=[0xA, 0xB, 0xC, 0xD],
+                        )
+                    ]
                 )
                 os._exit(0)
             else:
@@ -114,24 +144,25 @@ class TestBootstrapChannel:
                 while ch.state == ChipBootstrapMailboxState.IDLE:
                     pass
                 assert ch.state == ChipBootstrapMailboxState.SUCCESS
-                assert ch.device_ctx == 0x1111222233334444
-                assert ch.local_window_base == 0x5555666677778888
-                assert ch.actual_window_size == 128
-                assert ch.buffer_ptrs == [0xA, 0xB, 0xC, 0xD]
+                d = ch.domain("default")
+                assert d.device_ctx == 0x1111222233334444
+                assert d.local_window_base == 0x5555666677778888
+                assert d.actual_window_size == 128
+                assert d.buffer_ptrs == [0xA, 0xB, 0xC, 0xD]
                 os.waitpid(pid, 0)
         finally:
             shm.close()
             shm.unlink()
 
     def test_buffer_ptrs_overflow(self):
-        """write_success with too many ptrs throws."""
+        """write_success_domains with too many ptrs in one domain throws."""
         shm = SharedMemory(create=True, size=CHIP_BOOTSTRAP_MAILBOX_SIZE)
         try:
             ch = ChipBootstrapChannel(_mailbox_addr(shm), max_buffer_count=376)
             ch.reset()
             too_many = list(range(377))
             with pytest.raises(ValueError, match="buffer_ptrs exceeds max_buffer_count"):
-                ch.write_success(0, 0, 0, too_many)
+                ch.write_success_domains([_single_domain(0, 0, 0, too_many)])
         finally:
             shm.close()
             shm.unlink()
