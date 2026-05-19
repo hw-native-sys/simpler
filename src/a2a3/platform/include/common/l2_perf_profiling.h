@@ -66,6 +66,28 @@
 #endif
 
 // =============================================================================
+// L2 perf_level — granularity ladder for the L2 swimlane profiler.
+//
+// Each level is a strict superset of the previous: higher levels add the data
+// described by their name on top of all lower-level data. Naming describes
+// what is NEWLY captured at that level (incremental view), so gate sites read
+// naturally — e.g. `if (level >= SCHED_PHASES)` means "this section runs when
+// scheduler phase records are being collected (or any higher tier)".
+//
+// Transported via `L2PerfDataHeader::l2_perf_level` (host → AICPU,
+// shared memory) and `CallConfig::enable_l2_swimlane` (Python → C). The wire
+// representation stays integer (uint32_t / int32_t) for ABI stability; this
+// enum is the canonical in-code type used for comparisons.
+// =============================================================================
+enum class L2PerfLevel : uint32_t {
+    DISABLED = 0,       // No collection at all
+    AICORE_TIMING = 1,  // AICore per-task start/end timestamps + task record buffer
+    AICPU_TIMING = 2,   // + AICPU dispatch/finish timestamps + fanout dependency list
+    SCHED_PHASES = 3,   // + scheduler main-loop phase records (SCHED_COMPLETE/DISPATCH/IDLE_WAIT)
+    ORCH_PHASES = 4,    // + orchestrator phase records
+};
+
+// =============================================================================
 // L2PerfRecord - Single Task Execution Record
 // =============================================================================
 
@@ -274,7 +296,10 @@ struct L2PerfDataHeader {
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // Producer write positions (AICPU modifies)
 
     // Metadata (Host initializes, Device read-only)
-    uint32_t num_cores;  // Actual number of cores launched
+    uint32_t num_cores;      // Actual number of cores launched
+    uint32_t l2_perf_level;  // 0=off, 1=AICore timing, 2=+dispatch/fanout,
+                             // 3=+sched phases, 4=+orch phases. Host writes
+                             // at init; AICPU reads in l2_perf_aicpu_init.
 } __attribute__((aligned(64)));
 
 // =============================================================================

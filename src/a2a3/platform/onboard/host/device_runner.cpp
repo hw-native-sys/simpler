@@ -1259,7 +1259,7 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     };
 
     int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, output_prefix_
+        num_aicore, device_id, l2_perf_level_, alloc_cb, register_cb, free_cb, &mem_alloc_, output_prefix_
     );
     if (rc != 0) {
         return rc;

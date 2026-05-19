@@ -21,19 +21,26 @@ class TestCallConfig:
         config = CallConfig()
         assert config.block_dim == 24
         assert config.aicpu_thread_num == 3
-        assert config.enable_l2_swimlane is False
+        assert config.enable_l2_swimlane == 0
         assert config.enable_dump_tensor is False
         assert config.enable_pmu == 0
         assert config.enable_dep_gen is False
 
     def test_setters(self):
+        # enable_l2_swimlane accepts both an int perf_level (0-4) and a Python
+        # bool. `True` maps to level 4 (preserves the pre-perf_level "fully on"
+        # semantics for legacy callers); explicit ints select a specific level.
         config = CallConfig()
         config.block_dim = 32
         config.aicpu_thread_num = 4
         config.enable_l2_swimlane = True
         assert config.block_dim == 32
         assert config.aicpu_thread_num == 4
-        assert config.enable_l2_swimlane is True
+        assert config.enable_l2_swimlane == 4
+        config.enable_l2_swimlane = 2
+        assert config.enable_l2_swimlane == 2
+        config.enable_l2_swimlane = False
+        assert config.enable_l2_swimlane == 0
 
     def test_diagnostics_subfeatures_are_parallel(self):
         # Guard against drift: the four diagnostics sub-features under the
@@ -43,12 +50,12 @@ class TestCallConfig:
         config.enable_dump_tensor = True
         config.enable_pmu = 2
         config.enable_dep_gen = True
-        assert config.enable_l2_swimlane is True
+        assert config.enable_l2_swimlane == 4
         assert config.enable_dump_tensor is True
         assert config.enable_pmu == 2
         assert config.enable_dep_gen is True
         r = repr(config)
-        assert "enable_l2_swimlane=True" in r
+        assert "enable_l2_swimlane=4" in r
         assert "enable_dump_tensor=True" in r
         assert "enable_pmu=2" in r
         assert "enable_dep_gen=True" in r
@@ -57,7 +64,7 @@ class TestCallConfig:
         config = CallConfig()
         r = repr(config)
         assert "block_dim=24" in r
-        assert "enable_l2_swimlane=False" in r
+        assert "enable_l2_swimlane=0" in r
 
 
 # ============================================================================

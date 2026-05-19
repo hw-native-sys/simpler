@@ -30,13 +30,26 @@
 
 /**
  * L2 perf handshake setters — called by the host (sim) or the AICPU kernel
- * entry (onboard) before `l2_perf_aicpu_init()` so AICPU code can
- * read perf state without reaching into the generic `Runtime` struct.
+ * entry (onboard) before `l2_perf_aicpu_init()` so AICPU code can read perf
+ * state without reaching into the generic `Runtime` struct.
+ *
+ * Two-channel level transport (mirrors the PMU pattern):
+ *   - binary on/off — `enable_profiling_flag` bit1 → `set_l2_swimlane_enabled(bool)`
+ *     at kernel entry; queried via `is_l2_swimlane_enabled()`.
+ *   - granular L2PerfLevel — `L2PerfDataHeader::l2_perf_level`
+ *     (shared memory); read in `l2_perf_aicpu_init` and cached, then queried
+ *     via `get_l2_perf_level()` for
+ *     `>= AICPU_TIMING / SCHED_PHASES / ORCH_PHASES` gates.
  */
 extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base);
 extern "C" uint64_t get_platform_l2_perf_base();
 extern "C" void set_l2_swimlane_enabled(bool enable);
 extern "C" bool is_l2_swimlane_enabled();
+
+// Typed getter for the granular perf_level (promoted from the shared-memory
+// header inside l2_perf_aicpu_init). Gate sites should use this so the
+// comparison RHS is a named L2PerfLevel constant.
+L2PerfLevel get_l2_perf_level();
 
 /**
  * Initialize performance profiling

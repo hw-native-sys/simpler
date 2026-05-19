@@ -483,7 +483,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
 #if PTO2_PROFILING
-            rt->orchestrator.enable_l2_swimlane = is_l2_swimlane_enabled();
+            rt->orchestrator.l2_perf_level = get_l2_perf_level();
 #endif
 
             // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
@@ -505,7 +505,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             sched_ctx_.wait_pto2_init_complete();
 
 #if PTO2_PROFILING
-            if (is_l2_swimlane_enabled()) {
+            if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
                 l2_perf_aicpu_set_orch_thread_idx(thread_idx);
             }
 #endif

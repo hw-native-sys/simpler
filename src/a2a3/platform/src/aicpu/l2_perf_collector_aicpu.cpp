@@ -52,14 +52,21 @@ static int s_orch_thread_idx = -1;
 // L2 perf platform state. Published by the host (via dlsym'd setters on sim)
 // or by the AICPU kernel entry (onboard) before perf init runs, so downstream
 // perf code can discover enablement + device-base without reading the generic
-// Runtime struct.
+// Runtime struct. Two channels (mirrors PMU):
+//   - g_enable_l2_swimlane (bool) — set at kernel entry from the bitmask bit
+//   - g_l2_perf_level (L2PerfLevel) — promoted in
+//     l2_perf_aicpu_init from the shared-memory header so
+//     `>= AICPU_TIMING / SCHED_PHASES / ORCH_PHASES` gates have the granular
+//     value (exposed via get_l2_perf_level()).
 static uint64_t g_platform_l2_perf_base = 0;
 static bool g_enable_l2_swimlane = false;
+static L2PerfLevel g_l2_perf_level = L2PerfLevel::DISABLED;
 
 extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base) { g_platform_l2_perf_base = l2_perf_data_base; }
 extern "C" uint64_t get_platform_l2_perf_base() { return g_platform_l2_perf_base; }
 extern "C" void set_l2_swimlane_enabled(bool enable) { g_enable_l2_swimlane = enable; }
 extern "C" bool is_l2_swimlane_enabled() { return g_enable_l2_swimlane; }
+L2PerfLevel get_l2_perf_level() { return g_l2_perf_level; }
 
 /**
  * Enqueue ready buffer to per-thread queue
@@ -104,7 +111,15 @@ void l2_perf_aicpu_init(int worker_count) {
 
     s_l2_perf_header = get_l2_perf_header(l2_perf_base);
 
-    LOG_INFO_V0("Initializing performance profiling for %d cores (free queue)", worker_count);
+    // Read the granular perf_level from the shared-memory header (host wrote
+    // it in L2PerfCollector::initialize). The kernel-entry setter only seeded
+    // the binary g_enable_l2_swimlane via the bitmask bit.
+    g_l2_perf_level = static_cast<L2PerfLevel>(s_l2_perf_header->l2_perf_level);
+
+    LOG_INFO_V0(
+        "Initializing performance profiling for %d cores (free queue), l2_perf_level=%u", worker_count,
+        static_cast<uint32_t>(g_l2_perf_level)
+    );
 
     // Pop first buffer from free_queue for each core
     for (int i = 0; i < worker_count; i++) {
@@ -272,16 +287,23 @@ int l2_perf_aicpu_complete_record(
     record->task_id = task_id;
     record->func_id = func_id;
     record->core_type = core_type;
-    record->dispatch_time = dispatch_time;
-    record->finish_time = finish_time;
 
-    if (fanout != nullptr && fanout_count > 0) {
-        int32_t n = (fanout_count > RUNTIME_MAX_FANOUT) ? RUNTIME_MAX_FANOUT : fanout_count;
-        for (int32_t i = 0; i < n; i++) {
-            record->fanout[i] = fanout[i];
+    // AICPU_TIMING and above: dispatch/finish timing and fanout dependency info
+    if (g_l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+        record->dispatch_time = dispatch_time;
+        record->finish_time = finish_time;
+        if (fanout != nullptr && fanout_count > 0) {
+            int32_t n = (fanout_count > RUNTIME_MAX_FANOUT) ? RUNTIME_MAX_FANOUT : fanout_count;
+            for (int32_t i = 0; i < n; i++) {
+                record->fanout[i] = fanout[i];
+            }
+            record->fanout_count = n;
+        } else {
+            record->fanout_count = 0;
         }
-        record->fanout_count = n;
     } else {
+        record->dispatch_time = 0;
+        record->finish_time = 0;
         record->fanout_count = 0;
     }
 

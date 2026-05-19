@@ -4,7 +4,7 @@ This document describes the profiling macro hierarchy and logging control in the
 
 ## Overview
 
-PTO Runtime2 uses a hierarchical profiling system with compile-time macros to control profiling code compilation and log output. The `enable_l2_swimlane` runtime flag controls data collection (performance buffers, shared memory writes) but does NOT control log output.
+PTO Runtime2 uses a hierarchical profiling system with compile-time macros to control profiling code compilation and log output. The `enable_l2_swimlane` runtime flag (integer perf_level 0–4) controls data collection granularity (performance buffers, shared memory writes) but does NOT control log output.
 
 ## Profiling Macro Hierarchy
 
@@ -13,7 +13,7 @@ PTO2_PROFILING (base level, default=1)
 ├── PTO2_ORCH_PROFILING (orchestrator, default=0, requires PTO2_PROFILING=1)
 |   └──PTO2_TENSORMAP_PROFILING (tensormap, default=0, requires PTO2_ORCH_PROFILING=1)
 ├── PTO2_SCHED_PROFILING (scheduler, default=0, requires PTO2_PROFILING=1)
-└── --enable-l2-swimlane (Dump profiling merged swimlane json file for visualization, requires PTO2_PROFILING=1)
+└── --enable-l2-swimlane [PERF_LEVEL] (L2 swimlane data collection, 0-4, bare=4, requires PTO2_PROFILING=1)
 
 ```
 
@@ -231,35 +231,74 @@ Thread X:   overlap checks : XXX, hits=XXX (XX.X%)
 
 ---
 
-## Runtime Flag: enable_l2_swimlane
+## Runtime Flag: enable_l2_swimlane (perf_level)
 
-L2 swimlane enablement is published through the
-`KernelArgs::enable_profiling_flag` bitmask (bit1 = `PROFILING_FLAG_L2_SWIMLANE`).
-AICPU code reads it via `is_l2_swimlane_enabled()` (set at launch time
-by the platform from `kernel_args.l2_perf_data_base` + the bitmask). It
-controls **data collection**, NOT log output.
+`--enable-l2-swimlane` accepts an integer perf_level (0–4). Transport
+mirrors the PMU pattern — two independent channels (one binary, one int):
 
-### When enable_l2_swimlane=true
+- **Binary on/off** — `KernelArgs::enable_profiling_flag` bit1
+  (`PROFILING_FLAG_L2_SWIMLANE`). Set by the host whenever level > 0; read
+  by AICore (which only needs on/off to decide whether to write timing) and
+  by AICPU kernel entry via `set_l2_swimlane_enabled(bool)`.
+- **Granular level (0–4)** — `L2PerfDataHeader::l2_perf_level`
+  (shared memory). Host writes it in `L2PerfCollector::initialize`; AICPU
+  promotes it from the header in `l2_perf_aicpu_init` and exposes it via
+  `get_l2_perf_level()` (typed `L2PerfLevel`) for
+  `>= AICPU_TIMING / SCHED_PHASES / ORCH_PHASES` gates.
 
-- Performance buffers are allocated and written
-- Per-task timing data is collected
-- Phase profiling data is recorded
-- Orchestrator summary is written to shared memory
+On sim, the binary on/off travels via the dlsym'd `set_l2_swimlane_enabled`
+entry point; the granular level still goes through the shared-memory
+header just like on onboard.
 
-### When enable_l2_swimlane=false
+| Level | Collects |
+| ----- | -------- |
+| 0 | Nothing (disabled) |
+| 1 | AICore timing only (start/end/task_id/func_id/core_type) |
+| 2 | + dispatch_time, finish_time, fanout |
+| 3 | + Scheduler phases (`SCHED_*`) |
+| 4 | + Orchestrator phases (full) |
+
+Bare `--enable-l2-swimlane` = level 4 (backward compatible).
+
+### Level gating in AICPU code
+
+Use the strongly-typed `L2PerfLevel` enum so each gate names the
+content it depends on instead of relying on magic numbers:
+
+```cpp
+// Any level > 0: AICPU task record buffer init / flush.
+// Cheap binary check, available immediately after kernel entry.
+if (is_l2_swimlane_enabled()) { ... }
+
+// AICPU dispatch/finish timestamps + fanout.
+// Granular checks below require l2_perf_aicpu_init to have already run
+// (so the level has been promoted from the shared-memory header).
+if (get_l2_perf_level() >= L2PerfLevel::AICPU_TIMING) { ... }
+
+// Scheduler main-loop phase records (SCHED_*)
+if (get_l2_perf_level() >= L2PerfLevel::SCHED_PHASES) { ... }
+
+// Orchestrator phase records
+if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) { ... }
+```
+
+`L2PerfLevel` is defined in `common/l2_perf_profiling.h` with
+underlying type `uint32_t` (matches the `L2PerfDataHeader::l2_perf_level`
+shared-memory field and mirrors `PmuEventType : uint32_t`):
+
+| Enumerator | Underlying value |
+| ---------- | ---------------- |
+| `DISABLED` | 0 |
+| `AICORE_TIMING` | 1 |
+| `AICPU_TIMING` | 2 |
+| `SCHED_PHASES` | 3 |
+| `ORCH_PHASES` | 4 |
+
+### When enable_l2_swimlane=0
 
 - No performance data collection
 - No shared memory writes
 - Logs still print (controlled by macros only)
-
-### Usage
-
-```cpp
-// AICPU path — read enablement from the platform accessor, not the Runtime struct.
-if (is_l2_swimlane_enabled()) {
-    // ... perf-collection code ...
-}
-```
 
 ---
 
@@ -383,7 +422,7 @@ add_definitions(-DPTO2_ORCH_PROFILING=1)
 ### Runtime overhead
 
 - Logging: Negligible (device logs are asynchronous)
-- Data collection (`enable_l2_swimlane=true`): Low to moderate
+- Data collection (`enable_l2_swimlane>0`): Low to moderate
   - Performance buffer writes
   - Shared memory updates
   - Per-task timing measurements
