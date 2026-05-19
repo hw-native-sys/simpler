@@ -12,10 +12,9 @@
 Hardware-only: dispatches an AIC kernel that spins forever. The 3-layer
 timeout chain (STARS op watchdog ~1 s, AICPU deinit ~1 s, host stream sync
 2 s/stream) must reap the hang and surface a ``RuntimeError`` in
-single-digit seconds rather than deadlocking. There is no a2a3sim case
+single-digit seconds rather than deadlocking. Sim variants are excluded
 because the simulator has no STARS watchdog — a ``while(true)`` kernel
-would wedge the sim. a5 has no equivalent timeout mechanism yet; mirror
-this test there once it does.
+would wedge the sim.
 """
 
 import os
@@ -57,7 +56,7 @@ def _build_chip_callable(platform: str) -> ChipCallable:
     )
 
 
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(60)

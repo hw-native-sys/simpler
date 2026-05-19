@@ -552,6 +552,16 @@ private:
     int prepare_orch_so(Runtime &runtime);
 
     /**
+     * Configure STARS op execution timeout (once per DeviceRunner lifetime).
+     *
+     * Called on first device attach to set the hardware-level AICore op
+     * execution timeout via aclrtSetOpExecuteTimeOutV2.  The actual
+     * timeout may differ from the requested value due to hardware timer
+     * granularity.
+     */
+    void configure_aicore_op_timeout();
+
+    /**
      * Initialize performance profiling device buffers
      *
      * Allocates L2PerfSetupHeader and per-core/per-thread buffers on device;
