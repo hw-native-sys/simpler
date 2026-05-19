@@ -17,8 +17,9 @@
  *
  * Python callers register sub-workers via `add_next_level_worker(mailbox_ptr)`
  * / `add_sub_worker(mailbox_ptr)`. Each mailbox addresses a MAILBOX_SIZE-byte
- * MAP_SHARED region; the real IWorker lives in a forked Python child consuming
- * the mailbox via `_chip_process_loop` / `_sub_worker_loop`.
+ * MAP_SHARED region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
+ * callable for SUB) lives in a forked Python child consuming the mailbox via
+ * `_chip_process_loop` / `_sub_worker_loop`.
  */
 
 #pragma once

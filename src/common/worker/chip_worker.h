@@ -21,7 +21,7 @@
 #include "../task_interface/task_args.h"
 #include "types.h"
 
-class ChipWorker : public IWorker {
+class ChipWorker {
 public:
     ChipWorker() = default;
     ~ChipWorker();
@@ -48,10 +48,10 @@ public:
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
-    // IWorker: launch a cid previously staged via prepare_callable.
+    // Launch a cid previously staged via prepare_callable.
     // Materializes a ChipStorageTaskArgs from `args` (one memcpy of T*40B + S*8B
     // into a stack POD), then delegates to the overload below.
-    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config) override;
+    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config);
     // Same launch, but the caller already holds the runtime.so-ABI POD —
     // skip the view→storage memcpy and hand the pointer straight to the C ABI.
     // Used by the ChipStorageTaskArgs path in the nanobind binding.

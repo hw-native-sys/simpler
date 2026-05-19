@@ -19,8 +19,8 @@
  * Each WorkerThread encodes `(callable, config, args_blob)` into a
  * pre-forked child's shared-memory mailbox, signals TASK_READY, and
  * spin-polls TASK_DONE. The child process loop (Python) reads the
- * mailbox and calls the appropriate IWorker / Python callable in its
- * own address space.
+ * mailbox and runs the cid on its `ChipWorker` (NEXT_LEVEL) or the
+ * registered Python callable (SUB) in its own address space.
  */
 
 #pragma once
@@ -150,7 +150,8 @@ public:
     // Start the worker thread.
     //
     // `mailbox` points to a MAILBOX_SIZE-byte MAP_SHARED region managed
-    // by the Python facade — the real IWorker lives in the forked child
+    // by the Python facade — the real worker (a `ChipWorker` for
+    // NEXT_LEVEL, a Python callable for SUB) lives in the forked child
     // and consumes the mailbox via `_chip_process_loop` / `_sub_worker_loop`.
     //
     // `ring` is a borrowed pointer to the engine's slot-state pool —
@@ -239,7 +240,8 @@ public:
     using OnCompleteFn = std::function<void(TaskSlot)>;
 
     // Register a worker. `mailbox` is a MAILBOX_SIZE-byte MAP_SHARED
-    // region; the real IWorker lives in the forked child.
+    // region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
+    // callable for SUB) lives in the forked child.
     void add_next_level(void *mailbox);
     void add_sub(void *mailbox);
 

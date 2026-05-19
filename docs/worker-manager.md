@@ -4,13 +4,13 @@
 of a `Worker` engine. `WorkerManager` owns two pools of `WorkerThread`s (one
 for next-level workers, one for sub workers); each `WorkerThread` drives a
 shared-memory mailbox that a forked Python child consumes — the child runs
-the real `IWorker` in its own address space.
+the real worker (a `ChipWorker` for NEXT_LEVEL, a Python callable for SUB)
+in its own address space.
 
 For the high-level role of this layer among the three engine components, see
-[hierarchical_level_runtime.md](hierarchical_level_runtime.md). For what the
-`IWorker` implementations actually do with task data, see
-[task-flow.md](task-flow.md). For where dispatched tasks come from, see
-[scheduler.md](scheduler.md).
+[hierarchical_level_runtime.md](hierarchical_level_runtime.md). For what
+runs on the other side of the mailbox, see [task-flow.md](task-flow.md).
+For where dispatched tasks come from, see [scheduler.md](scheduler.md).
 
 ---
 
@@ -20,7 +20,8 @@ For the high-level role of this layer among the three engine components, see
 class WorkerManager {
 public:
     // Registration (before init). `mailbox` is a MAILBOX_SIZE-byte
-    // MAP_SHARED region; the real IWorker lives in the forked child.
+    // MAP_SHARED region; the real worker (a `ChipWorker` for NEXT_LEVEL,
+    // a Python callable for SUB) lives in the forked child.
     void add_next_level(void *mailbox);
     void add_sub       (void *mailbox);
 
@@ -51,7 +52,7 @@ private:
 
 ## 2. `WorkerThread`
 
-One WorkerThread per IWorker instance.
+One WorkerThread per registered mailbox (i.e. per forked child worker).
 
 ```cpp
 struct WorkerDispatch {
@@ -152,8 +153,9 @@ Total ~nanoseconds overhead; the wait is dominated by actual kernel execution.
 The child loop lives in Python — see `_chip_process_loop` and
 `_sub_worker_loop` in `python/simpler/worker.py`. Each child polls
 `MAILBOX_OFF_STATE`, decodes the args blob on `TASK_READY`, runs the
-real `IWorker` (`ChipWorker` for chip children) or registered Python
-callable (sub workers), writes back any error, and publishes `TASK_DONE`.
+real worker (a `ChipWorker.run(cid, …)` call for chip children, the
+registered Python callable for sub workers), writes back any error,
+and publishes `TASK_DONE`.
 The child inherits the parent's full address space at fork time, so:
 
 - ChipCallable objects (pre-fork allocated) are COW-visible at the same VA
@@ -191,22 +193,25 @@ the C++ dispatcher thread — it does not own the child process.
 
 ---
 
-## 4. Adding a new IWorker type
+## 4. Adding a new worker kind
 
-To add a new worker kind (e.g., a RemoteWorker over RPC):
+To add a new worker type (e.g., a RemoteWorker over RPC):
 
-1. Implement `IWorker::run(callable, TaskArgsView, const CallConfig&)` on the
-   new class
-2. Decode the mailbox in a child-process loop (mirroring
-   `_chip_process_loop`) so the parent talks to it through the same
-   handshake as `ChipWorker`
-3. Register the mailbox via `manager.add_next_level(mailbox)` or
-   `manager.add_sub(mailbox)`
+1. Define the kernel-running entry point (a C++ class with a `run` method
+   or a Python callable — there is no abstract interface to inherit from).
+2. Write a child-process loop (mirroring `_chip_process_loop` or
+   `_sub_worker_loop`) that polls the mailbox, decodes the args blob, and
+   invokes that entry point.
+3. Register the per-child mailbox via `manager.add_next_level(mailbox)`
+   or `manager.add_sub(mailbox)`.
+
+The parent side (WorkerManager / WorkerThread) doesn't change — it
+only knows the mailbox protocol, not who runs the kernel on the other
+end.
 
 ### 4.1 Nested fork ordering (L4+ Worker children)
 
-When an L4 Worker has L3 Worker children (PROCESS mode), the fork sequence
-nests:
+When an L4 Worker has L3 Worker children, the fork sequence nests:
 
 ```text
 L4 parent process
@@ -249,13 +254,13 @@ children never do. Putting the slot in shm would force cross-process atomics
 and shm-safe containers for no benefit. See
 [task-flow.md](task-flow.md) §11 for full rationale.
 
-### 5.3 Why one WorkerThread per IWorker?
+### 5.3 Why one WorkerThread per child?
 
-Alternative: N workers share one dispatch queue. Rejected because:
+Alternative: N children share one dispatch queue. Rejected because:
 
-- `WorkerThread` queue is the natural unit of backpressure — if worker `i` is
+- `WorkerThread` queue is the natural unit of backpressure — if child `i` is
   slow, its queue fills up and scheduler falls back to another
-- Simpler mental model: one IWorker = one thread that drives it
+- Simpler mental model: one child = one thread that drives it
 - Zero contention on queue access (only one producer, one consumer per queue)
 
 ---
@@ -264,6 +269,6 @@ Alternative: N workers share one dispatch queue. Rejected because:
 
 - [hierarchical_level_runtime.md](hierarchical_level_runtime.md) — where this
   layer fits in the three-component engine
-- [task-flow.md](task-flow.md) — what `IWorker::run` receives
+- [task-flow.md](task-flow.md) — what `ChipWorker::run` receives
 - [scheduler.md](scheduler.md) — the producer of `WorkerThread::dispatch`
   calls

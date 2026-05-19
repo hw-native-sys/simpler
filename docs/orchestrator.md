@@ -669,9 +669,9 @@ instead of stalling forever. Default timeout: 10 s.
    `submit_*`. Phases after submit (slot storage, dispatch, execution) do not
    see tags.
 3. **Slot is parent-heap**: all `TaskSlotState` state is in the parent
-   process's heap. Child processes (PROCESS mode workers) never read slot
-   state; they receive task data via the mailbox (see
-   [worker-manager.md](worker-manager.md) §4).
+   process's heap. Forked child workers never read slot state; they
+   receive task data via the mailbox (see
+   [worker-manager.md](worker-manager.md) §3).
 4. **Ring.alloc is the only blocking point in Orch**: `submit_*` never
    blocks except on ring pressure.
 5. **Scope.register_task is idempotent per slot per scope level**: each

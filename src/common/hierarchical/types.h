@@ -10,7 +10,7 @@
  */
 
 /**
- * Distributed runtime — shared types and IWorker interface.
+ * Distributed runtime — shared scheduling types.
  *
  * Every level in the hierarchy (L3 HostWorker, L4, L5, …) runs the same
  * scheduling engine.  This header defines:
@@ -18,15 +18,13 @@
  *   - TaskSlotState: per-task scheduling bookkeeping (stores TaskArgs
  *                        directly — no separate dispatch carrier struct)
  *   - ReadyQueue: Orch→Scheduler notification channel
- *   - IWorker: abstract interface implemented by ChipWorker (the in-child
- *              worker invoked from `_chip_process_loop`)
  *
- * IWorker::run takes (callable_id, TaskArgsView, CallConfig) — the cid is the
- * value returned by ``Worker.register()``; the callable must have been
- * prepared via ``prepare_callable`` before dispatch.  TaskArgs is encoded
- * into the per-WorkerThread shm mailbox with inline std::memcpy of
+ * Dispatch encodes (callable_id, CallConfig, TaskArgs) into the
+ * per-WorkerThread shm mailbox with inline std::memcpy of
  * [int32 T][int32 S][ContinuousTensor × T][uint64 × S]; the forked child
- * decodes the same layout to rebuild the view.
+ * decodes the same layout to rebuild a TaskArgsView and runs the cid
+ * (returned by `Worker.register()`, prepared via `prepare_callable`) on
+ * its `ChipWorker` instance.
  */
 
 #pragma once
@@ -216,24 +214,4 @@ private:
     std::mutex mu_;
     std::condition_variable cv_;
     bool shutdown_{false};
-};
-
-// =============================================================================
-// IWorker — abstract interface
-// =============================================================================
-
-class IWorker {
-public:
-    virtual ~IWorker() = default;
-
-    // Execute one task synchronously. Invoked in the forked child process
-    // by `_chip_process_loop`, blocking until the task is complete.
-    //
-    // `callable_id` is the cid returned by ``Worker.register()``; the
-    // callable must have been prepared via ``prepare_callable()`` before
-    // this call.
-    //
-    // slot_id is not a parameter — completion routing is owned by
-    // WorkerThread / Scheduler at a higher layer.
-    virtual void run(int32_t callable_id, TaskArgsView args, const CallConfig &config) = 0;
 };

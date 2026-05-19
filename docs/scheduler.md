@@ -213,8 +213,8 @@ void Scheduler::dispatch_ready() {
 Dispatch hands off a `WorkerDispatch {slot, group_index}` to a
 `WorkerThread`. The WorkerThread reads
 `ring.slot_state(slot).{callable, task_args, config}` on its own thread
-and executes — see [worker-manager.md](worker-manager.md) §3 for THREAD
-mode and §4 for PROCESS mode.
+and encodes it into the per-WT mailbox — see
+[worker-manager.md](worker-manager.md) §3 for the dispatch protocol.
 
 **Pick-idle back-pressure**: when `pick_n_idle` returns fewer workers
 than the task needs, the slot is pushed back onto *its* queue and that
@@ -318,11 +318,12 @@ void Scheduler::stop() {
 ## 8. Completion channel from WorkerThread
 
 ```cpp
-// In WorkerThread, after worker->run() returns:
+// In WorkerThread, after the mailbox round-trip returns TASK_DONE:
 void WorkerThread::loop() {
     for (;;) {
         TaskSlot sid = queue_.pop();
-        // ... run worker (see worker-manager.md for THREAD/PROCESS) ...
+        // dispatch_process: encode mailbox, spin-poll TASK_DONE
+        // (see worker-manager.md §3 for the mailbox protocol)
         scheduler_->completion_queue_.push(sid);   // notify Scheduler
     }
 }

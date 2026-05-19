@@ -1539,17 +1539,6 @@ class Worker:
             return 0
         return self._chip_worker.host_dlopen_count
 
-    def _run_as_child(self, cid: int, args, config) -> None:
-        """Called from C++ _Worker::run when this Worker is a THREAD-mode child.
-
-        Looks up the orch function from the callable registry and delegates
-        to ``self.run(orch_fn, args, config)``.
-        """
-        orch_fn = self._callable_registry.get(cid)
-        if orch_fn is None:
-            raise KeyError(f"callable id {cid} not found in registry")
-        self.run(orch_fn, args, config)
-
     # ------------------------------------------------------------------
     # close
     # ------------------------------------------------------------------

@@ -181,7 +181,7 @@ using TaskArgs = TaskArgsTpl<ContinuousTensor, uint64_t, 0, 0, TensorArgType>;
 using ChipStorageTaskArgs = TaskArgsTpl<ContinuousTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS>;
 
 // ============================================================================
-// TaskArgsView — zero-copy view used by IWorker::run and the wire format
+// TaskArgsView — zero-copy view used by ChipWorker::run and the wire format
 // ============================================================================
 //
 // View-only: refers to externally owned tensor + scalar arrays. No tags

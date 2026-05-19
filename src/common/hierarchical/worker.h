@@ -20,8 +20,10 @@
  * Public surface:
  *   - add_worker(type, mailbox)    — register a sub-worker (before init).
  *                                    `mailbox` is a MAILBOX_SIZE-byte
- *                                    MAP_SHARED region; the real IWorker
- *                                    lives in the forked child.
+ *                                    MAP_SHARED region; the real worker
+ *                                    (a `ChipWorker` for NEXT_LEVEL, a
+ *                                    Python callable for SUB) lives in
+ *                                    the forked child.
  *   - init() / close()             — lifecycle
  *   - get_orchestrator()           — accessor used by the Python facade
  *                                    (scope_begin / drain / scope_end live
@@ -69,8 +71,9 @@ public:
     Worker &operator=(const Worker &) = delete;
 
     // Register a sub-worker before calling init(). `mailbox` is a
-    // MAILBOX_SIZE-byte MAP_SHARED region; the real IWorker lives in the
-    // forked child and consumes the mailbox via the Python child loop.
+    // MAILBOX_SIZE-byte MAP_SHARED region; the real worker (a `ChipWorker`
+    // for NEXT_LEVEL, a Python callable for SUB) lives in the forked
+    // child and consumes the mailbox via the Python child loop.
     void add_worker(WorkerType type, void *mailbox);
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
