@@ -152,11 +152,11 @@ class TestDepGen(SceneTestCase):
             return
         with deps_path.open() as f:
             deps = json.load(f)
-        # v2 is the only supported schema — annotated edges with tasks[] /
-        # tensors[] sidecars. Project annotated edges down to a (pred, succ)
-        # set for the existing structural checks; the annotation sanity check
-        # below verifies the tensor metadata path.
-        assert deps.get("version") == 2, f"deps.json version {deps.get('version')} != 2"
+        # v3 schema: annotated edges with tasks[] / tensors[] sidecars carrying
+        # strided slice descriptors (start_offset + stride[]). Project annotated
+        # edges down to a (pred, succ) set for the existing structural checks;
+        # the annotation sanity check below verifies the tensor metadata path.
+        assert deps.get("version") == 3, f"deps.json version {deps.get('version')} != 3"
         raw_edges = deps.get("edges", [])
         deps_edges = set()
         for e in raw_edges:
@@ -209,9 +209,9 @@ class TestDepGen(SceneTestCase):
                 f"edge {e.get('pred')}->{e.get('succ')} (source={source}) "
                 f"references tensor_id {tid} absent from tensors[]"
             )
-            # Annotated edges must carry consumer-side slice info.
-            assert "consumer_shape" in e and "consumer_offset" in e, (
-                f"edge {e.get('pred')}->{e.get('succ')} (source={source}) missing consumer_shape/offset"
+            # Annotated edges must carry consumer-side strided slice info.
+            assert "consumer_shape" in e and "consumer_start_offset" in e and "consumer_strides" in e, (
+                f"edge {e.get('pred')}->{e.get('succ')} (source={source}) missing consumer_shape/start_offset/strides"
             )
 
         # ---- fanout ⊆ deps validation gate ----

@@ -71,47 +71,83 @@ extern uint64_t g_insert_count;
 /**
  * TensorMap entry structure — cache-line optimized for lookup
  *
- * Cache line 1 (64B, lookup hot path):
- *   next_in_bucket, producer_task_id, buffer_addr — chain traversal + validity + hash match
- *   version, ndims, is_all_offset_zero, bucket_index — overlap fast path
- *   shapes[5] — overlap comparison
+ * Cache line 1 (64B, lookup hot path) mirrors Tensor cache line 1 byte-for-byte
+ * from byte 16 onward, so that `memcpy(this, &tensor, 64)` populates everything
+ * we need for overlap checks. Bytes [0, 16) carry entry-only fields (hash
+ * bucket head + chain pointer) that overlap Tensor::buffer (addr in [0, 8) is
+ * the hash key, size in [8, 16) is unused by the entry — we repurpose it for
+ * `next_in_bucket`).
  *
- * Cache line 2 (64B, insert/remove/slow-path only):
- *   prev_in_bucket, next_in_task, prev_in_task — chain manipulation
- *   offsets[5] — only read when !is_all_offset_zero
+ *   buffer_addr / next_in_bucket / producer_task_id   — chain traversal + match
+ *   start_offset                                       — overlap byte range begin
+ *   version, ndims, dtype, manual_dep, is_contiguous   — overlap fast path
+ *   shapes[5]                                          — overlap comparison (line 1)
  *
- * When is_all_offset_zero is true, lookup touches only cache line 1.
- * Entry size: 128B (2 cache lines) vs previous 192B (3 cache lines with embedded Tensor).
+ * Cache line 2 (64B, slow-path / non-contiguous overlap):
+ *   prev_in_bucket / next_in_task / prev_in_task       — chain manipulation
+ *   bucket_index                                       — bookkeeping
+ *   extent_elem_cache                                  — overlap byte range end
+ *   strides[5]                                          — reserved for L2 overlap (PR-2)
+ *
+ * When both entry & probe are `is_contiguous && start_offset == 0`, the overlap
+ * check derives `extent_elem = prod(shapes)` from cache line 1 alone.
+ *
+ * Entry size: 128B (2 cache lines), matches Tensor.
  */
 struct alignas(64) PTO2TensorMapEntry {
-    // === Cache line 1 (64B) — lookup hot path ===
-    uint64_t buffer_addr;                // 8B: tensor base address (hash key)
-    PTO2TensorMapEntry *next_in_bucket;  // 8B: next entry in hash bucket chain
-    PTO2TaskId producer_task_id;         // 8B: raw (ring_id << 32) | local_id
-    int32_t bucket_index;                // 4B: bucket index (-1 if unlinked)
-    uint32_t __padding0__;               // 4B: occupies Tensor::start_offset high half
-    int32_t version;                     // 4B: tensor version for overlap detection
-    uint32_t ndims;                      // 4B: number of dimensions
-    DataType __padding_dtype__;          // 1B: occupies Tensor::dtype
-    bool is_all_offset_zero;             // 1B: fast-path flag
-    uint8_t __padding1__[2];
-    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // 20B: shape per dimension
+    // === Cache line 1 (64B) — lookup hot path; mirrors Tensor line 1 from byte 16 ===
+    uint64_t buffer_addr;                // 8B [0, 8):   tensor base address (hash key, mirrors Tensor::buffer.addr)
+    PTO2TensorMapEntry *next_in_bucket;  // 8B [8, 16):  next entry in hash bucket chain (overlays Tensor::buffer.size)
+    PTO2TaskId producer_task_id;         // 8B [16,24):  mirrors Tensor::owner_task_id slot
+    uint64_t start_offset;               // 8B [24,32):  mirrors Tensor::start_offset (element offset)
+    int32_t version;                     // 4B [32,36):  mirrors Tensor::version
+    uint32_t ndims;                      // 4B [36,40):  mirrors Tensor::ndims
+    DataType dtype;                      // 1B [40,41):  mirrors Tensor::dtype
+    bool manual_dep;                     // 1B [41,42):  mirrors Tensor::manual_dep
+    bool is_contiguous;                  // 1B [42,43):  mirrors Tensor::is_contiguous
+    uint8_t __padding1__;                // 1B [43,44):  mirrors Tensor padding
+    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // 20B [44,64): mirrors Tensor::shapes
 
-    // === Cache line 2 (64B) — insert/remove/slow-path ===
-    PTO2TensorMapEntry *prev_in_bucket;         // 8B: prev in hash bucket chain
-    PTO2TensorMapEntry *next_in_task;           // 8B: next entry for same task
-    PTO2TensorMapEntry *prev_in_task;           // 8B: prev entry for same task
-    uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS];  // 20B: only when !is_all_offset_zero
-    // padding: 20B to fill 64B
+    // === Cache line 2 (64B) — chain manipulation + non-contiguous overlap data ===
+    PTO2TensorMapEntry *prev_in_bucket;         // 8B [64, 72)
+    PTO2TensorMapEntry *next_in_task;           // 8B [72, 80)
+    PTO2TensorMapEntry *prev_in_task;           // 8B [80, 88)
+    int32_t bucket_index;                       // 4B [88, 92): -1 when unlinked
+    uint32_t __padding2__;                      // 4B [92, 96)
+    uint64_t extent_elem_cache;                 // 8B [96,104): non-contiguous extent (mirrors Tensor)
+    uint32_t strides[RUNTIME_MAX_TENSOR_DIMS];  // 20B [104,124): element strides, mirrors Tensor::strides
+    uint8_t __padding3__[4];                    // 4B [124,128)
 
     /**
      * Copy overlap-relevant fields from a Tensor into this entry.
+     *
+     * 64B memcpy of Tensor cache line 1 populates buffer_addr (byte [0,8)),
+     * producer_task_id, start_offset, version, ndims, dtype, manual_dep,
+     * is_contiguous and shapes[]. Byte [8,16) holds Tensor::buffer.size in
+     * the source and gets written into next_in_bucket; that's harmless
+     * because link_entry() overwrites next_in_bucket immediately after.
+     *
+     * Cache line 2 (stride / extent_elem_cache) is derived from line 1 when
+     * the source is canonically contiguous (is_contiguous && start_offset==0),
+     * so the producer Tensor's cache line 2 stays cold during insert. Only
+     * non-contiguous producers pay one extra line 2 read.
      */
     void copy_from_tensor(const Tensor &tensor) {
         memcpy(this, &tensor, 64);
-        if (!tensor.is_all_offset_zero) {
+        if (tensor.is_contiguous && tensor.start_offset == 0) {
+            uint64_t numel = 1;
+            for (uint32_t i = 0; i < tensor.ndims; i++)
+                numel *= tensor.shapes[i];
+            extent_elem_cache = numel;
+            uint32_t s = 1;
+            for (int32_t i = static_cast<int32_t>(tensor.ndims) - 1; i >= 0; i--) {
+                strides[i] = s;
+                s *= tensor.shapes[i];
+            }
+        } else {
+            extent_elem_cache = tensor.extent_elem_cache;
             for (uint32_t i = 0; i < tensor.ndims; i++) {
-                offsets[i] = tensor.offsets[i];
+                strides[i] = tensor.strides[i];
             }
         }
     }
@@ -119,11 +155,51 @@ struct alignas(64) PTO2TensorMapEntry {
     void copy_tensor_create_info(const TensorCreateInfo &tensor_create_info, uint64_t addr) {
         memcpy(this, &tensor_create_info, 64);
         buffer_addr = addr;
+        // Create-info outputs are always contiguous with start_offset = 0;
+        // extent_elem = prod(shapes); stride is row-major.
+        uint64_t numel = 1;
+        for (uint32_t i = 0; i < tensor_create_info.ndims; i++) {
+            numel *= tensor_create_info.shapes[i];
+        }
+        extent_elem_cache = numel;
+        uint32_t s = 1;
+        for (int32_t i = static_cast<int32_t>(tensor_create_info.ndims) - 1; i >= 0; i--) {
+            strides[i] = s;
+            s *= tensor_create_info.shapes[i];
+        }
+    }
+
+    /**
+     * Effective element extent of this entry.
+     * Contiguous-aligned views compute it from shapes alone (line 1 hit only);
+     * non-contiguous views read the cached value from line 2.
+     */
+    uint64_t effective_extent_elem() const {
+        if (is_contiguous) {
+            uint64_t n = 1;
+            for (uint32_t i = 0; i < ndims; i++)
+                n *= shapes[i];
+            return n;
+        }
+        return extent_elem_cache;
     }
 
     /**
      * Check overlap between input tensor and this entry (the producer output).
-     * Mirrors Tensor::is_overlap() logic but operates on entry fields directly.
+     *
+     * Three-level cascade:
+     *   L1 — O(1) byte-range intersection. Disjoint -> NO_OVERLAP.
+     *   L2 — O(ndims) hyper-rectangle precise check, eligible only when both
+     *        sides share the same canonical row-major axis layout (same
+     *        dtype/ndims/strides[], stride descends as integer multiples,
+     *        start_offset decomposes cleanly under the reference shape).
+     *        Yields NO_OVERLAP / COVERED / OTHER per-dim.
+     *   L3 — Non-hyper-rectangle pairs (transpose/permute mismatch, slice
+     *        with step, etc): conservative OTHER. Exact enumeration via
+     *        contiguous-segment merge is scheduled for a follow-up.
+     *
+     * COVERED is returned when `input` completely contains `entry` per-dim
+     * — dep_compute uses this to retire the now-redundant entry.
      */
     OverlapStatus check_overlap(const Tensor &input) const {
         debug_assert(input.buffer.addr == buffer_addr);
@@ -131,39 +207,113 @@ struct alignas(64) PTO2TensorMapEntry {
         if (input.version > version) {
             return OverlapStatus::OTHER;
         }
-        // Fast path: both have zero offsets → ranges are [0, shape[i])
-        if (input.is_all_offset_zero && is_all_offset_zero) {
-            bool contains = true;
-            for (uint32_t i = 0; i < ndims; i++) {
-                if (input.shapes[i] < shapes[i]) {
-                    contains = false;
-                    break;
-                }
-            }
-            return contains ? OverlapStatus::COVERED : OverlapStatus::OTHER;
+
+        // -------- L1: byte-range intersection (O(1) fast reject) --------
+        const uint64_t in_begin = input.start_offset;
+        const uint64_t in_end = input.start_offset + input.extent_elem();
+        const uint64_t ent_begin = start_offset;
+        const uint64_t ent_end = start_offset + effective_extent_elem();
+        Segment in_range_bytes{in_begin, in_end};
+        Segment ent_range_bytes{ent_begin, ent_end};
+        if (!in_range_bytes.line_segment_intersection(ent_range_bytes)) {
+            return OverlapStatus::NO_OVERLAP;
         }
-        // Slow path: at least one has non-zero offsets
-        bool contains = true;
+
+        // -------- L2 prereqs: same axis layout? --------
+        if (input.dtype != dtype || input.ndims != ndims || ndims == 0) {
+            return OverlapStatus::OTHER;
+        }
         for (uint32_t i = 0; i < ndims; i++) {
-            uint64_t in_off = input.is_all_offset_zero ? 0 : input.offsets[i];
-            uint64_t ent_off = is_all_offset_zero ? 0 : offsets[i];
-            Segment in_range{in_off, in_off + static_cast<uint64_t>(input.shapes[i])};
-            Segment ent_range{ent_off, ent_off + static_cast<uint64_t>(shapes[i])};
-            if (!in_range.line_segment_intersection(ent_range)) {
+            if (input.strides[i] != strides[i]) return OverlapStatus::OTHER;
+        }
+        // strides[ndims-1] must be 1 and strides[i-1] must be an integer
+        // multiple of strides[i] for the row-major reference-shape derivation
+        // below to hold. This rejects slice-with-step (strides[d] != prev factor)
+        // and any view chain that scrambles the axis order. (strides is
+        // uint32_t with the > 0 invariant enforced at construction, so no
+        // sign check needed.)
+        if (strides[ndims - 1] != 1) return OverlapStatus::OTHER;
+        for (uint32_t i = 1; i < ndims; i++) {
+            if (strides[i - 1] % strides[i] != 0) return OverlapStatus::OTHER;
+        }
+
+        // Derive reference shape A from stride. By construction stride is
+        // row-major over A: strides[i] = prod(A[i+1..ndims-1]). So
+        //   A[i] = strides[i-1] / strides[i]   for i >= 1
+        //   A[0] = (buffer.size / dtype_bytes) / strides[0]
+        // input.buffer.size is the storage size; entry shares the same buffer
+        // (debug-asserted by buffer.addr equality at the top), so we read it
+        // from input rather than mirroring buffer.size into the entry.
+        //
+        // Note on buffer padding: runtime allocators may over-allocate
+        // `buffer.size` (cache-line / 1024B alignment, ring-buffer slot
+        // rounding, etc). When that happens, `numel_storage` is larger than
+        // the true logical extent and `ref_shapes[0]` ends up generously over-
+        // sized. This is intentional: ref_shapes is only used as an *upper
+        // bound* in the in-bounds checks below; the actual overlap test (the
+        // per-dim line-segment intersection on the real start_offset /
+        // shapes / stride further down) is unaffected. A larger-than-truth
+        // ref_shapes[0] simply makes the bounds check more permissive — it
+        // can never cause a false NO_OVERLAP nor a false COVERED.
+        uint32_t ref_shapes[RUNTIME_MAX_TENSOR_DIMS] = {};
+        for (uint32_t i = 1; i < ndims; i++) {
+            ref_shapes[i] = strides[i - 1] / strides[i];
+        }
+        const uint64_t elem_size = get_element_size(dtype);
+        if (elem_size == 0) return OverlapStatus::OTHER;
+        const uint64_t numel_storage = input.buffer.size / elem_size;
+        const uint32_t stride0 = strides[0];  // > 0 by Tensor invariant
+        if (numel_storage % stride0 != 0) return OverlapStatus::OTHER;
+        ref_shapes[0] = static_cast<uint32_t>(numel_storage / stride0);
+
+        // Decompose start_offset into row-major multi-dim offsets. By the same
+        // relation strides[i] = prod(ref_shapes[i+1..]) so dividing by strides[i]
+        // (no inner loop) yields each axis offset directly.
+        uint32_t in_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+        uint32_t ent_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+        uint64_t in_remain = input.start_offset;
+        uint64_t ent_remain = start_offset;
+        for (uint32_t i = 0; i < ndims; i++) {
+            const uint32_t s = strides[i];
+            in_offsets[i] = static_cast<uint32_t>(in_remain / s);
+            ent_offsets[i] = static_cast<uint32_t>(ent_remain / s);
+            in_remain %= s;
+            ent_remain %= s;
+        }
+        if (in_remain != 0 || ent_remain != 0) return OverlapStatus::OTHER;
+
+        // Validate that each side fits within ref_shapes (defense in depth —
+        // a well-formed view always satisfies this).
+        for (uint32_t i = 0; i < ndims; i++) {
+            if (static_cast<uint64_t>(in_offsets[i]) + input.shapes[i] > ref_shapes[i]) return OverlapStatus::OTHER;
+            if (static_cast<uint64_t>(ent_offsets[i]) + shapes[i] > ref_shapes[i]) return OverlapStatus::OTHER;
+        }
+
+        // -------- L2 core: per-dim line-segment intersection --------
+        bool input_contains_entry = true;
+        for (uint32_t i = 0; i < ndims; i++) {
+            Segment in_seg{in_offsets[i], static_cast<uint64_t>(in_offsets[i]) + input.shapes[i]};
+            Segment ent_seg{ent_offsets[i], static_cast<uint64_t>(ent_offsets[i]) + shapes[i]};
+            if (!in_seg.line_segment_intersection(ent_seg)) {
                 return OverlapStatus::NO_OVERLAP;
-            } else if (!in_range.contains(ent_range)) {
-                contains = false;
+            }
+            if (!in_seg.contains(ent_seg)) {
+                input_contains_entry = false;
             }
         }
-        return contains ? OverlapStatus::COVERED : OverlapStatus::OTHER;
+        return input_contains_entry ? OverlapStatus::COVERED : OverlapStatus::OTHER;
     }
 };
 
 static_assert(sizeof(PTO2TensorMapEntry) == 128, "TensorMapEntry must be exactly 2 cache lines (128 bytes)");
 static_assert(offsetof(PTO2TensorMapEntry, buffer_addr) == offsetof(Tensor, buffer.addr));
+static_assert(offsetof(PTO2TensorMapEntry, producer_task_id) == offsetof(Tensor, owner_task_id));
+static_assert(offsetof(PTO2TensorMapEntry, start_offset) == offsetof(Tensor, start_offset));
 static_assert(offsetof(PTO2TensorMapEntry, version) == offsetof(Tensor, version));
 static_assert(offsetof(PTO2TensorMapEntry, ndims) == offsetof(Tensor, ndims));
-static_assert(offsetof(PTO2TensorMapEntry, is_all_offset_zero) == offsetof(Tensor, is_all_offset_zero));
+static_assert(offsetof(PTO2TensorMapEntry, dtype) == offsetof(Tensor, dtype));
+static_assert(offsetof(PTO2TensorMapEntry, manual_dep) == offsetof(Tensor, manual_dep));
+static_assert(offsetof(PTO2TensorMapEntry, is_contiguous) == offsetof(Tensor, is_contiguous));
 static_assert(offsetof(PTO2TensorMapEntry, shapes) == offsetof(Tensor, shapes));
 static_assert(
     offsetof(PTO2TensorMapEntry, prev_in_bucket) == 64, "TensorMapEntry must be exactly 2 cache lines (128 bytes)"

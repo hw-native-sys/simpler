@@ -141,9 +141,9 @@ struct DumpedTensor {
     TensorDumpStage stage;
     uint8_t dtype;
     uint8_t ndims;
-    uint32_t raw_shapes[PLATFORM_DUMP_MAX_DIMS];
-    uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];
-    uint32_t offsets[PLATFORM_DUMP_MAX_DIMS];
+    uint64_t start_offset;                     // 1D element offset of the view origin
+    uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
+    uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dim (> 0, type-enforced)
     bool is_contiguous;
     bool truncated;
     bool overwritten;

@@ -254,36 +254,27 @@ static inline uint64_t get_tensor_dump_num_elements(const TensorDumpInfo &info) 
     return elements;
 }
 
+// PyTorch-style contiguous: strides[d] == prod(shapes[d+1..]) for all d.
 static inline bool tensor_dump_is_contiguous(const TensorDumpInfo &info) {
-    if (info.ndims == 0) {
-        return true;
-    }
-    for (uint32_t d = 1; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
-        if (info.shapes[d] != info.raw_shapes[d]) {
-            return false;
-        }
+    if (info.ndims == 0) return true;
+    uint64_t expected = 1;
+    for (int32_t d = static_cast<int32_t>(info.ndims) - 1; d >= 0 && d < PLATFORM_DUMP_MAX_DIMS; --d) {
+        if (info.strides[d] != expected) return false;
+        expected *= info.shapes[d];
     }
     return true;
-}
-
-static inline uint64_t tensor_dump_start_offset_elements(const TensorDumpInfo &info) {
-    uint64_t result = 0;
-    uint64_t stride = 1;
-    for (int d = static_cast<int>(info.ndims) - 1; d >= 0; d--) {
-        result += static_cast<uint64_t>(info.offsets[d]) * stride;
-        stride *= info.raw_shapes[d];
-    }
-    return result;
 }
 
 static inline void write_tensor_dump_contiguous_prefix(
     CircularArenaWriter *writer, const TensorDumpInfo &info, uint64_t elem_sz, uint64_t copy_bytes
 ) {
-    uint64_t start_offset = tensor_dump_start_offset_elements(info);
-    const char *src = reinterpret_cast<const char *>(info.buffer_addr) + start_offset * elem_sz;
+    const char *src = reinterpret_cast<const char *>(info.buffer_addr) + info.start_offset * elem_sz;
     writer->write(src, copy_bytes);
 }
 
+// Recursive per-dim gather: at dim d we step shapes[d] times with element step
+// strides[d]. Inner-most dim writes `shapes[d]` contiguous elements (only valid
+// when strides[innermost] == 1 — non-unit innermost stride degrades to per-element).
 static void gather_tensor_dump_dim(
     CircularArenaWriter *writer, const TensorDumpInfo &info, uint64_t elem_sz, uint32_t dim,
     uint64_t base_element_index, uint64_t *remaining_bytes
@@ -292,21 +283,30 @@ static void gather_tensor_dump_dim(
         return;
     }
     if (dim + 1 >= info.ndims) {
-        uint64_t row_start = base_element_index + info.offsets[dim];
-        const char *src = reinterpret_cast<const char *>(info.buffer_addr) + row_start * elem_sz;
-        uint64_t row_bytes = static_cast<uint64_t>(info.shapes[dim]) * elem_sz;
-        uint64_t bytes_to_copy = (row_bytes < *remaining_bytes) ? row_bytes : *remaining_bytes;
-        writer->write(src, bytes_to_copy);
-        *remaining_bytes -= bytes_to_copy;
+        // Innermost dim: if strides[dim] == 1 the row is contiguous in memory and
+        // a single memcpy works. Otherwise emit element-by-element.
+        const uint32_t s = info.strides[dim];
+        if (s == 1) {
+            const char *src = reinterpret_cast<const char *>(info.buffer_addr) + base_element_index * elem_sz;
+            uint64_t row_bytes =
+                static_cast<uint64_t>(info.shapes[dim]) * elem_sz;  // promote first to avoid uint32 overflow
+            uint64_t bytes_to_copy = (row_bytes < *remaining_bytes) ? row_bytes : *remaining_bytes;
+            writer->write(src, bytes_to_copy);
+            *remaining_bytes -= bytes_to_copy;
+        } else {
+            for (uint32_t i = 0; i < info.shapes[dim] && *remaining_bytes >= elem_sz; i++) {
+                uint64_t pos = base_element_index + static_cast<uint64_t>(i) * static_cast<uint64_t>(s);
+                const char *src = reinterpret_cast<const char *>(info.buffer_addr) + pos * elem_sz;
+                writer->write(src, elem_sz);
+                *remaining_bytes -= elem_sz;
+            }
+        }
         return;
     }
 
-    uint64_t inner_stride = 1;
-    for (uint32_t d = dim + 1; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
-        inner_stride *= info.raw_shapes[d];
-    }
+    const int32_t s = info.strides[dim];
     for (uint32_t i = 0; i < info.shapes[dim] && *remaining_bytes > 0; i++) {
-        uint64_t next_base = base_element_index + (static_cast<uint64_t>(info.offsets[dim]) + i) * inner_stride;
+        uint64_t next_base = base_element_index + static_cast<uint64_t>(i) * static_cast<uint64_t>(s);
         gather_tensor_dump_dim(writer, info, elem_sz, dim + 1, next_base, remaining_bytes);
     }
 }
@@ -321,9 +321,9 @@ static inline void write_tensor_dump_logical_prefix(
         write_tensor_dump_contiguous_prefix(writer, info, elem_sz, copy_bytes);
         return;
     }
-
+    // Walk the view origin first; per-dim recursion adds (i * strides[d]) for each axis.
     uint64_t remaining_bytes = copy_bytes;
-    gather_tensor_dump_dim(writer, info, elem_sz, 0, 0, &remaining_bytes);
+    gather_tensor_dump_dim(writer, info, elem_sz, 0, info.start_offset, &remaining_bytes);
 }
 
 void dump_tensor_init(int num_dump_threads) {
@@ -437,10 +437,10 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     rec->truncated = truncated ? 1 : 0;
     rec->payload_offset = offset;
     rec->payload_size = copy_bytes;
+    rec->start_offset = info.start_offset;
     for (int d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
-        rec->raw_shapes[d] = info.raw_shapes[d];
         rec->shapes[d] = info.shapes[d];
-        rec->offsets[d] = info.offsets[d];
+        rec->strides[d] = info.strides[d];
     }
     buf->count = idx + 1;
     wmb();

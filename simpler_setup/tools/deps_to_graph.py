@@ -125,13 +125,13 @@ def _load_deps_edges(deps_path):
             ``--show-tensor-info`` view renders as compartments inside each
             task node.
 
-    Raises ValueError if ``version`` is not 2 — v1 is no longer supported.
+    Raises ValueError if ``version`` is not 3 — older versions are no longer supported.
     """
     with open(deps_path) as f:
         data = json.load(f)
     version = data.get("version")
-    if version != 2:
-        raise ValueError(f"deps.json version={version!r}; only v2 is supported (regenerate with current dep_gen)")
+    if version != 3:
+        raise ValueError(f"deps.json version={version!r}; only v3 is supported (regenerate with current dep_gen)")
     edges_raw = data.get("edges", [])
     seen: set[tuple[int, int]] = set()
     edges: list[tuple[int, int]] = []
@@ -400,33 +400,40 @@ def _arg_row_html(arg, tensor_table, side):
     tname = _short_tensor_label(tid, tensor_table)
     dtype = arg.get("dtype")
     shape = arg.get("shape")
-    offset = arg.get("offset")
-    raw_shape = None
+    # v3 schema: per-slot strided descriptor (start_offset is uint64 quoted as
+    # string, stride is per-dim int32 array). Older v2 args used a multi-dim
+    # `offset` array — viewers consuming older logs should bump producer first.
+    start_offset = arg.get("start_offset")
+    strides = arg.get("strides")
+    buffer_numel = None
     if isinstance(tid, int) and tid in tensor_table:
         tt = tensor_table[tid]
-        raw_shape = tt.get("raw_shapes")
+        buffer_numel = tt.get("buffer_numel")
         if dtype is None:
             dtype = tt.get("dtype")
-    # Backfilled OUTPUT slots have tensor_id but no captured shape/offset —
-    # treat them as accessing the whole underlying buffer (the runtime
-    # materializes an unsliced output buffer).
+    # Backfilled OUTPUT slots have tensor_id but no captured shape/stride —
+    # treat them as accessing the whole underlying buffer.
     if arg.get("inferred"):
-        if shape is None:
-            shape = raw_shape or []
-        if offset is None:
-            offset = [0] * len(shape) if shape else []
+        if shape is None and buffer_numel is not None:
+            shape = [int(buffer_numel)]
+        if start_offset is None:
+            start_offset = "0"
+        if strides is None and shape:
+            strides = [1] * len(shape)
 
     dtype_str = f":{dtype.lower()}" if isinstance(dtype, str) else ""
     inferred_mark = " ?" if arg.get("inferred") else ""
     head = f"arg{idx} {arg_type}{inferred_mark} {tname}{dtype_str}"
-    raw_line = f"raw: {_format_dims(raw_shape) if isinstance(raw_shape, list) else '[]'}"
+    storage_line = f"storage: {buffer_numel} elems" if buffer_numel is not None else "storage: ?"
     shape_line = f"shape: {_format_dims(shape) if isinstance(shape, list) else '[]'}"
-    offset_line = f"offset: {_format_dims(offset) if isinstance(offset, list) else '[]'}"
+    strides_line = f"strides: {_format_dims(strides) if isinstance(strides, list) else '[]'}"
+    offset_line = f"start_offset: {start_offset if start_offset is not None else '?'} (elem)"
 
     body = (
         f'{_html_escape(head)}<BR ALIGN="LEFT"/>'
-        f'<FONT POINT-SIZE="9">{_html_escape(raw_line)}<BR ALIGN="LEFT"/>'
+        f'<FONT POINT-SIZE="9">{_html_escape(storage_line)}<BR ALIGN="LEFT"/>'
         f'{_html_escape(shape_line)}<BR ALIGN="LEFT"/>'
+        f'{_html_escape(strides_line)}<BR ALIGN="LEFT"/>'
         f'{_html_escape(offset_line)}<BR ALIGN="LEFT"/></FONT>'
     )
     return f'<TR><TD ALIGN="LEFT" PORT="{port}" BGCOLOR="{bg}">{body}</TD></TR>'

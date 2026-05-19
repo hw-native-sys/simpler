@@ -108,8 +108,8 @@ def write_tensor(tensor: dict, bin_path: Path, out):
     out.write(f"# dtype: {t['dtype']}\n")
     out.write(f"# is_contiguous: {t['is_contiguous']}\n")
     out.write(f"# shape: {t['shape']}\n")
-    out.write(f"# raw_shape: {t['raw_shape']}\n")
-    out.write(f"# offsets: {t['offsets']}\n")
+    out.write(f"# strides: {t['strides']}\n")
+    out.write(f"# start_offset: {t['start_offset']}\n")
 
     if t.get("overwritten"):
         out.write("# DATA OVERWRITTEN (host too slow)\n")
