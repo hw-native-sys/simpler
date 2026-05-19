@@ -219,7 +219,12 @@ class TestWorkerBootstrapErrorPath:
             num_sub_workers=0,
             comm_plan=_make_bad_store_plan(nranks),
         )
-        with pytest.raises(RuntimeError, match="chip 0 bootstrap failed"):
+        # The regex matches any chip index — with nranks=2 either child may
+        # report the ValueError first depending on OS fork / scheduling order
+        # (observed flaky on macOS GitHub runners). The contract asserted here
+        # is "some chip's bootstrap failed and the parent surfaces it"; which
+        # chip wins the race is not part of that contract.
+        with pytest.raises(RuntimeError, match=r"chip \d+ bootstrap failed"):
             worker.init()
 
         # init() abort path must return the Worker to an uninitialised state.
