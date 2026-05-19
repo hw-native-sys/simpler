@@ -11,7 +11,7 @@
 /**
  * Tile-based Matrix Multiplication Kernel (Cube Core)
  *
- * Computes: output = input_a @ input_b (tile_size x tile_size tile matmul)
+ * Computes: output = input_a @ input_b (batched matrix multiplication of size matrix_size)
  * Uses TMATMUL instruction
  *
  * Tile size is determined by golden.py configuration and passed through
@@ -21,7 +21,7 @@
  *   args[0] = input_a (INPUT)
  *   args[1] = input_b (INPUT)
  *   args[2] = output  (OUTPUT)
- *   args[3] = config  (INPUT) - int64_t[4]: [tile_size, grid_k, num_groups, incore_loop]
+ *   args[3] = config  (INPUT) - int64_t[4]: [batch_size, matrix_size]
  */
 
 #include <cstdint>
