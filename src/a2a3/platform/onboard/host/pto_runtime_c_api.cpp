@@ -23,7 +23,10 @@
 
 #include <pthread.h>
 
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -308,6 +311,22 @@ int run_prepared(
         return -1;
     }
 
+    // SIMPLER_CHIP_TIMING: opt-in env-gated per-stage instrumentation. When
+    // off, the static once-read keeps the hot path one comparison cheaper than
+    // the boolean default. Splits run_prepared into the five phases whose
+    // wall-clock relationship surfaces the PTO2_RING_HEAP validate-cost
+    // pattern (heap alloc lives in bind_runtime_impl; matching free in
+    // validate). See examples/.../qwen3_14b_decode for a reproducer.
+    using Clock = std::chrono::steady_clock;
+    static const bool chip_timing = (std::getenv("SIMPLER_CHIP_TIMING") != nullptr &&
+                                     std::string(std::getenv("SIMPLER_CHIP_TIMING")) == "1");
+    static int run_seq = 0;
+    const int cur_seq = run_seq++;
+    auto ms = [](Clock::time_point a, Clock::time_point b) -> double {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto t_total_start = Clock::now();
+
     pthread_once(&g_runner_key_once, create_runner_key);
     pthread_setspecific(g_runner_key, ctx);
     auto tsd_guard = RAIIScopeGuard([]() {
@@ -315,7 +334,9 @@ int run_prepared(
     });
 
     try {
+        auto t_prepare_start = Clock::now();
         int rc = runner->prepare_run_context(runner->device_id());
+        auto t_prepare_end = Clock::now();
         if (rc != 0) return rc;
         auto run_context_guard = RAIIScopeGuard([runner]() {
             runner->release_run_context();
@@ -334,17 +355,26 @@ int run_prepared(
         // is the cached ChipCallable signature_[]; it's plumbed end-to-end for
         // per-tensor direction decisions in runtime_maker but is currently
         // unconsumed on both runtimes — see bind_prepared_to_runtime_impl.
+        auto t_bind_callable_start = Clock::now();
         auto bind_result = runner->bind_prepared_callable_to_runtime(*r, callable_id);
+        auto t_bind_callable_end = Clock::now();
         if (bind_result.rc != 0) {
             r->~Runtime();
             return bind_result.rc;
         }
 
-        // Per-run binding (tensor args, GM heap, SM alloc)
+        // Per-run binding (tensor args, GM heap, SM alloc) — the
+        // device_malloc(total_heap_size) for the orchestrator GM heap and
+        // device_malloc(sm_size) for PTO2 shared memory both live here, so
+        // bind_runtime_impl is the timing phase that scales with
+        // PTO2_RING_HEAP. validate_runtime_impl matches it with the
+        // device_free calls.
+        auto t_bind_runtime_start = Clock::now();
         rc = bind_prepared_to_runtime_impl(
             r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
             bind_result.signature, bind_result.sig_count
         );
+        auto t_bind_runtime_end = Clock::now();
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
             validate_runtime_impl(r);
@@ -358,15 +388,41 @@ int run_prepared(
         runner->set_dep_gen_enabled(enable_dep_gen != 0);
         runner->set_output_prefix(output_prefix);
 
+        auto t_runner_run_start = Clock::now();
         rc = runner->run(*r, block_dim, aicpu_thread_num);
+        auto t_runner_run_end = Clock::now();
         if (rc != 0) {
             validate_runtime_impl(r);
             r->~Runtime();
             return rc;
         }
 
+        auto t_validate_start = Clock::now();
         rc = validate_runtime_impl(r);
+        auto t_validate_end = Clock::now();
         r->~Runtime();
+
+        if (chip_timing) {
+            auto t_total_end = Clock::now();
+            fprintf(
+                stderr,
+                "[c_api_timing dev=%d] run=%d"
+                "  prepare_ctx=%.2fms"
+                "  bind_callable=%.2fms"
+                "  bind_runtime=%.2fms"
+                "  runner_run=%.2fms"
+                "  validate=%.2fms"
+                "  total=%.2fms\n",
+                runner->device_id(), cur_seq,
+                ms(t_prepare_start, t_prepare_end),
+                ms(t_bind_callable_start, t_bind_callable_end),
+                ms(t_bind_runtime_start, t_bind_runtime_end),
+                ms(t_runner_run_start, t_runner_run_end),
+                ms(t_validate_start, t_validate_end),
+                ms(t_total_start, t_total_end)
+            );
+        }
+
         return rc;
     } catch (...) {
         return -1;

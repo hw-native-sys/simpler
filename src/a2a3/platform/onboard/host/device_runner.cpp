@@ -22,6 +22,9 @@
 #include <dlfcn.h>
 
 #include <cassert>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -499,6 +502,17 @@ int DeviceRunner::validate_block_dim(rtStream_t stream, int block_dim) {
 }
 
 int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
+    using Clock = std::chrono::steady_clock;
+    static const bool chip_timing = (std::getenv("SIMPLER_CHIP_TIMING") != nullptr &&
+                                     std::string(std::getenv("SIMPLER_CHIP_TIMING")) == "1");
+    static int run_seq = 0;
+    const int cur_seq = run_seq++;
+    auto ms = [](Clock::time_point a, Clock::time_point b) -> double {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    auto t_run_start = Clock::now();
+
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
@@ -506,7 +520,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
 
     // Ensure device is initialized (lazy initialization)
+    auto t_ensure_dev_start = Clock::now();
     int rc = ensure_device_initialized();
+    auto t_ensure_dev_end = Clock::now();
     if (rc != 0) {
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
@@ -548,6 +564,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     });
 
     // Get AICore register addresses for register-based task dispatch
+    auto t_regs_start = Clock::now();
     rc = init_aicore_register_addresses(
         &kernel_args_.args.regs, static_cast<uint64_t>(device_id_), mem_alloc_, AicoreRegKind::Ctrl
     );
@@ -566,6 +583,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
             return rc;
         }
     }
+    auto t_regs_end = Clock::now();
 
     // Calculate number of AIC cores (1/3 of total)
     int num_aic = block_dim;  // Round up for 1/3
@@ -657,13 +675,16 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     LOG_INFO_V0("=== Initialize runtime args ===");
     // Resolve the orchestration SO into a device-resident buffer and refresh
     // runtime metadata before the Runtime struct is uploaded to device.
+    auto t_orch_so_start = Clock::now();
     rc = prepare_orch_so(runtime);
+    auto t_orch_so_end = Clock::now();
     if (rc != 0) {
         LOG_ERROR("prepare_orch_so failed: %d", rc);
         return rc;
     }
 
     // Initialize runtime args
+    auto t_init_args_start = Clock::now();
     rc = kernel_args_.init_runtime_args(runtime, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("init_runtime_args failed: %d", rc);
@@ -689,6 +710,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         LOG_ERROR("init_device_kernel_args failed: %d", rc);
         return rc;
     }
+    auto t_init_args_end = Clock::now();
 
     // Start collector mgmt + poll threads now, just before kernels launch.
     // Starting earlier wastes CPU on empty queues and risks tripping
@@ -711,7 +733,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServerInit ===");
     // Launch AICPU init kernel
+    auto t_launch_aicpu_init_start = Clock::now();
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
+    auto t_launch_aicpu_init_end = Clock::now();
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
         return rc;
@@ -719,9 +743,11 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServer ===");
     // Launch AICPU main kernel (over-launch for affinity gate)
+    auto t_launch_aicpu_main_start = Clock::now();
     rc = launch_aicpu_kernel(
         stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
     );
+    auto t_launch_aicpu_main_end = Clock::now();
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
         return rc;
@@ -729,14 +755,18 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     LOG_INFO_V0("=== launch_aicore_kernel ===");
     // Launch AICore kernel (pass device copy of KernelArgs)
+    auto t_launch_aicore_start = Clock::now();
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
+    auto t_launch_aicore_end = Clock::now();
     if (rc != 0) {
         LOG_ERROR("launch_aicore_kernel failed: %d", rc);
         return rc;
     }
 
     LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
+    auto t_sync_aicpu_start = Clock::now();
     rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    auto t_sync_aicpu_end = Clock::now();
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
@@ -750,7 +780,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
 
     LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
+    auto t_sync_aicore_start = Clock::now();
     rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    auto t_sync_aicore_end = Clock::now();
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
@@ -761,6 +793,35 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (rc != 0) {
         LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
         return rc;
+    }
+
+    if (chip_timing) {
+        auto t_run_end = Clock::now();
+        fprintf(
+            stderr,
+            "[runner_timing dev=%d] run=%d"
+            "  ensure_dev=%.2fms"
+            "  regs=%.2fms"
+            "  orch_so=%.2fms"
+            "  init_args=%.2fms"
+            "  launch_aicpu_init=%.2fms"
+            "  launch_aicpu_main=%.2fms"
+            "  launch_aicore=%.2fms"
+            "  sync_aicpu=%.2fms"
+            "  sync_aicore=%.2fms"
+            "  total=%.2fms\n",
+            device_id_, cur_seq,
+            ms(t_ensure_dev_start, t_ensure_dev_end),
+            ms(t_regs_start, t_regs_end),
+            ms(t_orch_so_start, t_orch_so_end),
+            ms(t_init_args_start, t_init_args_end),
+            ms(t_launch_aicpu_init_start, t_launch_aicpu_init_end),
+            ms(t_launch_aicpu_main_start, t_launch_aicpu_main_end),
+            ms(t_launch_aicore_start, t_launch_aicore_end),
+            ms(t_sync_aicpu_start, t_sync_aicpu_end),
+            ms(t_sync_aicore_start, t_sync_aicore_end),
+            ms(t_run_start, t_run_end)
+        );
     }
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe

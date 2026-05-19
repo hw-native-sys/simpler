@@ -321,6 +321,13 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
     the first H2D upload); TASK_READY also lazy-prepares as a safety net.
     """
     prepared: set[int] = set()
+
+    # SIMPLER_CHIP_TIMING: opt-in env-gated Python-side timing of each
+    # chip task. When off, the boolean read once at loop start keeps the
+    # hot path one comparison cheaper than always sampling.
+    _chip_timing = os.environ.get("SIMPLER_CHIP_TIMING", "") == "1"
+    _task_seq = 0
+
     while True:
         state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
@@ -329,6 +336,8 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
 
             code = 0
             msg = ""
+            if _chip_timing:
+                _t0 = time.perf_counter()
             try:
                 _ensure_prepared(cw, registry, prepared, cid, lazy=True, device_id=device_id)
                 # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
@@ -341,6 +350,9 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                 code = 1
                 msg = _format_exc(f"chip_process dev={device_id}", e)
 
+            if _chip_timing:
+                _t_hook_start = time.perf_counter()
+
             # On a successful kernel run, give the caller a chance to do
             # post-run work (e.g. store_to_host D2H staging) before the
             # parent sees TASK_DONE. The kernel's failure path skips the
@@ -348,6 +360,17 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
             # staging garbage would mask the real error in post-mortems.
             if code == 0 and on_task_done_success is not None:
                 code, msg = on_task_done_success()
+
+            if _chip_timing:
+                _t_hook_end = time.perf_counter()
+                sys.stderr.write(
+                    f"[chip_timing dev={device_id}] task={_task_seq}"
+                    f"  run_from_blob={(_t_hook_start - _t0) * 1000:.2f}ms"
+                    f"  task_done_hook={(_t_hook_end - _t_hook_start) * 1000:.2f}ms"
+                    f"  total={(_t_hook_end - _t0) * 1000:.2f}ms\n"
+                )
+                sys.stderr.flush()
+                _task_seq += 1
 
             _write_error(buf, code, msg)
             _mailbox_store_i32(state_addr, _TASK_DONE)
