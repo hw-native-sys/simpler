@@ -314,6 +314,8 @@ void SchedulerContext::dispatch_shape(
 // =============================================================================
 
 int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
+    LOG_INFO_V0("Thread %d: At resolve_and_dispatch", thread_idx);
+
     always_assert(sched_ != nullptr);
     CoreTracker &tracker = core_trackers_[thread_idx];
     LOG_INFO_V0("Thread %d: resolve_and_dispatch entry", thread_idx);
@@ -392,6 +394,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     l2_perf.sched_start_ts = get_sys_cnt_aicpu();
 #endif
 
+    LOG_INFO_V0("Thread %d: Scheduling Start. (Completed: %s)", thread_idx, completed_.load() ? "True" : "False");
     while (true) {
         if (completed_.load(std::memory_order_acquire)) {
             break;

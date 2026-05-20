@@ -170,6 +170,7 @@ public:
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Timing parameters (for precise performance estimation)
+    bool is_timing_enabled;
     int warmup_iteration_count;
     int timing_iteration_count;
 
@@ -222,6 +223,7 @@ public:
     // Performance Profiling
     // =========================================================================
 
+    inline bool    get_timing_enabled() const { return is_timing_enabled; };
     inline int32_t get_warmup_iteration_count() const { return warmup_iteration_count; };
     inline int32_t get_timing_iteration_count() const { return timing_iteration_count; };
 

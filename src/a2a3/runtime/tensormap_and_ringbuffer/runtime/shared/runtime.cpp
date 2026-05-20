@@ -34,6 +34,7 @@ Runtime::Runtime() {
     worker_count = 0;
     sche_cpu_num = 1;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
+    is_timing_enabled = false;
     warmup_iteration_count = RUNTIME_DEFAULT_WARMUP_ITERATION_COUNT;
     timing_iteration_count = RUNTIME_DEFAULT_TIMING_ITERATION_COUNT;
     task_window_size = 0;

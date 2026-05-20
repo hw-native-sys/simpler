@@ -806,27 +806,28 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     // Return code for running the kernel. It must be zero (no error) for all runs
     int32_t rc = 0;
 
-    // Adding timing runs, exclusively for performance evaluation:
-    const auto warmupIterationCount = runtime->get_warmup_iteration_count(); 
-    const auto timingIterationCount = runtime->get_timing_iteration_count();
-
-    // First, perform warmup to disregard any cold cache effects and thread initialization times
-    for (int32_t i = 0; i < warmupIterationCount; i++)
+    // Performing timing evaluation, exclusively for performance evaluation:
+    const auto isTimingEnabled = runtime->get_timing_enabled(); 
+    if (isTimingEnabled == true)
     {
-        rc |= g_aicpu_executor.run(runtime);
+        const auto warmupIterationCount = runtime->get_warmup_iteration_count(); 
+        const auto timingIterationCount = runtime->get_timing_iteration_count();
 
-        // Waiting for threads to come back before re-running.
-        g_aicpu_executor.barrier();
-    }   
+        // First, perform warmup to disregard any cold cache effects and thread initialization times
+        for (int32_t i = 0; i < warmupIterationCount; i++) rc |= g_aicpu_executor.run(runtime);
 
-    // Second, perform timed runs (the ones that count)
-    for (int32_t i = 0; i < timingIterationCount; i++)
-    {
-         rc |= g_aicpu_executor.run(runtime);
+        // Second, perform timed runs (the ones that count)
+        for (int32_t i = 0; i < timingIterationCount; i++)
+        {
+            // Waiting for threads to arrive for before-timing.
+            g_aicpu_executor.barrier();
 
-        // Waiting for threads to come back before re-running.
-        g_aicpu_executor.barrier();
-    }   
+            rc |= g_aicpu_executor.run(runtime);
+
+            // Waiting for threads to come back for after-timing.
+            g_aicpu_executor.barrier();
+        }   
+    }
 
     // Perform actual kernel run
     rc |= g_aicpu_executor.run(runtime);
