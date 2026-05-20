@@ -505,7 +505,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
 #if PTO2_PROFILING
-            rt->orchestrator.enable_l2_swimlane = is_l2_swimlane_enabled();
+            rt->orchestrator.l2_perf_level = get_l2_perf_level();
 #endif
 
             // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
@@ -527,8 +527,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             sched_ctx_.wait_pto2_init_complete();
 
 #if PTO2_PROFILING
-            if (is_l2_swimlane_enabled()) {
-                l2_perf_aicpu_set_orch_thread_idx(my_thread_idx_);
+            if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
+                l2_perf_aicpu_set_orch_thread_idx(thread_idx);
             }
 #endif
 
@@ -594,10 +594,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
             );
             LOG_INFO_V9(
-                "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "",
-                my_thread_idx_, cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
-                cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle),
-                static_cast<uint64_t>(p.fanin_atomic_count)
+                "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus", thread_idx,
+                cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
+                cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle)
             );
             LOG_INFO_V9(
                 "Thread %d:   avg/task       : %.3fus", my_thread_idx_,
@@ -623,31 +622,16 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0
             );
 #endif
+#endif  // PTO2_ORCH_PROFILING
 
-#if PTO2_PROFILING
-            // Write orchestrator summary to shared memory for host-side export (only if profiling enabled)
-            if (is_l2_swimlane_enabled()) {
-                AicpuOrchSummary orch_summary = {};
-                orch_summary.start_time = orch_cycle_start;
-                orch_summary.end_time = orch_cycle_end;
-                orch_summary.sync_cycle = p.sync_cycle;
-                orch_summary.alloc_cycle = p.alloc_cycle;
-                orch_summary.args_cycle = p.args_cycle;
-                orch_summary.lookup_cycle = p.lookup_cycle;
-                orch_summary.heap_cycle = 0;  // Now included in alloc_cycle
-                orch_summary.insert_cycle = p.insert_cycle;
-                orch_summary.fanin_cycle = p.fanin_cycle;
-                orch_summary.scope_end_cycle = p.scope_end_cycle;
-                orch_summary.submit_count = p.submit_count;
-                l2_perf_aicpu_write_orch_summary(&orch_summary);
-            }
-#endif
-#endif
-
-            // Signal completion to the orchestrator state machine
-            rt_orchestration_done(rt);
-
-            // Latch task count from PTO2 shared memory
+            // Latch task count from PTO2 shared memory to hand off to the
+            // scheduler. The orchestrator's run window (start_time / end_time /
+            // submit_count) is no longer published to shared memory — the
+            // device LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…" line
+            // below carries the same envelope info for debugging, and
+            // host-side swimlane derives per-phase timing from the per-event
+            // AicpuPhaseRecord[] stream that already covers everything inside
+            // submit_task().
             int32_t total_tasks = 0;
             if (rt->orchestrator.sm_header) {
                 for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -655,11 +639,15 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         rt->orchestrator.sm_header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
                 }
             }
+
 #if PTO2_PROFILING
             pto2_submitted_tasks = total_tasks;
 #endif
 
-            sched_ctx_.on_orchestration_done(runtime, rt, my_thread_idx_, total_tasks);
+            // Signal completion to the orchestrator state machine
+            rt_orchestration_done(rt);
+
+            sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);
         }
 #if PTO2_PROFILING
         uint64_t orch_end_ts = get_sys_cnt_aicpu();

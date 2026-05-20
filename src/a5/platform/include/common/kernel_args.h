@@ -81,6 +81,12 @@ struct KernelArgs {
     uint32_t log_info_v{5};                 // INFO verbosity threshold (0..9); default V5
     uint32_t enable_profiling_flag{0};      // Profiling umbrella bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
     uint32_t _pad{0};                       // Alignment padding
+
+    // Device pointer to an 8-byte buffer that the platform AICPU entry writes
+    // the run-wall (ns) into. Allocated once at simpler_init, kept resident.
+    // See the a2a3 kernel_args.h for the full design rationale (CANN's
+    // AICPU args copy makes inline fields write-only).
+    uint64_t device_wall_data_base{0};
 };
 
 #ifdef __cplusplus

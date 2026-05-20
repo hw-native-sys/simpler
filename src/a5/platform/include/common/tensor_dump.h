@@ -95,17 +95,18 @@ struct alignas(64) TensorDumpRecord {
     uint32_t arg_index;       // Position in PTO2TaskPayload::tensors[]
     uint8_t dtype;            // DataType raw enum value
     uint8_t truncated;        // 1 if payload was truncated (tensor > arena capacity)
-    uint8_t is_contiguous;    // 1 when source view is already contiguous
+    uint8_t is_contiguous;    // 1 when source view is already PyTorch-contiguous
     uint8_t pad0_align;       // Explicit alignment before 64-bit payload offsets
     uint64_t payload_offset;  // Monotonic byte offset into thread arena
     uint64_t payload_size;    // Bytes actually copied (may be < full tensor bytes)
     uint8_t pad0[24];         // Preserve 64B cache-line layout
 
-    // === Cache line 2 (64B) ===
-    uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];      // Current view shape
-    uint32_t offsets[PLATFORM_DUMP_MAX_DIMS];     // Multi-dimensional offsets
-    uint32_t raw_shapes[PLATFORM_DUMP_MAX_DIMS];  // Underlying source layout shape
-    uint8_t pad1[4];                              // Pad to 128 bytes
+    // === Cache line 2 (64B) — strided view descriptor ===
+    // start_offset placed first for 8B alignment without padding gaps; total = 8 + 20 + 20 + 16 = 64B.
+    uint64_t start_offset;                     // 1D ELEMENT offset of the view origin
+    uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dimension (strictly > 0, type-enforced)
+    uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
+    uint8_t pad1[16];                          // Pad to 128 bytes
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(TensorDumpRecord) == 128, "TensorDumpRecord must be 128 bytes (2 cache lines)");
@@ -239,9 +240,9 @@ struct TensorDumpInfo {
     uint32_t func_id;
     uint32_t arg_index;
     uint64_t buffer_addr;
-    uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];
-    uint32_t offsets[PLATFORM_DUMP_MAX_DIMS];
-    uint32_t raw_shapes[PLATFORM_DUMP_MAX_DIMS];
+    uint64_t start_offset;                     // 1D ELEMENT offset of the view origin
+    uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
+    uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dimension (strictly > 0, type-enforced)
 };
 
 // =============================================================================

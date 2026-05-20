@@ -327,29 +327,29 @@ extern "C" int bind_prepared_to_runtime_impl(
     uint64_t eff_heap_size = runtime->heap_size ? runtime->heap_size : PTO2_HEAP_SIZE;
     uint64_t eff_task_window_size = runtime->task_window_size ? runtime->task_window_size : PTO2_TASK_WINDOW_SIZE;
 
-    // Allocate GM heap for orchestrator output buffers (all rings combined)
+    // Acquire pooled GM heap for orchestrator output buffers (all rings combined).
+    // Owned by DeviceRunner across runs; do NOT record in tensor_pairs_ — the
+    // free is deferred to DeviceRunner::finalize().
     uint64_t total_heap_size = eff_heap_size * PTO2_MAX_RING_DEPTH;
     int64_t t_heap_start = _now_ms();
-    void *gm_heap = runtime->host_api.device_malloc(total_heap_size);
+    void *gm_heap = runtime->host_api.acquire_pooled_gm_heap(total_heap_size);
     int64_t t_heap_end = _now_ms();
     if (gm_heap == nullptr) {
-        LOG_ERROR("Failed to allocate GM heap");
+        LOG_ERROR("Failed to acquire pooled GM heap");
         return -1;
     }
-    runtime->tensor_pairs_.push_back({nullptr, gm_heap, total_heap_size});
     runtime->set_gm_heap(gm_heap);
 
-    // Allocate PTO2 shared memory
+    // Acquire pooled PTO2 shared memory (same ownership rule as GM heap).
     int64_t t_sm_start = _now_ms();
     uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(eff_task_window_size);
-    void *sm_ptr = runtime->host_api.device_malloc(sm_size);
+    void *sm_ptr = runtime->host_api.acquire_pooled_gm_sm(sm_size);
     int64_t t_sm_end = _now_ms();
     if (sm_ptr == nullptr) {
-        LOG_ERROR("Failed to allocate PTO2 shared memory");
+        LOG_ERROR("Failed to acquire pooled PTO2 shared memory");
         return -1;
     }
     runtime->set_gm_sm_ptr(sm_ptr);
-    runtime->tensor_pairs_.push_back({nullptr, sm_ptr, static_cast<size_t>(sm_size)});
 
     // Set up device orchestration state
     runtime->set_orch_args(device_args);
@@ -358,8 +358,8 @@ extern "C" int bind_prepared_to_runtime_impl(
 
     int64_t t_total_end = _now_ms();
     LOG_INFO_V0("TIMING: args_malloc_copy = %" PRId64 "ms", t_args_end - t_args_start);
-    LOG_INFO_V0("TIMING: gm_heap_alloc(1GB) = %" PRId64 "ms", t_heap_end - t_heap_start);
-    LOG_INFO_V0("TIMING: shared_mem_alloc = %" PRId64 "ms", t_sm_end - t_sm_start);
+    LOG_INFO_V0("TIMING: gm_heap_acquire = %" PRId64 "ms", t_heap_end - t_heap_start);
+    LOG_INFO_V0("TIMING: shared_mem_acquire = %" PRId64 "ms", t_sm_end - t_sm_start);
     LOG_INFO_V0("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
 
     return 0;

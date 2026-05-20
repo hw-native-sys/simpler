@@ -23,6 +23,7 @@
 
 #include <pthread.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <utility>
 #include <vector>
@@ -104,6 +105,22 @@ static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
         return current_runner()->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));
     } catch (...) {
         return 0;
+    }
+}
+
+static void *acquire_pooled_gm_heap_wrapper(size_t size) {
+    try {
+        return current_runner()->acquire_pooled_gm_heap(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+static void *acquire_pooled_gm_sm_wrapper(size_t size) {
+    try {
+        return current_runner()->acquire_pooled_gm_sm(size);
+    } catch (...) {
+        return nullptr;
     }
 }
 
@@ -298,8 +315,12 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    const char *output_prefix
+    const char *output_prefix, PtoRunTiming *out_timing
 ) {
+    if (out_timing != NULL) {
+        out_timing->host_wall_ns = 0;
+        out_timing->device_wall_ns = 0;
+    }
     if (ctx == NULL || runtime == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
 
@@ -314,6 +335,8 @@ int run_prepared(
         pthread_setspecific(g_runner_key, nullptr);
     });
 
+    const auto host_t0 = std::chrono::steady_clock::now();
+
     try {
         int rc = runner->prepare_run_context(runner->device_id());
         if (rc != 0) return rc;
@@ -326,6 +349,8 @@ int run_prepared(
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
+        r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
+        r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         // Restore kernel addrs + orch symbol names + active_callable_id; the
@@ -352,7 +377,7 @@ int run_prepared(
             return rc;
         }
 
-        runner->set_l2_swimlane_enabled(enable_l2_swimlane != 0);
+        runner->set_l2_swimlane_enabled(enable_l2_swimlane);
         runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
         runner->set_pmu_enabled(enable_pmu);
         runner->set_dep_gen_enabled(enable_dep_gen != 0);
@@ -367,6 +392,12 @@ int run_prepared(
 
         rc = validate_runtime_impl(r);
         r->~Runtime();
+        if (out_timing != NULL) {
+            const auto host_t1 = std::chrono::steady_clock::now();
+            out_timing->host_wall_ns =
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(host_t1 - host_t0).count());
+            out_timing->device_wall_ns = runner->last_device_wall_ns();
+        }
         return rc;
     } catch (...) {
         return -1;

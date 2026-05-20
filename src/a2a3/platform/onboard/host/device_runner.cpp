@@ -22,6 +22,7 @@
 #include <dlfcn.h>
 
 #include <cassert>
+#include <cstddef>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -512,6 +513,19 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return rc;
     }
 
+    // Lazy-allocate the 8-byte device_wall buffer on first run. AICPU writes
+    // the run wall (ns) into this buffer via KernelArgs::device_wall_data_base;
+    // host pulls it back via rtMemcpy D2H after stream sync (see post-sync
+    // block below). Kept resident across runs; freed in finalize.
+    if (device_wall_dev_ptr_ == nullptr) {
+        device_wall_dev_ptr_ = allocate_tensor(sizeof(uint64_t));
+        if (device_wall_dev_ptr_ != nullptr) {
+            kernel_args_.args.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
+            uint64_t zero = 0;
+            (void)copy_to_device(device_wall_dev_ptr_, &zero, sizeof(uint64_t));
+        }
+    }
+
     // Validate block_dim against stream resource limits
     rc = validate_block_dim(stream_aicore_, block_dim);
     if (rc != 0) {
@@ -761,6 +775,23 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (rc != 0) {
         LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
         return rc;
+    }
+
+    // Pull the platform-level device wall (ns) back from the 8-byte device
+    // buffer that AICPU writes through via KernelArgs::device_wall_data_base.
+    // (We can't use the device_k_args_ shadow here — CANN's
+    // rtAicpuKernelLaunchExWithArgs copies KernelArgs into AICPU-private
+    // memory at launch, so AICPU's writes to its local copy don't propagate
+    // to device_k_args_.) Failure path is a soft warn — wall stays zero.
+    device_wall_ns_ = 0;
+    if (device_wall_dev_ptr_ != nullptr) {
+        int wall_rc = rtMemcpy(
+            &device_wall_ns_, sizeof(uint64_t), device_wall_dev_ptr_, sizeof(uint64_t), RT_MEMCPY_DEVICE_TO_HOST
+        );
+        if (wall_rc != 0) {
+            LOG_WARN("rtMemcpy(device_wall_ns) D2H failed: %d", wall_rc);
+            device_wall_ns_ = 0;
+        }
     }
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
@@ -1082,6 +1113,11 @@ int DeviceRunner::finalize() {
     // perf_cleanup guard; this is the backstop for the no-run-since-init case.
     finalize_collectors();
 
+    // Release per-Worker pooled GM heap / SM. Must precede mem_alloc_.finalize()
+    // so the pool frees through the still-live allocator, not after it.
+    gm_heap_pool_.release();
+    gm_sm_pool_.release();
+
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
 
@@ -1102,6 +1138,11 @@ int DeviceRunner::finalize() {
         acl_ready_ = false;
     }
 
+    // Free the 8-byte device_wall buffer (allocated lazily in run()).
+    if (device_wall_dev_ptr_ != nullptr) {
+        free_tensor(device_wall_dev_ptr_);
+        device_wall_dev_ptr_ = nullptr;
+    }
     device_id_ = -1;
     block_dim_ = 0;
     worker_count_ = 0;
@@ -1235,9 +1276,8 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
 }
 
 int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->alloc(size);
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
     };
 
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
@@ -1253,13 +1293,12 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
 
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
     };
 
     int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, output_prefix_
+        num_aicore, device_id, l2_perf_level_, alloc_cb, register_cb, free_cb, output_prefix_
     );
     if (rc != 0) {
         return rc;
@@ -1274,9 +1313,8 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.sche_cpu_num;
 
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->alloc(size);
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
     };
 
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
@@ -1292,14 +1330,11 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
 
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, output_prefix_
-    );
+    int rc = dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, register_cb, free_cb, output_prefix_);
     if (rc != 0) {
         return rc;
     }
@@ -1311,9 +1346,8 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
 int DeviceRunner::init_pmu(
     int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
 ) {
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->alloc(size);
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
     };
 
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
@@ -1329,14 +1363,12 @@ int DeviceRunner::init_pmu(
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
 
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = pmu_collector_.init(
-        num_cores, num_threads, csv_path, event_type, alloc_cb, register_cb, free_cb, &mem_alloc_, device_id
-    );
+    int rc =
+        pmu_collector_.init(num_cores, num_threads, csv_path, event_type, alloc_cb, register_cb, free_cb, device_id);
     if (rc != 0) {
         return rc;
     }
@@ -1346,9 +1378,8 @@ int DeviceRunner::init_pmu(
 }
 
 int DeviceRunner::init_dep_gen(int num_threads, int device_id) {
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->alloc(size);
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
     };
 
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
@@ -1364,12 +1395,11 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id) {
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
 
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = dep_gen_collector_.init(num_threads, alloc_cb, register_cb, free_cb, &mem_alloc_, device_id);
+    int rc = dep_gen_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id);
     if (rc != 0) {
         return rc;
     }
@@ -1386,21 +1416,20 @@ void DeviceRunner::finalize_collectors() {
         }
         return 0;
     };
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
     };
 
     if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+        l2_perf_collector_.finalize(unregister_cb, free_cb);
     }
     if (dump_collector_.is_initialized()) {
-        dump_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+        dump_collector_.finalize(unregister_cb, free_cb);
     }
     if (pmu_collector_.is_initialized()) {
-        pmu_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+        pmu_collector_.finalize(unregister_cb, free_cb);
     }
     if (dep_gen_collector_.is_initialized()) {
-        dep_gen_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+        dep_gen_collector_.finalize(unregister_cb, free_cb);
     }
 }

@@ -39,10 +39,6 @@
 #include "pto_task_id.h"
 #include "pto_types.h"
 
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-#include "aicpu/device_time.h"
-#endif
-
 // Spin-wait hint for AICPU threads.  On real hardware the AICPU has dedicated
 // ARM A55 cores — no OS yield is needed, so the hint is a no-op.  In simulation
 // all threads share host CPU cores, so we yield to prevent starvation.
@@ -84,6 +80,10 @@
 
 #if PTO2_TENSORMAP_PROFILING && !PTO2_ORCH_PROFILING
 #error "PTO2_TENSORMAP_PROFILING requires PTO2_ORCH_PROFILING=1"
+#endif
+
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#include "aicpu/device_time.h"
 #endif
 
 // =============================================================================
@@ -274,7 +274,6 @@ struct PTO2TaskPayload {
                 tensors[i].owner_task_id = result.task_id();
                 result.materialize_output(tensors[i]);
             }
-            tensors[i].update_start_offset();
         }
         // Round up to cache line boundary. Both arrays are 1024B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.

@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PTO_ISA_COMMIT: 50d9c806c3e351d5039c9f0f02a267590420b4d9
+  PTO_ISA_COMMIT: ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8
 
 jobs:
   # ---------- Pre-commit hooks (format, lint, clang-tidy) ----------
@@ -235,9 +235,9 @@ jobs:
 
       - name: l2_swimlane smoke
         run: |
-          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/test_l2_swimlane.py \
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --enable-l2-swimlane --clone-protocol https
+            --enable-l2-swimlane --enable-dep-gen --clone-protocol https
 
       - name: PMU smoke
         run: |
@@ -543,9 +543,9 @@ jobs:
       - name: l2_swimlane smoke
         run: |
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/test_l2_swimlane.py \
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --enable-l2-swimlane --clone-protocol ssh
+            --enable-l2-swimlane --enable-dep-gen --clone-protocol ssh
 
       - name: PMU smoke
         run: |

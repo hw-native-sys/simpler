@@ -15,7 +15,14 @@ from .main import run
 
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
-@pytest.mark.device_count(2)
-def test_allreduce_distributed(st_device_ids, st_platform):
+@pytest.mark.parametrize(
+    "n_devices",
+    [
+        pytest.param(2, marks=pytest.mark.device_count(2)),
+        pytest.param(4, marks=pytest.mark.device_count(4)),
+    ],
+)
+def test_allreduce_distributed(st_platform, st_device_ids, n_devices):
+    assert len(st_device_ids) == n_devices
     rc = run([int(d) for d in st_device_ids], platform=st_platform)
     assert rc == 0

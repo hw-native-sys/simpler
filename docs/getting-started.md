@@ -36,10 +36,10 @@ pytest examples --platform a2a3sim --clone-protocol https
 
 ```bash
 mkdir -p build
-git clone --branch main git@github.com:PTO-ISA/pto-isa.git build/pto-isa
+git clone --branch main git@github.com:hw-native-sys/pto-isa.git build/pto-isa
 
 # Or use HTTPS
-git clone --branch main https://github.com/PTO-ISA/pto-isa.git build/pto-isa
+git clone --branch main https://github.com/hw-native-sys/pto-isa.git build/pto-isa
 
 # Set environment variable (optional - auto-detected if in standard location)
 export PTO_ISA_ROOT=$(pwd)/build/pto-isa

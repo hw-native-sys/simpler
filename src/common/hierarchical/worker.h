@@ -20,8 +20,10 @@
  * Public surface:
  *   - add_worker(type, mailbox)    — register a sub-worker (before init).
  *                                    `mailbox` is a MAILBOX_SIZE-byte
- *                                    MAP_SHARED region; the real IWorker
- *                                    lives in the forked child.
+ *                                    MAP_SHARED region; the real worker
+ *                                    (a `ChipWorker` for NEXT_LEVEL, a
+ *                                    Python callable for SUB) lives in
+ *                                    the forked child.
  *   - init() / close()             — lifecycle
  *   - get_orchestrator()           — accessor used by the Python facade
  *                                    (scope_begin / drain / scope_end live
@@ -69,8 +71,9 @@ public:
     Worker &operator=(const Worker &) = delete;
 
     // Register a sub-worker before calling init(). `mailbox` is a
-    // MAILBOX_SIZE-byte MAP_SHARED region; the real IWorker lives in the
-    // forked child and consumes the mailbox via the Python child loop.
+    // MAILBOX_SIZE-byte MAP_SHARED region; the real worker (a `ChipWorker`
+    // for NEXT_LEVEL, a Python callable for SUB) lives in the forked
+    // child and consumes the mailbox via the Python child loop.
     void add_worker(WorkerType type, void *mailbox);
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
@@ -88,6 +91,20 @@ public:
     // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker (prewarm path
     // used by the Python facade at end of _start_hierarchical).
     void control_prepare(int worker_id, int32_t cid) { manager_.control_prepare(worker_id, cid); }
+
+    // Drive a single chip child through one CommDomain alloc / release.  The
+    // Python orch facade is expected to call this on every participating chip
+    // in parallel (one thread per chip) so the child-side `file_barrier` can
+    // converge.  Blocks per-chip until CONTROL_DONE; raises on child error.
+    void control_alloc_domain(int worker_id, const std::string &request_shm_name, const std::string &reply_shm_name) {
+        manager_.control_alloc_domain(worker_id, request_shm_name.c_str(), reply_shm_name.c_str());
+    }
+    void control_release_domain(int worker_id, const std::string &request_shm_name) {
+        manager_.control_release_domain(worker_id, request_shm_name.c_str());
+    }
+    void control_comm_init(int worker_id, const std::string &request_shm_name) {
+        manager_.control_comm_init(worker_id, request_shm_name.c_str());
+    }
 
     // Broadcast CTRL_REGISTER / CTRL_UNREGISTER for a ChipCallable cid to
     // every NEXT_LEVEL child in parallel. `blob_ptr`/`blob_size` describe

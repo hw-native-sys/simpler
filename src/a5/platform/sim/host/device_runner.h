@@ -43,6 +43,7 @@
 
 #include "callable.h"
 #include "prepare_callable_common.h"
+#include "pto_runtime2/device_pool.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -70,8 +71,32 @@
  */
 class DeviceRunner {
 public:
-    DeviceRunner() = default;
+    DeviceRunner() :
+        gm_heap_pool_(
+            [this](size_t n) {
+                return mem_alloc_.alloc(n);
+            },
+            [this](void *p) {
+                mem_alloc_.free(p);
+            }
+        ),
+        gm_sm_pool_(
+            [this](size_t n) {
+                return mem_alloc_.alloc(n);
+            },
+            [this](void *p) {
+                mem_alloc_.free(p);
+            }
+        ) {}
     ~DeviceRunner();
+
+    /**
+     * Per-Worker pooled GM heap / shared-memory buffer acquisition.
+     * Grows on demand, never shrinks; backed by `mem_alloc_` so the
+     * underlying allocations are released in `finalize()`.
+     */
+    void *acquire_pooled_gm_heap(size_t size) { return gm_heap_pool_.acquire(size); }
+    void *acquire_pooled_gm_sm(size_t size) { return gm_sm_pool_.acquire(size); }
 
     /**
      * Create a thread bound to this device.
@@ -168,6 +193,14 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
     /**
+     * Device-side wall (ns) from the most recently completed run, written
+     * by the platform AICPU entry (onboard: kernel.cpp; sim: lambda in
+     * run()). Returns 0 before any run completes. Independent of any
+     * profiling / swimlane subsystem.
+     */
+    uint64_t last_device_wall_ns() const { return device_wall_ns_; }
+
+    /**
      * Attach the calling thread to the simulated device.
      *
      * Mirrors the onboard contract: binds the caller's TLS to `device_id`
@@ -251,8 +284,23 @@ private:
     // Memory management
     MemoryAllocator mem_alloc_;
 
+    // Per-Worker pooled PTO2 GM heap and shared-memory buffers. Constructed
+    // with closures bound to mem_alloc_; released explicitly in finalize()
+    // before mem_alloc_.finalize() so they do not free pointers a second time.
+    pto_runtime2::DevicePool gm_heap_pool_;
+    pto_runtime2::DevicePool gm_sm_pool_;
+
     // Simulation state (no actual device resources)
     KernelArgs kernel_args_;
+
+    // Platform-level device wall buffer: 8-byte device-resident slot whose
+    // address rides on KernelArgs.device_wall_data_base. AICPU writes the
+    // run wall (ns) through that pointer; this DeviceRunner pulls it back
+    // via copy_from_device after stream sync and caches it for
+    // last_device_wall_ns(). Allocated once at simpler_init, freed in
+    // finalize.
+    void *device_wall_dev_ptr_{nullptr};
+    uint64_t device_wall_ns_{0};
 
     // Chip-callable buffer pool (sim path). Keyed by FNV-1a 64-bit content
     // hash; each entry owns the host scratch + dlopen handles needed for the

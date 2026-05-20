@@ -129,14 +129,16 @@ struct DepGenModule {
 };
 
 // ---------------------------------------------------------------------------
-// Memory operation callbacks (injected by DeviceRunner — same signatures as
-// PmuAlloc/Register/Free, in keeping with subsystem conventions)
+// Memory callbacks — thin aliases for the canonical profiling_common shapes.
+// alloc / free are std::function so callers bind their MemoryAllocator via
+// lambda capture; register / unregister stay as plain function pointers
+// because they wrap stateless HAL globals (halHost*).
 // ---------------------------------------------------------------------------
 
-using DepGenAllocCallback = void *(*)(size_t size, void *user_data);
-using DepGenRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
-using DepGenUnregisterCallback = int (*)(void *dev_ptr, int device_id);
-using DepGenFreeCallback = int (*)(void *dev_ptr, void *user_data);
+using DepGenAllocCallback = profiling_common::ProfAllocCallback;
+using DepGenRegisterCallback = profiling_common::ProfRegisterCallback;
+using DepGenUnregisterCallback = profiling_common::ProfUnregisterCallback;
+using DepGenFreeCallback = profiling_common::ProfFreeCallback;
 
 // ---------------------------------------------------------------------------
 // DepGenCollector
@@ -167,13 +169,12 @@ public:
      * @param alloc_cb        Memory allocation callback
      * @param register_cb     halHostRegister callback (nullptr in sim)
      * @param free_cb         Memory free callback
-     * @param user_data       Opaque pointer forwarded to callbacks
      * @param device_id       Device ID
      * @return 0 on success, non-zero on failure
      */
     int init(
-        int num_threads, DepGenAllocCallback alloc_cb, DepGenRegisterCallback register_cb, DepGenFreeCallback free_cb,
-        void *user_data, int device_id
+        int num_threads, const DepGenAllocCallback &alloc_cb, DepGenRegisterCallback register_cb,
+        const DepGenFreeCallback &free_cb, int device_id
     );
 
     /**
@@ -203,7 +204,7 @@ public:
     /**
      * Free all device memory and release the in-memory record buffer. Idempotent.
      */
-    void finalize(DepGenUnregisterCallback unregister_cb, DepGenFreeCallback free_cb, void *user_data);
+    void finalize(DepGenUnregisterCallback unregister_cb, const DepGenFreeCallback &free_cb);
 
     /**
      * @return true if init() succeeded and finalize() has not run.

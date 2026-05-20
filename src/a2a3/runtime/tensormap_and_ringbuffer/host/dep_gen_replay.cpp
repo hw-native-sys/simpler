@@ -142,6 +142,10 @@ const char *overlap_status_str(OverlapStatus s) {
 // One annotated edge. consumer_* always populated. producer_* populated for
 // TENSORMAP source only — the explicit/creator emit paths don't have a
 // matched tensormap entry to copy from.
+//
+// Slice description follows the strided Tensor model: (start_offset, strides[])
+// in element units. Byte offset of element coords[] is
+//   (start_offset + Σ coords[i] · strides[i]) · dtype_bytes
 struct EdgeAnnot {
     uint64_t pred;
     uint64_t succ;
@@ -153,27 +157,28 @@ struct EdgeAnnot {
     uint8_t consumer_dtype;
     uint32_t consumer_ndims;
     uint32_t consumer_shape[RUNTIME_MAX_TENSOR_DIMS];
-    uint32_t consumer_offset[RUNTIME_MAX_TENSOR_DIMS];
+    uint64_t consumer_start_offset;  // 1D element offset
+    uint32_t consumer_strides[RUNTIME_MAX_TENSOR_DIMS];
     // Producer side (the slice the producer wrote, from the tensormap entry).
     // Only populated when source == TENSORMAP.
     uint32_t producer_ndims;
     uint32_t producer_shape[RUNTIME_MAX_TENSOR_DIMS];
-    uint32_t producer_offset[RUNTIME_MAX_TENSOR_DIMS];
+    uint64_t producer_start_offset;
+    uint32_t producer_strides[RUNTIME_MAX_TENSOR_DIMS];
 };
 
-// One entry in the v2 tensors[] table: the underlying buffer, keyed by
-// (buffer_addr, version). raw_shapes describes the underlying buffer; per-edge
-// fields describe the slice.
+// One entry in the tensors[] table: the underlying storage, keyed by
+// (buffer_addr, version). buffer_numel is the storage element count;
+// per-edge fields describe the slice (start_offset + stride).
 struct TensorTableEntry {
     uint64_t tensor_id;
     uint64_t buffer_addr;
+    uint64_t buffer_numel;  // storage size in elements (= buffer.size / dtype_bytes)
     int32_t version;
     uint8_t dtype;
-    uint32_t ndims;
-    uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];
 };
 
-// One arg slot of a task, captured for the v2 `tasks[].args[]` block so
+// One arg slot of a task, captured for the `tasks[].args[]` block so
 // downstream viewers can render per-task input / output compartments without
 // having to scan every edge. `has_tensor_info` is false only for OUTPUT slots:
 // the runtime hasn't materialized a Tensor yet at submit_task time, so the
@@ -186,7 +191,8 @@ struct TaskArgEntry {
     uint8_t dtype;
     uint32_t ndims;
     uint32_t shape[RUNTIME_MAX_TENSOR_DIMS];
-    uint32_t offset[RUNTIME_MAX_TENSOR_DIMS];
+    uint64_t start_offset;  // 1D element offset
+    uint32_t strides[RUNTIME_MAX_TENSOR_DIMS];
 };
 
 struct TaskTableEntry {
@@ -231,10 +237,9 @@ uint64_t make_tensor_id(uint64_t buffer_addr, int32_t version) {
 }
 
 // Register a tensor in the v2 tensors[] table on first sight of (addr,
-// version). raw_shapes / dtype come from the consumer-side Tensor blob, which
-// is the only source carrying the full underlying-buffer description (the
-// producer-side PTO2TensorMapEntry intentionally drops raw_shapes to save a
-// cache line). Subsequent sightings of the same (addr, version) are no-ops.
+// version). buffer_numel describes the underlying storage size in elements;
+// per-edge fields describe the slice via (start_offset, strides[]). Subsequent
+// sightings of the same (addr, version) are no-ops.
 uint64_t register_tensor(
     std::unordered_map<uint64_t, size_t> &index_by_id, std::vector<TensorTableEntry> &table, const Tensor &t
 ) {
@@ -248,24 +253,22 @@ uint64_t register_tensor(
     e.buffer_addr = t.buffer.addr;
     e.version = t.version;
     e.dtype = static_cast<uint8_t>(t.dtype);
-    e.ndims = t.ndims;
-    const uint32_t *raw = t.get_raw_shapes();
-    for (uint32_t i = 0; i < t.ndims && i < RUNTIME_MAX_TENSOR_DIMS; i++) {
-        e.raw_shapes[i] = raw[i];
-    }
+    const uint64_t elem_size = get_element_size(t.dtype);
+    e.buffer_numel = (elem_size == 0) ? 0 : (t.buffer.size / elem_size);
     index_by_id[id] = table.size();
     table.push_back(e);
     return id;
 }
 
-// Copy a Tensor's slice description (shape + offset, expanded when the zero
-// fast path is set) into an EdgeAnnot's consumer_* fields.
+// Copy a Tensor's slice description (shape + start_offset + stride) into an
+// EdgeAnnot's consumer_* fields.
 void fill_consumer(EdgeAnnot &e, const Tensor &t) {
     e.consumer_dtype = static_cast<uint8_t>(t.dtype);
     e.consumer_ndims = t.ndims;
+    e.consumer_start_offset = t.start_offset;
     for (uint32_t i = 0; i < t.ndims && i < RUNTIME_MAX_TENSOR_DIMS; i++) {
         e.consumer_shape[i] = t.shapes[i];
-        e.consumer_offset[i] = t.is_all_offset_zero ? 0 : t.offsets[i];
+        e.consumer_strides[i] = t.strides[i];
     }
 }
 
@@ -273,9 +276,10 @@ void fill_consumer(EdgeAnnot &e, const Tensor &t) {
 // fields. Only called from the TENSORMAP emit path.
 void fill_producer(EdgeAnnot &e, const PTO2TensorMapEntry &entry) {
     e.producer_ndims = entry.ndims;
+    e.producer_start_offset = entry.start_offset;
     for (uint32_t i = 0; i < entry.ndims && i < RUNTIME_MAX_TENSOR_DIMS; i++) {
         e.producer_shape[i] = entry.shapes[i];
-        e.producer_offset[i] = entry.is_all_offset_zero ? 0 : entry.offsets[i];
+        e.producer_strides[i] = entry.strides[i];
     }
 }
 
@@ -301,7 +305,11 @@ bool write_deps_json_v2(
         LOG_ERROR("dep_gen replay: failed to open '%s' for write", path);
         return false;
     }
-    out << "{\"version\":2";
+    // Schema v3: strided tensor representation.
+    //   tensors[*]:   buffer_numel replaces raw_shapes (storage size in elements)
+    //   edges[*]:     consumer/producer_offset[]  ->  start_offset (uint64) + strides[] (int32)
+    //   tasks[*].args[*]: offset[]  ->  start_offset + strides[]
+    out << "{\"version\":3";
 
     out << ",\"tasks\":[";
     for (size_t i = 0; i < tasks.size(); i++) {
@@ -324,8 +332,9 @@ bool write_deps_json_v2(
                 out << ",\"dtype\":\"" << get_dtype_name(static_cast<DataType>(arg.dtype)) << '"';
                 out << ",\"shape\":";
                 write_uint_array(out, arg.shape, arg.ndims);
-                out << ",\"offset\":";
-                write_uint_array(out, arg.offset, arg.ndims);
+                out << ",\"start_offset\":\"" << arg.start_offset << '"';
+                out << ",\"strides\":";
+                write_uint_array(out, arg.strides, arg.ndims);
             }
             out << '}';
         }
@@ -341,9 +350,7 @@ bool write_deps_json_v2(
         out << ",\"buffer_addr\":\"" << t.buffer_addr << '"';
         out << ",\"version\":" << t.version;
         out << ",\"dtype\":\"" << get_dtype_name(static_cast<DataType>(t.dtype)) << '"';
-        out << ",\"ndims\":" << t.ndims;
-        out << ",\"raw_shapes\":";
-        write_uint_array(out, t.raw_shapes, t.ndims);
+        out << ",\"buffer_numel\":\"" << t.buffer_numel << '"';
         out << '}';
     }
     out << ']';
@@ -363,14 +370,16 @@ bool write_deps_json_v2(
             out << ",\"consumer_dtype\":\"" << get_dtype_name(static_cast<DataType>(e.consumer_dtype)) << '"';
             out << ",\"consumer_shape\":";
             write_uint_array(out, e.consumer_shape, e.consumer_ndims);
-            out << ",\"consumer_offset\":";
-            write_uint_array(out, e.consumer_offset, e.consumer_ndims);
+            out << ",\"consumer_start_offset\":\"" << e.consumer_start_offset << '"';
+            out << ",\"consumer_strides\":";
+            write_uint_array(out, e.consumer_strides, e.consumer_ndims);
         }
         if (e.source == EdgeSource::TENSORMAP) {
             out << ",\"producer_shape\":";
             write_uint_array(out, e.producer_shape, e.producer_ndims);
-            out << ",\"producer_offset\":";
-            write_uint_array(out, e.producer_offset, e.producer_ndims);
+            out << ",\"producer_start_offset\":\"" << e.producer_start_offset << '"';
+            out << ",\"producer_strides\":";
+            write_uint_array(out, e.producer_strides, e.producer_ndims);
         }
         out << '}';
     }
@@ -547,9 +556,10 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 slot.tensor_id = make_tensor_id(t.buffer.addr, t.version);
                 slot.dtype = static_cast<uint8_t>(t.dtype);
                 slot.ndims = t.ndims;
+                slot.start_offset = t.start_offset;
                 for (uint32_t d = 0; d < t.ndims && d < RUNTIME_MAX_TENSOR_DIMS; d++) {
                     slot.shape[d] = t.shapes[d];
-                    slot.offset[d] = t.is_all_offset_zero ? 0 : t.offsets[d];
+                    slot.strides[d] = t.strides[d];
                 }
             }
             task_entry.args.push_back(slot);

@@ -84,7 +84,7 @@
  *
  * Lifecycle (the only correct teardown order):
  *   1. Derived::init() — on the success path, calls set_memory_context() to
- *      stash the alloc/reg/free callbacks, user_data, shm_dev/host pointers,
+ *      stash the alloc/reg/free callbacks, shm_dev/host pointers,
  *      shm_size and device_id on the base. If init aborts before that,
  *      start(tf) becomes a no-op (shm_host_ stays nullptr).
  *   2. start(tf) — atomically: (a) assembles a MemoryOps from the stashed
@@ -161,12 +161,19 @@
 
 namespace profiling_common {
 
-// Common subsystem callback signatures. All three collectors (PMU / TensorDump
-// / L2Perf) used to declare their own typedefs with identical shapes; these
-// are the canonical types stashed in ProfilerBase via set_memory_context().
-using ProfAllocCallback = void *(*)(size_t size, void *user_data);
+// Common subsystem callback signatures. All four collectors (PMU / TensorDump
+// / L2Perf / DepGen) used to declare their own typedefs with identical
+// shapes; these are the canonical types stashed in ProfilerBase via
+// set_memory_context().
+//
+// Alloc / free use std::function so callers can bind state (e.g. their
+// MemoryAllocator) directly via lambda capture. Register / unregister stay
+// as plain function pointers — they wrap stateless HAL globals (halHost*),
+// so the captureless C-callback shape matches their actual nature.
+using ProfAllocCallback = std::function<void *(size_t size)>;
 using ProfRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr_out);
-using ProfFreeCallback = int (*)(void *dev_ptr, void *user_data);
+using ProfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
+using ProfFreeCallback = std::function<int(void *dev_ptr)>;
 
 /**
  * Default a5 host-shadow register: malloc a paired shadow, zero it, and push
@@ -423,13 +430,12 @@ public:
      * host-shadow register in that case (malloc + memset 0 + copy_to_device).
      */
     void set_memory_context(
-        ProfAllocCallback alloc_cb, ProfRegisterCallback register_cb, ProfFreeCallback free_cb, void *user_data,
+        const ProfAllocCallback &alloc_cb, ProfRegisterCallback register_cb, const ProfFreeCallback &free_cb,
         void *shm_dev, void *shm_host, size_t shm_size, int device_id
     ) {
         alloc_cb_ = alloc_cb;
         register_cb_ = register_cb;
         free_cb_ = free_cb;
-        user_data_ = user_data;
         shm_dev_ = shm_dev;
         shm_host_ = shm_host;
         shm_size_ = shm_size;
@@ -444,7 +450,6 @@ public:
         alloc_cb_ = nullptr;
         register_cb_ = nullptr;
         free_cb_ = nullptr;
-        user_data_ = nullptr;
         shm_dev_ = nullptr;
         shm_host_ = nullptr;
         shm_size_ = 0;
@@ -466,12 +471,8 @@ public:
         if (shm_host_ == nullptr) return;
 
         MemoryOps ops;
-        ops.alloc = [cb = alloc_cb_, ud = user_data_](size_t size) {
-            return cb(size, ud);
-        };
-        ops.free_ = [cb = free_cb_, ud = user_data_](void *dev_ptr) {
-            return cb(dev_ptr, ud);
-        };
+        ops.alloc = alloc_cb_;
+        ops.free_ = free_cb_;
         if (register_cb_ != nullptr) {
             ops.reg = register_cb_;
         } else {
@@ -542,11 +543,32 @@ protected:
     ProfAllocCallback alloc_cb_{nullptr};
     ProfRegisterCallback register_cb_{nullptr};
     ProfFreeCallback free_cb_{nullptr};
-    void *user_data_{nullptr};
     void *shm_dev_{nullptr};
     void *shm_host_{nullptr};
     size_t shm_size_{0};
     int device_id_{-1};
+
+    /**
+     * RAII counterpart of ``alloc_single_buffer``: unregister the host
+     * mapping (if there is one) then release the device memory. Each
+     * Derived's ``finalize()`` funnels every release site through here so
+     * the framework never frees a dev_ptr without first taking down the
+     * matching ``halHostRegister`` slot. On a5 onboard ``register_cb`` is
+     * always nullptr so the unregister branch is a no-op — the helper is
+     * shared with a2a3 anyway for code uniformity.
+     */
+    void release_one_buffer(void *dev_ptr, ProfUnregisterCallback unregister_cb, const ProfFreeCallback &free_cb) {
+        if (dev_ptr == nullptr) return;
+        if (unregister_cb != nullptr) {
+            int rc = unregister_cb(dev_ptr, device_id_);
+            if (rc != 0) {
+                LOG_ERROR("halHostUnregister failed for dev_ptr %p: %d", dev_ptr, rc);
+            }
+        }
+        if (free_cb) {
+            free_cb(dev_ptr);
+        }
+    }
 
 private:
     /**
@@ -569,9 +591,9 @@ private:
      * The bulk `mirror_shm_to_device` deliberately is NOT called: it races
      * with AICPU writes to device-only fields (current_buf_ptr, total/dropped/
      * mismatch counters, queue_tails, free_queue.head, AicpuPhaseHeader::magic,
-     * orch_summary, core_to_thread[]) and rolls them back to whatever was
-     * mirrored in at the start of the tick. Each host-side modification is
-     * written back as a narrow field write inside Alg.
+     * core_to_thread[]) and rolls them back to whatever was mirrored in at
+     * the start of the tick. Each host-side modification is written back as
+     * a narrow field write inside Alg.
      *
      * On exit (mgmt_running_ → false) it does one final drain pass without
      * sleeping to flush any straggler entries the device pushed before

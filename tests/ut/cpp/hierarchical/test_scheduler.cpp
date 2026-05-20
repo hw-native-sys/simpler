@@ -37,12 +37,12 @@
 // The production dispatch path writes (callable, config, args_blob) into a
 // MAILBOX_SIZE-byte shared region and spin-polls TASK_DONE; the real child
 // (`_chip_process_loop` in python/simpler/worker.py) decodes the mailbox and
-// runs an IWorker. For unit testing the Scheduler / WorkerManager state
-// machine in isolation, we replace the forked child with a thread inside
+// dispatches to a `ChipWorker`. For unit testing the Scheduler / WorkerManager
+// state machine in isolation, we replace the forked child with a thread inside
 // the test process that mimics the same handshake but blocks until the
 // test thread releases it via `complete()`.
 //
-// API parity with the previous IWorker-based MockWorker:
+// API parity with the previous MockWorker:
 //   - dispatched[i].callable / .tensor_key — recorded on TASK_READY
 //   - is_running                            — atomic flag the test polls
 //   - wait_running()                        — spin-wait until is_running flips

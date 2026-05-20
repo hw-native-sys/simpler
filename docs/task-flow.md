@@ -4,7 +4,7 @@ This document specifies **what data flows through the hierarchical runtime and
 what shapes it takes at each stage**. It covers:
 
 - The three handles carried through every level: `Callable`, `TaskArgs`, `CallConfig`
-- The `IWorker` interface and its three implementations
+- The `ChipWorker::run` execution leaf at L2
 - The L2 ABI edge where internal formats are converted to `ChipStorageTaskArgs`
 - Recursive composition for L4+
 - A single end-to-end walkthrough
@@ -14,8 +14,7 @@ scheduled), see:
 
 - [orchestrator.md](orchestrator.md) — submit flow, Ring, TensorMap, Scope
 - [scheduler.md](scheduler.md) — dispatch loop, queues, completion handling
-- [worker-manager.md](worker-manager.md) — WorkerThread, THREAD/PROCESS
-  modes, mailbox mechanics
+- [worker-manager.md](worker-manager.md) — WorkerThread, mailbox IPC mechanics
 - [hierarchical_level_runtime.md](hierarchical_level_runtime.md) — level model
   and how components compose
 
@@ -27,7 +26,7 @@ Every task flowing through any level carries exactly three pieces of data:
 
 | Handle | Type | What it is |
 | ------ | ---- | ---------- |
-| `Callable` | `uint64_t` (opaque) | What the target worker should execute — interpretation depends on the receiving `IWorker` subclass |
+| `Callable` | `uint64_t` (opaque) | What the target worker should execute — interpretation depends on the receiving worker type |
 | `TaskArgs` | user builder class | Tensors + scalars + per-tensor tags (IN/OUT/INOUT/etc.) |
 | `CallConfig` | small POD | Execution knobs (block_dim, aicpu_thread_num, profiling/dump/PMU flags, …) |
 
@@ -44,20 +43,15 @@ using Callable = uint64_t;
 
 Opaque 64-bit handle. What it actually is depends on the destination worker:
 
-| Context | `Callable` encodes | Who casts it | How |
-| ------- | ------------------ | ------------ | --- |
-| `w3.submit_next_level(cb, …)` dispatched to `ChipWorker` (L2) | `ChipCallable*` — C++ object with compiled kernels | `ChipWorker::run` | `reinterpret_cast<ChipCallable*>(callable)` |
-| `w4.submit_next_level(cb, …)` dispatched to `Worker(level=3)` (L3 as L4 child) | `OrchFn` — Python orchestration function pointer | `Worker::run` | `reinterpret_cast<OrchFn>(callable)` |
-| `w3.submit_sub(cb, …)` dispatched to `SubWorker` | `uint64_t` callable_id indexing `py_registry_` | `SubWorker::run` | direct use as integer |
+| Context | `Callable` encodes | How it's consumed |
+| ------- | ------------------ | ----------------- |
+| `w3.submit_next_level(cid, …)` dispatched to a chip child (L2) | `int32_t` cid returned by `Worker.register(ChipCallable)` | `ChipWorker::run(cid, …)` in the forked child looks up the prepared callable |
+| `w4.submit_next_level(cid, …)` dispatched to an L3 `Worker` child | `int32_t` cid returned by `Worker.register(orch_fn)` (Python orch fn) | `_child_worker_loop` looks up the orch fn in the child's COW registry and calls `inner_worker.run(orch_fn, …)` |
+| `w3.submit_sub(cid, …)` dispatched to a SUB child | `int32_t` cid indexing the Python callable registry | `_sub_worker_loop` calls `fn(args)` with the decoded `TaskArgs` |
 
-Where `OrchFn` is:
-
-```cpp
-using OrchFn = void (*)(Orchestrator*, TaskArgsView, const CallConfig&);
-```
-
-The `submit_*` API uses `Callable` (uint64) uniformly — no `void*` / `int32_t`
-split, no three-way cast.
+All three paths share one mailbox wire format — the cid is written into
+`MAILBOX_OFF_CALLABLE` and the child does the dispatch in its own
+address space.
 
 ### Lifetime — pre-fork registration
 
@@ -99,7 +93,7 @@ public:
 | **① User submit** | `TaskArgs` object (builder) | Python/C++ parent heap | user orch fn | Orchestrator |
 | **② Slot storage** | `TaskArgs` object (inside `slot.task_args`) | parent heap | Orchestrator.submit moves it here | WorkerThread at dispatch |
 | **③ Dispatch wire (PROCESS only)** | length-prefixed blob | shm mailbox (MAP_SHARED) | parent WorkerThread encodes | forked child decodes |
-| **④ L2 ABI edge** | `ChipStorageTaskArgs` POD (1672 B) | child stack | `ChipWorker::run` assembles | `pto2_run_runtime` consumes |
+| **④ L2 ABI edge** | `ChipStorageTaskArgs` POD | child stack | `ChipWorker::run` assembles | `pto2_run_runtime` consumes |
 
 ### Tags stripped at submit
 
@@ -121,8 +115,8 @@ No tags, no pickle, no schema versioning — pure memcpy.
 
 ### TaskArgsView — the interface type
 
-Both THREAD mode (from `TaskArgs::view()`) and PROCESS mode (from `read_blob`)
-yield the same view type:
+The parent-side encoder (from `TaskArgs::view()`) and the child-side
+decoder (over the mailbox blob bytes) yield the same view type:
 
 ```cpp
 struct TaskArgsView {
@@ -140,8 +134,8 @@ mode:
   backing inside `slot.task_args`
 - **PROCESS**: `tensors` points into the shm mailbox blob region
 
-View does **not** own memory. Valid for the duration of a single `IWorker::run`
-call.
+View does **not** own memory. Valid for the duration of a single
+`ChipWorker::run` call in the forked child.
 
 ### Conversion diagram
 
@@ -151,30 +145,22 @@ call.
      │ Orchestrator::submit_next_level (tags consumed)
      ▼
 ② slot.task_args: TaskArgs           — parent heap, stored in slot
-
-     ┌── THREAD mode ─────────────────────────────────────┐
-     │  view = slot.task_args.view()                       │
-     │    (pointers into slot's vector backing)            │
-     └─────────────────────────────────────────────────────┘
-                     OR
-     ┌── PROCESS mode ────────────────────────────────────┐
-     │  write_blob(mailbox, slot.task_args)                │
-     │    (memcpy into shm mailbox)                        │
-     │  child reads mailbox:                               │
-     │  view = read_blob(mailbox_bytes)                    │
-     │    (pointers into shm mailbox)                      │
-     └─────────────────────────────────────────────────────┘
-
-     │ (both paths yield TaskArgsView)
+     │
+     │ WorkerThread::dispatch_process: memcpy into shm mailbox blob
+     │   layout = [int32 T][int32 S][ContinuousTensor × T][uint64 × S]
      ▼
-    IWorker::run(callable, view, config)
+③ shm mailbox bytes (MAP_SHARED)     — visible to forked child
+     │
+     │ child decodes header → builds TaskArgsView over the blob bytes
+     ▼
+    ChipWorker::run(cid, view, config)         (in the forked child)
 
-     │ (ChipWorker only, at L2 ABI)
+     │ (L2 ABI edge)
      ▼
 ④ ChipStorageTaskArgs POD — child stack
      │ memcpy view.tensors, view.scalars into struct
      ▼
-    pto2_run_runtime(callable, &chip_storage, &config)
+    pto2_run_runtime(cid, &chip_storage, &config)
 ```
 
 ---
@@ -196,52 +182,46 @@ Propagated by value throughout:
 
 1. User builds `CallConfig` and passes into `submit_next_level`
 2. Orchestrator stores it inline in `slot.config` (POD copy)
-3. Dispatch: THREAD passes `const slot.config &`; PROCESS memcpy into mailbox
+3. Dispatch: `WorkerThread::dispatch_process` memcpys the slot's `CallConfig`
+   into the shm mailbox
 4. Child reads `CallConfig` from mailbox by value
-5. `IWorker::run` receives `const CallConfig&`; passed on to `pto2_run_runtime`
-   at the L2 edge
+5. `ChipWorker::run` receives `const CallConfig&`; passed on to
+   `pto2_run_runtime` at the L2 edge
 
 Same type at every level. Used directly at the L2 runtime ABI.
 
 ---
 
-## 5. `IWorker` — the unified execution interface
+## 5. Execution leaves — what runs the kernel
+
+There is no abstract `IWorker` interface; dispatch ends in one of two
+concrete leaves, each consumed by its own Python child loop.
+
+### `ChipWorker` (NEXT_LEVEL, L2 leaf)
+
+Wraps a dlsym'd `runtime.so`. `_chip_process_loop` instantiates one
+`ChipWorker` per chip child and calls its `run` on every dispatch.
+`run()` assembles a `ChipStorageTaskArgs` POD from the decoded view and
+calls `pto2_run_runtime`:
 
 ```cpp
-class IWorker {
-public:
-    virtual ~IWorker() = default;
-    virtual void run(Callable callable,
-                     TaskArgsView args,
-                     const CallConfig &config) = 0;
-};
-```
-
-Three implementations:
-
-### `ChipWorker` (L2 leaf)
-
-Wraps a dlsym'd `runtime.so`. `run()` assembles `ChipStorageTaskArgs` from the
-view and calls `pto2_run_runtime`:
-
-```cpp
-void ChipWorker::run(Callable cb, TaskArgsView view, const CallConfig &config) override {
+void ChipWorker::run(int32_t cid, TaskArgsView view, const CallConfig &config) {
     ChipStorageTaskArgs chip_storage;
     chip_storage.tensor_count_ = view.tensor_count;
     chip_storage.scalar_count_ = view.scalar_count;
     memcpy(chip_storage.tensors_, view.tensors, view.tensor_count * sizeof(ContinuousTensor));
     memcpy(chip_storage.scalars_, view.scalars, view.scalar_count * sizeof(uint64_t));
-    pto2_run_runtime(reinterpret_cast<ChipCallable*>(cb), &chip_storage, &config);
+    pto2_run_runtime(cid, &chip_storage, &config);
 }
 ```
 
-~1.6 KB memcpy per task; negligible.
+One memcpy of a few KB per task; negligible.
 
-### `SubWorker` (Python callable leaf)
+### SUB-type child loop (Python callable leaf)
 
-SubWorker execution is handled entirely in Python. The forked child process
-runs ``_sub_worker_loop`` which reads the args blob from the shared-memory
-mailbox, decodes it into a ``TaskArgs`` object, and passes it to the
+SUB execution is handled entirely in Python. The forked child process
+runs `_sub_worker_loop` which reads the args blob from the shared-memory
+mailbox, decodes it into a `TaskArgs` object, and passes it to the
 registered callable:
 
 ```python
@@ -249,33 +229,19 @@ fn(args)    # args: TaskArgs decoded from the mailbox blob
 ```
 
 The callable receives the same `TaskArgs` that was submitted via
-`orch.submit_sub(cid, args)`, with tags stripped (tags are consumed by the
-Orchestrator at submit time). There is no C++ `SubWorker` class — the
-Python child loop and callable registry are the entire implementation.
+`orch.submit_sub(cid, args)`, with tags stripped (tags are consumed by
+the Orchestrator at submit time). There is no C++ class for SUB workers
+— the Python child loop and callable registry are the entire
+implementation; the child inherits the Python registry through fork COW.
 
-Child inherits the Python registry through fork COW; the registry lookup works
-with no IPC.
+### L4+ recursion — no extra leaf type
 
-### `Worker` (L3+ composite)
-
-Runs one DAG per `run` invocation. The `Callable` is the user's orch fn:
-
-```cpp
-void Worker::run(Callable cb, TaskArgsView args, const CallConfig &config) override {
-    orchestrator_.scope_begin();
-    reinterpret_cast<OrchFn>(cb)(&orchestrator_, args, config);   // user orch fn
-    orchestrator_.drain();
-    orchestrator_.scope_end();
-}
-```
-
-User convenience overload:
-
-```cpp
-void Worker::run(const Task &task) {
-    run(reinterpret_cast<Callable>(task.orch), task.task_args.view(), task.config);
-}
-```
+A higher-level `Worker` is **not** itself an execution leaf. When L4
+dispatches to an L3 child, the child process runs `_child_worker_loop`,
+which looks up the registered orch fn for that cid and calls
+`inner_worker.run(orch_fn, args, config)` — i.e. the L3 `Worker.run`
+Python method, not a C++ leaf. The kernel-running leaves stay at L2
+(`ChipWorker`); higher levels just compose more scheduling engines.
 
 ---
 
@@ -312,37 +278,22 @@ fanout wiring), see [orchestrator.md](orchestrator.md).
 ## 7. Data flow through dispatch
 
 After the scheduler picks an idle `WorkerThread` and calls `wt->dispatch(sid)`,
-the WorkerThread reads task data from the slot and hands it to
-`IWorker::run`:
-
-### THREAD mode — zero-copy
-
-`TaskArgs::view()` returns pointers into the slot's vector backing. No encode,
-no memcpy beyond `CallConfig` value-passing.
-
-```cpp
-worker_->run(slot.callable, slot.task_args.view(), slot.config);
-```
-
-### PROCESS mode — encode once to mailbox
-
-Parent-side WorkerThread encodes callable + config + TaskArgs blob into a
-shm mailbox; child reads the blob back as a view:
+the parent-side WorkerThread encodes `(cid, CallConfig, TaskArgs)` into
+the per-WT shm mailbox and the forked child decodes it:
 
 ```text
-slot.callable   ─┐
-slot.config     ─┼─► memcpy into shm mailbox ─► child reads view ─► worker_->run(cb, view, config)
-slot.task_args  ─┘    (write_blob)                (read_blob)
+slot.callable_id ─┐
+slot.config      ─┼─► memcpy into shm mailbox ─► child decodes ─► ChipWorker::run(cid, view, cfg)
+slot.task_args   ─┘    (dispatch_process)         (_chip_process_loop)
 ```
 
-For SUB workers in PROCESS mode, the child is a Python process running
-``_sub_worker_loop``. The mailbox carries the same blob format, but the
-Python child decodes it via ``_read_args_from_mailbox`` into a ``TaskArgs``
-object and calls ``fn(args)`` directly — the dispatch path bypasses
-``IWorker`` entirely.
+For SUB children the same mailbox layout is reused; the Python child
+runs `_sub_worker_loop`, which decodes the args blob via
+`_read_args_from_mailbox` into a `TaskArgs` object and calls
+`fn(args)` directly — no C++ leaf involved.
 
 The mailbox layout, fork ordering, and child loop are in
-[worker-manager.md](worker-manager.md) §4.
+[worker-manager.md](worker-manager.md).
 
 ### Memory partitioning
 
@@ -350,10 +301,10 @@ The mailbox layout, fork ordering, and child loop are in
 | ------ | -------- | ------- | -------- |
 | `Ring` slot-state pool (`std::deque<unique_ptr<TaskSlotState>>`) | parent heap | Orchestrator, Scheduler, WorkerThread parent side | monotonic task-id; reset at `Worker.run` drain |
 | `slot.task_args` (single) or `task_args_list[N]` (group, vector-backed) | parent heap | same | until slot reaches CONSUMED |
-| per-WT mailbox (PROCESS only) | shm MAP_SHARED | parent WorkerThread writes, child reads | lifetime of WorkerThread |
+| per-WT mailbox | shm MAP_SHARED | parent WorkerThread writes, child reads | lifetime of WorkerThread |
 | **HeapRing[0..3]** (user OUTPUT auto-alloc + `orch.alloc`) | **4 separate shm MAP_SHARED mmaps**, one per scope-layer ring | output to user code; inherited by forked children | per-ring FIFO via `rings_[r].last_alive`; scope depth picks the ring |
 | tensor data bytes (user-provided) | torch shm (`share_memory_()` or equiv) | kernel reads/writes | user-managed |
-| `Callable` target (ChipCallable / OrchFn / Python fn) | parent heap | child via fork COW | pre-fork registered |
+| Registered callables (ChipCallable / orch fn / Python fn) | parent heap | child via fork COW or `CTRL_REGISTER` IPC | pre-fork or dynamically registered |
 
 Slot state lives inside `Ring` as `std::deque<std::unique_ptr<…>>` so
 `push_back` never invalidates pointers to live slots.
@@ -381,12 +332,10 @@ reclaim independently of outer-scope tasks. See
 
 ## 8. Data flow on completion
 
-When `IWorker::run` returns, the WorkerThread signals completion:
-
-- **THREAD mode**: direct call to `on_complete_(slot_id)`, which pushes to
-  `Scheduler::completion_queue_`
-- **PROCESS mode**: child writes `TASK_DONE` to mailbox; parent WorkerThread
-  sees it, calls `on_complete_(slot_id)`
+When the child finishes the kernel, it writes `TASK_DONE` to the mailbox;
+the parent's `WorkerThread::dispatch_process` exits its spin-poll and
+calls `on_complete_(slot_id)`, which pushes the slot onto
+`Scheduler::completion_queue_`.
 
 At this point:
 
@@ -402,10 +351,12 @@ release), see [scheduler.md](scheduler.md) §6.
 
 ## 9. Recursive composition (L4+)
 
-`Worker` implements `IWorker`, so a higher-level `Worker` can register a
-lower-level `Worker` as a NEXT_LEVEL child. The dispatch is structurally
-identical to how L3 dispatches to `ChipWorker` — via a shared-memory
-mailbox and a forked child process loop.
+A higher-level `Worker` registers a lower-level `Worker` as a
+NEXT_LEVEL child via a mailbox just like L3 does for `ChipWorker`. The
+parent side is uniform — `WorkerThread::dispatch_process` doesn't care
+what kind of child is on the other end of the mailbox. The forked
+child runs `_child_worker_loop`, which delegates each dispatched cid to
+`inner_worker.run(...)` — i.e. another full scheduling engine inside.
 
 ### Setup
 
@@ -458,7 +409,7 @@ L4 parent process
                                              └─ _start_hierarchical() forks L3's sub children
 ```
 
-### Dispatch walkthrough (PROCESS mode)
+### Dispatch walkthrough
 
 | Step | Where | What happens |
 | ---- | ----- | ------------ |
@@ -508,7 +459,7 @@ w3.init()    # fork chip_0 here
 w3.run(my_orch, args, CallConfig(block_dim=3))
 ```
 
-Step-by-step (PROCESS mode, one chip worker):
+Step-by-step (one chip worker):
 
 | Step | Where | What happens |
 | ---- | ----- | ------------ |
@@ -548,10 +499,10 @@ runtime: `ChipStorageTaskArgs` (`task_args.h:157`) is already declared with
 
 ### Why no `WorkerPayload` wrapper
 
-`IWorker::run` takes `(Callable, TaskArgsView, const CallConfig&)` directly.
+`ChipWorker::run` takes `(cid, TaskArgsView, const CallConfig&)` directly.
 Wrapping them in a struct added no value and made mailbox serialization
-indirect. Task identity (slot_id) is held by the WorkerThread for the
-completion callback, not passed into the IWorker.
+indirect. Task identity (slot_id) is held by the parent's WorkerThread
+for the completion callback, not passed into the child.
 
 ### Why slots on heap, mailbox on shm
 
@@ -571,10 +522,11 @@ time.
 
 ### Why `TaskArgsView` is just pointers + counts
 
-View is constructed at both ends of dispatch (from `TaskArgs::view()` and
-from `read_blob()`). Making it POD (24 B) lets it pass by value through
-`IWorker::run`. The underlying `ContinuousTensor[]` lives either in the
-vector's heap backing or inline in the mailbox blob — view doesn't care.
+View is constructed at both ends of the mailbox handshake (from
+`TaskArgs::view()` on the parent side for encoding, from a decoded
+mailbox blob on the child side). Making it POD (24 B) lets it pass by
+value through `ChipWorker::run`. The underlying `ContinuousTensor[]`
+lives in the mailbox blob bytes on the child side — view doesn't care.
 
 ---
 
@@ -584,8 +536,8 @@ vector's heap backing or inline in the mailbox blob — view doesn't care.
   model, three-component composition
 - [orchestrator.md](orchestrator.md) — how `submit_*` actually builds the DAG
 - [scheduler.md](scheduler.md) — how dispatched slots get worker threads
-- [worker-manager.md](worker-manager.md) — `WorkerThread`, THREAD/PROCESS
-  modes, mailbox layout, fork ordering
+- [worker-manager.md](worker-manager.md) — `WorkerThread`, mailbox
+  layout, fork ordering
 - [chip-level-arch.md](chip-level-arch.md) — L2 single-chip: three-program
   model (host / AICPU / AICore)
 - [`../src/common/task_interface/task_args.h`](../src/common/task_interface/task_args.h)

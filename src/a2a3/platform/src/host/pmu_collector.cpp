@@ -37,8 +37,8 @@ PmuCollector::~PmuCollector() { stop(); }
 // ---------------------------------------------------------------------------
 
 int PmuCollector::init(
-    int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, PmuAllocCallback alloc_cb,
-    PmuRegisterCallback register_cb, PmuFreeCallback free_cb, void *user_data, int device_id
+    int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type,
+    const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb, const PmuFreeCallback &free_cb, int device_id
 ) {
     if (num_cores <= 0 || num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
         LOG_ERROR("PmuCollector::init: invalid arguments");
@@ -59,7 +59,7 @@ int PmuCollector::init(
 
     // ---- Allocate shared header + buffer-state region ----
     shm_size_ = calc_pmu_data_size(num_cores);
-    shm_dev_ = alloc_cb(shm_size_, user_data);
+    shm_dev_ = alloc_cb(shm_size_);
     if (shm_dev_ == nullptr) {
         LOG_ERROR("PmuCollector: failed to allocate PMU shared memory (%zu bytes)", shm_size_);
         return -1;
@@ -69,7 +69,7 @@ int PmuCollector::init(
         int rc = register_cb(shm_dev_, shm_size_, device_id, &shm_host_);
         if (rc != 0) {
             LOG_ERROR("PmuCollector: halHostRegister for PMU SHM failed: %d", rc);
-            free_cb(shm_dev_, user_data);
+            free_cb(shm_dev_);
             shm_dev_ = nullptr;
             return rc;
         }
@@ -90,7 +90,7 @@ int PmuCollector::init(
         PmuBufferState *state = pmu_state(c);
 
         for (int b = 0; b < PLATFORM_PMU_BUFFERS_PER_CORE; b++) {
-            void *dev_ptr = alloc_cb(buf_size, user_data);
+            void *dev_ptr = alloc_cb(buf_size);
             if (dev_ptr == nullptr) {
                 LOG_ERROR("PmuCollector: failed to allocate PmuBuffer c=%d b=%d", c, b);
                 return -1;
@@ -101,7 +101,7 @@ int PmuCollector::init(
                 int rc = register_cb(dev_ptr, buf_size, device_id, &host_ptr);
                 if (rc != 0) {
                     LOG_ERROR("PmuCollector: halHostRegister for PmuBuffer c=%d b=%d failed: %d", c, b, rc);
-                    free_cb(dev_ptr, user_data);
+                    free_cb(dev_ptr);
                     return rc;
                 }
             }
@@ -149,7 +149,7 @@ int PmuCollector::init(
     // a MemoryOps from these and launch mgmt + poll threads. PmuModule's alloc
     // fallback in process_entry can then grow the buffer pool on demand if
     // both the per-core free_queue and the recycled pool drain.
-    set_memory_context(alloc_cb, register_cb, free_cb, user_data, shm_host_, device_id);
+    set_memory_context(alloc_cb, register_cb, free_cb, shm_host_, device_id);
 
     LOG_INFO_V0(
         "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
@@ -180,7 +180,7 @@ void PmuCollector::write_buffer_to_csv(int core_id, int thread_idx, const void *
     }
     if (n == 0) return;
 
-    std::lock_guard<std::mutex> lock(csv_mutex_);
+    std::scoped_lock<std::mutex> lock(csv_mutex_);
     ensure_csv_open_unlocked();
     if (!csv_file_.is_open()) return;
     total_collected_ += n;
@@ -295,7 +295,7 @@ void PmuCollector::reconcile_counters() {
 // finalize
 // ---------------------------------------------------------------------------
 
-void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, PmuFreeCallback free_cb, void *user_data) {
+void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCallback &free_cb) {
     if (!initialized_) return;
 
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
@@ -309,12 +309,7 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, PmuFreeCallback
     // each PmuBuffer individually at init time (when register_cb was set), so
     // unregister each one here before freeing.
     auto release_buf = [&](void *p) {
-        if (buffers_registered_ && unregister_cb != nullptr) {
-            unregister_cb(p, device_id_);
-        }
-        if (free_cb != nullptr) {
-            free_cb(p, user_data);
-        }
+        release_one_buffer(p, buffers_registered_ ? unregister_cb : nullptr, free_cb);
     };
     manager_.release_owned_buffers(release_buf);
 
@@ -344,14 +339,9 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, PmuFreeCallback
     }
     manager_.clear_mappings();
 
-    // Free shared header region.
+    // Free shared header region via the shared RAII helper.
     if (shm_dev_ != nullptr) {
-        if (shm_registered_ && unregister_cb != nullptr) {
-            unregister_cb(shm_dev_, device_id_);
-        }
-        if (free_cb != nullptr) {
-            free_cb(shm_dev_, user_data);
-        }
+        release_one_buffer(shm_dev_, shm_registered_ ? unregister_cb : nullptr, free_cb);
         shm_dev_ = nullptr;
         shm_host_ = nullptr;
     }

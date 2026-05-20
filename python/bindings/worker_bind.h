@@ -17,8 +17,9 @@
  *
  * Python callers register sub-workers via `add_next_level_worker(mailbox_ptr)`
  * / `add_sub_worker(mailbox_ptr)`. Each mailbox addresses a MAILBOX_SIZE-byte
- * MAP_SHARED region; the real IWorker lives in a forked Python child consuming
- * the mailbox via `_chip_process_loop` / `_sub_worker_loop`.
+ * MAP_SHARED region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
+ * callable for SUB) lives in a forked Python child consuming the mailbox via
+ * `_chip_process_loop` / `_sub_worker_loop`.
  */
 
 #pragma once
@@ -30,7 +31,6 @@
 #include <cstdint>
 #include <stdexcept>
 
-#include "chip_bootstrap_channel.h"
 #include "ring.h"
 #include "orchestrator.h"
 #include "types.h"
@@ -245,6 +245,24 @@ inline void bind_worker(nb::module_ &m) {
             nb::call_guard<nb::gil_scoped_release>(),
             "Best-effort broadcast of CTRL_UNREGISTER to every NEXT_LEVEL child in parallel. "
             "Returns a list of per-child error strings (empty on full success)."
+        )
+        .def(
+            "control_alloc_domain", &Worker::control_alloc_domain, nb::arg("worker_id"), nb::arg("request_shm_name"),
+            nb::arg("reply_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
+            "Drive one NEXT_LEVEL chip child through CTRL_ALLOC_DOMAIN.  Holds mailbox_mu_ "
+            "so it serialises with task dispatch on the same mailbox.  Caller fans out to all "
+            "participating chips in parallel (one Python thread per chip)."
+        )
+        .def(
+            "control_release_domain", &Worker::control_release_domain, nb::arg("worker_id"),
+            nb::arg("request_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
+            "Drive one NEXT_LEVEL chip child through CTRL_RELEASE_DOMAIN.  Same serialisation "
+            "semantics as control_alloc_domain."
+        )
+        .def(
+            "control_comm_init", &Worker::control_comm_init, nb::arg("worker_id"), nb::arg("request_shm_name"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Drive one NEXT_LEVEL chip child through CTRL_COMM_INIT (lazy base comm init)."
         );
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);
@@ -253,46 +271,6 @@ inline void bind_worker(nb::module_ &m) {
     m.attr("MAILBOX_ERROR_MSG_SIZE") = static_cast<int>(MAILBOX_ERROR_MSG_SIZE);
     m.attr("MAX_RING_DEPTH") = static_cast<int32_t>(MAX_RING_DEPTH);
     m.attr("MAX_SCOPE_DEPTH") = static_cast<int32_t>(MAX_SCOPE_DEPTH);
-
-    // --- ChipBootstrapChannel ---
-    m.attr("CHIP_BOOTSTRAP_MAILBOX_SIZE") = static_cast<int>(CHIP_BOOTSTRAP_MAILBOX_SIZE);
-
-    nb::enum_<ChipBootstrapMailboxState>(m, "ChipBootstrapMailboxState")
-        .value("IDLE", ChipBootstrapMailboxState::IDLE)
-        .value("SUCCESS", ChipBootstrapMailboxState::SUCCESS)
-        .value("ERROR", ChipBootstrapMailboxState::ERROR);
-
-    nb::class_<ChipBootstrapChannel>(m, "ChipBootstrapChannel")
-        .def(
-            "__init__",
-            [](ChipBootstrapChannel *self, uint64_t mailbox_ptr, size_t max_buffer_count) {
-                new (self) ChipBootstrapChannel(reinterpret_cast<void *>(mailbox_ptr), max_buffer_count);
-            },
-            nb::arg("mailbox_ptr"), nb::arg("max_buffer_count")
-        )
-        .def("reset", &ChipBootstrapChannel::reset)
-        .def(
-            "write_success",
-            [](ChipBootstrapChannel &self, uint64_t device_ctx, uint64_t local_window_base, uint64_t actual_window_size,
-               const std::vector<uint64_t> &buffer_ptrs) {
-                self.write_success(device_ctx, local_window_base, actual_window_size, buffer_ptrs);
-            },
-            nb::arg("device_ctx"), nb::arg("local_window_base"), nb::arg("actual_window_size"), nb::arg("buffer_ptrs")
-        )
-        .def(
-            "write_error",
-            [](ChipBootstrapChannel &self, int32_t error_code, const std::string &message) {
-                self.write_error(error_code, message);
-            },
-            nb::arg("error_code"), nb::arg("message")
-        )
-        .def_prop_ro("state", &ChipBootstrapChannel::state)
-        .def_prop_ro("error_code", &ChipBootstrapChannel::error_code)
-        .def_prop_ro("device_ctx", &ChipBootstrapChannel::device_ctx)
-        .def_prop_ro("local_window_base", &ChipBootstrapChannel::local_window_base)
-        .def_prop_ro("actual_window_size", &ChipBootstrapChannel::actual_window_size)
-        .def_prop_ro("buffer_ptrs", &ChipBootstrapChannel::buffer_ptrs)
-        .def_prop_ro("error_message", &ChipBootstrapChannel::error_message);
 
     // Private mailbox acquire/release helpers — only for simpler.worker. The
     // underscore prefix keeps them out of the public surface; they do not

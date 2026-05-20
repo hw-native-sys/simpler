@@ -33,7 +33,7 @@
  * ├─────────────────────────────────────────────────────────────┤
  * │ AicpuPhaseHeader (optional, present when phase profiling)   │
  * │  - magic, num_sched_threads, records_per_thread             │
- * │  - orch_summary                                             │
+ * │  - core_to_thread mapping                                   │
  * ├─────────────────────────────────────────────────────────────┤
  * │ PhaseBufferState[thread0]                                   │
  * │  - free_queue: SPSC queue of available buffer pointers      │
@@ -64,6 +64,28 @@
 #ifndef RUNTIME_MAX_FANOUT
 #define RUNTIME_MAX_FANOUT 128
 #endif
+
+// =============================================================================
+// L2 perf_level — granularity ladder for the L2 swimlane profiler.
+//
+// Each level is a strict superset of the previous: higher levels add the data
+// described by their name on top of all lower-level data. Naming describes
+// what is NEWLY captured at that level (incremental view), so gate sites read
+// naturally — e.g. `if (level >= SCHED_PHASES)` means "this section runs when
+// scheduler phase records are being collected (or any higher tier)".
+//
+// Transported via `L2PerfDataHeader::l2_perf_level` (host → AICPU,
+// shared memory) and `CallConfig::enable_l2_swimlane` (Python → C). The wire
+// representation stays integer (uint32_t / int32_t) for ABI stability; this
+// enum is the canonical in-code type used for comparisons.
+// =============================================================================
+enum class L2PerfLevel : uint32_t {
+    DISABLED = 0,       // No collection at all
+    AICORE_TIMING = 1,  // AICore per-task start/end timestamps + task record buffer
+    AICPU_TIMING = 2,   // + AICPU dispatch/finish timestamps + fanout dependency list
+    SCHED_PHASES = 3,   // + scheduler main-loop phase records (SCHED_COMPLETE/DISPATCH/IDLE_WAIT)
+    ORCH_PHASES = 4,    // + orchestrator phase records
+};
 
 // =============================================================================
 // L2PerfRecord - Single Task Execution Record
@@ -274,7 +296,10 @@ struct L2PerfDataHeader {
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // Producer write positions (AICPU modifies)
 
     // Metadata (Host initializes, Device read-only)
-    uint32_t num_cores;  // Actual number of cores launched
+    uint32_t num_cores;      // Actual number of cores launched
+    uint32_t l2_perf_level;  // 0=off, 1=AICore timing, 2=+dispatch/fanout,
+                             // 3=+sched phases, 4=+orch phases. Host writes
+                             // at init; AICPU reads in l2_perf_aicpu_init.
 } __attribute__((aligned(64)));
 
 // =============================================================================
@@ -332,28 +357,6 @@ struct AicpuPhaseRecord {
 };
 static_assert(sizeof(AicpuPhaseRecord) == 40, "AicpuPhaseRecord layout drift");
 
-/**
- * AICPU orchestrator cumulative summary
- *
- * Contains accumulated cycle counts from the orchestrator thread.
- * Written once after orchestration completes.
- */
-struct AicpuOrchSummary {
-    uint64_t start_time;       // Orchestrator start timestamp
-    uint64_t end_time;         // Orchestrator end timestamp
-    uint64_t sync_cycle;       // sync_tensormap phase
-    uint64_t alloc_cycle;      // task_ring_alloc phase
-    uint64_t args_cycle;       // param_copy phase
-    uint64_t lookup_cycle;     // lookup+dep phase
-    uint64_t heap_cycle;       // heap_alloc phase
-    uint64_t insert_cycle;     // tensormap_insert phase
-    uint64_t fanin_cycle;      // fanin+ready phase
-    uint64_t scope_end_cycle;  // scope_end phase
-    int64_t submit_count;      // Total tasks submitted
-    uint32_t magic;            // Validation magic (AICPU_PHASE_MAGIC)
-    uint32_t padding;          // Alignment padding
-} __attribute__((aligned(64)));
-
 constexpr uint32_t AICPU_PHASE_MAGIC = 0x41435048;        // "ACPH"
 constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 16384;  // ~512KB per thread
 
@@ -380,7 +383,6 @@ struct AicpuPhaseHeader {
     uint32_t records_per_thread;                // Max records per PhaseBuffer
     uint32_t num_cores;                         // Total number of cores with valid assignments
     int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
-    AicpuOrchSummary orch_summary;              // Orchestrator cumulative data
 } __attribute__((aligned(64)));
 
 // =============================================================================

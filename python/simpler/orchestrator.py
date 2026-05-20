@@ -36,6 +36,8 @@ from typing import Any, Optional
 from .task_interface import (
     CallConfig,
     ChipCallable,
+    CommBufferSpec,
+    CommDomainHandle,
     ContinuousTensor,
     DataType,
     TaskArgs,
@@ -71,8 +73,13 @@ class Orchestrator:
     stays valid.
     """
 
-    def __init__(self, c_orchestrator: _COrchestrator) -> None:
+    def __init__(self, c_orchestrator: _COrchestrator, worker: Optional[Any] = None) -> None:
         self._o = c_orchestrator
+        # Back-reference to the Python Worker so dynamic-allocate APIs
+        # (allocate_domain / release_domain) can dispatch CTRL_* through the
+        # Worker's chip mailboxes.  None when the Orchestrator is constructed
+        # in isolation for tests.
+        self._worker = worker
 
     # ------------------------------------------------------------------
     # User-facing submit API
@@ -120,6 +127,56 @@ class Orchestrator:
     def submit_sub_group(self, callable_id: int, args_list: list):
         """Submit a group of SUB tasks (N TaskArgs → N workers, 1 DAG node)."""
         return self._o.submit_sub_group(int(callable_id), args_list)
+
+    # ------------------------------------------------------------------
+    # Dynamic CommDomain allocation (collective; blocks orch_fn for the
+    # duration of the alloc / release handshake)
+    # ------------------------------------------------------------------
+
+    def allocate_domain(
+        self,
+        *,
+        name: str,
+        workers: Sequence[int],
+        window_size: int,
+        buffers: Sequence[CommBufferSpec] = (),
+    ) -> CommDomainHandle:
+        """Collectively allocate a fresh CommDomain across `workers`.
+
+        Driven from the orch thread.  Dispatches CTRL_ALLOC_DOMAIN to each
+        participating chip in parallel and blocks until all have completed
+        the IPC handshake (HCCL: aclrtMalloc + IPC import; sim: shm + ftruncate).
+        Returns a ``CommDomainHandle`` whose ``contexts[chip_idx]`` exposes
+        the per-chip ``ChipDomainContext`` (``device_ctx``, ``local_window_base``,
+        ``buffer_ptrs`` by name).
+
+        ``name`` is a local identifier (uniqueness checked against currently-live
+        handles); peers do not need to agree on the string.  ``workers`` must be
+        a subset of the Worker's ``device_ids`` indices; their order defines
+        dense domain ranks.  ``buffers`` are carved sequentially inside the
+        window in declaration order; their ``nbytes`` sum must fit within
+        ``window_size`` — this is validated on the orch thread before any
+        chip-side allocation is dispatched, so an oversized request raises
+        ``ValueError`` here without leaking a backend allocation.
+
+        Use the handle as a context manager for auto-release:
+
+            with orch.allocate_domain(name="tp", workers=[0, 1], window_size=4096) as tp:
+                for chip_idx in tp.workers:
+                    orch.submit_next_level(cid, ..., worker=chip_idx)
+        """
+        if self._worker is None:
+            raise RuntimeError("allocate_domain requires an Orchestrator bound to a Worker")
+        return self._worker._allocate_domain(
+            name=str(name),
+            workers=tuple(int(w) for w in workers),
+            window_size=int(window_size),
+            buffers=list(buffers),
+        )
+
+    def release_domain(self, handle: CommDomainHandle) -> None:
+        """Collective release.  Equivalent to ``handle.release()``."""
+        handle.release()
 
     # ------------------------------------------------------------------
     # Nested scope (Strict-1 per-scope rings)

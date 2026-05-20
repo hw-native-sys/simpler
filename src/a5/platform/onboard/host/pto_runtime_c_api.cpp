@@ -23,6 +23,7 @@
 
 #include <pthread.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <utility>
 #include <vector>
@@ -104,6 +105,22 @@ static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
         return current_runner()->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));
     } catch (...) {
         return 0;
+    }
+}
+
+static void *acquire_pooled_gm_heap_wrapper(size_t size) {
+    try {
+        return current_runner()->acquire_pooled_gm_heap(size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+static void *acquire_pooled_gm_sm_wrapper(size_t size) {
+    try {
+        return current_runner()->acquire_pooled_gm_sm(size);
+    } catch (...) {
+        return nullptr;
     }
 }
 
@@ -221,6 +238,43 @@ int comm_get_window_size(void *handle, size_t *size_out) {
     return -1;
 }
 
+int comm_derive_context(
+    void *handle, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank, size_t window_offset,
+    size_t window_size, uint64_t *device_ctx_out
+) {
+    (void)handle;
+    (void)rank_ids;
+    (void)rank_count;
+    (void)domain_rank;
+    (void)window_offset;
+    (void)window_size;
+    (void)device_ctx_out;
+    return -1;
+}
+
+int comm_alloc_domain_windows(
+    void *handle, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+) {
+    (void)handle;
+    (void)allocation_id;
+    (void)rank_ids;
+    (void)rank_count;
+    (void)domain_rank;
+    (void)window_size;
+    (void)device_ctx_out;
+    (void)local_window_base_out;
+    return -1;
+}
+
+int comm_release_domain_windows(void *handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) {
+    (void)handle;
+    (void)allocation_id;
+    (void)rank_count;
+    (void)domain_rank;
+    return -1;
+}
+
 int comm_barrier(void *handle) {
     (void)handle;
     return -1;
@@ -320,8 +374,12 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int /*enable_dep_gen*/,
-    const char *output_prefix
+    const char *output_prefix, PtoRunTiming *out_timing
 ) {
+    if (out_timing != NULL) {
+        out_timing->host_wall_ns = 0;
+        out_timing->device_wall_ns = 0;
+    }
     if (ctx == NULL || runtime == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
 
@@ -336,6 +394,8 @@ int run_prepared(
         pthread_setspecific(g_runner_key, nullptr);
     });
 
+    const auto host_t0 = std::chrono::steady_clock::now();
+
     try {
         int rc = runner->prepare_run_context(runner->device_id());
         if (rc != 0) return rc;
@@ -348,6 +408,8 @@ int run_prepared(
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
+        r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
+        r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         // Restore kernel addrs + orch symbol names + active_callable_id; the
@@ -388,6 +450,12 @@ int run_prepared(
 
         rc = validate_runtime_impl(r);
         r->~Runtime();
+        if (out_timing != NULL) {
+            const auto host_t1 = std::chrono::steady_clock::now();
+            out_timing->host_wall_ns =
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(host_t1 - host_t0).count());
+            out_timing->device_wall_ns = runner->last_device_wall_ns();
+        }
         return rc;
     } catch (...) {
         return -1;

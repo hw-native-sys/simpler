@@ -52,6 +52,7 @@ Type/shape contract:
 Run:
 
     python examples/workers/l3/ep_dispatch_combine/main.py -p a2a3sim -d 0-1
+
 """
 
 from __future__ import annotations
@@ -66,11 +67,8 @@ import torch  # noqa: E402
 from simpler.task_interface import (  # noqa: E402
     ArgDirection,
     CallConfig,
-    ChipBootstrapConfig,
-    ChipBufferSpec,
     ChipCallable,
-    ChipCommBootstrapConfig,
-    ChipContext,
+    CommBufferSpec,
     ContinuousTensor,
     CoreCallable,
     DataType,
@@ -429,12 +427,6 @@ def run(
 
     window_size = max(SCRATCH_NBYTES, 128 * 1024)
 
-    rootinfo_path = f"/tmp/pto_ep_dispatch_rootinfo_{os.getpid()}.bin"
-    try:
-        os.unlink(rootinfo_path)
-    except FileNotFoundError:
-        pass
-
     print(f"[ep_dispatch] platform={platform} devices={device_ids} nranks={nranks}")
 
     # x_norm[r, t, d] = r*100 + t*10 + d  →  max value = 1*100 + 7*10 + 63 = 233.
@@ -485,27 +477,8 @@ def run(
     print("[ep_dispatch] computing host golden...")
     expected_recv_x, expected_recv_w, expected_recv_idx, expected_count = compute_golden(x_norms, indices, weights)
 
-    cfgs = [
-        ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank,
-                nranks=nranks,
-                rootinfo_path=rootinfo_path,
-                window_size=window_size,
-            ),
-            buffers=[
-                ChipBufferSpec(
-                    name="scratch",
-                    dtype="float32",
-                    count=SCRATCH_NBYTES // 4,
-                    nbytes=SCRATCH_NBYTES,
-                ),
-            ],
-        )
-        for rank in range(nranks)
-    ]
-
     print("[ep_dispatch] compiling kernels...")
+
     chip_callable = build_chip_callable(platform, pto_isa_commit)
 
     worker = Worker(
@@ -514,65 +487,78 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        chip_bootstrap_configs=cfgs,
         build=build,
     )
     chip_cid = worker.register(chip_callable)
 
     try:
-        print("[ep_dispatch] init worker (forks chip children + bootstraps HCCL)...")
+        print("[ep_dispatch] init worker (forks chip children; base comm is lazy)...")
         worker.init()
 
-        contexts: list[ChipContext] = worker.chip_contexts
-        assert len(contexts) == nranks
-        for i, ctx in enumerate(contexts):
-            print(
-                f"[ep_dispatch] chip {i}: device={ctx.device_id} rank={ctx.rank}/{ctx.nranks} "
-                f"window=[0x{ctx.local_window_base:x} +{ctx.actual_window_size}B] "
-                f"scratch=0x{ctx.buffer_ptrs['scratch']:x}"
-            )
-
         def orch_fn(orch, _args, cfg):
-            for i, ctx in enumerate(contexts):
-                chip_args = TaskArgs()
-                chip_args.add_tensor(make_tensor_arg(indices_per_rank[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(x_norms[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(w_padded_list[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(idx_padded_list[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(recv_x_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(make_tensor_arg(recv_w_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(make_tensor_arg(recv_idx_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(make_tensor_arg(recv_count_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(make_tensor_arg(recv_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(make_tensor_arg(routed_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                chip_args.add_tensor(
-                    ContinuousTensor.make(
-                        data=ctx.buffer_ptrs["scratch"],
-                        shapes=(SCRATCH_NBYTES // 4,),
-                        dtype=DataType.FLOAT32,
-                        child_memory=True,
-                    ),
-                    TensorArgType.INOUT,
-                )
-                chip_args.add_scalar(ctx.nranks)
-                chip_args.add_scalar(ctx.device_ctx)
-                orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
+            with orch.allocate_domain(
+                name="default",
+                workers=list(range(nranks)),
+                window_size=window_size,
+                buffers=[
+                    CommBufferSpec(
+                        name="scratch",
+                        dtype="float32",
+                        count=SCRATCH_NBYTES // 4,
+                        nbytes=SCRATCH_NBYTES,
+                    )
+                ],
+            ) as handle:
+                for i in range(nranks):
+                    domain = handle[i]
+                    print(
+                        f"[ep_dispatch] chip {i}: rank={domain.domain_rank}/{domain.domain_size} "
+                        f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
+                        f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
+                    )
+                    chip_args = TaskArgs()
+                    chip_args.add_tensor(make_tensor_arg(indices_per_rank[i]), TensorArgType.INPUT)
+                    chip_args.add_tensor(make_tensor_arg(x_norms[i]), TensorArgType.INPUT)
+                    chip_args.add_tensor(make_tensor_arg(w_padded_list[i]), TensorArgType.INPUT)
+                    chip_args.add_tensor(make_tensor_arg(idx_padded_list[i]), TensorArgType.INPUT)
+                    chip_args.add_tensor(make_tensor_arg(recv_x_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(make_tensor_arg(recv_w_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(make_tensor_arg(recv_idx_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(make_tensor_arg(recv_count_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(make_tensor_arg(recv_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(make_tensor_arg(routed_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(
+                        ContinuousTensor.make(
+                            data=domain.buffer_ptrs["scratch"],
+                            shapes=(SCRATCH_NBYTES // 4,),
+                            dtype=DataType.FLOAT32,
+                            child_memory=True,
+                        ),
+                        TensorArgType.INOUT,
+                    )
+                    chip_args.add_scalar(domain.domain_size)
+                    chip_args.add_scalar(domain.device_ctx)
+                    orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
 
         print("[ep_dispatch] running 2-chip dispatch DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
 
-        ok = _verify_recv_outputs(
-            nranks,
-            expected_count,
-            expected_recv_x,
-            expected_recv_w,
-            expected_recv_idx,
-            recv_count_outs,
-            recv_x_outs,
-            recv_w_outs,
-            recv_idx_outs,
-        )
-        ok = _verify_routed_y(nranks, x_norms, weights, routed_y_outs) and ok
+        if platform.endswith("sim"):
+            # Sim keeps intermediate child outputs device-local when they feed later child tasks.
+            ok = _verify_routed_y(nranks, x_norms, weights, routed_y_outs)
+        else:
+            ok = _verify_recv_outputs(
+                nranks,
+                expected_count,
+                expected_recv_x,
+                expected_recv_w,
+                expected_recv_idx,
+                recv_count_outs,
+                recv_x_outs,
+                recv_w_outs,
+                recv_idx_outs,
+            )
+            ok = _verify_routed_y(nranks, x_norms, weights, routed_y_outs) and ok
 
         if not ok:
             print("[ep_dispatch] golden check FAILED")
@@ -581,10 +567,6 @@ def run(
         return 0
     finally:
         worker.close()
-        try:
-            os.unlink(rootinfo_path)
-        except FileNotFoundError:
-            pass
 
 
 def main() -> int:
@@ -596,6 +578,7 @@ def main() -> int:
     )
     parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
+
     return run(
         parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit, build=cli.build
     )

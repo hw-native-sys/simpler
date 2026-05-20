@@ -384,7 +384,6 @@ void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads) {
     s_phase_header->num_cores = 0;
 
     memset(s_phase_header->core_to_thread, -1, sizeof(s_phase_header->core_to_thread));
-    memset(&s_phase_header->orch_summary, 0, sizeof(AicpuOrchSummary));
 
     // Cache per-thread record pointers and clear buffers
     // Include all threads: scheduler + orchestrator (orchestrators may become schedulers)
@@ -568,25 +567,6 @@ void l2_perf_aicpu_record_phase(
 
     buf->count = idx + 1;
     wmb();
-}
-
-void l2_perf_aicpu_write_orch_summary(const AicpuOrchSummary *src) {
-    if (s_phase_header == nullptr) {
-        return;
-    }
-
-    AicpuOrchSummary *dst = &s_phase_header->orch_summary;
-
-    memcpy(dst, src, sizeof(AicpuOrchSummary));
-    dst->magic = AICPU_PHASE_MAGIC;
-    dst->padding = 0;
-
-    wmb();
-
-    LOG_INFO_V0(
-        "Orchestrator summary written: %" PRId64 " tasks, %.3fus", static_cast<int64_t>(src->submit_count),
-        cycles_to_us(src->end_time - src->start_time)
-    );
 }
 
 void l2_perf_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }

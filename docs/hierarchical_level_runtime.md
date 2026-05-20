@@ -11,8 +11,8 @@ For details of each component's internals, see:
 
 - [orchestrator.md](orchestrator.md) — submit flow, TensorMap, Scope, Ring, task state machine
 - [scheduler.md](scheduler.md) — dispatch loop, queues, completion handling
-- [worker-manager.md](worker-manager.md) — WorkerThread pool, THREAD/PROCESS modes, fork + mailbox
-- [task-flow.md](task-flow.md) — Callable / TaskArgs / CallConfig data flow, IWorker interface
+- [worker-manager.md](worker-manager.md) — WorkerThread pool, fork + mailbox
+- [task-flow.md](task-flow.md) — Callable / TaskArgs / CallConfig data flow, execution leaves
 
 For the L2 chip-level details (host `.so`, AICPU, AICore), see
 [chip-level-arch.md](chip-level-arch.md).
@@ -114,7 +114,7 @@ memory region, signals the pre-forked Python child, and spin-polls
 
 See [worker-manager.md](worker-manager.md) for the dispatch state machine,
 fork ordering, and mailbox layout. See [task-flow.md](task-flow.md) for
-what flows through `IWorker::run`.
+what flows through `ChipWorker::run`.
 
 ---
 
@@ -136,8 +136,8 @@ what flows through `IWorker::run`.
                  │                                 │ pop ready_queue
                  │                                 │ pick idle WorkerThread
                  │                                 │ wt.dispatch(slot_id) ──────► WorkerThread
-                 │                                 │                              worker->run(callable, view, config)
-                 │                                 │                              (blocking, THREAD or PROCESS mode)
+                 │                                 │                              encode mailbox → spin-poll TASK_DONE
+                 │                                 │                              (blocking; child runs the kernel)
                  │                                 │◄── completion_queue ────── on_complete_(slot_id)
                  │                                 │ on_task_complete:
                  │                                 │   fanout release
@@ -153,7 +153,7 @@ Communication channels:
 | Orch → Scheduler | wiring_queue (mutex + CV) | slot id |
 | Scheduler → WorkerThread | WorkerThread internal queue | slot id |
 | WorkerThread → Scheduler | completion_queue (mutex + CV) | slot id |
-| WorkerThread ↔ child (PROCESS mode) | shm mailbox (state + error + task data) | encoded blob |
+| WorkerThread ↔ child | shm mailbox (state + error + task data) | encoded blob |
 | Python ↔ C++ | nanobind bindings | TaskArgs / CallConfig / callable handle |
 | Tensor data | `torch.share_memory_()` or host malloc | zero-copy shared address |
 
@@ -161,11 +161,11 @@ Communication channels:
 
 ## 4. Recursive Composition
 
-A `Worker` is itself an `IWorker`, so a higher-level `Worker` can register it
-as a NEXT_LEVEL child. The Python `Worker.add_worker(child)` stores an
-un-init'd child Worker; on first `run()`, the parent forks a child process
-that inits the inner Worker and enters a mailbox-polling loop
-(`_child_worker_loop`).
+A higher-level `Worker` can register a lower-level `Worker` as a
+NEXT_LEVEL child through the same mailbox protocol L3 uses for chip
+children. The Python `Worker.add_worker(child)` stores an un-init'd child
+Worker; on first `run()`, the parent forks a child process that inits the
+inner Worker and enters a mailbox-polling loop (`_child_worker_loop`).
 
 ```python
 # L3 child: sub-only (or with chips via device_ids)
@@ -217,7 +217,7 @@ walk-through.
 | Callable registration | maintains `py_registry[cid]` for sub callables | — |
 | Orchestration DAG | user's orch fn, `submit_*` calls | `Orchestrator::submit_*` engine |
 | Scheduling | — | `Scheduler` thread, queues, `WorkerThread` pool |
-| Dispatch | — | `WorkerManager::dispatch`, THREAD/PROCESS mode |
+| Dispatch | — | `WorkerThread::dispatch_process`, mailbox IPC |
 | Runtime execution | — | `ChipWorker` via dlsym'd runtime `.so` |
 
 Python handles **when** things happen (fork ordering, lifecycle). C++ handles
@@ -283,6 +283,6 @@ device allocation algorithm.
 | `src/common/hierarchical/ring.{h,cpp}` | slot allocator |
 | `src/common/hierarchical/tensormap.{h,cpp}` | base_ptr → producer slot |
 | `src/common/hierarchical/scope.{h,cpp}` | scope lifetime management |
-| `src/common/worker/chip_worker.{h,cpp}` | L2 `ChipWorker` (IWorker leaf, runs in the forked chip child) |
+| `src/common/worker/chip_worker.{h,cpp}` | L2 `ChipWorker` (kernel-running leaf, runs in the forked chip child) |
 | `python/bindings/` | nanobind exposure of C++ engine to Python |
 | `python/simpler/worker.py` | Python `Worker` factory + lifecycle wrapper |

@@ -55,7 +55,7 @@ L2PerfCollector::~L2PerfCollector() {
 }
 
 void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size, user_data_);
+    void *dev_ptr = alloc_cb_(size);
     if (dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate buffer (%zu bytes)", size);
         *host_ptr_out = nullptr;
@@ -81,8 +81,8 @@ void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
 }
 
 int L2PerfCollector::initialize(
-    int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfRegisterCallback register_cb,
-    L2PerfFreeCallback free_cb, void *user_data, const std::string &output_prefix
+    int num_aicore, int device_id, L2PerfLevel l2_perf_level, const L2PerfAllocCallback &alloc_cb,
+    L2PerfRegisterCallback register_cb, const L2PerfFreeCallback &free_cb, const std::string &output_prefix
 ) {
     if (shm_host_ != nullptr) {
         LOG_ERROR("L2PerfCollector already initialized");
@@ -97,6 +97,7 @@ int L2PerfCollector::initialize(
     }
 
     num_aicore_ = num_aicore;
+    l2_perf_level_ = l2_perf_level;
     output_prefix_ = output_prefix;
     total_perf_collected_ = 0;
 
@@ -104,7 +105,7 @@ int L2PerfCollector::initialize(
     // sees consistent values during init. shm_host_ stays nullptr until the
     // shm allocation succeeds — the nullptr guard makes a post-failure
     // start(tf) a no-op.
-    set_memory_context(alloc_cb, register_cb, free_cb, user_data, /*shm_host=*/nullptr, device_id);
+    set_memory_context(alloc_cb, register_cb, free_cb, /*shm_host=*/nullptr, device_id);
 
     // Step 1: Calculate shared memory size (slot arrays only, no actual buffers)
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
@@ -118,7 +119,7 @@ int L2PerfCollector::initialize(
     LOG_DEBUG("  Total shared memory:  %zu bytes (%zu KB)", total_size, total_size / 1024);
 
     // Step 2: Allocate shared memory for slot arrays
-    void *perf_dev_ptr = alloc_cb(total_size, user_data);
+    void *perf_dev_ptr = alloc_cb(total_size);
     if (perf_dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate shared memory (%zu bytes)", total_size);
         return -1;
@@ -133,7 +134,6 @@ int L2PerfCollector::initialize(
             LOG_ERROR("Memory registration failed: %d", rc);
             return rc;
         }
-        was_registered_ = true;
         if (perf_host_ptr == nullptr) {
             LOG_ERROR("register_cb succeeded but returned null host_ptr");
             return -1;
@@ -154,11 +154,13 @@ int L2PerfCollector::initialize(
     }
 
     header->num_cores = num_aicore;
+    header->l2_perf_level = static_cast<uint32_t>(l2_perf_level_);
 
     LOG_DEBUG("Initialized L2PerfDataHeader:");
-    LOG_DEBUG("  num_cores:        %d", header->num_cores);
-    LOG_DEBUG("  buffer_capacity:  %d", PLATFORM_PROF_BUFFER_SIZE);
-    LOG_DEBUG("  queue capacity:   %d", PLATFORM_PROF_READYQUEUE_SIZE);
+    LOG_DEBUG("  num_cores:              %d", header->num_cores);
+    LOG_DEBUG("  l2_perf_level: %u", header->l2_perf_level);
+    LOG_DEBUG("  buffer_capacity:        %d", PLATFORM_PROF_BUFFER_SIZE);
+    LOG_DEBUG("  queue capacity:         %d", PLATFORM_PROF_READYQUEUE_SIZE);
 
     // Step 5: Initialize L2PerfBufferStates — 1 buffer per core in free_queue, rest to recycled pool
     for (int i = 0; i < num_aicore; i++) {
@@ -496,28 +498,9 @@ void L2PerfCollector::read_phase_header_metadata() {
         }
     }
 
-    // Orchestrator summary (header-resident; not buffered).
-    collected_orch_summary_ = phase_header->orch_summary;
-    bool orch_valid = (collected_orch_summary_.magic == AICPU_PHASE_MAGIC);
-    if (orch_valid) {
-        LOG_INFO_V0(
-            "  Orchestrator: %" PRId64 " tasks, %.3fus", static_cast<int64_t>(collected_orch_summary_.submit_count),
-            cycles_to_us(collected_orch_summary_.end_time - collected_orch_summary_.start_time)
-        );
-    } else {
-        LOG_INFO_V0("  Orchestrator: no summary data");
-    }
-
-    bool has_accumulated = has_phase_data_;
-    if (!has_accumulated) {
-        for (const auto &v : collected_phase_records_) {
-            if (!v.empty()) {
-                has_accumulated = true;
-                break;
-            }
-        }
-    }
-    has_phase_data_ = (orch_valid || has_accumulated);
+    // has_phase_data_ is set by copy_phase_buffer() during the drain — every
+    // push into collected_phase_records_ goes through that single call site
+    // and toggles the flag. No re-scan needed here.
 
     // Core-to-thread mapping (header-resident; not buffered).
     int num_cores = static_cast<int>(phase_header->num_cores);
@@ -526,7 +509,7 @@ void L2PerfCollector::read_phase_header_metadata() {
         LOG_INFO_V0("  Core-to-thread mapping: %d cores", num_cores);
     }
 
-    LOG_INFO_V0("Phase metadata collection complete: orch_summary=%s", orch_valid ? "yes" : "no");
+    LOG_INFO_V0("Phase metadata collection complete: has_phase_data=%s", has_phase_data_ ? "yes" : "no");
 }
 
 int L2PerfCollector::export_swimlane_json() {
@@ -595,10 +578,6 @@ int L2PerfCollector::export_swimlane_json() {
                 }
             }
         }
-        if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC && collected_orch_summary_.start_time > 0 &&
-            collected_orch_summary_.start_time < base_time_cycles) {
-            base_time_cycles = collected_orch_summary_.start_time;
-        }
     }
 
     // Step 5: Compose output path. Filename is fixed (no timestamp) — the
@@ -613,7 +592,7 @@ int L2PerfCollector::export_swimlane_json() {
     }
 
     // Step 7: Write JSON data
-    int version = has_phase_data_ ? 2 : 1;
+    int version = static_cast<int>(l2_perf_level_);
     outfile << "{\n";
     outfile << "  \"version\": " << version << ",\n";
     outfile << "  \"tasks\": [\n";
@@ -661,8 +640,8 @@ int L2PerfCollector::export_swimlane_json() {
     }
     outfile << "  ]";
 
-    // Step 8: Write phase profiling data (version 2)
-    if (has_phase_data_) {
+    // Step 8: Write phase profiling data (level >= 3)
+    if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
         auto sched_phase_name = [](AicpuPhaseId id) -> const char * {
             switch (id) {
             case AicpuPhaseId::SCHED_COMPLETE:
@@ -733,46 +712,24 @@ int L2PerfCollector::export_swimlane_json() {
         }
         outfile << "  ]";
 
-        // AICPU orchestrator summary
-        if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC) {
-            double orch_start_us = cycles_to_us(collected_orch_summary_.start_time - base_time_cycles);
-            double orch_end_us = cycles_to_us(collected_orch_summary_.end_time - base_time_cycles);
+        // Orchestrator timing is no longer emitted as a separate aggregate
+        // block. Per-event AicpuPhaseRecord[] entries (emitted as
+        // aicpu_orchestrator_phases below) are the single source of truth;
+        // the run-window envelope is still visible in the device-side
+        // LOG_INFO_V9 "Thread N: orch_start=… orch_end=… orch_cost=…" line.
 
-            outfile << ",\n  \"aicpu_orchestrator\": {\n";
-            outfile << "    \"start_time_us\": " << std::fixed << std::setprecision(3) << orch_start_us << ",\n";
-            outfile << "    \"end_time_us\": " << std::fixed << std::setprecision(3) << orch_end_us << ",\n";
-            outfile << "    \"submit_count\": " << collected_orch_summary_.submit_count << ",\n";
-            outfile << "    \"phase_us\": {\n";
-            outfile << "      \"sync\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.sync_cycle) << ",\n";
-            outfile << "      \"alloc\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.alloc_cycle) << ",\n";
-            outfile << "      \"params\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.args_cycle) << ",\n";
-            outfile << "      \"lookup\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.lookup_cycle) << ",\n";
-            outfile << "      \"heap\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.heap_cycle) << ",\n";
-            outfile << "      \"insert\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.insert_cycle) << ",\n";
-            outfile << "      \"fanin\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.fanin_cycle) << ",\n";
-            outfile << "      \"scope_end\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.scope_end_cycle) << "\n";
-            outfile << "    }\n";
-            outfile << "  }";
-        }
-
-        // Per-task orchestrator phase records (filtered from unified collected_phase_records_)
+        // Per-task orchestrator phase records (level >= 4, filtered from unified collected_phase_records_)
         bool has_orch_phases = false;
-        for (const auto &v : collected_phase_records_) {
-            for (const auto &r : v) {
-                if (!is_scheduler_phase(r.phase_id)) {
-                    has_orch_phases = true;
-                    break;
+        if (l2_perf_level_ >= L2PerfLevel::ORCH_PHASES) {
+            for (const auto &v : collected_phase_records_) {
+                for (const auto &r : v) {
+                    if (!is_scheduler_phase(r.phase_id)) {
+                        has_orch_phases = true;
+                        break;
+                    }
                 }
+                if (has_orch_phases) break;
             }
-            if (has_orch_phases) break;
         }
         if (has_orch_phases) {
             outfile << ",\n  \"aicpu_orchestrator_phases\": [\n";
@@ -822,7 +779,7 @@ int L2PerfCollector::export_swimlane_json() {
     return 0;
 }
 
-int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb, void *user_data) {
+int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, const L2PerfFreeCallback &free_cb) {
     if (shm_host_ == nullptr) {
         return 0;
     }
@@ -832,40 +789,34 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
 
     LOG_DEBUG("Cleaning up performance profiling resources");
 
+    // Every release site below goes through release_one_buffer so the
+    // unregister and free are an inseparable pair — each dev_ptr that
+    // alloc_single_buffer installed via halHostRegister is unregistered
+    // before its device memory is freed. Without this the Ascend HAL's
+    // per-device registration table accumulates leaked entries across
+    // init_l2_perf() invocations and back-to-back l2_swimlane tests on
+    // a reused Worker fail at rc=8 from halHostRegister.
+
     // Free standalone aicore_ring_addr table
-    if (aicore_ring_addr_table_dev_ != nullptr && free_cb != nullptr) {
-        free_cb(aicore_ring_addr_table_dev_, user_data);
-        aicore_ring_addr_table_dev_ = nullptr;
-    }
+    release_one_buffer(aicore_ring_addr_table_dev_, unregister_cb, free_cb);
+    aicore_ring_addr_table_dev_ = nullptr;
 
     // Release framework-owned buffers (recycled pools, done_queue, ready_queue).
-    // These were not consumed via the AICPU side, so the per-pool free_queue
-    // and current_buf_ptr remain populated and are handled in the loops below.
-    if (free_cb != nullptr) {
-        manager_.release_owned_buffers([free_cb, user_data](void *p) {
-            free_cb(p, user_data);
-        });
-    }
+    manager_.release_owned_buffers([this, unregister_cb, free_cb](void *p) {
+        release_one_buffer(p, unregister_cb, free_cb);
+    });
 
-    // Free buffers still parked in per-core / per-thread free_queues and as
-    // current_buf_ptr — these were owned by the AICPU side, not the framework.
+    // Per-core: current buffer + staging ring + free_queue slots — these
+    // were owned by the AICPU side, not the framework.
     for (int i = 0; i < num_aicore_; i++) {
         L2PerfBufferState *state = get_perf_buffer_state(shm_host_, i);
 
-        // Free current buffer if any
-        if (state->current_buf_ptr != 0 && free_cb != nullptr) {
-            free_cb(reinterpret_cast<void *>(state->current_buf_ptr), user_data);
-        }
+        release_one_buffer(reinterpret_cast<void *>(state->current_buf_ptr), unregister_cb, free_cb);
         state->current_buf_ptr = 0;
 
-        // Free the per-core AICore staging ring (allocated once at init,
-        // never recycled).
-        if (state->aicore_ring_ptr != 0 && free_cb != nullptr) {
-            free_cb(reinterpret_cast<void *>(state->aicore_ring_ptr), user_data);
-        }
+        release_one_buffer(reinterpret_cast<void *>(state->aicore_ring_ptr), unregister_cb, free_cb);
         state->aicore_ring_ptr = 0;
 
-        // Free all buffers remaining in free_queue
         rmb();
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
@@ -875,10 +826,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
         }
         for (uint32_t k = 0; k < queued; k++) {
             uint32_t slot = (head + k) % PLATFORM_PROF_SLOT_COUNT;
-            uint64_t buf_ptr = state->free_queue.buffer_ptrs[slot];
-            if (buf_ptr != 0 && free_cb != nullptr) {
-                free_cb(reinterpret_cast<void *>(buf_ptr), user_data);
-            }
+            release_one_buffer(reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]), unregister_cb, free_cb);
             state->free_queue.buffer_ptrs[slot] = 0;
         }
         state->free_queue.head = tail;
@@ -888,13 +836,9 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
     for (int t = 0; t < num_phase_threads; t++) {
         PhaseBufferState *state = get_phase_buffer_state(shm_host_, num_aicore_, t);
 
-        // Free current buffer if any
-        if (state->current_buf_ptr != 0 && free_cb != nullptr) {
-            free_cb(reinterpret_cast<void *>(state->current_buf_ptr), user_data);
-        }
+        release_one_buffer(reinterpret_cast<void *>(state->current_buf_ptr), unregister_cb, free_cb);
         state->current_buf_ptr = 0;
 
-        // Free all buffers remaining in free_queue
         rmb();
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
@@ -904,30 +848,18 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
         }
         for (uint32_t k = 0; k < queued; k++) {
             uint32_t slot = (head + k) % PLATFORM_PROF_SLOT_COUNT;
-            uint64_t buf_ptr = state->free_queue.buffer_ptrs[slot];
-            if (buf_ptr != 0 && free_cb != nullptr) {
-                free_cb(reinterpret_cast<void *>(buf_ptr), user_data);
-            }
+            release_one_buffer(reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]), unregister_cb, free_cb);
             state->free_queue.buffer_ptrs[slot] = 0;
         }
         state->free_queue.head = tail;
     }
 
-    // Unregister host mapping (optional)
-    if (unregister_cb != nullptr && was_registered_) {
-        int rc = unregister_cb(perf_shared_mem_dev_, device_id_);
-        if (rc != 0) {
-            LOG_ERROR("halHostUnregister failed: %d", rc);
-            return rc;
-        }
-        LOG_DEBUG("Host mapping unregistered");
-    }
-
-    // Free shared memory (slot arrays)
-    if (free_cb != nullptr && perf_shared_mem_dev_ != nullptr) {
-        free_cb(perf_shared_mem_dev_, user_data);
-        LOG_DEBUG("Shared memory freed");
-    }
+    // Main shm: unregister + free as a pair, same as every other buffer.
+    // ProfilerBase's set_memory_context handed register_cb == nullptr iff the
+    // caller doesn't intend to register, so checking unregister_cb inside
+    // release_one_buffer is sufficient — no separate ``was_registered_`` flag.
+    release_one_buffer(perf_shared_mem_dev_, unregister_cb, free_cb);
+    LOG_DEBUG("Main shm released");
 
     perf_shared_mem_dev_ = nullptr;
     // shm_host_ aliases freed device/host memory now; null it so is_initialized()
@@ -935,7 +867,6 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFree
     // quiet, and a re-entrant finalize() / re-init hits the early-out instead of
     // walking freed buffer state. Mirrors PMU/DepGen/TensorDump collectors.
     shm_host_ = nullptr;
-    was_registered_ = false;
     collected_perf_records_.clear();
     collected_phase_records_.clear();
     core_to_thread_.clear();

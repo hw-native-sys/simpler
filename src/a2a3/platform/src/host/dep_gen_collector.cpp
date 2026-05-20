@@ -36,8 +36,8 @@ DepGenCollector::~DepGenCollector() { stop(); }
 // ---------------------------------------------------------------------------
 
 int DepGenCollector::init(
-    int num_threads, DepGenAllocCallback alloc_cb, DepGenRegisterCallback register_cb, DepGenFreeCallback free_cb,
-    void *user_data, int device_id
+    int num_threads, const DepGenAllocCallback &alloc_cb, DepGenRegisterCallback register_cb,
+    const DepGenFreeCallback &free_cb, int device_id
 ) {
     if (num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
         LOG_ERROR("DepGenCollector::init: invalid arguments");
@@ -54,7 +54,7 @@ int DepGenCollector::init(
     // dep_gen is single-instance: just one DepGenBufferState after the header.
     const int num_instances = 1;
     shm_size_ = calc_dep_gen_shm_size(num_instances);
-    shm_dev_ = alloc_cb(shm_size_, user_data);
+    shm_dev_ = alloc_cb(shm_size_);
     if (shm_dev_ == nullptr) {
         LOG_ERROR("DepGenCollector: failed to allocate dep_gen shared memory (%zu bytes)", shm_size_);
         return -1;
@@ -64,7 +64,7 @@ int DepGenCollector::init(
         int rc = register_cb(shm_dev_, shm_size_, device_id, &shm_host_);
         if (rc != 0) {
             LOG_ERROR("DepGenCollector: halHostRegister for dep_gen SHM failed: %d", rc);
-            free_cb(shm_dev_, user_data);
+            free_cb(shm_dev_);
             shm_dev_ = nullptr;
             return rc;
         }
@@ -82,7 +82,7 @@ int DepGenCollector::init(
     DepGenBufferState *state = dep_gen_state(0);
 
     for (int b = 0; b < PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE; b++) {
-        void *dev_ptr = alloc_cb(buf_size, user_data);
+        void *dev_ptr = alloc_cb(buf_size);
         if (dev_ptr == nullptr) {
             LOG_ERROR("DepGenCollector: failed to allocate DepGenBuffer b=%d", b);
             return -1;
@@ -93,7 +93,7 @@ int DepGenCollector::init(
             int rc = register_cb(dev_ptr, buf_size, device_id, &host_ptr);
             if (rc != 0) {
                 LOG_ERROR("DepGenCollector: halHostRegister for DepGenBuffer b=%d failed: %d", b, rc);
-                free_cb(dev_ptr, user_data);
+                free_cb(dev_ptr);
                 return rc;
             }
         }
@@ -114,7 +114,7 @@ int DepGenCollector::init(
     }
 
     initialized_ = true;
-    set_memory_context(alloc_cb, register_cb, free_cb, user_data, shm_host_, device_id);
+    set_memory_context(alloc_cb, register_cb, free_cb, shm_host_, device_id);
 
     LOG_INFO_V0(
         "DepGen collector initialized: %d threads, SHM=0x%lx (records held in memory until replay)", num_threads,
@@ -211,7 +211,7 @@ bool DepGenCollector::reconcile_counters() {
 // finalize
 // ---------------------------------------------------------------------------
 
-void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, DepGenFreeCallback free_cb, void *user_data) {
+void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, const DepGenFreeCallback &free_cb) {
     if (!initialized_) return;
 
     stop();
@@ -225,12 +225,7 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, DepGenFre
     // Same pattern as PmuCollector: walk owned buffers, then the free_queue
     // and current_buf_ptr, releasing each unique device pointer once.
     auto release_buf = [&](void *p) {
-        if (buffers_registered_ && unregister_cb != nullptr) {
-            unregister_cb(p, device_id_);
-        }
-        if (free_cb != nullptr) {
-            free_cb(p, user_data);
-        }
+        release_one_buffer(p, buffers_registered_ ? unregister_cb : nullptr, free_cb);
     };
     manager_.release_owned_buffers(release_buf);
 
@@ -258,12 +253,7 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, DepGenFre
     manager_.clear_mappings();
 
     if (shm_dev_ != nullptr) {
-        if (shm_registered_ && unregister_cb != nullptr) {
-            unregister_cb(shm_dev_, device_id_);
-        }
-        if (free_cb != nullptr) {
-            free_cb(shm_dev_, user_data);
-        }
+        release_one_buffer(shm_dev_, shm_registered_ ? unregister_cb : nullptr, free_cb);
         shm_dev_ = nullptr;
         shm_host_ = nullptr;
     }

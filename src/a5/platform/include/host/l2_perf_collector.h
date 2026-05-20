@@ -161,32 +161,16 @@ struct L2PerfModule {
     }
 };
 
-/**
- * Memory allocation callback for performance profiling.
- *
- * @param size       Memory size in bytes
- * @param user_data  Opaque allocator context
- * @return Allocated device memory pointer, or nullptr on failure
- */
-using L2PerfAllocCallback = void *(*)(size_t size, void *user_data);
-
-/**
- * Memory registration callback (host-visible mapping). nullptr on a5 — the
- * framework allocates a paired host shadow via malloc + memset 0 +
- * copy_to_device. Stateless: HAL state is global, so no user_data is
- * threaded through.
- */
-using L2PerfRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
-
-/**
- * Memory unregister callback. May be nullptr. Stateless (see register_cb).
- */
-using L2PerfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
-
-/**
- * Memory free callback.
- */
-using L2PerfFreeCallback = int (*)(void *dev_ptr, void *user_data);
+// Memory callbacks — thin aliases for the canonical profiling_common shapes.
+// alloc / free are std::function so callers bind their MemoryAllocator via
+// lambda capture; register / unregister stay as plain function pointers
+// because they wrap stateless HAL globals. On a5 onboard the runner passes
+// register_cb=nullptr and the framework installs a malloc-shadow + DMA
+// fallback (default_host_shadow_register).
+using L2PerfAllocCallback = profiling_common::ProfAllocCallback;
+using L2PerfRegisterCallback = profiling_common::ProfRegisterCallback;
+using L2PerfUnregisterCallback = profiling_common::ProfUnregisterCallback;
+using L2PerfFreeCallback = profiling_common::ProfFreeCallback;
 
 // =============================================================================
 // L2PerfCollector
@@ -206,7 +190,7 @@ using L2PerfFreeCallback = int (*)(void *dev_ptr, void *user_data);
  *   4. stop()                      — joins both threads in the correct
  *                                    order (mgmt first so its final-drain
  *                                    entries have a consumer).
- *   5. read_phase_header_metadata() — single-shot read of orch_summary +
+ *   5. read_phase_header_metadata() — single-shot read of the
  *                                    core→thread mapping from the
  *                                    AicpuPhaseHeader.
  *   6. reconcile_counters()        — leftover-active sanity check (a5 lacks
@@ -250,8 +234,8 @@ public:
      * @return 0 on success, error code on failure
      */
     int initialize(
-        int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfRegisterCallback register_cb,
-        L2PerfFreeCallback free_cb, void *user_data, const std::string &output_prefix
+        int num_aicore, int device_id, const L2PerfAllocCallback &alloc_cb, L2PerfRegisterCallback register_cb,
+        const L2PerfFreeCallback &free_cb, const std::string &output_prefix
     );
 
     /**
@@ -280,7 +264,7 @@ public:
      * @param user_data      Opaque pointer forwarded to callbacks
      * @return 0 on success, error code on failure
      */
-    int finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb, void *user_data);
+    int finalize(L2PerfUnregisterCallback unregister_cb, const L2PerfFreeCallback &free_cb);
 
     /**
      * @return true if initialize() succeeded and finalize() has not run.
@@ -304,8 +288,9 @@ public:
 
     /**
      * Read AICPU phase metadata that lives in AicpuPhaseHeader (not on the
-     * buffer pipeline): the orchestrator summary and core→thread mapping.
-     * Single-shot — must be called after stop() so orch_summary has settled.
+     * buffer pipeline): the core→thread mapping plus a has-data signal
+     * derived from accumulated per-event records. Single-shot — must be
+     * called after stop() so the shm region has settled.
      * The shm region was last mirrored to host shadow at the end of mgmt's
      * final-drain pass.
      */
@@ -352,7 +337,6 @@ private:
 
     // AICPU phase profiling data (per-thread, mixed sched + orch records)
     std::vector<std::vector<AicpuPhaseRecord>> collected_phase_records_;
-    AicpuOrchSummary collected_orch_summary_{};
     bool has_phase_data_{false};
 
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)

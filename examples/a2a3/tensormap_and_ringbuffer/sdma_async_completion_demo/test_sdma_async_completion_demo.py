@@ -10,35 +10,28 @@
 """SDMA deferred completion smoke test for onboard a2a3.
 
 Each rank stages its input inside the HCCL window.  The deferred producer
-builds an ``SdmaRequestDescriptor`` via ``SdmaTget`` and submits it through
-``send_request_entry``, which registers the resulting AsyncEvent's GM flag(s)
-on the task's deferred-wait slab.  The consumer depends on the producer
-output and writes ``result = out + 1``.  Correct ``out`` and ``result``
-therefore validate both the SDMA completion polling and the deferred-release
-dependency path.
+TGET_ASYNCs the peer rank's input into local ``out`` and registers the PTO
+AsyncEvent through ``defer_pto_async_event``.  The consumer depends on the
+producer output and writes ``result = out + 1``.  Correct ``out`` and
+``result`` therefore validate both the SDMA completion polling and the
+deferred-release dependency path.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import tempfile
-from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 import torch
 from simpler.task_interface import (
     ArgDirection,
     CallConfig,
-    ChipBootstrapConfig,
-    ChipBufferSpec,
     ChipCallable,
-    ChipCommBootstrapConfig,
-    ChipContext,
+    CommBufferSpec,
     ContinuousTensor,
     CoreCallable,
     DataType,
-    HostBufferStaging,
     TaskArgs,
     TensorArgType,
 )
@@ -122,47 +115,16 @@ def run(
 
     input_nbytes = N * DTYPE_NBYTES
     window_size = max(input_nbytes, 4 * 1024)
-    rootinfo_path = os.path.join(tempfile.gettempdir(), f"pto_sdma_async_completion_rootinfo_{os.getpid()}.bin")
-    try:
-        os.unlink(rootinfo_path)
-    except FileNotFoundError:
-        pass
 
+    # `inputs` must live in shared memory: `orch.copy_to` stages each rank's
+    # data into its HCCL window from the forked chip child, which reads `src`
+    # out of its own address space.
     inputs = [
-        torch.tensor([float(rank * 1000 + (i % 251)) / 10.0 for i in range(N)], dtype=torch.float32)
+        torch.tensor([float(rank * 1000 + (i % 251)) / 10.0 for i in range(N)], dtype=torch.float32).share_memory_()
         for rank in range(nranks)
     ]
     out = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
     result = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
-
-    input_shms = [SharedMemory(create=True, size=input_nbytes) for _ in range(nranks)]
-    for rank, shm in enumerate(input_shms):
-        buf = shm.buf
-        if buf is None:
-            raise RuntimeError("SharedMemory buffer is unavailable")
-        buf[:input_nbytes] = inputs[rank].numpy().tobytes()
-
-    cfgs = [
-        ChipBootstrapConfig(
-            comm=ChipCommBootstrapConfig(
-                rank=rank,
-                nranks=nranks,
-                rootinfo_path=rootinfo_path,
-                window_size=window_size,
-            ),
-            buffers=[
-                ChipBufferSpec(
-                    name="input_window",
-                    dtype="float32",
-                    count=N,
-                    nbytes=input_nbytes,
-                    load_from_host=True,
-                ),
-            ],
-            host_inputs=[HostBufferStaging(name="input_window", shm_name=input_shms[rank].name, size=input_nbytes)],
-        )
-        for rank in range(nranks)
-    ]
 
     chip_callable = build_chip_callable(platform, pto_isa_commit, "https")
     worker = Worker(
@@ -171,30 +133,47 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        chip_bootstrap_configs=cfgs,
         build=build,
     )
     chip_cid = worker.register(chip_callable)
     try:
         worker.init()
-        contexts: list[ChipContext] = worker.chip_contexts
 
         def orch_fn(orch, _args, cfg):
-            for rank, ctx in enumerate(contexts):
-                args = TaskArgs()
-                args.add_tensor(
-                    ContinuousTensor.make(
-                        data=ctx.buffer_ptrs["input_window"],
-                        shapes=(N,),
-                        dtype=DataType.FLOAT32,
-                        child_memory=True,
-                    ),
-                    TensorArgType.INPUT,
-                )
-                args.add_tensor(make_tensor_arg(out[rank]), TensorArgType.OUTPUT_EXISTING)
-                args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
-                args.add_scalar(ctx.device_ctx)
-                orch.submit_next_level(chip_cid, args, cfg, worker=rank)
+            with orch.allocate_domain(
+                name="default",
+                workers=list(range(nranks)),
+                window_size=window_size,
+                buffers=[
+                    CommBufferSpec(name="input_window", dtype="float32", count=N, nbytes=input_nbytes),
+                ],
+            ) as handle:
+                # Stage every rank's input window before submitting any kernel:
+                # each producer TGET_ASYNCs the *peer* rank's window, so all
+                # windows must hold real data before execution begins.
+                for rank in range(nranks):
+                    orch.copy_to(
+                        rank,
+                        dst=handle[rank].buffer_ptrs["input_window"],
+                        src=inputs[rank].data_ptr(),
+                        size=input_nbytes,
+                    )
+                for rank in range(nranks):
+                    domain = handle[rank]
+                    args = TaskArgs()
+                    args.add_tensor(
+                        ContinuousTensor.make(
+                            data=domain.buffer_ptrs["input_window"],
+                            shapes=(N,),
+                            dtype=DataType.FLOAT32,
+                            child_memory=True,
+                        ),
+                        TensorArgType.INPUT,
+                    )
+                    args.add_tensor(make_tensor_arg(out[rank]), TensorArgType.OUTPUT_EXISTING)
+                    args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
+                    args.add_scalar(domain.device_ctx)
+                    orch.submit_next_level(chip_cid, args, cfg, worker=rank)
 
         worker.run(orch_fn, args=None, config=CallConfig())
 
@@ -210,13 +189,6 @@ def run(
         return 0 if ok else 1
     finally:
         worker.close()
-        try:
-            os.unlink(rootinfo_path)
-        except FileNotFoundError:
-            pass
-        for shm in input_shms:
-            shm.close()
-            shm.unlink()
 
 
 @pytest.mark.platforms(["a2a3"])

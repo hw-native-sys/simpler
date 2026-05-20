@@ -578,8 +578,6 @@ NB_MODULE(_task_interface, m) {
         });
 
     // --- CallConfig ---
-    // The two enable_* fields are stored as int32 on the wire (see call_config.h).
-    // Expose them as Python `bool` via def_property so user-facing API is unchanged.
     nb::class_<CallConfig>(m, "CallConfig")
         .def(nb::init<>())
         .def_rw("block_dim", &CallConfig::block_dim)
@@ -587,10 +585,18 @@ NB_MODULE(_task_interface, m) {
         .def_prop_rw(
             "enable_l2_swimlane",
             [](const CallConfig &c) {
-                return static_cast<bool>(c.enable_l2_swimlane);
+                return c.enable_l2_swimlane;
             },
-            [](CallConfig &c, bool v) {
-                c.enable_l2_swimlane = v ? 1 : 0;
+            // Accept either an int perf_level (0-4) or a Python bool. `True` maps to
+            // level 4 (full collection) to preserve the pre-perf_level semantics for
+            // callers that still pass a boolean; `False` maps to 0.
+            [](CallConfig &c, nb::object v) {
+                if (PyBool_Check(v.ptr())) {
+                    c.enable_l2_swimlane = nb::cast<bool>(v) ? 4 : 0;
+                } else {
+                    int level = nb::cast<int>(v);
+                    c.enable_l2_swimlane = (level < 0) ? 0 : (level > 4) ? 4 : level;
+                }
             }
         )
         .def_prop_rw(
@@ -631,7 +637,7 @@ NB_MODULE(_task_interface, m) {
         .def("__repr__", [](const CallConfig &self) -> std::string {
             std::ostringstream os;
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
-               << ", enable_l2_swimlane=" << (self.enable_l2_swimlane ? "True" : "False")
+               << ", enable_l2_swimlane=" << self.enable_l2_swimlane
                << ", enable_dump_tensor=" << (self.enable_dump_tensor ? "True" : "False")
                << ", enable_pmu=" << self.enable_pmu << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False");
             if (self.output_prefix_set()) {
@@ -645,6 +651,57 @@ NB_MODULE(_task_interface, m) {
     // src/common/log/host_log.h::simpler::log::kDefaultThreshold; if you change
     // one, change the other.
     m.attr("DEFAULT_LOG_THRESHOLD") = 20;  // V5 = Python INFO
+
+    // --- RunTiming ---
+    // Returned by ChipWorker.run_prepared* / Worker.run. Cycles → ns conversion
+    // happens on the platform side (frequency known there); units exposed to
+    // Python are µs as floats to match historical benchmark_rounds.sh output.
+    nb::class_<RunTiming>(m, "RunTiming")
+        .def(nb::init<>())
+        .def(
+            "__init__",
+            [](RunTiming *self, uint64_t host_wall_ns, uint64_t device_wall_ns) {
+                new (self) RunTiming{host_wall_ns, device_wall_ns};
+            },
+            nb::arg("host_wall_ns"), nb::arg("device_wall_ns") = 0,
+            "Construct with explicit ns values (used by the Python Worker.run "
+            "wrapper to surface host-side timing for L3+ DAGs)."
+        )
+        .def_prop_ro(
+            "host_wall_us",
+            [](const RunTiming &t) {
+                return t.host_wall_ns / 1000.0;
+            },
+            "Host steady-clock wall around the dispatch, in microseconds."
+        )
+        .def_prop_ro(
+            "device_wall_us",
+            [](const RunTiming &t) {
+                return t.device_wall_ns / 1000.0;
+            },
+            "On-NPU wall (orch end - orch start), in microseconds. Populated whenever the "
+            "runtime was built with PTO2_PROFILING (the default); independent of "
+            "enable_l2_swimlane after the orch_summary capture was decoupled from the "
+            "swimlane shared region. Zero only on a PTO2_PROFILING-off build."
+        )
+        .def_prop_ro(
+            "host_wall_ns",
+            [](const RunTiming &t) {
+                return t.host_wall_ns;
+            }
+        )
+        .def_prop_ro(
+            "device_wall_ns",
+            [](const RunTiming &t) {
+                return t.device_wall_ns;
+            }
+        )
+        .def("__repr__", [](const RunTiming &t) {
+            std::ostringstream os;
+            os << "RunTiming(host_wall_us=" << t.host_wall_ns / 1000.0
+               << ", device_wall_us=" << t.device_wall_ns / 1000.0 << ")";
+            return os.str();
+        });
 
     // --- ChipWorker ---
     nb::class_<ChipWorker>(m, "_ChipWorker")
@@ -679,19 +736,21 @@ NB_MODULE(_task_interface, m) {
         .def(
             "run",
             [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config) {
-                self.run(callable_id, &args, config);
+                return self.run(callable_id, &args, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
-            "Launch a callable_id previously staged via prepare_callable."
+            "Launch a callable_id previously staged via prepare_callable. "
+            "Returns RunTiming with host/device wall."
         )
         .def(
             "run",
             [](ChipWorker &self, int32_t callable_id, TaskArgs &args, const CallConfig &config) {
                 TaskArgsView view = make_view(args);
-                self.run(callable_id, view, config);
+                return self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
-            "Launch a callable_id from a TaskArgs (used for in-process callers)."
+            "Launch a callable_id from a TaskArgs (used for in-process callers). "
+            "Returns RunTiming."
         )
         .def(
             "run_prepared_from_blob",
@@ -704,7 +763,7 @@ NB_MODULE(_task_interface, m) {
                 // loops never re-implement the tensor/scalar layout in Python
                 // (where it has historically dropped fields like child_memory).
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
-                self.run(callable_id, view, config);
+                return self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
             "Launch a callable_id from a raw mailbox-blob pointer + capacity "
@@ -759,11 +818,35 @@ NB_MODULE(_task_interface, m) {
             "comm_get_window_size", &ChipWorker::comm_get_window_size, nb::arg("comm_handle"),
             "Return the actual per-rank window size (may differ from the hint)."
         )
+        .def(
+            "comm_derive_context", &ChipWorker::comm_derive_context, nb::arg("comm_handle"), nb::arg("rank_ids"),
+            nb::arg("domain_rank"), nb::arg("window_offset"), nb::arg("window_size"),
+            "Derive a domain-local CommContext from an allocated base communicator."
+        )
+        .def(
+            "comm_alloc_domain_windows",
+            [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids,
+               uint32_t domain_rank, size_t window_size) {
+                auto [device_ctx, local_window_base] =
+                    self.comm_alloc_domain_windows(comm_handle, allocation_id, rank_ids, domain_rank, window_size);
+                return nb::make_tuple(device_ctx, local_window_base);
+            },
+            nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
+            nb::arg("window_size"),
+            "Collectively allocate a fresh per-rank pool for a subset; returns "
+            "(device_ctx, local_window_base) for this rank."
+        )
+        .def(
+            "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
+            nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
+            "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
+        )
         .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"), "Synchronize all ranks.")
         .def(
             "comm_destroy", &ChipWorker::comm_destroy, nb::arg("comm_handle"),
             "Destroy the communicator and release its resources."
-        );
+        )
+        .def("comm_destroy_all", &ChipWorker::comm_destroy_all, "Destroy all owned communicators in LIFO order.");
 
     // --- Standalone blob helpers ---
     m.def(

@@ -325,6 +325,69 @@ def _temporary_env(env_updates):
                 os.environ[k] = v
 
 
+def _log_round_timings(timings):
+    """Print per-round + summary host/device wall (µs) for multi-round runs.
+
+    Replaces the device-log scraping that ``tools/benchmark_rounds.sh`` used to
+    do — Worker.run now returns the timing directly, so the per-round table
+    can be emitted by the framework without grep+awk over device logs.
+
+    Output goes to ``print`` (not ``logger.info``) because benchmark numbers
+    are a user-facing artifact and the project's default log level suppresses
+    INFO in standalone test_*.py runs.
+
+    ``timings`` is a list of (host_wall_us, device_wall_us) tuples. The device
+    column reports 0 when the runtime was built without PTO2_PROFILING (the
+    default build has it on) or when an L3+ DAG is in use (per-task device
+    cycles aren't aggregated).
+    """
+    if not timings:
+        return
+    n = len(timings)
+    host_vals = sorted(t[0] for t in timings)
+    dev_vals = sorted(t[1] for t in timings)
+    host_avg = sum(host_vals) / n
+    # Device avg averages over non-zero rounds only. When --rounds > 1 the
+    # framework restricts enable_l2_swimlane (and thus orch_summary capture)
+    # to round 0, so the other rounds report 0; including those zeros in the
+    # average would silently halve / quarter the reported device wall and
+    # mislead the benchmark consumer. dev_count carries the sample size into
+    # the summary line for transparency.
+    dev_nonzero = [v for v in dev_vals if v > 0.0]
+    dev_count = len(dev_nonzero)
+    dev_avg = (sum(dev_nonzero) / dev_count) if dev_count else 0.0
+    show_device = dev_count > 0
+
+    header = f"  {'Round':<6}  {'Host (us)':>12}"
+    if show_device:
+        header += f"  {'Device (us)':>12}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for i, (h, d) in enumerate(timings):
+        line = f"  {i:<6d}  {h:>12.1f}"
+        if show_device:
+            line += f"  {d:>12.1f}"
+        print(line)
+    summary = f"  Avg Host: {host_avg:.1f} us"
+    if show_device:
+        summary += f"  |  Avg Device: {dev_avg:.1f} us [{dev_count}/{n} rounds captured]"
+    summary += f"  ({n} rounds)"
+    print(summary)
+
+    trim = 10
+    if n > 2 * trim:
+        tc = n - 2 * trim
+        host_trim = sum(host_vals[trim:-trim]) / tc
+        msg = f"  Trimmed Avg Host: {host_trim:.1f} us"
+        if show_device and dev_count > 2 * trim:
+            dev_nonzero_sorted = sorted(dev_nonzero)
+            dev_trim_count = dev_count - 2 * trim
+            dev_trim = sum(dev_nonzero_sorted[trim:-trim]) / dev_trim_count
+            msg += f"  |  Trimmed Avg Device: {dev_trim:.1f} us"
+        msg += f"  (dropped {trim} low + {trim} high, {tc} rounds used)"
+        print(msg)
+
+
 def _resolve_callable_paths(cls, cls_dir):
     """Resolve relative source paths in CALLABLE against cls_dir."""
     callable_spec = cls.CALLABLE
@@ -784,7 +847,7 @@ class SceneTestCase:
     def _build_config(
         self,
         config_dict,
-        enable_l2_swimlane=False,
+        enable_l2_swimlane=0,
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -832,7 +895,7 @@ class SceneTestCase:
         sub_ids=None,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=False,
+        enable_l2_swimlane=0,
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -873,7 +936,7 @@ class SceneTestCase:
         case,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=False,
+        enable_l2_swimlane=0,
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -909,25 +972,36 @@ class SceneTestCase:
                 initial_outputs[name] = getattr(test_args, name).clone()
 
         # Execute rounds
+        timings = []  # populated only when rounds > 1
         for round_idx in range(rounds):
             if round_idx > 0:
                 for name, initial in initial_outputs.items():
                     getattr(test_args, name).copy_(initial)
 
+            # enable_l2_swimlane / enable_dep_gen are already forced False by
+            # the upstream gate in test_run / run_module when rounds > 1, so an
+            # extra `and round_idx == 0` here is dead code; pass them through
+            # verbatim. (If the upstream gate is ever relaxed, restore the
+            # per-round masking here.)
             config = self._build_config(
                 config_dict,
-                enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
+                enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
-                enable_dep_gen=(enable_dep_gen and round_idx == 0),
+                enable_dep_gen=enable_dep_gen,
                 output_prefix=output_prefix,
             )
 
             with _temporary_env(self._resolve_env()):
-                worker.run(cid, chip_args, config=config)
+                timing = worker.run(cid, chip_args, config=config)
+            if rounds > 1 and timing is not None:
+                timings.append((timing.host_wall_us, timing.device_wall_us))
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+
+        if timings:
+            _log_round_timings(timings)
 
     def _run_and_validate_l3(  # noqa: PLR0913 -- threads CLI diagnostic flags + L3 ns context
         self,
@@ -937,7 +1011,7 @@ class SceneTestCase:
         case,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=False,
+        enable_l2_swimlane=0,
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -981,17 +1055,20 @@ class SceneTestCase:
         orch_fn = self.CALLABLE["orchestration"]
 
         # Execute rounds
+        timings = []
         for round_idx in range(rounds):
             if round_idx > 0:
                 for name, initial in initial_tensors.items():
                     getattr(test_args, name).copy_(initial)
 
+            # See _run_and_validate_l2: the per-round masking is dead code
+            # under the existing upstream gate. Keep parity by passing through.
             config = self._build_config(
                 config_dict,
-                enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
+                enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
-                enable_dep_gen=(enable_dep_gen and round_idx == 0),
+                enable_dep_gen=enable_dep_gen,
                 output_prefix=output_prefix,
             )
 
@@ -1001,10 +1078,17 @@ class SceneTestCase:
                 orch_fn(orch, _ns, _test_args, _config)
 
             with _temporary_env(self._resolve_env()):
-                worker.run(task_orch)
+                timing = worker.run(task_orch)
+            if rounds > 1 and timing is not None:
+                # L3+ DAGs surface host wall only; device_wall_us is 0 because
+                # per-task device cycles aren't aggregated up to Worker.run.
+                timings.append((timing.host_wall_us, timing.device_wall_us))
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
+
+        if timings:
+            _log_round_timings(timings)
 
     # ------------------------------------------------------------------
     # pytest auto test method
@@ -1034,14 +1118,14 @@ class SceneTestCase:
         manual_mode = request.config.getoption("--manual", default="exclude")
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
-        enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=False)
+        enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=0)
         enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
         if rounds > 1:
             if enable_l2_swimlane:
                 logger.warning("Profiling disabled: --rounds > 1")
-                enable_l2_swimlane = False
+                enable_l2_swimlane = 0
             if enable_dump_tensor:
                 logger.warning("Dump tensor disabled: --rounds > 1")
                 enable_dump_tensor = False
@@ -1130,7 +1214,14 @@ class SceneTestCase:
         parser.add_argument("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
         parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
         parser.add_argument(
-            "--enable-l2-swimlane", action="store_true", help="Enable perf swimlane collection (first round only)"
+            "--enable-l2-swimlane",
+            nargs="?",
+            const=4,
+            default=0,
+            type=int,
+            metavar="PERF_LEVEL",
+            help="Enable L2 swimlane. Bare flag=level 4 (full). "
+            "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
         )
         parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
         parser.add_argument(
@@ -1205,7 +1296,7 @@ class SceneTestCase:
 
         if args.rounds > 1 and args.enable_l2_swimlane:
             logger.warning("Profiling disabled: --rounds > 1")
-            args.enable_l2_swimlane = False
+            args.enable_l2_swimlane = 0
         if args.rounds > 1 and args.enable_dep_gen:
             logger.warning("dep_gen disabled: --rounds > 1")
             args.enable_dep_gen = False
@@ -1372,7 +1463,7 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
     if args.skip_golden:
         common.append("--skip-golden")
     if args.enable_l2_swimlane:
-        common.append("--enable-l2-swimlane")
+        common += ["--enable-l2-swimlane", str(args.enable_l2_swimlane)]
     if args.dump_tensor:
         common.append("--dump-tensor")
     if args.enable_dep_gen:

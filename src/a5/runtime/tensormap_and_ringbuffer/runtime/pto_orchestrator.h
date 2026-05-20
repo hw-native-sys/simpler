@@ -151,8 +151,6 @@ struct PTO2OrchProfilingData {
     // Atomic operation counts per phase
     uint64_t alloc_atomic_count;
     uint64_t args_atomic_count;
-    uint64_t fanin_atomic_count;
-    uint64_t finalize_atomic_count;
     uint64_t scope_end_atomic_count;
 };
 

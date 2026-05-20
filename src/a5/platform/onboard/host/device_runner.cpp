@@ -23,6 +23,7 @@
 #include <dlfcn.h>
 
 #include <cassert>
+#include <cstddef>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -179,15 +180,16 @@ int AicpuSoInfo::finalize() {
 // =============================================================================
 
 // rtMalloc / rtFree wrappers shared by all three profiling subsystems.
-// `user_data` is unused on a5 onboard but kept in the signature to match
-// the framework's canonical alloc/free callback shape.
-static void *prof_alloc_cb(size_t size, void * /*user_data*/) {
+// a5 onboard goes directly through CANN runtime — no per-allocation tracking,
+// so the framework's std::function alloc / free shapes match plain function
+// pointers here.
+static void *prof_alloc_cb(size_t size) {
     void *ptr = nullptr;
     int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
     return (rc == 0) ? ptr : nullptr;
 }
 
-static int prof_free_cb(void *dev_ptr, void * /*user_data*/) { return rtFree(dev_ptr); }
+static int prof_free_cb(void *dev_ptr) { return rtFree(dev_ptr); }
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
@@ -231,8 +233,27 @@ int DeviceRunner::attach_current_thread(int device_id) {
         return rc;
     }
 
+    if (device_id_ == -1) {
+        configure_aicore_op_timeout();
+    }
+
     device_id_ = device_id;
     return 0;
+}
+
+void DeviceRunner::configure_aicore_op_timeout() {
+    uint64_t actual_timeout = 0;
+    int rc = aclrtSetOpExecuteTimeOutV2(PLATFORM_OP_EXECUTE_TIMEOUT_US, &actual_timeout);
+    if (rc != 0) {
+        LOG_ERROR(
+            "aclrtSetOpExecuteTimeOutV2(%llu us) failed: %d", (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, rc
+        );
+    } else {
+        LOG_INFO_V0(
+            "aclrtSetOpExecuteTimeOutV2: requested=%llu us, actual=%llu us",
+            (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, (unsigned long long)actual_timeout
+        );
+    }
 }
 
 int DeviceRunner::prepare_run_context(int device_id) {
@@ -372,6 +393,17 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (rc != 0) {
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
+    }
+
+    // Lazy-allocate the 8-byte device_wall buffer on first run. See the a2a3
+    // onboard equivalent for the rationale.
+    if (device_wall_dev_ptr_ == nullptr) {
+        device_wall_dev_ptr_ = allocate_tensor(sizeof(uint64_t));
+        if (device_wall_dev_ptr_ != nullptr) {
+            kernel_args_.args.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
+            uint64_t zero = 0;
+            (void)copy_to_device(device_wall_dev_ptr_, &zero, sizeof(uint64_t));
+        }
     }
 
     // Validate block_dim against stream resource limits
@@ -545,18 +577,46 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return rc;
     }
 
-    LOG_INFO_V0("=== rtStreamSynchronize stream_aicpu_ ===");
-    rc = rtStreamSynchronize(stream_aicpu_);
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+        );
+        return rc;
+    }
     if (rc != 0) {
-        LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICPU) failed: %d", rc);
         return rc;
     }
 
-    LOG_INFO_V0("=== rtStreamSynchronize stream_aicore_ ===");
-    rc = rtStreamSynchronize(stream_aicore_);
-    if (rc != 0) {
-        LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+        );
         return rc;
+    }
+    if (rc != 0) {
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
+        return rc;
+    }
+
+    // Pull the platform-level device wall (ns) back from the dedicated
+    // 8-byte device buffer (AICPU writes via KernelArgs::device_wall_data_base
+    // — CANN copies args at launch so the inline field would be unreachable).
+    device_wall_ns_ = 0;
+    if (device_wall_dev_ptr_ != nullptr) {
+        int wall_rc = rtMemcpy(
+            &device_wall_ns_, sizeof(uint64_t), device_wall_dev_ptr_, sizeof(uint64_t), RT_MEMCPY_DEVICE_TO_HOST
+        );
+        if (wall_rc != 0) {
+            LOG_WARN("rtMemcpy(device_wall_ns) D2H failed: %d", wall_rc);
+            device_wall_ns_ = 0;
+        }
     }
 
     // Tear down collectors. stop() joins mgmt then collector in the only
@@ -863,14 +923,19 @@ int DeviceRunner::finalize() {
     // Cleanup all profiling subsystems (free shm + per-buffer dev/host
     // shadows). All three collectors share the same alloc/free shape.
     if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr);
+        l2_perf_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (dump_collector_.is_initialized()) {
-        dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr);
+        dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (pmu_collector_.is_initialized()) {
-        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr);
+        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
+
+    // Release per-Worker pooled GM heap / SM. Must precede mem_alloc_.finalize()
+    // so the pool frees through the still-live allocator, not after it.
+    gm_heap_pool_.release();
+    gm_sm_pool_.release();
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
@@ -881,6 +946,11 @@ int DeviceRunner::finalize() {
         return rc;
     }
 
+    // Free the 8-byte device_wall buffer (allocated lazily in run()).
+    if (device_wall_dev_ptr_ != nullptr) {
+        free_tensor(device_wall_dev_ptr_);
+        device_wall_dev_ptr_ = nullptr;
+    }
     device_id_ = -1;
     block_dim_ = 0;
     worker_count_ = 0;
@@ -1038,8 +1108,7 @@ void DeviceRunner::finalize_collectors() {
 
 int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr,
-        output_prefix_
+        num_aicore, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
         kernel_args_.args.l2_perf_data_base =
@@ -1054,8 +1123,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.sche_cpu_num;
 
     int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*user_data=*/nullptr,
-        output_prefix_
+        num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc != 0) {
         return rc;
@@ -1069,8 +1137,7 @@ int DeviceRunner::init_pmu(
     int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
 ) {
     int rc = pmu_collector_.init(
-        num_cores, num_threads, csv_path, event_type, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb,
-        /*user_data=*/nullptr, device_id
+        num_cores, num_threads, csv_path, event_type, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, device_id
     );
     if (rc == 0) {
         kernel_args_.args.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());

@@ -35,7 +35,6 @@ Thread 3 loads the orchestration `.so` via `dlopen`, calls `aicpu_orchestration_
 
 ```text
 Thread 3: Calling aicpu_orchestration_entry from SO
-aicpu_orchestration_entry ">>>>>> batch = 64"
 Thread 3: aicpu_orchestration_entry returned, cost 20943.940us
 Thread 3: === Orchestrator Profiling: 16704 tasks, total=14601.580us ===
 Thread 3:   sync_tensormap : 286.300us (2.0%)

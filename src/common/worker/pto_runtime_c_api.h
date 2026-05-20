@@ -48,6 +48,31 @@ extern "C" {
 typedef void *RuntimeHandle;
 typedef void *DeviceContextHandle;
 
+/**
+ * Timing breakdown for a single run_prepared() invocation.
+ *
+ *   host_wall_ns   — wall-clock around the host-side dispatch (steady_clock
+ *                    delta wrapping the platform run() call). Always populated
+ *                    when out_timing != NULL.
+ *
+ *   device_wall_ns — on-NPU wall of the most recent orchestrator phase
+ *                    (orch_summary.end_time - .start_time, converted to ns
+ *                    using arch frequency). Populated whenever the runtime
+ *                    was built with PTO2_PROFILING (the default), regardless
+ *                    of enable_l2_swimlane. The orch_summary capture is
+ *                    decoupled from the per-record swimlane buffer pool —
+ *                    only the lightweight phase header allocation is needed
+ *                    for this field. Zero only when PTO2_PROFILING was off
+ *                    at runtime build time.
+ *
+ * Both fields are zeroed by the callee on entry (including on error paths)
+ * so callers can pass an uninitialized struct.
+ */
+typedef struct PtoRunTiming {
+    uint64_t host_wall_ns;
+    uint64_t device_wall_ns;
+} PtoRunTiming;
+
 /* ===========================================================================
  * Public API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
@@ -160,12 +185,16 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
  * `device_id` and the executor binaries are not threaded through this entry
  * — they were captured by `simpler_init` and live on the DeviceRunner.
  *
+ * If `out_timing` is non-NULL, the callee writes the wall-clock breakdown for
+ * this invocation into it (see PtoRunTiming above). The struct is zeroed on
+ * entry and partially populated on early-error returns.
+ *
  * @return 0 on success, negative on error (no prep state, NULL ctx, etc.).
  */
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    const char *output_prefix
+    const char *output_prefix, PtoRunTiming *out_timing
 );
 
 /**

@@ -50,21 +50,55 @@ python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane
 
 ### 3.1 Enable L2 swimlane
 
-```bash
-# Standalone runner
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane
-python tests/st/<case>/test_<name>.py -p a5sim --enable-l2-swimlane
+`--enable-l2-swimlane` accepts an optional integer **perf_level**
+(0–4). A bare flag defaults to level 4 (full collection,
+backward-compatible with the old boolean behavior).
 
-# pytest
-pytest tests/st/<case> --platform a2a3 -d 0 --enable-l2-swimlane
-pytest examples/a5/host_build_graph/vector_example --platform a5sim --enable-l2-swimlane
+| Level | Collects | Notes |
+| ----- | -------- | ----- |
+| 0 | Nothing (disabled) | Default when flag is absent |
+| 1 | AICore timing only (start/end/task_id/func_id/core_type) | No AICPU timestamps, no fanout |
+| 2 | + dispatch_time, finish_time, fanout | Full per-task record |
+| 3 | + Scheduler phases (`SCHED_*`) | Skips orchestrator phases |
+| 4 | + Orchestrator phases | Full collection |
+
+> **Platform scope.** The tiered perf_level is currently
+> implemented on **a2a3 only**. The a5 backend (both `a5` onboard
+> and `a5sim`) has not been updated and still interprets
+> `--enable-l2-swimlane` as a plain boolean: bare flag = on,
+> absent = off. Passing an integer to a5 is silently treated as
+> "on" regardless of value.
+
+```bash
+# Standalone runner — full collection (level 4)
+python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane
+
+# Standalone runner — AICore timing only (level 1)
+python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane 1
+
+# Standalone runner — per-task with dispatch/fanout (level 2)
+python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane 2
+
+# pytest — scheduler phases (level 3)
+pytest tests/st/<case> --platform a2a3 -d 0 --enable-l2-swimlane 3
+
+# a5 onboard / a5sim — boolean only (perf_level integer not honored on a5 yet)
+python tests/st/<case>/test_<name>.py -p a5 -d 0 --enable-l2-swimlane
+python tests/st/<case>/test_<name>.py -p a5sim --enable-l2-swimlane
 ```
 
-The flag flips `CallConfig::enable_l2_swimlane`. The host then
-allocates the per-core / per-thread shared region and publishes
-its base address through `kernel_args.l2_perf_data_base`. AICore
-writes timing into per-task WIP slots; AICPU commits the records
-on FIN and emits its own per-iteration phase records.
+The flag sets `CallConfig::enable_l2_swimlane` to the chosen
+level. The host then allocates the per-core / per-thread shared
+region and publishes its base address through
+`kernel_args.l2_perf_data_base`. AICore writes timing into
+per-task WIP slots; AICPU commits the records on FIN. Per-task
+dispatch/finish timestamps and fanout are recorded only at
+level >= 2, scheduler phase records only at level >= 3, and
+orchestrator phase records only at level >= 4.
+
+The JSON output `"version"` field directly reflects the
+perf_level: `1` = AICore timing only, `2` = +dispatch/fanout,
+`3` = +scheduler phases, `4` = +orchestrator phases.
 
 `--rounds > 1` collects only on the **first** round so warm-up
 runs are not double-counted.
@@ -224,7 +258,7 @@ L2PerfBufferState[num_cores]                    (per-core perf state)
 
 [AicpuPhaseHeader + PhaseBufferState[num_threads]]  (optional)
 ├── magic / num_sched_threads
-├── orch_summary  (cumulative orchestrator cycles)
+├── core_to_thread[]  (core_id → scheduler thread index)
 └── per-thread phase buffers (PhaseBufferState aliases L2PerfBufferState;
                               `aicore_ring_ptr` / `mismatch_record_count`
                               unused for PHASE)
@@ -235,10 +269,13 @@ The records themselves are identical across architectures:
 - `L2PerfRecord` — per-task timing + fanout, 64-byte aligned.
 - `AicpuPhaseRecord` — per-iteration scheduler / orchestrator
   phase, 32 bytes.
-- `AicpuOrchSummary` — one-shot cumulative orchestrator cycles.
 
 This is the key reason a single `swimlane_converter` consumes
-both architectures' output unchanged.
+both architectures' output unchanged. Orchestrator timing is carried
+entirely by per-task `AicpuPhaseRecord` entries (ORCH_SYNC, ORCH_ALLOC,
+…); there is no separate shared-memory aggregate. The run-window
+envelope is emitted to device log via `LOG_INFO_V9
+"orch_start=… orch_end=… orch_cost=…"`.
 
 **Producer/consumer protocol on AICore.** AICore writes per-task
 timing into a stable per-core `L2PerfAicoreRing` at
@@ -323,7 +360,7 @@ start(tf)                          ← spawn mgmt + poll threads
 launch AICPU / AICore
 rtStreamSynchronize
 stop()                             ← join mgmt → join poll
-read_phase_header_metadata()       ← single-shot read of orch_summary +
+read_phase_header_metadata()       ← single-shot read of the
                                      core→thread mapping
 reconcile_counters()               ← three-bucket accounting for both
                                      PERF and PHASE pools (total /
@@ -384,8 +421,8 @@ The bulk `mirror_shm_to_device` is deliberately **not** called from
 the mgmt loop: it would race with AICPU writes to device-only
 fields (`current_buf_ptr`, `total/dropped/mismatch` counters,
 `queue_tails`, `free_queue.head`, `AicpuPhaseHeader::magic`,
-`orch_summary`, `core_to_thread[]`) and roll them back to whatever
-the host shadow held at the start of the tick. Per-buffer
+`core_to_thread[]`) and roll them back to whatever the host shadow
+held at the start of the tick. Per-buffer
 payloads (`L2PerfBuffer` / `PhaseBuffer`) are pulled on demand
 inside `ProfilerAlgorithms::process_entry` after a popped
 ready-entry resolves to its host shadow. `BufferPoolManager`'s
@@ -480,7 +517,7 @@ PHASE), same shape as a2a3.
 
 | Aspect | a2a3 | a5 |
 | ------ | ---- | -- |
-| Record shape | identical (`L2PerfRecord` / `AicpuPhaseRecord` / `AicpuOrchSummary`) | |
+| Record shape | identical (`L2PerfRecord` / `AicpuPhaseRecord`) | |
 | AICore WIP-slot protocol | identical | |
 | AICPU commit on FIN | identical | |
 | Buffer model | rotating pool (free + ready queues) per kind | identical |

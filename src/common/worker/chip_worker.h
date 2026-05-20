@@ -14,13 +14,15 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
+#include "pto_runtime_c_api.h"
 #include "types.h"
 
-class ChipWorker : public IWorker {
+class ChipWorker {
 public:
     ChipWorker() = default;
     ~ChipWorker();
@@ -47,14 +49,16 @@ public:
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
-    // IWorker: launch a cid previously staged via prepare_callable.
+    // Launch a cid previously staged via prepare_callable.
     // Materializes a ChipStorageTaskArgs from `args` (one memcpy of T*40B + S*8B
-    // into a stack POD), then delegates to the overload below.
-    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config) override;
+    // into a stack POD), then delegates to the overload below. Returns
+    // RunTiming with host wall (steady_clock around dispatch) + device wall
+    // (KernelArgs::device_wall_ns captured by the platform AICPU entry).
+    RunTiming run(int32_t callable_id, TaskArgsView args, const CallConfig &config);
     // Same launch, but the caller already holds the runtime.so-ABI POD —
     // skip the view→storage memcpy and hand the pointer straight to the C ABI.
     // Used by the ChipStorageTaskArgs path in the nanobind binding.
-    void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
+    RunTiming run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
@@ -91,14 +95,34 @@ public:
     ///     ensure_acl_ready / aclrtCreateStream surface area).
     ///   - On sim, ACL / stream are no-ops; the stashed stream is null.
     ///
-    /// One active comm session per ChipWorker is supported.  Users needing
-    /// multiple concurrent comms should instantiate multiple ChipWorkers.
+    /// Multi-domain bootstrap allocates a hidden base communicator plus one
+    /// symmetric pool, then derives per-domain views with comm_derive_context.
     uint64_t comm_init(int rank, int nranks, const std::string &rootinfo_path);
     uint64_t comm_alloc_windows(uint64_t comm_handle, size_t win_size);
     uint64_t comm_get_local_window_base(uint64_t comm_handle);
     size_t comm_get_window_size(uint64_t comm_handle);
+    uint64_t comm_derive_context(
+        uint64_t comm_handle, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank, size_t window_offset,
+        size_t window_size
+    );
+    /// Collectively allocate a fresh per-rank symmetric pool for a subset of
+    /// ranks.  Multiple concurrent allocations are disambiguated by
+    /// `allocation_id`.  Returns (device_ctx, local_window_base).  Only
+    /// participating ranks call this; non-members of the subset must not.
+    std::pair<uint64_t, uint64_t> comm_alloc_domain_windows(
+        uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
+        size_t window_size
+    );
+    /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
+    /// pool and the device CommContext, then drop the allocation record.
+    /// `rank_count` + `domain_rank` size the subset barrier; the rank list
+    /// itself is not needed (the alloc-time identity is already cached
+    /// inside the backend's per-allocation record).
+    void
+    comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
     void comm_barrier(uint64_t comm_handle);
     void comm_destroy(uint64_t comm_handle);
+    void comm_destroy_all();
 
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
@@ -116,7 +140,8 @@ private:
     // CANN dlog sync. Reads the current log level off HostLogger itself.
     using SimplerInitFn = int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t);
     using PrepareCallableFn = int (*)(void *, int32_t, const void *);
-    using RunPreparedFn = int (*)(void *, void *, int32_t, const void *, int, int, int, int, int, int, const char *);
+    using RunPreparedFn =
+        int (*)(void *, void *, int32_t, const void *, int, int, int, int, int, int, const char *, PtoRunTiming *);
     using UnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);
@@ -127,8 +152,29 @@ private:
     using CommAllocWindowsFn = int (*)(void *, size_t, uint64_t *);
     using CommGetLocalWindowBaseFn = int (*)(void *, uint64_t *);
     using CommGetWindowSizeFn = int (*)(void *, size_t *);
+    using CommDeriveContextFn = int (*)(void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *);
+    using CommAllocDomainWindowsFn =
+        int (*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint64_t *, uint64_t *);
+    using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
+
+    struct CommSession {
+        void *handle = nullptr;
+        void *stream = nullptr;
+        bool is_base = false;
+        uint64_t device_ctx = 0;
+        uint64_t local_window_base = 0;
+        size_t window_size = 0;
+    };
+
+    void *create_comm_stream_checked(const char *op_name);
+    void destroy_comm_stream_best_effort(void *stream, int *rc);
+    CommSession *find_comm_session(uint64_t comm_handle);
+    CommSession *create_comm_session(void *handle, void *stream, bool is_base);
+    int destroy_comm_session(CommSession &session);
+    uint64_t create_base_comm(int rank, int nranks, const std::string &rootinfo_path);
+    void clear_comm_sessions();
 
     void *lib_handle_ = nullptr;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
@@ -152,14 +198,15 @@ private:
     CommAllocWindowsFn comm_alloc_windows_fn_ = nullptr;
     CommGetLocalWindowBaseFn comm_get_local_window_base_fn_ = nullptr;
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
+    CommDeriveContextFn comm_derive_context_fn_ = nullptr;
+    CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
+    CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
     void *device_ctx_ = nullptr;
-    // aclrtStream owned by the currently-active comm session (created inside
-    // comm_init on onboard via DeviceRunner::create_comm_stream, paired with
-    // destroy_comm_stream in comm_destroy).  Null when no comm is active or
-    // when running on a backend without ACL (sim).
-    void *comm_stream_ = nullptr;
+    std::vector<CommSession> comm_sessions_;
+    std::unordered_map<uint64_t, size_t> comm_session_index_;
+    uint64_t base_comm_handle_ = 0;
 
     std::vector<uint8_t> runtime_buf_;
     // device_id_ is set once in init() and never modified afterward. All

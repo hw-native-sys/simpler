@@ -21,20 +21,15 @@ Usage:
 
 import ctypes
 import os
-from dataclasses import dataclass, field
-from multiprocessing.shared_memory import SharedMemory
-from typing import Optional
+from dataclasses import dataclass
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
-    CHIP_BOOTSTRAP_MAILBOX_SIZE,
     CONTINUOUS_TENSOR_MAX_DIMS,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     ArgDirection,
     CallConfig,
-    ChipBootstrapChannel,
-    ChipBootstrapMailboxState,
     ChipCallable,
     ChipStorageTaskArgs,
     ContinuousTensor,
@@ -80,18 +75,28 @@ __all__ = [
     "MAILBOX_OFF_ERROR_MSG",
     "MAILBOX_ERROR_MSG_SIZE",
     "read_args_from_blob",
-    # Chip bootstrap
-    "CHIP_BOOTSTRAP_MAILBOX_SIZE",
-    "ChipBootstrapChannel",
-    "ChipBootstrapMailboxState",
-    "ChipCommBootstrapConfig",
-    "ChipBufferSpec",
-    "HostBufferStaging",
-    "ChipBootstrapConfig",
-    "ChipBootstrapResult",
-    # Worker-level chip bootstrap orchestration
-    "ChipContext",
+    # Dynamic CommDomain allocation (orch-only API)
+    "CommBufferSpec",
+    "ChipDomainContext",
+    "CommDomainHandle",
 ]
+
+COMM_MAX_RANK_NUM = 64
+
+
+class _CommContextStruct(ctypes.Structure):
+    _fields_ = [
+        ("workSpace", ctypes.c_uint64),
+        ("workSpaceSize", ctypes.c_uint64),
+        ("rankId", ctypes.c_uint32),
+        ("rankNum", ctypes.c_uint32),
+        ("winSize", ctypes.c_uint64),
+        ("windowsIn", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
+        ("windowsOut", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
+    ]
+
+
+assert ctypes.sizeof(_CommContextStruct) == 1056
 
 
 def scalar_to_uint64(value) -> int:
@@ -120,35 +125,13 @@ def scalar_to_uint64(value) -> int:
 
 
 @dataclass
-class ChipCommBootstrapConfig:
-    """Per-chip communicator bring-up knobs consumed by `ChipWorker.bootstrap_context`.
-
-    A ``ChipBootstrapConfig`` with ``comm=None`` skips the communicator step
-    entirely; in that mode ``cfg.buffers`` must be empty because buffers are
-    per-rank slices of the HCCL communicator window, and the window only
-    exists once a communicator has been brought up.  Comm-less configs are
-    used by error-path tests that need to trip ``bootstrap_context`` before
-    it reaches any communicator call.
-    """
-
-    rank: int
-    nranks: int
-    rootinfo_path: str
-    window_size: int
-    """Requested per-rank window size in bytes.  HCCL may round this up — the
-    actual allocation is reported back via
-    ``ChipBootstrapResult.actual_window_size`` and must be what callers use
-    when slicing the window."""
-
-
-@dataclass
-class ChipBufferSpec:
+class CommBufferSpec:
     """A named slice of the per-rank communicator window.
 
     Buffers are placed sequentially inside the window in declaration order —
-    ``ChipBootstrapResult.buffer_ptrs`` is 1:1 aligned with the ``buffers``
-    list so downstream code (the Worker's ``ChipContext``) can build a
-    ``name → ptr`` dict by zipping the two.
+    Buffers are placed sequentially inside the window in declaration order.
+    The ``CommDomainHandle.contexts[chip_idx].buffer_ptrs`` dict returned by
+    ``Orchestrator.allocate_domain`` is keyed by ``CommBufferSpec.name``.
     """
 
     name: str
@@ -160,72 +143,121 @@ class ChipBufferSpec:
 
 
 @dataclass
-class HostBufferStaging:
-    """A POSIX shared-memory region staged by the parent for one named buffer.
-
-    The parent creates the ``SharedMemory`` object and fills it with the input
-    bytes *before* forking; the child attaches read-only via
-    ``SharedMemory(name=shm_name)`` and does not unlink it.
-    """
-
+class ChipDomainContext:
     name: str
-    shm_name: str
-    size: int
-
-
-@dataclass
-class ChipBootstrapConfig:
-    """Inputs to `ChipWorker.bootstrap_context` for one chip child."""
-
-    comm: Optional[ChipCommBootstrapConfig] = None
-    buffers: list[ChipBufferSpec] = field(default_factory=list)
-    host_inputs: list[HostBufferStaging] = field(default_factory=list)
-    host_outputs: list[HostBufferStaging] = field(default_factory=list)
-
-    def input_staging(self, buffer_name: str) -> HostBufferStaging:
-        for s in self.host_inputs:
-            if s.name == buffer_name:
-                return s
-        raise KeyError(buffer_name)
-
-    def output_staging(self, buffer_name: str) -> HostBufferStaging:
-        for s in self.host_outputs:
-            if s.name == buffer_name:
-                return s
-        raise KeyError(buffer_name)
-
-
-@dataclass
-class ChipBootstrapResult:
-    """Return value of `ChipWorker.bootstrap_context` — and the tuple the
-    `ChipBootstrapChannel` publishes to the parent on success.
-    """
-
-    device_ctx: int
-    local_window_base: int
-    actual_window_size: int
-    buffer_ptrs: list[int]
-
-
-@dataclass
-class ChipContext:
-    """Per-chip view of a successful bootstrap, exposed to L3+ orch functions.
-
-    Built by the parent `Worker` in `_start_hierarchical` from the
-    `ChipBootstrapConfig` it forwarded to the chip child and the
-    `ChipBootstrapResult` the child published via its `ChipBootstrapChannel`.
-    `buffer_ptrs` is the `name → device pointer` map obtained by zipping the
-    config's `ChipBufferSpec.name` with the result's `buffer_ptrs`, so orch
-    code can address a named window slice without tracking list indices.
-    """
-
-    device_id: int
-    rank: int
-    nranks: int
+    domain_rank: int
+    domain_size: int
     device_ctx: int
     local_window_base: int
     actual_window_size: int
     buffer_ptrs: dict[str, int]
+
+
+class CommDomainHandle:
+    """User-facing handle for one dynamically-allocated CommDomain.
+
+    Returned by ``Orchestrator.allocate_domain(...)``.  Acts as a context
+    manager: ``with`` exit *marks* the handle for release and prevents
+    further use; the actual backend free runs **after** ``Worker.run`` has
+    drained any tasks the orch function submitted using this domain.  This
+    is required because ``submit_*`` only enqueues to the DAG — freeing
+    before drain would create a use-after-free on the chip side.
+
+    Lifecycle states::
+
+        live           — allocated, indexable, can be passed to submit_*
+        released       — release() called; further indexing raises;
+                          backend memory still alive until Worker.run drain
+        freed          — backend release_domain has executed, memory gone
+
+    Most users only see ``released``; the ``live → released`` transition
+    happens at ``with`` exit (or explicit ``release()``), and the
+    ``released → freed`` transition is the runtime's job at end-of-run.
+    """
+
+    __slots__ = ("name", "workers", "contexts", "allocation_id", "_release_fn", "_released", "_freed")
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        workers: tuple[int, ...],
+        contexts: dict[int, "ChipDomainContext"],
+        allocation_id: int,
+        _release_fn,
+    ) -> None:
+        self.name = name
+        self.workers = tuple(workers)
+        # Frozen dict-ish — we don't expose mutation
+        self.contexts: dict[int, ChipDomainContext] = dict(contexts)
+        self.allocation_id = int(allocation_id)
+        self._release_fn = _release_fn
+        self._released = False
+        self._freed = False
+
+    def __getitem__(self, chip_idx: int) -> "ChipDomainContext":
+        if self._released:
+            raise RuntimeError(
+                f"CommDomainHandle({self.name!r}) already released; do not pass it to submit_* "
+                "after release(). Submitted tasks that captured device_ctx / buffer_ptrs before "
+                "release will still see live memory until Worker.run drains."
+            )
+        return self.contexts[chip_idx]
+
+    @property
+    def released(self) -> bool:
+        """True once ``release()`` (or ``with`` exit) has been called.
+
+        Backend memory may still be alive — it is freed by the Worker after
+        DAG drain at end-of-run.  Use this to gate further indexing /
+        submission, not to assert physical teardown (use ``freed`` for that).
+        """
+        return self._released
+
+    @property
+    def freed(self) -> bool:
+        """True once the backend ``comm_release_domain_windows`` has executed.
+
+        Only flips after the owning ``Worker.run`` drains and processes the
+        pending-release queue.  An ``orch_fn`` will never observe ``True``
+        for a handle it released within the same ``run`` call.
+        """
+        return self._freed
+
+    def release(self) -> None:
+        """Mark this handle for collective release.  Idempotent.
+
+        Inside an orch function, this is a non-blocking mark — the actual
+        backend ``comm_release_domain_windows`` runs after
+        ``Worker.run.drain()`` so that any tasks already submitted with
+        this domain's ``device_ctx`` see live memory through execution.
+
+        After this returns, the handle is treated as released for the
+        user's purposes: ``__getitem__`` raises, repeated ``release()`` is
+        a no-op, and the orch function must not pass it to further
+        ``submit_*`` calls.
+        """
+        if self._released:
+            return
+        self._released = True
+        # _release_fn is owned by Worker; it queues the actual backend
+        # release and runs it after drain.  Worker also flips _freed.
+        self._release_fn(self)
+
+    def __enter__(self) -> "CommDomainHandle":
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+    def __repr__(self) -> str:
+        if self._freed:
+            state = "freed"
+        elif self._released:
+            state = "released-pending-free"
+        else:
+            state = "live"
+        return f"CommDomainHandle(name={self.name!r}, workers={self.workers}, {state})"
 
 
 # Process-wide RTLD_GLOBAL preload registry. host_runtime.so resolves its
@@ -353,12 +385,14 @@ class ChipWorker:
             args: ChipStorageTaskArgs for this invocation.
             config: Optional CallConfig. If None, a default is created.
             **kwargs: Overrides applied to config (e.g. block_dim=24).
+
+        Returns a :class:`RunTiming` with host + device wall.
         """
         if config is None:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
-        self._impl.run(int(callable_id), args, config)
+        return self._impl.run(int(callable_id), args, config)
 
     def unregister_callable(self, callable_id):
         """Drop prepared state for ``callable_id`` and release its orch SO share."""
@@ -420,6 +454,25 @@ class ChipWorker:
         """Return the actual per-rank window size in bytes."""
         return int(self._impl.comm_get_window_size(int(comm_handle)))
 
+    def comm_derive_context(
+        self,
+        comm_handle: int,
+        rank_ids: list[int],
+        domain_rank: int,
+        window_offset: int,
+        window_size: int,
+    ) -> int:
+        """Derive a domain-local device CommContext from an allocated base communicator."""
+        return int(
+            self._impl.comm_derive_context(
+                int(comm_handle),
+                [int(x) for x in rank_ids],
+                int(domain_rank),
+                int(window_offset),
+                int(window_size),
+            )
+        )
+
     def comm_barrier(self, comm_handle: int) -> None:
         """Synchronize all ranks."""
         self._impl.comm_barrier(int(comm_handle))
@@ -428,140 +481,9 @@ class ChipWorker:
         """Destroy the communicator and release its resources."""
         self._impl.comm_destroy(int(comm_handle))
 
-    def bootstrap_context(  # noqa: PLR0912 -- config validation + comm setup + window carving + H2D staging in one linear flow; splitting would obscure the ordered failure semantics
-        self,
-        device_id: int,
-        cfg: ChipBootstrapConfig,
-        channel: Optional[ChipBootstrapChannel] = None,
-    ) -> ChipBootstrapResult:
-        """One-shot per-chip bootstrap: build communicator, slice window,
-        stage inputs from host shared memory, and (optionally) publish the result.
-
-        The target device must already be attached via ``init(bins, device_id)``
-        before invoking this method; ``device_id`` is supplied here only to
-        catch a caller that wired up the wrong device on the wrong worker.
-
-        Runs inside a forked chip child.  If ``channel`` is provided (the
-        Worker-orchestrated integration path), the result is written as
-        SUCCESS or — on any exception — as ERROR (code=1,
-        ``"<ExceptionType>: <message>"``) before the exception is re-raised.
-        Standalone callers can pass ``channel=None`` and consume the return
-        value directly.
-
-        The HCCL comm handle produced by ``comm_init`` is stashed on
-        ``self._comm_handle`` so ``shutdown_bootstrap()`` can release it later;
-        ``finalize()`` is intentionally *not* wired to this handle — teardown
-        ordering is the caller's responsibility.
-        """
-        try:
-            # Validate host-staging symmetry up-front — before any device or
-            # communicator state is touched — so a missing staging entry
-            # surfaces as a clean ValueError on the channel rather than a
-            # KeyError from deep inside the flush/H2D loop (which would leave
-            # the parent waiting on a silent chip child).
-            for spec in cfg.buffers:
-                if spec.load_from_host:
-                    try:
-                        cfg.input_staging(spec.name)
-                    except KeyError:
-                        raise ValueError(
-                            f"ChipBufferSpec(name={spec.name!r}, load_from_host=True) requires a "
-                            f"matching HostBufferStaging in host_inputs; none found"
-                        ) from None
-                if spec.store_to_host:
-                    try:
-                        cfg.output_staging(spec.name)
-                    except KeyError:
-                        raise ValueError(
-                            f"ChipBufferSpec(name={spec.name!r}, store_to_host=True) requires a "
-                            f"matching HostBufferStaging in host_outputs; none found"
-                        ) from None
-
-            if self.device_id != device_id:
-                raise RuntimeError(
-                    f"bootstrap_context(device_id={device_id}) called on a ChipWorker "
-                    f"already initialized for device_id={self.device_id}"
-                )
-
-            device_ctx = 0
-            local_base = 0
-            actual_size = 0
-            if cfg.comm is not None:
-                handle = self.comm_init(cfg.comm.rank, cfg.comm.nranks, cfg.comm.rootinfo_path)
-                if handle == 0:
-                    raise RuntimeError(f"comm_init returned 0 handle (rank={cfg.comm.rank}, nranks={cfg.comm.nranks})")
-                self._comm_handle = handle
-                device_ctx = self.comm_alloc_windows(handle, cfg.comm.window_size)
-                if device_ctx == 0:
-                    raise RuntimeError("comm_alloc_windows returned null device_ctx")
-                local_base = self.comm_get_local_window_base(handle)
-                actual_size = self.comm_get_window_size(handle)
-
-            offset = 0
-            buffer_ptrs: list[int] = []
-            for spec in cfg.buffers:
-                if cfg.comm is None:
-                    raise ValueError("ChipBufferSpec requires comm; cfg.comm is None")
-                if offset + spec.nbytes > actual_size:
-                    raise ValueError(
-                        f"buffer '{spec.name}' (nbytes={spec.nbytes}) at offset={offset} "
-                        f"overflows window size {actual_size}"
-                    )
-                buffer_ptrs.append(local_base + offset)
-                offset += spec.nbytes
-
-            for spec, ptr in zip(cfg.buffers, buffer_ptrs):
-                if not spec.load_from_host:
-                    continue
-                staging = cfg.input_staging(spec.name)
-                if staging.size != spec.nbytes:
-                    raise ValueError(f"host_inputs[{spec.name!r}].size={staging.size} != buffer.nbytes={spec.nbytes}")
-                if staging.size == 0:
-                    continue
-                shm = SharedMemory(name=staging.shm_name)
-                try:
-                    buf = shm.buf
-                    assert buf is not None
-                    host_ptr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-                    self.copy_to(ptr, host_ptr, staging.size)
-                finally:
-                    shm.close()
-
-            result = ChipBootstrapResult(
-                device_ctx=device_ctx,
-                local_window_base=local_base,
-                actual_window_size=actual_size,
-                buffer_ptrs=buffer_ptrs,
-            )
-            if channel is not None:
-                channel.write_success(
-                    result.device_ctx,
-                    result.local_window_base,
-                    result.actual_window_size,
-                    result.buffer_ptrs,
-                )
-            return result
-        except Exception as e:
-            if channel is not None:
-                channel.write_error(1, f"{type(e).__name__}: {e}")
-            raise
-
-    def shutdown_bootstrap(self) -> None:
-        """Release the communicator handle stashed by ``bootstrap_context``.
-
-        Idempotent — safe to call multiple times, and safe to call if
-        ``bootstrap_context`` was never invoked.  ``finalize()`` does *not*
-        chain into this method, so callers (e.g. the Worker's chip child
-        loop) must call ``shutdown_bootstrap()`` before ``finalize()`` (or
-        after, if the comm handle was already destroyed — the zero-handle
-        guard makes a second call a no-op).
-        """
-        handle = getattr(self, "_comm_handle", 0)
-        if handle != 0:
-            try:
-                self.comm_destroy(handle)
-            finally:
-                self._comm_handle = 0
+    def comm_destroy_all(self) -> None:
+        """Destroy all communicators owned by this worker."""
+        self._impl.comm_destroy_all()
 
     @property
     def device_id(self):

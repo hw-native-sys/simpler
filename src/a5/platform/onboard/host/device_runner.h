@@ -39,6 +39,7 @@
 
 #include "callable.h"
 #include "prepare_callable_common.h"
+#include "pto_runtime2/device_pool.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
 #include "common/l2_perf_profiling.h"
@@ -179,8 +180,32 @@ struct AicpuSoInfo {
  */
 class DeviceRunner {
 public:
-    DeviceRunner() = default;
+    DeviceRunner() :
+        gm_heap_pool_(
+            [this](size_t n) {
+                return mem_alloc_.alloc(n);
+            },
+            [this](void *p) {
+                mem_alloc_.free(p);
+            }
+        ),
+        gm_sm_pool_(
+            [this](size_t n) {
+                return mem_alloc_.alloc(n);
+            },
+            [this](void *p) {
+                mem_alloc_.free(p);
+            }
+        ) {}
     ~DeviceRunner();
+
+    /**
+     * Per-Worker pooled GM heap / shared-memory buffer acquisition.
+     * Grows on demand, never shrinks; backed by `mem_alloc_` so the
+     * underlying allocations are released in `finalize()`.
+     */
+    void *acquire_pooled_gm_heap(size_t size) { return gm_heap_pool_.acquire(size); }
+    void *acquire_pooled_gm_sm(size_t size) { return gm_sm_pool_.acquire(size); }
 
     /**
      * Create a thread bound to this device.
@@ -278,6 +303,14 @@ public:
     // is enabled; CallConfig::validate() enforces this contract upstream.
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
     const std::string &output_prefix() const { return output_prefix_; }
+
+    /**
+     * Device-side wall (ns) from the most recently completed run, written
+     * by the platform AICPU entry (onboard: kernel.cpp; sim: lambda in
+     * run()). Returns 0 before any run completes. Independent of any
+     * profiling / swimlane subsystem.
+     */
+    uint64_t last_device_wall_ns() const { return device_wall_ns_; }
 
     /**
      * Print handshake results from device
@@ -452,11 +485,26 @@ private:
     // Memory management
     MemoryAllocator mem_alloc_;
 
+    // Per-Worker pooled PTO2 GM heap and shared-memory buffers. Constructed
+    // with closures bound to mem_alloc_; released explicitly in finalize()
+    // before mem_alloc_.finalize() so they do not free pointers a second time.
+    pto_runtime2::DevicePool gm_heap_pool_;
+    pto_runtime2::DevicePool gm_sm_pool_;
+
     // Device resources
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
     AicpuSoInfo so_info_;
     KernelArgsHelper kernel_args_;
+
+    // Platform-level device wall buffer: 8-byte device-resident slot whose
+    // address rides on KernelArgs.device_wall_data_base. AICPU writes the
+    // run wall (ns) through that pointer; this DeviceRunner pulls it back
+    // via copy_from_device after stream sync and caches it for
+    // last_device_wall_ns(). Allocated once at simpler_init, freed in
+    // finalize.
+    void *device_wall_dev_ptr_{nullptr};
+    uint64_t device_wall_ns_{0};
     DeviceArgs device_args_;
 
     // Kernel binary management
@@ -550,6 +598,16 @@ private:
      * cache). See a2a3 onboard documentation for details.
      */
     int prepare_orch_so(Runtime &runtime);
+
+    /**
+     * Configure STARS op execution timeout (once per DeviceRunner lifetime).
+     *
+     * Called on first device attach to set the hardware-level AICore op
+     * execution timeout via aclrtSetOpExecuteTimeOutV2.  The actual
+     * timeout may differ from the requested value due to hardware timer
+     * granularity.
+     */
+    void configure_aicore_op_timeout();
 
     /**
      * Initialize performance profiling device buffers

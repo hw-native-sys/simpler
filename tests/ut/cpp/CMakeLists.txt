@@ -266,6 +266,7 @@ set_tests_properties(test_chip_callable_upload_immutable PROPERTIES LABELS "no_h
 # ---------------------------------------------------------------------------
 add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
+add_common_utils_test(test_device_pool common/test_device_pool.cpp)
 
 # Per-callable_id orch SO file naming regression (see rtStreamSynchronize
 # 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`

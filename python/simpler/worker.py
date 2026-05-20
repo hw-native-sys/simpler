@@ -61,15 +61,12 @@ import struct
 import sys
 import threading
 import time
-import traceback
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Optional
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
-    CHIP_BOOTSTRAP_MAILBOX_SIZE,
     MAX_REGISTERED_CALLABLE_IDS,
-    ChipBootstrapChannel,
-    ChipBootstrapMailboxState,
+    RunTiming,
     _mailbox_load_i32,
     _mailbox_store_i32,
     read_args_from_blob,
@@ -82,10 +79,11 @@ from .task_interface import (
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     CallConfig,
-    ChipBootstrapConfig,
     ChipCallable,
-    ChipContext,
+    ChipDomainContext,
     ChipWorker,
+    CommBufferSpec,
+    CommDomainHandle,
     TaskArgs,
     _Worker,
 )
@@ -152,12 +150,47 @@ _CTRL_REGISTER = 5
 # Symmetric unregister: drop the cid from chip-child state so the AICPU
 # orch_so_table_ slot can be reused. Payload is just the cid; no shm.
 _CTRL_UNREGISTER = 6
+# Dynamic CommDomain allocate / release (collective across the participating
+# subset).  Parent stages the request in a POSIX shm whose name is at
+# OFF_ARGS+0; for alloc, it also pre-allocates a reply shm whose name is at
+# OFF_ARGS+32.  Both shms have a fixed header (see _DOMAIN_REQ_HEADER /
+# _DOMAIN_REPLY_HEADER) followed by variable buffer/rank data.
+_CTRL_ALLOC_DOMAIN = 7
+_CTRL_RELEASE_DOMAIN = 8
+# Lazy base-comm init driven from Orchestrator.allocate_domain on first use.
+# Request shm carries `<II` header (rank, nranks) + NUL-terminated
+# rootinfo_path bytes.  Chip child calls cw.comm_init(rank, nranks,
+# rootinfo_path) and caches the handle on the ChipWorker so subsequent
+# CTRL_ALLOC_DOMAIN calls can find it.
+_CTRL_COMM_INIT = 9
+
+# Layout of the CTRL_COMM_INIT request shm.
+_COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
+assert _COMM_INIT_HEADER.size == 8
 
 # Reserved 32-byte region at the start of OFF_ARGS used by _CTRL_REGISTER to
 # carry the NUL-terminated POSIX shm name. POSIX shm names on Linux are
 # bounded well below this, but the on-wire field is fixed-width to keep
 # the layout simple.
+#
+# _CTRL_ALLOC_DOMAIN uses two such slots back to back at OFF_ARGS (request
+# shm at offset 0, reply shm at offset CTRL_SHM_NAME_BYTES).  _CTRL_RELEASE_DOMAIN
+# uses only the first slot.
 _CTRL_SHM_NAME_BYTES = 32
+
+# Domain-allocation request shm layout: 32-byte header + buffer_nbytes (u64) +
+# rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
+# of rank_count parity; rank_ids come last (u32 has no alignment concern).
+_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI4x")
+# fields: allocation_id (u64), rank_count (u32), domain_rank (u32),
+#         window_size (u64), buffer_count (u32), padding (4 bytes)
+assert _DOMAIN_REQ_HEADER.size == 32
+
+# Domain-allocation reply shm layout: 24-byte header + buffer_ptrs (u64).
+_DOMAIN_REPLY_HEADER = struct.Struct("<QQI4x")
+# fields: device_ctx (u64), local_window_base (u64),
+#         buffer_count (u32), padding (4 bytes)
+assert _DOMAIN_REPLY_HEADER.size == 24
 
 # Control args layout (reuses task mailbox fields when state == _CONTROL_*):
 #   offset  8 (_OFF_CALLABLE):  uint64  sub-command
@@ -270,6 +303,132 @@ def _sub_worker_loop(buf, registry: dict) -> None:
             break
 
 
+def _read_shm_name(buf, offset: int) -> str:
+    """Decode a NUL-terminated POSIX shm name out of a fixed-width slot.
+
+    Shared by every control sub-command that stages payload via a separate
+    shm — CTRL_REGISTER (one slot), CTRL_ALLOC_DOMAIN (two slots), and
+    CTRL_RELEASE_DOMAIN (one slot).
+    """
+    raw = bytes(buf[offset : offset + _CTRL_SHM_NAME_BYTES])
+    nul = raw.find(b"\x00")
+    return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+
+
+def _handle_ctrl_alloc_domain(cw: "ChipWorker", buf: memoryview) -> None:
+    """CTRL_ALLOC_DOMAIN handler — runs on the chip child.
+
+    Reads the request shm (header + buffer_nbytes + rank_ids), calls
+    ``ChipWorker.comm_alloc_domain_windows`` (which drives the collective
+    handshake via file barriers), carves buffer pointers locally, and writes
+    (device_ctx, local_window_base, buffer_ptrs) into the parent-owned reply
+    shm.  Failures propagate as exceptions; the dispatch loop turns them into
+    a CONTROL_DONE with non-zero error code.
+    """
+    request_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    reply_shm_name = _read_shm_name(buf, _OFF_ARGS + _CTRL_SHM_NAME_BYTES)
+
+    req_shm = SharedMemory(name=request_shm_name)
+    try:
+        req_buf = req_shm.buf
+        assert req_buf is not None
+        (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+        # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
+        nbytes_offset = _DOMAIN_REQ_HEADER.size
+        nbytes_struct = struct.Struct(f"<{buffer_count}Q") if buffer_count else struct.Struct("")
+        buffer_nbytes = nbytes_struct.unpack_from(req_buf, nbytes_offset) if buffer_count else ()
+        rank_ids_offset = nbytes_offset + nbytes_struct.size
+        rank_ids_struct = struct.Struct(f"<{rank_count}I")
+        rank_ids = list(rank_ids_struct.unpack_from(req_buf, rank_ids_offset))
+    finally:
+        req_shm.close()
+
+    handle = _comm_base_handle(cw)  # base communicator handle (cached on the ChipWorker)
+    device_ctx, local_window_base = cw._impl.comm_alloc_domain_windows(
+        int(handle),
+        int(allocation_id),
+        rank_ids,
+        int(domain_rank),
+        int(window_size),
+    )
+
+    # Carve buffer pointers sequentially inside the local window.
+    buffer_ptrs: list[int] = []
+    offset = 0
+    for nbytes in buffer_nbytes:
+        if offset + nbytes > window_size:
+            raise ValueError(
+                f"alloc_domain: buffer #{len(buffer_ptrs)} (nbytes={nbytes}) at offset={offset} "
+                f"overflows window_size {window_size}"
+            )
+        buffer_ptrs.append(int(local_window_base) + offset)
+        offset += int(nbytes)
+
+    reply_shm = SharedMemory(name=reply_shm_name)
+    try:
+        reply_buf = reply_shm.buf
+        assert reply_buf is not None
+        _DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, int(device_ctx), int(local_window_base), int(buffer_count))
+        if buffer_ptrs:
+            struct.pack_into(f"<{len(buffer_ptrs)}Q", reply_buf, _DOMAIN_REPLY_HEADER.size, *buffer_ptrs)
+    finally:
+        reply_shm.close()
+
+
+def _handle_ctrl_comm_init(cw: "ChipWorker", buf: memoryview) -> None:
+    """CTRL_COMM_INIT handler — drives `cw.comm_init` on the chip child.
+
+    Idempotent: ``ChipWorker.comm_init`` itself caches the handle and returns
+    the existing one if already initialized, so a duplicate dispatch from the
+    parent is a no-op.
+    """
+    request_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    req_shm = SharedMemory(name=request_shm_name)
+    try:
+        req_buf = req_shm.buf
+        assert req_buf is not None
+        (rank, nranks) = _COMM_INIT_HEADER.unpack_from(req_buf, 0)
+        # rootinfo_path is the rest of the shm, NUL-terminated.
+        raw = bytes(req_buf[_COMM_INIT_HEADER.size :])
+        nul = raw.find(b"\x00")
+        rootinfo_path = raw[: nul if nul >= 0 else len(raw)].decode("utf-8", "replace")
+    finally:
+        req_shm.close()
+
+    handle = cw.comm_init(int(rank), int(nranks), rootinfo_path)
+    if handle == 0:
+        raise RuntimeError("comm_init returned 0 handle for hidden base communicator")
+    cw._comm_base_handle_cached = int(handle)
+
+
+def _handle_ctrl_release_domain(cw: "ChipWorker", buf: memoryview) -> None:
+    """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
+    request_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    req_shm = SharedMemory(name=request_shm_name)
+    try:
+        req_buf = req_shm.buf
+        assert req_buf is not None
+        (allocation_id, rank_count, domain_rank, _ws, _bc) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+    finally:
+        req_shm.close()
+
+    handle = _comm_base_handle(cw)
+    cw._impl.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
+
+
+def _comm_base_handle(cw: "ChipWorker") -> int:
+    """Return the cached base-communicator handle the chip allocated during bootstrap.
+
+    The dynamic-allocate path requires an established base communicator (HCCL
+    RootInfo handshake already done).  ``bootstrap_context`` stashes the handle
+    on the ChipWorker; this helper exposes it to the CTRL_* handlers.
+    """
+    handle = getattr(cw, "_comm_base_handle_cached", 0)
+    if not handle:
+        raise RuntimeError("CTRL_ALLOC_DOMAIN: chip has no base communicator — bootstrap_context must run first")
+    return int(handle)
+
+
 def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id: int) -> None:
     if cid in prepared:
         return
@@ -300,10 +459,6 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
     on_task_done_success=None,
 ) -> None:
     """Unified TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
-
-    Used by both ``_chip_process_loop`` (no extra side effects on task
-    success) and ``_chip_process_loop_with_bootstrap`` (flushes
-    ``store_to_host`` buffers before publishing TASK_DONE).
 
     `on_task_done_success`, if provided, is invoked after a successful
     ``run_prepared_from_blob`` and before publishing TASK_DONE. It must
@@ -414,6 +569,12 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     # CTRL_PREPARE for the same cid is treated as a fresh
                     # registration (re-runs the H2D upload / AICPU dlopen).
                     prepared.discard(int(cid))
+                elif sub_cmd == _CTRL_ALLOC_DOMAIN:
+                    _handle_ctrl_alloc_domain(cw, buf)
+                elif sub_cmd == _CTRL_RELEASE_DOMAIN:
+                    _handle_ctrl_release_domain(cw, buf)
+                elif sub_cmd == _CTRL_COMM_INIT:
+                    _handle_ctrl_comm_init(cw, buf)
             except Exception as e:  # noqa: BLE001
                 code = 1
                 if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
@@ -475,111 +636,13 @@ def _chip_process_loop(
         cw.finalize()
 
 
-def _chip_process_loop_with_bootstrap(
-    buf: memoryview,
-    bins,
-    device_id: int,
-    bootstrap_cfg: ChipBootstrapConfig,
-    bootstrap_mailbox_addr: int,
-    max_buffer_count: int,
-    registry: dict,
-    log_level: int = 1,
-    log_info_v: int = 5,
-) -> None:
-    """Chip child variant that runs ``bootstrap_context`` before the main loop.
-
-    The child constructs its own ``ChipBootstrapChannel`` wrapping the
-    pre-fork shared-memory region, calls ``bootstrap_context`` (which
-    publishes SUCCESS/ERROR on the channel), and on success enters the
-    shared task / control polling loop. On any failure before the main
-    loop starts, the channel has already been written by the callee and
-    the function returns — the ``os._exit(0)`` in the fork branch reaps
-    the process without an extra non-zero exit code that would confuse
-    the parent's ``waitpid`` teardown.
-    """
-    channel = ChipBootstrapChannel(bootstrap_mailbox_addr, max_buffer_count)
-
-    cw = ChipWorker()
-    try:
-        cw.init(device_id, bins, log_level=log_level, log_info_v=log_info_v)
-    except Exception as e:  # noqa: BLE001
-        traceback.print_exc()
-        channel.write_error(1, f"{type(e).__name__}: chip_worker.init: {e}")
-        return
-
-    try:
-        result = cw.bootstrap_context(device_id, bootstrap_cfg, channel=channel)
-    except Exception:  # noqa: BLE001
-        # bootstrap_context already wrote the error payload.  Release the
-        # comm handle (if any) best-effort and return; finalize() is safe to
-        # skip — the process is about to exit and the OS reclaims FDs.
-        traceback.print_exc()
-        try:
-            cw.shutdown_bootstrap()
-        except Exception:  # noqa: BLE001
-            pass
-        return
-
-    # Build store_to_host mapping: (device_ptr, HostBufferStaging) for each
-    # buffer with store_to_host=True.  Processed after every task completion
-    # so the parent can read results from SharedMemory without a cross-fork
-    # host-pointer copy_from (which is broken across processes).
-    store_to_host: list[tuple[int, object]] = []
-    for spec, ptr in zip(bootstrap_cfg.buffers, result.buffer_ptrs):
-        if spec.store_to_host:
-            store_to_host.append((ptr, bootstrap_cfg.output_staging(spec.name)))
-
-    mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-    state_addr = mailbox_addr + _OFF_STATE
-    sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id} bootstrap] ready\n")
-    sys.stderr.flush()
-
-    def flush_store_to_host() -> tuple[int, str]:
-        # Runs *before* publishing TASK_DONE so the parent cannot observe
-        # the mailbox transition (and start reading the output
-        # SharedMemory) while the D2H DMA is still in flight.
-        for dev_ptr, staging in store_to_host:
-            # Skip zero-byte stagings up-front — mirrors the
-            # load_from_host H2D path in task_interface.py and avoids a
-            # spurious ValueError from ``ctypes.c_char.from_buffer`` on
-            # an empty buffer.
-            if staging.size == 0:
-                continue
-            try:
-                shm = SharedMemory(name=staging.shm_name)
-                try:
-                    shm_buf = shm.buf
-                    assert shm_buf is not None
-                    host_ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
-                    cw.copy_from(host_ptr, dev_ptr, staging.size)
-                finally:
-                    shm.close()
-            except Exception as e:  # noqa: BLE001
-                return 1, _format_exc(f"chip_process dev={device_id} store_to_host={staging.name!r}", e)
-        return 0, ""
-
-    try:
-        _run_chip_main_loop(
-            cw, buf, mailbox_addr, state_addr, device_id, registry, on_task_done_success=flush_store_to_host
-        )
-    finally:
-        # Teardown contract: release the comm handle before finalize so HCCL
-        # state is torn down in LIFO order; the channel shm the parent may
-        # still reference is not touched here — only the parent unlinks it
-        # once waitpid returns.
-        try:
-            cw.shutdown_bootstrap()
-        finally:
-            cw.finalize()
-
-
 def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     """Reconstruct a CallConfig from the unified mailbox layout."""
     block_dim, aicpu_tn, swl, dt, pmu, dep_gen, prefix_bytes = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
     cfg = CallConfig()
     cfg.block_dim = block_dim
     cfg.aicpu_thread_num = aicpu_tn
-    cfg.enable_l2_swimlane = bool(swl)
+    cfg.enable_l2_swimlane = swl
     cfg.enable_dump_tensor = bool(dt)
     cfg.enable_pmu = pmu
     cfg.enable_dep_gen = bool(dep_gen)
@@ -684,7 +747,6 @@ class Worker:
     def __init__(
         self,
         level: int,
-        chip_bootstrap_configs: Optional[list[ChipBootstrapConfig]] = None,
         **config,
     ) -> None:
         self.level = level
@@ -715,22 +777,34 @@ class Worker:
         self._next_level_shms: list[SharedMemory] = []
         self._next_level_pids: list[int] = []
 
-        # Per-chip bootstrap: one `ChipBootstrapConfig` per device_id plus a
-        # matching shared-memory mailbox the child publishes its
-        # `ChipBootstrapResult` into.  The `ChipContext` list is populated by
-        # `_start_hierarchical` once every chip reports SUCCESS.
-        if chip_bootstrap_configs is not None:
-            if level < 3:
-                raise ValueError(f"chip_bootstrap_configs requires level >= 3 (got level={level})")
-            device_ids = config.get("device_ids", [])
-            if len(chip_bootstrap_configs) != len(device_ids):
-                raise ValueError(
-                    f"chip_bootstrap_configs length ({len(chip_bootstrap_configs)}) "
-                    f"must equal device_ids length ({len(device_ids)})"
-                )
-        self._chip_bootstrap_configs: Optional[list[ChipBootstrapConfig]] = chip_bootstrap_configs
-        self._bootstrap_shms: list[SharedMemory] = []
-        self._chip_contexts: list[ChipContext] = []
+        # Dynamic CommDomain allocations.  Keyed by user-facing name (unique
+        # among live handles).  ``orch.allocate_domain`` adds entries here;
+        # ``release()`` removes them and queues a deferred backend free.
+        self._live_domains: dict[str, CommDomainHandle] = {}
+        # Handles whose `release()` has been called inside an orch function.
+        # The backend free is deferred until after Worker.run.drain() so that
+        # tasks already submitted with this domain's device_ctx / buffer_ptrs
+        # see live memory through execution.
+        self._pending_release_domains: list[CommDomainHandle] = []
+        # Monotonic per-Worker counter; mixed into IPC barrier filenames so
+        # two concurrent allocations don't share a marker file.  Wraps after
+        # 2^64 allocations — far beyond any realistic Worker lifetime.
+        self._next_alloc_id: int = 0
+        self._alloc_id_lock = threading.Lock()
+        # Base HCCL/sim communicator is built lazily on the first
+        # ``orch.allocate_domain`` call (see ``_ensure_comm_base``).  We
+        # keep ``Worker.init()`` cheap — it only forks chip children and
+        # starts the C++ scheduler; no comm work happens there.
+        self._comm_base_ready: bool = False
+
+    def _comm_plan_rootinfo_path(self) -> str:
+        """Per-Worker rootinfo path used by HCCL/sim base comm_init.
+
+        Namespaced by parent pid + Python id(self) so two concurrent L3
+        Workers in the same process do not collide on the handshake file.
+        """
+        tag = f"pto_multi_comm_{os.getpid()}_{id(self):x}.bin"
+        return os.path.join("/tmp", tag)
 
     # ------------------------------------------------------------------
     # Callable registration (before init)
@@ -927,14 +1001,6 @@ class Worker:
             self._init_level2()
         elif self.level >= 3:
             self._init_hierarchical()
-            # When the caller passes chip_bootstrap_configs, bring up every
-            # chip child *during* init — the parent must be able to consume
-            # `worker.chip_contexts` before the first `run()`.  Any bootstrap
-            # failure is surfaced as a RuntimeError; the helper does its own
-            # best-effort teardown of partially-forked children and shms so
-            # the caller does not need to call close().
-            if self._chip_bootstrap_configs is not None:
-                self._start_hierarchical()
         else:
             raise ValueError(f"Worker: level {self.level} not supported")
 
@@ -1002,16 +1068,6 @@ class Worker:
             _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
             self._next_level_shms.append(shm)
 
-        # 3b. Allocate per-chip bootstrap mailboxes (one per device_id).  Must
-        # live in shared memory so the forked child's `ChipBootstrapChannel`
-        # and the parent's read-side view see the same region.  SharedMemory
-        # zero-fills on create, which is IDLE (=0) for ChipBootstrapMailboxState,
-        # so no explicit state reset is required.
-        if self._chip_bootstrap_configs is not None:
-            for _ in self._chip_bootstrap_configs:
-                shm = SharedMemory(create=True, size=CHIP_BOOTSTRAP_MAILBOX_SIZE)
-                self._bootstrap_shms.append(shm)
-
         # 4. Construct the _Worker *before* fork so the HeapRing mmap
         #    (taken in the C++ ctor) is inherited by every child process at
         #    the same virtual address. No C++ thread is spawned here; the
@@ -1044,15 +1100,9 @@ class Worker:
             else:
                 self._sub_pids.append(pid)
 
-        # Fork ChipWorker processes (L3 with device_ids).  When
-        # chip_bootstrap_configs is provided the child runs a variant loop
-        # that publishes `bootstrap_context` on a dedicated mailbox *before*
-        # entering the normal task/control loop.
-        bootstrap_configs = self._chip_bootstrap_configs
-        use_bootstrap = bootstrap_configs is not None
-        # Snapshot the simpler logger config now, in the parent. After fork the
-        # child cannot read this same logger state across the process boundary,
-        # so the values must be passed explicitly to the child loop.
+        # Fork ChipWorker processes (L3 with device_ids).  Always use the
+        # plain task-loop variant; the base communicator is established
+        # lazily on first ``orch.allocate_domain`` via CTRL_COMM_INIT.
         chip_log_level, chip_log_info_v = _simpler_log.get_current_config()
         if device_ids:
             for idx, dev_id in enumerate(device_ids):
@@ -1060,32 +1110,14 @@ class Worker:
                 if pid == 0:
                     buf = self._chip_shms[idx].buf
                     assert buf is not None
-                    if bootstrap_configs is not None:
-                        bootstrap_cfg = bootstrap_configs[idx]
-                        max_buffer_count = len(bootstrap_cfg.buffers)
-                        bootstrap_buf = self._bootstrap_shms[idx].buf
-                        assert bootstrap_buf is not None
-                        bootstrap_addr = ctypes.addressof(ctypes.c_char.from_buffer(bootstrap_buf))
-                        _chip_process_loop_with_bootstrap(
-                            buf,
-                            self._l3_bins,
-                            dev_id,
-                            bootstrap_cfg,
-                            bootstrap_addr,
-                            max_buffer_count,
-                            registry,
-                            chip_log_level,
-                            chip_log_info_v,
-                        )
-                    else:
-                        _chip_process_loop(
-                            buf,
-                            self._l3_bins,
-                            dev_id,
-                            registry,
-                            chip_log_level,
-                            chip_log_info_v,
-                        )
+                    _chip_process_loop(
+                        buf,
+                        self._l3_bins,
+                        dev_id,
+                        registry,
+                        chip_log_level,
+                        chip_log_info_v,
+                    )
                     os._exit(0)
                 else:
                     self._chip_pids.append(pid)
@@ -1106,19 +1138,6 @@ class Worker:
                 os._exit(0)
             else:
                 self._next_level_pids.append(pid)
-
-        # When chip_bootstrap_configs was provided, block here until every
-        # chip child publishes its result on its bootstrap mailbox.  We wait
-        # *before* registering the chip mailboxes with the scheduler so a
-        # failed bring-up never reaches `dw.init()`; the abort path below
-        # SIGKILLs every forked child and unlinks every shm so init() can
-        # raise cleanly without leaking state.
-        if use_bootstrap:
-            try:
-                self._wait_for_bootstrap()
-            except BaseException:
-                self._abort_hierarchical()
-                raise
 
         # _Worker was constructed in _init_hierarchical (pre-fork) so
         # children inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode
@@ -1141,7 +1160,7 @@ class Worker:
         # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
         dw.init()
 
-        self._orch = Orchestrator(dw.get_orchestrator())
+        self._orch = Orchestrator(dw.get_orchestrator(), self)
 
         # Pre-warm every chip child: for each registered ChipCallable cid,
         # send `_CTRL_PREPARE` to all chip children so the first
@@ -1155,73 +1174,8 @@ class Worker:
                         dw.control_prepare(worker_id, int(cid))
 
     # ------------------------------------------------------------------
-    # Bootstrap plumbing
+    # Hierarchical abort
     # ------------------------------------------------------------------
-
-    def _wait_for_bootstrap(self) -> None:
-        """Block until every chip child has left IDLE on its bootstrap mailbox.
-
-        Fails fast on the first ERROR — returning from this function only
-        when *all* chips reached SUCCESS.  Times out after
-        `_BOOTSTRAP_WAIT_TIMEOUT_S` to surface a hung child as a TimeoutError
-        rather than blocking the CI job.  On success, populates
-        `self._chip_contexts` with one `ChipContext` per chip.
-        """
-        assert self._chip_bootstrap_configs is not None
-        device_ids = self._config.get("device_ids", [])
-        assert len(self._bootstrap_shms) == len(device_ids) == len(self._chip_bootstrap_configs)
-
-        channels: list[ChipBootstrapChannel] = []
-        for shm, cfg in zip(self._bootstrap_shms, self._chip_bootstrap_configs):
-            addr = _mailbox_addr(shm)
-            channels.append(ChipBootstrapChannel(addr, max(len(cfg.buffers), 0)))
-
-        pending = set(range(len(channels)))
-        contexts: list[Optional[ChipContext]] = [None] * len(channels)
-        deadline = time.monotonic() + _BOOTSTRAP_WAIT_TIMEOUT_S
-
-        while pending:
-            if time.monotonic() > deadline:
-                raise TimeoutError(
-                    f"bootstrap wait timed out after {_BOOTSTRAP_WAIT_TIMEOUT_S:.0f}s; "
-                    f"pending chip indices: {sorted(pending)}"
-                )
-            for idx in list(pending):
-                state = channels[idx].state
-                if state == ChipBootstrapMailboxState.IDLE:
-                    continue
-                if state == ChipBootstrapMailboxState.ERROR:
-                    raise RuntimeError(f"chip {idx} bootstrap failed: {channels[idx].error_message}")
-                # SUCCESS — assemble the ChipContext from the published fields.
-                cfg = self._chip_bootstrap_configs[idx]
-                comm = cfg.comm
-                rank = comm.rank if comm is not None else 0
-                nranks = comm.nranks if comm is not None else 1
-                ptrs = channels[idx].buffer_ptrs
-                # zip() silently truncates on mismatch, which would hide a
-                # child/parent buffer-count disagreement behind a short
-                # ChipContext — verify explicitly so the caller sees the real
-                # fault instead of a surprising missing key at orch time.
-                if len(ptrs) != len(cfg.buffers):
-                    raise RuntimeError(
-                        f"chip {idx} bootstrap success but buffer count mismatch: "
-                        f"expected {len(cfg.buffers)}, got {len(ptrs)}"
-                    )
-                buffer_ptrs = {spec.name: ptr for spec, ptr in zip(cfg.buffers, ptrs)}
-                contexts[idx] = ChipContext(
-                    device_id=device_ids[idx],
-                    rank=rank,
-                    nranks=nranks,
-                    device_ctx=channels[idx].device_ctx,
-                    local_window_base=channels[idx].local_window_base,
-                    actual_window_size=channels[idx].actual_window_size,
-                    buffer_ptrs=buffer_ptrs,
-                )
-                pending.discard(idx)
-            if pending:
-                time.sleep(_BOOTSTRAP_POLL_INTERVAL_S)
-
-        self._chip_contexts = [c for c in contexts if c is not None]
 
     def _abort_hierarchical(self) -> None:
         """Tear down all forked children + shms after a bootstrap failure.
@@ -1245,7 +1199,7 @@ class Worker:
             except ChildProcessError:
                 pass
 
-        for shm in self._sub_shms + self._chip_shms + self._next_level_shms + self._bootstrap_shms:
+        for shm in self._sub_shms + self._chip_shms + self._next_level_shms:
             try:
                 shm.close()
             except Exception:  # noqa: BLE001
@@ -1268,20 +1222,378 @@ class Worker:
         self._sub_shms.clear()
         self._chip_shms.clear()
         self._next_level_shms.clear()
-        self._bootstrap_shms.clear()
-        self._chip_contexts.clear()
 
     @property
-    def chip_contexts(self) -> list[ChipContext]:
-        """Per-chip bootstrap results, populated during `init()`.
+    def live_domains(self) -> dict[str, "CommDomainHandle"]:
+        """Read-only snapshot of currently-live dynamic CommDomain handles.
 
-        Raises ``RuntimeError`` when accessed before `init()` so an orch
-        function that consumes this property in the wrong order fails
-        loudly rather than seeing a misleading empty list.
+        Useful for debugging.  Mutating the returned dict has no effect; use
+        ``handle.release()`` or ``orch.release_domain(handle)`` to free.
         """
+        return dict(self._live_domains)
+
+    # ------------------------------------------------------------------
+    # Dynamic CommDomain allocation (driven by Orchestrator.allocate_domain;
+    # do not call directly from user code — use the orch API.)
+    # ------------------------------------------------------------------
+
+    def _ensure_comm_base(self) -> None:
+        """Lazily establish the base HCCL/sim communicator across all chips.
+
+        Idempotent — sets ``self._comm_base_ready`` after the first
+        successful collective so subsequent ``allocate_domain`` calls skip
+        straight to the per-allocation IPC handshake.  Dispatched to every
+        ``device_ids`` chip in parallel via CTRL_COMM_INIT control mailbox;
+        the chip child runs ``ChipWorker.comm_init`` (which itself caches
+        the handle, so a re-dispatch would be a no-op anyway).
+        """
+        if getattr(self, "_comm_base_ready", False):
+            return
+        assert self._worker is not None
+        device_ids = self._config.get("device_ids", [])
+        rootinfo_path = self._comm_plan_rootinfo_path()
+
+        request_shms: dict[int, SharedMemory] = {}
+        # Layout: header (rank, nranks) + NUL-terminated rootinfo_path bytes.
+        path_bytes = rootinfo_path.encode("utf-8") + b"\x00"
+        req_size = _COMM_INIT_HEADER.size + len(path_bytes)
+        try:
+            for chip_idx, _device_id in enumerate(device_ids):
+                req = SharedMemory(create=True, size=req_size)
+                req_buf = req.buf
+                assert req_buf is not None
+                _COMM_INIT_HEADER.pack_into(req_buf, 0, int(chip_idx), int(len(device_ids)))
+                req_buf[_COMM_INIT_HEADER.size : _COMM_INIT_HEADER.size + len(path_bytes)] = path_bytes
+                request_shms[chip_idx] = req
+
+            dw = self._worker
+            errors: dict[int, BaseException] = {}
+
+            def dispatch(chip_idx: int) -> None:
+                try:
+                    dw.control_comm_init(chip_idx, request_shms[chip_idx].name)
+                except BaseException as e:  # noqa: BLE001
+                    errors[chip_idx] = e
+
+            threads = [
+                threading.Thread(target=dispatch, args=(i,), name=f"comm_init_chip_{i}") for i in range(len(device_ids))
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            if errors:
+                first = next(iter(errors.items()))
+                raise RuntimeError(
+                    f"_ensure_comm_base failed on {len(errors)}/{len(device_ids)} chips; "
+                    f"first error chip={first[0]}: {first[1]}"
+                )
+        finally:
+            for shm in request_shms.values():
+                try:
+                    shm.close()
+                    shm.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._comm_base_ready = True
+
+    def _allocate_domain(  # noqa: PLR0912 -- linear input-validation + per-chip shm staging + dispatch + reply unpack; splitting obscures the fail-fast ordering
+        self,
+        *,
+        name: str,
+        workers: tuple[int, ...],
+        window_size: int,
+        buffers: list[CommBufferSpec],
+    ) -> CommDomainHandle:
         if not self._initialized:
-            raise RuntimeError("Worker.chip_contexts available only after init()")
-        return list(self._chip_contexts)
+            raise RuntimeError("allocate_domain requires Worker.init() (HCCL membership) to have run")
+        if self.level < 3:
+            raise RuntimeError("allocate_domain requires level >= 3")
+        if self._worker is None:
+            raise RuntimeError("allocate_domain requires a hierarchical Worker (_start_hierarchical ran)")
+        if not workers:
+            raise ValueError("allocate_domain: workers must be non-empty")
+        if len(set(workers)) != len(workers):
+            raise ValueError(f"allocate_domain: workers contains duplicates: {workers}")
+        device_ids = self._config.get("device_ids", [])
+        for w in workers:
+            if w < 0 or w >= len(device_ids):
+                raise ValueError(f"allocate_domain: worker index {w} outside [0, {len(device_ids)})")
+        if window_size <= 0:
+            raise ValueError("allocate_domain: window_size must be positive")
+        buffer_names = [b.name for b in buffers]
+        if len(set(buffer_names)) != len(buffer_names):
+            raise ValueError(f"allocate_domain: duplicate buffer names: {buffer_names}")
+        # Check buffer carving fits in window BEFORE dispatching: a chip-side
+        # overflow would still register the backend allocation (aclrtMalloc
+        # already succeeded) but never produce a Handle on the parent, so it
+        # would silently leak.  Fail fast here instead.
+        total_buffer_nbytes = sum(int(b.nbytes) for b in buffers)
+        if total_buffer_nbytes > window_size:
+            raise ValueError(
+                f"allocate_domain: buffers sum to {total_buffer_nbytes} bytes, exceeds window_size={window_size}"
+            )
+        if name in self._live_domains:
+            raise ValueError(f"allocate_domain: domain {name!r} already live")
+
+        # Lazy base communicator: first orch.allocate_domain on this Worker
+        # triggers HCCL RootInfo handshake + EnablePeerAccess on every chip.
+        # Cheap enough to do once per Worker; defers cost from init() (which
+        # used to pre-bootstrap) to the first DAG that actually needs comm.
+        self._ensure_comm_base()
+
+        with self._alloc_id_lock:
+            allocation_id = self._next_alloc_id
+            self._next_alloc_id += 1
+
+        # Stage per-chip request shms (domain_rank differs per chip) and a
+        # per-chip reply shm.  We let the chip child write back its own slot.
+        buffer_count = len(buffers)
+        req_size = _DOMAIN_REQ_HEADER.size + buffer_count * 8 + len(workers) * 4
+        reply_size = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
+        # Precompute worker → dense rank for O(1) lookup in the staging /
+        # context loops below (and again in _release_domain_handle).  Without
+        # this, `workers.index(chip_idx)` makes the hot path quadratic.
+        worker_to_rank = {w: r for r, w in enumerate(workers)}
+
+        request_shms: dict[int, SharedMemory] = {}
+        reply_shms: dict[int, SharedMemory] = {}
+        try:
+            for chip_idx in workers:
+                req = SharedMemory(create=True, size=req_size)
+                req_buf = req.buf
+                assert req_buf is not None
+                _DOMAIN_REQ_HEADER.pack_into(
+                    req_buf,
+                    0,
+                    int(allocation_id),
+                    int(len(workers)),
+                    int(worker_to_rank[chip_idx]),  # domain_rank
+                    int(window_size),
+                    int(buffer_count),
+                )
+                nbytes_off = _DOMAIN_REQ_HEADER.size
+                if buffer_count:
+                    struct.pack_into(f"<{buffer_count}Q", req_buf, nbytes_off, *[int(b.nbytes) for b in buffers])
+                rank_ids_off = nbytes_off + buffer_count * 8
+                struct.pack_into(f"<{len(workers)}I", req_buf, rank_ids_off, *[int(w) for w in workers])
+                request_shms[chip_idx] = req
+
+                reply_shms[chip_idx] = SharedMemory(create=True, size=reply_size)
+
+            self._dispatch_control_domain(
+                workers=workers,
+                request_shms=request_shms,
+                reply_shms=reply_shms,
+                op="alloc",
+                allocation_id=allocation_id,
+            )
+
+            contexts: dict[int, ChipDomainContext] = {}
+            for chip_idx in workers:
+                reply_buf = reply_shms[chip_idx].buf
+                assert reply_buf is not None
+                (device_ctx, local_window_base, reply_buffer_count) = _DOMAIN_REPLY_HEADER.unpack_from(reply_buf, 0)
+                if reply_buffer_count != buffer_count:
+                    raise RuntimeError(
+                        f"allocate_domain: chip {chip_idx} reply buffer_count={reply_buffer_count} "
+                        f"!= requested {buffer_count}"
+                    )
+                ptrs: list[int] = []
+                if buffer_count:
+                    ptrs = list(struct.unpack_from(f"<{buffer_count}Q", reply_buf, _DOMAIN_REPLY_HEADER.size))
+                contexts[chip_idx] = ChipDomainContext(
+                    name=name,
+                    domain_rank=worker_to_rank[chip_idx],
+                    domain_size=len(workers),
+                    device_ctx=int(device_ctx),
+                    local_window_base=int(local_window_base),
+                    actual_window_size=int(window_size),
+                    buffer_ptrs={b.name: ptrs[i] for i, b in enumerate(buffers)},
+                )
+        finally:
+            # Close + unlink local copies regardless of outcome.  Children
+            # have already finished reading by the time CONTROL_DONE fires.
+            for shm in request_shms.values():
+                try:
+                    shm.close()
+                    shm.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+            for shm in reply_shms.values():
+                try:
+                    shm.close()
+                    shm.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        handle = CommDomainHandle(
+            name=name,
+            workers=workers,
+            contexts=contexts,
+            allocation_id=allocation_id,
+            _release_fn=self._release_domain_handle,
+        )
+        self._live_domains[name] = handle
+        return handle
+
+    def _release_domain_handle(self, handle: CommDomainHandle) -> None:
+        """Mark a handle for release.  Actual backend free is deferred.
+
+        Called by ``CommDomainHandle.release()``.  We do NOT drive
+        ``CTRL_RELEASE_DOMAIN`` here because the orch function is allowed
+        to have already submitted DAG tasks that capture the handle's
+        ``device_ctx`` / ``buffer_ptrs``.  Those tasks must see live
+        memory through execution; ``Worker.run`` calls
+        ``_execute_pending_domain_releases`` only after ``drain()``.
+        """
+        if self._worker is None:
+            return
+        # Pop from live_domains so a subsequent allocate_domain(name=...)
+        # call within the same run can reuse the name.  The actual memory
+        # is still live until _execute_pending_domain_releases runs.
+        self._live_domains.pop(handle.name, None)
+        self._pending_release_domains.append(handle)
+
+    def _execute_pending_domain_releases(self) -> None:
+        """Drive CTRL_RELEASE_DOMAIN for every queued handle.  Must run
+        after ``self._orch._drain()`` so chip-side tasks have completed
+        their use of the domain memory.
+        """
+        if not self._pending_release_domains:
+            return
+        pending, self._pending_release_domains = self._pending_release_domains, []
+        for handle in pending:
+            try:
+                self._release_domain_now(handle)
+                handle._freed = True  # noqa: SLF001 -- runtime owns this transition
+            except Exception as e:  # noqa: BLE001
+                # A failed release should not block other handles' frees or
+                # the rest of Worker.run() shutdown.  Drop from any residual
+                # tracking and log; the kernel-side memory may have already
+                # been reclaimed by the device_ctx-owning chip's finalize.
+                sys.stderr.write(
+                    f"Worker._execute_pending_domain_releases: {handle.name!r} "
+                    f"(allocation_id={handle.allocation_id}) failed: "
+                    f"{type(e).__name__}: {e}\n"
+                )
+                sys.stderr.flush()
+
+    def _release_domain_now(self, handle: CommDomainHandle) -> None:
+        """Synchronous backend release for one handle.  Used by the
+        deferred-release path and by the abort/close cleanup helpers."""
+        if self._worker is None:
+            return
+        workers = handle.workers
+        # Release payload is just the fixed header — no rank_ids tail; the
+        # backend looked them up from its own per-allocation record at
+        # alloc time and doesn't need them again.
+        req_size = _DOMAIN_REQ_HEADER.size
+        worker_to_rank = {w: r for r, w in enumerate(workers)}
+
+        request_shms: dict[int, SharedMemory] = {}
+        try:
+            for chip_idx in workers:
+                req = SharedMemory(create=True, size=req_size)
+                req_buf = req.buf
+                assert req_buf is not None
+                _DOMAIN_REQ_HEADER.pack_into(
+                    req_buf,
+                    0,
+                    int(handle.allocation_id),
+                    int(len(workers)),
+                    int(worker_to_rank[chip_idx]),
+                    0,  # window_size — ignored on release
+                    0,  # buffer_count — ignored on release
+                )
+                request_shms[chip_idx] = req
+
+            self._dispatch_control_domain(
+                workers=workers,
+                request_shms=request_shms,
+                reply_shms=None,
+                op="release",
+                allocation_id=handle.allocation_id,
+            )
+        finally:
+            for shm in request_shms.values():
+                try:
+                    shm.close()
+                    shm.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._live_domains.pop(handle.name, None)
+
+    def _dispatch_control_domain(
+        self,
+        *,
+        workers: tuple[int, ...],
+        request_shms: dict[int, SharedMemory],
+        reply_shms: Optional[dict[int, SharedMemory]],
+        op: str,
+        allocation_id: int,
+    ) -> None:
+        """Fan out CTRL_ALLOC_DOMAIN / CTRL_RELEASE_DOMAIN to all participating chips.
+
+        Each chip's `_Worker.control_*` is a blocking per-mailbox call; we issue
+        them on separate threads so the child-side file barrier can converge.
+        Joins all threads; raises on first error after all join.
+        """
+        dw = self._worker
+        assert dw is not None
+        errors: dict[int, BaseException] = {}
+
+        def dispatch(chip_idx: int) -> None:
+            try:
+                req_name = request_shms[chip_idx].name
+                if op == "alloc":
+                    assert reply_shms is not None
+                    dw.control_alloc_domain(chip_idx, req_name, reply_shms[chip_idx].name)
+                else:
+                    dw.control_release_domain(chip_idx, req_name)
+            except BaseException as e:  # noqa: BLE001
+                errors[chip_idx] = e
+
+        threads = [threading.Thread(target=dispatch, args=(w,), name=f"{op}_domain_chip_{w}") for w in workers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        if errors:
+            first = next(iter(errors.items()))
+            raise RuntimeError(
+                f"{op}_domain(allocation_id={allocation_id}) failed on "
+                f"{len(errors)}/{len(workers)} chips; first error chip={first[0]}: {first[1]}"
+            )
+
+    def _release_all_live_domains(self) -> None:
+        """Best-effort release of every still-live domain handle (LIFO).
+
+        Called from ``Worker.run`` end-of-run sweep (after pending releases)
+        and ``Worker.close``.  Skips the deferred-release machinery
+        (``_pending_release_domains``) because by the time this runs, drain
+        has already happened — synchronous release of leftover handles is
+        safe.  Falls back to immediate backend free + drop from
+        ``_live_domains`` on each handle; logs and moves on if one fails.
+        """
+        for handle in list(self._live_domains.values())[::-1]:
+            try:
+                # Mark released first (flips handle._released so further
+                # indexing raises), then synchronously free.  The handle is
+                # not in _pending_release_domains, so we use the direct path.
+                if not handle.released:
+                    handle._released = True  # noqa: SLF001 -- runtime owns the transition
+                self._release_domain_now(handle)
+                handle._freed = True  # noqa: SLF001
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(
+                    f"Worker._release_all_live_domains: {handle.name!r} release failed: {type(e).__name__}: {e}\n"
+                )
+                sys.stderr.flush()
+                # Drop from live_domains anyway — leaving a known-bad handle
+                # would just block close().
+                self._live_domains.pop(handle.name, None)
 
     # ------------------------------------------------------------------
     # memory management — forward to C++ Orchestrator, which holds
@@ -1309,7 +1621,7 @@ class Worker:
             return self._chip_worker.malloc(size)
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
-        return self._orch._impl.malloc(worker_id, size)
+        return self._orch.malloc(worker_id, size)
 
     def free(self, ptr: int, worker_id: int = 0) -> None:
         """Free memory allocated by ``malloc()``."""
@@ -1319,7 +1631,7 @@ class Worker:
             return
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
-        self._orch._impl.free(worker_id, ptr)
+        self._orch.free(worker_id, ptr)
 
     def copy_to(self, dst: int, src: int, size: int, worker_id: int = 0) -> None:
         """Copy *size* bytes from host *src* to chip worker *dst*."""
@@ -1329,7 +1641,7 @@ class Worker:
             return
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
-        self._orch._impl.copy_to(worker_id, dst, src, size)
+        self._orch.copy_to(worker_id, dst, src, size)
 
     def copy_from(self, dst: int, src: int, size: int, worker_id: int = 0) -> None:
         """Copy *size* bytes from chip worker *src* to host *dst*."""
@@ -1339,13 +1651,13 @@ class Worker:
             return
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
-        self._orch._impl.copy_from(worker_id, dst, src, size)
+        self._orch.copy_from(worker_id, dst, src, size)
 
     # ------------------------------------------------------------------
     # run — uniform entry point
     # ------------------------------------------------------------------
 
-    def run(self, callable, args=None, config=None) -> None:
+    def run(self, callable, args=None, config=None) -> RunTiming:
         """Execute one task (L2) or one DAG (L3+) synchronously.
 
         Dispatch:
@@ -1356,35 +1668,62 @@ class Worker:
 
         ``args``  : TaskArgs (optional)
         ``config``: CallConfig (optional, default-constructed if None)
+
+        Returns a :class:`RunTiming` with ``host_wall_us`` (Python wall-clock
+        around the dispatch) and ``device_wall_us`` (on-NPU orchestrator wall,
+        populated whenever the runtime was built with ``PTO2_PROFILING`` —
+        the default build has it on). For L3+ DAGs, ``host_wall_us`` covers
+        the whole orch fn and ``device_wall_us`` is unset (0) — per-task
+        device timings are not aggregated here.
         """
         assert self._initialized, "Worker not initialized; call init() first"
         cfg = config if config is not None else CallConfig()
 
         if self.level == 2:
             assert self._chip_worker is not None
-            self._chip_worker.run(int(callable), args, cfg)
-        else:
-            self._start_hierarchical()
-            assert self._orch is not None
-            assert self._worker is not None
-            # Drop any error stashed by a previous run() so this call starts
-            # clean. drain() rethrows on the way out; every successful run()
-            # leaves the error slot empty, but an unrelated caller may have
-            # poked it.
-            self._orch._clear_error()
-            self._orch._scope_begin()
+            return self._chip_worker.run(int(callable), args, cfg)
+
+        self._start_hierarchical()
+        assert self._orch is not None
+        assert self._worker is not None
+        # Drop any error stashed by a previous run() so this call starts
+        # clean. drain() rethrows on the way out; every successful run()
+        # leaves the error slot empty, but an unrelated caller may have
+        # poked it.
+        self._orch._clear_error()
+        self._orch._scope_begin()
+        t_start = time.perf_counter_ns()
+        try:
+            callable(self._orch, args, cfg)
+        finally:
+            # Always release scope refs and drain so ring slots aren't
+            # stranded when the orch fn raises mid-DAG. drain() also
+            # rethrows the first dispatch failure for this run — that
+            # is how child-task exceptions surface to the caller of
+            # Worker.run(). scope_end deliberately does NOT throw: if
+            # it did, released refs would be incomplete and drain
+            # would hang on in-flight tasks.
+            self._orch._scope_end()
+            # ORDER MATTERS: drain() must complete first so any in-flight
+            # task that captured a now-pending handle's device_ctx /
+            # buffer_ptrs sees live memory.  THEN execute the pending
+            # backend releases.  Last, sweep any handles that the orch
+            # function neither released nor passed out (covers exception
+            # unwind and "forgot to release" — auto-release in LIFO).
+            # drain() rethrows the first chip-task/dispatch failure, so the
+            # cleanup lives in a finally: a failed task must not strand
+            # backend domain allocations into the next run.
             try:
-                callable(self._orch, args, cfg)
-            finally:
-                # Always release scope refs and drain so ring slots aren't
-                # stranded when the orch fn raises mid-DAG. drain() also
-                # rethrows the first dispatch failure for this run — that
-                # is how child-task exceptions surface to the caller of
-                # Worker.run(). scope_end deliberately does NOT throw: if
-                # it did, released refs would be incomplete and drain
-                # would hang on in-flight tasks.
-                self._orch._scope_end()
                 self._orch._drain()
+            finally:
+                self._execute_pending_domain_releases()
+                if self._live_domains:
+                    self._release_all_live_domains()
+        # device_wall stays 0 for L3+: aggregating per-task device cycles
+        # across a DAG isn't implemented here (would need accumulation in the
+        # ring scheduler). Callers wanting per-task device wall should issue
+        # individual run calls.
+        return RunTiming(time.perf_counter_ns() - t_start, 0)
 
     def prepare_callable(self, callable_id: int, callable) -> None:
         """L2 only: pre-stage a callable under ``callable_id`` (see
@@ -1440,17 +1779,6 @@ class Worker:
             return 0
         return self._chip_worker.host_dlopen_count
 
-    def _run_as_child(self, cid: int, args, config) -> None:
-        """Called from C++ _Worker::run when this Worker is a THREAD-mode child.
-
-        Looks up the orch function from the callable registry and delegates
-        to ``self.run(orch_fn, args, config)``.
-        """
-        orch_fn = self._callable_registry.get(cid)
-        if orch_fn is None:
-            raise KeyError(f"callable id {cid} not found in registry")
-        self.run(orch_fn, args, config)
-
     # ------------------------------------------------------------------
     # close
     # ------------------------------------------------------------------
@@ -1458,6 +1786,12 @@ class Worker:
     def close(self) -> None:  # noqa: PLR0912 -- parallel teardown for _worker + sub/chip/next/bootstrap shms with ordering constraints documented inline
         if not self._initialized:
             return
+
+        # Release any orch-allocated CommDomain handles before tearing down
+        # the C++ scheduler.  Once `dw.close()` runs, the chip mailboxes
+        # become unusable and we can no longer drive CTRL_RELEASE_DOMAIN.
+        if self._live_domains:
+            self._release_all_live_domains()
 
         if self.level == 2:
             if self._chip_worker:
@@ -1503,21 +1837,6 @@ class Worker:
                 shm.close()
                 shm.unlink()
 
-            # Unlink the bootstrap mailboxes last — chip children touch their
-            # `ChipBootstrapChannel` from inside `shutdown_bootstrap()` +
-            # `finalize()`, which runs after they leave the main loop on
-            # SHUTDOWN.  Waiting until every chip pid has been reaped above
-            # guarantees no child is still reading from these shms.
-            for shm in self._bootstrap_shms:
-                try:
-                    shm.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    shm.unlink()
-                except FileNotFoundError:
-                    pass
-
             self._sub_shms.clear()
             self._sub_pids.clear()
             self._chip_shms.clear()
@@ -1525,8 +1844,6 @@ class Worker:
             self._next_level_shms.clear()
             self._next_level_pids.clear()
             self._next_level_workers.clear()
-            self._bootstrap_shms.clear()
-            self._chip_contexts.clear()
 
         self._initialized = False
 

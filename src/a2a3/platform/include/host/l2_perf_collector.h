@@ -156,45 +156,14 @@ struct L2PerfModule {
     }
 };
 
-/**
- * Memory allocation callback for performance profiling.
- *
- * @param size       Memory size in bytes
- * @param user_data  Opaque allocator context
- * @return Allocated device memory pointer, or nullptr on failure
- */
-using L2PerfAllocCallback = void *(*)(size_t size, void *user_data);
-
-/**
- * Memory registration callback (host-visible mapping). nullptr in sim mode
- * (dev pointer is directly host-accessible). Stateless: HAL state is global,
- * so no user_data is threaded through.
- *
- * @param dev_ptr        Device memory pointer
- * @param size           Memory size in bytes
- * @param device_id      Device ID
- * @param[out] host_ptr  Host-mapped pointer
- * @return 0 on success, error code on failure
- */
-using L2PerfRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
-
-/**
- * Memory unregister callback. May be nullptr. Stateless (see register_cb).
- *
- * @param dev_ptr    Device memory pointer
- * @param device_id  Device ID
- * @return 0 on success, error code on failure
- */
-using L2PerfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
-
-/**
- * Memory free callback.
- *
- * @param dev_ptr    Device memory pointer
- * @param user_data  Opaque allocator context
- * @return 0 on success, error code on failure
- */
-using L2PerfFreeCallback = int (*)(void *dev_ptr, void *user_data);
+// Memory callbacks — thin aliases for the canonical profiling_common shapes.
+// alloc / free are std::function so callers bind their MemoryAllocator via
+// lambda capture; register / unregister stay as plain function pointers
+// because they wrap stateless HAL globals (halHost*).
+using L2PerfAllocCallback = profiling_common::ProfAllocCallback;
+using L2PerfRegisterCallback = profiling_common::ProfRegisterCallback;
+using L2PerfUnregisterCallback = profiling_common::ProfUnregisterCallback;
+using L2PerfFreeCallback = profiling_common::ProfFreeCallback;
 
 // =============================================================================
 // L2PerfCollector
@@ -214,8 +183,8 @@ using L2PerfFreeCallback = int (*)(void *dev_ptr, void *user_data);
  *   4. stop()                      — joins both threads in the correct order
  *                                    (mgmt first so its final-drain entries
  *                                    have a consumer).
- *   5. read_phase_header_metadata() — single-shot read of orch_summary +
- *                                    core→thread mapping from AicpuPhaseHeader.
+ *   5. read_phase_header_metadata() — single-shot read of the core→thread
+ *                                    mapping from AicpuPhaseHeader.
  *   6. reconcile_counters()        — device-side three-bucket accounting for
  *                                    both PERF and PHASE pools (total /
  *                                    collected / dropped).
@@ -244,21 +213,31 @@ public:
      * BufferStates), pre-allocates initial L2PerfBuffers and PhaseBuffers,
      * and seeds the per-pool free_queues + the framework's recycled pools.
      *
-     * @param num_aicore     Number of AICore instances
-     * @param device_id      Device ID (forwarded to register_cb)
-     * @param alloc_cb       Device memory allocation callback
-     * @param register_cb    Memory registration callback (nullptr for simulation)
-     * @param free_cb        Device memory free callback
-     * @param user_data      Opaque pointer forwarded to callbacks
-     * @param output_prefix  Per-task directory; l2_perf_records.json lands here.
-     *                       Stored on the collector and consumed by
-     *                       export_swimlane_json(). Required (non-empty);
-     *                       CallConfig::validate() enforces this upstream.
+     * @param num_aicore               Number of AICore instances
+     * @param device_id                Device ID (forwarded to register_cb)
+     * @param l2_perf_level   Collection granularity (DISABLED / AICORE_TIMING
+     *                                 / AICPU_TIMING / SCHED_PHASES / ORCH_PHASES).
+     *                                 Written into
+     *                                 `L2PerfDataHeader::l2_perf_level`
+     *                                 so AICPU can promote it in
+     *                                 `l2_perf_aicpu_init`, AND cached on the
+     *                                 collector so `export_swimlane_json()`
+     *                                 can gate phase sections and stamp the
+     *                                 JSON `version`.
+     * @param alloc_cb                 Device memory allocation callback
+     * @param register_cb              Memory registration callback (nullptr for
+     *                                 simulation)
+     * @param free_cb                  Device memory free callback
+     * @param user_data                Opaque pointer forwarded to callbacks
+     * @param output_prefix            Per-task directory; l2_perf_records.json
+     *                                 lands here. Required (non-empty);
+     *                                 CallConfig::validate() enforces this
+     *                                 upstream.
      * @return 0 on success, error code on failure
      */
     int initialize(
-        int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfRegisterCallback register_cb,
-        L2PerfFreeCallback free_cb, void *user_data, const std::string &output_prefix
+        int num_aicore, int device_id, L2PerfLevel l2_perf_level, const L2PerfAllocCallback &alloc_cb,
+        L2PerfRegisterCallback register_cb, const L2PerfFreeCallback &free_cb, const std::string &output_prefix
     );
 
     /**
@@ -287,7 +266,7 @@ public:
      * @param user_data      Opaque pointer forwarded to callbacks
      * @return 0 on success, error code on failure
      */
-    int finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb, void *user_data);
+    int finalize(L2PerfUnregisterCallback unregister_cb, const L2PerfFreeCallback &free_cb);
 
     /**
      * @return true if initialize() succeeded and finalize() has not run.
@@ -313,8 +292,9 @@ public:
 
     /**
      * Read AICPU phase metadata that lives in AicpuPhaseHeader (not on the
-     * buffer pipeline): the orchestrator summary and core→thread mapping.
-     * Single-shot — must be called after stop() so orch_summary has settled.
+     * buffer pipeline): the core→thread mapping plus a has-data signal
+     * derived from accumulated per-event records. Single-shot — must be
+     * called after stop() so the shm region has settled.
      */
     void read_phase_header_metadata();
 
@@ -339,7 +319,6 @@ private:
     // Shared memory pointers. shm_host_ / device_id_ live on ProfilerBase
     // (set via set_memory_context in initialize()).
     void *perf_shared_mem_dev_{nullptr};
-    bool was_registered_{false};
 
     // Standalone uint64_t[num_aicore] table holding per-core L2PerfAicoreRing
     // addresses. Allocated in initialize(), freed in finalize(). AICore reads
@@ -347,6 +326,7 @@ private:
     void *aicore_ring_addr_table_dev_{nullptr};
 
     int num_aicore_{0};
+    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};
 
     // Per-task output directory captured at initialize() time. Consumed by
     // export_swimlane_json() to build <prefix>/l2_perf_records.json.
@@ -357,7 +337,6 @@ private:
 
     // AICPU phase profiling data (per-thread, mixed sched + orch records)
     std::vector<std::vector<AicpuPhaseRecord>> collected_phase_records_;
-    AicpuOrchSummary collected_orch_summary_{};
     bool has_phase_data_{false};
 
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)
@@ -367,7 +346,9 @@ private:
     uint64_t total_perf_collected_{0};
     uint64_t total_phase_collected_{0};
 
-    // Allocate a single buffer (L2PerfBuffer or PhaseBuffer) and register it
+    // Allocate a single buffer (L2PerfBuffer or PhaseBuffer) and register it.
+    // The RAII counterpart ``release_one_buffer`` lives on ProfilerBase and
+    // is shared with every other collector.
     void *alloc_single_buffer(size_t size, void **host_ptr_out);
 
     // Per-buffer-kind handlers used by on_buffer_collected.

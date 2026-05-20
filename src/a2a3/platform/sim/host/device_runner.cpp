@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -351,6 +352,18 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return rc;
     }
 
+    // Lazy-allocate the 8-byte device_wall buffer on first run. Sim's
+    // "device pointer" is a host malloc returned by allocate_tensor; the
+    // sim AICPU thread (host CPU thread) writes through this pointer just
+    // like onboard's AICPU does.
+    if (device_wall_dev_ptr_ == nullptr) {
+        device_wall_dev_ptr_ = allocate_tensor(sizeof(uint64_t));
+        if (device_wall_dev_ptr_ != nullptr) {
+            kernel_args_.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
+            *static_cast<uint64_t *>(device_wall_dev_ptr_) = 0;
+        }
+    }
+
     // Calculate execution parameters
     block_dim_ = block_dim;
     int num_aicore = block_dim * cores_per_blockdim_;
@@ -578,8 +591,20 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     std::vector<std::thread> aicpu_threads;
     aicpu_threads.reserve(over_launch);
     std::atomic<int> aicpu_rc{0};
+
+    // Sim "device wall" capture — mirrors the onboard kernel.cpp path via the
+    // device_wall_data_base buffer (sim's "device pointer" is a host malloc'd
+    // uint64). sim_t0 is the host steady_clock equivalent of get_sys_cnt_aicpu
+    // in Init; each thread on exit overwrites the buffer with (now - sim_t0).
+    // Last-writer-wins — sim threads are host CPU threads, variance is well
+    // below benchmark noise.
+    if (kernel_args_.device_wall_data_base != 0) {
+        *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = 0;
+    }
+    const auto sim_t0 = std::chrono::steady_clock::now();
+
     for (int i = 0; i < over_launch; i++) {
-        aicpu_threads.push_back(create_thread([this, &runtime, launch_aicpu_num, over_launch, &aicpu_rc]() {
+        aicpu_threads.push_back(create_thread([this, &runtime, launch_aicpu_num, over_launch, &aicpu_rc, sim_t0]() {
             if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
                 return;
             }
@@ -587,6 +612,11 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
             if (rc != 0) {
                 int expected = 0;
                 aicpu_rc.compare_exchange_strong(expected, rc, std::memory_order_acq_rel);
+            }
+            if (kernel_args_.device_wall_data_base != 0) {
+                const auto t1 = std::chrono::steady_clock::now();
+                *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) =
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - sim_t0).count());
             }
         }));
     }
@@ -614,6 +644,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         t.join();
     }
     LOG_INFO_V0("All threads completed");
+
+    // Snapshot the device_wall buffer into device_wall_ns_. Sim's "device
+    // memory" is host memory, so this is a single dereference — no DMA.
+    // Mirrors the post-sync rtMemcpy D2H that the onboard DeviceRunner does.
+    device_wall_ns_ = 0;
+    if (device_wall_dev_ptr_ != nullptr) {
+        device_wall_ns_ = *static_cast<uint64_t *>(device_wall_dev_ptr_);
+    }
 
     int runtime_rc = aicpu_rc.load(std::memory_order_acquire);
     if (runtime_rc != 0) {
@@ -951,10 +989,20 @@ int DeviceRunner::finalize() {
     // Close executor .so files (typically already closed by run(), this is a safety net)
     unload_executor_binaries();
 
+    // Release per-Worker pooled GM heap / SM. Must precede mem_alloc_.finalize()
+    // so the pool frees through the still-live allocator, not after it.
+    gm_heap_pool_.release();
+    gm_sm_pool_.release();
+
     // Free all remaining allocations
     mem_alloc_.finalize();
     clear_cpu_sim_shared_storage();
 
+    // Free the 8-byte device_wall buffer (allocated lazily in run()).
+    if (device_wall_dev_ptr_ != nullptr) {
+        free_tensor(device_wall_dev_ptr_);
+        device_wall_dev_ptr_ = nullptr;
+    }
     device_id_ = -1;
     worker_count_ = 0;
     last_runtime_ = nullptr;
@@ -1057,18 +1105,17 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
 // =============================================================================
 
 int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->alloc(size);
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
     };
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
     };
 
     // Simulation: dev pointer is directly host-accessible, no register pass-through.
-    int rc =
-        l2_perf_collector_.initialize(num_aicore, device_id, alloc_cb, nullptr, free_cb, &mem_alloc_, output_prefix_);
+    int rc = l2_perf_collector_.initialize(
+        num_aicore, device_id, l2_perf_level_, alloc_cb, nullptr, free_cb, output_prefix_
+    );
     if (rc != 0) {
         return rc;
     }
@@ -1082,18 +1129,14 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.sche_cpu_num;
 
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->alloc(size);
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
     };
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, alloc_cb, nullptr, free_cb, &mem_alloc_, output_prefix_
-    );
+    int rc = dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, nullptr, free_cb, output_prefix_);
     if (rc != 0) {
         return rc;
     }
@@ -1105,17 +1148,14 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
 int DeviceRunner::init_pmu(
     int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int /*device_id*/
 ) {
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->alloc(size);
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
     };
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
     };
 
-    int rc =
-        pmu_collector_.init(num_cores, num_threads, csv_path, event_type, alloc_cb, nullptr, free_cb, &mem_alloc_, -1);
+    int rc = pmu_collector_.init(num_cores, num_threads, csv_path, event_type, alloc_cb, nullptr, free_cb, -1);
     if (rc != 0) {
         return rc;
     }
@@ -1125,18 +1165,16 @@ int DeviceRunner::init_pmu(
 }
 
 int DeviceRunner::init_dep_gen(int num_threads, int /*device_id*/) {
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->alloc(size);
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
     };
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
     };
 
     // Sim shares an address space with the AICPU thread, so register_cb is
     // not needed (mirrors PMU's nullptr in sim).
-    int rc = dep_gen_collector_.init(num_threads, alloc_cb, nullptr, free_cb, &mem_alloc_, -1);
+    int rc = dep_gen_collector_.init(num_threads, alloc_cb, nullptr, free_cb, -1);
     if (rc != 0) {
         return rc;
     }
@@ -1148,21 +1186,20 @@ int DeviceRunner::init_dep_gen(int num_threads, int /*device_id*/) {
 void DeviceRunner::finalize_collectors() {
     // Free through MemoryAllocator so finalize() can audit. Sim shares an
     // address space with the AICPU thread, so no host unregister is needed.
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
     };
 
     if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.finalize(nullptr, free_cb, &mem_alloc_);
+        l2_perf_collector_.finalize(nullptr, free_cb);
     }
     if (dump_collector_.is_initialized()) {
-        dump_collector_.finalize(nullptr, free_cb, &mem_alloc_);
+        dump_collector_.finalize(nullptr, free_cb);
     }
     if (pmu_collector_.is_initialized()) {
-        pmu_collector_.finalize(nullptr, free_cb, &mem_alloc_);
+        pmu_collector_.finalize(nullptr, free_cb);
     }
     if (dep_gen_collector_.is_initialized()) {
-        dep_gen_collector_.finalize(nullptr, free_cb, &mem_alloc_);
+        dep_gen_collector_.finalize(nullptr, free_cb);
     }
 }
