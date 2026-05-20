@@ -528,7 +528,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
-                l2_perf_aicpu_set_orch_thread_idx(thread_idx);
+                l2_perf_aicpu_set_orch_thread_idx(my_thread_idx_);
             }
 #endif
 
@@ -594,7 +594,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
             );
             LOG_INFO_V9(
-                "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus", thread_idx,
+                "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus", my_thread_idx_,
                 cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
                 cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle)
             );
@@ -647,7 +647,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Signal completion to the orchestrator state machine
             rt_orchestration_done(rt);
 
-            sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);
+            sched_ctx_.on_orchestration_done(runtime, rt, my_thread_idx_, total_tasks);
         }
 #if PTO2_PROFILING
         uint64_t orch_end_ts = get_sys_cnt_aicpu();

@@ -190,6 +190,11 @@ public:
     // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
     // Controlled via PTO2_ORCH_TO_SCHED environment variable.
     bool orch_to_sched;
+    
+    // Timing parameters (for precise performance estimation)
+    bool is_timing_enabled;
+    int warmup_iteration_count;
+    int timing_iteration_count;
 
 private:
     // Kernel binary tracking for cleanup
@@ -214,12 +219,6 @@ private:
     bool register_new_callable_id_;
     char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
     char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
-
-    // Timing parameters (for precise performance estimation)
-    bool is_timing_enabled;
-    int warmup_iteration_count;
-    int timing_iteration_count;
-
 public:
     /**
      * Constructor - zero-initialize all arrays
