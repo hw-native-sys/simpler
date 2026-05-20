@@ -863,6 +863,52 @@ int32_t SchedulerContext::init(
     return 0;
 }
 
+void SchedulerContext::reset()
+{
+    // Reset all per-core execution state
+    for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
+        core_exec_states_[i] = {};
+        core_exec_states_[i].running_reg_task_id = AICPU_TASK_INVALID;
+        core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
+    }
+
+    // Clear per-core dispatch payloads
+    memset(payload_per_core_, 0, sizeof(payload_per_core_));
+    memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_));
+
+    // Reset sync-start drain coordination — a previous run that aborted mid-drain
+    // would otherwise leave dirty pending/elected/ack state for the next reuse.
+    drain_state_.sync_start_pending.store(0, std::memory_order_release);
+    drain_state_.drain_worker_elected.store(0, std::memory_order_release);
+    drain_state_.drain_ack_mask.store(0, std::memory_order_release);
+    drain_state_.pending_task = nullptr;
+
+    // Reset task counters and orchestrator state
+    completed_tasks_.store(0, std::memory_order_release);
+    total_tasks_ = 0;
+    orchestrator_done_ = false;
+    pto2_init_done_.store(false, std::memory_order_release);
+    pto2_init_complete_.store(false, std::memory_order_release);
+
+    // Reset core transition state
+    transition_requested_.store(false, std::memory_order_release);
+    wait_reassign_.store(0, std::memory_order_release);
+    reassigned_.store(false, std::memory_order_release);
+    completed_.store(false, std::memory_order_release);
+
+    // Reset core discovery and assignment state
+    aic_count_ = 0;
+    aiv_count_ = 0;
+    cores_total_num_ = 0;
+    thread_num_ = 0;
+    sched_thread_num_ = 0;
+    orch_to_sched_ = false;
+    active_sched_threads_ = 0;
+    for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
+        core_trackers_[t] = CoreTracker{};
+    }
+}
+
 void SchedulerContext::deinit() {
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {

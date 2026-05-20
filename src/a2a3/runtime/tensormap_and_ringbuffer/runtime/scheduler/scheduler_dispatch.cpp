@@ -314,8 +314,6 @@ void SchedulerContext::dispatch_shape(
 // =============================================================================
 
 int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
-    LOG_INFO_V0("Thread %d: At resolve_and_dispatch", thread_idx);
-
     always_assert(sched_ != nullptr);
     CoreTracker &tracker = core_trackers_[thread_idx];
     LOG_INFO_V0("Thread %d: resolve_and_dispatch entry", thread_idx);

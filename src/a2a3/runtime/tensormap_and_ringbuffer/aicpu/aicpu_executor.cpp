@@ -145,8 +145,10 @@ struct AicpuExecutor {
     // ===== Methods =====
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime);
+    int32_t performTimingRuns(Runtime *runtime);
     void deinit(Runtime *runtime);
     int32_t getThreadId() { return thread_idx_accumulator.fetch_add(1); }
+    void resetSchedulerContext() { sched_ctx_.reset(); }
 
     // Barrier function to synchronize threads
     inline void barrier()
@@ -769,6 +771,54 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     LOG_INFO_V0("DeInit: AicpuExecutor reset complete");
 }
 
+int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
+{
+    const auto warmupIterationCount = runtime->get_warmup_iteration_count(); 
+    const auto timingIterationCount = runtime->get_timing_iteration_count();
+
+    // Return code for running the kernel. It must be zero (no error) for all runs
+    int32_t rc = 0;
+
+    // First, perform warmup to disregard any cold cache effects and thread initialization times
+    for (int32_t i = 0; i < warmupIterationCount; i++)
+    {
+        barrier();
+        uint64_t t0_ts = get_sys_cnt_aicpu();
+        rc |= run(runtime);
+        barrier();
+        uint64_t t1_ts = get_sys_cnt_aicpu();
+        LOG_INFO_V9("Thread %d: Warmup %d/%d Time: %luns", my_thread_idx_, i, warmupIterationCount, t1_ts - t0_ts);
+
+        // Waiting for threads to come back for after-timing.
+        // deinit(runtime);
+        // init(runtime);
+    } 
+
+    // Second, perform timed runs (the ones that count)
+    for (int32_t i = 0; i < timingIterationCount; i++)
+    {
+        // Waiting for threads to arrive for before-timing.
+        barrier();
+        uint64_t t0_ts = get_sys_cnt_aicpu();
+        rc |= run(runtime);
+        barrier();
+        uint64_t t1_ts = get_sys_cnt_aicpu();
+        LOG_INFO_V9("Thread %d: Timing %d/%d time: %luns", my_thread_idx_, i, timingIterationCount, t1_ts - t0_ts);
+
+        // Waiting for threads to come back for after-timing.
+        // deinit(runtime);
+        // init(runtime);
+    }   
+
+    // A barier to make sure all threads agree at this point before running the actual run
+    barrier();
+
+    if (rc != 0) LOG_ERROR("Thread %d - Timed runs failed with rc=%d", my_thread_idx_, rc);
+
+    // Return code
+    return rc;
+}
+
 // ===== Public Entry Point =====
 
 /**
@@ -803,31 +853,11 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         }
     }
 
-    // Return code for running the kernel. It must be zero (no error) for all runs
+    // Return code. Must be zero for all runs
     int32_t rc = 0;
 
     // Performing timing evaluation, exclusively for performance evaluation:
-    const auto isTimingEnabled = runtime->get_timing_enabled(); 
-    if (isTimingEnabled == true)
-    {
-        const auto warmupIterationCount = runtime->get_warmup_iteration_count(); 
-        const auto timingIterationCount = runtime->get_timing_iteration_count();
-
-        // First, perform warmup to disregard any cold cache effects and thread initialization times
-        for (int32_t i = 0; i < warmupIterationCount; i++) rc |= g_aicpu_executor.run(runtime);
-
-        // Second, perform timed runs (the ones that count)
-        for (int32_t i = 0; i < timingIterationCount; i++)
-        {
-            // Waiting for threads to arrive for before-timing.
-            g_aicpu_executor.barrier();
-
-            rc |= g_aicpu_executor.run(runtime);
-
-            // Waiting for threads to come back for after-timing.
-            g_aicpu_executor.barrier();
-        }   
-    }
+    if (runtime->get_timing_enabled() == true) rc |= g_aicpu_executor.performTimingRuns(runtime);
 
     // Perform actual kernel run
     rc |= g_aicpu_executor.run(runtime);
