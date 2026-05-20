@@ -256,6 +256,7 @@ public:
     void set_active_callable_id(int32_t callable_id, bool is_new);
     int32_t get_active_callable_id() const;
     bool register_new_callable_id() const;
+    void notify_callable_id_registered();
     void set_device_orch_func_name(const char *name);
     const char *get_device_orch_func_name() const;
     void set_device_orch_config_name(const char *name);

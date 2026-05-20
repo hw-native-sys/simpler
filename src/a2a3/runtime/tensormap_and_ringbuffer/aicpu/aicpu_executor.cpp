@@ -253,10 +253,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             DeviceOrchestrationBindRuntimeFunc *p_bind = &orch_so_table_[callable_id].bind;
             DeviceOrchestrationConfigFunc *p_config_func = &orch_so_table_[callable_id].config_func;
             const bool reload_so = runtime->register_new_callable_id();
-            const bool so_in_use = orch_so_table_[callable_id].in_use;
 
-            if (reload_so && so_in_use == false) {
+            if (reload_so) {
                 LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", my_thread_idx_, callable_id);
+                runtime->notify_callable_id_registered();
+                
                 if (*p_handle != nullptr) {
                     dlclose(*p_handle);
                     *p_handle = nullptr;
@@ -394,7 +395,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 *p_bind = bind_runtime_func;
                 *p_config_func = config_func;
                 snprintf(p_path, 256, "%s", so_path);
-                orch_so_table_[callable_id].in_use = true;
             } else {
                 LOG_INFO_V0(
                     "Thread %d: Reusing cached orch SO handle=%p (callable_id=%d)", my_thread_idx_, *p_handle, callable_id
@@ -434,7 +434,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         *p_func = nullptr;
                         *p_bind = nullptr;
                         *p_config_func = nullptr;
-                        orch_so_table_[callable_id].in_use = false;
                         // Unblock scheduler threads before returning so they don't spin forever.
                         runtime_init_ready_.store(true, std::memory_order_release);
                         return -1;
