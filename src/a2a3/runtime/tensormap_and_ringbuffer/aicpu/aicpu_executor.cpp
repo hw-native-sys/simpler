@@ -154,10 +154,10 @@ struct AicpuExecutor {
     {
         // Two phase barrier (in_out), guarantees that all threads are retained in the rendezvous point, until all of them have arrived
        barrier_counter_in_.fetch_add(1);
-       while (barrier_counter_in_.load(std::memory_order_relaxed) % thread_num_ != 0);
+       while (barrier_counter_in_.load(std::memory_order_acquire) % thread_num_ != 0);
        
        barrier_counter_out_.fetch_add(1);
-       while (barrier_counter_out_.load(std::memory_order_relaxed) % thread_num_ != 0);
+       while (barrier_counter_out_.load(std::memory_order_acquire) % thread_num_ != 0);
     }
 
 
@@ -698,7 +698,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     // Check if this is the last thread to finish
     int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
-    if (prev_finished + 1 % thread_num_ == 0) {
+    if ((prev_finished + 1) % thread_num_ == 0) {
         finished_.store(true, std::memory_order_release);
         // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
         // always tear them down here, but we keep the per-cid orch SO entries
@@ -777,8 +777,10 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
         LOG_INFO_V9("Thread %d: Warmup %d/%d Time: %luns", my_thread_idx_, i, warmupIterationCount, t1_ts - t0_ts);
 
         // Resetting execution back to start
-        deinit(runtime);
-        init(runtime);
+        if (my_thread_idx_ == 0) {
+            deinit(runtime);
+            init(runtime);
+        }
     } 
 
     // Second, perform timed runs (the ones that count)
@@ -793,8 +795,10 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
         LOG_INFO_V9("Thread %d: Timing %d/%d time: %luns", my_thread_idx_, i, timingIterationCount, t1_ts - t0_ts);
 
         // Resetting execution back to start
-        deinit(runtime);
-        init(runtime);
+        if (my_thread_idx_ == 0) {
+            deinit(runtime);
+            init(runtime);
+        }
     }   
 
     if (rc != 0) LOG_ERROR("Thread %d - Timed runs failed with rc=%d", my_thread_idx_, rc);

@@ -277,7 +277,7 @@ extern "C" int bind_prepared_to_runtime_impl(
                 runtime->timing_iteration_count = RUNTIME_DEFAULT_TIMING_ITERATION_COUNT;
             }
         }
-        LOG_INFO_V0("Warmup iteration count: %d", runtime->timing_iteration_count);
+        LOG_INFO_V0("Timing iteration count: %d", runtime->timing_iteration_count);
     }
 
     // Read ready queue shard count from environment for AICPU scheduler

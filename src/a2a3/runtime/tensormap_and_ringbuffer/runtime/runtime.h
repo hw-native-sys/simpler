@@ -176,11 +176,6 @@ public:
     int sche_cpu_num;        // Number of AICPU threads for scheduling
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
-    // Timing parameters (for precise performance estimation)
-    bool is_timing_enabled;
-    int warmup_iteration_count;
-    int timing_iteration_count;
-
     // Ring buffer size overrides (0 = use compile-time defaults)
     uint64_t task_window_size;
     uint64_t heap_size;
@@ -219,6 +214,11 @@ private:
     bool register_new_callable_id_;
     char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
     char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
+
+    // Timing parameters (for precise performance estimation)
+    bool is_timing_enabled;
+    int warmup_iteration_count;
+    int timing_iteration_count;
 
 public:
     /**
