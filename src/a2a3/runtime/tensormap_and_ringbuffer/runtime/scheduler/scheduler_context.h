@@ -62,9 +62,6 @@ public:
     int32_t
     init(Runtime *runtime, int32_t thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base);
 
-    // Resets all scheduling progress to before execution
-    void reset();
-
     // Reset all SchedulerContext-owned state to its post-construction defaults.
     // Called by AicpuExecutor::deinit() during per-run teardown.
     void deinit();

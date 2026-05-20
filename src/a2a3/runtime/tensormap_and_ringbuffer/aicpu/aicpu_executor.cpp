@@ -148,7 +148,6 @@ struct AicpuExecutor {
     int32_t performTimingRuns(Runtime *runtime);
     void deinit(Runtime *runtime);
     int32_t getThreadId() { return thread_idx_accumulator.fetch_add(1); }
-    void resetSchedulerContext() { sched_ctx_.reset(); }
 
     // Barrier function to synchronize threads
     inline void barrier()
@@ -789,9 +788,9 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
         uint64_t t1_ts = get_sys_cnt_aicpu();
         LOG_INFO_V9("Thread %d: Warmup %d/%d Time: %luns", my_thread_idx_, i, warmupIterationCount, t1_ts - t0_ts);
 
-        // Waiting for threads to come back for after-timing.
-        // deinit(runtime);
-        // init(runtime);
+        // Resetting execution back to start
+        deinit(runtime);
+        init(runtime);
     } 
 
     // Second, perform timed runs (the ones that count)
@@ -805,13 +804,10 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
         uint64_t t1_ts = get_sys_cnt_aicpu();
         LOG_INFO_V9("Thread %d: Timing %d/%d time: %luns", my_thread_idx_, i, timingIterationCount, t1_ts - t0_ts);
 
-        // Waiting for threads to come back for after-timing.
-        // deinit(runtime);
-        // init(runtime);
+        // Resetting execution back to start
+        deinit(runtime);
+        init(runtime);
     }   
-
-    // A barier to make sure all threads agree at this point before running the actual run
-    barrier();
 
     if (rc != 0) LOG_ERROR("Thread %d - Timed runs failed with rc=%d", my_thread_idx_, rc);
 
