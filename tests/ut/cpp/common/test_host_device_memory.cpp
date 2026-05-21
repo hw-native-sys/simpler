@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include "host_device_memory.h"
 
@@ -39,6 +40,14 @@ TEST(HostDeviceMemoryTest, RejectsInvalidConfig) {
 
     auto no_signals = cfg(64, 0);
     EXPECT_EQ(host_device_memory_required_bytes(&no_signals), 0u);
+}
+
+TEST(HostDeviceMemoryTest, RejectsOverflowingRequiredBytes) {
+    auto too_large_data = cfg(std::numeric_limits<uint64_t>::max(), 1);
+    EXPECT_EQ(host_device_memory_required_bytes(&too_large_data), 0u);
+
+    auto align_overflow = cfg(static_cast<uint64_t>(std::numeric_limits<size_t>::max() - 31U), 1);
+    EXPECT_EQ(host_device_memory_required_bytes(&align_overflow), 0u);
 }
 
 TEST(HostDeviceMemoryTest, InfoReturnsPointersAndShape) {

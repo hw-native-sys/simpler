@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include <chrono>
+#include <limits>
 #include <new>
 #include <thread>
 
@@ -22,7 +23,25 @@ namespace {
 
 bool is_power_of_two(uint32_t v) { return v != 0 && (v & (v - 1U)) == 0; }
 
-size_t align_up(size_t v, size_t alignment) { return (v + alignment - 1U) & ~(alignment - 1U); }
+bool checked_add_size(size_t a, size_t b, size_t *out) {
+    if (out == nullptr || a > std::numeric_limits<size_t>::max() - b) return false;
+    *out = a + b;
+    return true;
+}
+
+bool checked_mul_size(size_t a, size_t b, size_t *out) {
+    if (out == nullptr || (a != 0 && b > std::numeric_limits<size_t>::max() / a)) return false;
+    *out = a * b;
+    return true;
+}
+
+bool checked_align_up(size_t v, size_t alignment, size_t *out) {
+    if (alignment == 0 || (alignment & (alignment - 1U)) != 0) return false;
+    size_t biased = 0;
+    if (!checked_add_size(v, alignment - 1U, &biased)) return false;
+    *out = biased & ~(alignment - 1U);
+    return true;
+}
 
 bool valid_cfg(const HostDeviceChannelConfig *cfg) {
     return cfg != nullptr && cfg->lane_count_cpu_to_l2 > 0 && cfg->lane_count_l2_to_cpu > 0 &&
@@ -30,11 +49,35 @@ bool valid_cfg(const HostDeviceChannelConfig *cfg) {
            cfg->max_message_bytes <= HDCH_MAX_INLINE_BYTES;
 }
 
+bool compute_layout(const HostDeviceChannelConfig *cfg, size_t *total_bytes) {
+    if (!valid_cfg(cfg) || total_bytes == nullptr) return false;
+
+    size_t desc_bytes = 0;
+    size_t lane_bytes = 0;
+    size_t total_lanes = 0;
+    size_t lanes_bytes = 0;
+    size_t raw_total = 0;
+    size_t required = 0;
+    if (!checked_mul_size(static_cast<size_t>(cfg->lane_depth), sizeof(HostDeviceDesc), &desc_bytes)) return false;
+    if (!checked_add_size(sizeof(HostDeviceLaneHeader), desc_bytes, &lane_bytes)) return false;
+    if (!checked_add_size(
+            static_cast<size_t>(cfg->lane_count_cpu_to_l2), static_cast<size_t>(cfg->lane_count_l2_to_cpu), &total_lanes
+        )) {
+        return false;
+    }
+    if (!checked_mul_size(lane_bytes, total_lanes, &lanes_bytes)) return false;
+    if (!checked_add_size(sizeof(HostDeviceChannelHeader), lanes_bytes, &raw_total)) return false;
+    if (!checked_align_up(raw_total, 64, &required)) return false;
+
+    *total_bytes = required;
+    return true;
+}
+
 HostDeviceLaneHeader *first_lane(HostDeviceChannelHeader *hdr) {
     return reinterpret_cast<HostDeviceLaneHeader *>(reinterpret_cast<uint8_t *>(hdr) + sizeof(HostDeviceChannelHeader));
 }
 
-HostDeviceLaneHeader *lane_at(HostDeviceLaneHeader *base, uint32_t lane_depth, uint32_t index) {
+HostDeviceLaneHeader *lane_at(HostDeviceLaneHeader *base, uint32_t lane_depth, size_t index) {
     size_t stride = sizeof(HostDeviceLaneHeader) + static_cast<size_t>(lane_depth) * sizeof(HostDeviceDesc);
     return reinterpret_cast<HostDeviceLaneHeader *>(reinterpret_cast<uint8_t *>(base) + stride * index);
 }
@@ -139,15 +182,15 @@ int recv_one(
 }  // namespace
 
 size_t host_device_channel_required_bytes(const HostDeviceChannelConfig *cfg) {
-    if (!valid_cfg(cfg)) return 0;
-    size_t lane_bytes = sizeof(HostDeviceLaneHeader) + static_cast<size_t>(cfg->lane_depth) * sizeof(HostDeviceDesc);
-    size_t total_lanes = static_cast<size_t>(cfg->lane_count_cpu_to_l2) + cfg->lane_count_l2_to_cpu;
-    return align_up(sizeof(HostDeviceChannelHeader) + lane_bytes * total_lanes, 64);
+    size_t total_bytes = 0;
+    if (!compute_layout(cfg, &total_bytes)) return 0;
+    return total_bytes;
 }
 
 int host_device_channel_init_region(void *host_base, size_t bytes, const HostDeviceChannelConfig *cfg) {
-    if (host_base == nullptr || !valid_cfg(cfg)) return HDCH_ERR_INVALID;
-    size_t required = host_device_channel_required_bytes(cfg);
+    if (host_base == nullptr) return HDCH_ERR_INVALID;
+    size_t required = 0;
+    if (!compute_layout(cfg, &required)) return HDCH_ERR_INVALID;
     if (required == 0 || bytes < required) return HDCH_ERR_INVALID;
 
     memset(host_base, 0, required);
@@ -162,8 +205,8 @@ int host_device_channel_init_region(void *host_base, size_t bytes, const HostDev
     hdr->control_bytes = required;
 
     HostDeviceLaneHeader *lane = first_lane(hdr);
-    uint32_t lane_count = cfg->lane_count_cpu_to_l2 + cfg->lane_count_l2_to_cpu;
-    for (uint32_t i = 0; i < lane_count; ++i) {
+    size_t lane_count = static_cast<size_t>(cfg->lane_count_cpu_to_l2) + cfg->lane_count_l2_to_cpu;
+    for (size_t i = 0; i < lane_count; ++i) {
         HostDeviceLaneHeader *cur = lane_at(lane, cfg->lane_depth, i);
         cur->depth = cfg->lane_depth;
         cur->depth_mask = cfg->lane_depth - 1U;
@@ -199,8 +242,7 @@ void host_device_channel_destroy(HostDeviceChannel *ch) {
 }
 
 int host_device_channel_send_cpu(
-    HostDeviceChannel *ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id,
-    uint32_t timeout_us
+    HostDeviceChannel *ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
 ) {
     if (ch == nullptr || ch->host_base == nullptr) return HDCH_ERR_INVALID;
     auto *hdr = reinterpret_cast<HostDeviceChannelHeader *>(ch->host_base);
@@ -225,8 +267,7 @@ int host_device_channel_recv_cpu(
 }
 
 int host_device_channel_send_l2_for_test(
-    HostDeviceChannel *ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id,
-    uint32_t timeout_us
+    HostDeviceChannel *ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
 ) {
     if (ch == nullptr || ch->host_base == nullptr) return HDCH_ERR_INVALID;
     auto *hdr = reinterpret_cast<HostDeviceChannelHeader *>(ch->host_base);

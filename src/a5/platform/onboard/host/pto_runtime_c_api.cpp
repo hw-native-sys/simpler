@@ -21,6 +21,7 @@
 #include "prepare_callable_common.h"
 #include "task_args.h"
 
+#include <cerrno>
 #include <pthread.h>
 
 #include <chrono>
@@ -187,6 +188,7 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg) {
     (void)ctx;
     (void)cfg;
+    errno = ENOTSUP;
     return NULL;
 }
 
@@ -224,11 +226,10 @@ int host_device_recv_ctx(
     (void)timeout_us;
     return HDCH_ERR_BACKEND;
 }
-
-
 HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, const HostDeviceMemoryConfig *cfg) {
     (void)ctx;
     (void)cfg;
+    errno = ENOTSUP;
     return NULL;
 }
 

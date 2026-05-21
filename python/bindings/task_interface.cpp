@@ -870,7 +870,7 @@ NB_MODULE(_task_interface, m) {
                 HostDeviceMemoryInfo info = self.shared_memory_info(mem);
                 return nb::make_tuple(info.host_ptr, info.device_ptr, info.data_bytes, info.signal_count, info.flags);
             },
-            nb::arg("memory")
+            nb::arg("memory"), "Return shared-memory metadata. host_ptr is a current-process address."
         )
         .def(
             "shared_memory_read",

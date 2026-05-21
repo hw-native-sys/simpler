@@ -47,8 +47,8 @@ else()
     set(GTEST_INCLUDE_DIRS /usr/local/include)
 endif()
 
-find_library(GTEST_LIB      gtest      PATHS ${GTEST_SEARCH_PATHS})
-find_library(GTEST_MAIN_LIB gtest_main PATHS ${GTEST_SEARCH_PATHS})
+find_library(GTEST_LIB      gtest      PATHS ${GTEST_SEARCH_PATHS} NO_DEFAULT_PATH)
+find_library(GTEST_MAIN_LIB gtest_main PATHS ${GTEST_SEARCH_PATHS} NO_DEFAULT_PATH)
 
 if(NOT GTEST_LIB OR NOT GTEST_MAIN_LIB)
     message(STATUS "System GoogleTest not found — fetching via FetchContent")
@@ -133,6 +133,8 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/scheduler.cpp
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
+    ${WORKER_SRC_DIR}/host_device_channel.cpp
+    ${WORKER_SRC_DIR}/host_device_memory.cpp
 )
 target_include_directories(hierarchical_objs PUBLIC
     ${HIERARCHICAL_SRC_DIR}
@@ -164,6 +166,7 @@ function(add_a2a3_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     )
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
@@ -236,7 +239,7 @@ function(add_common_worker_test name src)
         ${GTEST_INCLUDE_DIRS}
         ${CMAKE_SOURCE_DIR}/../../../src/common/worker
     )
-    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=1)
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}

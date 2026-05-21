@@ -11,6 +11,8 @@
 
 #include "chip_worker.h"
 
+#include <cerrno>
+#include <cstring>
 #include <dlfcn.h>
 
 #include <fstream>
@@ -51,6 +53,23 @@ std::vector<uint8_t> read_binary_file(const std::string &path) {
         throw std::runtime_error("Failed to read binary file: " + path);
     }
     return buf;
+}
+
+std::string errno_suffix(int err) {
+    if (err == 0) return "";
+    return std::string(": ") + std::strerror(err) + " (errno=" + std::to_string(err) + ")";
+}
+
+std::string channel_cfg_summary(const HostDeviceChannelConfig &cfg) {
+    return "cpu_to_l2_lanes=" + std::to_string(cfg.lane_count_cpu_to_l2) +
+           ", l2_to_cpu_lanes=" + std::to_string(cfg.lane_count_l2_to_cpu) +
+           ", lane_depth=" + std::to_string(cfg.lane_depth) +
+           ", max_message_bytes=" + std::to_string(cfg.max_message_bytes) + ", flags=" + std::to_string(cfg.flags);
+}
+
+std::string memory_cfg_summary(const HostDeviceMemoryConfig &cfg) {
+    return "data_bytes=" + std::to_string(cfg.data_bytes) + ", signal_count=" + std::to_string(cfg.signal_count) +
+           ", flags=" + std::to_string(cfg.flags);
 }
 
 }  // namespace
@@ -539,9 +558,18 @@ uint64_t ChipWorker::open_channel(const HostDeviceChannelConfig &cfg) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    size_t required = host_device_channel_required_bytes(&cfg);
+    if (required == 0) {
+        throw std::runtime_error("open_channel invalid config or size overflow: " + channel_cfg_summary(cfg));
+    }
+    errno = 0;
     void *ch = open_host_device_channel_ctx_fn_(device_ctx_, &cfg);
     if (ch == nullptr) {
-        throw std::runtime_error("open_channel failed");
+        int err = errno;
+        throw std::runtime_error(
+            "open_channel failed" + errno_suffix(err) + "; required_bytes=" + std::to_string(required) + "; " +
+            channel_cfg_summary(cfg)
+        );
     }
     return reinterpret_cast<uint64_t>(ch);
 }
@@ -623,15 +651,22 @@ std::vector<uint8_t> ChipWorker::channel_recv_l2_for_test(
     if (out_correlation_id != nullptr) *out_correlation_id = correlation_id;
     return buf;
 }
-
-
 uint64_t ChipWorker::open_shared_memory(const HostDeviceMemoryConfig &cfg) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    size_t required = host_device_memory_required_bytes(&cfg);
+    if (required == 0) {
+        throw std::runtime_error("open_shared_memory invalid config or size overflow: " + memory_cfg_summary(cfg));
+    }
+    errno = 0;
     void *mem = open_host_device_memory_ctx_fn_(device_ctx_, &cfg);
     if (mem == nullptr) {
-        throw std::runtime_error("open_shared_memory failed");
+        int err = errno;
+        throw std::runtime_error(
+            "open_shared_memory failed" + errno_suffix(err) + "; required_bytes=" + std::to_string(required) + "; " +
+            memory_cfg_summary(cfg)
+        );
     }
     return reinterpret_cast<uint64_t>(mem);
 }

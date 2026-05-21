@@ -282,16 +282,29 @@ class Orchestrator:
         self._o.close_shared_memory(int(worker_id), int(memory))
 
     def shared_memory_info(self, worker_id: int, memory: int) -> tuple[int, int, int, int, int]:
-        """Return ``(host_ptr, device_ptr, data_bytes, signal_count, flags)``."""
+        """Return ``(host_ptr, device_ptr, data_bytes, signal_count, flags)``.
+
+        ``host_ptr`` is always ``0`` because the L3 parent has no directly
+        dereferenceable host mapping for chip-child shared memory.
+        """
         host_ptr, device_ptr, data_bytes, signal_count, flags = self._o.shared_memory_info(int(worker_id), int(memory))
         return int(host_ptr), int(device_ptr), int(data_bytes), int(signal_count), int(flags)
 
     def shared_memory_read(self, worker_id: int, memory: int, offset: int, nbytes: int) -> bytes:
-        """Read bytes from a shared-memory data region."""
+        """Read bytes from a shared-memory data region.
+
+        L3 access chunks large reads through mailbox RPC; it is not a direct
+        parent-process mapping or streaming data plane. The returned
+        ``bytes`` materializes the full requested range.
+        """
         return bytes(self._o.shared_memory_read(int(worker_id), int(memory), int(offset), int(nbytes)))
 
     def shared_memory_write(self, worker_id: int, memory: int, offset: int, data: bytes) -> None:
-        """Write bytes into a shared-memory data region."""
+        """Write bytes into a shared-memory data region.
+
+        L3 access chunks large writes through mailbox RPC; it is not a direct
+        parent-process mapping or streaming data plane.
+        """
         self._o.shared_memory_write(int(worker_id), int(memory), int(offset), bytes(data))
 
     def shared_memory_notify(self, worker_id: int, memory: int, signal_id: int, value: int) -> None:

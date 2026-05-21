@@ -155,7 +155,11 @@ HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, cons
 /** Close a memory region returned by open_host_device_memory_ctx. */
 int close_host_device_memory_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem);
 
-/** Return host/device data pointers and region metadata for a shared-memory region. */
+/** Return host/device data pointers and region metadata for a shared-memory region.
+ *
+ * host_ptr is valid only in the process that owns the host mapping. Hierarchical
+ * mailbox callers that do not own that mapping expose host_ptr as 0.
+ */
 int host_device_memory_info_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, HostDeviceMemoryInfo *info);
 
 /** Copy from shared-memory data region into host dst. */

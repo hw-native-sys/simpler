@@ -626,8 +626,8 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     cw.close_shared_memory(mem)
                 elif sub_cmd == _CTRL_SHARED_MEMORY_INFO:
                     mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    host_ptr, device_ptr, data_bytes, signal_count, flags = cw.shared_memory_info(mem)
-                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, host_ptr)
+                    _host_ptr, device_ptr, data_bytes, signal_count, flags = cw.shared_memory_info(mem)
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, 0)
                     struct.pack_into("Q", buf, _CTRL_OFF_ARG1, device_ptr)
                     struct.pack_into("Q", buf, _CTRL_OFF_ARG2, data_bytes)
                     struct.pack_into("Q", buf, _CTRL_OFF_ARG3, signal_count)
@@ -1876,45 +1876,97 @@ class Worker:
         self._chip_control(worker_id, _CTRL_CLOSE_SHARED_MEMORY, arg0=memory)
 
     def shared_memory_info(self, memory: int, worker_id: int = 0) -> tuple[int, int, int, int, int]:
-        """Return ``(host_ptr, device_ptr, data_bytes, signal_count, flags)``."""
+        """Return shared-memory metadata.
+
+        For L3 mailbox access, ``host_ptr`` is always ``0`` because the
+        parent process has no directly dereferenceable host mapping.
+        """
         if self.level == 2:
             assert self._chip_worker is not None
             return self._chip_worker.shared_memory_info(memory)
-        host_ptr, _payload, device_ptr, data_bytes, signal_count, flags = self._chip_control_payload(
+        _host_ptr, _payload, device_ptr, data_bytes, signal_count, flags = self._chip_control_payload(
             worker_id, _CTRL_SHARED_MEMORY_INFO, arg0=memory
         )
-        return int(host_ptr), int(device_ptr), int(data_bytes), int(signal_count), int(flags)
+        return 0, int(device_ptr), int(data_bytes), int(signal_count), int(flags)
 
     def shared_memory_read(self, memory: int, offset: int, nbytes: int, worker_id: int = 0) -> bytes:
-        """Read bytes from a shared-memory data region."""
+        """Read bytes from a shared-memory data region.
+
+        L3 mailbox access chunks large reads internally; it is still an RPC
+        copy helper, not a parent-process direct mapping or streaming data
+        plane. The returned ``bytes`` materializes the full requested range.
+        """
         if self.level == 2:
             assert self._chip_worker is not None
             return self._chip_worker.shared_memory_read(memory, offset, nbytes)
-        out_nbytes, payload, _arg1, _arg2, _arg3, _arg4 = self._chip_control_payload(
-            worker_id,
-            _CTRL_SHARED_MEMORY_READ,
-            arg0=memory,
-            arg1=offset,
-            arg2=nbytes,
-            recv_capacity=nbytes,
-        )
-        return payload[:out_nbytes]
+        if nbytes < 0:
+            raise ValueError("shared_memory_read: nbytes must be non-negative")
+        if offset < 0:
+            raise ValueError("shared_memory_read: offset must be non-negative")
+        _host_ptr, _device_ptr, data_bytes, _signal_count, _flags = self.shared_memory_info(memory, worker_id=worker_id)
+        if offset > data_bytes or nbytes > data_bytes - offset:
+            raise ValueError(
+                f"shared_memory_read out of range: offset={offset}, nbytes={nbytes}, data_bytes={data_bytes}"
+            )
+        out = bytearray()
+        remaining = int(nbytes)
+        current_offset = int(offset)
+        while remaining > 0 or (nbytes == 0 and not out):
+            chunk = min(remaining, _CTRL_PAYLOAD_CAPACITY)
+            out_nbytes, payload, _arg1, _arg2, _arg3, _arg4 = self._chip_control_payload(
+                worker_id,
+                _CTRL_SHARED_MEMORY_READ,
+                arg0=memory,
+                arg1=current_offset,
+                arg2=chunk,
+                recv_capacity=chunk,
+            )
+            if int(out_nbytes) != chunk:
+                raise RuntimeError(f"shared_memory_read short read: expected {chunk}, got {out_nbytes}")
+            if len(payload) < chunk:
+                raise RuntimeError(f"shared_memory_read short payload: expected {chunk}, got {len(payload)}")
+            out.extend(payload[:out_nbytes])
+            if nbytes == 0:
+                break
+            current_offset += chunk
+            remaining -= chunk
+        return bytes(out)
 
     def shared_memory_write(self, memory: int, offset: int, data: bytes, worker_id: int = 0) -> None:
-        """Write bytes into a shared-memory data region."""
+        """Write bytes into a shared-memory data region.
+
+        L3 mailbox access chunks large writes internally; it is still an RPC
+        copy helper, not a parent-process direct mapping.
+        """
         payload = bytes(data)
         if self.level == 2:
             assert self._chip_worker is not None
             self._chip_worker.shared_memory_write(memory, offset, payload)
             return
-        self._chip_control_payload(
-            worker_id,
-            _CTRL_SHARED_MEMORY_WRITE,
-            arg0=memory,
-            arg1=offset,
-            arg2=len(payload),
-            payload=payload,
-        )
+        if len(payload) == 0:
+            self._chip_control_payload(
+                worker_id,
+                _CTRL_SHARED_MEMORY_WRITE,
+                arg0=memory,
+                arg1=offset,
+                arg2=0,
+                payload=b"",
+            )
+            return
+        current_offset = int(offset)
+        written = 0
+        while written < len(payload):
+            chunk = payload[written : written + _CTRL_PAYLOAD_CAPACITY]
+            self._chip_control_payload(
+                worker_id,
+                _CTRL_SHARED_MEMORY_WRITE,
+                arg0=memory,
+                arg1=current_offset,
+                arg2=len(chunk),
+                payload=chunk,
+            )
+            current_offset += len(chunk)
+            written += len(chunk)
 
     def shared_memory_notify(self, memory: int, signal_id: int, value: int, worker_id: int = 0) -> None:
         """Publish a software signal value for a shared-memory region."""

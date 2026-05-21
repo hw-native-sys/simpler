@@ -19,7 +19,13 @@ from multiprocessing.shared_memory import SharedMemory
 import pytest
 from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
 from simpler.task_interface import ChipCallable, DataType, TaskArgs, TensorArgType
-from simpler.worker import Worker
+from simpler.worker import (
+    _CTRL_PAYLOAD_CAPACITY,
+    _CTRL_SHARED_MEMORY_INFO,
+    _CTRL_SHARED_MEMORY_READ,
+    _CTRL_SHARED_MEMORY_WRITE,
+    Worker,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,6 +48,134 @@ def _read_counter(buf) -> int:
 def _increment_counter(buf) -> None:
     v = struct.unpack_from("i", buf, 0)[0]
     struct.pack_into("i", buf, 0, v + 1)
+
+
+# ---------------------------------------------------------------------------
+# Test: L3 shared-memory metadata
+# ---------------------------------------------------------------------------
+
+
+class TestSharedMemoryInfo:
+    def test_l3_shared_memory_info_hides_child_host_ptr(self, monkeypatch):
+        hw = Worker(level=3, device_ids=[0], num_sub_workers=0)
+
+        def fake_chip_control_payload(*args, **kwargs):
+            return 0x12345678, b"", 0xABCDEF00, 256, 3, 7
+
+        monkeypatch.setattr(hw, "_chip_control_payload", fake_chip_control_payload)
+
+        host_ptr, device_ptr, data_bytes, signal_count, flags = hw.shared_memory_info(0x42)
+
+        assert host_ptr == 0
+        assert device_ptr == 0xABCDEF00
+        assert data_bytes == 256
+        assert signal_count == 3
+        assert flags == 7
+
+    def test_l3_shared_memory_read_chunks_over_mailbox_payload(self, monkeypatch):
+        hw = Worker(level=3, device_ids=[0], num_sub_workers=0)
+        nbytes = _CTRL_PAYLOAD_CAPACITY * 2 + 17
+        offset = 11
+        payload_data = bytes((i % 251 for i in range(offset + nbytes)))
+        calls = []
+
+        def fake_chip_control_payload(
+            worker_id,
+            sub_cmd,
+            arg0=0,
+            arg1=0,
+            arg2=0,
+            arg3=0,
+            payload=b"",
+            recv_capacity=0,
+        ):
+            assert worker_id == 0
+            assert arg0 == 0x42
+            assert arg3 == 0
+            assert payload == b""
+            if sub_cmd == _CTRL_SHARED_MEMORY_INFO:
+                calls.append((arg1, arg2))
+                return 0, b"", 0xABCDEF00, len(payload_data), 2, 0
+            assert sub_cmd == _CTRL_SHARED_MEMORY_READ
+            assert 0 <= arg2 <= _CTRL_PAYLOAD_CAPACITY
+            assert recv_capacity == arg2
+            calls.append((arg1, arg2))
+            chunk = payload_data[arg1 : arg1 + arg2]
+            return len(chunk), chunk, 0, 0, 0, 0
+
+        monkeypatch.setattr(hw, "_chip_control_payload", fake_chip_control_payload)
+
+        assert hw.shared_memory_read(0x42, offset, nbytes) == payload_data[offset : offset + nbytes]
+
+        assert calls == [
+            (0, 0),
+            (11, _CTRL_PAYLOAD_CAPACITY),
+            (11 + _CTRL_PAYLOAD_CAPACITY, _CTRL_PAYLOAD_CAPACITY),
+            (11 + _CTRL_PAYLOAD_CAPACITY * 2, 17),
+        ]
+
+    def test_l3_shared_memory_read_rejects_out_of_range_before_chunk_read(self, monkeypatch):
+        hw = Worker(level=3, device_ids=[0], num_sub_workers=0)
+        calls = []
+
+        def fake_chip_control_payload(
+            worker_id,
+            sub_cmd,
+            arg0=0,
+            arg1=0,
+            arg2=0,
+            arg3=0,
+            payload=b"",
+            recv_capacity=0,
+        ):
+            calls.append(sub_cmd)
+            if sub_cmd == _CTRL_SHARED_MEMORY_INFO:
+                return 0, b"", 0xABCDEF00, 32, 2, 0
+            if sub_cmd == _CTRL_SHARED_MEMORY_READ:
+                return arg2, bytes(arg2), 0, 0, 0, 0
+            raise AssertionError(f"unexpected control command {sub_cmd}")
+
+        monkeypatch.setattr(hw, "_chip_control_payload", fake_chip_control_payload)
+
+        with pytest.raises(ValueError, match="shared_memory_read out of range"):
+            hw.shared_memory_read(0x42, 28, 8)
+
+        assert calls == [_CTRL_SHARED_MEMORY_INFO]
+
+    def test_l3_shared_memory_write_chunks_over_mailbox_payload(self, monkeypatch):
+        hw = Worker(level=3, device_ids=[0], num_sub_workers=0)
+        payload = bytes((i % 253 for i in range(_CTRL_PAYLOAD_CAPACITY * 2 + 19)))
+        calls = []
+
+        def fake_chip_control_payload(
+            worker_id,
+            sub_cmd,
+            arg0=0,
+            arg1=0,
+            arg2=0,
+            arg3=0,
+            payload=b"",
+            recv_capacity=0,
+        ):
+            assert worker_id == 0
+            assert sub_cmd == _CTRL_SHARED_MEMORY_WRITE
+            assert arg0 == 0x43
+            assert arg2 == len(payload)
+            assert arg3 == 0
+            assert recv_capacity == 0
+            assert len(payload) <= _CTRL_PAYLOAD_CAPACITY
+            calls.append((arg1, payload))
+            return 0, b"", 0, 0, 0, 0
+
+        monkeypatch.setattr(hw, "_chip_control_payload", fake_chip_control_payload)
+
+        hw.shared_memory_write(0x43, 23, payload)
+
+        assert calls == [
+            (23, payload[:_CTRL_PAYLOAD_CAPACITY]),
+            (23 + _CTRL_PAYLOAD_CAPACITY, payload[_CTRL_PAYLOAD_CAPACITY : _CTRL_PAYLOAD_CAPACITY * 2]),
+            (23 + _CTRL_PAYLOAD_CAPACITY * 2, payload[_CTRL_PAYLOAD_CAPACITY * 2 :]),
+        ]
 
 
 # ---------------------------------------------------------------------------

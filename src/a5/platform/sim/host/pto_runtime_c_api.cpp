@@ -21,6 +21,7 @@
 #include "prepare_callable_common.h"
 #include "task_args.h"
 
+#include <cerrno>
 #include <new>
 #include <cstdlib>
 #include <pthread.h>
@@ -183,12 +184,20 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg) {
     (void)ctx;
     size_t bytes = host_device_channel_required_bytes(cfg);
-    if (bytes == 0) return NULL;
+    if (bytes == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
     void *base = NULL;
-    if (posix_memalign(&base, 64, bytes) != 0) return NULL;
+    int rc = posix_memalign(&base, 64, bytes);
+    if (rc != 0) {
+        errno = rc;
+        return NULL;
+    }
     HostDeviceChannel *ch = host_device_channel_wrap(base, base, bytes, cfg, 1, free);
     if (ch == nullptr) {
         free(base);
+        errno = ENOMEM;
         return NULL;
     }
     return static_cast<HostDeviceChannelHandle>(ch);
@@ -219,17 +228,23 @@ int host_device_recv_ctx(
         static_cast<HostDeviceChannel *>(ch), dst, dst_capacity, out_nbytes, out_correlation_id, out_route, timeout_us
     );
 }
-
-
 HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, const HostDeviceMemoryConfig *cfg) {
     (void)ctx;
     size_t bytes = host_device_memory_required_bytes(cfg);
-    if (bytes == 0) return NULL;
+    if (bytes == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
     void *base = NULL;
-    if (posix_memalign(&base, 64, bytes) != 0) return NULL;
+    int rc = posix_memalign(&base, 64, bytes);
+    if (rc != 0) {
+        errno = rc;
+        return NULL;
+    }
     HostDeviceMemory *mem = host_device_memory_wrap(base, base, bytes, cfg, 1, free);
     if (mem == nullptr) {
         free(base);
+        errno = ENOMEM;
         return NULL;
     }
     return static_cast<HostDeviceMemoryHandle>(mem);

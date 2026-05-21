@@ -280,6 +280,8 @@ private:
     // region and holds `mailbox_mu_`; this helper signals the child,
     // spin-polls CONTROL_DONE, and throws on a non-zero child error code.
     void run_control_command(const char *op_name);
+    HostDeviceMemoryInfo control_shared_memory_info_locked(uint64_t mem);
+    void validate_shared_memory_read_range_locked(uint64_t mem, uint64_t offset, size_t nbytes);
 
     char *mbox() const { return static_cast<char *>(mailbox_); }
     MailboxState read_mailbox_state() const;

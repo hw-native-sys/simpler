@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include "host_device_channel.h"
 
@@ -39,6 +40,11 @@ TEST(HostDeviceChannelTest, RejectsInvalidConfig) {
 
     auto too_large = cfg(1, 1, 4, HDCH_MAX_INLINE_BYTES + 1);
     EXPECT_EQ(host_device_channel_required_bytes(&too_large), 0u);
+}
+
+TEST(HostDeviceChannelTest, RejectsOverflowingRequiredBytes) {
+    auto huge_layout = cfg(std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max(), 1U << 31U, 64);
+    EXPECT_EQ(host_device_channel_required_bytes(&huge_layout), 0u);
 }
 
 TEST(HostDeviceChannelTest, CpuToL2SendRecvRoundTrip) {

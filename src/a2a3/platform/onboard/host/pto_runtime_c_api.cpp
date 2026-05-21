@@ -21,6 +21,7 @@
 #include "prepare_callable_common.h"
 #include "task_args.h"
 
+#include <cerrno>
 #include <dlfcn.h>
 #include <pthread.h>
 
@@ -244,23 +245,34 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 }
 
 HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg) {
-    if (ctx == NULL) return NULL;
+    if (ctx == NULL) {
+        errno = EINVAL;
+        return NULL;
+    }
     size_t bytes = host_device_channel_required_bytes(cfg);
-    if (bytes == 0) return NULL;
+    if (bytes == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
     auto *runner = static_cast<DeviceRunner *>(ctx);
     void *dev_ptr = nullptr;
     void *host_ptr = nullptr;
     try {
         dev_ptr = runner->allocate_tensor(bytes);
-        if (dev_ptr == nullptr) return NULL;
+        if (dev_ptr == nullptr) {
+            errno = ENOMEM;
+            return NULL;
+        }
         if (hdch_load_hal_if_needed() != 0) {
             runner->free_tensor(dev_ptr);
+            errno = EIO;
             return NULL;
         }
         HdchHalHostRegisterFn fn = hdch_get_halHostRegister();
         if (fn == nullptr || fn(dev_ptr, bytes, HDCH_DEV_SVM_MAP_HOST, runner->device_id(), &host_ptr) != 0 ||
             host_ptr == nullptr) {
             runner->free_tensor(dev_ptr);
+            errno = EIO;
             return NULL;
         }
         HostDeviceChannel *ch = host_device_channel_wrap(dev_ptr, host_ptr, bytes, cfg, 0, nullptr);
@@ -268,6 +280,7 @@ HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, co
             HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
             if (unreg != nullptr) unreg(host_ptr, runner->device_id());
             runner->free_tensor(dev_ptr);
+            errno = ENOMEM;
             return NULL;
         }
         return static_cast<HostDeviceChannelHandle>(ch);
@@ -277,6 +290,7 @@ HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, co
             if (unreg != nullptr) unreg(host_ptr, runner->device_id());
         }
         if (dev_ptr != nullptr) runner->free_tensor(dev_ptr);
+        errno = EIO;
         return NULL;
     }
 }
@@ -318,26 +332,35 @@ int host_device_recv_ctx(
         static_cast<HostDeviceChannel *>(ch), dst, dst_capacity, out_nbytes, out_correlation_id, out_route, timeout_us
     );
 }
-
-
 HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, const HostDeviceMemoryConfig *cfg) {
-    if (ctx == NULL) return NULL;
+    if (ctx == NULL) {
+        errno = EINVAL;
+        return NULL;
+    }
     size_t bytes = host_device_memory_required_bytes(cfg);
-    if (bytes == 0) return NULL;
+    if (bytes == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
     auto *runner = static_cast<DeviceRunner *>(ctx);
     void *dev_ptr = nullptr;
     void *host_ptr = nullptr;
     try {
         dev_ptr = runner->allocate_tensor(bytes);
-        if (dev_ptr == nullptr) return NULL;
+        if (dev_ptr == nullptr) {
+            errno = ENOMEM;
+            return NULL;
+        }
         if (hdch_load_hal_if_needed() != 0) {
             runner->free_tensor(dev_ptr);
+            errno = EIO;
             return NULL;
         }
         HdchHalHostRegisterFn fn = hdch_get_halHostRegister();
         if (fn == nullptr || fn(dev_ptr, bytes, HDCH_DEV_SVM_MAP_HOST, runner->device_id(), &host_ptr) != 0 ||
             host_ptr == nullptr) {
             runner->free_tensor(dev_ptr);
+            errno = EIO;
             return NULL;
         }
         HostDeviceMemory *mem = host_device_memory_wrap(dev_ptr, host_ptr, bytes, cfg, 0, nullptr);
@@ -345,6 +368,7 @@ HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, cons
             HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
             if (unreg != nullptr) unreg(host_ptr, runner->device_id());
             runner->free_tensor(dev_ptr);
+            errno = ENOMEM;
             return NULL;
         }
         return static_cast<HostDeviceMemoryHandle>(mem);
@@ -354,6 +378,7 @@ HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, cons
             if (unreg != nullptr) unreg(host_ptr, runner->device_id());
         }
         if (dev_ptr != nullptr) runner->free_tensor(dev_ptr);
+        errno = EIO;
         return NULL;
     }
 }

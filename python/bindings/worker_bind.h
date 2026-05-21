@@ -186,8 +186,8 @@ inline void bind_worker(nb::module_ &m) {
                 std::vector<uint8_t> bytes(payload.begin(), payload.end());
                 self.channel_send(worker_id, channel, route, bytes, correlation_id);
             },
-            nb::arg("worker_id"), nb::arg("channel"), nb::arg("route"), nb::arg("data"),
-            nb::arg("correlation_id") = 0, "Send a message through a host/device channel."
+            nb::arg("worker_id"), nb::arg("channel"), nb::arg("route"), nb::arg("data"), nb::arg("correlation_id") = 0,
+            "Send a message through a host/device channel."
         )
         .def(
             "channel_recv",
@@ -223,7 +223,8 @@ inline void bind_worker(nb::module_ &m) {
                 HostDeviceMemoryInfo info = self.shared_memory_info(worker_id, memory);
                 return nb::make_tuple(info.host_ptr, info.device_ptr, info.data_bytes, info.signal_count, info.flags);
             },
-            nb::arg("worker_id"), nb::arg("memory")
+            nb::arg("worker_id"), nb::arg("memory"),
+            "Return shared-memory metadata. host_ptr is 0 for hierarchical mailbox callers."
         )
         .def(
             "shared_memory_read",
@@ -231,7 +232,9 @@ inline void bind_worker(nb::module_ &m) {
                 auto data = self.shared_memory_read(worker_id, memory, offset, nbytes);
                 return nb::bytes(reinterpret_cast<const char *>(data.data()), data.size());
             },
-            nb::arg("worker_id"), nb::arg("memory"), nb::arg("offset"), nb::arg("nbytes")
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("offset"), nb::arg("nbytes"),
+            "Read shared-memory bytes via chunked mailbox RPC. Returns a full materialized bytes object; this is "
+            "not streaming or zero-copy."
         )
         .def(
             "shared_memory_write",
@@ -240,7 +243,8 @@ inline void bind_worker(nb::module_ &m) {
                 std::vector<uint8_t> bytes(payload.begin(), payload.end());
                 self.shared_memory_write(worker_id, memory, offset, bytes);
             },
-            nb::arg("worker_id"), nb::arg("memory"), nb::arg("offset"), nb::arg("data")
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("offset"), nb::arg("data"),
+            "Write shared-memory bytes via chunked mailbox RPC. This is not streaming or zero-copy."
         )
         .def(
             "shared_memory_notify",
@@ -255,8 +259,7 @@ inline void bind_worker(nb::module_ &m) {
                uint32_t timeout_us) {
                 self.shared_memory_wait(worker_id, memory, signal_id, target, timeout_us);
             },
-            nb::arg("worker_id"), nb::arg("memory"), nb::arg("signal_id"), nb::arg("target"),
-            nb::arg("timeout_us") = 0
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("signal_id"), nb::arg("target"), nb::arg("timeout_us") = 0
         )
         .def(
             "alloc",

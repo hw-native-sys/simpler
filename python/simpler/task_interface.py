@@ -488,7 +488,11 @@ class ChipWorker:
         self._impl.close_shared_memory(int(memory))
 
     def shared_memory_info(self, memory: int) -> tuple[int, int, int, int, int]:
-        """Return ``(host_ptr, device_ptr, data_bytes, signal_count, flags)``."""
+        """Return ``(host_ptr, device_ptr, data_bytes, signal_count, flags)``.
+
+        ``host_ptr`` is a current-process host address and may be directly
+        dereferenced only by this process.
+        """
         host_ptr, device_ptr, data_bytes, signal_count, flags = self._impl.shared_memory_info(int(memory))
         return int(host_ptr), int(device_ptr), int(data_bytes), int(signal_count), int(flags)
 

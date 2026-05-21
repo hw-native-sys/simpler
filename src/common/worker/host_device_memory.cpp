@@ -14,15 +14,56 @@
 #include <string.h>
 
 #include <chrono>
+#include <limits>
 #include <new>
 #include <thread>
 
 namespace {
 
-size_t align_up(size_t v, size_t alignment) { return (v + alignment - 1U) & ~(alignment - 1U); }
+bool checked_add_size(size_t a, size_t b, size_t *out) {
+    if (out == nullptr || a > std::numeric_limits<size_t>::max() - b) return false;
+    *out = a + b;
+    return true;
+}
+
+bool checked_mul_size(size_t a, size_t b, size_t *out) {
+    if (out == nullptr || (a != 0 && b > std::numeric_limits<size_t>::max() / a)) return false;
+    *out = a * b;
+    return true;
+}
+
+bool checked_align_up(size_t v, size_t alignment, size_t *out) {
+    if (alignment == 0 || (alignment & (alignment - 1U)) != 0) return false;
+    size_t biased = 0;
+    if (!checked_add_size(v, alignment - 1U, &biased)) return false;
+    *out = biased & ~(alignment - 1U);
+    return true;
+}
 
 bool valid_cfg(const HostDeviceMemoryConfig *cfg) {
     return cfg != nullptr && cfg->data_bytes > 0 && cfg->signal_count > 0;
+}
+
+bool compute_layout(const HostDeviceMemoryConfig *cfg, size_t *data_offset, size_t *total_bytes) {
+    if (!valid_cfg(cfg) || data_offset == nullptr || total_bytes == nullptr) return false;
+    if (cfg->data_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) return false;
+
+    size_t signal_bytes = 0;
+    size_t signals_end = 0;
+    size_t offset = 0;
+    size_t raw_total = 0;
+    size_t required = 0;
+    if (!checked_mul_size(static_cast<size_t>(cfg->signal_count), sizeof(HostDeviceSignalSlot), &signal_bytes)) {
+        return false;
+    }
+    if (!checked_add_size(sizeof(HostDeviceMemoryHeader), signal_bytes, &signals_end)) return false;
+    if (!checked_align_up(signals_end, 64, &offset)) return false;
+    if (!checked_add_size(offset, static_cast<size_t>(cfg->data_bytes), &raw_total)) return false;
+    if (!checked_align_up(raw_total, 64, &required)) return false;
+
+    *data_offset = offset;
+    *total_bytes = required;
+    return true;
 }
 
 HostDeviceMemoryHeader *header(HostDeviceMemory *mem) {
@@ -97,15 +138,17 @@ int wait_impl(HostDeviceMemory *mem, uint32_t signal_id, uint64_t target, uint32
 }  // namespace
 
 size_t host_device_memory_required_bytes(const HostDeviceMemoryConfig *cfg) {
-    if (!valid_cfg(cfg)) return 0;
-    size_t signal_bytes = static_cast<size_t>(cfg->signal_count) * sizeof(HostDeviceSignalSlot);
-    size_t data_offset = align_up(sizeof(HostDeviceMemoryHeader) + signal_bytes, 64);
-    return align_up(data_offset + static_cast<size_t>(cfg->data_bytes), 64);
+    size_t data_offset = 0;
+    size_t total_bytes = 0;
+    if (!compute_layout(cfg, &data_offset, &total_bytes)) return 0;
+    return total_bytes;
 }
 
 int host_device_memory_init_region(void *host_base, size_t bytes, const HostDeviceMemoryConfig *cfg) {
-    if (host_base == nullptr || !valid_cfg(cfg)) return HDMEM_ERR_INVALID;
-    size_t required = host_device_memory_required_bytes(cfg);
+    if (host_base == nullptr) return HDMEM_ERR_INVALID;
+    size_t data_offset = 0;
+    size_t required = 0;
+    if (!compute_layout(cfg, &data_offset, &required)) return HDMEM_ERR_INVALID;
     if (required == 0 || bytes < required) return HDMEM_ERR_INVALID;
     memset(host_base, 0, required);
     auto *hdr = reinterpret_cast<HostDeviceMemoryHeader *>(host_base);
@@ -113,7 +156,7 @@ int host_device_memory_init_region(void *host_base, size_t bytes, const HostDevi
     hdr->version = HDMEM_VERSION;
     hdr->flags = cfg->flags;
     hdr->signal_count = cfg->signal_count;
-    hdr->data_offset = align_up(sizeof(HostDeviceMemoryHeader) + static_cast<size_t>(cfg->signal_count) * sizeof(HostDeviceSignalSlot), 64);
+    hdr->data_offset = data_offset;
     hdr->data_bytes = cfg->data_bytes;
     hdr->total_bytes = required;
     return HDMEM_OK;
