@@ -39,7 +39,7 @@
 
 #include "callable.h"
 #include "prepare_callable_common.h"
-#include "pto_runtime2/device_pool.h"
+#include "device_pool.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
 #include "common/l2_perf_profiling.h"
@@ -488,8 +488,8 @@ private:
     // Per-Worker pooled PTO2 GM heap and shared-memory buffers. Constructed
     // with closures bound to mem_alloc_; released explicitly in finalize()
     // before mem_alloc_.finalize() so they do not free pointers a second time.
-    pto_runtime2::DevicePool gm_heap_pool_;
-    pto_runtime2::DevicePool gm_sm_pool_;
+    DevicePool gm_heap_pool_;
+    DevicePool gm_sm_pool_;
 
     // Device resources
     rtStream_t stream_aicpu_{nullptr};

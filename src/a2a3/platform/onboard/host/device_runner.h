@@ -44,7 +44,7 @@
 #include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
-#include "pto_runtime2/device_pool.h"
+#include "device_arena.h"
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
 #include "host/l2_perf_collector.h"
@@ -192,31 +192,25 @@ struct AicpuSoInfo {
 class DeviceRunner {
 public:
     DeviceRunner() :
-        gm_heap_pool_(
-            [this](size_t n) {
-                return mem_alloc_.alloc(n);
-            },
-            [this](void *p) {
-                mem_alloc_.free(p);
-            }
-        ),
-        gm_sm_pool_(
-            [this](size_t n) {
-                return mem_alloc_.alloc(n);
-            },
-            [this](void *p) {
-                mem_alloc_.free(p);
-            }
-        ) {}
+        static_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
     ~DeviceRunner();
 
     /**
-     * Per-Worker pooled GM heap / shared-memory buffer acquisition.
-     * Grows on demand, never shrinks; backed by `mem_alloc_` so the
-     * underlying allocations are released in `finalize()`.
+     * Lay out and commit the per-Worker static device arena that backs the
+     * PTO2 GM heap and PTO2 shared memory in a single underlying allocation.
+     * Must be called before acquire_pooled_gm_heap / acquire_pooled_gm_sm.
+     * Idempotent on identical sizes. Returns 0 on success, -1 on failure.
      */
-    void *acquire_pooled_gm_heap(size_t size) { return gm_heap_pool_.acquire(size); }
-    void *acquire_pooled_gm_sm(size_t size) { return gm_sm_pool_.acquire(size); }
+    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size);
+
+    /**
+     * Return the pooled GM heap / PTO2 SM pointer. setup_static_arena must
+     * have been called earlier in this Worker; otherwise these return
+     * nullptr. Both pointers are stable for the lifetime of the Worker and
+     * the single underlying device buffer is released in `finalize()`.
+     */
+    void *acquire_pooled_gm_heap();
+    void *acquire_pooled_gm_sm();
 
     /**
      * Create a thread bound to this device.
@@ -578,11 +572,18 @@ private:
     // Memory management
     MemoryAllocator mem_alloc_;
 
-    // Per-Worker pooled PTO2 GM heap and shared-memory buffers. Constructed
-    // with closures bound to mem_alloc_; released explicitly in finalize()
-    // before mem_alloc_.finalize() so they do not free pointers a second time.
-    pto_runtime2::DevicePool gm_heap_pool_;
-    pto_runtime2::DevicePool gm_sm_pool_;
+    // Per-Worker arena backing the PTO2 GM heap + PTO2 shared memory in a
+    // single device allocation. Released explicitly in finalize() before
+    // mem_alloc_.finalize() so it does not free pointers a second time.
+    //
+    // Trampolines forward DeviceArena's alloc/free calls to mem_alloc_.
+    static void *arena_alloc_trampoline(void *ctx, size_t size) {
+        return static_cast<MemoryAllocator *>(ctx)->alloc(size);
+    }
+    static void arena_free_trampoline(void *ctx, void *p) { static_cast<MemoryAllocator *>(ctx)->free(p); }
+    DeviceArena static_arena_;
+    size_t gm_heap_region_off_{SIZE_MAX};
+    size_t gm_sm_region_off_{SIZE_MAX};
 
     // Device resources
     rtStream_t stream_aicpu_{nullptr};

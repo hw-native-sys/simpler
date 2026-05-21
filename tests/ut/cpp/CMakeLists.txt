@@ -99,6 +99,7 @@ target_include_directories(a2a3_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
 )
 target_compile_options(a2a3_rt_objs PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
 
@@ -213,6 +214,8 @@ function(add_common_utils_test name src)
         ${GTEST_INCLUDE_DIRS}
         # utils/elf_build_id.h lives under src/common, exposed as "utils/..."
         ${CMAKE_SOURCE_DIR}/../../../src/common
+        # device_comm/{device_pool,device_arena}.h consumed without prefix.
+        ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
@@ -267,6 +270,7 @@ set_tests_properties(test_chip_callable_upload_immutable PROPERTIES LABELS "no_h
 add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 add_common_utils_test(test_device_pool common/test_device_pool.cpp)
+add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 
 # Per-callable_id orch SO file naming regression (see rtStreamSynchronize
 # 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`

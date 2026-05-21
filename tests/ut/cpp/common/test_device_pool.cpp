@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-// Unit tests for src/common/pto_runtime2/device_pool.h.
+// Unit tests for src/common/device_comm/device_pool.h.
 //
 // DevicePool is a single-slot pooled buffer holder used by DeviceRunner to
 // keep the PTO2 GM heap / shared memory alive across worker.run() dispatches.
@@ -27,9 +27,7 @@
 
 #include <gtest/gtest.h>
 
-#include "pto_runtime2/device_pool.h"
-
-using pto_runtime2::DevicePool;
+#include "device_pool.h"
 
 namespace {
 

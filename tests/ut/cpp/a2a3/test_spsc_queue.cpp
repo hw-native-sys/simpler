@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+#include "device_arena.h"
 #include "scheduler/pto_scheduler.h"
 
 // =============================================================================
@@ -38,15 +39,21 @@ protected:
     static constexpr uint64_t CAPACITY = 16;  // must be power of 2
 
     PTO2SpscQueue queue{};
+    DeviceArena arena;
     // Dummy slot states used as push values
     alignas(64) PTO2TaskSlotState slots[64]{};
 
     void SetUp() override {
         memset(&queue, 0, sizeof(queue));
-        ASSERT_TRUE(queue.init(CAPACITY));
+        const size_t off = PTO2SpscQueue::reserve_layout(arena, CAPACITY);
+        ASSERT_NE(arena.commit(), nullptr);
+        ASSERT_TRUE(queue.init_from_layout(arena, off, CAPACITY));
     }
 
-    void TearDown() override { queue.destroy(); }
+    void TearDown() override {
+        queue.destroy();
+        arena.release();
+    }
 };
 
 // =============================================================================
@@ -60,17 +67,27 @@ TEST_F(SpscQueueTest, InitValidState) {
 }
 
 TEST_F(SpscQueueTest, InitRejectsNonPowerOfTwo) {
+    // init_from_layout rejects non-power-of-two capacities. Use a fresh arena
+    // each time since reserve runs before commit.
     PTO2SpscQueue bad{};
-    EXPECT_FALSE(bad.init(3));
-    EXPECT_FALSE(bad.init(7));
-    EXPECT_FALSE(bad.init(0));
+    DeviceArena local;
+    const size_t off = PTO2SpscQueue::reserve_layout(local, 1);  // dummy reservation so commit succeeds
+    (void)off;
+    ASSERT_NE(local.commit(), nullptr);
+    EXPECT_FALSE(bad.init_from_layout(local, off, 3));
+    EXPECT_FALSE(bad.init_from_layout(local, off, 7));
+    EXPECT_FALSE(bad.init_from_layout(local, off, 0));
 }
 
 TEST_F(SpscQueueTest, InitAcceptsPowerOfTwo) {
     PTO2SpscQueue q{};
-    EXPECT_TRUE(q.init(4));
+    DeviceArena local;
+    const size_t off4 = PTO2SpscQueue::reserve_layout(local, 4);
+    const size_t off1024 = PTO2SpscQueue::reserve_layout(local, 1024);
+    ASSERT_NE(local.commit(), nullptr);
+    EXPECT_TRUE(q.init_from_layout(local, off4, 4));
     q.destroy();
-    EXPECT_TRUE(q.init(1024));
+    EXPECT_TRUE(q.init_from_layout(local, off1024, 1024));
     q.destroy();
 }
 

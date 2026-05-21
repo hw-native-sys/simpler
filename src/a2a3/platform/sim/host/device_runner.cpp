@@ -122,6 +122,32 @@ bool create_temp_so_file(const std::string &path_template, const uint8_t *data, 
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
+int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size) {
+    if (static_arena_.is_committed()) {
+        const bool fits = gm_heap_region_off_ != SIZE_MAX && gm_sm_region_off_ != SIZE_MAX &&
+                          static_arena_.region_size(gm_heap_region_off_) >= gm_heap_size &&
+                          static_arena_.region_size(gm_sm_region_off_) >= gm_sm_size;
+        if (fits) return 0;
+        static_arena_.release();
+        gm_heap_region_off_ = SIZE_MAX;
+        gm_sm_region_off_ = SIZE_MAX;
+    }
+    gm_heap_region_off_ = static_arena_.reserve(gm_heap_size, DeviceArena::kDefaultBaseAlign);
+    gm_sm_region_off_ = static_arena_.reserve(gm_sm_size, DeviceArena::kDefaultBaseAlign);
+    if (static_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) return -1;
+    return 0;
+}
+
+void *DeviceRunner::acquire_pooled_gm_heap() {
+    if (!static_arena_.is_committed()) return nullptr;
+    return static_arena_.region_ptr(gm_heap_region_off_);
+}
+
+void *DeviceRunner::acquire_pooled_gm_sm() {
+    if (!static_arena_.is_committed()) return nullptr;
+    return static_arena_.region_ptr(gm_sm_region_off_);
+}
+
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     int dev_id = device_id_;
     return std::thread([dev_id, fn = std::move(fn)]() {
@@ -989,10 +1015,12 @@ int DeviceRunner::finalize() {
     // Close executor .so files (typically already closed by run(), this is a safety net)
     unload_executor_binaries();
 
-    // Release per-Worker pooled GM heap / SM. Must precede mem_alloc_.finalize()
-    // so the pool frees through the still-live allocator, not after it.
-    gm_heap_pool_.release();
-    gm_sm_pool_.release();
+    // Release per-Worker static arena (GM heap + PTO2 SM in a single backing
+    // device allocation). Must precede mem_alloc_.finalize() so the arena
+    // frees through the still-live allocator, not after it.
+    static_arena_.release();
+    gm_heap_region_off_ = SIZE_MAX;
+    gm_sm_region_off_ = SIZE_MAX;
 
     // Free all remaining allocations
     mem_alloc_.finalize();

@@ -9,13 +9,10 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_COMMON_PTO_RUNTIME2_DEVICE_POOL_H_
-#define SRC_COMMON_PTO_RUNTIME2_DEVICE_POOL_H_
+#pragma once
 
 #include <cstddef>
 #include <functional>
-
-namespace pto_runtime2 {
 
 /**
  * Single-slot pooled device buffer. Holds at most one allocation at a time.
@@ -71,7 +68,3 @@ private:
     void *ptr_{nullptr};
     size_t size_{0};
 };
-
-}  // namespace pto_runtime2
-
-#endif  // SRC_COMMON_PTO_RUNTIME2_DEVICE_POOL_H_

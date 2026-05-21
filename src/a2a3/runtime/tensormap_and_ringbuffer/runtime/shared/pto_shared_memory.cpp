@@ -84,76 +84,41 @@ void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
     setup_pointers_per_ring(task_window_sizes);
 }
 
-PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create(uint64_t task_window_size, uint64_t heap_size) {
-    // Allocate handle
-    PTO2SharedMemoryHandle *handle = (PTO2SharedMemoryHandle *)calloc(1, sizeof(PTO2SharedMemoryHandle));
-    if (!handle) {
-        return NULL;
-    }
-
-    // Calculate total size
-    uint64_t sm_size = calculate_size(task_window_size);
-
-// Allocate shared memory (aligned for DMA efficiency)
-#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
-    if (posix_memalign(&handle->sm_base, PTO2_ALIGN_SIZE, static_cast<size_t>(sm_size)) != 0) {
-        free(handle);
-        return NULL;
-    }
-#else
-    handle->sm_base = aligned_alloc(PTO2_ALIGN_SIZE, static_cast<size_t>(sm_size));
-    if (!handle->sm_base) {
-        free(handle);
-        return NULL;
-    }
-#endif
-
-    handle->sm_size = sm_size;
-    handle->is_owner = true;
-
-    // Initialize to zero
-    memset(handle->sm_base, 0, static_cast<size_t>(sm_size));
-
-    // Set up pointers
-    handle->setup_pointers(task_window_size);
-
-    // Initialize header
-    handle->init_header(task_window_size, heap_size);
-
-    return handle;
-}
-
-PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create_default() {
-    return create(PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE);
-}
-
-PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create_from_buffer(
-    void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size
+bool PTO2SharedMemoryHandle::init(
+    void *sm_base_arg, uint64_t sm_size_arg, uint64_t task_window_size, uint64_t heap_size
 ) {
-    if (!sm_base || sm_size == 0) return NULL;
+    if (!sm_base_arg || sm_size_arg == 0) return false;
+    if (sm_size_arg < calculate_size(task_window_size)) return false;
 
-    uint64_t required = calculate_size(task_window_size);
-    if (sm_size < required) return NULL;
+    sm_base = sm_base_arg;
+    sm_size = sm_size_arg;
+    is_owner = false;
+    setup_pointers(task_window_size);
+    init_header(task_window_size, heap_size);
+    return true;
+}
 
-    PTO2SharedMemoryHandle *handle = (PTO2SharedMemoryHandle *)calloc(1, sizeof(PTO2SharedMemoryHandle));
-    if (!handle) return NULL;
+PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create_and_init_default(DeviceArena &arena) {
+    const uint64_t buffer_size = calculate_size(PTO2_TASK_WINDOW_SIZE);
+    const size_t off_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
+    const size_t off_buffer = arena.reserve(static_cast<size_t>(buffer_size), PTO2_ALIGN_SIZE);
+    if (arena.commit() == nullptr) return nullptr;
 
-    handle->sm_base = sm_base;
-    handle->sm_size = sm_size;
-    handle->is_owner = false;
-
-    handle->setup_pointers(task_window_size);
-    handle->init_header(task_window_size, heap_size);
-
+    auto *handle = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(off_handle));
+    memset(handle, 0, sizeof(*handle));
+    void *buffer = arena.region_ptr(off_buffer);
+    memset(buffer, 0, static_cast<size_t>(buffer_size));
+    if (!handle->init(buffer, buffer_size, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE)) return nullptr;
     return handle;
 }
 
 void PTO2SharedMemoryHandle::destroy() {
+    // Arena-owned wrappers (is_owner == false) are reclaimed by arena.release();
+    // calling destroy on them is a no-op so existing callers stay safe.
     if (is_owner && sm_base) {
         free(sm_base);
+        free(this);
     }
-
-    free(this);
 }
 
 // =============================================================================

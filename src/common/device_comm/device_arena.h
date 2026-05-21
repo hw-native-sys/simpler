@@ -1,0 +1,176 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#pragma once
+
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+
+/**
+ * Single-shot bump arena over one backing allocation.
+ *
+ * Workflow:
+ *   1. reserve(size, align)  — declare every sub-region up-front, returning
+ *      its offset (also serving as region id);
+ *   2. commit(base_align)    — perform exactly one underlying allocation,
+ *      sized to fit all reservations plus forward-alignment padding;
+ *   3. region_ptr(offset)    — read back the device pointer of any region.
+ *
+ * Backing alloc/free are injected as function pointers + ctx, so this header
+ * is usable from both host code (forwarding to MemoryAllocator) and AICPU
+ * code (forwarding to libc). The class deliberately avoids STL containers
+ * (std::vector / std::function) since it is compiled into the AICPU binary.
+ *
+ * RAII: the destructor calls release(). Copy is disallowed.
+ */
+class DeviceArena {
+public:
+    using AllocFn = void *(*)(void *ctx, size_t size);
+    using FreeFn = void (*)(void *ctx, void *ptr);
+
+    // Upper bound on the number of distinct sub-regions a single arena can
+    // hold. Current AICPU init reserves ~30 regions; 128 leaves comfortable
+    // headroom for per-thread / per-ring expansions.
+    static constexpr size_t kMaxRegions = 128;
+
+    // Default base alignment for the underlying allocation. PTO2_PACKED_OUTPUT_ALIGN
+    // (1024) covers every sub-region alignment requirement in the runtime
+    // (max is 64-byte cache line); also matches HBM DMA granularity.
+    static constexpr size_t kDefaultBaseAlign = 1024;
+
+    // Default libc backend used when the caller does not supply alloc/free.
+    static void *default_alloc(void * /*ctx*/, size_t size) noexcept { return std::malloc(size); }
+    static void default_free(void * /*ctx*/, void *ptr) noexcept { std::free(ptr); }
+
+    // Default ctor: libc-backed (most AICPU / UT use sites). For callers that
+    // need a custom backend (e.g. host-side MemoryAllocator), use the 3-arg ctor.
+    DeviceArena() noexcept :
+        alloc_(&default_alloc),
+        free_(&default_free),
+        ctx_(nullptr) {}
+
+    DeviceArena(AllocFn alloc, FreeFn free_fn, void *ctx) noexcept :
+        alloc_(alloc),
+        free_(free_fn),
+        ctx_(ctx) {}
+
+    ~DeviceArena() noexcept { release(); }
+
+    DeviceArena(const DeviceArena &) = delete;
+    DeviceArena &operator=(const DeviceArena &) = delete;
+
+    // Phase 1: declare a sub-region. Returns its offset from base() (also
+    // serves as region id). Asserts if called after commit() or if the region
+    // count would exceed kMaxRegions.
+    size_t reserve(size_t size, size_t align) noexcept;
+
+    // Phase 2: perform the backing allocation, forward-align the base, and
+    // mark the arena committed. Idempotent: repeated calls return the same
+    // base without re-allocating. Returns nullptr if the backing alloc fails.
+    void *commit(size_t base_align = kDefaultBaseAlign) noexcept;
+
+    // Phase 3: pointer to the sub-region at `offset`. Asserts if called
+    // before commit().
+    void *region_ptr(size_t offset) const noexcept;
+
+    // Size of the sub-region whose offset matches `offset`. Linear scan;
+    // intended for debug / assertions, not hot path.
+    size_t region_size(size_t offset) const noexcept;
+
+    // Free the backing buffer (if any) and reset to the pre-commit state so
+    // a fresh reserve+commit cycle can run.
+    void release() noexcept;
+
+    bool is_committed() const noexcept { return committed_; }
+    void *base() const noexcept { return base_; }
+
+    // Total bytes reserved across all regions (excludes base_align padding).
+    size_t total_size() const noexcept { return cursor_; }
+
+    // Diagnostics for UT — counts of underlying alloc/free invocations.
+    size_t alloc_count() const noexcept { return alloc_count_; }
+    size_t free_count() const noexcept { return free_count_; }
+
+private:
+    struct Region {
+        size_t offset;
+        size_t size;
+    };
+
+    AllocFn alloc_;
+    FreeFn free_;
+    void *ctx_;
+
+    Region regions_[kMaxRegions]{};
+    size_t region_count_{0};
+
+    size_t cursor_{0};
+    void *raw_base_{nullptr};
+    size_t raw_size_{0};
+    void *base_{nullptr};
+    bool committed_{false};
+
+    size_t alloc_count_{0};
+    size_t free_count_{0};
+};
+
+inline size_t DeviceArena::reserve(size_t size, size_t align) noexcept {
+    assert(!committed_ && "DeviceArena::reserve() called after commit()");
+    assert(region_count_ < kMaxRegions && "DeviceArena: exceeded kMaxRegions");
+    assert(align > 0 && (align & (align - 1)) == 0 && "DeviceArena: align must be a power of two");
+    cursor_ = (cursor_ + align - 1) & ~(align - 1);
+    const size_t off = cursor_;
+    regions_[region_count_++] = Region{off, size};
+    cursor_ += size;
+    return off;
+}
+
+inline void *DeviceArena::commit(size_t base_align) noexcept {
+    if (committed_) return base_;
+    assert(base_align > 0 && (base_align & (base_align - 1)) == 0 && "DeviceArena: base_align must be a power of two");
+    // Allocate enough to fit the layout starting from any pointer returned by
+    // the backend, then forward-align the visible base.
+    raw_size_ = cursor_ + base_align - 1;
+    raw_base_ = alloc_(ctx_, raw_size_);
+    if (raw_base_ == nullptr) return nullptr;
+    ++alloc_count_;
+    const auto raw = reinterpret_cast<uintptr_t>(raw_base_);
+    base_ = reinterpret_cast<void *>((raw + base_align - 1) & ~(static_cast<uintptr_t>(base_align) - 1));
+    committed_ = true;
+    return base_;
+}
+
+inline void *DeviceArena::region_ptr(size_t offset) const noexcept {
+    assert(committed_ && "DeviceArena::region_ptr() called before commit()");
+    return reinterpret_cast<char *>(base_) + offset;
+}
+
+inline size_t DeviceArena::region_size(size_t offset) const noexcept {
+    for (size_t i = 0; i < region_count_; ++i) {
+        if (regions_[i].offset == offset) return regions_[i].size;
+    }
+    return 0;
+}
+
+inline void DeviceArena::release() noexcept {
+    if (raw_base_ != nullptr) {
+        free_(ctx_, raw_base_);
+        ++free_count_;
+    }
+    raw_base_ = nullptr;
+    base_ = nullptr;
+    raw_size_ = 0;
+    cursor_ = 0;
+    region_count_ = 0;
+    committed_ = false;
+}

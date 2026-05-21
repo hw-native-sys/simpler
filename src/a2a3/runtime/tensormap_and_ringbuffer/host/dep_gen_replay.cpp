@@ -476,11 +476,18 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     PTO2TensorMap tm_annot;
     std::memset(&tm_oracle, 0, sizeof(tm_oracle));
     std::memset(&tm_annot, 0, sizeof(tm_annot));
-    if (!tm_oracle.init(PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes) ||
-        !tm_annot.init(PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes)) {
+
+    // Libc-backed arena (default ctor) that owns both replay tensormaps'
+    // storage. Released by the arena destructor when this function returns.
+    DeviceArena replay_arena;
+
+    auto oracle_layout =
+        PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
+    auto annot_layout =
+        PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
+    if (replay_arena.commit() == nullptr || !tm_oracle.init_from_layout(oracle_layout, replay_arena) ||
+        !tm_annot.init_from_layout(annot_layout, replay_arena)) {
         LOG_ERROR("dep_gen replay: tensormap.init failed (buckets=%d, pool=%d)", PTO2_TENSORMAP_NUM_BUCKETS, pool_size);
-        tm_oracle.destroy();
-        tm_annot.destroy();
         return -3;
     }
 

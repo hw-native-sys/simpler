@@ -126,6 +126,11 @@ struct AicpuExecutor {
     std::atomic<int32_t> finished_count_{0};
     std::atomic<bool> runtime_init_ready_{false};
 
+    // Per-Worker arena backing the PTO2Runtime + sm_handle + orch/sched/mailbox
+    // sub-regions (created in runtime_create_from_sm, released in runtime_destroy).
+    // Default-constructed: libc-backed backend, no ctx.
+    DeviceArena runtime_arena_;
+
     // Cached orch args pointer set by the orchestration thread before scheduler
     // init; consumed by the (*p_func)(*orch_args_cached_) invocation below.
     const ChipStorageTaskArgs *orch_args_cached_{nullptr};
@@ -464,19 +469,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             void *gm_heap = runtime->get_gm_heap_ptr();
 
             uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
-            PTO2SharedMemoryHandle *sm_handle =
-                PTO2SharedMemoryHandle::create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
-            if (!sm_handle) {
-                LOG_ERROR("Thread %d: Failed to create shared memory handle", thread_idx);
-                // Unblock scheduler threads before returning so they don't spin forever.
-                runtime_init_ready_.store(true, std::memory_order_release);
-                return -1;
-            }
-
-            rt = runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
+            rt = runtime_create_from_sm(
+                PTO2_MODE_EXECUTE, sm_ptr, sm_size, task_window_size, gm_heap, heap_size, runtime_arena_,
+                dep_pool_capacity
+            );
             if (!rt) {
                 LOG_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
-                sm_handle->destroy();
                 // Unblock scheduler threads before returning so they don't spin forever.
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
@@ -691,7 +689,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     bind(nullptr);
                 }
             }
-            runtime_destroy(rt);
+            runtime_destroy(rt, runtime_arena_);
+            rt = nullptr;
         }
     }
 

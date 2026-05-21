@@ -119,13 +119,19 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
-    // Acquire a pooled per-Worker device buffer for the PTO2 GM heap / shared
-    // memory. The platform layer keeps the allocation alive across runs and
-    // grows it on demand; the returned pointer must NOT be passed to
-    // device_free or recorded in `tensor_pairs_`, because it is owned by the
-    // DeviceRunner and freed in `DeviceRunner::finalize()`.
-    void *(*acquire_pooled_gm_heap)(size_t size);
-    void *(*acquire_pooled_gm_sm)(size_t size);
+    // Lay out and commit the per-Worker static device arena that backs both
+    // the PTO2 GM heap and the PTO2 shared memory in a single underlying
+    // allocation. Must be called once before acquire_pooled_gm_heap /
+    // acquire_pooled_gm_sm. Idempotent on identical sizes; returns 0 on
+    // success, -1 on allocation failure.
+    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size);
+    // Return the per-Worker pooled pointer for the PTO2 GM heap / shared
+    // memory. The static arena must already be committed via
+    // setup_static_arena; the returned pointer is owned by the DeviceRunner
+    // and freed in `DeviceRunner::finalize()` — do NOT pass it to
+    // device_free or record it in `tensor_pairs_`.
+    void *(*acquire_pooled_gm_heap)();
+    void *(*acquire_pooled_gm_sm)();
     // Single-shot upload of the entire ChipCallable buffer. `callable` is a
     // `const ChipCallable *` (declared void* to avoid pulling task_interface
     // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
