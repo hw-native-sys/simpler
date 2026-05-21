@@ -223,6 +223,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
     finished_count_.store(0, std::memory_order_release);
 
+    sched_ctx_.initializePerfCounters();
+
     // Loading orchestrator
     int32_t load_orch_rc = loadOrchestrator(runtime);
     if (load_orch_rc != 0)
@@ -825,7 +827,7 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
         
         uint64_t t1 = get_sys_cnt_aicpu();
         rc |= runScheduling(runtime);
-        barrier();
+
         uint64_t tf = get_sys_cnt_aicpu();
 
         // Calculating time segments and adding them to the timing vector
