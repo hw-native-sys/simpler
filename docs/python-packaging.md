@@ -51,12 +51,19 @@ Internal coupling: `simpler_setup.toolchain`, `simpler_setup.kernel_compiler`, a
 
 | Category | Packages |
 | -------- | -------- |
-| `simpler` runtime | No third-party Python deps. Requires platform backend: simulation (`a*sim`) or NPU hardware (`a2a3`/`a5` with CANN toolkit) |
-| `simpler_setup` runtime | `torch` (tensor operations in golden scripts, test comparison) |
+| `simpler` runtime | `cloudpickle`; platform backend |
+| `simpler_setup` runtime | `torch` for golden/test tensor operations |
 | Build | `scikit-build-core`, `nanobind`, `cmake` |
 | Test | `pytest` (ut-py, st), `googletest` + `ctest` (ut-cpp) |
 
-`pyproject.toml` declares no `[project.dependencies]` — both `torch` and `pytest` are environment prerequisites, not pip-installed transitively. This is intentional: torch's index URL (`--index-url https://download.pytorch.org/whl/cpu`) and hardware-specific builds make automatic resolution impractical.
+`pyproject.toml` declares `cloudpickle` as a `[project.dependencies]` runtime
+dependency. `torch` and `pytest` remain environment prerequisites, not
+pip-installed transitively. This is intentional: torch's index URL
+(`--index-url https://download.pytorch.org/whl/cpu`) and hardware-specific
+builds make automatic resolution impractical.
+
+The `simpler` runtime also requires a platform backend: simulation (`a*sim`) or
+NPU hardware (`a2a3`/`a5` with CANN toolkit).
 
 ### `PROJECT_ROOT` resolution
 
