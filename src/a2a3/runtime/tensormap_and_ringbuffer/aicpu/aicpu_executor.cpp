@@ -145,6 +145,7 @@ struct AicpuExecutor {
     // ===== Methods =====
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime);
+    int32_t shutdown(Runtime *runtime);
     int32_t performTimingRuns(Runtime *runtime);
     void deinit(Runtime *runtime);
     int32_t getThreadId() { return thread_idx_accumulator.fetch_add(1); }
@@ -687,35 +688,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     LOG_INFO_V0("Thread %d: Scheduling Completed", my_thread_idx_);
 
-    // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
-    // platform_deinit_aicore_regs is idempotent; orchestrator threads have
-    // core_trackers_[my_thread_idx_].core_num() == 0 so they skip the loop harmlessly.
-    int32_t shutdown_rc = sched_ctx_.shutdown(my_thread_idx_);
-    if (shutdown_rc != 0 && run_rc == 0) {
-        run_rc = shutdown_rc;
-    }
-
-    // Check if this is the last thread to finish
-    int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
-    if ((prev_finished + 1) % thread_num_ == 0) {
-        finished_.store(true, std::memory_order_release);
-        // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
-        // always tear them down here, but we keep the per-cid orch SO entries
-        // alive for the next run's cache-hit reuse (see run() reload_so branch).
-        if (rt != nullptr) {
-            // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.
-            const int32_t callable_id = runtime->get_active_callable_id();
-            framework_bind_runtime(nullptr);
-            if (callable_id >= 0 && callable_id < MAX_REGISTERED_CALLABLE_IDS) {
-                DeviceOrchestrationBindRuntimeFunc bind = orch_so_table_[callable_id].bind;
-                if (bind != nullptr) {
-                    bind(nullptr);
-                }
-            }
-            runtime_destroy(rt);
-        }
-    }
-
     return run_rc;
 }
 
@@ -755,6 +727,37 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     finished_.store(false, std::memory_order_release);
 
     LOG_INFO_V0("DeInit: AicpuExecutor reset complete");
+}
+
+int32_t AicpuExecutor::shutdown(Runtime *runtime)
+{
+    // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
+    // platform_deinit_aicore_regs is idempotent; orchestrator threads have
+    // core_trackers_[my_thread_idx_].core_num() == 0 so they skip the loop harmlessly.
+    int32_t shutdown_rc = sched_ctx_.shutdown(my_thread_idx_);
+
+    // Check if this is the last thread to finish
+    int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
+    if ((prev_finished + 1) % thread_num_ == 0) {
+        finished_.store(true, std::memory_order_release);
+        // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
+        // always tear them down here, but we keep the per-cid orch SO entries
+        // alive for the next run's cache-hit reuse (see run() reload_so branch).
+        if (rt != nullptr) {
+            // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.
+            const int32_t callable_id = runtime->get_active_callable_id();
+            framework_bind_runtime(nullptr);
+            if (callable_id >= 0 && callable_id < MAX_REGISTERED_CALLABLE_IDS) {
+                DeviceOrchestrationBindRuntimeFunc bind = orch_so_table_[callable_id].bind;
+                if (bind != nullptr) {
+                    bind(nullptr);
+                }
+            }
+            runtime_destroy(rt);
+        }
+    }
+
+    return shutdown_rc;
 }
 
 int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
@@ -844,9 +847,19 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     int32_t rc = 0;
 
     // Performing timing evaluation, exclusively for performance evaluation:
-    if (runtime->get_timing_enabled() == true) rc |= g_aicpu_executor.performTimingRuns(runtime);
+    // if (runtime->get_timing_enabled() == true) rc |= g_aicpu_executor.performTimingRuns(runtime);
 
     // Perform actual kernel run
+    rc |= g_aicpu_executor.run(runtime);
+
+    g_aicpu_executor.barrier();
+    if (my_thread_idx_ == 0)
+    {
+        g_aicpu_executor.deinit(runtime);
+        g_aicpu_executor.init(runtime);
+    }
+    g_aicpu_executor.barrier();
+
     rc |= g_aicpu_executor.run(runtime);
 
     if (rc != 0) {
@@ -854,16 +867,23 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     }
 
     int32_t runtime_rc = read_pto2_runtime_status(runtime);
+    
+    if (runtime_rc != 0) {
+        LOG_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);
+        return runtime_rc;
+    }
+
+    // Shutting down
+    int32_t shutdown_rc = g_aicpu_executor.shutdown(runtime);
+    if (shutdown_rc != 0) {
+        LOG_ERROR("aicpu_execute: shutdown failed with rc=%d", shutdown_rc);
+        return shutdown_rc;
+    }
 
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
         LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
-    }
-
-    if (runtime_rc != 0) {
-        LOG_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);
-        return runtime_rc;
     }
 
     if (rc != 0) {

@@ -238,6 +238,7 @@ void SchedulerContext::dispatch_shape(
     int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, PTO2LocalReadyBuffer &local_buf,
     CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
+
 #if PTO2_SCHED_PROFILING
     auto &l2_perf = sched_l2_perf_[thread_idx];
 #endif
@@ -260,15 +261,18 @@ void SchedulerContext::dispatch_shape(
             if (slot_state->active_mask.requires_sync_start()) {
                 if (is_pending) {
                     sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
                     continue;
                 }
                 int32_t available = cores.count();
                 if (available < slot_state->logical_block_num) {
                     if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
                         sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
                     }
                     for (int rem = bi + 1; rem < got; rem++) {
                         sched_->ready_queues[static_cast<int32_t>(shape)].push(batch[rem]);
+                        LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
                     }
                     entered_drain = true;
                     break;
@@ -277,6 +281,7 @@ void SchedulerContext::dispatch_shape(
 
             if (!cores.has_value()) {
                 sched_->ready_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
+                LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
                 break;
             }
 
@@ -293,6 +298,7 @@ void SchedulerContext::dispatch_shape(
 
             if (slot_state->next_block_idx < slot_state->logical_block_num) {
                 sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
             }
             made_progress = true;
 #if PTO2_SCHED_PROFILING
@@ -391,7 +397,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     l2_perf.sched_start_ts = get_sys_cnt_aicpu();
 #endif
 
-    LOG_INFO_V0("Thread %d: Scheduling Start. (Completed: %s)", thread_idx, completed_.load() ? "True" : "False");
     while (true) {
         if (completed_.load(std::memory_order_acquire)) {
             break;
@@ -578,6 +583,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
             if (local_buf.count > 0) {
                 ready_queue.push_batch(local_buf.slot_states, local_buf.count);
+                LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
                 local_buf.count = 0;
             }
         }
