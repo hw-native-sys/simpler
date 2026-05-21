@@ -43,10 +43,26 @@
 #pragma once
 
 #include "common.h"
+#include "device_arena.h"
 #include "pto_runtime2_types.h"
 #include "tensor.h"
 
 struct PTO2OrchestratorState;  // forward declare
+
+/**
+ * Layout descriptor produced by PTO2TensorMap::reserve_layout(). Stores the
+ * region offsets returned by DeviceArena::reserve() so init_from_layout()
+ * can fetch the matching pointers after the arena is committed.
+ */
+struct PTO2TensorMapLayout {
+    size_t off_buckets;
+    size_t off_entry_pool;
+    size_t off_free_entry_list;
+    size_t off_task_entry_heads[PTO2_MAX_RING_DEPTH];
+    int32_t num_buckets;
+    int32_t pool_size;
+    int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
+};
 
 // =============================================================================
 // TensorMap Lookup Profiling (must precede inline lookup/insert methods)
@@ -400,21 +416,32 @@ struct PTO2TensorMap {
     // =============================================================================
 
     /**
-     * Initialize TensorMap
-     *
-     * @param num_buckets Number of hash buckets (must be power of 2)
-     * @param pool_size   Size of entry pool
-     * @return true on success, false on allocation failure
+     * Phase 1: reserve every sub-region (buckets, entry_pool, free list, per-ring
+     * task_entry_heads) on the supplied arena. Records the resulting offsets in
+     * the returned layout descriptor. Must be called before the arena is
+     * committed.
      */
-    bool init(int32_t num_buckets, int32_t pool_size, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
+    static PTO2TensorMapLayout reserve_layout(
+        DeviceArena &arena, int32_t num_buckets, int32_t pool_size, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH]
+    );
 
     /**
-     * Initialize TensorMap with default sizes
+     * Same as reserve_layout() with default sizes (PTO2_TENSORMAP_NUM_BUCKETS,
+     * PTO2_TENSORMAP_POOL_SIZE).
      */
-    bool init_default(const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
+    static PTO2TensorMapLayout
+    reserve_layout_default(DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
 
     /**
-     * Destroy TensorMap and free resources
+     * Phase 3: bind region pointers and initialize state. The arena must already
+     * be committed; layout must have been produced by reserve_layout() against
+     * the same arena.
+     */
+    bool init_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena);
+
+    /**
+     * Tear down state. Does not free memory — the arena owns the backing
+     * buffer. Pointers are set to nullptr so accidental reuse traps.
      */
     void destroy();
 
