@@ -131,7 +131,7 @@ struct AicpuExecutor {
     std::atomic<bool> runtime_init_ready_{false};
 
     // Cached orch args pointer set by the orchestration thread before scheduler
-    // init; consumed by the (*p_func)(*orch_args_cached_) invocation below.
+    // init; consumed by the (*p_func_)(*orch_args_cached_) invocation below.
     const ChipStorageTaskArgs *orch_args_cached_{nullptr};
 
     // Per-callable_id table. Single orch thread today, so first-write/read
@@ -142,10 +142,18 @@ struct AicpuExecutor {
     // ===== Scheduler context (owns all dispatch/completion/drain state) =====
     SchedulerContext sched_ctx_;
 
+    // ===== Orchestrator dynamically loaded structures
+    void **p_handle_{nullptr};
+    char *p_path_{nullptr};
+    DeviceOrchestrationFunc *p_func_{nullptr};
+    DeviceOrchestrationBindRuntimeFunc *p_bind_{nullptr};
+    DeviceOrchestrationConfigFunc *p_config_func_{nullptr};
+
     // ===== Methods =====
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime);
     int32_t shutdown(Runtime *runtime);
+    int32_t loadOrchestrator(Runtime* runtime);
     int32_t performTimingRuns(Runtime *runtime);
     void deinit(Runtime *runtime);
     int32_t getThreadId() { return thread_idx_accumulator.fetch_add(1); }
@@ -213,8 +221,229 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
     finished_count_.store(0, std::memory_order_release);
 
+    // Loading orchestrator
+    int32_t load_orch_rc = loadOrchestrator(runtime);
+    if (load_orch_rc != 0)
+    {
+        LOG_ERROR("Thread %d: Failed to load orchestrator", my_thread_idx_);
+        return load_orch_rc;
+    }
+
     init_done_.store(true, std::memory_order_release);
     LOG_INFO_V0("AicpuExecutor: Init complete");
+    return 0;
+}
+
+int32_t AicpuExecutor::loadOrchestrator(Runtime* runtime)
+{
+    LOG_INFO_V0("Thread %d: Orchestrator Loading", my_thread_idx_);
+
+    // Per-callable_id dispatch: the orch SO state lives in
+    // `orch_so_table_[callable_id]` keyed by registration order;
+    // reload is governed by `register_new_callable_id_`.
+    const int32_t callable_id = runtime->get_active_callable_id();
+    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
+        LOG_ERROR(
+            "Thread %d: invalid callable_id %d (limit=%d)", my_thread_idx_, callable_id, MAX_REGISTERED_CALLABLE_IDS
+        );
+        runtime_init_ready_.store(true, std::memory_order_release);
+        return -1;
+    }
+    p_handle_ = &orch_so_table_[callable_id].handle;
+    p_path_ = orch_so_table_[callable_id].path;
+    p_func_ = &orch_so_table_[callable_id].func;
+    p_bind_ = &orch_so_table_[callable_id].bind;
+    p_config_func_ = &orch_so_table_[callable_id].config_func;
+    const bool reload_so = runtime->register_new_callable_id();
+
+    if (reload_so) {
+        LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", my_thread_idx_, callable_id);
+        
+        if (*p_handle_ != nullptr) {
+            dlclose(*p_handle_);
+            *p_handle_ = nullptr;
+            *p_func_ = nullptr;
+            *p_bind_ = nullptr;
+            if (p_path_[0] != '\0') {
+                // Unlink the old file so the new open() lands on a
+                // fresh inode — protects against SIGBUS / ETXTBSY when
+                // the kernel still has the old mapping pinned.
+                unlink(p_path_);
+                p_path_[0] = '\0';
+            }
+        }
+
+        const void *so_data = reinterpret_cast<const void *>(runtime->get_dev_orch_so_addr());
+        size_t so_size = runtime->get_dev_orch_so_size();
+
+        if (so_data == nullptr || so_size == 0) {
+            LOG_ERROR("Thread %d: Device orchestration SO not set", my_thread_idx_);
+            // Unblock scheduler threads before returning so they don't spin forever.
+            runtime_init_ready_.store(true, std::memory_order_release);
+            return -1;
+        }
+
+        // Try multiple paths that may allow execution on AICPU
+        char so_path[256];
+        bool file_created = false;
+        const char *candidate_dirs[] = {
+            "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device", "/usr/lib64", "/lib64", "/var/tmp", "/tmp"
+        };
+        const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
+
+        for (int32_t i = 0; i < num_candidates && !file_created; i++) {
+            int32_t fd = create_orch_so_file(candidate_dirs[i], callable_id, so_path, sizeof(so_path));
+            if (fd < 0) {
+                LOG_INFO_V0(
+                    "Thread %d: Cannot create SO at %s (errno=%d), trying next path", my_thread_idx_, so_path, errno
+                );
+                continue;
+            }
+            ssize_t written = write(fd, so_data, so_size);
+            close(fd);
+            if (written != static_cast<ssize_t>(so_size)) {
+                LOG_INFO_V0(
+                    "Thread %d: Cannot write SO to %s (errno=%d), trying next path", my_thread_idx_, so_path, errno
+                );
+                unlink(so_path);
+                continue;
+            }
+            file_created = true;
+            LOG_INFO_V0("Thread %d: Created SO file at %s (%zu bytes)", my_thread_idx_, so_path, so_size);
+        }
+
+        if (!file_created) {
+            LOG_ERROR("Thread %d: Failed to create SO file in any candidate path", my_thread_idx_);
+            // Unblock scheduler threads before returning so they don't spin forever.
+            runtime_init_ready_.store(true, std::memory_order_release);
+            return -1;
+        }
+
+        dlerror();
+        void *handle = dlopen(so_path, RTLD_LAZY | RTLD_LOCAL);
+        const char *dlopen_err = dlerror();
+        if (handle == nullptr) {
+            LOG_ERROR("Thread %d: dlopen failed: %s", my_thread_idx_, dlopen_err ? dlopen_err : "unknown");
+            unlink(so_path);
+            // Unblock scheduler threads before returning so they don't spin forever.
+            runtime_init_ready_.store(true, std::memory_order_release);
+            return -1;
+        }
+        LOG_INFO_V0("Thread %d: dlopen succeeded, handle=%p", my_thread_idx_, handle);
+
+        // Unlink the on-disk SO immediately: dlopen has already mmap'd
+        // the image, so the kernel keeps the inode alive until the
+        // matching dlclose / process exit. This prevents stale
+        // libdevice_orch_<pid>_<cid>.so files from accumulating in
+        // /tmp when child processes exit via os._exit(0), which skips
+        // ~AicpuExecutor (worker.py: _sub/_chip/_child loops).
+        unlink(so_path);
+
+        const char *entry_symbol = runtime->get_device_orch_func_name();
+        if (entry_symbol == nullptr || entry_symbol[0] == '\0') {
+            entry_symbol = DEFAULT_ORCH_ENTRY_SYMBOL;
+        }
+        const char *config_symbol = runtime->get_device_orch_config_name();
+        if (config_symbol == nullptr || config_symbol[0] == '\0') {
+            config_symbol = DEFAULT_ORCH_CONFIG_SYMBOL;
+        }
+
+        dlerror();
+        DeviceOrchestrationFunc orch_func =
+            reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, entry_symbol));
+        const char *entry_dlsym_error = dlerror();
+        if (entry_dlsym_error != nullptr) {
+            LOG_ERROR(
+                "Thread %d: dlsym failed for entry symbol '%s': %s", my_thread_idx_, entry_symbol, entry_dlsym_error
+            );
+            dlclose(handle);
+            unlink(so_path);
+            // Unblock scheduler threads before returning so they don't spin forever.
+            runtime_init_ready_.store(true, std::memory_order_release);
+            return -1;
+        }
+        if (orch_func == nullptr) {
+            LOG_ERROR("Thread %d: dlsym returned NULL for entry symbol '%s'", my_thread_idx_, entry_symbol);
+            dlclose(handle);
+            unlink(so_path);
+            // Unblock scheduler threads before returning so they don't spin forever.
+            runtime_init_ready_.store(true, std::memory_order_release);
+            return -1;
+        }
+
+        dlerror();
+        auto config_func = reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, config_symbol));
+        const char *config_dlsym_error = dlerror();
+        if (config_dlsym_error != nullptr || config_func == nullptr) {
+            LOG_ERROR(
+                "Thread %d: dlsym failed for config symbol '%s': %s", my_thread_idx_, config_symbol,
+                config_dlsym_error ? config_dlsym_error : "NULL function pointer"
+            );
+            config_func = nullptr;
+        }
+
+        dlerror();
+        auto bind_runtime_func =
+            reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "framework_bind_runtime"));
+        const char *bind_runtime_error = dlerror();
+        if (bind_runtime_error != nullptr) {
+            LOG_ERROR("Thread %d: dlsym failed for framework_bind_runtime: %s", my_thread_idx_, bind_runtime_error);
+            bind_runtime_func = nullptr;
+        }
+
+        *p_handle_ = handle;
+        *p_func_ = orch_func;
+        *p_bind_ = bind_runtime_func;
+        *p_config_func_ = config_func;
+        snprintf(p_path_, 256, "%s", so_path);
+    } else {
+        LOG_INFO_V0(
+            "Thread %d: Reusing cached orch SO handle=%p (callable_id=%d)", my_thread_idx_, *p_handle_, callable_id
+        );
+        if (*p_handle_ == nullptr || *p_func_ == nullptr) {
+            LOG_ERROR(
+                "Thread %d: reload=false but no cached SO handle/func for callable_id=%d", my_thread_idx_,
+                callable_id
+            );
+            // Unblock scheduler threads before returning so they don't spin forever.
+            runtime_init_ready_.store(true, std::memory_order_release);
+            return -1;
+        }
+    }
+
+    // Validate arg count on every run (reload or cache hit).
+    if (*p_config_func_ != nullptr) {
+        PTO2OrchestrationConfig cfg = (*p_config_func_)(runtime->get_orch_args());
+        LOG_INFO_V0("Thread %d: Config: expected_args=%d", my_thread_idx_, cfg.expected_arg_count);
+        if (cfg.expected_arg_count > 0) {
+            const ChipStorageTaskArgs &args_validate = runtime->get_orch_args();
+            int32_t actual_arg_count = args_validate.tensor_count() + args_validate.scalar_count();
+            if (actual_arg_count < cfg.expected_arg_count) {
+                LOG_ERROR(
+                    "Thread %d: arg_count %d < expected %d", my_thread_idx_, actual_arg_count,
+                    cfg.expected_arg_count
+                );
+                // Clean up cached state so a subsequent run does a full reload.
+                if (*p_handle_ != nullptr) {
+                    dlclose(*p_handle_);
+                    *p_handle_ = nullptr;
+                }
+                if (p_path_[0] != '\0') {
+                    unlink(p_path_);
+                    p_path_[0] = '\0';
+                }
+                *p_func_ = nullptr;
+                *p_bind_ = nullptr;
+                *p_config_func_ = nullptr;
+                // Unblock scheduler threads before returning so they don't spin forever.
+                runtime_init_ready_.store(true, std::memory_order_release);
+                return -1;
+            }
+        }
+    } else {
+        LOG_INFO_V0("Thread %d: No config function, using defaults", my_thread_idx_);
+    }
+
     return 0;
 }
 
@@ -232,423 +461,213 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         int32_t pto2_submitted_tasks = -1;
 #endif
 
+        // Orchestrator thread: load + run the device orchestration SO. 
         LOG_INFO_V0("Thread %d: Orchestrator Running", my_thread_idx_);
 
-        // Orchestrator thread: load + run the device orchestration SO. The braces
-        // scope the per-callable dlopen / SO-table locals to this block.
-        {
-            // Per-callable_id dispatch: the orch SO state lives in
-            // `orch_so_table_[callable_id]` keyed by registration order;
-            // reload is governed by `register_new_callable_id_`.
-            const int32_t callable_id = runtime->get_active_callable_id();
-            if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
-                LOG_ERROR(
-                    "Thread %d: invalid callable_id %d (limit=%d)", my_thread_idx_, callable_id, MAX_REGISTERED_CALLABLE_IDS
-                );
-                runtime_init_ready_.store(true, std::memory_order_release);
-                return -1;
-            }
-            void **p_handle = &orch_so_table_[callable_id].handle;
-            char *p_path = orch_so_table_[callable_id].path;
-            DeviceOrchestrationFunc *p_func = &orch_so_table_[callable_id].func;
-            DeviceOrchestrationBindRuntimeFunc *p_bind = &orch_so_table_[callable_id].bind;
-            DeviceOrchestrationConfigFunc *p_config_func = &orch_so_table_[callable_id].config_func;
-            const bool reload_so = runtime->register_new_callable_id();
-
-            if (reload_so) {
-                LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", my_thread_idx_, callable_id);
-                runtime->notify_callable_id_registered();
-                
-                if (*p_handle != nullptr) {
-                    dlclose(*p_handle);
-                    *p_handle = nullptr;
-                    *p_func = nullptr;
-                    *p_bind = nullptr;
-                    if (p_path[0] != '\0') {
-                        // Unlink the old file so the new open() lands on a
-                        // fresh inode — protects against SIGBUS / ETXTBSY when
-                        // the kernel still has the old mapping pinned.
-                        unlink(p_path);
-                        p_path[0] = '\0';
-                    }
-                }
-
-                const void *so_data = reinterpret_cast<const void *>(runtime->get_dev_orch_so_addr());
-                size_t so_size = runtime->get_dev_orch_so_size();
-
-                if (so_data == nullptr || so_size == 0) {
-                    LOG_ERROR("Thread %d: Device orchestration SO not set", my_thread_idx_);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-
-                // Try multiple paths that may allow execution on AICPU
-                char so_path[256];
-                bool file_created = false;
-                const char *candidate_dirs[] = {
-                    "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device", "/usr/lib64", "/lib64", "/var/tmp", "/tmp"
-                };
-                const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
-
-                for (int32_t i = 0; i < num_candidates && !file_created; i++) {
-                    int32_t fd = create_orch_so_file(candidate_dirs[i], callable_id, so_path, sizeof(so_path));
-                    if (fd < 0) {
-                        LOG_INFO_V0(
-                            "Thread %d: Cannot create SO at %s (errno=%d), trying next path", my_thread_idx_, so_path, errno
-                        );
-                        continue;
-                    }
-                    ssize_t written = write(fd, so_data, so_size);
-                    close(fd);
-                    if (written != static_cast<ssize_t>(so_size)) {
-                        LOG_INFO_V0(
-                            "Thread %d: Cannot write SO to %s (errno=%d), trying next path", my_thread_idx_, so_path, errno
-                        );
-                        unlink(so_path);
-                        continue;
-                    }
-                    file_created = true;
-                    LOG_INFO_V0("Thread %d: Created SO file at %s (%zu bytes)", my_thread_idx_, so_path, so_size);
-                }
-
-                if (!file_created) {
-                    LOG_ERROR("Thread %d: Failed to create SO file in any candidate path", my_thread_idx_);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-
-                dlerror();
-                void *handle = dlopen(so_path, RTLD_LAZY | RTLD_LOCAL);
-                const char *dlopen_err = dlerror();
-                if (handle == nullptr) {
-                    LOG_ERROR("Thread %d: dlopen failed: %s", my_thread_idx_, dlopen_err ? dlopen_err : "unknown");
-                    unlink(so_path);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-                LOG_INFO_V0("Thread %d: dlopen succeeded, handle=%p", my_thread_idx_, handle);
-
-                // Unlink the on-disk SO immediately: dlopen has already mmap'd
-                // the image, so the kernel keeps the inode alive until the
-                // matching dlclose / process exit. This prevents stale
-                // libdevice_orch_<pid>_<cid>.so files from accumulating in
-                // /tmp when child processes exit via os._exit(0), which skips
-                // ~AicpuExecutor (worker.py: _sub/_chip/_child loops).
-                unlink(so_path);
-
-                const char *entry_symbol = runtime->get_device_orch_func_name();
-                if (entry_symbol == nullptr || entry_symbol[0] == '\0') {
-                    entry_symbol = DEFAULT_ORCH_ENTRY_SYMBOL;
-                }
-                const char *config_symbol = runtime->get_device_orch_config_name();
-                if (config_symbol == nullptr || config_symbol[0] == '\0') {
-                    config_symbol = DEFAULT_ORCH_CONFIG_SYMBOL;
-                }
-
-                dlerror();
-                DeviceOrchestrationFunc orch_func =
-                    reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, entry_symbol));
-                const char *entry_dlsym_error = dlerror();
-                if (entry_dlsym_error != nullptr) {
-                    LOG_ERROR(
-                        "Thread %d: dlsym failed for entry symbol '%s': %s", my_thread_idx_, entry_symbol, entry_dlsym_error
-                    );
-                    dlclose(handle);
-                    unlink(so_path);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-                if (orch_func == nullptr) {
-                    LOG_ERROR("Thread %d: dlsym returned NULL for entry symbol '%s'", my_thread_idx_, entry_symbol);
-                    dlclose(handle);
-                    unlink(so_path);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-
-                dlerror();
-                auto config_func = reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, config_symbol));
-                const char *config_dlsym_error = dlerror();
-                if (config_dlsym_error != nullptr || config_func == nullptr) {
-                    LOG_ERROR(
-                        "Thread %d: dlsym failed for config symbol '%s': %s", my_thread_idx_, config_symbol,
-                        config_dlsym_error ? config_dlsym_error : "NULL function pointer"
-                    );
-                    config_func = nullptr;
-                }
-
-                dlerror();
-                auto bind_runtime_func =
-                    reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "framework_bind_runtime"));
-                const char *bind_runtime_error = dlerror();
-                if (bind_runtime_error != nullptr) {
-                    LOG_ERROR("Thread %d: dlsym failed for framework_bind_runtime: %s", my_thread_idx_, bind_runtime_error);
-                    bind_runtime_func = nullptr;
-                }
-
-                *p_handle = handle;
-                *p_func = orch_func;
-                *p_bind = bind_runtime_func;
-                *p_config_func = config_func;
-                snprintf(p_path, 256, "%s", so_path);
-            } else {
-                LOG_INFO_V0(
-                    "Thread %d: Reusing cached orch SO handle=%p (callable_id=%d)", my_thread_idx_, *p_handle, callable_id
-                );
-                if (*p_handle == nullptr || *p_func == nullptr) {
-                    LOG_ERROR(
-                        "Thread %d: reload=false but no cached SO handle/func for callable_id=%d", my_thread_idx_,
-                        callable_id
-                    );
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-            }
-
-            // Validate arg count on every run (reload or cache hit).
-            if (*p_config_func != nullptr) {
-                PTO2OrchestrationConfig cfg = (*p_config_func)(runtime->get_orch_args());
-                LOG_INFO_V0("Thread %d: Config: expected_args=%d", my_thread_idx_, cfg.expected_arg_count);
-                if (cfg.expected_arg_count > 0) {
-                    const ChipStorageTaskArgs &args_validate = runtime->get_orch_args();
-                    int32_t actual_arg_count = args_validate.tensor_count() + args_validate.scalar_count();
-                    if (actual_arg_count < cfg.expected_arg_count) {
-                        LOG_ERROR(
-                            "Thread %d: arg_count %d < expected %d", my_thread_idx_, actual_arg_count,
-                            cfg.expected_arg_count
-                        );
-                        // Clean up cached state so a subsequent run does a full reload.
-                        if (*p_handle != nullptr) {
-                            dlclose(*p_handle);
-                            *p_handle = nullptr;
-                        }
-                        if (p_path[0] != '\0') {
-                            unlink(p_path);
-                            p_path[0] = '\0';
-                        }
-                        *p_func = nullptr;
-                        *p_bind = nullptr;
-                        *p_config_func = nullptr;
-                        // Unblock scheduler threads before returning so they don't spin forever.
-                        runtime_init_ready_.store(true, std::memory_order_release);
-                        return -1;
-                    }
-                }
-            } else {
-                LOG_INFO_V0("Thread %d: No config function, using defaults", my_thread_idx_);
-            }
-
-            // sm_handle / rt are bound to *this* run's memory and must be
-            // (re)created every run, regardless of whether the SO itself was
-            // reused above.
-            const ChipStorageTaskArgs &args = runtime->get_orch_args();
-            int32_t arg_count = args.tensor_count() + args.scalar_count();
-            LOG_INFO_V0("Thread %d: sm_ptr=%p, arg_count=%d", my_thread_idx_, runtime->get_gm_sm_ptr(), arg_count);
-            for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
-                const ContinuousTensor &t = args.tensor(i);
-                LOG_INFO_V0(
-                    "Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)", my_thread_idx_, i,
-                    static_cast<uint64_t>(t.data), t.ndims, static_cast<unsigned>(t.dtype)
-                );
-            }
-            for (int32_t i = 0; i < args.scalar_count() && (args.tensor_count() + i) < 20; i++) {
-                LOG_INFO_V0(
-                    "Thread %d: orch_args[%d] = SCALAR(0x%lx)", my_thread_idx_, args.tensor_count() + i,
-                    static_cast<uint64_t>(args.scalar(i))
-                );
-            }
-
-            uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
-            uint64_t heap_size = PTO2_HEAP_SIZE;
-
-            if (runtime->task_window_size > 0) {
-                task_window_size = runtime->task_window_size;
-            }
-            if (runtime->heap_size > 0) {
-                heap_size = runtime->heap_size;
-            }
-            int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
-            if (runtime->dep_pool_size > 0) {
-                dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
-            }
+        // sm_handle / rt are bound to *this* run's memory and must be
+        // (re)created every run, regardless of whether the SO itself was
+        // reused above.
+        const ChipStorageTaskArgs &args = runtime->get_orch_args();
+        int32_t arg_count = args.tensor_count() + args.scalar_count();
+        LOG_INFO_V0("Thread %d: sm_ptr=%p, arg_count=%d", my_thread_idx_, runtime->get_gm_sm_ptr(), arg_count);
+        for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
+            const ContinuousTensor &t = args.tensor(i);
             LOG_INFO_V0(
-                "Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%d", my_thread_idx_,
-                static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
+                "Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)", my_thread_idx_, i,
+                static_cast<uint64_t>(t.data), t.ndims, static_cast<unsigned>(t.dtype)
             );
+        }
+        for (int32_t i = 0; i < args.scalar_count() && (args.tensor_count() + i) < 20; i++) {
+            LOG_INFO_V0(
+                "Thread %d: orch_args[%d] = SCALAR(0x%lx)", my_thread_idx_, args.tensor_count() + i,
+                static_cast<uint64_t>(args.scalar(i))
+            );
+        }
 
-            void *sm_ptr = runtime->get_gm_sm_ptr();
-            void *gm_heap = runtime->get_gm_heap_ptr();
+        uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
+        uint64_t heap_size = PTO2_HEAP_SIZE;
 
-            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
-            PTO2SharedMemoryHandle *sm_handle =
-                PTO2SharedMemoryHandle::create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
-            if (!sm_handle) {
-                LOG_ERROR("Thread %d: Failed to create shared memory handle", my_thread_idx_);
-                // Unblock scheduler threads before returning so they don't spin forever.
-                runtime_init_ready_.store(true, std::memory_order_release);
-                return -1;
-            }
+        if (runtime->task_window_size > 0) {
+            task_window_size = runtime->task_window_size;
+        }
+        if (runtime->heap_size > 0) {
+            heap_size = runtime->heap_size;
+        }
+        int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
+        if (runtime->dep_pool_size > 0) {
+            dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
+        }
+        LOG_INFO_V0(
+            "Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%d", my_thread_idx_,
+            static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
+        );
 
-            rt = runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
-            if (!rt) {
-                LOG_ERROR("Thread %d: Failed to create PTO2Runtime", my_thread_idx_);
-                sm_handle->destroy();
-                // Unblock scheduler threads before returning so they don't spin forever.
-                runtime_init_ready_.store(true, std::memory_order_release);
-                return -1;
-            }
+        void *sm_ptr = runtime->get_gm_sm_ptr();
+        void *gm_heap = runtime->get_gm_heap_ptr();
 
-#if PTO2_PROFILING
-            rt->orchestrator.l2_perf_level = get_l2_perf_level();
-#endif
-
-            // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
-            rt->orchestrator.total_cluster_count = sched_ctx_.aic_count();
-            rt->orchestrator.total_aiv_count = sched_ctx_.aiv_count();
-
-            // With multi-ring, slot_states are per-ring inside the scheduler.
-            runtime->set_slot_states_ptr(nullptr);
-
-            orch_args_cached_ = &args;
-
-            // Wire scheduler context to the newly created PTO2Runtime before
-            // releasing scheduler threads from runtime_init_ready_.
-            sched_ctx_.bind_runtime(rt);
-
+        uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
+        PTO2SharedMemoryHandle *sm_handle =
+            PTO2SharedMemoryHandle::create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
+        if (!sm_handle) {
+            LOG_ERROR("Thread %d: Failed to create shared memory handle", my_thread_idx_);
+            // Unblock scheduler threads before returning so they don't spin forever.
             runtime_init_ready_.store(true, std::memory_order_release);
+            return -1;
+        }
 
-            // Wait for scheduler's one-time init to complete
-            sched_ctx_.wait_pto2_init_complete();
-
-#if PTO2_PROFILING
-            if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
-                l2_perf_aicpu_set_orch_thread_idx(my_thread_idx_);
-            }
-#endif
-
-            // dep_gen plugs into the orchestrator thread (single-instance subsystem):
-            // set the per-thread queue index and pop the initial buffer before any
-            // submit_task can fire inside orch_func_.
-            if (is_dep_gen_enabled()) {
-                dep_gen_aicpu_set_orch_thread_idx(my_thread_idx_);
-                dep_gen_aicpu_init();
-            }
+        rt = runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
+        if (!rt) {
+            LOG_ERROR("Thread %d: Failed to create PTO2Runtime", my_thread_idx_);
+            sm_handle->destroy();
+            // Unblock scheduler threads before returning so they don't spin forever.
+            runtime_init_ready_.store(true, std::memory_order_release);
+            return -1;
+        }
 
 #if PTO2_PROFILING
-            orch_cycle_start = get_sys_cnt_aicpu();
+        rt->orchestrator.l2_perf_level = get_l2_perf_level();
 #endif
-            framework_bind_runtime(rt);
-            if (*p_bind != nullptr) {
-                (*p_bind)(rt);
-            }
-            rt_scope_begin(rt);
-            (*p_func)(*orch_args_cached_);
-            rt_scope_end(rt);
 
-            // Flush the (potentially partially-filled) DepGenBuffer so the host
-            // collector can pick it up before this orchestrator thread joins.
-            if (is_dep_gen_enabled()) {
-                dep_gen_aicpu_flush();
-            }
+        // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
+        rt->orchestrator.total_cluster_count = sched_ctx_.aic_count();
+        rt->orchestrator.total_aiv_count = sched_ctx_.aiv_count();
+
+        // With multi-ring, slot_states are per-ring inside the scheduler.
+        runtime->set_slot_states_ptr(nullptr);
+
+        orch_args_cached_ = &args;
+
+        // Wire scheduler context to the newly created PTO2Runtime before
+        // releasing scheduler threads from runtime_init_ready_.
+        sched_ctx_.bind_runtime(rt);
+
+        runtime_init_ready_.store(true, std::memory_order_release);
+
+        // Wait for scheduler's one-time init to complete
+        sched_ctx_.wait_pto2_init_complete();
+
 #if PTO2_PROFILING
-            uint64_t orch_cycle_end = get_sys_cnt_aicpu();
-            (void)orch_cycle_end;
+        if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
+            l2_perf_aicpu_set_orch_thread_idx(my_thread_idx_);
+        }
 #endif
 
-            // Print orchestrator profiling data
+        // dep_gen plugs into the orchestrator thread (single-instance subsystem):
+        // set the per-thread queue index and pop the initial buffer before any
+        // submit_task can fire inside orch_func_.
+        if (is_dep_gen_enabled()) {
+            dep_gen_aicpu_set_orch_thread_idx(my_thread_idx_);
+            dep_gen_aicpu_init();
+        }
+
+#if PTO2_PROFILING
+        orch_cycle_start = get_sys_cnt_aicpu();
+#endif
+        framework_bind_runtime(rt);
+        if (*p_bind_ != nullptr) {
+            (*p_bind_)(rt);
+        }
+        rt_scope_begin(rt);
+        (*p_func_)(*orch_args_cached_);
+        rt_scope_end(rt);
+
+        // Flush the (potentially partially-filled) DepGenBuffer so the host
+        // collector can pick it up before this orchestrator thread joins.
+        if (is_dep_gen_enabled()) {
+            dep_gen_aicpu_flush();
+        }
+#if PTO2_PROFILING
+        uint64_t orch_cycle_end = get_sys_cnt_aicpu();
+        (void)orch_cycle_end;
+#endif
+
+        // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
-            PTO2OrchProfilingData p = orchestrator_get_profiling();
-            uint64_t total =
-                p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
-            if (total == 0) total = 1;  // avoid div-by-zero
-            LOG_INFO_V9(
-                "Thread %d: === Orchestrator Profiling: %" PRId64 " tasks, total=%.3fus ===", my_thread_idx_,
-                static_cast<int64_t>(p.submit_count), cycles_to_us(total)
-            );
-            LOG_INFO_V9(
-                "Thread %d:   task+heap_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "",
-                my_thread_idx_, cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total,
-                cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle), cycles_to_us(p.alloc_wait_cycle),
-                static_cast<uint64_t>(p.alloc_atomic_count)
-            );
-            LOG_INFO_V9(
-                "Thread %d:   sync_tensormap : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.sync_cycle),
-                p.sync_cycle * 100.0 / total
-            );
-            LOG_INFO_V9(
-                "Thread %d:   lookup+dep     : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.lookup_cycle),
-                p.lookup_cycle * 100.0 / total
-            );
-            LOG_INFO_V9(
-                "Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.insert_cycle),
-                p.insert_cycle * 100.0 / total
-            );
-            LOG_INFO_V9(
-                "Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%" PRIu64 "", my_thread_idx_,
-                cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
-            );
-            LOG_INFO_V9(
-                "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus", my_thread_idx_,
-                cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
-                cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle)
-            );
-            LOG_INFO_V9(
-                "Thread %d:   avg/task       : %.3fus", my_thread_idx_,
-                p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0
-            );
+        PTO2OrchProfilingData p = orchestrator_get_profiling();
+        uint64_t total =
+            p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
+        if (total == 0) total = 1;  // avoid div-by-zero
+        LOG_INFO_V9(
+            "Thread %d: === Orchestrator Profiling: %" PRId64 " tasks, total=%.3fus ===", my_thread_idx_,
+            static_cast<int64_t>(p.submit_count), cycles_to_us(total)
+        );
+        LOG_INFO_V9(
+            "Thread %d:   task+heap_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "",
+            my_thread_idx_, cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total,
+            cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle), cycles_to_us(p.alloc_wait_cycle),
+            static_cast<uint64_t>(p.alloc_atomic_count)
+        );
+        LOG_INFO_V9(
+            "Thread %d:   sync_tensormap : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.sync_cycle),
+            p.sync_cycle * 100.0 / total
+        );
+        LOG_INFO_V9(
+            "Thread %d:   lookup+dep     : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.lookup_cycle),
+            p.lookup_cycle * 100.0 / total
+        );
+        LOG_INFO_V9(
+            "Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.insert_cycle),
+            p.insert_cycle * 100.0 / total
+        );
+        LOG_INFO_V9(
+            "Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%" PRIu64 "", my_thread_idx_,
+            cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
+        );
+        LOG_INFO_V9(
+            "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus", my_thread_idx_,
+            cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
+            cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle)
+        );
+        LOG_INFO_V9(
+            "Thread %d:   avg/task       : %.3fus", my_thread_idx_,
+            p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0
+        );
 
 #if PTO2_TENSORMAP_PROFILING
-            PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
-            LOG_INFO_V9("Thread %d: === TensorMap Lookup Stats ===", my_thread_idx_);
-            LOG_INFO_V9(
-                "Thread %d:   lookups        : %" PRIu64 ", inserts: %" PRIu64 "", my_thread_idx_,
-                static_cast<uint64_t>(tp.lookup_count), static_cast<uint64_t>(tp.insert_count)
-            );
-            LOG_INFO_V9(
-                "Thread %d:   chain walked   : total=%" PRIu64 ", avg=%.1f, max=%d", my_thread_idx_,
-                static_cast<uint64_t>(tp.lookup_chain_total),
-                tp.lookup_count > 0 ? static_cast<double>(tp.lookup_chain_total) / tp.lookup_count : 0.0,
-                tp.lookup_chain_max
-            );
-            LOG_INFO_V9(
-                "Thread %d:   overlap checks : %" PRIu64 ", hits=%" PRIu64 " (%.1f%%)", my_thread_idx_,
-                static_cast<uint64_t>(tp.overlap_checks), static_cast<uint64_t>(tp.overlap_hits),
-                tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0
-            );
+        PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
+        LOG_INFO_V9("Thread %d: === TensorMap Lookup Stats ===", my_thread_idx_);
+        LOG_INFO_V9(
+            "Thread %d:   lookups        : %" PRIu64 ", inserts: %" PRIu64 "", my_thread_idx_,
+            static_cast<uint64_t>(tp.lookup_count), static_cast<uint64_t>(tp.insert_count)
+        );
+        LOG_INFO_V9(
+            "Thread %d:   chain walked   : total=%" PRIu64 ", avg=%.1f, max=%d", my_thread_idx_,
+            static_cast<uint64_t>(tp.lookup_chain_total),
+            tp.lookup_count > 0 ? static_cast<double>(tp.lookup_chain_total) / tp.lookup_count : 0.0,
+            tp.lookup_chain_max
+        );
+        LOG_INFO_V9(
+            "Thread %d:   overlap checks : %" PRIu64 ", hits=%" PRIu64 " (%.1f%%)", my_thread_idx_,
+            static_cast<uint64_t>(tp.overlap_checks), static_cast<uint64_t>(tp.overlap_hits),
+            tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0
+        );
 #endif
 #endif  // PTO2_ORCH_PROFILING
 
-            // Latch task count from PTO2 shared memory to hand off to the
-            // scheduler. The orchestrator's run window (start_time / end_time /
-            // submit_count) is no longer published to shared memory — the
-            // device LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…" line
-            // below carries the same envelope info for debugging, and
-            // host-side swimlane derives per-phase timing from the per-event
-            // AicpuPhaseRecord[] stream that already covers everything inside
-            // submit_task().
-            int32_t total_tasks = 0;
-            if (rt->orchestrator.sm_header) {
-                for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-                    total_tasks +=
-                        rt->orchestrator.sm_header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
-                }
+        // Latch task count from PTO2 shared memory to hand off to the
+        // scheduler. The orchestrator's run window (start_time / end_time /
+        // submit_count) is no longer published to shared memory — the
+        // device LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…" line
+        // below carries the same envelope info for debugging, and
+        // host-side swimlane derives per-phase timing from the per-event
+        // AicpuPhaseRecord[] stream that already covers everything inside
+        // submit_task().
+        int32_t total_tasks = 0;
+        if (rt->orchestrator.sm_header) {
+            for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+                total_tasks +=
+                    rt->orchestrator.sm_header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
             }
+        }
 
 #if PTO2_PROFILING
-            pto2_submitted_tasks = total_tasks;
+        pto2_submitted_tasks = total_tasks;
 #endif
 
-            // Signal completion to the orchestrator state machine
-            rt_orchestration_done(rt);
+        // Signal completion to the orchestrator state machine
+        rt_orchestration_done(rt);
 
-            sched_ctx_.on_orchestration_done(runtime, rt, my_thread_idx_, total_tasks);
-        }
+        sched_ctx_.on_orchestration_done(runtime, rt, my_thread_idx_, total_tasks);
 #if PTO2_PROFILING
         uint64_t orch_end_ts = get_sys_cnt_aicpu();
         LOG_INFO_V9(

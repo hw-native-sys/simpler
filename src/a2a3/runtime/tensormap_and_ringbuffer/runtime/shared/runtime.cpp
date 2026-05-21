@@ -96,7 +96,6 @@ void Runtime::set_active_callable_id(int32_t callable_id, bool is_new) {
 int32_t Runtime::get_active_callable_id() const { return active_callable_id_; }
 
 bool Runtime::register_new_callable_id() const { return register_new_callable_id_; }
-void Runtime::notify_callable_id_registered() { register_new_callable_id_ = false; }
 
 void Runtime::set_device_orch_func_name(const char *name) {
     if (name == nullptr) {
