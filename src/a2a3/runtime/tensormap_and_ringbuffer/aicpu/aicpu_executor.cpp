@@ -151,7 +151,8 @@ struct AicpuExecutor {
 
     // ===== Methods =====
     int32_t init(Runtime *runtime);
-    int32_t run(Runtime *runtime);
+    int32_t runScheduling(Runtime *runtime);
+    int32_t runOrchestration(Runtime* runtime);
     int32_t shutdown(Runtime *runtime);
     int32_t loadOrchestrator(Runtime* runtime);
     int32_t performTimingRuns(Runtime *runtime);
@@ -450,240 +451,9 @@ int32_t AicpuExecutor::loadOrchestrator(Runtime* runtime)
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
-int32_t AicpuExecutor::run(Runtime *runtime) {
+int32_t AicpuExecutor::runScheduling(Runtime *runtime) {
     int32_t run_rc = 0;
-    LOG_INFO_V0("Thread %d: at AicpuExecutor::Run", my_thread_idx_);
-
-    // Orchestrator check
-    if (my_thread_idx_ >= sched_thread_num_) {
-#if PTO2_PROFILING
-        uint64_t orch_cycle_start = 0;
-        int32_t pto2_submitted_tasks = -1;
-#endif
-
-        // Orchestrator thread: load + run the device orchestration SO. 
-        LOG_INFO_V0("Thread %d: Orchestrator Running", my_thread_idx_);
-
-        // sm_handle / rt are bound to *this* run's memory and must be
-        // (re)created every run, regardless of whether the SO itself was
-        // reused above.
-        const ChipStorageTaskArgs &args = runtime->get_orch_args();
-        int32_t arg_count = args.tensor_count() + args.scalar_count();
-        LOG_INFO_V0("Thread %d: sm_ptr=%p, arg_count=%d", my_thread_idx_, runtime->get_gm_sm_ptr(), arg_count);
-        for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
-            const ContinuousTensor &t = args.tensor(i);
-            LOG_INFO_V0(
-                "Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)", my_thread_idx_, i,
-                static_cast<uint64_t>(t.data), t.ndims, static_cast<unsigned>(t.dtype)
-            );
-        }
-        for (int32_t i = 0; i < args.scalar_count() && (args.tensor_count() + i) < 20; i++) {
-            LOG_INFO_V0(
-                "Thread %d: orch_args[%d] = SCALAR(0x%lx)", my_thread_idx_, args.tensor_count() + i,
-                static_cast<uint64_t>(args.scalar(i))
-            );
-        }
-
-        uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
-        uint64_t heap_size = PTO2_HEAP_SIZE;
-
-        if (runtime->task_window_size > 0) {
-            task_window_size = runtime->task_window_size;
-        }
-        if (runtime->heap_size > 0) {
-            heap_size = runtime->heap_size;
-        }
-        int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
-        if (runtime->dep_pool_size > 0) {
-            dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
-        }
-        LOG_INFO_V0(
-            "Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%d", my_thread_idx_,
-            static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
-        );
-
-        void *sm_ptr = runtime->get_gm_sm_ptr();
-        void *gm_heap = runtime->get_gm_heap_ptr();
-
-        uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
-        PTO2SharedMemoryHandle *sm_handle =
-            PTO2SharedMemoryHandle::create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
-        if (!sm_handle) {
-            LOG_ERROR("Thread %d: Failed to create shared memory handle", my_thread_idx_);
-            // Unblock scheduler threads before returning so they don't spin forever.
-            runtime_init_ready_.store(true, std::memory_order_release);
-            return -1;
-        }
-
-        rt = runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
-        if (!rt) {
-            LOG_ERROR("Thread %d: Failed to create PTO2Runtime", my_thread_idx_);
-            sm_handle->destroy();
-            // Unblock scheduler threads before returning so they don't spin forever.
-            runtime_init_ready_.store(true, std::memory_order_release);
-            return -1;
-        }
-
-#if PTO2_PROFILING
-        rt->orchestrator.l2_perf_level = get_l2_perf_level();
-#endif
-
-        // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
-        rt->orchestrator.total_cluster_count = sched_ctx_.aic_count();
-        rt->orchestrator.total_aiv_count = sched_ctx_.aiv_count();
-
-        // With multi-ring, slot_states are per-ring inside the scheduler.
-        runtime->set_slot_states_ptr(nullptr);
-
-        orch_args_cached_ = &args;
-
-        // Wire scheduler context to the newly created PTO2Runtime before
-        // releasing scheduler threads from runtime_init_ready_.
-        sched_ctx_.bind_runtime(rt);
-
-        runtime_init_ready_.store(true, std::memory_order_release);
-
-        // Wait for scheduler's one-time init to complete
-        sched_ctx_.wait_pto2_init_complete();
-
-#if PTO2_PROFILING
-        if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
-            l2_perf_aicpu_set_orch_thread_idx(my_thread_idx_);
-        }
-#endif
-
-        // dep_gen plugs into the orchestrator thread (single-instance subsystem):
-        // set the per-thread queue index and pop the initial buffer before any
-        // submit_task can fire inside orch_func_.
-        if (is_dep_gen_enabled()) {
-            dep_gen_aicpu_set_orch_thread_idx(my_thread_idx_);
-            dep_gen_aicpu_init();
-        }
-
-#if PTO2_PROFILING
-        orch_cycle_start = get_sys_cnt_aicpu();
-#endif
-        framework_bind_runtime(rt);
-        if (*p_bind_ != nullptr) {
-            (*p_bind_)(rt);
-        }
-        rt_scope_begin(rt);
-        (*p_func_)(*orch_args_cached_);
-        rt_scope_end(rt);
-
-        // Flush the (potentially partially-filled) DepGenBuffer so the host
-        // collector can pick it up before this orchestrator thread joins.
-        if (is_dep_gen_enabled()) {
-            dep_gen_aicpu_flush();
-        }
-#if PTO2_PROFILING
-        uint64_t orch_cycle_end = get_sys_cnt_aicpu();
-        (void)orch_cycle_end;
-#endif
-
-        // Print orchestrator profiling data
-#if PTO2_ORCH_PROFILING
-        PTO2OrchProfilingData p = orchestrator_get_profiling();
-        uint64_t total =
-            p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
-        if (total == 0) total = 1;  // avoid div-by-zero
-        LOG_INFO_V9(
-            "Thread %d: === Orchestrator Profiling: %" PRId64 " tasks, total=%.3fus ===", my_thread_idx_,
-            static_cast<int64_t>(p.submit_count), cycles_to_us(total)
-        );
-        LOG_INFO_V9(
-            "Thread %d:   task+heap_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "",
-            my_thread_idx_, cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total,
-            cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle), cycles_to_us(p.alloc_wait_cycle),
-            static_cast<uint64_t>(p.alloc_atomic_count)
-        );
-        LOG_INFO_V9(
-            "Thread %d:   sync_tensormap : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.sync_cycle),
-            p.sync_cycle * 100.0 / total
-        );
-        LOG_INFO_V9(
-            "Thread %d:   lookup+dep     : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.lookup_cycle),
-            p.lookup_cycle * 100.0 / total
-        );
-        LOG_INFO_V9(
-            "Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.insert_cycle),
-            p.insert_cycle * 100.0 / total
-        );
-        LOG_INFO_V9(
-            "Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%" PRIu64 "", my_thread_idx_,
-            cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
-        );
-        LOG_INFO_V9(
-            "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus", my_thread_idx_,
-            cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
-            cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle)
-        );
-        LOG_INFO_V9(
-            "Thread %d:   avg/task       : %.3fus", my_thread_idx_,
-            p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0
-        );
-
-#if PTO2_TENSORMAP_PROFILING
-        PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
-        LOG_INFO_V9("Thread %d: === TensorMap Lookup Stats ===", my_thread_idx_);
-        LOG_INFO_V9(
-            "Thread %d:   lookups        : %" PRIu64 ", inserts: %" PRIu64 "", my_thread_idx_,
-            static_cast<uint64_t>(tp.lookup_count), static_cast<uint64_t>(tp.insert_count)
-        );
-        LOG_INFO_V9(
-            "Thread %d:   chain walked   : total=%" PRIu64 ", avg=%.1f, max=%d", my_thread_idx_,
-            static_cast<uint64_t>(tp.lookup_chain_total),
-            tp.lookup_count > 0 ? static_cast<double>(tp.lookup_chain_total) / tp.lookup_count : 0.0,
-            tp.lookup_chain_max
-        );
-        LOG_INFO_V9(
-            "Thread %d:   overlap checks : %" PRIu64 ", hits=%" PRIu64 " (%.1f%%)", my_thread_idx_,
-            static_cast<uint64_t>(tp.overlap_checks), static_cast<uint64_t>(tp.overlap_hits),
-            tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0
-        );
-#endif
-#endif  // PTO2_ORCH_PROFILING
-
-        // Latch task count from PTO2 shared memory to hand off to the
-        // scheduler. The orchestrator's run window (start_time / end_time /
-        // submit_count) is no longer published to shared memory — the
-        // device LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…" line
-        // below carries the same envelope info for debugging, and
-        // host-side swimlane derives per-phase timing from the per-event
-        // AicpuPhaseRecord[] stream that already covers everything inside
-        // submit_task().
-        int32_t total_tasks = 0;
-        if (rt->orchestrator.sm_header) {
-            for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-                total_tasks +=
-                    rt->orchestrator.sm_header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
-            }
-        }
-
-#if PTO2_PROFILING
-        pto2_submitted_tasks = total_tasks;
-#endif
-
-        // Signal completion to the orchestrator state machine
-        rt_orchestration_done(rt);
-
-        sched_ctx_.on_orchestration_done(runtime, rt, my_thread_idx_, total_tasks);
-#if PTO2_PROFILING
-        uint64_t orch_end_ts = get_sys_cnt_aicpu();
-        LOG_INFO_V9(
-            "Thread %d: orch_start=%" PRIu64 " orch_end=%" PRIu64 " orch_cost=%.3fus", my_thread_idx_,
-            static_cast<uint64_t>(orch_cycle_start), static_cast<uint64_t>(orch_end_ts),
-            cycles_to_us(orch_end_ts - orch_cycle_start)
-        );
-        if (pto2_submitted_tasks >= 0) {
-            LOG_INFO_V9(
-                "PTO2 total submitted tasks = %d, already executed %d tasks", pto2_submitted_tasks,
-                sched_ctx_.completed_tasks_count()
-            );
-        }
-#endif
-        LOG_INFO_V0("Thread %d: Orchestrator completed", my_thread_idx_);
-    }
+    LOG_INFO_V0("Thread %d: at AicpuExecutor::runScheduling", my_thread_idx_);
 
     // Scheduler thread (orchestrator threads skip dispatch when orch_to_sched_ is false)
     if (!sched_ctx_.is_completed() && (my_thread_idx_ < sched_thread_num_ || orch_to_sched_)) {
@@ -708,6 +478,242 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     LOG_INFO_V0("Thread %d: Scheduling Completed", my_thread_idx_);
 
     return run_rc;
+}
+
+int32_t AicpuExecutor::runOrchestration(Runtime* runtime)
+{
+    // Only the orchestrator thread runs this
+    if (my_thread_idx_ < sched_thread_num_) return 0;
+
+#if PTO2_PROFILING
+    uint64_t orch_cycle_start = 0;
+    int32_t pto2_submitted_tasks = -1;
+#endif
+
+    // Orchestrator thread: load + run the device orchestration SO. 
+    LOG_INFO_V0("Thread %d: Orchestrator Running", my_thread_idx_);
+
+    // sm_handle / rt are bound to *this* run's memory and must be
+    // (re)created every run, regardless of whether the SO itself was
+    // reused above.
+    const ChipStorageTaskArgs &args = runtime->get_orch_args();
+    int32_t arg_count = args.tensor_count() + args.scalar_count();
+    LOG_INFO_V0("Thread %d: sm_ptr=%p, arg_count=%d", my_thread_idx_, runtime->get_gm_sm_ptr(), arg_count);
+    for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
+        const ContinuousTensor &t = args.tensor(i);
+        LOG_INFO_V0(
+            "Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)", my_thread_idx_, i,
+            static_cast<uint64_t>(t.data), t.ndims, static_cast<unsigned>(t.dtype)
+        );
+    }
+    for (int32_t i = 0; i < args.scalar_count() && (args.tensor_count() + i) < 20; i++) {
+        LOG_INFO_V0(
+            "Thread %d: orch_args[%d] = SCALAR(0x%lx)", my_thread_idx_, args.tensor_count() + i,
+            static_cast<uint64_t>(args.scalar(i))
+        );
+    }
+
+    uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
+    uint64_t heap_size = PTO2_HEAP_SIZE;
+
+    if (runtime->task_window_size > 0) {
+        task_window_size = runtime->task_window_size;
+    }
+    if (runtime->heap_size > 0) {
+        heap_size = runtime->heap_size;
+    }
+    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
+    if (runtime->dep_pool_size > 0) {
+        dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
+    }
+    LOG_INFO_V0(
+        "Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%d", my_thread_idx_,
+        static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
+    );
+
+    void *sm_ptr = runtime->get_gm_sm_ptr();
+    void *gm_heap = runtime->get_gm_heap_ptr();
+
+    uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
+    PTO2SharedMemoryHandle *sm_handle =
+        PTO2SharedMemoryHandle::create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
+    if (!sm_handle) {
+        LOG_ERROR("Thread %d: Failed to create shared memory handle", my_thread_idx_);
+        // Unblock scheduler threads before returning so they don't spin forever.
+        runtime_init_ready_.store(true, std::memory_order_release);
+        return -1;
+    }
+
+    rt = runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
+    if (!rt) {
+        LOG_ERROR("Thread %d: Failed to create PTO2Runtime", my_thread_idx_);
+        sm_handle->destroy();
+        // Unblock scheduler threads before returning so they don't spin forever.
+        runtime_init_ready_.store(true, std::memory_order_release);
+        return -1;
+    }
+
+#if PTO2_PROFILING
+    rt->orchestrator.l2_perf_level = get_l2_perf_level();
+#endif
+
+    // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
+    rt->orchestrator.total_cluster_count = sched_ctx_.aic_count();
+    rt->orchestrator.total_aiv_count = sched_ctx_.aiv_count();
+
+    // With multi-ring, slot_states are per-ring inside the scheduler.
+    runtime->set_slot_states_ptr(nullptr);
+
+    orch_args_cached_ = &args;
+
+    // Wire scheduler context to the newly created PTO2Runtime before
+    // releasing scheduler threads from runtime_init_ready_.
+    sched_ctx_.bind_runtime(rt);
+
+    runtime_init_ready_.store(true, std::memory_order_release);
+
+    // Wait for scheduler's one-time init to complete
+    sched_ctx_.wait_pto2_init_complete();
+
+#if PTO2_PROFILING
+    if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
+        l2_perf_aicpu_set_orch_thread_idx(my_thread_idx_);
+    }
+#endif
+
+    // dep_gen plugs into the orchestrator thread (single-instance subsystem):
+    // set the per-thread queue index and pop the initial buffer before any
+    // submit_task can fire inside orch_func_.
+    if (is_dep_gen_enabled()) {
+        dep_gen_aicpu_set_orch_thread_idx(my_thread_idx_);
+        dep_gen_aicpu_init();
+    }
+
+#if PTO2_PROFILING
+    orch_cycle_start = get_sys_cnt_aicpu();
+#endif
+    framework_bind_runtime(rt);
+    if (*p_bind_ != nullptr) {
+        (*p_bind_)(rt);
+    }
+    rt_scope_begin(rt);
+    (*p_func_)(*orch_args_cached_);
+    rt_scope_end(rt);
+
+    // Flush the (potentially partially-filled) DepGenBuffer so the host
+    // collector can pick it up before this orchestrator thread joins.
+    if (is_dep_gen_enabled()) {
+        dep_gen_aicpu_flush();
+    }
+#if PTO2_PROFILING
+    uint64_t orch_cycle_end = get_sys_cnt_aicpu();
+    (void)orch_cycle_end;
+#endif
+
+    // Print orchestrator profiling data
+#if PTO2_ORCH_PROFILING
+    PTO2OrchProfilingData p = orchestrator_get_profiling();
+    uint64_t total =
+        p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
+    if (total == 0) total = 1;  // avoid div-by-zero
+    LOG_INFO_V9(
+        "Thread %d: === Orchestrator Profiling: %" PRId64 " tasks, total=%.3fus ===", my_thread_idx_,
+        static_cast<int64_t>(p.submit_count), cycles_to_us(total)
+    );
+    LOG_INFO_V9(
+        "Thread %d:   task+heap_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "",
+        my_thread_idx_, cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total,
+        cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle), cycles_to_us(p.alloc_wait_cycle),
+        static_cast<uint64_t>(p.alloc_atomic_count)
+    );
+    LOG_INFO_V9(
+        "Thread %d:   sync_tensormap : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.sync_cycle),
+        p.sync_cycle * 100.0 / total
+    );
+    LOG_INFO_V9(
+        "Thread %d:   lookup+dep     : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.lookup_cycle),
+        p.lookup_cycle * 100.0 / total
+    );
+    LOG_INFO_V9(
+        "Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.insert_cycle),
+        p.insert_cycle * 100.0 / total
+    );
+    LOG_INFO_V9(
+        "Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%" PRIu64 "", my_thread_idx_,
+        cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
+    );
+    LOG_INFO_V9(
+        "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus", my_thread_idx_,
+        cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
+        cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle)
+    );
+    LOG_INFO_V9(
+        "Thread %d:   avg/task       : %.3fus", my_thread_idx_,
+        p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0
+    );
+
+#if PTO2_TENSORMAP_PROFILING
+    PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
+    LOG_INFO_V9("Thread %d: === TensorMap Lookup Stats ===", my_thread_idx_);
+    LOG_INFO_V9(
+        "Thread %d:   lookups        : %" PRIu64 ", inserts: %" PRIu64 "", my_thread_idx_,
+        static_cast<uint64_t>(tp.lookup_count), static_cast<uint64_t>(tp.insert_count)
+    );
+    LOG_INFO_V9(
+        "Thread %d:   chain walked   : total=%" PRIu64 ", avg=%.1f, max=%d", my_thread_idx_,
+        static_cast<uint64_t>(tp.lookup_chain_total),
+        tp.lookup_count > 0 ? static_cast<double>(tp.lookup_chain_total) / tp.lookup_count : 0.0,
+        tp.lookup_chain_max
+    );
+    LOG_INFO_V9(
+        "Thread %d:   overlap checks : %" PRIu64 ", hits=%" PRIu64 " (%.1f%%)", my_thread_idx_,
+        static_cast<uint64_t>(tp.overlap_checks), static_cast<uint64_t>(tp.overlap_hits),
+        tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0
+    );
+#endif
+#endif  // PTO2_ORCH_PROFILING
+
+    // Latch task count from PTO2 shared memory to hand off to the
+    // scheduler. The orchestrator's run window (start_time / end_time /
+    // submit_count) is no longer published to shared memory — the
+    // device LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…" line
+    // below carries the same envelope info for debugging, and
+    // host-side swimlane derives per-phase timing from the per-event
+    // AicpuPhaseRecord[] stream that already covers everything inside
+    // submit_task().
+    int32_t total_tasks = 0;
+    if (rt->orchestrator.sm_header) {
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            total_tasks +=
+                rt->orchestrator.sm_header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+        }
+    }
+
+#if PTO2_PROFILING
+    pto2_submitted_tasks = total_tasks;
+#endif
+
+    // Signal completion to the orchestrator state machine
+    rt_orchestration_done(rt);
+
+    sched_ctx_.on_orchestration_done(runtime, rt, my_thread_idx_, total_tasks);
+#if PTO2_PROFILING
+    uint64_t orch_end_ts = get_sys_cnt_aicpu();
+    LOG_INFO_V9(
+        "Thread %d: orch_start=%" PRIu64 " orch_end=%" PRIu64 " orch_cost=%.3fus", my_thread_idx_,
+        static_cast<uint64_t>(orch_cycle_start), static_cast<uint64_t>(orch_end_ts),
+        cycles_to_us(orch_end_ts - orch_cycle_start)
+    );
+    if (pto2_submitted_tasks >= 0) {
+        LOG_INFO_V9(
+            "PTO2 total submitted tasks = %d, already executed %d tasks", pto2_submitted_tasks,
+            sched_ctx_.completed_tasks_count()
+        );
+    }
+#endif
+    LOG_INFO_V0("Thread %d: Orchestrator completed", my_thread_idx_);
+
+    return 0;
 }
 
 void AicpuExecutor::deinit(Runtime *runtime) {
@@ -792,7 +798,8 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
     {
         barrier();
         uint64_t t0_ts = get_sys_cnt_aicpu();
-        rc |= run(runtime);
+        rc |= runOrchestration(runtime);
+        rc |= runScheduling(runtime);
         barrier();
         uint64_t t1_ts = get_sys_cnt_aicpu();
         LOG_INFO_V9("Thread %d: Warmup %d/%d Time: %luns", my_thread_idx_, i, warmupIterationCount, t1_ts - t0_ts);
@@ -810,7 +817,8 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
         // Waiting for threads to arrive for before-timing.
         barrier();
         uint64_t t0_ts = get_sys_cnt_aicpu();
-        rc |= run(runtime);
+        rc |= runOrchestration(runtime);
+        rc |= runScheduling(runtime);
         barrier();
         uint64_t t1_ts = get_sys_cnt_aicpu();
         LOG_INFO_V9("Thread %d: Timing %d/%d time: %luns", my_thread_idx_, i, timingIterationCount, t1_ts - t0_ts);
@@ -872,10 +880,18 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         }
     }
 
-    // Perform actual kernel run
-    int32_t rc = g_aicpu_executor.run(runtime);
-    if (rc != 0) {
-        LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
+    // Perform orchestration step
+    int32_t orch_rc = g_aicpu_executor.runOrchestration(runtime);
+    if (orch_rc != 0) {
+        LOG_ERROR("aicpu_execute: Orhestration execution failed with rc=%d", orch_rc);
+        return orch_rc;
+    }
+
+    // Perform scheduling step
+    int32_t sched_rc = g_aicpu_executor.runScheduling(runtime);
+    if (sched_rc != 0) {
+        LOG_ERROR("aicpu_execute: Scheduling execution failed with rc=%d", sched_rc);
+        return sched_rc;
     }
 
     int32_t runtime_rc = read_pto2_runtime_status(runtime);
@@ -896,10 +912,6 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
         LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
-    }
-
-    if (rc != 0) {
-        return rc;
     }
 
     LOG_INFO_V0("%s", "aicpu_execute: Kernel execution completed successfully");
