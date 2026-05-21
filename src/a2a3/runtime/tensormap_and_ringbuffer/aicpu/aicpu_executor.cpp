@@ -122,12 +122,11 @@ struct AicpuExecutor {
 
     int32_t thread_num_{0};
 
-    // Barrier counters for synchronization (timing) across threads
+    // ====== Barrier counters for synchronization (timing) across threads
     std::atomic<uint64_t> barrier_counter_in_{0};
     std::atomic<uint64_t> barrier_counter_out_{0};
 
     // ===== Task queue state (managed by scheduler ready queues) =====
-
     std::atomic<int32_t> finished_count_{0};
     std::atomic<bool> runtime_init_ready_{false};
 
@@ -186,6 +185,8 @@ struct AicpuExecutor {
 };
 
 static AicpuExecutor g_aicpu_executor;
+
+// Thread-local identifier
 thread_local int32_t my_thread_idx_;
 
 // ===== AicpuExecutor Method Implementations =====
@@ -478,7 +479,7 @@ int32_t AicpuExecutor::runScheduling(Runtime *runtime) {
         }
     }
 
-    LOG_INFO_V9("Thread %d: Scheduling Completed", my_thread_idx_);
+    LOG_INFO_V0("Thread %d: Scheduling Completed", my_thread_idx_);
 
     return run_rc;
 }
@@ -576,7 +577,7 @@ int32_t AicpuExecutor::runOrchestration(Runtime* runtime)
     runtime_init_ready_.store(true, std::memory_order_release);
 
     // Wait for scheduler's one-time init to complete
-    sched_ctx_.wait_pto2_init_complete();
+    // sched_ctx_.wait_pto2_init_complete();
 
 #if PTO2_PROFILING
     if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
@@ -714,7 +715,7 @@ int32_t AicpuExecutor::runOrchestration(Runtime* runtime)
         );
     }
 #endif
-    LOG_INFO_V9("Thread %d: Orchestrator completed", my_thread_idx_);
+    LOG_INFO_V0("Thread %d: Orchestrator completed", my_thread_idx_);
 
     return 0;
 }
@@ -805,7 +806,7 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
         rc |= runScheduling(runtime);
         barrier();
         uint64_t tf = get_sys_cnt_aicpu();
-        LOG_INFO_V9("Thread %d: Warmup %d/%d Time: %luns", my_thread_idx_, i, warmupIterationCount, tf - t0);
+        LOG_INFO_V0("Thread %d: Warmup %d/%d Time: %luns", my_thread_idx_, i, warmupIterationCount, tf - t0);
 
         // Resetting execution back to start
         if (my_thread_idx_ == 0) {
@@ -815,8 +816,6 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
     } 
 
     // Second, perform timed runs (the ones that count)
-    std::vector<uint64_t> orchTimes;
-    std::vector<uint64_t> schedTimes;
     std::vector<uint64_t> runTimes;
     for (int32_t i = 0; i < timingIterationCount; i++)
     {
@@ -824,21 +823,15 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
         barrier();
         uint64_t t0 = get_sys_cnt_aicpu();
         rc |= runOrchestration(runtime);
-        
-        uint64_t t1 = get_sys_cnt_aicpu();
         rc |= runScheduling(runtime);
-
+        barrier();
         uint64_t tf = get_sys_cnt_aicpu();
 
         // Calculating time segments and adding them to the timing vector
-        const uint64_t orchTime  = t1 - t0;
-        const uint64_t schedTime = tf - t1;
         const uint64_t runTime   = tf - t0;
-        orchTimes.push_back(orchTime);
-        schedTimes.push_back(schedTime);
         runTimes.push_back(runTime);
 
-        LOG_INFO_V9("Thread %d: Timing %d/%d Total Time: %luns (Orch: %luns + Sched: %luns)", my_thread_idx_, i, timingIterationCount, runTime, orchTime, schedTime);
+        LOG_INFO_V0("Thread %d: Timing %d/%d Total Time: %luns", my_thread_idx_, i, timingIterationCount, runTime);
 
         // Resetting execution back to start before the next run
         if (my_thread_idx_ == 0) {
@@ -856,37 +849,21 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
     // The orchestrator thread now calculates and reports timing
     if (my_thread_idx_ == sched_thread_num_)
     {
-        uint64_t orchSum = 0; 
-        uint64_t schedSum = 0; 
+        // Calculating timing sum over all runs
         uint64_t runSum = 0; 
-
-        for (const auto t : orchTimes) orchSum += t;
-        for (const auto t : schedTimes) schedSum += t;
         for (const auto t : runTimes) runSum += t;
 
-        // Calculating averages
+        // Calculating average
         const auto runCount = runTimes.size();
-        double orchAvg  = (double)orchSum  / (double)runCount;
-        double schedAvg = (double)schedSum / (double)runCount;
         double runAvg   = (double)runSum   / (double)runCount;
 
-        // Calculating L2 norms
-        double orchDiff  = 0; 
-        double schedDiff = 0; 
+        // Calculating stddev
         double runDiff   = 0; 
-
-        for (const auto t : orchTimes)  orchDiff  += ((double)t - orchAvg)  * ((double)t - orchAvg) ;
-        for (const auto t : schedTimes) schedDiff += ((double)t - schedAvg) * ((double)t - schedAvg);
         for (const auto t : runTimes)   runDiff   += ((double)t - runAvg)   * ((double)t - runAvg)  ;
-
-        double orchStdDev   = runCount == 1 ? 0.0 : std::sqrt(orchDiff   / (double)(runCount-1)); 
-        double schedStdDev  = runCount == 1 ? 0.0 : std::sqrt(schedDiff  / (double)(runCount-1));
         double runStdDev    = runCount == 1 ? 0.0 : std::sqrt(runDiff    / (double)(runCount-1));
 
-        LOG_INFO_V9("Thread %d: [Timing] Average Runtime over %d timed runs: ", my_thread_idx_, timingIterationCount);
-        LOG_INFO_V9("Thread %d: [Timing]   + Orchestration: %10.0fns +- %6.0fns", my_thread_idx_, orchAvg,  orchStdDev);
-        LOG_INFO_V9("Thread %d: [Timing]   + Scheduling:    %10.0fns +- %6.0fns", my_thread_idx_, schedAvg, schedStdDev);
-        LOG_INFO_V9("Thread %d: [Timing]   + Run Total:     %10.0fns +- %6.0fns", my_thread_idx_, runAvg,   runStdDev);
+        // Printing
+        LOG_INFO_V9("Thread %d: [Timing] Average Runtime over %d timed runs: %10.0fns +- %6.0fns", my_thread_idx_, timingIterationCount, runAvg,   runStdDev);
     }
 
     return 0;
