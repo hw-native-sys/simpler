@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <math.h>
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -475,7 +476,7 @@ int32_t AicpuExecutor::runScheduling(Runtime *runtime) {
         }
     }
 
-    LOG_INFO_V0("Thread %d: Scheduling Completed", my_thread_idx_);
+    LOG_INFO_V9("Thread %d: Scheduling Completed", my_thread_idx_);
 
     return run_rc;
 }
@@ -711,7 +712,7 @@ int32_t AicpuExecutor::runOrchestration(Runtime* runtime)
         );
     }
 #endif
-    LOG_INFO_V0("Thread %d: Orchestrator completed", my_thread_idx_);
+    LOG_INFO_V9("Thread %d: Orchestrator completed", my_thread_idx_);
 
     return 0;
 }
@@ -797,12 +798,12 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
     for (int32_t i = 0; i < warmupIterationCount; i++)
     {
         barrier();
-        uint64_t t0_ts = get_sys_cnt_aicpu();
+        uint64_t t0 = get_sys_cnt_aicpu();
         rc |= runOrchestration(runtime);
         rc |= runScheduling(runtime);
         barrier();
-        uint64_t t1_ts = get_sys_cnt_aicpu();
-        LOG_INFO_V9("Thread %d: Warmup %d/%d Time: %luns", my_thread_idx_, i, warmupIterationCount, t1_ts - t0_ts);
+        uint64_t tf = get_sys_cnt_aicpu();
+        LOG_INFO_V9("Thread %d: Warmup %d/%d Time: %luns", my_thread_idx_, i, warmupIterationCount, tf - t0);
 
         // Resetting execution back to start
         if (my_thread_idx_ == 0) {
@@ -812,28 +813,81 @@ int32_t AicpuExecutor::performTimingRuns(Runtime *runtime)
     } 
 
     // Second, perform timed runs (the ones that count)
+    std::vector<uint64_t> orchTimes;
+    std::vector<uint64_t> schedTimes;
+    std::vector<uint64_t> runTimes;
     for (int32_t i = 0; i < timingIterationCount; i++)
     {
         // Waiting for threads to arrive for before-timing.
         barrier();
-        uint64_t t0_ts = get_sys_cnt_aicpu();
+        uint64_t t0 = get_sys_cnt_aicpu();
         rc |= runOrchestration(runtime);
+        
+        uint64_t t1 = get_sys_cnt_aicpu();
         rc |= runScheduling(runtime);
         barrier();
-        uint64_t t1_ts = get_sys_cnt_aicpu();
-        LOG_INFO_V9("Thread %d: Timing %d/%d time: %luns", my_thread_idx_, i, timingIterationCount, t1_ts - t0_ts);
+        uint64_t tf = get_sys_cnt_aicpu();
 
-        // Resetting execution back to start
+        // Calculating time segments and adding them to the timing vector
+        const uint64_t orchTime  = t1 - t0;
+        const uint64_t schedTime = tf - t1;
+        const uint64_t runTime   = tf - t0;
+        orchTimes.push_back(orchTime);
+        schedTimes.push_back(schedTime);
+        runTimes.push_back(runTime);
+
+        LOG_INFO_V9("Thread %d: Timing %d/%d Total Time: %luns (Orch: %luns + Sched: %luns)", my_thread_idx_, i, timingIterationCount, runTime, orchTime, schedTime);
+
+        // Resetting execution back to start before the next run
         if (my_thread_idx_ == 0) {
             deinit(runtime);
             init(runtime);
         }
     }   
 
-    if (rc != 0) LOG_ERROR("Thread %d - Timed runs failed with rc=%d", my_thread_idx_, rc);
+    if (rc != 0)
+    {
+        LOG_ERROR("Thread %d - Timed runs failed with rc=%d", my_thread_idx_, rc);
+        return rc;
+    } 
 
-    // Return code
-    return rc;
+    // The orchestrator thread now calculates and reports timing
+    if (my_thread_idx_ == sched_thread_num_)
+    {
+        uint64_t orchSum = 0; 
+        uint64_t schedSum = 0; 
+        uint64_t runSum = 0; 
+
+        for (const auto t : orchTimes) orchSum += t;
+        for (const auto t : schedTimes) schedSum += t;
+        for (const auto t : runTimes) runSum += t;
+
+        // Calculating averages
+        const auto runCount = runTimes.size();
+        double orchAvg  = (double)orchSum  / (double)runCount;
+        double schedAvg = (double)schedSum / (double)runCount;
+        double runAvg   = (double)runSum   / (double)runCount;
+
+        // Calculating L2 norms
+        double orchDiff  = 0; 
+        double schedDiff = 0; 
+        double runDiff   = 0; 
+
+        for (const auto t : orchTimes)  orchDiff  += ((double)t - orchAvg)  * ((double)t - orchAvg) ;
+        for (const auto t : schedTimes) schedDiff += ((double)t - schedAvg) * ((double)t - schedAvg);
+        for (const auto t : runTimes)   runDiff   += ((double)t - runAvg)   * ((double)t - runAvg)  ;
+
+        double orchStdDev   = runCount == 1 ? 0.0 : std::sqrt(orchDiff   / (double)(runCount-1)); 
+        double schedStdDev  = runCount == 1 ? 0.0 : std::sqrt(schedDiff  / (double)(runCount-1));
+        double runStdDev    = runCount == 1 ? 0.0 : std::sqrt(runDiff    / (double)(runCount-1));
+
+        LOG_INFO_V9("Thread %d: [Timing] Average Runtime over %d timed runs: ", my_thread_idx_, timingIterationCount);
+        LOG_INFO_V9("Thread %d: [Timing]   + Orchestration: %10.0fns +- %6.0fns", my_thread_idx_, orchAvg,  orchStdDev);
+        LOG_INFO_V9("Thread %d: [Timing]   + Scheduling:    %10.0fns +- %6.0fns", my_thread_idx_, schedAvg, schedStdDev);
+        LOG_INFO_V9("Thread %d: [Timing]   + Run Total:     %10.0fns +- %6.0fns", my_thread_idx_, runAvg,   runStdDev);
+    }
+
+    return 0;
 }
 
 // ===== Public Entry Point =====
@@ -894,11 +948,17 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         return sched_rc;
     }
 
+    // Reading PTO2 runtime status
     int32_t runtime_rc = read_pto2_runtime_status(runtime);
-    
     if (runtime_rc != 0) {
         LOG_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);
         return runtime_rc;
+    }
+
+    // Last thread cleans up
+    if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
+        LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
+        g_aicpu_executor.deinit(runtime);
     }
 
     // Shutting down
@@ -908,11 +968,6 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         return shutdown_rc;
     }
 
-    // Last thread cleans up
-    if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
-        LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
-        g_aicpu_executor.deinit(runtime);
-    }
 
     LOG_INFO_V0("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
