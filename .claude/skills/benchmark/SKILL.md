@@ -214,7 +214,15 @@ git -C "$PROJECT_ROOT" worktree remove "$WORKTREE_ABS" --force
 
 ## Step 6: Report Results
 
-Parse `Trimmed Avg:` for elapsed and `Orch Trimmed Avg:` for orchestration time from benchmark output.
+Parse all five `<Metric> Trimmed Avg:` lines per example (`Host`, `Device`, `Total`, `Sched`, `Orch`) from benchmark output.
+
+| Metric | Source | What it captures |
+| ------ | ------ | ---------------- |
+| Host | `RunTiming.host_wall_us` | steady_clock around dispatch (Python overhead included) |
+| Device | `RunTiming.device_wall_us` | AICPU mailbox `orch_start` → `orch_end` |
+| Total | device log | full span across `sched_*` / `orch_*` events |
+| Sched | device log | `sched_start` → `sched_end` |
+| Orch | device log | `orch_start` → `orch_end` |
 
 ### Single Mode
 
@@ -222,16 +230,16 @@ Parse `Trimmed Avg:` for elapsed and `Orch Trimmed Avg:` for orchestration time 
 Benchmark at: <short SHA>
 Args: -d 4 -n 100
 
-Example                          Elapsed (us)   Orch (us)
--------------------------------  ------------   ---------
-alternating_matmul_add               1235.5       820.3
-benchmark_bgemm                       892.1       650.2
+Example                          Host (us)   Device (us)   Total (us)   Sched (us)   Orch (us)
+-------------------------------  ---------   -----------   ----------   ----------   ---------
+alternating_matmul_add           480000.0        9050.0       1235.5       1235.4       820.3
+benchmark_bgemm                  370000.0        7100.0        892.1        892.0       650.2
 ...
 ```
 
 ### Compare Mode
 
-Show comparison table with both Elapsed and Orch deltas, **grouped by runtime**:
+Show comparison table per metric (one row per metric per example), **grouped by runtime**. `Total` is the headline metric used in the overall summary; the other four are sub-rows for context:
 
 ```text
 Merge-base: <short SHA>  →  HEAD: <short SHA> (+ uncommitted)
@@ -242,13 +250,19 @@ Device: baseline=4, current=4  (or baseline=4, current=6)
 
 Example                      Base (us)   HEAD (us)   Delta (us)   Change (%)
 ---------------------------  ---------   ---------   ----------   ----------
-alternating_matmul_add        1240.1      1235.5        -4.6       -0.37%
-  (orch)                       830.0       820.3        -9.7       -1.17%
-benchmark_bgemm                890.3       892.1        +1.8       +0.20%
-  (orch)                       650.0       650.2        +0.2       +0.03%
+alternating_matmul_add         1240.1      1235.5        -4.6       -0.37%
+  (host)                     480000.0    470000.0    -10000.0       -2.08%
+  (device)                     9000.0      8800.0       -200.0       -2.22%
+  (sched)                      1240.0      1235.4        -4.6       -0.37%
+  (orch)                        830.0       820.3        -9.7       -1.17%
+benchmark_bgemm                 890.3       892.1        +1.8       +0.20%
+  (host)                     370000.0    370500.0      +500.0       +0.14%
+  (device)                     7100.0      7080.0       -20.0       -0.28%
+  (sched)                       890.2       892.0        +1.8       +0.20%
+  (orch)                        650.0       650.2        +0.2       +0.03%
 ...
 
-Overall: X of Y examples improved, Z regressed
+Overall: X of Y examples improved, Z regressed   (based on Total)
 ```
 
 If baseline and current ran on **different devices**, add a note:
@@ -287,6 +301,6 @@ If any example shows > 5% regression, highlight it explicitly.
 - [ ] (Compare mode) Baseline completed — venv activated, `pwd` confirmed worktree path before running
 - [ ] Current completed in main workspace
 - [ ] Worktree cleaned up (compare mode)
-- [ ] Results table presented with Elapsed + Orch times
+- [ ] Results table presented with Host / Device / Total / Sched / Orch times
 - [ ] (Compare mode) Device difference noted if applicable
 - [ ] (Compare mode) Regressions > 2% flagged

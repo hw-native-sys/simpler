@@ -7,8 +7,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# Benchmark wrapper: run examples on hardware,
-# then parse device-log timing lines to report per-round latency.
+# Benchmark wrapper: run examples on hardware and report per-round latency
+# in five columns:
+#   - Host   from RunTiming (host_wall_us)
+#   - Device from RunTiming (device_wall_us, AICPU orch mailbox)
+#   - Total  device-log: full span across sched/orch events
+#   - Sched  device-log: sched_start -> sched_end
+#   - Orch   device-log: orch_start  -> orch_end
 #
 # Usage:
 #   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>]
@@ -98,7 +103,8 @@ Edit the EXAMPLE_CASES map at the top of this script to control which
 examples and cases to benchmark.
 
 Output:
-  Average elapsed time in microseconds for each example.
+  Per-round and average latency (microseconds) in 5 columns:
+  Host, Device (from RunTiming) + Total, Sched, Orch (from device log).
 USAGE
             exit 0
             ;;
@@ -168,21 +174,41 @@ fi
 DEVICE_LOG_DIR="$LOG_ROOT/device-${DEVICE_ID}"
 
 # ---------------------------------------------------------------------------
-# parse_timing <log_file>
-#   Grep for orch_start / end lines, compute per-round elapsed, print summary.
+# parse_timing <fw_stdout_file> <device_log_file>
+#   Merge per-round timing from two sources into a 5-column table:
+#     - Host (us)   from RunTiming (framework `_log_round_timings` stdout)
+#     - Device (us) from RunTiming (AICPU mailbox orch_start/end)
+#     - Total (us)  device-log: max(end) - min(start) across sched/orch events
+#     - Sched (us)  device-log: sched_start -> sched_end
+#     - Orch (us)   device-log: orch_start -> orch_end
 # ---------------------------------------------------------------------------
 parse_timing() {
-    local log_file="$1"
+    local fw_file="$1"
+    local log_file="$2"
 
-    local timing
-    timing=$(grep -E 'Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_end)' "$log_file" || true)
+    # Slice device log to just timing lines (keeps awk input small).
+    local dev_timing_file
+    dev_timing_file=$(mktemp)
+    trap 'rm -f -- "$dev_timing_file"' RETURN
+    grep -E 'Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_end)' \
+        "$log_file" > "$dev_timing_file" 2>/dev/null || true
 
-    if [[ -z "$timing" ]]; then
+    if [[ ! -s "$fw_file" && ! -s "$dev_timing_file" ]]; then
         echo "  (no benchmark timing data — was PTO2_PROFILING enabled?)"
         return 1
     fi
 
-    echo "$timing" | awk -v freq="$FREQ" '
+    awk -v freq="$FREQ" '
+    function flush_round() {
+        if (round >= 0 && max_end > 0 && min_start > 0) {
+            total_results[round] = (max_end - min_start) / freq
+            if (max_sched_end > 0 && min_sched_start > 0)
+                sched_results[round] = (max_sched_end - min_sched_start) / freq
+            if (max_orch_end > 0 && min_orch_start > 0)
+                orch_results[round] = (max_orch_end - min_orch_start) / freq
+            dev_count++
+        }
+    }
     function new_round() {
         flush_round()
         round++
@@ -192,23 +218,42 @@ parse_timing() {
         delete sched_seen
         delete orch_seen
     }
-    function flush_round() {
-        if (round >= 0 && max_end > 0 && min_start > 0) {
-            results[round] = (max_end - min_start) / freq
-            if (max_sched_end > 0 && min_sched_start > 0)
-                sched_results[round] = (max_sched_end - min_sched_start) / freq
-            if (max_orch_end > 0 && min_orch_start > 0)
-                orch_results[round] = (max_orch_end - min_orch_start) / freq
-            count++
+    function trimmed(label, arr, n, trim,    i, j, k, tc, ts) {
+        for (i = 2; i <= n; i++) {
+            k = arr[i]; j = i - 1
+            while (j >= 1 && arr[j] > k) { arr[j+1] = arr[j]; j-- }
+            arr[j+1] = k
         }
+        tc = n - 2 * trim; ts = 0
+        for (i = trim + 1; i <= n - trim; i++) ts += arr[i]
+        printf "  %s Trimmed Avg: %.1f us  (dropped %d low + %d high, %d rounds used)\n", \
+               label, ts / tc, trim, trim, tc
     }
     BEGIN {
-        round = 0; count = 0
+        round = 0; dev_count = 0
         min_start = 0; max_end = 0
         min_sched_start = 0; max_sched_end = 0
         min_orch_start = 0; max_orch_end = 0
         has_sched = 0; has_orch_end = 0
+        fw_n = 0; in_fw = 0
     }
+    # First file: framework `_log_round_timings` stdout (Host / Device per round).
+    # Header may be concatenated with the test runner status line (uses end=""),
+    # so anchor on "Round...Host (us)" anywhere on the line, not column 0.
+    FNR == NR {
+        if (match($0, /Round +Host \(us\)/))   { in_fw = 1; next }
+        if (in_fw && /^  -+$/)                 next
+        if (in_fw && /Avg Host:/)              { in_fw = 0; next }
+        if (in_fw && NF == 0)                  { in_fw = 0; next }
+        if (in_fw && match($0, /^  +([0-9]+) +([0-9.]+)( +([0-9.]+))?/, m)) {
+            r = m[1] + 0
+            fw_host[r] = m[2] + 0
+            if (m[4] != "") fw_dev[r] = m[4] + 0
+            if (r + 1 > fw_n) fw_n = r + 1
+        }
+        next
+    }
+    # Second file: device-log timing lines
     /sched_start=/ {
         match($0, /Thread ([0-9]+):/, tm)
         tid = tm[1] + 0
@@ -250,84 +295,85 @@ parse_timing() {
     }
     END {
         flush_round()
-        if (count == 0) { print "  (no rounds parsed)"; exit 1 }
 
+        show_host  = (fw_n > 0)
+        show_dev   = 0
+        for (i = 0; i < fw_n; i++) if ((i in fw_dev) && fw_dev[i] > 0) { show_dev = 1; break }
+        has_total  = (dev_count > 0)
         show_sched = has_sched
-        show_orch = has_orch_end
+        show_orch  = has_orch_end
 
-        # Header
-        hdr = sprintf("  %-8s  %12s", "Round", "Elapsed (us)")
-        sep = sprintf("  %-8s  %12s", "-----", "------------")
-        if (show_sched) { hdr = hdr sprintf("  %12s", "Sched (us)"); sep = sep sprintf("  %12s", "----------") }
-        if (show_orch)  { hdr = hdr sprintf("  %12s", "Orch (us)");  sep = sep sprintf("  %12s", "---------")  }
+        if (!has_total && fw_n == 0) {
+            print "  (no benchmark timing data — was PTO2_PROFILING enabled?)"
+            exit 1
+        }
+
+        n_rounds = (dev_count > fw_n) ? dev_count : fw_n
+
+        # Header / separator
+        hdr = sprintf("  %-6s", "Round")
+        sep = sprintf("  %-6s", "------")
+        if (show_host)  { hdr = hdr sprintf("  %12s", "Host (us)");   sep = sep sprintf("  %12s", "------------") }
+        if (show_dev)   { hdr = hdr sprintf("  %12s", "Device (us)"); sep = sep sprintf("  %12s", "------------") }
+        if (has_total)  { hdr = hdr sprintf("  %12s", "Total (us)");  sep = sep sprintf("  %12s", "------------") }
+        if (show_sched) { hdr = hdr sprintf("  %12s", "Sched (us)");  sep = sep sprintf("  %12s", "------------") }
+        if (show_orch)  { hdr = hdr sprintf("  %12s", "Orch (us)");   sep = sep sprintf("  %12s", "------------") }
         print hdr; print sep
 
-        sum_v = 0; min_v = results[0]; max_v = results[0]
-        sum_s = 0; min_s = sched_results[0]; max_s = sched_results[0]
-        sum_o = 0; min_o = orch_results[0]; max_o = orch_results[0]
+        cnt_host = 0; cnt_dev = 0; cnt_tot = 0; cnt_sch = 0; cnt_orc = 0
+        sum_host = 0; sum_dev = 0; sum_tot = 0; sum_sch = 0; sum_orc = 0
 
-        for (i = 0; i < count; i++) {
-            line = sprintf("  %-8d  %12.1f", i, results[i])
-            sum_v += results[i]
-            if (results[i] < min_v) min_v = results[i]
-            if (results[i] > max_v) max_v = results[i]
+        for (i = 0; i < n_rounds; i++) {
+            row = sprintf("  %-6d", i)
+            if (show_host) {
+                if (i in fw_host) {
+                    row = row sprintf("  %12.1f", fw_host[i])
+                    sum_host += fw_host[i]; cnt_host++; host_arr[cnt_host] = fw_host[i]
+                } else row = row sprintf("  %12s", "-")
+            }
+            if (show_dev) {
+                if ((i in fw_dev) && fw_dev[i] > 0) {
+                    row = row sprintf("  %12.1f", fw_dev[i])
+                    sum_dev += fw_dev[i]; cnt_dev++; dev_arr[cnt_dev] = fw_dev[i]
+                } else row = row sprintf("  %12s", "-")
+            }
+            if (has_total) {
+                if (i in total_results) {
+                    row = row sprintf("  %12.1f", total_results[i])
+                    sum_tot += total_results[i]; cnt_tot++; tot_arr[cnt_tot] = total_results[i]
+                } else row = row sprintf("  %12s", "-")
+            }
             if (show_sched) {
-                line = line sprintf("  %12.1f", sched_results[i])
-                sum_s += sched_results[i]
-                if (sched_results[i] < min_s) min_s = sched_results[i]
-                if (sched_results[i] > max_s) max_s = sched_results[i]
+                if (i in sched_results) {
+                    row = row sprintf("  %12.1f", sched_results[i])
+                    sum_sch += sched_results[i]; cnt_sch++; sch_arr[cnt_sch] = sched_results[i]
+                } else row = row sprintf("  %12s", "-")
             }
             if (show_orch) {
-                line = line sprintf("  %12.1f", orch_results[i])
-                sum_o += orch_results[i]
-                if (orch_results[i] < min_o) min_o = orch_results[i]
-                if (orch_results[i] > max_o) max_o = orch_results[i]
+                if (i in orch_results) {
+                    row = row sprintf("  %12.1f", orch_results[i])
+                    sum_orc += orch_results[i]; cnt_orc++; orc_arr[cnt_orc] = orch_results[i]
+                } else row = row sprintf("  %12s", "-")
             }
-            print line
+            print row
         }
 
-        printf "\n  Avg: %.1f us", sum_v / count
-        if (show_sched) printf "  |  Sched Avg: %.1f us", sum_s / count
-        if (show_orch)  printf "  |  Orch Avg: %.1f us", sum_o / count
-        printf "  (%d rounds)\n", count
+        # Averages: Host | Device | Total | Sched | Orch
+        avg_line = ""; avg_sep = ""
+        if (show_host  && cnt_host > 0) { avg_line = avg_line avg_sep sprintf("Host Avg: %.1f us",   sum_host / cnt_host); avg_sep = "  |  " }
+        if (show_dev   && cnt_dev > 0)  { avg_line = avg_line avg_sep sprintf("Device Avg: %.1f us", sum_dev  / cnt_dev);  avg_sep = "  |  " }
+        if (has_total  && cnt_tot > 0)  { avg_line = avg_line avg_sep sprintf("Total Avg: %.1f us",  sum_tot  / cnt_tot);  avg_sep = "  |  " }
+        if (show_sched && cnt_sch > 0)  { avg_line = avg_line avg_sep sprintf("Sched Avg: %.1f us",  sum_sch  / cnt_sch);  avg_sep = "  |  " }
+        if (show_orch  && cnt_orc > 0)  { avg_line = avg_line avg_sep sprintf("Orch Avg: %.1f us",   sum_orc  / cnt_orc);  avg_sep = "  |  " }
+        printf "\n  %s  (%d rounds)\n", avg_line, n_rounds
 
         TRIM = 10
-        if (count > 2 * TRIM) {
-            # Insertion sort for each metric
-            for (i = 0; i < count; i++) sv[i] = results[i]
-            for (i = 1; i < count; i++) {
-                k = sv[i]; j = i - 1
-                while (j >= 0 && sv[j] > k) { sv[j+1] = sv[j]; j-- }
-                sv[j+1] = k
-            }
-            tc = count - 2 * TRIM; ts = 0
-            for (i = TRIM; i < count - TRIM; i++) ts += sv[i]
-            printf "  Trimmed Avg: %.1f us  (dropped %d low + %d high, %d rounds used)\n", ts / tc, TRIM, TRIM, tc
-
-            if (show_sched) {
-                for (i = 0; i < count; i++) ss[i] = sched_results[i]
-                for (i = 1; i < count; i++) {
-                    k = ss[i]; j = i - 1
-                    while (j >= 0 && ss[j] > k) { ss[j+1] = ss[j]; j-- }
-                    ss[j+1] = k
-                }
-                ts2 = 0
-                for (i = TRIM; i < count - TRIM; i++) ts2 += ss[i]
-                printf "  Sched Trimmed Avg: %.1f us  (dropped %d low + %d high)\n", ts2 / tc, TRIM, TRIM
-            }
-            if (show_orch) {
-                for (i = 0; i < count; i++) so[i] = orch_results[i]
-                for (i = 1; i < count; i++) {
-                    k = so[i]; j = i - 1
-                    while (j >= 0 && so[j] > k) { so[j+1] = so[j]; j-- }
-                    so[j+1] = k
-                }
-                ts3 = 0
-                for (i = TRIM; i < count - TRIM; i++) ts3 += so[i]
-                printf "  Orch Trimmed Avg: %.1f us  (dropped %d low + %d high)\n", ts3 / tc, TRIM, TRIM
-            }
-        }
-    }'
+        if (cnt_host > 2 * TRIM) trimmed("Host",   host_arr, cnt_host, TRIM)
+        if (cnt_dev  > 2 * TRIM) trimmed("Device", dev_arr,  cnt_dev,  TRIM)
+        if (cnt_tot  > 2 * TRIM) trimmed("Total",  tot_arr,  cnt_tot,  TRIM)
+        if (cnt_sch  > 2 * TRIM) trimmed("Sched",  sch_arr,  cnt_sch,  TRIM)
+        if (cnt_orc  > 2 * TRIM) trimmed("Orch",   orc_arr,  cnt_orc,  TRIM)
+    }' "$fw_file" "$dev_timing_file"
 }
 
 # ---------------------------------------------------------------------------
@@ -375,9 +421,10 @@ run_bench() {
     fi
 
     # Snapshot existing logs
-    local pre_log_file
+    local pre_log_file fw_stdout_file
     pre_log_file=$(mktemp)
-    trap 'rm -f -- "$pre_log_file"' RETURN
+    fw_stdout_file=$(mktemp)
+    trap 'rm -f -- "$pre_log_file" "$fw_stdout_file"' RETURN
     ls -1 "$DEVICE_LOG_DIR"/*.log 2>/dev/null | sort > "$pre_log_file" || true
 
     # Build run command using test_*.py
@@ -401,15 +448,12 @@ run_bench() {
     fi
     run_cmd+=("${EXTRA_ARGS[@]}")
 
-    # Run example
+    # Run example, capturing stdout/stderr for Host/Device timing parse
     vlog "Running: ${run_cmd[*]}"
     local rc=0
-    if [[ -n "$VERBOSE_LOG" ]]; then
-        local run_output
-        run_output=$("${run_cmd[@]}" 2>&1) || rc=$?
-        if [[ -n "$run_output" ]]; then echo "$run_output" >> "$VERBOSE_LOG"; fi
-    else
-        "${run_cmd[@]}" > /dev/null 2>&1 || rc=$?
+    "${run_cmd[@]}" > "$fw_stdout_file" 2>&1 || rc=$?
+    if [[ -n "$VERBOSE_LOG" && -s "$fw_stdout_file" ]]; then
+        cat "$fw_stdout_file" >> "$VERBOSE_LOG"
     fi
     if [[ $rc -ne 0 ]]; then
         echo "  FAILED: benchmark run returned non-zero"
@@ -431,7 +475,7 @@ run_bench() {
     echo "  Log: $new_log"
     local timing_output
     local parse_rc=0
-    timing_output=$(parse_timing "$new_log") || parse_rc=$?
+    timing_output=$(parse_timing "$fw_stdout_file" "$new_log") || parse_rc=$?
     echo "$timing_output"
 
     if [[ $parse_rc -ne 0 ]]; then
@@ -445,16 +489,25 @@ run_bench() {
     [[ -n "$case_name" ]] && label="$example ($case_name)"
 
     local avg_line
-    avg_line=$(echo "$timing_output" | grep "^  Avg:" || true)
-    local avg_elapsed="-" avg_sched="-" avg_orch="-"
+    avg_line=$(echo "$timing_output" | grep -E '(Host|Device|Total|Sched|Orch) Avg:' | grep -v 'Trimmed' | head -1 || true)
+    local avg_host="-" avg_device="-" avg_total="-" avg_sched="-" avg_orch="-"
     if [[ -n "$avg_line" ]]; then
-        avg_elapsed=$(echo "$avg_line" | awk '{print $2}')
-        avg_sched=$(echo "$avg_line" | grep -o 'Sched Avg: [0-9.]*' | awk '{print $3}') || avg_sched="-"
-        avg_orch=$(echo "$avg_line" | grep -o 'Orch Avg: [0-9.]*' | awk '{print $3}') || avg_orch="-"
+        avg_host=$(  echo "$avg_line" | grep -oE 'Host Avg: [0-9.]+'   || true); avg_host=${avg_host##* }
+        avg_device=$(echo "$avg_line" | grep -oE 'Device Avg: [0-9.]+' || true); avg_device=${avg_device##* }
+        avg_total=$( echo "$avg_line" | grep -oE 'Total Avg: [0-9.]+'  || true); avg_total=${avg_total##* }
+        avg_sched=$( echo "$avg_line" | grep -oE 'Sched Avg: [0-9.]+'  || true); avg_sched=${avg_sched##* }
+        avg_orch=$(  echo "$avg_line" | grep -oE 'Orch Avg: [0-9.]+'   || true); avg_orch=${avg_orch##* }
+        [[ -z "$avg_host" ]]   && avg_host="-"
+        [[ -z "$avg_device" ]] && avg_device="-"
+        [[ -z "$avg_total" ]]  && avg_total="-"
+        [[ -z "$avg_sched" ]]  && avg_sched="-"
+        [[ -z "$avg_orch" ]]   && avg_orch="-"
     fi
 
     SUMMARY_NAMES+=("$label")
-    SUMMARY_ELAPSED+=("$avg_elapsed")
+    SUMMARY_HOST+=("$avg_host")
+    SUMMARY_DEVICE+=("$avg_device")
+    SUMMARY_TOTAL+=("$avg_total")
     SUMMARY_SCHED+=("$avg_sched")
     SUMMARY_ORCH+=("$avg_orch")
 }
@@ -467,7 +520,9 @@ FAIL=0
 
 # Summary collection arrays
 SUMMARY_NAMES=()
-SUMMARY_ELAPSED=()
+SUMMARY_HOST=()
+SUMMARY_DEVICE=()
+SUMMARY_TOTAL=()
 SUMMARY_SCHED=()
 SUMMARY_ORCH=()
 
@@ -522,12 +577,14 @@ done
 # Performance Summary Table
 # ---------------------------------------------------------------------------
 if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
-    # Check if any sched/orch data exists across all runs
-    _has_sched=0
-    _has_orch=0
+    # Show only columns that have at least one non-"-" value
+    _has_host=0; _has_device=0; _has_total=0; _has_sched=0; _has_orch=0
     for _i in "${!SUMMARY_NAMES[@]}"; do
-        [[ "${SUMMARY_SCHED[$_i]}" != "-" ]] && _has_sched=1
-        [[ "${SUMMARY_ORCH[$_i]}" != "-" ]] && _has_orch=1
+        [[ "${SUMMARY_HOST[$_i]}"   != "-" ]] && _has_host=1
+        [[ "${SUMMARY_DEVICE[$_i]}" != "-" ]] && _has_device=1
+        [[ "${SUMMARY_TOTAL[$_i]}"  != "-" ]] && _has_total=1
+        [[ "${SUMMARY_SCHED[$_i]}"  != "-" ]] && _has_sched=1
+        [[ "${SUMMARY_ORCH[$_i]}"   != "-" ]] && _has_orch=1
     done
 
     echo ""
@@ -536,29 +593,23 @@ if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
     echo "================================================================"
     echo ""
 
-    # Header
-    _hdr=$(printf "  %-40s  %12s" "Example" "Elapsed (us)")
-    _sep=$(printf "  %-40s  %12s" "----------------------------------------" "------------")
-    if [[ $_has_sched -eq 1 ]]; then
-        _hdr=$(printf "%s  %12s" "$_hdr" "Sched (us)")
-        _sep=$(printf "%s  %12s" "$_sep" "------------")
-    fi
-    if [[ $_has_orch -eq 1 ]]; then
-        _hdr=$(printf "%s  %12s" "$_hdr" "Orch (us)")
-        _sep=$(printf "%s  %12s" "$_sep" "------------")
-    fi
+    _hdr=$(printf "  %-40s" "Example")
+    _sep=$(printf "  %-40s" "----------------------------------------")
+    if [[ $_has_host   -eq 1 ]]; then _hdr=$(printf "%s  %12s" "$_hdr" "Host (us)");   _sep=$(printf "%s  %12s" "$_sep" "------------"); fi
+    if [[ $_has_device -eq 1 ]]; then _hdr=$(printf "%s  %12s" "$_hdr" "Device (us)"); _sep=$(printf "%s  %12s" "$_sep" "------------"); fi
+    if [[ $_has_total  -eq 1 ]]; then _hdr=$(printf "%s  %12s" "$_hdr" "Total (us)");  _sep=$(printf "%s  %12s" "$_sep" "------------"); fi
+    if [[ $_has_sched  -eq 1 ]]; then _hdr=$(printf "%s  %12s" "$_hdr" "Sched (us)");  _sep=$(printf "%s  %12s" "$_sep" "------------"); fi
+    if [[ $_has_orch   -eq 1 ]]; then _hdr=$(printf "%s  %12s" "$_hdr" "Orch (us)");   _sep=$(printf "%s  %12s" "$_sep" "------------"); fi
     echo "$_hdr"
     echo "$_sep"
 
-    # Rows
     for _i in "${!SUMMARY_NAMES[@]}"; do
-        _row=$(printf "  %-40s  %12s" "${SUMMARY_NAMES[$_i]}" "${SUMMARY_ELAPSED[$_i]}")
-        if [[ $_has_sched -eq 1 ]]; then
-            _row=$(printf "%s  %12s" "$_row" "${SUMMARY_SCHED[$_i]}")
-        fi
-        if [[ $_has_orch -eq 1 ]]; then
-            _row=$(printf "%s  %12s" "$_row" "${SUMMARY_ORCH[$_i]}")
-        fi
+        _row=$(printf "  %-40s" "${SUMMARY_NAMES[$_i]}")
+        if [[ $_has_host   -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_HOST[$_i]}");   fi
+        if [[ $_has_device -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_DEVICE[$_i]}"); fi
+        if [[ $_has_total  -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_TOTAL[$_i]}");  fi
+        if [[ $_has_sched  -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_SCHED[$_i]}");  fi
+        if [[ $_has_orch   -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_ORCH[$_i]}");   fi
         echo "$_row"
     done
 fi
