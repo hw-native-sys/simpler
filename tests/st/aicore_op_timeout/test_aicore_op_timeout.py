@@ -75,11 +75,17 @@ def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids)
         config.aicpu_thread_num = 2
 
         t0 = time.monotonic()
-        # 507046 = ACL_ERROR_RT_STREAM_SYNC_TIMEOUT — what
-        # aclrtSynchronizeStreamWithTimeout returns when the AICore stream
-        # (carrying the STARS-killed op) doesn't drain within the host's 2 s
-        # budget. Observed elapsed on Ascend910 / a2a3 onboard: ~6.3 s.
-        with pytest.raises(RuntimeError, match=r"run_prepared failed with code 507046"):
+        # Acceptable error codes for the STARS-killed AICore op:
+        #   507046 = ACL_ERROR_RT_STREAM_SYNC_TIMEOUT — host's AICore stream
+        #            sync hits the 2 s budget first (old Mode A AICPU path).
+        #   507018 = ACL_ERROR_RT_AICPU_EXCEPTION — Mode B AICPU stream sync
+        #            surfaces the AICore failure as an AICPU exception when
+        #            the orchestration kernel detects the dead AIC task.
+        #   507000 = ACL_ERROR_RT_INTERNAL_ERROR — same Mode B detection,
+        #            mapped through a different code path on a5.
+        # Regardless of which fires, the regression we care about is that
+        # the timeout chain reaps the hang in single-digit seconds.
+        with pytest.raises(RuntimeError, match=r"run_prepared failed with code 507(046|018|000)"):
             worker.run(cid, ChipStorageTaskArgs(), config)
         elapsed = time.monotonic() - t0
 

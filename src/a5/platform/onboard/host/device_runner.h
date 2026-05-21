@@ -50,6 +50,7 @@
 #include "host/l2_perf_collector.h"
 #include "host/pmu_collector.h"
 #include "host/tensor_dump_collector.h"
+#include "load_aicpu_op.h"
 #include "runtime.h"
 
 /**
@@ -474,6 +475,9 @@ private:
     // simpler_init, owned by this runner for the rest of its lifetime.
     std::vector<uint8_t> aicpu_so_binary_;
     std::vector<uint8_t> aicore_kernel_binary_;
+
+    // AICPU op loader — handles dispatcher bootstrap and per-task launches.
+    host::LoadAicpuOp load_aicpu_op_;
 
     // Memory management
     MemoryAllocator mem_alloc_;

@@ -247,6 +247,7 @@ class RuntimeBuilder:
                     source_dirs,
                     build_dir=str(cache_dir),
                     output_dir=output_dir,
+                    runtime_name=name,
                 )
 
         logger.info("Compiling AICore, AICPU, Host in parallel...")

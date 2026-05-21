@@ -40,14 +40,27 @@ class BuildTarget:
     def get_binary_name(self) -> str:
         return self._binary_name
 
-    def gen_cmake_args(self, include_dirs: list[str], source_dirs: list[str]) -> list[str]:
-        """Generate CMake arguments list from toolchain args + custom directories."""
+    def gen_cmake_args(
+        self,
+        include_dirs: list[str],
+        source_dirs: list[str],
+        runtime_name: Optional[str] = None,
+    ) -> list[str]:
+        """Generate CMake arguments list from toolchain args + custom directories.
+
+        ``runtime_name`` is propagated to CMake as ``-DRUNTIME_NAME=<name>`` so
+        per-runtime build outputs (e.g. the AICPU dispatcher SO) can pick a
+        per-runtime basename — needed for ChipWorker to bind multiple runtimes
+        in a single process without colliding on dispatcher state.
+        """
         inc = ";".join(os.path.abspath(d) for d in include_dirs)
         src = ";".join(os.path.abspath(d) for d in source_dirs)
         args = self.toolchain.get_cmake_args() + [
             f"-DCUSTOM_INCLUDE_DIRS={inc}",
             f"-DCUSTOM_SOURCE_DIRS={src}",
         ]
+        if runtime_name is not None:
+            args.append(f"-DRUNTIME_NAME={runtime_name}")
         if logger.isEnabledFor(logging.DEBUG):
             args.append("--log-level=VERBOSE")
         return args
@@ -201,6 +214,7 @@ class RuntimeCompiler:
         source_dirs: list[str],
         build_dir: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        runtime_name: Optional[str] = None,
     ) -> Union[bytes, Path]:
         """
         Compile binary for the specified target platform.
@@ -231,7 +245,7 @@ class RuntimeCompiler:
         else:
             raise ValueError(f"Invalid target platform: {target_platform}. Must be 'aicore', 'aicpu', or 'host'.")
 
-        cmake_args = target.gen_cmake_args(include_dirs, source_dirs)
+        cmake_args = target.gen_cmake_args(include_dirs, source_dirs, runtime_name=runtime_name)
         cmake_source_dir = target.get_root_dir()
         binary_name = target.get_binary_name()
         platform = target_platform.upper()
@@ -249,6 +263,19 @@ class RuntimeCompiler:
                 od.mkdir(parents=True, exist_ok=True)
                 dest = od / binary_name
                 shutil.copy2(binary_path, dest)
+                # The AICPU dispatcher SO has a stable, runtime-invariant name.
+                # Host BootstrapDispatcher uploads it into the main aicpu_scheduler
+                # at process startup (no tar.gz / sudo), and the dispatcher
+                # self-deploys into /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/.
+                # Per-runtime AICPU kernel SOs (libaicpu_kernel.so) are uploaded
+                # by host at runtime via DeviceArgs.aicpu_so_bin and lazily
+                # loaded by the dispatcher.
+                dispatcher_name = "libsimpler_aicpu_dispatcher.so"
+                dispatcher_so = Path(actual_build_dir) / dispatcher_name
+                if dispatcher_so.is_file():
+                    dest_dispatcher = od / dispatcher_name
+                    shutil.copy2(dispatcher_so, dest_dispatcher)
+                    subprocess.run(["strip", "-s", str(dest_dispatcher)], check=True)
                 return dest
             else:
                 with open(binary_path, "rb") as f:

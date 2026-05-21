@@ -24,8 +24,8 @@
 #include "runtime.h"
 
 // Run-wall capture: g_device_start_cycle is set once in
-// DynTileFwkBackendKernelServerInit (single-threaded launch); each thread
-// of the multi-threaded DynTileFwkBackendKernelServer writes the converted
+// simpler_aicpu_init (single-threaded launch); each thread
+// of the multi-threaded simpler_aicpu_exec writes the converted
 // (end - start) into KernelArgs.device_wall_ns on exit. Plain stores —
 // last-writer-wins is fine for wall measurement (concurrent exiting threads'
 // `my_end` values differ by µs, the final overwrite is within benchmark
@@ -35,27 +35,18 @@ static uint64_t g_device_start_cycle = 0;
 // Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp)
 extern "C" int aicpu_execute(Runtime *arg);
 
-extern "C" __attribute__((visibility("default"))) int StaticTileFwkBackendKernelServer(void *arg) {
-    if (arg == nullptr) {
-        LOG_ERROR("%s", "Invalid kernel arguments: null pointer");
-        return -1;
-    }
-
-    return 0;
-}
-
 /**
- * AICPU kernel initialization entry point
+ * AICPU kernel initialization entry point.
  *
- * This function is called once during kernel initialization by the CANN
- * runtime. It initializes logging and validates kernel arguments.
- *
- * Note: Function name is hardcoded in libaicpu_extend_kernels.so
+ * Called once by simpler_dispatcher in the Init phase. The dispatcher
+ * dlsym's "simpler_aicpu_init" inside this inner SO (an internal
+ * dispatcher↔inner protocol — independent of CANN's preinstalled
+ * libaicpu_extend_kernels contract, which only binds the dispatcher itself).
  *
  * @param arg Pointer to KernelArgs structure
  * @return 0 on success, -1 on error
  */
-extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelServerInit(void *arg) {
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *arg) {
     init_log_switch();
     if (arg == nullptr) {
         LOG_ERROR("%s", "Invalid kernel arguments: null pointer");
@@ -67,7 +58,7 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
 
     // Init is launched single-threaded (block_dim=1), so the race-free spot
     // to capture run start and reset the wall accumulator. Subsequent
-    // DynTileFwkBackendKernelServer threads stamp end on their way out, via
+    // simpler_aicpu_exec threads stamp end on their way out, via
     // the device-resident 8-byte buffer addressed by device_wall_data_base.
     g_device_start_cycle = get_sys_cnt_aicpu();
     if (k_args->device_wall_data_base != 0) {
@@ -79,17 +70,15 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
 }
 
 /**
- * AICPU kernel main execution entry point
+ * AICPU kernel main execution entry point.
  *
- * This is the main entry point for the AICPU runtime executor kernel.
- * It extracts the Runtime from KernelArgs and delegates to AicpuExecute.
- *
- * Note: Function name is hardcoded in libaicpu_extend_kernels.so
+ * Called per-thread by simpler_dispatcher in the Run phase via dlsym
+ * "simpler_aicpu_exec" on the inner SO.
  *
  * @param arg Pointer to KernelArgs structure containing runtime_args
  * @return 0 on success, non-zero on error
  */
-extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelServer(void *arg) {
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
     if (arg == nullptr) {
         LOG_ERROR("%s", "Invalid kernel arguments: null pointer");
         return -1;
@@ -128,13 +117,13 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
         return 0;
     }
 
-    LOG_INFO_V0("%s", "DynTileFwkBackendKernelServer: Calling aicpu_execute with Runtime");
+    LOG_INFO_V0("%s", "simpler_aicpu_exec: Calling aicpu_execute with Runtime");
     int rc = aicpu_execute(runtime);
     if (rc != 0) {
-        LOG_ERROR("DynTileFwkBackendKernelServer: aicpu_execute failed with rc=%d", rc);
+        LOG_ERROR("simpler_aicpu_exec: aicpu_execute failed with rc=%d", rc);
         return rc;
     }
-    LOG_INFO_V0("%s", "DynTileFwkBackendKernelServer: aicpu_execute completed successfully");
+    LOG_INFO_V0("%s", "simpler_aicpu_exec: aicpu_execute completed successfully");
 
     // Stamp end into the device_wall buffer (addressed via
     // device_wall_data_base). Last-writer-wins across threads — wall

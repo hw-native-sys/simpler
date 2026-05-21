@@ -20,6 +20,7 @@ list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/device_comm")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher")
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
         list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${INC_DIR}")
@@ -84,3 +85,35 @@ target_link_directories(aicpu_kernel
 
 # Output name
 set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME aicpu_kernel)
+
+# See src/a2a3/platform/onboard/aicpu/CMakeLists.txt for design rationale.
+# Direction 1: stable single dispatcher + runtime AICPU kernel uploaded at runtime.
+set(AICPU_DISPATCHER_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher/aicpu_dispatcher.cpp"
+)
+add_library(aicpu_dispatcher SHARED ${AICPU_DISPATCHER_SOURCES})
+
+target_compile_options(aicpu_dispatcher
+    PRIVATE
+        -Wall
+        -Wextra
+        -rdynamic
+        -O3
+        -fPIC
+        -g
+        $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>
+)
+
+target_include_directories(aicpu_dispatcher
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CUSTOM_INCLUDE_DIRS}
+        ${ASCEND_HOME_PATH}/include
+)
+
+target_link_libraries(aicpu_dispatcher PRIVATE dl)
+
+set_target_properties(aicpu_dispatcher PROPERTIES
+    LINK_FLAGS "-Wl,--build-id"
+    OUTPUT_NAME "simpler_aicpu_dispatcher"
+)

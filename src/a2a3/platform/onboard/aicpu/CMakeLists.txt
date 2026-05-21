@@ -20,6 +20,7 @@ list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/device_comm")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher")
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
         list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${INC_DIR}")
@@ -84,3 +85,47 @@ target_link_directories(aicpu_kernel
 
 # Output name
 set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME aicpu_kernel)
+
+# Build dispatcher SO (direction 1: stable single dispatcher, runtime kernel
+# uploaded at runtime). The dispatcher has NO runtime-specific code; it
+# receives the per-runtime AICPU kernel SO bytes via DeviceArgs.aicpu_so_bin
+# at Null phase, writes them to disk, dlopens, and dlsyms the inner
+# DynTileFwkBackendKernelServer{,Init} symbols. Cache key is
+# (aicpu_so_bin device address, aicpu_so_len) — different ChipWorker
+# instances in the same process get separate cache entries, enabling
+# single-process multi-runtime without firstCreatSo_-style locks.
+#
+# Output name is fixed ("simpler_aicpu_dispatcher"). Host bootstrap uploads
+# this SO into /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/ at process
+# startup via LoadAicpuOp::BootstrapDispatcher — no tar.gz, no sudo.
+# Building per-runtime libaicpu_kernel.so stays in this same CMakeLists
+# (aicpu_kernel target above).
+set(AICPU_DISPATCHER_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher/aicpu_dispatcher.cpp"
+)
+add_library(aicpu_dispatcher SHARED ${AICPU_DISPATCHER_SOURCES})
+
+target_compile_options(aicpu_dispatcher
+    PRIVATE
+        -Wall
+        -Wextra
+        -rdynamic
+        -O3
+        -fPIC
+        -g
+        $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>
+)
+
+target_include_directories(aicpu_dispatcher
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CUSTOM_INCLUDE_DIRS}
+        ${ASCEND_HOME_PATH}/include
+)
+
+target_link_libraries(aicpu_dispatcher PRIVATE dl)
+
+set_target_properties(aicpu_dispatcher PROPERTIES
+    LINK_FLAGS "-Wl,--build-id"
+    OUTPUT_NAME "simpler_aicpu_dispatcher"
+)
