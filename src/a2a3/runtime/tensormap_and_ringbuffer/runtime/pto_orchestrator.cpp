@@ -364,7 +364,7 @@ PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(
 ) {
     PTO2OrchestratorLayout layout{};
     layout.dep_pool_capacity = dep_pool_capacity;
-    layout.scope_tasks_init_cap = PTO2_SCOPE_TASKS_INIT_CAP;
+    layout.scope_tasks_cap = PTO2_SCOPE_TASKS_CAP;
     layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -373,7 +373,7 @@ PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(
         layout.off_fanin_pool[r] = arena.reserve(fanin_pool_bytes, PTO2_ALIGN_SIZE);
     }
     layout.off_scope_tasks = arena.reserve(
-        static_cast<size_t>(layout.scope_tasks_init_cap) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *)
+        static_cast<size_t>(layout.scope_tasks_cap) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *)
     );
     layout.off_scope_begins =
         arena.reserve(static_cast<size_t>(layout.scope_stack_capacity) * sizeof(int32_t), alignof(int32_t));
@@ -418,7 +418,7 @@ bool PTO2OrchestratorState::init_from_layout(
     orch->scope_tasks = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_scope_tasks));
     orch->scope_begins = static_cast<int32_t *>(arena.region_ptr(layout.off_scope_begins));
     orch->scope_tasks_size = 0;
-    orch->scope_tasks_capacity = layout.scope_tasks_init_cap;
+    orch->scope_tasks_capacity = layout.scope_tasks_cap;
     orch->scope_stack_top = -1;
     orch->scope_stack_capacity = layout.scope_stack_capacity;
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
@@ -444,12 +444,16 @@ void PTO2OrchestratorState::set_scheduler(PTO2SchedulerState *scheduler) { this-
 
 static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state) {
     if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
-        int32_t new_cap = orch->scope_tasks_capacity * 2;
-        PTO2TaskSlotState **new_buf =
-            reinterpret_cast<PTO2TaskSlotState **>(realloc(orch->scope_tasks, new_cap * sizeof(PTO2TaskSlotState *)));
-        assert(new_buf && "Failed to grow scope task buffer");
-        orch->scope_tasks = new_buf;
-        orch->scope_tasks_capacity = new_cap;
+        // scope_tasks lives in the per-Worker arena (single backing allocation),
+        // so realloc is not legal. Capacity == PTO2_SCOPE_TASKS_CAP ==
+        // PTO2_TASK_WINDOW_SIZE × PTO2_MAX_RING_DEPTH, the total in-flight slot
+        // budget — hitting it means every ring is saturated, so no further push
+        // could succeed regardless of buffer growth.
+        orch->report_fatal(
+            PTO2_ERROR_SCOPE_TASKS_OVERFLOW, __FUNCTION__,
+            "scope_tasks buffer saturated at %d entries (all rings full)", orch->scope_tasks_capacity
+        );
+        return;
     }
     orch->scope_tasks[orch->scope_tasks_size++] = task_slot_state;
 }

@@ -490,6 +490,10 @@ private:
     DeviceArena static_arena_;
     size_t gm_heap_region_off_{SIZE_MAX};
     size_t gm_sm_region_off_{SIZE_MAX};
+    // Cached sizes for setup_static_arena's "fits" check — avoids calling
+    // region_size() on the arena's public API for the two regions we own.
+    size_t cached_gm_heap_size_{0};
+    size_t cached_gm_sm_size_{0};
 
     // Device resources
     rtStream_t stream_aicpu_{nullptr};

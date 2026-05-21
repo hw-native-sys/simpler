@@ -276,7 +276,7 @@ PTO2Runtime *runtime_create_from_sm(
 
     // Phase 3: bind region pointers and initialize.
     PTO2Runtime *rt = static_cast<PTO2Runtime *>(arena.region_ptr(off_runtime));
-    memset(rt, 0, sizeof(*rt));
+    memset(rt, 0, sizeof(*rt));  // calloc-equivalent for the runtime header.
 
     // Initialize the SM handle wrapper in-place on its arena region before
     // anything that reads sm_handle->header (orchestrator / scheduler init).
@@ -312,14 +312,14 @@ PTO2Runtime *runtime_create_from_sm(
 
 void runtime_destroy(PTO2Runtime *rt, DeviceArena &arena) {
     if (!rt) {
-        arena.release();
+        arena.release();  // safe: idempotent if nothing's committed.
         return;
     }
 
     rt->scheduler.destroy();
     rt->orchestrator.destroy();
-    rt->aicore_mailbox = nullptr;
-    rt->sm_handle = nullptr;
+    rt->aicore_mailbox = nullptr;  // arena-owned.
+    rt->sm_handle = nullptr;       // wrapper lives in arena; release() reclaims it.
 
     // arena.release() frees the single backing buffer that holds rt,
     // mailbox, sm_handle, orchestrator and scheduler sub-regions in one shot.

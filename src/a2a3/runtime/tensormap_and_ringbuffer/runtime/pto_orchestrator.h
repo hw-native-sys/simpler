@@ -49,7 +49,7 @@ struct PTO2OrchestratorLayout {
     size_t off_scope_begins;
     PTO2TensorMapLayout tensor_map;
     int32_t dep_pool_capacity;
-    int32_t scope_tasks_init_cap;
+    int32_t scope_tasks_cap;
     uint64_t scope_stack_capacity;
 };
 

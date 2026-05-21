@@ -43,9 +43,12 @@ public:
     // headroom for per-thread / per-ring expansions.
     static constexpr size_t kMaxRegions = 128;
 
-    // Default base alignment for the underlying allocation. PTO2_PACKED_OUTPUT_ALIGN
-    // (1024) covers every sub-region alignment requirement in the runtime
-    // (max is 64-byte cache line); also matches HBM DMA granularity.
+    // Default base alignment for the underlying allocation. 1024 bytes is a
+    // hardware requirement (HBM DMA granularity / PTO2_PACKED_OUTPUT_ALIGN),
+    // not a software-side optimization — do NOT lower it to the 64-byte cache
+    // line that satisfies every sub-region alignment requirement. The cost is
+    // a one-time forward-alignment pad of up to 1023 bytes per arena, which is
+    // negligible compared to typical region payloads (GM heap MBs, runtime KBs).
     static constexpr size_t kDefaultBaseAlign = 1024;
 
     // Default libc backend used when the caller does not supply alloc/free.
@@ -66,6 +69,10 @@ public:
 
     ~DeviceArena() noexcept { release(); }
 
+    // Non-copyable, and implicitly non-movable: user-declared copy operations
+    // suppress the implicit move ctor/assignment. The arena owns a heap-allocated
+    // buffer, so moves would need to transfer raw_base_ + region table — keep it
+    // pinned in place.
     DeviceArena(const DeviceArena &) = delete;
     DeviceArena &operator=(const DeviceArena &) = delete;
 
@@ -77,7 +84,16 @@ public:
     // Phase 2: perform the backing allocation, forward-align the base, and
     // mark the arena committed. Idempotent: repeated calls return the same
     // base without re-allocating. Returns nullptr if the backing alloc fails.
-    void *commit(size_t base_align = kDefaultBaseAlign) noexcept;
+    //
+    // NOT noexcept: the injected alloc_ function pointer may run code that
+    // throws (e.g. host-side MemoryAllocator goes through std::mutex /
+    // std::unordered_set which can throw on OOM or lock failure). Letting
+    // exceptions propagate lets the extern "C" boundary's catch-all turn
+    // them into status codes; a noexcept here would std::terminate before
+    // that boundary gets a chance. (release() stays noexcept because it
+    // runs from ~DeviceArena(), where throwing would terminate anyway —
+    // the trampoline's free path must therefore be nothrow.)
+    void *commit(size_t base_align = kDefaultBaseAlign);
 
     // Phase 3: pointer to the sub-region at `offset`. Asserts if called
     // before commit().
@@ -135,7 +151,7 @@ inline size_t DeviceArena::reserve(size_t size, size_t align) noexcept {
     return off;
 }
 
-inline void *DeviceArena::commit(size_t base_align) noexcept {
+inline void *DeviceArena::commit(size_t base_align) {
     if (committed_) return base_;
     assert(base_align > 0 && (base_align & (base_align - 1)) == 0 && "DeviceArena: base_align must be a power of two");
     // Allocate enough to fit the layout starting from any pointer returned by

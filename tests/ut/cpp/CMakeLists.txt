@@ -214,7 +214,7 @@ function(add_common_utils_test name src)
         ${GTEST_INCLUDE_DIRS}
         # utils/elf_build_id.h lives under src/common, exposed as "utils/..."
         ${CMAKE_SOURCE_DIR}/../../../src/common
-        # device_comm/{device_pool,device_arena}.h consumed without prefix.
+        # device_comm/device_arena.h consumed without prefix.
         ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)

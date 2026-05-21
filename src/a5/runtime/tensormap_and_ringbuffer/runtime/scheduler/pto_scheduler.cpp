@@ -129,8 +129,9 @@ PTO2SchedulerLayout PTO2SchedulerState::reserve_layout(DeviceArena &arena, int32
     }
     layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        // Cache-line base so writes from scheduler thread 0 don't false-share
-        // with adjacent multi-threaded ready_queue.slots.
+        // Force a cache-line base so writes from scheduler thread 0 (sole
+        // writer of this ring's dep_pool) do not invalidate adjacent
+        // multi-threaded regions like ready_queue.slots.
         layout.off_dep_pool_entries[r] =
             arena.reserve(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2DepListEntry), PTO2_ALIGN_SIZE);
     }
@@ -155,6 +156,7 @@ bool PTO2SchedulerState::init_from_layout(
         }
     }
 
+    // Ready queues — one per resource shape plus DUMMY.
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_from_layout(
                 &sched->ready_queues[i], arena, layout.off_ready_queue_slots[i], layout.ready_queue_capacity
@@ -168,14 +170,18 @@ bool PTO2SchedulerState::init_from_layout(
         return false;
     }
 
+    // Per-ring dep_pool: PTO2DepListPool::init takes an externally-allocated
+    // base + capacity, so we just plumb the arena region into it.
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         auto *dep_entries = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries[r]));
+        // calloc-equivalent: pool expects entries zeroed at construction.
         memset(dep_entries, 0, static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2DepListEntry));
         sched->ring_sched_states[r].dep_pool.init(
             dep_entries, layout.dep_pool_capacity, &sm_header_arg->orch_error_code
         );
     }
 
+    // Wiring SPSC queue (orchestrator push, scheduler thread 0 pop).
     if (!sched->wiring.queue.init_from_layout(arena, layout.off_wiring_spsc_buffer, layout.spsc_capacity)) {
         return false;
     }

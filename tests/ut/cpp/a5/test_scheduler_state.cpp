@@ -19,25 +19,28 @@
 #include <atomic>
 #include <cstring>
 
+#include "device_arena.h"
 #include "scheduler/pto_scheduler.h"
 
 class SchedulerStateTest : public ::testing::Test {
 protected:
     PTO2SchedulerState sched;
     PTO2SharedMemoryHandle *sm_handle = nullptr;
+    DeviceArena sm_arena;
+    DeviceArena sched_arena;
 
     void SetUp() override {
-        sm_handle = PTO2SharedMemoryHandle::create_default();
+        sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
-        bool ok = sched.init(sm_handle->header);
-        ASSERT_TRUE(ok);
+        auto layout = PTO2SchedulerState::reserve_layout(sched_arena);
+        ASSERT_NE(sched_arena.commit(), nullptr);
+        ASSERT_TRUE(sched.init_from_layout(layout, sched_arena, sm_handle->header));
     }
 
     void TearDown() override {
         sched.destroy();
-        if (sm_handle) {
-            sm_handle->destroy();
-        }
+        sched_arena.release();
+        sm_arena.release();
     }
 
     void init_slot(
