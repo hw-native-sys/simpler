@@ -843,25 +843,18 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         }
     }
 
-    // Return code. Must be zero for all runs
-    int32_t rc = 0;
-
     // Performing timing evaluation, exclusively for performance evaluation:
-    // if (runtime->get_timing_enabled() == true) rc |= g_aicpu_executor.performTimingRuns(runtime);
+    if (runtime->get_timing_enabled() == true)
+    {
+        int32_t timing_rc = g_aicpu_executor.performTimingRuns(runtime);
+        if (timing_rc != 0) {
+            LOG_ERROR("aicpu_execute: timing run failed with rc=%d", timing_rc);
+            return timing_rc;
+        }
+    }
 
     // Perform actual kernel run
-    rc |= g_aicpu_executor.run(runtime);
-
-    g_aicpu_executor.barrier();
-    if (my_thread_idx_ == 0)
-    {
-        g_aicpu_executor.deinit(runtime);
-        g_aicpu_executor.init(runtime);
-    }
-    g_aicpu_executor.barrier();
-
-    rc |= g_aicpu_executor.run(runtime);
-
+    int32_t rc = g_aicpu_executor.run(runtime);
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
     }
