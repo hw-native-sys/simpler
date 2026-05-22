@@ -435,11 +435,22 @@ struct PTO2TensorMap {
     reserve_layout_default(DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
 
     /**
-     * Phase 3: bind region pointers and initialize state. The arena must already
-     * be committed; layout must have been produced by reserve_layout() against
-     * the same arena.
+     * Phase 3a: write everything *except* arena-internal pointer fields
+     * (buckets, entry_pool, free_entry_list, task_entry_heads[r], orch).
+     * Uses arena.region_ptr to address the arena regions for data writes,
+     * but does not store those addresses in struct fields. Safe to call on
+     * a host arena that holds the prebuilt image.
      */
-    bool init_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena);
+    bool init_data_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena);
+
+    /**
+     * Phase 3b: write the arena-internal pointer fields. Idempotent;
+     * called once on the host arena and once on the AICPU after attach.
+     * `parent_orch` is the device address (or host-mirror address) of the
+     * enclosing PTO2OrchestratorState; we store it in tensor_map.orch
+     * (self-pointer within the same arena).
+     */
+    void wire_arena_pointers(const PTO2TensorMapLayout &layout, DeviceArena &arena, PTO2OrchestratorState *parent_orch);
 
     /**
      * Tear down state. Does not free memory — the arena owns the backing

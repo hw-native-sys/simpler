@@ -43,7 +43,8 @@ protected:
         ASSERT_NE(sm_handle, nullptr);
         auto layout = PTO2SchedulerState::reserve_layout(sched_arena);
         ASSERT_NE(sched_arena.commit(), nullptr);
-        ASSERT_TRUE(sched.init_from_layout(layout, sched_arena, sm_handle->header));
+        ASSERT_TRUE(sched.init_data_from_layout(layout, sched_arena, sm_handle->header, PTO2_TASK_WINDOW_SIZE));
+        sched.wire_arena_pointers(layout, sched_arena);
     }
 
     void TearDown() override {

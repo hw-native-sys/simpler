@@ -249,81 +249,19 @@ static const PTO2RuntimeOps s_runtime_ops = {
 };
 
 // =============================================================================
-// Runtime Creation and Destruction
+// Runtime Lifecycle (AICPU-only fixup)
 // =============================================================================
+//
+// Layout / init_data / wire / destroy live in
+// runtime/shared/pto_runtime2_init.cpp so the host build can pre-populate the
+// prebuilt arena image. The pieces below — wiring the ops table and the
+// SPMD core counts — depend on the device-side s_runtime_ops global and the
+// AICPU SchedulerContext respectively, so they remain in the AICPU build.
 
-PTO2Runtime *runtime_create_from_sm(
-    PTO2RuntimeMode mode, void *sm_base, uint64_t sm_size, uint64_t task_window_size, void *gm_heap, uint64_t heap_size,
-    DeviceArena &arena, int32_t dep_pool_capacity
-) {
-    if (!sm_base || sm_size == 0) return nullptr;
-
-    // Phase 1: layout. Reserve every sub-region the runtime needs (including
-    // the SM handle wrapper itself) without touching memory yet.
-    int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        task_window_sizes[r] = static_cast<int32_t>(task_window_size);
-    }
-    const size_t off_sm_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
-    PTO2OrchestratorLayout orch_layout =
-        PTO2OrchestratorState::reserve_layout(arena, task_window_sizes, dep_pool_capacity);
-    PTO2SchedulerLayout sched_layout = PTO2SchedulerState::reserve_layout(arena, dep_pool_capacity);
-    const size_t off_runtime = arena.reserve(sizeof(PTO2Runtime), PTO2_ALIGN_SIZE);
-    const size_t off_mailbox = arena.reserve(sizeof(AICoreCompletionMailbox), alignof(AICoreCompletionMailbox));
-
-    // Phase 2: single backing allocation.
-    if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) return nullptr;
-
-    // Phase 3: bind region pointers and initialize.
-    PTO2Runtime *rt = static_cast<PTO2Runtime *>(arena.region_ptr(off_runtime));
-    memset(rt, 0, sizeof(*rt));  // calloc-equivalent for the runtime header.
-
-    // Initialize the SM handle wrapper in-place on its arena region before
-    // anything that reads sm_handle->header (orchestrator / scheduler init).
-    rt->sm_handle = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(off_sm_handle));
-    memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-    if (!rt->sm_handle->init(sm_base, sm_size, task_window_size, heap_size)) {
-        arena.release();
-        return nullptr;
-    }
-
+void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count) {
     rt->ops = &s_runtime_ops;
-    rt->mode = mode;
-    rt->gm_heap = gm_heap;
-    rt->gm_heap_size = heap_size > 0 ? heap_size * PTO2_MAX_RING_DEPTH : 0;
-    rt->gm_heap_owned = false;
-
-    if (!rt->orchestrator.init_from_layout(orch_layout, arena, rt->sm_handle->header, gm_heap, heap_size)) {
-        arena.release();
-        return nullptr;
-    }
-    if (!rt->scheduler.init_from_layout(sched_layout, arena, rt->sm_handle->header)) {
-        rt->orchestrator.destroy();
-        arena.release();
-        return nullptr;
-    }
-    rt->orchestrator.set_scheduler(&rt->scheduler);
-
-    rt->aicore_mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(off_mailbox));
-    memset(rt->aicore_mailbox, 0, sizeof(*rt->aicore_mailbox));
-
-    return rt;
-}
-
-void runtime_destroy(PTO2Runtime *rt, DeviceArena &arena) {
-    if (!rt) {
-        arena.release();  // safe: idempotent if nothing's committed.
-        return;
-    }
-
-    rt->scheduler.destroy();
-    rt->orchestrator.destroy();
-    rt->aicore_mailbox = nullptr;  // arena-owned.
-    rt->sm_handle = nullptr;       // wrapper lives in arena; release() reclaims it.
-
-    // arena.release() frees the single backing buffer that holds rt,
-    // mailbox, sm_handle, orchestrator and scheduler sub-regions in one shot.
-    arena.release();
+    rt->orchestrator.total_cluster_count = aic_count;
+    rt->orchestrator.total_aiv_count = aiv_count;
 }
 
 void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {

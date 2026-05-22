@@ -68,10 +68,22 @@ class PTO2TaskAllocator {
 public:
     /**
      * Initialize the allocator with task ring and heap ring resources.
+     *
+     * All pointer arguments are device addresses (live in SM / GM heap); this
+     * function only stores them, no dereferences, so it is safe to invoke
+     * from host code that constructs a prebuilt arena image.
+     *
+     * Production callers leave `initial_local_task_id` at 0: the SM ring
+     * flow-control counters that current_index_ptr / last_alive_ptr point at
+     * start at zero (PTO2RingFlowControl::init() runs on the AICPU during SM
+     * reset), so we keep local_task_id_ aligned with that without reading the
+     * SM. Tests that drive SM state directly may pass a non-zero seed to
+     * exercise corner cases like task IDs near INT32_MAX.
      */
     void init(
         PTO2TaskDescriptor *descriptors, int32_t window_size, std::atomic<int32_t> *current_index_ptr,
-        std::atomic<int32_t> *last_alive_ptr, void *heap_base, uint64_t heap_size, std::atomic<int32_t> *error_code_ptr
+        std::atomic<int32_t> *last_alive_ptr, void *heap_base, uint64_t heap_size, std::atomic<int32_t> *error_code_ptr,
+        int32_t initial_local_task_id = 0
     ) {
         descriptors_ = descriptors;
         window_size_ = window_size;
@@ -81,7 +93,7 @@ public:
         heap_base_ = heap_base;
         heap_size_ = heap_size;
         error_code_ptr_ = error_code_ptr;
-        local_task_id_ = current_index_ptr->load(std::memory_order_relaxed);
+        local_task_id_ = initial_local_task_id;
         heap_top_ = 0;
         heap_tail_ = 0;
         last_alive_seen_ = 0;

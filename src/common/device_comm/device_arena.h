@@ -95,6 +95,18 @@ public:
     // the trampoline's free path must therefore be nothrow.)
     void *commit(size_t base_align = kDefaultBaseAlign);
 
+    // Phase 2 alternative: attach to an externally-owned buffer instead of
+    // allocating one. Caller guarantees `external_base` is at least the size
+    // reported by `total_size()` rounded up to `base_align`, and that the
+    // same reserve() sequence has been (or will be) replayed. Forward-aligns
+    // the visible base in the same way as commit().
+    //
+    // The external buffer is NOT freed by release()/~DeviceArena(); ownership
+    // stays with the caller. Used for the prebuilt-arena fast path where
+    // a host-built image is rtMemcpy'd into a device buffer that DeviceRunner
+    // owns across runs.
+    void attach(void *external_base, size_t base_align = kDefaultBaseAlign) noexcept;
+
     // Phase 3: pointer to the sub-region at `offset`. Asserts if called
     // before commit().
     void *region_ptr(size_t offset) const noexcept;
@@ -135,6 +147,9 @@ private:
     size_t raw_size_{0};
     void *base_{nullptr};
     bool committed_{false};
+    // True when committed via attach(): the backing buffer is externally
+    // owned, so release() must not call free_().
+    bool attached_{false};
 
     size_t alloc_count_{0};
     size_t free_count_{0};
@@ -166,6 +181,31 @@ inline void *DeviceArena::commit(size_t base_align) {
     return base_;
 }
 
+inline void DeviceArena::attach(void *external_base, size_t base_align) noexcept {
+    // Re-attach (e.g. AICPU boot path attaches each run) is fine: only an
+    // attached state can be "re-attached" — release() it first to keep
+    // semantics tight. A real commit() (alloc-backed) must not be silently
+    // dropped, so still trap on that.
+    if (committed_) {
+        assert(attached_ && "DeviceArena::attach() called after commit (only re-attach is allowed)");
+        release();
+    }
+    assert(external_base != nullptr && "DeviceArena::attach() requires non-null base");
+    assert(base_align > 0 && (base_align & (base_align - 1)) == 0 && "DeviceArena: base_align must be a power of two");
+    // The external buffer must already be base_align-aligned by the caller —
+    // forward-align in-place would shift the visible base off the address the
+    // caller advertised (and that the prebuilt image was constructed for).
+    const auto raw = reinterpret_cast<uintptr_t>(external_base);
+    (void)raw;
+    (void)base_align;
+    assert((raw & (static_cast<uintptr_t>(base_align) - 1)) == 0 && "DeviceArena::attach() base must be pre-aligned");
+    base_ = external_base;
+    raw_base_ = nullptr;
+    raw_size_ = 0;
+    committed_ = true;
+    attached_ = true;
+}
+
 inline void *DeviceArena::region_ptr(size_t offset) const noexcept {
     assert(committed_ && "DeviceArena::region_ptr() called before commit()");
     return reinterpret_cast<char *>(base_) + offset;
@@ -179,7 +219,8 @@ inline size_t DeviceArena::region_size(size_t offset) const noexcept {
 }
 
 inline void DeviceArena::release() noexcept {
-    if (raw_base_ != nullptr) {
+    // attached arenas wrap externally-owned memory — never free.
+    if (raw_base_ != nullptr && !attached_) {
         free_(ctx_, raw_base_);
         ++free_count_;
     }
@@ -189,4 +230,5 @@ inline void DeviceArena::release() noexcept {
     cursor_ = 0;
     region_count_ = 0;
     committed_ = false;
+    attached_ = false;
 }

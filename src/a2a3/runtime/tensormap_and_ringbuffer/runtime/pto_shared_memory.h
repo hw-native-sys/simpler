@@ -187,3 +187,64 @@ private:
     void setup_pointers(uint64_t task_window_size);
     void setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
 };
+
+// =============================================================================
+// SM Device Layout Helpers
+// =============================================================================
+//
+// When the host pre-builds a runtime-arena image, it needs the device-side
+// addresses of several SM sub-fields (ring flow-control counters,
+// task_descriptors arrays, orch_error_code) so it can wire them into the
+// orchestrator / scheduler init_data path without dereferencing the SM —
+// the SM lives in device memory and cannot be touched from host.
+//
+// These helpers compute those addresses by offset arithmetic on the SM
+// device base. Pure pointer math, no loads/stores; safe to call from host.
+// The same arithmetic happens on AICPU too (via PTO2SharedMemoryHandle's
+// own setup_pointers), so values are guaranteed consistent across sides.
+namespace pto2_sm_layout {
+
+inline std::atomic<int32_t> *orch_error_code_addr(void *sm_dev_base) noexcept {
+    return reinterpret_cast<std::atomic<int32_t> *>(
+        static_cast<char *>(sm_dev_base) + offsetof(PTO2SharedMemoryHeader, orch_error_code)
+    );
+}
+
+inline PTO2SharedMemoryRingHeader *ring_header_addr(void *sm_dev_base, int ring_id) noexcept {
+    return reinterpret_cast<PTO2SharedMemoryRingHeader *>(
+        static_cast<char *>(sm_dev_base) + offsetof(PTO2SharedMemoryHeader, rings) +
+        static_cast<size_t>(ring_id) * sizeof(PTO2SharedMemoryRingHeader)
+    );
+}
+
+inline std::atomic<int32_t> *ring_current_task_index_addr(void *sm_dev_base, int ring_id) noexcept {
+    return reinterpret_cast<std::atomic<int32_t> *>(
+        reinterpret_cast<char *>(ring_header_addr(sm_dev_base, ring_id)) + offsetof(PTO2SharedMemoryRingHeader, fc) +
+        offsetof(PTO2RingFlowControl, current_task_index)
+    );
+}
+
+inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base, int ring_id) noexcept {
+    return reinterpret_cast<std::atomic<int32_t> *>(
+        reinterpret_cast<char *>(ring_header_addr(sm_dev_base, ring_id)) + offsetof(PTO2SharedMemoryRingHeader, fc) +
+        offsetof(PTO2RingFlowControl, last_task_alive)
+    );
+}
+
+// Walk the per-ring SM layout (same arithmetic as setup_pointers_per_ring)
+// to compute ring `ring_id`'s task_descriptors device address. Uniform
+// per-ring task_window_size; matches the production callsite which always
+// passes a uniform window size to runtime_create_from_sm.
+inline PTO2TaskDescriptor *
+ring_task_descriptors_addr(void *sm_dev_base, uint64_t task_window_size, int ring_id) noexcept {
+    char *p = static_cast<char *>(sm_dev_base);
+    p += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
+    for (int r = 0; r < ring_id; r++) {
+        p += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+        p += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+        p += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+    }
+    return reinterpret_cast<PTO2TaskDescriptor *>(p);
+}
+
+}  // namespace pto2_sm_layout
