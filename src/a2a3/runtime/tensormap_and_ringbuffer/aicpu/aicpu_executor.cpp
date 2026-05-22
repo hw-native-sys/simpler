@@ -937,19 +937,18 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         return runtime_rc;
     }
 
-    // Last thread cleans up
-    if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
-        LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
-        g_aicpu_executor.deinit(runtime);
-    }
-
     // Shutting down
     int32_t shutdown_rc = g_aicpu_executor.shutdown(runtime);
     if (shutdown_rc != 0) {
         LOG_ERROR("aicpu_execute: shutdown failed with rc=%d", shutdown_rc);
         return shutdown_rc;
     }
-
+    
+    // Last thread cleans up
+    if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
+        LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
+        g_aicpu_executor.deinit(runtime);
+    }
 
     LOG_INFO_V0("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
