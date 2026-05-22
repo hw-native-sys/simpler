@@ -330,7 +330,11 @@ struct alignas(64) PTO2TaskSlotState {
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
     std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
 
-    // --- Immutable after RingSchedState::init() (same value on every slot reuse) ---
+    // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
+    // Value is the same on every reuse (&task_payloads[slot] / &task_descriptors[slot]),
+    // but written here per-submit instead of in an O(window_size) init loop —
+    // these are the only "scale-dependent" pointers in this struct, so moving
+    // them out of init makes startup cost independent of task_window_size.
     PTO2TaskPayload *payload;
     PTO2TaskDescriptor *task;
 
@@ -345,14 +349,21 @@ struct alignas(64) PTO2TaskSlotState {
     int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
 
     /**
-     * One-time binding of slot-invariant fields.
-     * Called during RingSchedState::init() — these values are determined by
-     * the slot's position in the ring and never change across reuses.
+     * Bind the slot-invariant ring id. Called once per slot during
+     * RingSchedState::init(); ring_id never changes across reuses.
      */
-    void bind(PTO2TaskPayload *p, PTO2TaskDescriptor *t, uint8_t rid) {
+    void bind_ring(uint8_t rid) { ring_id = rid; }
+
+    /**
+     * Re-bind the per-slot payload/task pointers. Called by
+     * orch::prepare_task on every submit. Value is constant for a given
+     * slot, but we pay the cheap re-write each submit (both fields land on
+     * the same 64B slot_state cache line that prepare_task is already
+     * dirtying) to avoid the init-time per-slot loop.
+     */
+    void bind_buffers(PTO2TaskPayload *p, PTO2TaskDescriptor *t) {
         payload = p;
         task = t;
-        ring_id = rid;
     }
 
     /**

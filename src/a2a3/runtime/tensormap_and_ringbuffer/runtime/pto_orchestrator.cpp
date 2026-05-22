@@ -355,11 +355,21 @@ static bool prepare_task(
 
     prefetch_payload(out->payload, args.tensor_count(), args.scalar_count());
 
+    // Re-bind payload/task pointers each submit. Value is per-slot constant
+    // (same as &task_payloads[slot] / &task_descriptors[slot]), but writing
+    // here lets RingSchedState::init() skip the O(window_size) bind loop.
+    // Both writes hit the same 64B slot_state cache line we're about to
+    // dirty below, so the extra cost is two stores on an already-hot line.
+    // Must precede the scheduler wiring.queue.push at the end of
+    // submit_task_common — that push is the first read of slot_state->task /
+    // slot_state->payload by another thread.
+    out->slot_state->bind_buffers(out->payload, out->task);
+
     // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
     //   fanout_lock=0, fanout_count=1, fanout_head=nullptr,
     //   fanin_refcount=0, fanout_refcount=0, completed_subtasks=0, next_block_idx=0
     // Fields immutable after RingSchedState::init():
-    //   payload, task, ring_id
+    //   ring_id
     // task_state left as CONSUMED by eager reset (safe for stale wait_for_tensor
     // observers); set to PENDING here when orchestrator actually reuses the slot.
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);

@@ -102,12 +102,13 @@ bool PTO2SchedulerState::RingSchedState::init(PTO2SharedMemoryHeader *sm_header,
     advance_lock.store(0, std::memory_order_relaxed);
 
     // Initialize all per-task slot state fields.
-    // bind() sets payload, task, ring_id — immutable after init, bound once
-    // to their fixed shared-memory addresses.
+    // bind_ring() sets the ring_id only — payload/task pointers are re-bound
+    // by orch::prepare_task on every submit (their value is per-slot constant
+    // but pinning them here would cost O(task_window_size) at startup).
     // reset_for_reuse() sets dynamic fields to reclaim defaults (fanout_count=1,
     // rest zero) so the first submit needs no reset.
     for (uint64_t i = 0; i < ring->task_window_size; i++) {
-        ring->slot_states[i].bind(&ring->task_payloads[i], &ring->task_descriptors[i], static_cast<uint8_t>(ring_id));
+        ring->slot_states[i].bind_ring(static_cast<uint8_t>(ring_id));
         ring->slot_states[i].reset_for_reuse();
         ring->slot_states[i].fanin_count = 0;
         ring->slot_states[i].active_mask = ActiveMask{};
