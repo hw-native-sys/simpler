@@ -19,13 +19,17 @@
  * complete — especially on resource-constrained CI runners (e.g., 2 cores
  * running 13+ threads).
  *
- * The CPU hint (pause/yield) reduces pipeline waste, and sched_yield() lets the
- * OS scheduler give time slices to threads doing real work.
+ * Two mitigations live here. The CPU hint (pause/yield) plus sched_yield() let
+ * the OS scheduler give time slices to threads doing real work, and
+ * PLATFORM_MAX_IDLE_ITERATIONS below raises the idle cap well above the onboard
+ * value so a slow CPU-sim task (e.g. matmul-heavy kernels) making real progress
+ * is not mistaken for a deadlock.
  */
 
 #ifndef PLATFORM_A2A3SIM_AICPU_SPIN_HINT_H_
 #define PLATFORM_A2A3SIM_AICPU_SPIN_HINT_H_
 
+#include <cstdint>
 #include <sched.h>
 
 #if defined(__aarch64__)
@@ -43,5 +47,14 @@
 #else
 #define SPIN_WAIT_HINT() sched_yield()
 #endif
+
+// Consecutive idle scheduler iterations (no task progress) before the dispatch
+// loop aborts with PTO2_ERROR_SCHEDULER_TIMEOUT. CPU sim accumulates idle
+// iterations far faster than real kernel progress, so the cap is raised well
+// above the onboard value to avoid false timeouts on slow (e.g. matmul-heavy)
+// kernels. Set to 10x the onboard cap as a conservative bump; raise further if
+// a slow kernel still false-times-out. The runtime consumes it as
+// MAX_IDLE_ITERATIONS (see scheduler_types.h).
+constexpr int32_t PLATFORM_MAX_IDLE_ITERATIONS = 8000000;
 
 #endif  // PLATFORM_A2A3SIM_AICPU_SPIN_HINT_H_
