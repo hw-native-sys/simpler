@@ -65,6 +65,38 @@ from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Optional
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    CTRL_ALLOC_DOMAIN,
+    CTRL_CHANNEL_RECV,
+    CTRL_CHANNEL_SEND,
+    CTRL_CLOSE_CHANNEL,
+    CTRL_CLOSE_SHARED_MEMORY,
+    CTRL_COMM_INIT,
+    CTRL_COPY_FROM,
+    CTRL_COPY_TO,
+    CTRL_FREE,
+    CTRL_MALLOC,
+    CTRL_OFF_ARG0,
+    CTRL_OFF_ARG1,
+    CTRL_OFF_ARG2,
+    CTRL_OFF_ARG3,
+    CTRL_OFF_ARG4,
+    CTRL_OFF_PAYLOAD,
+    CTRL_OFF_RESULT,
+    CTRL_OPEN_CHANNEL,
+    CTRL_OPEN_SHARED_MEMORY,
+    CTRL_PAYLOAD_CAPACITY,
+    CTRL_PREPARE,
+    CTRL_REGISTER,
+    CTRL_RELEASE_DOMAIN,
+    CTRL_SHARED_MEMORY_INFO,
+    CTRL_SHARED_MEMORY_NOTIFY,
+    CTRL_SHARED_MEMORY_READ,
+    CTRL_SHARED_MEMORY_WAIT,
+    CTRL_SHARED_MEMORY_WRITE,
+    CTRL_SHM_NAME_BYTES,
+    CTRL_UNREGISTER,
+    MAILBOX_ARGS_CAPACITY,
+    MAILBOX_OFF_ARGS,
     MAX_REGISTERED_CALLABLE_IDS,
     RunTiming,
     _mailbox_load_i32,
@@ -116,12 +148,14 @@ _CFG_FMT = struct.Struct("=iiiiii1024s")
 # Args region starts after CONFIG, rounded up to 8 bytes so the first
 # ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
-_OFF_ARGS = (_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
+_PY_OFF_ARGS = (_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
+assert _PY_OFF_ARGS == MAILBOX_OFF_ARGS, "CallConfig mailbox layout drifted"
+_OFF_ARGS = MAILBOX_OFF_ARGS
 assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for ContinuousTensor.data"
-# MAILBOX_ARGS_CAPACITY mirrors the C++ constexpr in worker_manager.h so the
-# Python reader can bounds-check incoming args blobs. Source-of-truth for the
-# constants on the right is the nanobind binding (cannot drift).
-_MAILBOX_ARGS_CAPACITY = MAILBOX_SIZE - _OFF_ARGS - MAILBOX_ERROR_MSG_SIZE
+# MAILBOX_ARGS_CAPACITY comes from the nanobind binding so the Python reader
+# can bounds-check incoming args blobs against the C++ mailbox layout.
+_MAILBOX_ARGS_CAPACITY = MAILBOX_ARGS_CAPACITY
+assert _MAILBOX_ARGS_CAPACITY == MAILBOX_SIZE - _OFF_ARGS - MAILBOX_ERROR_MSG_SIZE
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
 
@@ -133,51 +167,53 @@ _CONTROL_REQUEST = 4
 _CONTROL_DONE = 5
 
 # Control sub-commands (written at _OFF_CALLABLE as uint64)
-_CTRL_MALLOC = 0
-_CTRL_FREE = 1
-_CTRL_COPY_TO = 2
-_CTRL_COPY_FROM = 3
+_CTRL_MALLOC = CTRL_MALLOC
+_CTRL_FREE = CTRL_FREE
+_CTRL_COPY_TO = CTRL_COPY_TO
+_CTRL_COPY_FROM = CTRL_COPY_FROM
 # Pre-warm a chip child for cid=arg0 by calling
 # `prepare_callable(cid, registry[cid])` so the first run() does
 # not pay the H2D upload cost.  Sent from the parent right after init()
 # (or whenever a new ChipCallable cid is registered).
-_CTRL_PREPARE = 4
+_CTRL_PREPARE = CTRL_PREPARE
 # Dynamic post-init register of a ChipCallable. Parent stages the bytes
 # in a per-register POSIX shm and writes (cid, shm_name) into the mailbox;
 # the child mmaps the shm and calls prepare_callable_from_blob(cid, addr).
 # See docs/callable-ipc-dynamic-register.md for the design.
-_CTRL_REGISTER = 5
+_CTRL_REGISTER = CTRL_REGISTER
 # Symmetric unregister: drop the cid from chip-child state so the AICPU
 # orch_so_table_ slot can be reused. Payload is just the cid; no shm.
-_CTRL_UNREGISTER = 6
+_CTRL_UNREGISTER = CTRL_UNREGISTER
 # Dynamic CommDomain allocate / release (collective across the participating
 # subset).  Parent stages the request in a POSIX shm whose name is at
 # OFF_ARGS+0; for alloc, it also pre-allocates a reply shm whose name is at
 # OFF_ARGS+32.  Both shms have a fixed header (see _DOMAIN_REQ_HEADER /
 # _DOMAIN_REPLY_HEADER) followed by variable buffer/rank data.
-_CTRL_ALLOC_DOMAIN = 7
-_CTRL_RELEASE_DOMAIN = 8
+_CTRL_ALLOC_DOMAIN = CTRL_ALLOC_DOMAIN
+_CTRL_RELEASE_DOMAIN = CTRL_RELEASE_DOMAIN
 # Lazy base-comm init driven from Orchestrator.allocate_domain on first use.
 # Request shm carries `<II` header (rank, nranks) + NUL-terminated
 # rootinfo_path bytes.  Chip child calls cw.comm_init(rank, nranks,
 # rootinfo_path) and caches the handle on the ChipWorker so subsequent
 # CTRL_ALLOC_DOMAIN calls can find it.
-_CTRL_COMM_INIT = 9
+_CTRL_COMM_INIT = CTRL_COMM_INIT
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
 assert _COMM_INIT_HEADER.size == 8
-_CTRL_OPEN_CHANNEL = 10
-_CTRL_CLOSE_CHANNEL = 11
-_CTRL_CHANNEL_SEND = 12
-_CTRL_CHANNEL_RECV = 13
-_CTRL_OPEN_SHARED_MEMORY = 14
-_CTRL_CLOSE_SHARED_MEMORY = 15
-_CTRL_SHARED_MEMORY_INFO = 16
-_CTRL_SHARED_MEMORY_READ = 17
-_CTRL_SHARED_MEMORY_WRITE = 18
-_CTRL_SHARED_MEMORY_NOTIFY = 19
-_CTRL_SHARED_MEMORY_WAIT = 20
+_CTRL_OPEN_CHANNEL = CTRL_OPEN_CHANNEL
+_CTRL_CLOSE_CHANNEL = CTRL_CLOSE_CHANNEL
+_CTRL_CHANNEL_SEND = CTRL_CHANNEL_SEND
+_CTRL_CHANNEL_RECV = CTRL_CHANNEL_RECV
+_CTRL_OPEN_SHARED_MEMORY = CTRL_OPEN_SHARED_MEMORY
+_CTRL_CLOSE_SHARED_MEMORY = CTRL_CLOSE_SHARED_MEMORY
+_CTRL_SHARED_MEMORY_INFO = CTRL_SHARED_MEMORY_INFO
+_CTRL_SHARED_MEMORY_READ = CTRL_SHARED_MEMORY_READ
+_CTRL_SHARED_MEMORY_WRITE = CTRL_SHARED_MEMORY_WRITE
+_CTRL_SHARED_MEMORY_NOTIFY = CTRL_SHARED_MEMORY_NOTIFY
+_CTRL_SHARED_MEMORY_WAIT = CTRL_SHARED_MEMORY_WAIT
+_CTRL_TEST_CHANNEL_SEND_L2 = 0x545354000001
+_CTRL_TEST_CHANNEL_RECV_L2 = 0x545354000002
 
 # Reserved 32-byte region at the start of OFF_ARGS used by _CTRL_REGISTER to
 # carry the NUL-terminated POSIX shm name. POSIX shm names on Linux are
@@ -187,7 +223,7 @@ _CTRL_SHARED_MEMORY_WAIT = 20
 # _CTRL_ALLOC_DOMAIN uses two such slots back to back at OFF_ARGS (request
 # shm at offset 0, reply shm at offset CTRL_SHM_NAME_BYTES).  _CTRL_RELEASE_DOMAIN
 # uses only the first slot.
-_CTRL_SHM_NAME_BYTES = 32
+_CTRL_SHM_NAME_BYTES = CTRL_SHM_NAME_BYTES
 
 # Domain-allocation request shm layout: 32-byte header + buffer_nbytes (u64) +
 # rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
@@ -209,14 +245,14 @@ assert _DOMAIN_REPLY_HEADER.size == 24
 #   offset 24:                  uint64  arg1 (host_ptr for copy)
 #   offset 32:                  uint64  arg2 (nbytes for copy)
 #   offset 40:                  uint64  result (returned ptr from malloc)
-_CTRL_OFF_ARG0 = 16
-_CTRL_OFF_ARG1 = 24
-_CTRL_OFF_ARG2 = 32
-_CTRL_OFF_RESULT = 40
-_CTRL_OFF_ARG3 = 48
-_CTRL_OFF_ARG4 = 56
-_CTRL_OFF_PAYLOAD = 64
-_CTRL_PAYLOAD_CAPACITY = MAILBOX_SIZE - _CTRL_OFF_PAYLOAD - MAILBOX_ERROR_MSG_SIZE
+_CTRL_OFF_ARG0 = CTRL_OFF_ARG0
+_CTRL_OFF_ARG1 = CTRL_OFF_ARG1
+_CTRL_OFF_ARG2 = CTRL_OFF_ARG2
+_CTRL_OFF_RESULT = CTRL_OFF_RESULT
+_CTRL_OFF_ARG3 = CTRL_OFF_ARG3
+_CTRL_OFF_ARG4 = CTRL_OFF_ARG4
+_CTRL_OFF_PAYLOAD = CTRL_OFF_PAYLOAD
+_CTRL_PAYLOAD_CAPACITY = CTRL_PAYLOAD_CAPACITY
 
 
 def _mailbox_addr(shm: SharedMemory) -> int:
@@ -611,6 +647,21 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     capacity = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
                     timeout_us = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
                     data, route, cid = cw.channel_recv(ch, capacity, timeout_us)
+                    buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + len(data)] = data
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, len(data))
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG3, route)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG4, cid)
+                elif sub_cmd == _CTRL_TEST_CHANNEL_SEND_L2:
+                    ch = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    route = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    n = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    cid = struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0]
+                    cw.channel_send_l2_for_test(ch, route, bytes(buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + n]), cid)
+                elif sub_cmd == _CTRL_TEST_CHANNEL_RECV_L2:
+                    ch = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    capacity = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    timeout_us = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    data, route, cid = cw.channel_recv_l2_for_test(ch, capacity, timeout_us)
                     buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + len(data)] = data
                     struct.pack_into("Q", buf, _CTRL_OFF_RESULT, len(data))
                     struct.pack_into("Q", buf, _CTRL_OFF_ARG3, route)

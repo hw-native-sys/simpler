@@ -17,8 +17,10 @@ import threading
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
+import _task_interface as ti  # pyright: ignore[reportMissingImports]
 from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
 from simpler.task_interface import ChipCallable, DataType, TaskArgs, TensorArgType
+import simpler.worker as worker_mod
 from simpler.worker import (
     _CTRL_PAYLOAD_CAPACITY,
     _CTRL_SHARED_MEMORY_INFO,
@@ -53,6 +55,21 @@ def _increment_counter(buf) -> None:
 # ---------------------------------------------------------------------------
 # Test: L3 shared-memory metadata
 # ---------------------------------------------------------------------------
+
+
+def test_worker_control_protocol_constants_match_binding():
+    names = (
+        "CTRL_MALLOC CTRL_FREE CTRL_COPY_TO CTRL_COPY_FROM CTRL_PREPARE CTRL_REGISTER CTRL_UNREGISTER "
+        "CTRL_OPEN_CHANNEL CTRL_CLOSE_CHANNEL CTRL_CHANNEL_SEND CTRL_CHANNEL_RECV CTRL_OPEN_SHARED_MEMORY "
+        "CTRL_CLOSE_SHARED_MEMORY CTRL_SHARED_MEMORY_INFO CTRL_SHARED_MEMORY_READ CTRL_SHARED_MEMORY_WRITE "
+        "CTRL_SHARED_MEMORY_NOTIFY CTRL_SHARED_MEMORY_WAIT CTRL_OFF_ARG0 CTRL_OFF_ARG1 CTRL_OFF_ARG2 "
+        "CTRL_OFF_RESULT CTRL_OFF_ARG3 CTRL_OFF_ARG4 CTRL_OFF_PAYLOAD CTRL_PAYLOAD_CAPACITY "
+        "CTRL_SHM_NAME_BYTES"
+    ).split()
+    for name in names:
+        assert getattr(worker_mod, f"_{name}") == getattr(ti, name)
+    assert worker_mod._OFF_ARGS == ti.MAILBOX_OFF_ARGS
+    assert worker_mod._MAILBOX_ARGS_CAPACITY == ti.MAILBOX_ARGS_CAPACITY
 
 
 class TestSharedMemoryInfo:
