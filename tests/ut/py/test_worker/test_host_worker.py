@@ -27,7 +27,19 @@ from simpler.task_interface import (
     WorkerType,
     _Worker,
 )
-from simpler.worker import Worker
+from simpler.worker import (
+    _CONTROL_REQUEST,
+    _CTRL_PY_REGISTER,
+    _CTRL_PY_UNREGISTER,
+    _IDLE,
+    _OFF_STATE,
+    Worker,
+    _buffer_field_addr,
+    _mailbox_addr,
+    _mailbox_load_i32,
+    _mailbox_store_i32,
+    _pack_py_callable_payload,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -203,9 +215,7 @@ class TestLifecycle:
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
-            callable_obj = ChipCallable.build(
-                signature=[], func_name="x", binary=b"\x00", children=[]
-            )
+            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
             cid = hw.register(callable_obj)
             assert isinstance(cid, int)
             assert cid >= 0
@@ -262,9 +272,7 @@ class TestLifecycle:
         hw = Worker(level=3, num_sub_workers=0)
         hw._initialized = True
         hw._hierarchical_started = True
-        callable_obj = ChipCallable.build(
-            signature=[], func_name="x", binary=b"\x00", children=[]
-        )
+        callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
         observed = {}
 
         def fake_post_init_register(cid, target):
@@ -282,9 +290,7 @@ class TestLifecycle:
     def test_register_at_broadcast_runs_without_registry_lock(self):
         hw = Worker(level=3, num_sub_workers=0)
         hw._initialized = True
-        callable_obj = ChipCallable.build(
-            signature=[], func_name="x", binary=b"\x00", children=[]
-        )
+        callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
         observed = {}
 
         def fake_post_init_register(cid, target):
@@ -629,8 +635,6 @@ class TestLifecycle:
             hw.close()
 
     def test_broadcast_control_all_accepts_memoryview_payload(self):
-        from simpler.worker import _CTRL_PY_REGISTER, _pack_py_callable_payload  # noqa: PLC0415
-
         counter_shm, counter_buf = _make_shared_counter()
         try:
             hw = Worker(level=3, num_sub_workers=1)
@@ -651,7 +655,9 @@ class TestLifecycle:
                     shm.close()
 
             cid = 5
-            results = hw._worker.broadcast_control_all(
+            worker_impl = hw._worker
+            assert worker_impl is not None
+            results = worker_impl.broadcast_control_all(
                 WorkerType.SUB,
                 _CTRL_PY_REGISTER,
                 cid,
@@ -672,14 +678,14 @@ class TestLifecycle:
             counter_shm.unlink()
 
     def test_broadcast_control_all_reports_malformed_payload(self):
-        from simpler.worker import _CTRL_PY_REGISTER  # noqa: PLC0415
-
         hw = Worker(level=3, num_sub_workers=1)
         bootstrap_cid = hw.register(lambda args: None)
         hw.init()
         try:
             hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
-            results = hw._worker.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, 5, b"bad")
+            worker_impl = hw._worker
+            assert worker_impl is not None
+            results = worker_impl.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, 5, b"bad")
             assert len(results) == 1
             assert not results[0].ok
             assert "payload" in results[0].error_message
@@ -687,28 +693,19 @@ class TestLifecycle:
             hw.close()
 
     def test_broadcast_control_all_empty_payload_raises_before_fanout(self):
-        from simpler.worker import _CTRL_PY_REGISTER  # noqa: PLC0415
-
         hw = Worker(level=3, num_sub_workers=1)
         bootstrap_cid = hw.register(lambda args: None)
         hw.init()
         try:
             hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            worker_impl = hw._worker
+            assert worker_impl is not None
             with pytest.raises(RuntimeError, match="payload pointer and size"):
-                hw._worker.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, 5, b"")
+                worker_impl.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, 5, b"")
         finally:
             hw.close()
 
     def test_broadcast_control_all_timeout_reports_failed_child(self):
-        from simpler.worker import (
-            _CTRL_PY_UNREGISTER,
-            _IDLE,
-            _OFF_STATE,
-            _buffer_field_addr,
-            _mailbox_addr,
-        )
-        from simpler.worker import _mailbox_store_i32  # noqa: PLC0415
-
         shm = SharedMemory(create=True, size=MAILBOX_SIZE)
         dw = _Worker(3)
         try:
@@ -732,17 +729,6 @@ class TestLifecycle:
             shm.unlink()
 
     def test_broadcast_control_all_selected_pool_routing(self):
-        from simpler.worker import (
-            _CTRL_PY_UNREGISTER,
-            _CONTROL_REQUEST,
-            _IDLE,
-            _OFF_STATE,
-            _buffer_field_addr,
-            _mailbox_addr,
-            _mailbox_load_i32,
-            _mailbox_store_i32,
-        )
-
         def make_mailbox():
             shm = SharedMemory(create=True, size=MAILBOX_SIZE)
             assert shm.buf is not None
@@ -785,20 +771,20 @@ class TestLifecycle:
                 next_shm.unlink()
 
     def test_broadcast_control_all_result_shape_for_register_and_unregister(self):
-        from simpler.worker import _CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER  # noqa: PLC0415
-
         hw = Worker(level=3, num_sub_workers=1)
         bootstrap_cid = hw.register(lambda args: None)
         hw.init()
         try:
             hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
-            register_results = hw._worker.broadcast_control_all(
+            worker_impl = hw._worker
+            assert worker_impl is not None
+            register_results = worker_impl.broadcast_control_all(
                 WorkerType.SUB,
                 _CTRL_PY_REGISTER,
                 5,
                 b"bad",
             )
-            unregister_results = hw._worker.broadcast_control_all(
+            unregister_results = worker_impl.broadcast_control_all(
                 WorkerType.SUB,
                 _CTRL_PY_UNREGISTER,
                 bootstrap_cid,

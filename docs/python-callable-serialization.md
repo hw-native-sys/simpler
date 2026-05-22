@@ -216,8 +216,11 @@ exact bytes returned by `cloudpickle.dumps(target)`:
 
 The first implementation accepts only `(magic="SPYC", version=1,
 serializer=1, flags=0)`. Unknown magic, version, serializer, non-zero flags,
-size mismatch, malformed bytes, or incompatible pickle data fail through the
-normal mailbox error field.
+payload size larger than the mapped shm, malformed bytes, or incompatible
+pickle data fail through the normal mailbox error field. The child treats
+`payload_size` as the authoritative byte count and ignores any trailing bytes
+in the shm object, because some platforms expose POSIX shm at a page-rounded
+size even when the parent requested the exact payload length.
 
 ### Child Deserialization
 

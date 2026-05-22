@@ -66,7 +66,6 @@ from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Optional
 
 import cloudpickle
-
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RunTiming,
@@ -218,13 +217,16 @@ _CTRL_OFF_RESULT = 40
 
 def _pack_py_callable_payload(target) -> bytes:
     payload = cloudpickle.dumps(target)
-    return _PY_CALLABLE_HEADER.pack(
-        _PY_CALLABLE_MAGIC,
-        _PY_CALLABLE_VERSION,
-        _PY_CALLABLE_SERIALIZER_CLOUDPICKLE,
-        0,
-        len(payload),
-    ) + payload
+    return (
+        _PY_CALLABLE_HEADER.pack(
+            _PY_CALLABLE_MAGIC,
+            _PY_CALLABLE_VERSION,
+            _PY_CALLABLE_SERIALIZER_CLOUDPICKLE,
+            0,
+            len(payload),
+        )
+        + payload
+    )
 
 
 def _load_py_callable_from_shm(shm_name: str):
@@ -244,7 +246,7 @@ def _load_py_callable_from_shm(shm_name: str):
         if flags != 0:
             raise RuntimeError(f"unsupported python callable payload flags: {flags}")
         expected_size = _PY_CALLABLE_HEADER.size + int(payload_size)
-        if expected_size != shm.size:
+        if expected_size > shm.size:
             raise RuntimeError(f"python callable payload size mismatch: header={payload_size}, shm={shm.size}")
         payload = bytes(shm_buf[_PY_CALLABLE_HEADER.size : expected_size])
     finally:
@@ -858,9 +860,7 @@ class Worker:
         self._registry_lock = threading.Lock()
         self._pending_unregister_cids: set[int] = set()
         self._py_callable_cids_seen: set[int] = set()
-        self._py_control_timeout_s = float(
-            config.get("py_control_timeout_s", _PY_CONTROL_TIMEOUT_S)
-        )
+        self._py_control_timeout_s = float(config.get("py_control_timeout_s", _PY_CONTROL_TIMEOUT_S))
         self._hierarchical_start_state = "not_started"
         self._hierarchical_start_mu = threading.Lock()
         self._hierarchical_start_cv = threading.Condition(self._hierarchical_start_mu)
