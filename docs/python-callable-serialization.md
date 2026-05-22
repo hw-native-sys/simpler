@@ -10,7 +10,8 @@ document covers `ChipCallable` binary registration for chip children. This
 document covers Python callables consumed by SUB workers and by higher-level
 Worker-child dispatch loops.
 
-It is a design document, not an implementation.
+It is the design and contract for the implementation in
+`python/simpler/worker.py` and `src/common/hierarchical/worker_manager.*`.
 
 ---
 
@@ -102,6 +103,10 @@ The parent routes Python callable registration to Python-capable children:
 L3 chip children are not recipients for Python callable payloads. They can
 only consume prepared `ChipCallable` ids.
 
+To keep the `NEXT_LEVEL` control pool unambiguous, L4+ Workers must use
+`add_worker(...)` for next-level children and must not also configure direct
+`device_ids`. Direct chip children remain an L3-only configuration.
+
 Because `Worker.register()` does not currently take a "sub" versus
 "next-level orch" kind, the simplest compatible policy is to broadcast to all
 Python-capable child groups owned by this Worker. Extra registry entries are
@@ -185,10 +190,12 @@ name instead of a live `SharedMemory.buf` object.
 
 ### Payload Format
 
-The parent serializes the callable into an in-memory byte blob. The C++
-broadcast binding creates the side-band POSIX shm, copies that blob into it,
-fan-outs the shm name to children, and unlinks the shm after all child
-round-trips have completed. Python does not create or unlink the broadcast shm.
+The parent serializes the callable with `cloudpickle`, then wraps those bytes in
+the Python-callable wire header described below. The resulting complete payload
+is an in-memory byte blob. The C++ broadcast binding creates the side-band POSIX
+shm, copies that complete payload into it, fan-outs the shm name to children,
+and unlinks the shm after all child round-trips have completed. Python does not
+create or unlink the broadcast shm.
 
 The Python binding must accept a Python buffer object, preferably `bytes`, not
 only a raw integer pointer. The binding copies the buffer into the staging shm
@@ -280,7 +287,8 @@ The mailbox layout for `CTRL_PY_REGISTER` mirrors binary register:
    `self._callable_registry[cid] = target`, and return the cid; future children
    will inherit the registry when they start.
 4. If no configured Python-capable child group exists, raise `RuntimeError`.
-5. Serialize the target into a bytes blob with `cloudpickle.dumps(...)`.
+5. Serialize the target with `cloudpickle.dumps(...)` and wrap it in the
+   complete Python-callable wire payload.
 6. Hold `_registry_lock`, allocate the smallest free cid, insert
    `self._callable_registry[cid] = target`, and release `_registry_lock`.
 7. Broadcast `CTRL_PY_REGISTER` to required Python-capable worker groups.
@@ -340,11 +348,15 @@ _Worker.broadcast_control_all(worker_type, sub_cmd, cid, payload=None,
 
 `worker_type` selects `SUB` versus `NEXT_LEVEL`; `sub_cmd` is
 `CTRL_PY_REGISTER` or `CTRL_PY_UNREGISTER`. For register, `payload` is the
-`cloudpickle`-serialized callable, passed as a Python buffer object. For
-unregister, `payload` is absent. The binding owns shm creation, copying,
-fan-out, and unlink when a payload is present, matching
-`broadcast_register_all` for binary callables while avoiding four
-near-identical Python-specific bindings.
+complete Python-callable wire payload, passed as a Python buffer object. That
+means the bytes start with the `SPYC` header and the header's payload region is
+the exact `cloudpickle.dumps(target)` result. Passing raw `cloudpickle` bytes
+directly to `_Worker.broadcast_control_all(..., CTRL_PY_REGISTER, ...)` is
+invalid because the C++ binding is a generic staging layer and does not add or
+interpret Python-callable headers. For unregister, `payload` is absent. The
+binding owns shm creation, copying, fan-out, and unlink when a payload is
+present, matching `broadcast_register_all` for binary callables while avoiding
+four near-identical Python-specific bindings.
 
 For a selected worker pool, fan-out is parallel: C++ starts one worker thread
 per target child, each round trip holds that child's `mailbox_mu_`, and the
@@ -358,9 +370,14 @@ message. The timeout does not repair the wedged child or reclaim a mailbox
 that is still owned by a stuck control command; it only bounds the caller's
 wait and makes the partial failure visible to Python policy code.
 
-The binding always returns structured per-child results. It does not switch
-between "raise" and "return errors" based on `sub_cmd`. Python decides whether
-those results are strict or best-effort:
+The Python `Worker` facade uses a finite default timeout for its own dynamic
+Python callable register/unregister broadcasts. The default is 30 seconds and
+can be overridden per Worker with `py_control_timeout_s`.
+
+Once a control request is staged and fan-out begins, the binding returns
+structured per-child results. It does not switch between "raise" and "return
+errors" based on `sub_cmd`. Python decides whether those results are strict or
+best-effort:
 
 ```text
 ControlResult(worker_type, worker_index, ok, error_message)
@@ -374,6 +391,12 @@ ControlResult(worker_type, worker_index, ok, error_message)
 - The cross-type reuse hook treats failed Python-residue cleanup as strict: it
   fails the `ChipCallable` registration before starting binary
   `CTRL_REGISTER`.
+
+Argument conversion and setup failures that happen before a selected worker
+pool can be contacted, such as a non-buffer `payload` object, an empty payload
+buffer for a register command, or shm creation failure, may still raise
+directly from the binding. Once fan-out begins, child-side failures and
+timeouts are reported through `ControlResult`.
 
 The existing `mailbox_mu_` must be held for each child round trip, just like
 binary register. This serializes Python register/unregister against
@@ -508,7 +531,7 @@ parent dispatch registries. It does not clear
 
 | Trigger | Handling |
 | ------- | -------- |
-| `cloudpickle` unavailable | Import fails at parent register time |
+| `cloudpickle` unavailable | `simpler.worker` import fails. |
 | Serializer cannot encode target | Parent raises before cid allocation |
 | Post-start no Python child group | Parent raises before cid allocation |
 | cid space exhausted | Parent raises before parent mutation |

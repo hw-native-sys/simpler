@@ -104,6 +104,17 @@ class TestL4Validation:
         child.close()
         w4.close()
 
+    def test_l4_device_ids_rejected(self):
+        w4 = Worker(level=4, device_ids=[0], num_sub_workers=0)
+        with pytest.raises(RuntimeError, match="device_ids are only supported on L3"):
+            w4.init()
+
+    def test_add_worker_with_device_ids_rejected(self):
+        w4 = Worker(level=4, device_ids=[0], num_sub_workers=0)
+        child = Worker(level=3, num_sub_workers=0)
+        with pytest.raises(RuntimeError, match="cannot be combined with device_ids"):
+            w4.add_worker(child)
+
     def test_malloc_on_l4_raises_index_error(self):
         # L4 has no chip mailboxes — `Worker.malloc` must surface IndexError
         # rather than silently dispatch CTRL_MALLOC to a next_level (L3 worker)
@@ -174,6 +185,38 @@ class TestL4DynamicRegister:
             assert cid_b == cid_a
         finally:
             w4.close()
+
+    def test_l4_register_python_orch_after_start_succeeds(self):
+        counter_shm, counter_buf = _make_shared_counter()
+        try:
+            l3 = Worker(level=3, num_sub_workers=1)
+            l3_sub_cid = l3.register(lambda args: _increment_counter(counter_buf))
+
+            w4 = Worker(level=4, num_sub_workers=0)
+            bootstrap_cid = w4.register(lambda orch, args, config: None)
+            w4.add_worker(l3)
+            w4.init()
+
+            def bootstrap(orch, args, config):
+                orch.submit_next_level(bootstrap_cid, TaskArgs(), CallConfig())
+
+            w4.run(bootstrap)
+
+            def dynamic_l3_orch(orch, args, config):
+                orch.submit_sub(l3_sub_cid)
+
+            dynamic_cid = w4.register(dynamic_l3_orch)
+
+            def l4_orch(orch, args, config):
+                orch.submit_next_level(dynamic_cid, TaskArgs(), CallConfig())
+
+            w4.run(l4_orch)
+            w4.close()
+
+            assert _read_counter(counter_buf) == 1
+        finally:
+            counter_shm.close()
+            counter_shm.unlink()
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,15 @@ from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
-from simpler.task_interface import ChipCallable, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import (
+    MAILBOX_SIZE,
+    ChipCallable,
+    DataType,
+    TaskArgs,
+    TensorArgType,
+    WorkerType,
+    _Worker,
+)
 from simpler.worker import Worker
 
 # ---------------------------------------------------------------------------
@@ -44,6 +52,33 @@ def _increment_counter(buf) -> None:
     struct.pack_into("i", buf, 0, v + 1)
 
 
+def _add_counter(buf, delta: int) -> None:
+    v = struct.unpack_from("i", buf, 0)[0]
+    struct.pack_into("i", buf, 0, v + delta)
+
+
+def _set_flag(buf, offset: int, value: int) -> None:
+    struct.pack_into("i", buf, offset, value)
+
+
+def _get_flag(buf, offset: int) -> int:
+    return struct.unpack_from("i", buf, offset)[0]
+
+
+def _roundtrip_py_callable_payload(target):
+    from simpler.worker import _load_py_callable_from_shm, _pack_py_callable_payload  # noqa: PLC0415
+
+    payload = _pack_py_callable_payload(target)
+    shm = SharedMemory(create=True, size=len(payload))
+    try:
+        assert shm.buf is not None
+        shm.buf[: len(payload)] = payload
+        return _load_py_callable_from_shm(shm.name)
+    finally:
+        shm.close()
+        shm.unlink()
+
+
 # ---------------------------------------------------------------------------
 # Test: lifecycle (init / close without submitting any tasks)
 # ---------------------------------------------------------------------------
@@ -65,15 +100,100 @@ class TestLifecycle:
             hw.register(lambda args: None)
         # close() called by __exit__, no exception
 
-    def test_register_python_fn_after_init_raises(self):
-        # Post-init register of a non-ChipCallable (lambda / sub fn) is
-        # rejected because Python callables cannot cross the fork boundary.
-        # ChipCallable is the only post-init target — see the next test.
+    def test_l2_rejects_python_callable(self):
+        hw = Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
+        with pytest.raises(TypeError, match="level 2 only supports ChipCallable"):
+            hw.register(lambda args: None)
+
+    def test_register_python_fn_after_init_before_start_succeeds(self):
+        # init() allocates mailboxes but does not fork children. Python
+        # callables registered in this window still land in the startup
+        # snapshot consumed by the first run().
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
-        with pytest.raises(NotImplementedError, match="only ChipCallable is supported post-init"):
-            hw.register(lambda args: None)
-        hw.close()
+        try:
+            cid = hw.register(lambda args: None)
+            assert cid in hw._callable_registry
+        finally:
+            hw.close()
+
+    def test_register_python_fn_after_init_before_start_does_not_broadcast(self):
+        class BroadcastTrap:
+            def broadcast_control_all(self, *args, **kwargs):
+                raise AssertionError("pre-start Python register must not broadcast")
+
+        hw = Worker(level=3, num_sub_workers=1)
+        hw.init()
+        real_worker = hw._worker
+        try:
+            hw._worker = BroadcastTrap()
+            cid = hw.register(lambda args: None)
+            assert cid in hw._callable_registry
+        finally:
+            hw._worker = real_worker
+            hw.close()
+
+    def test_register_python_fn_after_start_no_python_children_raises(self):
+        hw = Worker(level=3, num_sub_workers=0)
+        hw.init()
+        try:
+            hw.run(lambda orch, args, cfg: None)
+            with pytest.raises(RuntimeError, match="no Python-capable child"):
+                hw.register(lambda args: None)
+        finally:
+            hw.close()
+
+    def test_register_waits_for_first_startup_then_uses_post_start_path(self):
+        hw = Worker(level=3, num_sub_workers=1)
+        hw.init()
+        try:
+            with hw._hierarchical_start_cv:
+                hw._hierarchical_start_state = "starting"
+
+            observed = {}
+
+            def fake_post_start_register(target):
+                observed["target"] = target
+                observed["state"] = hw._hierarchical_start_state
+                observed["hierarchical_started"] = hw._hierarchical_started
+                return 7
+
+            hw._post_start_register_python = fake_post_start_register
+            result: list[int] = []
+            errors: list[BaseException] = []
+            wait_entered = threading.Event()
+            original_wait = hw._hierarchical_start_cv.wait
+
+            def wait_with_signal(timeout=None):
+                wait_entered.set()
+                return original_wait(timeout)
+
+            hw._hierarchical_start_cv.wait = wait_with_signal
+
+            def do_register():
+                try:
+                    result.append(hw.register(lambda args: None))
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            t = threading.Thread(target=do_register)
+            t.start()
+            assert wait_entered.wait(timeout=2.0)
+            with hw._hierarchical_start_cv:
+                hw._hierarchical_started = True
+                hw._hierarchical_start_state = "started"
+                hw._hierarchical_start_cv.notify_all()
+            t.join(timeout=2.0)
+
+            assert not t.is_alive()
+            assert errors == []
+            assert result == [7]
+            assert observed["state"] == "started"
+            assert observed["hierarchical_started"] is True
+        finally:
+            if "original_wait" in locals():
+                hw._hierarchical_start_cv.wait = original_wait
+            hw.close()
 
     def test_register_chip_callable_after_init_no_chips_succeeds(self):
         # With no chip children (device_ids unset), the C++ broadcast is a
@@ -83,7 +203,9 @@ class TestLifecycle:
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
-            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+            callable_obj = ChipCallable.build(
+                signature=[], func_name="x", binary=b"\x00", children=[]
+            )
             cid = hw.register(callable_obj)
             assert isinstance(cid, int)
             assert cid >= 0
@@ -135,6 +257,635 @@ class TestLifecycle:
             assert cid_b == cid_a, "smallest-unused-cid policy should reuse the freed slot"
         finally:
             hw.close()
+
+    def test_register_chip_callable_broadcast_runs_without_registry_lock(self):
+        hw = Worker(level=3, num_sub_workers=0)
+        hw._initialized = True
+        hw._hierarchical_started = True
+        callable_obj = ChipCallable.build(
+            signature=[], func_name="x", binary=b"\x00", children=[]
+        )
+        observed = {}
+
+        def fake_post_init_register(cid, target):
+            observed["cid"] = cid
+            observed["target"] = target
+            observed["locked"] = hw._registry_lock.locked()
+
+        hw._post_init_register = fake_post_init_register
+
+        cid = hw.register(callable_obj)
+
+        assert observed == {"cid": cid, "target": callable_obj, "locked": False}
+        assert hw._callable_registry[cid] is callable_obj
+
+    def test_register_at_broadcast_runs_without_registry_lock(self):
+        hw = Worker(level=3, num_sub_workers=0)
+        hw._initialized = True
+        callable_obj = ChipCallable.build(
+            signature=[], func_name="x", binary=b"\x00", children=[]
+        )
+        observed = {}
+
+        def fake_post_init_register(cid, target):
+            observed["cid"] = cid
+            observed["target"] = target
+            observed["locked"] = hw._registry_lock.locked()
+
+        hw._post_init_register = fake_post_init_register
+
+        hw._register_at(7, callable_obj)
+
+        assert observed == {"cid": 7, "target": callable_obj, "locked": False}
+        assert hw._callable_registry[7] is callable_obj
+
+    def test_python_control_broadcast_passes_default_timeout(self):
+        from simpler.worker import _CTRL_PY_UNREGISTER, _PY_CONTROL_TIMEOUT_S  # noqa: PLC0415
+
+        class FakeControlWorker:
+            def __init__(self):
+                self.calls = []
+
+            def broadcast_control_all(self, worker_type, sub_cmd, cid, payload, timeout_s=None):
+                self.calls.append((worker_type, sub_cmd, cid, payload, timeout_s))
+                return []
+
+        fake = FakeControlWorker()
+        hw = Worker(level=3, num_sub_workers=1)
+        hw._worker = fake
+
+        errors = hw._broadcast_py_control([WorkerType.SUB], _CTRL_PY_UNREGISTER, 3, strict=False)
+
+        assert errors == []
+        assert fake.calls == [(WorkerType.SUB, _CTRL_PY_UNREGISTER, 3, None, _PY_CONTROL_TIMEOUT_S)]
+
+    def test_cloudpickle_payload_roundtrip_supported_callable_shapes(self):
+        class AddValue:
+            def __init__(self, value):
+                self.value = value
+
+            def __call__(self, arg):
+                return arg + self.value
+
+        scale = 3
+
+        def nested(arg):
+            return arg * scale
+
+        cases = [
+            (lambda arg: arg + 1, 4, 5),
+            (nested, 4, 12),
+            (AddValue(7), 4, 11),
+        ]
+        for target, arg, expected in cases:
+            loaded = _roundtrip_py_callable_payload(target)
+            assert callable(loaded)
+            assert loaded(arg) == expected
+
+    def test_python_unregister_child_failure_warns_pops_and_allows_reuse(self, capsys):
+        from simpler.worker import _CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER  # noqa: PLC0415
+
+        hw = Worker(level=3, num_sub_workers=1)
+        cid = hw.register(lambda args: None)
+        hw._initialized = True
+        hw._hierarchical_started = True
+        calls = []
+
+        def fake_broadcast(worker_types, sub_cmd, broadcast_cid, *, payload=None, strict):
+            calls.append((list(worker_types), sub_cmd, broadcast_cid, strict))
+            if sub_cmd == _CTRL_PY_UNREGISTER:
+                return ["SUB[0]: injected unregister failure"]
+            if sub_cmd == _CTRL_PY_REGISTER:
+                return []
+            raise AssertionError(f"unexpected sub_cmd={sub_cmd}")
+
+        hw._broadcast_py_control = fake_broadcast
+
+        hw.unregister(cid)
+
+        captured = capsys.readouterr()
+        assert "Python children reported errors" in captured.err
+        assert "injected unregister failure" in captured.err
+        assert cid not in hw._callable_registry
+        assert cid not in hw._pending_unregister_cids
+
+        reused = hw.register(lambda args: None)
+        assert reused == cid
+        assert calls[0] == ([WorkerType.SUB], _CTRL_PY_UNREGISTER, cid, False)
+        assert calls[1] == ([WorkerType.SUB], _CTRL_PY_REGISTER, cid, True)
+
+    def test_pending_unregister_cid_is_not_reused_until_broadcast_returns(self):
+        from simpler.worker import _CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER  # noqa: PLC0415
+
+        hw = Worker(level=3, num_sub_workers=1)
+        cid = hw.register(lambda args: None)
+        hw._initialized = True
+        hw._hierarchical_started = True
+
+        broadcast_started = threading.Event()
+        release_broadcast = threading.Event()
+        errors: list[BaseException] = []
+
+        def fake_broadcast(worker_types, sub_cmd, broadcast_cid, *, payload=None, strict):
+            if sub_cmd == _CTRL_PY_UNREGISTER:
+                broadcast_started.set()
+                assert release_broadcast.wait(timeout=2.0)
+            elif sub_cmd == _CTRL_PY_REGISTER:
+                return []
+            else:
+                raise AssertionError(f"unexpected sub_cmd={sub_cmd}")
+            return []
+
+        hw._broadcast_py_control = fake_broadcast
+
+        def do_unregister():
+            try:
+                hw.unregister(cid)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = threading.Thread(target=do_unregister)
+        t.start()
+        assert broadcast_started.wait(timeout=2.0)
+
+        cid_during_unregister = hw.register(lambda args: None)
+        assert cid_during_unregister != cid
+        assert cid in hw._pending_unregister_cids
+
+        release_broadcast.set()
+        t.join(timeout=2.0)
+        assert not t.is_alive()
+        assert errors == []
+
+        cid_after_unregister = hw.register(lambda args: None)
+        assert cid_after_unregister == cid
+
+    def test_register_python_sub_callable_after_start_succeeds(self):
+        counter_shm, counter_buf = _make_shared_counter()
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+            bootstrap_cid = hw.register(lambda args: None)
+            hw.init()
+
+            def bootstrap(orch, args, cfg):
+                orch.submit_sub(bootstrap_cid)
+
+            hw.run(bootstrap)
+            counter_name = counter_shm.name
+
+            def dynamic_sub(args):
+                shm = SharedMemory(name=counter_name)
+                try:
+                    _increment_counter(shm.buf)
+                finally:
+                    shm.close()
+
+            dynamic_cid = hw.register(dynamic_sub)
+
+            def run_dynamic(orch, args, cfg):
+                orch.submit_sub(dynamic_cid)
+
+            hw.run(run_dynamic)
+            hw.close()
+
+            assert _read_counter(counter_buf) == 1
+        finally:
+            counter_shm.close()
+            counter_shm.unlink()
+
+    def test_post_start_python_register_waits_for_active_sub_mailbox(self):
+        import time  # noqa: PLC0415
+
+        control_shm = SharedMemory(create=True, size=8)
+        counter_shm, counter_buf = _make_shared_counter()
+        hw = Worker(level=3, num_sub_workers=1)
+        run_errors: list[BaseException] = []
+        register_errors: list[BaseException] = []
+        dynamic_cids: list[int] = []
+        run_thread = None
+        register_thread = None
+        try:
+            assert control_shm.buf is not None
+            _set_flag(control_shm.buf, 0, 0)  # started
+            _set_flag(control_shm.buf, 4, 0)  # release
+            control_name = control_shm.name
+            counter_name = counter_shm.name
+
+            def blocking_sub(args):
+                import time as child_time  # noqa: PLC0415
+
+                shm = SharedMemory(name=control_name)
+                try:
+                    _set_flag(shm.buf, 0, 1)
+                    while _get_flag(shm.buf, 4) == 0:
+                        child_time.sleep(0.001)
+                finally:
+                    shm.close()
+
+            blocking_cid = hw.register(blocking_sub)
+            hw.init()
+
+            def run_blocking():
+                try:
+                    hw.run(lambda orch, args, cfg: orch.submit_sub(blocking_cid))
+                except BaseException as exc:  # noqa: BLE001
+                    run_errors.append(exc)
+
+            run_thread = threading.Thread(target=run_blocking)
+            run_thread.start()
+
+            deadline = time.monotonic() + 2.0
+            while _get_flag(control_shm.buf, 0) == 0 and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert _get_flag(control_shm.buf, 0) == 1
+
+            def dynamic_sub(args):
+                shm = SharedMemory(name=counter_name)
+                try:
+                    _increment_counter(shm.buf)
+                finally:
+                    shm.close()
+
+            def do_register():
+                try:
+                    dynamic_cids.append(hw.register(dynamic_sub))
+                except BaseException as exc:  # noqa: BLE001
+                    register_errors.append(exc)
+
+            register_thread = threading.Thread(target=do_register)
+            register_thread.start()
+            register_thread.join(timeout=0.05)
+            assert register_thread.is_alive()
+
+            _set_flag(control_shm.buf, 4, 1)
+            run_thread.join(timeout=2.0)
+            register_thread.join(timeout=2.0)
+
+            assert not run_thread.is_alive()
+            assert not register_thread.is_alive()
+            assert run_errors == []
+            assert register_errors == []
+            assert len(dynamic_cids) == 1
+
+            hw.run(lambda orch, args, cfg: orch.submit_sub(dynamic_cids[0]))
+            assert _read_counter(counter_buf) == 1
+        finally:
+            if control_shm.buf is not None:
+                _set_flag(control_shm.buf, 4, 1)
+            if run_thread is not None:
+                run_thread.join(timeout=2.0)
+            if register_thread is not None:
+                register_thread.join(timeout=2.0)
+            hw.close()
+            control_shm.close()
+            control_shm.unlink()
+            counter_shm.close()
+            counter_shm.unlink()
+
+    def test_post_start_unregister_pre_start_python_callable_removes_child_entry(self):
+        counter_shm, counter_buf = _make_shared_counter()
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+            cid = hw.register(lambda args: _increment_counter(counter_buf))
+            hw.init()
+
+            hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
+            assert _read_counter(counter_buf) == 1
+
+            hw.unregister(cid)
+            assert cid not in hw._callable_registry
+            with pytest.raises(RuntimeError, match="not registered"):
+                hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
+
+            counter_name = counter_shm.name
+
+            def replacement(args):
+                shm = SharedMemory(name=counter_name)
+                try:
+                    _add_counter(shm.buf, 10)
+                finally:
+                    shm.close()
+
+            reused = hw.register(replacement)
+            assert reused == cid
+            hw.run(lambda orch, args, cfg: orch.submit_sub(reused))
+            hw.close()
+
+            assert _read_counter(counter_buf) == 11
+        finally:
+            counter_shm.close()
+            counter_shm.unlink()
+
+    def test_post_start_unregister_post_start_python_callable_removes_child_entry(self):
+        counter_shm, counter_buf = _make_shared_counter()
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+            bootstrap_cid = hw.register(lambda args: None)
+            hw.init()
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+
+            counter_name = counter_shm.name
+
+            def dynamic(args):
+                shm = SharedMemory(name=counter_name)
+                try:
+                    _increment_counter(shm.buf)
+                finally:
+                    shm.close()
+
+            cid = hw.register(dynamic)
+            hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
+            assert _read_counter(counter_buf) == 1
+
+            hw.unregister(cid)
+            assert cid not in hw._callable_registry
+            with pytest.raises(RuntimeError, match="not registered"):
+                hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
+
+            reused = hw.register(dynamic)
+            assert reused == cid
+            hw.run(lambda orch, args, cfg: orch.submit_sub(reused))
+            hw.close()
+
+            assert _read_counter(counter_buf) == 2
+        finally:
+            counter_shm.close()
+            counter_shm.unlink()
+
+    def test_post_start_dynamic_python_callable_execute_failure_propagates(self):
+        hw = Worker(level=3, num_sub_workers=1)
+        bootstrap_cid = hw.register(lambda args: None)
+        hw.init()
+        try:
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+
+            def boom(args):
+                raise RuntimeError("dynamic callable boom")
+
+            cid = hw.register(boom)
+            with pytest.raises(RuntimeError, match="dynamic callable boom"):
+                hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
+        finally:
+            hw.close()
+
+    def test_broadcast_control_all_accepts_memoryview_payload(self):
+        from simpler.worker import _CTRL_PY_REGISTER, _pack_py_callable_payload  # noqa: PLC0415
+
+        counter_shm, counter_buf = _make_shared_counter()
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+            bootstrap_cid = hw.register(lambda args: None)
+            hw.init()
+
+            def bootstrap(orch, args, cfg):
+                orch.submit_sub(bootstrap_cid)
+
+            hw.run(bootstrap)
+            counter_name = counter_shm.name
+
+            def dynamic_sub(args):
+                shm = SharedMemory(name=counter_name)
+                try:
+                    _increment_counter(shm.buf)
+                finally:
+                    shm.close()
+
+            cid = 5
+            results = hw._worker.broadcast_control_all(
+                WorkerType.SUB,
+                _CTRL_PY_REGISTER,
+                cid,
+                memoryview(_pack_py_callable_payload(dynamic_sub)),
+            )
+            assert len(results) == 1
+            assert results[0].ok
+
+            def run_dynamic(orch, args, cfg):
+                orch.submit_sub(cid)
+
+            hw.run(run_dynamic)
+            hw.close()
+
+            assert _read_counter(counter_buf) == 1
+        finally:
+            counter_shm.close()
+            counter_shm.unlink()
+
+    def test_broadcast_control_all_reports_malformed_payload(self):
+        from simpler.worker import _CTRL_PY_REGISTER  # noqa: PLC0415
+
+        hw = Worker(level=3, num_sub_workers=1)
+        bootstrap_cid = hw.register(lambda args: None)
+        hw.init()
+        try:
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            results = hw._worker.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, 5, b"bad")
+            assert len(results) == 1
+            assert not results[0].ok
+            assert "payload" in results[0].error_message
+        finally:
+            hw.close()
+
+    def test_broadcast_control_all_empty_payload_raises_before_fanout(self):
+        from simpler.worker import _CTRL_PY_REGISTER  # noqa: PLC0415
+
+        hw = Worker(level=3, num_sub_workers=1)
+        bootstrap_cid = hw.register(lambda args: None)
+        hw.init()
+        try:
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            with pytest.raises(RuntimeError, match="payload pointer and size"):
+                hw._worker.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, 5, b"")
+        finally:
+            hw.close()
+
+    def test_broadcast_control_all_timeout_reports_failed_child(self):
+        from simpler.worker import (
+            _CTRL_PY_UNREGISTER,
+            _IDLE,
+            _OFF_STATE,
+            _buffer_field_addr,
+            _mailbox_addr,
+        )
+        from simpler.worker import _mailbox_store_i32  # noqa: PLC0415
+
+        shm = SharedMemory(create=True, size=MAILBOX_SIZE)
+        dw = _Worker(3)
+        try:
+            assert shm.buf is not None
+            _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
+            dw.add_sub_worker(_mailbox_addr(shm))
+            dw.init()
+            results = dw.broadcast_control_all(
+                WorkerType.SUB,
+                _CTRL_PY_UNREGISTER,
+                0,
+                None,
+                timeout_s=0.001,
+            )
+            assert len(results) == 1
+            assert not results[0].ok
+            assert "timed out" in results[0].error_message
+        finally:
+            dw.close()
+            shm.close()
+            shm.unlink()
+
+    def test_broadcast_control_all_selected_pool_routing(self):
+        from simpler.worker import (
+            _CTRL_PY_UNREGISTER,
+            _CONTROL_REQUEST,
+            _IDLE,
+            _OFF_STATE,
+            _buffer_field_addr,
+            _mailbox_addr,
+            _mailbox_load_i32,
+            _mailbox_store_i32,
+        )
+
+        def make_mailbox():
+            shm = SharedMemory(create=True, size=MAILBOX_SIZE)
+            assert shm.buf is not None
+            _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
+            return shm
+
+        for selected_type, selected_kind in (
+            (WorkerType.SUB, "SUB"),
+            (WorkerType.NEXT_LEVEL, "NEXT_LEVEL"),
+        ):
+            sub_shm = make_mailbox()
+            next_shm = make_mailbox()
+            dw = _Worker(3)
+            try:
+                dw.add_sub_worker(_mailbox_addr(sub_shm))
+                dw.add_next_level_worker(_mailbox_addr(next_shm))
+                dw.init()
+                results = dw.broadcast_control_all(
+                    selected_type,
+                    _CTRL_PY_UNREGISTER,
+                    0,
+                    None,
+                    timeout_s=0.001,
+                )
+                assert len(results) == 1
+                assert results[0].worker_type == selected_kind
+                sub_state = _mailbox_load_i32(_buffer_field_addr(sub_shm.buf, _OFF_STATE))
+                next_state = _mailbox_load_i32(_buffer_field_addr(next_shm.buf, _OFF_STATE))
+                if selected_type == WorkerType.SUB:
+                    assert sub_state == _CONTROL_REQUEST
+                    assert next_state == _IDLE
+                else:
+                    assert sub_state == _IDLE
+                    assert next_state == _CONTROL_REQUEST
+            finally:
+                dw.close()
+                sub_shm.close()
+                sub_shm.unlink()
+                next_shm.close()
+                next_shm.unlink()
+
+    def test_broadcast_control_all_result_shape_for_register_and_unregister(self):
+        from simpler.worker import _CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER  # noqa: PLC0415
+
+        hw = Worker(level=3, num_sub_workers=1)
+        bootstrap_cid = hw.register(lambda args: None)
+        hw.init()
+        try:
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            register_results = hw._worker.broadcast_control_all(
+                WorkerType.SUB,
+                _CTRL_PY_REGISTER,
+                5,
+                b"bad",
+            )
+            unregister_results = hw._worker.broadcast_control_all(
+                WorkerType.SUB,
+                _CTRL_PY_UNREGISTER,
+                bootstrap_cid,
+                None,
+            )
+
+            for result in (register_results[0], unregister_results[0]):
+                assert isinstance(result.worker_type, str)
+                assert isinstance(result.worker_index, int)
+                assert isinstance(result.ok, bool)
+                assert isinstance(result.error_message, str)
+            assert not register_results[0].ok
+            assert unregister_results[0].ok
+        finally:
+            hw.close()
+
+    def test_nonserializable_dynamic_python_callable_does_not_consume_cid(self):
+        lock = threading.Lock()
+        hw = Worker(level=3, num_sub_workers=1)
+        bootstrap_cid = hw.register(lambda args: None)
+        hw.init()
+        try:
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            before = dict(hw._callable_registry)
+
+            def captures_lock(args):
+                lock.acquire(False)
+
+            with pytest.raises(TypeError, match="lock"):
+                hw.register(captures_lock)
+            assert hw._callable_registry == before
+        finally:
+            hw.close()
+
+    def test_chip_register_reuse_clears_seen_python_cid_before_binary_register(self):
+        from simpler.worker import _CTRL_PY_UNREGISTER  # noqa: PLC0415
+
+        calls = []
+
+        class FakeWorker:
+            def broadcast_register_all(self, cid, blob_ptr, blob_size):
+                calls.append(("binary_register", cid, blob_size))
+
+        hw = Worker(level=3, num_sub_workers=1)
+        hw._initialized = True
+        hw._hierarchical_started = True
+        hw._worker = FakeWorker()
+        hw._py_callable_cids_seen.add(0)
+
+        def fake_py_control(worker_types, sub_cmd, cid, *, payload=None, strict):
+            calls.append(("py_clear", list(worker_types), sub_cmd, cid, strict))
+            return []
+
+        hw._broadcast_py_control = fake_py_control
+        callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+
+        cid = hw.register(callable_obj)
+
+        assert cid == 0
+        assert calls[0] == ("py_clear", [WorkerType.SUB], _CTRL_PY_UNREGISTER, 0, True)
+        assert calls[1][0] == "binary_register"
+
+    def test_chip_register_reuse_fails_before_binary_register_when_python_clear_fails(self):
+        calls = []
+
+        class FakeWorker:
+            def broadcast_register_all(self, cid, blob_ptr, blob_size):
+                calls.append(("binary_register", cid))
+
+        hw = Worker(level=3, num_sub_workers=1)
+        hw._initialized = True
+        hw._hierarchical_started = True
+        hw._worker = FakeWorker()
+        hw._py_callable_cids_seen.add(0)
+
+        def fake_py_control(worker_types, sub_cmd, cid, *, payload=None, strict):
+            calls.append(("py_clear", cid, strict))
+            raise RuntimeError("clear failed")
+
+        hw._broadcast_py_control = fake_py_control
+        callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+
+        with pytest.raises(RuntimeError, match="clear failed"):
+            hw.register(callable_obj)
+
+        assert calls == [("py_clear", 0, True)]
+        assert hw._callable_registry == {}
 
     def test_unregister_middle_cid_reuses_hole(self):
         # `_allocate_cid` must fill the smallest hole, not append at

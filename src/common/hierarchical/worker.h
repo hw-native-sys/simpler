@@ -115,6 +115,11 @@ public:
         manager_.broadcast_register_all(cid, reinterpret_cast<const void *>(blob_ptr), static_cast<size_t>(blob_size));
     }
     std::vector<std::string> broadcast_unregister_all(int32_t cid) { return manager_.broadcast_unregister_all(cid); }
+    std::vector<ControlResult> broadcast_control_all(
+        WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size, double timeout_s
+    ) {
+        return manager_.broadcast_control_all(type, sub_cmd, cid, payload, payload_size, timeout_s);
+    }
 
 private:
     int32_t level_;

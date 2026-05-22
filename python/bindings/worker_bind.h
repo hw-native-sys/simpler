@@ -77,6 +77,12 @@ inline void bind_worker(nb::module_ &m) {
     // --- WorkerType ---
     nb::enum_<WorkerType>(m, "WorkerType").value("NEXT_LEVEL", WorkerType::NEXT_LEVEL).value("SUB", WorkerType::SUB);
 
+    nb::class_<ControlResult>(m, "ControlResult")
+        .def_ro("worker_type", &ControlResult::worker_type)
+        .def_ro("worker_index", &ControlResult::worker_index)
+        .def_ro("ok", &ControlResult::ok)
+        .def_ro("error_message", &ControlResult::error_message);
+
     // --- TaskState ---
     nb::enum_<TaskState>(m, "TaskState")
         .value("FREE", TaskState::FREE)
@@ -245,6 +251,33 @@ inline void bind_worker(nb::module_ &m) {
             nb::call_guard<nb::gil_scoped_release>(),
             "Best-effort broadcast of CTRL_UNREGISTER to every NEXT_LEVEL child in parallel. "
             "Returns a list of per-child error strings (empty on full success)."
+        )
+        .def(
+            "broadcast_control_all",
+            [](Worker &self, WorkerType worker_type, uint64_t sub_cmd, int32_t cid, nb::object payload,
+               nb::object timeout_s) {
+                std::string payload_bytes;
+                const void *payload_ptr = nullptr;
+                size_t payload_size = 0;
+                if (!payload.is_none()) {
+                    Py_buffer view;
+                    if (PyObject_GetBuffer(payload.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
+                        throw nb::python_error();
+                    }
+                    payload_bytes.assign(static_cast<const char *>(view.buf), static_cast<size_t>(view.len));
+                    PyBuffer_Release(&view);
+                    payload_ptr = payload_bytes.data();
+                    payload_size = payload_bytes.size();
+                }
+                double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
+                nb::gil_scoped_release release;
+                return self.broadcast_control_all(worker_type, sub_cmd, cid, payload_ptr, payload_size, timeout_val);
+            },
+            nb::arg("worker_type"), nb::arg("sub_cmd"), nb::arg("cid"), nb::arg("payload") = nb::none(),
+            nb::arg("timeout_s") = nb::none(),
+            "Broadcast an arbitrary CONTROL_REQUEST to the selected worker pool. "
+            "If payload is a Python buffer, C++ stages it in POSIX shm and writes the shm name "
+            "into the mailbox. Returns per-child ControlResult entries."
         )
         .def(
             "control_alloc_domain", &Worker::control_alloc_domain, nb::arg("worker_id"), nb::arg("request_shm_name"),

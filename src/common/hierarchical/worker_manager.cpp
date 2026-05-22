@@ -157,6 +157,9 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     // orch thread waits for the dispatch to finish before claiming the
     // mailbox; without this they would race on MAILBOX_OFF_STATE.
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    if (mailbox_control_timed_out_) {
+        throw std::runtime_error("WorkerThread::dispatch_process: mailbox has an unresolved timed-out control command");
+    }
 
     // Clear the child-writable error fields so stale bytes from a prior
     // dispatch cannot masquerade as a fresh failure.
@@ -338,12 +341,26 @@ static uint64_t read_control_result(const char *mbox) {
 // from the child, throws and leaves the mailbox in IDLE before unwinding
 // (so the next claim starts from a clean state). The `op_name` is used
 // only for the exception message.
-void WorkerThread::run_control_command(const char *op_name) {
+void WorkerThread::run_control_command(const char *op_name, double timeout_s) {
+    if (mailbox_control_timed_out_) {
+        throw std::runtime_error(std::string(op_name) + " failed: mailbox has an unresolved timed-out control command");
+    }
     int32_t zero_err = 0;
     std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
     std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
     write_mailbox_state(MailboxState::CONTROL_REQUEST);
-    while (read_mailbox_state() != MailboxState::CONTROL_DONE) {}
+    auto deadline = std::chrono::steady_clock::time_point::max();
+    if (timeout_s >= 0.0) {
+        deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s));
+    }
+    while (read_mailbox_state() != MailboxState::CONTROL_DONE) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            mailbox_control_timed_out_ = true;
+            throw std::runtime_error(std::string(op_name) + " timed out waiting for CONTROL_DONE");
+        }
+    }
     int32_t err = 0;
     std::memcpy(&err, mbox() + MAILBOX_OFF_ERROR, sizeof(int32_t));
     if (err != 0) {
@@ -390,6 +407,21 @@ void WorkerThread::control_unregister(int32_t cid) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_UNREGISTER, static_cast<uint64_t>(static_cast<uint32_t>(cid)));
     run_control_command("control_unregister");
+}
+
+void WorkerThread::control_generic(uint64_t sub_cmd, int32_t cid, const char *shm_name, double timeout_s) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    uint64_t cid_v = static_cast<uint32_t>(cid);
+    std::memcpy(mbox() + CTRL_OFF_ARG0, &cid_v, sizeof(uint64_t));
+    const char *name = shm_name ? shm_name : "";
+    size_t name_len = std::strlen(name);
+    if (name_len + 1 > CTRL_SHM_NAME_BYTES) {
+        throw std::runtime_error(std::string("control_generic: shm name too long: ") + name);
+    }
+    if (name_len > 0) std::memcpy(mbox() + MAILBOX_OFF_ARGS, name, name_len);
+    std::memset(mbox() + MAILBOX_OFF_ARGS + name_len, 0, CTRL_SHM_NAME_BYTES - name_len);
+    run_control_command("control_generic", timeout_s);
 }
 
 void WorkerThread::control_free(uint64_t ptr) {
@@ -660,4 +692,46 @@ std::vector<std::string> WorkerManager::broadcast_unregister_all(int32_t cid) {
         if (!msg.empty()) errors.push_back(std::move(msg));
     }
     return errors;
+}
+
+std::vector<ControlResult> WorkerManager::broadcast_control_all(
+    WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size, double timeout_s
+) {
+    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
+    const char *type_name = (type == WorkerType::NEXT_LEVEL) ? "NEXT_LEVEL" : "SUB";
+
+    std::vector<ControlResult> results;
+    results.reserve(threads.size());
+    for (size_t i = 0; i < threads.size(); ++i) {
+        results.push_back(ControlResult{type_name, static_cast<int32_t>(i), true, ""});
+    }
+    if (threads.empty()) return results;
+
+    std::unique_ptr<PosixShmHolder> shm;
+    std::string shm_name;
+    if (payload != nullptr || payload_size != 0) {
+        if (payload == nullptr || payload_size == 0) {
+            throw std::runtime_error("broadcast_control_all: payload pointer and size must both be set");
+        }
+        shm_name = make_shm_name(cid);
+        shm = std::make_unique<PosixShmHolder>(shm_name, payload_size);
+        std::memcpy(shm->addr(), payload, payload_size);
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(threads.size());
+    for (size_t i = 0; i < threads.size(); ++i) {
+        workers.emplace_back([&, i]() {
+            try {
+                threads[i]->control_generic(sub_cmd, cid, shm_name.empty() ? nullptr : shm_name.c_str(), timeout_s);
+            } catch (const std::exception &e) {
+                results[i].ok = false;
+                results[i].error_message = strip_control_prefix(e.what(), "control_generic");
+            }
+        });
+    }
+    for (auto &t : workers)
+        t.join();
+
+    return results;
 }
