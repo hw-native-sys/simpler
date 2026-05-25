@@ -97,6 +97,9 @@ struct PtoCudaPersistentDagState {
     uint32_t *queue_head;
     uint32_t *queue_tail;
     uint32_t *completed_count;
+    uint32_t *error_count;
+    uint32_t *error_code;
+    uint32_t *error_task_id;
 };
 
 struct PtoCudaPersistentDagArgs {

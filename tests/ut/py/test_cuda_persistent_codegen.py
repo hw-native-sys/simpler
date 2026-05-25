@@ -226,6 +226,26 @@ def test_render_persistent_dag_source_includes_tensor_descriptor_metadata():
     assert "unsigned long long out_batch_stride;" in source
 
 
+def test_render_persistent_dag_source_records_device_scheduler_errors():
+    source = render_persistent_dag_source(
+        [
+            CudaPersistentTaskFunction(
+                func_id=1,
+                name="add_f32",
+                body="task->out[i] = task->a[i] + task->b[i];",
+            )
+        ]
+    )
+
+    assert "unsigned int *error_count;" in source
+    assert "unsigned int *error_code;" in source
+    assert "unsigned int *error_task_id;" in source
+    assert "__device__ bool pto_dag_dispatch" in source
+    assert "return true;" in source
+    assert "return false;" in source
+    assert "pto_dag_record_error(state, 1U, task_id);" in source
+
+
 def test_render_persistent_dag_source_rejects_duplicate_func_id():
     with pytest.raises(ValueError, match="duplicate func_id"):
         render_persistent_dag_source(

@@ -183,6 +183,9 @@ class CudaPersistentDagState(ctypes.Structure):
         ("queue_head", ctypes.c_void_p),
         ("queue_tail", ctypes.c_void_p),
         ("completed_count", ctypes.c_void_p),
+        ("error_count", ctypes.c_void_p),
+        ("error_code", ctypes.c_void_p),
+        ("error_task_id", ctypes.c_void_p),
     ]
 
 
@@ -430,16 +433,16 @@ def _render_dispatch(task_functions: Sequence[CudaPersistentFunctionSpec]) -> st
             f"""
     case {_persistent_func_id(task)}U:
         {_persistent_dispatch_entry(task)}(task);
-        return;
+        return true;
 """.rstrip()
         )
     rendered_cases = "\n".join(cases)
     return f"""
-__device__ void pto_dag_dispatch(const PtoCudaPersistentDagTask *task) {{
+__device__ bool pto_dag_dispatch(const PtoCudaPersistentDagTask *task) {{
     switch (task->func_id) {{
 {rendered_cases}
     default:
-        return;
+        return false;
     }}
 }}
 """.strip()
@@ -496,7 +499,21 @@ struct PtoCudaPersistentDagState {{
     unsigned int *queue_head;
     unsigned int *queue_tail;
     unsigned int *completed_count;
+    unsigned int *error_count;
+    unsigned int *error_code;
+    unsigned int *error_task_id;
 }};
+
+__device__ void pto_dag_record_error(
+    const PtoCudaPersistentDagState *state,
+    unsigned int error_code,
+    unsigned int task_id) {{
+    unsigned int old = atomicCAS(state->error_count, 0U, 1U);
+    if (old == 0U) {{
+        *state->error_code = error_code;
+        *state->error_task_id = task_id;
+    }}
+}}
 
 __device__ void pto_dag_push_ready(const PtoCudaPersistentDagState *state, unsigned int task_id) {{
     unsigned int ticket = atomicAdd(state->queue_tail, 1U);
@@ -552,18 +569,22 @@ extern "C" __global__ void pto_persistent_dag_f32_executor(const PtoCudaPersiste
         }}
 
         PtoCudaPersistentDagTask task = state->tasks[task_id];
-        pto_dag_dispatch(&task);
+        bool task_ok = pto_dag_dispatch(&task);
         __syncthreads();
 
         if (threadIdx.x == 0) {{
-            for (unsigned int idx = 0; idx < task.dependent_count; ++idx) {{
-                unsigned int dependent_id = state->dependents[task.dependent_begin + idx];
-                unsigned int old = atomicSub(&state->fanin[dependent_id], 1U);
-                if (old == 1U) {{
-                    pto_dag_push_ready(state, dependent_id);
+            if (!task_ok) {{
+                pto_dag_record_error(state, 1U, task_id);
+            }} else {{
+                for (unsigned int idx = 0; idx < task.dependent_count; ++idx) {{
+                    unsigned int dependent_id = state->dependents[task.dependent_begin + idx];
+                    unsigned int old = atomicSub(&state->fanin[dependent_id], 1U);
+                    if (old == 1U) {{
+                        pto_dag_push_ready(state, dependent_id);
+                    }}
                 }}
+                atomicAdd(state->completed_count, 1U);
             }}
-            atomicAdd(state->completed_count, 1U);
         }}
     }}
 }}

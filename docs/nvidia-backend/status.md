@@ -84,6 +84,8 @@ execution modes:
 - five-task DAG-chain runtime graph descriptor;
 - six-task scratch-reuse DAG descriptor;
 - tensor-tile DAG descriptor with rows/cols/inner/stride metadata.
+- device-side scheduler diagnostics for unsupported generated-dispatch
+  `func_id` values.
 
 The persistent DAG path compiles generated CUDA source with `nvcc` and stores
 the generated source, PTX, and manifest under
@@ -105,8 +107,9 @@ Evidence:
 - `tests/ut/py/test_cuda_backend.py` runs persistent-device smoke tests with
   real CUDA data when `nvcc` is available.
 - `tests/ut/py/test_cuda_persistent_codegen.py` covers generated dispatch,
-  tensor descriptor fields, shared task-body wrapper generation, host-schedule
-  and persistent-device manifest writing, and cache reuse.
+  device scheduler diagnostic fields, tensor descriptor fields, shared
+  task-body wrapper generation, host-schedule and persistent-device manifest
+  writing, and cache reuse.
 - `tests/ut/py/test_cuda_kernel_compiler.py` covers both CUDA
   `KernelCompiler` entry points.
 - `simpler_setup/cuda_callable_compiler.py` contains the generated-dispatch
@@ -332,6 +335,68 @@ Result: `status=pass`, `runtime=persistent_device`,
 `ptx_source=nvcc-persistent-generated-dispatch-compute_90`,
 `completed_count=3`.
 
+After adding persistent-device scheduler diagnostics, the focused CUDA test
+set was rerun locally:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_backend.py \
+  tests/ut/py/test_cuda_persistent_codegen.py \
+  tests/ut/py/test_cuda_kernel_compiler.py \
+  tests/ut/py/test_cuda_scene_test.py -q
+```
+
+Result: `38 passed`.
+
+The local A100 persistent DAG smoke now reports zero device scheduler errors
+on the normal generated-dispatch path:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 3 --n 1024 --arch compute_80 \
+    --mode dag --queue-capacity 2
+```
+
+Result: `status=pass`, `device_scheduler_errors={"count": 0, "code": 0,
+"task_id": 0}`, `completed_count=3`.
+
+The synthetic invalid-dispatch shape was also run locally to verify that an
+unsupported generated-dispatch `func_id` is surfaced before output mismatch
+checks:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 1 --n 1024 --arch compute_80 \
+    --mode dag --queue-capacity 1 --dag-shape bad_func_id
+```
+
+Result: expected non-zero exit with `persistent dag scheduler error code=1
+task_id=0 count=1`.
+
+The same scheduler-diagnostic slice was verified on the remote H200 checkout
+after pushing this change:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   git fetch origin design/nvidia-backend >/dev/null && \
+   git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+     --device 0 --task-count 3 --n 1024 --arch compute_90 \
+     --mode dag --queue-capacity 2'
+```
+
+Result: `status=pass`, `ptx_arch=compute_90`,
+`device_scheduler_errors={"count": 0, "code": 0, "task_id": 0}`,
+`completed_count=3`.
+
+The H200 invalid-dispatch check returned the expected diagnostic:
+`persistent dag scheduler error code=1 task_id=0 count=1`.
+
 ## Remaining Gaps
 
 ### Kernel Compiler Integration
@@ -371,7 +436,8 @@ Needed:
 - graph construction from normal PTO task graphs;
 - lifecycle validation beyond the current scratch-reuse smoke;
 - resource policy for scheduler blocks, worker blocks, and stream use;
-- error propagation and diagnostics for device-side scheduler failures.
+- broader scheduler error taxonomy beyond the current unsupported-`func_id`
+  diagnostic.
 
 ### Tuned Tensor Workloads
 

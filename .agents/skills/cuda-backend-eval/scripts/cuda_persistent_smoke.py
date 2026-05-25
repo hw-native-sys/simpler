@@ -805,6 +805,9 @@ class CudaPersistentDagState(ctypes.Structure):
         ("queue_head", ctypes.c_void_p),
         ("queue_tail", ctypes.c_void_p),
         ("completed_count", ctypes.c_void_p),
+        ("error_count", ctypes.c_void_p),
+        ("error_code", ctypes.c_void_p),
+        ("error_task_id", ctypes.c_void_p),
     ]
 
 
@@ -1207,6 +1210,27 @@ def _make_dag_shape(
                 ),
             ),
         )
+    if dag_shape == "bad_func_id":
+        task_count = 1
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 1
+        task_t = CudaPersistentDagTask * task_count
+        return (
+            host_fanin_t(0),
+            dependents_t(0),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=99,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=0,
+                    initial_fanin=0,
+                )
+            ),
+        )
     raise ValueError(f"unknown dag shape: {dag_shape}")
 
 
@@ -1375,8 +1399,8 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
     dev_tmp2 = runtime.device_malloc_ctx(ctx, output_nbytes)
     dev_tmp3 = runtime.device_malloc_ctx(ctx, output_nbytes)
     dev_out = runtime.device_malloc_ctx(ctx, output_nbytes)
-    host_counters_t = ctypes.c_uint32 * 3
-    host_counters = host_counters_t(0, 0, 0)
+    host_counters_t = ctypes.c_uint32 * 6
+    host_counters = host_counters_t(0, 0, 0, 0, 0, 0)
     host_flags_t = ctypes.c_uint32 * queue_capacity
     host_flags = host_flags_t(*([0] * queue_capacity))
     host_fanin, dependents, tasks = _make_dag_shape(
@@ -1444,6 +1468,9 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             queue_head=dev_counters,
             queue_tail=dev_counters + ctypes.sizeof(ctypes.c_uint32),
             completed_count=dev_counters + 2 * ctypes.sizeof(ctypes.c_uint32),
+            error_count=dev_counters + 3 * ctypes.sizeof(ctypes.c_uint32),
+            error_code=dev_counters + 4 * ctypes.sizeof(ctypes.c_uint32),
+            error_task_id=dev_counters + 5 * ctypes.sizeof(ctypes.c_uint32),
         )
         if runtime.copy_to_device_ctx(ctx, dev_state, ctypes.byref(state), ctypes.sizeof(state)) != 0:
             raise RuntimeError("copy_to_device dag state failed")
@@ -1493,6 +1520,14 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
         if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_fanin), dev_fanin, ctypes.sizeof(host_fanin)) != 0:
             raise RuntimeError("copy_from_device dag fanin failed")
 
+        error_count = int(host_counters[3])
+        error_code = int(host_counters[4])
+        error_task_id = int(host_counters[5])
+        if error_count != 0:
+            raise RuntimeError(
+                f"persistent dag scheduler error code={error_code} task_id={error_task_id} count={error_count}"
+            )
+
         expected_tmp0 = [_f32(host_a[i] + host_b[i]) for i in range(n)]
         expected_tmp1 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
         expected_tmp2 = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
@@ -1536,6 +1571,11 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "scheduler_blocks": scheduler_blocks,
             "worker_blocks": worker_blocks,
             "completed_count": completed_count,
+            "device_scheduler_errors": {
+                "count": error_count,
+                "code": error_code,
+                "task_id": error_task_id,
+            },
             "dispatch_func_ids": [int(task.func_id) for task in tasks],
             "fanin_remaining": [int(value) for value in host_fanin],
             "ptx_arch": config.arch,
@@ -1590,7 +1630,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913
 ) -> dict:
     if mode not in {"dag", "direct", "queue"}:
         raise ValueError(f"unknown persistent mode: {mode}")
-    if dag_shape not in {"chain", "fork_join", "scratch_reuse", "tensor_tile"}:
+    if dag_shape not in {"bad_func_id", "chain", "fork_join", "scratch_reuse", "tensor_tile"}:
         raise ValueError(f"unknown dag shape: {dag_shape}")
     if worker_blocks_per_task <= 0:
         raise ValueError("worker_blocks_per_task must be positive")
@@ -1753,7 +1793,7 @@ def main() -> None:
     parser.add_argument("--worker-blocks-per-task", type=int, default=1)
     parser.add_argument(
         "--dag-shape",
-        choices=["chain", "fork_join", "scratch_reuse", "tensor_tile"],
+        choices=["bad_func_id", "chain", "fork_join", "scratch_reuse", "tensor_tile"],
         default="fork_join",
     )
     parser.add_argument("--tensor-rows", type=int, default=16)

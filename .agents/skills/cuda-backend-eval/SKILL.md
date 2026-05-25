@@ -85,6 +85,35 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2
 ```
 
+The generated-dispatch DAG smoke also carries device-side scheduler
+diagnostics. A normal pass returns `device_scheduler_errors` with zero counts.
+Use the synthetic invalid-dispatch shape below to validate propagation of an
+unsupported device `func_id` without relying on output mismatches:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 - <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+try:
+    run_persistent_smoke(
+        device=0,
+        task_count=1,
+        n=1024,
+        arch="compute_80",
+        mode="dag",
+        queue_capacity=1,
+        dag_shape="bad_func_id",
+    )
+except RuntimeError as exc:
+    print(exc)
+PY
+```
+
 Run the five-task persistent DAG-chain smoke, which reuses the same generated
 dispatch PTX but passes a different runtime task graph:
 

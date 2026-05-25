@@ -486,10 +486,10 @@ class _CudaPersistentDagSceneBuffers:
         )
         fanin_t = ctypes.c_uint32 * 3
         flags_t = ctypes.c_uint32 * queue_capacity
-        counters_t = ctypes.c_uint32 * 3
+        counters_t = ctypes.c_uint32 * 6
         self.host_fanin = fanin_t(0, 0, 2)
         self.host_flags = flags_t(*([0] * queue_capacity))
-        self.host_counters = counters_t(0, 0, 0)
+        self.host_counters = counters_t(0, 0, 0, 0, 0, 0)
 
         self.dev_tasks = self._malloc(ctypes.sizeof(self.host_tasks))
         self.dev_dependents = self._malloc(ctypes.sizeof(self.host_dependents))
@@ -516,6 +516,9 @@ class _CudaPersistentDagSceneBuffers:
             queue_head=self.dev_counters,
             queue_tail=self.dev_counters + ctypes.sizeof(ctypes.c_uint32),
             completed_count=self.dev_counters + 2 * ctypes.sizeof(ctypes.c_uint32),
+            error_count=self.dev_counters + 3 * ctypes.sizeof(ctypes.c_uint32),
+            error_code=self.dev_counters + 4 * ctypes.sizeof(ctypes.c_uint32),
+            error_task_id=self.dev_counters + 5 * ctypes.sizeof(ctypes.c_uint32),
         )
         self.worker.copy_to(self.dev_state, ctypes.addressof(state), ctypes.sizeof(state))
         self.args = CudaPersistentDagArgs(state=self.dev_state)
