@@ -34,6 +34,13 @@ The current smoke test builds `cuda/host_schedule`, compiles a PTX vector-add
 kernel with `nvcc`, allocates real CUDA device buffers, copies real data, runs
 the kernel through the runtime C API, and validates copied-back results.
 
+For remote machines without `pytest`, run the standalone smoke:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_smoke.py
+```
+
 ## Hardware Checks
 
 Local A100:

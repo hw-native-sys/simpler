@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Standalone CUDA host_schedule smoke runner."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+from simpler_setup.runtime_builder import RuntimeBuilder
+
+
+class CudaHostCallable(ctypes.Structure):
+    _fields_ = [
+        ("version", ctypes.c_uint32),
+        ("op", ctypes.c_uint32),
+        ("image", ctypes.c_void_p),
+        ("image_size", ctypes.c_size_t),
+        ("entry_name", ctypes.c_char_p),
+        ("grid_dim", ctypes.c_uint32),
+        ("block_dim", ctypes.c_uint32),
+        ("shared_mem_bytes", ctypes.c_size_t),
+    ]
+
+
+class CudaVectorAddArgs(ctypes.Structure):
+    _fields_ = [
+        ("a", ctypes.c_void_p),
+        ("b", ctypes.c_void_p),
+        ("out", ctypes.c_void_p),
+        ("n", ctypes.c_uint64),
+    ]
+
+
+class PtoRunTiming(ctypes.Structure):
+    _fields_ = [
+        ("host_wall_ns", ctypes.c_uint64),
+        ("device_wall_ns", ctypes.c_uint64),
+    ]
+
+
+def _compile_ptx(work_dir: Path, arch: str) -> bytes:
+    kernel_src = work_dir / "vector_add.cu"
+    kernel_src.write_text(
+        """
+extern "C" __global__ void pto_vector_add_f32(
+    const float *a, const float *b, float *out, unsigned long long n) {
+    unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = a[i] + b[i];
+    }
+}
+""".lstrip()
+    )
+    ptx_path = work_dir / "vector_add.ptx"
+    subprocess.run(
+        ["nvcc", "--ptx", "-std=c++17", f"-arch={arch}", str(kernel_src), "-o", str(ptx_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return ptx_path.read_bytes()
+
+
+def _bind_runtime(runtime):
+    runtime.create_device_context.restype = ctypes.c_void_p
+    runtime.destroy_device_context.argtypes = [ctypes.c_void_p]
+    runtime.simpler_init.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    runtime.simpler_init.restype = ctypes.c_int
+    runtime.finalize_device.argtypes = [ctypes.c_void_p]
+    runtime.finalize_device.restype = ctypes.c_int
+    runtime.device_malloc_ctx.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    runtime.device_malloc_ctx.restype = ctypes.c_void_p
+    runtime.device_free_ctx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    runtime.copy_to_device_ctx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    runtime.copy_to_device_ctx.restype = ctypes.c_int
+    runtime.copy_from_device_ctx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    runtime.copy_from_device_ctx.restype = ctypes.c_int
+    runtime.prepare_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p]
+    runtime.prepare_callable.restype = ctypes.c_int
+    runtime.run_prepared.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int32,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.POINTER(PtoRunTiming),
+    ]
+    runtime.run_prepared.restype = ctypes.c_int
+    runtime.unregister_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+    runtime.unregister_callable.restype = ctypes.c_int
+
+
+def run_smoke(device: int, n: int, block_dim: int, arch: str) -> dict:
+    if shutil.which("nvcc") is None:
+        raise RuntimeError("nvcc not found")
+
+    with tempfile.TemporaryDirectory(prefix="pto_cuda_smoke_") as td:
+        ptx = _compile_ptx(Path(td), arch)
+    ptx_buf = ctypes.create_string_buffer(ptx + b"\0")
+
+    binaries = RuntimeBuilder(platform="cuda").get_binaries("host_schedule", build=True)
+    runtime = ctypes.CDLL(str(binaries.host_path))
+    _bind_runtime(runtime)
+
+    ctx = runtime.create_device_context()
+    if not ctx:
+        raise RuntimeError("create_device_context returned null")
+
+    start = time.time()
+    try:
+        if runtime.simpler_init(ctx, device, None, 0, None, 0) != 0:
+            raise RuntimeError("simpler_init failed")
+
+        array_t = ctypes.c_float * n
+        host_a = array_t(*[float(i) for i in range(n)])
+        host_b = array_t(*[float(2 * i) for i in range(n)])
+        host_out = array_t()
+        nbytes = ctypes.sizeof(host_a)
+
+        dev_a = runtime.device_malloc_ctx(ctx, nbytes)
+        dev_b = runtime.device_malloc_ctx(ctx, nbytes)
+        dev_out = runtime.device_malloc_ctx(ctx, nbytes)
+        if not (dev_a and dev_b and dev_out):
+            raise RuntimeError("device allocation failed")
+
+        try:
+            if runtime.copy_to_device_ctx(ctx, dev_a, ctypes.byref(host_a), nbytes) != 0:
+                raise RuntimeError("copy_to_device a failed")
+            if runtime.copy_to_device_ctx(ctx, dev_b, ctypes.byref(host_b), nbytes) != 0:
+                raise RuntimeError("copy_to_device b failed")
+
+            manifest = CudaHostCallable(
+                version=1,
+                op=1,
+                image=ctypes.cast(ptx_buf, ctypes.c_void_p),
+                image_size=len(ptx) + 1,
+                entry_name=b"pto_vector_add_f32",
+                grid_dim=(n + block_dim - 1) // block_dim,
+                block_dim=block_dim,
+                shared_mem_bytes=0,
+            )
+            args = CudaVectorAddArgs(a=dev_a, b=dev_b, out=dev_out, n=n)
+            timing = PtoRunTiming()
+
+            if runtime.prepare_callable(ctx, 0, ctypes.byref(manifest)) != 0:
+                raise RuntimeError("prepare_callable failed")
+            if (
+                runtime.run_prepared(
+                    ctx, None, 0, ctypes.byref(args), block_dim, 0, 0, 0, 0, 0, None, ctypes.byref(timing)
+                )
+                != 0
+            ):
+                raise RuntimeError("run_prepared failed")
+            if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_out), dev_out, nbytes) != 0:
+                raise RuntimeError("copy_from_device failed")
+            expected = [float(3 * i) for i in range(n)]
+            if list(host_out) != expected:
+                raise RuntimeError("vector-add output mismatch")
+            if runtime.unregister_callable(ctx, 0) != 0:
+                raise RuntimeError("unregister_callable failed")
+        finally:
+            runtime.device_free_ctx(ctx, dev_a)
+            runtime.device_free_ctx(ctx, dev_b)
+            runtime.device_free_ctx(ctx, dev_out)
+    finally:
+        runtime.finalize_device(ctx)
+        runtime.destroy_device_context(ctx)
+
+    return {
+        "status": "pass",
+        "device": device,
+        "n": n,
+        "block_dim": block_dim,
+        "ptx_arch": arch,
+        "host_wall_ns": timing.host_wall_ns,
+        "device_wall_ns": timing.device_wall_ns,
+        "elapsed_s": time.time() - start,
+        "host_runtime": str(binaries.host_path),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--n", type=int, default=1024)
+    parser.add_argument("--block-dim", type=int, default=256)
+    parser.add_argument("--arch", default="compute_80")
+    args = parser.parse_args()
+
+    print(json.dumps(run_smoke(args.device, args.n, args.block_dim, args.arch), indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
