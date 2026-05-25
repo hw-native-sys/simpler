@@ -88,9 +88,9 @@ benchmark artifacts and compact smoke-report artifacts.
 - `pto_persistent_dag_reuse`: six-task generated-dispatch DAG that reuses a
   scratch buffer after the buffer's last dependent completes. It is a
   lifecycle validation row rather than a throughput row.
-- `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a
-  16x16 tiled GEMM task followed by residual, gate, and fan-in elementwise
-  tasks.
+- `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a tiled
+  GEMM task followed by residual, gate, and fan-in elementwise tasks. The
+  benchmark row uses the default 16x16x16 descriptor.
 - `*_batch`: same-work rows with six vector-add task descriptors. These rows
   compare repeated host launches with one persistent launch over the same
   descriptor count.
@@ -284,11 +284,13 @@ effect, not a claim that reuse is inherently faster.
 
 The tensor row keeps the same persistent-DAG scheduler but extends the task
 descriptor ABI with rows, columns, inner dimension, leading dimensions, and
-per-tile strides. Its generated-dispatch `func_id=3` computes one or more
-16x16 GEMM tiles before residual, gate, and fan-in elementwise tasks. The
-following rows compare the older tensor DAG capture against the three-task
-elementwise DAG and the one-call host-schedule vector baseline for shape
-context only. They are not same-work throughput comparisons.
+per-tile strides. Its generated-dispatch `func_id=3` computes one or more GEMM
+tiles before residual, gate, and fan-in elementwise tasks. The smoke helper now
+supports non-square descriptors by allocating separate A, B, and output
+extents. The following rows compare the older default 16x16x16 tensor DAG
+capture against the three-task elementwise DAG and the one-call host-schedule
+vector baseline for shape context only. They are not same-work throughput
+comparisons.
 
 | GPU | N | Host ns | DAG ns | Tensor DAG ns | Tensor/DAG |
 | --- | - | ------- | ------ | ------------- | ---------- |
@@ -522,6 +524,6 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 - Add model-shaped kernels and more repetitions before treating any
   worker-grid setting as a tuned baseline.
-- Replace the fixed 16x16 scalar GEMM body with a CUDA implementation closer
-  to the intended tensor-core/tiling backend once the runtime ABI can carry
-  richer tensor metadata.
+- Replace the scalar GEMM body with a CUDA implementation closer to the
+  intended tensor-core/tiling backend once the runtime ABI can carry richer
+  tensor metadata.

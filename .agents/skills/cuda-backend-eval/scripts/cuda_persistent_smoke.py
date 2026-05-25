@@ -642,7 +642,7 @@ _PERSISTENT_DAG_TASK_FUNCTIONS = [
     ),
     CudaPersistentTaskFunction(
         func_id=3,
-        name="matmul16_f32",
+        name="matmul_tile_f32",
         body="""
 unsigned long long rows = static_cast<unsigned long long>(task->rows);
 unsigned long long cols = static_cast<unsigned long long>(task->cols);
@@ -772,17 +772,36 @@ def _f32(value: float) -> float:
     return ctypes.c_float(value).value
 
 
-_TENSOR_TILE_DESCRIPTOR = {
-    "rows": 16,
-    "cols": 16,
-    "inner": 16,
-    "lda": 16,
-    "ldb": 16,
-    "ldc": 16,
-    "a_batch_stride": 256,
-    "b_batch_stride": 256,
-    "out_batch_stride": 256,
-}
+def _make_tensor_tile_descriptor(rows: int = 16, cols: int = 16, inner: int = 16) -> dict[str, int]:
+    if rows <= 0 or cols <= 0 or inner <= 0:
+        raise ValueError("tensor tile rows, cols, and inner must be positive")
+    return {
+        "rows": rows,
+        "cols": cols,
+        "inner": inner,
+        "lda": inner,
+        "ldb": cols,
+        "ldc": cols,
+        "a_batch_stride": rows * inner,
+        "b_batch_stride": inner * cols,
+        "out_batch_stride": rows * cols,
+    }
+
+
+_TENSOR_TILE_DESCRIPTOR = _make_tensor_tile_descriptor()
+
+
+def _tensor_tile_buffer_lengths(n: int, descriptor: dict[str, int]) -> dict[str, int]:
+    out_batch_stride = descriptor["out_batch_stride"]
+    if n % out_batch_stride != 0:
+        raise ValueError(f"tensor_tile DAG shape requires n to be a multiple of rows*cols ({out_batch_stride})")
+    tile_count = n // out_batch_stride
+    return {
+        "a": max(n, tile_count * descriptor["a_batch_stride"]),
+        "b": max(n, tile_count * descriptor["b_batch_stride"]),
+        "output": n,
+        "tile_count": tile_count,
+    }
 
 
 def _matmul_expected(host_a, host_b, n: int, descriptor: dict[str, int]) -> list[float]:
@@ -837,6 +856,7 @@ class DagSmokeConfig:
     ptx_source: str
     start: float
     dag_shape: str
+    tensor_tile: dict[str, int]
 
 
 def _compile_persistent_ptx(work_dir: Path, arch: str, mode: str) -> tuple[bytes, str]:
@@ -889,6 +909,7 @@ def _make_dag_shape(
     dev_tmp2: int,
     dev_tmp3: int,
     dev_out: int,
+    tensor_tile: dict[str, int] | None = None,
 ) -> tuple[Any, Any, Any]:
     def make_task(
         func_id: int,
@@ -1089,6 +1110,7 @@ def _make_dag_shape(
             ),
         )
     if dag_shape == "tensor_tile":
+        descriptor = tensor_tile or _TENSOR_TILE_DESCRIPTOR
         task_count = 4
         host_fanin_t = ctypes.c_uint32 * task_count
         dependents_t = ctypes.c_uint32 * 4
@@ -1105,7 +1127,7 @@ def _make_dag_shape(
                     0,
                     2,
                     0,
-                    _TENSOR_TILE_DESCRIPTOR,
+                    descriptor,
                 ),
                 CudaPersistentDagTask(
                     func_id=1,
@@ -1272,29 +1294,41 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
     ctx = config.ctx
     n = config.n
     queue_capacity = config.queue_capacity
-    if config.dag_shape == "tensor_tile" and n % 256 != 0:
-        raise ValueError("tensor_tile DAG shape requires n to be a multiple of 256")
-    array_t = ctypes.c_float * n
+    tensor_lengths = None
     if config.dag_shape == "tensor_tile":
-        host_a = array_t(*[float((i % 5) + 1) for i in range(n)])
-        host_b = array_t(*[float((i % 3) + 1) for i in range(n)])
+        tensor_lengths = _tensor_tile_buffer_lengths(n, config.tensor_tile)
+        a_len = tensor_lengths["a"]
+        b_len = tensor_lengths["b"]
+        output_len = tensor_lengths["output"]
     else:
-        host_a = array_t(*[float(i) for i in range(n)])
-        host_b = array_t(*[float(2 * i) for i in range(n)])
+        a_len = n
+        b_len = n
+        output_len = n
+    array_a_t = ctypes.c_float * a_len
+    array_b_t = ctypes.c_float * b_len
+    array_t = ctypes.c_float * output_len
+    if config.dag_shape == "tensor_tile":
+        host_a = array_a_t(*[float((i % 5) + 1) for i in range(a_len)])
+        host_b = array_b_t(*[float((i % 3) + 1) for i in range(b_len)])
+    else:
+        host_a = array_a_t(*[float(i) for i in range(a_len)])
+        host_b = array_b_t(*[float(2 * i) for i in range(b_len)])
     host_tmp0 = array_t()
     host_tmp1 = array_t()
     host_tmp2 = array_t()
     host_tmp3 = array_t()
     host_out = array_t()
-    nbytes = ctypes.sizeof(host_a)
+    a_nbytes = ctypes.sizeof(host_a)
+    b_nbytes = ctypes.sizeof(host_b)
+    output_nbytes = ctypes.sizeof(host_out)
 
-    dev_a = runtime.device_malloc_ctx(ctx, nbytes)
-    dev_b = runtime.device_malloc_ctx(ctx, nbytes)
-    dev_tmp0 = runtime.device_malloc_ctx(ctx, nbytes)
-    dev_tmp1 = runtime.device_malloc_ctx(ctx, nbytes)
-    dev_tmp2 = runtime.device_malloc_ctx(ctx, nbytes)
-    dev_tmp3 = runtime.device_malloc_ctx(ctx, nbytes)
-    dev_out = runtime.device_malloc_ctx(ctx, nbytes)
+    dev_a = runtime.device_malloc_ctx(ctx, a_nbytes)
+    dev_b = runtime.device_malloc_ctx(ctx, b_nbytes)
+    dev_tmp0 = runtime.device_malloc_ctx(ctx, output_nbytes)
+    dev_tmp1 = runtime.device_malloc_ctx(ctx, output_nbytes)
+    dev_tmp2 = runtime.device_malloc_ctx(ctx, output_nbytes)
+    dev_tmp3 = runtime.device_malloc_ctx(ctx, output_nbytes)
+    dev_out = runtime.device_malloc_ctx(ctx, output_nbytes)
     host_counters_t = ctypes.c_uint32 * 3
     host_counters = host_counters_t(0, 0, 0)
     host_flags_t = ctypes.c_uint32 * queue_capacity
@@ -1309,6 +1343,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
         dev_tmp2,
         dev_tmp3,
         dev_out,
+        tensor_tile=config.tensor_tile,
     )
     task_count = len(tasks)
 
@@ -1340,8 +1375,8 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
 
     try:
         copies = [
-            (dev_a, ctypes.byref(host_a), nbytes, "a"),
-            (dev_b, ctypes.byref(host_b), nbytes, "b"),
+            (dev_a, ctypes.byref(host_a), a_nbytes, "a"),
+            (dev_b, ctypes.byref(host_b), b_nbytes, "b"),
             (dev_tasks, ctypes.byref(tasks), ctypes.sizeof(tasks), "tasks"),
             (dev_dependents, ctypes.byref(dependents), ctypes.sizeof(dependents), "dependents"),
             (dev_fanin, ctypes.byref(host_fanin), ctypes.sizeof(host_fanin), "fanin"),
@@ -1386,15 +1421,15 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
         if runtime.run_prepared(ctx, None, 0, ctypes.byref(args), 256, 0, 0, 0, 0, 0, None, ctypes.byref(timing)) != 0:
             raise RuntimeError("run_prepared dag failed")
 
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp0), dev_tmp0, nbytes) != 0:
+        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp0), dev_tmp0, output_nbytes) != 0:
             raise RuntimeError("copy_from_device dag tmp0 failed")
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp1), dev_tmp1, nbytes) != 0:
+        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp1), dev_tmp1, output_nbytes) != 0:
             raise RuntimeError("copy_from_device dag tmp1 failed")
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp2), dev_tmp2, nbytes) != 0:
+        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp2), dev_tmp2, output_nbytes) != 0:
             raise RuntimeError("copy_from_device dag tmp2 failed")
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp3), dev_tmp3, nbytes) != 0:
+        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp3), dev_tmp3, output_nbytes) != 0:
             raise RuntimeError("copy_from_device dag tmp3 failed")
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_out), dev_out, nbytes) != 0:
+        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_out), dev_out, output_nbytes) != 0:
             raise RuntimeError("copy_from_device dag out failed")
         if (
             runtime.copy_from_device_ctx(ctx, ctypes.byref(host_counters), dev_counters, ctypes.sizeof(host_counters))
@@ -1415,7 +1450,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             expected_tmp0 = [_f32(expected_tmp2[i] + host_a[i]) for i in range(n)]
             expected_out = [_f32(expected_tmp0[i] + expected_tmp3[i]) for i in range(n)]
         if config.dag_shape == "tensor_tile":
-            expected_tmp0 = _matmul_expected(host_a, host_b, n, _TENSOR_TILE_DESCRIPTOR)
+            expected_tmp0 = _matmul_expected(host_a, host_b, n, config.tensor_tile)
             expected_tmp1 = [_f32(expected_tmp0[i] + host_a[i]) for i in range(n)]
             expected_tmp2 = [_f32(expected_tmp0[i] * host_b[i]) for i in range(n)]
             expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
@@ -1461,8 +1496,8 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             result["scratch_reuse"] = {"reused_buffer": "tmp0", "reuse_task": 4}
         if config.dag_shape == "tensor_tile":
             result["tensor_tile"] = {
-                **_TENSOR_TILE_DESCRIPTOR,
-                "tile_count": n // (_TENSOR_TILE_DESCRIPTOR["rows"] * _TENSOR_TILE_DESCRIPTOR["cols"]),
+                **config.tensor_tile,
+                "tile_count": (tensor_lengths or _tensor_tile_buffer_lengths(n, config.tensor_tile))["tile_count"],
             }
         return result
     finally:
@@ -1486,7 +1521,7 @@ def _completed_count(runtime, ctx: int, launch: PersistentLaunch, task_count: in
     return completed_count
 
 
-def run_persistent_smoke(  # noqa: PLR0912
+def run_persistent_smoke(  # noqa: PLR0912, PLR0913
     device: int,
     task_count: int,
     n: int,
@@ -1495,6 +1530,9 @@ def run_persistent_smoke(  # noqa: PLR0912
     queue_capacity: int | None = None,
     worker_blocks_per_task: int = 1,
     dag_shape: str = "fork_join",
+    tensor_rows: int = 16,
+    tensor_cols: int = 16,
+    tensor_inner: int = 16,
 ) -> dict:
     if mode not in {"dag", "direct", "queue"}:
         raise ValueError(f"unknown persistent mode: {mode}")
@@ -1504,6 +1542,7 @@ def run_persistent_smoke(  # noqa: PLR0912
         raise ValueError("worker_blocks_per_task must be positive")
     if mode != "direct" and worker_blocks_per_task != 1:
         raise ValueError("worker_blocks_per_task is only supported for direct mode")
+    tensor_tile = _make_tensor_tile_descriptor(rows=tensor_rows, cols=tensor_cols, inner=tensor_inner)
     if queue_capacity is None:
         queue_capacity = task_count
     if queue_capacity <= 0:
@@ -1540,6 +1579,7 @@ def run_persistent_smoke(  # noqa: PLR0912
                     ptx_source=ptx_source,
                     start=start,
                     dag_shape=dag_shape,
+                    tensor_tile=tensor_tile,
                 )
             )
 
@@ -1661,19 +1701,25 @@ def main() -> None:
         choices=["chain", "fork_join", "scratch_reuse", "tensor_tile"],
         default="fork_join",
     )
+    parser.add_argument("--tensor-rows", type=int, default=16)
+    parser.add_argument("--tensor-cols", type=int, default=16)
+    parser.add_argument("--tensor-inner", type=int, default=16)
     args = parser.parse_args()
 
     print(
         json.dumps(
             run_persistent_smoke(
-                args.device,
-                args.task_count,
-                args.n,
-                args.arch,
-                args.mode,
-                args.queue_capacity,
-                args.worker_blocks_per_task,
-                args.dag_shape,
+                device=args.device,
+                task_count=args.task_count,
+                n=args.n,
+                arch=args.arch,
+                mode=args.mode,
+                queue_capacity=args.queue_capacity,
+                worker_blocks_per_task=args.worker_blocks_per_task,
+                dag_shape=args.dag_shape,
+                tensor_rows=args.tensor_rows,
+                tensor_cols=args.tensor_cols,
+                tensor_inner=args.tensor_inner,
             ),
             indent=2,
             sort_keys=True,

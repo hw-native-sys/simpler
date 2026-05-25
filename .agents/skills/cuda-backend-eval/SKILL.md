@@ -97,8 +97,8 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 Run the tensor-tile persistent DAG smoke. This graph uses a generated-dispatch
-16x16 tiled GEMM task with rows/cols/inner/stride descriptor metadata, then
-residual, gate, and fan-in elementwise tasks:
+tiled GEMM task with rows/cols/inner/stride descriptor metadata, then residual,
+gate, and fan-in elementwise tasks. The default descriptor is 16x16x16:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -106,6 +106,11 @@ PYTHONPATH=$PWD:$PWD/python \
     --device 0 --task-count 4 --n 4096 --arch compute_80 \
     --mode dag --queue-capacity 2 --dag-shape tensor_tile
 ```
+
+Pass `--tensor-rows`, `--tensor-cols`, and `--tensor-inner` to test a
+non-square descriptor. `n` must be a multiple of `rows * cols`; the smoke
+allocates separate A, B, and output extents so A/B strides can differ from the
+output tile size while later elementwise tasks still run over `n` values.
 
 The DAG smoke compiles generated CUDA source from
 `simpler_setup.cuda_callable_compiler.render_persistent_dag_source()`. The
@@ -135,9 +140,10 @@ same vector-add PTX kernel through two launch paths:
 - `pto_persistent_dag_reuse`: six-task generated-dispatch DAG with scratch
   buffer reuse after dependency completion, validating that graph lifetime
   rules can be represented by runtime descriptors.
-- `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a
-  16x16 tiled GEMM task followed by elementwise residual, gate, and fan-in
-  tasks.
+- `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a tiled
+  GEMM task followed by elementwise residual, gate, and fan-in tasks. The
+  benchmark uses the default 16x16x16 descriptor unless the smoke helper is
+  called directly with tensor descriptor flags.
 - `pto_host_schedule_batch`, `pto_persistent_device_batch`,
   `pto_persistent_device_grid_batch`, and `pto_persistent_queue_batch`:
   same-work batch rows enabled by `--batch-tasks N`. Pass a
@@ -307,11 +313,13 @@ kernel workload.
 
 The tensor-tile DAG capture at `8950e029` adds `pto_persistent_dag_tensor`.
 It validates generated-dispatch task bodies beyond elementwise kernels by
-running a fixed 16x16 tiled GEMM task before residual, gate, and fan-in tasks.
-The later descriptor-metadata smoke extends that tensor task with
-rows/cols/inner/leading-dimension and per-tile stride fields. Use these rows
-as ABI and scheduler validation; they are still scalar CUDA GEMM
-microbenchmarks, not tuned tensor-core workloads.
+running the default 16x16x16 tiled GEMM descriptor before residual, gate, and
+fan-in tasks. The later descriptor-metadata smoke extends that tensor task
+with rows/cols/inner/leading-dimension and per-tile stride fields. The current
+smoke helper can also run non-square descriptors and allocates separate A, B,
+and output buffer extents. Use these rows as ABI and scheduler validation;
+they are still scalar CUDA GEMM microbenchmarks, not tuned tensor-core
+workloads.
 The `38db010e` A100/H200 descriptor smoke outputs were saved under
 `tmp/cuda-backend/tensor-descriptor-smoke-38db010e/`, with a generated smoke
 Markdown report and SVG in the same directory.

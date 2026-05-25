@@ -52,9 +52,11 @@ def _load_persistent_smoke_module():
         spec = importlib.util.spec_from_file_location("cuda_persistent_smoke", script_path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         return module
     finally:
+        sys.modules.pop("cuda_persistent_smoke", None)
         sys.path.remove(str(script_dir))
 
 
@@ -282,6 +284,44 @@ def test_persistent_direct_launch_can_use_multiple_worker_blocks_per_task():
     assert launch.worker_blocks == 12
     assert launch.manifest.grid_dim == 12
     assert launch.args.worker_blocks_per_task == 4
+
+
+def test_tensor_tile_dag_shape_uses_caller_provided_descriptor():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    descriptor = cuda_persistent_smoke._make_tensor_tile_descriptor(rows=8, cols=4, inner=12)
+    lengths = cuda_persistent_smoke._tensor_tile_buffer_lengths(n=64, descriptor=descriptor)
+    _, _, tasks = cuda_persistent_smoke._make_dag_shape(
+        "tensor_tile",
+        64,
+        101,
+        102,
+        201,
+        202,
+        203,
+        204,
+        301,
+        tensor_tile=descriptor,
+    )
+
+    assert descriptor == {
+        "rows": 8,
+        "cols": 4,
+        "inner": 12,
+        "lda": 12,
+        "ldb": 4,
+        "ldc": 4,
+        "a_batch_stride": 96,
+        "b_batch_stride": 48,
+        "out_batch_stride": 32,
+    }
+    assert lengths == {"a": 192, "b": 96, "output": 64, "tile_count": 2}
+    assert tasks[0].rows == 8
+    assert tasks[0].cols == 4
+    assert tasks[0].inner == 12
+    assert tasks[0].a_batch_stride == 96
+    assert tasks[0].b_batch_stride == 48
+    assert tasks[0].out_batch_stride == 32
 
 
 def test_summarize_results_groups_by_machine_and_baseline():
@@ -649,7 +689,7 @@ def test_render_report_describes_dag_tensor_rows():
     svg = cuda_benchmark.render_svg(cuda_benchmark.summarize_results(payload))
 
     assert "| a100-local | pto_persistent_dag_tensor | 1024 | 4 | 1 | 1 | 5000 | 5000 | - |" in report
-    assert "`pto_persistent_dag_tensor` uses a 16x16 tiled GEMM task" in report
+    assert "`pto_persistent_dag_tensor` uses the default 16x16x16 tiled GEMM" in report
     assert "pto_persistent_dag_tensor" in svg
 
 
