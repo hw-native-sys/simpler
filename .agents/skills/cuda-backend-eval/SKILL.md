@@ -182,6 +182,40 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
      --label h200-remote --output-dir tmp/cuda-backend/h200'
 ```
 
+Current paired A100/H200 benchmark recipe:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --device 0 --sizes 1024,65536,1048576 --repeats 3 \
+    --arch compute_80 --include-persistent --batch-tasks 2,6,12 \
+    --worker-blocks-per-task 32,64,128,256 \
+    --tensor-rows 8 --tensor-cols 4 --tensor-inner 12 \
+    --label a100-current-$(git rev-parse --short HEAD) \
+    --output-dir tmp/cuda-backend/a100-current-$(git rev-parse --short HEAD)
+
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && git pull --ff-only >/dev/null && \
+   PYTHONPATH=$PWD:$PWD/python \
+   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+     --device 0 --sizes 1024,65536,1048576 --repeats 3 \
+     --arch compute_90 --include-persistent --batch-tasks 2,6,12 \
+     --worker-blocks-per-task 32,64,128,256 \
+     --tensor-rows 8 --tensor-cols 4 --tensor-inner 12 \
+     --label h200-current-$(git rev-parse --short HEAD) \
+     --output-dir tmp/cuda-backend/h200-current-$(git rev-parse --short HEAD)'
+```
+
+Copy the remote H200 artifact directory back before merging. The current
+committed summary uses the `6c49c5cf` artifact names in
+`docs/nvidia-backend/evaluation-current.md`.
+
+```bash
+scp -r \
+  bizhaoh200:/data/shibizhao/pto-cu/tmp/cuda-backend/h200-current-<commit> \
+  tmp/cuda-backend/h200-current-<commit>
+```
+
 The script writes:
 
 - `cuda-benchmark.json`: raw samples, metadata, hardware, git commit.
