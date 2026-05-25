@@ -139,8 +139,9 @@ now uses `simpler_setup.cuda_callable_compiler.render_persistent_dag_source()`
 to generate the task-body wrappers and dispatch switch before compiling the
 executor source with `nvcc`. The companion
 `compile_cuda_persistent_device()` helper writes the generated source, PTX, and
-JSON manifest under a cache key, matching the intended per-callable artifact
-layout before the full `KernelCompiler` integration exists.
+JSON manifest under `build/cache/cuda/onboard/persistent_device/callables/`,
+matching the intended per-callable artifact layout before the full
+`KernelCompiler` integration exists.
 
 ### Runtime Roles
 

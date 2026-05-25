@@ -80,7 +80,8 @@ The DAG smoke compiles generated CUDA source from
 returned JSON includes `source_kind: generated-dispatch` when that path is in
 use. The `nvcc` path goes through `compile_cuda_persistent_device()`, which
 writes `generated_dispatch.cu`, `pto_callable.ptx`, and `pto_callable.json`
-under a callables cache directory before the host runtime loads the PTX bytes.
+under `build/cache/cuda/onboard/persistent_device/callables/` before the host
+runtime loads the PTX bytes.
 
 ## Microbenchmark Report
 

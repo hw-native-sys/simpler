@@ -19,9 +19,12 @@ from hashlib import sha256
 from pathlib import Path
 from textwrap import indent
 
+from .environment import PROJECT_ROOT
+
 _CUDA_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PERSISTENT_DAG_ENTRY_NAME = "pto_persistent_dag_f32_executor"
 _PERSISTENT_DAG_SOURCE_KIND = "generated-dispatch"
+_PERSISTENT_CACHE_RELATIVE_PATH = Path("build") / "cache" / "cuda" / "onboard" / "persistent_device"
 
 
 @dataclass(frozen=True)
@@ -235,10 +238,16 @@ def _run_nvcc_ptx(source_path: Path, ptx_path: Path, arch: str, nvcc: str) -> No
         raise RuntimeError(f"nvcc persistent_device compile failed:\n{result.stderr}")
 
 
+def default_cuda_persistent_cache_root() -> Path:
+    """Return the repo-local persistent-device callable cache root."""
+
+    return PROJECT_ROOT / _PERSISTENT_CACHE_RELATIVE_PATH
+
+
 def compile_cuda_persistent_device(
     task_functions: Sequence[CudaPersistentTaskFunction],
-    cache_root: Path,
     arch: str,
+    cache_root: Path | None = None,
     nvcc: str = "nvcc",
 ) -> CudaPersistentCallableArtifact:
     """Compile or reuse a generated persistent-device CUDA callable PTX."""
@@ -246,7 +255,8 @@ def compile_cuda_persistent_device(
     ordered = _validate_task_functions(task_functions)
     source = render_persistent_dag_source(ordered)
     cache_key = _cache_key(source, ordered, arch)
-    cache_dir = Path(cache_root) / "callables" / cache_key
+    resolved_cache_root = default_cuda_persistent_cache_root() if cache_root is None else Path(cache_root)
+    cache_dir = resolved_cache_root / "callables" / cache_key
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     source_path = cache_dir / "generated_dispatch.cu"

@@ -763,7 +763,6 @@ def _compile_persistent_ptx(work_dir: Path, arch: str, mode: str) -> tuple[bytes
     if mode == "dag":
         artifact = compile_cuda_persistent_device(
             _PERSISTENT_DAG_TASK_FUNCTIONS,
-            cache_root=work_dir,
             arch=arch,
         )
         return artifact.ptx, f"nvcc-persistent-{artifact.source_kind}-{arch}"

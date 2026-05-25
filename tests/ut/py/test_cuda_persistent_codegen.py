@@ -18,6 +18,7 @@ from simpler_setup import cuda_callable_compiler
 from simpler_setup.cuda_callable_compiler import (
     CudaPersistentTaskFunction,
     compile_cuda_persistent_device,
+    default_cuda_persistent_cache_root,
     render_persistent_dag_source,
 )
 
@@ -92,3 +93,26 @@ def test_compile_cuda_persistent_device_writes_manifest_and_reuses_cache(tmp_pat
     assert manifest["arch"] == "compute_80"
     assert manifest["source_kind"] == "generated-dispatch"
     assert manifest["task_functions"] == [{"func_id": 1, "name": "add_f32"}]
+
+
+def test_compile_cuda_persistent_device_defaults_to_repo_cache(tmp_path, monkeypatch):
+    def fake_run_nvcc(source_path, ptx_path, arch, nvcc):
+        ptx_path.write_bytes(b"default-cache-ptx")
+
+    monkeypatch.setattr(cuda_callable_compiler, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(cuda_callable_compiler, "_run_nvcc_ptx", fake_run_nvcc)
+
+    tasks = [
+        CudaPersistentTaskFunction(
+            func_id=1,
+            name="add_f32",
+            body="task->out[i] = task->a[i] + task->b[i];",
+        )
+    ]
+    artifact = compile_cuda_persistent_device(tasks, arch="compute_80", nvcc="nvcc")
+
+    expected_root = tmp_path / "build" / "cache" / "cuda" / "onboard" / "persistent_device"
+    assert default_cuda_persistent_cache_root() == expected_root
+    assert artifact.ptx == b"default-cache-ptx"
+    assert artifact.ptx_path.parent.parent == expected_root / "callables"
+    assert artifact.manifest_path.is_file()
