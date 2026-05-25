@@ -187,8 +187,6 @@ class RuntimeCompiler:
     def _init_cuda(self):
         """Initialize toolchains for the CUDA host-scheduled runtime."""
         self._ensure_host_compilers()
-        if not self._find_executable("nvcc"):
-            raise FileNotFoundError("CUDA compiler not found: nvcc. Please install CUDA toolkit.")
         gxx = GxxToolchain()
 
         self.aicore_target = BuildTarget(gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so")
