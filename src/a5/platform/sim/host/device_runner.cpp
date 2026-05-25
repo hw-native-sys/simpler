@@ -1068,7 +1068,7 @@ void DeviceRunner::finalize_collectors() {
 
 int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
+        num_aicore, device_id, l2_perf_level_, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
         kernel_args_.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());

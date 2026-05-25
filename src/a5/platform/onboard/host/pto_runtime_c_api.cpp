@@ -445,7 +445,7 @@ int run_prepared(
             return rc;
         }
 
-        runner->set_l2_swimlane_enabled(enable_l2_swimlane != 0);
+        runner->set_l2_swimlane_enabled(enable_l2_swimlane);
         runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
         runner->set_pmu_enabled(enable_pmu);
         runner->set_output_prefix(output_prefix);

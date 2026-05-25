@@ -286,7 +286,7 @@ inline bool AicpuExecutor::try_dispatch_task(
     pending_task_ids_[core_id] = task_id;
 
     // Record the real AICPU dispatch point for this core.
-    if (l2_perf_enabled) {
+    if (l2_perf_enabled && get_l2_perf_level() >= L2PerfLevel::AICPU_TIMING) {
         dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
     }
 
@@ -677,6 +677,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
     int verification_warning_count = 0;
     const int MAX_VERIFICATION_WARNINGS = 10;
     bool l2_perf_enabled = is_l2_swimlane_enabled();
+    L2PerfLevel l2_perf_level = get_l2_perf_level();
 
     // Extract array pointers as local variables for better readability and performance
     int *cur_ready_queue_aic = cur_ready_queue_aic_[thread_idx];
@@ -697,11 +698,13 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
         "Thread %d: Initial state - local queue: %d AIC, %d AIV", thread_idx, cur_aic_ready_count, cur_aiv_ready_count
     );
 
-    // Initialize dispatch timestamps for all cores
-    uint64_t dispatch_start_time = get_sys_cnt_aicpu();
-    for (int i = 0; i < core_num; i++) {
-        int core_id = cur_thread_cores[i];
-        dispatch_timestamps_[core_id] = dispatch_start_time;
+    // Initialize dispatch timestamps for all cores (only needed at level >= 2)
+    if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+        uint64_t dispatch_start_time = get_sys_cnt_aicpu();
+        for (int i = 0; i < core_num; i++) {
+            int core_id = cur_thread_cores[i];
+            dispatch_timestamps_[core_id] = dispatch_start_time;
+        }
     }
 
     // Main execution loop with unified scheduling
@@ -729,43 +732,55 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 // written to wip[id & 1] first, so complete it BEFORE the
                 // pending task's record to maintain buffer ordering.
                 if (l2_perf_enabled) {
-                    uint64_t finish_ts = get_sys_cnt_aicpu();
+                    uint64_t finish_ts = (l2_perf_level >= L2PerfLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
 
                     if (prev_running_id != AICPU_TASK_INVALID) {
                         Task *prev_task = &runtime.tasks[prev_running_id];
                         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                        for (int i = 0; i < prev_task->fanout_count; i++) {
-                            fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
+                        int fanout_count = 0;
+                        if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+                            for (int i = 0; i < prev_task->fanout_count; i++) {
+                                fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
+                            }
+                            fanout_count = prev_task->fanout_count;
                         }
                         if (l2_perf_aicpu_complete_record(
-                                core_id, static_cast<uint32_t>(prev_running_id), static_cast<uint64_t>(prev_running_id),
-                                prev_task->func_id, h->core_type, dispatch_timestamps_[core_id], finish_ts, fanout_arr,
-                                prev_task->fanout_count
+                                core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
+                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
+                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
                             ) != 0) {
                             LOG_ERROR(
                                 "Core %d: l2_perf_aicpu_complete_record failed for implicit task %d", core_id,
                                 prev_running_id
                             );
                         }
-                        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                        if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+                            dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                        }
                     }
 
-                    finish_ts = get_sys_cnt_aicpu();
+                    finish_ts = (l2_perf_level >= L2PerfLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
                     Task *task = &runtime.tasks[completed_task_id];
                     uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                    for (int i = 0; i < task->fanout_count; i++) {
-                        fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
+                    int fanout_count = 0;
+                    if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+                        for (int i = 0; i < task->fanout_count; i++) {
+                            fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
+                        }
+                        fanout_count = task->fanout_count;
                     }
                     if (l2_perf_aicpu_complete_record(
-                            core_id, static_cast<uint32_t>(completed_task_id), static_cast<uint64_t>(completed_task_id),
-                            task->func_id, h->core_type, dispatch_timestamps_[core_id], finish_ts, fanout_arr,
-                            task->fanout_count
+                            core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
+                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
+                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
                         ) != 0) {
                         LOG_ERROR(
                             "Core %d: l2_perf_aicpu_complete_record failed for task %d", core_id, completed_task_id
                         );
                     }
-                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                    if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+                        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                    }
                 }
 
                 cur_thread_completed++;
@@ -817,7 +832,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 made_progress = true;
 
                 // Update timestamp if didn't dispatch (try_dispatch_task updates it if dispatched)
-                if (!dispatched && l2_perf_enabled) {
+                if (!dispatched && l2_perf_enabled && l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
                     dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                 }
             } else if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_ACK_STATE) {
@@ -840,23 +855,29 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 if (prev_running_id != AICPU_TASK_INVALID) {
                     // Profiling: complete the implicit task's AICore record
                     if (l2_perf_enabled) {
-                        uint64_t finish_ts = get_sys_cnt_aicpu();
+                        uint64_t finish_ts = (l2_perf_level >= L2PerfLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
                         Task *prev_task = &runtime.tasks[prev_running_id];
                         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                        for (int i = 0; i < prev_task->fanout_count; i++) {
-                            fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
+                        int fanout_count = 0;
+                        if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+                            for (int i = 0; i < prev_task->fanout_count; i++) {
+                                fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
+                            }
+                            fanout_count = prev_task->fanout_count;
                         }
                         if (l2_perf_aicpu_complete_record(
-                                core_id, static_cast<uint32_t>(prev_running_id), static_cast<uint64_t>(prev_running_id),
-                                prev_task->func_id, h->core_type, dispatch_timestamps_[core_id], finish_ts, fanout_arr,
-                                prev_task->fanout_count
+                                core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
+                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
+                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
                             ) != 0) {
                             LOG_ERROR(
                                 "Core %d: l2_perf_aicpu_complete_record failed for implicit task %d", core_id,
                                 prev_running_id
                             );
                         }
-                        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                        if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+                            dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                        }
                     }
 
                     cur_thread_completed++;
@@ -885,22 +906,28 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 int completed_task_id = running_task_ids_[core_id];
 
                 if (l2_perf_enabled) {
-                    uint64_t finish_ts = get_sys_cnt_aicpu();
+                    uint64_t finish_ts = (l2_perf_level >= L2PerfLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
                     Task *task = &runtime.tasks[completed_task_id];
                     uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                    for (int i = 0; i < task->fanout_count; i++) {
-                        fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
+                    int fanout_count = 0;
+                    if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+                        for (int i = 0; i < task->fanout_count; i++) {
+                            fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
+                        }
+                        fanout_count = task->fanout_count;
                     }
                     if (l2_perf_aicpu_complete_record(
-                            core_id, static_cast<uint32_t>(completed_task_id), static_cast<uint64_t>(completed_task_id),
-                            task->func_id, h->core_type, dispatch_timestamps_[core_id], finish_ts, fanout_arr,
-                            task->fanout_count
+                            core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
+                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
+                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
                         ) != 0) {
                         LOG_ERROR(
                             "Core %d: l2_perf_aicpu_complete_record failed for task %d", core_id, completed_task_id
                         );
                     }
-                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                    if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+                        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                    }
                 }
 
                 cur_thread_completed++;
@@ -932,7 +959,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 made_progress = true;
 
                 // Update timestamp if didn't dispatch (try_dispatch_task updates it if dispatched)
-                if (!dispatched && l2_perf_enabled) {
+                if (!dispatched && l2_perf_enabled && l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
                     dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                 }
             }

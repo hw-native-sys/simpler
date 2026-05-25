@@ -33,11 +33,23 @@
  * L2 perf platform setters — called by the host (sim) or the AICPU kernel
  * entry (onboard) before `l2_perf_aicpu_init()` so AICPU code can read perf
  * state without reaching into the generic `Runtime` struct.
+ *
+ * Two-channel level transport (mirrors the PMU pattern):
+ *   - binary on/off — `enable_profiling_flag` bit1 → `set_l2_swimlane_enabled(bool)`
+ *     at kernel entry; queried via `is_l2_swimlane_enabled()`.
+ *   - granular L2PerfLevel — `L2PerfDataHeader::l2_perf_level` (shared memory);
+ *     read in `l2_perf_aicpu_init` and cached, then queried via
+ *     `get_l2_perf_level()` for `>= AICPU_TIMING / SCHED_PHASES / ORCH_PHASES` gates.
  */
 extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base);
 extern "C" uint64_t get_platform_l2_perf_base();
 extern "C" void set_l2_swimlane_enabled(bool enable);
 extern "C" bool is_l2_swimlane_enabled();
+
+// Typed getter for the granular perf_level (promoted from the shared-memory
+// header inside l2_perf_aicpu_init). Gate sites should use this so the
+// comparison RHS is a named L2PerfLevel constant.
+L2PerfLevel get_l2_perf_level();
 
 /**
  * Initialize performance profiling for `worker_count` cores.
@@ -63,6 +75,7 @@ void l2_perf_aicpu_init(int worker_count);
  * runtime linked-list types).
  *
  * @param core_id               Core ID owning the destination buffer (resolved via s_perf_buffer_states)
+ * @param thread_idx            Owning AICPU thread (used when rotating records buffer)
  * @param expected_reg_task_id  Register dispatch token (low 32 bits) to validate
  * @param task_id               Task identifier to write (PTO2 encoding or plain id)
  * @param func_id               Kernel function identifier
@@ -77,7 +90,7 @@ void l2_perf_aicpu_init(int worker_count);
  * (they take the dropped path). Same shape as a2a3.
  */
 int l2_perf_aicpu_complete_record(
-    int core_id, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
+    int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
     uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
 );
 

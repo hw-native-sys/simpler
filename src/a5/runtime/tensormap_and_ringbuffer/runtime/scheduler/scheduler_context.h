@@ -11,6 +11,7 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
+#include "common/l2_perf_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
 
@@ -134,6 +135,9 @@ private:
 
 #if PTO2_PROFILING
     SchedL2PerfCounters sched_l2_perf_[MAX_AICPU_THREADS];
+    // Cached once at init() from get_l2_perf_level(), AFTER
+    // l2_perf_aicpu_init has promoted the level from the shared-memory header.
+    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};
 #endif
 
     // --- Task-execution tracking ---
