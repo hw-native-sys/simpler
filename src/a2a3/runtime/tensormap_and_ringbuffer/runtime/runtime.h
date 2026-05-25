@@ -15,7 +15,7 @@
  * protocol. Task graph construction is handled by PTO2Runtime; this class
  * only handles:
  * - Handshake buffers for AICPU-AICore communication
- * - Execution parameters (block_dim, sche_cpu_num)
+ * - Execution parameters (block_dim, aicpu_thread_num)
  * - Tensor pair management for host-device memory tracking
  * - Device orchestration state (gm_sm_ptr_, orch_args_)
  * - Function address mapping (func_id_to_addr_)
@@ -176,8 +176,14 @@ public:
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
-    // Execution parameters for AICPU scheduling
-    int sche_cpu_num;        // Number of AICPU threads for scheduling
+    // Execution parameters for AICPU scheduling.
+    //
+    // aicpu_thread_num is the *total* AICPU thread count launched on this run
+    // (= orch + schedulers). AicpuExecutor splits this into one orchestrator
+    // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
+    // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
+    // The orch thread also dispatches when env PTO2_ORCH_TO_SCHED is set.
+    int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Ring buffer size overrides (0 = use compile-time defaults)

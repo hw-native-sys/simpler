@@ -118,7 +118,7 @@ struct AicpuExecutor {
     std::atomic<bool> init_failed_{false};
     std::atomic<bool> finished_{false};
 
-    int32_t thread_num_{0};
+    int32_t aicpu_thread_num_{0};
 
     // ===== Task queue state (managed by scheduler ready queues) =====
 
@@ -178,19 +178,21 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
 
-    // Read execution parameters from runtime
-    thread_num_ = runtime->sche_cpu_num;
-    sched_thread_num_ = thread_num_ - 1;
+    // Read execution parameters from runtime. The 0 → 1 fixup runs before the
+    // sched_thread_num_ derivation so a zero input doesn't leave the scheduler
+    // count at -1.
+    aicpu_thread_num_ = runtime->aicpu_thread_num;
+    if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
+    sched_thread_num_ = aicpu_thread_num_ - 1;
     orch_to_sched_ = runtime->orch_to_sched;
-    if (thread_num_ == 0) thread_num_ = 1;
 
-    if (thread_num_ < 1 || thread_num_ > MAX_AICPU_THREADS) {
-        LOG_ERROR("Invalid thread_num: %d", thread_num_);
+    if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
+        LOG_ERROR("Invalid aicpu_thread_num: %d", aicpu_thread_num_);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
 
-    if (sched_ctx_.init(runtime, thread_num_, sched_thread_num_, orch_to_sched_, get_platform_regs()) != 0) {
+    if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, orch_to_sched_, get_platform_regs()) != 0) {
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -659,7 +661,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     // Check if this is the last thread to finish
     int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
-    if (prev_finished + 1 == thread_num_) {
+    if (prev_finished + 1 == aicpu_thread_num_) {
         finished_.store(true, std::memory_order_release);
         // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
         // always tear them down here, but we keep the per-cid orch SO entries
@@ -694,7 +696,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     finished_count_.store(0, std::memory_order_release);
     runtime_init_ready_.store(false, std::memory_order_release);
 
-    thread_num_ = 0;
+    aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
 

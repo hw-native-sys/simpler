@@ -479,7 +479,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     runtime.worker_count = num_aicore;
     worker_count_ = num_aicore;  // Store for print_handshake_results in destructor
-    runtime.sche_cpu_num = launch_aicpu_num;
+    runtime.aicpu_thread_num = launch_aicpu_num;
 
     // Get AICore register addresses for register-based task dispatch
     rc = init_aicore_register_addresses(&kernel_args_.args.regs, static_cast<uint64_t>(device_id_), mem_alloc_);
@@ -1181,7 +1181,7 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
-    int num_dump_threads = runtime.sche_cpu_num;
+    int num_dump_threads = runtime.aicpu_thread_num;
 
     int rc = dump_collector_.initialize(
         num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_

@@ -357,7 +357,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
         if (is_dump_tensor_enabled()) {
-            dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
+            dump_tensor_init(orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_);
         }
 #endif
 

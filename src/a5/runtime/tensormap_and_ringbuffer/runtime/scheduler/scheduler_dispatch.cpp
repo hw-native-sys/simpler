@@ -369,7 +369,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 #if PTO2_PROFILING
         if (is_dump_tensor_enabled()) {
-            dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
+            dump_tensor_init(orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_);
         }
         if (is_pmu_enabled()) {
             pmu_aicpu_init(physical_core_ids_, cores_total_num_);

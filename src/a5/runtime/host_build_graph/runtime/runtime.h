@@ -214,8 +214,10 @@ public:
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
-    // Execution parameters for AICPU scheduling
-    int sche_cpu_num;  // Number of AICPU threads for scheduling
+    // Total AICPU threads launched on this run. host_build_graph has no
+    // orchestrator/scheduler split — every thread dispatches tasks in
+    // round-robin across the assigned cores. See AicpuExecutor::init.
+    int aicpu_thread_num;
 
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
