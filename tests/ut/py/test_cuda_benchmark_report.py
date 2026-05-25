@@ -74,6 +74,22 @@ def _load_artifact_index_module():
     return module
 
 
+def _load_smoke_report_module():
+    script_path = (
+        Path(__file__).resolve().parents[3]
+        / ".agents"
+        / "skills"
+        / "cuda-backend-eval"
+        / "scripts"
+        / "cuda_smoke_report.py"
+    )
+    spec = importlib.util.spec_from_file_location("cuda_smoke_report", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _write_artifact_payload(path: Path, label: str, machine: str, baseline: str) -> None:
     path.mkdir(parents=True)
     payload = {
@@ -85,6 +101,53 @@ def _write_artifact_payload(path: Path, label: str, machine: str, baseline: str)
         "results": [{"baseline": baseline, "n": 1024, "device_wall_ns": 10}],
     }
     (path / "cuda-benchmark.json").write_text(json.dumps(payload) + "\n")
+
+
+def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
+    cuda_smoke_report = _load_smoke_report_module()
+    a100 = {
+        "status": "pass",
+        "runtime": "persistent_device",
+        "mode": "dag",
+        "dag_shape": "tensor_tile",
+        "n": 4096,
+        "ptx_arch": "compute_80",
+        "ptx_source": "nvcc-persistent-generated-dispatch-compute_80",
+        "device_wall_ns": 102400,
+        "host_wall_ns": 122260,
+        "tensor_tile": {
+            "rows": 16,
+            "cols": 16,
+            "inner": 16,
+            "tile_count": 16,
+        },
+    }
+    h200 = {
+        **a100,
+        "ptx_arch": "compute_90",
+        "ptx_source": "nvcc-persistent-generated-dispatch-compute_90",
+        "device_wall_ns": 70464,
+        "host_wall_ns": 79788,
+    }
+    a100_path = tmp_path / "a100.json"
+    h200_path = tmp_path / "h200.json"
+    a100_path.write_text(json.dumps(a100) + "\n")
+    h200_path.write_text(json.dumps(h200) + "\n")
+
+    payload = cuda_smoke_report.load_smoke_payloads([a100_path, h200_path])
+    markdown = cuda_smoke_report.render_markdown_report(payload, label="tensor-smoke")
+    svg = cuda_smoke_report.render_svg_report(payload, label="tensor-smoke")
+
+    assert (
+        "| a100 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_80` | 102400 | 122260 | 16x16x16 | 16 |"
+    ) in markdown
+    assert (
+        "| h200 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_90` | 70464 | 79788 | 16x16x16 | 16 |"
+    ) in markdown
+    assert "nvcc-persistent-generated-dispatch-compute_90" in markdown
+    assert "<svg" in svg
+    assert "tensor-smoke" in svg
+    assert "h200" in svg
 
 
 def test_cuda_artifact_index_scans_benchmark_outputs(tmp_path):

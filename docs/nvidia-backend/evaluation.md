@@ -10,6 +10,8 @@ The latest captured raw reports are under `tmp/`:
 
 - `tmp/cuda-backend/tensor-descriptor-smoke-38db010e/a100.json`
 - `tmp/cuda-backend/tensor-descriptor-smoke-38db010e/h200.json`
+- `tmp/cuda-backend/tensor-descriptor-smoke-38db010e/cuda-smoke-report.md`
+- `tmp/cuda-backend/tensor-descriptor-smoke-38db010e/cuda-smoke-report.svg`
 - `tmp/cuda-backend/a100-rangewide-cc6869f7/cuda-benchmark.md`
 - `tmp/cuda-backend/h200-rangewide-cc6869f7/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-rangewide-cc6869f7/cuda-benchmark.md`
@@ -299,7 +301,8 @@ elementwise residual, gate, and fan-in tasks. This is expected and confirms
 that the persistent-device scheduler can run non-elementwise callable bodies
 without changing the launch path. A metadata-carrying tensor DAG smoke after
 the descriptor extension validated `N=4096` and 16 tiles with copied-back real
-CUDA data on both A100 and H200:
+CUDA data on both A100 and H200. The compact smoke report and SVG are rendered
+from the raw JSON with `.agents/skills/cuda-backend-eval/scripts/cuda_smoke_report.py`.
 
 | GPU | PTX arch | Device ns | Rows x Cols x Inner | Tile count |
 | --- | -------- | --------- | ------------------- | ---------- |

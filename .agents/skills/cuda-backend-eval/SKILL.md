@@ -197,6 +197,21 @@ The indexer scans `cuda-benchmark.json` files and writes
 sizes, and generated report/chart presence. It is a local audit aid under
 `tmp/`; do not commit it with benchmark raw data.
 
+Render compact smoke JSON reports when a result is a smoke validation rather
+than a full benchmark:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_smoke_report.py \
+    tmp/cuda-backend/tensor-descriptor-smoke-38db010e/a100.json \
+    tmp/cuda-backend/tensor-descriptor-smoke-38db010e/h200.json \
+    --label tensor-descriptor-smoke-38db010e \
+    --output-dir tmp/cuda-backend/tensor-descriptor-smoke-38db010e
+```
+
+The smoke reporter writes `cuda-smoke-report.md` and
+`cuda-smoke-report.svg`, keeping the raw JSON under `tmp/`.
+
 The report's ratio column uses the matched host-schedule row for the same
 machine, vector length, and task count. Same-work batch rows are therefore
 relative to `pto_host_schedule_batch`, not the one-task `pto_host_schedule`
@@ -297,7 +312,8 @@ rows/cols/inner/leading-dimension and per-tile stride fields. Use these rows
 as ABI and scheduler validation; they are still scalar CUDA GEMM
 microbenchmarks, not tuned tensor-core workloads.
 The `38db010e` A100/H200 descriptor smoke outputs were saved under
-`tmp/cuda-backend/tensor-descriptor-smoke-38db010e/`.
+`tmp/cuda-backend/tensor-descriptor-smoke-38db010e/`, with a generated smoke
+Markdown report and SVG in the same directory.
 
 The CUDA Graph launch-baseline capture at `ba2cdd0e` adds
 `direct_driver_graph` to the default benchmark. It showed graph replay faster
