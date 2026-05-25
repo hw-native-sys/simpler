@@ -49,8 +49,9 @@ same vector-add PTX kernel through two launch paths:
 - `pto_host_schedule`: the PTO CUDA host runtime C API and manifest dispatch.
 - `direct_driver`: a thin CUDA Driver API baseline in Python `ctypes`.
 
-Each sample runs in a fresh subprocess. This avoids cross-sample CUDA state
-leakage while the PTO host runtime lifecycle is still minimal.
+The smoke helper caches the built and loaded host runtime per process, so the
+benchmark can run repeated PTO and baseline samples without rebuilding a shared
+object that is already loaded.
 
 Local A100 example:
 

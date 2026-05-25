@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -191,3 +192,24 @@ extern "C" __global__ void pto_vector_add_f32(
     finally:
         runtime.finalize_device(ctx)
         runtime.destroy_device_context(ctx)
+
+
+@pytest.mark.skipif(shutil.which("nvcc") is None, reason="nvcc is required for CUDA runtime smoke test")
+def test_cuda_standalone_smoke_can_run_twice_in_one_process():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_smoke import run_smoke
+
+for _ in range(2):
+    run_smoke(device=0, n=1024, block_dim=256, arch="compute_80", build=False)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"

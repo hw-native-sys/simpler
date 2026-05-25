@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import functools
 import json
 import shutil
 import subprocess
@@ -178,14 +179,20 @@ def _bind_runtime(runtime):
     runtime.unregister_callable.restype = ctypes.c_int
 
 
-def run_smoke(device: int, n: int, block_dim: int, arch: str) -> dict:
+@functools.lru_cache(maxsize=2)
+def _load_runtime(build: bool):
+    binaries = RuntimeBuilder(platform="cuda").get_binaries("host_schedule", build=build)
+    runtime = ctypes.CDLL(str(binaries.host_path))
+    _bind_runtime(runtime)
+    return runtime, binaries
+
+
+def run_smoke(device: int, n: int, block_dim: int, arch: str, build: bool = True) -> dict:
     with tempfile.TemporaryDirectory(prefix="pto_cuda_smoke_") as td:
         ptx, ptx_source = _compile_ptx(Path(td), arch)
     ptx_buf = ctypes.create_string_buffer(ptx + b"\0")
 
-    binaries = RuntimeBuilder(platform="cuda").get_binaries("host_schedule", build=True)
-    runtime = ctypes.CDLL(str(binaries.host_path))
-    _bind_runtime(runtime)
+    runtime, binaries = _load_runtime(build)
 
     ctx = runtime.create_device_context()
     if not ctx:

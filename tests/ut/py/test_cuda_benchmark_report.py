@@ -91,3 +91,40 @@ def test_merge_payloads_preserves_results_and_records_sources():
     assert merged["metadata"]["source_labels"] == ["a100", "h200"]
     assert merged["metadata"]["git_commits"] == ["abc123"]
     assert len(merged["results"]) == 2
+
+
+def test_run_benchmark_uses_in_process_samples(monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = []
+
+    def fake_compile_ptx(work_dir, arch):
+        return b"ptx", f"fake-{arch}"
+
+    def fake_run_single_sample(baseline, device, n, block_dim, arch):
+        seen.append((baseline, device, n, block_dim, arch))
+        return {
+            "baseline": baseline,
+            "n": n,
+            "block_dim": block_dim,
+            "host_wall_ns": 20,
+            "device_wall_ns": 10,
+            "status": "pass",
+        }
+
+    monkeypatch.setattr(cuda_benchmark, "_compile_ptx", fake_compile_ptx)
+    monkeypatch.setattr(cuda_benchmark, "run_single_sample", fake_run_single_sample)
+
+    payload = cuda_benchmark.run_benchmark(
+        device=3,
+        sizes=[1024],
+        repeats=1,
+        block_dim=128,
+        arch="compute_80",
+        label="unit",
+    )
+
+    assert seen == [
+        ("pto_host_schedule", 3, 1024, 128, "compute_80"),
+        ("direct_driver", 3, 1024, 128, "compute_80"),
+    ]
+    assert len(payload["results"]) == 2

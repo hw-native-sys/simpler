@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
-import os
 import socket
 import statistics
 import subprocess
@@ -220,43 +219,6 @@ def run_single_sample(baseline: str, device: int, n: int, block_dim: int, arch: 
     raise ValueError(f"unknown baseline: {baseline}")
 
 
-def _sample_env() -> dict[str, str]:
-    repo_root = Path(__file__).resolve().parents[4]
-    script_dir = Path(__file__).resolve().parent
-    python_paths = [str(repo_root), str(repo_root / "python"), str(script_dir)]
-    existing = os.environ.get("PYTHONPATH")
-    if existing:
-        python_paths.append(existing)
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(python_paths)
-    return env
-
-
-def run_sample_subprocess(baseline: str, device: int, n: int, block_dim: int, arch: str) -> dict[str, Any]:
-    cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--single-baseline",
-        baseline,
-        "--device",
-        str(device),
-        "--sizes",
-        str(n),
-        "--block-dim",
-        str(block_dim),
-        "--arch",
-        arch,
-    ]
-    result = subprocess.run(cmd, check=False, capture_output=True, text=True, env=_sample_env())
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"{baseline} sample failed with exit code {result.returncode}\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
-    return json.loads(result.stdout)
-
-
 def run_benchmark(device: int, sizes: list[int], repeats: int, block_dim: int, arch: str, label: str) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="pto_cuda_bench_") as td:
         ptx, ptx_source = _compile_ptx(Path(td), arch)
@@ -279,13 +241,11 @@ def run_benchmark(device: int, sizes: list[int], repeats: int, block_dim: int, a
     results: list[dict[str, Any]] = []
     for n in sizes:
         for repeat in range(repeats):
-            pto = run_sample_subprocess(
-                baseline="pto_host_schedule", device=device, n=n, block_dim=block_dim, arch=arch
-            )
+            pto = run_single_sample(baseline="pto_host_schedule", device=device, n=n, block_dim=block_dim, arch=arch)
             pto.update({"machine": metadata["machine"], "repeat": repeat})
             results.append(pto)
 
-            direct = run_sample_subprocess(baseline="direct_driver", device=device, n=n, block_dim=block_dim, arch=arch)
+            direct = run_single_sample(baseline="direct_driver", device=device, n=n, block_dim=block_dim, arch=arch)
             direct.update({"machine": metadata["machine"], "repeat": repeat})
             results.append(direct)
 
