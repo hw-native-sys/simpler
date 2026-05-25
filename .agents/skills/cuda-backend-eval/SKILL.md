@@ -99,7 +99,8 @@ same vector-add PTX kernel through two launch paths:
   `pto_persistent_device_grid_batch`, and `pto_persistent_queue_batch`:
   same-work batch rows enabled by `--batch-tasks N`. The worker-grid row is
   enabled with `--worker-blocks-per-task M` and assigns multiple CUDA worker
-  blocks to each task descriptor.
+  blocks to each task descriptor. Pass a comma-separated list, such as
+  `--worker-blocks-per-task 2,4,8,16`, to sweep grid shapes in one report.
 
 The smoke helper caches the built and loaded host runtime per process, so the
 benchmark can run repeated PTO and baseline samples without rebuilding a shared
@@ -111,7 +112,7 @@ Local A100 example:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_80 \
-    --include-persistent --batch-tasks 6 --worker-blocks-per-task 4 \
+    --include-persistent --batch-tasks 6 --worker-blocks-per-task 2,4,8,16 \
     --label a100-local --output-dir tmp/cuda-backend/a100
 ```
 
@@ -123,7 +124,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_90 \
-     --include-persistent --batch-tasks 6 --worker-blocks-per-task 4 \
+     --include-persistent --batch-tasks 6 --worker-blocks-per-task 2,4,8,16 \
      --label h200-remote --output-dir tmp/cuda-backend/h200'
 ```
 
@@ -144,9 +145,10 @@ embedded `sm_80` PTX instead of using `nvcc` to produce fresh PTX for the
 requested target architecture.
 
 The default persistent batch row uses one worker block per descriptor. Add
-`--worker-blocks-per-task M` to include `pto_persistent_device_grid_batch`,
-which separates launch amortization from intra-task grid parallelism by giving
-each descriptor multiple worker blocks.
+`--worker-blocks-per-task M[,N...]` to include one
+`pto_persistent_device_grid_batch` row per value, which separates launch
+amortization from intra-task grid parallelism by giving each descriptor
+multiple worker blocks.
 
 Merge local and remote JSON payloads into one comparative report:
 

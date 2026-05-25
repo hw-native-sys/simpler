@@ -513,6 +513,19 @@ def run_single_sample(
     raise ValueError(f"unknown baseline: {baseline}")
 
 
+def _normalize_worker_blocks_per_task(raw: int | list[int]) -> list[int]:
+    values = [raw] if isinstance(raw, int) else raw
+    if not values:
+        raise ValueError("worker_blocks_per_task must not be empty")
+    normalized: list[int] = []
+    for value in values:
+        if value <= 0:
+            raise ValueError("worker_blocks_per_task must be positive")
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
 def run_benchmark(
     device: int,
     sizes: list[int],
@@ -522,12 +535,11 @@ def run_benchmark(
     label: str,
     include_persistent: bool = False,
     batch_tasks: int = 0,
-    worker_blocks_per_task: int = 1,
+    worker_blocks_per_task: int | list[int] = 1,
 ) -> dict[str, Any]:
     if batch_tasks < 0:
         raise ValueError("batch_tasks must be non-negative")
-    if worker_blocks_per_task <= 0:
-        raise ValueError("worker_blocks_per_task must be positive")
+    worker_blocks_per_task_values = _normalize_worker_blocks_per_task(worker_blocks_per_task)
     with tempfile.TemporaryDirectory(prefix="pto_cuda_bench_") as td:
         ptx, ptx_source = _compile_ptx(Path(td), arch)
 
@@ -541,7 +553,10 @@ def run_benchmark(
         "ptx_arch": arch,
         "ptx_source": ptx_source,
         "batch_tasks": batch_tasks,
-        "worker_blocks_per_task": worker_blocks_per_task,
+        "worker_blocks_per_task": worker_blocks_per_task
+        if isinstance(worker_blocks_per_task, int)
+        else worker_blocks_per_task_values,
+        "worker_blocks_per_task_values": worker_blocks_per_task_values,
         "nvidia_smi": _nvidia_smi_summary(),
         "paper_setup": (
             "Microbenchmark slice inspired by VDCores/MPK persistent-kernel evaluation; "
@@ -587,18 +602,19 @@ def run_benchmark(
                         )
                         batch.update({"machine": metadata["machine"], "repeat": repeat})
                         results.append(batch)
-                    if worker_blocks_per_task > 1:
-                        grid_batch = run_single_sample(
-                            baseline="pto_persistent_device_grid_batch",
-                            device=device,
-                            n=n,
-                            block_dim=block_dim,
-                            arch=arch,
-                            task_count=batch_tasks,
-                            worker_blocks_per_task=worker_blocks_per_task,
-                        )
-                        grid_batch.update({"machine": metadata["machine"], "repeat": repeat})
-                        results.append(grid_batch)
+                    for worker_blocks in worker_blocks_per_task_values:
+                        if worker_blocks > 1:
+                            grid_batch = run_single_sample(
+                                baseline="pto_persistent_device_grid_batch",
+                                device=device,
+                                n=n,
+                                block_dim=block_dim,
+                                arch=arch,
+                                task_count=batch_tasks,
+                                worker_blocks_per_task=worker_blocks,
+                            )
+                            grid_batch.update({"machine": metadata["machine"], "repeat": repeat})
+                            results.append(grid_batch)
 
     return {"metadata": metadata, "results": results}
 
@@ -787,22 +803,28 @@ def run_stream_concurrency_benchmark(device: int, repeats: int, arch: str, label
     return {"metadata": metadata, "results": results}
 
 
-def summarize_results(payload: dict[str, Any]) -> dict[tuple[str, str, int], dict[str, Any]]:
-    grouped: dict[tuple[str, str, int], list[dict[str, Any]]] = defaultdict(list)
+def summarize_results(payload: dict[str, Any]) -> dict[tuple[str, str, int, int, int], dict[str, Any]]:
+    grouped: dict[tuple[str, str, int, int, int], list[dict[str, Any]]] = defaultdict(list)
     for row in payload.get("results", []):
-        key = (row["machine"], row["baseline"], int(row["n"]))
+        key = (
+            row["machine"],
+            row["baseline"],
+            int(row["n"]),
+            int(row.get("task_count", 1)),
+            int(row.get("worker_blocks_per_task", 1)),
+        )
         grouped[key].append(row)
 
-    summary: dict[tuple[str, str, int], dict[str, Any]] = {}
+    summary: dict[tuple[str, str, int, int, int], dict[str, Any]] = {}
     for key, rows in grouped.items():
         host_values = [int(row.get("host_wall_ns", row["device_wall_ns"])) for row in rows]
         device_values = [int(row["device_wall_ns"]) for row in rows]
-        task_count_values = [int(row.get("task_count", 1)) for row in rows]
         summary[key] = {
             "machine": key[0],
             "baseline": key[1],
             "n": key[2],
-            "task_count": max(task_count_values),
+            "task_count": key[3],
+            "worker_blocks_per_task": key[4],
             "samples": len(rows),
             "median_host_wall_ns": int(statistics.median(host_values)),
             "median_device_wall_ns": int(statistics.median(device_values)),
@@ -810,12 +832,21 @@ def summarize_results(payload: dict[str, Any]) -> dict[tuple[str, str, int], dic
     return summary
 
 
-def _sorted_summary_rows(summary: dict[tuple[str, str, int], dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(summary.values(), key=lambda row: (row["machine"], row["n"], row["baseline"]))
+def _sorted_summary_rows(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        summary.values(),
+        key=lambda row: (
+            row["machine"],
+            row["n"],
+            row["baseline"],
+            row["task_count"],
+            row["worker_blocks_per_task"],
+        ),
+    )
 
 
 def _matched_host_schedule_device_refs(
-    summary: dict[tuple[str, str, int], dict[str, Any]],
+    summary: dict[tuple[str, str, int, int, int], dict[str, Any]],
 ) -> dict[tuple[str, int, int], int]:
     refs: dict[tuple[str, int, int], int] = {}
     for row in summary.values():
@@ -871,7 +902,7 @@ def merge_payloads(payloads: list[dict[str, Any]], label: str) -> dict[str, Any]
     }
 
 
-def render_svg(summary: dict[tuple[str, str, int], dict[str, Any]]) -> str:
+def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) -> str:
     rows = _sorted_summary_rows(summary)
     if not rows:
         return '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="80"></svg>\n'
@@ -902,7 +933,10 @@ def render_svg(summary: dict[tuple[str, str, int], dict[str, Any]]) -> str:
     ]
     for idx, row in enumerate(rows):
         y = 50 + idx * (bar_height + row_gap)
-        label = f"{row['machine']} n={row['n']} {row['baseline']}"
+        label = (
+            f"{row['machine']} n={row['n']} tasks={row['task_count']} "
+            f"w={row['worker_blocks_per_task']} {row['baseline']}"
+        )
         bar_width = int(chart_width * row["median_device_wall_ns"] / max_ns)
         color = colors.get(row["baseline"], "#777777")
         lines.append(f'<text x="20" y="{y + 14}" font-family="sans-serif" font-size="12">{label}</text>')
@@ -938,17 +972,17 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "| Machine | Baseline | N | Tasks | Samples | Median device ns | Median host ns | "
-            "Device vs matched host_schedule |",
-            "| ------- | -------- | - | ----- | ------- | ---------------- | -------------- | "
-            "------------------------------- |",
+            "| Machine | Baseline | N | Tasks | Worker blocks/task | Samples | Median device ns | "
+            "Median host ns | Device vs matched host_schedule |",
+            "| ------- | -------- | - | ----- | ------------------ | ------- | ---------------- | "
+            "-------------- | ------------------------------- |",
         ]
     )
     for row in _sorted_summary_rows(summary):
         reference = host_schedule_refs.get((row["machine"], row["n"], row["task_count"]))
         lines.append(
             f"| {row['machine']} | {row['baseline']} | {row['n']} | {row['task_count']} | "
-            f"{row['samples']} | "
+            f"{row['worker_blocks_per_task']} | {row['samples']} | "
             f"{row['median_device_wall_ns']} | {row['median_host_wall_ns']} | "
             f"{_ratio_text(row['median_device_wall_ns'], reference)} |"
         )
@@ -1029,6 +1063,10 @@ def _parse_sizes(raw: str) -> list[int]:
     return [int(part) for part in raw.split(",") if part]
 
 
+def _parse_worker_blocks_per_task(raw: str) -> list[int]:
+    return _normalize_worker_blocks_per_task([int(part) for part in raw.split(",") if part])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
@@ -1064,11 +1102,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--worker-blocks-per-task",
-        type=int,
-        default=1,
-        help="run the persistent direct worker-grid batch baseline with this many worker blocks per task",
+        default="1",
+        help="comma-separated worker-block counts for persistent direct worker-grid batch rows",
     )
     args = parser.parse_args()
+    worker_blocks_per_task_values = _parse_worker_blocks_per_task(args.worker_blocks_per_task)
 
     if args.merge_json:
         payloads = [json.loads(path.read_text()) for path in args.merge_json]
@@ -1092,6 +1130,8 @@ def main() -> None:
         sizes = _parse_sizes(args.sizes)
         if len(sizes) != 1:
             raise SystemExit("--single-baseline requires exactly one --sizes value")
+        if len(worker_blocks_per_task_values) != 1:
+            raise SystemExit("--single-baseline requires exactly one --worker-blocks-per-task value")
         print(
             json.dumps(
                 run_single_sample(
@@ -1101,7 +1141,7 @@ def main() -> None:
                     args.block_dim,
                     args.arch,
                     task_count=max(1, args.batch_tasks),
-                    worker_blocks_per_task=args.worker_blocks_per_task,
+                    worker_blocks_per_task=worker_blocks_per_task_values[0],
                 ),
                 sort_keys=True,
             )
@@ -1117,7 +1157,7 @@ def main() -> None:
         label=args.label,
         include_persistent=args.include_persistent,
         batch_tasks=args.batch_tasks,
-        worker_blocks_per_task=args.worker_blocks_per_task,
+        worker_blocks_per_task=worker_blocks_per_task_values,
     )
     write_report(payload, args.output_dir)
     print(json.dumps(payload["metadata"], indent=2, sort_keys=True))
