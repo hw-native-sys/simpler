@@ -253,8 +253,10 @@ source fragment with one `pto_task_body_<name>` function, one
 `pto_task_<name>` `__device__` wrapper for `persistent_device`.
 `KernelCompiler(platform="cuda").compile_cuda_host_schedule()` now uses this
 renderer for the host-schedule side and writes a cached PTX artifact plus
-manifest. The persistent-device side still needs dispatch composition and
-scene-test plumbing.
+manifest. It can also generate a host wrapper whose parameters match the
+current host-schedule vector-add launch ABI, while the shared task body still
+receives `PtoTaskContext *`. The persistent-device side still needs dispatch
+composition and scene-test plumbing.
 
 ## Static NVCC Linking Feasibility
 

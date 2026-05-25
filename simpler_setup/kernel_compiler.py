@@ -508,6 +508,9 @@ class KernelCompiler:
         task_name: str,
         arch: str,
         context_type: str = "PtoTaskContext",
+        context_definition: str = "",
+        host_parameters: Optional[tuple[str, ...]] = None,
+        host_context_initializer: str = "",
         cache_root: Optional[Union[str, Path]] = None,
         nvcc: str = "nvcc",
     ):
@@ -521,7 +524,14 @@ class KernelCompiler:
             raise FileNotFoundError(f"Source file not found: {source}")
 
         return compile_cuda_host_schedule(
-            CudaTaskBody(name=task_name, body=source.read_text(), context_type=context_type),
+            CudaTaskBody(
+                name=task_name,
+                body=source.read_text(),
+                context_type=context_type,
+                context_definition=context_definition,
+                host_parameters=() if host_parameters is None else host_parameters,
+                host_context_initializer=host_context_initializer,
+            ),
             arch=arch,
             cache_root=None if cache_root is None else Path(cache_root),
             nvcc=nvcc,

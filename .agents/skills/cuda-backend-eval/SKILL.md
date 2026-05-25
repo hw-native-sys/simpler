@@ -126,6 +126,10 @@ one shared PTO CUDA task body into host-schedule and persistent-device wrappers,
 then writes the host-schedule generated source, PTX, and JSON manifest under
 `build/cache/cuda/onboard/host_schedule/callables/`. This is a compiler slice;
 the normal scene-test `ChipCallable` path does not consume the artifact yet.
+For real host-schedule smoke coverage, pass a context definition plus
+`host_parameters`/`host_context_initializer` so the generated `__global__`
+wrapper matches the current vector-add launch ABI and can be loaded by
+`prepare_callable`.
 
 ## Microbenchmark Report
 

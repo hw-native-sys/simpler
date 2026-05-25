@@ -37,7 +37,10 @@ slice. It supports:
 `KernelCompiler(platform="cuda").compile_cuda_host_schedule()` now compiles a
 user-authored CUDA task body through the shared wrapper generator and writes a
 cached host-schedule callable artifact under
-`build/cache/cuda/onboard/host_schedule/callables/`.
+`build/cache/cuda/onboard/host_schedule/callables/`. The generated host
+wrapper can lower a task context into the current vector-add launch ABI, so
+the artifact can be passed to `prepare_callable` and run with real device
+data.
 
 Evidence:
 
@@ -47,6 +50,9 @@ Evidence:
   on distinct streams.
 - `tests/ut/py/test_cuda_kernel_compiler.py` covers the CUDA `KernelCompiler`
   entry point for host-schedule task bodies.
+- `tests/ut/py/test_cuda_backend.py` runs one host-schedule callable compiled
+  by `KernelCompiler` through `prepare_callable` and validates real CUDA output
+  data.
 
 ### Persistent-Device Runtime
 
@@ -122,7 +128,7 @@ The focused CUDA test set was run from the project-local virtual environment:
   tests/ut/py/test_cuda_persistent_codegen.py -q
 ```
 
-Result: `23 passed`.
+Result: `24 passed`.
 
 The docs and skill updates were checked with targeted `pre-commit` runs and
 `git diff --check` before commit.

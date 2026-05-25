@@ -19,6 +19,7 @@ import time
 
 import pytest
 
+from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.platform_info import parse_platform, to_platform
 from simpler_setup.runtime_builder import RuntimeBuilder
 
@@ -78,6 +79,149 @@ class PtoRunTiming(ctypes.Structure):
 @pytest.fixture(scope="module")
 def cuda_host_runtime_binaries():
     return RuntimeBuilder(platform="cuda").get_binaries("host_schedule", build=True)
+
+
+@pytest.mark.skipif(shutil.which("nvcc") is None, reason="nvcc is required for CUDA runtime smoke test")
+def test_cuda_host_schedule_runs_kernel_compiler_task_body_with_real_device_data(tmp_path, cuda_host_runtime_binaries):
+    task_src = tmp_path / "vector_add.pto.cu"
+    task_src.write_text(
+        """
+unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+if (i < ctx->n) {
+    ctx->out[i] = ctx->a[i] + ctx->b[i];
+}
+""".lstrip()
+    )
+
+    artifact = KernelCompiler(platform="cuda").compile_cuda_host_schedule(
+        str(task_src),
+        task_name="vector_add",
+        arch="compute_80",
+        cache_root=tmp_path / "cache",
+        context_definition="""
+struct PtoTaskContext {
+    const float *a;
+    const float *b;
+    float *out;
+    unsigned long long n;
+};
+""".strip(),
+        host_parameters=(
+            "const float *a",
+            "const float *b",
+            "float *out",
+            "unsigned long long n",
+        ),
+        host_context_initializer="a, b, out, n",
+    )
+    ptx_buf = ctypes.create_string_buffer(artifact.ptx + b"\0")
+
+    runtime = ctypes.CDLL(str(cuda_host_runtime_binaries.host_path))
+
+    runtime.create_device_context.restype = ctypes.c_void_p
+    runtime.destroy_device_context.argtypes = [ctypes.c_void_p]
+    runtime.simpler_init.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    runtime.simpler_init.restype = ctypes.c_int
+    runtime.finalize_device.argtypes = [ctypes.c_void_p]
+    runtime.finalize_device.restype = ctypes.c_int
+    runtime.device_malloc_ctx.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    runtime.device_malloc_ctx.restype = ctypes.c_void_p
+    runtime.device_free_ctx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    runtime.copy_to_device_ctx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    runtime.copy_to_device_ctx.restype = ctypes.c_int
+    runtime.copy_from_device_ctx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    runtime.copy_from_device_ctx.restype = ctypes.c_int
+    runtime.prepare_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p]
+    runtime.prepare_callable.restype = ctypes.c_int
+    runtime.run_prepared.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int32,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.POINTER(PtoRunTiming),
+    ]
+    runtime.run_prepared.restype = ctypes.c_int
+    runtime.unregister_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+    runtime.unregister_callable.restype = ctypes.c_int
+
+    ctx = runtime.create_device_context()
+    assert ctx
+    try:
+        assert runtime.simpler_init(ctx, 0, None, 0, None, 0) == 0
+
+        n = 1024
+        array_t = ctypes.c_float * n
+        host_a = array_t(*[float(i) for i in range(n)])
+        host_b = array_t(*[float(2 * i) for i in range(n)])
+        host_out = array_t()
+        nbytes = ctypes.sizeof(host_a)
+
+        dev_a = runtime.device_malloc_ctx(ctx, nbytes)
+        dev_b = runtime.device_malloc_ctx(ctx, nbytes)
+        dev_out = runtime.device_malloc_ctx(ctx, nbytes)
+        assert dev_a and dev_b and dev_out
+        try:
+            assert runtime.copy_to_device_ctx(ctx, dev_a, ctypes.byref(host_a), nbytes) == 0
+            assert runtime.copy_to_device_ctx(ctx, dev_b, ctypes.byref(host_b), nbytes) == 0
+
+            callable_manifest = CudaHostCallable(
+                version=1,
+                op=1,
+                image=ctypes.cast(ptx_buf, ctypes.c_void_p),
+                image_size=len(artifact.ptx) + 1,
+                entry_name=artifact.entry_name.encode("utf-8"),
+                grid_dim=(n + 255) // 256,
+                block_dim=256,
+                shared_mem_bytes=0,
+            )
+            args = CudaVectorAddArgs(a=dev_a, b=dev_b, out=dev_out, n=n)
+            timing = PtoRunTiming()
+
+            assert runtime.prepare_callable(ctx, 0, ctypes.byref(callable_manifest)) == 0
+            assert (
+                runtime.run_prepared(
+                    ctx,
+                    None,
+                    0,
+                    ctypes.byref(args),
+                    256,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    ctypes.byref(timing),
+                )
+                == 0
+            )
+            assert timing.host_wall_ns > 0
+            assert timing.device_wall_ns > 0
+            assert runtime.copy_from_device_ctx(ctx, ctypes.byref(host_out), dev_out, nbytes) == 0
+
+            assert list(host_out) == [float(3 * i) for i in range(n)]
+            assert runtime.unregister_callable(ctx, 0) == 0
+        finally:
+            runtime.device_free_ctx(ctx, dev_a)
+            runtime.device_free_ctx(ctx, dev_b)
+            runtime.device_free_ctx(ctx, dev_out)
+    finally:
+        runtime.finalize_device(ctx)
+        runtime.destroy_device_context(ctx)
 
 
 @pytest.mark.skipif(shutil.which("nvcc") is None, reason="nvcc is required for CUDA runtime smoke test")

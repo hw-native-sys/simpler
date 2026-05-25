@@ -36,6 +36,9 @@ class CudaTaskBody:
     name: str
     body: str
     context_type: str = "PtoTaskContext"
+    context_definition: str = ""
+    host_parameters: tuple[str, ...] = ()
+    host_context_initializer: str = ""
 
 
 @dataclass(frozen=True)
@@ -99,14 +102,33 @@ def render_cuda_task_wrappers(task_body: CudaTaskBody) -> CudaTaskWrapperSource:
     host_entry_name = f"pto_kernel_{task_body.name}"
     persistent_entry_name = f"pto_task_{task_body.name}"
     rendered_body = indent(task_body.body.strip() or "(void)ctx;", "    ")
+    context_definition = task_body.context_definition.strip()
+    preamble = f"{context_definition}\n\n" if context_definition else ""
+    if task_body.host_parameters:
+        host_parameters = ", ".join(param.strip() for param in task_body.host_parameters)
+        if not all(param.strip() for param in task_body.host_parameters):
+            raise ValueError("CUDA host wrapper parameters must be non-empty")
+        initializer = task_body.host_context_initializer.strip()
+        ctx_initializer = f"{{{initializer}}}" if initializer else "{}"
+        host_wrapper = f"""
+extern "C" __global__ void {host_entry_name}({host_parameters}) {{
+    {task_body.context_type} ctx{ctx_initializer};
+    {body_name}(&ctx);
+}}
+""".strip()
+    else:
+        host_wrapper = f"""
+extern "C" __global__ void {host_entry_name}({task_body.context_type} ctx) {{
+    {body_name}(&ctx);
+}}
+""".strip()
     source = f"""
+{preamble}
 __device__ void {body_name}({task_body.context_type} *ctx) {{
 {rendered_body}
 }}
 
-extern "C" __global__ void {host_entry_name}({task_body.context_type} ctx) {{
-    {body_name}(&ctx);
-}}
+{host_wrapper}
 
 __device__ void {persistent_entry_name}({task_body.context_type} *ctx) {{
     {body_name}(ctx);
@@ -293,8 +315,15 @@ def _task_manifest(task_functions: Sequence[CudaPersistentTaskFunction]) -> list
     return [{"func_id": task.func_id, "name": task.name} for task in task_functions]
 
 
-def _task_body_manifest(task_body: CudaTaskBody) -> dict[str, str]:
-    return {"context_type": task_body.context_type, "name": task_body.name}
+def _task_body_manifest(task_body: CudaTaskBody) -> dict[str, object]:
+    manifest: dict[str, object] = {"context_type": task_body.context_type, "name": task_body.name}
+    if task_body.context_definition:
+        manifest["context_definition_sha256"] = sha256(task_body.context_definition.encode("utf-8")).hexdigest()
+    if task_body.host_parameters:
+        manifest["host_parameters"] = list(task_body.host_parameters)
+    if task_body.host_context_initializer:
+        manifest["host_context_initializer"] = task_body.host_context_initializer
+    return manifest
 
 
 def _host_schedule_cache_key(source: str, task_body: CudaTaskBody, arch: str, entry_name: str) -> str:
