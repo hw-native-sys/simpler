@@ -41,6 +41,43 @@ PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_smoke.py
 ```
 
+## Microbenchmark Report
+
+Use `cuda_benchmark.py` for the current early-runtime comparison. It runs the
+same vector-add PTX kernel through two launch paths:
+
+- `pto_host_schedule`: the PTO CUDA host runtime C API and manifest dispatch.
+- `direct_driver`: a thin CUDA Driver API baseline in Python `ctypes`.
+
+Each sample runs in a fresh subprocess. This avoids cross-sample CUDA state
+leakage while the PTO host runtime lifecycle is still minimal.
+
+Local A100 example:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_80 \
+    --label a100-local --output-dir tmp/cuda-backend/a100
+```
+
+Remote H200 example:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+   PYTHONPATH=$PWD:$PWD/python \
+   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+     --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_90 \
+     --label h200-remote --output-dir tmp/cuda-backend/h200'
+```
+
+The script writes:
+
+- `cuda-benchmark.json`: raw samples, metadata, hardware, git commit.
+- `cuda-benchmark.md`: short report with interpretation notes.
+- `cuda-benchmark.svg`: bar chart of median device time by baseline.
+
 ## Hardware Checks
 
 Local A100:
