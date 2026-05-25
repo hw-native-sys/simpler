@@ -45,6 +45,9 @@ commit `bcf54a88`.
 - `pto_persistent_dag_reuse`: six-task generated-dispatch DAG that reuses a
   scratch buffer after the buffer's last dependent completes. It is a
   lifecycle validation row rather than a throughput row.
+- `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a
+  16x16 tiled GEMM task followed by residual, gate, and fan-in elementwise
+  tasks.
 - `*_batch`: same-work rows with six vector-add task descriptors. These rows
   compare repeated host launches with one persistent launch over the same
   descriptor count.
@@ -243,7 +246,5 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 - Extend the worker-grid sweep beyond 64 blocks per descriptor and add more
   vector lengths before treating the grid row as a tuned baseline.
-- Add a richer tensor-shaped task graph with non-vector-add work and explicit
-  memory reuse once the runtime ABI is stable enough. The first scratch-reuse
-  vector DAG is implemented; the remaining gap is tensor-shaped work beyond
-  elementwise kernels.
+- Evaluate the new tensor-tile DAG row on A100 and H200, then add the raw
+  artifact paths and headline numbers here.

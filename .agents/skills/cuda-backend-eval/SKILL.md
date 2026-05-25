@@ -96,6 +96,16 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2 --dag-shape scratch_reuse
 ```
 
+Run the tensor-tile persistent DAG smoke. This graph uses a generated-dispatch
+16x16 tiled GEMM task, then residual, gate, and fan-in elementwise tasks:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 4 --n 4096 --arch compute_80 \
+    --mode dag --queue-capacity 2 --dag-shape tensor_tile
+```
+
 The DAG smoke compiles generated CUDA source from
 `simpler_setup.cuda_callable_compiler.render_persistent_dag_source()`. The
 returned JSON includes `source_kind: generated-dispatch` when that path is in
@@ -122,6 +132,9 @@ same vector-add PTX kernel through two launch paths:
 - `pto_persistent_dag_reuse`: six-task generated-dispatch DAG with scratch
   buffer reuse after dependency completion, validating that graph lifetime
   rules can be represented by runtime descriptors.
+- `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a
+  16x16 tiled GEMM task followed by elementwise residual, gate, and fan-in
+  tasks.
 - `pto_host_schedule_batch`, `pto_persistent_device_batch`,
   `pto_persistent_device_grid_batch`, and `pto_persistent_queue_batch`:
   same-work batch rows enabled by `--batch-tasks N`. The worker-grid row is

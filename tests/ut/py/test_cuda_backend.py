@@ -458,6 +458,45 @@ assert result["scratch_reuse"] == {"reused_buffer": "tmp0", "reuse_task": 4}
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
 
+@pytest.mark.skipif(shutil.which("nvcc") is None, reason="nvcc is required for CUDA persistent DAG smoke test")
+def test_cuda_persistent_device_smoke_runs_dispatch_dag_tensor_tile():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+result = run_persistent_smoke(
+    device=0,
+    task_count=4,
+    n=4096,
+    arch="compute_80",
+    mode="dag",
+    queue_capacity=2,
+    dag_shape="tensor_tile",
+)
+assert result["status"] == "pass"
+assert result["runtime"] == "persistent_device"
+assert result["mode"] == "dag"
+assert result["dag_shape"] == "tensor_tile"
+assert result["task_count"] == 4
+assert result["queue_capacity"] == 2
+assert result["completed_count"] == 4
+assert result["dispatch_func_ids"] == [3, 1, 2, 1]
+assert result["fanin_remaining"] == [0, 0, 0, 0]
+assert result["source_kind"] == "generated-dispatch"
+assert result["tensor_tile"] == {"m": 16, "n": 16, "k": 16, "tile_count": 16}
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
 @pytest.mark.skipif(shutil.which("nvcc") is None, reason="nvcc is required for CUDA runtime concurrency test")
 def test_cuda_host_schedule_runs_independent_callables_on_multiple_streams(tmp_path, cuda_host_runtime_binaries):
     kernel_src = tmp_path / "slow_vector_add.cu"

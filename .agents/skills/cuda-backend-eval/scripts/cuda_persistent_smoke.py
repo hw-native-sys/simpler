@@ -640,6 +640,21 @@ _PERSISTENT_DAG_TASK_FUNCTIONS = [
         name="mul_f32",
         body="task->out[i] = task->a[i] * task->b[i];",
     ),
+    CudaPersistentTaskFunction(
+        func_id=3,
+        name="matmul16_f32",
+        body="""
+unsigned long long tile_base = (i / 256ULL) * 256ULL;
+unsigned long long elem = i % 256ULL;
+unsigned long long row = elem / 16ULL;
+unsigned long long col = elem % 16ULL;
+float acc = 0.0f;
+for (unsigned long long k = 0; k < 16ULL; ++k) {
+  acc += task->a[tile_base + row * 16ULL + k] * task->b[tile_base + k * 16ULL + col];
+}
+task->out[i] = acc;
+""".strip(),
+    ),
 ]
 _PERSISTENT_DAG_SOURCE = render_persistent_dag_source(_PERSISTENT_DAG_TASK_FUNCTIONS)
 
@@ -736,6 +751,20 @@ class CudaPersistentDagArgs(ctypes.Structure):
 
 def _f32(value: float) -> float:
     return ctypes.c_float(value).value
+
+
+def _matmul16_expected(host_a, host_b, n: int) -> list[float]:
+    expected: list[float] = []
+    for i in range(n):
+        tile_base = (i // 256) * 256
+        elem = i % 256
+        row = elem // 16
+        col = elem % 16
+        acc = 0.0
+        for k in range(16):
+            acc = _f32(acc + _f32(host_a[tile_base + row * 16 + k] * host_b[tile_base + k * 16 + col]))
+        expected.append(acc)
+    return expected
 
 
 @dataclass
@@ -993,6 +1022,57 @@ def _make_dag_shape(
                 ),
             ),
         )
+    if dag_shape == "tensor_tile":
+        task_count = 4
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 4
+        task_t = CudaPersistentDagTask * task_count
+        return (
+            host_fanin_t(0, 1, 1, 2),
+            dependents_t(1, 2, 3, 3),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=3,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp0,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=2,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp0,
+                    b=dev_a,
+                    out=dev_tmp1,
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=1,
+                    initial_fanin=1,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=dev_tmp0,
+                    b=dev_b,
+                    out=dev_tmp2,
+                    n=n,
+                    dependent_begin=3,
+                    dependent_count=1,
+                    initial_fanin=1,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp1,
+                    b=dev_tmp2,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=4,
+                    dependent_count=0,
+                    initial_fanin=2,
+                ),
+            ),
+        )
     raise ValueError(f"unknown dag shape: {dag_shape}")
 
 
@@ -1126,9 +1206,15 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
     ctx = config.ctx
     n = config.n
     queue_capacity = config.queue_capacity
+    if config.dag_shape == "tensor_tile" and n % 256 != 0:
+        raise ValueError("tensor_tile DAG shape requires n to be a multiple of 256")
     array_t = ctypes.c_float * n
-    host_a = array_t(*[float(i) for i in range(n)])
-    host_b = array_t(*[float(2 * i) for i in range(n)])
+    if config.dag_shape == "tensor_tile":
+        host_a = array_t(*[float((i % 5) + 1) for i in range(n)])
+        host_b = array_t(*[float((i % 3) + 1) for i in range(n)])
+    else:
+        host_a = array_t(*[float(i) for i in range(n)])
+        host_b = array_t(*[float(2 * i) for i in range(n)])
     host_tmp0 = array_t()
     host_tmp1 = array_t()
     host_tmp2 = array_t()
@@ -1262,11 +1348,16 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
         if config.dag_shape == "scratch_reuse":
             expected_tmp0 = [_f32(expected_tmp2[i] + host_a[i]) for i in range(n)]
             expected_out = [_f32(expected_tmp0[i] + expected_tmp3[i]) for i in range(n)]
+        if config.dag_shape == "tensor_tile":
+            expected_tmp0 = _matmul16_expected(host_a, host_b, n)
+            expected_tmp1 = [_f32(expected_tmp0[i] + host_a[i]) for i in range(n)]
+            expected_tmp2 = [_f32(expected_tmp0[i] * host_b[i]) for i in range(n)]
+            expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
         if list(host_tmp0) != expected_tmp0:
             raise RuntimeError("dag tmp0 mismatch")
         if list(host_tmp1) != expected_tmp1:
             raise RuntimeError("dag tmp1 mismatch")
-        if config.dag_shape in {"chain", "scratch_reuse"} and list(host_tmp2) != expected_tmp2:
+        if config.dag_shape in {"chain", "scratch_reuse", "tensor_tile"} and list(host_tmp2) != expected_tmp2:
             raise RuntimeError("dag tmp2 mismatch")
         if config.dag_shape in {"chain", "scratch_reuse"} and list(host_tmp3) != expected_tmp3:
             raise RuntimeError("dag tmp3 mismatch")
@@ -1302,6 +1393,8 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
         }
         if config.dag_shape == "scratch_reuse":
             result["scratch_reuse"] = {"reused_buffer": "tmp0", "reuse_task": 4}
+        if config.dag_shape == "tensor_tile":
+            result["tensor_tile"] = {"m": 16, "n": 16, "k": 16, "tile_count": n // 256}
         return result
     finally:
         for ptr in allocated:
@@ -1336,7 +1429,7 @@ def run_persistent_smoke(  # noqa: PLR0912
 ) -> dict:
     if mode not in {"dag", "direct", "queue"}:
         raise ValueError(f"unknown persistent mode: {mode}")
-    if dag_shape not in {"chain", "fork_join", "scratch_reuse"}:
+    if dag_shape not in {"chain", "fork_join", "scratch_reuse", "tensor_tile"}:
         raise ValueError(f"unknown dag shape: {dag_shape}")
     if worker_blocks_per_task <= 0:
         raise ValueError("worker_blocks_per_task must be positive")
@@ -1350,6 +1443,8 @@ def run_persistent_smoke(  # noqa: PLR0912
         ptx, ptx_source = _compile_persistent_ptx(Path(td), arch, mode)
     if mode == "direct" and worker_blocks_per_task > 1 and ptx_source.startswith("embedded-"):
         raise RuntimeError("worker_blocks_per_task > 1 requires nvcc-built persistent direct PTX")
+    if mode == "dag" and dag_shape == "tensor_tile" and ptx_source.startswith("embedded-"):
+        raise RuntimeError("tensor_tile DAG shape requires nvcc-built generated-dispatch PTX")
     ptx_buf = ctypes.create_string_buffer(ptx + b"\0")
 
     runtime, binaries = _load_persistent_runtime()
@@ -1492,7 +1587,11 @@ def main() -> None:
     parser.add_argument("--mode", choices=["dag", "direct", "queue"], default="direct")
     parser.add_argument("--queue-capacity", type=int, default=None)
     parser.add_argument("--worker-blocks-per-task", type=int, default=1)
-    parser.add_argument("--dag-shape", choices=["chain", "fork_join", "scratch_reuse"], default="fork_join")
+    parser.add_argument(
+        "--dag-shape",
+        choices=["chain", "fork_join", "scratch_reuse", "tensor_tile"],
+        default="fork_join",
+    )
     args = parser.parse_args()
 
     print(
