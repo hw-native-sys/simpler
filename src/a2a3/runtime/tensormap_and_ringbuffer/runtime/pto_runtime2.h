@@ -143,14 +143,14 @@ struct PTO2Runtime {
     // Statistics
     int64_t total_cycles;
 
-    // Prebuilt-arena fast path metadata. `prebuilt_arena_base` is the device
-    // address of the runtime arena (the buffer that holds *this* PTO2Runtime
-    // at offset prebuilt_layout.off_runtime). `prebuilt_layout` carries every
-    // offset wire_arena_pointers needs at AICPU boot, so the AICPU can
-    // reconstruct all arena-internal pointer fields without re-running
-    // init_data. Populated by the host's runtime_init_data_from_layout +
-    // runtime_wire_arena_pointers; read by aicpu_executor.cpp.
-    void *prebuilt_arena_base{nullptr};
+    // Prebuilt-arena fast path metadata. Carries every offset
+    // wire_arena_pointers needs at AICPU boot so the AICPU can reconstruct
+    // all arena-internal pointer fields without re-running init_data. The
+    // device base of the runtime arena travels separately on the host-side
+    // Runtime (Runtime::prebuilt_arena_base_), since the AICPU needs it
+    // *before* dereferencing this image. Populated on host by
+    // runtime_init_data_from_layout + runtime_wire_arena_pointers; read by
+    // aicpu_executor.cpp.
     PTO2RuntimeArenaLayout prebuilt_layout;
 };
 

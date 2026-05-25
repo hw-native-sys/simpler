@@ -96,10 +96,22 @@ public:
     void *commit(size_t base_align = kDefaultBaseAlign);
 
     // Phase 2 alternative: attach to an externally-owned buffer instead of
-    // allocating one. Caller guarantees `external_base` is at least the size
-    // reported by `total_size()` rounded up to `base_align`, and that the
-    // same reserve() sequence has been (or will be) replayed. Forward-aligns
-    // the visible base in the same way as commit().
+    // allocating one. Caller guarantees:
+    //   (a) `external_base` is already `base_align`-aligned — attach does
+    //       NOT forward-align, since the prebuilt image was constructed for
+    //       the address the caller advertised;
+    //   (b) the buffer is at least `total_size()` bytes (the sum of sizes
+    //       passed to reserve()), since attach uses no forward-alignment
+    //       slack of its own;
+    //   (c) all region offsets the caller plans to read back via
+    //       `region_ptr(off)` are held by the caller — attach does NOT
+    //       repopulate the internal region table, and reserve() cannot run
+    //       after attach (it asserts !committed_). `region_size()` likewise
+    //       returns 0 for attached arenas; treat the arena post-attach as
+    //       a base-pointer wrapper.
+    //
+    // Re-attach (release + attach the same or another buffer) is permitted
+    // so the AICPU boot path can rebind the same pooled image each run.
     //
     // The external buffer is NOT freed by release()/~DeviceArena(); ownership
     // stays with the caller. Used for the prebuilt-arena fast path where
@@ -112,7 +124,10 @@ public:
     void *region_ptr(size_t offset) const noexcept;
 
     // Size of the sub-region whose offset matches `offset`. Linear scan;
-    // intended for debug / assertions, not hot path.
+    // intended for debug / assertions, not hot path. Returns 0 for an
+    // attached arena (attach() does not repopulate the region table) —
+    // callers in the prebuilt-image path keep sizes alongside their offsets
+    // instead.
     size_t region_size(size_t offset) const noexcept;
 
     // Free the backing buffer (if any) and reset to the pre-commit state so
@@ -190,15 +205,22 @@ inline void DeviceArena::attach(void *external_base, size_t base_align) noexcept
         assert(attached_ && "DeviceArena::attach() called after commit (only re-attach is allowed)");
         release();
     }
-    assert(external_base != nullptr && "DeviceArena::attach() requires non-null base");
-    assert(base_align > 0 && (base_align & (base_align - 1)) == 0 && "DeviceArena: base_align must be a power of two");
     // The external buffer must already be base_align-aligned by the caller —
     // forward-align in-place would shift the visible base off the address the
     // caller advertised (and that the prebuilt image was constructed for).
+    // The checks below are promoted to unconditional aborts (rather than
+    // plain assert()) because a misaligned attach silently produces a buffer
+    // whose visible base disagrees with every offset the prebuilt image was
+    // laid out against — release builds, which strip assert(), would still
+    // run on a corrupted arena. Aborting at the breakage point is far cheaper
+    // to triage than the downstream wild-pointer accesses.
     const auto raw = reinterpret_cast<uintptr_t>(external_base);
-    (void)raw;
-    (void)base_align;
-    assert((raw & (static_cast<uintptr_t>(base_align) - 1)) == 0 && "DeviceArena::attach() base must be pre-aligned");
+    const bool ok = (external_base != nullptr) && (base_align > 0) && ((base_align & (base_align - 1)) == 0) &&
+                    ((raw & (static_cast<uintptr_t>(base_align) - 1)) == 0);
+    if (!ok) {
+        assert(false && "DeviceArena::attach(): null base, non-power-of-two align, or pre-alignment violated");
+        std::abort();
+    }
     base_ = external_base;
     raw_base_ = nullptr;
     raw_size_ = 0;

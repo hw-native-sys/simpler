@@ -58,6 +58,13 @@ struct alignas(64) PTO2RingFlowControl {
     // === Cache Line 1: Written by Scheduler, Read by Orchestrator (for back-pressure) ===
     alignas(64) std::atomic<int32_t> last_task_alive;  // Task ring tail (oldest active task)
 
+    // Per-boot SM reset. PTO2TaskAllocator::init() seeds its private
+    // local_task_id_ from initial_local_task_id (default 0 in production)
+    // *without* dereferencing current_task_index — it relies on this reset
+    // running on every AICPU boot so 0 stays in sync. If you ever change
+    // the initial fc value or the boot ordering, update the default in
+    // PTO2TaskAllocator::init (pto_ring_buffer.h) in the same change, or
+    // submit IDs will be off by the divergence.
     void init() {
         current_task_index.store(0, std::memory_order_relaxed);
         last_task_alive.store(0, std::memory_order_relaxed);
@@ -232,17 +239,20 @@ inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base, int ri
 }
 
 // Walk the per-ring SM layout (same arithmetic as setup_pointers_per_ring)
-// to compute ring `ring_id`'s task_descriptors device address. Uniform
-// per-ring task_window_size; matches the production callsite which always
-// passes a uniform window size to runtime_create_from_sm.
-inline PTO2TaskDescriptor *
-ring_task_descriptors_addr(void *sm_dev_base, uint64_t task_window_size, int ring_id) noexcept {
+// to compute ring `ring_id`'s task_descriptors device address. Accepts a
+// per-ring window-size array so the helper's signature mirrors
+// `PTO2SharedMemoryHandle::setup_pointers_per_ring` and cannot silently
+// disagree with the SM layout when (hypothetically) ring sizes diverge.
+inline PTO2TaskDescriptor *ring_task_descriptors_addr(
+    void *sm_dev_base, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int ring_id
+) noexcept {
+    assert(ring_id >= 0 && ring_id < PTO2_MAX_RING_DEPTH && "pto2_sm_layout: ring_id out of range");
     char *p = static_cast<char *>(sm_dev_base);
     p += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
     for (int r = 0; r < ring_id; r++) {
-        p += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
-        p += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
-        p += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     }
     return reinterpret_cast<PTO2TaskDescriptor *>(p);
 }

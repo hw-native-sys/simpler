@@ -129,16 +129,13 @@ bool PTO2TensorMap::init_data_from_layout(const PTO2TensorMapLayout &layout, Dev
     return true;
 }
 
-void PTO2TensorMap::wire_arena_pointers(
-    const PTO2TensorMapLayout &layout, DeviceArena &arena, PTO2OrchestratorState *parent_orch
-) {
+void PTO2TensorMap::wire_arena_pointers(const PTO2TensorMapLayout &layout, DeviceArena &arena) {
     buckets = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_buckets));
     entry_pool = static_cast<PTO2TensorMapEntry *>(arena.region_ptr(layout.off_entry_pool));
     free_entry_list = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_free_entry_list));
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_entry_heads[r] = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_task_entry_heads[r]));
     }
-    orch = parent_orch;
 }
 
 void PTO2TensorMap::destroy() {

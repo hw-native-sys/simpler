@@ -170,6 +170,10 @@ void *DeviceRunner::acquire_pooled_gm_sm() {
 
 void *DeviceRunner::acquire_pooled_runtime_arena() {
     if (!static_arena_.is_committed()) return nullptr;
+    // hbg calls setup_static_arena(...,0) and never reserves a runtime-arena
+    // region — fail loudly if a caller asks for it anyway, rather than
+    // returning region_ptr(SIZE_MAX) (base + SIZE_MAX is undefined).
+    if (runtime_arena_region_off_ == SIZE_MAX) return nullptr;
     return static_arena_.region_ptr(runtime_arena_region_off_);
 }
 

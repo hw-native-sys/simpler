@@ -583,7 +583,7 @@ struct PTO2SchedulerState {
         // by SchedulerState::wire_arena_pointers). The `ring` field stores
         // the device address of the SM ring header — computed via offset
         // arithmetic, no SM dereference.
-        bool init_data_from_layout(void *sm_dev_base, int32_t ring_id, int32_t dep_pool_capacity);
+        bool init_data_from_layout(void *sm_dev_base, int32_t ring_id);
         void destroy();
 
         void sync_to_sm() { ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release); }
@@ -1068,13 +1068,12 @@ struct PTO2SchedulerState {
 
     // Phase 3a: write everything *except* arena-internal pointer fields.
     // `sm_dev_base` is the device address of the SM (only stored, never
-    // dereferenced here); `task_window_size` lets the per-ring data-addr
-    // arithmetic resolve ring task_descriptors / fc field addresses without
-    // an SM load. Safe to call on a host arena that holds the prebuilt
-    // image buffer.
-    bool init_data_from_layout(
-        const PTO2SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base, uint64_t task_window_size
-    );
+    // dereferenced here). Safe to call on a host arena that holds the
+    // prebuilt image buffer. (The orchestrator counterpart takes
+    // task_window_size for ring task_descriptors address arithmetic; the
+    // scheduler only needs the SM header / ring header base addresses,
+    // both window-size-independent.)
+    bool init_data_from_layout(const PTO2SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base);
 
     // Phase 3b: write the arena-internal pointer fields
     // (ready_queues[].slots, dummy_ready_queue.slots, dep_pool.base for each

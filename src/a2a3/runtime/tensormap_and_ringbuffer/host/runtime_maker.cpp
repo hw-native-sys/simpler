@@ -344,11 +344,11 @@ extern "C" int bind_prepared_to_runtime_impl(
     }
     runtime_wire_arena_pointers(host_arena, layout, rt);
 
-    // Stash the prebuilt metadata inside the PTO2Runtime image so the AICPU
-    // picks them up directly via the pooled buffer after rtMemcpy. The host
-    // Runtime also carries the pointers so the AICPU can locate the
-    // PTO2Runtime before it does anything else (no chicken-and-egg).
-    rt->prebuilt_arena_base = runtime_arena_dev;
+    // Stash the layout inside the PTO2Runtime image so the AICPU can recover
+    // every arena-internal offset after rtMemcpy. The runtime arena's device
+    // base does NOT travel in this image — it's on the host Runtime
+    // (set_prebuilt_arena below), since the AICPU needs that pointer
+    // *before* it can dereference the image.
     rt->prebuilt_layout = layout;
 
     int rc_upload = runtime->host_api.copy_to_device(runtime_arena_dev, host_arena.base(), layout.arena_size);

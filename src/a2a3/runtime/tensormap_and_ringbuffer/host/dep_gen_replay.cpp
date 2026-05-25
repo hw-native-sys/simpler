@@ -492,11 +492,10 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         LOG_ERROR("dep_gen replay: tensormap.init failed (buckets=%d, pool=%d)", PTO2_TENSORMAP_NUM_BUCKETS, pool_size);
         return -3;
     }
-    // Replay tensormaps live entirely on host; both arena base and the
-    // parent-orch self-pointer use host addresses. parent_orch is unused by
-    // the lookup/insert code paths exercised below — nullptr is safe.
-    tm_oracle.wire_arena_pointers(oracle_layout, replay_arena, nullptr);
-    tm_annot.wire_arena_pointers(annot_layout, replay_arena, nullptr);
+    // Replay tensormaps live entirely on host; only arena-internal pointer
+    // fields need wiring (no parent-orch back-reference exists anymore).
+    tm_oracle.wire_arena_pointers(oracle_layout, replay_arena);
+    tm_annot.wire_arena_pointers(annot_layout, replay_arena);
 
     // JSON output accumulators.
     std::vector<TaskTableEntry> task_table;
