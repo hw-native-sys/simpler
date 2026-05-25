@@ -228,8 +228,10 @@ amortization from intra-task grid parallelism by giving each descriptor
 multiple worker blocks. In the current vector-add slice, the
 `32,64,128,256` extended sweep at `3eeb399a` showed `256` worker blocks per
 descriptor as the best large-vector point on both A100 and H200. Treat that
-as evidence for the current microbenchmark, not a tuned default; sweep more
-vector lengths and task counts before setting a policy.
+as evidence for the current microbenchmark, not a tuned default. The
+`7194bfc9` task-count sweep adds `--batch-tasks 2,6,12` with
+`--worker-blocks-per-task 128,256`; use that report to reason about
+descriptor-count scaling before setting a policy.
 
 The default benchmark includes `direct_driver_graph`. Use it to compare
 `host_schedule` launch overhead against CUDA Graph replay for the same
