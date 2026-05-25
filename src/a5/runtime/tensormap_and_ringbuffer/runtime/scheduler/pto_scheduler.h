@@ -69,8 +69,8 @@ struct PTO2ReadyQueueSlot {
  * the start of each iteration (verified by always_assert).
  *
  * Phase 1 fills per-CoreType buffers via on_task_complete().
- * dispatch_ready_tasks_to_idle_cores drains them: local-first via
- * get_ready_task_batch, then remaining tasks pushed to global readyQ.
+ * The dispatch stage drains them local-first via get_ready_tasks_batch,
+ * with any remaining tasks pushed to the global ready queue.
  */
 // Number of CoreType values eligible for local dispatch (AIC=0, AIV=1)
 static constexpr int PTO2_LOCAL_DISPATCH_TYPE_NUM = 2;

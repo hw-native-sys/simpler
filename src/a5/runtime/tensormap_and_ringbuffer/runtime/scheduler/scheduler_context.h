@@ -220,7 +220,6 @@ private:
         }
         return "?";
     }
-    static const PTO2ResourceShape *get_dispatch_order(int32_t thread_idx);
 
     int pop_ready_tasks_batch(
         PTO2ResourceShape shape, int32_t thread_idx, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out,
@@ -252,6 +251,41 @@ private:
         PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress,
         bool &try_pushed
     );
+
+    // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
+    // for MIX then (if no mix residual) AIC/AIV; mid-flush of local buffers; then
+    // PENDING-stage dispatch with cross-thread idle gating. MIX is strictly
+    // prioritized — when mix residual is detected after MIX-IDLE, AIC/AIV are
+    // skipped for the whole pass but MIX-PENDING still runs.
+    //
+    // Forward-progress argument for AIC/AIV: skip_aic_aiv is sticky for the
+    // current pass only. The next loop iteration re-evaluates after Phase 1
+    // completion polling and the global MIX queue draining (here or on any
+    // peer thread). AIC/AIV starvation is therefore bounded by MIX throughput,
+    // not unbounded — once mix completes on at least one cluster, the next
+    // pass either drains the residual or admits AIC/AIV.
+    void dispatch_ready_tasks(
+        Runtime *runtime, int32_t thread_idx, CoreTracker &tracker,
+        PTO2LocalReadyBuffer (&local_bufs)[PTO2_NUM_RESOURCE_SHAPES], bool pmu_active, bool &made_progress,
+        bool &try_pushed
+    );
+
+    // Returns true if any *other* scheduler thread currently has an idle core
+    // matching `shape`. Used as a scheduling hint on the PENDING dispatch path
+    // — see the implementation in scheduler_dispatch.cpp for the hint-semantics
+    // rationale and the safety argument against the drain worker.
+    bool has_idle_in_other_threads(int32_t self_thread_idx, PTO2ResourceShape shape) const;
+
+    // True if mix tasks remain anywhere this thread could see them: the caller's
+    // MIX local LIFO stack or the global MIX ready queue. Approximate —
+    // PTO2ReadyQueue::size() (see pto_scheduler.h) snapshots its enqueue/dequeue
+    // positions with std::memory_order_relaxed and may interleave with concurrent
+    // push/pop. Don't confuse with PTO2SpscQueue::size(), which uses acquire
+    // loads — that one isn't on this path. A stale read here causes at most one
+    // extra/missed AIC/AIV skip and self-corrects on the next loop iteration.
+    bool has_residual_mix(const PTO2LocalReadyBuffer &mix_local_buf) const {
+        return mix_local_buf.count > 0 || sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
+    }
 
     // =========================================================================
     // Completion & drain (scheduler_completion.cpp)
