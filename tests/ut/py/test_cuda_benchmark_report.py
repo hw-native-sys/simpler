@@ -141,6 +141,51 @@ def test_summarize_results_separates_worker_blocks_per_task():
     assert "| a100-local | pto_persistent_device_grid_batch | 1024 | 6 | 4 | 1 | 3000 | 3000 | - |" in report
 
 
+def test_render_report_highlights_best_worker_grid_rows():
+    cuda_benchmark = _load_benchmark_module()
+    payload = {
+        "metadata": {
+            "label": "grid-best-unit",
+            "git_commit": "abc123",
+            "paper_setup": "microbenchmarks only",
+        },
+        "results": [
+            {
+                "machine": "a100-local",
+                "baseline": "pto_host_schedule_batch",
+                "n": 1048576,
+                "task_count": 6,
+                "device_wall_ns": 100000,
+            },
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_device_grid_batch",
+                "n": 1048576,
+                "task_count": 6,
+                "worker_blocks_per_task": 4,
+                "device_wall_ns": 450000,
+            },
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_device_grid_batch",
+                "n": 1048576,
+                "task_count": 6,
+                "worker_blocks_per_task": 16,
+                "device_wall_ns": 150000,
+            },
+        ],
+    }
+
+    report = cuda_benchmark.render_markdown_report(payload)
+
+    assert "## Best Worker Grid Rows" in report
+    expected_header = (
+        "| Machine | N | Tasks | Best worker blocks/task | Median device ns | Device vs matched host_schedule |"
+    )
+    assert expected_header in report
+    assert "| a100-local | 1048576 | 6 | 16 | 150000 | 1.50x |" in report
+
+
 def test_render_report_contains_table_and_svg():
     cuda_benchmark = _load_benchmark_module()
     payload = {

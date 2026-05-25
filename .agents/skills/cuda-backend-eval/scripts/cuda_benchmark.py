@@ -861,6 +861,18 @@ def _ratio_text(value: int, reference: int | None) -> str:
     return f"{value / reference:.2f}x"
 
 
+def _best_worker_grid_rows(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) -> list[dict[str, Any]]:
+    best: dict[tuple[str, int, int], dict[str, Any]] = {}
+    for row in summary.values():
+        if row["baseline"] != "pto_persistent_device_grid_batch":
+            continue
+        key = (row["machine"], row["n"], row["task_count"])
+        current = best.get(key)
+        if current is None or row["median_device_wall_ns"] < current["median_device_wall_ns"]:
+            best[key] = row
+    return sorted(best.values(), key=lambda row: (row["machine"], row["n"], row["task_count"]))
+
+
 def _ptx_source_rows(payload: dict[str, Any]) -> list[tuple[str, str, str]]:
     sources: set[tuple[str, str, str]] = set()
     for row in payload.get("results", []):
@@ -986,6 +998,26 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             f"{row['median_device_wall_ns']} | {row['median_host_wall_ns']} | "
             f"{_ratio_text(row['median_device_wall_ns'], reference)} |"
         )
+    best_grid_rows = _best_worker_grid_rows(summary)
+    if best_grid_rows:
+        lines.extend(
+            [
+                "",
+                "## Best Worker Grid Rows",
+                "",
+                "| Machine | N | Tasks | Best worker blocks/task | Median device ns | "
+                "Device vs matched host_schedule |",
+                "| ------- | - | ----- | ----------------------- | ---------------- | "
+                "------------------------------- |",
+            ]
+        )
+        for row in best_grid_rows:
+            reference = host_schedule_refs.get((row["machine"], row["n"], row["task_count"]))
+            lines.append(
+                f"| {row['machine']} | {row['n']} | {row['task_count']} | "
+                f"{row['worker_blocks_per_task']} | {row['median_device_wall_ns']} | "
+                f"{_ratio_text(row['median_device_wall_ns'], reference)} |"
+            )
     ptx_source_rows = _ptx_source_rows(payload)
     if ptx_source_rows:
         lines.extend(
