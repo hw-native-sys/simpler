@@ -943,6 +943,32 @@ def test_run_single_sample_dispatches_compiler_host_schedule(monkeypatch):
     assert result["baseline"] == "pto_host_schedule_compiler"
 
 
+def test_compile_compiler_host_schedule_artifact_uses_discovered_nvcc(tmp_path, monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = {}
+
+    class FakeKernelCompiler:
+        def __init__(self, platform):
+            seen["platform"] = platform
+
+        def compile_cuda_host_schedule(self, source_path, **kwargs):
+            seen["source_path"] = source_path
+            seen.update(kwargs)
+            return "artifact"
+
+    monkeypatch.setattr(cuda_benchmark, "_find_nvcc", lambda: "/usr/local/cuda/bin/nvcc")
+    monkeypatch.setattr(cuda_benchmark, "KernelCompiler", FakeKernelCompiler)
+
+    artifact = cuda_benchmark._compile_compiler_host_schedule_artifact(tmp_path, "compute_90")
+
+    assert artifact == "artifact"
+    assert seen["platform"] == "cuda"
+    assert seen["arch"] == "compute_90"
+    assert seen["nvcc"] == "/usr/local/cuda/bin/nvcc"
+    assert seen["task_name"] == "vector_add"
+    assert Path(seen["source_path"]).name == "vector_add.pto.cu"
+
+
 def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
     cuda_benchmark = _load_benchmark_module()
     seen = []

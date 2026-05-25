@@ -409,24 +409,26 @@ def run_pto_sample(device: int, n: int, block_dim: int, arch: str) -> dict[str, 
     return result
 
 
-def run_pto_compiler_sample(device: int, n: int, block_dim: int, arch: str) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="pto_cuda_compiler_") as td:
-        work_dir = Path(td)
-        task_src = work_dir / "vector_add.pto.cu"
-        task_src.write_text(
-            """
+def _compile_compiler_host_schedule_artifact(work_dir: Path, arch: str):
+    task_src = work_dir / "vector_add.pto.cu"
+    task_src.write_text(
+        """
 unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
 if (i < ctx->n) {
     ctx->out[i] = ctx->a[i] + ctx->b[i];
 }
 """.lstrip()
-        )
-        artifact = KernelCompiler(platform="cuda").compile_cuda_host_schedule(
-            str(task_src),
-            task_name="vector_add",
-            arch=arch,
-            cache_root=work_dir / "cache",
-            context_definition="""
+    )
+    nvcc = _find_nvcc()
+    if nvcc is None:
+        raise RuntimeError("nvcc is required for pto_host_schedule_compiler")
+    return KernelCompiler(platform="cuda").compile_cuda_host_schedule(
+        str(task_src),
+        task_name="vector_add",
+        arch=arch,
+        cache_root=work_dir / "cache",
+        nvcc=nvcc,
+        context_definition="""
 struct PtoTaskContext {
     const float *a;
     const float *b;
@@ -434,14 +436,20 @@ struct PtoTaskContext {
     unsigned long long n;
 };
 """.strip(),
-            host_parameters=(
-                "const float *a",
-                "const float *b",
-                "float *out",
-                "unsigned long long n",
-            ),
-            host_context_initializer="a, b, out, n",
-        )
+        host_parameters=(
+            "const float *a",
+            "const float *b",
+            "float *out",
+            "unsigned long long n",
+        ),
+        host_context_initializer="a, b, out, n",
+    )
+
+
+def run_pto_compiler_sample(device: int, n: int, block_dim: int, arch: str) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="pto_cuda_compiler_") as td:
+        work_dir = Path(td)
+        artifact = _compile_compiler_host_schedule_artifact(work_dir, arch)
         ptx_buf = ctypes.create_string_buffer(artifact.ptx + b"\0")
 
         runtime, binaries = _load_runtime(True)
