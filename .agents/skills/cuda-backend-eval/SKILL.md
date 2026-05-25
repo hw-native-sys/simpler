@@ -75,6 +75,16 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2
 ```
 
+Run the five-task persistent DAG-chain smoke, which reuses the same generated
+dispatch PTX but passes a different runtime task graph:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 5 --n 1024 --arch compute_80 \
+    --mode dag --queue-capacity 2 --dag-shape chain
+```
+
 The DAG smoke compiles generated CUDA source from
 `simpler_setup.cuda_callable_compiler.render_persistent_dag_source()`. The
 returned JSON includes `source_kind: generated-dispatch` when that path is in
@@ -95,6 +105,9 @@ same vector-add PTX kernel through two launch paths:
   bounded device ring queue consumed by worker blocks inside the same launch.
 - `pto_persistent_dag`: generated-dispatch-like task selection and fan-in
   counters that release dependent tasks onto the bounded ring.
+- `pto_persistent_dag_chain`: five-task generated-dispatch DAG with a
+  post-fan-in dependency chain, using the same compiled device binary as the
+  smaller DAG and only changing runtime graph descriptors.
 - `pto_host_schedule_batch`, `pto_persistent_device_batch`,
   `pto_persistent_device_grid_batch`, and `pto_persistent_queue_batch`:
   same-work batch rows enabled by `--batch-tasks N`. The worker-grid row is

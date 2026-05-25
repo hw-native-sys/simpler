@@ -433,8 +433,17 @@ def run_persistent_sample(
     task_count: int | None = None,
     baseline: str | None = None,
     worker_blocks_per_task: int = 1,
+    dag_shape: str = "fork_join",
 ) -> dict[str, Any]:
-    task_count = task_count if task_count is not None else 3 if mode == "dag" else 6 if mode == "queue" else 2
+    if task_count is None:
+        if dag_shape == "chain":
+            task_count = 5
+        elif mode == "dag":
+            task_count = 3
+        elif mode == "queue":
+            task_count = 6
+        else:
+            task_count = 2
     queue_capacity = 2 if mode in {"dag", "queue"} else None
     result = run_persistent_smoke(
         device=device,
@@ -444,6 +453,7 @@ def run_persistent_sample(
         mode=mode,
         queue_capacity=queue_capacity,
         worker_blocks_per_task=worker_blocks_per_task,
+        dag_shape=dag_shape,
     )
     result["baseline"] = (
         baseline
@@ -482,6 +492,15 @@ def run_single_sample(
         return run_persistent_sample(device=device, n=n, arch=arch, mode="queue")
     if baseline == "pto_persistent_dag":
         return run_persistent_sample(device=device, n=n, arch=arch, mode="dag")
+    if baseline == "pto_persistent_dag_chain":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="chain",
+        )
     if baseline == "pto_persistent_device_batch":
         return run_persistent_sample(
             device=device,
@@ -575,7 +594,12 @@ def run_benchmark(
             results.append(direct)
 
             if include_persistent:
-                for baseline in ("pto_persistent_device", "pto_persistent_queue", "pto_persistent_dag"):
+                for baseline in (
+                    "pto_persistent_device",
+                    "pto_persistent_queue",
+                    "pto_persistent_dag",
+                    "pto_persistent_dag_chain",
+                ):
                     persistent = run_single_sample(
                         baseline=baseline,
                         device=device,
@@ -941,6 +965,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         "pto_host_schedule_batch": "#1f4e89",
         "direct_driver": "#2a9d65",
         "pto_persistent_dag": "#d62728",
+        "pto_persistent_dag_chain": "#8c1d1d",
         "pto_persistent_device": "#9467bd",
         "pto_persistent_device_batch": "#7b52ab",
         "pto_persistent_device_grid_batch": "#5f3b9d",
@@ -1078,6 +1103,9 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "- `pto_persistent_dag` measures generated-dispatch-like task",
             "  selection plus fan-in counters that release a dependent task",
             "  onto the same bounded ring queue.",
+            "- `pto_persistent_dag_chain` extends the DAG smoke to five tasks",
+            "  with a post-fan-in chain, reusing the same generated-dispatch",
+            "  compiled binary but changing the runtime task graph.",
             "- `pto_stream_serial` measures two independent PTO launches issued",
             "  sequentially on the host-schedule stream pool.",
             "- `pto_stream_parallel` measures two independent PTO launches issued",
@@ -1127,6 +1155,7 @@ def main() -> None:
             "pto_persistent_device",
             "pto_persistent_queue",
             "pto_persistent_dag",
+            "pto_persistent_dag_chain",
             "pto_host_schedule_batch",
             "pto_persistent_device_batch",
             "pto_persistent_device_grid_batch",

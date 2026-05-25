@@ -766,6 +766,7 @@ class DagSmokeConfig:
     ptx_buf: Any
     ptx_source: str
     start: float
+    dag_shape: str
 
 
 def _compile_persistent_ptx(work_dir: Path, arch: str, mode: str) -> tuple[bytes, str]:
@@ -806,6 +807,122 @@ def _compile_persistent_ptx(work_dir: Path, arch: str, mode: str) -> tuple[bytes
     )
     source_kind = "generated-dispatch" if mode == "dag" else mode
     return ptx_path.read_bytes(), f"nvcc-persistent-{source_kind}-{arch}"
+
+
+def _make_dag_shape(
+    dag_shape: str,
+    n: int,
+    dev_a: int,
+    dev_b: int,
+    dev_tmp0: int,
+    dev_tmp1: int,
+    dev_tmp2: int,
+    dev_tmp3: int,
+    dev_out: int,
+) -> tuple[Any, Any, Any]:
+    if dag_shape == "fork_join":
+        task_count = 3
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 2
+        task_t = CudaPersistentDagTask * task_count
+        return (
+            host_fanin_t(0, 0, 2),
+            dependents_t(2, 2),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp0,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp1,
+                    n=n,
+                    dependent_begin=1,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp0,
+                    b=dev_tmp1,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=0,
+                    initial_fanin=2,
+                ),
+            ),
+        )
+    if dag_shape == "chain":
+        task_count = 5
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 4
+        task_t = CudaPersistentDagTask * task_count
+        return (
+            host_fanin_t(0, 0, 2, 1, 1),
+            dependents_t(2, 2, 3, 4),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp0,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp1,
+                    n=n,
+                    dependent_begin=1,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp0,
+                    b=dev_tmp1,
+                    out=dev_tmp2,
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=1,
+                    initial_fanin=2,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=dev_tmp2,
+                    b=dev_b,
+                    out=dev_tmp3,
+                    n=n,
+                    dependent_begin=3,
+                    dependent_count=1,
+                    initial_fanin=1,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp2,
+                    b=dev_tmp3,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=4,
+                    dependent_count=0,
+                    initial_fanin=1,
+                ),
+            ),
+        )
+    raise ValueError(f"unknown dag shape: {dag_shape}")
 
 
 @functools.lru_cache(maxsize=1)
@@ -936,7 +1053,6 @@ def _make_launch(
 def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
     runtime = config.runtime
     ctx = config.ctx
-    task_count = 3
     n = config.n
     queue_capacity = config.queue_capacity
     array_t = ctypes.c_float * n
@@ -944,6 +1060,8 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
     host_b = array_t(*[float(2 * i) for i in range(n)])
     host_tmp0 = array_t()
     host_tmp1 = array_t()
+    host_tmp2 = array_t()
+    host_tmp3 = array_t()
     host_out = array_t()
     nbytes = ctypes.sizeof(host_a)
 
@@ -951,27 +1069,25 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
     dev_b = runtime.device_malloc_ctx(ctx, nbytes)
     dev_tmp0 = runtime.device_malloc_ctx(ctx, nbytes)
     dev_tmp1 = runtime.device_malloc_ctx(ctx, nbytes)
+    dev_tmp2 = runtime.device_malloc_ctx(ctx, nbytes)
+    dev_tmp3 = runtime.device_malloc_ctx(ctx, nbytes)
     dev_out = runtime.device_malloc_ctx(ctx, nbytes)
     host_counters_t = ctypes.c_uint32 * 3
     host_counters = host_counters_t(0, 0, 0)
     host_flags_t = ctypes.c_uint32 * queue_capacity
     host_flags = host_flags_t(*([0] * queue_capacity))
-    host_fanin_t = ctypes.c_uint32 * task_count
-    host_fanin = host_fanin_t(0, 0, 2)
-    dependents_t = ctypes.c_uint32 * 2
-    dependents = dependents_t(2, 2)
-    task_t = CudaPersistentDagTask * task_count
-    tasks = task_t(
-        CudaPersistentDagTask(
-            func_id=1, a=dev_a, b=dev_b, out=dev_tmp0, n=n, dependent_begin=0, dependent_count=1, initial_fanin=0
-        ),
-        CudaPersistentDagTask(
-            func_id=2, a=dev_a, b=dev_b, out=dev_tmp1, n=n, dependent_begin=1, dependent_count=1, initial_fanin=0
-        ),
-        CudaPersistentDagTask(
-            func_id=1, a=dev_tmp0, b=dev_tmp1, out=dev_out, n=n, dependent_begin=2, dependent_count=0, initial_fanin=2
-        ),
+    host_fanin, dependents, tasks = _make_dag_shape(
+        config.dag_shape,
+        n,
+        dev_a,
+        dev_b,
+        dev_tmp0,
+        dev_tmp1,
+        dev_tmp2,
+        dev_tmp3,
+        dev_out,
     )
+    task_count = len(tasks)
 
     dev_tasks = runtime.device_malloc_ctx(ctx, ctypes.sizeof(tasks))
     dev_dependents = runtime.device_malloc_ctx(ctx, ctypes.sizeof(dependents))
@@ -985,6 +1101,8 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
         dev_b,
         dev_tmp0,
         dev_tmp1,
+        dev_tmp2,
+        dev_tmp3,
         dev_out,
         dev_tasks,
         dev_dependents,
@@ -1049,6 +1167,10 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
             raise RuntimeError("copy_from_device dag tmp0 failed")
         if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp1), dev_tmp1, nbytes) != 0:
             raise RuntimeError("copy_from_device dag tmp1 failed")
+        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp2), dev_tmp2, nbytes) != 0:
+            raise RuntimeError("copy_from_device dag tmp2 failed")
+        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp3), dev_tmp3, nbytes) != 0:
+            raise RuntimeError("copy_from_device dag tmp3 failed")
         if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_out), dev_out, nbytes) != 0:
             raise RuntimeError("copy_from_device dag out failed")
         if (
@@ -1061,11 +1183,21 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
 
         expected_tmp0 = [_f32(host_a[i] + host_b[i]) for i in range(n)]
         expected_tmp1 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
-        expected_out = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
+        expected_tmp2 = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
+        expected_tmp3 = [_f32(expected_tmp2[i] * host_b[i]) for i in range(n)]
+        expected_out = (
+            expected_tmp2
+            if config.dag_shape == "fork_join"
+            else [_f32(expected_tmp2[i] + expected_tmp3[i]) for i in range(n)]
+        )
         if list(host_tmp0) != expected_tmp0:
             raise RuntimeError("dag tmp0 mismatch")
         if list(host_tmp1) != expected_tmp1:
             raise RuntimeError("dag tmp1 mismatch")
+        if config.dag_shape == "chain" and list(host_tmp2) != expected_tmp2:
+            raise RuntimeError("dag tmp2 mismatch")
+        if config.dag_shape == "chain" and list(host_tmp3) != expected_tmp3:
+            raise RuntimeError("dag tmp3 mismatch")
         if list(host_out) != expected_out:
             raise RuntimeError("dag output mismatch")
         completed_count = int(host_counters[2])
@@ -1078,6 +1210,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
             "status": "pass",
             "runtime": "persistent_device",
             "mode": "dag",
+            "dag_shape": config.dag_shape,
             "device": config.device,
             "task_count": task_count,
             "n": n,
@@ -1124,9 +1257,12 @@ def run_persistent_smoke(  # noqa: PLR0912
     mode: str = "direct",
     queue_capacity: int | None = None,
     worker_blocks_per_task: int = 1,
+    dag_shape: str = "fork_join",
 ) -> dict:
     if mode not in {"dag", "direct", "queue"}:
         raise ValueError(f"unknown persistent mode: {mode}")
+    if dag_shape not in {"chain", "fork_join"}:
+        raise ValueError(f"unknown dag shape: {dag_shape}")
     if worker_blocks_per_task <= 0:
         raise ValueError("worker_blocks_per_task must be positive")
     if mode != "direct" and worker_blocks_per_task != 1:
@@ -1164,6 +1300,7 @@ def run_persistent_smoke(  # noqa: PLR0912
                     ptx_buf=ptx_buf,
                     ptx_source=ptx_source,
                     start=start,
+                    dag_shape=dag_shape,
                 )
             )
 
@@ -1280,6 +1417,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=["dag", "direct", "queue"], default="direct")
     parser.add_argument("--queue-capacity", type=int, default=None)
     parser.add_argument("--worker-blocks-per-task", type=int, default=1)
+    parser.add_argument("--dag-shape", choices=["chain", "fork_join"], default="fork_join")
     args = parser.parse_args()
 
     print(
@@ -1292,6 +1430,7 @@ def main() -> None:
                 args.mode,
                 args.queue_capacity,
                 args.worker_blocks_per_task,
+                args.dag_shape,
             ),
             indent=2,
             sort_keys=True,

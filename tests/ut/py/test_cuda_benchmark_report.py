@@ -314,6 +314,35 @@ def test_render_report_describes_worker_grid_batch_rows():
     assert "pto_persistent_device_grid_batch" in svg
 
 
+def test_render_report_describes_dag_chain_rows():
+    cuda_benchmark = _load_benchmark_module()
+    payload = {
+        "metadata": {
+            "label": "dag-chain-unit",
+            "git_commit": "abc123",
+            "paper_setup": "microbenchmarks only",
+        },
+        "results": [
+            {"machine": "a100-local", "baseline": "pto_host_schedule", "n": 1024, "device_wall_ns": 1000},
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_dag_chain",
+                "n": 1024,
+                "task_count": 5,
+                "dag_shape": "chain",
+                "device_wall_ns": 3000,
+            },
+        ],
+    }
+
+    report = cuda_benchmark.render_markdown_report(payload)
+    svg = cuda_benchmark.render_svg(cuda_benchmark.summarize_results(payload))
+
+    assert "| a100-local | pto_persistent_dag_chain | 1024 | 5 | 1 | 1 | 3000 | 3000 | - |" in report
+    assert "`pto_persistent_dag_chain` extends the DAG smoke to five tasks" in report
+    assert "pto_persistent_dag_chain" in svg
+
+
 def test_render_report_summarizes_ptx_sources_by_machine_and_baseline():
     cuda_benchmark = _load_benchmark_module()
     payload = {
@@ -452,8 +481,9 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_persistent_device",
         "pto_persistent_queue",
         "pto_persistent_dag",
+        "pto_persistent_dag_chain",
     ]
-    assert len(payload["results"]) == 5
+    assert len(payload["results"]) == 6
 
 
 def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
@@ -495,12 +525,13 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_device", 1),
         ("pto_persistent_queue", 1),
         ("pto_persistent_dag", 1),
+        ("pto_persistent_dag_chain", 1),
         ("pto_host_schedule_batch", 6),
         ("pto_persistent_device_batch", 6),
         ("pto_persistent_queue_batch", 6),
     ]
     assert payload["metadata"]["batch_tasks"] == 6
-    assert len(payload["results"]) == 8
+    assert len(payload["results"]) == 9
 
 
 def test_run_benchmark_can_include_worker_grid_batch_mode(monkeypatch):

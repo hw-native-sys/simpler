@@ -29,6 +29,9 @@ concurrency data was captured from commit `37bebf44`.
 - `pto_persistent_queue`: scheduler block plus bounded device ring queue.
 - `pto_persistent_dag`: generated-dispatch-like task selection with fan-in
   counters.
+- `pto_persistent_dag_chain`: five-task generated-dispatch DAG with a
+  post-fan-in dependency chain. It reuses the same compiled device binary as
+  `pto_persistent_dag`; the difference is only the runtime graph descriptors.
 - `*_batch`: same-work rows with six vector-add task descriptors. These rows
   compare repeated host launches with one persistent launch over the same
   descriptor count.
@@ -142,5 +145,5 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 - Extend the worker-grid sweep beyond 64 blocks per descriptor and add more
   vector lengths before treating the grid row as a tuned baseline.
-- Add a higher-level task graph workload beyond vector add once the runtime
-  ABI is stable enough.
+- Evaluate the new five-task DAG-chain row on A100 and H200, then add the raw
+  artifact paths and headline numbers here.
