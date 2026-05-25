@@ -8,6 +8,11 @@ baselines, local A100 runs, and remote H200 runs.
 
 The latest captured raw reports are under `tmp/`:
 
+- `tmp/cuda-backend/a100-gridext-3eeb399a/cuda-benchmark.md`
+- `tmp/cuda-backend/h200-gridext-3eeb399a/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-gridext-3eeb399a/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-gridext-3eeb399a/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-gridext-3eeb399a/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/a100-wide-e430bc1b/cuda-benchmark.md`
 - `tmp/cuda-backend/h200-wide-e430bc1b/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-wide-e430bc1b/cuda-benchmark.md`
@@ -37,7 +42,8 @@ The latest captured raw reports are under `tmp/`:
 - `tmp/cuda-backend/combined-graph-ba2cdd0e/cuda-benchmark.svg`
 - `tmp/cuda-backend/combined-graph-ba2cdd0e/cuda-benchmark-ratios.svg`
 
-The worker-grid data was captured from commit `e430bc1b`. The stream
+The extended worker-grid data was captured from commit `3eeb399a`. The
+earlier worker-grid data was captured from commit `e430bc1b`. The stream
 concurrency data was captured from commit `37bebf44`. The DAG-chain data was
 captured from commit `323f4587`. The scratch-reuse DAG data was captured from
 commit `bcf54a88`. The tensor-tile DAG data was captured from commit
@@ -87,21 +93,23 @@ count.
 
 | GPU | N | `pto_host_schedule_batch` ns | `persistent_device_batch` | Best grid blocks/task | Best grid ratio | `persistent_queue_batch` |
 | --- | - | ---------------------------- | ------------------------- | --------------------- | --------------- | ------------------------ |
-| A100 | 1024 | 90112 | 0.50x | 16 | 0.49x | 0.62x |
-| H200 | 1024 | 70144 | 0.50x | 64 | 0.53x | 0.58x |
-| A100 | 65536 | 56928 | 1.64x | 32 | 0.52x | 1.74x |
-| H200 | 65536 | 66464 | 1.22x | 64 | 0.32x | 1.27x |
-| A100 | 1048576 | 74176 | 16.99x | 64 | 0.68x | 16.90x |
-| H200 | 1048576 | 62590 | 19.50x | 64 | 0.57x | 19.58x |
+| A100 | 1024 | 73728 | 0.61x | 256 | 0.58x | 0.82x |
+| H200 | 1024 | 66879 | 0.42x | 256 | 0.55x | 0.60x |
+| A100 | 65536 | 67968 | 1.34x | 128 | 0.47x | 1.42x |
+| H200 | 65536 | 61952 | 1.33x | 32 | 0.37x | 1.40x |
+| A100 | 1048576 | 76768 | 16.46x | 256 | 0.53x | 16.06x |
+| H200 | 1048576 | 67327 | 18.13x | 256 | 0.42x | 18.15x |
 
 The small-vector rows show launch-amortization benefit from the persistent
 paths. The large-vector rows show why the worker-grid variant matters: in the
-`8,16,32,64` sweep, the best large-vector row uses 64 worker blocks per
-descriptor on both GPUs. That reduces the A100 direct persistent batch row
-from `16.99x` to `0.68x` versus the matched host-schedule batch row, and
-reduces the H200 row from `19.50x` to `0.57x`. The middle `N=65536` rows show
-the same shape: plain persistent batch and queue batch are slower than
-host-schedule batch, while the best worker-grid row is faster.
+`32,64,128,256` extended sweep, the best large-vector row uses 256 worker
+blocks per descriptor on both GPUs. That reduces the A100 direct persistent
+batch row from `16.46x` to `0.53x` versus the matched host-schedule batch
+row, and reduces the H200 row from `18.13x` to `0.42x`. The middle `N=65536`
+rows show the same shape: plain persistent batch and queue batch are slower
+than host-schedule batch, while the best worker-grid row is faster. The
+middle-size optimum is not monotonic: A100 ties at 128/256 blocks, while H200
+is best at 32 blocks in this capture.
 
 ## PTX Sources
 
@@ -313,6 +321,36 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
      --output-dir tmp/cuda-backend/h200-tensor-8950e029'
 ```
 
+Extended worker-grid capture:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --device 0 --sizes 1024,65536,1048576 --repeats 3 \
+    --arch compute_80 --include-persistent --batch-tasks 6 \
+    --worker-blocks-per-task 32,64,128,256 \
+    --label a100-gridext-3eeb399a \
+    --output-dir tmp/cuda-backend/a100-gridext-3eeb399a
+
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+   PYTHONPATH=$PWD:$PWD/python \
+   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+     --device 0 --sizes 1024,65536,1048576 --repeats 3 \
+     --arch compute_90 --include-persistent --batch-tasks 6 \
+     --worker-blocks-per-task 32,64,128,256 \
+     --label h200-gridext-3eeb399a \
+     --output-dir tmp/cuda-backend/h200-gridext-3eeb399a'
+
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --merge-json \
+    tmp/cuda-backend/a100-gridext-3eeb399a/cuda-benchmark.json \
+    tmp/cuda-backend/h200-gridext-3eeb399a/cuda-benchmark.json \
+    --label cuda-gridext-a100-h200-3eeb399a \
+    --output-dir tmp/cuda-backend/combined-gridext-3eeb399a
+```
+
 Stream concurrency:
 
 ```bash
@@ -333,8 +371,8 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 ## Next Evaluation Gaps
 
-- Extend the worker-grid sweep beyond 64 blocks per descriptor and add more
-  vector lengths before treating the grid row as a tuned baseline.
+- Sweep additional vector lengths and task counts before treating the grid row
+  as a tuned baseline.
 - Replace the fixed 16x16 scalar GEMM body with a CUDA implementation closer
   to the intended tensor-core/tiling backend once the runtime ABI can carry
   richer tensor metadata.

@@ -142,7 +142,8 @@ same vector-add PTX kernel through two launch paths:
   same-work batch rows enabled by `--batch-tasks N`. The worker-grid row is
   enabled with `--worker-blocks-per-task M` and assigns multiple CUDA worker
   blocks to each task descriptor. Pass a comma-separated list, such as
-  `--worker-blocks-per-task 8,16,32,64`, to sweep grid shapes in one report.
+  `--worker-blocks-per-task 32,64,128,256`, to sweep grid shapes in one
+  report.
 
 The smoke helper caches the built and loaded host runtime per process, so the
 benchmark can run repeated PTO and baseline samples without rebuilding a shared
@@ -153,8 +154,9 @@ Local A100 example:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
-    --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_80 \
-    --include-persistent --batch-tasks 6 --worker-blocks-per-task 8,16,32,64 \
+    --device 0 --sizes 1024,65536,1048576 --repeats 3 --arch compute_80 \
+    --include-persistent --batch-tasks 6 \
+    --worker-blocks-per-task 32,64,128,256 \
     --label a100-local --output-dir tmp/cuda-backend/a100
 ```
 
@@ -165,8 +167,9 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
   'cd /data/shibizhao/pto-cu && git pull --ff-only && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
-     --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_90 \
-     --include-persistent --batch-tasks 6 --worker-blocks-per-task 8,16,32,64 \
+     --device 0 --sizes 1024,65536,1048576 --repeats 3 --arch compute_90 \
+     --include-persistent --batch-tasks 6 \
+     --worker-blocks-per-task 32,64,128,256 \
      --label h200-remote --output-dir tmp/cuda-backend/h200'
 ```
 
@@ -220,9 +223,11 @@ The default persistent batch row uses one worker block per descriptor. Add
 `--worker-blocks-per-task M[,N...]` to include one
 `pto_persistent_device_grid_batch` row per value, which separates launch
 amortization from intra-task grid parallelism by giving each descriptor
-multiple worker blocks. In the current vector-add slice, `64` worker blocks
-per descriptor is the best large-vector point observed on both A100 and H200;
-keep sweeping beyond that before treating it as tuned.
+multiple worker blocks. In the current vector-add slice, the
+`32,64,128,256` extended sweep at `3eeb399a` showed `256` worker blocks per
+descriptor as the best large-vector point on both A100 and H200. Treat that
+as evidence for the current microbenchmark, not a tuned default; sweep more
+vector lengths and task counts before setting a policy.
 
 The default benchmark includes `direct_driver_graph`. Use it to compare
 `host_schedule` launch overhead against CUDA Graph replay for the same
