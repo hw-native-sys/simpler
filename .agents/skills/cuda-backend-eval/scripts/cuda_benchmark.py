@@ -855,6 +855,16 @@ def _matched_host_schedule_device_refs(
     return refs
 
 
+def _matched_device_refs(
+    summary: dict[tuple[str, str, int, int, int], dict[str, Any]],
+) -> dict[tuple[str, int, int], int]:
+    refs = _matched_host_schedule_device_refs(summary)
+    for row in summary.values():
+        if row["baseline"] == "pto_stream_serial":
+            refs[(row["machine"], row["n"], row["task_count"])] = row["median_device_wall_ns"]
+    return refs
+
+
 def _ratio_text(value: int, reference: int | None) -> str:
     if reference is None or reference == 0:
         return "-"
@@ -963,7 +973,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
 
 def render_markdown_report(payload: dict[str, Any]) -> str:
     summary = summarize_results(payload)
-    host_schedule_refs = _matched_host_schedule_device_refs(summary)
+    device_refs = _matched_device_refs(summary)
     metadata = payload.get("metadata", {})
     lines = [
         "# CUDA Backend Microbenchmark Report",
@@ -985,13 +995,13 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
         [
             "",
             "| Machine | Baseline | N | Tasks | Worker blocks/task | Samples | Median device ns | "
-            "Median host ns | Device vs matched host_schedule |",
+            "Median host ns | Device vs matched reference |",
             "| ------- | -------- | - | ----- | ------------------ | ------- | ---------------- | "
             "-------------- | ------------------------------- |",
         ]
     )
     for row in _sorted_summary_rows(summary):
-        reference = host_schedule_refs.get((row["machine"], row["n"], row["task_count"]))
+        reference = device_refs.get((row["machine"], row["n"], row["task_count"]))
         lines.append(
             f"| {row['machine']} | {row['baseline']} | {row['n']} | {row['task_count']} | "
             f"{row['worker_blocks_per_task']} | {row['samples']} | "
@@ -1012,7 +1022,7 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             ]
         )
         for row in best_grid_rows:
-            reference = host_schedule_refs.get((row["machine"], row["n"], row["task_count"]))
+            reference = device_refs.get((row["machine"], row["n"], row["task_count"]))
             lines.append(
                 f"| {row['machine']} | {row['n']} | {row['task_count']} | "
                 f"{row['worker_blocks_per_task']} | {row['median_device_wall_ns']} | "
@@ -1072,10 +1082,11 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  sequentially on the host-schedule stream pool.",
             "- `pto_stream_parallel` measures two independent PTO launches issued",
             "  concurrently from host threads onto separate CUDA streams.",
+            "- stream rows use `pto_stream_serial` as their reference.",
             "- Small `n` values are dominated by launch overhead; larger `n` values start",
             "  to include more device work but are still a microbenchmark.",
-            "- Ratio columns are relative to the matched `pto_host_schedule` row",
-            "  for the same machine, `N`, and task count.",
+            "- Non-stream ratio columns are relative to the matched",
+            "  `pto_host_schedule` row for the same machine, `N`, and task count.",
             "",
             "![Median device time](cuda-benchmark.svg)",
             "",

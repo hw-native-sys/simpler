@@ -206,7 +206,7 @@ def test_render_report_contains_table_and_svg():
     assert "CUDA Backend Microbenchmark Report" in report
     expected_header = (
         "| Machine | Baseline | N | Tasks | Worker blocks/task | Samples | Median device ns | "
-        "Median host ns | Device vs matched host_schedule |"
+        "Median host ns | Device vs matched reference |"
     )
     assert expected_header in report
     assert "a100-local" in report
@@ -234,7 +234,8 @@ def test_render_report_includes_host_schedule_relative_ratios():
     assert "| a100-local | pto_host_schedule | 1024 | 1 | 1 | 1 | 1000 | 1000 | 1.00x |" in report
     assert "| a100-local | direct_driver | 1024 | 1 | 1 | 1 | 500 | 500 | 0.50x |" in report
     assert "| a100-local | pto_persistent_dag | 1024 | 1 | 1 | 1 | 2500 | 2500 | 2.50x |" in report
-    assert "relative to the matched `pto_host_schedule` row" in report
+    assert "Non-stream ratio columns are relative to the matched" in report
+    assert "`pto_host_schedule` row for the same machine, `N`, and task count" in report
     assert "for the same machine, `N`, and task count" in report
 
 
@@ -598,4 +599,6 @@ def test_render_report_describes_stream_concurrency_rows():
     report = cuda_benchmark.render_markdown_report(payload)
 
     assert "pto_stream_serial" in report
+    assert "| a100-local | pto_stream_parallel | 2 | 1 | 1 | 1 | 1200 | 1200 | 0.60x |" in report
     assert "`pto_stream_parallel` measures two independent PTO launches" in report
+    assert "stream rows use `pto_stream_serial` as their reference" in report
