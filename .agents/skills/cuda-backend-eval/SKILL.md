@@ -95,10 +95,11 @@ same vector-add PTX kernel through two launch paths:
   bounded device ring queue consumed by worker blocks inside the same launch.
 - `pto_persistent_dag`: generated-dispatch-like task selection and fan-in
   counters that release dependent tasks onto the bounded ring.
-- `pto_host_schedule_batch`, `pto_persistent_device_batch`, and
-  `pto_persistent_queue_batch`: same-work batch rows enabled by
-  `--batch-tasks N`. These compare N host launches against one persistent
-  launch over N equivalent vector-add task descriptors.
+- `pto_host_schedule_batch`, `pto_persistent_device_batch`,
+  `pto_persistent_device_grid_batch`, and `pto_persistent_queue_batch`:
+  same-work batch rows enabled by `--batch-tasks N`. The worker-grid row is
+  enabled with `--worker-blocks-per-task M` and assigns multiple CUDA worker
+  blocks to each task descriptor.
 
 The smoke helper caches the built and loaded host runtime per process, so the
 benchmark can run repeated PTO and baseline samples without rebuilding a shared
@@ -110,7 +111,7 @@ Local A100 example:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_80 \
-    --include-persistent --batch-tasks 6 \
+    --include-persistent --batch-tasks 6 --worker-blocks-per-task 4 \
     --label a100-local --output-dir tmp/cuda-backend/a100
 ```
 
@@ -122,7 +123,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_90 \
-     --include-persistent --batch-tasks 6 \
+     --include-persistent --batch-tasks 6 --worker-blocks-per-task 4 \
      --label h200-remote --output-dir tmp/cuda-backend/h200'
 ```
 
@@ -142,10 +143,10 @@ The report also includes a PTX-source table by machine and baseline. Treat any
 embedded `sm_80` PTX instead of using `nvcc` to produce fresh PTX for the
 requested target architecture.
 
-Current batch rows match descriptor count, not intra-task grid shape. The
-persistent tracer bullet uses one worker block per descriptor, while
-`pto_host_schedule` vector-add uses a full grid, so large-vector rows expose
-worker-parallelism limitations as well as launch overhead.
+The default persistent batch row uses one worker block per descriptor. Add
+`--worker-blocks-per-task M` to include `pto_persistent_device_grid_batch`,
+which separates launch amortization from intra-task grid parallelism by giving
+each descriptor multiple worker blocks.
 
 Merge local and remote JSON payloads into one comparative report:
 

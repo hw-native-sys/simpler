@@ -165,6 +165,7 @@ public:
         }
         if (header->op != PTO_CUDA_HOST_OP_VECTOR_ADD_F32 &&
             header->op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS &&
+            header->op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_GRID &&
             header->op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_QUEUE &&
             header->op != PTO_CUDA_PERSISTENT_OP_DAG_F32_RING) {
             return -1;
@@ -235,6 +236,7 @@ public:
         PreparedCallable &prepared = it->second;
         if (prepared.op != PTO_CUDA_HOST_OP_VECTOR_ADD_F32 &&
             prepared.op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS &&
+            prepared.op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_GRID &&
             prepared.op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_QUEUE &&
             prepared.op != PTO_CUDA_PERSISTENT_OP_DAG_F32_RING) {
             return -1;
@@ -263,6 +265,7 @@ public:
         uint64_t n = 0;
         const PtoCudaPersistentVectorAddTask *tasks = nullptr;
         uint64_t task_count = 0;
+        uint32_t worker_blocks_per_task = 1;
         const PtoCudaPersistentVectorAddQueueState *queue_state = nullptr;
         const PtoCudaPersistentDagState *dag_state = nullptr;
         void *kernel_args[4] = {};
@@ -293,6 +296,20 @@ public:
             task_count = typed_args->task_count;
             kernel_args[0] = &tasks;
             kernel_args[1] = &task_count;
+        } else if (prepared.op == PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_GRID) {
+            auto *typed_args = static_cast<const PtoCudaPersistentVectorAddGridArgs *>(args);
+            if (typed_args->tasks == nullptr || typed_args->task_count == 0 ||
+                typed_args->worker_blocks_per_task == 0) {
+                cudaEventDestroy(start);
+                cudaEventDestroy(stop);
+                return -1;
+            }
+            tasks = typed_args->tasks;
+            task_count = typed_args->task_count;
+            worker_blocks_per_task = typed_args->worker_blocks_per_task;
+            kernel_args[0] = &tasks;
+            kernel_args[1] = &task_count;
+            kernel_args[2] = &worker_blocks_per_task;
         } else if (prepared.op == PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_QUEUE) {
             auto *typed_args = static_cast<const PtoCudaPersistentVectorAddQueueArgs *>(args);
             if (typed_args->state == nullptr) {

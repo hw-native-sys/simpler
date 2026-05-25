@@ -432,6 +432,7 @@ def run_persistent_sample(
     mode: str = "direct",
     task_count: int | None = None,
     baseline: str | None = None,
+    worker_blocks_per_task: int = 1,
 ) -> dict[str, Any]:
     task_count = task_count if task_count is not None else 3 if mode == "dag" else 6 if mode == "queue" else 2
     queue_capacity = 2 if mode in {"dag", "queue"} else None
@@ -442,6 +443,7 @@ def run_persistent_sample(
         arch=arch,
         mode=mode,
         queue_capacity=queue_capacity,
+        worker_blocks_per_task=worker_blocks_per_task,
     )
     result["baseline"] = (
         baseline
@@ -456,7 +458,13 @@ def run_persistent_sample(
 
 
 def run_single_sample(
-    baseline: str, device: int, n: int, block_dim: int, arch: str, task_count: int = 1
+    baseline: str,
+    device: int,
+    n: int,
+    block_dim: int,
+    arch: str,
+    task_count: int = 1,
+    worker_blocks_per_task: int = 1,
 ) -> dict[str, Any]:
     if baseline == "pto_host_schedule":
         return run_pto_sample(device=device, n=n, block_dim=block_dim, arch=arch)
@@ -483,6 +491,16 @@ def run_single_sample(
             task_count=task_count,
             baseline=baseline,
         )
+    if baseline == "pto_persistent_device_grid_batch":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="direct",
+            task_count=task_count,
+            baseline=baseline,
+            worker_blocks_per_task=worker_blocks_per_task,
+        )
     if baseline == "pto_persistent_queue_batch":
         return run_persistent_sample(
             device=device,
@@ -504,9 +522,12 @@ def run_benchmark(
     label: str,
     include_persistent: bool = False,
     batch_tasks: int = 0,
+    worker_blocks_per_task: int = 1,
 ) -> dict[str, Any]:
     if batch_tasks < 0:
         raise ValueError("batch_tasks must be non-negative")
+    if worker_blocks_per_task <= 0:
+        raise ValueError("worker_blocks_per_task must be positive")
     with tempfile.TemporaryDirectory(prefix="pto_cuda_bench_") as td:
         ptx, ptx_source = _compile_ptx(Path(td), arch)
 
@@ -520,6 +541,7 @@ def run_benchmark(
         "ptx_arch": arch,
         "ptx_source": ptx_source,
         "batch_tasks": batch_tasks,
+        "worker_blocks_per_task": worker_blocks_per_task,
         "nvidia_smi": _nvidia_smi_summary(),
         "paper_setup": (
             "Microbenchmark slice inspired by VDCores/MPK persistent-kernel evaluation; "
@@ -565,6 +587,18 @@ def run_benchmark(
                         )
                         batch.update({"machine": metadata["machine"], "repeat": repeat})
                         results.append(batch)
+                    if worker_blocks_per_task > 1:
+                        grid_batch = run_single_sample(
+                            baseline="pto_persistent_device_grid_batch",
+                            device=device,
+                            n=n,
+                            block_dim=block_dim,
+                            arch=arch,
+                            task_count=batch_tasks,
+                            worker_blocks_per_task=worker_blocks_per_task,
+                        )
+                        grid_batch.update({"machine": metadata["machine"], "repeat": repeat})
+                        results.append(grid_batch)
 
     return {"metadata": metadata, "results": results}
 
@@ -856,6 +890,7 @@ def render_svg(summary: dict[tuple[str, str, int], dict[str, Any]]) -> str:
         "pto_persistent_dag": "#d62728",
         "pto_persistent_device": "#9467bd",
         "pto_persistent_device_batch": "#7b52ab",
+        "pto_persistent_device_grid_batch": "#5f3b9d",
         "pto_persistent_queue": "#c46a2c",
         "pto_persistent_queue_batch": "#a95723",
     }
@@ -953,6 +988,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "- `pto_persistent_device_batch` uses the same descriptor count as",
             "  `pto_host_schedule_batch`, giving a same-work launch-amortization",
             "  comparison.",
+            "- `pto_persistent_device_grid_batch` assigns multiple worker blocks per task descriptor,",
+            "  separating launch amortization from intra-task grid parallelism.",
             "- `pto_persistent_queue` measures the next persistent-device slice:",
             "  one scheduler block publishes descriptor IDs into a bounded",
             "  device ring queue and worker blocks pop them inside the same",
@@ -1011,6 +1048,7 @@ def main() -> None:
             "pto_persistent_dag",
             "pto_host_schedule_batch",
             "pto_persistent_device_batch",
+            "pto_persistent_device_grid_batch",
             "pto_persistent_queue_batch",
         ],
         default=None,
@@ -1023,6 +1061,12 @@ def main() -> None:
         type=int,
         default=0,
         help="also run same-work host_schedule and persistent-device batch baselines with this task count",
+    )
+    parser.add_argument(
+        "--worker-blocks-per-task",
+        type=int,
+        default=1,
+        help="run the persistent direct worker-grid batch baseline with this many worker blocks per task",
     )
     args = parser.parse_args()
 
@@ -1057,6 +1101,7 @@ def main() -> None:
                     args.block_dim,
                     args.arch,
                     task_count=max(1, args.batch_tasks),
+                    worker_blocks_per_task=args.worker_blocks_per_task,
                 ),
                 sort_keys=True,
             )
@@ -1072,6 +1117,7 @@ def main() -> None:
         label=args.label,
         include_persistent=args.include_persistent,
         batch_tasks=args.batch_tasks,
+        worker_blocks_per_task=args.worker_blocks_per_task,
     )
     write_report(payload, args.output_dir)
     print(json.dumps(payload["metadata"], indent=2, sort_keys=True))

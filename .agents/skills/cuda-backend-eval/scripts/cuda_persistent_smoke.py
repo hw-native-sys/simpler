@@ -542,6 +542,23 @@ extern "C" __global__ void pto_persistent_vector_add_executor(
         task.out[i] = task.a[i] + task.b[i];
     }
 }
+
+extern "C" __global__ void pto_persistent_vector_add_grid_executor(
+    const PtoCudaPersistentVectorAddTask *tasks,
+    unsigned long long task_count,
+    unsigned int worker_blocks_per_task) {
+    unsigned long long task_id = blockIdx.x / worker_blocks_per_task;
+    if (task_id >= task_count) {
+        return;
+    }
+    unsigned int worker_block = blockIdx.x % worker_blocks_per_task;
+    PtoCudaPersistentVectorAddTask task = tasks[task_id];
+    unsigned long long first_i = threadIdx.x + static_cast<unsigned long long>(worker_block) * blockDim.x;
+    unsigned long long stride = static_cast<unsigned long long>(blockDim.x) * worker_blocks_per_task;
+    for (unsigned long long i = first_i; i < task.n; i += stride) {
+        task.out[i] = task.a[i] + task.b[i];
+    }
+}
 """.lstrip()
 
 _PERSISTENT_QUEUE_SOURCE = """
@@ -653,6 +670,14 @@ class CudaPersistentVectorAddArgs(ctypes.Structure):
     _fields_ = [
         ("tasks", ctypes.c_void_p),
         ("task_count", ctypes.c_uint64),
+    ]
+
+
+class CudaPersistentVectorAddGridArgs(ctypes.Structure):
+    _fields_ = [
+        ("tasks", ctypes.c_void_p),
+        ("task_count", ctypes.c_uint64),
+        ("worker_blocks_per_task", ctypes.c_uint32),
     ]
 
 
@@ -791,21 +816,41 @@ def _load_persistent_runtime():
     return runtime, binaries
 
 
-def _make_direct_launch(ptx_buf, ptx_size: int, task_count: int, dev_tasks: int) -> PersistentLaunch:
+def _make_direct_launch(
+    ptx_buf,
+    ptx_size: int,
+    task_count: int,
+    dev_tasks: int,
+    worker_blocks_per_task: int = 1,
+) -> PersistentLaunch:
+    if worker_blocks_per_task <= 0:
+        raise ValueError("worker_blocks_per_task must be positive")
+    worker_blocks = max(1, task_count * worker_blocks_per_task)
+    entry_name = b"pto_persistent_vector_add_executor"
+    op = 1001
+    args: Any = CudaPersistentVectorAddArgs(tasks=dev_tasks, task_count=task_count)
+    if worker_blocks_per_task > 1:
+        entry_name = b"pto_persistent_vector_add_grid_executor"
+        op = 1004
+        args = CudaPersistentVectorAddGridArgs(
+            tasks=dev_tasks,
+            task_count=task_count,
+            worker_blocks_per_task=worker_blocks_per_task,
+        )
     return PersistentLaunch(
         manifest=CudaPersistentCallable(
             version=1,
-            op=1001,
+            op=op,
             image=ctypes.cast(ptx_buf, ctypes.c_void_p),
             image_size=ptx_size,
-            entry_name=b"pto_persistent_vector_add_executor",
-            grid_dim=max(1, task_count),
+            entry_name=entry_name,
+            grid_dim=worker_blocks,
             block_dim=256,
             shared_mem_bytes=0,
         ),
-        args=CudaPersistentVectorAddArgs(tasks=dev_tasks, task_count=task_count),
+        args=args,
         scheduler_blocks=0,
-        worker_blocks=max(1, task_count),
+        worker_blocks=worker_blocks,
         completed_count=task_count,
     )
 
@@ -873,10 +918,18 @@ def _make_queue_launch(
 
 
 def _make_launch(
-    runtime, ctx: int, mode: str, ptx_buf, ptx_size: int, task_count: int, queue_capacity: int, dev_tasks: int
+    runtime,
+    ctx: int,
+    mode: str,
+    ptx_buf,
+    ptx_size: int,
+    task_count: int,
+    queue_capacity: int,
+    dev_tasks: int,
+    worker_blocks_per_task: int = 1,
 ) -> PersistentLaunch:
     if mode == "direct":
-        return _make_direct_launch(ptx_buf, ptx_size, task_count, dev_tasks)
+        return _make_direct_launch(ptx_buf, ptx_size, task_count, dev_tasks, worker_blocks_per_task)
     return _make_queue_launch(runtime, ctx, ptx_buf, ptx_size, task_count, queue_capacity, dev_tasks)
 
 
@@ -1064,16 +1117,28 @@ def _completed_count(runtime, ctx: int, launch: PersistentLaunch, task_count: in
 
 
 def run_persistent_smoke(  # noqa: PLR0912
-    device: int, task_count: int, n: int, arch: str, mode: str = "direct", queue_capacity: int | None = None
+    device: int,
+    task_count: int,
+    n: int,
+    arch: str,
+    mode: str = "direct",
+    queue_capacity: int | None = None,
+    worker_blocks_per_task: int = 1,
 ) -> dict:
     if mode not in {"dag", "direct", "queue"}:
         raise ValueError(f"unknown persistent mode: {mode}")
+    if worker_blocks_per_task <= 0:
+        raise ValueError("worker_blocks_per_task must be positive")
+    if mode != "direct" and worker_blocks_per_task != 1:
+        raise ValueError("worker_blocks_per_task is only supported for direct mode")
     if queue_capacity is None:
         queue_capacity = task_count
     if queue_capacity <= 0:
         raise ValueError("queue_capacity must be positive")
     with tempfile.TemporaryDirectory(prefix="pto_cuda_persistent_") as td:
         ptx, ptx_source = _compile_persistent_ptx(Path(td), arch, mode)
+    if mode == "direct" and worker_blocks_per_task > 1 and ptx_source.startswith("embedded-"):
+        raise RuntimeError("worker_blocks_per_task > 1 requires nvcc-built persistent direct PTX")
     ptx_buf = ctypes.create_string_buffer(ptx + b"\0")
 
     runtime, binaries = _load_persistent_runtime()
@@ -1127,7 +1192,17 @@ def run_persistent_smoke(  # noqa: PLR0912
             if runtime.copy_to_device_ctx(ctx, dev_tasks, ctypes.byref(task_desc), ctypes.sizeof(task_desc)) != 0:
                 raise RuntimeError("copy_to_device tasks failed")
 
-            launch = _make_launch(runtime, ctx, mode, ptx_buf, len(ptx) + 1, task_count, queue_capacity, dev_tasks)
+            launch = _make_launch(
+                runtime,
+                ctx,
+                mode,
+                ptx_buf,
+                len(ptx) + 1,
+                task_count,
+                queue_capacity,
+                dev_tasks,
+                worker_blocks_per_task,
+            )
             timing = PtoRunTiming()
             if runtime.prepare_callable(ctx, 0, ctypes.byref(launch.manifest)) != 0:
                 raise RuntimeError("prepare_callable failed")
@@ -1185,6 +1260,7 @@ def run_persistent_smoke(  # noqa: PLR0912
         "queue_capacity": queue_capacity,
         "scheduler_blocks": launch.scheduler_blocks,
         "worker_blocks": launch.worker_blocks,
+        "worker_blocks_per_task": worker_blocks_per_task,
         "completed_count": completed_count,
         "ptx_arch": arch,
         "ptx_source": ptx_source,
@@ -1203,11 +1279,20 @@ def main() -> None:
     parser.add_argument("--arch", default="compute_80")
     parser.add_argument("--mode", choices=["dag", "direct", "queue"], default="direct")
     parser.add_argument("--queue-capacity", type=int, default=None)
+    parser.add_argument("--worker-blocks-per-task", type=int, default=1)
     args = parser.parse_args()
 
     print(
         json.dumps(
-            run_persistent_smoke(args.device, args.task_count, args.n, args.arch, args.mode, args.queue_capacity),
+            run_persistent_smoke(
+                args.device,
+                args.task_count,
+                args.n,
+                args.arch,
+                args.mode,
+                args.queue_capacity,
+                args.worker_blocks_per_task,
+            ),
             indent=2,
             sort_keys=True,
         )

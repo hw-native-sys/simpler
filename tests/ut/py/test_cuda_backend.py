@@ -256,6 +256,38 @@ assert result["task_count"] == 2
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
 
+@pytest.mark.skipif(shutil.which("nvcc") is None, reason="nvcc is required for CUDA persistent grid smoke test")
+def test_cuda_persistent_device_smoke_runs_multi_block_vector_add_tasks():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+result = run_persistent_smoke(
+    device=0,
+    task_count=2,
+    n=4096,
+    arch="compute_80",
+    mode="direct",
+    worker_blocks_per_task=4,
+)
+assert result["status"] == "pass"
+assert result["runtime"] == "persistent_device"
+assert result["task_count"] == 2
+assert result["worker_blocks_per_task"] == 4
+assert result["worker_blocks"] == 8
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
 @pytest.mark.skipif(shutil.which("nvcc") is None, reason="nvcc is required for CUDA persistent queue smoke test")
 def test_cuda_persistent_device_smoke_runs_scheduler_worker_queue():
     script = """
