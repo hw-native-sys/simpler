@@ -145,10 +145,12 @@ Evidence:
   Markdown, and SVG reports.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_smoke_report.py` writes
   compact smoke Markdown and SVG reports.
+- `.agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py` automates
+  the local A100 run, remote H200 run, artifact copy, merge, and index refresh.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_artifact_index.py` indexes
   local `tmp/cuda-backend/` artifacts, including tensor-tile shapes.
 - `.agents/skills/cuda-backend-eval/SKILL.md` documents the current paired
-  A100/H200 recipe and remote artifact copy step.
+  A100/H200 recipe.
 
 ## Latest Local Verification
 
@@ -391,5 +393,4 @@ local evidence but are not guaranteed in every CI environment.
 Needed:
 
 - clear skip reporting when CUDA, `nvcc`, or a driver is unavailable;
-- optional CUDA CI runner coverage if infrastructure becomes available;
-- remote H200 smoke automation that can be invoked without hand-copy steps.
+- optional CUDA CI runner coverage if infrastructure becomes available.

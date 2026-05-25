@@ -66,6 +66,18 @@ The committed workflow lives under
 `.agents/skills/cuda-backend-eval/scripts/`. The most commonly used commands
 are documented in `.agents/skills/cuda-backend-eval/SKILL.md`.
 
+Use the paired runner to refresh the local A100 and remote H200 capture in one
+step:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py
+```
+
+It runs the local benchmark, refreshes the remote `bizhaoh200` checkout,
+copies the H200 artifact directory back, merges the JSON reports, and rebuilds
+the local artifact index.
+
 Refresh the local artifact index after adding or merging captures:
 
 ```bash

@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -76,6 +77,26 @@ def _load_artifact_index_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_pair_benchmark_module():
+    script_path = (
+        Path(__file__).resolve().parents[3]
+        / ".agents"
+        / "skills"
+        / "cuda-backend-eval"
+        / "scripts"
+        / "cuda_pair_benchmark.py"
+    )
+    spec = importlib.util.spec_from_file_location("cuda_pair_benchmark", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
 
 
 def _load_smoke_report_module():
@@ -307,6 +328,73 @@ def test_cuda_artifact_index_sorts_numeric_sizes_before_strings(tmp_path):
     [entry] = cuda_artifact_index.scan_artifacts(tmp_path)
 
     assert entry["sizes"] == [1024, 65536, 1048576, "unknown"]
+
+
+def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
+    cuda_pair_benchmark = _load_pair_benchmark_module()
+    config = cuda_pair_benchmark.PairedBenchmarkConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        branch="design/nvidia-backend",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+    )
+
+    local = cuda_pair_benchmark.build_local_benchmark_command(config, "abc123")
+    remote = cuda_pair_benchmark.build_remote_benchmark_command(config, "abc123")
+    scp = cuda_pair_benchmark.build_scp_command(config, "abc123")
+    merge = cuda_pair_benchmark.build_merge_command(config, "abc123")
+    index = cuda_pair_benchmark.build_index_command(config)
+
+    assert local[:2] == ["env", f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}"]
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py" in local
+    assert "--arch" in local
+    assert "compute_80" in local
+    assert "a100-current-abc123" in local
+    assert str(tmp_path / "cuda-backend" / "a100-current-abc123") in local
+
+    assert remote[:6] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "h200-box"]
+    remote_shell = remote[-1]
+    assert "cd /remote/pto-cu" in remote_shell
+    assert "git fetch origin design/nvidia-backend >/dev/null" in remote_shell
+    assert "git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null" in remote_shell
+    assert "CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH PYTHONPATH=$PWD:$PWD/python" in remote_shell
+    assert "--arch compute_90" in remote_shell
+    assert "h200-current-abc123" in remote_shell
+
+    assert scp == [
+        "scp",
+        "-r",
+        f"h200-box:/remote/pto-cu/{tmp_path / 'cuda-backend' / 'h200-current-abc123'}",
+        str(tmp_path / "cuda-backend"),
+    ]
+    assert "--merge-json" in merge
+    assert str(tmp_path / "cuda-backend" / "a100-current-abc123" / "cuda-benchmark.json") in merge
+    assert str(tmp_path / "cuda-backend" / "h200-current-abc123" / "cuda-benchmark.json") in merge
+    assert "combined-current-abc123" in merge
+    assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
+
+
+def test_cuda_pair_benchmark_dry_run_does_not_launch_benchmarks(tmp_path):
+    cuda_pair_benchmark = _load_pair_benchmark_module()
+    calls = []
+
+    def fake_runner(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="abc123\n", stderr="")
+
+    config = cuda_pair_benchmark.PairedBenchmarkConfig(
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+    )
+    commands = cuda_pair_benchmark.run_paired_benchmark(config, runner=fake_runner, dry_run=True)
+
+    assert calls == [(["git", "rev-parse", "--short", "HEAD"], {"check": True, "capture_output": True, "text": True})]
+    assert len(commands) == 5
+    assert commands[0][0] == "env"
+    assert commands[1][0] == "ssh"
+    assert commands[2][0] == "scp"
 
 
 def test_find_nvcc_uses_cuda_home_when_nvcc_is_not_on_path(tmp_path, monkeypatch):
