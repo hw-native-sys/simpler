@@ -28,12 +28,17 @@ The latest captured raw reports are under `tmp/`:
 - `tmp/cuda-backend/h200-tensor-8950e029/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-tensor-8950e029/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-tensor-8950e029/cuda-benchmark.svg`
+- `tmp/cuda-backend/a100-graph-ba2cdd0e/cuda-benchmark.md`
+- `tmp/cuda-backend/h200-graph-ba2cdd0e/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-graph-ba2cdd0e/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-graph-ba2cdd0e/cuda-benchmark.svg`
 
 The worker-grid data was captured from commit `e430bc1b`. The stream
 concurrency data was captured from commit `37bebf44`. The DAG-chain data was
 captured from commit `323f4587`. The scratch-reuse DAG data was captured from
 commit `bcf54a88`. The tensor-tile DAG data was captured from commit
-`8950e029`.
+`8950e029`. The CUDA Graph launch-baseline data was captured from commit
+`ba2cdd0e`.
 
 ## Current Baselines
 
@@ -96,6 +101,29 @@ The A100 rows compiled PTX with local `nvcc` for `compute_80`. The H200 rows
 compiled PTX with remote `nvcc` for `compute_90`, discovered from the
 `/usr/local/cuda*` toolkit path. The report still marks embedded PTX rows when
 fallback PTX is used, but the latest H200 report does not use that fallback.
+
+## CUDA Graph Launch Baseline
+
+The `direct_driver_graph` row instantiates a one-kernel CUDA Graph before the
+timed interval and measures replay of that graph. This is a host-launch
+amortization baseline for repeated `host_schedule` style callables; it is not
+a replacement for the persistent-device scheduler because the host still owns
+graph construction and replay.
+
+| GPU | N | Host-schedule ns | Driver ns | Driver graph ns | Graph/host | Graph/driver |
+| --- | - | ---------------- | --------- | --------------- | ---------- | ------------ |
+| A100 | 1024 | 32768 | 38911 | 26623 | 0.81x | 0.68x |
+| H200 | 1024 | 26720 | 30848 | 29311 | 1.10x | 0.95x |
+| A100 | 65536 | 35648 | 27744 | 18975 | 0.53x | 0.68x |
+| H200 | 65536 | 32896 | 37184 | 24351 | 0.74x | 0.65x |
+| A100 | 1048576 | 28192 | 27904 | 23360 | 0.83x | 0.84x |
+| H200 | 1048576 | 34048 | 40832 | 27071 | 0.80x | 0.66x |
+
+Graph replay is faster than raw Driver API launch on every captured row. It is
+also faster than the current PTO `host_schedule` path on five of six rows; the
+H200 `N=1024` row is the exception, where `host_schedule` remains lower. This
+keeps CUDA Graphs useful for a phase-1 repeated-launch optimization, while
+leaving the phase-2 persistent-device work focused on device-side scheduling.
 
 ## Stream Concurrency
 

@@ -204,6 +204,11 @@ multiple worker blocks. In the current vector-add slice, `64` worker blocks
 per descriptor is the best large-vector point observed on both A100 and H200;
 keep sweeping beyond that before treating it as tuned.
 
+The default benchmark includes `direct_driver_graph`. Use it to compare
+`host_schedule` launch overhead against CUDA Graph replay for the same
+one-kernel callable. It should not be interpreted as a persistent-device
+scheduler because the host still instantiates and replays the graph.
+
 Merge local and remote JSON payloads into one comparative report:
 
 ```bash
@@ -253,6 +258,11 @@ It validates generated-dispatch task bodies beyond elementwise kernels by
 running a fixed 16x16 tiled GEMM task before residual, gate, and fan-in tasks.
 Use it as an ABI and scheduler validation row; it is still a scalar CUDA
 GEMM microbenchmark, not a tuned tensor-core workload.
+
+The CUDA Graph launch-baseline capture at `ba2cdd0e` adds
+`direct_driver_graph` to the default benchmark. It showed graph replay faster
+than raw Driver API launch on A100 and H200, and faster than PTO
+`host_schedule` on every captured row except H200 `N=1024`.
 
 ## Hardware Checks
 
