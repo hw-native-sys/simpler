@@ -141,8 +141,10 @@ then writes the host-schedule generated source, PTX, and JSON manifest under
 ctypes manifest consumed by the current `prepare_callable` C API. This is still
 a compiler/runtime slice; L2 `Worker.register(...)` can prepare that raw
 manifest blob, and L2 `Worker.run(...)` can launch raw CUDA argument structs
-that expose `buffer_ptr()` / `buffer_size()`. The normal scene-test compiler
-path does not build CUDA callables yet.
+that expose `buffer_ptr()` / `buffer_size()`. The normal `SceneTestCase` L2
+path can now build `CALLABLE["cuda"]` host-schedule specs and run the current
+`arg_builder: vector_add_f32` adapter from CPU `TaskArgsBuilder` tensors
+through real CUDA device buffers.
 For real host-schedule smoke coverage, pass a context definition plus
 `host_parameters`/`host_context_initializer` so the generated `__global__`
 wrapper matches the current vector-add launch ABI and can be loaded by

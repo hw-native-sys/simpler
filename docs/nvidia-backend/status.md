@@ -66,6 +66,11 @@ Evidence:
   host-schedule vector-add through `Worker(level=2, platform="cuda")`,
   `Worker.register(...)`, device allocation/copy helpers, and `Worker.run(...)`
   with a real `CudaVectorAddArgs` struct.
+- `SceneTestCase` L2 compilation accepts `CALLABLE["cuda"]` specs for
+  `host_schedule`, compiles them through `KernelCompiler(platform="cuda")`,
+  registers the prepared raw callable through the normal L2 `Worker`, builds
+  `CudaVectorAddArgs` from normal `TaskArgsBuilder` CPU tensors, and validates
+  real copied-back CUDA output data.
 
 ### Persistent-Device Runtime
 
@@ -144,6 +149,48 @@ Evidence:
 The focused CUDA test set was run from the project-local virtual environment.
 The CUDA backend tests run separately so the shell exit status is authoritative
 even when hardware tests take longer than the default tool wait window:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py \
+  tests/ut/py/test_cuda_backend.py \
+  tests/ut/py/test_cuda_kernel_compiler.py \
+  tests/ut/py/test_cuda_persistent_codegen.py -q
+```
+
+Result: `34 passed`.
+
+The CUDA scene-test file was also run on the remote H200 checkout after
+pushing this change:
+
+```bash
+ssh bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py -q'
+```
+
+Result: `1 passed, 1 skipped`. The compile/plumbing test passed; the real-data
+scene case skipped because the remote Python environment does not have
+`torch`.
+
+The remote H200 real-data Worker smoke was run through the no-torch smoke
+script:
+
+```bash
+ssh bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_smoke.py \
+     --runner worker --device 0 --n 1024 --block-dim 256 \
+     --arch compute_90 --no-build'
+```
+
+Result: `status=pass`, `runner=worker`, `ptx_arch=compute_90`,
+`ptx_source=kernel-compiler-worker-task-body-compute_90`,
+`device_wall_ns=12736`.
 
 ```bash
 .venv/bin/python -m pytest tests/ut/py/test_cuda_backend.py -q
@@ -231,16 +278,15 @@ Result: `status=pass`, `runtime=persistent_device`,
 Host-schedule task-body compilation and persistent-device generated dispatch
 now have first `KernelCompiler` entry points. Both paths can consume
 `CudaTaskBody` style sources. CUDA prepared-callable artifacts can be staged
-through the L2 Python `Worker` registration path, but the normal scene-test
-flow still does not compile and run CUDA callable artifacts end to end.
+through the L2 Python `Worker` registration path. The normal scene-test flow
+can compile and run host-schedule CUDA vector-add callable specs end to end.
 
 Needed:
 
-- scene-test plumbing from CUDA callable specs into CUDA callable artifacts;
-- scene-test and orchestration helpers that construct CUDA-specific argument
-  structs from normal test/user data instead of requiring manual ctypes setup;
 - persistent-device callable manifests wired through the normal build/cache
   layout.
+- broader CUDA scene-test argument builders beyond the current
+  `vector_add_f32` tracer bullet.
 
 ### Target Role Cleanup
 

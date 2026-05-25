@@ -266,8 +266,11 @@ path. `prepare_cuda_persistent_device_callable()` turns the compiled artifact
 into the ctypes manifest consumed by the current host runtime
 `prepare_callable` C API, L2 `Worker.register(...)` can stage that raw manifest
 blob, and L2 `Worker.run(...)` can launch backend-specific raw argument
-structs. The remaining work is to plumb CUDA callable specs and argument
-construction through the normal scene-test compiler and run paths.
+structs. The normal scene-test compiler and run path can now consume
+host-schedule CUDA callable specs and construct the current `vector_add_f32`
+raw argument struct from `TaskArgsBuilder` CPU tensors. The remaining work is
+to extend the same scene-test plumbing to persistent-device manifests and
+non-vector-add CUDA argument builders.
 
 ## Static NVCC Linking Feasibility
 

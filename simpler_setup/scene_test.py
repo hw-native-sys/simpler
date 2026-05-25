@@ -306,6 +306,105 @@ def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list):
     return chip_args, output_names
 
 
+def _output_names_from_signature(test_args: TaskArgsBuilder, signature: list) -> list[str]:
+    from simpler.task_interface import ArgDirection  # noqa: PLC0415
+
+    output_names: list[str] = []
+    tensor_idx = 0
+    for spec in test_args.specs:
+        if not isinstance(spec, Tensor):
+            continue
+        if tensor_idx >= len(signature):
+            raise ValueError(
+                f"Tensor '{spec.name}' at index {tensor_idx} has no matching entry in "
+                f"callable signature (length {len(signature)})."
+            )
+        if signature[tensor_idx] in (ArgDirection.OUT, ArgDirection.INOUT):
+            output_names.append(spec.name)
+        tensor_idx += 1
+    return output_names
+
+
+def _callable_signature(callable_spec: dict) -> list:
+    cuda = callable_spec.get("cuda")
+    if isinstance(cuda, dict) and "signature" in cuda:
+        return cuda.get("signature", [])
+    return callable_spec.get("orchestration", {}).get("signature", [])
+
+
+def _tensor_nbytes(tensor) -> int:
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+class _CudaSceneDeviceBuffers:
+    def __init__(self, worker, test_args: TaskArgsBuilder):
+        self.worker = worker
+        self.test_args = test_args
+        self.ptrs: dict[str, int] = {}
+        self.sizes: dict[str, int] = {}
+        self._allocate()
+
+    def _allocate(self) -> None:
+        for spec in self.test_args.specs:
+            if not isinstance(spec, Tensor):
+                continue
+            tensor = spec.value
+            device = getattr(tensor, "device", None)
+            if device is not None and getattr(device, "type", "cpu") != "cpu":
+                raise ValueError(f"CUDA scene-test tensor '{spec.name}' must be a CPU tensor")
+            if not tensor.is_contiguous():
+                raise ValueError(f"CUDA scene-test tensor '{spec.name}' must be contiguous")
+            nbytes = _tensor_nbytes(tensor)
+            if nbytes <= 0:
+                raise ValueError(f"CUDA scene-test tensor '{spec.name}' must be non-empty")
+            self.ptrs[spec.name] = int(self.worker.malloc(nbytes))
+            self.sizes[spec.name] = nbytes
+
+    def copy_all_to_device(self) -> None:
+        for spec in self.test_args.specs:
+            if isinstance(spec, Tensor):
+                self.worker.copy_to(self.ptrs[spec.name], int(spec.value.data_ptr()), self.sizes[spec.name])
+
+    def copy_outputs_from_device(self, output_names: list[str]) -> None:
+        for name in output_names:
+            tensor = getattr(self.test_args, name)
+            self.worker.copy_from(int(tensor.data_ptr()), self.ptrs[name], self.sizes[name])
+
+    def free(self) -> None:
+        for ptr in self.ptrs.values():
+            self.worker.free(ptr)
+        self.ptrs.clear()
+        self.sizes.clear()
+
+
+def _build_cuda_host_schedule_args(
+    test_args: TaskArgsBuilder,
+    device_buffers: _CudaSceneDeviceBuffers,
+    cuda_spec: dict,
+):
+    from simpler_setup.cuda_callable_compiler import CudaVectorAddArgs  # noqa: PLC0415
+
+    arg_builder = cuda_spec.get("arg_builder", "vector_add_f32")
+    if arg_builder != "vector_add_f32":
+        raise NotImplementedError(f"Unsupported CUDA scene-test arg_builder: {arg_builder}")
+
+    tensor_names = [spec.name for spec in test_args.specs if isinstance(spec, Tensor)]
+    names = list(cuda_spec.get("args", tensor_names[:3]))
+    if len(names) != 3:
+        raise ValueError("CUDA vector_add_f32 scene tests require exactly three tensor args")
+    missing = [name for name in names if name not in device_buffers.ptrs]
+    if missing:
+        raise ValueError(f"CUDA vector_add_f32 args reference unknown tensors: {', '.join(missing)}")
+
+    n = int(cuda_spec.get("n", getattr(test_args, names[0]).numel()))
+    return CudaVectorAddArgs(
+        a=device_buffers.ptrs[names[0]],
+        b=device_buffers.ptrs[names[1]],
+        out=device_buffers.ptrs[names[2]],
+        n=n,
+    )
+
+
 @contextmanager
 def _temporary_env(env_updates):
     """Temporarily set environment variables."""
@@ -407,6 +506,11 @@ def _resolve_callable_paths(cls, cls_dir):
 
 def _resolve_chip_entry_paths(entry, cls_dir):
     """Resolve relative source paths in a chip entry (orchestration + incores)."""
+    if "cuda" in entry:
+        cuda = entry["cuda"]
+        if isinstance(cuda, dict) and "source" in cuda and not os.path.isabs(cuda["source"]):
+            entry["cuda"] = dict(cuda)
+            entry["cuda"]["source"] = str(cls_dir / cuda["source"])
     if "orchestration" in entry:
         orch = entry["orchestration"]
         if isinstance(orch, dict) and "source" in orch and not os.path.isabs(orch["source"]):
@@ -443,6 +547,10 @@ def _extract_name_map(callable_spec: dict) -> dict:
     if "callables" not in callable_spec:
         # L2: orchestration + incores
         callable_id_to_name: dict[str, str] = {}
+        cuda = callable_spec.get("cuda")
+        if isinstance(cuda, dict):
+            task_name = cuda.get("task_name") or cuda.get("name")
+            return {"level": 2, "orchestrator_name": task_name}
         orch = callable_spec.get("orchestration", {})
         orchestrator_name = orch.get("name") if isinstance(orch, dict) else None
         for k in callable_spec.get("incores", []):
@@ -703,6 +811,11 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
 
+    if platform == "cuda" or "cuda" in spec:
+        compiled = _compile_cuda_callable_from_spec(spec, runtime)
+        _compile_cache[cache_key] = compiled
+        return compiled
+
     from simpler.task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
 
     from .elf_parser import extract_text_section  # noqa: PLC0415
@@ -737,6 +850,38 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     )
     _compile_cache[cache_key] = chip_callable
     return chip_callable
+
+
+def _compile_cuda_callable_from_spec(spec, runtime):
+    if runtime != "host_schedule":
+        raise NotImplementedError(f"CUDA SceneTestCase compilation is not implemented for runtime={runtime!r}")
+    cuda = spec.get("cuda")
+    if not isinstance(cuda, dict):
+        raise ValueError("CUDA SceneTestCase CALLABLE must include a 'cuda' spec")
+
+    from .cuda_callable_compiler import prepare_cuda_host_schedule_callable  # noqa: PLC0415
+    from .kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+    kc = KernelCompiler(platform="cuda")
+    artifact = kc.compile_cuda_host_schedule(
+        cuda["source"],
+        task_name=cuda["task_name"],
+        arch=cuda.get("arch", os.environ.get("PTO_CUDA_ARCH", "compute_80")),
+        context_type=cuda.get("context_type", "PtoTaskContext"),
+        context_definition=cuda.get("context_definition", ""),
+        host_parameters=tuple(cuda.get("host_parameters", ())),
+        host_context_initializer=cuda.get("host_context_initializer", ""),
+        cache_root=cuda.get("cache_root"),
+        nvcc=cuda.get("nvcc", "nvcc"),
+    )
+    return prepare_cuda_host_schedule_callable(
+        artifact,
+        grid_dim=int(cuda["grid_dim"]),
+        block_dim=int(cuda.get("block_dim", 256)),
+        shared_mem_bytes=int(cuda.get("shared_mem_bytes", 0)),
+        stream_id=int(cuda.get("stream_id", 0)),
+        op=int(cuda.get("op", 1)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -944,7 +1089,7 @@ class SceneTestCase:
     ):
         params = case.get("params", {})
         config_dict = case.get("config", {})
-        orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
+        orch_sig = _callable_signature(self.CALLABLE)
 
         # The L2 entry point is `Worker.run(cid, args, cfg)`.  Reuse the
         # cid registered by the st_worker fixture / standalone path.  For
@@ -954,6 +1099,21 @@ class SceneTestCase:
         if cid is None:
             cid = worker.register(callable_obj)
             type(self)._st_l2_cid = cid
+
+        if getattr(callable_obj, "runtime", None) == "host_schedule" and "cuda" in self.CALLABLE:
+            self._run_and_validate_l2_cuda_host_schedule(
+                worker,
+                cid,
+                case,
+                rounds=rounds,
+                skip_golden=skip_golden,
+                enable_l2_swimlane=enable_l2_swimlane,
+                enable_dump_tensor=enable_dump_tensor,
+                enable_pmu=enable_pmu,
+                enable_dep_gen=enable_dep_gen,
+                output_prefix=output_prefix,
+            )
+            return
 
         # Build args
         test_args = self.generate_args(params)
@@ -999,6 +1159,69 @@ class SceneTestCase:
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+
+        if timings:
+            _log_round_timings(timings)
+
+    def _run_and_validate_l2_cuda_host_schedule(
+        self,
+        worker,
+        cid,
+        case,
+        rounds=1,
+        skip_golden=False,
+        enable_l2_swimlane=0,
+        enable_dump_tensor=False,
+        enable_pmu=0,
+        enable_dep_gen=False,
+        output_prefix="",
+    ):
+        params = case.get("params", {})
+        config_dict = case.get("config", {})
+        cuda_spec = self.CALLABLE["cuda"]
+
+        test_args = self.generate_args(params)
+        output_names = _output_names_from_signature(test_args, _callable_signature(self.CALLABLE))
+
+        golden_args = None
+        if not skip_golden:
+            golden_args = test_args.clone()
+            self.compute_golden(golden_args, params)
+
+        initial_outputs = {}
+        if rounds > 1:
+            for name in output_names:
+                initial_outputs[name] = getattr(test_args, name).clone()
+
+        device_buffers = _CudaSceneDeviceBuffers(worker, test_args)
+        timings = []
+        try:
+            for round_idx in range(rounds):
+                if round_idx > 0:
+                    for name, initial in initial_outputs.items():
+                        getattr(test_args, name).copy_(initial)
+
+                device_buffers.copy_all_to_device()
+                raw_args = _build_cuda_host_schedule_args(test_args, device_buffers, cuda_spec)
+                config = self._build_config(
+                    config_dict,
+                    enable_l2_swimlane=enable_l2_swimlane,
+                    enable_dump_tensor=enable_dump_tensor,
+                    enable_pmu=enable_pmu,
+                    enable_dep_gen=enable_dep_gen,
+                    output_prefix=output_prefix,
+                )
+
+                with _temporary_env(self._resolve_env()):
+                    timing = worker.run(cid, raw_args, config=config)
+                device_buffers.copy_outputs_from_device(output_names)
+                if rounds > 1 and timing is not None:
+                    timings.append((timing.host_wall_us, timing.device_wall_us))
+
+                if not skip_golden:
+                    _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+        finally:
+            device_buffers.free()
 
         if timings:
             _log_round_timings(timings)
