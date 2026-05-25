@@ -78,7 +78,9 @@ PYTHONPATH=$PWD:$PWD/python \
 The DAG smoke compiles generated CUDA source from
 `simpler_setup.cuda_callable_compiler.render_persistent_dag_source()`. The
 returned JSON includes `source_kind: generated-dispatch` when that path is in
-use.
+use. The `nvcc` path goes through `compile_cuda_persistent_device()`, which
+writes `generated_dispatch.cu`, `pto_callable.ptx`, and `pto_callable.json`
+under a callables cache directory before the host runtime loads the PTX bytes.
 
 ## Microbenchmark Report
 

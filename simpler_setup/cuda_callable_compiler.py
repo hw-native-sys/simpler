@@ -10,12 +10,18 @@
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
 from textwrap import indent
 
 _CUDA_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_PERSISTENT_DAG_ENTRY_NAME = "pto_persistent_dag_f32_executor"
+_PERSISTENT_DAG_SOURCE_KIND = "generated-dispatch"
 
 
 @dataclass(frozen=True)
@@ -25,6 +31,21 @@ class CudaPersistentTaskFunction:
     func_id: int
     name: str
     body: str
+
+
+@dataclass(frozen=True)
+class CudaPersistentCallableArtifact:
+    """Compiled CUDA persistent-device callable artifact."""
+
+    cache_key: str
+    cache_hit: bool
+    source_path: Path
+    ptx_path: Path
+    manifest_path: Path
+    ptx: bytes
+    entry_name: str
+    arch: str
+    source_kind: str
 
 
 def _validate_task_functions(task_functions: Sequence[CudaPersistentTaskFunction]) -> list[CudaPersistentTaskFunction]:
@@ -184,3 +205,80 @@ extern "C" __global__ void pto_persistent_dag_f32_executor(const PtoCudaPersiste
     }}
 }}
 """.lstrip()
+
+
+def _task_manifest(task_functions: Sequence[CudaPersistentTaskFunction]) -> list[dict[str, int | str]]:
+    return [{"func_id": task.func_id, "name": task.name} for task in task_functions]
+
+
+def _cache_key(source: str, task_functions: Sequence[CudaPersistentTaskFunction], arch: str) -> str:
+    payload = {
+        "arch": arch,
+        "entry_name": _PERSISTENT_DAG_ENTRY_NAME,
+        "generator": "cuda-persistent-device-v1",
+        "source": source,
+        "source_kind": _PERSISTENT_DAG_SOURCE_KIND,
+        "task_functions": _task_manifest(task_functions),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _run_nvcc_ptx(source_path: Path, ptx_path: Path, arch: str, nvcc: str) -> None:
+    result = subprocess.run(
+        [nvcc, "--ptx", "-std=c++17", f"-arch={arch}", str(source_path), "-o", str(ptx_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"nvcc persistent_device compile failed:\n{result.stderr}")
+
+
+def compile_cuda_persistent_device(
+    task_functions: Sequence[CudaPersistentTaskFunction],
+    cache_root: Path,
+    arch: str,
+    nvcc: str = "nvcc",
+) -> CudaPersistentCallableArtifact:
+    """Compile or reuse a generated persistent-device CUDA callable PTX."""
+
+    ordered = _validate_task_functions(task_functions)
+    source = render_persistent_dag_source(ordered)
+    cache_key = _cache_key(source, ordered, arch)
+    cache_dir = Path(cache_root) / "callables" / cache_key
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    source_path = cache_dir / "generated_dispatch.cu"
+    ptx_path = cache_dir / "pto_callable.ptx"
+    manifest_path = cache_dir / "pto_callable.json"
+    source_path.write_text(source)
+
+    cache_hit = ptx_path.is_file() and manifest_path.is_file()
+    if not cache_hit:
+        _run_nvcc_ptx(source_path, ptx_path, arch, nvcc)
+
+    ptx = ptx_path.read_bytes()
+    manifest = {
+        "arch": arch,
+        "cache_key": cache_key,
+        "entry_name": _PERSISTENT_DAG_ENTRY_NAME,
+        "ptx_path": ptx_path.name,
+        "runtime": "persistent_device",
+        "source_kind": _PERSISTENT_DAG_SOURCE_KIND,
+        "source_path": source_path.name,
+        "source_sha256": sha256(source.encode("utf-8")).hexdigest(),
+        "task_functions": _task_manifest(ordered),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return CudaPersistentCallableArtifact(
+        cache_key=cache_key,
+        cache_hit=cache_hit,
+        source_path=source_path,
+        ptx_path=ptx_path,
+        manifest_path=manifest_path,
+        ptx=ptx,
+        entry_name=_PERSISTENT_DAG_ENTRY_NAME,
+        arch=arch,
+        source_kind=_PERSISTENT_DAG_SOURCE_KIND,
+    )

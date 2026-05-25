@@ -10,9 +10,16 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from simpler_setup.cuda_callable_compiler import CudaPersistentTaskFunction, render_persistent_dag_source
+from simpler_setup import cuda_callable_compiler
+from simpler_setup.cuda_callable_compiler import (
+    CudaPersistentTaskFunction,
+    compile_cuda_persistent_device,
+    render_persistent_dag_source,
+)
 
 
 def test_render_persistent_dag_source_generates_dispatch_switch():
@@ -50,3 +57,38 @@ def test_render_persistent_dag_source_rejects_duplicate_func_id():
                 CudaPersistentTaskFunction(func_id=1, name="add_b", body=""),
             ]
         )
+
+
+def test_compile_cuda_persistent_device_writes_manifest_and_reuses_cache(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_nvcc(source_path, ptx_path, arch, nvcc):
+        calls.append((source_path, ptx_path, arch, nvcc))
+        ptx_path.write_bytes(b"fake-ptx")
+
+    monkeypatch.setattr(cuda_callable_compiler, "_run_nvcc_ptx", fake_run_nvcc)
+
+    tasks = [
+        CudaPersistentTaskFunction(
+            func_id=1,
+            name="add_f32",
+            body="task->out[i] = task->a[i] + task->b[i];",
+        )
+    ]
+    first = compile_cuda_persistent_device(tasks, cache_root=tmp_path, arch="compute_80", nvcc="nvcc")
+    second = compile_cuda_persistent_device(tasks, cache_root=tmp_path, arch="compute_80", nvcc="nvcc")
+
+    assert first.cache_key == second.cache_key
+    assert first.ptx_path == second.ptx_path
+    assert first.cache_hit is False
+    assert second.cache_hit is True
+    assert len(calls) == 1
+    assert first.ptx == b"fake-ptx"
+    assert first.source_path.read_text() == second.source_path.read_text()
+
+    manifest = json.loads(first.manifest_path.read_text())
+    assert manifest["runtime"] == "persistent_device"
+    assert manifest["entry_name"] == "pto_persistent_dag_f32_executor"
+    assert manifest["arch"] == "compute_80"
+    assert manifest["source_kind"] == "generated-dispatch"
+    assert manifest["task_functions"] == [{"func_id": 1, "name": "add_f32"}]

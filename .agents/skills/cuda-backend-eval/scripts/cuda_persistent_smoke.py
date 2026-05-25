@@ -25,7 +25,11 @@ from typing import Any
 
 from cuda_smoke import PtoRunTiming, _bind_runtime
 
-from simpler_setup.cuda_callable_compiler import CudaPersistentTaskFunction, render_persistent_dag_source
+from simpler_setup.cuda_callable_compiler import (
+    CudaPersistentTaskFunction,
+    compile_cuda_persistent_device,
+    render_persistent_dag_source,
+)
 from simpler_setup.runtime_builder import RuntimeBuilder
 
 _FALLBACK_PERSISTENT_VECTOR_ADD_PTX = rb"""
@@ -609,20 +613,19 @@ extern "C" __global__ void pto_persistent_vector_add_queue_executor(
 }
 """.lstrip()
 
-_PERSISTENT_DAG_SOURCE = render_persistent_dag_source(
-    [
-        CudaPersistentTaskFunction(
-            func_id=1,
-            name="add_f32",
-            body="task->out[i] = task->a[i] + task->b[i];",
-        ),
-        CudaPersistentTaskFunction(
-            func_id=2,
-            name="mul_f32",
-            body="task->out[i] = task->a[i] * task->b[i];",
-        ),
-    ]
-)
+_PERSISTENT_DAG_TASK_FUNCTIONS = [
+    CudaPersistentTaskFunction(
+        func_id=1,
+        name="add_f32",
+        body="task->out[i] = task->a[i] + task->b[i];",
+    ),
+    CudaPersistentTaskFunction(
+        func_id=2,
+        name="mul_f32",
+        body="task->out[i] = task->a[i] * task->b[i];",
+    ),
+]
+_PERSISTENT_DAG_SOURCE = render_persistent_dag_source(_PERSISTENT_DAG_TASK_FUNCTIONS)
 
 
 class CudaPersistentCallable(ctypes.Structure):
@@ -755,9 +758,15 @@ def _compile_persistent_ptx(work_dir: Path, arch: str, mode: str) -> tuple[bytes
 
     source_by_mode = {
         "direct": _PERSISTENT_DIRECT_SOURCE,
-        "dag": _PERSISTENT_DAG_SOURCE,
         "queue": _PERSISTENT_QUEUE_SOURCE,
     }
+    if mode == "dag":
+        artifact = compile_cuda_persistent_device(
+            _PERSISTENT_DAG_TASK_FUNCTIONS,
+            cache_root=work_dir,
+            arch=arch,
+        )
+        return artifact.ptx, f"nvcc-persistent-{artifact.source_kind}-{arch}"
     if mode not in source_by_mode:
         raise ValueError(f"unknown persistent mode: {mode}")
 
