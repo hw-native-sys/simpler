@@ -8,6 +8,7 @@ baselines, local A100 runs, and remote H200 runs.
 
 The latest captured raw reports are under `tmp/`:
 
+- `tmp/cuda-backend/index.md`
 - `tmp/cuda-backend/tensor-descriptor-smoke-38db010e/a100.json`
 - `tmp/cuda-backend/tensor-descriptor-smoke-38db010e/h200.json`
 - `tmp/cuda-backend/tensor-descriptor-smoke-38db010e/cuda-smoke-report.md`
@@ -65,6 +66,9 @@ captured from commit `37bebf44`. The DAG-chain data was captured from commit
 `323f4587`. The scratch-reuse DAG data was captured from commit `bcf54a88`.
 The tensor-tile DAG data was captured from commit `8950e029`. The CUDA Graph
 launch-baseline data was captured from commit `ba2cdd0e`.
+
+`tmp/cuda-backend/index.md` is a generated local index that includes both
+benchmark artifacts and compact smoke-report artifacts.
 
 ## Current Baselines
 

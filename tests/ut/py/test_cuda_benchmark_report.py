@@ -168,6 +168,7 @@ def test_cuda_artifact_index_scans_benchmark_outputs(tmp_path):
     assert entries == [
         {
             "path": "combined-graph",
+            "kind": "benchmark",
             "label": "cuda-graph-a100-h200",
             "machine": "combined",
             "git_commit": "abc123",
@@ -196,8 +197,38 @@ def test_cuda_artifact_index_renders_markdown_and_writes_default_index(tmp_path)
 
     assert output == tmp_path / "index.md"
     assert "# CUDA Backend Artifact Index" in report
-    assert ("| a100-graph | a100-graph | hina | abc123 | 1 | 1024 | direct_driver_graph |") in report
+    assert ("| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 | direct_driver_graph |") in report
     assert "ratio SVG" in report
+
+
+def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
+    cuda_artifact_index = _load_artifact_index_module()
+    artifact_dir = tmp_path / "tensor-descriptor-smoke"
+    artifact_dir.mkdir()
+    (artifact_dir / "a100.json").write_text(json.dumps({"status": "pass", "runtime": "persistent_device"}) + "\n")
+    (artifact_dir / "h200.json").write_text(json.dumps({"status": "pass", "runtime": "persistent_device"}) + "\n")
+    (artifact_dir / "cuda-smoke-report.md").write_text("# CUDA Smoke Report\n\n- Label: `tensor-smoke`\n")
+    (artifact_dir / "cuda-smoke-report.svg").write_text("<svg></svg>\n")
+
+    entries = cuda_artifact_index.scan_artifacts(tmp_path)
+    report = cuda_artifact_index.render_markdown(entries)
+
+    assert entries == [
+        {
+            "path": "tensor-descriptor-smoke",
+            "kind": "smoke",
+            "label": "tensor-smoke",
+            "machine": "combined",
+            "git_commit": "unknown",
+            "result_count": 2,
+            "baselines": ["persistent_device"],
+            "sizes": ["unknown"],
+            "has_markdown": True,
+            "has_svg": True,
+            "has_ratio_svg": False,
+        }
+    ]
+    assert "| tensor-descriptor-smoke | smoke | tensor-smoke | combined | unknown | 2 |" in report
 
 
 def test_cuda_artifact_index_sorts_numeric_sizes_before_strings(tmp_path):
