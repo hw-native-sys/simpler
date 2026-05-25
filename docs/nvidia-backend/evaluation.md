@@ -8,12 +8,12 @@ baselines, local A100 runs, and remote H200 runs.
 
 The latest captured raw reports are under `tmp/`:
 
-- `tmp/cuda-backend/a100-grid-37d75192/cuda-benchmark.md`
-- `tmp/cuda-backend/h200-grid-37d75192/cuda-benchmark.md`
-- `tmp/cuda-backend/combined-grid-37d75192/cuda-benchmark.md`
-- `tmp/cuda-backend/combined-grid-37d75192/cuda-benchmark.svg`
+- `tmp/cuda-backend/a100-sweep-fd40edd1/cuda-benchmark.md`
+- `tmp/cuda-backend/h200-sweep-fd40edd1/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-sweep-fd40edd1/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-sweep-fd40edd1/cuda-benchmark.svg`
 
-The data was captured from commit `37d75192`.
+The data was captured from commit `fd40edd1`.
 
 ## Current Baselines
 
@@ -28,7 +28,7 @@ The data was captured from commit `37d75192`.
   compare repeated host launches with one persistent launch over the same
   descriptor count.
 - `pto_persistent_device_grid_batch`: direct persistent-device batch row with
-  four CUDA worker blocks assigned to each task descriptor.
+  a swept number of CUDA worker blocks assigned to each task descriptor.
 
 Ratios are relative to the matched host-schedule row for the same GPU, vector
 length, and task count. For batch rows, the reference is
@@ -36,20 +36,21 @@ length, and task count. For batch rows, the reference is
 
 ## Headline Results
 
-| GPU | N | `pto_host_schedule_batch` ns | `persistent_device_batch` | `persistent_grid_batch` | `persistent_queue_batch` |
-| --- | - | ---------------------------- | ------------------------- | ----------------------- | ------------------------ |
-| A100 | 1024 | 81920 | 0.62x | 0.53x | 0.57x |
-| H200 | 1024 | 75072 | 0.49x | 0.51x | 0.57x |
-| A100 | 1048576 | 73248 | 17.28x | 4.85x | 16.83x |
-| H200 | 1048576 | 90272 | 13.74x | 3.60x | 13.66x |
+| GPU | N | `pto_host_schedule_batch` ns | `persistent_device_batch` | Best grid blocks/task | Best grid ratio | `persistent_queue_batch` |
+| --- | - | ---------------------------- | ------------------------- | --------------------- | --------------- | ------------------------ |
+| A100 | 1024 | 101376 | 0.48x | 4 | 0.42x | 0.47x |
+| H200 | 1024 | 70464 | 0.50x | 8 | 0.51x | 0.59x |
+| A100 | 1048576 | 75040 | 16.73x | 16 | 1.47x | 16.89x |
+| H200 | 1048576 | 62783 | 19.55x | 16 | 1.40x | 19.38x |
 
 The small-vector rows show launch-amortization benefit from the persistent
-paths. The large-vector rows show why the worker-grid variant matters: giving
-each descriptor four worker blocks reduces the A100 large-vector direct
-persistent row from `17.28x` to `4.85x` versus the matched host-schedule batch
-row, and reduces the H200 row from `13.74x` to `3.60x`. It is still not a
-full parity comparison with `pto_host_schedule`, which launches a full grid
-per vector-add task.
+paths. The large-vector rows show why the worker-grid variant matters: in the
+`2,4,8,16` sweep, the best large-vector row uses 16 worker blocks per
+descriptor on both GPUs. That reduces the A100 direct persistent batch row
+from `16.73x` to `1.47x` versus the matched host-schedule batch row, and
+reduces the H200 row from `19.55x` to `1.40x`. It is still not a full parity
+comparison with `pto_host_schedule`, which launches a full grid per vector-add
+task.
 
 ## PTX Sources
 
@@ -66,9 +67,9 @@ Local A100:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --device 0 --sizes 1024,1048576 --repeats 3 --arch compute_80 \
-    --include-persistent --batch-tasks 6 --worker-blocks-per-task 4 \
-    --label a100-grid-$(git rev-parse --short HEAD) \
-    --output-dir tmp/cuda-backend/a100-grid-$(git rev-parse --short HEAD)
+    --include-persistent --batch-tasks 6 --worker-blocks-per-task 2,4,8,16 \
+    --label a100-sweep-$(git rev-parse --short HEAD) \
+    --output-dir tmp/cuda-backend/a100-sweep-$(git rev-parse --short HEAD)
 ```
 
 Remote H200:
@@ -79,9 +80,9 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,1048576 --repeats 3 --arch compute_90 \
-     --include-persistent --batch-tasks 6 --worker-blocks-per-task 4 \
-     --label h200-grid-$(git rev-parse --short HEAD) \
-     --output-dir tmp/cuda-backend/h200-grid-$(git rev-parse --short HEAD)'
+     --include-persistent --batch-tasks 6 --worker-blocks-per-task 2,4,8,16 \
+     --label h200-sweep-$(git rev-parse --short HEAD) \
+     --output-dir tmp/cuda-backend/h200-sweep-$(git rev-parse --short HEAD)'
 ```
 
 Merge reports:
@@ -89,15 +90,15 @@ Merge reports:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
-    --merge-json tmp/cuda-backend/a100-grid-37d75192/cuda-benchmark.json \
-    tmp/cuda-backend/h200-grid-37d75192/cuda-benchmark.json \
-    --label cuda-grid-a100-h200-37d75192 \
-    --output-dir tmp/cuda-backend/combined-grid-37d75192
+    --merge-json tmp/cuda-backend/a100-sweep-fd40edd1/cuda-benchmark.json \
+    tmp/cuda-backend/h200-sweep-fd40edd1/cuda-benchmark.json \
+    --label cuda-sweep-a100-h200-fd40edd1 \
+    --output-dir tmp/cuda-backend/combined-sweep-fd40edd1
 ```
 
 ## Next Evaluation Gaps
 
-- Sweep `--worker-blocks-per-task` to find a better large-vector point before
-  treating the grid row as a tuned baseline.
+- Extend the worker-grid sweep beyond 16 blocks per descriptor and across more
+  vector lengths before treating the grid row as a tuned baseline.
 - Add a higher-level task graph workload beyond vector add once the runtime
   ABI is stable enough.
