@@ -100,7 +100,7 @@ same vector-add PTX kernel through two launch paths:
   same-work batch rows enabled by `--batch-tasks N`. The worker-grid row is
   enabled with `--worker-blocks-per-task M` and assigns multiple CUDA worker
   blocks to each task descriptor. Pass a comma-separated list, such as
-  `--worker-blocks-per-task 2,4,8,16`, to sweep grid shapes in one report.
+  `--worker-blocks-per-task 8,16,32,64`, to sweep grid shapes in one report.
 
 The smoke helper caches the built and loaded host runtime per process, so the
 benchmark can run repeated PTO and baseline samples without rebuilding a shared
@@ -112,7 +112,7 @@ Local A100 example:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_80 \
-    --include-persistent --batch-tasks 6 --worker-blocks-per-task 2,4,8,16 \
+    --include-persistent --batch-tasks 6 --worker-blocks-per-task 8,16,32,64 \
     --label a100-local --output-dir tmp/cuda-backend/a100
 ```
 
@@ -124,7 +124,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_90 \
-     --include-persistent --batch-tasks 6 --worker-blocks-per-task 2,4,8,16 \
+     --include-persistent --batch-tasks 6 --worker-blocks-per-task 8,16,32,64 \
      --label h200-remote --output-dir tmp/cuda-backend/h200'
 ```
 
@@ -139,6 +139,10 @@ machine, vector length, and task count. Same-work batch rows are therefore
 relative to `pto_host_schedule_batch`, not the one-task `pto_host_schedule`
 row.
 
+When worker-grid rows are present, the report includes a
+`Best Worker Grid Rows` table that picks the lowest median device time for
+each machine, vector length, and task count.
+
 The report also includes a PTX-source table by machine and baseline. Treat any
 `embedded-sm80-*` row as a fallback path: the local CUDA driver JIT compiled
 embedded `sm_80` PTX instead of using `nvcc` to produce fresh PTX for the
@@ -148,7 +152,9 @@ The default persistent batch row uses one worker block per descriptor. Add
 `--worker-blocks-per-task M[,N...]` to include one
 `pto_persistent_device_grid_batch` row per value, which separates launch
 amortization from intra-task grid parallelism by giving each descriptor
-multiple worker blocks.
+multiple worker blocks. In the current vector-add slice, `64` worker blocks
+per descriptor is the best large-vector point observed on both A100 and H200;
+keep sweeping beyond that before treating it as tuned.
 
 Merge local and remote JSON payloads into one comparative report:
 
