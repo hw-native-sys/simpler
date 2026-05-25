@@ -97,7 +97,8 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 Run the tensor-tile persistent DAG smoke. This graph uses a generated-dispatch
-16x16 tiled GEMM task, then residual, gate, and fan-in elementwise tasks:
+16x16 tiled GEMM task with rows/cols/inner/stride descriptor metadata, then
+residual, gate, and fan-in elementwise tasks:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -291,8 +292,10 @@ kernel workload.
 The tensor-tile DAG capture at `8950e029` adds `pto_persistent_dag_tensor`.
 It validates generated-dispatch task bodies beyond elementwise kernels by
 running a fixed 16x16 tiled GEMM task before residual, gate, and fan-in tasks.
-Use it as an ABI and scheduler validation row; it is still a scalar CUDA
-GEMM microbenchmark, not a tuned tensor-core workload.
+The later descriptor-metadata smoke extends that tensor task with
+rows/cols/inner/leading-dimension and per-tile stride fields. Use these rows
+as ABI and scheduler validation; they are still scalar CUDA GEMM
+microbenchmarks, not tuned tensor-core workloads.
 
 The CUDA Graph launch-baseline capture at `ba2cdd0e` adds
 `direct_driver_graph` to the default benchmark. It showed graph replay faster

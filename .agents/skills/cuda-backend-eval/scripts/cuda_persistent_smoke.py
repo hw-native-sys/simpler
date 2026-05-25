@@ -644,15 +644,25 @@ _PERSISTENT_DAG_TASK_FUNCTIONS = [
         func_id=3,
         name="matmul16_f32",
         body="""
-unsigned long long tile_base = (i / 256ULL) * 256ULL;
-unsigned long long elem = i % 256ULL;
-unsigned long long row = elem / 16ULL;
-unsigned long long col = elem % 16ULL;
-float acc = 0.0f;
-for (unsigned long long k = 0; k < 16ULL; ++k) {
-  acc += task->a[tile_base + row * 16ULL + k] * task->b[tile_base + k * 16ULL + col];
+unsigned long long rows = static_cast<unsigned long long>(task->rows);
+unsigned long long cols = static_cast<unsigned long long>(task->cols);
+unsigned long long inner = static_cast<unsigned long long>(task->inner);
+if (rows == 0ULL || cols == 0ULL || inner == 0ULL) {
+  return;
 }
-task->out[i] = acc;
+unsigned long long matrix_elems = rows * cols;
+unsigned long long tile_id = i / matrix_elems;
+unsigned long long elem = i % matrix_elems;
+unsigned long long row = elem / cols;
+unsigned long long col = elem % cols;
+unsigned long long a_base = tile_id * task->a_batch_stride;
+unsigned long long b_base = tile_id * task->b_batch_stride;
+unsigned long long out_base = tile_id * task->out_batch_stride;
+float acc = 0.0f;
+for (unsigned long long k = 0; k < inner; ++k) {
+  acc += task->a[a_base + row * task->lda + k] * task->b[b_base + k * task->ldb + col];
+}
+task->out[out_base + row * task->ldc + col] = acc;
 """.strip(),
     ),
 ]
@@ -725,6 +735,15 @@ class CudaPersistentDagTask(ctypes.Structure):
         ("dependent_begin", ctypes.c_uint32),
         ("dependent_count", ctypes.c_uint32),
         ("initial_fanin", ctypes.c_uint32),
+        ("rows", ctypes.c_uint32),
+        ("cols", ctypes.c_uint32),
+        ("inner", ctypes.c_uint32),
+        ("lda", ctypes.c_uint32),
+        ("ldb", ctypes.c_uint32),
+        ("ldc", ctypes.c_uint32),
+        ("a_batch_stride", ctypes.c_uint64),
+        ("b_batch_stride", ctypes.c_uint64),
+        ("out_batch_stride", ctypes.c_uint64),
     ]
 
 
@@ -753,17 +772,39 @@ def _f32(value: float) -> float:
     return ctypes.c_float(value).value
 
 
-def _matmul16_expected(host_a, host_b, n: int) -> list[float]:
-    expected: list[float] = []
+_TENSOR_TILE_DESCRIPTOR = {
+    "rows": 16,
+    "cols": 16,
+    "inner": 16,
+    "lda": 16,
+    "ldb": 16,
+    "ldc": 16,
+    "a_batch_stride": 256,
+    "b_batch_stride": 256,
+    "out_batch_stride": 256,
+}
+
+
+def _matmul_expected(host_a, host_b, n: int, descriptor: dict[str, int]) -> list[float]:
+    expected: list[float] = [0.0] * n
+    rows = descriptor["rows"]
+    cols = descriptor["cols"]
+    inner = descriptor["inner"]
+    matrix_elems = rows * cols
     for i in range(n):
-        tile_base = (i // 256) * 256
-        elem = i % 256
-        row = elem // 16
-        col = elem % 16
+        tile_id = i // matrix_elems
+        elem = i % matrix_elems
+        row = elem // cols
+        col = elem % cols
+        a_base = tile_id * descriptor["a_batch_stride"]
+        b_base = tile_id * descriptor["b_batch_stride"]
+        out_base = tile_id * descriptor["out_batch_stride"]
         acc = 0.0
-        for k in range(16):
-            acc = _f32(acc + _f32(host_a[tile_base + row * 16 + k] * host_b[tile_base + k * 16 + col]))
-        expected.append(acc)
+        for k in range(inner):
+            a_index = a_base + row * descriptor["lda"] + k
+            b_index = b_base + k * descriptor["ldb"] + col
+            acc = _f32(acc + _f32(host_a[a_index] * host_b[b_index]))
+        expected[out_base + row * descriptor["ldc"] + col] = acc
     return expected
 
 
@@ -849,6 +890,31 @@ def _make_dag_shape(
     dev_tmp3: int,
     dev_out: int,
 ) -> tuple[Any, Any, Any]:
+    def make_task(
+        func_id: int,
+        a: int,
+        b: int,
+        out: int,
+        dependent_begin: int,
+        dependent_count: int,
+        initial_fanin: int,
+        descriptor: dict[str, int] | None = None,
+    ) -> CudaPersistentDagTask:
+        task = CudaPersistentDagTask(
+            func_id,
+            a,
+            b,
+            out,
+            n,
+            dependent_begin,
+            dependent_count,
+            initial_fanin,
+        )
+        if descriptor is not None:
+            for field, value in descriptor.items():
+                setattr(task, field, value)
+        return task
+
     if dag_shape == "fork_join":
         task_count = 3
         host_fanin_t = ctypes.c_uint32 * task_count
@@ -1031,15 +1097,15 @@ def _make_dag_shape(
             host_fanin_t(0, 1, 1, 2),
             dependents_t(1, 2, 3, 3),
             task_t(
-                CudaPersistentDagTask(
-                    func_id=3,
-                    a=dev_a,
-                    b=dev_b,
-                    out=dev_tmp0,
-                    n=n,
-                    dependent_begin=0,
-                    dependent_count=2,
-                    initial_fanin=0,
+                make_task(
+                    3,
+                    dev_a,
+                    dev_b,
+                    dev_tmp0,
+                    0,
+                    2,
+                    0,
+                    _TENSOR_TILE_DESCRIPTOR,
                 ),
                 CudaPersistentDagTask(
                     func_id=1,
@@ -1201,7 +1267,7 @@ def _make_launch(
     return _make_queue_launch(runtime, ctx, ptx_buf, ptx_size, task_count, queue_capacity, dev_tasks)
 
 
-def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
+def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
     runtime = config.runtime
     ctx = config.ctx
     n = config.n
@@ -1349,7 +1415,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
             expected_tmp0 = [_f32(expected_tmp2[i] + host_a[i]) for i in range(n)]
             expected_out = [_f32(expected_tmp0[i] + expected_tmp3[i]) for i in range(n)]
         if config.dag_shape == "tensor_tile":
-            expected_tmp0 = _matmul16_expected(host_a, host_b, n)
+            expected_tmp0 = _matmul_expected(host_a, host_b, n, _TENSOR_TILE_DESCRIPTOR)
             expected_tmp1 = [_f32(expected_tmp0[i] + host_a[i]) for i in range(n)]
             expected_tmp2 = [_f32(expected_tmp0[i] * host_b[i]) for i in range(n)]
             expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
@@ -1394,7 +1460,10 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912
         if config.dag_shape == "scratch_reuse":
             result["scratch_reuse"] = {"reused_buffer": "tmp0", "reuse_task": 4}
         if config.dag_shape == "tensor_tile":
-            result["tensor_tile"] = {"m": 16, "n": 16, "k": 16, "tile_count": n // 256}
+            result["tensor_tile"] = {
+                **_TENSOR_TILE_DESCRIPTOR,
+                "tile_count": n // (_TENSOR_TILE_DESCRIPTOR["rows"] * _TENSOR_TILE_DESCRIPTOR["cols"]),
+            }
         return result
     finally:
         for ptr in allocated:

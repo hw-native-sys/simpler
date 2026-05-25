@@ -131,12 +131,13 @@ scheduler/worker split and back-pressure shape that CUDA needs because there
 is no AICPU.
 
 The following slice layers a small DAG on top of that bounded ring. Task
-descriptors carry a `func_id`, dependent ranges, and an initial fan-in count.
-The persistent executor seeds zero-fan-in tasks, dispatches task bodies through
-a generated `func_id` switch, decrements dependent fan-in counters when tasks
-complete, and pushes newly ready dependents back into the ring. The smoke path
-now uses `simpler_setup.cuda_callable_compiler.render_persistent_dag_source()`
-to generate the task-body wrappers and dispatch switch before compiling the
+descriptors carry a `func_id`, dependent ranges, an initial fan-in count, and
+optional tensor shape/stride metadata for tiled callables. The persistent
+executor seeds zero-fan-in tasks, dispatches task bodies through a generated
+`func_id` switch, decrements dependent fan-in counters when tasks complete,
+and pushes newly ready dependents back into the ring. The smoke path now uses
+`simpler_setup.cuda_callable_compiler.render_persistent_dag_source()` to
+generate the task-body wrappers and dispatch switch before compiling the
 executor source with `nvcc`. The companion
 `compile_cuda_persistent_device()` helper writes the generated source, PTX, and
 JSON manifest under `build/cache/cuda/onboard/persistent_device/callables/`,

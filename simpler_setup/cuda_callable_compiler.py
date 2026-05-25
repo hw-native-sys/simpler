@@ -123,6 +123,15 @@ struct PtoCudaPersistentDagTask {{
     unsigned int dependent_begin;
     unsigned int dependent_count;
     unsigned int initial_fanin;
+    unsigned int rows;
+    unsigned int cols;
+    unsigned int inner;
+    unsigned int lda;
+    unsigned int ldb;
+    unsigned int ldc;
+    unsigned long long a_batch_stride;
+    unsigned long long b_batch_stride;
+    unsigned long long out_batch_stride;
 }};
 
 struct PtoCudaPersistentDagState {{
@@ -218,7 +227,7 @@ def _cache_key(source: str, task_functions: Sequence[CudaPersistentTaskFunction]
     payload = {
         "arch": arch,
         "entry_name": _PERSISTENT_DAG_ENTRY_NAME,
-        "generator": "cuda-persistent-device-v1",
+        "generator": "cuda-persistent-device-v2",
         "source": source,
         "source_kind": _PERSISTENT_DAG_SOURCE_KIND,
         "task_functions": _task_manifest(task_functions),

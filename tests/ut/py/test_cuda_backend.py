@@ -485,7 +485,18 @@ assert result["completed_count"] == 4
 assert result["dispatch_func_ids"] == [3, 1, 2, 1]
 assert result["fanin_remaining"] == [0, 0, 0, 0]
 assert result["source_kind"] == "generated-dispatch"
-assert result["tensor_tile"] == {"m": 16, "n": 16, "k": 16, "tile_count": 16}
+assert result["tensor_tile"] == {
+    "rows": 16,
+    "cols": 16,
+    "inner": 16,
+    "lda": 16,
+    "ldb": 16,
+    "ldc": 16,
+    "a_batch_stride": 256,
+    "b_batch_stride": 256,
+    "out_batch_stride": 256,
+    "tile_count": 16,
+}
 """
     result = subprocess.run(
         [sys.executable, "-c", script],

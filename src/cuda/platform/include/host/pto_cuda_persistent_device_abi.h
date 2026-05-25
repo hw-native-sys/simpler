@@ -75,6 +75,15 @@ struct PtoCudaPersistentDagTask {
     uint32_t dependent_begin;
     uint32_t dependent_count;
     uint32_t initial_fanin;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t inner;
+    uint32_t lda;
+    uint32_t ldb;
+    uint32_t ldc;
+    uint64_t a_batch_stride;
+    uint64_t b_batch_stride;
+    uint64_t out_batch_stride;
 };
 
 struct PtoCudaPersistentDagState {

@@ -273,9 +273,11 @@ chain row for larger vectors because the final add consumes the reused
 scratch branch rather than the earlier chain value; this is a microbenchmark
 effect, not a claim that reuse is inherently faster.
 
-The tensor row keeps the same persistent-DAG scheduler and descriptor ABI but
-adds a generated-dispatch `func_id=3` that computes one or more 16x16 GEMM
-tiles. The following rows compare the tensor DAG against the three-task
+The tensor row keeps the same persistent-DAG scheduler but extends the task
+descriptor ABI with rows, columns, inner dimension, leading dimensions, and
+per-tile strides. Its generated-dispatch `func_id=3` computes one or more
+16x16 GEMM tiles before residual, gate, and fan-in elementwise tasks. The
+following rows compare the older tensor DAG capture against the three-task
 elementwise DAG and the one-call host-schedule vector baseline for shape
 context only. They are not same-work throughput comparisons.
 
@@ -292,7 +294,9 @@ At large `N`, the tensor DAG is roughly four times slower than the simple DAG
 because each output element performs a 16-term dot product before the
 elementwise residual, gate, and fan-in tasks. This is expected and confirms
 that the persistent-device scheduler can run non-elementwise callable bodies
-without changing the host ABI.
+without changing the launch path. A local A100 smoke after the descriptor
+extension validated the metadata-carrying tensor DAG at `N=4096` with
+16 tiles, `compute_80` PTX, and copied-back real CUDA data.
 
 ## Reproduction Commands
 

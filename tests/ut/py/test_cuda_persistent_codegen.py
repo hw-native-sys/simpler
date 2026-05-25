@@ -50,6 +50,28 @@ def test_render_persistent_dag_source_generates_dispatch_switch():
     assert source.index("case 1U:") < source.index("case 2U:")
 
 
+def test_render_persistent_dag_source_includes_tensor_descriptor_metadata():
+    source = render_persistent_dag_source(
+        [
+            CudaPersistentTaskFunction(
+                func_id=3,
+                name="matmul_f32",
+                body="task->out[i] = task->a[i];",
+            )
+        ]
+    )
+
+    assert "unsigned int rows;" in source
+    assert "unsigned int cols;" in source
+    assert "unsigned int inner;" in source
+    assert "unsigned int lda;" in source
+    assert "unsigned int ldb;" in source
+    assert "unsigned int ldc;" in source
+    assert "unsigned long long a_batch_stride;" in source
+    assert "unsigned long long b_batch_stride;" in source
+    assert "unsigned long long out_batch_stride;" in source
+
+
 def test_render_persistent_dag_source_rejects_duplicate_func_id():
     with pytest.raises(ValueError, match="duplicate func_id"):
         render_persistent_dag_source(
