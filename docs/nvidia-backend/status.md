@@ -99,9 +99,10 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest paired capture uses the `8x4x12` tensor descriptor, sizes
-`1024,65536,1048576`, three repeats, task counts `2,6,12`, and worker-grid
-values `32,64,128,256`.
+The latest paired capture at commit `d7257c84` uses the `8x4x12` tensor
+descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
+and worker-grid values `32,64,128,256`. It includes the compiler-backed
+host-schedule row on both A100 and H200.
 
 Evidence:
 
@@ -130,10 +131,27 @@ The focused CUDA test set was run from the project-local virtual environment:
   tests/ut/py/test_cuda_persistent_codegen.py -q
 ```
 
-Result: `59 passed`.
+Result: `60 passed`.
 
 The docs and skill updates were checked with targeted `pre-commit` runs and
 `git diff --check` before commit.
+
+The H200 compiler-backed host-schedule smoke was also run after pushing
+`d7257c84` to the remote checkout:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && git pull --ff-only >/dev/null && \
+   PYTHONPATH=$PWD:$PWD/python \
+   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+     --device 0 --sizes 1024 --repeats 1 --arch compute_90 \
+     --single-baseline pto_host_schedule_compiler \
+     --label h200-compiler-smoke-$(git rev-parse --short HEAD) \
+     --output-dir tmp/cuda-backend/h200-compiler-smoke-$(git rev-parse --short HEAD)'
+```
+
+Result: `status=pass`, `n=1024`, `ptx_arch=compute_90`,
+`ptx_source=kernel-compiler-task-body-wrapper-compute_90`.
 
 ## Remaining Gaps
 

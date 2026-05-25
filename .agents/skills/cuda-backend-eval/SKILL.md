@@ -221,7 +221,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 ```
 
 Copy the remote H200 artifact directory back before merging. The current
-committed summary uses the `6c49c5cf` artifact names in
+committed summary uses the `d7257c84` artifact names in
 `docs/nvidia-backend/evaluation-current.md`.
 
 ```bash

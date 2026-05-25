@@ -62,6 +62,11 @@ The archived raw reports are under `tmp/`:
 - `tmp/cuda-backend/combined-graph-ba2cdd0e/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-graph-ba2cdd0e/cuda-benchmark.svg`
 - `tmp/cuda-backend/combined-graph-ba2cdd0e/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/a100-current-6c49c5cf/cuda-benchmark.md`
+- `tmp/cuda-backend/h200-current-6c49c5cf/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-current-6c49c5cf/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-current-6c49c5cf/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-current-6c49c5cf/cuda-benchmark-ratios.svg`
 
 The tensor descriptor smoke data was captured from commit `38db010e`. The
 wider vector/task range data was captured from commit `cc6869f7`. The
@@ -71,7 +76,9 @@ data was captured from commit `e430bc1b`. The stream concurrency data was
 captured from commit `37bebf44`. The DAG-chain data was captured from commit
 `323f4587`. The scratch-reuse DAG data was captured from commit `bcf54a88`.
 The tensor-tile DAG data was captured from commit `8950e029`. The CUDA Graph
-launch-baseline data was captured from commit `ba2cdd0e`.
+launch-baseline data was captured from commit `ba2cdd0e`. The previous
+current-capture data with the `8x4x12` tensor descriptor, before adding the
+compiler-backed host-schedule row, was captured from commit `6c49c5cf`.
 
 `tmp/cuda-backend/index.md` is a generated local index that includes both
 benchmark artifacts and compact smoke-report artifacts. It records tensor-tile

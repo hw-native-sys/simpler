@@ -1,7 +1,7 @@
 # CUDA Current Evaluation Capture
 
 This page summarizes the current paired A100/H200 CUDA backend capture from
-commit `6c49c5cf`. The raw JSON, Markdown, and SVG reports are generated
+commit `d7257c84`. The raw JSON, Markdown, and SVG reports are generated
 locally under `tmp/cuda-backend/` and intentionally remain uncommitted.
 
 The capture uses `nvcc` for target-specific PTX on both machines:
@@ -16,29 +16,39 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 
 ## Artifact Paths
 
-- `tmp/cuda-backend/a100-current-6c49c5cf/cuda-benchmark.json`
-- `tmp/cuda-backend/a100-current-6c49c5cf/cuda-benchmark.md`
-- `tmp/cuda-backend/h200-current-6c49c5cf/cuda-benchmark.json`
-- `tmp/cuda-backend/h200-current-6c49c5cf/cuda-benchmark.md`
-- `tmp/cuda-backend/combined-current-6c49c5cf/cuda-benchmark.json`
-- `tmp/cuda-backend/combined-current-6c49c5cf/cuda-benchmark.md`
-- `tmp/cuda-backend/combined-current-6c49c5cf/cuda-benchmark.svg`
-- `tmp/cuda-backend/combined-current-6c49c5cf/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/a100-current-d7257c84/cuda-benchmark.json`
+- `tmp/cuda-backend/a100-current-d7257c84/cuda-benchmark.md`
+- `tmp/cuda-backend/h200-current-d7257c84/cuda-benchmark.json`
+- `tmp/cuda-backend/h200-current-d7257c84/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-current-d7257c84/cuda-benchmark.json`
+- `tmp/cuda-backend/combined-current-d7257c84/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-current-d7257c84/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-current-d7257c84/cuda-benchmark-ratios.svg`
 
 ## Launch Baselines
 
 CUDA Graph replay remains a useful phase-one host-launch baseline. It is
-faster than PTO host scheduling for every captured row in this run, but it is
-still host-owned replay rather than a device-side scheduler.
+faster than PTO host scheduling for most captured rows, but it is still
+host-owned replay rather than a device-side scheduler.
 
-| GPU | N | PTO host ns | Driver ns | Graph ns | Graph/PTO |
-| --- | - | ----------- | --------- | -------- | --------- |
-| A100 | 1024 | 46080 | 39935 | 26623 | 0.58x |
-| A100 | 65536 | 41568 | 41983 | 27551 | 0.66x |
-| A100 | 1048576 | 28672 | 36768 | 24224 | 0.84x |
-| H200 | 1024 | 31392 | 26944 | 20191 | 0.64x |
-| H200 | 65536 | 23200 | 26784 | 20160 | 0.87x |
-| H200 | 1048576 | 20832 | 24768 | 20255 | 0.97x |
+The `pto_host_schedule_compiler` row validates the new task-body compiler
+path. It uses the same host runtime path as `pto_host_schedule`, but the PTX
+comes from `KernelCompiler(platform="cuda").compile_cuda_host_schedule(...)`
+and the shared task wrapper generator.
+
+| GPU | N | PTO host ns | Compiler ns | Driver ns | Graph ns | Compiler/PTO | Graph/PTO |
+| --- | - | ----------- | ----------- | --------- | -------- | ------------ | --------- |
+| A100 | 1024 | 43008 | 46080 | 43007 | 25599 | 1.07x | 0.60x |
+| A100 | 65536 | 32320 | 31424 | 42847 | 29120 | 0.97x | 0.90x |
+| A100 | 1048576 | 29568 | 25152 | 37055 | 24351 | 0.85x | 0.82x |
+| H200 | 1024 | 37472 | 37728 | 33952 | 27551 | 1.01x | 0.74x |
+| H200 | 65536 | 25632 | 25184 | 39039 | 27712 | 0.98x | 1.08x |
+| H200 | 1048576 | 18528 | 19264 | 23040 | 17535 | 1.04x | 0.95x |
+
+The compiler row is within the same launch-latency band as the handwritten
+host-schedule PTX. That is the important signal for this slice: the shared
+task-body wrapper path can feed the existing host runtime without changing
+the launch ABI or adding a separate generated-kernel calling convention.
 
 ## Worker Grid Rows
 
@@ -49,29 +59,29 @@ worker blocks to each task descriptor.
 
 | GPU | N | Tasks | Best worker blocks/task | Device ns | Vs host batch |
 | --- | - | ----- | ----------------------- | --------- | ------------- |
-| A100 | 1024 | 2 | 256 | 47104 | 1.02x |
-| A100 | 1024 | 6 | 32 | 46080 | 0.38x |
-| A100 | 1024 | 12 | 32 | 47104 | 0.22x |
-| A100 | 65536 | 2 | 32 | 35840 | 0.79x |
-| A100 | 65536 | 6 | 256 | 31744 | 0.34x |
-| A100 | 65536 | 12 | 32 | 31744 | 0.23x |
-| A100 | 1048576 | 2 | 256 | 31744 | 0.85x |
-| A100 | 1048576 | 6 | 128 | 41984 | 0.53x |
-| A100 | 1048576 | 12 | 64 | 63488 | 0.45x |
-| H200 | 1024 | 2 | 256 | 29920 | 0.91x |
-| H200 | 1024 | 6 | 32 | 30496 | 0.37x |
-| H200 | 1024 | 12 | 128 | 31168 | 0.22x |
-| H200 | 65536 | 2 | 128 | 17632 | 0.68x |
-| H200 | 65536 | 6 | 64 | 15648 | 0.29x |
-| H200 | 65536 | 12 | 64 | 15776 | 0.21x |
-| H200 | 1048576 | 2 | 256 | 20864 | 0.61x |
-| H200 | 1048576 | 6 | 128 | 26752 | 0.45x |
-| H200 | 1048576 | 12 | 256 | 38080 | 0.34x |
+| A100 | 1024 | 2 | 256 | 41984 | 0.85x |
+| A100 | 1024 | 6 | 32 | 43008 | 0.41x |
+| A100 | 1024 | 12 | 256 | 43008 | 0.23x |
+| A100 | 65536 | 2 | 32 | 31744 | 0.81x |
+| A100 | 65536 | 6 | 64 | 30720 | 0.43x |
+| A100 | 65536 | 12 | 32 | 29696 | 0.28x |
+| A100 | 1048576 | 2 | 256 | 27648 | 0.72x |
+| A100 | 1048576 | 6 | 128 | 41984 | 0.56x |
+| A100 | 1048576 | 12 | 256 | 60416 | 0.45x |
+| H200 | 1024 | 2 | 64 | 38240 | 0.96x |
+| H200 | 1024 | 6 | 32 | 37280 | 0.32x |
+| H200 | 1024 | 12 | 128 | 36576 | 0.20x |
+| H200 | 65536 | 2 | 128 | 22560 | 0.56x |
+| H200 | 65536 | 6 | 32 | 21696 | 0.30x |
+| H200 | 65536 | 12 | 128 | 22432 | 0.19x |
+| H200 | 1048576 | 2 | 256 | 18528 | 0.67x |
+| H200 | 1048576 | 6 | 128 | 22848 | 0.39x |
+| H200 | 1048576 | 12 | 256 | 35232 | 0.32x |
 
-The strongest launch-amortization rows are the 12-task rows: `0.45x` on A100
-and `0.34x` on H200 at `N=1048576`. Small vectors also benefit once task
-count is high enough, but the two-task A100 `N=1024` row remains slightly
-slower than host batch.
+The strongest launch-amortization rows are still the 12-task rows: `0.45x`
+on A100 and `0.32x` on H200 at `N=1048576`. The best worker-block count is
+not monotonic, so these rows support a tunable policy rather than a fixed
+default.
 
 ## Persistent DAG Shapes
 
@@ -82,12 +92,12 @@ large-vector ratio is expected to be several times slower than the simple DAG.
 
 | GPU | N | Chain/DAG | Reuse/DAG | Tensor/DAG |
 | --- | - | --------- | --------- | ---------- |
-| A100 | 1024 | 1.33x | 1.20x | 1.23x |
-| A100 | 65536 | 1.75x | 1.74x | 4.14x |
-| A100 | 1048576 | 1.81x | 1.71x | 4.59x |
-| H200 | 1024 | 1.29x | 1.56x | 1.31x |
-| H200 | 65536 | 1.78x | 1.79x | 3.81x |
-| H200 | 1048576 | 1.79x | 1.78x | 3.93x |
+| A100 | 1024 | 1.29x | 1.38x | 1.50x |
+| A100 | 65536 | 1.77x | 1.73x | 4.07x |
+| A100 | 1048576 | 1.78x | 1.72x | 4.58x |
+| H200 | 1024 | 1.21x | 1.41x | 1.42x |
+| H200 | 65536 | 1.71x | 1.73x | 3.62x |
+| H200 | 1048576 | 1.79x | 1.79x | 3.93x |
 
 The key correctness signal is that all DAG variants use generated dispatch
 and runtime graph descriptors without changing the persistent launch path.
@@ -130,8 +140,8 @@ Merge reports:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --merge-json \
-    tmp/cuda-backend/a100-current-6c49c5cf/cuda-benchmark.json \
-    tmp/cuda-backend/h200-current-6c49c5cf/cuda-benchmark.json \
-    --label combined-current-6c49c5cf \
-    --output-dir tmp/cuda-backend/combined-current-6c49c5cf
+    tmp/cuda-backend/a100-current-d7257c84/cuda-benchmark.json \
+    tmp/cuda-backend/h200-current-d7257c84/cuda-benchmark.json \
+    --label combined-current-d7257c84 \
+    --output-dir tmp/cuda-backend/combined-current-d7257c84
 ```
