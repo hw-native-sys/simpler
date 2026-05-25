@@ -130,7 +130,7 @@ def test_run_benchmark_uses_in_process_samples(monkeypatch):
     assert len(payload["results"]) == 2
 
 
-def test_run_benchmark_can_include_persistent_device(monkeypatch):
+def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
     cuda_benchmark = _load_benchmark_module()
     seen = []
 
@@ -161,8 +161,8 @@ def test_run_benchmark_can_include_persistent_device(monkeypatch):
         include_persistent=True,
     )
 
-    assert seen == ["pto_host_schedule", "direct_driver", "pto_persistent_device"]
-    assert len(payload["results"]) == 3
+    assert seen == ["pto_host_schedule", "direct_driver", "pto_persistent_device", "pto_persistent_queue"]
+    assert len(payload["results"]) == 4
 
 
 def test_render_report_describes_stream_concurrency_rows():

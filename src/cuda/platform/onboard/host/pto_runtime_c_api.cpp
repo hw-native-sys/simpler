@@ -164,7 +164,8 @@ public:
             return -1;
         }
         if (header->op != PTO_CUDA_HOST_OP_VECTOR_ADD_F32 &&
-            header->op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS) {
+            header->op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS &&
+            header->op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_QUEUE) {
             return -1;
         }
         uint32_t stream_id = 0;
@@ -232,7 +233,8 @@ public:
         }
         PreparedCallable &prepared = it->second;
         if (prepared.op != PTO_CUDA_HOST_OP_VECTOR_ADD_F32 &&
-            prepared.op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS) {
+            prepared.op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS &&
+            prepared.op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_QUEUE) {
             return -1;
         }
         if (cudaSetDevice(device_id_) != cudaSuccess) {
@@ -259,6 +261,7 @@ public:
         uint64_t n = 0;
         const PtoCudaPersistentVectorAddTask *tasks = nullptr;
         uint64_t task_count = 0;
+        const PtoCudaPersistentVectorAddQueueState *queue_state = nullptr;
         void *kernel_args[4] = {};
         if (prepared.op == PTO_CUDA_HOST_OP_VECTOR_ADD_F32) {
             auto *typed_args = static_cast<const PtoCudaVectorAddArgs *>(args);
@@ -276,7 +279,7 @@ public:
             kernel_args[1] = &b;
             kernel_args[2] = &out;
             kernel_args[3] = &n;
-        } else {
+        } else if (prepared.op == PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS) {
             auto *typed_args = static_cast<const PtoCudaPersistentVectorAddArgs *>(args);
             if (typed_args->tasks == nullptr || typed_args->task_count == 0) {
                 cudaEventDestroy(start);
@@ -287,6 +290,15 @@ public:
             task_count = typed_args->task_count;
             kernel_args[0] = &tasks;
             kernel_args[1] = &task_count;
+        } else if (prepared.op == PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_QUEUE) {
+            auto *typed_args = static_cast<const PtoCudaPersistentVectorAddQueueArgs *>(args);
+            if (typed_args->state == nullptr) {
+                cudaEventDestroy(start);
+                cudaEventDestroy(stop);
+                return -1;
+            }
+            queue_state = typed_args->state;
+            kernel_args[0] = &queue_state;
         }
         CUresult cu_rc = cuLaunchKernel(
             prepared.function, prepared.grid_dim, 1, 1, prepared.block_dim, 1, 1, prepared.shared_mem_bytes,

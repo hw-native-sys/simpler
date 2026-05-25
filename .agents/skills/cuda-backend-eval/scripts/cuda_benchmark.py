@@ -304,9 +304,9 @@ def run_direct_sample(device: int, n: int, block_dim: int, ptx: bytes) -> dict[s
         return driver.run_vector_add(n=n, block_dim=block_dim)
 
 
-def run_persistent_sample(device: int, n: int, arch: str) -> dict[str, Any]:
-    result = run_persistent_smoke(device=device, task_count=2, n=n, arch=arch)
-    result["baseline"] = "pto_persistent_device"
+def run_persistent_sample(device: int, n: int, arch: str, mode: str = "direct") -> dict[str, Any]:
+    result = run_persistent_smoke(device=device, task_count=2, n=n, arch=arch, mode=mode)
+    result["baseline"] = "pto_persistent_queue" if mode == "queue" else "pto_persistent_device"
     result["block_dim"] = 256
     return result
 
@@ -321,7 +321,9 @@ def run_single_sample(baseline: str, device: int, n: int, block_dim: int, arch: 
         result["ptx_source"] = ptx_source
         return result
     if baseline == "pto_persistent_device":
-        return run_persistent_sample(device=device, n=n, arch=arch)
+        return run_persistent_sample(device=device, n=n, arch=arch, mode="direct")
+    if baseline == "pto_persistent_queue":
+        return run_persistent_sample(device=device, n=n, arch=arch, mode="queue")
     raise ValueError(f"unknown baseline: {baseline}")
 
 
@@ -364,15 +366,16 @@ def run_benchmark(
             results.append(direct)
 
             if include_persistent:
-                persistent = run_single_sample(
-                    baseline="pto_persistent_device",
-                    device=device,
-                    n=n,
-                    block_dim=block_dim,
-                    arch=arch,
-                )
-                persistent.update({"machine": metadata["machine"], "repeat": repeat})
-                results.append(persistent)
+                for baseline in ("pto_persistent_device", "pto_persistent_queue"):
+                    persistent = run_single_sample(
+                        baseline=baseline,
+                        device=device,
+                        n=n,
+                        block_dim=block_dim,
+                        arch=arch,
+                    )
+                    persistent.update({"machine": metadata["machine"], "repeat": repeat})
+                    results.append(persistent)
 
     return {"metadata": metadata, "results": results}
 
@@ -630,7 +633,12 @@ def render_svg(summary: dict[tuple[str, str, int], dict[str, Any]]) -> str:
     chart_width = 520
     height = 50 + len(rows) * (bar_height + row_gap)
     width = left + chart_width + 160
-    colors = {"pto_host_schedule": "#2f6fbb", "direct_driver": "#2a9d65"}
+    colors = {
+        "pto_host_schedule": "#2f6fbb",
+        "direct_driver": "#2a9d65",
+        "pto_persistent_device": "#9467bd",
+        "pto_persistent_queue": "#c46a2c",
+    }
     lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="white"/>',
@@ -694,6 +702,9 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  including the runtime C API boundary and manifest lookup.",
             "- `pto_persistent_device` measures the tracer-bullet persistent executor",
             "  path: one host launch processes a device array of task descriptors.",
+            "- `pto_persistent_queue` measures the next persistent-device slice:",
+            "  one scheduler block publishes descriptor IDs into a device ready",
+            "  queue and worker blocks pop them inside the same CUDA launch.",
             "- `pto_stream_serial` measures two independent PTO launches issued",
             "  sequentially on the host-schedule stream pool.",
             "- `pto_stream_parallel` measures two independent PTO launches issued",
@@ -730,7 +741,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/cuda-backend/latest"))
     parser.add_argument(
         "--single-baseline",
-        choices=["pto_host_schedule", "direct_driver", "pto_persistent_device"],
+        choices=["pto_host_schedule", "direct_driver", "pto_persistent_device", "pto_persistent_queue"],
         default=None,
     )
     parser.add_argument("--merge-json", type=Path, nargs="*", default=None)

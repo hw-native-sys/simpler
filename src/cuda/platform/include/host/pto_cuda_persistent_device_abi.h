@@ -17,6 +17,7 @@
 
 enum PtoCudaPersistentDeviceOp : uint32_t {
     PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS = 1001,
+    PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_QUEUE = 1002,
 };
 
 struct PtoCudaPersistentCallable {
@@ -40,6 +41,20 @@ struct PtoCudaPersistentVectorAddTask {
 struct PtoCudaPersistentVectorAddArgs {
     const PtoCudaPersistentVectorAddTask *tasks;
     uint64_t task_count;
+};
+
+struct PtoCudaPersistentVectorAddQueueState {
+    const PtoCudaPersistentVectorAddTask *tasks;
+    uint64_t task_count;
+    uint32_t *ready_queue;
+    uint32_t queue_capacity;
+    uint32_t *queue_head;
+    uint32_t *queue_tail;
+    uint32_t *completed_count;
+};
+
+struct PtoCudaPersistentVectorAddQueueArgs {
+    const PtoCudaPersistentVectorAddQueueState *state;
 };
 
 #endif  // SRC_CUDA_PLATFORM_INCLUDE_HOST_PTO_CUDA_PERSISTENT_DEVICE_ABI_H_

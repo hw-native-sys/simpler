@@ -256,6 +256,32 @@ assert result["task_count"] == 2
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
 
+@pytest.mark.skipif(shutil.which("nvcc") is None, reason="nvcc is required for CUDA persistent queue smoke test")
+def test_cuda_persistent_device_smoke_runs_scheduler_worker_queue():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+result = run_persistent_smoke(device=0, task_count=4, n=1024, arch="compute_80", mode="queue")
+assert result["status"] == "pass"
+assert result["runtime"] == "persistent_device"
+assert result["mode"] == "queue"
+assert result["scheduler_blocks"] == 1
+assert result["worker_blocks"] >= 1
+assert result["completed_count"] == 4
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
 @pytest.mark.skipif(shutil.which("nvcc") is None, reason="nvcc is required for CUDA runtime concurrency test")
 def test_cuda_host_schedule_runs_independent_callables_on_multiple_streams(tmp_path, cuda_host_runtime_binaries):
     kernel_src = tmp_path / "slow_vector_add.cu"
