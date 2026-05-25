@@ -56,6 +56,45 @@ def test_render_cuda_task_wrappers_rejects_invalid_task_name():
         cuda_callable_compiler.render_cuda_task_wrappers(cuda_callable_compiler.CudaTaskBody(name="not-valid", body=""))
 
 
+def test_compile_cuda_host_schedule_writes_manifest_and_reuses_cache(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run_nvcc(source_path, ptx_path, arch, nvcc):
+        calls.append((source_path, ptx_path, arch, nvcc))
+        ptx_path.write_bytes(b"host-schedule-ptx")
+
+    monkeypatch.setattr(cuda_callable_compiler, "_run_nvcc_ptx", fake_run_nvcc)
+
+    assert hasattr(cuda_callable_compiler, "compile_cuda_host_schedule")
+
+    task_body = cuda_callable_compiler.CudaTaskBody(
+        name="vector_add",
+        body="out[pto_linear_tid()] = a[pto_linear_tid()] + b[pto_linear_tid()];",
+    )
+    first = cuda_callable_compiler.compile_cuda_host_schedule(
+        task_body, cache_root=tmp_path, arch="compute_80", nvcc="nvcc"
+    )
+    second = cuda_callable_compiler.compile_cuda_host_schedule(
+        task_body, cache_root=tmp_path, arch="compute_80", nvcc="nvcc"
+    )
+
+    assert first.cache_key == second.cache_key
+    assert first.ptx_path == second.ptx_path
+    assert first.cache_hit is False
+    assert second.cache_hit is True
+    assert len(calls) == 1
+    assert first.ptx == b"host-schedule-ptx"
+    assert "pto_kernel_vector_add" in first.source_path.read_text()
+
+    manifest = json.loads(first.manifest_path.read_text())
+    assert manifest["runtime"] == "host_schedule"
+    assert manifest["entry_name"] == "pto_kernel_vector_add"
+    assert manifest["persistent_entry_name"] == "pto_task_vector_add"
+    assert manifest["arch"] == "compute_80"
+    assert manifest["source_kind"] == "task-body-wrapper"
+    assert manifest["task_body"] == {"context_type": "PtoTaskContext", "name": "vector_add"}
+
+
 def test_render_persistent_dag_source_generates_dispatch_switch():
     source = render_persistent_dag_source(
         [

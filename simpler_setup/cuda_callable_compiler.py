@@ -22,8 +22,10 @@ from textwrap import indent
 from .environment import PROJECT_ROOT
 
 _CUDA_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_HOST_SCHEDULE_SOURCE_KIND = "task-body-wrapper"
 _PERSISTENT_DAG_ENTRY_NAME = "pto_persistent_dag_f32_executor"
 _PERSISTENT_DAG_SOURCE_KIND = "generated-dispatch"
+_HOST_SCHEDULE_CACHE_RELATIVE_PATH = Path("build") / "cache" / "cuda" / "onboard" / "host_schedule"
 _PERSISTENT_CACHE_RELATIVE_PATH = Path("build") / "cache" / "cuda" / "onboard" / "persistent_device"
 
 
@@ -45,6 +47,22 @@ class CudaTaskWrapperSource:
     host_entry_name: str
     persistent_entry_name: str
     source: str
+
+
+@dataclass(frozen=True)
+class CudaHostScheduleCallableArtifact:
+    """Compiled CUDA host-schedule callable artifact."""
+
+    cache_key: str
+    cache_hit: bool
+    source_path: Path
+    ptx_path: Path
+    manifest_path: Path
+    ptx: bytes
+    entry_name: str
+    persistent_entry_name: str
+    arch: str
+    source_kind: str
 
 
 @dataclass(frozen=True)
@@ -275,6 +293,23 @@ def _task_manifest(task_functions: Sequence[CudaPersistentTaskFunction]) -> list
     return [{"func_id": task.func_id, "name": task.name} for task in task_functions]
 
 
+def _task_body_manifest(task_body: CudaTaskBody) -> dict[str, str]:
+    return {"context_type": task_body.context_type, "name": task_body.name}
+
+
+def _host_schedule_cache_key(source: str, task_body: CudaTaskBody, arch: str, entry_name: str) -> str:
+    payload = {
+        "arch": arch,
+        "entry_name": entry_name,
+        "generator": "cuda-host-schedule-v1",
+        "source": source,
+        "source_kind": _HOST_SCHEDULE_SOURCE_KIND,
+        "task_body": _task_body_manifest(task_body),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
 def _cache_key(source: str, task_functions: Sequence[CudaPersistentTaskFunction], arch: str) -> str:
     payload = {
         "arch": arch,
@@ -296,13 +331,70 @@ def _run_nvcc_ptx(source_path: Path, ptx_path: Path, arch: str, nvcc: str) -> No
         text=True,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"nvcc persistent_device compile failed:\n{result.stderr}")
+        raise RuntimeError(f"nvcc CUDA PTX compile failed:\n{result.stderr}")
+
+
+def default_cuda_host_schedule_cache_root() -> Path:
+    """Return the repo-local host-schedule callable cache root."""
+
+    return PROJECT_ROOT / _HOST_SCHEDULE_CACHE_RELATIVE_PATH
 
 
 def default_cuda_persistent_cache_root() -> Path:
     """Return the repo-local persistent-device callable cache root."""
 
     return PROJECT_ROOT / _PERSISTENT_CACHE_RELATIVE_PATH
+
+
+def compile_cuda_host_schedule(
+    task_body: CudaTaskBody,
+    arch: str,
+    cache_root: Path | None = None,
+    nvcc: str = "nvcc",
+) -> CudaHostScheduleCallableArtifact:
+    """Compile or reuse a generated host-schedule CUDA callable PTX."""
+
+    wrappers = render_cuda_task_wrappers(task_body)
+    cache_key = _host_schedule_cache_key(wrappers.source, task_body, arch, wrappers.host_entry_name)
+    resolved_cache_root = default_cuda_host_schedule_cache_root() if cache_root is None else Path(cache_root)
+    cache_dir = resolved_cache_root / "callables" / cache_key
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    source_path = cache_dir / "generated_host_wrapper.cu"
+    ptx_path = cache_dir / "pto_callable.ptx"
+    manifest_path = cache_dir / "pto_callable.json"
+    source_path.write_text(wrappers.source)
+
+    cache_hit = ptx_path.is_file() and manifest_path.is_file()
+    if not cache_hit:
+        _run_nvcc_ptx(source_path, ptx_path, arch, nvcc)
+
+    ptx = ptx_path.read_bytes()
+    manifest = {
+        "arch": arch,
+        "cache_key": cache_key,
+        "entry_name": wrappers.host_entry_name,
+        "persistent_entry_name": wrappers.persistent_entry_name,
+        "ptx_path": ptx_path.name,
+        "runtime": "host_schedule",
+        "source_kind": _HOST_SCHEDULE_SOURCE_KIND,
+        "source_path": source_path.name,
+        "source_sha256": sha256(wrappers.source.encode("utf-8")).hexdigest(),
+        "task_body": _task_body_manifest(task_body),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return CudaHostScheduleCallableArtifact(
+        cache_key=cache_key,
+        cache_hit=cache_hit,
+        source_path=source_path,
+        ptx_path=ptx_path,
+        manifest_path=manifest_path,
+        ptx=ptx,
+        entry_name=wrappers.host_entry_name,
+        persistent_entry_name=wrappers.persistent_entry_name,
+        arch=arch,
+        source_kind=_HOST_SCHEDULE_SOURCE_KIND,
+    )
 
 
 def compile_cuda_persistent_device(

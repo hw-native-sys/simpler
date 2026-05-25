@@ -250,8 +250,11 @@ The current branch has the first codegen slice for that boundary:
 `simpler_setup.cuda_callable_compiler.render_cuda_task_wrappers()` renders a
 source fragment with one `pto_task_body_<name>` function, one
 `pto_kernel_<name>` `__global__` wrapper for `host_schedule`, and one
-`pto_task_<name>` `__device__` wrapper for `persistent_device`. It is not yet
-wired into `KernelCompiler` or the normal scene-test callable build flow.
+`pto_task_<name>` `__device__` wrapper for `persistent_device`.
+`KernelCompiler(platform="cuda").compile_cuda_host_schedule()` now uses this
+renderer for the host-schedule side and writes a cached PTX artifact plus
+manifest. The persistent-device side still needs dispatch composition and
+scene-test plumbing.
 
 ## Static NVCC Linking Feasibility
 

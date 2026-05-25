@@ -120,6 +120,13 @@ writes `generated_dispatch.cu`, `pto_callable.ptx`, and `pto_callable.json`
 under `build/cache/cuda/onboard/persistent_device/callables/` before the host
 runtime loads the PTX bytes.
 
+For host-schedule task-body compiler work, use
+`KernelCompiler(platform="cuda").compile_cuda_host_schedule(...)`. It renders
+one shared PTO CUDA task body into host-schedule and persistent-device wrappers,
+then writes the host-schedule generated source, PTX, and JSON manifest under
+`build/cache/cuda/onboard/host_schedule/callables/`. This is a compiler slice;
+the normal scene-test `ChipCallable` path does not consume the artifact yet.
+
 ## Microbenchmark Report
 
 Use `cuda_benchmark.py` for the current early-runtime comparison. It runs the

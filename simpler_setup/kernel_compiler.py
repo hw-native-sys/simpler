@@ -17,6 +17,7 @@ from typing import Optional, Union
 
 from simpler import env_manager
 
+from .cuda_callable_compiler import CudaTaskBody, compile_cuda_host_schedule
 from .environment import PROJECT_ROOT
 from .toolchain import (
     Aarch64GxxToolchain,
@@ -68,6 +69,8 @@ class KernelCompiler:
             self.platform_dir = self.project_root / "src" / "a2a3" / "platform"
         elif platform in ("a5", "a5sim"):
             self.platform_dir = self.project_root / "src" / "a5" / "platform"
+        elif platform == "cuda":
+            self.platform_dir = self.project_root / "src" / "cuda" / "platform"
         else:
             raise ValueError(f"Unknown platform: {platform}")
 
@@ -76,6 +79,10 @@ class KernelCompiler:
             env_manager.ensure("ASCEND_HOME_PATH")
             self.ccec = CCECToolchain(platform)
             self.aarch64 = Aarch64GxxToolchain()
+            self.host_gxx = GxxToolchain()
+        elif platform == "cuda":
+            self.ccec = None
+            self.aarch64 = None
             self.host_gxx = GxxToolchain()
         else:
             self.ccec = None
@@ -492,6 +499,32 @@ class KernelCompiler:
             "Orchestration",
             error_hint=f"{toolchain.cxx_path} not found. Please install it.",
             delete_output=build_dir is None,
+        )
+
+    def compile_cuda_host_schedule(
+        self,
+        source_path: str,
+        *,
+        task_name: str,
+        arch: str,
+        context_type: str = "PtoTaskContext",
+        cache_root: Optional[Union[str, Path]] = None,
+        nvcc: str = "nvcc",
+    ):
+        """Compile a CUDA task body for the host_schedule runtime."""
+
+        if self.platform != "cuda":
+            raise ValueError("compile_cuda_host_schedule is only available for platform='cuda'")
+
+        source = Path(source_path)
+        if not source.is_file():
+            raise FileNotFoundError(f"Source file not found: {source}")
+
+        return compile_cuda_host_schedule(
+            CudaTaskBody(name=task_name, body=source.read_text(), context_type=context_type),
+            arch=arch,
+            cache_root=None if cache_root is None else Path(cache_root),
+            nvcc=nvcc,
         )
 
     def _compile_incore_sim(
