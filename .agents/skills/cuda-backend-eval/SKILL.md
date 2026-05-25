@@ -121,6 +121,8 @@ same vector-add PTX kernel through two launch paths:
 
 - `pto_host_schedule`: the PTO CUDA host runtime C API and manifest dispatch.
 - `direct_driver`: a thin CUDA Driver API baseline in Python `ctypes`.
+- `direct_driver_graph`: the same Driver API kernel replayed through a CUDA
+  Graph, with graph instantiation outside the timed interval.
 - `pto_persistent_device`: a descriptor-array persistent executor.
 - `pto_persistent_queue`: one scheduler block publishing ready task IDs to a
   bounded device ring queue consumed by worker blocks inside the same launch.

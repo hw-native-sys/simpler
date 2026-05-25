@@ -155,6 +155,21 @@ def _check_cuda(rc: int, op: str) -> None:
         raise RuntimeError(f"{op} failed with CUDA driver code {rc}")
 
 
+class CudaKernelNodeParams(ctypes.Structure):
+    _fields_ = [
+        ("func", ctypes.c_void_p),
+        ("gridDimX", ctypes.c_uint),
+        ("gridDimY", ctypes.c_uint),
+        ("gridDimZ", ctypes.c_uint),
+        ("blockDimX", ctypes.c_uint),
+        ("blockDimY", ctypes.c_uint),
+        ("blockDimZ", ctypes.c_uint),
+        ("sharedMemBytes", ctypes.c_uint),
+        ("kernelParams", ctypes.POINTER(ctypes.c_void_p)),
+        ("extra", ctypes.POINTER(ctypes.c_void_p)),
+    ]
+
+
 class DirectCudaDriver:
     """Minimal CUDA Driver API wrapper used as a launch baseline."""
 
@@ -196,6 +211,25 @@ class DirectCudaDriver:
             ctypes.POINTER(ctypes.c_void_p),
             ctypes.c_void_p,
         ]
+        self.lib.cuGraphCreate.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+        ]
+        self.lib.cuGraphAddKernelNode.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_size_t,
+            ctypes.POINTER(CudaKernelNodeParams),
+        ]
+        self.lib.cuGraphInstantiateWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.c_ulonglong,
+        ]
+        self.lib.cuGraphLaunch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.lib.cuGraphExecDestroy.argtypes = [ctypes.c_void_p]
+        self.lib.cuGraphDestroy.argtypes = [ctypes.c_void_p]
         self.lib.cuCtxSynchronize.argtypes = []
         self.lib.cuEventCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
         self.lib.cuEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -241,6 +275,12 @@ class DirectCudaDriver:
         self.close()
 
     def run_vector_add(self, n: int, block_dim: int) -> dict[str, Any]:
+        return self._run_vector_add(n=n, block_dim=block_dim, use_graph=False)
+
+    def run_vector_add_graph(self, n: int, block_dim: int) -> dict[str, Any]:
+        return self._run_vector_add(n=n, block_dim=block_dim, use_graph=True)
+
+    def _run_vector_add(self, n: int, block_dim: int, use_graph: bool) -> dict[str, Any]:
         array_t = ctypes.c_float * n
         host_a = array_t(*[float(i) for i in range(n)])
         host_b = array_t(*[float(2 * i) for i in range(n)])
@@ -269,15 +309,73 @@ class DirectCudaDriver:
             )
 
             grid_dim = (n + block_dim - 1) // block_dim
+            graph = ctypes.c_void_p()
+            graph_exec = ctypes.c_void_p()
+            graph_node = ctypes.c_void_p()
+            if use_graph:
+                node_params = CudaKernelNodeParams(
+                    self.function,
+                    grid_dim,
+                    1,
+                    1,
+                    block_dim,
+                    1,
+                    1,
+                    0,
+                    kernel_args,
+                    None,
+                )
+                _check_cuda(self.lib.cuGraphCreate(ctypes.byref(graph), 0), "cuGraphCreate")
+                try:
+                    _check_cuda(
+                        self.lib.cuGraphAddKernelNode(
+                            ctypes.byref(graph_node),
+                            graph,
+                            None,
+                            0,
+                            ctypes.byref(node_params),
+                        ),
+                        "cuGraphAddKernelNode",
+                    )
+                    _check_cuda(
+                        self.lib.cuGraphInstantiateWithFlags(ctypes.byref(graph_exec), graph, 0),
+                        "cuGraphInstantiateWithFlags",
+                    )
+                except Exception:
+                    if graph:
+                        self.lib.cuGraphDestroy(graph)
+                    raise
+
             host_start = time.time_ns()
-            _check_cuda(self.lib.cuEventRecord(self.start_event, None), "cuEventRecord(start)")
-            _check_cuda(
-                self.lib.cuLaunchKernel(self.function, grid_dim, 1, 1, block_dim, 1, 1, 0, None, kernel_args, None),
-                "cuLaunchKernel",
-            )
-            _check_cuda(self.lib.cuEventRecord(self.stop_event, None), "cuEventRecord(stop)")
-            _check_cuda(self.lib.cuEventSynchronize(self.stop_event), "cuEventSynchronize")
-            host_wall_ns = time.time_ns() - host_start
+            try:
+                _check_cuda(self.lib.cuEventRecord(self.start_event, None), "cuEventRecord(start)")
+                if use_graph:
+                    _check_cuda(self.lib.cuGraphLaunch(graph_exec, None), "cuGraphLaunch")
+                else:
+                    _check_cuda(
+                        self.lib.cuLaunchKernel(
+                            self.function,
+                            grid_dim,
+                            1,
+                            1,
+                            block_dim,
+                            1,
+                            1,
+                            0,
+                            None,
+                            kernel_args,
+                            None,
+                        ),
+                        "cuLaunchKernel",
+                    )
+                _check_cuda(self.lib.cuEventRecord(self.stop_event, None), "cuEventRecord(stop)")
+                _check_cuda(self.lib.cuEventSynchronize(self.stop_event), "cuEventSynchronize")
+                host_wall_ns = time.time_ns() - host_start
+            finally:
+                if graph_exec:
+                    self.lib.cuGraphExecDestroy(graph_exec)
+                if graph:
+                    self.lib.cuGraphDestroy(graph)
 
             elapsed_ms = ctypes.c_float()
             _check_cuda(
@@ -293,7 +391,7 @@ class DirectCudaDriver:
             self.lib.cuMemFree_v2(dev_out)
 
         return {
-            "baseline": "direct_driver",
+            "baseline": "direct_driver_graph" if use_graph else "direct_driver",
             "n": n,
             "block_dim": block_dim,
             "host_wall_ns": host_wall_ns,
@@ -418,9 +516,19 @@ def run_pto_batch_sample(  # noqa: PLR0912
     }
 
 
-def run_direct_sample(device: int, n: int, block_dim: int, ptx: bytes) -> dict[str, Any]:
+def run_direct_sample(
+    device: int,
+    n: int,
+    block_dim: int,
+    ptx: bytes,
+    use_graph: bool = False,
+) -> dict[str, Any]:
     with DirectCudaDriver(device=device, ptx=ptx) as driver:
-        result = driver.run_vector_add(n=n, block_dim=block_dim)
+        result = (
+            driver.run_vector_add_graph(n=n, block_dim=block_dim)
+            if use_graph
+            else driver.run_vector_add(n=n, block_dim=block_dim)
+        )
         result["task_count"] = 1
         return result
 
@@ -488,6 +596,18 @@ def run_single_sample(
         with tempfile.TemporaryDirectory(prefix="pto_cuda_bench_") as td:
             ptx, ptx_source = _compile_ptx(Path(td), arch)
         result = run_direct_sample(device=device, n=n, block_dim=block_dim, ptx=ptx)
+        result["ptx_source"] = ptx_source
+        return result
+    if baseline == "direct_driver_graph":
+        with tempfile.TemporaryDirectory(prefix="pto_cuda_bench_") as td:
+            ptx, ptx_source = _compile_ptx(Path(td), arch)
+        result = run_direct_sample(
+            device=device,
+            n=n,
+            block_dim=block_dim,
+            ptx=ptx,
+            use_graph=True,
+        )
         result["ptx_source"] = ptx_source
         return result
     if baseline == "pto_persistent_device":
@@ -614,6 +734,16 @@ def run_benchmark(
             direct = run_single_sample(baseline="direct_driver", device=device, n=n, block_dim=block_dim, arch=arch)
             direct.update({"machine": metadata["machine"], "repeat": repeat})
             results.append(direct)
+
+            graph = run_single_sample(
+                baseline="direct_driver_graph",
+                device=device,
+                n=n,
+                block_dim=block_dim,
+                arch=arch,
+            )
+            graph.update({"machine": metadata["machine"], "repeat": repeat})
+            results.append(graph)
 
             if include_persistent:
                 for baseline in (
@@ -1013,6 +1143,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         "pto_host_schedule": "#2f6fbb",
         "pto_host_schedule_batch": "#1f4e89",
         "direct_driver": "#2a9d65",
+        "direct_driver_graph": "#8ab17d",
         "pto_persistent_dag": "#d62728",
         "pto_persistent_dag_chain": "#8c1d1d",
         "pto_persistent_dag_reuse": "#b23a48",
@@ -1150,6 +1281,9 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "",
             "- `direct_driver` measures a thin CUDA Driver API launch path for the same",
             "  vector-add PTX kernel.",
+            "- `direct_driver_graph` measures a CUDA Graph replay path for the same",
+            "  Driver API vector-add kernel, with graph instantiation outside the",
+            "  timed interval.",
             "- `pto_host_schedule` measures the current PTO CUDA host runtime path,",
             "  including the runtime C API boundary and manifest lookup.",
             "- `pto_host_schedule_batch` measures the same host-schedule vector-add",
@@ -1226,6 +1360,7 @@ def main() -> None:
         choices=[
             "pto_host_schedule",
             "direct_driver",
+            "direct_driver_graph",
             "pto_persistent_device",
             "pto_persistent_queue",
             "pto_persistent_dag",

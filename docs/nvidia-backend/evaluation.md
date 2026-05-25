@@ -39,6 +39,9 @@ commit `bcf54a88`. The tensor-tile DAG data was captured from commit
 
 - `direct_driver`: thin CUDA Driver API launch path for the same vector-add
   PTX kernel.
+- `direct_driver_graph`: same Driver API vector-add kernel replayed through a
+  CUDA Graph, with graph instantiation outside the measured interval. This is
+  a host-launch amortization baseline, not a device-side scheduler.
 - `pto_host_schedule`: PTO CUDA host runtime C API and manifest dispatch.
 - `pto_persistent_device`: descriptor-array persistent executor.
 - `pto_persistent_queue`: scheduler block plus bounded device ring queue.

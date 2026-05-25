@@ -225,6 +225,12 @@ def test_render_report_includes_host_schedule_relative_ratios():
         "results": [
             {"machine": "a100-local", "baseline": "pto_host_schedule", "n": 1024, "device_wall_ns": 1000},
             {"machine": "a100-local", "baseline": "direct_driver", "n": 1024, "device_wall_ns": 500},
+            {
+                "machine": "a100-local",
+                "baseline": "direct_driver_graph",
+                "n": 1024,
+                "device_wall_ns": 450,
+            },
             {"machine": "a100-local", "baseline": "pto_persistent_dag", "n": 1024, "device_wall_ns": 2500},
         ],
     }
@@ -233,7 +239,11 @@ def test_render_report_includes_host_schedule_relative_ratios():
 
     assert "| a100-local | pto_host_schedule | 1024 | 1 | 1 | 1 | 1000 | 1000 | 1.00x |" in report
     assert "| a100-local | direct_driver | 1024 | 1 | 1 | 1 | 500 | 500 | 0.50x |" in report
+    assert (
+        "| a100-local | direct_driver_graph | 1024 | 1 | 1 | 1 | 450 | 450 | 0.45x |"
+    ) in report
     assert "| a100-local | pto_persistent_dag | 1024 | 1 | 1 | 1 | 2500 | 2500 | 2.50x |" in report
+    assert "`direct_driver_graph` measures a CUDA Graph replay path" in report
     assert "Non-stream ratio columns are relative to the matched" in report
     assert "`pto_host_schedule` row for the same machine, `N`, and task count" in report
     assert "for the same machine, `N`, and task count" in report
@@ -546,8 +556,9 @@ def test_run_benchmark_uses_in_process_samples(monkeypatch):
     assert seen == [
         ("pto_host_schedule", 3, 1024, 128, "compute_80"),
         ("direct_driver", 3, 1024, 128, "compute_80"),
+        ("direct_driver_graph", 3, 1024, 128, "compute_80"),
     ]
-    assert len(payload["results"]) == 2
+    assert len(payload["results"]) == 3
 
 
 def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
@@ -584,6 +595,7 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
     assert seen == [
         "pto_host_schedule",
         "direct_driver",
+        "direct_driver_graph",
         "pto_persistent_device",
         "pto_persistent_queue",
         "pto_persistent_dag",
@@ -591,7 +603,7 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_persistent_dag_reuse",
         "pto_persistent_dag_tensor",
     ]
-    assert len(payload["results"]) == 8
+    assert len(payload["results"]) == 9
 
 
 def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
@@ -630,6 +642,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
     assert seen == [
         ("pto_host_schedule", 1),
         ("direct_driver", 1),
+        ("direct_driver_graph", 1),
         ("pto_persistent_device", 1),
         ("pto_persistent_queue", 1),
         ("pto_persistent_dag", 1),
@@ -641,7 +654,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_queue_batch", 6),
     ]
     assert payload["metadata"]["batch_tasks"] == 6
-    assert len(payload["results"]) == 11
+    assert len(payload["results"]) == 12
 
 
 def test_run_benchmark_can_include_worker_grid_batch_mode(monkeypatch):
