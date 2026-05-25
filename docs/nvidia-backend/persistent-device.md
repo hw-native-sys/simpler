@@ -267,10 +267,11 @@ into the ctypes manifest consumed by the current host runtime
 `prepare_callable` C API, L2 `Worker.register(...)` can stage that raw manifest
 blob, and L2 `Worker.run(...)` can launch backend-specific raw argument
 structs. The normal scene-test compiler and run path can now consume
-host-schedule CUDA callable specs and construct the current `vector_add_f32`
-raw argument struct from `TaskArgsBuilder` CPU tensors. The remaining work is
-to extend the same scene-test plumbing to persistent-device manifests and
-non-vector-add CUDA argument builders.
+host-schedule CUDA callable specs and persistent-device generated-dispatch
+DAG specs. The current adapters construct `vector_add_f32` and
+`persistent_dag_fork_join_f32` raw argument/state structs from
+`TaskArgsBuilder` CPU tensors. The remaining work is to add broader CUDA
+argument builders beyond those two tracer bullets.
 
 ## Static NVCC Linking Feasibility
 

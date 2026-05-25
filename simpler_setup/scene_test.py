@@ -405,6 +405,147 @@ def _build_cuda_host_schedule_args(
     )
 
 
+class _CudaPersistentDagSceneBuffers:
+    def __init__(self, worker, test_args: TaskArgsBuilder, cuda_spec: dict):
+        self.worker = worker
+        self.test_args = test_args
+        self.cuda_spec = cuda_spec
+        self.tensor_buffers = _CudaSceneDeviceBuffers(worker, test_args)
+        self.ptrs: list[int] = []
+        self.args = None
+        self.output_names = list(cuda_spec.get("args", test_args.tensor_names()[:3]))
+        self._setup()
+
+    def _malloc(self, nbytes: int) -> int:
+        ptr = int(self.worker.malloc(nbytes))
+        self.ptrs.append(ptr)
+        return ptr
+
+    def _setup(self) -> None:
+        import ctypes  # noqa: PLC0415
+
+        from simpler_setup.cuda_callable_compiler import (  # noqa: PLC0415
+            CudaPersistentDagArgs,
+            CudaPersistentDagState,
+            CudaPersistentDagTask,
+        )
+
+        arg_builder = self.cuda_spec.get("arg_builder")
+        if arg_builder != "persistent_dag_fork_join_f32":
+            raise NotImplementedError(f"Unsupported CUDA persistent scene-test arg_builder: {arg_builder}")
+        if len(self.output_names) != 3:
+            raise ValueError("CUDA persistent_dag_fork_join_f32 scene tests require three tensor args")
+        missing = [name for name in self.output_names if name not in self.tensor_buffers.ptrs]
+        if missing:
+            raise ValueError(f"CUDA persistent DAG args reference unknown tensors: {', '.join(missing)}")
+
+        a_name, b_name, out_name = self.output_names
+        n = int(self.cuda_spec.get("n", getattr(self.test_args, a_name).numel()))
+        queue_capacity = int(self.cuda_spec.get("queue_capacity", 2))
+        if queue_capacity <= 0:
+            raise ValueError("CUDA persistent DAG queue_capacity must be positive")
+
+        output_nbytes = self.tensor_buffers.sizes[out_name]
+        self.dev_tmp0 = self._malloc(output_nbytes)
+        self.dev_tmp1 = self._malloc(output_nbytes)
+
+        dependents_t = ctypes.c_uint32 * 2
+        self.host_dependents = dependents_t(2, 2)
+        task_t = CudaPersistentDagTask * 3
+        self.host_tasks = task_t(
+            CudaPersistentDagTask(
+                func_id=1,
+                a=self.tensor_buffers.ptrs[a_name],
+                b=self.tensor_buffers.ptrs[b_name],
+                out=self.dev_tmp0,
+                n=n,
+                dependent_begin=0,
+                dependent_count=1,
+                initial_fanin=0,
+            ),
+            CudaPersistentDagTask(
+                func_id=2,
+                a=self.tensor_buffers.ptrs[a_name],
+                b=self.tensor_buffers.ptrs[b_name],
+                out=self.dev_tmp1,
+                n=n,
+                dependent_begin=1,
+                dependent_count=1,
+                initial_fanin=0,
+            ),
+            CudaPersistentDagTask(
+                func_id=1,
+                a=self.dev_tmp0,
+                b=self.dev_tmp1,
+                out=self.tensor_buffers.ptrs[out_name],
+                n=n,
+                dependent_begin=2,
+                dependent_count=0,
+                initial_fanin=2,
+            ),
+        )
+        fanin_t = ctypes.c_uint32 * 3
+        flags_t = ctypes.c_uint32 * queue_capacity
+        counters_t = ctypes.c_uint32 * 3
+        self.host_fanin = fanin_t(0, 0, 2)
+        self.host_flags = flags_t(*([0] * queue_capacity))
+        self.host_counters = counters_t(0, 0, 0)
+
+        self.dev_tasks = self._malloc(ctypes.sizeof(self.host_tasks))
+        self.dev_dependents = self._malloc(ctypes.sizeof(self.host_dependents))
+        self.dev_fanin = self._malloc(ctypes.sizeof(self.host_fanin))
+        self.dev_ready_queue = self._malloc(ctypes.sizeof(ctypes.c_uint32 * queue_capacity))
+        self.dev_ready_flags = self._malloc(ctypes.sizeof(self.host_flags))
+        self.dev_counters = self._malloc(ctypes.sizeof(self.host_counters))
+        self.dev_state = self._malloc(ctypes.sizeof(CudaPersistentDagState))
+
+        self.worker.copy_to(self.dev_tasks, ctypes.addressof(self.host_tasks), ctypes.sizeof(self.host_tasks))
+        self.worker.copy_to(
+            self.dev_dependents,
+            ctypes.addressof(self.host_dependents),
+            ctypes.sizeof(self.host_dependents),
+        )
+        state = CudaPersistentDagState(
+            tasks=self.dev_tasks,
+            task_count=len(self.host_tasks),
+            dependents=self.dev_dependents,
+            fanin=self.dev_fanin,
+            ready_queue=self.dev_ready_queue,
+            ready_flags=self.dev_ready_flags,
+            queue_capacity=queue_capacity,
+            queue_head=self.dev_counters,
+            queue_tail=self.dev_counters + ctypes.sizeof(ctypes.c_uint32),
+            completed_count=self.dev_counters + 2 * ctypes.sizeof(ctypes.c_uint32),
+        )
+        self.worker.copy_to(self.dev_state, ctypes.addressof(state), ctypes.sizeof(state))
+        self.args = CudaPersistentDagArgs(state=self.dev_state)
+
+    def reset_for_run(self) -> None:
+        import ctypes  # noqa: PLC0415
+
+        self.tensor_buffers.copy_all_to_device()
+        self.worker.copy_to(self.dev_fanin, ctypes.addressof(self.host_fanin), ctypes.sizeof(self.host_fanin))
+        self.worker.copy_to(
+            self.dev_ready_flags,
+            ctypes.addressof(self.host_flags),
+            ctypes.sizeof(self.host_flags),
+        )
+        self.worker.copy_to(
+            self.dev_counters,
+            ctypes.addressof(self.host_counters),
+            ctypes.sizeof(self.host_counters),
+        )
+
+    def copy_outputs_from_device(self, output_names: list[str]) -> None:
+        self.tensor_buffers.copy_outputs_from_device(output_names)
+
+    def free(self) -> None:
+        for ptr in self.ptrs:
+            self.worker.free(ptr)
+        self.ptrs.clear()
+        self.tensor_buffers.free()
+
+
 @contextmanager
 def _temporary_env(env_updates):
     """Temporarily set environment variables."""
@@ -853,16 +994,36 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
 
 
 def _compile_cuda_callable_from_spec(spec, runtime):
-    if runtime != "host_schedule":
-        raise NotImplementedError(f"CUDA SceneTestCase compilation is not implemented for runtime={runtime!r}")
     cuda = spec.get("cuda")
     if not isinstance(cuda, dict):
         raise ValueError("CUDA SceneTestCase CALLABLE must include a 'cuda' spec")
+    if cuda.get("runtime", runtime) != runtime:
+        raise ValueError(f"CUDA CALLABLE runtime {cuda.get('runtime')!r} does not match scene runtime {runtime!r}")
 
-    from .cuda_callable_compiler import prepare_cuda_host_schedule_callable  # noqa: PLC0415
+    from .cuda_callable_compiler import (  # noqa: PLC0415
+        prepare_cuda_host_schedule_callable,
+        prepare_cuda_persistent_device_callable,
+    )
     from .kernel_compiler import KernelCompiler  # noqa: PLC0415
 
     kc = KernelCompiler(platform="cuda")
+    if runtime == "persistent_device":
+        artifact = kc.compile_cuda_persistent_device(
+            cuda["task_sources"],
+            arch=cuda.get("arch", os.environ.get("PTO_CUDA_ARCH", "compute_80")),
+            cache_root=cuda.get("cache_root"),
+            nvcc=cuda.get("nvcc", "nvcc"),
+        )
+        return prepare_cuda_persistent_device_callable(
+            artifact,
+            grid_dim=int(cuda["grid_dim"]),
+            block_dim=int(cuda.get("block_dim", 256)),
+            shared_mem_bytes=int(cuda.get("shared_mem_bytes", 0)),
+            op=int(cuda.get("op", 1003)),
+        )
+    if runtime != "host_schedule":
+        raise NotImplementedError(f"CUDA SceneTestCase compilation is not implemented for runtime={runtime!r}")
+
     artifact = kc.compile_cuda_host_schedule(
         cuda["source"],
         task_name=cuda["task_name"],
@@ -1114,6 +1275,20 @@ class SceneTestCase:
                 output_prefix=output_prefix,
             )
             return
+        if getattr(callable_obj, "runtime", None) == "persistent_device" and "cuda" in self.CALLABLE:
+            self._run_and_validate_l2_cuda_persistent_device(
+                worker,
+                cid,
+                case,
+                rounds=rounds,
+                skip_golden=skip_golden,
+                enable_l2_swimlane=enable_l2_swimlane,
+                enable_dump_tensor=enable_dump_tensor,
+                enable_pmu=enable_pmu,
+                enable_dep_gen=enable_dep_gen,
+                output_prefix=output_prefix,
+            )
+            return
 
         # Build args
         test_args = self.generate_args(params)
@@ -1214,6 +1389,68 @@ class SceneTestCase:
 
                 with _temporary_env(self._resolve_env()):
                     timing = worker.run(cid, raw_args, config=config)
+                device_buffers.copy_outputs_from_device(output_names)
+                if rounds > 1 and timing is not None:
+                    timings.append((timing.host_wall_us, timing.device_wall_us))
+
+                if not skip_golden:
+                    _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+        finally:
+            device_buffers.free()
+
+        if timings:
+            _log_round_timings(timings)
+
+    def _run_and_validate_l2_cuda_persistent_device(
+        self,
+        worker,
+        cid,
+        case,
+        rounds=1,
+        skip_golden=False,
+        enable_l2_swimlane=0,
+        enable_dump_tensor=False,
+        enable_pmu=0,
+        enable_dep_gen=False,
+        output_prefix="",
+    ):
+        params = case.get("params", {})
+        config_dict = case.get("config", {})
+        cuda_spec = self.CALLABLE["cuda"]
+
+        test_args = self.generate_args(params)
+        output_names = _output_names_from_signature(test_args, _callable_signature(self.CALLABLE))
+
+        golden_args = None
+        if not skip_golden:
+            golden_args = test_args.clone()
+            self.compute_golden(golden_args, params)
+
+        initial_outputs = {}
+        if rounds > 1:
+            for name in output_names:
+                initial_outputs[name] = getattr(test_args, name).clone()
+
+        device_buffers = _CudaPersistentDagSceneBuffers(worker, test_args, cuda_spec)
+        timings = []
+        try:
+            for round_idx in range(rounds):
+                if round_idx > 0:
+                    for name, initial in initial_outputs.items():
+                        getattr(test_args, name).copy_(initial)
+
+                device_buffers.reset_for_run()
+                config = self._build_config(
+                    config_dict,
+                    enable_l2_swimlane=enable_l2_swimlane,
+                    enable_dump_tensor=enable_dump_tensor,
+                    enable_pmu=enable_pmu,
+                    enable_dep_gen=enable_dep_gen,
+                    output_prefix=output_prefix,
+                )
+
+                with _temporary_env(self._resolve_env()):
+                    timing = worker.run(cid, device_buffers.args, config=config)
                 device_buffers.copy_outputs_from_device(output_names)
                 if rounds > 1 and timing is not None:
                     timings.append((timing.host_wall_us, timing.device_wall_us))

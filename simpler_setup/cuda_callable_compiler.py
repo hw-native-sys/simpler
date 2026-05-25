@@ -149,6 +149,55 @@ class CudaPersistentDeviceCallable(ctypes.Structure):
     ]
 
 
+class CudaPersistentDagTask(ctypes.Structure):
+    _fields_ = [
+        ("func_id", ctypes.c_uint32),
+        ("a", ctypes.c_void_p),
+        ("b", ctypes.c_void_p),
+        ("out", ctypes.c_void_p),
+        ("n", ctypes.c_uint64),
+        ("dependent_begin", ctypes.c_uint32),
+        ("dependent_count", ctypes.c_uint32),
+        ("initial_fanin", ctypes.c_uint32),
+        ("rows", ctypes.c_uint32),
+        ("cols", ctypes.c_uint32),
+        ("inner", ctypes.c_uint32),
+        ("lda", ctypes.c_uint32),
+        ("ldb", ctypes.c_uint32),
+        ("ldc", ctypes.c_uint32),
+        ("a_batch_stride", ctypes.c_uint64),
+        ("b_batch_stride", ctypes.c_uint64),
+        ("out_batch_stride", ctypes.c_uint64),
+    ]
+
+
+class CudaPersistentDagState(ctypes.Structure):
+    _fields_ = [
+        ("tasks", ctypes.c_void_p),
+        ("task_count", ctypes.c_uint64),
+        ("dependents", ctypes.c_void_p),
+        ("fanin", ctypes.c_void_p),
+        ("ready_queue", ctypes.c_void_p),
+        ("ready_flags", ctypes.c_void_p),
+        ("queue_capacity", ctypes.c_uint32),
+        ("queue_head", ctypes.c_void_p),
+        ("queue_tail", ctypes.c_void_p),
+        ("completed_count", ctypes.c_void_p),
+    ]
+
+
+class CudaPersistentDagArgs(ctypes.Structure):
+    _fields_ = [
+        ("state", ctypes.c_void_p),
+    ]
+
+    def buffer_ptr(self) -> int:
+        return ctypes.addressof(self)
+
+    def buffer_size(self) -> int:
+        return ctypes.sizeof(self)
+
+
 @dataclass(frozen=True)
 class PreparedCudaCallable:
     """ctypes callable manifest plus buffers it points into."""

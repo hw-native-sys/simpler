@@ -93,6 +93,12 @@ The smoke and benchmark path now reaches that artifact compiler through
 accepts task source files plus `func_id` metadata, lowers task-body style
 sources through the same `CudaTaskBody` wrapper contract as `host_schedule`,
 and composes the generated dispatch entry.
+`SceneTestCase` L2 compilation accepts `CALLABLE["cuda"]` specs for
+`persistent_device`, compiles task-body sources through the same
+`KernelCompiler` entry point, registers the prepared raw callable through the
+normal L2 `Worker`, builds a `persistent_dag_fork_join_f32` state object from
+normal `TaskArgsBuilder` CPU tensors, and validates real copied-back CUDA
+output data.
 
 Evidence:
 
@@ -160,6 +166,19 @@ even when hardware tests take longer than the default tool wait window:
 
 Result: `34 passed`.
 
+After adding persistent-device scene-test plumbing, the same focused CUDA set
+was rerun:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_backend.py \
+  tests/ut/py/test_cuda_kernel_compiler.py \
+  tests/ut/py/test_cuda_persistent_codegen.py \
+  tests/ut/py/test_cuda_scene_test.py -q
+```
+
+Result: `36 passed`.
+
 The CUDA scene-test file was also run on the remote H200 checkout after
 pushing this change:
 
@@ -191,6 +210,40 @@ ssh bizhaoh200 \
 Result: `status=pass`, `runner=worker`, `ptx_arch=compute_90`,
 `ptx_source=kernel-compiler-worker-task-body-compute_90`,
 `device_wall_ns=12736`.
+
+After adding persistent-device scene-test plumbing, the CUDA scene-test file
+was rerun on the remote H200 checkout:
+
+```bash
+ssh bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py -q'
+```
+
+Result: `2 passed, 2 skipped`. The host-schedule and persistent-device
+compile/plumbing tests passed; both real-data scene cases skipped because the
+remote Python environment does not have `torch`.
+
+The remote H200 persistent DAG real-data smoke was run through the no-torch
+smoke script:
+
+```bash
+ssh bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python \
+     .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+     --device 0 --task-count 3 --n 1024 --arch compute_90 \
+     --mode dag --queue-capacity 2'
+```
+
+Result: `status=pass`, `runtime=persistent_device`,
+`ptx_arch=compute_90`,
+`ptx_source=nvcc-persistent-generated-dispatch-compute_90`,
+`completed_count=3`, `device_wall_ns=41152`.
 
 ```bash
 .venv/bin/python -m pytest tests/ut/py/test_cuda_backend.py -q
@@ -279,14 +332,13 @@ Host-schedule task-body compilation and persistent-device generated dispatch
 now have first `KernelCompiler` entry points. Both paths can consume
 `CudaTaskBody` style sources. CUDA prepared-callable artifacts can be staged
 through the L2 Python `Worker` registration path. The normal scene-test flow
-can compile and run host-schedule CUDA vector-add callable specs end to end.
+can compile and run host-schedule CUDA vector-add callable specs and
+persistent-device fork/join DAG callable specs end to end.
 
 Needed:
 
-- persistent-device callable manifests wired through the normal build/cache
-  layout.
 - broader CUDA scene-test argument builders beyond the current
-  `vector_add_f32` tracer bullet.
+  `vector_add_f32` and `persistent_dag_fork_join_f32` tracer bullets.
 
 ### Target Role Cleanup
 
