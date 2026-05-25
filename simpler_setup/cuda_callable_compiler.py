@@ -147,6 +147,15 @@ class PreparedCudaCallable:
     def byref(self) -> Any:
         return ctypes.byref(self.manifest)
 
+    def buffer_ptr(self) -> int:
+        return ctypes.addressof(self.manifest)
+
+    def buffer_size(self) -> int:
+        return ctypes.sizeof(self.manifest)
+
+    def to_bytes(self) -> bytes:
+        return ctypes.string_at(self.buffer_ptr(), self.buffer_size())
+
 
 def _create_c_string_buffer(value: bytes) -> Any:
     data = value if value.endswith(b"\0") else value + b"\0"

@@ -51,6 +51,9 @@ Evidence:
 - `simpler_setup.cuda_callable_compiler.prepare_cuda_host_schedule_callable()`
   builds the shared ctypes manifest for host-schedule compiler artifacts and
   preserves PTX/entry-name buffer lifetimes for `prepare_callable`.
+- `PreparedCudaCallable` exposes `buffer_ptr()` / `buffer_size()`, and the L2
+  Python `Worker.register(...)` path can prepare those raw CUDA callable
+  blobs through `prepare_callable_from_blob`.
 - `tests/ut/py/test_cuda_kernel_compiler.py` covers the CUDA `KernelCompiler`
   entry point for host-schedule task bodies.
 - `tests/ut/py/test_cuda_backend.py` runs one host-schedule callable compiled
@@ -138,10 +141,12 @@ The focused CUDA test set was run from the project-local virtual environment:
   tests/ut/py/test_cuda_benchmark_report.py \
   tests/ut/py/test_cuda_backend.py \
   tests/ut/py/test_cuda_kernel_compiler.py \
-  tests/ut/py/test_cuda_persistent_codegen.py -q
+  tests/ut/py/test_cuda_persistent_codegen.py \
+  tests/ut/py/test_worker/test_ensure_prepared.py \
+  tests/ut/py/test_worker/test_host_worker.py -q
 ```
 
-Result: `65 passed`.
+Result: `100 passed`.
 
 The docs and skill updates were checked with targeted `pre-commit` runs and
 `git diff --check` before commit.
@@ -199,13 +204,15 @@ Result: `status=pass`, `runtime=persistent_device`,
 
 Host-schedule task-body compilation and persistent-device generated dispatch
 now have first `KernelCompiler` entry points. Both paths can consume
-`CudaTaskBody` style sources. The normal scene-test flow still does not
-consume CUDA callable artifacts end to end.
+`CudaTaskBody` style sources. CUDA prepared-callable artifacts can be staged
+through the L2 Python `Worker` registration path, but the normal scene-test
+flow still does not compile and run CUDA callable artifacts end to end.
 
 Needed:
 
-- scene-test plumbing from CUDA callable artifacts into `ChipCallable` and
-  `prepare_callable`;
+- scene-test plumbing from CUDA callable specs into CUDA callable artifacts;
+- a normal Python run path for CUDA-specific argument structs instead of the
+  current direct C API smoke helpers;
 - persistent-device callable manifests wired through the normal build/cache
   layout.
 

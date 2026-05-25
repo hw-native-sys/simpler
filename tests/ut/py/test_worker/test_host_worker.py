@@ -14,7 +14,9 @@ Each test verifies a distinct aspect of the L3 scheduling pipeline.
 
 import struct
 import threading
+from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
+from unittest.mock import MagicMock
 
 import pytest
 from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
@@ -42,6 +44,18 @@ def _read_counter(buf) -> int:
 def _increment_counter(buf) -> None:
     v = struct.unpack_from("i", buf, 0)[0]
     struct.pack_into("i", buf, 0, v + 1)
+
+
+@dataclass
+class _BlobCallable:
+    ptr: int = 0x1000
+    size: int = 64
+
+    def buffer_ptr(self) -> int:
+        return self.ptr
+
+    def buffer_size(self) -> int:
+        return self.size
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +119,18 @@ class TestLifecycle:
                 hw.register(callable_obj)
         finally:
             hw.close()
+
+    def test_l2_register_blob_callable_after_init_prepares_from_blob(self):
+        hw = Worker(level=2, platform="cuda", runtime="host_schedule")
+        hw._initialized = True
+        hw._chip_worker = MagicMock()
+
+        target = _BlobCallable()
+        cid = hw.register(target)
+
+        assert cid == 0
+        hw._chip_worker.prepare_callable_from_blob.assert_called_once_with(0, target.buffer_ptr())
+        hw._chip_worker.prepare_callable.assert_not_called()
 
     def test_unregister_unknown_cid_raises(self):
         # Symmetric to register: unregister must fail loud if the caller

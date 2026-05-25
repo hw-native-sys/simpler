@@ -135,6 +135,9 @@ def test_prepare_cuda_host_schedule_callable_keeps_artifact_buffers_alive(tmp_pa
     assert prepared.manifest.shared_mem_bytes == 64
     assert prepared.manifest.stream_id == 2
     assert prepared.byref()
+    assert prepared.buffer_ptr() == ctypes.addressof(prepared.manifest)
+    assert prepared.buffer_size() == ctypes.sizeof(prepared.manifest)
+    assert prepared.to_bytes() == ctypes.string_at(prepared.buffer_ptr(), prepared.buffer_size())
     assert prepared.image_buffer.raw == b"fake-host-ptx\0"
     assert prepared.entry_name_buffer.value == artifact.entry_name.encode("utf-8")
     assert prepared.manifest.image == ctypes.cast(prepared.image_buffer, ctypes.c_void_p).value
@@ -292,6 +295,9 @@ def test_prepare_cuda_persistent_device_callable_uses_generated_dispatch_entry(t
     assert prepared.manifest.block_dim == 256
     assert prepared.manifest.shared_mem_bytes == 0
     assert prepared.byref()
+    assert prepared.buffer_ptr() == ctypes.addressof(prepared.manifest)
+    assert prepared.buffer_size() == ctypes.sizeof(prepared.manifest)
+    assert prepared.to_bytes() == ctypes.string_at(prepared.buffer_ptr(), prepared.buffer_size())
     assert prepared.image_buffer.raw == b"fake-persistent-ptx\0"
     assert prepared.entry_name_buffer.value == artifact.entry_name.encode("utf-8")
     assert prepared.manifest.image == ctypes.cast(prepared.image_buffer, ctypes.c_void_p).value

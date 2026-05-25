@@ -137,10 +137,9 @@ _CTRL_MALLOC = 0
 _CTRL_FREE = 1
 _CTRL_COPY_TO = 2
 _CTRL_COPY_FROM = 3
-# Pre-warm a chip child for cid=arg0 by calling
-# `prepare_callable(cid, registry[cid])` so the first run() does
-# not pay the H2D upload cost.  Sent from the parent right after init()
-# (or whenever a new ChipCallable cid is registered).
+# Pre-warm a chip child for cid=arg0 by preparing registry[cid] so the first
+# run() does not pay the H2D upload cost. Sent from the parent right after
+# init() (or whenever a new chip callable payload cid is registered).
 _CTRL_PREPARE = 4
 # Dynamic post-init register of a ChipCallable. Parent stages the bytes
 # in a per-register POSIX shm and writes (cid, shm_name) into the mailbox;
@@ -218,6 +217,19 @@ def _buffer_field_addr(buf, offset: int) -> int:
     (worker_manager.cpp::read_mailbox_state / write_mailbox_state).
     """
     return ctypes.addressof(ctypes.c_char.from_buffer(buf)) + offset
+
+
+def _is_raw_callable_blob(target) -> bool:
+    return callable(getattr(target, "buffer_ptr", None)) and callable(getattr(target, "buffer_size", None))
+
+
+def _prepare_callable_target(cw: ChipWorker, cid: int, target) -> None:
+    if isinstance(target, ChipCallable):
+        cw.prepare_callable(cid, target)
+    elif _is_raw_callable_blob(target):
+        cw.prepare_callable_from_blob(cid, target.buffer_ptr())
+    else:
+        cw.prepare_callable(cid, target)
 
 
 def _write_error(buf, code: int, msg: str = "") -> None:
@@ -444,7 +456,7 @@ def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id:
             f"[chip_process pid={os.getpid()} dev={device_id}] WARN: lazy-prepare cid={cid}; prewarm path missed it\n"
         )
         sys.stderr.flush()
-    cw.prepare_callable(cid, callable_obj)
+    _prepare_callable_target(cw, cid, callable_obj)
     prepared.add(cid)
 
 
@@ -466,12 +478,12 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
     error tuple if the hook itself failed (e.g. D2H staging error).
     Returning a non-zero code overrides the kernel's success.
 
-    Per-callable_id dispatch: TASK_READY carries a cid in OFF_CALLABLE;
-    the child looks the cid up in the COW-inherited Python ``registry``
-    to get the ChipCallable, calls ``cw.prepare_callable(cid, callable)``
-    once, then ``cw.run(cid, args, cfg)``. ``_CTRL_PREPARE`` is
-    the explicit pre-warm path (parent pushes after init() to amortise
-    the first H2D upload); TASK_READY also lazy-prepares as a safety net.
+    Per-callable_id dispatch: TASK_READY carries a cid in OFF_CALLABLE.
+    The child looks the cid up in the COW-inherited Python ``registry``,
+    prepares the chip callable payload once, then runs ``cw.run(cid, args,
+    cfg)``. ``_CTRL_PREPARE`` is the explicit pre-warm path (parent pushes
+    after init() to amortise the first H2D upload); TASK_READY also
+    lazy-prepares as a safety net.
     """
     prepared: set[int] = set()
     while True:
@@ -814,7 +826,7 @@ class Worker:
         """Register a callable. Returns the cid passed to ``run`` / ``submit_*``.
 
         A unified id space serves Python functions (sub fn / orch fn) and
-        ``ChipCallable`` instances at every level. L2 returns a cid the
+        chip callable payloads at every level. L2 returns a cid the
         user passes to ``Worker.run(cid, args, cfg)``; L3+ returns a cid
         the orch function passes to ``orch.submit_next_level(cid, …)`` /
         ``orch.submit_sub(cid, …)``.
@@ -829,9 +841,10 @@ class Worker:
             docs/callable-ipc-dynamic-register.md). Post-init register at
             L3+ is ChipCallable-only.
           - L2: may be called either before or after ``init()`` (no fork,
-            no COW constraint).  When called post-init, ChipCallables are
-            prepared on the device immediately; pre-init registrations are
-            batched and prepared at the end of ``init()``.
+            no COW constraint).  When called post-init, ChipCallables and
+            raw callable blobs are prepared on the device immediately;
+            pre-init registrations are batched and prepared at the end of
+            ``init()``.
         """
         with self._registry_lock:
             if self.level >= 3 and self._initialized and not isinstance(target, ChipCallable):
@@ -861,9 +874,13 @@ class Worker:
 
             # L2 post-init: pre-warm immediately so the very first
             # `Worker.run(cid, …)` is a clean cache hit.
-            if self.level == 2 and self._initialized and isinstance(target, ChipCallable):
+            if (
+                self.level == 2
+                and self._initialized
+                and (isinstance(target, ChipCallable) or _is_raw_callable_blob(target))
+            ):
                 assert self._chip_worker is not None
-                self._chip_worker.prepare_callable(cid, target)
+                _prepare_callable_target(self._chip_worker, cid, target)
             return cid
 
     def _allocate_cid(self) -> int:
@@ -1019,12 +1036,12 @@ class Worker:
         self._chip_worker = ChipWorker()
         self._chip_worker.init(device_id, binaries)
 
-        # Pre-warm any registered ChipCallable so the first run(cid, …)
+        # Pre-warm any registered chip callable so the first run(cid, …)
         # does not pay the H2D upload cost.
         assert self._chip_worker is not None
         for cid, target in self._callable_registry.items():
-            if isinstance(target, ChipCallable):
-                self._chip_worker.prepare_callable(cid, target)
+            if isinstance(target, ChipCallable) or _is_raw_callable_blob(target):
+                _prepare_callable_target(self._chip_worker, cid, target)
 
     def _init_hierarchical(self) -> None:
         device_ids = self._config.get("device_ids", [])
@@ -1162,14 +1179,14 @@ class Worker:
 
         self._orch = Orchestrator(dw.get_orchestrator(), self)
 
-        # Pre-warm every chip child: for each registered ChipCallable cid,
+        # Pre-warm every chip child: for each registered chip callable cid,
         # send `_CTRL_PREPARE` to all chip children so the first
         # `submit_next_level` does not pay the H2D upload cost.  Sub fns /
         # orch fns do not need pre-warming — the registry is already
         # COW-inherited.
         if device_ids:
             for cid, target in self._callable_registry.items():
-                if isinstance(target, ChipCallable):
+                if isinstance(target, ChipCallable) or _is_raw_callable_blob(target):
                     for worker_id in range(len(self._chip_shms)):
                         dw.control_prepare(worker_id, int(cid))
 

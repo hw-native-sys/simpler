@@ -377,6 +377,15 @@ class ChipWorker:
         """
         self._impl.prepare_callable(int(callable_id), callable)
 
+    def prepare_callable_from_blob(self, callable_id, blob_ptr):
+        """Stage a raw callable manifest buffer under ``callable_id``.
+
+        CUDA callables use this path because their prepared manifest is not a
+        serialized ``ChipCallable``. The runtime C API still consumes it through
+        the same ``prepare_callable`` entry point.
+        """
+        self._impl.prepare_callable_from_blob(int(callable_id), int(blob_ptr))
+
     def run(self, callable_id, args, config=None, **kwargs):
         """Launch a ``callable_id`` previously staged via ``prepare_callable``.
 
