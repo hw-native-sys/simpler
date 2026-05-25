@@ -23,6 +23,12 @@ from .toolchain import Aarch64GxxToolchain, CCECToolchain, GxxToolchain, Toolcha
 logger = logging.getLogger(__name__)
 
 
+class _BuildStepError(RuntimeError):
+    def __init__(self, message: str, result: subprocess.CompletedProcess):
+        super().__init__(message)
+        self.result = result
+
+
 class BuildTarget:
     """CMake build target: composes a Toolchain with a source directory and output name.
 
@@ -281,6 +287,8 @@ class RuntimeCompiler:
         cwd: str,
         platform: str,
         step_name: str,
+        *,
+        log_failure: bool = True,
     ) -> None:
         """Run a single build step (CMake or Make) with logging and error handling.
 
@@ -308,8 +316,11 @@ class RuntimeCompiler:
                 logger.debug(result.stderr)
 
             if result.returncode != 0:
+                message = f"{step_name} failed for {platform} with exit code {result.returncode}"
+                if not log_failure:
+                    raise _BuildStepError(message, result)
                 self._log_failed_build_output(platform, step_name, result)
-                raise RuntimeError(f"{step_name} failed for {platform} with exit code {result.returncode}")
+                raise RuntimeError(message)
         except FileNotFoundError:
             raise RuntimeError(f"{step_name} not found. Please install {step_name}.")
 
@@ -359,13 +370,15 @@ class RuntimeCompiler:
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
         ] + cmake_args
         try:
-            self._run_build_step(cmake_cmd, build_dir, platform, "CMake configuration")
+            self._run_build_step(cmake_cmd, build_dir, platform, "CMake configuration", log_failure=False)
         except RuntimeError as exc:
             # Persistent CMake cache dirs under build/cache can become invalid when the
             # selected compiler or command-line cache entries change. In that case, wipe
             # the target build dir and retry once with a clean configure.
             build_path = Path(build_dir)
             if not any(build_path.iterdir()):
+                if isinstance(exc, _BuildStepError):
+                    self._log_failed_build_output(platform, "CMake configuration", exc.result)
                 raise
             logger.warning(
                 "[%s] CMake configuration failed in cached build dir %s; clearing cache and retrying once",
