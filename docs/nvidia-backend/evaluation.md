@@ -38,6 +38,8 @@ when the JSON payloads carry that metadata.
 - `direct_driver_graph`: CUDA Graph replay of the same Driver API vector-add
   kernel, with graph instantiation outside the measured interval.
 - `pto_host_schedule`: PTO CUDA host runtime C API and manifest dispatch.
+- `pto_host_schedule_compiler`: same host runtime path using a
+  `KernelCompiler(platform="cuda")` generated task-body wrapper and cached PTX.
 - `pto_persistent_device`: descriptor-array persistent executor.
 - `pto_persistent_queue`: scheduler block plus bounded device ring queue.
 - `pto_persistent_dag`: generated-dispatch-like task selection with fan-in

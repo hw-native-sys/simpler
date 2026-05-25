@@ -89,6 +89,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `direct_driver`;
 - `direct_driver_graph`;
 - `pto_host_schedule`;
+- `pto_host_schedule_compiler`;
 - `pto_persistent_device`;
 - `pto_persistent_queue`;
 - `pto_persistent_dag`;
@@ -123,12 +124,13 @@ The focused CUDA test set was run from the project-local virtual environment:
 
 ```bash
 .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_benchmark_report.py \
   tests/ut/py/test_cuda_backend.py \
   tests/ut/py/test_cuda_kernel_compiler.py \
   tests/ut/py/test_cuda_persistent_codegen.py -q
 ```
 
-Result: `24 passed`.
+Result: `59 passed`.
 
 The docs and skill updates were checked with targeted `pre-commit` runs and
 `git diff --check` before commit.

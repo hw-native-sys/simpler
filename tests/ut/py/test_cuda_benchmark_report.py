@@ -907,10 +907,40 @@ def test_run_benchmark_uses_in_process_samples(monkeypatch):
 
     assert seen == [
         ("pto_host_schedule", 3, 1024, 128, "compute_80"),
+        ("pto_host_schedule_compiler", 3, 1024, 128, "compute_80"),
         ("direct_driver", 3, 1024, 128, "compute_80"),
         ("direct_driver_graph", 3, 1024, 128, "compute_80"),
     ]
-    assert len(payload["results"]) == 3
+    assert len(payload["results"]) == 4
+
+
+def test_run_single_sample_dispatches_compiler_host_schedule(monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = {}
+
+    def fake_run_pto_compiler_sample(device, n, block_dim, arch):
+        seen["args"] = (device, n, block_dim, arch)
+        return {
+            "baseline": "pto_host_schedule_compiler",
+            "n": n,
+            "block_dim": block_dim,
+            "host_wall_ns": 20,
+            "device_wall_ns": 10,
+            "status": "pass",
+        }
+
+    monkeypatch.setattr(cuda_benchmark, "run_pto_compiler_sample", fake_run_pto_compiler_sample)
+
+    result = cuda_benchmark.run_single_sample(
+        baseline="pto_host_schedule_compiler",
+        device=3,
+        n=1024,
+        block_dim=128,
+        arch="compute_80",
+    )
+
+    assert seen["args"] == (3, 1024, 128, "compute_80")
+    assert result["baseline"] == "pto_host_schedule_compiler"
 
 
 def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
@@ -946,6 +976,7 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
 
     assert seen == [
         "pto_host_schedule",
+        "pto_host_schedule_compiler",
         "direct_driver",
         "direct_driver_graph",
         "pto_persistent_device",
@@ -955,7 +986,7 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_persistent_dag_reuse",
         "pto_persistent_dag_tensor",
     ]
-    assert len(payload["results"]) == 9
+    assert len(payload["results"]) == 10
 
 
 def test_run_benchmark_passes_tensor_descriptor_to_tensor_dag(monkeypatch):
@@ -1043,6 +1074,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
 
     assert seen == [
         ("pto_host_schedule", 1),
+        ("pto_host_schedule_compiler", 1),
         ("direct_driver", 1),
         ("direct_driver_graph", 1),
         ("pto_persistent_device", 1),
@@ -1056,7 +1088,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_queue_batch", 6),
     ]
     assert payload["metadata"]["batch_tasks"] == 6
-    assert len(payload["results"]) == 12
+    assert len(payload["results"]) == 13
 
 
 def test_run_benchmark_can_include_worker_grid_batch_mode(monkeypatch):

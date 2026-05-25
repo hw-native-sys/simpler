@@ -137,6 +137,9 @@ Use `cuda_benchmark.py` for the current early-runtime comparison. It runs the
 same vector-add PTX kernel through two launch paths:
 
 - `pto_host_schedule`: the PTO CUDA host runtime C API and manifest dispatch.
+- `pto_host_schedule_compiler`: the same host runtime path, but the PTX comes
+  from `KernelCompiler(platform="cuda").compile_cuda_host_schedule(...)` and
+  the shared task-body wrapper generator.
 - `direct_driver`: a thin CUDA Driver API baseline in Python `ctypes`.
 - `direct_driver_graph`: the same Driver API kernel replayed through a CUDA
   Graph, with graph instantiation outside the timed interval.
