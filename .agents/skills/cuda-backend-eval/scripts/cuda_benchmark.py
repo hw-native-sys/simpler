@@ -931,6 +931,31 @@ def _best_worker_grid_rows(summary: dict[tuple[str, str, int, int, int], dict[st
     return sorted(best.values(), key=lambda row: (row["machine"], row["n"], row["task_count"]))
 
 
+def _dag_shape_rows(
+    summary: dict[tuple[str, str, int, int, int], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    base_by_shape: dict[tuple[str, int], dict[str, Any]] = {}
+    shape_rows: list[dict[str, Any]] = []
+    for row in summary.values():
+        if row["baseline"] == "pto_persistent_dag":
+            base_by_shape[(row["machine"], row["n"])] = row
+        elif row["baseline"].startswith("pto_persistent_dag_"):
+            shape_rows.append(row)
+    return sorted(
+        [
+            {
+                **row,
+                "base_device_wall_ns": base_by_shape[(row["machine"], row["n"])][
+                    "median_device_wall_ns"
+                ],
+            }
+            for row in shape_rows
+            if (row["machine"], row["n"]) in base_by_shape
+        ],
+        key=lambda row: (row["machine"], row["n"], row["baseline"]),
+    )
+
+
 def _ptx_source_rows(payload: dict[str, Any]) -> list[tuple[str, str, str]]:
     sources: set[tuple[str, str, str]] = set()
     for row in payload.get("results", []):
@@ -1078,6 +1103,25 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
                 f"| {row['machine']} | {row['n']} | {row['task_count']} | "
                 f"{row['worker_blocks_per_task']} | {row['median_device_wall_ns']} | "
                 f"{_ratio_text(row['median_device_wall_ns'], reference)} |"
+            )
+    dag_shape_rows = _dag_shape_rows(summary)
+    if dag_shape_rows:
+        lines.extend(
+            [
+                "",
+                "## DAG Shape Rows",
+                "",
+                "| Machine | N | Baseline | Tasks | Median device ns | "
+                "Device vs pto_persistent_dag |",
+                "| ------- | - | -------- | ----- | ---------------- | "
+                "---------------------------- |",
+            ]
+        )
+        for row in dag_shape_rows:
+            lines.append(
+                f"| {row['machine']} | {row['n']} | {row['baseline']} | "
+                f"{row['task_count']} | {row['median_device_wall_ns']} | "
+                f"{_ratio_text(row['median_device_wall_ns'], row['base_device_wall_ns'])} |"
             )
     ptx_source_rows = _ptx_source_rows(payload)
     if ptx_source_rows:

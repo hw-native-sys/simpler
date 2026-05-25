@@ -183,6 +183,12 @@ When worker-grid rows are present, the report includes a
 `Best Worker Grid Rows` table that picks the lowest median device time for
 each machine, vector length, and task count.
 
+When DAG-shape rows are present, the report includes a `DAG Shape Rows` table
+that compares `pto_persistent_dag_*` rows against the three-task
+`pto_persistent_dag` row for the same machine and vector length. Use this
+table for lifecycle and callable-shape interpretation because those rows do
+not have the same task count as the host-schedule baseline.
+
 The report also includes a PTX-source table by machine and baseline. Treat any
 `embedded-sm80-*` row as a fallback path: the local CUDA driver JIT compiled
 embedded `sm_80` PTX instead of using `nvcc` to produce fresh PTX for the

@@ -401,6 +401,54 @@ def test_render_report_describes_dag_tensor_rows():
     assert "pto_persistent_dag_tensor" in svg
 
 
+def test_render_report_highlights_dag_shape_rows():
+    cuda_benchmark = _load_benchmark_module()
+    payload = {
+        "metadata": {
+            "label": "dag-shapes-unit",
+            "git_commit": "abc123",
+            "paper_setup": "microbenchmarks only",
+        },
+        "results": [
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_dag",
+                "n": 4096,
+                "task_count": 3,
+                "device_wall_ns": 1000,
+            },
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_dag_chain",
+                "n": 4096,
+                "task_count": 5,
+                "device_wall_ns": 1800,
+            },
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_dag_tensor",
+                "n": 4096,
+                "task_count": 4,
+                "device_wall_ns": 4200,
+            },
+        ],
+    }
+
+    report = cuda_benchmark.render_markdown_report(payload)
+
+    assert "## DAG Shape Rows" in report
+    assert (
+        "| Machine | N | Baseline | Tasks | Median device ns | "
+        "Device vs pto_persistent_dag |"
+    ) in report
+    assert (
+        "| a100-local | 4096 | pto_persistent_dag_chain | 5 | 1800 | 1.80x |"
+    ) in report
+    assert (
+        "| a100-local | 4096 | pto_persistent_dag_tensor | 4 | 4200 | 4.20x |"
+    ) in report
+
+
 def test_render_report_summarizes_ptx_sources_by_machine_and_baseline():
     cuda_benchmark = _load_benchmark_module()
     payload = {

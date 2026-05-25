@@ -62,6 +62,10 @@ commit `bcf54a88`. The tensor-tile DAG data was captured from commit
 Ratios are relative to the matched host-schedule row for the same GPU, vector
 length, and task count. For batch rows, the reference is
 `pto_host_schedule_batch`, not the one-task `pto_host_schedule` row.
+Generated reports also include a `DAG Shape Rows` table that compares
+`pto_persistent_dag_*` rows against `pto_persistent_dag` for the same GPU and
+vector length. Use that table for graph-shape interpretation because the
+chain, reuse, and tensor DAGs intentionally have different task counts.
 
 ## Headline Results
 
