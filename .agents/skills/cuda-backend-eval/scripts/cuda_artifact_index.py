@@ -30,6 +30,35 @@ def _sorted_unique(values: set[Any]) -> list[Any]:
     return sorted(values, key=_sort_key)
 
 
+def _tensor_tile_shape(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    rows = value.get("rows")
+    cols = value.get("cols")
+    inner = value.get("inner")
+    if rows is None or cols is None or inner is None:
+        return None
+    return f"{rows}x{cols}x{inner}"
+
+
+def _tensor_tile_shapes(payloads: list[dict[str, Any]]) -> list[str]:
+    shapes = {
+        shape
+        for payload in payloads
+        for shape in (
+            _tensor_tile_shape(payload.get("metadata", {}).get("tensor_tile")),
+            _tensor_tile_shape(payload.get("tensor_tile")),
+        )
+        if shape is not None
+    }
+    for payload in payloads:
+        for row in payload.get("results", []):
+            shape = _tensor_tile_shape(row.get("tensor_tile"))
+            if shape is not None:
+                shapes.add(shape)
+    return _sorted_unique(shapes)
+
+
 def _read_artifact(path: Path, root: Path) -> dict[str, Any]:
     payload = json.loads((path / "cuda-benchmark.json").read_text())
     metadata = payload.get("metadata", {})
@@ -43,6 +72,7 @@ def _read_artifact(path: Path, root: Path) -> dict[str, Any]:
         "result_count": len(results),
         "baselines": _sorted_unique({row.get("baseline", "unknown") for row in results}),
         "sizes": _sorted_unique({row.get("n", "unknown") for row in results}),
+        "tensor_tiles": _tensor_tile_shapes([payload]),
         "has_markdown": (path / "cuda-benchmark.md").exists(),
         "has_svg": (path / "cuda-benchmark.svg").exists(),
         "has_ratio_svg": (path / "cuda-benchmark-ratios.svg").exists(),
@@ -75,6 +105,7 @@ def _read_smoke_artifact(path: Path, root: Path) -> dict[str, Any]:
         "result_count": len(payloads),
         "baselines": _sorted_unique({payload.get("runtime", "unknown") for payload in payloads}),
         "sizes": _sorted_unique({payload.get("n", "unknown") for payload in payloads}),
+        "tensor_tiles": _tensor_tile_shapes(payloads),
         "has_markdown": True,
         "has_svg": (path / "cuda-smoke-report.svg").exists(),
         "has_ratio_svg": False,
@@ -111,14 +142,21 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
         "Generated from local CUDA benchmark and smoke report artifacts. Raw",
         "artifacts remain under `tmp/` and are intentionally not committed.",
         "",
-        "| Path | Kind | Label | Machine | Commit | Results | Sizes | Baselines | Markdown | SVG | ratio SVG |",
-        "| ---- | ---- | ----- | ------- | ------ | ------- | ----- | --------- | -------- | --- | --------- |",
+        (
+            "| Path | Kind | Label | Machine | Commit | Results | Sizes | "
+            "Tensor tile | Baselines | Markdown | SVG | ratio SVG |"
+        ),
+        (
+            "| ---- | ---- | ----- | ------- | ------ | ------- | ----- | "
+            "----------- | --------- | -------- | --- | --------- |"
+        ),
     ]
     for entry in entries:
         lines.append(
             f"| {entry['path']} | {entry['kind']} | {entry['label']} | {entry['machine']} | "
             f"{entry['git_commit']} | {entry['result_count']} | "
-            f"{_format_list(entry['sizes'])} | {_format_list(entry['baselines'])} | "
+            f"{_format_list(entry['sizes'])} | {_format_list(entry['tensor_tiles'])} | "
+            f"{_format_list(entry['baselines'])} | "
             f"{_checkmark(entry['has_markdown'])} | {_checkmark(entry['has_svg'])} | "
             f"{_checkmark(entry['has_ratio_svg'])} |"
         )

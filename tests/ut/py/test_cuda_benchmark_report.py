@@ -177,6 +177,7 @@ def test_cuda_artifact_index_scans_benchmark_outputs(tmp_path):
             "result_count": 1,
             "baselines": ["direct_driver_graph"],
             "sizes": [1024],
+            "tensor_tiles": [],
             "has_markdown": True,
             "has_svg": True,
             "has_ratio_svg": True,
@@ -199,16 +200,60 @@ def test_cuda_artifact_index_renders_markdown_and_writes_default_index(tmp_path)
 
     assert output == tmp_path / "index.md"
     assert "# CUDA Backend Artifact Index" in report
-    assert ("| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 | direct_driver_graph |") in report
+    assert ("| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  | direct_driver_graph |") in report
     assert "ratio SVG" in report
+
+
+def test_cuda_artifact_index_records_benchmark_tensor_tiles(tmp_path):
+    cuda_artifact_index = _load_artifact_index_module()
+    artifact_dir = tmp_path / "combined-tensorflags"
+    artifact_dir.mkdir()
+    payload = {
+        "metadata": {
+            "label": "tensorflags",
+            "git_commit": "abc123",
+            "machine": "combined",
+            "tensor_tile": {"rows": 8, "cols": 4, "inner": 12},
+        },
+        "results": [
+            {
+                "baseline": "pto_persistent_dag_tensor",
+                "n": 64,
+                "device_wall_ns": 10,
+                "tensor_tile": {
+                    "rows": 8,
+                    "cols": 4,
+                    "inner": 12,
+                    "tile_count": 2,
+                },
+            }
+        ],
+    }
+    (artifact_dir / "cuda-benchmark.json").write_text(json.dumps(payload) + "\n")
+
+    entries = cuda_artifact_index.scan_artifacts(tmp_path)
+    report = cuda_artifact_index.render_markdown(entries)
+
+    assert entries[0]["tensor_tiles"] == ["8x4x12"]
+    assert "| combined-tensorflags | benchmark | tensorflags | combined | abc123 | 1 | 64 | 8x4x12 |" in report
 
 
 def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
     cuda_artifact_index = _load_artifact_index_module()
     artifact_dir = tmp_path / "tensor-descriptor-smoke"
     artifact_dir.mkdir()
-    (artifact_dir / "a100.json").write_text(json.dumps({"status": "pass", "runtime": "persistent_device"}) + "\n")
-    (artifact_dir / "h200.json").write_text(json.dumps({"status": "pass", "runtime": "persistent_device"}) + "\n")
+    smoke_payload = {
+        "status": "pass",
+        "runtime": "persistent_device",
+        "tensor_tile": {
+            "rows": 16,
+            "cols": 16,
+            "inner": 16,
+            "tile_count": 16,
+        },
+    }
+    (artifact_dir / "a100.json").write_text(json.dumps(smoke_payload) + "\n")
+    (artifact_dir / "h200.json").write_text(json.dumps(smoke_payload) + "\n")
     (artifact_dir / "cuda-smoke-report.md").write_text("# CUDA Smoke Report\n\n- Label: `tensor-smoke`\n")
     (artifact_dir / "cuda-smoke-report.svg").write_text("<svg></svg>\n")
 
@@ -225,6 +270,7 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
             "result_count": 2,
             "baselines": ["persistent_device"],
             "sizes": ["unknown"],
+            "tensor_tiles": ["16x16x16"],
             "has_markdown": True,
             "has_svg": True,
             "has_ratio_svg": False,

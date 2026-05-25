@@ -206,9 +206,9 @@ PYTHONPATH=$PWD:$PWD/python \
 
 The indexer scans benchmark `cuda-benchmark.json` files and smoke
 `cuda-smoke-report.md` directories, then writes `tmp/cuda-backend/index.md`
-with each artifact's kind, metadata, baselines, vector sizes, and generated
-report/chart presence. It is a local audit aid under `tmp/`; do not commit it
-with raw benchmark or smoke data.
+with each artifact's kind, metadata, baselines, vector sizes, tensor-tile
+descriptor shapes, and generated report/chart presence. It is a local audit
+aid under `tmp/`; do not commit it with raw benchmark or smoke data.
 
 Render compact smoke JSON reports when a result is a smoke validation rather
 than a full benchmark:

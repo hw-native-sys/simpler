@@ -68,7 +68,8 @@ The tensor-tile DAG data was captured from commit `8950e029`. The CUDA Graph
 launch-baseline data was captured from commit `ba2cdd0e`.
 
 `tmp/cuda-backend/index.md` is a generated local index that includes both
-benchmark artifacts and compact smoke-report artifacts.
+benchmark artifacts and compact smoke-report artifacts. It records tensor-tile
+descriptor shapes when a benchmark or smoke payload carries that metadata.
 
 ## Current Baselines
 
