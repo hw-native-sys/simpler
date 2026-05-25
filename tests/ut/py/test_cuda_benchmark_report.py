@@ -138,6 +138,7 @@ def test_render_report_uses_batch_host_schedule_reference_for_batch_rows():
     assert "| a100-local | pto_host_schedule_batch | 1024 | 6 | 1 | 6000 | 6000 | 1.00x |" in report
     assert "| a100-local | pto_persistent_queue_batch | 1024 | 6 | 1 | 3000 | 3000 | 0.50x |" in report
     assert "same-work batch rows use `pto_host_schedule_batch` as their reference" in report
+    assert "match descriptor count, not intra-task grid shape" in report
 
 
 def test_merge_payloads_preserves_results_and_records_sources():

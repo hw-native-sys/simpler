@@ -137,6 +137,11 @@ machine, vector length, and task count. Same-work batch rows are therefore
 relative to `pto_host_schedule_batch`, not the one-task `pto_host_schedule`
 row.
 
+Current batch rows match descriptor count, not intra-task grid shape. The
+persistent tracer bullet uses one worker block per descriptor, while
+`pto_host_schedule` vector-add uses a full grid, so large-vector rows expose
+worker-parallelism limitations as well as launch overhead.
+
 Merge local and remote JSON payloads into one comparative report:
 
 ```bash
