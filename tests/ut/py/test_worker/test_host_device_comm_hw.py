@@ -9,7 +9,6 @@
 """a2a3 onboard host/device channel + shared-memory smoke tests."""
 
 import pytest
-
 import simpler.worker as worker_mod
 from simpler.task_interface import CallConfig
 from simpler.worker import Worker
@@ -113,14 +112,15 @@ def test_a2a3_onboard_channel_round_trip(l3_a2a3_worker):
 @pytest.mark.device_count(1)
 def test_a2a3_onboard_shared_memory_chunked_round_trip(l3_a2a3_worker):
     payload = bytes(i % 251 for i in range(worker_mod._CTRL_PAYLOAD_CAPACITY + 23))
-    seen: dict[str, object] = {}
+    seen_info: dict[str, tuple[int, int, int, int, int]] = {}
+    seen_readback: dict[str, bytes] = {}
 
     def shm_round_trip(orch, _args, _cfg):
         memory = orch.open_shared_memory(0, data_bytes=len(payload) + 16, signal_count=2, flags=7)
         try:
-            seen["info"] = orch.shared_memory_info(0, memory)
+            seen_info["value"] = orch.shared_memory_info(0, memory)
             orch.shared_memory_write(0, memory, 5, payload)
-            seen["readback"] = orch.shared_memory_read(0, memory, 5, len(payload))
+            seen_readback["value"] = orch.shared_memory_read(0, memory, 5, len(payload))
             orch.shared_memory_notify(0, memory, signal_id=1, value=9)
             orch.shared_memory_wait(0, memory, signal_id=1, target=9, timeout_us=0)
         finally:
@@ -128,13 +128,13 @@ def test_a2a3_onboard_shared_memory_chunked_round_trip(l3_a2a3_worker):
 
     l3_a2a3_worker.run(shm_round_trip, args=None, config=CallConfig())
 
-    host_ptr, device_ptr, data_bytes, signal_count, flags = seen["info"]
+    host_ptr, device_ptr, data_bytes, signal_count, flags = seen_info["value"]
     assert host_ptr == 0
     assert device_ptr != 0
     assert data_bytes == len(payload) + 16
     assert signal_count == 2
     assert flags == 7
-    assert seen["readback"] == payload
+    assert seen_readback["value"] == payload
 
 
 @pytest.mark.requires_hardware

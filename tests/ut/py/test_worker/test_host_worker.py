@@ -16,11 +16,11 @@ import struct
 import threading
 from multiprocessing.shared_memory import SharedMemory
 
-import pytest
 import _task_interface as ti  # pyright: ignore[reportMissingImports]
+import pytest
+import simpler.worker as worker_mod
 from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
 from simpler.task_interface import ChipCallable, DataType, TaskArgs, TensorArgType
-import simpler.worker as worker_mod
 from simpler.worker import (
     _CTRL_PAYLOAD_CAPACITY,
     _CTRL_SHARED_MEMORY_INFO,
@@ -93,7 +93,7 @@ class TestSharedMemoryInfo:
         hw = Worker(level=3, device_ids=[0], num_sub_workers=0)
         nbytes = _CTRL_PAYLOAD_CAPACITY * 2 + 17
         offset = 11
-        payload_data = bytes((i % 251 for i in range(offset + nbytes)))
+        payload_data = bytes(i % 251 for i in range(offset + nbytes))
         calls = []
 
         def fake_chip_control_payload(
@@ -161,7 +161,7 @@ class TestSharedMemoryInfo:
 
     def test_l3_shared_memory_write_chunks_over_mailbox_payload(self, monkeypatch):
         hw = Worker(level=3, device_ids=[0], num_sub_workers=0)
-        payload = bytes((i % 253 for i in range(_CTRL_PAYLOAD_CAPACITY * 2 + 19)))
+        payload = bytes(i % 253 for i in range(_CTRL_PAYLOAD_CAPACITY * 2 + 19))
         calls = []
 
         def fake_chip_control_payload(

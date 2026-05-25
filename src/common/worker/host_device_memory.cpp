@@ -75,7 +75,9 @@ const HostDeviceMemoryHeader *header_const(const HostDeviceMemory *mem) {
 }
 
 HostDeviceSignalSlot *signals(HostDeviceMemory *mem) {
-    return reinterpret_cast<HostDeviceSignalSlot *>(reinterpret_cast<uint8_t *>(mem->host_base) + sizeof(HostDeviceMemoryHeader));
+    return reinterpret_cast<HostDeviceSignalSlot *>(
+        reinterpret_cast<uint8_t *>(mem->host_base) + sizeof(HostDeviceMemoryHeader)
+    );
 }
 
 void *host_data_ptr(HostDeviceMemory *mem) {
@@ -226,6 +228,8 @@ int host_device_memory_notify_l2_for_test(HostDeviceMemory *mem, uint32_t signal
     return notify_impl(mem, signal_id, value);
 }
 
-int host_device_memory_wait_l2_for_test(HostDeviceMemory *mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us) {
+int host_device_memory_wait_l2_for_test(
+    HostDeviceMemory *mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
+) {
     return wait_impl(mem, signal_id, target, timeout_us);
 }

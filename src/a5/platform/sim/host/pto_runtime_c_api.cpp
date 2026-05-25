@@ -275,7 +275,9 @@ int host_device_memory_write_ctx(
     return host_device_memory_write(static_cast<HostDeviceMemory *>(mem), offset, src, nbytes);
 }
 
-int host_device_memory_notify_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value) {
+int host_device_memory_notify_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value
+) {
     (void)ctx;
     return host_device_memory_notify(static_cast<HostDeviceMemory *>(mem), signal_id, value);
 }

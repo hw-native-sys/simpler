@@ -66,6 +66,8 @@ int host_device_memory_wait(HostDeviceMemory *mem, uint32_t signal_id, uint64_t 
 int host_device_memory_read_l2_for_test(HostDeviceMemory *mem, uint64_t offset, void *dst, size_t nbytes);
 int host_device_memory_write_l2_for_test(HostDeviceMemory *mem, uint64_t offset, const void *src, size_t nbytes);
 int host_device_memory_notify_l2_for_test(HostDeviceMemory *mem, uint32_t signal_id, uint64_t value);
-int host_device_memory_wait_l2_for_test(HostDeviceMemory *mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us);
+int host_device_memory_wait_l2_for_test(
+    HostDeviceMemory *mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
+);
 
 #endif  // SRC_COMMON_WORKER_HOST_DEVICE_MEMORY_H_

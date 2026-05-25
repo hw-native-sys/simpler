@@ -268,7 +268,9 @@ int host_device_memory_write_ctx(
     return HDMEM_ERR_BACKEND;
 }
 
-int host_device_memory_notify_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value) {
+int host_device_memory_notify_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value
+) {
     (void)ctx;
     (void)mem;
     (void)signal_id;

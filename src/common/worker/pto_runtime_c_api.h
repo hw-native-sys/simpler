@@ -130,9 +130,7 @@ int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_
 int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size);
 
 /** Open a bounded host/device message channel backed by host-mapped device memory. */
-HostDeviceChannelHandle open_host_device_channel_ctx(
-    DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg
-);
+HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg);
 
 /** Close a channel returned by open_host_device_channel_ctx. */
 int close_host_device_channel_ctx(DeviceContextHandle ctx, HostDeviceChannelHandle ch);
@@ -173,7 +171,9 @@ int host_device_memory_write_ctx(
 );
 
 /** Publish a software signal value after caller-visible writes. */
-int host_device_memory_notify_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value);
+int host_device_memory_notify_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value
+);
 
 /** Wait until a software signal value reaches target, or return -EAGAIN/-EWOULDBLOCK style error. */
 int host_device_memory_wait_ctx(

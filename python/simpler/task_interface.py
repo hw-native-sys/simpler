@@ -474,7 +474,9 @@ class ChipWorker:
         """Sim/test helper that injects a message from the L2 side."""
         self._impl.channel_send_l2_for_test(int(channel), int(route), bytes(data), int(correlation_id), int(timeout_us))
 
-    def channel_recv_l2_for_test(self, channel: int, capacity: int = 256, timeout_us: int = 0) -> tuple[bytes, int, int]:
+    def channel_recv_l2_for_test(
+        self, channel: int, capacity: int = 256, timeout_us: int = 0
+    ) -> tuple[bytes, int, int]:
         """Sim/test helper that receives a CPU-to-L2 message from the L2 side."""
         data, route, correlation_id = self._impl.channel_recv_l2_for_test(int(channel), int(capacity), int(timeout_us))
         return bytes(data), int(route), int(correlation_id)

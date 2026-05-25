@@ -1,9 +1,9 @@
 # L3/L2 Host-Device Communication
 
-A second L3/L2 communication model is added beside the existing bounded
-message channel. The runtime now exposes both **send/recv** for small control
-messages and **shared-memory read/write + notify/wait** for data regions that
-need explicit producer-consumer synchronization.
+Simpler exposes an L3/L2 host-device communication surface with both
+**send/recv** for small control messages and **shared-memory read/write +
+notify/wait** for data regions that need explicit producer-consumer
+synchronization.
 
 In this document, L3 means the host-side Worker / Orchestrator runtime that
 issues control commands. L2 means the device-side execution boundary reached
@@ -12,11 +12,11 @@ implementation covers the AICPU broker / sim test paths, while the memory
 layout is kept plain POD so future device-side participants can use the same
 region format.
 
-Current L3 shared-memory access is intentionally mailbox-mediated. The L3
-parent does not mmap the chip child's host mapping and does not access the
-device pointer directly. L3 `shared_memory_read` and `shared_memory_write`
-are chunked mailbox RPC copy helpers over the child-owned region; they are
-not a device-direct zero-copy data plane.
+For L3 Orchestrator callers, shared-memory access is intentionally
+mailbox-mediated. The L3 parent does not mmap the chip child's host mapping
+and does not access the device pointer directly. L3 `shared_memory_read` and
+`shared_memory_write` are chunked mailbox RPC copy helpers over the
+child-owned region; they are not a device-direct zero-copy data plane.
 
 For the WorkerThread mailbox used to reach chip children, see
 [worker-manager.md](worker-manager.md). For where the Orchestrator fits
@@ -28,7 +28,7 @@ platform/runtime split, see [chip-level-arch.md](chip-level-arch.md).
 
 ## 1. Communication model
 
-The PR deliberately keeps three semantics separate:
+This communication surface deliberately keeps three semantics separate:
 
 ```text
 Control:  send(route, payload, correlation_id) / recv()
@@ -283,10 +283,10 @@ chunks no larger than `CTRL_PAYLOAD_CAPACITY`; the API materializes the full
 `bytes` result for reads. This is a convenient control-plane data copy path,
 not a zero-copy parent mapping and not a streaming transport.
 
-The mailbox protocol is intentionally kept stable while chunking is handled
-above it. A logical L3 read/write may issue multiple
-`CTRL_SHARED_MEMORY_READ` or `CTRL_SHARED_MEMORY_WRITE` child requests, but
-each individual mailbox payload still fits inside `CTRL_PAYLOAD_CAPACITY`.
+The L3 shared-memory API adds mailbox commands for read/write requests, while
+chunking keeps each child-control mailbox payload within
+`CTRL_PAYLOAD_CAPACITY`. A logical L3 read/write may issue multiple
+`CTRL_SHARED_MEMORY_READ` or `CTRL_SHARED_MEMORY_WRITE` child requests.
 
 ---
 
@@ -373,10 +373,10 @@ memory primitive from inventing hidden fences or ownership rules.
 ### 9.3 Why no direct L3 parent pointer?
 
 The shared-memory region is opened by the chip child that owns the runtime
-context. In PROCESS mode, the L3 parent talks to that child through a
-pre-existing mailbox and does not have a valid mapping to dereference.
-Returning `host_ptr = 0` prevents accidental parent-side pointer use and
-forces L3 callers onto mailbox-mediated read/write operations.
+context. In PROCESS mode, the L3 parent reaches that child through the
+WorkerThread child-control mailbox and does not have a valid mapping to
+dereference. Returning `host_ptr = 0` prevents accidental parent-side pointer
+use and forces L3 callers onto the mailbox-mediated read/write operations.
 
 ### 9.4 Why unsupported stubs?
 

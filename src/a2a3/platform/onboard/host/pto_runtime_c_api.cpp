@@ -25,6 +25,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <utility>
@@ -44,26 +45,46 @@
 extern "C" int dlog_setlevel(int moduleId, int level, int enableEvent);
 
 namespace {
-void *g_hdch_hal_handle = nullptr;
+std::atomic<void *> g_hdch_hal_handle{nullptr};
 constexpr unsigned int HDCH_DEV_SVM_MAP_HOST = 2U;
 
 using HdchHalHostRegisterFn = int (*)(void *dev_ptr, size_t size, unsigned int flags, int device_id, void **host_ptr);
 using HdchHalHostUnregisterFn = int (*)(void *host_ptr, int device_id);
+std::atomic<HdchHalHostRegisterFn> g_hal_host_register{nullptr};
+std::atomic<HdchHalHostUnregisterFn> g_hal_host_unregister{nullptr};
 
 int hdch_load_hal_if_needed() {
-    if (g_hdch_hal_handle != nullptr) return 0;
-    g_hdch_hal_handle = dlopen("libascend_hal.so", RTLD_NOW | RTLD_LOCAL);
-    return g_hdch_hal_handle == nullptr ? -1 : 0;
+    if (g_hdch_hal_handle.load(std::memory_order_acquire) != nullptr) return 0;
+    void *handle = dlopen("libascend_hal.so", RTLD_NOW | RTLD_GLOBAL);
+    if (handle == nullptr) return -1;
+
+    auto reg = reinterpret_cast<HdchHalHostRegisterFn>(dlsym(handle, "halHostRegister"));
+    auto unreg = reinterpret_cast<HdchHalHostUnregisterFn>(dlsym(handle, "halHostUnregister"));
+    if (reg == nullptr || unreg == nullptr) {
+        dlclose(handle);
+        return -1;
+    }
+
+    g_hal_host_register.store(reg, std::memory_order_release);
+    g_hal_host_unregister.store(unreg, std::memory_order_release);
+    void *expected = nullptr;
+    if (g_hdch_hal_handle.compare_exchange_strong(
+            expected, handle, std::memory_order_acq_rel, std::memory_order_acquire
+        )) {
+        return 0;
+    }
+    dlclose(handle);
+    return 0;
 }
 
 HdchHalHostRegisterFn hdch_get_halHostRegister() {
-    if (g_hdch_hal_handle == nullptr) return nullptr;
-    return reinterpret_cast<HdchHalHostRegisterFn>(dlsym(g_hdch_hal_handle, "halHostRegister"));
+    if (g_hdch_hal_handle.load(std::memory_order_acquire) == nullptr) return nullptr;
+    return g_hal_host_register.load(std::memory_order_acquire);
 }
 
 HdchHalHostUnregisterFn hdch_get_halHostUnregister() {
-    if (g_hdch_hal_handle == nullptr) return nullptr;
-    return reinterpret_cast<HdchHalHostUnregisterFn>(dlsym(g_hdch_hal_handle, "halHostUnregister"));
+    if (g_hdch_hal_handle.load(std::memory_order_acquire) == nullptr) return nullptr;
+    return g_hal_host_unregister.load(std::memory_order_acquire);
 }
 
 }  // namespace
@@ -420,7 +441,9 @@ int host_device_memory_write_ctx(
     return host_device_memory_write(static_cast<HostDeviceMemory *>(mem), offset, src, nbytes);
 }
 
-int host_device_memory_notify_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value) {
+int host_device_memory_notify_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value
+) {
     (void)ctx;
     return host_device_memory_notify(static_cast<HostDeviceMemory *>(mem), signal_id, value);
 }

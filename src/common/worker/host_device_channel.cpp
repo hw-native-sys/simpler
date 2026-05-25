@@ -104,7 +104,7 @@ int send_one(
     uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
 ) {
     if (lanes == nullptr || cursor == nullptr || (data == nullptr && nbytes != 0)) return HDCH_ERR_INVALID;
-    if (nbytes > max_message_bytes) return HDCH_ERR_MSG_TOO_LARGE;
+    if (nbytes > max_message_bytes || nbytes > HDCH_MAX_INLINE_BYTES) return HDCH_ERR_MSG_TOO_LARGE;
 
     auto start = std::chrono::steady_clock::now();
     while (true) {
@@ -160,11 +160,12 @@ int recv_one(
             }
 
             HostDeviceDesc *slot = lane_slots(lane) + (head & lane->depth_mask);
-            if (slot->payload_bytes > dst_capacity) return HDCH_ERR_MSG_TOO_LARGE;
-            if (slot->payload_bytes != 0) {
-                memcpy(dst, slot->inline_data, slot->payload_bytes);
+            uint32_t n = slot->payload_bytes;
+            if (n > HDCH_MAX_INLINE_BYTES || n > dst_capacity) n = 0;
+            if (n != 0) {
+                memcpy(dst, slot->inline_data, n);
             }
-            *out_nbytes = slot->payload_bytes;
+            *out_nbytes = n;
             *out_correlation_id = slot->correlation_id;
             *out_route = slot->route;
             store_u32(&lane->head, head + 1U);

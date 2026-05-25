@@ -80,8 +80,7 @@ HostDeviceChannel *host_device_channel_wrap(
 void host_device_channel_destroy(HostDeviceChannel *ch);
 
 int host_device_channel_send_cpu(
-    HostDeviceChannel *ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id,
-    uint32_t timeout_us
+    HostDeviceChannel *ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
 );
 int host_device_channel_recv_cpu(
     HostDeviceChannel *ch, void *dst, size_t dst_capacity, size_t *out_nbytes, uint64_t *out_correlation_id,
@@ -91,8 +90,7 @@ int host_device_channel_recv_cpu(
 // Test/sim endpoint for the L2 side. V2 AICPU broker should use the same POD
 // layout and publish/consume protocol from device code.
 int host_device_channel_send_l2_for_test(
-    HostDeviceChannel *ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id,
-    uint32_t timeout_us
+    HostDeviceChannel *ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
 );
 int host_device_channel_recv_l2_for_test(
     HostDeviceChannel *ch, void *dst, size_t dst_capacity, size_t *out_nbytes, uint64_t *out_correlation_id,

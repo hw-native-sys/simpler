@@ -97,9 +97,11 @@ public:
         uint32_t max_message_bytes
     );
     void close_channel(int worker_id, uint64_t ch);
-    void channel_send(int worker_id, uint64_t ch, uint32_t route, const std::vector<uint8_t> &data, uint64_t correlation_id);
-    std::vector<uint8_t>
-    channel_recv(int worker_id, uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *route, uint64_t *correlation_id);
+    void
+    channel_send(int worker_id, uint64_t ch, uint32_t route, const void *data, size_t size, uint64_t correlation_id);
+    std::vector<uint8_t> channel_recv(
+        int worker_id, uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *route, uint64_t *correlation_id
+    );
     uint64_t open_shared_memory(int worker_id, uint64_t data_bytes, uint32_t signal_count, uint32_t flags);
     void close_shared_memory(int worker_id, uint64_t mem);
     HostDeviceMemoryInfo shared_memory_info(int worker_id, uint64_t mem);

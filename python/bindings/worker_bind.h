@@ -182,9 +182,7 @@ inline void bind_worker(nb::module_ &m) {
             "channel_send",
             [](Orchestrator &self, int worker_id, uint64_t channel, uint32_t route, nb::bytes data,
                uint64_t correlation_id) {
-                std::string payload(data.c_str(), data.size());
-                std::vector<uint8_t> bytes(payload.begin(), payload.end());
-                self.channel_send(worker_id, channel, route, bytes, correlation_id);
+                self.channel_send(worker_id, channel, route, data.c_str(), data.size(), correlation_id);
             },
             nb::arg("worker_id"), nb::arg("channel"), nb::arg("route"), nb::arg("data"), nb::arg("correlation_id") = 0,
             "Send a message through a host/device channel."

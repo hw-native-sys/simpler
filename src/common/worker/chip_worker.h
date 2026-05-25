@@ -84,10 +84,11 @@ public:
     void copy_from(uint64_t dst, uint64_t src, size_t size);
     uint64_t open_channel(const HostDeviceChannelConfig &cfg);
     void close_channel(uint64_t ch);
-    void channel_send(uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us);
-    std::vector<uint8_t> channel_recv(
-        uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *out_route, uint64_t *out_correlation_id
+    void channel_send(
+        uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
     );
+    std::vector<uint8_t>
+    channel_recv(uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *out_route, uint64_t *out_correlation_id);
     void channel_send_l2_for_test(
         uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
     );

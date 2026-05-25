@@ -116,3 +116,45 @@ TEST(HostDeviceChannelTest, MessageTooLarge) {
 
     host_device_channel_destroy(ch);
 }
+
+TEST(HostDeviceChannelTest, RejectsCorruptedMaxMessageBytesAboveInlineCapacity) {
+    auto c = cfg(1, 1, 4, 4);
+    HostDeviceChannel *ch = make_channel(c);
+    auto *hdr = reinterpret_cast<HostDeviceChannelHeader *>(ch->host_base);
+    hdr->max_message_bytes = HDCH_MAX_INLINE_BYTES + 1;
+    uint8_t payload[HDCH_MAX_INLINE_BYTES + 1]{};
+
+    EXPECT_EQ(host_device_channel_send_cpu(ch, 0, payload, sizeof(payload), 0, 0), HDCH_ERR_MSG_TOO_LARGE);
+
+    host_device_channel_destroy(ch);
+}
+
+TEST(HostDeviceChannelTest, ClampsCorruptedPayloadBytesBeforeCopy) {
+    auto c = cfg(1, 1, 4, 64);
+    HostDeviceChannel *ch = make_channel(c);
+    auto *hdr = reinterpret_cast<HostDeviceChannelHeader *>(ch->host_base);
+    auto *first_lane =
+        reinterpret_cast<HostDeviceLaneHeader *>(reinterpret_cast<uint8_t *>(hdr) + sizeof(HostDeviceChannelHeader));
+    auto *l2_lane = reinterpret_cast<HostDeviceLaneHeader *>(
+        reinterpret_cast<uint8_t *>(first_lane) + sizeof(HostDeviceLaneHeader) +
+        static_cast<size_t>(hdr->lane_depth) * sizeof(HostDeviceDesc)
+    );
+    auto *slot =
+        reinterpret_cast<HostDeviceDesc *>(reinterpret_cast<uint8_t *>(l2_lane) + sizeof(HostDeviceLaneHeader));
+    slot->payload_bytes = HDCH_MAX_INLINE_BYTES + 1;
+    slot->correlation_id = 123;
+    slot->route = 5;
+    l2_lane->tail = 1;
+
+    uint8_t out[64]{0xAB};
+    size_t nbytes = 99;
+    uint64_t cid = 0;
+    uint32_t route = 0;
+    EXPECT_EQ(host_device_channel_recv_cpu(ch, out, sizeof(out), &nbytes, &cid, &route, 0), HDCH_OK);
+    EXPECT_EQ(nbytes, 0u);
+    EXPECT_EQ(cid, 123u);
+    EXPECT_EQ(route, 5u);
+    EXPECT_EQ(l2_lane->head, 1u);
+
+    host_device_channel_destroy(ch);
+}

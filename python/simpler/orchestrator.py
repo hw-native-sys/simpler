@@ -266,11 +266,11 @@ class Orchestrator:
         """Send one inline message from L3 CPU toward L2."""
         self._o.channel_send(int(worker_id), int(channel), int(route), bytes(data), int(correlation_id))
 
-    def channel_recv(self, worker_id: int, channel: int, capacity: int = 256, timeout_us: int = 0) -> tuple[bytes, int, int]:
+    def channel_recv(
+        self, worker_id: int, channel: int, capacity: int = 256, timeout_us: int = 0
+    ) -> tuple[bytes, int, int]:
         """Receive one inline message from L2 toward L3 CPU."""
-        data, route, correlation_id = self._o.channel_recv(
-            int(worker_id), int(channel), int(capacity), int(timeout_us)
-        )
+        data, route, correlation_id = self._o.channel_recv(int(worker_id), int(channel), int(capacity), int(timeout_us))
         return bytes(data), int(route), int(correlation_id)
 
     def open_shared_memory(self, worker_id: int, data_bytes: int, signal_count: int = 2, flags: int = 0) -> int:
@@ -311,9 +311,7 @@ class Orchestrator:
         """Publish a software signal value for a shared-memory region."""
         self._o.shared_memory_notify(int(worker_id), int(memory), int(signal_id), int(value))
 
-    def shared_memory_wait(
-        self, worker_id: int, memory: int, signal_id: int, target: int, timeout_us: int = 0
-    ) -> None:
+    def shared_memory_wait(self, worker_id: int, memory: int, signal_id: int, target: int, timeout_us: int = 0) -> None:
         """Wait until a shared-memory software signal reaches ``target``."""
         self._o.shared_memory_wait(int(worker_id), int(memory), int(signal_id), int(target), int(timeout_us))
 

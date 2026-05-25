@@ -124,20 +124,16 @@ void ChipWorker::init(
             load_symbol<CloseHostDeviceChannelCtxFn>(handle, "close_host_device_channel_ctx");
         host_device_send_ctx_fn_ = load_symbol<HostDeviceSendCtxFn>(handle, "host_device_send_ctx");
         host_device_recv_ctx_fn_ = load_symbol<HostDeviceRecvCtxFn>(handle, "host_device_recv_ctx");
-        open_host_device_memory_ctx_fn_ =
-            load_symbol<OpenHostDeviceMemoryCtxFn>(handle, "open_host_device_memory_ctx");
+        open_host_device_memory_ctx_fn_ = load_symbol<OpenHostDeviceMemoryCtxFn>(handle, "open_host_device_memory_ctx");
         close_host_device_memory_ctx_fn_ =
             load_symbol<CloseHostDeviceMemoryCtxFn>(handle, "close_host_device_memory_ctx");
-        host_device_memory_info_ctx_fn_ =
-            load_symbol<HostDeviceMemoryInfoCtxFn>(handle, "host_device_memory_info_ctx");
-        host_device_memory_read_ctx_fn_ =
-            load_symbol<HostDeviceMemoryReadCtxFn>(handle, "host_device_memory_read_ctx");
+        host_device_memory_info_ctx_fn_ = load_symbol<HostDeviceMemoryInfoCtxFn>(handle, "host_device_memory_info_ctx");
+        host_device_memory_read_ctx_fn_ = load_symbol<HostDeviceMemoryReadCtxFn>(handle, "host_device_memory_read_ctx");
         host_device_memory_write_ctx_fn_ =
             load_symbol<HostDeviceMemoryWriteCtxFn>(handle, "host_device_memory_write_ctx");
         host_device_memory_notify_ctx_fn_ =
             load_symbol<HostDeviceMemoryNotifyCtxFn>(handle, "host_device_memory_notify_ctx");
-        host_device_memory_wait_ctx_fn_ =
-            load_symbol<HostDeviceMemoryWaitCtxFn>(handle, "host_device_memory_wait_ctx");
+        host_device_memory_wait_ctx_fn_ = load_symbol<HostDeviceMemoryWaitCtxFn>(handle, "host_device_memory_wait_ctx");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
         prepare_callable_fn_ = load_symbol<PrepareCallableFn>(handle, "prepare_callable");
@@ -698,7 +694,8 @@ std::vector<uint8_t> ChipWorker::shared_memory_read(uint64_t mem, uint64_t offse
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
     std::vector<uint8_t> buf(nbytes);
-    int rc = host_device_memory_read_ctx_fn_(device_ctx_, reinterpret_cast<void *>(mem), offset, buf.data(), buf.size());
+    int rc =
+        host_device_memory_read_ctx_fn_(device_ctx_, reinterpret_cast<void *>(mem), offset, buf.data(), buf.size());
     if (rc != 0) {
         throw std::runtime_error("shared_memory_read failed with code " + std::to_string(rc));
     }
@@ -737,7 +734,8 @@ void ChipWorker::shared_memory_wait(uint64_t mem, uint32_t signal_id, uint64_t t
 
 std::vector<uint8_t> ChipWorker::shared_memory_read_l2_for_test(uint64_t mem, uint64_t offset, size_t nbytes) {
     std::vector<uint8_t> buf(nbytes);
-    int rc = host_device_memory_read_l2_for_test(reinterpret_cast<HostDeviceMemory *>(mem), offset, buf.data(), buf.size());
+    int rc =
+        host_device_memory_read_l2_for_test(reinterpret_cast<HostDeviceMemory *>(mem), offset, buf.data(), buf.size());
     if (rc != 0) {
         throw std::runtime_error("shared_memory_read_l2_for_test failed with code " + std::to_string(rc));
     }
@@ -758,8 +756,11 @@ void ChipWorker::shared_memory_notify_l2_for_test(uint64_t mem, uint32_t signal_
     }
 }
 
-void ChipWorker::shared_memory_wait_l2_for_test(uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us) {
-    int rc = host_device_memory_wait_l2_for_test(reinterpret_cast<HostDeviceMemory *>(mem), signal_id, target, timeout_us);
+void ChipWorker::shared_memory_wait_l2_for_test(
+    uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
+) {
+    int rc =
+        host_device_memory_wait_l2_for_test(reinterpret_cast<HostDeviceMemory *>(mem), signal_id, target, timeout_us);
     if (rc != 0) {
         throw std::runtime_error("shared_memory_wait_l2_for_test failed with code " + std::to_string(rc));
     }

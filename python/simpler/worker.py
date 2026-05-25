@@ -499,7 +499,7 @@ def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id:
     prepared.add(cid)
 
 
-def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands + SHUTDOWN form the unified state machine; cannot collapse without obscuring dispatch
+def _run_chip_main_loop(  # noqa: PLR0912, PLR0915 -- TASK_READY + 6 control sub-commands + SHUTDOWN form the unified state machine; cannot collapse without obscuring dispatch
     cw: ChipWorker,
     buf: memoryview,
     mailbox_addr: int,
@@ -1890,7 +1890,9 @@ class Worker:
             payload=payload,
         )
 
-    def channel_recv(self, channel: int, capacity: int = 256, timeout_us: int = 0, worker_id: int = 0) -> tuple[bytes, int, int]:
+    def channel_recv(
+        self, channel: int, capacity: int = 256, timeout_us: int = 0, worker_id: int = 0
+    ) -> tuple[bytes, int, int]:
         """Receive one inline message from L2 toward L3 CPU."""
         if self.level == 2:
             assert self._chip_worker is not None
