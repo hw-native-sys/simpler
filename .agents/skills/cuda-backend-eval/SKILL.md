@@ -112,13 +112,13 @@ non-square descriptor. `n` must be a multiple of `rows * cols`; the smoke
 allocates separate A, B, and output extents so A/B strides can differ from the
 output tile size while later elementwise tasks still run over `n` values.
 
-The DAG smoke compiles generated CUDA source from
-`simpler_setup.cuda_callable_compiler.render_persistent_dag_source()`. The
+The DAG smoke compiles generated CUDA source through
+`KernelCompiler(platform="cuda").compile_cuda_persistent_device(...)`. The
 returned JSON includes `source_kind: generated-dispatch` when that path is in
-use. The `nvcc` path goes through `compile_cuda_persistent_device()`, which
-writes `generated_dispatch.cu`, `pto_callable.ptx`, and `pto_callable.json`
-under `build/cache/cuda/onboard/persistent_device/callables/` before the host
-runtime loads the PTX bytes.
+use. The `nvcc` path writes `generated_dispatch.cu`, `pto_callable.ptx`, and
+`pto_callable.json` under
+`build/cache/cuda/onboard/persistent_device/callables/` before the host runtime
+loads the PTX bytes.
 
 For host-schedule task-body compiler work, use
 `KernelCompiler(platform="cuda").compile_cuda_host_schedule(...)`. It renders

@@ -70,6 +70,10 @@ execution modes:
 The persistent DAG path compiles generated CUDA source with `nvcc` and stores
 the generated source, PTX, and manifest under
 `build/cache/cuda/onboard/persistent_device/callables/`.
+The smoke and benchmark path now reaches that artifact compiler through
+`KernelCompiler(platform="cuda").compile_cuda_persistent_device(...)`, which
+accepts task source files plus `func_id` metadata and composes the generated
+dispatch entry.
 
 Evidence:
 
@@ -78,6 +82,8 @@ Evidence:
 - `tests/ut/py/test_cuda_persistent_codegen.py` covers generated dispatch,
   tensor descriptor fields, shared task-body wrapper generation, host-schedule
   and persistent-device manifest writing, and cache reuse.
+- `tests/ut/py/test_cuda_kernel_compiler.py` covers both CUDA
+  `KernelCompiler` entry points.
 - `simpler_setup/cuda_callable_compiler.py` contains the generated-dispatch
   source renderer, shared task-body wrapper renderer, and offline `nvcc`
   compile helper.
@@ -131,7 +137,7 @@ The focused CUDA test set was run from the project-local virtual environment:
   tests/ut/py/test_cuda_persistent_codegen.py -q
 ```
 
-Result: `60 passed`.
+Result: `62 passed`.
 
 The docs and skill updates were checked with targeted `pre-commit` runs and
 `git diff --check` before commit.
@@ -153,18 +159,31 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 Result: `status=pass`, `n=1024`, `ptx_arch=compute_90`,
 `ptx_source=kernel-compiler-task-body-wrapper-compute_90`.
 
+The local A100 persistent DAG smoke was run through the persistent-device
+`KernelCompiler` entry point:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 3 --n 1024 --arch compute_80 \
+    --mode dag --queue-capacity 2
+```
+
+Result: `status=pass`, `runtime=persistent_device`,
+`ptx_source=nvcc-persistent-generated-dispatch-compute_80`,
+`completed_count=3`.
+
 ## Remaining Gaps
 
 ### Kernel Compiler Integration
 
-Host-schedule task-body compilation has a first `KernelCompiler` entry point.
-Persistent-device generated dispatch is still driven by smoke and benchmark
-helpers, and the normal scene-test flow does not yet consume CUDA callable
-artifacts end to end.
+Host-schedule task-body compilation and persistent-device generated dispatch
+now have first `KernelCompiler` entry points. The normal scene-test flow still
+does not consume CUDA callable artifacts end to end.
 
 Needed:
 
-- dispatch entry composition for generated persistent-device task wrappers;
+- shared task-body wrapper composition for persistent-device task sources;
 - scene-test plumbing from CUDA callable artifacts into `ChipCallable` and
   `prepare_callable`;
 - persistent-device callable manifests wired through the normal build/cache

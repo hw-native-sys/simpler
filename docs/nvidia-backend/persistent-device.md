@@ -246,7 +246,7 @@ wrappers generated per runtime. `PtoTaskContext` is the common ABI that hides
 whether arguments came from `ChipStorageTaskArgs`, a host-scheduled launch
 manifest, or a persistent device descriptor.
 
-The current branch has the first codegen slice for that boundary:
+The current branch has the first codegen slices for that boundary:
 `simpler_setup.cuda_callable_compiler.render_cuda_task_wrappers()` renders a
 source fragment with one `pto_task_body_<name>` function, one
 `pto_kernel_<name>` `__global__` wrapper for `host_schedule`, and one
@@ -255,8 +255,16 @@ source fragment with one `pto_task_body_<name>` function, one
 renderer for the host-schedule side and writes a cached PTX artifact plus
 manifest. It can also generate a host wrapper whose parameters match the
 current host-schedule vector-add launch ABI, while the shared task body still
-receives `PtoTaskContext *`. The persistent-device side still needs dispatch
-composition and scene-test plumbing.
+receives `PtoTaskContext *`.
+
+`KernelCompiler(platform="cuda").compile_cuda_persistent_device()` now exposes
+the persistent-device generated-dispatch compiler through the same public
+compiler object. It accepts task source files plus `func_id` metadata, writes
+the generated dispatch source, PTX, and manifest under the persistent-device
+callable cache, and is used by the DAG smoke/evaluation path. The remaining
+work is to make this consume the same `CudaTaskBody` wrapper contract as
+`host_schedule` and to plumb the resulting artifacts through normal
+scene-test `ChipCallable` preparation.
 
 ## Static NVCC Linking Feasibility
 

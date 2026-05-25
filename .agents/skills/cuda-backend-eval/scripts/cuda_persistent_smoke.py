@@ -26,9 +26,9 @@ from cuda_smoke import PtoRunTiming, _bind_runtime, _find_nvcc
 
 from simpler_setup.cuda_callable_compiler import (
     CudaPersistentTaskFunction,
-    compile_cuda_persistent_device,
     render_persistent_dag_source,
 )
+from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.runtime_builder import RuntimeBuilder
 
 _FALLBACK_PERSISTENT_VECTOR_ADD_PTX = rb"""
@@ -669,6 +669,31 @@ task->out[out_base + row * task->ldc + col] = acc;
 _PERSISTENT_DAG_SOURCE = render_persistent_dag_source(_PERSISTENT_DAG_TASK_FUNCTIONS)
 
 
+def _compile_persistent_dag_ptx(work_dir: Path, arch: str) -> tuple[bytes, str]:
+    nvcc = _find_nvcc()
+    if nvcc is None:
+        raise RuntimeError("nvcc is required for persistent dag mode until the embedded PTX fallback is generated")
+
+    task_sources = []
+    for task in _PERSISTENT_DAG_TASK_FUNCTIONS:
+        source_path = work_dir / f"persistent_dag_{task.func_id}_{task.name}.pto.cu"
+        source_path.write_text(task.body)
+        task_sources.append(
+            {
+                "func_id": task.func_id,
+                "task_name": task.name,
+                "source_path": str(source_path),
+            }
+        )
+
+    artifact = KernelCompiler(platform="cuda").compile_cuda_persistent_device(
+        task_sources,
+        arch=arch,
+        nvcc=nvcc,
+    )
+    return artifact.ptx, f"nvcc-persistent-{artifact.source_kind}-{arch}"
+
+
 class CudaPersistentCallable(ctypes.Structure):
     _fields_ = [
         ("version", ctypes.c_uint32),
@@ -877,12 +902,7 @@ def _compile_persistent_ptx(work_dir: Path, arch: str, mode: str) -> tuple[bytes
         "queue": _PERSISTENT_QUEUE_SOURCE,
     }
     if mode == "dag":
-        artifact = compile_cuda_persistent_device(
-            _PERSISTENT_DAG_TASK_FUNCTIONS,
-            arch=arch,
-            nvcc=nvcc,
-        )
-        return artifact.ptx, f"nvcc-persistent-{artifact.source_kind}-{arch}"
+        return _compile_persistent_dag_ptx(work_dir, arch)
     if mode not in source_by_mode:
         raise ValueError(f"unknown persistent mode: {mode}")
 

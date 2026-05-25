@@ -57,3 +57,52 @@ def test_cuda_kernel_compiler_compiles_host_schedule_task_body(tmp_path, monkeyp
     assert seen["arch"] == "compute_80"
     assert seen["cache_root"] == tmp_path / "cache"
     assert seen["nvcc"] == "nvcc-test"
+
+
+def test_cuda_kernel_compiler_compiles_persistent_device_task_sources(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_compile_cuda_persistent_device(task_functions, arch, cache_root=None, nvcc="nvcc"):
+        seen["task_functions"] = task_functions
+        seen["arch"] = arch
+        seen["cache_root"] = cache_root
+        seen["nvcc"] = nvcc
+        return SimpleNamespace(
+            cache_key="persistent-key",
+            cache_hit=False,
+            source_path=tmp_path / "generated_dispatch.cu",
+            ptx_path=tmp_path / "pto_callable.ptx",
+            manifest_path=tmp_path / "pto_callable.json",
+            ptx=b"persistent-ptx",
+            entry_name="pto_persistent_dag_f32_executor",
+            arch=arch,
+            source_kind="generated-dispatch",
+        )
+
+    monkeypatch.setattr(kernel_compiler, "compile_cuda_persistent_device", fake_compile_cuda_persistent_device)
+    add_src = tmp_path / "add.pto.cu"
+    mul_src = tmp_path / "mul.pto.cu"
+    add_src.write_text("task->out[i] = task->a[i] + task->b[i];\n")
+    mul_src.write_text("task->out[i] = task->a[i] * task->b[i];\n")
+
+    compiler = KernelCompiler(platform="cuda")
+    artifact = compiler.compile_cuda_persistent_device(
+        [
+            {"func_id": 2, "task_name": "mul_f32", "source_path": str(mul_src)},
+            {"func_id": 1, "task_name": "add_f32", "source_path": str(add_src)},
+        ],
+        arch="compute_90",
+        cache_root=tmp_path / "cache",
+        nvcc="/usr/local/cuda/bin/nvcc",
+    )
+
+    assert artifact.ptx == b"persistent-ptx"
+    assert seen["arch"] == "compute_90"
+    assert seen["cache_root"] == tmp_path / "cache"
+    assert seen["nvcc"] == "/usr/local/cuda/bin/nvcc"
+    assert [task.func_id for task in seen["task_functions"]] == [2, 1]
+    assert [task.name for task in seen["task_functions"]] == ["mul_f32", "add_f32"]
+    assert [task.body for task in seen["task_functions"]] == [
+        "task->out[i] = task->a[i] * task->b[i];\n",
+        "task->out[i] = task->a[i] + task->b[i];\n",
+    ]

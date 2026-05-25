@@ -17,7 +17,12 @@ from typing import Optional, Union
 
 from simpler import env_manager
 
-from .cuda_callable_compiler import CudaTaskBody, compile_cuda_host_schedule
+from .cuda_callable_compiler import (
+    CudaPersistentTaskFunction,
+    CudaTaskBody,
+    compile_cuda_host_schedule,
+    compile_cuda_persistent_device,
+)
 from .environment import PROJECT_ROOT
 from .toolchain import (
     Aarch64GxxToolchain,
@@ -532,6 +537,41 @@ class KernelCompiler:
                 host_parameters=() if host_parameters is None else host_parameters,
                 host_context_initializer=host_context_initializer,
             ),
+            arch=arch,
+            cache_root=None if cache_root is None else Path(cache_root),
+            nvcc=nvcc,
+        )
+
+    def compile_cuda_persistent_device(
+        self,
+        task_sources,
+        *,
+        arch: str,
+        cache_root: Optional[Union[str, Path]] = None,
+        nvcc: str = "nvcc",
+    ):
+        """Compile CUDA task sources for the persistent_device runtime."""
+
+        if self.platform != "cuda":
+            raise ValueError("compile_cuda_persistent_device is only available for platform='cuda'")
+
+        task_functions = []
+        for item in task_sources:
+            func_id = item["func_id"]
+            task_name = item["task_name"]
+            source = Path(item["source_path"])
+            if not source.is_file():
+                raise FileNotFoundError(f"Source file not found: {source}")
+            task_functions.append(
+                CudaPersistentTaskFunction(
+                    func_id=func_id,
+                    name=task_name,
+                    body=source.read_text(),
+                )
+            )
+
+        return compile_cuda_persistent_device(
+            task_functions,
             arch=arch,
             cache_root=None if cache_root is None else Path(cache_root),
             nvcc=nvcc,

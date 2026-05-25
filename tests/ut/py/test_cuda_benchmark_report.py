@@ -370,6 +370,45 @@ def test_tensor_tile_dag_shape_uses_caller_provided_descriptor():
     assert tasks[0].out_batch_stride == 32
 
 
+def test_persistent_dag_compiler_path_uses_kernel_compiler(tmp_path, monkeypatch):
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+    seen = {}
+
+    class FakeKernelCompiler:
+        def __init__(self, platform):
+            seen["platform"] = platform
+
+        def compile_cuda_persistent_device(self, task_sources, **kwargs):
+            seen["task_sources"] = task_sources
+            seen.update(kwargs)
+            return type(
+                "Artifact",
+                (),
+                {
+                    "ptx": b"persistent-dag-ptx",
+                    "source_kind": "generated-dispatch",
+                },
+            )()
+
+    monkeypatch.setattr(cuda_persistent_smoke, "_find_nvcc", lambda: "/usr/local/cuda/bin/nvcc")
+    monkeypatch.setattr(cuda_persistent_smoke, "KernelCompiler", FakeKernelCompiler)
+
+    ptx, source_kind = cuda_persistent_smoke._compile_persistent_dag_ptx(tmp_path, "compute_90")
+
+    assert ptx == b"persistent-dag-ptx"
+    assert source_kind == "nvcc-persistent-generated-dispatch-compute_90"
+    assert seen["platform"] == "cuda"
+    assert seen["arch"] == "compute_90"
+    assert seen["nvcc"] == "/usr/local/cuda/bin/nvcc"
+    assert [task["func_id"] for task in seen["task_sources"]] == [1, 2, 3]
+    assert [task["task_name"] for task in seen["task_sources"]] == [
+        "add_f32",
+        "mul_f32",
+        "matmul_tile_f32",
+    ]
+    assert all(Path(task["source_path"]).is_file() for task in seen["task_sources"])
+
+
 def test_summarize_results_groups_by_machine_and_baseline():
     cuda_benchmark = _load_benchmark_module()
     payload = {
