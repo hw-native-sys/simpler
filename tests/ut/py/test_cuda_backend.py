@@ -34,6 +34,12 @@ def test_cuda_runtime_builder_discovers_host_schedule():
     assert "host_schedule" in builder.list_runtimes()
 
 
+def test_cuda_runtime_builder_discovers_persistent_device():
+    builder = RuntimeBuilder(platform="cuda")
+
+    assert "persistent_device" in builder.list_runtimes()
+
+
 class CudaHostCallable(ctypes.Structure):
     _fields_ = [
         ("version", ctypes.c_uint32),
@@ -216,6 +222,29 @@ from cuda_smoke import run_smoke
 
 for _ in range(2):
     run_smoke(device=0, n=1024, block_dim=256, arch="compute_80", build=False)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+@pytest.mark.skipif(shutil.which("nvcc") is None, reason="nvcc is required for CUDA persistent smoke test")
+def test_cuda_persistent_device_smoke_runs_vector_add_tasks():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+result = run_persistent_smoke(device=0, task_count=2, n=1024, arch="compute_80")
+assert result["status"] == "pass"
+assert result["runtime"] == "persistent_device"
+assert result["task_count"] == 2
 """
     result = subprocess.run(
         [sys.executable, "-c", script],

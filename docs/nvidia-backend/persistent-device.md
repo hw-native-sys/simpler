@@ -114,6 +114,13 @@ the device-side dispatch latency target of `persistent_device`.
 The `persistent_device` runtime is the CUDA analogue of
 `tensormap_and_ringbuffer`, not a port of the AICPU implementation.
 
+The first implementation slice in this branch is intentionally a tracer
+bullet: `persistent_device` is registered as a CUDA runtime and can launch a
+single executor kernel that consumes a device array of vector-add task
+descriptors. It proves the build/discovery path, module loading, descriptor
+memory layout, and "one host launch handles multiple device tasks" shape before
+adding TensorMap/ring queues and generated dispatch tables.
+
 ### Runtime Roles
 
 ```text

@@ -41,6 +41,14 @@ PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_smoke.py
 ```
 
+Run the persistent-device tracer-bullet smoke:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 2 --n 1024 --arch compute_80
+```
+
 ## Microbenchmark Report
 
 Use `cuda_benchmark.py` for the current early-runtime comparison. It runs the
@@ -59,7 +67,7 @@ Local A100 example:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_80 \
-    --label a100-local --output-dir tmp/cuda-backend/a100
+    --include-persistent --label a100-local --output-dir tmp/cuda-backend/a100
 ```
 
 Remote H200 example:
@@ -70,7 +78,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,1048576 --repeats 5 --arch compute_90 \
-     --label h200-remote --output-dir tmp/cuda-backend/h200'
+     --include-persistent --label h200-remote --output-dir tmp/cuda-backend/h200'
 ```
 
 The script writes:

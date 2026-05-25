@@ -130,6 +130,41 @@ def test_run_benchmark_uses_in_process_samples(monkeypatch):
     assert len(payload["results"]) == 2
 
 
+def test_run_benchmark_can_include_persistent_device(monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = []
+
+    def fake_compile_ptx(work_dir, arch):
+        return b"ptx", f"fake-{arch}"
+
+    def fake_run_single_sample(baseline, device, n, block_dim, arch):
+        seen.append(baseline)
+        return {
+            "baseline": baseline,
+            "n": n,
+            "block_dim": block_dim,
+            "host_wall_ns": 20,
+            "device_wall_ns": 10,
+            "status": "pass",
+        }
+
+    monkeypatch.setattr(cuda_benchmark, "_compile_ptx", fake_compile_ptx)
+    monkeypatch.setattr(cuda_benchmark, "run_single_sample", fake_run_single_sample)
+
+    payload = cuda_benchmark.run_benchmark(
+        device=3,
+        sizes=[1024],
+        repeats=1,
+        block_dim=128,
+        arch="compute_80",
+        label="unit",
+        include_persistent=True,
+    )
+
+    assert seen == ["pto_host_schedule", "direct_driver", "pto_persistent_device"]
+    assert len(payload["results"]) == 3
+
+
 def test_render_report_describes_stream_concurrency_rows():
     cuda_benchmark = _load_benchmark_module()
     payload = {

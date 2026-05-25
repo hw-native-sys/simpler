@@ -27,6 +27,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from cuda_persistent_smoke import run_persistent_smoke
 from cuda_smoke import CudaHostCallable, CudaVectorAddArgs, PtoRunTiming, _compile_ptx, _load_runtime, run_smoke
 
 _FALLBACK_SLOW_VECTOR_ADD_PTX = rb"""
@@ -303,6 +304,13 @@ def run_direct_sample(device: int, n: int, block_dim: int, ptx: bytes) -> dict[s
         return driver.run_vector_add(n=n, block_dim=block_dim)
 
 
+def run_persistent_sample(device: int, n: int, arch: str) -> dict[str, Any]:
+    result = run_persistent_smoke(device=device, task_count=2, n=n, arch=arch)
+    result["baseline"] = "pto_persistent_device"
+    result["block_dim"] = 256
+    return result
+
+
 def run_single_sample(baseline: str, device: int, n: int, block_dim: int, arch: str) -> dict[str, Any]:
     if baseline == "pto_host_schedule":
         return run_pto_sample(device=device, n=n, block_dim=block_dim, arch=arch)
@@ -312,10 +320,20 @@ def run_single_sample(baseline: str, device: int, n: int, block_dim: int, arch: 
         result = run_direct_sample(device=device, n=n, block_dim=block_dim, ptx=ptx)
         result["ptx_source"] = ptx_source
         return result
+    if baseline == "pto_persistent_device":
+        return run_persistent_sample(device=device, n=n, arch=arch)
     raise ValueError(f"unknown baseline: {baseline}")
 
 
-def run_benchmark(device: int, sizes: list[int], repeats: int, block_dim: int, arch: str, label: str) -> dict[str, Any]:
+def run_benchmark(
+    device: int,
+    sizes: list[int],
+    repeats: int,
+    block_dim: int,
+    arch: str,
+    label: str,
+    include_persistent: bool = False,
+) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="pto_cuda_bench_") as td:
         ptx, ptx_source = _compile_ptx(Path(td), arch)
 
@@ -344,6 +362,17 @@ def run_benchmark(device: int, sizes: list[int], repeats: int, block_dim: int, a
             direct = run_single_sample(baseline="direct_driver", device=device, n=n, block_dim=block_dim, arch=arch)
             direct.update({"machine": metadata["machine"], "repeat": repeat})
             results.append(direct)
+
+            if include_persistent:
+                persistent = run_single_sample(
+                    baseline="pto_persistent_device",
+                    device=device,
+                    n=n,
+                    block_dim=block_dim,
+                    arch=arch,
+                )
+                persistent.update({"machine": metadata["machine"], "repeat": repeat})
+                results.append(persistent)
 
     return {"metadata": metadata, "results": results}
 
@@ -663,6 +692,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  vector-add PTX kernel.",
             "- `pto_host_schedule` measures the current PTO CUDA host runtime path,",
             "  including the runtime C API boundary and manifest lookup.",
+            "- `pto_persistent_device` measures the tracer-bullet persistent executor",
+            "  path: one host launch processes a device array of task descriptors.",
             "- `pto_stream_serial` measures two independent PTO launches issued",
             "  sequentially on the host-schedule stream pool.",
             "- `pto_stream_parallel` measures two independent PTO launches issued",
@@ -697,9 +728,14 @@ def main() -> None:
     parser.add_argument("--arch", default="compute_80")
     parser.add_argument("--label", default="local")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/cuda-backend/latest"))
-    parser.add_argument("--single-baseline", choices=["pto_host_schedule", "direct_driver"], default=None)
+    parser.add_argument(
+        "--single-baseline",
+        choices=["pto_host_schedule", "direct_driver", "pto_persistent_device"],
+        default=None,
+    )
     parser.add_argument("--merge-json", type=Path, nargs="*", default=None)
     parser.add_argument("--stream-concurrency", action="store_true")
+    parser.add_argument("--include-persistent", action="store_true")
     args = parser.parse_args()
 
     if args.merge_json:
@@ -739,6 +775,7 @@ def main() -> None:
         block_dim=args.block_dim,
         arch=args.arch,
         label=args.label,
+        include_persistent=args.include_persistent,
     )
     write_report(payload, args.output_dir)
     print(json.dumps(payload["metadata"], indent=2, sort_keys=True))

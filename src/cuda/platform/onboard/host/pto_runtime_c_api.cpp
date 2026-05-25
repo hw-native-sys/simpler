@@ -12,6 +12,7 @@
 #include "pto_runtime_c_api.h"
 
 #include "host/pto_cuda_host_schedule_abi.h"
+#include "host/pto_cuda_persistent_device_abi.h"
 #include "platform_comm/comm.h"
 
 #include <cuda.h>
@@ -28,6 +29,17 @@ namespace {
 
 struct PtoCudaRuntime {
     uint32_t reserved = 0;
+};
+
+struct PtoCudaCallableHeader {
+    uint32_t version;
+    uint32_t op;
+    const void *image;
+    size_t image_size;
+    const char *entry_name;
+    uint32_t grid_dim;
+    uint32_t block_dim;
+    size_t shared_mem_bytes;
 };
 
 struct PreparedCallable {
@@ -144,18 +156,19 @@ public:
     }
 
     int prepare(int32_t callable_id, const PtoCudaHostCallable *callable) {
-        if (callable == nullptr || callable->image == nullptr || callable->image_size == 0 ||
-            callable->entry_name == nullptr) {
+        auto *header = static_cast<const PtoCudaCallableHeader *>(static_cast<const void *>(callable));
+        if (header == nullptr || header->image == nullptr || header->image_size == 0 || header->entry_name == nullptr) {
             return -1;
         }
-        if (callable->version != 1 && callable->version != 2) {
+        if (header->version != 1 && header->version != 2) {
             return -1;
         }
-        if (callable->op != PTO_CUDA_HOST_OP_VECTOR_ADD_F32) {
+        if (header->op != PTO_CUDA_HOST_OP_VECTOR_ADD_F32 &&
+            header->op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS) {
             return -1;
         }
         uint32_t stream_id = 0;
-        if (callable->version >= 2) {
+        if (header->op == PTO_CUDA_HOST_OP_VECTOR_ADD_F32 && header->version >= 2) {
             stream_id = callable->stream_id;
         }
         if (stream_id >= streams_.size()) {
@@ -168,8 +181,7 @@ public:
         unregister(callable_id);
 
         std::vector<char> image(
-            static_cast<const char *>(callable->image),
-            static_cast<const char *>(callable->image) + callable->image_size
+            static_cast<const char *>(header->image), static_cast<const char *>(header->image) + header->image_size
         );
         if (image.empty() || image.back() != '\0') {
             image.push_back('\0');
@@ -180,17 +192,17 @@ public:
         if (cu_rc != CUDA_SUCCESS) {
             return -1;
         }
-        cu_rc = cuModuleGetFunction(&prepared.function, prepared.module, callable->entry_name);
+        cu_rc = cuModuleGetFunction(&prepared.function, prepared.module, header->entry_name);
         if (cu_rc != CUDA_SUCCESS) {
             cuModuleUnload(prepared.module);
             return -1;
         }
 
-        prepared.op = callable->op;
-        prepared.grid_dim = callable->grid_dim;
-        prepared.block_dim = callable->block_dim;
+        prepared.op = header->op;
+        prepared.grid_dim = header->grid_dim;
+        prepared.block_dim = header->block_dim;
         prepared.stream_id = stream_id;
-        prepared.shared_mem_bytes = callable->shared_mem_bytes;
+        prepared.shared_mem_bytes = header->shared_mem_bytes;
         prepared_[callable_id] = prepared;
         return 0;
     }
@@ -219,11 +231,8 @@ public:
             return -1;
         }
         PreparedCallable &prepared = it->second;
-        if (prepared.op != PTO_CUDA_HOST_OP_VECTOR_ADD_F32) {
-            return -1;
-        }
-        auto *typed_args = static_cast<const PtoCudaVectorAddArgs *>(args);
-        if (typed_args->a == nullptr || typed_args->b == nullptr || typed_args->out == nullptr || typed_args->n == 0) {
+        if (prepared.op != PTO_CUDA_HOST_OP_VECTOR_ADD_F32 &&
+            prepared.op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS) {
             return -1;
         }
         if (cudaSetDevice(device_id_) != cudaSuccess) {
@@ -244,11 +253,41 @@ public:
 
         auto host_start = std::chrono::steady_clock::now();
         cudaEventRecord(start, stream);
-        const float *a = typed_args->a;
-        const float *b = typed_args->b;
-        float *out = typed_args->out;
-        uint64_t n = typed_args->n;
-        void *kernel_args[] = {&a, &b, &out, &n};
+        const float *a = nullptr;
+        const float *b = nullptr;
+        float *out = nullptr;
+        uint64_t n = 0;
+        const PtoCudaPersistentVectorAddTask *tasks = nullptr;
+        uint64_t task_count = 0;
+        void *kernel_args[4] = {};
+        if (prepared.op == PTO_CUDA_HOST_OP_VECTOR_ADD_F32) {
+            auto *typed_args = static_cast<const PtoCudaVectorAddArgs *>(args);
+            if (typed_args->a == nullptr || typed_args->b == nullptr || typed_args->out == nullptr ||
+                typed_args->n == 0) {
+                cudaEventDestroy(start);
+                cudaEventDestroy(stop);
+                return -1;
+            }
+            a = typed_args->a;
+            b = typed_args->b;
+            out = typed_args->out;
+            n = typed_args->n;
+            kernel_args[0] = &a;
+            kernel_args[1] = &b;
+            kernel_args[2] = &out;
+            kernel_args[3] = &n;
+        } else {
+            auto *typed_args = static_cast<const PtoCudaPersistentVectorAddArgs *>(args);
+            if (typed_args->tasks == nullptr || typed_args->task_count == 0) {
+                cudaEventDestroy(start);
+                cudaEventDestroy(stop);
+                return -1;
+            }
+            tasks = typed_args->tasks;
+            task_count = typed_args->task_count;
+            kernel_args[0] = &tasks;
+            kernel_args[1] = &task_count;
+        }
         CUresult cu_rc = cuLaunchKernel(
             prepared.function, prepared.grid_dim, 1, 1, prepared.block_dim, 1, 1, prepared.shared_mem_bytes,
             reinterpret_cast<CUstream>(stream), kernel_args, nullptr
