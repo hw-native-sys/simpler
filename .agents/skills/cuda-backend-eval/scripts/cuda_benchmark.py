@@ -1178,6 +1178,59 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
     return "\n".join(lines) + "\n"
 
 
+def _ratio_svg_rows(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) -> list[dict[str, Any]]:
+    refs = _matched_device_refs(summary)
+    rows: list[dict[str, Any]] = []
+    for row in _sorted_summary_rows(summary):
+        reference = refs.get((row["machine"], row["n"], row["task_count"]))
+        if reference is None or reference == 0:
+            continue
+        rows.append({**row, "ratio": row["median_device_wall_ns"] / reference})
+    return rows
+
+
+def render_ratio_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) -> str:
+    rows = _ratio_svg_rows(summary)
+    if not rows:
+        return '<svg xmlns="http://www.w3.org/2000/svg" width="760" height="96"></svg>\n'
+
+    max_ratio = max(max(row["ratio"] for row in rows), 1.0)
+    left = 280
+    chart_width = 520
+    bar_height = 18
+    row_gap = 10
+    height = 68 + len(rows) * (bar_height + row_gap)
+    width = left + chart_width + 150
+    reference_x = left + int(chart_width / max_ratio)
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<text x="20" y="28" font-family="sans-serif" font-size="18" font-weight="700">'
+        "Device time ratio vs matched reference</text>",
+        f'<line x1="{reference_x}" y1="42" x2="{reference_x}" y2="{height - 16}" '
+        'stroke="#444" stroke-width="1" stroke-dasharray="4 4"/>',
+        f'<text x="{reference_x + 6}" y="56" font-family="sans-serif" font-size="12">'
+        "reference=1.00x</text>",
+    ]
+    for idx, row in enumerate(rows):
+        y = 68 + idx * (bar_height + row_gap)
+        label = (
+            f"{row['machine']} n={row['n']} tasks={row['task_count']} "
+            f"{row['baseline']}"
+        )
+        ratio = row["ratio"]
+        bar_width = max(1, int(chart_width * ratio / max_ratio))
+        color = "#2a9d65" if ratio <= 1.0 else "#c43d3d"
+        lines.append(f'<text x="20" y="{y + 14}" font-family="sans-serif" font-size="12">{label}</text>')
+        lines.append(f'<rect x="{left}" y="{y}" width="{bar_width}" height="{bar_height}" fill="{color}"/>')
+        lines.append(
+            f'<text x="{left + bar_width + 8}" y="{y + 14}" font-family="sans-serif" font-size="12">'
+            f"{ratio:.2f}x</text>"
+        )
+    lines.append("</svg>")
+    return "\n".join(lines) + "\n"
+
+
 def render_markdown_report(payload: dict[str, Any]) -> str:
     summary = summarize_results(payload)
     device_refs = _matched_device_refs(summary)
@@ -1326,6 +1379,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "",
             "![Median device time](cuda-benchmark.svg)",
             "",
+            "![Device ratio chart](cuda-benchmark-ratios.svg)",
+            "",
         ]
     )
     return "\n".join(lines)
@@ -1333,9 +1388,11 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
 
 def write_report(payload: dict[str, Any], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    summary = summarize_results(payload)
     (output_dir / "cuda-benchmark.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     (output_dir / "cuda-benchmark.md").write_text(render_markdown_report(payload))
-    (output_dir / "cuda-benchmark.svg").write_text(render_svg(summarize_results(payload)))
+    (output_dir / "cuda-benchmark.svg").write_text(render_svg(summary))
+    (output_dir / "cuda-benchmark-ratios.svg").write_text(render_ratio_svg(summary))
 
 
 def _parse_sizes(raw: str) -> list[int]:

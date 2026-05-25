@@ -175,11 +175,18 @@ The script writes:
 - `cuda-benchmark.json`: raw samples, metadata, hardware, git commit.
 - `cuda-benchmark.md`: short report with interpretation notes.
 - `cuda-benchmark.svg`: bar chart of median device time by baseline.
+- `cuda-benchmark-ratios.svg`: bar chart of each row's device-time ratio
+  against its matched reference.
 
 The report's ratio column uses the matched host-schedule row for the same
 machine, vector length, and task count. Same-work batch rows are therefore
 relative to `pto_host_schedule_batch`, not the one-task `pto_host_schedule`
 row.
+
+The ratio SVG uses the same matched-reference rule as the Markdown table. It
+is the clearest visual for launch-overhead comparisons such as
+`direct_driver_graph` vs. `pto_host_schedule`, stream parallel-vs-serial, and
+same-work persistent batch rows.
 
 When worker-grid rows are present, the report includes a
 `Best Worker Grid Rows` table that picks the lowest median device time for

@@ -249,6 +249,56 @@ def test_render_report_includes_host_schedule_relative_ratios():
     assert "for the same machine, `N`, and task count" in report
 
 
+def test_render_ratio_svg_visualizes_matched_reference_ratios():
+    cuda_benchmark = _load_benchmark_module()
+    payload = {
+        "metadata": {
+            "label": "ratio-svg-unit",
+            "git_commit": "abc123",
+            "paper_setup": "microbenchmarks only",
+        },
+        "results": [
+            {"machine": "a100-local", "baseline": "pto_host_schedule", "n": 1024, "device_wall_ns": 1000},
+            {"machine": "a100-local", "baseline": "direct_driver", "n": 1024, "device_wall_ns": 500},
+            {
+                "machine": "a100-local",
+                "baseline": "direct_driver_graph",
+                "n": 1024,
+                "device_wall_ns": 250,
+            },
+        ],
+    }
+
+    report = cuda_benchmark.render_markdown_report(payload)
+    summary = cuda_benchmark.summarize_results(payload)
+    svg = cuda_benchmark.render_ratio_svg(summary)
+
+    assert "![Device ratio chart](cuda-benchmark-ratios.svg)" in report
+    assert "Device time ratio vs matched reference" in svg
+    assert "direct_driver_graph" in svg
+    assert "0.25x" in svg
+    assert "reference=1.00x" in svg
+
+
+def test_write_report_writes_ratio_svg(tmp_path):
+    cuda_benchmark = _load_benchmark_module()
+    payload = {
+        "metadata": {
+            "label": "write-ratio-unit",
+            "git_commit": "abc123",
+            "paper_setup": "microbenchmarks only",
+        },
+        "results": [
+            {"machine": "a100-local", "baseline": "pto_host_schedule", "n": 1024, "device_wall_ns": 1000},
+            {"machine": "a100-local", "baseline": "direct_driver", "n": 1024, "device_wall_ns": 500},
+        ],
+    }
+
+    cuda_benchmark.write_report(payload, tmp_path)
+
+    assert (tmp_path / "cuda-benchmark-ratios.svg").exists()
+
+
 def test_render_report_uses_batch_host_schedule_reference_for_batch_rows():
     cuda_benchmark = _load_benchmark_module()
     payload = {

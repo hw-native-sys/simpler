@@ -12,10 +12,12 @@ The latest captured raw reports are under `tmp/`:
 - `tmp/cuda-backend/h200-wide-e430bc1b/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-wide-e430bc1b/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-wide-e430bc1b/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-wide-e430bc1b/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/a100-stream-37bebf44/cuda-benchmark.md`
 - `tmp/cuda-backend/h200-stream-37bebf44/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-stream-37bebf44/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-stream-37bebf44/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-stream-37bebf44/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/a100-dag-323f4587/cuda-benchmark.md`
 - `tmp/cuda-backend/h200-dag-323f4587/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-dag-323f4587/cuda-benchmark.md`
@@ -28,10 +30,12 @@ The latest captured raw reports are under `tmp/`:
 - `tmp/cuda-backend/h200-tensor-8950e029/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-tensor-8950e029/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-tensor-8950e029/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-tensor-8950e029/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/a100-graph-ba2cdd0e/cuda-benchmark.md`
 - `tmp/cuda-backend/h200-graph-ba2cdd0e/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-graph-ba2cdd0e/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-graph-ba2cdd0e/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-graph-ba2cdd0e/cuda-benchmark-ratios.svg`
 
 The worker-grid data was captured from commit `e430bc1b`. The stream
 concurrency data was captured from commit `37bebf44`. The DAG-chain data was
@@ -74,6 +78,10 @@ Generated reports also include a `DAG Shape Rows` table that compares
 `pto_persistent_dag_*` rows against `pto_persistent_dag` for the same GPU and
 vector length. Use that table for graph-shape interpretation because the
 chain, reuse, and tensor DAGs intentionally have different task counts.
+The generated `cuda-benchmark-ratios.svg` file visualizes the same matched
+reference ratios used by the main Markdown table; use it for launch-overhead
+and stream-concurrency comparisons where the rows share a reference task
+count.
 
 ## Headline Results
 
