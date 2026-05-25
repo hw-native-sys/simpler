@@ -169,7 +169,7 @@ View does **not** own memory. Valid for the duration of a single
 
 ```cpp
 struct CallConfig {
-    int32_t block_dim = 1;
+    int32_t block_dim = 0;  // 0 = auto (DeviceRunner resolves to stream max at run() time)
     int32_t aicpu_thread_num = 3;
     bool    enable_l2_swimlane = false;
     bool    enable_dump_tensor = false;

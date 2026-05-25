@@ -376,6 +376,13 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // DeviceRunner::validate_block_dim). The scheduler assigns cores to
     // threads cluster-aligned round-robin, so block_dim need not be evenly
     // divisible by the scheduler thread count.
+    //
+    // block_dim == 0 is the CallConfig "auto" sentinel — resolve to the
+    // static max since sim has no per-stream resource query.
+    if (block_dim == 0) {
+        block_dim = PLATFORM_MAX_BLOCKDIM;
+        LOG_INFO_V0("block_dim auto-resolved to %d", block_dim);
+    }
     if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
         LOG_ERROR("block_dim (%d) must be in range [1, %d]", block_dim, PLATFORM_MAX_BLOCKDIM);
         return -1;

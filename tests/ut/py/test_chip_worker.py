@@ -19,7 +19,9 @@ from _task_interface import CallConfig, _ChipWorker  # pyright: ignore[reportMis
 class TestCallConfig:
     def test_defaults(self):
         config = CallConfig()
-        assert config.block_dim == 24
+        # 0 is the "auto" sentinel — DeviceRunner resolves it at run() time
+        # to the max the AICore stream allows.
+        assert config.block_dim == 0
         assert config.aicpu_thread_num == 3
         assert config.enable_l2_swimlane == 0
         assert config.enable_dump_tensor is False
@@ -63,7 +65,7 @@ class TestCallConfig:
     def test_repr(self):
         config = CallConfig()
         r = repr(config)
-        assert "block_dim=24" in r
+        assert "block_dim=0" in r
         assert "enable_l2_swimlane=0" in r
 
 

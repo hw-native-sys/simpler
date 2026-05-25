@@ -167,8 +167,10 @@ worker.init(device_id=0, bins=binaries)
 # Register the ChipCallable to obtain a callable_id
 cid = worker.register(chip_callable)
 
-# Execute the registered callable on device
-worker.run(cid, orch_args, block_dim=24)
+# Execute the registered callable on device. Omitting block_dim uses the
+# default 0 = auto, which DeviceRunner resolves to the max the AICore
+# stream allows. Pass block_dim=<n> to pin a smaller value.
+worker.run(cid, orch_args)
 
 # Cleanup
 worker.finalize()

@@ -857,7 +857,11 @@ class SceneTestCase:
         from simpler.task_interface import CallConfig  # noqa: PLC0415
 
         config = CallConfig()
-        config.block_dim = config_dict.get("block_dim", 1)
+        # Default to 0 (CallConfig "auto" sentinel) when a case omits
+        # block_dim — DeviceRunner resolves it to the stream's max capacity
+        # at run() time. Cases that need a specific value still set it
+        # explicitly in their config dict.
+        config.block_dim = config_dict.get("block_dim", 0)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
         config.enable_l2_swimlane = enable_l2_swimlane
         config.enable_dump_tensor = enable_dump_tensor
