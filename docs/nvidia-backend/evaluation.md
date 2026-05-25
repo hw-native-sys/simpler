@@ -20,10 +20,15 @@ The latest captured raw reports are under `tmp/`:
 - `tmp/cuda-backend/h200-dag-323f4587/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-dag-323f4587/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-dag-323f4587/cuda-benchmark.svg`
+- `tmp/cuda-backend/a100-reuse-bcf54a88/cuda-benchmark.md`
+- `tmp/cuda-backend/h200-reuse-bcf54a88/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-reuse-bcf54a88/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-reuse-bcf54a88/cuda-benchmark.svg`
 
 The worker-grid data was captured from commit `e430bc1b`. The stream
 concurrency data was captured from commit `37bebf44`. The DAG-chain data was
-captured from commit `323f4587`.
+captured from commit `323f4587`. The scratch-reuse DAG data was captured from
+commit `bcf54a88`.
 
 ## Current Baselines
 
@@ -94,7 +99,7 @@ independent prepared callables can overlap when issued from separate host
 threads. It does not solve the persistent-device scheduling problem, where the
 CUDA device-side scheduler still has to run inside a persistent kernel.
 
-## DAG Chain
+## DAG Graph Shapes
 
 The `pto_persistent_dag_chain` row validates that the same generated-dispatch
 compiled binary can run a different runtime graph descriptor: two initial
@@ -102,6 +107,13 @@ tasks fan into an add task, then a multiply task, then a final add task. This
 is still a vector microbenchmark, but it is closer to the desired persistent
 runtime shape than a flat descriptor array because dependencies and fan-in
 counters drive the ready queue.
+
+The `pto_persistent_dag_reuse` row adds one more task and reuses `tmp0` after
+the original `tmp0` producer's final dependent has completed. This is still
+elementwise vector work, but it validates the lifecycle rule needed by a
+persistent-device runtime: buffer lifetime can be represented by graph
+dependencies and runtime descriptors while the generated-dispatch binary stays
+unchanged.
 
 | GPU | N | DAG ns | DAG-chain ns | Chain/DAG |
 | --- | - | ------ | ------------ | --------- |
@@ -116,6 +128,21 @@ The chain row is slower than the three-task DAG because it performs more
 device work and serializes two more dependency levels. That is expected here;
 the useful signal is that graph shape, fan-in, and callable selection are
 runtime data while the generated-dispatch device binary stays stable.
+
+| GPU | N | DAG ns | DAG-chain ns | DAG-reuse ns | Reuse/DAG |
+| --- | - | ------ | ------------ | ------------ | --------- |
+| A100 | 1024 | 25600 | 36864 | 34816 | 1.36x |
+| H200 | 1024 | 31456 | 39232 | 39168 | 1.25x |
+| A100 | 65536 | 153600 | 268288 | 266240 | 1.73x |
+| H200 | 65536 | 139328 | 244128 | 245696 | 1.76x |
+| A100 | 1048576 | 2328576 | 4263936 | 3947520 | 1.70x |
+| H200 | 1048576 | 2005919 | 3580768 | 3581664 | 1.79x |
+
+The reuse row is close to the chain row because it has the same long multiply
+path and one additional add branch. On A100 it is slightly faster than the
+chain row for larger vectors because the final add consumes the reused
+scratch branch rather than the earlier chain value; this is a microbenchmark
+effect, not a claim that reuse is inherently faster.
 
 ## Reproduction Commands
 
@@ -172,6 +199,26 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
      --include-persistent --batch-tasks 6 --worker-blocks-per-task 64 \
      --label h200-dag-323f4587 \
      --output-dir tmp/cuda-backend/h200-dag-323f4587'
+```
+
+Scratch-reuse DAG capture:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --device 0 --sizes 1024,65536,1048576 --repeats 3 --arch compute_80 \
+    --include-persistent --batch-tasks 6 --worker-blocks-per-task 64 \
+    --label a100-reuse-bcf54a88 \
+    --output-dir tmp/cuda-backend/a100-reuse-bcf54a88
+
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+   PYTHONPATH=$PWD:$PWD/python \
+   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+     --device 0 --sizes 1024,65536,1048576 --repeats 3 --arch compute_90 \
+     --include-persistent --batch-tasks 6 --worker-blocks-per-task 64 \
+     --label h200-reuse-bcf54a88 \
+     --output-dir tmp/cuda-backend/h200-reuse-bcf54a88'
 ```
 
 Stream concurrency:

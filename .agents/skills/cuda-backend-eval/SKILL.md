@@ -221,6 +221,12 @@ slower because it performs more vector work and has two more dependency
 levels; use it as a lifecycle/scheduler validation row, not as a throughput
 claim.
 
+The scratch-reuse DAG capture at `bcf54a88` adds `pto_persistent_dag_reuse`.
+It validates that a runtime graph can reuse a scratch buffer after dependency
+completion without recompiling the generated-dispatch PTX. Use this as an
+early buffer-lifecycle row; it is still elementwise vector work, not a tensor
+kernel workload.
+
 ## Hardware Checks
 
 Local A100:
