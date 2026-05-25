@@ -59,7 +59,7 @@
 #endif
 
 #ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 0
+#define PTO2_ORCH_PROFILING 1
 #endif
 
 #ifndef PTO2_SCHED_PROFILING
