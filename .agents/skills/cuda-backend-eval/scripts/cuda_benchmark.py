@@ -1128,22 +1128,34 @@ def merge_payloads(payloads: list[dict[str, Any]], label: str) -> dict[str, Any]
     results: list[dict[str, Any]] = []
     for payload in payloads:
         results.extend(payload.get("results", []))
+    tensor_tiles = [
+        payload.get("metadata", {}).get("tensor_tile")
+        for payload in payloads
+        if payload.get("metadata", {}).get("tensor_tile") is not None
+    ]
+    common_tensor_tile = None
+    if tensor_tiles and all(tensor_tile == tensor_tiles[0] for tensor_tile in tensor_tiles):
+        common_tensor_tile = tensor_tiles[0]
+
+    metadata: dict[str, Any] = {
+        "label": label,
+        "git_commit": ",".join(git_commits) if git_commits else "unknown",
+        "git_commits": git_commits,
+        "machine": "combined",
+        "nvidia_smi": "combined report",
+        "paper_setup": (
+            "Combined microbenchmark slice inspired by VDCores/MPK "
+            "persistent-kernel evaluation; not an end-to-end LLM serving "
+            "result."
+        ),
+        "source_labels": source_labels,
+        "timestamp_unix": time.time(),
+    }
+    if common_tensor_tile is not None:
+        metadata["tensor_tile"] = common_tensor_tile
 
     return {
-        "metadata": {
-            "label": label,
-            "git_commit": ",".join(git_commits) if git_commits else "unknown",
-            "git_commits": git_commits,
-            "machine": "combined",
-            "nvidia_smi": "combined report",
-            "paper_setup": (
-                "Combined microbenchmark slice inspired by VDCores/MPK "
-                "persistent-kernel evaluation; not an end-to-end LLM serving "
-                "result."
-            ),
-            "source_labels": source_labels,
-            "timestamp_unix": time.time(),
-        },
+        "metadata": metadata,
         "results": results,
     }
 
@@ -1251,6 +1263,14 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
     summary = summarize_results(payload)
     device_refs = _matched_device_refs(summary)
     metadata = payload.get("metadata", {})
+    tensor_tile = metadata.get("tensor_tile")
+    tensor_tile_shape = None
+    if isinstance(tensor_tile, dict):
+        rows = tensor_tile.get("rows")
+        cols = tensor_tile.get("cols")
+        inner = tensor_tile.get("inner")
+        if rows is not None and cols is not None and inner is not None:
+            tensor_tile_shape = f"{rows}x{cols}x{inner}"
     lines = [
         "# CUDA Backend Microbenchmark Report",
         "",
@@ -1267,13 +1287,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
     ]
     if metadata.get("source_labels"):
         lines.append(f"- Source reports: `{', '.join(metadata['source_labels'])}`")
-    tensor_tile = metadata.get("tensor_tile")
-    if isinstance(tensor_tile, dict):
-        rows = tensor_tile.get("rows")
-        cols = tensor_tile.get("cols")
-        inner = tensor_tile.get("inner")
-        if rows is not None and cols is not None and inner is not None:
-            lines.append(f"- Tensor tile descriptor: `{rows}x{cols}x{inner}`.")
+    if tensor_tile_shape is not None:
+        lines.append(f"- Tensor tile descriptor: `{tensor_tile_shape}`.")
     lines.extend(
         [
             "",
@@ -1386,7 +1401,11 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  compiled binary but changing the runtime task graph.",
             "- `pto_persistent_dag_reuse` uses a six-task DAG with scratch-buffer reuse",
             "  after the reused buffer's last dependent has completed.",
-            "- `pto_persistent_dag_tensor` uses the default 16x16x16 tiled GEMM",
+            (
+                f"- `pto_persistent_dag_tensor` uses the configured {tensor_tile_shape} tiled GEMM"
+                if tensor_tile_shape is not None
+                else "- `pto_persistent_dag_tensor` uses the default 16x16x16 tiled GEMM"
+            ),
             "  descriptor followed by elementwise residual, gate, and fan-in tasks.",
             "- `pto_stream_serial` measures two independent PTO launches issued",
             "  sequentially on the host-schedule stream pool.",

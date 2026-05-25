@@ -720,6 +720,7 @@ def test_render_report_describes_tensor_tile_metadata():
     report = cuda_benchmark.render_markdown_report(payload)
 
     assert "- Tensor tile descriptor: `8x4x12`." in report
+    assert "`pto_persistent_dag_tensor` uses the configured 8x4x12 tiled GEMM" in report
 
 
 def test_render_report_highlights_dag_shape_rows():
@@ -810,11 +811,11 @@ def test_merge_payloads_preserves_results_and_records_sources():
     cuda_benchmark = _load_benchmark_module()
     payloads = [
         {
-            "metadata": {"label": "a100", "git_commit": "abc123"},
+            "metadata": {"label": "a100", "git_commit": "abc123", "tensor_tile": {"rows": 8, "cols": 4, "inner": 12}},
             "results": [{"machine": "a100-local", "baseline": "direct_driver", "n": 1024, "device_wall_ns": 500}],
         },
         {
-            "metadata": {"label": "h200", "git_commit": "abc123"},
+            "metadata": {"label": "h200", "git_commit": "abc123", "tensor_tile": {"rows": 8, "cols": 4, "inner": 12}},
             "results": [{"machine": "h200-remote", "baseline": "direct_driver", "n": 1024, "device_wall_ns": 300}],
         },
     ]
@@ -824,6 +825,7 @@ def test_merge_payloads_preserves_results_and_records_sources():
     assert merged["metadata"]["label"] == "combined"
     assert merged["metadata"]["source_labels"] == ["a100", "h200"]
     assert merged["metadata"]["git_commits"] == ["abc123"]
+    assert merged["metadata"]["tensor_tile"] == {"rows": 8, "cols": 4, "inner": 12}
     assert len(merged["results"]) == 2
 
 
