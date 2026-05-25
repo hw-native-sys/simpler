@@ -47,6 +47,7 @@ struct PtoCudaPersistentVectorAddQueueState {
     const PtoCudaPersistentVectorAddTask *tasks;
     uint64_t task_count;
     uint32_t *ready_queue;
+    uint32_t *ready_flags;
     uint32_t queue_capacity;
     uint32_t *queue_head;
     uint32_t *queue_tail;

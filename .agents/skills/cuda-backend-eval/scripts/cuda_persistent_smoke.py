@@ -118,127 +118,155 @@ _FALLBACK_PERSISTENT_QUEUE_VECTOR_ADD_PTX = rb"""
 	.param .u64 pto_persistent_vector_add_queue_executor_param_0
 )
 {
-	.reg .pred 	%p<13>;
+	.reg .pred 	%p<14>;
 	.reg .f32 	%f<4>;
-	.reg .b32 	%r<11>;
-	.reg .b64 	%rd<50>;
+	.reg .b32 	%r<21>;
+	.reg .b64 	%rd<58>;
 	// demoted variable
 	.shared .align 4 .u32 _ZZ40pto_persistent_vector_add_queue_executorE4slot;
 	// demoted variable
 	.shared .align 4 .u32 _ZZ40pto_persistent_vector_add_queue_executorE7task_id;
 
-	ld.param.u64 	%rd22, [pto_persistent_vector_add_queue_executor_param_0];
-	cvta.to.global.u64 	%rd1, %rd22;
-	mov.u32 	%r3, %ctaid.x;
-	setp.eq.s32 	%p1, %r3, 0;
+	ld.param.u64 	%rd21, [pto_persistent_vector_add_queue_executor_param_0];
+	cvta.to.global.u64 	%rd1, %rd21;
+	mov.u32 	%r4, %ctaid.x;
+	setp.eq.s32 	%p1, %r4, 0;
 	mov.u32 	%r1, %tid.x;
-	@%p1 bra 	$L__BB0_12;
+	@%p1 bra 	$L__BB0_13;
 
 	cvt.u64.u32 	%rd2, %r1;
-	mov.u32 	%r4, %ntid.x;
-	cvt.u64.u32 	%rd3, %r4;
+	mov.u32 	%r5, %ntid.x;
+	cvt.u64.u32 	%rd3, %r5;
 	bra.uni 	$L__BB0_2;
 
-$L__BB0_11:
-	ld.global.u64 	%rd38, [%rd1+48];
-	atom.add.u32 	%r9, [%rd38], 1;
+$L__BB0_12:
+	ld.global.u64 	%rd41, [%rd1+56];
+	atom.add.u32 	%r12, [%rd41], 1;
 
 $L__BB0_2:
 	setp.ne.s32 	%p2, %r1, 0;
-	@%p2 bra 	$L__BB0_6;
+	@%p2 bra 	$L__BB0_7;
 
-	ld.global.u64 	%rd23, [%rd1+32];
-	atom.add.u32 	%r5, [%rd23], 1;
-	st.shared.u32 	[_ZZ40pto_persistent_vector_add_queue_executorE4slot], %r5;
-	cvt.u64.u32 	%rd24, %r5;
-	ld.global.u64 	%rd25, [%rd1+8];
-	setp.le.u64 	%p3, %rd25, %rd24;
-	@%p3 bra 	$L__BB0_6;
+	ld.global.u64 	%rd22, [%rd1+40];
+	atom.add.u32 	%r2, [%rd22], 1;
+	st.shared.u32 	[_ZZ40pto_persistent_vector_add_queue_executorE4slot], %r2;
+	cvt.u64.u32 	%rd23, %r2;
+	ld.global.u64 	%rd24, [%rd1+8];
+	setp.le.u64 	%p3, %rd24, %rd23;
+	@%p3 bra 	$L__BB0_7;
 
-$L__BB0_4:
-	ld.global.u64 	%rd26, [%rd1+40];
-	atom.add.u32 	%r6, [%rd26], 0;
-	ld.shared.u32 	%r2, [_ZZ40pto_persistent_vector_add_queue_executorE4slot];
-	setp.le.u32 	%p4, %r6, %r2;
-	@%p4 bra 	$L__BB0_4;
+	ld.global.u32 	%r6, [%rd1+32];
+	rem.u32 	%r7, %r2, %r6;
+	add.s32 	%r3, %r2, 1;
+	cvt.u64.u32 	%rd5, %r7;
 
-	ld.global.u64 	%rd27, [%rd1+16];
-	mul.wide.u32 	%rd28, %r2, 4;
-	add.s64 	%rd29, %rd27, %rd28;
-	ld.u32 	%r7, [%rd29];
-	st.shared.u32 	[_ZZ40pto_persistent_vector_add_queue_executorE7task_id], %r7;
+$L__BB0_5:
+	ld.global.u64 	%rd25, [%rd1+24];
+	shl.b64 	%rd26, %rd5, 2;
+	add.s64 	%rd27, %rd25, %rd26;
+	atom.add.u32 	%r8, [%rd27], 0;
+	setp.ne.s32 	%p4, %r8, %r3;
+	@%p4 bra 	$L__BB0_5;
 
-$L__BB0_6:
+	ld.global.u64 	%rd28, [%rd1+16];
+	add.s64 	%rd30, %rd28, %rd26;
+	ld.u32 	%r9, [%rd30];
+	st.shared.u32 	[_ZZ40pto_persistent_vector_add_queue_executorE7task_id], %r9;
+	membar.gl;
+	ld.global.u64 	%rd31, [%rd1+24];
+	add.s64 	%rd32, %rd31, %rd26;
+	atom.exch.b32 	%r10, [%rd32], 0;
+
+$L__BB0_7:
 	bar.sync 	0;
-	ld.shared.u32 	%rd30, [_ZZ40pto_persistent_vector_add_queue_executorE4slot];
-	ld.global.u64 	%rd31, [%rd1+8];
-	setp.le.u64 	%p5, %rd31, %rd30;
-	@%p5 bra 	$L__BB0_18;
+	ld.shared.u32 	%rd33, [_ZZ40pto_persistent_vector_add_queue_executorE4slot];
+	ld.global.u64 	%rd34, [%rd1+8];
+	setp.le.u64 	%p5, %rd34, %rd33;
+	@%p5 bra 	$L__BB0_21;
 
-	ld.global.u64 	%rd32, [%rd1];
-	ld.shared.u32 	%r8, [_ZZ40pto_persistent_vector_add_queue_executorE7task_id];
-	mul.wide.u32 	%rd33, %r8, 32;
-	add.s64 	%rd5, %rd32, %rd33;
-	add.s64 	%rd6, %rd5, 8;
-	add.s64 	%rd7, %rd5, 16;
-	ld.u64 	%rd8, [%rd5+24];
-	setp.le.u64 	%p6, %rd8, %rd2;
-	@%p6 bra 	$L__BB0_10;
+	ld.global.u64 	%rd35, [%rd1];
+	ld.shared.u32 	%r11, [_ZZ40pto_persistent_vector_add_queue_executorE7task_id];
+	mul.wide.u32 	%rd36, %r11, 32;
+	add.s64 	%rd6, %rd35, %rd36;
+	add.s64 	%rd7, %rd6, 8;
+	add.s64 	%rd8, %rd6, 16;
+	ld.u64 	%rd9, [%rd6+24];
+	setp.le.u64 	%p6, %rd9, %rd2;
+	@%p6 bra 	$L__BB0_11;
 
-	ld.u64 	%rd9, [%rd5];
 	ld.u64 	%rd10, [%rd6];
 	ld.u64 	%rd11, [%rd7];
-	mov.u64 	%rd45, %rd2;
-
-$L__BB0_9:
-	shl.b64 	%rd34, %rd45, 2;
-	add.s64 	%rd35, %rd10, %rd34;
-	ld.f32 	%f1, [%rd35];
-	add.s64 	%rd36, %rd9, %rd34;
-	ld.f32 	%f2, [%rd36];
-	add.f32 	%f3, %f2, %f1;
-	add.s64 	%rd37, %rd11, %rd34;
-	st.f32 	[%rd37], %f3;
-	add.s64 	%rd45, %rd45, %rd3;
-	setp.lt.u64 	%p7, %rd45, %rd8;
-	@%p7 bra 	$L__BB0_9;
+	ld.u64 	%rd12, [%rd8];
+	mov.u64 	%rd55, %rd2;
 
 $L__BB0_10:
+	shl.b64 	%rd37, %rd55, 2;
+	add.s64 	%rd38, %rd11, %rd37;
+	ld.f32 	%f1, [%rd38];
+	add.s64 	%rd39, %rd10, %rd37;
+	ld.f32 	%f2, [%rd39];
+	add.f32 	%f3, %f2, %f1;
+	add.s64 	%rd40, %rd12, %rd37;
+	st.f32 	[%rd40], %f3;
+	add.s64 	%rd55, %rd55, %rd3;
+	setp.lt.u64 	%p7, %rd55, %rd9;
+	@%p7 bra 	$L__BB0_10;
+
+$L__BB0_11:
 	bar.sync 	0;
 	@%p2 bra 	$L__BB0_2;
-	bra.uni 	$L__BB0_11;
+	bra.uni 	$L__BB0_12;
 
-$L__BB0_12:
+$L__BB0_13:
 	setp.ne.s32 	%p9, %r1, 0;
-	@%p9 bra 	$L__BB0_18;
+	@%p9 bra 	$L__BB0_21;
 
-	ld.global.u64 	%rd49, [%rd1+8];
-	setp.eq.s64 	%p10, %rd49, 0;
-	@%p10 bra 	$L__BB0_18;
+	ld.global.u64 	%rd42, [%rd1+8];
+	setp.eq.s64 	%p10, %rd42, 0;
+	@%p10 bra 	$L__BB0_21;
 
-	mov.u64 	%rd46, 0;
-	mov.u64 	%rd48, %rd46;
+	mov.u64 	%rd56, 0;
 
-$L__BB0_15:
-	ld.global.u32 	%rd41, [%rd1+24];
-	setp.ge.u64 	%p11, %rd48, %rd41;
-	@%p11 bra 	$L__BB0_17;
+$L__BB0_16:
+	ld.global.u32 	%rd16, [%rd1+32];
+	and.b64  	%rd44, %rd56, -4294967296;
+	setp.eq.s64 	%p11, %rd44, 0;
+	@%p11 bra 	$L__BB0_18;
 
-	ld.global.u64 	%rd42, [%rd1+16];
-	add.s64 	%rd43, %rd42, %rd46;
-	st.u32 	[%rd43], %rd48;
-	membar.gl;
-	ld.global.u64 	%rd44, [%rd1+40];
-	atom.add.u32 	%r10, [%rd44], 1;
-	ld.global.u64 	%rd49, [%rd1+8];
-
-$L__BB0_17:
-	add.s64 	%rd46, %rd46, 4;
-	add.s64 	%rd48, %rd48, 1;
-	setp.lt.u64 	%p12, %rd48, %rd49;
-	@%p12 bra 	$L__BB0_15;
+	rem.u64 	%rd57, %rd56, %rd16;
+	bra.uni 	$L__BB0_19;
 
 $L__BB0_18:
+	cvt.u32.u64 	%r13, %rd16;
+	cvt.u32.u64 	%r14, %rd56;
+	rem.u32 	%r15, %r14, %r13;
+	cvt.u64.u32 	%rd57, %r15;
+
+$L__BB0_19:
+	ld.global.u64 	%rd45, [%rd1+24];
+	shl.b64 	%rd46, %rd57, 2;
+	add.s64 	%rd47, %rd45, %rd46;
+	atom.add.u32 	%r16, [%rd47], 0;
+	setp.ne.s32 	%p12, %r16, 0;
+	@%p12 bra 	$L__BB0_19;
+
+	cvt.u32.u64 	%r17, %rd56;
+	ld.global.u64 	%rd48, [%rd1+16];
+	add.s64 	%rd50, %rd48, %rd46;
+	st.u32 	[%rd50], %r17;
+	membar.gl;
+	ld.global.u64 	%rd51, [%rd1+24];
+	add.s64 	%rd52, %rd51, %rd46;
+	add.s32 	%r18, %r17, 1;
+	atom.exch.b32 	%r19, [%rd52], %r18;
+	ld.global.u64 	%rd53, [%rd1+48];
+	atom.add.u32 	%r20, [%rd53], 1;
+	ld.global.u64 	%rd54, [%rd1+8];
+	add.s64 	%rd56, %rd56, 1;
+	setp.lt.u64 	%p13, %rd56, %rd54;
+	@%p13 bra 	$L__BB0_16;
+
+$L__BB0_21:
 	ret;
 
 }
@@ -278,6 +306,7 @@ struct PtoCudaPersistentVectorAddQueueState {
     const PtoCudaPersistentVectorAddTask *tasks;
     unsigned long long task_count;
     unsigned int *ready_queue;
+    unsigned int *ready_flags;
     unsigned int queue_capacity;
     unsigned int *queue_head;
     unsigned int *queue_tail;
@@ -292,11 +321,13 @@ extern "C" __global__ void pto_persistent_vector_add_queue_executor(
     if (blockIdx.x == 0) {
         if (threadIdx.x == 0) {
             for (unsigned long long task_id = 0; task_id < state->task_count; ++task_id) {
-                if (task_id < state->queue_capacity) {
-                    state->ready_queue[task_id] = static_cast<unsigned int>(task_id);
-                    __threadfence();
-                    atomicAdd(state->queue_tail, 1U);
+                unsigned int slot = static_cast<unsigned int>(task_id % state->queue_capacity);
+                while (atomicAdd(&state->ready_flags[slot], 0U) != 0U) {
                 }
+                state->ready_queue[slot] = static_cast<unsigned int>(task_id);
+                __threadfence();
+                atomicExch(&state->ready_flags[slot], static_cast<unsigned int>(task_id + 1ULL));
+                atomicAdd(state->queue_tail, 1U);
             }
         }
         return;
@@ -306,9 +337,13 @@ extern "C" __global__ void pto_persistent_vector_add_queue_executor(
         if (threadIdx.x == 0) {
             slot = atomicAdd(state->queue_head, 1U);
             if (static_cast<unsigned long long>(slot) < state->task_count) {
-                while (atomicAdd(state->queue_tail, 0U) <= slot) {
+                unsigned int ring_slot = slot % state->queue_capacity;
+                unsigned int ready_value = slot + 1U;
+                while (atomicAdd(&state->ready_flags[ring_slot], 0U) != ready_value) {
                 }
-                task_id = state->ready_queue[slot];
+                task_id = state->ready_queue[ring_slot];
+                __threadfence();
+                atomicExch(&state->ready_flags[ring_slot], 0U);
             }
         }
         __syncthreads();
@@ -362,6 +397,7 @@ class CudaPersistentVectorAddQueueState(ctypes.Structure):
         ("tasks", ctypes.c_void_p),
         ("task_count", ctypes.c_uint64),
         ("ready_queue", ctypes.c_void_p),
+        ("ready_flags", ctypes.c_void_p),
         ("queue_capacity", ctypes.c_uint32),
         ("queue_head", ctypes.c_void_p),
         ("queue_tail", ctypes.c_void_p),
@@ -441,16 +477,23 @@ def _make_direct_launch(ptx_buf, ptx_size: int, task_count: int, dev_tasks: int)
     )
 
 
-def _make_queue_launch(runtime, ctx: int, ptx_buf, ptx_size: int, task_count: int, dev_tasks: int) -> PersistentLaunch:
+def _make_queue_launch(
+    runtime, ctx: int, ptx_buf, ptx_size: int, task_count: int, queue_capacity: int, dev_tasks: int
+) -> PersistentLaunch:
     host_counters_t = ctypes.c_uint32 * 3
     host_counters = host_counters_t(0, 0, 0)
-    dev_ready_queue = runtime.device_malloc_ctx(ctx, ctypes.sizeof(ctypes.c_uint32 * task_count))
+    host_flags_t = ctypes.c_uint32 * queue_capacity
+    host_flags = host_flags_t(*([0] * queue_capacity))
+    dev_ready_queue = runtime.device_malloc_ctx(ctx, ctypes.sizeof(ctypes.c_uint32 * queue_capacity))
+    dev_ready_flags = runtime.device_malloc_ctx(ctx, ctypes.sizeof(host_flags))
     dev_counters = runtime.device_malloc_ctx(ctx, ctypes.sizeof(host_counters))
     dev_queue_state = runtime.device_malloc_ctx(ctx, ctypes.sizeof(CudaPersistentVectorAddQueueState))
-    device_allocations = tuple(ptr for ptr in (dev_ready_queue, dev_counters, dev_queue_state) if ptr)
+    device_allocations = tuple(ptr for ptr in (dev_ready_queue, dev_ready_flags, dev_counters, dev_queue_state) if ptr)
     try:
-        if not (dev_ready_queue and dev_counters and dev_queue_state):
+        if not (dev_ready_queue and dev_ready_flags and dev_counters and dev_queue_state):
             raise RuntimeError("queue device allocation failed")
+        if runtime.copy_to_device_ctx(ctx, dev_ready_flags, ctypes.byref(host_flags), ctypes.sizeof(host_flags)) != 0:
+            raise RuntimeError("copy_to_device queue flags failed")
         if (
             runtime.copy_to_device_ctx(ctx, dev_counters, ctypes.byref(host_counters), ctypes.sizeof(host_counters))
             != 0
@@ -460,7 +503,8 @@ def _make_queue_launch(runtime, ctx: int, ptx_buf, ptx_size: int, task_count: in
             tasks=dev_tasks,
             task_count=task_count,
             ready_queue=dev_ready_queue,
-            queue_capacity=task_count,
+            ready_flags=dev_ready_flags,
+            queue_capacity=queue_capacity,
             queue_head=dev_counters,
             queue_tail=dev_counters + ctypes.sizeof(ctypes.c_uint32),
             completed_count=dev_counters + 2 * ctypes.sizeof(ctypes.c_uint32),
@@ -496,11 +540,11 @@ def _make_queue_launch(runtime, ctx: int, ptx_buf, ptx_size: int, task_count: in
 
 
 def _make_launch(
-    runtime, ctx: int, mode: str, ptx_buf, ptx_size: int, task_count: int, dev_tasks: int
+    runtime, ctx: int, mode: str, ptx_buf, ptx_size: int, task_count: int, queue_capacity: int, dev_tasks: int
 ) -> PersistentLaunch:
     if mode == "direct":
         return _make_direct_launch(ptx_buf, ptx_size, task_count, dev_tasks)
-    return _make_queue_launch(runtime, ctx, ptx_buf, ptx_size, task_count, dev_tasks)
+    return _make_queue_launch(runtime, ctx, ptx_buf, ptx_size, task_count, queue_capacity, dev_tasks)
 
 
 def _completed_count(runtime, ctx: int, launch: PersistentLaunch, task_count: int) -> int:
@@ -519,9 +563,15 @@ def _completed_count(runtime, ctx: int, launch: PersistentLaunch, task_count: in
     return completed_count
 
 
-def run_persistent_smoke(device: int, task_count: int, n: int, arch: str, mode: str = "direct") -> dict:  # noqa: PLR0912
+def run_persistent_smoke(  # noqa: PLR0912
+    device: int, task_count: int, n: int, arch: str, mode: str = "direct", queue_capacity: int | None = None
+) -> dict:
     if mode not in {"direct", "queue"}:
         raise ValueError(f"unknown persistent mode: {mode}")
+    if queue_capacity is None:
+        queue_capacity = task_count
+    if queue_capacity <= 0:
+        raise ValueError("queue_capacity must be positive")
     with tempfile.TemporaryDirectory(prefix="pto_cuda_persistent_") as td:
         ptx, ptx_source = _compile_persistent_ptx(Path(td), arch, mode)
     ptx_buf = ctypes.create_string_buffer(ptx + b"\0")
@@ -561,7 +611,7 @@ def run_persistent_smoke(device: int, task_count: int, n: int, arch: str, mode: 
             if runtime.copy_to_device_ctx(ctx, dev_tasks, ctypes.byref(task_desc), ctypes.sizeof(task_desc)) != 0:
                 raise RuntimeError("copy_to_device tasks failed")
 
-            launch = _make_launch(runtime, ctx, mode, ptx_buf, len(ptx) + 1, task_count, dev_tasks)
+            launch = _make_launch(runtime, ctx, mode, ptx_buf, len(ptx) + 1, task_count, queue_capacity, dev_tasks)
             timing = PtoRunTiming()
             if runtime.prepare_callable(ctx, 0, ctypes.byref(launch.manifest)) != 0:
                 raise RuntimeError("prepare_callable failed")
@@ -616,6 +666,7 @@ def run_persistent_smoke(device: int, task_count: int, n: int, arch: str, mode: 
         "device": device,
         "task_count": task_count,
         "n": n,
+        "queue_capacity": queue_capacity,
         "scheduler_blocks": launch.scheduler_blocks,
         "worker_blocks": launch.worker_blocks,
         "completed_count": completed_count,
@@ -635,11 +686,12 @@ def main() -> None:
     parser.add_argument("--n", type=int, default=1024)
     parser.add_argument("--arch", default="compute_80")
     parser.add_argument("--mode", choices=["direct", "queue"], default="direct")
+    parser.add_argument("--queue-capacity", type=int, default=None)
     args = parser.parse_args()
 
     print(
         json.dumps(
-            run_persistent_smoke(args.device, args.task_count, args.n, args.arch, args.mode),
+            run_persistent_smoke(args.device, args.task_count, args.n, args.arch, args.mode, args.queue_capacity),
             indent=2,
             sort_keys=True,
         )

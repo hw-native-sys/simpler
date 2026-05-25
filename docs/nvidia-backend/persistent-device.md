@@ -121,11 +121,14 @@ descriptors. It proves the build/discovery path, module loading, descriptor
 memory layout, and "one host launch handles multiple device tasks" shape before
 adding TensorMap/ring queues and generated dispatch tables.
 
-The next implementation slice adds a synthetic ready queue for the same
-vector-add task descriptor. One scheduler block publishes task IDs into global
-memory and worker blocks pop those IDs through atomics inside the same executor
-launch. This still is not the final TensorMap/ring runtime, but it exercises
-the scheduler/worker split that CUDA needs because there is no AICPU.
+The next implementation slice adds a bounded ready ring for the same vector-add
+task descriptor. One scheduler block publishes task IDs into global memory and
+worker blocks pop those IDs through atomics inside the same executor launch.
+The queue uses per-slot sequence flags so a capacity smaller than the task
+count can wrap without a later ticket consuming an earlier slot value. This
+still is not the final TensorMap/ring runtime, but it exercises the
+scheduler/worker split and back-pressure shape that CUDA needs because there
+is no AICPU.
 
 ### Runtime Roles
 

@@ -305,7 +305,16 @@ def run_direct_sample(device: int, n: int, block_dim: int, ptx: bytes) -> dict[s
 
 
 def run_persistent_sample(device: int, n: int, arch: str, mode: str = "direct") -> dict[str, Any]:
-    result = run_persistent_smoke(device=device, task_count=2, n=n, arch=arch, mode=mode)
+    task_count = 6 if mode == "queue" else 2
+    queue_capacity = 2 if mode == "queue" else None
+    result = run_persistent_smoke(
+        device=device,
+        task_count=task_count,
+        n=n,
+        arch=arch,
+        mode=mode,
+        queue_capacity=queue_capacity,
+    )
     result["baseline"] = "pto_persistent_queue" if mode == "queue" else "pto_persistent_device"
     result["block_dim"] = 256
     return result
@@ -703,8 +712,9 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "- `pto_persistent_device` measures the tracer-bullet persistent executor",
             "  path: one host launch processes a device array of task descriptors.",
             "- `pto_persistent_queue` measures the next persistent-device slice:",
-            "  one scheduler block publishes descriptor IDs into a device ready",
-            "  queue and worker blocks pop them inside the same CUDA launch.",
+            "  one scheduler block publishes descriptor IDs into a bounded",
+            "  device ring queue and worker blocks pop them inside the same",
+            "  CUDA launch.",
             "- `pto_stream_serial` measures two independent PTO launches issued",
             "  sequentially on the host-schedule stream pool.",
             "- `pto_stream_parallel` measures two independent PTO launches issued",
