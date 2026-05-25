@@ -15,6 +15,7 @@ import argparse
 import ctypes
 import functools
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -82,6 +83,25 @@ $L__BB0_2:
 """
 
 
+def _find_nvcc() -> str | None:
+    for env_name in ("CUDA_HOME", "CUDA_PATH"):
+        cuda_root = os.environ.get(env_name)
+        if not cuda_root:
+            continue
+        nvcc = Path(cuda_root) / "bin" / "nvcc"
+        if nvcc.is_file():
+            return str(nvcc)
+
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        return nvcc
+
+    for nvcc in sorted(Path("/usr/local").glob("cuda*/bin/nvcc"), reverse=True):
+        if nvcc.is_file():
+            return str(nvcc)
+    return None
+
+
 class CudaHostCallable(ctypes.Structure):
     _fields_ = [
         ("version", ctypes.c_uint32),
@@ -113,7 +133,8 @@ class PtoRunTiming(ctypes.Structure):
 
 
 def _compile_ptx(work_dir: Path, arch: str) -> tuple[bytes, str]:
-    if shutil.which("nvcc") is None:
+    nvcc = _find_nvcc()
+    if nvcc is None:
         return _FALLBACK_VECTOR_ADD_PTX, "embedded-sm80-ptx"
 
     kernel_src = work_dir / "vector_add.cu"
@@ -130,7 +151,7 @@ extern "C" __global__ void pto_vector_add_f32(
     )
     ptx_path = work_dir / "vector_add.ptx"
     subprocess.run(
-        ["nvcc", "--ptx", "-std=c++17", f"-arch={arch}", str(kernel_src), "-o", str(ptx_path)],
+        [nvcc, "--ptx", "-std=c++17", f"-arch={arch}", str(kernel_src), "-o", str(ptx_path)],
         check=True,
         capture_output=True,
         text=True,

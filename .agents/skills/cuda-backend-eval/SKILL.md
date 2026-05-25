@@ -166,8 +166,10 @@ PYTHONPATH=$PWD:$PWD/python \
     --label a100-streams --output-dir tmp/cuda-backend/a100-streams
 ```
 
-For remote H200, use `--arch compute_90`; if `nvcc` is unavailable the script
-uses an embedded `sm_80` PTX fallback that the H200 driver JITs.
+For remote H200, use `--arch compute_90`. The scripts discover `nvcc` from
+`CUDA_HOME`, `CUDA_PATH`, `PATH`, and common `/usr/local/cuda*` toolkit paths.
+If `nvcc` is still unavailable, the script uses an embedded `sm_80` PTX
+fallback that the H200 driver JITs.
 
 ## Hardware Checks
 

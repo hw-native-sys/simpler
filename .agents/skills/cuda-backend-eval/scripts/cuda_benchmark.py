@@ -28,7 +28,15 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cuda_persistent_smoke import run_persistent_smoke
-from cuda_smoke import CudaHostCallable, CudaVectorAddArgs, PtoRunTiming, _compile_ptx, _load_runtime, run_smoke
+from cuda_smoke import (
+    CudaHostCallable,
+    CudaVectorAddArgs,
+    PtoRunTiming,
+    _compile_ptx,
+    _find_nvcc,
+    _load_runtime,
+    run_smoke,
+)
 
 _FALLBACK_SLOW_VECTOR_ADD_PTX = rb"""
 //
@@ -113,7 +121,8 @@ def _nvidia_smi_summary() -> str:
 
 
 def _compile_slow_ptx(work_dir: Path, arch: str) -> tuple[bytes, str]:
-    if subprocess.run(["which", "nvcc"], check=False, capture_output=True).returncode != 0:
+    nvcc = _find_nvcc()
+    if nvcc is None:
         return _FALLBACK_SLOW_VECTOR_ADD_PTX, "embedded-sm80-slow-ptx"
 
     kernel_src = work_dir / "slow_vector_add.cu"
@@ -133,7 +142,7 @@ extern "C" __global__ void pto_vector_add_f32(
     )
     ptx_path = work_dir / "slow_vector_add.ptx"
     subprocess.run(
-        ["nvcc", "--ptx", "-std=c++17", f"-arch={arch}", str(kernel_src), "-o", str(ptx_path)],
+        [nvcc, "--ptx", "-std=c++17", f"-arch={arch}", str(kernel_src), "-o", str(ptx_path)],
         check=True,
         capture_output=True,
         text=True,

@@ -15,7 +15,6 @@ import argparse
 import ctypes
 import functools
 import json
-import shutil
 import subprocess
 import tempfile
 import time
@@ -23,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cuda_smoke import PtoRunTiming, _bind_runtime
+from cuda_smoke import PtoRunTiming, _bind_runtime, _find_nvcc
 
 from simpler_setup.cuda_callable_compiler import (
     CudaPersistentTaskFunction,
@@ -745,7 +744,8 @@ class DagSmokeConfig:
 
 
 def _compile_persistent_ptx(work_dir: Path, arch: str, mode: str) -> tuple[bytes, str]:
-    if shutil.which("nvcc") is None:
+    nvcc = _find_nvcc()
+    if nvcc is None:
         if mode == "direct":
             return _FALLBACK_PERSISTENT_VECTOR_ADD_PTX, "embedded-sm80-persistent-ptx"
         if mode == "dag":
@@ -764,6 +764,7 @@ def _compile_persistent_ptx(work_dir: Path, arch: str, mode: str) -> tuple[bytes
         artifact = compile_cuda_persistent_device(
             _PERSISTENT_DAG_TASK_FUNCTIONS,
             arch=arch,
+            nvcc=nvcc,
         )
         return artifact.ptx, f"nvcc-persistent-{artifact.source_kind}-{arch}"
     if mode not in source_by_mode:
@@ -773,7 +774,7 @@ def _compile_persistent_ptx(work_dir: Path, arch: str, mode: str) -> tuple[bytes
     kernel_src.write_text(source_by_mode[mode])
     ptx_path = work_dir / "persistent_vector_add.ptx"
     subprocess.run(
-        ["nvcc", "--ptx", "-std=c++17", f"-arch={arch}", str(kernel_src), "-o", str(ptx_path)],
+        [nvcc, "--ptx", "-std=c++17", f"-arch={arch}", str(kernel_src), "-o", str(ptx_path)],
         check=True,
         capture_output=True,
         text=True,

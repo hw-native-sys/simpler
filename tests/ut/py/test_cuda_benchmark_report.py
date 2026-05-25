@@ -30,6 +30,32 @@ def _load_benchmark_module():
     return module
 
 
+def _load_smoke_module():
+    script_path = (
+        Path(__file__).resolve().parents[3] / ".agents" / "skills" / "cuda-backend-eval" / "scripts" / "cuda_smoke.py"
+    )
+    spec = importlib.util.spec_from_file_location("cuda_smoke", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_find_nvcc_uses_cuda_home_when_nvcc_is_not_on_path(tmp_path, monkeypatch):
+    cuda_smoke = _load_smoke_module()
+    cuda_home = tmp_path / "cuda-12.8"
+    nvcc = cuda_home / "bin" / "nvcc"
+    nvcc.parent.mkdir(parents=True)
+    nvcc.write_text("#!/bin/sh\n")
+    nvcc.chmod(0o755)
+
+    monkeypatch.setenv("CUDA_HOME", str(cuda_home))
+    monkeypatch.delenv("CUDA_PATH", raising=False)
+    monkeypatch.setattr(cuda_smoke.shutil, "which", lambda name: None)
+
+    assert cuda_smoke._find_nvcc() == str(nvcc)
+
+
 def test_summarize_results_groups_by_machine_and_baseline():
     cuda_benchmark = _load_benchmark_module()
     payload = {
