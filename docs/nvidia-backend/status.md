@@ -98,9 +98,9 @@ and composes the generated dispatch entry.
 `SceneTestCase` L2 compilation accepts `CALLABLE["cuda"]` specs for
 `persistent_device`, compiles task-body sources through the same
 `KernelCompiler` entry point, registers the prepared raw callable through the
-normal L2 `Worker`, builds a `persistent_dag_fork_join_f32` state object from
-normal `TaskArgsBuilder` CPU tensors, and validates real copied-back CUDA
-output data.
+normal L2 `Worker`, builds `persistent_dag_fork_join_f32` and
+`persistent_dag_tensor_tile_f32` state objects from normal `TaskArgsBuilder`
+CPU tensors, and validates real copied-back CUDA output data.
 
 Evidence:
 
@@ -411,6 +411,51 @@ set was rerun:
 
 Result: `25 passed`.
 
+After adding the tensor-tile persistent DAG scene-test arg builder, the
+focused CUDA suite was rerun locally on A100:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py \
+  tests/ut/py/test_cuda_backend.py \
+  tests/ut/py/test_cuda_persistent_codegen.py \
+  tests/ut/py/test_cuda_kernel_compiler.py -q
+```
+
+Result: `39 passed`.
+
+The same branch tip was checked on the remote H200 checkout. The scene-test
+file passed its compile/plumbing cases and skipped the real-data cases because
+the remote Python environment still lacks `torch`:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   git fetch origin design/nvidia-backend >/dev/null && \
+   git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py -q'
+```
+
+Result: `2 passed, 3 skipped`.
+
+The no-torch tensor-tile persistent DAG smoke was also run on H200:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+     --device 0 --task-count 4 --n 4096 --arch compute_90 \
+     --mode dag --queue-capacity 2 --dag-shape tensor_tile'
+```
+
+Result: `status=pass`, `ptx_arch=compute_90`,
+`dispatch_func_ids=[3, 1, 2, 1]`, `completed_count=4`,
+`device_scheduler_errors={"count": 0, "code": 0, "task_id": 0}`.
+
 The preflight and CUDA scene-test subset was also run on the remote H200
 checkout after pushing this change:
 
@@ -444,7 +489,8 @@ persistent-device fork/join DAG callable specs end to end.
 Needed:
 
 - broader CUDA scene-test argument builders beyond the current
-  `vector_add_f32` and `persistent_dag_fork_join_f32` tracer bullets.
+  `vector_add_f32`, `persistent_dag_fork_join_f32`, and
+  `persistent_dag_tensor_tile_f32` tracer bullets.
 
 ### Target Role Cleanup
 

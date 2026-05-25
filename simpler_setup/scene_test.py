@@ -431,10 +431,10 @@ class _CudaPersistentDagSceneBuffers:
         )
 
         arg_builder = self.cuda_spec.get("arg_builder")
-        if arg_builder != "persistent_dag_fork_join_f32":
+        if arg_builder not in {"persistent_dag_fork_join_f32", "persistent_dag_tensor_tile_f32"}:
             raise NotImplementedError(f"Unsupported CUDA persistent scene-test arg_builder: {arg_builder}")
         if len(self.output_names) != 3:
-            raise ValueError("CUDA persistent_dag_fork_join_f32 scene tests require three tensor args")
+            raise ValueError(f"CUDA {arg_builder} scene tests require three tensor args")
         missing = [name for name in self.output_names if name not in self.tensor_buffers.ptrs]
         if missing:
             raise ValueError(f"CUDA persistent DAG args reference unknown tensors: {', '.join(missing)}")
@@ -449,45 +449,97 @@ class _CudaPersistentDagSceneBuffers:
         self.dev_tmp0 = self._malloc(output_nbytes)
         self.dev_tmp1 = self._malloc(output_nbytes)
 
-        dependents_t = ctypes.c_uint32 * 2
-        self.host_dependents = dependents_t(2, 2)
-        task_t = CudaPersistentDagTask * 3
-        self.host_tasks = task_t(
-            CudaPersistentDagTask(
-                func_id=1,
-                a=self.tensor_buffers.ptrs[a_name],
-                b=self.tensor_buffers.ptrs[b_name],
-                out=self.dev_tmp0,
-                n=n,
-                dependent_begin=0,
-                dependent_count=1,
-                initial_fanin=0,
-            ),
-            CudaPersistentDagTask(
-                func_id=2,
-                a=self.tensor_buffers.ptrs[a_name],
-                b=self.tensor_buffers.ptrs[b_name],
-                out=self.dev_tmp1,
-                n=n,
-                dependent_begin=1,
-                dependent_count=1,
-                initial_fanin=0,
-            ),
-            CudaPersistentDagTask(
-                func_id=1,
-                a=self.dev_tmp0,
-                b=self.dev_tmp1,
-                out=self.tensor_buffers.ptrs[out_name],
-                n=n,
-                dependent_begin=2,
-                dependent_count=0,
-                initial_fanin=2,
-            ),
-        )
-        fanin_t = ctypes.c_uint32 * 3
+        if arg_builder == "persistent_dag_fork_join_f32":
+            dependents_t = ctypes.c_uint32 * 2
+            self.host_dependents = dependents_t(2, 2)
+            task_t = CudaPersistentDagTask * 3
+            self.host_tasks = task_t(
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=self.tensor_buffers.ptrs[a_name],
+                    b=self.tensor_buffers.ptrs[b_name],
+                    out=self.dev_tmp0,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=self.tensor_buffers.ptrs[a_name],
+                    b=self.tensor_buffers.ptrs[b_name],
+                    out=self.dev_tmp1,
+                    n=n,
+                    dependent_begin=1,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=self.dev_tmp0,
+                    b=self.dev_tmp1,
+                    out=self.tensor_buffers.ptrs[out_name],
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=0,
+                    initial_fanin=2,
+                ),
+            )
+            self.host_fanin = (ctypes.c_uint32 * 3)(0, 0, 2)
+        else:
+            descriptor = self._tensor_tile_descriptor(n)
+            self.dev_tmp2 = self._malloc(output_nbytes)
+            dependents_t = ctypes.c_uint32 * 4
+            self.host_dependents = dependents_t(1, 2, 3, 3)
+            task_t = CudaPersistentDagTask * 4
+            self.host_tasks = task_t(
+                self._make_tensor_tile_task(
+                    CudaPersistentDagTask,
+                    descriptor,
+                    func_id=3,
+                    a=self.tensor_buffers.ptrs[a_name],
+                    b=self.tensor_buffers.ptrs[b_name],
+                    out=self.dev_tmp0,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=2,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=self.dev_tmp0,
+                    b=self.tensor_buffers.ptrs[a_name],
+                    out=self.dev_tmp1,
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=1,
+                    initial_fanin=1,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=self.dev_tmp0,
+                    b=self.tensor_buffers.ptrs[b_name],
+                    out=self.dev_tmp2,
+                    n=n,
+                    dependent_begin=3,
+                    dependent_count=1,
+                    initial_fanin=1,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=self.dev_tmp1,
+                    b=self.dev_tmp2,
+                    out=self.tensor_buffers.ptrs[out_name],
+                    n=n,
+                    dependent_begin=4,
+                    dependent_count=0,
+                    initial_fanin=2,
+                ),
+            )
+            self.host_fanin = (ctypes.c_uint32 * 4)(0, 1, 1, 2)
+
         flags_t = ctypes.c_uint32 * queue_capacity
         counters_t = ctypes.c_uint32 * 6
-        self.host_fanin = fanin_t(0, 0, 2)
         self.host_flags = flags_t(*([0] * queue_capacity))
         self.host_counters = counters_t(0, 0, 0, 0, 0, 0)
 
@@ -522,6 +574,45 @@ class _CudaPersistentDagSceneBuffers:
         )
         self.worker.copy_to(self.dev_state, ctypes.addressof(state), ctypes.sizeof(state))
         self.args = CudaPersistentDagArgs(state=self.dev_state)
+
+    def _tensor_tile_descriptor(self, n: int) -> dict[str, int]:
+        descriptor = dict(self.cuda_spec.get("tensor_tile", {}))
+        rows = int(descriptor.get("rows", 16))
+        cols = int(descriptor.get("cols", 16))
+        inner = int(descriptor.get("inner", 16))
+        if rows <= 0 or cols <= 0 or inner <= 0:
+            raise ValueError("CUDA tensor tile rows, cols, and inner must be positive")
+        if n % (rows * cols) != 0:
+            raise ValueError("CUDA persistent_dag_tensor_tile_f32 output size must be a multiple of rows*cols")
+
+        a_batch_stride = int(descriptor.get("a_batch_stride", rows * inner))
+        b_batch_stride = int(descriptor.get("b_batch_stride", inner * cols))
+        out_batch_stride = int(descriptor.get("out_batch_stride", rows * cols))
+        tile_count = n // (rows * cols)
+        a_required = max(n, tile_count * a_batch_stride)
+        b_required = max(n, tile_count * b_batch_stride)
+        a_name, b_name, _ = self.output_names
+        if self.tensor_buffers.sizes[a_name] < a_required * 4 or self.tensor_buffers.sizes[b_name] < b_required * 4:
+            raise ValueError("CUDA tensor tile input tensors must cover matmul and elementwise extents")
+
+        return {
+            "rows": rows,
+            "cols": cols,
+            "inner": inner,
+            "lda": int(descriptor.get("lda", inner)),
+            "ldb": int(descriptor.get("ldb", cols)),
+            "ldc": int(descriptor.get("ldc", cols)),
+            "a_batch_stride": a_batch_stride,
+            "b_batch_stride": b_batch_stride,
+            "out_batch_stride": out_batch_stride,
+        }
+
+    @staticmethod
+    def _make_tensor_tile_task(task_type, descriptor: dict[str, int], **kwargs):
+        task = task_type(**kwargs)
+        for field, value in descriptor.items():
+            setattr(task, field, value)
+        return task
 
     def reset_for_run(self) -> None:
         import ctypes  # noqa: PLC0415

@@ -72,6 +72,30 @@ unsigned long long i = ctx->i;
 task->out[i] = task->a[i] * task->b[i];
 """.strip()
 
+_PERSISTENT_MATMUL_TILE_BODY = """
+const PtoCudaPersistentDagTask *task = ctx->task;
+unsigned long long i = ctx->i;
+unsigned long long rows = static_cast<unsigned long long>(task->rows);
+unsigned long long cols = static_cast<unsigned long long>(task->cols);
+unsigned long long inner = static_cast<unsigned long long>(task->inner);
+if (rows == 0ULL || cols == 0ULL || inner == 0ULL) {
+  return;
+}
+unsigned long long matrix_elems = rows * cols;
+unsigned long long tile_id = i / matrix_elems;
+unsigned long long elem = i % matrix_elems;
+unsigned long long row = elem / cols;
+unsigned long long col = elem % cols;
+unsigned long long a_base = tile_id * task->a_batch_stride;
+unsigned long long b_base = tile_id * task->b_batch_stride;
+unsigned long long out_base = tile_id * task->out_batch_stride;
+float acc = 0.0f;
+for (unsigned long long k = 0; k < inner; ++k) {
+  acc += task->a[a_base + row * task->lda + k] * task->b[b_base + k * task->ldb + col];
+}
+task->out[out_base + row * task->ldc + col] = acc;
+""".strip()
+
 
 def _cuda_vector_add_spec(source, *, arch="compute_80", grid_dim=4, block_dim=256):
     return {
@@ -119,6 +143,46 @@ def _cuda_persistent_dag_spec(add_source, mul_source, *, arch="compute_80", bloc
             "arg_builder": "persistent_dag_fork_join_f32",
             "args": ["a", "b", "out"],
             "queue_capacity": 2,
+        }
+    }
+
+
+def _cuda_persistent_tensor_tile_spec(matmul_source, add_source, mul_source, *, arch="compute_80", block_dim=256):
+    return {
+        "cuda": {
+            "runtime": "persistent_device",
+            "arch": arch,
+            "task_sources": [
+                {
+                    "func_id": 3,
+                    "task_name": "matmul_tile_f32",
+                    "source_path": str(matmul_source),
+                    "body_style": "task_body",
+                    "context_definition": _PERSISTENT_CONTEXT,
+                },
+                {
+                    "func_id": 1,
+                    "task_name": "add_f32",
+                    "source_path": str(add_source),
+                    "body_style": "task_body",
+                    "context_definition": _PERSISTENT_CONTEXT,
+                },
+                {
+                    "func_id": 2,
+                    "task_name": "mul_f32",
+                    "source_path": str(mul_source),
+                    "body_style": "task_body",
+                    "context_definition": _PERSISTENT_CONTEXT,
+                },
+            ],
+            "grid_dim": 5,
+            "block_dim": block_dim,
+            "shared_mem_bytes": 0,
+            "signature": [ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
+            "arg_builder": "persistent_dag_tensor_tile_f32",
+            "args": ["a", "b", "out"],
+            "queue_capacity": 2,
+            "tensor_tile": {"rows": 16, "cols": 16, "inner": 16},
         }
     }
 
@@ -292,5 +356,55 @@ def test_scene_test_runs_cuda_persistent_device_dag_with_real_data(tmp_path):
     try:
         callable_obj = scene.build_callable("cuda")
         scene._run_and_validate_l2(worker, callable_obj, CudaPersistentDagScene.CASES[0])
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_tensor_tile_with_real_data(tmp_path):
+    torch = pytest.importorskip("torch")
+
+    matmul_source = tmp_path / "matmul.pto.cu"
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    matmul_source.write_text(_PERSISTENT_MATMUL_TILE_BODY)
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentTensorTileScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_tensor_tile_spec(matmul_source, add_source, mul_source)
+        CASES = [
+            {
+                "name": "tile16",
+                "platforms": ["cuda"],
+                "params": {"rows": 16, "cols": 16, "inner": 16},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            rows = params["rows"]
+            cols = params["cols"]
+            inner = params["inner"]
+            return TaskArgsBuilder(
+                Tensor("a", (torch.arange(rows * inner, dtype=torch.float32) % 5.0) + 1.0),
+                Tensor("b", (torch.arange(inner * cols, dtype=torch.float32) % 3.0) + 1.0),
+                Tensor("out", torch.zeros(rows * cols, dtype=torch.float32)),
+            )
+
+        def compute_golden(self, args, params):
+            rows = params["rows"]
+            cols = params["cols"]
+            inner = params["inner"]
+            matmul = args.a.reshape(rows, inner) @ args.b.reshape(inner, cols)
+            flat = matmul.reshape(rows * cols)
+            args.out[:] = flat + args.a[: rows * cols] + flat * args.b[: rows * cols]
+
+    scene = CudaPersistentTensorTileScene()
+    worker = CudaPersistentTensorTileScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(worker, callable_obj, CudaPersistentTensorTileScene.CASES[0])
     finally:
         worker.close()

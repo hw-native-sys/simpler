@@ -174,8 +174,10 @@ that expose `buffer_ptr()` / `buffer_size()`. The normal `SceneTestCase` L2
 path can now build `CALLABLE["cuda"]` host-schedule specs and run the current
 `arg_builder: vector_add_f32` adapter from CPU `TaskArgsBuilder` tensors
 through real CUDA device buffers. The same path can build
-`persistent_device` generated-dispatch DAG specs and run the current
-`arg_builder: persistent_dag_fork_join_f32` adapter through the L2 `Worker`.
+`persistent_device` generated-dispatch DAG specs and run the
+`arg_builder: persistent_dag_fork_join_f32` and
+`arg_builder: persistent_dag_tensor_tile_f32` adapters through the L2
+`Worker`.
 For real host-schedule smoke coverage, pass a context definition plus
 `host_parameters`/`host_context_initializer` so the generated `__global__`
 wrapper matches the current vector-add launch ABI and can be loaded by
