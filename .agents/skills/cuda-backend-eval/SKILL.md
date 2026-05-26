@@ -511,7 +511,7 @@ local commit. It syncs `.git` so the remote benchmark metadata reports the
 same commit as the synced source tree.
 
 Use `--dry-run` to print the commands without launching benchmarks. The current
-committed summary uses the `47ac2bb5` artifact names in
+committed summary uses the `93636997` artifact names in
 `docs/nvidia-backend/evaluation-current.md`.
 
 For a lighter no-torch real-data check, run the paired Worker smoke instead of
@@ -599,7 +599,7 @@ directly from a combined benchmark JSON payload:
 ```bash
 PYTHONPATH=$PWD:$PWD/python:.agents/skills/cuda-backend-eval/scripts \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_current_summary.py \
-    tmp/cuda-backend/combined-current-47ac2bb5/cuda-benchmark.json
+    tmp/cuda-backend/combined-current-93636997/cuda-benchmark.json
 ```
 
 Use `--section launch`, `--section worker-grid`, or `--section dag-shapes` to

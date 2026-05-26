@@ -160,11 +160,10 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest paired capture at commit `47ac2bb5` uses the `8x4x12` tensor
+The latest paired capture at commit `93636997` uses the `8x4x12` tensor
 descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
 and worker-grid values `32,64,128,256`. It includes the compiler-backed
-host-schedule row on both A100 and H200. New captures after the scalar AXPY
-benchmark slice also include `pto_persistent_dag_scalar_axpy`.
+host-schedule row and `pto_persistent_dag_scalar_axpy` on both A100 and H200.
 
 Evidence:
 
@@ -356,7 +355,7 @@ under `tmp/cuda-backend/worker-scale-smoke-4240a4ba/`.
 The docs and skill updates were checked with targeted `pre-commit` runs and
 `git diff --check` before commit.
 
-The paired benchmark capture was refreshed at commit `47ac2bb5` after
+The paired benchmark capture was refreshed at commit `93636997` after
 syncing the local checkout to the remote H200 host:
 
 ```bash
@@ -365,10 +364,10 @@ PYTHONPATH=$PWD:$PWD/python \
     --sync-remote-tree
 ```
 
-Result: A100 `label=a100-current-47ac2bb5`, `ptx_arch=compute_80`; H200
-`label=h200-current-47ac2bb5`, `ptx_arch=compute_90`. Both reports use
+Result: A100 `label=a100-current-93636997`, `ptx_arch=compute_80`; H200
+`label=h200-current-93636997`, `ptx_arch=compute_90`. Both reports use
 `ptx_source=nvcc-*`, include generated compiler and persistent-device rows,
-and are merged in `tmp/cuda-backend/combined-current-47ac2bb5/`.
+and are merged in `tmp/cuda-backend/combined-current-93636997/`.
 
 The local A100 persistent DAG smoke was run through the persistent-device
 `KernelCompiler` entry point with task-body style DAG sources:
