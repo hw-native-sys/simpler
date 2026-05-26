@@ -235,6 +235,10 @@ Evidence:
   checks paired benchmark captures for expected machines, selected baselines,
   sizes, repeats, sample count, and generated report files before docs are
   refreshed.
+- `.agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py` checks
+  paired smoke captures for required A100/H200 artifacts, pass status, zero
+  scheduler errors, expected runtime/mode, dispatch IDs, repeat-run lifecycle
+  counts, and generated smoke report files.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_artifact_index.py` indexes
   local `tmp/cuda-backend/` artifacts, including tensor-tile shapes,
   persistent smoke modes, dispatch sequences, scheduler error counters,

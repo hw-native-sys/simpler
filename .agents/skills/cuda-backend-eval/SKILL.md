@@ -335,6 +335,20 @@ This writes `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
 `tmp/cuda-backend/persistent-<shape>-smoke-<commit>/`, then refreshes
 `tmp/cuda-backend/index.md`. Use `--sync-remote-tree` when remote Git fetch is
 unreliable or the remote `origin` URL is not accessible.
+Validate paired persistent smoke artifacts before citing them:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py \
+    tmp/cuda-backend/persistent-graph_descriptor-repeat2-smoke-d3a86494/a100.json \
+    tmp/cuda-backend/persistent-graph_descriptor-repeat2-smoke-d3a86494/h200.json \
+    --require-artifact a100 --require-artifact h200 \
+    --expected-runtime persistent_device --expected-mode dag \
+    --expected-dag-shape graph_descriptor --expected-repeat-runs 2 \
+    --expected-completed-count 3 --expected-dispatch 9,2,1 \
+    --require-report-files
+```
+
 The JSON payload and compact report include `resource_policy` fields for
 `scheduler_blocks`, `worker_blocks`, `worker_blocks_per_task`, `stream_id`,
 `block_dim`, and `grid_dim`. Scalar DAG payloads also include `scalar_args`
@@ -928,6 +942,10 @@ PYTHONPATH=$PWD:$PWD/python \
 The preset checks the expected A100/H200 machines, current selected
 baselines, sizes `1024,65536,1048576`, three repeats, `720` combined samples,
 and the Markdown/SVG report files.
+
+Use `cuda_validate_smoke.py` for paired smoke artifacts. It checks required
+artifacts, pass status, zero device scheduler errors, expected runtime/mode,
+dispatch IDs, repeat-run lifecycle counts, and generated smoke report files.
 
 When worker-grid rows are present, the report includes a
 `Best Worker Grid Rows` table that picks the lowest median device time for

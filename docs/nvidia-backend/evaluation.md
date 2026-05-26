@@ -175,3 +175,17 @@ The current paired benchmark shape uses:
 - tensor descriptor: `8x4x12`
 - local A100 PTX arch: `compute_80`
 - remote H200 PTX arch: `compute_90`
+
+Validate paired smoke artifacts before citing them:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py \
+    tmp/cuda-backend/persistent-graph_descriptor-repeat2-smoke-d3a86494/a100.json \
+    tmp/cuda-backend/persistent-graph_descriptor-repeat2-smoke-d3a86494/h200.json \
+    --require-artifact a100 --require-artifact h200 \
+    --expected-runtime persistent_device --expected-mode dag \
+    --expected-dag-shape graph_descriptor --expected-repeat-runs 2 \
+    --expected-completed-count 3 --expected-dispatch 9,2,1 \
+    --require-report-files
+```

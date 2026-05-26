@@ -175,6 +175,26 @@ def _load_capture_validator_module():
         sys.modules.pop(spec.name, None)
 
 
+def _load_smoke_validator_module():
+    script_path = (
+        Path(__file__).resolve().parents[3]
+        / ".agents"
+        / "skills"
+        / "cuda-backend-eval"
+        / "scripts"
+        / "cuda_validate_smoke.py"
+    )
+    spec = importlib.util.spec_from_file_location("cuda_validate_smoke", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
 def _load_smoke_report_module():
     script_path = (
         Path(__file__).resolve().parents[3]
@@ -637,6 +657,86 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     assert "pto_persistent_dag_generic_args" in args.require_baseline
     assert "pto_persistent_dag_graph" in args.require_baseline
     assert args.expected_result_count == 720
+
+
+def test_cuda_smoke_validator_accepts_paired_lifecycle_artifact(tmp_path):
+    cuda_validate_smoke = _load_smoke_validator_module()
+    artifact_dir = tmp_path / "persistent-graph-smoke"
+    artifact_dir.mkdir()
+    payload = {
+        "status": "pass",
+        "runtime": "persistent_device",
+        "mode": "dag",
+        "dag_shape": "graph_descriptor",
+        "n": 1024,
+        "repeat_runs": 2,
+        "launch_completed_counts": [3, 3],
+        "dispatch_func_ids": [9, 2, 1],
+        "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+    }
+    (artifact_dir / "a100.json").write_text(json.dumps(payload) + "\n")
+    (artifact_dir / "h200.json").write_text(json.dumps(payload) + "\n")
+    (artifact_dir / "cuda-smoke-report.md").write_text("# report\n")
+    (artifact_dir / "cuda-smoke-report.svg").write_text("<svg></svg>\n")
+
+    payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json", artifact_dir / "h200.json"])
+    errors = cuda_validate_smoke.validate_smoke(
+        payloads,
+        artifact_dir=artifact_dir,
+        required_artifacts=["a100", "h200"],
+        expected_runtime="persistent_device",
+        expected_mode="dag",
+        expected_dag_shape="graph_descriptor",
+        expected_repeat_runs=2,
+        expected_completed_count=3,
+        expected_dispatch="9,2,1",
+        require_report_files=True,
+    )
+
+    assert errors == []
+
+
+def test_cuda_smoke_validator_reports_lifecycle_and_report_errors(tmp_path):
+    cuda_validate_smoke = _load_smoke_validator_module()
+    artifact_dir = tmp_path / "persistent-graph-smoke"
+    artifact_dir.mkdir()
+    (artifact_dir / "a100.json").write_text(
+        json.dumps(
+            {
+                "status": "fail",
+                "runtime": "persistent_device",
+                "mode": "dag",
+                "dag_shape": "graph_descriptor",
+                "n": 1024,
+                "repeat_runs": 2,
+                "launch_completed_counts": [3, 2],
+                "dispatch_func_ids": [9, 2, 1],
+                "device_scheduler_errors": {"count": 1, "code": 7, "task_id": 0},
+            }
+        )
+        + "\n"
+    )
+
+    payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json"])
+    errors = cuda_validate_smoke.validate_smoke(
+        payloads,
+        artifact_dir=artifact_dir,
+        required_artifacts=["a100", "h200"],
+        expected_runtime="persistent_device",
+        expected_mode="dag",
+        expected_dag_shape="graph_descriptor",
+        expected_repeat_runs=2,
+        expected_completed_count=3,
+        expected_dispatch="9,2,1",
+        require_report_files=True,
+    )
+
+    assert "missing artifact h200" in errors
+    assert "non-pass artifact=a100 status=fail" in errors
+    assert "scheduler error artifact=a100 count=1 code=7 task=0" in errors
+    assert "expected completed count 3 for artifact=a100 launch=1, found 2" in errors
+    assert "missing report file cuda-smoke-report.md" in errors
+    assert "missing report file cuda-smoke-report.svg" in errors
 
 
 def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
