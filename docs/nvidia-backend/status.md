@@ -85,7 +85,8 @@ execution modes:
 - six-task scratch-reuse DAG descriptor;
 - tensor-tile DAG descriptor with rows/cols/inner/stride metadata.
 - device-side scheduler diagnostics for unsupported generated-dispatch
-  `func_id` values and invalid dependent task IDs.
+  `func_id` values, invalid dependent task IDs, and out-of-range dependent
+  spans.
 
 The persistent DAG path compiles generated CUDA source with `nvcc` and stores
 the generated source, PTX, and manifest under
@@ -390,6 +391,19 @@ PYTHONPATH=$PWD:$PWD/python \
 Result: expected non-zero exit with `persistent dag scheduler error code=2
 task_id=7 count=1`.
 
+The synthetic invalid-dependent-range shape was run locally to verify that a
+runtime graph descriptor cannot read outside the dependents array:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 1 --n 1024 --arch compute_80 \
+    --mode dag --queue-capacity 1 --dag-shape bad_dependent_range
+```
+
+Result: expected non-zero exit with `persistent dag scheduler error code=3
+task_id=0 count=1`.
+
 The same scheduler-diagnostic slice was verified on the remote H200 checkout
 after pushing this change:
 
@@ -415,17 +429,21 @@ The H200 invalid-dispatch check returned the expected diagnostic:
 The H200 invalid-dependent check returned the expected diagnostic:
 `persistent dag scheduler error code=2 task_id=7 count=1`.
 
-After adding invalid-dependent scheduler diagnostics, the focused CUDA test set
-was rerun locally:
+The H200 invalid-dependent-range check returned the expected diagnostic:
+`persistent dag scheduler error code=3 task_id=0 count=1`.
+
+After adding invalid-dependent and dependent-range scheduler diagnostics, the
+focused CUDA test set was rerun locally:
 
 ```bash
 .venv/bin/python -m pytest \
   tests/ut/py/test_cuda_backend.py \
   tests/ut/py/test_cuda_persistent_codegen.py \
-  tests/ut/py/test_cuda_kernel_compiler.py -q
+  tests/ut/py/test_cuda_kernel_compiler.py \
+  tests/ut/py/test_cuda_scene_test.py -q
 ```
 
-Result: `35 passed`.
+Result: `41 passed`.
 
 After adding shared CUDA preflight skip reporting, the local A100-focused test
 set was rerun:
@@ -544,7 +562,7 @@ Needed:
 - lifecycle validation beyond the current scratch-reuse smoke;
 - resource policy for scheduler blocks, worker blocks, and stream use;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
-  and invalid-dependent-ID diagnostics.
+  invalid-dependent-ID, and dependent-range diagnostics.
 
 ### Tuned Tensor Workloads
 

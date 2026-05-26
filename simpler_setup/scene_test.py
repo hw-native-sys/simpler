@@ -561,6 +561,7 @@ class _CudaPersistentDagSceneBuffers:
             tasks=self.dev_tasks,
             task_count=len(self.host_tasks),
             dependents=self.dev_dependents,
+            dependent_count=len(self.host_dependents),
             fanin=self.dev_fanin,
             ready_queue=self.dev_ready_queue,
             ready_flags=self.dev_ready_flags,

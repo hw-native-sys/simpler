@@ -90,6 +90,7 @@ struct PtoCudaPersistentDagState {
     const PtoCudaPersistentDagTask *tasks;
     uint64_t task_count;
     const uint32_t *dependents;
+    uint64_t dependent_count;
     uint32_t *fanin;
     uint32_t *ready_queue;
     uint32_t *ready_flags;

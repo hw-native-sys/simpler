@@ -141,6 +141,34 @@ except RuntimeError as exc:
 PY
 ```
 
+Use the synthetic invalid-dependent-range shape below to validate propagation
+of a runtime graph descriptor whose dependent range exceeds the dependent
+array length:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 - <<'PY'
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+try:
+    run_persistent_smoke(
+        device=0,
+        task_count=1,
+        n=1024,
+        arch="compute_80",
+        mode="dag",
+        queue_capacity=1,
+        dag_shape="bad_dependent_range",
+    )
+except RuntimeError as exc:
+    print(exc)
+PY
+```
+
 Run the five-task persistent DAG-chain smoke, which reuses the same generated
 dispatch PTX but passes a different runtime task graph:
 

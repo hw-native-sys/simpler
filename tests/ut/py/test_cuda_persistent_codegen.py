@@ -240,10 +240,13 @@ def test_render_persistent_dag_source_records_device_scheduler_errors():
     assert "unsigned int *error_count;" in source
     assert "unsigned int *error_code;" in source
     assert "unsigned int *error_task_id;" in source
+    assert "unsigned long long dependent_count;" in source
     assert "__device__ bool pto_dag_dispatch" in source
     assert "return true;" in source
     assert "return false;" in source
     assert "pto_dag_record_error(state, 1U, task_id);" in source
+    assert "dependent_end > state->dependent_count" in source
+    assert "pto_dag_record_error(state, 3U, task_id);" in source
     assert "static_cast<unsigned long long>(dependent_id) >= state->task_count" in source
     assert "pto_dag_record_error(state, 2U, dependent_id);" in source
 

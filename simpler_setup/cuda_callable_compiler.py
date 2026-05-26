@@ -176,6 +176,7 @@ class CudaPersistentDagState(ctypes.Structure):
         ("tasks", ctypes.c_void_p),
         ("task_count", ctypes.c_uint64),
         ("dependents", ctypes.c_void_p),
+        ("dependent_count", ctypes.c_uint64),
         ("fanin", ctypes.c_void_p),
         ("ready_queue", ctypes.c_void_p),
         ("ready_flags", ctypes.c_void_p),
@@ -492,6 +493,7 @@ struct PtoCudaPersistentDagState {{
     const PtoCudaPersistentDagTask *tasks;
     unsigned long long task_count;
     const unsigned int *dependents;
+    unsigned long long dependent_count;
     unsigned int *fanin;
     unsigned int *ready_queue;
     unsigned int *ready_flags;
@@ -576,6 +578,14 @@ extern "C" __global__ void pto_persistent_dag_f32_executor(const PtoCudaPersiste
             if (!task_ok) {{
                 pto_dag_record_error(state, 1U, task_id);
             }} else {{
+                unsigned long long dependent_begin =
+                    static_cast<unsigned long long>(task.dependent_begin);
+                unsigned long long dependent_end =
+                    dependent_begin + static_cast<unsigned long long>(task.dependent_count);
+                if (dependent_end > state->dependent_count) {{
+                    pto_dag_record_error(state, 3U, task_id);
+                    continue;
+                }}
                 for (unsigned int idx = 0; idx < task.dependent_count; ++idx) {{
                     unsigned int dependent_id = state->dependents[task.dependent_begin + idx];
                     if (static_cast<unsigned long long>(dependent_id) >= state->task_count) {{
