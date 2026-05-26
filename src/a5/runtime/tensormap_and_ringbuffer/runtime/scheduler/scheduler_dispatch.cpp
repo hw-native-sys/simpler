@@ -10,6 +10,7 @@
  */
 #include "scheduler_context.h"
 
+#include <algorithm>
 #include <cinttypes>
 
 #include "common.h"  // debug_assert
@@ -97,7 +98,7 @@ int SchedulerContext::pop_ready_tasks_batch(
 
 void SchedulerContext::build_payload(
     PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-    const AsyncCtx &async_ctx
+    const AsyncCtx &async_ctx, int32_t block_idx
 ) {
     int32_t slot_idx = static_cast<int32_t>(subslot);
     uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
@@ -111,7 +112,7 @@ void SchedulerContext::build_payload(
     for (int32_t i = 0; i < payload.scalar_count; i++) {
         dispatch_payload.args[n++] = payload.scalars[i];
     }
-    dispatch_payload.local_context.s_block_idx = slot_state.next_block_idx;
+    dispatch_payload.local_context.s_block_idx = block_idx;
     dispatch_payload.local_context.s_block_num = slot_state.logical_block_num;
     dispatch_payload.local_context.async_ctx = async_ctx;
     dispatch_payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.local_context);
@@ -120,7 +121,7 @@ void SchedulerContext::build_payload(
 
 void SchedulerContext::dispatch_subtask_to_core(
     Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-    bool to_pending
+    bool to_pending, int32_t block_idx
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto core_id = tracker.get_core_id_by_offset(core_offset);
@@ -147,7 +148,7 @@ void SchedulerContext::dispatch_subtask_to_core(
     deferred_slab->count = 0;
     deferred_slab->error_code = PTO2_ERROR_NONE;
     AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
-    build_payload(payload, slot_state, subslot, async_ctx);
+    build_payload(payload, slot_state, subslot, async_ctx, block_idx);
 
     if (to_pending) {
         core_exec_state.pending_subslot = subslot;
@@ -175,8 +176,8 @@ void SchedulerContext::dispatch_subtask_to_core(
         " core_offset=%d core_id=%d reg_task_id=%u",
         thread_idx, to_pending ? "pending" : "idle", subslot_name(subslot),
         static_cast<int64_t>(slot_state.task->task_id.raw), slot_state.task->kernel_id[0],
-        slot_state.task->kernel_id[1], slot_state.task->kernel_id[2], slot_state.next_block_idx,
-        slot_state.logical_block_num, core_offset, core_id, reg_task_id
+        slot_state.task->kernel_id[1], slot_state.task->kernel_id[2], block_idx, slot_state.logical_block_num,
+        core_offset, core_id, reg_task_id
     );
 
     write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
@@ -184,7 +185,8 @@ void SchedulerContext::dispatch_subtask_to_core(
 }
 
 void SchedulerContext::dispatch_mix_block_to_cluster(
-    Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending
+    Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending,
+    int32_t block_idx
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     uint8_t cmask = slot_state.active_mask.core_mask();
@@ -192,28 +194,28 @@ void SchedulerContext::dispatch_mix_block_to_cluster(
         bool aic_to_pending = to_pending && !tracker.is_aic_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC,
-            aic_to_pending
+            aic_to_pending, block_idx
         );
     }
     if (cmask & PTO2_SUBTASK_MASK_AIV0) {
         bool aiv0_to_pending = to_pending && !tracker.is_aiv0_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0,
-            aiv0_to_pending
+            aiv0_to_pending, block_idx
         );
     }
     if (cmask & PTO2_SUBTASK_MASK_AIV1) {
         bool aiv1_to_pending = to_pending && !tracker.is_aiv1_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1,
-            aiv1_to_pending
+            aiv1_to_pending, block_idx
         );
     }
 }
 
 void SchedulerContext::dispatch_block(
     Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
-    bool to_pending
+    bool to_pending, int32_t block_idx
 ) {
 #if PTO2_PROFILING
     if (is_dump_tensor_enabled()) {
@@ -229,11 +231,15 @@ void SchedulerContext::dispatch_block(
     }
 #endif
     if (shape == PTO2ResourceShape::MIX) {
-        dispatch_mix_block_to_cluster(runtime, thread_idx, core_offset, slot_state, to_pending);
+        dispatch_mix_block_to_cluster(runtime, thread_idx, core_offset, slot_state, to_pending, block_idx);
     } else if (shape == PTO2ResourceShape::AIC) {
-        dispatch_subtask_to_core(runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending);
+        dispatch_subtask_to_core(
+            runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx
+        );
     } else {
-        dispatch_subtask_to_core(runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending);
+        dispatch_subtask_to_core(
+            runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx
+        );
     }
 #if PTO2_PROFILING
     sched_l2_perf_[thread_idx].phase_dispatch_count += __builtin_popcount(slot_state.active_mask.core_mask());
@@ -291,14 +297,25 @@ void SchedulerContext::dispatch_shape(
 #if PTO2_SCHED_PROFILING
             uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
-            do {
-                auto core_offset = cores.pop_first();
-                dispatch_block(runtime, thread_idx, core_offset, *slot_state, shape, is_pending);
-                slot_state->next_block_idx++;
-            } while (slot_state->next_block_idx < slot_state->logical_block_num && cores.has_value());
+            // Claim a contiguous range of blocks, hand the slot back to the
+            // ready queue immediately, then perform the expensive dispatches.
+            // This lets other schedulers concurrently claim and dispatch the
+            // remaining blocks of the same SPMD task instead of spinning while
+            // this thread fills all its own cores.  Only local `start + b` is
+            // read after the push -- `next_block_idx` may already be advanced
+            // by another scheduler that popped the slot.
+            int32_t remaining = slot_state->logical_block_num - slot_state->next_block_idx;
+            int32_t claim = std::min(cores.count(), remaining);
+            int32_t start = slot_state->next_block_idx;
+            slot_state->next_block_idx += claim;
 
             if (slot_state->next_block_idx < slot_state->logical_block_num) {
                 sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+            }
+
+            for (int32_t b = 0; b < claim; b++) {
+                auto core_offset = cores.pop_first();
+                dispatch_block(runtime, thread_idx, core_offset, *slot_state, shape, is_pending, start + b);
             }
             made_progress = true;
 #if PTO2_SCHED_PROFILING
