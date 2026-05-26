@@ -49,16 +49,25 @@ Opaque 64-bit handle. What it actually is depends on the destination worker:
 | `w4.submit_next_level(cid, …)` dispatched to an L3 `Worker` child | `int32_t` cid returned by `Worker.register(orch_fn)` (Python orch fn) | `_child_worker_loop` looks up the orch fn in the child's COW registry and calls `inner_worker.run(orch_fn, …)` |
 | `w3.submit_sub(cid, …)` dispatched to a SUB child | `int32_t` cid indexing the Python callable registry | `_sub_worker_loop` calls `fn(args)` with the decoded `TaskArgs` |
 
-All three paths share one mailbox wire format — the cid is written into
-`MAILBOX_OFF_CALLABLE` and the child does the dispatch in its own
-address space.
+The implemented local paths share one mailbox wire format — the cid is written
+into `MAILBOX_OFF_CALLABLE` and the child does the dispatch in its own address
+space. The proposed remote L3 path keeps the cid concept, but sends it in a
+versioned TASK frame and resolves it against the remote endpoint's registry
+after the endpoint has reported `HELLO READY`.
 
 ### Lifetime — pre-fork registration
 
-Every concrete `Callable` object (ChipCallable, Python orch fn, sub callable)
-**must be registered before any child process is forked**. After fork, the
-child inherits these through COW and the uint64 handle dereferences validly
-in the child.
+For the local fork/shm path, every concrete `Callable` object (ChipCallable,
+Python orch fn, sub callable) **must be registered before any child process is
+forked**, except for explicit dynamic registration controls. After fork, the
+child inherits these through COW and the uint64 handle dereferences validly in
+the child.
+
+For remote L3, the parent cannot rely on COW. Remote callable registration uses
+explicit descriptors: required `PYTHON_IMPORT` paths, optional negotiated
+PR #839 serialized Python callable payloads, and `CHIP_CALLABLE` payloads for
+inner L3 chip work. A remote cid becomes visible only after the selected
+endpoint replies success.
 
 ---
 
@@ -241,7 +250,10 @@ dispatches to an L3 child, the child process runs `_child_worker_loop`,
 which looks up the registered orch fn for that cid and calls
 `inner_worker.run(orch_fn, args, config)` — i.e. the L3 `Worker.run`
 Python method, not a C++ leaf. The kernel-running leaves stay at L2
-(`ChipWorker`); higher levels just compose more scheduling engines.
+(`ChipWorker`); higher levels just compose more scheduling engines. A remote
+L3 session runner follows the same execution shape after it has prestarted its
+inner L3 Worker, but task/control/completion bytes travel through the remote
+framed protocol instead of the local mailbox.
 
 ---
 

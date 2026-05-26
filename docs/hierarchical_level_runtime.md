@@ -13,6 +13,8 @@ For details of each component's internals, see:
 - [scheduler.md](scheduler.md) — dispatch loop, queues, completion handling
 - [worker-manager.md](worker-manager.md) — WorkerThread pool, fork + mailbox
 - [task-flow.md](task-flow.md) — Callable / TaskArgs / CallConfig data flow, execution leaves
+- [remote-l3-worker-design.md](remote-l3-worker-design.md) — design proposal
+  for scheduling remote L3 workers as NEXT_LEVEL children
 
 For the L2 chip-level details (host `.so`, AICPU, AICore), see
 [chip-level-arch.md](chip-level-arch.md).
@@ -42,14 +44,16 @@ L0  CORE  / AIV, AIC   ── individual compute core (hardware-managed)
   atomics and barriers.
 - **L3–L6** (host/cluster): each level runs the same scheduling engine
   composed of Orchestrator + Scheduler + Worker pool. Communication via IPC
-  (fork + shm at L3 today; RDMA / sockets at L4+).
+  (fork + shm for today's L3 and for local recursive L4+ composition).
+  Cross-host L4/L5/L6 composition, where a parent schedules a remote L3
+  endpoint over RoCE/HCCS/UB/sockets, is a proposed extension.
 
 | Level | Workers it contains | Status |
 | ----- | ------------------- | ------ |
 | L3 (Host) | `ChipWorker` ×N + `SubWorker` ×M | Implemented |
-| L4 (Pod) | `Worker(level=3)` ×N + `SubWorker` ×M | Implemented |
-| L5 (SuperNode) | `Worker(level=4)` ×N | Same code as L4 (untested) |
-| L6 (Cluster) | `Worker(level=5)` ×N | Same code as L4 (untested) |
+| L4 (Pod) | `Worker(level=3)` ×N + `SubWorker` ×M | Local-only implemented; remote proposed |
+| L5 (SuperNode) | `Worker(level=4)` ×N | Local L4 code path, untested; remote proposed |
+| L6 (Cluster) | `Worker(level=5)` ×N | Local L4 code path, untested; remote proposed |
 
 `Worker` is a single C++ class that handles every level from L3 upward — the
 `level` parameter is a diagnostic label; behavior does not branch on it. The

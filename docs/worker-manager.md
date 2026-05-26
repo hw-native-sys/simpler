@@ -1,15 +1,21 @@
 # Worker Manager — Pool, Threading, and Dispatch
 
 `WorkerManager` and `WorkerThread` together implement the **execution layer**
-of a `Worker` engine. `WorkerManager` owns two pools of `WorkerThread`s (one
-for next-level workers, one for sub workers); each `WorkerThread` drives a
-shared-memory mailbox that a forked Python child consumes — the child runs
-the real worker (a `ChipWorker` for NEXT_LEVEL, a Python callable for SUB)
-in its own address space.
+of a `Worker` engine. In today's local implementation, `WorkerManager` owns two
+pools of `WorkerThread`s (one for next-level workers, one for sub workers);
+each `WorkerThread` drives a shared-memory mailbox that a forked Python child
+consumes — the child runs the real worker (a `ChipWorker` for NEXT_LEVEL, a
+Python callable for SUB) in its own address space.
+
+The proposed remote L3 design keeps this local fork/shm path behind a
+`LocalMailboxEndpoint` and adds a framed `RemoteL3Endpoint` for cross-host
+NEXT_LEVEL children. A remote endpoint is not another child loop that polls the
+4096-byte mailbox; it uses the contracts in
+[remote-l3-worker-design.md](remote-l3-worker-design.md).
 
 For the high-level role of this layer among the three engine components, see
 [hierarchical_level_runtime.md](hierarchical_level_runtime.md). For what
-runs on the other side of the mailbox, see [task-flow.md](task-flow.md).
+runs on the other side of the local mailbox, see [task-flow.md](task-flow.md).
 For where dispatched tasks come from, see [scheduler.md](scheduler.md).
 
 ---
@@ -193,21 +199,23 @@ the C++ dispatcher thread — it does not own the child process.
 
 ---
 
-## 4. Adding a new worker kind
+## 4. Local vs. Remote Endpoints
 
-To add a new worker type (e.g., a RemoteWorker over RPC):
+The mailbox protocol is the local endpoint contract. Adding another local
+forked worker kind still follows the existing pattern:
 
-1. Define the kernel-running entry point (a C++ class with a `run` method
-   or a Python callable — there is no abstract interface to inherit from).
-2. Write a child-process loop (mirroring `_chip_process_loop` or
-   `_sub_worker_loop`) that polls the mailbox, decodes the args blob, and
-   invokes that entry point.
-3. Register the per-child mailbox via `manager.add_next_level(mailbox)`
-   or `manager.add_sub(mailbox)`.
+1. Define the worker entry point.
+2. Write a child-process loop that polls the mailbox, decodes the args blob,
+   and invokes that entry point.
+3. Register the mailbox via `manager.add_next_level(mailbox)` or
+   `manager.add_sub(mailbox)`.
 
-The parent side (WorkerManager / WorkerThread) doesn't change — it
-only knows the mailbox protocol, not who runs the kernel on the other
-end.
+Remote L3 is different. It cannot reuse the mailbox wire format because the
+remote side does not share virtual addresses, fork-time COW registries, POSIX
+shm names, or parent-visible child PIDs. The remote design introduces a
+transport-neutral endpoint under `WorkerThread`: `LocalMailboxEndpoint` wraps
+this local mailbox path, while `RemoteL3Endpoint` sends framed TASK, CONTROL,
+COMPLETION, HEALTH, and SHUTDOWN messages over the negotiated transport.
 
 ### 4.1 Nested fork ordering (L4+ Worker children)
 
