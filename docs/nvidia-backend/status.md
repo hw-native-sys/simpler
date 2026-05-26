@@ -1310,7 +1310,7 @@ row reported `status=pass`,
 The paired persistent-smoke runner also supports `graph_descriptor`, so the
 explicit graph path can be captured with the same A100/H200 lifecycle workflow
 as the fixed DAG shapes. A repeat-run lifecycle smoke was captured at commit
-`d3a86494`:
+`5139ba23` with automatic smoke artifact validation enabled:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -1321,13 +1321,19 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 Result:
-`tmp/cuda-backend/persistent-graph_descriptor-repeat2-smoke-d3a86494/`
+`tmp/cuda-backend/persistent-graph_descriptor-repeat2-smoke-5139ba23/`
 contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
-`cuda-smoke-report.svg`. Both A100 and H200 reported `status=pass`,
-`launch_completed_counts=[3,3]`, `device_scheduler_errors=count=0`, and
-`dispatch_func_ids=[9,2,1]`. This validates that the explicit graph descriptor
-path can reuse one prepared generated-dispatch callable across two launches
-after resetting fan-in, ready flags, counters, and scratch/output buffers.
+`cuda-smoke-report.svg`. The paired runner then ran
+`cuda_validate_smoke.py`, which accepted both JSON payloads, required the
+`a100` and `h200` artifacts, checked `runtime=persistent_device`,
+`mode=dag`, `dag_shape=graph_descriptor`, `repeat_runs=2`,
+`launch_completed_counts=[3,3]`, `dispatch_func_ids=[9,2,1]`, zero scheduler
+errors, and the generated report files. The A100 row reported
+`device_wall_ns=51200` and `host_wall_ns=74021`; H200 reported
+`device_wall_ns=51616` and `host_wall_ns=71847`. This validates that the
+explicit graph descriptor path can reuse one prepared generated-dispatch
+callable across two launches after resetting fan-in, ready flags, counters,
+and scratch/output buffers.
 
 Needed:
 
