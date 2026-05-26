@@ -155,6 +155,26 @@ def _load_current_summary_module():
         sys.path.remove(str(script_dir))
 
 
+def _load_capture_validator_module():
+    script_path = (
+        Path(__file__).resolve().parents[3]
+        / ".agents"
+        / "skills"
+        / "cuda-backend-eval"
+        / "scripts"
+        / "cuda_validate_capture.py"
+    )
+    spec = importlib.util.spec_from_file_location("cuda_validate_capture", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
 def _load_smoke_report_module():
     script_path = (
         Path(__file__).resolve().parents[3]
@@ -443,6 +463,96 @@ def test_cuda_artifact_index_sorts_numeric_sizes_before_strings(tmp_path):
     [entry] = cuda_artifact_index.scan_artifacts(tmp_path)
 
     assert entry["sizes"] == [1024, 65536, 1048576, "unknown"]
+
+
+def _paired_capture_payload():
+    baselines = [
+        "direct_driver",
+        "direct_driver_graph",
+        "pto_host_schedule",
+        "pto_host_schedule_compiler",
+    ]
+    results = []
+    for machine in ("hina", "dasys-h200x8"):
+        for n in (1024, 65536):
+            for baseline in baselines:
+                for repeat in range(2):
+                    results.append(
+                        {
+                            "machine": machine,
+                            "baseline": baseline,
+                            "n": n,
+                            "repeat": repeat,
+                            "status": "pass",
+                            "device_wall_ns": 1024,
+                        }
+                    )
+    return {
+        "metadata": {
+            "label": "combined-current-abc123",
+            "git_commit": "abc123",
+            "machine": "combined",
+        },
+        "results": results,
+    }
+
+
+def test_cuda_capture_validator_accepts_complete_capture(tmp_path):
+    cuda_validate_capture = _load_capture_validator_module()
+    artifact_dir = tmp_path / "combined-current-abc123"
+    artifact_dir.mkdir()
+    payload = _paired_capture_payload()
+    json_path = artifact_dir / "cuda-benchmark.json"
+    json_path.write_text(json.dumps(payload) + "\n")
+    (artifact_dir / "cuda-benchmark.md").write_text("# report\n")
+    (artifact_dir / "cuda-benchmark.svg").write_text("<svg></svg>\n")
+    (artifact_dir / "cuda-benchmark-ratios.svg").write_text("<svg></svg>\n")
+
+    errors = cuda_validate_capture.validate_capture(
+        payload,
+        artifact_dir=artifact_dir,
+        required_machines=["hina", "dasys-h200x8"],
+        required_baselines=[
+            "direct_driver",
+            "direct_driver_graph",
+            "pto_host_schedule",
+            "pto_host_schedule_compiler",
+        ],
+        required_sizes=[1024, 65536],
+        expected_repeats=2,
+        require_report_files=True,
+    )
+
+    assert errors == []
+
+
+def test_cuda_capture_validator_reports_missing_baseline_and_artifact(tmp_path):
+    cuda_validate_capture = _load_capture_validator_module()
+    artifact_dir = tmp_path / "combined-current-abc123"
+    artifact_dir.mkdir()
+    payload = _paired_capture_payload()
+    payload["results"] = [row for row in payload["results"] if row["baseline"] != "direct_driver_graph"]
+
+    errors = cuda_validate_capture.validate_capture(
+        payload,
+        artifact_dir=artifact_dir,
+        required_machines=["hina", "dasys-h200x8"],
+        required_baselines=[
+            "direct_driver",
+            "direct_driver_graph",
+            "pto_host_schedule",
+            "pto_host_schedule_compiler",
+        ],
+        required_sizes=[1024, 65536],
+        expected_repeats=2,
+        require_report_files=True,
+    )
+
+    assert "missing baseline direct_driver_graph on dasys-h200x8" in errors
+    assert "missing baseline direct_driver_graph on hina" in errors
+    assert "missing report file cuda-benchmark.md" in errors
+    assert "missing report file cuda-benchmark.svg" in errors
+    assert "missing report file cuda-benchmark-ratios.svg" in errors
 
 
 def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):

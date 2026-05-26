@@ -744,6 +744,19 @@ Use `--section launch`, `--section unary-square`, `--section worker-grid`, or
 `--section dag-shapes` to refresh only one table. This avoids hand-calculating
 the current-evaluation summary from raw JSON.
 
+Validate the paired-current capture before copying numbers into docs:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    tmp/cuda-backend/combined-current-0eed34ff/cuda-benchmark.json \
+    --preset paired-current
+```
+
+The preset checks the expected A100/H200 machines, current selected
+baselines, sizes `1024,65536,1048576`, three repeats, `630` combined samples,
+and the Markdown/SVG report files.
+
 When worker-grid rows are present, the report includes a
 `Best Worker Grid Rows` table that picks the lowest median device time for
 each machine, vector length, and task count.

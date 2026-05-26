@@ -36,6 +36,8 @@ when the JSON payloads carry that metadata.
 The compact tables in [Current capture](evaluation-current.md) can be
 regenerated from the combined JSON with
 `.agents/skills/cuda-backend-eval/scripts/cuda_current_summary.py`.
+Validate a refreshed paired-current capture before updating committed docs
+with `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`.
 
 ## Baselines
 
@@ -131,6 +133,16 @@ Refresh the local artifact index after adding or merging captures:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_artifact_index.py \
     --root tmp/cuda-backend
+```
+
+Validate the current paired capture before copying numbers into
+[Current capture](evaluation-current.md):
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    tmp/cuda-backend/combined-current-0eed34ff/cuda-benchmark.json \
+    --preset paired-current
 ```
 
 The current paired benchmark shape uses:

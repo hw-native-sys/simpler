@@ -202,6 +202,10 @@ Evidence:
   automates no-torch persistent-device DAG smoke captures on local A100 and
   remote H200, including optional remote tree sync, tensor-tile descriptor
   flags, compact report rendering, and artifact-index refresh.
+- `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`
+  checks paired benchmark captures for expected machines, selected baselines,
+  sizes, repeats, sample count, and generated report files before docs are
+  refreshed.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_artifact_index.py` indexes
   local `tmp/cuda-backend/` artifacts, including tensor-tile shapes,
   persistent smoke modes, dispatch sequences, and scheduler error counters.
@@ -982,6 +986,18 @@ versus `pto_persistent_dag` of `1.00x`, `0.14x`, and `1.02x` on A100 for
 same sizes. The A100 `N=65536` triad ratio is an unusually fast row in this
 capture, so it is recorded as correctness evidence and should be rechecked
 before using it as a throughput conclusion.
+
+The combined capture was validated with:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    tmp/cuda-backend/combined-current-0eed34ff/cuda-benchmark.json \
+    --preset paired-current
+```
+
+Result: `validated tmp/cuda-backend/combined-current-0eed34ff/cuda-benchmark.json`.
 
 ## Remaining Gaps
 
