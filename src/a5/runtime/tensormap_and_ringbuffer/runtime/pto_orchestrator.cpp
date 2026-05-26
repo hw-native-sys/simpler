@@ -72,19 +72,30 @@ uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
-#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
+// Cycle accumulation is unconditional under PTO2_ORCH_PROFILING (that's what
+// the flag is for). Swim-lane recording is an opt-in add-on gated at runtime
+// by l2_perf_level so callers can collect totals without paying GM-store cost.
+// When the swim-lane write fires, _t0 is re-sampled from the counter *after*
+// the write so its cost is not attributed to the next phase's accumulator.
+#define CYCLE_COUNT_START()                                                \
+    bool _prof_active = (orch->l2_perf_level >= L2PerfLevel::ORCH_PHASES); \
+    uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc)       \
     do {                           \
         _t1 = get_sys_cnt_aicpu(); \
         acc += (_t1 - _t0);        \
         _t0 = _t1;                 \
     } while (0)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                       \
-    do {                                                                                 \
-        _t1 = get_sys_cnt_aicpu();                                                       \
-        acc += (_t1 - _t0);                                                              \
-        l2_perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
-        _t0 = _t1;                                                                       \
+#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                           \
+    do {                                                                                     \
+        _t1 = get_sys_cnt_aicpu();                                                           \
+        acc += (_t1 - _t0);                                                                  \
+        if (_prof_active) {                                                                  \
+            l2_perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
+            _t0 = get_sys_cnt_aicpu();                                                       \
+        } else {                                                                             \
+            _t0 = _t1;                                                                       \
+        }                                                                                    \
     } while (0)
 #elif PTO2_PROFILING
 #include "aicpu/device_time.h"
