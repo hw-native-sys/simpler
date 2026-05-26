@@ -73,6 +73,8 @@ with `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`.
 - `pto_persistent_dag_quad`: generated-dispatch DAG that reads third and
   fourth tensor task descriptor fields for four-input work before downstream
   fan-in.
+- `pto_persistent_dag_generic_args`: generated-dispatch DAG that reads generic
+  tensor/scalar descriptor slots before downstream fan-in.
 - `pto_persistent_dag_unary_square`: generated-dispatch DAG with a one-input
   square task body before downstream fan-in.
 - `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a tiled

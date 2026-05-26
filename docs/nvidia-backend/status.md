@@ -188,6 +188,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_scalar_affine`;
 - `pto_persistent_dag_triad`;
 - `pto_persistent_dag_quad`;
+- `pto_persistent_dag_generic_args`;
 - `pto_persistent_dag_unary_square`;
 - `pto_persistent_dag_tensor`;
 - same-work batch rows;
@@ -1167,6 +1168,27 @@ focused local command passed on A100:
 
 The same command was run on H200 after syncing the working tree to
 `bizhaoh200`; it passed with `1 passed, 35 deselected`.
+
+After promoting generic persistent DAG tensor/scalar argument slots to a
+benchmark baseline, the focused single-baseline path was checked on both GPUs:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_generic_args --sizes 4096 \
+    --repeats 1 --arch compute_80
+```
+
+The same command was run on H200 with `--arch compute_90`. Result:
+`tmp/cuda-backend/persistent-generic-args-baseline-working/` contains
+`a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The A100 row reported `status=pass`,
+`ptx_source=nvcc-persistent-generated-dispatch-compute_80`,
+`dispatch_func_ids=[9,2,1]`, and `device_wall_ns=30720`; H200 reported
+`status=pass`, `ptx_source=nvcc-persistent-generated-dispatch-compute_90`,
+`dispatch_func_ids=[9,2,1]`, and `device_wall_ns=33600`.
+The paired-current validator now expects this baseline in the next refreshed
+full paired capture, raising the combined sample count from `684` to `702`.
 
 ## Remaining Gaps
 
