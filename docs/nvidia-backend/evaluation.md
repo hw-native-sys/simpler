@@ -26,6 +26,7 @@ committed:
 - `tmp/cuda-backend/combined-current-ba99b593/`
 - `tmp/cuda-backend/persistent-scalar_affine-smoke-469f55cd/`
 - `tmp/cuda-backend/worker-square-smoke-4cdde399/`
+- `tmp/cuda-backend/worker-quad-smoke-4327698e/`
 - `tmp/cuda-backend/worker-mul-smoke-output-json/`
 - `tmp/cuda-backend/tensor-descriptor-smoke-6c49c5cf/`
 - `tmp/cuda-backend/index.md`

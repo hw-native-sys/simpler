@@ -140,12 +140,14 @@ for unary `(a, out, n)` task bodies, `elementwise_scale_f32` for scalar
 tensor/scalar `(a, b, out, alpha, n)` task bodies. It also accepts
 `elementwise_affine_f32` for two-scalar affine
 `(a, b, out, alpha, beta, n)` task bodies and `elementwise_triad_f32` for
-three-input `(a, b, c, out, n)` task bodies.
+three-input `(a, b, c, out, n)` task bodies, and `elementwise_quad_f32` for
+four-input `(a, b, c, d, out, n)` task bodies.
 The no-torch Worker smoke can validate that same non-addition host-schedule
 ABI with `--op mul`, unary ABI with `--op square`, scalar ABI with
 `--op scale`, mixed tensor/scalar ABI with `--op axpy`, and two-scalar affine
-ABI with `--op affine`, and three-input ABI with `--op triad`, which keeps
-H200 coverage available when the remote Python environment lacks `torch`.
+ABI with `--op affine`, three-input ABI with `--op triad`, and four-input ABI
+with `--op quad`, which keeps H200 coverage available when the remote Python
+environment lacks `torch`.
 
 Evidence:
 
@@ -1095,6 +1097,23 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 Result: `2 passed, 28 deselected`.
 
+After adding the four-input host-schedule ABI, the no-torch Worker quad smoke
+was captured on local A100 and remote H200 with runtime rebuild enabled:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
+    --op quad --sync-remote-tree --build-runtime
+```
+
+Result: `tmp/cuda-backend/worker-quad-smoke-4327698e/` contains `a100.json`,
+`h200.json`, `cuda-smoke-report.md`, and `cuda-smoke-report.svg`. A100
+reported `status=pass`, `ptx_arch=compute_80`, and `device_wall_ns=21504`;
+H200 reported `status=pass`, `ptx_arch=compute_90`, and
+`device_wall_ns=18752`. The local A100 quad smoke was also checked at
+`N=65536` to exercise the same CUDA fused multiply-add rounding path used by
+`ctx->a[i] * ctx->b[i] + ctx->c[i] * ctx->d[i]`.
+
 ## Remaining Gaps
 
 ### Kernel Compiler Integration
@@ -1110,13 +1129,15 @@ fork/join, chain, reuse, scalar AXPY, scalar affine, and tensor-tile DAG
 callable specs, plus third-tensor persistent triad and unary-square callable
 specs, end to end.
 The fourth-tensor persistent quad callable spec also runs end to end through
-ctypes-backed real data.
+ctypes-backed real data. The host-schedule quad callable spec also runs
+through both the normal `SceneTestCase` L2 path and the no-torch Worker smoke
+path.
 
 Needed:
 
 - broader CUDA scene-test argument builders beyond the current binary
-  elementwise, unary square, scalar scale, axpy, affine, triad, and persistent
-  DAG tracer bullets.
+  elementwise, unary square, scalar scale, axpy, affine, triad, quad, and
+  persistent DAG tracer bullets.
 
 ### Fourth-Tensor Persistent DAG Verification
 

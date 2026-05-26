@@ -30,6 +30,7 @@ from simpler_setup.cuda_callable_compiler import (
     CudaVectorAddArgs,
     CudaVectorAffineArgs,
     CudaVectorAxpyArgs,
+    CudaVectorQuaternaryArgs,
     CudaVectorScaleArgs,
     CudaVectorTernaryArgs,
     CudaVectorUnaryArgs,
@@ -215,6 +216,8 @@ def _worker_task_body(op: str) -> str:
         expression = "ctx->alpha * ctx->a[i] + ctx->beta * ctx->b[i]"
     elif op == "triad":
         expression = "ctx->a[i] * ctx->b[i] + ctx->c[i]"
+    elif op == "quad":
+        expression = "ctx->a[i] * ctx->b[i] + ctx->c[i] * ctx->d[i]"
     else:
         raise ValueError(f"unknown worker smoke op: {op}")
     return f"""
@@ -227,6 +230,10 @@ if (i < ctx->n) {{
 
 def _float32(value: float) -> float:
     return ctypes.c_float(value).value
+
+
+def _fma_f32(a: float, b: float, c: float) -> float:
+    return _float32(float(a) * float(b) + float(c))
 
 
 def _worker_expected_output(op: str, n: int) -> list[float]:
@@ -244,6 +251,8 @@ def _worker_expected_output(op: str, n: int) -> list[float]:
         return [float(1.5 * i + 0.5 * (2 * i)) for i in range(n)]
     if op == "triad":
         return [float(i * (2 * i) + (3 * i)) for i in range(n)]
+    if op == "quad":
+        return [_fma_f32(float(i), float(2 * i), _float32(float(3 * i) * float(4 * i))) for i in range(n)]
     raise ValueError(f"unknown worker smoke op: {op}")
 
 
@@ -292,6 +301,17 @@ struct PtoTaskContext {
     const float *a;
     const float *b;
     const float *c;
+    float *out;
+    unsigned long long n;
+};
+""".strip()
+    if op == "quad":
+        return """
+struct PtoTaskContext {
+    const float *a;
+    const float *b;
+    const float *c;
+    const float *d;
     float *out;
     unsigned long long n;
 };
@@ -345,6 +365,15 @@ def _worker_host_parameters(op: str) -> tuple[str, ...]:
             "float *out",
             "unsigned long long n",
         )
+    if op == "quad":
+        return (
+            "const float *a",
+            "const float *b",
+            "const float *c",
+            "const float *d",
+            "float *out",
+            "unsigned long long n",
+        )
     return (
         "const float *a",
         "const float *b",
@@ -364,6 +393,8 @@ def _worker_host_context_initializer(op: str) -> str:
         return "a, b, out, alpha, beta, n"
     if op == "triad":
         return "a, b, c, out, n"
+    if op == "quad":
+        return "a, b, c, d, out, n"
     return "a, b, out, n"
 
 
@@ -378,7 +409,25 @@ def _worker_host_op(op: str) -> int:
         return 5
     if op == "triad":
         return 6
+    if op == "quad":
+        return 7
     return 1
+
+
+def _worker_raw_args(op: str, dev_a, dev_b, dev_c, dev_d, dev_out, n: int):
+    if op == "scale":
+        return CudaVectorScaleArgs(a=dev_a, out=dev_out, alpha=1.5, n=n)
+    if op == "square":
+        return CudaVectorUnaryArgs(a=dev_a, out=dev_out, n=n)
+    if op == "axpy":
+        return CudaVectorAxpyArgs(a=dev_a, b=dev_b, out=dev_out, alpha=1.5, n=n)
+    if op == "affine":
+        return CudaVectorAffineArgs(a=dev_a, b=dev_b, out=dev_out, alpha=1.5, beta=0.5, n=n)
+    if op == "triad":
+        return CudaVectorTernaryArgs(a=dev_a, b=dev_b, c=dev_c, out=dev_out, n=n)
+    if op == "quad":
+        return CudaVectorQuaternaryArgs(a=dev_a, b=dev_b, c=dev_c, d=dev_d, out=dev_out, n=n)
+    return CudaVectorAddArgs(a=dev_a, b=dev_b, out=dev_out, n=n)
 
 
 def run_smoke(device: int, n: int, block_dim: int, arch: str, build: bool = True) -> dict:
@@ -503,7 +552,8 @@ def run_worker_smoke(device: int, n: int, block_dim: int, arch: str, build: bool
 
         dev_a = worker.malloc(nbytes)
         dev_b = worker.malloc(nbytes) if op not in {"scale", "square"} else None
-        dev_c = worker.malloc(nbytes) if op == "triad" else None
+        dev_c = worker.malloc(nbytes) if op in {"triad", "quad"} else None
+        dev_d = worker.malloc(nbytes) if op == "quad" else None
         dev_out = worker.malloc(nbytes)
         try:
             worker.copy_to(dev_a, ctypes.addressof(host_a), nbytes)
@@ -511,19 +561,11 @@ def run_worker_smoke(device: int, n: int, block_dim: int, arch: str, build: bool
                 worker.copy_to(dev_b, ctypes.addressof(host_b), nbytes)
             if dev_c is not None:
                 worker.copy_to(dev_c, ctypes.addressof(host_c), nbytes)
+            if dev_d is not None:
+                host_d = array_t(*[float(4 * i) for i in range(n)])
+                worker.copy_to(dev_d, ctypes.addressof(host_d), nbytes)
 
-            if op == "scale":
-                args = CudaVectorScaleArgs(a=dev_a, out=dev_out, alpha=1.5, n=n)
-            elif op == "square":
-                args = CudaVectorUnaryArgs(a=dev_a, out=dev_out, n=n)
-            elif op == "axpy":
-                args = CudaVectorAxpyArgs(a=dev_a, b=dev_b, out=dev_out, alpha=1.5, n=n)
-            elif op == "affine":
-                args = CudaVectorAffineArgs(a=dev_a, b=dev_b, out=dev_out, alpha=1.5, beta=0.5, n=n)
-            elif op == "triad":
-                args = CudaVectorTernaryArgs(a=dev_a, b=dev_b, c=dev_c, out=dev_out, n=n)
-            else:
-                args = CudaVectorAddArgs(a=dev_a, b=dev_b, out=dev_out, n=n)
+            args = _worker_raw_args(op, dev_a, dev_b, dev_c, dev_d, dev_out, n)
             config = CallConfig()
             config.block_dim = block_dim
             timing = worker.run(cid, args, config)
@@ -537,6 +579,8 @@ def run_worker_smoke(device: int, n: int, block_dim: int, arch: str, build: bool
                 worker.free(dev_b)
             if dev_c is not None:
                 worker.free(dev_c)
+            if dev_d is not None:
+                worker.free(dev_d)
             worker.free(dev_out)
     finally:
         worker.close()
@@ -572,7 +616,7 @@ def main() -> None:
     parser.add_argument("--runner", choices=("direct_c_api", "worker"), default="direct_c_api")
     parser.add_argument(
         "--op",
-        choices=("add", "mul", "scale", "square", "axpy", "affine", "triad"),
+        choices=("add", "mul", "scale", "square", "axpy", "affine", "triad", "quad"),
         default="add",
         help="Worker task body operation",
     )

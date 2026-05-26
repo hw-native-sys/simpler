@@ -386,6 +386,7 @@ def _build_cuda_host_schedule_args(
         CudaVectorAddArgs,
         CudaVectorAffineArgs,
         CudaVectorAxpyArgs,
+        CudaVectorQuaternaryArgs,
         CudaVectorScaleArgs,
         CudaVectorTernaryArgs,
         CudaVectorUnaryArgs,
@@ -400,6 +401,7 @@ def _build_cuda_host_schedule_args(
         "elementwise_axpy_f32",
         "elementwise_affine_f32",
         "elementwise_triad_f32",
+        "elementwise_quad_f32",
     }
     if arg_builder not in supported_builders:
         raise NotImplementedError(f"Unsupported CUDA scene-test arg_builder: {arg_builder}")
@@ -412,6 +414,7 @@ def _build_cuda_host_schedule_args(
         "elementwise_axpy_f32": 4,
         "elementwise_affine_f32": 5,
         "elementwise_triad_f32": 4,
+        "elementwise_quad_f32": 5,
     }.get(arg_builder, 3)
     if len(names) != expected_arg_count:
         raise ValueError(f"CUDA {arg_builder} scene tests require exactly {expected_arg_count} args")
@@ -469,6 +472,15 @@ def _build_cuda_host_schedule_args(
             b=device_buffers.ptrs[names[1]],
             c=device_buffers.ptrs[names[2]],
             out=device_buffers.ptrs[names[3]],
+            n=n,
+        )
+    if arg_builder == "elementwise_quad_f32":
+        return CudaVectorQuaternaryArgs(
+            a=device_buffers.ptrs[names[0]],
+            b=device_buffers.ptrs[names[1]],
+            c=device_buffers.ptrs[names[2]],
+            d=device_buffers.ptrs[names[3]],
+            out=device_buffers.ptrs[names[4]],
             n=n,
         )
     return CudaVectorAddArgs(

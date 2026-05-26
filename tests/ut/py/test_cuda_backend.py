@@ -224,6 +224,43 @@ def test_cuda_host_schedule_worker_run_accepts_triad_task_body():
 
 
 @requires_cuda
+def test_cuda_host_schedule_worker_run_accepts_quad_task_body():
+    result = subprocess.run(
+        [
+            sys.executable,
+            ".agents/skills/cuda-backend-eval/scripts/cuda_smoke.py",
+            "--runner",
+            "worker",
+            "--op",
+            "quad",
+            "--device",
+            "0",
+            "--n",
+            "1024",
+            "--block-dim",
+            "256",
+            "--arch",
+            "compute_80",
+            "--no-build",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "pass"
+    assert payload["runner"] == "worker"
+    assert payload["runtime"] == "host_schedule"
+    assert payload["mode"] == "worker/quad"
+    assert payload["op"] == "quad"
+    assert payload["ptx_source"] == "kernel-compiler-worker-task-body-quad-compute_80"
+    assert payload["host_wall_ns"] > 0
+    assert payload["device_wall_ns"] > 0
+
+
+@requires_cuda
 def test_cuda_host_schedule_runs_kernel_compiler_task_body_with_real_device_data(tmp_path, cuda_host_runtime_binaries):
     task_src = tmp_path / "vector_add.pto.cu"
     task_src.write_text(

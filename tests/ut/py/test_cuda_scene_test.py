@@ -21,6 +21,7 @@ from simpler_setup.cuda_callable_compiler import (
     CudaPersistentCallableArtifact,
     CudaVectorAffineArgs,
     CudaVectorAxpyArgs,
+    CudaVectorQuaternaryArgs,
     CudaVectorScaleArgs,
     CudaVectorTernaryArgs,
     CudaVectorUnaryArgs,
@@ -80,6 +81,13 @@ _VECTOR_TRIAD_BODY = """
 unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
 if (i < ctx->n) {
     ctx->out[i] = ctx->a[i] * ctx->b[i] + ctx->c[i];
+}
+""".lstrip()
+
+_VECTOR_QUAD_BODY = """
+unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+if (i < ctx->n) {
+    ctx->out[i] = ctx->a[i] * ctx->b[i] + ctx->c[i] * ctx->d[i];
 }
 """.lstrip()
 
@@ -147,6 +155,17 @@ struct PtoTaskContext {
 };
 """.strip()
 
+_VECTOR_QUAD_CONTEXT = """
+struct PtoTaskContext {
+    const float *a;
+    const float *b;
+    const float *c;
+    const float *d;
+    float *out;
+    unsigned long long n;
+};
+""".strip()
+
 _VECTOR_ADD_HOST_PARAMS = (
     "const float *a",
     "const float *b",
@@ -188,6 +207,15 @@ _VECTOR_TRIAD_HOST_PARAMS = (
     "const float *a",
     "const float *b",
     "const float *c",
+    "float *out",
+    "unsigned long long n",
+)
+
+_VECTOR_QUAD_HOST_PARAMS = (
+    "const float *a",
+    "const float *b",
+    "const float *c",
+    "const float *d",
     "float *out",
     "unsigned long long n",
 )
@@ -304,7 +332,7 @@ class _CtypesFloatTensor:
 
 
 class _FakeCudaBuffers:
-    ptrs = {"a": 101, "b": 202, "c": 404, "out": 303}
+    ptrs = {"a": 101, "b": 202, "c": 404, "d": 505, "out": 303}
 
 
 class _FakeWorker:
@@ -452,6 +480,25 @@ def _cuda_elementwise_triad_spec(source, *, task_name, arch="compute_80", grid_d
             "signature": [ArgDirection.IN, ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
             "arg_builder": "elementwise_triad_f32",
             "args": ["a", "b", "c", "out"],
+        }
+    }
+
+
+def _cuda_elementwise_quad_spec(source, *, task_name, arch="compute_80", grid_dim=4, block_dim=256):
+    return {
+        "cuda": {
+            "source": str(source),
+            "task_name": task_name,
+            "arch": arch,
+            "context_definition": _VECTOR_QUAD_CONTEXT,
+            "host_parameters": _VECTOR_QUAD_HOST_PARAMS,
+            "host_context_initializer": "a, b, c, d, out, n",
+            "grid_dim": grid_dim,
+            "block_dim": block_dim,
+            "op": 7,
+            "signature": [ArgDirection.IN, ArgDirection.IN, ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
+            "arg_builder": "elementwise_quad_f32",
+            "args": ["a", "b", "c", "d", "out"],
         }
     }
 
@@ -915,6 +962,30 @@ def test_scene_test_builds_cuda_elementwise_triad_args():
     assert args.a == 101
     assert args.b == 202
     assert args.c == 404
+    assert args.out == 303
+    assert args.n == 17
+
+
+def test_scene_test_builds_cuda_elementwise_quad_args():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("c", _FakeTensor(17)),
+        Tensor("d", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "elementwise_quad_f32",
+        "args": ["a", "b", "c", "d", "out"],
+    }
+
+    args = _build_cuda_host_schedule_args(test_args, cast(Any, _FakeCudaBuffers()), cuda_spec)
+
+    assert isinstance(args, CudaVectorQuaternaryArgs)
+    assert args.a == 101
+    assert args.b == 202
+    assert args.c == 404
+    assert args.d == 505
     assert args.out == 303
     assert args.n == 17
 
@@ -1390,6 +1461,47 @@ def test_scene_test_runs_cuda_host_schedule_elementwise_triad_with_real_data(tmp
     try:
         callable_obj = scene.build_callable("cuda")
         scene._run_and_validate_l2(worker, callable_obj, CudaVectorTriadScene.CASES[0])
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_host_schedule_elementwise_quad_with_real_data(tmp_path):
+    torch = pytest.importorskip("torch")
+
+    source = tmp_path / "vector_quad.pto.cu"
+    source.write_text(_VECTOR_QUAD_BODY)
+
+    @scene_test(level=2, runtime="host_schedule")
+    class CudaVectorQuadScene(SceneTestCase):
+        CALLABLE = _cuda_elementwise_quad_spec(source, task_name="vector_quad")
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            return TaskArgsBuilder(
+                Tensor("a", torch.arange(n, dtype=torch.float32) + 1.0),
+                Tensor("b", torch.arange(n, dtype=torch.float32) * 0.5),
+                Tensor("c", torch.arange(n, dtype=torch.float32) * 0.25),
+                Tensor("d", torch.arange(n, dtype=torch.float32) * 0.125),
+                Tensor("out", torch.zeros(n, dtype=torch.float32)),
+            )
+
+        def compute_golden(self, args, params):
+            args.out[:] = args.a * args.b + args.c * args.d
+
+    scene = CudaVectorQuadScene()
+    worker = CudaVectorQuadScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(worker, callable_obj, CudaVectorQuadScene.CASES[0])
     finally:
         worker.close()
 

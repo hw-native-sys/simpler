@@ -810,6 +810,15 @@ def test_cuda_pair_smoke_accepts_triad_op():
     assert args.sync_remote_tree is True
 
 
+def test_cuda_pair_smoke_accepts_quad_op():
+    cuda_pair_smoke = _load_pair_smoke_module()
+
+    args = cuda_pair_smoke.parse_args(["--op", "quad", "--sync-remote-tree"])
+
+    assert args.op == "quad"
+    assert args.sync_remote_tree is True
+
+
 def test_cuda_pair_smoke_can_sync_local_tree_and_dry_run(tmp_path):
     cuda_pair_smoke = _load_pair_smoke_module()
     calls = []
