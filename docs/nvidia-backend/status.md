@@ -136,7 +136,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest paired capture at commit `38ff341e` uses the `8x4x12` tensor
+The latest paired capture at commit `0e1be392` uses the `8x4x12` tensor
 descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
 and worker-grid values `32,64,128,256`. It includes the compiler-backed
 host-schedule row on both A100 and H200.
@@ -285,28 +285,18 @@ Result: `status=pass`, `runner=worker`, `ptx_arch=compute_80`,
 The docs and skill updates were checked with targeted `pre-commit` runs and
 `git diff --check` before commit.
 
-The H200 paired benchmark capture was also run after pushing `38ff341e` to
-the remote checkout:
+The H200 paired benchmark capture was also run at commit `0e1be392` after
+syncing the local checkout to the remote H200 host:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git fetch origin design/nvidia-backend \
-     >/dev/null && \
-   git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null && \
-   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
-   PYTHONPATH=$PWD:$PWD/python \
-   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
-     --device 0 --sizes 1024,65536,1048576 --repeats 3 \
-     --arch compute_90 --include-persistent --batch-tasks 2,6,12 \
-     --worker-blocks-per-task 32,64,128,256 \
-     --tensor-rows 8 --tensor-cols 4 --tensor-inner 12 \
-     --label h200-current-$(git rev-parse --short HEAD) \
-     --output-dir tmp/cuda-backend/h200-current-$(git rev-parse --short HEAD)'
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
+    --sync-remote-tree
 ```
 
-Result: `label=h200-current-38ff341e`, `ptx_arch=compute_90`,
+Result: `label=h200-current-0e1be392`, `ptx_arch=compute_90`,
 `ptx_source=nvcc-compute_90`, with generated compiler and persistent-device
-rows included in `tmp/cuda-backend/h200-current-38ff341e/`.
+rows included in `tmp/cuda-backend/h200-current-0e1be392/`.
 
 The local A100 persistent DAG smoke was run through the persistent-device
 `KernelCompiler` entry point with task-body style DAG sources:

@@ -390,7 +390,7 @@ local commit. It syncs `.git` so the remote benchmark metadata reports the
 same commit as the synced source tree.
 
 Use `--dry-run` to print the commands without launching benchmarks. The current
-committed summary uses the `38ff341e` artifact names in
+committed summary uses the `0e1be392` artifact names in
 `docs/nvidia-backend/evaluation-current.md`.
 
 The script writes:
