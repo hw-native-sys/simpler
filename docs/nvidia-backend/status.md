@@ -75,9 +75,10 @@ Evidence:
 - `SceneTestCase` L2 compilation accepts `CALLABLE["cuda"]` specs for
   `host_schedule`, compiles them through `KernelCompiler(platform="cuda")`,
   registers the prepared raw callable through the normal L2 `Worker`, builds
-  `CudaVectorAddArgs`, `CudaVectorUnaryArgs`, `CudaVectorScaleArgs`, and
-  `CudaVectorAxpyArgs` from normal `TaskArgsBuilder` CPU tensors/scalars, and
-  validates real copied-back CUDA output data.
+  `CudaVectorAddArgs`, `CudaVectorUnaryArgs`, `CudaVectorScaleArgs`,
+  `CudaVectorAxpyArgs`, `CudaVectorAffineArgs`, and `CudaVectorTernaryArgs`
+  from normal `TaskArgsBuilder` CPU tensors/scalars, and validates real
+  copied-back CUDA output data.
 
 ### Persistent-Device Runtime
 
@@ -124,12 +125,13 @@ for unary `(a, out, n)` task bodies, `elementwise_scale_f32` for scalar
 `(a, out, alpha, n)` task bodies, and `elementwise_axpy_f32` for mixed
 tensor/scalar `(a, b, out, alpha, n)` task bodies. It also accepts
 `elementwise_affine_f32` for two-scalar affine
-`(a, b, out, alpha, beta, n)` task bodies.
+`(a, b, out, alpha, beta, n)` task bodies and `elementwise_triad_f32` for
+three-input `(a, b, c, out, n)` task bodies.
 The no-torch Worker smoke can validate that same non-addition host-schedule
 ABI with `--op mul`, unary ABI with `--op square`, scalar ABI with
 `--op scale`, mixed tensor/scalar ABI with `--op axpy`, and two-scalar affine
-ABI with `--op affine`, which keeps H200 coverage available when the remote
-Python environment lacks `torch`.
+ABI with `--op affine`, and three-input ABI with `--op triad`, which keeps
+H200 coverage available when the remote Python environment lacks `torch`.
 
 Evidence:
 
@@ -739,6 +741,20 @@ H200 JSON plus Markdown/SVG reports. A100 reported `status=pass`,
 `ptx_arch=compute_80`, and `device_wall_ns=16384`; H200 reported
 `status=pass`, `ptx_arch=compute_90`, and `device_wall_ns=41760`.
 
+The three-input triad host-schedule Worker smoke was captured on local A100
+and remote H200 after adding the `(a, b, c, out, n)` ABI:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
+    --op triad --sync-remote-tree --build-runtime
+```
+
+Result: `tmp/cuda-backend/worker-triad-smoke-1af18449/` contains A100 and
+H200 JSON plus Markdown/SVG reports. A100 reported `status=pass`,
+`ptx_arch=compute_80`, and `device_wall_ns=22528`; H200 reported
+`status=pass`, `ptx_arch=compute_90`, and `device_wall_ns=42496`.
+
 The local A100 and remote H200 persistent-device DAG smokes also passed after
 building the native `device` role:
 
@@ -882,16 +898,16 @@ now have first `KernelCompiler` entry points. Both paths can consume
 `CudaTaskBody` style sources. CUDA prepared-callable artifacts can be staged
 through the L2 Python `Worker` registration path. The normal scene-test flow
 can compile and run host-schedule CUDA vector-add, binary elementwise, unary
-square, scalar scale, axpy, and two-scalar affine callable specs and
-persistent-device
+square, scalar scale, axpy, two-scalar affine, and three-input triad callable
+specs and persistent-device
 fork/join, chain, reuse, scalar AXPY, scalar affine, and tensor-tile DAG
 callable specs end to end.
 
 Needed:
 
 - broader CUDA scene-test argument builders beyond the current binary
-  elementwise, unary square, scalar scale, axpy, affine, and persistent DAG
-  tracer bullets.
+  elementwise, unary square, scalar scale, axpy, affine, triad, and persistent
+  DAG tracer bullets.
 
 ### Target Role Cleanup
 

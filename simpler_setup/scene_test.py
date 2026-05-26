@@ -387,41 +387,40 @@ def _build_cuda_host_schedule_args(
         CudaVectorAffineArgs,
         CudaVectorAxpyArgs,
         CudaVectorScaleArgs,
+        CudaVectorTernaryArgs,
         CudaVectorUnaryArgs,
     )
 
     arg_builder = cuda_spec.get("arg_builder", "vector_add_f32")
-    if arg_builder not in {
+    supported_builders = {
         "vector_add_f32",
         "elementwise_binary_f32",
         "elementwise_unary_f32",
         "elementwise_scale_f32",
         "elementwise_axpy_f32",
         "elementwise_affine_f32",
-    }:
+        "elementwise_triad_f32",
+    }
+    if arg_builder not in supported_builders:
         raise NotImplementedError(f"Unsupported CUDA scene-test arg_builder: {arg_builder}")
 
     tensor_names = [spec.name for spec in test_args.specs if isinstance(spec, Tensor)]
     default_arg_count = 2 if arg_builder == "elementwise_unary_f32" else 3
     names = list(cuda_spec.get("args", tensor_names[:default_arg_count]))
-    if arg_builder == "elementwise_affine_f32":
-        expected_arg_count = 5
-    elif arg_builder == "elementwise_axpy_f32":
-        expected_arg_count = 4
-    elif arg_builder == "elementwise_unary_f32":
-        expected_arg_count = 2
-    else:
-        expected_arg_count = 3
+    expected_arg_count = {
+        "elementwise_unary_f32": 2,
+        "elementwise_axpy_f32": 4,
+        "elementwise_affine_f32": 5,
+        "elementwise_triad_f32": 4,
+    }.get(arg_builder, 3)
     if len(names) != expected_arg_count:
         raise ValueError(f"CUDA {arg_builder} scene tests require exactly {expected_arg_count} args")
-    if arg_builder == "elementwise_scale_f32":
-        missing = [name for name in names[:2] if name not in device_buffers.ptrs]
-    elif arg_builder == "elementwise_unary_f32":
-        missing = [name for name in names if name not in device_buffers.ptrs]
-    elif arg_builder in {"elementwise_axpy_f32", "elementwise_affine_f32"}:
-        missing = [name for name in names[:3] if name not in device_buffers.ptrs]
-    else:
-        missing = [name for name in names if name not in device_buffers.ptrs]
+    tensor_arg_count = {
+        "elementwise_scale_f32": 2,
+        "elementwise_axpy_f32": 3,
+        "elementwise_affine_f32": 3,
+    }.get(arg_builder, expected_arg_count)
+    missing = [name for name in names[:tensor_arg_count] if name not in device_buffers.ptrs]
     if missing:
         raise ValueError(f"CUDA {arg_builder} args reference unknown tensors: {', '.join(missing)}")
 
@@ -462,6 +461,14 @@ def _build_cuda_host_schedule_args(
             out=device_buffers.ptrs[names[2]],
             alpha=float(alpha_value),
             beta=float(beta_value),
+            n=n,
+        )
+    if arg_builder == "elementwise_triad_f32":
+        return CudaVectorTernaryArgs(
+            a=device_buffers.ptrs[names[0]],
+            b=device_buffers.ptrs[names[1]],
+            c=device_buffers.ptrs[names[2]],
+            out=device_buffers.ptrs[names[3]],
             n=n,
         )
     return CudaVectorAddArgs(

@@ -31,6 +31,7 @@ from simpler_setup.cuda_callable_compiler import (
     CudaVectorAffineArgs,
     CudaVectorAxpyArgs,
     CudaVectorScaleArgs,
+    CudaVectorTernaryArgs,
     CudaVectorUnaryArgs,
     prepare_cuda_host_schedule_callable,
 )
@@ -212,6 +213,8 @@ def _worker_task_body(op: str) -> str:
         expression = "ctx->alpha * ctx->a[i] + ctx->b[i]"
     elif op == "affine":
         expression = "ctx->alpha * ctx->a[i] + ctx->beta * ctx->b[i]"
+    elif op == "triad":
+        expression = "ctx->a[i] * ctx->b[i] + ctx->c[i]"
     else:
         raise ValueError(f"unknown worker smoke op: {op}")
     return f"""
@@ -239,6 +242,8 @@ def _worker_expected_output(op: str, n: int) -> list[float]:
         return [float(1.5 * i + (2 * i)) for i in range(n)]
     if op == "affine":
         return [float(1.5 * i + 0.5 * (2 * i)) for i in range(n)]
+    if op == "triad":
+        return [float(i * (2 * i) + (3 * i)) for i in range(n)]
     raise ValueError(f"unknown worker smoke op: {op}")
 
 
@@ -278,6 +283,16 @@ struct PtoTaskContext {
     float *out;
     float alpha;
     float beta;
+    unsigned long long n;
+};
+""".strip()
+    if op == "triad":
+        return """
+struct PtoTaskContext {
+    const float *a;
+    const float *b;
+    const float *c;
+    float *out;
     unsigned long long n;
 };
 """.strip()
@@ -322,6 +337,14 @@ def _worker_host_parameters(op: str) -> tuple[str, ...]:
             "float beta",
             "unsigned long long n",
         )
+    if op == "triad":
+        return (
+            "const float *a",
+            "const float *b",
+            "const float *c",
+            "float *out",
+            "unsigned long long n",
+        )
     return (
         "const float *a",
         "const float *b",
@@ -339,6 +362,8 @@ def _worker_host_context_initializer(op: str) -> str:
         return "a, b, out, alpha, n"
     if op == "affine":
         return "a, b, out, alpha, beta, n"
+    if op == "triad":
+        return "a, b, c, out, n"
     return "a, b, out, n"
 
 
@@ -351,6 +376,8 @@ def _worker_host_op(op: str) -> int:
         return 4
     if op == "affine":
         return 5
+    if op == "triad":
+        return 6
     return 1
 
 
@@ -470,16 +497,20 @@ def run_worker_smoke(device: int, n: int, block_dim: int, arch: str, build: bool
         array_t = ctypes.c_float * n
         host_a = array_t(*[float(i) for i in range(n)])
         host_b = array_t(*[float(2 * i) for i in range(n)])
+        host_c = array_t(*[float(3 * i) for i in range(n)])
         host_out = array_t()
         nbytes = ctypes.sizeof(host_a)
 
         dev_a = worker.malloc(nbytes)
         dev_b = worker.malloc(nbytes) if op not in {"scale", "square"} else None
+        dev_c = worker.malloc(nbytes) if op == "triad" else None
         dev_out = worker.malloc(nbytes)
         try:
             worker.copy_to(dev_a, ctypes.addressof(host_a), nbytes)
             if dev_b is not None:
                 worker.copy_to(dev_b, ctypes.addressof(host_b), nbytes)
+            if dev_c is not None:
+                worker.copy_to(dev_c, ctypes.addressof(host_c), nbytes)
 
             if op == "scale":
                 args = CudaVectorScaleArgs(a=dev_a, out=dev_out, alpha=1.5, n=n)
@@ -489,6 +520,8 @@ def run_worker_smoke(device: int, n: int, block_dim: int, arch: str, build: bool
                 args = CudaVectorAxpyArgs(a=dev_a, b=dev_b, out=dev_out, alpha=1.5, n=n)
             elif op == "affine":
                 args = CudaVectorAffineArgs(a=dev_a, b=dev_b, out=dev_out, alpha=1.5, beta=0.5, n=n)
+            elif op == "triad":
+                args = CudaVectorTernaryArgs(a=dev_a, b=dev_b, c=dev_c, out=dev_out, n=n)
             else:
                 args = CudaVectorAddArgs(a=dev_a, b=dev_b, out=dev_out, n=n)
             config = CallConfig()
@@ -502,6 +535,8 @@ def run_worker_smoke(device: int, n: int, block_dim: int, arch: str, build: bool
             worker.free(dev_a)
             if dev_b is not None:
                 worker.free(dev_b)
+            if dev_c is not None:
+                worker.free(dev_c)
             worker.free(dev_out)
     finally:
         worker.close()
@@ -537,7 +572,7 @@ def main() -> None:
     parser.add_argument("--runner", choices=("direct_c_api", "worker"), default="direct_c_api")
     parser.add_argument(
         "--op",
-        choices=("add", "mul", "scale", "square", "axpy", "affine"),
+        choices=("add", "mul", "scale", "square", "axpy", "affine", "triad"),
         default="add",
         help="Worker task body operation",
     )

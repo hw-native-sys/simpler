@@ -21,6 +21,7 @@ enum PtoCudaHostScheduleOp : uint32_t {
     PTO_CUDA_HOST_OP_VECTOR_AXPY_F32 = 3,
     PTO_CUDA_HOST_OP_VECTOR_UNARY_F32 = 4,
     PTO_CUDA_HOST_OP_VECTOR_AFFINE_F32 = 5,
+    PTO_CUDA_HOST_OP_VECTOR_TRIAD_F32 = 6,
 };
 
 struct PtoCudaHostCallable {
@@ -69,6 +70,14 @@ struct PtoCudaVectorAffineArgs {
     float *out;
     float alpha;
     float beta;
+    uint64_t n;
+};
+
+struct PtoCudaVectorTernaryArgs {
+    const float *a;
+    const float *b;
+    const float *c;
+    float *out;
     uint64_t n;
 };
 

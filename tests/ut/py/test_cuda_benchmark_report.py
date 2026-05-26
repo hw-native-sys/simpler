@@ -675,6 +675,15 @@ def test_cuda_pair_smoke_accepts_affine_op():
     assert args.sync_remote_tree is True
 
 
+def test_cuda_pair_smoke_accepts_triad_op():
+    cuda_pair_smoke = _load_pair_smoke_module()
+
+    args = cuda_pair_smoke.parse_args(["--op", "triad", "--sync-remote-tree"])
+
+    assert args.op == "triad"
+    assert args.sync_remote_tree is True
+
+
 def test_cuda_pair_smoke_can_sync_local_tree_and_dry_run(tmp_path):
     cuda_pair_smoke = _load_pair_smoke_module()
     calls = []
@@ -1046,6 +1055,25 @@ def test_cuda_worker_smoke_affine_helpers_use_two_scalars():
     assert cuda_smoke._worker_host_op("affine") == 5
 
 
+def test_cuda_worker_smoke_triad_helpers_use_three_tensors():
+    cuda_smoke = _load_smoke_module()
+
+    body = cuda_smoke._worker_task_body("triad")
+
+    assert "ctx->out[i] = ctx->a[i] * ctx->b[i] + ctx->c[i];" in body
+    assert cuda_smoke._worker_expected_output("triad", 4) == [0.0, 5.0, 14.0, 27.0]
+    assert "const float *c;" in cuda_smoke._worker_context_definition("triad")
+    assert cuda_smoke._worker_host_parameters("triad") == (
+        "const float *a",
+        "const float *b",
+        "const float *c",
+        "float *out",
+        "unsigned long long n",
+    )
+    assert cuda_smoke._worker_host_context_initializer("triad") == "a, b, c, out, n"
+    assert cuda_smoke._worker_host_op("triad") == 6
+
+
 def test_cuda_smoke_main_writes_output_json(tmp_path, monkeypatch, capsys):
     cuda_smoke = _load_smoke_module()
     output = tmp_path / "smoke.json"
@@ -1302,6 +1330,57 @@ def test_cuda_smoke_main_accepts_affine_output_json(tmp_path, monkeypatch, capsy
     assert printed == written
     assert written["op"] == "affine"
     assert written["mode"] == "worker/affine"
+
+
+def test_cuda_smoke_main_accepts_triad_output_json(tmp_path, monkeypatch, capsys):
+    cuda_smoke = _load_smoke_module()
+    output = tmp_path / "triad-smoke.json"
+
+    monkeypatch.setattr(
+        cuda_smoke,
+        "run_worker_smoke",
+        lambda device, n, block_dim, arch, build, op: {
+            "status": "pass",
+            "runner": "worker",
+            "runtime": "host_schedule",
+            "mode": f"worker/{op}",
+            "op": op,
+            "device": device,
+            "n": n,
+            "block_dim": block_dim,
+            "ptx_arch": arch,
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cuda_smoke.py",
+            "--runner",
+            "worker",
+            "--op",
+            "triad",
+            "--device",
+            "1",
+            "--n",
+            "64",
+            "--block-dim",
+            "32",
+            "--arch",
+            "compute_90",
+            "--no-build",
+            "--output-json",
+            str(output),
+        ],
+    )
+
+    cuda_smoke.main()
+
+    printed = json.loads(capsys.readouterr().out)
+    written = json.loads(output.read_text())
+    assert printed == written
+    assert written["op"] == "triad"
+    assert written["mode"] == "worker/triad"
 
 
 def test_persistent_direct_launch_can_use_multiple_worker_blocks_per_task():
