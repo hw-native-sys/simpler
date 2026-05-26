@@ -357,7 +357,10 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     assert remote[:6] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "h200-box"]
     remote_shell = remote[-1]
     assert "cd /remote/pto-cu" in remote_shell
-    assert "git fetch origin design/nvidia-backend >/dev/null" in remote_shell
+    assert (
+        "timeout 60 git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=30 "
+        "fetch origin design/nvidia-backend" in remote_shell
+    )
     assert "git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null" in remote_shell
     assert "CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH PYTHONPATH=$PWD:$PWD/python" in remote_shell
     assert "--arch compute_90" in remote_shell

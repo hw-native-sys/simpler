@@ -76,7 +76,9 @@ PYTHONPATH=$PWD:$PWD/python \
 
 It runs the local benchmark, refreshes the remote `bizhaoh200` checkout,
 copies the H200 artifact directory back, merges the JSON reports, and rebuilds
-the local artifact index.
+the local artifact index. The remote checkout step uses bounded Git HTTPS
+low-speed settings by default so a bad network fetch fails instead of
+stranding the paired run, and the fetch is wrapped in a shell `timeout`.
 
 Refresh the local artifact index after adding or merging captures:
 

@@ -369,6 +369,11 @@ PYTHONPATH=$PWD:$PWD/python \
 This runs the local A100 benchmark, checks out the current branch on
 `bizhaoh200`, runs the H200 benchmark, copies the H200 artifact directory back,
 merges the two JSON reports, and refreshes `tmp/cuda-backend/index.md`.
+The remote checkout step uses bounded Git HTTPS low-speed settings by default;
+override them with `--remote-git-low-speed-limit` and
+`--remote-git-low-speed-time` if the remote network is unusually slow. The
+fetch is also wrapped in `timeout`; override it with
+`--remote-git-fetch-timeout`.
 
 Use `--dry-run` to print the commands without launching benchmarks. The current
 committed summary uses the `38ff341e` artifact names in

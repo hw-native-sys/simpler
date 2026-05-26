@@ -123,7 +123,10 @@ Remote H200:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git pull --ff-only >/dev/null && \
+  'cd /data/shibizhao/pto-cu && \
+   timeout 60 git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=30 \
+     fetch origin design/nvidia-backend >/dev/null && \
+   git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,65536,1048576 --repeats 3 \
