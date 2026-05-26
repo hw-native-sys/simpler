@@ -1512,6 +1512,28 @@ def test_triad_dag_shape_uses_third_tensor_descriptor_field():
     assert tasks[0].out == 202
 
 
+def test_bad_no_root_dag_shape_has_no_initial_ready_tasks():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    host_fanin, dependents, tasks = cuda_persistent_smoke._make_dag_shape(
+        "bad_no_root",
+        64,
+        101,
+        102,
+        201,
+        202,
+        203,
+        204,
+        301,
+    )
+
+    assert list(host_fanin) == [1]
+    assert list(dependents) == [0]
+    assert len(tasks) == 1
+    assert tasks[0].initial_fanin == 1
+    assert tasks[0].dependent_count == 0
+
+
 def test_persistent_dag_compiler_path_uses_kernel_compiler(tmp_path, monkeypatch):
     cuda_persistent_smoke = _load_persistent_smoke_module()
     seen = {}

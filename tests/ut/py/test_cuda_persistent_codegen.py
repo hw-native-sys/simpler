@@ -299,6 +299,10 @@ def test_render_persistent_dag_source_records_device_scheduler_errors():
     assert "pto_dag_record_error(state, 4U, dependent_id);" in source
     assert "state->fanin[idx] != state->tasks[idx].initial_fanin" in source
     assert "pto_dag_record_error(state, 5U, idx);" in source
+    assert "unsigned int initial_ready_count = 0U;" in source
+    assert "++initial_ready_count;" in source
+    assert "initial_ready_count == 0U" in source
+    assert "pto_dag_record_error(state, 6U, 0U);" in source
     assert "atomicAdd(state->error_count, 0U) != 0U" in source
 
 

@@ -659,14 +659,19 @@ extern "C" __global__ void pto_persistent_dag_f32_executor(const PtoCudaPersiste
 
     if (blockIdx.x == 0) {{
         if (threadIdx.x == 0) {{
+            unsigned int initial_ready_count = 0U;
             for (unsigned int idx = 0; static_cast<unsigned long long>(idx) < state->task_count; ++idx) {{
                 if (state->fanin[idx] != state->tasks[idx].initial_fanin) {{
                     pto_dag_record_error(state, 5U, idx);
                     continue;
                 }}
                 if (state->tasks[idx].initial_fanin == 0U) {{
+                    ++initial_ready_count;
                     pto_dag_push_ready(state, idx);
                 }}
+            }}
+            if (state->task_count != 0ULL && initial_ready_count == 0U) {{
+                pto_dag_record_error(state, 6U, 0U);
             }}
         }}
         return;

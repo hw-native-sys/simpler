@@ -523,6 +523,19 @@ PYTHONPATH=$PWD:$PWD/python \
 Result: expected non-zero exit with `persistent dag scheduler error code=5
 task_id=0 count=1`.
 
+The synthetic no-root shape was run locally to verify that a runtime graph
+descriptor cannot deadlock workers by declaring no zero-fan-in task:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 1 --n 1024 --arch compute_80 \
+    --mode dag --queue-capacity 1 --dag-shape bad_no_root
+```
+
+Result: expected non-zero exit with `persistent dag scheduler error code=6
+task_id=0 count=1`.
+
 The same scheduler-diagnostic slice was verified on the remote H200 checkout
 after pushing this change:
 
@@ -557,19 +570,23 @@ The H200 fan-in-underflow check returned the expected diagnostic:
 The H200 initial-fan-in mismatch check returned the expected diagnostic:
 `persistent dag scheduler error code=5 task_id=0 count=1`.
 
-After adding invalid-dependent, dependent-range, fan-in-underflow, and
-initial-fan-in scheduler diagnostics, the focused CUDA test set was rerun
-locally:
+The H200 no-root check returned the expected diagnostic:
+`persistent dag scheduler error code=6 task_id=0 count=1`.
+
+After adding invalid-dependent, dependent-range, fan-in-underflow,
+initial-fan-in, and no-root scheduler diagnostics, the focused CUDA test set
+was rerun locally:
 
 ```bash
 .venv/bin/python -m pytest \
   tests/ut/py/test_cuda_backend.py \
   tests/ut/py/test_cuda_persistent_codegen.py \
   tests/ut/py/test_cuda_kernel_compiler.py \
-  tests/ut/py/test_cuda_scene_test.py -q
+  tests/ut/py/test_cuda_scene_test.py \
+  tests/ut/py/test_cuda_benchmark_report.py -q
 ```
 
-Result: `43 passed`.
+Result: `160 passed`.
 
 After adding shared CUDA preflight skip reporting, the local A100-focused test
 set was rerun:
@@ -992,8 +1009,8 @@ Needed:
   configurable queue/DAG worker blocks, direct worker-blocks-per-task, and
   callable stream id tracer bullet;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
-  invalid-dependent-ID, dependent-range, fan-in-underflow, and
-  initial-fan-in diagnostics.
+  invalid-dependent-ID, dependent-range, fan-in-underflow, initial-fan-in, and
+  no-root diagnostics.
 
 ### Tuned Tensor Workloads
 
