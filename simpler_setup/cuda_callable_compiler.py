@@ -542,6 +542,21 @@ __device__ bool pto_dag_pop_ready(const PtoCudaPersistentDagState *state, unsign
     return true;
 }}
 
+__device__ unsigned int pto_dag_try_decrement_fanin(
+    const PtoCudaPersistentDagState *state,
+    unsigned int task_id) {{
+    while (true) {{
+        unsigned int old = atomicAdd(&state->fanin[task_id], 0U);
+        if (old == 0U) {{
+            return 0U;
+        }}
+        unsigned int observed = atomicCAS(&state->fanin[task_id], old, old - 1U);
+        if (observed == old) {{
+            return old;
+        }}
+    }}
+}}
+
 {rendered_tasks}
 
 {rendered_dispatch}
@@ -592,7 +607,11 @@ extern "C" __global__ void pto_persistent_dag_f32_executor(const PtoCudaPersiste
                         pto_dag_record_error(state, 2U, dependent_id);
                         continue;
                     }}
-                    unsigned int old = atomicSub(&state->fanin[dependent_id], 1U);
+                    unsigned int old = pto_dag_try_decrement_fanin(state, dependent_id);
+                    if (old == 0U) {{
+                        pto_dag_record_error(state, 4U, dependent_id);
+                        continue;
+                    }}
                     if (old == 1U) {{
                         pto_dag_push_ready(state, dependent_id);
                     }}

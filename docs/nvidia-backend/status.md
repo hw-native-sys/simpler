@@ -86,7 +86,7 @@ execution modes:
 - tensor-tile DAG descriptor with rows/cols/inner/stride metadata.
 - device-side scheduler diagnostics for unsupported generated-dispatch
   `func_id` values, invalid dependent task IDs, and out-of-range dependent
-  spans.
+  spans, and fan-in underflow.
 
 The persistent DAG path compiles generated CUDA source with `nvcc` and stores
 the generated source, PTX, and manifest under
@@ -404,6 +404,19 @@ PYTHONPATH=$PWD:$PWD/python \
 Result: expected non-zero exit with `persistent dag scheduler error code=3
 task_id=0 count=1`.
 
+The synthetic fan-in-underflow shape was run locally to verify that a runtime
+graph descriptor cannot decrement a dependent task's fan-in below zero:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 3 --n 1024 --arch compute_80 \
+    --mode dag --queue-capacity 2 --dag-shape bad_fanin_underflow
+```
+
+Result: expected non-zero exit with `persistent dag scheduler error code=4
+task_id=2 count=1`.
+
 The same scheduler-diagnostic slice was verified on the remote H200 checkout
 after pushing this change:
 
@@ -432,8 +445,11 @@ The H200 invalid-dependent check returned the expected diagnostic:
 The H200 invalid-dependent-range check returned the expected diagnostic:
 `persistent dag scheduler error code=3 task_id=0 count=1`.
 
-After adding invalid-dependent and dependent-range scheduler diagnostics, the
-focused CUDA test set was rerun locally:
+The H200 fan-in-underflow check returned the expected diagnostic:
+`persistent dag scheduler error code=4 task_id=2 count=1`.
+
+After adding invalid-dependent, dependent-range, and fan-in-underflow
+scheduler diagnostics, the focused CUDA test set was rerun locally:
 
 ```bash
 .venv/bin/python -m pytest \
@@ -443,7 +459,7 @@ focused CUDA test set was rerun locally:
   tests/ut/py/test_cuda_scene_test.py -q
 ```
 
-Result: `41 passed`.
+Result: `42 passed`.
 
 After adding shared CUDA preflight skip reporting, the local A100-focused test
 set was rerun:
@@ -562,7 +578,7 @@ Needed:
 - lifecycle validation beyond the current scratch-reuse smoke;
 - resource policy for scheduler blocks, worker blocks, and stream use;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
-  invalid-dependent-ID, and dependent-range diagnostics.
+  invalid-dependent-ID, dependent-range, and fan-in-underflow diagnostics.
 
 ### Tuned Tensor Workloads
 

@@ -664,6 +664,42 @@ else:
 
 
 @requires_cuda
+def test_cuda_persistent_device_smoke_reports_bad_fanin_underflow_errors():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+try:
+    run_persistent_smoke(
+        device=0,
+        task_count=3,
+        n=1024,
+        arch="compute_80",
+        mode="dag",
+        queue_capacity=2,
+        dag_shape="bad_fanin_underflow",
+    )
+except RuntimeError as exc:
+    message = str(exc)
+    assert "persistent dag scheduler error" in message
+    assert "code=4" in message
+    assert "task_id=2" in message
+else:
+    raise AssertionError("expected persistent DAG fanin-underflow scheduler error")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+@requires_cuda
 def test_cuda_persistent_device_smoke_runs_dispatch_dag_chain():
     script = """
 import sys

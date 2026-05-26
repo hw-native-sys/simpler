@@ -249,6 +249,8 @@ def test_render_persistent_dag_source_records_device_scheduler_errors():
     assert "pto_dag_record_error(state, 3U, task_id);" in source
     assert "static_cast<unsigned long long>(dependent_id) >= state->task_count" in source
     assert "pto_dag_record_error(state, 2U, dependent_id);" in source
+    assert "if (old == 0U)" in source
+    assert "pto_dag_record_error(state, 4U, dependent_id);" in source
 
 
 def test_render_persistent_dag_source_rejects_duplicate_func_id():
