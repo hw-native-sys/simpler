@@ -12,7 +12,7 @@ import logging
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -76,6 +76,22 @@ class RuntimeBinaries:
     aicore_path: Path
     simpler_log_path: Path
     sim_context_path: Optional[Path] = None
+    role_paths: dict[str, Path] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.role_paths:
+            self.role_paths = {
+                "host": self.host_path,
+                "aicpu": self.aicpu_path,
+                "aicore": self.aicore_path,
+            }
+
+    def path_for_role(self, role: str) -> Path:
+        try:
+            return self.role_paths[role]
+        except KeyError:
+            available = ", ".join(sorted(self.role_paths)) or "(none)"
+            raise KeyError(f"RuntimeBinaries has no target role {role!r}; available roles: {available}") from None
 
 
 class RuntimeBuilder:
@@ -143,6 +159,12 @@ class RuntimeBuilder:
         source_dirs = [str((config_dir / p).resolve()) for p in cfg["source_dirs"]]
         return include_dirs, source_dirs
 
+    def _target_role_paths(self, paths: dict[str, Path]) -> dict[str, Path]:
+        role_paths = dict(paths)
+        if self._arch == "cuda":
+            role_paths["device"] = paths["aicpu"]
+        return role_paths
+
     def _lookup_binaries(self, name: str, output_dir: Path) -> RuntimeBinaries:
         """Look up pre-built binaries from output_dir.
 
@@ -192,6 +214,7 @@ class RuntimeBuilder:
             aicore_path=paths["aicore"],
             simpler_log_path=simpler_log_path,
             sim_context_path=sim_context_path,
+            role_paths=self._target_role_paths(paths),
         )
 
     def get_binaries(self, name: str, build: bool = False) -> RuntimeBinaries:
@@ -268,12 +291,18 @@ class RuntimeBuilder:
 
         self._place_compile_commands(name)
         logger.info("Build complete!")
+        paths = {
+            "host": host_path,
+            "aicpu": aicpu_path,
+            "aicore": aicore_path,
+        }
         return RuntimeBinaries(
             host_path=host_path,
             aicpu_path=aicpu_path,
             aicore_path=aicore_path,
             simpler_log_path=simpler_log_path,
             sim_context_path=sim_context_path,
+            role_paths=self._target_role_paths(paths),
         )
 
     def _resolve_sim_context_path(self) -> Optional[Path]:

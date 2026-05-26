@@ -209,6 +209,48 @@ class TestRuntimeBuilderGetBinaries:
         assert result.aicore_path.name == "libaicore.so"
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_runtime_binaries_exposes_role_keyed_paths(self, MockCompiler, tmp_path, default_test_platform, test_arch):
+        """get_binaries(build=True) exposes a role-keyed path view."""
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        self._make_runtime(tmp_path, test_arch)
+
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+
+        builder = RuntimeBuilder(platform=default_test_platform)
+        result = builder.get_binaries("test_rt", build=True)
+
+        assert result.role_paths == {
+            "host": result.host_path,
+            "aicpu": result.aicpu_path,
+            "aicore": result.aicore_path,
+        }
+        assert result.path_for_role("host") == result.host_path
+        with pytest.raises(KeyError, match="device"):
+            result.path_for_role("device")
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_cuda_runtime_binaries_exposes_device_compat_role(self, MockCompiler, tmp_path, monkeypatch):
+        """CUDA gets a host/device role view while preserving legacy paths."""
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
+        self._make_runtime(tmp_path, "cuda")
+
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+
+        builder = RuntimeBuilder(platform="cuda")
+        result = builder.get_binaries("test_rt", build=True)
+
+        assert result.role_paths["host"] == result.host_path
+        assert result.role_paths["device"] == result.aicpu_path
+        assert result.path_for_role("device") == result.aicpu_path
+        assert result.aicore_path.name == "libaicore.so"
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_calls_compiler_three_times(self, MockCompiler, tmp_path, default_test_platform, test_arch):
         """get_binaries(build=True) invokes compiler.compile() exactly 3 times."""
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415

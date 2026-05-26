@@ -436,7 +436,10 @@ Required Python/build changes:
 
 - replace global `TARGETS = ("host", "aicpu", "aicore")` with per-platform or
   per-runtime target discovery;
-- generalize `RuntimeBinaries` so CUDA can return a map of named artifacts;
+- finish generalizing `RuntimeBinaries`; the current transitional
+  `role_paths` map exposes Ascend's legacy roles and CUDA's compatibility
+  `device` role, but CUDA build configs still emit through the legacy target
+  names;
 - add a CUDA callable compiler that owns wrapper generation and final device
   link;
 - add manifest fields to `ChipCallable` or introduce a CUDA callable payload

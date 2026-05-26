@@ -11,8 +11,11 @@ design work so evaluation results are not mistaken for a complete backend.
 - `cuda` maps to the `cuda/onboard` platform variant.
 - `RuntimeBuilder(platform="cuda")` discovers both CUDA runtimes:
   `host_schedule` and `persistent_device`.
-- The current runtime layout still fits the existing host/aicpu/aicore binary
-  slots while the CUDA target-role cleanup remains future work.
+- `RuntimeBinaries` now exposes a role-keyed view through `role_paths` and
+  `path_for_role(...)`. Ascend platforms map the existing `host`, `aicpu`,
+  and `aicore` roles directly. CUDA keeps the legacy path fields for
+  compatibility and adds a transitional `device` role that points at the
+  compatibility AICPU slot.
 
 Evidence:
 
@@ -611,15 +614,25 @@ Needed:
 
 ### Target Role Cleanup
 
-CUDA still fits through the legacy host/aicpu/aicore binary shape. The design
-calls for target roles such as `host`, `device`, and optional `scheduler` so
-CUDA does not have to pretend to own AICPU/AICore artifacts.
+CUDA still builds through the legacy host/aicpu/aicore target list, but
+runtime consumers can now read binaries through roles instead of direct
+hardware slot names. The current compatibility mapping is:
+
+- Ascend: `host`, `aicpu`, and `aicore` map to their existing artifacts.
+- CUDA: `host` maps to the host runtime artifact, and `device` maps to the
+  compatibility AICPU artifact until CUDA build configs declare native device
+  targets.
+
+The remaining cleanup is to remove the need for CUDA to pretend it owns
+AICPU/AICore artifacts at build-config time.
 
 Needed:
 
-- a role-keyed binary model;
-- Ascend compatibility mapping for `host`, `aicpu`, and `aicore`;
-- CUDA mapping for host runtime and device images.
+- native CUDA build roles for device images;
+- optional `scheduler` role once `persistent_device` has a separately named
+  scheduler/runtime image;
+- migration of CUDA call sites away from direct `aicpu_path` and
+  `aicore_path` usage.
 
 ### Persistent Scheduler Generalization
 
