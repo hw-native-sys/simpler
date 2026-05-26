@@ -74,6 +74,20 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-dir tmp/cuda-backend/worker-mul-smoke
 ```
 
+Use `cuda_pair_smoke.py` when the same no-torch Worker smoke should be
+captured on local A100 and remote H200 in one command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
+    --op mul --sync-remote-tree
+```
+
+This writes `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg` under
+`tmp/cuda-backend/worker-<op>-smoke-<commit>/`, then refreshes
+`tmp/cuda-backend/index.md`.
+
 Run the persistent-device tracer-bullet smoke:
 
 ```bash
@@ -418,6 +432,20 @@ same commit as the synced source tree.
 Use `--dry-run` to print the commands without launching benchmarks. The current
 committed summary uses the `32744245` artifact names in
 `docs/nvidia-backend/evaluation-current.md`.
+
+For a lighter no-torch real-data check, run the paired Worker smoke instead of
+the full benchmark:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
+    --op mul --sync-remote-tree
+```
+
+It mirrors the benchmark runner's remote refresh, `--skip-remote-refresh`,
+`--sync-remote-tree`, and `--dry-run` controls, but only captures
+host-schedule Worker smoke JSON on A100/H200, renders a compact smoke report,
+and refreshes the artifact index.
 
 The script writes:
 

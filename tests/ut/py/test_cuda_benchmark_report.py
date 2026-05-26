@@ -99,6 +99,26 @@ def _load_pair_benchmark_module():
         sys.modules.pop(spec.name, None)
 
 
+def _load_pair_smoke_module():
+    script_path = (
+        Path(__file__).resolve().parents[3]
+        / ".agents"
+        / "skills"
+        / "cuda-backend-eval"
+        / "scripts"
+        / "cuda_pair_smoke.py"
+    )
+    spec = importlib.util.spec_from_file_location("cuda_pair_smoke", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
 def _load_current_summary_module():
     script_dir = Path(__file__).resolve().parents[3] / ".agents" / "skills" / "cuda-backend-eval" / "scripts"
     script_path = script_dir / "cuda_current_summary.py"
@@ -516,6 +536,93 @@ def test_cuda_pair_benchmark_dry_run_does_not_launch_benchmarks(tmp_path):
     assert commands[0][0] == "env"
     assert commands[1][0] == "ssh"
     assert commands[2][0] == "scp"
+
+
+def test_cuda_pair_smoke_builds_worker_mul_a100_h200_workflow(tmp_path):
+    cuda_pair_smoke = _load_pair_smoke_module()
+    config = cuda_pair_smoke.PairedSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        branch="design/nvidia-backend",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        op="mul",
+    )
+
+    local = cuda_pair_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_smoke.build_remote_smoke_command(config, "abc123")
+    scp = cuda_pair_smoke.build_scp_command(config, "abc123")
+    report = cuda_pair_smoke.build_report_command(config, "abc123")
+    index = cuda_pair_smoke.build_index_command(config)
+
+    assert local[:2] == ["env", f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}"]
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_smoke.py" in local
+    assert "--runner" in local
+    assert "worker" in local
+    assert "--op" in local
+    assert "mul" in local
+    assert "--arch" in local
+    assert "compute_80" in local
+    assert str(tmp_path / "cuda-backend" / "worker-mul-smoke-abc123" / "a100.json") in local
+
+    assert remote[:6] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "h200-box"]
+    remote_shell = remote[-1]
+    assert "cd /remote/pto-cu" in remote_shell
+    assert (
+        "timeout 60 git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=30 "
+        "fetch origin design/nvidia-backend" in remote_shell
+    )
+    assert "git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null" in remote_shell
+    assert "CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH PYTHONPATH=$PWD:$PWD/python" in remote_shell
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_smoke.py" in remote_shell
+    assert "--runner worker" in remote_shell
+    assert "--op mul" in remote_shell
+    assert "--arch compute_90" in remote_shell
+    assert "worker-mul-smoke-abc123/h200.json" in remote_shell
+
+    assert scp == [
+        "scp",
+        f"h200-box:/remote/pto-cu/{tmp_path / 'cuda-backend' / 'worker-mul-smoke-abc123' / 'h200.json'}",
+        str(tmp_path / "cuda-backend" / "worker-mul-smoke-abc123" / "h200.json"),
+    ]
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_smoke_report.py" in report
+    assert str(tmp_path / "cuda-backend" / "worker-mul-smoke-abc123" / "a100.json") in report
+    assert str(tmp_path / "cuda-backend" / "worker-mul-smoke-abc123" / "h200.json") in report
+    assert "worker-mul-smoke-abc123" in report
+    assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
+
+
+def test_cuda_pair_smoke_can_sync_local_tree_and_dry_run(tmp_path):
+    cuda_pair_smoke = _load_pair_smoke_module()
+    calls = []
+
+    def fake_runner(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="local123\n", stderr="")
+
+    config = cuda_pair_smoke.PairedSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        sync_remote_tree=True,
+    )
+
+    commands = cuda_pair_smoke.run_paired_smoke(config, runner=fake_runner, dry_run=True)
+
+    assert calls == [(["git", "rev-parse", "--short", "HEAD"], {"check": True, "capture_output": True, "text": True})]
+    assert len(commands) == 6
+    sync = commands[1]
+    assert sync[:3] == ["rsync", "-a", "--delete"]
+    assert sync[-2:] == [f"{Path.cwd()}/", "h200-box:/remote/pto-cu/"]
+    assert "git fetch" not in commands[2][-1]
+    assert "git checkout" not in commands[2][-1]
+    assert any("worker-add-smoke-local123" in part for part in commands[0])
+    assert "worker-add-smoke-local123" in commands[2][-1]
+    assert "worker-add-smoke-local123" in commands[3][1]
+    assert any("worker-add-smoke-local123" in part for part in commands[4])
 
 
 def test_find_nvcc_uses_cuda_home_when_nvcc_is_not_on_path(tmp_path, monkeypatch):

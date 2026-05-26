@@ -159,6 +159,9 @@ Evidence:
   compact smoke Markdown and SVG reports.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py` automates
   the local A100 run, remote H200 run, artifact copy, merge, and index refresh.
+- `.agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py` automates the
+  no-torch host-schedule Worker smoke on local A100 and remote H200, then
+  renders the compact smoke report and refreshes the artifact index.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_artifact_index.py` indexes
   local `tmp/cuda-backend/` artifacts, including tensor-tile shapes.
 - `.agents/skills/cuda-backend-eval/SKILL.md` documents the current paired
@@ -296,6 +299,19 @@ with `--output-json` and rendered through `cuda_smoke_report.py`:
 - Report:
   `tmp/cuda-backend/worker-mul-smoke-output-json/cuda-smoke-report.md`
 - SVG: `tmp/cuda-backend/worker-mul-smoke-output-json/cuda-smoke-report.svg`
+
+The paired no-torch smoke runner was also verified with remote tree sync:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
+    --op mul --sync-remote-tree
+```
+
+Result: A100 `status=pass`, `mode=worker/mul`, `ptx_arch=compute_80`,
+`device_wall_ns=20480`; H200 `status=pass`, `mode=worker/mul`,
+`ptx_arch=compute_90`, `device_wall_ns=20000`. The generated artifacts are
+under `tmp/cuda-backend/worker-mul-smoke-d5788710/`.
 
 The docs and skill updates were checked with targeted `pre-commit` runs and
 `git diff --check` before commit.

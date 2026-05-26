@@ -97,6 +97,21 @@ excludes `.venv`, `build`, and `tmp`, and labels both GPU artifacts with the
 local commit. It syncs `.git` so the remote benchmark metadata reports the
 same commit as the synced source tree.
 
+Use the paired smoke runner when the goal is a fast real-data A100/H200 check
+without requiring `torch` on the H200 environment:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
+    --op mul --sync-remote-tree
+```
+
+It captures host-schedule Worker smoke JSON on both GPUs, renders
+`cuda-smoke-report.md` and `cuda-smoke-report.svg`, and refreshes
+`tmp/cuda-backend/index.md`. It supports the same remote refresh,
+`--skip-remote-refresh`, `--sync-remote-tree`, and `--dry-run` controls as the
+paired benchmark runner.
+
 Refresh the local artifact index after adding or merging captures:
 
 ```bash
