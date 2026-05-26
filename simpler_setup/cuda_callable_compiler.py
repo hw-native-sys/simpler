@@ -535,6 +535,9 @@ __device__ bool pto_dag_pop_ready(const PtoCudaPersistentDagState *state, unsign
     unsigned int slot = ticket % state->queue_capacity;
     unsigned int ready_value = ticket + 1U;
     while (atomicAdd(&state->ready_flags[slot], 0U) != ready_value) {{
+        if (atomicAdd(state->error_count, 0U) != 0U) {{
+            return false;
+        }}
     }}
     *task_id = state->ready_queue[slot];
     __threadfence();
@@ -568,6 +571,10 @@ extern "C" __global__ void pto_persistent_dag_f32_executor(const PtoCudaPersiste
     if (blockIdx.x == 0) {{
         if (threadIdx.x == 0) {{
             for (unsigned int idx = 0; static_cast<unsigned long long>(idx) < state->task_count; ++idx) {{
+                if (state->fanin[idx] != state->tasks[idx].initial_fanin) {{
+                    pto_dag_record_error(state, 5U, idx);
+                    continue;
+                }}
                 if (state->tasks[idx].initial_fanin == 0U) {{
                     pto_dag_push_ready(state, idx);
                 }}

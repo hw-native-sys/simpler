@@ -251,6 +251,9 @@ def test_render_persistent_dag_source_records_device_scheduler_errors():
     assert "pto_dag_record_error(state, 2U, dependent_id);" in source
     assert "if (old == 0U)" in source
     assert "pto_dag_record_error(state, 4U, dependent_id);" in source
+    assert "state->fanin[idx] != state->tasks[idx].initial_fanin" in source
+    assert "pto_dag_record_error(state, 5U, idx);" in source
+    assert "atomicAdd(state->error_count, 0U) != 0U" in source
 
 
 def test_render_persistent_dag_source_rejects_duplicate_func_id():

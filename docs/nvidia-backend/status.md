@@ -86,7 +86,7 @@ execution modes:
 - tensor-tile DAG descriptor with rows/cols/inner/stride metadata.
 - device-side scheduler diagnostics for unsupported generated-dispatch
   `func_id` values, invalid dependent task IDs, and out-of-range dependent
-  spans, and fan-in underflow.
+  spans, fan-in underflow, and initial-fan-in mismatch.
 
 The persistent DAG path compiles generated CUDA source with `nvcc` and stores
 the generated source, PTX, and manifest under
@@ -417,6 +417,20 @@ PYTHONPATH=$PWD:$PWD/python \
 Result: expected non-zero exit with `persistent dag scheduler error code=4
 task_id=2 count=1`.
 
+The synthetic initial-fan-in mismatch shape was run locally to verify that a
+runtime graph descriptor cannot start from fan-in counters that disagree with
+task metadata:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 1 --n 1024 --arch compute_80 \
+    --mode dag --queue-capacity 1 --dag-shape bad_initial_fanin
+```
+
+Result: expected non-zero exit with `persistent dag scheduler error code=5
+task_id=0 count=1`.
+
 The same scheduler-diagnostic slice was verified on the remote H200 checkout
 after pushing this change:
 
@@ -448,8 +462,12 @@ The H200 invalid-dependent-range check returned the expected diagnostic:
 The H200 fan-in-underflow check returned the expected diagnostic:
 `persistent dag scheduler error code=4 task_id=2 count=1`.
 
-After adding invalid-dependent, dependent-range, and fan-in-underflow
-scheduler diagnostics, the focused CUDA test set was rerun locally:
+The H200 initial-fan-in mismatch check returned the expected diagnostic:
+`persistent dag scheduler error code=5 task_id=0 count=1`.
+
+After adding invalid-dependent, dependent-range, fan-in-underflow, and
+initial-fan-in scheduler diagnostics, the focused CUDA test set was rerun
+locally:
 
 ```bash
 .venv/bin/python -m pytest \
@@ -459,7 +477,7 @@ scheduler diagnostics, the focused CUDA test set was rerun locally:
   tests/ut/py/test_cuda_scene_test.py -q
 ```
 
-Result: `42 passed`.
+Result: `43 passed`.
 
 After adding shared CUDA preflight skip reporting, the local A100-focused test
 set was rerun:
@@ -578,7 +596,8 @@ Needed:
 - lifecycle validation beyond the current scratch-reuse smoke;
 - resource policy for scheduler blocks, worker blocks, and stream use;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
-  invalid-dependent-ID, dependent-range, and fan-in-underflow diagnostics.
+  invalid-dependent-ID, dependent-range, fan-in-underflow, and
+  initial-fan-in diagnostics.
 
 ### Tuned Tensor Workloads
 
