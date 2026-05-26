@@ -28,16 +28,26 @@
 //   SMT enabled on phy 1..7 -> 2 logical CPUs per phy_cpu (ht 0 + ht 1)
 //   AICPU cluster mapping: cluster_id = phy_cpu_id / 2, die_id = phy_cpu_id / 4
 //
-// Placement intent (1 orch + 4 sched):
-//   orch_die       = 1 (die 0 carries reserved phy 0 -> orch lives on the "clean" die)
-//   orch_cluster   = 2 (smallest cluster_id on die 1, both phy 4 & 5 alive)
-//   remote_cluster = 1 (smallest "full" cluster on die 0; cluster 0 is half so excluded)
+// Placement intent (directa-stage1: single-die 1 orch + 4 sched, all on die 1):
+//   orch_die       = 1 (die 0 carries reserved phy 0 -> avoid it entirely)
+//   orch_cluster   = 2 (cpu 7..10)
+//   remote_cluster = 3 (cpu 11..14)  — within-die cross-cluster, NOT cross-die
 //
-//   orch    = cpu_id  9  (cluster 2 / phy 5 ht 0)            — alone on phy 5, ht 1 dropped
-//   sched 0 = cpu_id  7  (cluster 2 / phy 4 ht 0)            — local wiring sched (M5: publishes SM)
+//   orch    = cpu_id  9  (cluster 2 / phy 5 ht 0)            — alone on phy 5
+//   sched 0 = cpu_id  7  (cluster 2 / phy 4 ht 0)            — local wiring sched
 //   sched 1 = cpu_id  8  (cluster 2 / phy 4 ht 1)            — local SMT sibling of sched 0
-//   sched 2 = cpu_id  3  (cluster 1 / phy 2 ht 0)            — remote-die sched
-//   sched 3 = cpu_id  5  (cluster 1 / phy 3 ht 0)            — remote-die sched
+//   sched 2 = cpu_id 11  (cluster 3 / phy 6 ht 0)            — same-die remote-cluster sched
+//   sched 3 = cpu_id 13  (cluster 3 / phy 7 ht 0)            — same-die remote-cluster sched
+//
+// Rationale: the baseline 1+4 had sched 2/3 on die 0 cluster 1 — cross-die
+// from orch. Hot sync paths (SM `current_task_index`, `last_task_alive`,
+// `aicore_mailbox`) were all cross-die polls/stores in the dispatch loop,
+// blocking forward progress every iteration. directa-stage1 moves both
+// remote scheds onto die-1 cluster 3 so every sched↔orch sync line stays
+// within die 1. AICore mapping is NOT remapped: sched 2/3 will now dispatch
+// cross-die to die-0 AICores (via MMIO, write-buffered → async), and
+// AICore→sched mailbox reads may go cross-die depending on mailbox placement.
+// The trade is sync-coherence cross-die → async-MMIO cross-die.
 //
 // NOTE: orch_phy and sched_pair_phy could be either {phy 4, phy 5}. We use
 // phy 4 for the sched pair (cpu_id 7/8) because CANN's worker dispatch hits
@@ -45,25 +55,26 @@
 // CANN's observed dispatch set on this device under the current
 // PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH=7 launch budget.
 //
-// ALLOWED_CPUS ordering convention (matches simpler_wc):
+// ALLOWED_CPUS ordering convention:
 //   indices 0..N-2 are scheduler slots (thread_idx assigned in this order),
 //   index  N-1   is the orchestrator slot.
 //
-// PG variants (3-cluster SKUs): NOT auto-detected. Re-derive ALLOWED_CPUS by
-// running ~/simpler/basics/00-aicpu-num/launcher on the target device and
+// PG variants (3-cluster SKUs): NOT auto-detected. Single-die placement only
+// works on SKUs where two clusters are alive on die 1. Re-derive ALLOWED_CPUS
+// by running ~/simpler/basics/00-aicpu-num/launcher on the target device and
 // reading the AICPU+OCCUPY bitmap. Expected tables:
-//   PG-a (cluster 0 dead, OCCUPY=0x7ff8): {9, 10, 3, 5, 7}     same as Full
-//   PG-b (cluster 2 dead, OCCUPY=0x79fe): {13, 14, 3, 5, 11}   orch shifts to cluster 3
-//   PG-c (cluster 3 dead, OCCUPY=0x1ffe): {9, 10, 3, 5, 7}     same as Full
-//   PG-x (cluster 1 dead): unsupported — remote die has no full cluster.
-//                          Hardware vendor does not produce this SKU; gate would
-//                          have no valid placement so we keep the table unchanged.
+//   Full   (OCCUPY=0x7ffe):  {7, 8, 11, 13, 9}   die-1 cluster 2 + 3 (this file)
+//   PG-a   (cluster 0 dead, OCCUPY=0x7ff8): same as Full
+//   PG-b   (cluster 2 dead, OCCUPY=0x79fe): single-die infeasible (only one
+//                                           cluster alive on die 1)
+//   PG-c   (cluster 3 dead, OCCUPY=0x1ffe): single-die infeasible (only one
+//                                           cluster alive on die 1)
 // =============================================================================
-// 1 orch + 4 sched on Full A5 (cluster 2 = orch local, cluster 1 = remote).
+// directa-stage1: 1 orch + 4 sched single-die (cluster 2 = orch local, cluster 3 = same-die remote).
 // Last entry is the orchestrator; earlier entries are schedulers in thread_idx order.
 // The gate forces each surviving thread onto its slot's cpu_id via
 // sched_setaffinity, so CANN's worker→cpu dispatch order doesn't matter.
-static constexpr int32_t ALLOWED_CPUS[] = {7, 8, 3, 5, 9};
+static constexpr int32_t ALLOWED_CPUS[] = {7, 8, 11, 13, 9};
 static constexpr int32_t ALLOWED_CPU_COUNT = sizeof(ALLOWED_CPUS) / sizeof(ALLOWED_CPUS[0]);
 
 // Slot-claim counter: each gate call fetch_adds to get its slot index.
