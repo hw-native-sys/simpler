@@ -30,6 +30,7 @@ from simpler_setup.scene_test import (
     Tensor,
     _build_cuda_host_schedule_args,
     _compile_chip_callable_from_spec,
+    _CudaPersistentDagSceneBuffers,
     scene_test,
 )
 
@@ -140,9 +141,33 @@ class _FakeTensor:
     def numel(self):
         return self._n
 
+    def element_size(self):
+        return 4
+
+    def is_contiguous(self):
+        return True
+
 
 class _FakeCudaBuffers:
     ptrs = {"a": 101, "b": 202, "out": 303}
+
+
+class _FakeWorker:
+    def __init__(self):
+        self.next_ptr = 1000
+        self.copy_to_calls = []
+        self.freed = []
+
+    def malloc(self, nbytes):
+        ptr = self.next_ptr
+        self.next_ptr += max(int(nbytes), 1) + 64
+        return ptr
+
+    def copy_to(self, dst, src, nbytes):
+        self.copy_to_calls.append((dst, src, nbytes))
+
+    def free(self, ptr):
+        self.freed.append(ptr)
 
 
 def _cuda_vector_add_spec(source, *, arch="compute_80", grid_dim=4, block_dim=256):
@@ -270,6 +295,20 @@ def _cuda_persistent_tensor_tile_spec(matmul_source, add_source, mul_source, *, 
             "tensor_tile": {"rows": 16, "cols": 16, "inner": 16},
         }
     }
+
+
+def _cuda_persistent_chain_spec(add_source, mul_source, *, arch="compute_80", block_dim=256):
+    spec = _cuda_persistent_dag_spec(add_source, mul_source, arch=arch, block_dim=block_dim)
+    spec["cuda"]["arg_builder"] = "persistent_dag_chain_f32"
+    spec["cuda"]["queue_capacity"] = 3
+    return spec
+
+
+def _cuda_persistent_reuse_spec(add_source, mul_source, *, arch="compute_80", block_dim=256):
+    spec = _cuda_persistent_dag_spec(add_source, mul_source, arch=arch, block_dim=block_dim)
+    spec["cuda"]["arg_builder"] = "persistent_dag_reuse_f32"
+    spec["cuda"]["queue_capacity"] = 3
+    return spec
 
 
 def test_scene_test_compiles_cuda_host_schedule_callable(tmp_path, monkeypatch):
@@ -402,6 +441,55 @@ def test_scene_test_builds_cuda_elementwise_scale_args():
     assert args.out == 303
     assert args.alpha == pytest.approx(1.5)
     assert args.n == 17
+
+
+def test_scene_test_builds_cuda_persistent_chain_args():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_chain_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 3,
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert len(buffers.host_tasks) == 5
+    assert list(buffers.host_fanin) == [0, 0, 2, 1, 1]
+    assert list(buffers.host_dependents) == [2, 2, 3, 4]
+    assert [(task.func_id, task.dependent_begin, task.dependent_count) for task in buffers.host_tasks] == [
+        (1, 0, 1),
+        (2, 1, 1),
+        (1, 2, 1),
+        (2, 3, 1),
+        (1, 4, 0),
+    ]
+    assert buffers.host_tasks[4].out == buffers.tensor_buffers.ptrs["out"]
+
+
+def test_scene_test_builds_cuda_persistent_reuse_args():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_reuse_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 3,
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert len(buffers.host_tasks) == 6
+    assert list(buffers.host_fanin) == [0, 0, 2, 1, 1, 2]
+    assert list(buffers.host_dependents) == [2, 2, 3, 4, 5, 5]
+    assert buffers.host_tasks[0].out == buffers.host_tasks[4].out
+    assert buffers.host_tasks[2].dependent_count == 2
+    assert buffers.host_tasks[5].a == buffers.host_tasks[4].out
+    assert buffers.host_tasks[5].b == buffers.host_tasks[3].out
+    assert buffers.host_tasks[5].out == buffers.tensor_buffers.ptrs["out"]
 
 
 @requires_cuda
@@ -558,6 +646,97 @@ def test_scene_test_runs_cuda_persistent_device_dag_with_real_data(tmp_path):
     try:
         callable_obj = scene.build_callable("cuda")
         scene._run_and_validate_l2(worker, callable_obj, CudaPersistentDagScene.CASES[0])
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_chain_with_real_data(tmp_path):
+    torch = pytest.importorskip("torch")
+
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentChainScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_chain_spec(add_source, mul_source)
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            return TaskArgsBuilder(
+                Tensor("a", torch.arange(n, dtype=torch.float32) + 1.0),
+                Tensor("b", torch.arange(n, dtype=torch.float32) * 0.25),
+                Tensor("out", torch.zeros(n, dtype=torch.float32)),
+            )
+
+        def compute_golden(self, args, params):
+            tmp0 = args.a + args.b
+            tmp1 = args.a * args.b
+            tmp2 = tmp0 + tmp1
+            tmp3 = tmp2 * args.b
+            args.out[:] = tmp2 + tmp3
+
+    scene = CudaPersistentChainScene()
+    worker = CudaPersistentChainScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(worker, callable_obj, CudaPersistentChainScene.CASES[0])
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_reuse_with_real_data(tmp_path):
+    torch = pytest.importorskip("torch")
+
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentReuseScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_reuse_spec(add_source, mul_source)
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            return TaskArgsBuilder(
+                Tensor("a", torch.arange(n, dtype=torch.float32) + 1.0),
+                Tensor("b", torch.arange(n, dtype=torch.float32) * 0.25),
+                Tensor("out", torch.zeros(n, dtype=torch.float32)),
+            )
+
+        def compute_golden(self, args, params):
+            tmp0_initial = args.a + args.b
+            tmp1 = args.a * args.b
+            tmp2 = tmp0_initial + tmp1
+            tmp3 = tmp2 * args.b
+            tmp0_reused = tmp2 + args.a
+            args.out[:] = tmp0_reused + tmp3
+
+    scene = CudaPersistentReuseScene()
+    worker = CudaPersistentReuseScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(worker, callable_obj, CudaPersistentReuseScene.CASES[0])
     finally:
         worker.close()
 

@@ -270,7 +270,8 @@ structs. The normal scene-test compiler and run path can now consume
 host-schedule CUDA callable specs and persistent-device generated-dispatch
 DAG specs. The current adapters construct `vector_add_f32`,
 `elementwise_binary_f32`, `elementwise_scale_f32`,
-`persistent_dag_fork_join_f32`, and `persistent_dag_tensor_tile_f32` raw
+`persistent_dag_fork_join_f32`, `persistent_dag_chain_f32`,
+`persistent_dag_reuse_f32`, and `persistent_dag_tensor_tile_f32` raw
 argument/state structs from `TaskArgsBuilder` CPU tensors and scalars. The
 remaining work is to add broader CUDA argument builders beyond those tracer
 bullets.

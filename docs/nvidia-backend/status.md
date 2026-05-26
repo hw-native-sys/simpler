@@ -102,7 +102,8 @@ and composes the generated dispatch entry.
 `SceneTestCase` L2 compilation accepts `CALLABLE["cuda"]` specs for
 `persistent_device`, compiles task-body sources through the same
 `KernelCompiler` entry point, registers the prepared raw callable through the
-normal L2 `Worker`, builds `persistent_dag_fork_join_f32` and
+normal L2 `Worker`, builds `persistent_dag_fork_join_f32`,
+`persistent_dag_chain_f32`, `persistent_dag_reuse_f32`, and
 `persistent_dag_tensor_tile_f32` state objects from normal `TaskArgsBuilder`
 CPU tensors, and validates real copied-back CUDA output data.
 The host-schedule scene path also accepts the neutral
@@ -575,6 +576,37 @@ Result: `status=pass`, `ptx_arch=compute_90`,
 `dispatch_func_ids=[3, 1, 2, 1]`, `completed_count=4`,
 `device_scheduler_errors={"count": 0, "code": 0, "task_id": 0}`.
 
+After adding chain and reuse persistent DAG scene-test arg builders, the
+focused local CUDA scene/codegen set was rerun:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py \
+  tests/ut/py/test_cuda_persistent_codegen.py -q
+```
+
+Result: `27 passed`. The new real-data chain and reuse scene tests both ran
+through the local A100 CUDA L2 Worker path.
+
+The same chain and reuse DAG shapes were checked on the remote H200 through
+the no-torch persistent smoke path:
+
+```bash
+CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 5 --n 1024 --arch compute_90 \
+    --mode dag --queue-capacity 3 --dag-shape chain
+
+CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 6 --n 1024 --arch compute_90 \
+    --mode dag --queue-capacity 3 --dag-shape scratch_reuse
+```
+
+Result: both returned `status=pass` with zero device scheduler errors.
+
 The preflight and CUDA scene-test subset was also run on the remote H200
 checkout after pushing this change:
 
@@ -603,14 +635,13 @@ now have first `KernelCompiler` entry points. Both paths can consume
 `CudaTaskBody` style sources. CUDA prepared-callable artifacts can be staged
 through the L2 Python `Worker` registration path. The normal scene-test flow
 can compile and run host-schedule CUDA vector-add, binary elementwise, and
-scalar scale callable specs and persistent-device fork/join DAG callable specs
-end to end.
+scalar scale callable specs and persistent-device fork/join, chain, reuse, and
+tensor-tile DAG callable specs end to end.
 
 Needed:
 
 - broader CUDA scene-test argument builders beyond the current binary
-  elementwise, scalar scale, `persistent_dag_fork_join_f32`, and
-  `persistent_dag_tensor_tile_f32` tracer bullets.
+  elementwise, scalar scale, and persistent DAG tracer bullets.
 
 ### Target Role Cleanup
 

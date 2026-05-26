@@ -340,7 +340,9 @@ Use the neutral `elementwise_binary_f32` name when the compiled task body is
 not addition but still uses the current `(a, b, out, n)` launch ABI. The same
 path can build
 `persistent_device` generated-dispatch DAG specs and run the
-`arg_builder: persistent_dag_fork_join_f32` and
+`arg_builder: persistent_dag_fork_join_f32`,
+`arg_builder: persistent_dag_chain_f32`,
+`arg_builder: persistent_dag_reuse_f32`, and
 `arg_builder: persistent_dag_tensor_tile_f32` adapters through the L2
 `Worker`.
 For real host-schedule smoke coverage, pass a context definition plus
