@@ -248,6 +248,44 @@ int AicpuSoInfo::finalize() {
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
+int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size) {
+    if (static_arena_.is_committed()) {
+        // Idempotent for the production case (sizes do not change across a
+        // worker's lifetime). If a caller asks for a larger layout, redo it.
+        if (gm_heap_size <= cached_gm_heap_size_ && gm_sm_size <= cached_gm_sm_size_) return 0;
+        static_arena_.release();
+        gm_heap_region_off_ = SIZE_MAX;
+        gm_sm_region_off_ = SIZE_MAX;
+        cached_gm_heap_size_ = 0;
+        cached_gm_sm_size_ = 0;
+    }
+    gm_heap_region_off_ = static_arena_.reserve(gm_heap_size, DeviceArena::kDefaultBaseAlign);
+    gm_sm_region_off_ = static_arena_.reserve(gm_sm_size, DeviceArena::kDefaultBaseAlign);
+    if (static_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+        // Roll back the two reserves: commit() failure leaves committed_=false,
+        // so the next entry would skip the release branch and stack new
+        // reserves on top of the stale cursor. release() is idempotent on a
+        // never-committed arena (just zeroes cursor_ / region_count_).
+        static_arena_.release();
+        gm_heap_region_off_ = SIZE_MAX;
+        gm_sm_region_off_ = SIZE_MAX;
+        return -1;
+    }
+    cached_gm_heap_size_ = gm_heap_size;
+    cached_gm_sm_size_ = gm_sm_size;
+    return 0;
+}
+
+void *DeviceRunner::acquire_pooled_gm_heap() {
+    if (!static_arena_.is_committed()) return nullptr;
+    return static_arena_.region_ptr(gm_heap_region_off_);
+}
+
+void *DeviceRunner::acquire_pooled_gm_sm() {
+    if (!static_arena_.is_committed()) return nullptr;
+    return static_arena_.region_ptr(gm_sm_region_off_);
+}
+
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     int dev_id = device_id_;
     return std::thread([dev_id, fn = std::move(fn)]() {
@@ -465,35 +503,45 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
     return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
+int DeviceRunner::query_max_block_dim(rtStream_t stream, uint32_t *out_cube, uint32_t *out_vector) {
+    uint32_t cube_limit = 0, vector_limit = 0;
+    bool got_limits = (aclrtGetStreamResLimit(stream, ACL_RT_DEV_RES_CUBE_CORE, &cube_limit) == ACL_ERROR_NONE) &&
+                      (aclrtGetStreamResLimit(stream, ACL_RT_DEV_RES_VECTOR_CORE, &vector_limit) == ACL_ERROR_NONE) &&
+                      cube_limit > 0 && vector_limit > 0;
+    if (out_cube != nullptr) *out_cube = got_limits ? cube_limit : 0;
+    if (out_vector != nullptr) *out_vector = got_limits ? vector_limit : 0;
+    if (got_limits) {
+        // Cap by PLATFORM_MAX_BLOCKDIM as well: runtime handshake/scheduler
+        // arrays are statically sized to RUNTIME_MAX_WORKER (= PLATFORM_MAX_BLOCKDIM
+        // * PLATFORM_CORES_PER_BLOCKDIM), so even if ACL reports more cores
+        // than the platform cap we must not exceed it.
+        int from_stream = static_cast<int>(
+            std::min(cube_limit / PLATFORM_AIC_CORES_PER_BLOCKDIM, vector_limit / PLATFORM_AIV_CORES_PER_BLOCKDIM)
+        );
+        return std::min(from_stream, PLATFORM_MAX_BLOCKDIM);
+    }
+    return PLATFORM_MAX_BLOCKDIM;
+}
+
 int DeviceRunner::validate_block_dim(rtStream_t stream, int block_dim) {
     if (block_dim < 1) {
         LOG_ERROR("block_dim (%d) must be >= 1", block_dim);
         return -1;
     }
-
     uint32_t cube_limit = 0, vector_limit = 0;
-    bool got_limits = (aclrtGetStreamResLimit(stream, ACL_RT_DEV_RES_CUBE_CORE, &cube_limit) == ACL_ERROR_NONE) &&
-                      (aclrtGetStreamResLimit(stream, ACL_RT_DEV_RES_VECTOR_CORE, &vector_limit) == ACL_ERROR_NONE) &&
-                      cube_limit > 0 && vector_limit > 0;
-
-    if (got_limits) {
-        int max_bd = static_cast<int>(
-            std::min(cube_limit / PLATFORM_AIC_CORES_PER_BLOCKDIM, vector_limit / PLATFORM_AIV_CORES_PER_BLOCKDIM)
-        );
-        if (block_dim > max_bd) {
+    int max_bd = query_max_block_dim(stream, &cube_limit, &vector_limit);
+    if (block_dim > max_bd) {
+        if (cube_limit > 0 && vector_limit > 0) {
             LOG_ERROR(
                 "block_dim (%d) exceeds available cores (max_block_dim=%d, cube=%u, vector=%u)", block_dim, max_bd,
                 cube_limit, vector_limit
             );
-            return -1;
+        } else {
+            LOG_ERROR(
+                "aclrtGetStreamResLimit unavailable; block_dim (%d) exceeds static cap PLATFORM_MAX_BLOCKDIM (%d)",
+                block_dim, PLATFORM_MAX_BLOCKDIM
+            );
         }
-    } else if (block_dim > PLATFORM_MAX_BLOCKDIM) {
-        // aclrtGetStreamResLimit unavailable (or reported no cores) — fall back
-        // to the static platform capacity so block_dim stays bounded.
-        LOG_ERROR(
-            "aclrtGetStreamResLimit unavailable; block_dim (%d) exceeds static cap PLATFORM_MAX_BLOCKDIM (%d)",
-            block_dim, PLATFORM_MAX_BLOCKDIM
-        );
         return -1;
     }
     return 0;
@@ -526,10 +574,21 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
-    // Validate block_dim against stream resource limits
-    rc = validate_block_dim(stream_aicore_, block_dim);
-    if (rc != 0) {
-        return rc;
+    // Auto sentinel (block_dim == 0) is resolved directly from
+    // query_max_block_dim; explicit values still go through validate. The
+    // auto branch skips validate so we don't pay the ACL syscalls twice.
+    if (block_dim == 0) {
+        block_dim = query_max_block_dim(stream_aicore_);
+        LOG_INFO_V0("block_dim auto-resolved to %d", block_dim);
+        if (block_dim < 1) {
+            LOG_ERROR("block_dim auto-resolved to invalid value %d", block_dim);
+            return -1;
+        }
+    } else {
+        rc = validate_block_dim(stream_aicore_, block_dim);
+        if (rc != 0) {
+            return rc;
+        }
     }
     block_dim_ = block_dim;
 
@@ -542,7 +601,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     runtime.worker_count = num_aicore;
     worker_count_ = num_aicore;  // Store for print_handshake_results in destructor
-    runtime.sche_cpu_num = launch_aicpu_num;
+    runtime.aicpu_thread_num = launch_aicpu_num;
 
     // Scope guards for register-address cleanup on all exit paths. Declared
     // before the allocs so that an alloc-failure early-return still triggers
@@ -1113,10 +1172,14 @@ int DeviceRunner::finalize() {
     // perf_cleanup guard; this is the backstop for the no-run-since-init case.
     finalize_collectors();
 
-    // Release per-Worker pooled GM heap / SM. Must precede mem_alloc_.finalize()
-    // so the pool frees through the still-live allocator, not after it.
-    gm_heap_pool_.release();
-    gm_sm_pool_.release();
+    // Release per-Worker static arena (GM heap + PTO2 SM in a single backing
+    // device allocation). Must precede mem_alloc_.finalize() so the arena
+    // frees through the still-live allocator, not after it.
+    static_arena_.release();
+    gm_heap_region_off_ = SIZE_MAX;
+    gm_sm_region_off_ = SIZE_MAX;
+    cached_gm_heap_size_ = 0;
+    cached_gm_sm_size_ = 0;
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
@@ -1311,7 +1374,7 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
-    int num_dump_threads = runtime.sche_cpu_num;
+    int num_dump_threads = runtime.aicpu_thread_num;
 
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);

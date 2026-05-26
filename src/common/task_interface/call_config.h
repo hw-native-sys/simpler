@@ -15,6 +15,12 @@
  * sub-features under the profiling umbrella: `enable_l2_swimlane` (swimlane),
  * `enable_dump_tensor`, `enable_pmu`, and `enable_dep_gen`.
  *
+ * `block_dim == 0` is a sentinel for "auto" — DeviceRunner resolves it at
+ * run() time to the max block_dim the AICore stream allows
+ * (aclrtGetStreamResLimit on onboard; PLATFORM_MAX_BLOCKDIM on sim).
+ * Any positive value is taken as an explicit cap and validated against
+ * the same stream-resource limits.
+ *
  * Lives here (rather than chip_worker.h) so distributed task slot state
  * can store it directly without pulling in the full ChipWorker header
  * (which depends on types.h).
@@ -40,7 +46,7 @@
 
 #pragma pack(push, 1)
 struct CallConfig {
-    int32_t block_dim = 24;
+    int32_t block_dim = 0;  // 0 = auto; resolved by DeviceRunner at run() time
     int32_t aicpu_thread_num = 3;
     int32_t enable_l2_swimlane = 0;
     int32_t enable_dump_tensor = 0;

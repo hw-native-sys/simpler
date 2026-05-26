@@ -47,52 +47,57 @@ uint64_t g_insert_count = 0;
 // Initialization and Destruction
 // =============================================================================
 
-bool PTO2TensorMap::init(
-    int32_t new_num_buckets, int32_t new_pool_size, const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH]
+PTO2TensorMapLayout PTO2TensorMap::reserve_layout(
+    DeviceArena &arena, int32_t new_num_buckets, int32_t new_pool_size,
+    const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH]
 ) {
-    // Validate power of 2 for fast modulo
-    if ((new_num_buckets & (new_num_buckets - 1)) != 0) {
-        return false;  // num_buckets must be power of 2
+    // num_buckets must be a power of two for the hash truncation to work.
+    always_assert((new_num_buckets & (new_num_buckets - 1)) == 0);
+
+    PTO2TensorMapLayout layout{};
+    layout.num_buckets = new_num_buckets;
+    layout.pool_size = new_pool_size;
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        layout.task_window_sizes[r] = new_task_window_sizes[r];
     }
 
-    // Allocate buckets
-    buckets = (PTO2TensorMapEntry **)malloc(new_num_buckets * sizeof(PTO2TensorMapEntry *));
-    if (!buckets) {
-        return false;
+    layout.off_buckets = arena.reserve(
+        static_cast<size_t>(new_num_buckets) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *)
+    );
+    layout.off_entry_pool =
+        arena.reserve(static_cast<size_t>(new_pool_size) * sizeof(PTO2TensorMapEntry), alignof(PTO2TensorMapEntry));
+    layout.off_free_entry_list =
+        arena.reserve(static_cast<size_t>(new_pool_size) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *));
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        layout.off_task_entry_heads[r] = arena.reserve(
+            static_cast<size_t>(new_task_window_sizes[r]) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *)
+        );
     }
+    return layout;
+}
 
-    // Initialize all buckets to empty (-1)
-    for (int32_t i = 0; i < new_num_buckets; i++) {
+PTO2TensorMapLayout
+PTO2TensorMap::reserve_layout_default(DeviceArena &arena, const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH]) {
+    return reserve_layout(arena, PTO2_TENSORMAP_NUM_BUCKETS, PTO2_TENSORMAP_POOL_SIZE, new_task_window_sizes);
+}
+
+bool PTO2TensorMap::init_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena) {
+    num_buckets = layout.num_buckets;
+    pool_size = layout.pool_size;
+
+    buckets = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_buckets));
+    entry_pool = static_cast<PTO2TensorMapEntry *>(arena.region_ptr(layout.off_entry_pool));
+    free_entry_list = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_free_entry_list));
+
+    // buckets[]: empty == nullptr.
+    for (int32_t i = 0; i < num_buckets; i++) {
         buckets[i] = nullptr;
     }
 
-    num_buckets = new_num_buckets;
-
-    // Allocate entry pool (64-byte aligned for cache-line-aligned entries)
-    entry_pool =
-        (PTO2TensorMapEntry *)aligned_alloc(alignof(PTO2TensorMapEntry), new_pool_size * sizeof(PTO2TensorMapEntry));
-    if (!entry_pool) {
-        free(buckets);
-        buckets = NULL;
-        return false;
-    }
-    memset(entry_pool, 0, new_pool_size * sizeof(PTO2TensorMapEntry));
-
-    // Allocate free entry list
-    free_entry_list = (PTO2TensorMapEntry **)calloc(new_pool_size, sizeof(PTO2TensorMapEntry *));
-    if (!free_entry_list) {
-        free(buckets);
-        free(entry_pool);
-        buckets = NULL;
-        entry_pool = NULL;
-        return false;
-    }
-
-    pool_size = new_pool_size;
-    next_entry_idx = 0;
-    free_num = 0;
-
-    // Initialize all entries as not in bucket
+    // entry_pool: zero-init equivalent to the previous calloc(entry_pool, ...).
+    // The pool's persistent invariant after init is "bucket_index == -1 means
+    // not linked", set explicitly below.
+    memset(entry_pool, 0, static_cast<size_t>(pool_size) * sizeof(PTO2TensorMapEntry));
     for (int32_t i = 0; i < pool_size; i++) {
         entry_pool[i].bucket_index = -1;
         entry_pool[i].next_in_bucket = nullptr;
@@ -102,30 +107,19 @@ bool PTO2TensorMap::init(
         entry_pool[i].producer_task_id = PTO2TaskId{};
     }
 
-    // Allocate per-ring per-task entry tracking (each ring has its own window size)
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        task_entry_heads[r] = (PTO2TensorMapEntry **)malloc(new_task_window_sizes[r] * sizeof(PTO2TensorMapEntry *));
-        if (!task_entry_heads[r]) {
-            // Cleanup previously allocated rings
-            for (int j = 0; j < r; j++) {
-                free(task_entry_heads[j]);
-                task_entry_heads[j] = NULL;
-            }
-            free(entry_pool);
-            free(buckets);
-            free(free_entry_list);
-            entry_pool = NULL;
-            buckets = NULL;
-            free_entry_list = NULL;
-            return false;
-        }
-        for (int32_t i = 0; i < new_task_window_sizes[r]; i++) {
-            task_entry_heads[r][i] = nullptr;
-        }
-        task_window_sizes[r] = new_task_window_sizes[r];
-    }
+    // free_entry_list: zeroed (was calloc'd before); contents become meaningful
+    // only after entries are freed back, so the body of the array stays as 0.
+    memset(free_entry_list, 0, static_cast<size_t>(pool_size) * sizeof(PTO2TensorMapEntry *));
+
+    next_entry_idx = 0;
+    free_num = 0;
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        task_entry_heads[r] = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_task_entry_heads[r]));
+        for (int32_t i = 0; i < layout.task_window_sizes[r]; i++) {
+            task_entry_heads[r][i] = nullptr;
+        }
+        task_window_sizes[r] = layout.task_window_sizes[r];
         last_task_alives[r] = 0;
         last_cleanup[r] = 0;
     }
@@ -133,31 +127,15 @@ bool PTO2TensorMap::init(
     return true;
 }
 
-bool PTO2TensorMap::init_default(const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH]) {
-    return init(PTO2_TENSORMAP_NUM_BUCKETS, PTO2_TENSORMAP_POOL_SIZE, new_task_window_sizes);
-}
-
 void PTO2TensorMap::destroy() {
-    if (buckets) {
-        free(buckets);
-        buckets = NULL;
-    }
-
-    if (entry_pool) {
-        free(entry_pool);
-        entry_pool = NULL;
-    }
-
+    // Arena owns the backing memory; here we only forget our pointers so any
+    // stray post-destroy access trips a nullptr dereference instead of reading
+    // a recycled allocation.
+    buckets = nullptr;
+    entry_pool = nullptr;
+    free_entry_list = nullptr;
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (task_entry_heads[r]) {
-            free(task_entry_heads[r]);
-            task_entry_heads[r] = NULL;
-        }
-    }
-
-    if (free_entry_list) {
-        free(free_entry_list);
-        free_entry_list = NULL;
+        task_entry_heads[r] = nullptr;
     }
 }
 

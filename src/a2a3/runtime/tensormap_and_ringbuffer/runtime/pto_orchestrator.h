@@ -29,6 +29,7 @@
 #define PTO_ORCHESTRATOR_H
 
 #include "common/l2_perf_profiling.h"
+#include "device_arena.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
@@ -36,6 +37,21 @@
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
 #include "pto_types.h"
+
+/**
+ * Layout descriptor produced by PTO2OrchestratorState::reserve_layout(). Holds
+ * arena offsets for every sub-region the orchestrator owns (per-ring fanin
+ * pools, scope arrays, plus the nested PTO2TensorMap layout).
+ */
+struct PTO2OrchestratorLayout {
+    size_t off_fanin_pool[PTO2_MAX_RING_DEPTH];
+    size_t off_scope_tasks;
+    size_t off_scope_begins;
+    PTO2TensorMapLayout tensor_map;
+    int32_t dep_pool_capacity;
+    int32_t scope_tasks_cap;
+    uint64_t scope_stack_capacity;
+};
 
 // =============================================================================
 // Orchestrator State
@@ -117,10 +133,24 @@ struct PTO2OrchestratorState {
 
     // === Cold-path API (defined in pto_orchestrator.cpp) ===
 
-    bool init(
-        PTO2SharedMemoryHeader *sm_header, void *gm_heap, uint64_t heap_size,
+    // Phase 1: declare every sub-region (per-ring fanin pool, scope arrays,
+    // tensor_map sub-layout) on the supplied arena. task_window_sizes feeds
+    // the nested tensor_map layout. Returned layout is consumed by
+    // init_from_layout.
+    static PTO2OrchestratorLayout reserve_layout(
+        DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH],
         int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
     );
+
+    // Phase 3: bind region pointers, wire per-ring task_allocator + fanin_pool
+    // and tensor_map. Arena must be committed; layout must come from
+    // reserve_layout() against the same arena.
+    bool init_from_layout(
+        const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SharedMemoryHeader *sm_header, void *gm_heap,
+        uint64_t heap_size
+    );
+
+    // Forget pointers; arena owns the backing buffers.
     void destroy();
     void set_scheduler(PTO2SchedulerState *scheduler);
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);

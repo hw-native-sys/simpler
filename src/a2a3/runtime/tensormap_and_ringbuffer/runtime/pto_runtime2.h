@@ -32,9 +32,9 @@
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
-#ifndef PTO_RUNTIME2_H
-#define PTO_RUNTIME2_H
+#pragma once
 
+#include "device_arena.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
 #include "pto_shared_memory.h"
@@ -125,45 +125,40 @@ struct PTO2Runtime {
 // =============================================================================
 
 /**
- * Create a new runtime instance
+ * Create runtime from caller-provided GM SM buffer + GM heap.
  *
- * @param mode Execution mode
- * @return Runtime context, or NULL on failure
- */
-PTO2Runtime *runtime_create(PTO2RuntimeMode mode);
-
-/**
- * Create runtime with custom sizes
+ * All AICPU-side runtime state (PTO2SharedMemoryHandle wrapper, PTO2Runtime,
+ * AICoreCompletionMailbox, plus the orchestrator/scheduler/tensor_map
+ * sub-regions) is laid out on the supplied arena and committed in a single
+ * backing allocation — including the SM handle wrapper itself. The arena is
+ * owned by the caller (typically the per-Worker AicpuExecutor);
+ * runtime_destroy() calls arena.release() once to free the lot.
+ *
+ * `sm_base` / `sm_size` describe the SM buffer that host has already placed
+ * for the runtime to use; the SM handle wrapper is constructed in-place on
+ * an arena-reserved region pointing at that buffer.
  *
  * @param mode             Execution mode
- * @param task_window_size Number of task slots
- * @param heap_size        Size of GM heap
- * @return Runtime context, or NULL on failure
- */
-PTO2Runtime *runtime_create_custom(
-    PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size,
-    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
-);
-
-/**
- * Create runtime from existing shared memory and GM heap (e.g. on device).
- * Does not allocate sm_handle or gm_heap; caller owns them.
- *
- * @param mode      Execution mode
- * @param sm_handle Pre-created shared memory handle (e.g. from PTO2SharedMemoryHandle::create_from_buffer)
- * @param gm_heap   GM heap base for output buffers (or NULL if not used)
- * @param heap_size GM heap size in bytes
+ * @param sm_base          Pre-allocated SM buffer base (host-owned)
+ * @param sm_size          Size of the SM buffer in bytes
+ * @param task_window_size Per-ring task window size used to lay out SM
+ * @param gm_heap          GM heap base for output buffers (or NULL if not used)
+ * @param heap_size        GM heap size in bytes
+ * @param arena            Caller-owned arena that sources all runtime sub-regions.
+ *                         Must be freshly constructed (no prior commit) —
+ *                         runtime_create_from_sm reserves + commits internally.
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime *runtime_create_from_sm(
-    PTO2RuntimeMode mode, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
-    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
+    PTO2RuntimeMode mode, void *sm_base, uint64_t sm_size, uint64_t task_window_size, void *gm_heap, uint64_t heap_size,
+    DeviceArena &arena, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
 );
 
 /**
- * Destroy runtime and free all resources
+ * Destroy runtime and free all resources. arena.release() is the actual
+ * memory free; the rt pointer is no longer valid afterward.
  */
-void runtime_destroy(PTO2Runtime *rt);
+void runtime_destroy(PTO2Runtime *rt, DeviceArena &arena);
 
 /**
  * Set execution mode
@@ -225,5 +220,3 @@ struct PTO2OrchestrationConfig {
     int expected_arg_count;
 };
 #endif
-
-#endif  // PTO_RUNTIME2_H

@@ -103,17 +103,25 @@ static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     }
 }
 
-static void *acquire_pooled_gm_heap_wrapper(size_t size) {
+static int setup_static_arena_wrapper(size_t gm_heap_size, size_t gm_sm_size) {
     try {
-        return current_runner()->acquire_pooled_gm_heap(size);
+        return current_runner()->setup_static_arena(gm_heap_size, gm_sm_size);
+    } catch (...) {
+        return -1;
+    }
+}
+
+static void *acquire_pooled_gm_heap_wrapper() {
+    try {
+        return current_runner()->acquire_pooled_gm_heap();
     } catch (...) {
         return nullptr;
     }
 }
 
-static void *acquire_pooled_gm_sm_wrapper(size_t size) {
+static void *acquire_pooled_gm_sm_wrapper() {
     try {
-        return current_runner()->acquire_pooled_gm_sm(size);
+        return current_runner()->acquire_pooled_gm_sm();
     } catch (...) {
         return nullptr;
     }
@@ -312,6 +320,7 @@ int run_prepared(
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
+        r->host_api.setup_static_arena = setup_static_arena_wrapper;
         r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
         r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
@@ -336,7 +345,7 @@ int run_prepared(
             return rc;
         }
 
-        runner->set_l2_swimlane_enabled(enable_l2_swimlane != 0);
+        runner->set_l2_swimlane_enabled(enable_l2_swimlane);
         runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
         runner->set_pmu_enabled(enable_pmu);
         runner->set_output_prefix(output_prefix);

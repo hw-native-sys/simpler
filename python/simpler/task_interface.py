@@ -292,7 +292,7 @@ class ChipWorker:
         worker = ChipWorker()
         worker.init(device_id=0, bins=bins)
         worker.prepare_callable(callable_id=0, callable=chip_callable)
-        worker.run(callable_id=0, args=orch_args, config=CallConfig(block_dim=24))
+        worker.run(callable_id=0, args=orch_args, config=CallConfig())  # block_dim defaults to 0 = auto
         worker.unregister_callable(callable_id=0)
         worker.finalize()
     """
@@ -384,7 +384,11 @@ class ChipWorker:
             callable_id: Stable id passed to a prior ``prepare_callable``.
             args: ChipStorageTaskArgs for this invocation.
             config: Optional CallConfig. If None, a default is created.
-            **kwargs: Overrides applied to config (e.g. block_dim=24).
+            **kwargs: Overrides applied to config (e.g. ``block_dim=8`` to
+                pin a smaller value than the default). Omit ``block_dim`` (or
+                set it to 0) to have DeviceRunner auto-resolve it to the max
+                the AICore stream allows (``aclrtGetStreamResLimit`` on
+                onboard, ``PLATFORM_MAX_BLOCKDIM`` on sim).
 
         Returns a :class:`RunTiming` with host + device wall.
         """

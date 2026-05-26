@@ -177,6 +177,7 @@ bool DepGenCollector::reconcile_counters() {
 
     uint64_t total_device = state->total_record_count;
     uint64_t dropped_device = state->dropped_record_count;
+    uint64_t overflow_device = state->total_overflow_record_count;
 
     if (dropped_device > 0) {
         LOG_WARN(
@@ -187,20 +188,23 @@ bool DepGenCollector::reconcile_counters() {
         );
         clean = false;
     }
-    if (total_collected_ + dropped_device != total_device) {
+    // collected counts physical buffer slots; total_device counts submits; the
+    // chain expands submits into multiple slots, so the overflow counter
+    // bridges the two.
+    if (total_collected_ + dropped_device != total_device + overflow_device) {
         LOG_WARN(
-            "dep_gen reconcile: record count mismatch (collected=%lu + dropped=%lu != device_total=%lu, "
-            "silent_loss=%ld)",
+            "dep_gen reconcile: record count mismatch (collected=%lu + dropped=%lu != device_total=%lu + "
+            "overflow=%lu, silent_loss=%ld)",
             static_cast<unsigned long>(total_collected_), static_cast<unsigned long>(dropped_device),
-            static_cast<unsigned long>(total_device),
-            static_cast<long>(total_device) - static_cast<long>(total_collected_ + dropped_device)
+            static_cast<unsigned long>(total_device), static_cast<unsigned long>(overflow_device),
+            static_cast<long>(total_device + overflow_device) - static_cast<long>(total_collected_ + dropped_device)
         );
         clean = false;
     } else {
         LOG_INFO_V0(
-            "dep_gen reconcile: counts match (collected=%lu, dropped=%lu, device_total=%lu)",
+            "dep_gen reconcile: counts match (collected=%lu, dropped=%lu, device_total=%lu, overflow=%lu)",
             static_cast<unsigned long>(total_collected_), static_cast<unsigned long>(dropped_device),
-            static_cast<unsigned long>(total_device)
+            static_cast<unsigned long>(total_device), static_cast<unsigned long>(overflow_device)
         );
     }
 

@@ -141,13 +141,14 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
-    // Acquire a pooled per-Worker device buffer (PTO2 GM heap / shared memory).
-    // The host_build_graph runtime does not currently use these — the field
-    // exists only so the platform layer's pto_runtime_c_api.cpp can populate
-    // the same HostApi struct regardless of which runtime variant it is built
-    // against. Unset for this variant; do not call.
-    void *(*acquire_pooled_gm_heap)(size_t size);
-    void *(*acquire_pooled_gm_sm)(size_t size);
+    // PTO2 static-arena hooks. The host_build_graph runtime does not currently
+    // use these — the fields exist only so the platform layer's
+    // pto_runtime_c_api.cpp can populate the same HostApi struct regardless of
+    // which runtime variant it is built against. Unset for this variant; do
+    // not call.
+    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size);
+    void *(*acquire_pooled_gm_heap)();
+    void *(*acquire_pooled_gm_sm)();
     // Single-shot upload of the entire ChipCallable buffer. `callable` is a
     // `const ChipCallable *` (declared void* to avoid pulling task_interface
     // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
@@ -213,8 +214,10 @@ public:
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
-    // Execution parameters for AICPU scheduling
-    int sche_cpu_num;  // Number of AICPU threads for scheduling
+    // Total AICPU threads launched on this run. host_build_graph has no
+    // orchestrator/scheduler split — every thread dispatches tasks in
+    // round-robin across the assigned cores. See AicpuExecutor::init.
+    int aicpu_thread_num;
 
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array

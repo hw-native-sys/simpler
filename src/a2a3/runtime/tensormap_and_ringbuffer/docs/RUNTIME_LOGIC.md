@@ -544,7 +544,7 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 
 | Method | Phase | Purpose |
 | ------ | ----- | ------- |
-| `init(runtime, thread_num, sched_thread_num, orch_to_sched, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
+| `init(runtime, aicpu_thread_num, sched_thread_num, orch_to_sched, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
 | `bind_runtime(rt)` | device-orch only | Wire `sched_` to `rt->scheduler` once the orchestrator thread creates `rt` |
 | `resolve_and_dispatch(runtime, thread_idx)` | per scheduler thread | Main dispatch loop |
 | `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores; PMU finalize when enabled |

@@ -171,6 +171,11 @@ void dep_gen_aicpu_record_submit(
     // Account every attempted record so total == collected + dropped on host.
     s_dep_gen_state->total_record_count += 1;
 
+    int dc = explicit_dep_count;
+    if (dc < 0) dc = 0;
+    if (dc > 0 && explicit_deps_raw == nullptr) dc = 0;
+    int needed = dep_gen_records_needed_for(dc);
+
     rmb();
     uint64_t cur_ptr = s_dep_gen_state->current_buf_ptr;
     if (cur_ptr == 0) {
@@ -180,7 +185,21 @@ void dep_gen_aicpu_record_submit(
     }
     DepGenBuffer *buf = reinterpret_cast<DepGenBuffer *>(cur_ptr);
 
-    if (buf->count >= static_cast<uint32_t>(PLATFORM_DEP_GEN_RECORDS_PER_BUFFER)) {
+    // Snapshot the count from volatile shared memory into a local so capacity
+    // math, base-record idx, and the final publish all use the same value.
+    // Single-writer ownership means a re-read would return the same value
+    // today, but a local snapshot makes the invariant explicit and is also
+    // a guardrail if a future device-side actor ever races count.
+    uint32_t local_count = buf->count;
+
+    // Reserve the whole chain up front. If it won't fit in the current
+    // buffer, switch first (skipping the switch when the current buffer is
+    // already empty — switching would just enqueue a zero-record buffer and
+    // pop a fresh one we'd truncate into anyway). Then, regardless of whether
+    // we switched, if the chain still won't fit (chain larger than the
+    // buffer), cap dc to what the buffer can hold and log truncation.
+    if (local_count > 0 &&
+        local_count + static_cast<uint32_t>(needed) > static_cast<uint32_t>(PLATFORM_DEP_GEN_RECORDS_PER_BUFFER)) {
         dep_gen_switch_buffer();
         rmb();
         cur_ptr = s_dep_gen_state->current_buf_ptr;
@@ -190,15 +209,30 @@ void dep_gen_aicpu_record_submit(
             return;
         }
         buf = reinterpret_cast<DepGenBuffer *>(cur_ptr);
+        local_count = buf->count;  // refresh after switch — new buffer starts at 0
     }
 
-    uint32_t idx = buf->count;
-    DepGenRecord *rec = &buf->records[idx];
-
-    rec->task_id = task_id_raw;
-    // Cast the enum to uint32_t before the ternary so Linux GCC's -Wextra
-    // does not warn about "enumerated and non-enumerated type in conditional".
-    rec->flags = in_manual_scope ? static_cast<uint32_t>(DEP_GEN_FLAG_IN_MANUAL_SCOPE) : 0u;
+    const int capacity = PLATFORM_DEP_GEN_RECORDS_PER_BUFFER - static_cast<int>(local_count);
+    if (capacity <= 0) {
+        // local_count is bounded by the previous writer's publish step, so
+        // this is only reachable if shared memory was corrupted out from
+        // under us. Drop the record and bail rather than write past the end
+        // of buf->records[].
+        LOG_ERROR("dep_gen: invalid capacity %d (local_count=%u), dropping record", capacity, local_count);
+        s_dep_gen_state->dropped_record_count += 1;
+        wmb();
+        return;
+    }
+    if (needed > capacity) {
+        // Compute the largest dc that fits in `capacity` slots.
+        int dc_fit = DEP_GEN_MAX_EXPLICIT_DEPS + (capacity - 1) * DEP_GEN_OVERFLOW_DEPS_PER_RECORD;
+        LOG_ERROR(
+            "dep_gen: chain (%d records for %d deps) exceeds buffer capacity (%d slots), truncating to %d deps", needed,
+            dc, capacity, dc_fit
+        );
+        dc = dc_fit;
+        needed = dep_gen_records_needed_for(dc);
+    }
 
     int tc = tensor_count;
     if (tc < 0) {
@@ -209,22 +243,27 @@ void dep_gen_aicpu_record_submit(
         LOG_ERROR("dep_gen: tensor_count %d > CORE_MAX_TENSOR_ARGS (%d), truncating", tc, CORE_MAX_TENSOR_ARGS);
         tc = CORE_MAX_TENSOR_ARGS;
     }
+
+    // ---- Write base record ----
+    uint32_t idx = local_count;
+    DepGenRecord *rec = &buf->records[idx];
+
+    rec->task_id = task_id_raw;
+    // Cast the enum to uint32_t before the ternary so Linux GCC's -Wextra
+    // does not warn about "enumerated and non-enumerated type in conditional".
+    uint32_t base_flags = in_manual_scope ? static_cast<uint32_t>(DEP_GEN_FLAG_IN_MANUAL_SCOPE) : 0u;
+    if (needed > 1) {
+        base_flags |= static_cast<uint32_t>(DEP_GEN_FLAG_HAS_OVERFLOW);
+    }
+    rec->flags = base_flags;
     rec->tensor_count = static_cast<uint16_t>(tc);
 
-    int dc = explicit_dep_count;
-    if (dc < 0) {
-        dc = 0;
-    } else if (dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
-        LOG_ERROR(
-            "dep_gen: explicit_dep_count %d > DEP_GEN_MAX_EXPLICIT_DEPS (%d), truncating", dc, DEP_GEN_MAX_EXPLICIT_DEPS
-        );
-        dc = DEP_GEN_MAX_EXPLICIT_DEPS;
-    }
-    rec->explicit_dep_count = static_cast<uint16_t>(dc);
+    int base_dc = (dc < DEP_GEN_MAX_EXPLICIT_DEPS) ? dc : DEP_GEN_MAX_EXPLICIT_DEPS;
+    rec->explicit_dep_count = static_cast<uint16_t>(base_dc);
 
-    // explicit_deps (tail of the entry, packed; replay reads only the first dc entries)
-    if (dc > 0 && explicit_deps_raw != nullptr) {
-        memcpy(rec->explicit_deps, explicit_deps_raw, static_cast<size_t>(dc) * sizeof(uint64_t));
+    // explicit_deps (tail of the entry, packed; replay reads only the first base_dc entries)
+    if (base_dc > 0) {
+        memcpy(rec->explicit_deps, explicit_deps_raw, static_cast<size_t>(base_dc) * sizeof(uint64_t));
     }
 
     // arg_types
@@ -247,7 +286,39 @@ void dep_gen_aicpu_record_submit(
         }
     }
 
-    buf->count = idx + 1;
+    // ---- Write overflow chain ----
+    // Charge each overflow slot to total_overflow_record_count so the host's
+    // reconciliation equation (`collected + dropped == total + total_overflow`)
+    // accounts for chain expansion. total_record_count stays "one per submit"
+    // — see DepGenBufferState doc.
+    if (needed > 1) {
+        s_dep_gen_state->total_overflow_record_count += static_cast<uint32_t>(needed - 1);
+    }
+    int written = base_dc;
+    for (int slot = 1; slot < needed; slot++) {
+        auto *over = reinterpret_cast<DepGenOverflowRecord *>(&buf->records[idx + static_cast<uint32_t>(slot)]);
+        over->task_id = task_id_raw;
+        const int chunk =
+            ((dc - written) < DEP_GEN_OVERFLOW_DEPS_PER_RECORD) ? (dc - written) : DEP_GEN_OVERFLOW_DEPS_PER_RECORD;
+        const bool is_last = (slot == needed - 1);
+        uint32_t over_flags = static_cast<uint32_t>(DEP_GEN_FLAG_OVERFLOW);
+        if (is_last) {
+            over_flags |= static_cast<uint32_t>(DEP_GEN_FLAG_LAST_OVERFLOW);
+        }
+        over->flags = over_flags;
+        over->dep_count = static_cast<uint16_t>(chunk);
+        over->_reserved = 0;
+        if (chunk > 0) {
+            memcpy(over->deps, explicit_deps_raw + written, static_cast<size_t>(chunk) * sizeof(uint64_t));
+        }
+        written += chunk;
+    }
+
+    // Publish all reserved slots atomically — host either sees the old count
+    // (chain invisible) or the new count with the full chain committed. The
+    // single trailing wmb() flushes both the record payloads and the count
+    // store, matching the pre-chain contract.
+    buf->count = idx + static_cast<uint32_t>(needed);
     wmb();
 }
 

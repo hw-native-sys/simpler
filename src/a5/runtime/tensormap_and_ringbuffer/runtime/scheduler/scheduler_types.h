@@ -18,6 +18,7 @@
 #include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
 #include "pto_runtime2_types.h"
+#include "spin_hint.h"
 
 // =============================================================================
 // Profiling macros (compile-time gated)
@@ -44,9 +45,9 @@
 
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 
-constexpr int32_t MAX_IDLE_ITERATIONS = 800000;       // ~20s idle then scheduler gives up (avoid long hang)
-constexpr int32_t STALL_LOG_INTERVAL = 400000;        // LOG_INFO_V9 every N idle iters to debug hang
-constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
+constexpr int32_t MAX_IDLE_ITERATIONS = PLATFORM_MAX_IDLE_ITERATIONS;  // platform-defined cap (sim vs onboard)
+constexpr int32_t STALL_LOG_INTERVAL = MAX_IDLE_ITERATIONS / 2;  // derived: ~one stall diagnostic halfway to timeout
+constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;             // Check orchestrator error every N idle iters
 constexpr int32_t STALL_DUMP_READY_MAX = 8;
 constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
 constexpr int32_t STALL_DUMP_CORE_MAX = 8;

@@ -39,7 +39,7 @@
 
 #include "callable.h"
 #include "prepare_callable_common.h"
-#include "pto_runtime2/device_pool.h"
+#include "device_arena.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
 #include "common/l2_perf_profiling.h"
@@ -181,31 +181,24 @@ struct AicpuSoInfo {
 class DeviceRunner {
 public:
     DeviceRunner() :
-        gm_heap_pool_(
-            [this](size_t n) {
-                return mem_alloc_.alloc(n);
-            },
-            [this](void *p) {
-                mem_alloc_.free(p);
-            }
-        ),
-        gm_sm_pool_(
-            [this](size_t n) {
-                return mem_alloc_.alloc(n);
-            },
-            [this](void *p) {
-                mem_alloc_.free(p);
-            }
-        ) {}
+        static_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
     ~DeviceRunner();
 
     /**
-     * Per-Worker pooled GM heap / shared-memory buffer acquisition.
-     * Grows on demand, never shrinks; backed by `mem_alloc_` so the
-     * underlying allocations are released in `finalize()`.
+     * Lay out and commit the per-Worker static device arena that backs the
+     * PTO2 GM heap and PTO2 shared memory in a single underlying allocation.
+     * Must be called before acquire_pooled_gm_heap / acquire_pooled_gm_sm.
+     * Idempotent on identical sizes. Returns 0 on success, -1 on failure.
      */
-    void *acquire_pooled_gm_heap(size_t size) { return gm_heap_pool_.acquire(size); }
-    void *acquire_pooled_gm_sm(size_t size) { return gm_sm_pool_.acquire(size); }
+    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size);
+
+    /**
+     * Return the pooled GM heap / PTO2 SM pointer. setup_static_arena must
+     * have been called earlier in this Worker; otherwise these return
+     * nullptr. Pointers are stable for the lifetime of the Worker.
+     */
+    void *acquire_pooled_gm_heap();
+    void *acquire_pooled_gm_sm();
 
     /**
      * Create a thread bound to this device.
@@ -292,7 +285,10 @@ public:
      * corresponding `enable_*_` members directly. Moved off the generic
      * Runtime struct / run() arg list so all three travel the same way.
      */
-    void set_l2_swimlane_enabled(bool enable) { enable_l2_swimlane_ = enable; }
+    void set_l2_swimlane_enabled(int level) {
+        l2_perf_level_ = static_cast<L2PerfLevel>(level);
+        enable_l2_swimlane_ = (l2_perf_level_ != L2PerfLevel::DISABLED);
+    }
     void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
@@ -485,11 +481,22 @@ private:
     // Memory management
     MemoryAllocator mem_alloc_;
 
-    // Per-Worker pooled PTO2 GM heap and shared-memory buffers. Constructed
-    // with closures bound to mem_alloc_; released explicitly in finalize()
-    // before mem_alloc_.finalize() so they do not free pointers a second time.
-    pto_runtime2::DevicePool gm_heap_pool_;
-    pto_runtime2::DevicePool gm_sm_pool_;
+    // Per-Worker arena backing the PTO2 GM heap + PTO2 shared memory in a
+    // single device allocation. Released explicitly in finalize() before
+    // mem_alloc_.finalize() so it does not free pointers a second time.
+    //
+    // Trampolines forward DeviceArena's alloc/free calls to mem_alloc_.
+    static void *arena_alloc_trampoline(void *ctx, size_t size) {
+        return static_cast<MemoryAllocator *>(ctx)->alloc(size);
+    }
+    static void arena_free_trampoline(void *ctx, void *p) { static_cast<MemoryAllocator *>(ctx)->free(p); }
+    DeviceArena static_arena_;
+    size_t gm_heap_region_off_{SIZE_MAX};
+    size_t gm_sm_region_off_{SIZE_MAX};
+    // Cached sizes for setup_static_arena's "fits" check — avoids calling
+    // region_size() on the arena's public API for the two regions we own.
+    size_t cached_gm_heap_size_{0};
+    size_t cached_gm_sm_size_{0};
 
     // Device resources
     rtStream_t stream_aicpu_{nullptr};
@@ -576,10 +583,25 @@ private:
     int ensure_device_initialized();
 
     /**
+     * Query the maximum block_dim the stream can host.
+     *
+     * Uses aclrtGetStreamResLimit(CUBE_CORE / VECTOR_CORE) and returns
+     * min(cube / AIC_PER_BLOCKDIM, vector / AIV_PER_BLOCKDIM). Falls back to
+     * the static PLATFORM_MAX_BLOCKDIM cap when the query is unavailable or
+     * reports no cores. Used both to validate explicit block_dim values and
+     * to resolve the CallConfig "auto" sentinel (block_dim == 0).
+     *
+     * If non-null, `out_cube` / `out_vector` receive the raw ACL limits when
+     * the query succeeded, or 0 when it failed. Callers use this to
+     * distinguish the ACL-unavailable fallback path from the success path in
+     * error logs.
+     */
+    int query_max_block_dim(rtStream_t stream, uint32_t *out_cube = nullptr, uint32_t *out_vector = nullptr);
+
+    /**
      * Validate block_dim against the stream's CUBE/VECTOR core limits
-     * (aclrtGetStreamResLimit). When that query is unavailable or reports no
-     * cores, falls back to the static PLATFORM_MAX_BLOCKDIM cap.
-     * Returns 0 if block_dim fits, -1 otherwise (or if block_dim < 1).
+     * (via query_max_block_dim). Returns 0 if block_dim fits, -1 otherwise
+     * (or if block_dim < 1).
      */
     int validate_block_dim(rtStream_t stream, int block_dim);
 
@@ -647,6 +669,7 @@ private:
     bool enable_l2_swimlane_{false};
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
+    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};             // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
 

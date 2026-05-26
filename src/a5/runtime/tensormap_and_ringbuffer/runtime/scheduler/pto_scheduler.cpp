@@ -65,12 +65,15 @@ PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
 // Ready Queue Implementation
 // =============================================================================
 
-bool ready_queue_init(PTO2ReadyQueue *queue, uint64_t capacity) {
-    queue->slots = (PTO2ReadyQueueSlot *)malloc(capacity * sizeof(PTO2ReadyQueueSlot));
-    if (!queue->slots) {
-        return false;
-    }
+size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity) {
+    // Align the slots[] base to a full cache line so MPMC CAS traffic on the
+    // first slot cannot false-share with whatever region sits in front of us
+    // (e.g. orchestrator tensormap heads written by the orch thread).
+    return arena.reserve(capacity * sizeof(PTO2ReadyQueueSlot), PTO2_ALIGN_SIZE);
+}
 
+bool ready_queue_init_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity) {
+    queue->slots = static_cast<PTO2ReadyQueueSlot *>(arena.region_ptr(slots_off));
     queue->capacity = capacity;
     queue->mask = capacity - 1;
     queue->enqueue_pos.store(0, std::memory_order_relaxed);
@@ -85,10 +88,8 @@ bool ready_queue_init(PTO2ReadyQueue *queue, uint64_t capacity) {
 }
 
 void ready_queue_destroy(PTO2ReadyQueue *queue) {
-    if (queue->slots) {
-        free(queue->slots);
-        queue->slots = NULL;
-    }
+    // Arena owns the slots[] buffer; just forget the pointer.
+    queue->slots = nullptr;
 }
 
 // =============================================================================
@@ -117,82 +118,71 @@ bool PTO2SchedulerState::RingSchedState::init(PTO2SharedMemoryHeader *sm_header,
 
 void PTO2SchedulerState::RingSchedState::destroy() { ring = nullptr; }
 
-bool PTO2SchedulerState::init(PTO2SharedMemoryHeader *sm_header, int32_t dep_pool_capacity) {
+PTO2SchedulerLayout PTO2SchedulerState::reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity) {
+    PTO2SchedulerLayout layout{};
+    layout.ready_queue_capacity = PTO2_READY_QUEUE_SIZE;
+    layout.spsc_capacity = PTO2_WRIRING_QUEUE_SIZE;
+    layout.dep_pool_capacity = dep_pool_capacity;
+
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        layout.off_ready_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
+    }
+    layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        // Force a cache-line base so writes from scheduler thread 0 (sole
+        // writer of this ring's dep_pool) do not invalidate adjacent
+        // multi-threaded regions like ready_queue.slots.
+        layout.off_dep_pool_entries[r] =
+            arena.reserve(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2DepListEntry), PTO2_ALIGN_SIZE);
+    }
+    layout.off_wiring_spsc_buffer = PTO2SpscQueue::reserve_layout(arena, PTO2_WRIRING_QUEUE_SIZE);
+    return layout;
+}
+
+bool PTO2SchedulerState::init_from_layout(
+    const PTO2SchedulerLayout &layout, DeviceArena &arena, PTO2SharedMemoryHeader *sm_header_arg
+) {
     PTO2SchedulerState *sched = this;
-    sched->sm_header = sm_header;
+    sched->sm_header = sm_header_arg;
 #if PTO2_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
 #endif
 
-    // Initialize per-ring state
+    // Per-ring scheduler state — no arena buffers, just field init.
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (!sched->ring_sched_states[r].init(sm_header, r)) {
-            for (int j = 0; j < r; j++) {
-                sched->ring_sched_states[j].destroy();
-            }
+        if (!sched->ring_sched_states[r].init(sm_header_arg, r)) {
             return false;
         }
     }
 
-    // Initialize ready queues (one per resource shape, global)
+    // Ready queues — one per resource shape plus DUMMY.
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-        if (!ready_queue_init(&sched->ready_queues[i], PTO2_READY_QUEUE_SIZE)) {
-            // Cleanup on failure
-            for (int j = 0; j < i; j++) {
-                ready_queue_destroy(&sched->ready_queues[j]);
-            }
-            for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-                sched->ring_sched_states[r].destroy();
-            }
+        if (!ready_queue_init_from_layout(
+                &sched->ready_queues[i], arena, layout.off_ready_queue_slots[i], layout.ready_queue_capacity
+            )) {
             return false;
         }
     }
-
-    // Initialize the DUMMY (dep-only task) ready queue.
-    if (!ready_queue_init(&sched->dummy_ready_queue, PTO2_READY_QUEUE_SIZE)) {
-        for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-            ready_queue_destroy(&sched->ready_queues[i]);
-        }
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            sched->ring_sched_states[r].destroy();
-        }
+    if (!ready_queue_init_from_layout(
+            &sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots, layout.ready_queue_capacity
+        )) {
         return false;
     }
 
-    // Initialize per-ring wiring queues and dep pools (exclusively managed by scheduler thread 0)
+    // Per-ring dep_pool: PTO2DepListPool::init takes an externally-allocated
+    // base + capacity, so we just plumb the arena region into it.
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        PTO2DepListEntry *dep_entries =
-            reinterpret_cast<PTO2DepListEntry *>(calloc(dep_pool_capacity, sizeof(PTO2DepListEntry)));
-        if (!dep_entries) {
-            for (int j = 0; j < r; j++) {
-                free(sched->ring_sched_states[j].dep_pool.base);
-            }
-            for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-                ready_queue_destroy(&sched->ready_queues[i]);
-            }
-            ready_queue_destroy(&sched->dummy_ready_queue);
-            sched->wiring.queue.destroy();
-            for (int rr = 0; rr < PTO2_MAX_RING_DEPTH; rr++) {
-                sched->ring_sched_states[rr].destroy();
-            }
-            return false;
-        }
-        sched->ring_sched_states[r].dep_pool.init(dep_entries, dep_pool_capacity, &sm_header->orch_error_code);
+        auto *dep_entries = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries[r]));
+        // calloc-equivalent: pool expects entries zeroed at construction.
+        memset(dep_entries, 0, static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2DepListEntry));
+        sched->ring_sched_states[r].dep_pool.init(
+            dep_entries, layout.dep_pool_capacity, &sm_header_arg->orch_error_code
+        );
     }
 
-    // Initialize global wiring queue (SPSC: orchestrator pushes, scheduler thread 0 drains)
-    if (!sched->wiring.queue.init(PTO2_WRIRING_QUEUE_SIZE)) {
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            free(sched->ring_sched_states[r].dep_pool.base);
-        }
-        for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-            ready_queue_destroy(&sched->ready_queues[i]);
-        }
-        ready_queue_destroy(&sched->dummy_ready_queue);
-        for (int rr = 0; rr < PTO2_MAX_RING_DEPTH; rr++) {
-            sched->ring_sched_states[rr].destroy();
-        }
+    // Wiring SPSC queue (orchestrator push, scheduler thread 0 pop).
+    if (!sched->wiring.queue.init_from_layout(arena, layout.off_wiring_spsc_buffer, layout.spsc_capacity)) {
         return false;
     }
     sched->wiring.batch_count = 0;
@@ -206,7 +196,6 @@ void PTO2SchedulerState::destroy() {
     PTO2SchedulerState *sched = this;
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         sched->ring_sched_states[r].destroy();
-        free(sched->ring_sched_states[r].dep_pool.base);
         sched->ring_sched_states[r].dep_pool.base = nullptr;
     }
 

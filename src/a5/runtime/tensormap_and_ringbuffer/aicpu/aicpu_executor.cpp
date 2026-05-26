@@ -118,12 +118,17 @@ struct AicpuExecutor {
     std::atomic<bool> init_failed_{false};
     std::atomic<bool> finished_{false};
 
-    int32_t thread_num_{0};
+    int32_t aicpu_thread_num_{0};
 
     // ===== Task queue state (managed by scheduler ready queues) =====
 
     std::atomic<int32_t> finished_count_{0};
     std::atomic<bool> runtime_init_ready_{false};
+
+    // Per-Worker arena backing the PTO2Runtime + sm_handle + orch/sched/mailbox
+    // sub-regions (created in runtime_create_from_sm, released in runtime_destroy).
+    // Default-constructed: libc-backed backend, no ctx.
+    DeviceArena runtime_arena_;
 
     // Cached orch args pointer set by the orchestration thread before scheduler
     // init; consumed by the (*p_func)(*orch_args_cached_) invocation below.
@@ -173,19 +178,21 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
 
-    // Read execution parameters from runtime
-    thread_num_ = runtime->sche_cpu_num;
-    sched_thread_num_ = thread_num_ - 1;
+    // Read execution parameters from runtime. The 0 → 1 fixup runs before the
+    // sched_thread_num_ derivation so a zero input doesn't leave the scheduler
+    // count at -1.
+    aicpu_thread_num_ = runtime->aicpu_thread_num;
+    if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
+    sched_thread_num_ = aicpu_thread_num_ - 1;
     orch_to_sched_ = runtime->orch_to_sched;
-    if (thread_num_ == 0) thread_num_ = 1;
 
-    if (thread_num_ < 1 || thread_num_ > MAX_AICPU_THREADS) {
-        LOG_ERROR("Invalid thread_num: %d", thread_num_);
+    if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
+        LOG_ERROR("Invalid aicpu_thread_num: %d", aicpu_thread_num_);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
 
-    if (sched_ctx_.init(runtime, thread_num_, sched_thread_num_, orch_to_sched_, get_platform_regs()) != 0) {
+    if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, orch_to_sched_, get_platform_regs()) != 0) {
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -463,26 +470,19 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             void *gm_heap = runtime->get_gm_heap_ptr();
 
             uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
-            PTO2SharedMemoryHandle *sm_handle =
-                PTO2SharedMemoryHandle::create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
-            if (!sm_handle) {
-                LOG_ERROR("Thread %d: Failed to create shared memory handle", thread_idx);
-                // Unblock scheduler threads before returning so they don't spin forever.
-                runtime_init_ready_.store(true, std::memory_order_release);
-                return -1;
-            }
-
-            rt = runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, dep_pool_capacity);
+            rt = runtime_create_from_sm(
+                PTO2_MODE_EXECUTE, sm_ptr, sm_size, task_window_size, gm_heap, heap_size, runtime_arena_,
+                dep_pool_capacity
+            );
             if (!rt) {
                 LOG_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
-                sm_handle->destroy();
                 // Unblock scheduler threads before returning so they don't spin forever.
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
 #if PTO2_PROFILING
-            rt->orchestrator.enable_l2_swimlane = is_l2_swimlane_enabled();
+            rt->orchestrator.l2_perf_level = get_l2_perf_level();
 #endif
 
             // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
@@ -504,7 +504,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             sched_ctx_.wait_init_complete();
 
 #if PTO2_PROFILING
-            if (is_l2_swimlane_enabled()) {
+            if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
                 l2_perf_aicpu_set_orch_thread_idx(thread_idx);
             }
 #endif
@@ -661,7 +661,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     // Check if this is the last thread to finish
     int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
-    if (prev_finished + 1 == thread_num_) {
+    if (prev_finished + 1 == aicpu_thread_num_) {
         finished_.store(true, std::memory_order_release);
         // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
         // always tear them down here, but we keep the per-cid orch SO entries
@@ -676,7 +676,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     bind(nullptr);
                 }
             }
-            runtime_destroy(rt);
+            runtime_destroy(rt, runtime_arena_);
+            rt = nullptr;
         }
     }
 
@@ -695,7 +696,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     finished_count_.store(0, std::memory_order_release);
     runtime_init_ready_.store(false, std::memory_order_release);
 
-    thread_num_ = 0;
+    aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
 

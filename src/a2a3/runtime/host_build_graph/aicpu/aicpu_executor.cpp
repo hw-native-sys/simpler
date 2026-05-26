@@ -52,7 +52,7 @@ struct AicpuExecutor {
     std::atomic<bool> init_failed_{false};
     std::atomic<bool> finished_{false};
 
-    int thread_num_{0};
+    int aicpu_thread_num_{0};
     int cores_total_num_{0};
     int thread_cores_num_[MAX_AICPU_THREADS]{};  // Total cores (AIC+AIV) assigned to each thread
     int aic_per_thread_{0};                      // Max AIC cores per thread (ceil), used as local queue cap
@@ -309,11 +309,11 @@ int AicpuExecutor::init(Runtime *runtime) {
     }
 
     // Read execution parameters from runtime
-    thread_num_ = runtime->sche_cpu_num;
+    aicpu_thread_num_ = runtime->aicpu_thread_num;
 
     // Simplified defensive check
-    if (thread_num_ < 1 || thread_num_ > MAX_AICPU_THREADS) {
-        LOG_ERROR("Invalid thread_num: %d (valid range: 1-%d)", thread_num_, MAX_AICPU_THREADS);
+    if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
+        LOG_ERROR("Invalid aicpu_thread_num: %d (valid range: 1-%d)", aicpu_thread_num_, MAX_AICPU_THREADS);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -335,7 +335,7 @@ int AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
 
-    LOG_INFO_V0("Config: threads=%d, cores=%d", thread_num_, cores_total_num_);
+    LOG_INFO_V0("Config: threads=%d, cores=%d", aicpu_thread_num_, cores_total_num_);
 
     for (int i = 0; i < cores_total_num_; i++) {
         pending_task_ids_[i] = AICPU_TASK_INVALID;
@@ -355,7 +355,7 @@ int AicpuExecutor::init(Runtime *runtime) {
     }
 #if PTO2_PROFILING
     if (is_dump_tensor_enabled()) {
-        dump_tensor_init(thread_num_);
+        dump_tensor_init(aicpu_thread_num_);
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
@@ -485,27 +485,27 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
 
 // Assign discovered cores to threads using round-robin
 void AicpuExecutor::assign_cores_to_threads() {
-    // Round-robin: AIC core i → thread (i % thread_num_), AIV core i → thread (i % thread_num_).
+    // Round-robin: AIC core i → thread (i % aicpu_thread_num_), AIV core i → thread (i % aicpu_thread_num_).
     // AIC and AIV are assigned independently; no cluster pairing is required.
     // aic_per_thread_ / aiv_per_thread_ store the ceiling value and serve as local queue caps.
-    aic_per_thread_ = (aic_count_ + thread_num_ - 1) / thread_num_;
-    aiv_per_thread_ = (aiv_count_ + thread_num_ - 1) / thread_num_;
+    aic_per_thread_ = (aic_count_ + aicpu_thread_num_ - 1) / aicpu_thread_num_;
+    aiv_per_thread_ = (aiv_count_ + aicpu_thread_num_ - 1) / aicpu_thread_num_;
 
     LOG_INFO_V0(
         "Core Assignment: %d AIC cores, %d AIV cores across %d threads (max %d AIC/thread, %d AIV/thread)", aic_count_,
-        aiv_count_, thread_num_, aic_per_thread_, aiv_per_thread_
+        aiv_count_, aicpu_thread_num_, aic_per_thread_, aiv_per_thread_
     );
 
-    for (int t = 0; t < thread_num_; t++) {
+    for (int t = 0; t < aicpu_thread_num_; t++) {
         int core_idx = 0;
 
-        // Assign AIC cores: cores at indices t, t+thread_num_, t+2*thread_num_, ...
-        for (int i = t; i < aic_count_; i += thread_num_) {
+        // Assign AIC cores: cores at indices t, t+aicpu_thread_num_, t+2*aicpu_thread_num_, ...
+        for (int i = t; i < aic_count_; i += aicpu_thread_num_) {
             core_assignments_[t][core_idx++] = aic_cores_[i].worker_id;
         }
 
         // Assign AIV cores after AIC cores
-        for (int i = t; i < aiv_count_; i += thread_num_) {
+        for (int i = t; i < aiv_count_; i += aicpu_thread_num_) {
             core_assignments_[t][core_idx++] = aiv_cores_[i].worker_id;
         }
 
@@ -518,14 +518,14 @@ void AicpuExecutor::assign_cores_to_threads() {
             log_buffer + offset, sizeof(log_buffer) - offset, "Thread %d: assigned %d cores - AIC[", t, core_idx
         );
 
-        for (int k = 0, i = t; i < aic_count_; i += thread_num_, k++) {
+        for (int k = 0, i = t; i < aic_count_; i += aicpu_thread_num_, k++) {
             if (k > 0) offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, ",");
             offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "%d", aic_cores_[i].worker_id);
         }
 
         offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "] AIV[");
 
-        for (int k = 0, i = t; i < aiv_count_; i += thread_num_, k++) {
+        for (int k = 0, i = t; i < aiv_count_; i += aicpu_thread_num_, k++) {
             if (k > 0) offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, ",");
             offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "%d", aiv_cores_[i].worker_id);
         }
@@ -588,7 +588,7 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime *runtime) {
             shared_count++;
         }
 
-        next_thread_idx = (thread_idx + 1) % thread_num_;
+        next_thread_idx = (thread_idx + 1) % aicpu_thread_num_;
     };
 
     int task_count = runtime->get_task_count();
@@ -622,7 +622,7 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime *runtime) {
         initial_aiv_count - aiv_shared_count, aiv_shared_count
     );
 
-    for (int t = 0; t < thread_num_; t++) {
+    for (int t = 0; t < aicpu_thread_num_; t++) {
         int aic_size =
             (cur_ready_queue_aic_tail_[t] - cur_ready_queue_aic_head_[t] + MAX_CORES_PER_THREAD) % MAX_CORES_PER_THREAD;
         int aiv_size =
@@ -1147,7 +1147,7 @@ int AicpuExecutor::run(Runtime *runtime) {
     LOG_INFO_V0("Thread %d: Completed", thread_idx);
 
     int prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
-    if (prev_finished + 1 == thread_num_) {
+    if (prev_finished + 1 == aicpu_thread_num_) {
         finished_.store(true, std::memory_order_release);
         LOG_INFO_V0("Thread %d: Last thread, marking executor finished", thread_idx);
     }
@@ -1205,7 +1205,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     aic_count_ = 0;
     aiv_count_ = 0;
     cores_total_num_ = 0;
-    thread_num_ = 0;
+    aicpu_thread_num_ = 0;
     aic_per_thread_ = 0;
     aiv_per_thread_ = 0;
     memset(core_assignments_, 0, sizeof(core_assignments_));

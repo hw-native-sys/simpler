@@ -109,7 +109,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
 | `--manual` | | `exclude` | `exclude`/`include`/`only` for manual cases |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
-| `--enable-l2-swimlane [PERF_LEVEL]` | | `0` | Enable L2 swimlane collection on first round only. On a2a3 the flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md#31-enable-l2-swimlane) for the level table. On a5 (both `a5` onboard and `a5sim`) the perf_level integer is not honored yet — the flag is treated as boolean (bare = on). Each test case gets its own `outputs/<case>_<ts>/` directory under which `l2_perf_records.json` lands; parallel runs never collide. |
+| `--enable-l2-swimlane [PERF_LEVEL]` | | `0` | Enable L2 swimlane collection on first round only. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md#31-enable-l2-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `l2_perf_records.json` lands; parallel runs never collide. |
 | `--dump-tensor` | | false | Dump per-task tensor I/O during runtime execution |
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--build` | | false | Compile runtime from source (not pre-built) |

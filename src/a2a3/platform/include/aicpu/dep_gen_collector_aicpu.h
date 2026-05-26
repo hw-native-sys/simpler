@@ -73,9 +73,10 @@ void dep_gen_aicpu_set_orch_thread_idx(int thread_idx);
 void dep_gen_aicpu_init();
 
 /**
- * Append one DepGenRecord for a completed submit_task call. Switches buffer
- * via the SPSC free_queue / ready_queue protocol when the current buffer is
- * full. No-op if dep_gen is disabled.
+ * Append a base DepGenRecord (and zero or more DepGenOverflowRecord chain
+ * records) for a completed submit_task call. Switches buffer via the SPSC
+ * free_queue / ready_queue protocol when the current buffer cannot hold the
+ * full chain. No-op if dep_gen is disabled.
  *
  * Tensor handling: for slot i, if tensor_ptrs[i] is non-null, its first
  * DEP_GEN_TENSOR_SIZE bytes are memcpy'd into record.tensors[i]. If null
@@ -83,13 +84,19 @@ void dep_gen_aicpu_init();
  * the runtime), the slot is left zeroed. Replay decides what to do with
  * each slot based on arg_types[i].
  *
+ * Dep handling: the first DEP_GEN_MAX_EXPLICIT_DEPS deps land in the base
+ * record; any excess spills into a chain of DepGenOverflowRecord slots. A
+ * submit whose chain would exceed the buffer's remaining capacity (even
+ * after switch) is truncated to fit; the dropped tail is logged.
+ *
  * @param task_id_raw         PTO2TaskId::raw (the assigned task_id for this submit)
  * @param in_manual_scope     true iff the submit happened inside a manual scope
  * @param tensor_count        Number of slots in tensor_ptrs / arg_types (≤ CORE_MAX_TENSOR_ARGS)
  * @param tensor_ptrs         Per-slot Tensor pointer (nullptr to skip the slot)
  * @param arg_types           Per-slot TensorArgType (interpreted as raw byte)
- * @param explicit_dep_count  Number of explicit_deps (≤ DEP_GEN_MAX_EXPLICIT_DEPS)
- * @param explicit_deps_raw   Per-dep PTO2TaskId::raw
+ * @param explicit_dep_count  Number of explicit_deps — no static cap; truncated only when the
+ *                            chain would not fit in a single DepGenBuffer
+ * @param explicit_deps_raw   Per-dep PTO2TaskId::raw (length = explicit_dep_count)
  */
 void dep_gen_aicpu_record_submit(
     uint64_t task_id_raw, bool in_manual_scope, int tensor_count, const void *const *tensor_ptrs,

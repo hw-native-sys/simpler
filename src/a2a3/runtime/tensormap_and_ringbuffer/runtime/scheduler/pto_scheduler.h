@@ -32,6 +32,7 @@
 #include <atomic>
 
 #include "common/core_type.h"
+#include "device_arena.h"
 #include "pto_async_wait.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
@@ -68,8 +69,8 @@ struct PTO2ReadyQueueSlot {
  * the start of each iteration (verified by always_assert).
  *
  * Phase 1 fills per-CoreType buffers via on_task_complete().
- * dispatch_ready_tasks_to_idle_cores drains them: local-first via
- * get_ready_task_batch, then remaining tasks pushed to global readyQ.
+ * The dispatch stage drains them local-first via get_ready_tasks_batch,
+ * with any remaining tasks pushed to the global ready queue.
  */
 // Number of CoreType values eligible for local dispatch (AIC=0, AIV=1)
 static constexpr int PTO2_LOCAL_DISPATCH_TYPE_NUM = 2;
@@ -400,10 +401,15 @@ struct alignas(64) PTO2ReadyQueue {
 #endif
 };
 
-// Cold-path ready queue operations (defined in pto_scheduler.cpp)
-// Declared as non-member to keep PTO2ReadyQueue a POD-like struct with
-// cache-line alignment. The struct body above contains only hot-path inlines.
-bool ready_queue_init(PTO2ReadyQueue *queue, uint64_t capacity);
+// Cold-path ready queue operations (defined in pto_scheduler.cpp). Declared
+// as non-member so PTO2ReadyQueue stays a POD-like struct with cache-line
+// alignment. Storage is owned by the caller-supplied arena.
+//   reserve_layout: declare the slots[] region on the arena (must precede commit)
+//   init_from_layout: bind slots pointer from arena.region_ptr(off) and
+//                     initialize sequence counters
+//   destroy: forget the slots pointer (arena owns the buffer)
+size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity);
+bool ready_queue_init_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity);
 void ready_queue_destroy(PTO2ReadyQueue *queue);
 
 // =============================================================================
@@ -434,10 +440,24 @@ struct alignas(64) PTO2SpscQueue {
     PTO2TaskSlotState **buffer_{nullptr};
     uint64_t mask_{0};
 
-    bool init(uint64_t capacity) {
+    // Reserve the backing buffer region on the supplied arena. Returns the
+    // region offset, to be passed to init_from_layout() after the arena is
+    // committed. Cache-line aligned: the buffer is shared between the
+    // orchestrator (push) and scheduler thread 0 (pop_batch), so its base
+    // must not false-share with neighboring regions.
+    static size_t reserve_layout(DeviceArena &arena, uint64_t capacity) {
+        return arena.reserve(capacity * sizeof(PTO2TaskSlotState *), PTO2_ALIGN_SIZE);
+    }
+
+    // Bind buffer pointer + reset indices. The capacity must be a power of two
+    // and match the value passed to reserve_layout.
+    bool init_from_layout(DeviceArena &arena, size_t buffer_off, uint64_t capacity) {
         if (capacity == 0 || (capacity & (capacity - 1)) != 0) return false;
-        buffer_ = static_cast<PTO2TaskSlotState **>(calloc(capacity, sizeof(PTO2TaskSlotState *)));
-        if (!buffer_) return false;
+        buffer_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
+        // calloc'd-equivalent: zero the slot pointers so spurious early pops
+        // observe nullptr.
+        for (uint64_t i = 0; i < capacity; i++)
+            buffer_[i] = nullptr;
         mask_ = capacity - 1;
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
@@ -446,12 +466,8 @@ struct alignas(64) PTO2SpscQueue {
         return true;
     }
 
-    void destroy() {
-        if (buffer_) {
-            free(buffer_);
-            buffer_ = nullptr;
-        }
-    }
+    // Arena owns the buffer; here we only forget our pointer.
+    void destroy() { buffer_ = nullptr; }
 
     // Push one item (producer only). Returns false if queue is full.
     // Full condition: next_h - tail > mask_ (i.e. > capacity-1), so the
@@ -509,6 +525,21 @@ struct CompletionStats {
     int32_t tasks_enqueued;     // Number of consumers that became READY
     int32_t fanin_edges;        // Number of fanin edges traversed (release producers)
     bool mixed_task_completed;  // True only when this callback completed a mixed task
+};
+
+/**
+ * Layout descriptor produced by PTO2SchedulerState::reserve_layout(). Holds
+ * the arena offsets of every sub-region the scheduler needs plus the
+ * capacities used at layout time (init_from_layout reuses them).
+ */
+struct PTO2SchedulerLayout {
+    size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
+    size_t off_dummy_ready_queue_slots;
+    size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
+    size_t off_wiring_spsc_buffer;
+    uint64_t ready_queue_capacity;
+    uint64_t spsc_capacity;
+    int32_t dep_pool_capacity;
 };
 
 /**
@@ -1008,7 +1039,18 @@ struct PTO2SchedulerState {
     }
 
     // === Cold-path API (defined in pto_scheduler.cpp) ===
-    bool init(PTO2SharedMemoryHeader *sm_header, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+
+    // Phase 1: declare every sub-region (ready_queue slots, dummy queue slots,
+    // per-ring dep_pool entries, wiring SPSC buffer) on the supplied arena.
+    // Capacities are baked into the returned layout; init_from_layout uses
+    // the same values.
+    static PTO2SchedulerLayout reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+
+    // Phase 3: bind region pointers and initialize state. The arena must be
+    // committed; layout must come from reserve_layout() against the same arena.
+    bool init_from_layout(const PTO2SchedulerLayout &layout, DeviceArena &arena, PTO2SharedMemoryHeader *sm_header);
+
+    // Forget per-region pointers; arena owns the backing memory.
     void destroy();
     void print_stats();
     void print_queues();

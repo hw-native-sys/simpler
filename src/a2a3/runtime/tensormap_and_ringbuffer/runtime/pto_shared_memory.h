@@ -36,9 +36,9 @@
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
-#ifndef PTO_SHARED_MEMORY_H
-#define PTO_SHARED_MEMORY_H
+#pragma once
 
+#include "device_arena.h"
 #include "pto_runtime2_types.h"
 
 // =============================================================================
@@ -156,17 +156,24 @@ struct PTO2SharedMemoryHandle {
     // Ownership flag
     bool is_owner;  // True if this handle allocated the memory
 
-    // === Static factory methods ===
+    // === Static helpers ===
 
     static uint64_t calculate_size(uint64_t task_window_size);
     static uint64_t calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
 
-    static PTO2SharedMemoryHandle *create(uint64_t task_window_size, uint64_t heap_size);
-    static PTO2SharedMemoryHandle *create_default();
-    static PTO2SharedMemoryHandle *
-    create_from_buffer(void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size);
+    // UT convenience: reserve wrapper + sm_base on `arena`, commit, and init
+    // using default PTO2_TASK_WINDOW_SIZE / PTO2_HEAP_SIZE. Only valid when the
+    // arena is otherwise empty (the call performs the single commit). All
+    // memory is owned by the arena — caller must not call destroy().
+    static PTO2SharedMemoryHandle *create_and_init_default(DeviceArena &arena);
 
     // === Instance methods ===
+
+    // In-place init for caller-provided wrapper storage (e.g. a region carved
+    // out of a DeviceArena). Sets is_owner = false, calls setup_pointers and
+    // init_header. Returns false when `sm_size` is too small for the requested
+    // `task_window_size`.
+    bool init(void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size);
 
     void destroy();
     void print_layout();
@@ -180,5 +187,3 @@ private:
     void setup_pointers(uint64_t task_window_size);
     void setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
 };
-
-#endif  // PTO_SHARED_MEMORY_H

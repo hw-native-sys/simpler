@@ -223,6 +223,13 @@ public:
      *
      * @param num_aicore     Number of AICore instances
      * @param device_id      Device ID (forwarded to register_cb)
+     * @param l2_perf_level  Collection granularity (DISABLED / AICORE_TIMING
+     *                       / AICPU_TIMING / SCHED_PHASES / ORCH_PHASES).
+     *                       Written into `L2PerfDataHeader::l2_perf_level`
+     *                       so AICPU can promote it in `l2_perf_aicpu_init`,
+     *                       AND cached on the collector so
+     *                       `export_swimlane_json()` can gate phase sections
+     *                       and stamp the JSON `version`.
      * @param alloc_cb       Device memory allocation callback
      * @param register_cb    Memory registration callback (nullptr on a5 ⇒
      *                       host-shadow allocation via malloc)
@@ -234,8 +241,8 @@ public:
      * @return 0 on success, error code on failure
      */
     int initialize(
-        int num_aicore, int device_id, const L2PerfAllocCallback &alloc_cb, L2PerfRegisterCallback register_cb,
-        const L2PerfFreeCallback &free_cb, const std::string &output_prefix
+        int num_aicore, int device_id, L2PerfLevel l2_perf_level, const L2PerfAllocCallback &alloc_cb,
+        L2PerfRegisterCallback register_cb, const L2PerfFreeCallback &free_cb, const std::string &output_prefix
     );
 
     /**
@@ -327,6 +334,7 @@ private:
     void *aicore_ring_addrs_host_{nullptr};
 
     int num_aicore_{0};
+    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};
 
     // Per-task output directory captured at initialize() time. Consumed by
     // export_swimlane_json() to build <prefix>/l2_perf_records.json.

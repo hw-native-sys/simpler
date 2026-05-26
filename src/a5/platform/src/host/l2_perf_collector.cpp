@@ -99,8 +99,8 @@ void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
 }
 
 int L2PerfCollector::initialize(
-    int num_aicore, int device_id, const L2PerfAllocCallback &alloc_cb, L2PerfRegisterCallback register_cb,
-    const L2PerfFreeCallback &free_cb, const std::string &output_prefix
+    int num_aicore, int device_id, L2PerfLevel l2_perf_level, const L2PerfAllocCallback &alloc_cb,
+    L2PerfRegisterCallback register_cb, const L2PerfFreeCallback &free_cb, const std::string &output_prefix
 ) {
     if (shm_host_ != nullptr) {
         LOG_ERROR("L2PerfCollector already initialized");
@@ -115,6 +115,7 @@ int L2PerfCollector::initialize(
     }
 
     num_aicore_ = num_aicore;
+    l2_perf_level_ = l2_perf_level;
     output_prefix_ = output_prefix;
     total_perf_collected_ = 0;
     total_phase_collected_ = 0;
@@ -156,11 +157,13 @@ int L2PerfCollector::initialize(
         header->queue_tails[t] = 0;
     }
     header->num_cores = num_aicore;
+    header->l2_perf_level = static_cast<uint32_t>(l2_perf_level_);
 
     LOG_DEBUG("Initialized L2PerfDataHeader:");
-    LOG_DEBUG("  num_cores:        %d", header->num_cores);
-    LOG_DEBUG("  buffer_capacity:  %d", PLATFORM_PROF_BUFFER_SIZE);
-    LOG_DEBUG("  queue capacity:   %d", PLATFORM_PROF_READYQUEUE_SIZE);
+    LOG_DEBUG("  num_cores:              %d", header->num_cores);
+    LOG_DEBUG("  l2_perf_level:          %u", header->l2_perf_level);
+    LOG_DEBUG("  buffer_capacity:        %d", PLATFORM_PROF_BUFFER_SIZE);
+    LOG_DEBUG("  queue capacity:         %d", PLATFORM_PROF_READYQUEUE_SIZE);
 
     // Step 4: Allocate per-core stable L2PerfAicoreRings + the address-table
     // buffer. Rings are allocated once and never rotated; AICore writes into
@@ -576,7 +579,7 @@ int L2PerfCollector::export_swimlane_json() {
         return -1;
     }
 
-    int version = has_phase_data_ ? 2 : 1;
+    int version = static_cast<int>(l2_perf_level_);
     outfile << "{\n";
     outfile << "  \"version\": " << version << ",\n";
     outfile << "  \"tasks\": [\n";
@@ -623,7 +626,8 @@ int L2PerfCollector::export_swimlane_json() {
     }
     outfile << "  ]";
 
-    if (has_phase_data_) {
+    // Step: Write phase profiling data (level >= 3)
+    if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
         auto sched_phase_name = [](AicpuPhaseId id) -> const char * {
             switch (id) {
             case AicpuPhaseId::SCHED_COMPLETE:
@@ -693,20 +697,23 @@ int L2PerfCollector::export_swimlane_json() {
         }
         outfile << "  ]";
 
+        // Per-task orchestrator phase records (level >= 4, filtered from unified collected_phase_records_)
         // Orchestrator timing is no longer emitted as a separate aggregate
         // block. Per-event AicpuPhaseRecord[] entries (emitted as
         // aicpu_orchestrator_phases below) are the single source of truth;
         // the run-window envelope is still visible in the device-side
         // LOG_INFO_V9 "Thread N: orch_start=… orch_end=… orch_cost=…" line.
         bool has_orch_phases = false;
-        for (const auto &v : collected_phase_records_) {
-            for (const auto &r : v) {
-                if (!is_scheduler_phase(r.phase_id)) {
-                    has_orch_phases = true;
-                    break;
+        if (l2_perf_level_ >= L2PerfLevel::ORCH_PHASES) {
+            for (const auto &v : collected_phase_records_) {
+                for (const auto &r : v) {
+                    if (!is_scheduler_phase(r.phase_id)) {
+                        has_orch_phases = true;
+                        break;
+                    }
                 }
+                if (has_orch_phases) break;
             }
-            if (has_orch_phases) break;
         }
         if (has_orch_phases) {
             outfile << ",\n  \"aicpu_orchestrator_phases\": [\n";

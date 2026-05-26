@@ -32,7 +32,7 @@ Runtime::Runtime() {
     // Initialize handshake buffers
     memset(workers, 0, sizeof(workers));
     worker_count = 0;
-    sche_cpu_num = 1;
+    aicpu_thread_num = 1;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     is_timing_enabled = false;
     warmup_iteration_count = RUNTIME_DEFAULT_WARMUP_ITERATION_COUNT;

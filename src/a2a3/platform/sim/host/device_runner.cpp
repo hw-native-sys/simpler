@@ -122,6 +122,42 @@ bool create_temp_so_file(const std::string &path_template, const uint8_t *data, 
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
+int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size) {
+    if (static_arena_.is_committed()) {
+        if (gm_heap_size <= cached_gm_heap_size_ && gm_sm_size <= cached_gm_sm_size_) return 0;
+        static_arena_.release();
+        gm_heap_region_off_ = SIZE_MAX;
+        gm_sm_region_off_ = SIZE_MAX;
+        cached_gm_heap_size_ = 0;
+        cached_gm_sm_size_ = 0;
+    }
+    gm_heap_region_off_ = static_arena_.reserve(gm_heap_size, DeviceArena::kDefaultBaseAlign);
+    gm_sm_region_off_ = static_arena_.reserve(gm_sm_size, DeviceArena::kDefaultBaseAlign);
+    if (static_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+        // Roll back the two reserves: commit() failure leaves committed_=false,
+        // so the next entry would skip the release branch and stack new
+        // reserves on top of the stale cursor. release() is idempotent on a
+        // never-committed arena (just zeroes cursor_ / region_count_).
+        static_arena_.release();
+        gm_heap_region_off_ = SIZE_MAX;
+        gm_sm_region_off_ = SIZE_MAX;
+        return -1;
+    }
+    cached_gm_heap_size_ = gm_heap_size;
+    cached_gm_sm_size_ = gm_sm_size;
+    return 0;
+}
+
+void *DeviceRunner::acquire_pooled_gm_heap() {
+    if (!static_arena_.is_committed()) return nullptr;
+    return static_arena_.region_ptr(gm_heap_region_off_);
+}
+
+void *DeviceRunner::acquire_pooled_gm_sm() {
+    if (!static_arena_.is_committed()) return nullptr;
+    return static_arena_.region_ptr(gm_sm_region_off_);
+}
+
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     int dev_id = device_id_;
     return std::thread([dev_id, fn = std::move(fn)]() {
@@ -340,6 +376,13 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // DeviceRunner::validate_block_dim). The scheduler assigns cores to
     // threads cluster-aligned round-robin, so block_dim need not be evenly
     // divisible by the scheduler thread count.
+    //
+    // block_dim == 0 is the CallConfig "auto" sentinel — resolve to the
+    // static max since sim has no per-stream resource query.
+    if (block_dim == 0) {
+        block_dim = PLATFORM_MAX_BLOCKDIM;
+        LOG_INFO_V0("block_dim auto-resolved to %d", block_dim);
+    }
     if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
         LOG_ERROR("block_dim (%d) must be in range [1, %d]", block_dim, PLATFORM_MAX_BLOCKDIM);
         return -1;
@@ -376,7 +419,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Initialize handshake buffers
     runtime.worker_count = num_aicore;
     worker_count_ = num_aicore;
-    runtime.sche_cpu_num = launch_aicpu_num;
+    runtime.aicpu_thread_num = launch_aicpu_num;
 
     // Calculate number of AIC cores
     int num_aic = block_dim;
@@ -989,10 +1032,14 @@ int DeviceRunner::finalize() {
     // Close executor .so files (typically already closed by run(), this is a safety net)
     unload_executor_binaries();
 
-    // Release per-Worker pooled GM heap / SM. Must precede mem_alloc_.finalize()
-    // so the pool frees through the still-live allocator, not after it.
-    gm_heap_pool_.release();
-    gm_sm_pool_.release();
+    // Release per-Worker static arena (GM heap + PTO2 SM in a single backing
+    // device allocation). Must precede mem_alloc_.finalize() so the arena
+    // frees through the still-live allocator, not after it.
+    static_arena_.release();
+    gm_heap_region_off_ = SIZE_MAX;
+    gm_sm_region_off_ = SIZE_MAX;
+    cached_gm_heap_size_ = 0;
+    cached_gm_sm_size_ = 0;
 
     // Free all remaining allocations
     mem_alloc_.finalize();
@@ -1127,7 +1174,7 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
-    int num_dump_threads = runtime.sche_cpu_num;
+    int num_dump_threads = runtime.aicpu_thread_num;
 
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);

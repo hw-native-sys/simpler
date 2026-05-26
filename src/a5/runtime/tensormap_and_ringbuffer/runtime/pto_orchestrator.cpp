@@ -72,19 +72,30 @@ uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
-#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
+// Cycle accumulation is unconditional under PTO2_ORCH_PROFILING (that's what
+// the flag is for). Swim-lane recording is an opt-in add-on gated at runtime
+// by l2_perf_level so callers can collect totals without paying GM-store cost.
+// When the swim-lane write fires, _t0 is re-sampled from the counter *after*
+// the write so its cost is not attributed to the next phase's accumulator.
+#define CYCLE_COUNT_START()                                                \
+    bool _prof_active = (orch->l2_perf_level >= L2PerfLevel::ORCH_PHASES); \
+    uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc)       \
     do {                           \
         _t1 = get_sys_cnt_aicpu(); \
         acc += (_t1 - _t0);        \
         _t0 = _t1;                 \
     } while (0)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                       \
-    do {                                                                                 \
-        _t1 = get_sys_cnt_aicpu();                                                       \
-        acc += (_t1 - _t0);                                                              \
-        l2_perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
-        _t0 = _t1;                                                                       \
+#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                           \
+    do {                                                                                     \
+        _t1 = get_sys_cnt_aicpu();                                                           \
+        acc += (_t1 - _t0);                                                                  \
+        if (_prof_active) {                                                                  \
+            l2_perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
+            _t0 = get_sys_cnt_aicpu();                                                       \
+        } else {                                                                             \
+            _t0 = _t1;                                                                       \
+        }                                                                                    \
     } while (0)
 #elif PTO2_PROFILING
 #include "aicpu/device_time.h"
@@ -94,8 +105,8 @@ __attribute__((weak, visibility("hidden"))) void
 l2_perf_aicpu_record_orch_phase(AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
 static uint32_t g_orch_submit_idx = 0;
-#define CYCLE_COUNT_START()                       \
-    bool _prof_active = orch->enable_l2_swimlane; \
+#define CYCLE_COUNT_START()                                                \
+    bool _prof_active = (orch->l2_perf_level >= L2PerfLevel::ORCH_PHASES); \
     uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0
 #define CYCLE_COUNT_LAP(acc) \
     do {                     \
@@ -113,15 +124,6 @@ static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_LAP(acc)
 #define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)
 #endif
-
-static void *aligned_zalloc(size_t size, size_t alignment) {
-    void *ptr = nullptr;
-    if (posix_memalign(&ptr, alignment, size) != 0) {
-        return nullptr;
-    }
-    memset(ptr, 0, size);
-    return ptr;
-}
 
 static int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) {
     always_assert(orch != nullptr);
@@ -347,72 +349,67 @@ static bool prepare_task(
 // Orchestrator Initialization
 // =============================================================================
 
-bool PTO2OrchestratorState::init(
-    PTO2SharedMemoryHeader *sm_header, void *gm_heap, uint64_t heap_size, int32_t dep_pool_capacity
+PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(
+    DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH], int32_t dep_pool_capacity
+) {
+    PTO2OrchestratorLayout layout{};
+    layout.dep_pool_capacity = dep_pool_capacity;
+    layout.scope_tasks_cap = PTO2_SCOPE_TASKS_CAP;
+    layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
+
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        const size_t fanin_pool_bytes =
+            PTO2_ALIGN_UP(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
+        layout.off_fanin_pool[r] = arena.reserve(fanin_pool_bytes, PTO2_ALIGN_SIZE);
+    }
+    layout.off_scope_tasks = arena.reserve(
+        static_cast<size_t>(layout.scope_tasks_cap) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *)
+    );
+    layout.off_scope_begins =
+        arena.reserve(static_cast<size_t>(layout.scope_stack_capacity) * sizeof(int32_t), alignof(int32_t));
+    layout.tensor_map = PTO2TensorMap::reserve_layout_default(arena, task_window_sizes);
+    return layout;
+}
+
+bool PTO2OrchestratorState::init_from_layout(
+    const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SharedMemoryHeader *sm_header_arg, void *gm_heap,
+    uint64_t heap_size
 ) {
     auto *orch = this;
     *orch = PTO2OrchestratorState{};
 
-    orch->sm_header = sm_header;
+    orch->sm_header = sm_header_arg;
     orch->gm_heap_base = gm_heap;
     orch->gm_heap_size = heap_size * PTO2_MAX_RING_DEPTH;
     orch->fatal = false;
 
-    // Initialize per-ring resources
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + r * heap_size;
-        auto &ring = sm_header->rings[r];
+        auto &ring = sm_header_arg->rings[r];
 
-        // Initialize unified task allocator
         orch->rings[r].task_allocator.init(
             ring.task_descriptors, ring.task_window_size, &ring.fc.current_task_index, &ring.fc.last_task_alive,
-            ring_heap_base, heap_size, &sm_header->orch_error_code
+            ring_heap_base, heap_size, &sm_header_arg->orch_error_code
         );
 
-        size_t fanin_pool_bytes =
-            PTO2_ALIGN_UP(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
-        PTO2FaninSpillEntry *fanin_entries =
-            reinterpret_cast<PTO2FaninSpillEntry *>(aligned_zalloc(fanin_pool_bytes, PTO2_ALIGN_SIZE));
-        if (!fanin_entries) {
-            for (int j = 0; j < r; j++) {
-                free(orch->rings[j].fanin_pool.base);
-            }
-            return false;
-        }
-        orch->rings[r].fanin_pool.init(fanin_entries, dep_pool_capacity, &sm_header->orch_error_code);
+        const size_t fanin_pool_bytes =
+            PTO2_ALIGN_UP(static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
+        auto *fanin_entries = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
+        memset(fanin_entries, 0, fanin_pool_bytes);
+        orch->rings[r].fanin_pool.init(fanin_entries, layout.dep_pool_capacity, &sm_header_arg->orch_error_code);
     }
 
-    // Initialize TensorMap with per-ring task window sizes
-    int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        task_window_sizes[r] = sm_header->rings[r].task_window_size;
-    }
-    if (!orch->tensor_map.init_default(task_window_sizes)) {
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            free(orch->rings[r].fanin_pool.base);
-        }
+    if (!orch->tensor_map.init_from_layout(layout.tensor_map, arena)) {
         return false;
     }
     orch->tensor_map.orch = orch;
 
-    // Initialize scope stack: one flat buffer for task IDs + one array for begin offsets
-    uint64_t max_depth = PTO2_MAX_SCOPE_DEPTH;
-    int32_t init_cap = PTO2_SCOPE_TASKS_INIT_CAP;
-    orch->scope_tasks = reinterpret_cast<PTO2TaskSlotState **>(malloc(init_cap * sizeof(PTO2TaskSlotState *)));
-    orch->scope_begins = reinterpret_cast<int32_t *>(malloc(max_depth * sizeof(int32_t)));
-    if (!orch->scope_tasks || !orch->scope_begins) {
-        free(orch->scope_tasks);
-        free(orch->scope_begins);
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            free(orch->rings[r].fanin_pool.base);
-        }
-        orch->tensor_map.destroy();
-        return false;
-    }
+    orch->scope_tasks = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_scope_tasks));
+    orch->scope_begins = static_cast<int32_t *>(arena.region_ptr(layout.off_scope_begins));
     orch->scope_tasks_size = 0;
-    orch->scope_tasks_capacity = init_cap;
+    orch->scope_tasks_capacity = layout.scope_tasks_cap;
     orch->scope_stack_top = -1;
-    orch->scope_stack_capacity = max_depth;
+    orch->scope_stack_capacity = layout.scope_stack_capacity;
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
 
     return true;
@@ -421,16 +418,11 @@ bool PTO2OrchestratorState::init(
 void PTO2OrchestratorState::destroy() {
     auto *orch = this;
     orch->tensor_map.destroy();
-
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        free(orch->rings[r].fanin_pool.base);
-        orch->rings[r].fanin_pool.base = NULL;
+        orch->rings[r].fanin_pool.base = nullptr;
     }
-
-    free(orch->scope_tasks);
-    orch->scope_tasks = NULL;
-    free(orch->scope_begins);
-    orch->scope_begins = NULL;
+    orch->scope_tasks = nullptr;
+    orch->scope_begins = nullptr;
 }
 
 void PTO2OrchestratorState::set_scheduler(PTO2SchedulerState *scheduler) { this->scheduler = scheduler; }
@@ -441,12 +433,16 @@ void PTO2OrchestratorState::set_scheduler(PTO2SchedulerState *scheduler) { this-
 
 static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state) {
     if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
-        int32_t new_cap = orch->scope_tasks_capacity * 2;
-        PTO2TaskSlotState **new_buf =
-            reinterpret_cast<PTO2TaskSlotState **>(realloc(orch->scope_tasks, new_cap * sizeof(PTO2TaskSlotState *)));
-        assert(new_buf && "Failed to grow scope task buffer");
-        orch->scope_tasks = new_buf;
-        orch->scope_tasks_capacity = new_cap;
+        // scope_tasks lives in the per-Worker arena (single backing allocation),
+        // so realloc is not legal. Capacity == PTO2_SCOPE_TASKS_CAP ==
+        // PTO2_TASK_WINDOW_SIZE × PTO2_MAX_RING_DEPTH, the total in-flight slot
+        // budget — hitting it means every ring is saturated, so no further push
+        // could succeed regardless of buffer growth.
+        orch->report_fatal(
+            PTO2_ERROR_SCOPE_TASKS_OVERFLOW, __FUNCTION__,
+            "scope_tasks buffer saturated at %d entries (all rings full)", orch->scope_tasks_capacity
+        );
+        return;
     }
     orch->scope_tasks[orch->scope_tasks_size++] = task_slot_state;
 }

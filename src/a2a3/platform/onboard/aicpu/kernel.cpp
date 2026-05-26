@@ -123,7 +123,7 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
     set_dep_gen_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DEP_GEN));
 
     // Affinity gate: drop excess threads before entering runtime
-    if (!platform_aicpu_affinity_gate(runtime->sche_cpu_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
+    if (!platform_aicpu_affinity_gate(runtime->aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
         LOG_INFO_V0("Thread dropped by cluster affinity");
         return 0;
     }

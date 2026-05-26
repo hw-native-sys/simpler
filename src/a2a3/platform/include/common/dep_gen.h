@@ -59,22 +59,32 @@
 constexpr int DEP_GEN_TENSOR_SIZE = 128;
 
 /**
- * Max explicit_dep entries captured per submit by dep_gen replay. This is a
- * diagnostic-side cap only — the runtime's Arg::set_dependencies has no hard
- * limit on dep count. Submits exceeding this cap are logged and truncated by
+ * Max explicit_dep entries captured directly in a base DepGenRecord. Larger
+ * submits spill into a chain of DepGenOverflowRecord entries (same slot size,
+ * reinterpreted via DEP_GEN_FLAG_OVERFLOW) — see dep_gen_records_needed_for().
+ *
+ * This is a diagnostic-side capacity only — the runtime's Arg::set_dependencies
+ * has no hard limit on dep count. Submits whose chain would exceed the host
+ * buffer's record budget are logged and truncated by
  * dep_gen_aicpu_record_submit(); runtime correctness is unaffected.
  */
-constexpr int DEP_GEN_MAX_EXPLICIT_DEPS = 16;
+constexpr int DEP_GEN_MAX_EXPLICIT_DEPS = 64;
 
 // =============================================================================
 // DepGenRecord — one captured submit_task call
 // =============================================================================
 
 /**
- * Bitmask flags for DepGenRecord.flags.
+ * Bitmask flags for DepGenRecord.flags / DepGenOverflowRecord.flags.
+ *
+ * IN_MANUAL_SCOPE is the only flag the host capture path cares about; the
+ * overflow flags are wire-format markers consumed only by the replay scan.
  */
 enum DepGenRecordFlags : uint32_t {
     DEP_GEN_FLAG_IN_MANUAL_SCOPE = 1u << 0,  // submit happened inside a manual scope
+    DEP_GEN_FLAG_HAS_OVERFLOW = 1u << 1,     // base record: at least one overflow record follows
+    DEP_GEN_FLAG_OVERFLOW = 1u << 2,         // this slot is a DepGenOverflowRecord, not a DepGenRecord
+    DEP_GEN_FLAG_LAST_OVERFLOW = 1u << 3,    // overflow record: end of chain (no further overflow follows)
 };
 
 /**
@@ -84,9 +94,9 @@ enum DepGenRecordFlags : uint32_t {
  *   - task_id, flags, counts, explicit_deps, arg_types in the first cache lines
  *   - tensors[] (16 × 128 B opaque blobs) at the tail; covers ~64% of the entry
  *
- * Total size: 8 + 4 + 4 + 16*8 + 16 + 32 (pad) + 16*128 = 2240 bytes.
- * Aligned to 64 B → 2240 B (already a multiple of 64). The 32-byte _pad0
- * pushes the tensors[] array to offset 192 = 3 * 64 so each 128-byte tensor
+ * Total size: 8 + 4 + 4 + 64*8 + 16 + 32 (pad) + 16*128 = 2624 bytes.
+ * Aligned to 64 B → 2624 B (already a multiple of 64). The 32-byte _pad0
+ * pushes the tensors[] array to offset 576 = 9 * 64 so each 128-byte tensor
  * blob covers exactly two cache lines instead of straddling three.
  */
 struct DepGenRecord {
@@ -96,12 +106,72 @@ struct DepGenRecord {
     uint16_t explicit_dep_count;                                 // number of valid explicit_dep slots
     uint64_t explicit_deps[DEP_GEN_MAX_EXPLICIT_DEPS];           // PTO2TaskId::raw, length = explicit_dep_count
     uint8_t arg_types[CORE_MAX_TENSOR_ARGS];                     // TensorArgType, length = tensor_count
-    uint8_t _pad0[32];                                           // align tensors[] to 64 B (offset 192)
+    uint8_t _pad0[32];                                           // align tensors[] to 64 B (offset 576)
     uint8_t tensors[CORE_MAX_TENSOR_ARGS][DEP_GEN_TENSOR_SIZE];  // opaque Tensor blobs
 } __attribute__((aligned(64)));
 
+static_assert(sizeof(DepGenRecord) == 2624, "DepGenRecord size changed — update header comment + docs/dfx/dep_gen.md");
 static_assert(sizeof(DepGenRecord) % 64 == 0, "DepGenRecord must be cache-line aligned");
 static_assert(offsetof(DepGenRecord, tensors) % 64 == 0, "DepGenRecord::tensors[] must start on a cache-line boundary");
+static_assert(offsetof(DepGenRecord, tensors) == 576, "DepGenRecord::tensors offset changed — update header comment");
+
+// =============================================================================
+// DepGenOverflowRecord — chain extension for submits with >DEP_GEN_MAX_EXPLICIT_DEPS deps
+// =============================================================================
+
+/**
+ * Number of deps carried by a single overflow record. Sized so a
+ * DepGenOverflowRecord exactly overlays a DepGenRecord slot in the buffer.
+ *
+ * Layout: 16-byte header (task_id + flags + dep_count + _reserved) + deps[].
+ * deps[] occupies (sizeof(DepGenRecord) - 16) / sizeof(uint64_t) = 326 entries.
+ */
+constexpr int DEP_GEN_OVERFLOW_DEPS_PER_RECORD = 326;
+
+/**
+ * Reinterpret-view of a DepGenRecord slot when flags & DEP_GEN_FLAG_OVERFLOW.
+ *
+ * A submit with explicit_dep_count > DEP_GEN_MAX_EXPLICIT_DEPS is encoded as:
+ *   - One base DepGenRecord (carries first DEP_GEN_MAX_EXPLICIT_DEPS deps +
+ *     tensor info; flags |= HAS_OVERFLOW).
+ *   - One or more DepGenOverflowRecord (each carries up to
+ *     DEP_GEN_OVERFLOW_DEPS_PER_RECORD additional deps).
+ *   - The last overflow record carries flags |= LAST_OVERFLOW so replay knows
+ *     the chain is complete without peeking at the next slot.
+ *
+ * Chain records are guaranteed contiguous within the same DepGenBuffer:
+ * dep_gen_aicpu_record_submit() switches buffer up front if the full chain
+ * would not fit. Replay reads them by linear scan; same task_id ties them
+ * back to the preceding base.
+ */
+struct DepGenOverflowRecord {
+    uint64_t task_id;    // mirrors base record's task_id for chain join
+    uint32_t flags;      // DEP_GEN_FLAG_OVERFLOW [| DEP_GEN_FLAG_LAST_OVERFLOW]
+    uint16_t dep_count;  // number of valid entries in deps[]
+    uint16_t _reserved;
+    uint64_t deps[DEP_GEN_OVERFLOW_DEPS_PER_RECORD];  // PTO2TaskId::raw, length = dep_count
+} __attribute__((aligned(64)));
+
+static_assert(
+    sizeof(DepGenOverflowRecord) == sizeof(DepGenRecord), "DepGenOverflowRecord must overlay DepGenRecord exactly"
+);
+static_assert(
+    alignof(DepGenOverflowRecord) == alignof(DepGenRecord), "DepGenOverflowRecord alignment must match DepGenRecord"
+);
+
+/**
+ * Number of buffer slots (1 base + N overflow records) needed to capture a
+ * submit with `dc` explicit deps. Used by the writer to reserve the whole
+ * chain before writing any of it.
+ */
+inline int dep_gen_records_needed_for(int dc) {
+    if (dc <= DEP_GEN_MAX_EXPLICIT_DEPS) return 1;
+    // Use int64_t for the ceil-div so a pathologically large dc (close to
+    // INT_MAX, e.g. via a corrupted explicit_dep_count) cannot overflow
+    // `spill + DEP_GEN_OVERFLOW_DEPS_PER_RECORD - 1`.
+    int64_t spill = static_cast<int64_t>(dc) - DEP_GEN_MAX_EXPLICIT_DEPS;
+    return static_cast<int>(1 + (spill + DEP_GEN_OVERFLOW_DEPS_PER_RECORD - 1) / DEP_GEN_OVERFLOW_DEPS_PER_RECORD);
+}
 
 // =============================================================================
 // DepGenBuffer — fixed-capacity record container
@@ -153,18 +223,29 @@ static_assert(sizeof(DepGenFreeQueue) == 128, "DepGenFreeQueue must be 128 bytes
  * Per-instance state for dep_gen.
  *
  * Writers:
- *   free_queue.tail:        Host writes (pushes new/recycled buffers)
- *   free_queue.head:        Device writes (pops buffers)
- *   current_buf_ptr:        Device writes (after pop), Host reads
- *   current_buf_seq:        Device writes (monotonic counter)
- *   dropped_record_count:   Device writes — submits dropped because free_queue
- *                           was empty / ready_queue was full / no active buf
- *   total_record_count:     Device writes — monotonic count of every submit
- *                           the orchestrator attempted to record (success +
- *                           dropped)
+ *   free_queue.tail:               Host writes (pushes new/recycled buffers)
+ *   free_queue.head:               Device writes (pops buffers)
+ *   current_buf_ptr:               Device writes (after pop), Host reads
+ *   current_buf_seq:               Device writes (monotonic counter)
+ *   dropped_record_count:          Device writes — submits dropped because
+ *                                  free_queue was empty / ready_queue was full
+ *                                  / no active buf
+ *   total_record_count:            Device writes — monotonic count of every
+ *                                  submit the orchestrator attempted to record
+ *                                  (success + dropped). One increment per
+ *                                  submit_task regardless of chain length.
+ *   total_overflow_record_count:   Device writes — monotonic count of extra
+ *                                  DepGenOverflowRecord slots committed for
+ *                                  chained submits. Lets the host reconcile
+ *                                  physical records collected against logical
+ *                                  submits attempted (see formula below).
  *
- * Host reads dropped / total at finalize to cross-check:
- *   collected_on_host + sum(dropped) == sum(total)
+ * Host reconciliation invariant at finalize:
+ *   collected_on_host + sum(dropped) == sum(total) + sum(total_overflow)
+ *
+ * — `collected` counts physical buffer slots (base + every overflow), while
+ * `total` counts submits attempted. Without `total_overflow` the equation
+ * over-counts every chain on the LHS, which is why this counter is split out.
  */
 struct DepGenBufferState {
     DepGenFreeQueue free_queue;
@@ -172,7 +253,8 @@ struct DepGenBufferState {
     volatile uint32_t current_buf_seq;
     volatile uint32_t dropped_record_count;
     volatile uint32_t total_record_count;
-    uint32_t _pad[11];
+    volatile uint32_t total_overflow_record_count;
+    uint32_t _pad[10];
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(DepGenBufferState) == 192, "DepGenBufferState must be 192 bytes");
