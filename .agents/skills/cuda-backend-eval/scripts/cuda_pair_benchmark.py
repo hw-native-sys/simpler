@@ -45,6 +45,7 @@ class PairedBenchmarkConfig:
     remote_git_low_speed_limit: int = 1
     remote_git_low_speed_time: int = 30
     remote_git_fetch_timeout: int = 60
+    refresh_remote: bool = True
 
 
 def _csv(values: Sequence[int]) -> str:
@@ -131,12 +132,15 @@ def _remote_shell_command(config: PairedBenchmarkConfig, commit: str) -> str:
         f"-c http.lowSpeedTime={config.remote_git_low_speed_time} "
         f"fetch origin {shlex.quote(config.branch)} >/dev/null"
     )
-    commands = [
-        f"cd {shlex.quote(config.remote_workdir)}",
-        fetch_command,
-        f"git checkout -B {shlex.quote(config.branch)} FETCH_HEAD >/dev/null",
-        f"{remote_env} {' '.join(shlex.quote(part) for part in benchmark)}",
-    ]
+    commands = [f"cd {shlex.quote(config.remote_workdir)}"]
+    if config.refresh_remote:
+        commands.extend(
+            [
+                fetch_command,
+                f"git checkout -B {shlex.quote(config.branch)} FETCH_HEAD >/dev/null",
+            ]
+        )
+    commands.append(f"{remote_env} {' '.join(shlex.quote(part) for part in benchmark)}")
     return " && ".join(commands)
 
 
@@ -237,6 +241,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remote-git-low-speed-limit", type=int, default=1)
     parser.add_argument("--remote-git-low-speed-time", type=int, default=30)
     parser.add_argument("--remote-git-fetch-timeout", type=int, default=60)
+    parser.add_argument("--skip-remote-refresh", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -265,6 +270,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         remote_git_low_speed_limit=args.remote_git_low_speed_limit,
         remote_git_low_speed_time=args.remote_git_low_speed_time,
         remote_git_fetch_timeout=args.remote_git_fetch_timeout,
+        refresh_remote=not args.skip_remote_refresh,
     )
     run_paired_benchmark(config, dry_run=args.dry_run)
 

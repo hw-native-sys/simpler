@@ -373,7 +373,10 @@ The remote checkout step uses bounded Git HTTPS low-speed settings by default;
 override them with `--remote-git-low-speed-limit` and
 `--remote-git-low-speed-time` if the remote network is unusually slow. The
 fetch is also wrapped in `timeout`; override it with
-`--remote-git-fetch-timeout`.
+`--remote-git-fetch-timeout`. If the remote checkout is already prepared and
+Git HTTPS is unhealthy on `bizhaoh200`, pass `--skip-remote-refresh` to reuse
+that checkout and run only the H200 benchmark command before copying artifacts
+back.
 
 Use `--dry-run` to print the commands without launching benchmarks. The current
 committed summary uses the `38ff341e` artifact names in

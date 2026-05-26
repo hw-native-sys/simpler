@@ -379,6 +379,28 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
 
 
+def test_cuda_pair_benchmark_can_reuse_remote_checkout(tmp_path):
+    cuda_pair_benchmark = _load_pair_benchmark_module()
+    config = cuda_pair_benchmark.PairedBenchmarkConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        branch="design/nvidia-backend",
+        output_root=tmp_path / "cuda-backend",
+        remote_python=".venv/bin/python",
+        refresh_remote=False,
+    )
+
+    remote = cuda_pair_benchmark.build_remote_benchmark_command(config, "abc123")
+    remote_shell = remote[-1]
+
+    assert "cd /remote/pto-cu" in remote_shell
+    assert "git fetch" not in remote_shell
+    assert "git checkout" not in remote_shell
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py" in remote_shell
+    assert "--arch compute_90" in remote_shell
+    assert "h200-current-abc123" in remote_shell
+
+
 def test_cuda_pair_benchmark_dry_run_does_not_launch_benchmarks(tmp_path):
     cuda_pair_benchmark = _load_pair_benchmark_module()
     calls = []

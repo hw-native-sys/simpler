@@ -79,6 +79,9 @@ copies the H200 artifact directory back, merges the JSON reports, and rebuilds
 the local artifact index. The remote checkout step uses bounded Git HTTPS
 low-speed settings by default so a bad network fetch fails instead of
 stranding the paired run, and the fetch is wrapped in a shell `timeout`.
+When the remote checkout has already been updated by another path and Git
+HTTPS is unhealthy on `bizhaoh200`, add `--skip-remote-refresh` to reuse that
+checkout and still run the paired A100/H200 capture.
 
 Refresh the local artifact index after adding or merging captures:
 
