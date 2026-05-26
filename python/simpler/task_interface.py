@@ -281,6 +281,30 @@ def _preload_global(path: str) -> ctypes.CDLL:
     return handle
 
 
+def _runtime_binary_path(bins, role: str, legacy_attr: str):
+    if hasattr(bins, "path_for_role"):
+        try:
+            return bins.path_for_role(role)
+        except KeyError:
+            pass
+    role_paths = getattr(bins, "role_paths", None)
+    if role_paths and role in role_paths:
+        return role_paths[role]
+    return getattr(bins, legacy_attr, None)
+
+
+def _chip_worker_init_paths(bins):
+    host_path = _runtime_binary_path(bins, "host", "host_path")
+    device_path = _runtime_binary_path(bins, "device", "device_path")
+    if device_path is not None:
+        return host_path, device_path, device_path
+    return (
+        host_path,
+        _runtime_binary_path(bins, "aicpu", "aicpu_path"),
+        _runtime_binary_path(bins, "aicore", "aicore_path"),
+    )
+
+
 class ChipWorker:
     """Unified execution interface wrapping the host runtime C API.
 
@@ -318,8 +342,9 @@ class ChipWorker:
         Args:
             device_id: NPU device ID to attach the calling thread to.
             bins: A `simpler_setup.runtime_builder.RuntimeBinaries` (or any
-                object exposing host_path / aicpu_path / aicore_path /
-                simpler_log_path / sim_context_path).
+                object exposing role_paths / path_for_role plus
+                simpler_log_path / sim_context_path). Legacy host_path /
+                aicpu_path / aicore_path fields are still accepted.
             log_level: Severity floor (0=DEBUG..4=NUL). Defaults to a snapshot
                 of the simpler logger via `_log.get_current_config()`.
             log_info_v: INFO verbosity threshold (0..9). Same default.
@@ -354,10 +379,11 @@ class ChipWorker:
             _preload_global(str(bins.sim_context_path))
 
         # 3. host_runtime.so is dlopen'd RTLD_LOCAL inside _impl.init.
+        host_path, aicpu_path, aicore_path = _chip_worker_init_paths(bins)
         self._impl.init(
-            str(bins.host_path),
-            str(bins.aicpu_path),
-            str(bins.aicore_path),
+            str(host_path),
+            str(aicpu_path),
+            str(aicore_path),
             int(device_id),
         )
 

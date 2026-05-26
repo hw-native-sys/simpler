@@ -150,3 +150,57 @@ class TestChipWorkerPython:
         worker = ChipWorker()
         assert worker.initialized is False
         assert isinstance(PyCallConfig(), CallConfig)
+
+    def test_init_accepts_cuda_role_only_runtime_binaries(self, monkeypatch, tmp_path):
+        from simpler import task_interface as task_interface_module  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeLogInit:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, log_level, log_info_v):
+                self.calls.append((log_level, log_info_v))
+                return 0
+
+        class FakeLogHandle:
+            def __init__(self):
+                self.simpler_log_init = FakeLogInit()
+
+        class FakeImpl:
+            def __init__(self):
+                self.init_args = None
+
+            def init(self, *args):
+                self.init_args = args
+
+        class RoleOnlyBins:
+            simpler_log_path = tmp_path / "libsimpler_log.so"
+            sim_context_path = None
+
+            def __init__(self):
+                self.role_paths = {
+                    "host": tmp_path / "libhost_runtime.so",
+                    "device": tmp_path / "libcuda_device_runtime.so",
+                }
+
+            def path_for_role(self, role):
+                return self.role_paths[role]
+
+        fake_log_handle = FakeLogHandle()
+        monkeypatch.setattr(task_interface_module, "_preload_global", lambda path: fake_log_handle)
+
+        worker = ChipWorker()
+        fake_impl = FakeImpl()
+        worker._impl = fake_impl
+
+        worker.init(0, RoleOnlyBins(), log_level=1, log_info_v=2)
+
+        device_path = str(tmp_path / "libcuda_device_runtime.so")
+        assert fake_log_handle.simpler_log_init.calls == [(1, 2)]
+        assert fake_impl.init_args == (
+            str(tmp_path / "libhost_runtime.so"),
+            device_path,
+            device_path,
+            0,
+        )

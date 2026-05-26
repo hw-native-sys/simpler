@@ -734,15 +734,18 @@ is:
   `libcuda_device_runtime.so`, and legacy `aicpu_path` / `aicore_path`
   attributes alias the same CUDA device artifact.
 
-The remaining cleanup is to replace compatibility path attributes with a
-role-only binary map at the API boundary.
+The Python `ChipWorker.init(...)` wrapper now resolves runtime binary paths
+through `path_for_role(...)` / `role_paths` first. A CUDA role-only binary map
+with `host` and `device` can initialize through the Python API while the
+underlying C++ nanobind call still receives its compatibility host,
+scheduler, and device path arguments.
 
 Needed:
 
 - optional `scheduler` role once `persistent_device` has a separately named
   scheduler/runtime image;
-- migration of CUDA call sites away from direct `aicpu_path` and
-  `aicore_path` usage.
+- removal of legacy `aicpu_path` and `aicore_path` attributes after all
+  external and C++ binding boundaries accept role-keyed binaries directly.
 
 ### Persistent Scheduler Generalization
 
