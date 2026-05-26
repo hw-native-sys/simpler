@@ -251,6 +251,7 @@ class CudaPersistentDagTask(ctypes.Structure):
         ("a_batch_stride", ctypes.c_uint64),
         ("b_batch_stride", ctypes.c_uint64),
         ("out_batch_stride", ctypes.c_uint64),
+        ("c", ctypes.c_void_p),
     ]
 
 
@@ -573,6 +574,7 @@ struct PtoCudaPersistentDagTask {{
     unsigned long long a_batch_stride;
     unsigned long long b_batch_stride;
     unsigned long long out_batch_stride;
+    const float *c;
 }};
 
     {rendered_context_block}\

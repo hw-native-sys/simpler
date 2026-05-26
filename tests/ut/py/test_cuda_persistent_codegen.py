@@ -257,6 +257,21 @@ def test_render_persistent_dag_source_includes_second_scalar_descriptor():
     assert "task->scalar1 * task->b[i]" in source
 
 
+def test_render_persistent_dag_source_includes_third_tensor_descriptor():
+    source = render_persistent_dag_source(
+        [
+            CudaPersistentTaskFunction(
+                func_id=6,
+                name="triad_f32",
+                body="task->out[i] = task->a[i] * task->b[i] + task->c[i];",
+            )
+        ]
+    )
+
+    assert "const float *c;" in source
+    assert "task->c[i]" in source
+
+
 def test_render_persistent_dag_source_records_device_scheduler_errors():
     source = render_persistent_dag_source(
         [

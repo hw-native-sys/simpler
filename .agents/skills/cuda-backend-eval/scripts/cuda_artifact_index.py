@@ -104,6 +104,13 @@ def _scalar_args(payload: dict[str, Any]) -> str | None:
     return ",".join(f"{key}={scalars[key]}" for key in sorted(scalars))
 
 
+def _tensor_args(payload: dict[str, Any]) -> str | None:
+    tensors = payload.get("tensor_args")
+    if not isinstance(tensors, dict) or not tensors:
+        return None
+    return ",".join(f"{key}={tensors[key]}" for key in sorted(tensors))
+
+
 def _read_artifact(path: Path, root: Path) -> dict[str, Any]:
     payload = json.loads((path / "cuda-benchmark.json").read_text())
     metadata = payload.get("metadata", {})
@@ -165,6 +172,9 @@ def _read_smoke_artifact(path: Path, root: Path) -> dict[str, Any]:
         "scalar_args": _sorted_unique(
             {scalars for payload in payloads for scalars in (_scalar_args(payload),) if scalars is not None}
         ),
+        "tensor_args": _sorted_unique(
+            {tensors for payload in payloads for tensors in (_tensor_args(payload),) if tensors is not None}
+        ),
         "tensor_tiles": _tensor_tile_shapes(payloads),
         "has_markdown": True,
         "has_svg": (path / "cuda-smoke-report.svg").exists(),
@@ -205,14 +215,14 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
         (
             "| Path | Kind | Label | Machine | Commit | Results | Sizes | "
             "Tensor tile | Smoke mode | Dispatch | Scheduler errors | "
-            "Resource policy | Scalar args | Baselines | Markdown | SVG | "
-            "ratio SVG |"
+            "Resource policy | Scalar args | Tensor args | Baselines | "
+            "Markdown | SVG | ratio SVG |"
         ),
         (
             "| ---- | ---- | ----- | ------- | ------ | ------- | ----- | "
             "----------- | ---------- | -------- | ---------------- | "
-            "--------------- | ----------- | --------- | -------- | --- | "
-            "--------- |"
+            "--------------- | ----------- | ----------- | --------- | "
+            "-------- | --- | --------- |"
         ),
     ]
     for entry in entries:
@@ -225,6 +235,7 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
             f"{_format_list(entry.get('scheduler_errors', []))} | "
             f"{_format_list(entry.get('resource_policies', []))} | "
             f"{_format_list(entry.get('scalar_args', []))} | "
+            f"{_format_list(entry.get('tensor_args', []))} | "
             f"{_format_list(entry['baselines'])} | "
             f"{_checkmark(entry['has_markdown'])} | {_checkmark(entry['has_svg'])} | "
             f"{_checkmark(entry['has_ratio_svg'])} |"

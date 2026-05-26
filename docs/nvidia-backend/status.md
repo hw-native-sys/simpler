@@ -94,6 +94,8 @@ execution modes:
 - tensor-tile DAG descriptor with rows/cols/inner/stride metadata;
 - scalar-argument DAG descriptors for mixed tensor/scalar AXPY-style and
   two-scalar affine task bodies.
+- third tensor-argument DAG descriptor for a generated-dispatch triad task
+  body.
 - device-side scheduler diagnostics for unsupported generated-dispatch
   `func_id` values, invalid dependent task IDs, and out-of-range dependent
   spans, fan-in underflow, and initial-fan-in mismatch.
@@ -117,7 +119,9 @@ normal L2 `Worker`, builds `persistent_dag_fork_join_f32`,
 `persistent_dag_scalar_axpy_f32` and `persistent_dag_scalar_affine_f32` mixed
 tensor/scalar descriptors, plus `persistent_dag_tensor_tile_f32` state
 objects from normal `TaskArgsBuilder` CPU tensors, and validates real
-copied-back CUDA output data.
+copied-back CUDA output data. The no-torch persistent smoke path also
+validates a generated-dispatch triad descriptor with a third tensor pointer
+field.
 The host-schedule scene path also accepts the neutral
 `elementwise_binary_f32` adapter for non-addition task bodies that still use
 the current `(a, b, out, n)` launch ABI. It accepts `elementwise_unary_f32`
@@ -187,7 +191,7 @@ Evidence:
 - `.agents/skills/cuda-backend-eval/scripts/cuda_smoke_report.py` writes
   compact smoke Markdown and SVG reports, including persistent-device dispatch
   `func_id` sequences, device scheduler error counters, and resource-policy
-  metadata and scalar task arguments when present.
+  metadata plus scalar and tensor task arguments when present.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py` automates
   the local A100 run, remote H200 run, artifact copy, merge, and index refresh.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py` automates the
@@ -852,6 +856,26 @@ the H200 row returned `status=pass`, `ptx_arch=compute_90`,
 `dispatch_func_ids=[5,2,1]`, the same scalar args, and
 `device_wall_ns=35584`. Both rows reported zero device scheduler errors.
 
+After adding a third tensor pointer to the persistent DAG descriptor, the
+triad DAG smoke was captured on local A100 and remote H200 with tree sync and
+compact report generation:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape triad --task-count 3 --queue-capacity 2 \
+    --sync-remote-tree
+```
+
+Result: `tmp/cuda-backend/persistent-triad-smoke-3a3bcdb1/` contains
+`a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The A100 row returned `status=pass`,
+`ptx_arch=compute_80`, `dispatch_func_ids=[6,2,1]`,
+`tensor_args={"c":"tmp0"}`, `device_wall_ns=27648`; the H200 row returned
+`status=pass`, `ptx_arch=compute_90`, the same dispatch IDs and tensor args,
+and `device_wall_ns=24832`. Both rows reported zero device scheduler errors.
+
 After promoting the two-scalar affine DAG to a benchmark baseline, the focused
 report tests passed locally and the new single-baseline path was checked on
 both GPUs:
@@ -942,7 +966,7 @@ it is not yet a full TensorMap/ringbuffer analogue.
 Needed:
 
 - broader generalized task argument ABI beyond the current tensor-shape and
-  scalar descriptor fields;
+  scalar descriptor fields and one extra tensor pointer field;
 - graph construction from normal PTO task graphs;
 - lifecycle validation beyond the current scratch-reuse smoke;
 - broader resource policy beyond the current single scheduler block,

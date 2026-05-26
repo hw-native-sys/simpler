@@ -207,6 +207,7 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
             "grid_dim": 3,
         },
         "scalar_args": {"scalar0": 1.5},
+        "tensor_args": {"c": "tmp0"},
         "tensor_tile": {
             "rows": 16,
             "cols": 16,
@@ -231,16 +232,18 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
     markdown = cuda_smoke_report.render_markdown_report(payload, label="tensor-smoke")
     svg = cuda_smoke_report.render_svg_report(payload, label="tensor-smoke")
 
-    assert "| Dispatch | Scheduler errors | Resource policy | Scalar args |" in markdown
+    assert "| Dispatch | Scheduler errors | Resource policy | Scalar args | Tensor args |" in markdown
     assert "| a100 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_80` | 102400 | 122260 |" in markdown
     assert "| h200 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_90` | 70464 | 79788 |" in markdown
     assert (
-        "| `3,1,2,1` | `count=0,code=0,task=0` | `sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | `scalar0=1.5` |"
-        in markdown
+        "| `3,1,2,1` | `count=0,code=0,task=0` | "
+        "`sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | "
+        "`scalar0=1.5` | `c=tmp0` |" in markdown
     )
     assert (
-        "| `3,1,2,1` | `count=1,code=7,task=3` | `sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | `scalar0=1.5` |"
-        in markdown
+        "| `3,1,2,1` | `count=1,code=7,task=3` | "
+        "`sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | "
+        "`scalar0=1.5` | `c=tmp0` |" in markdown
     )
     assert "nvcc-persistent-generated-dispatch-compute_90" in markdown
     assert "<svg" in svg
@@ -249,6 +252,7 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
     assert "errors: count=1,code=7,task=3" in svg
     assert "policy: sched=1,workers=2,wp=1,stream=1,block=256,grid=3" in svg
     assert "scalars: scalar0=1.5" in svg
+    assert "tensors: c=tmp0" in svg
 
 
 def test_cuda_smoke_scripts_use_shared_callable_manifest_types():
@@ -308,7 +312,7 @@ def test_cuda_artifact_index_renders_markdown_and_writes_default_index(tmp_path)
     assert output == tmp_path / "index.md"
     assert "# CUDA Backend Artifact Index" in report
     assert (
-        "| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  |  |  |  |  |  | direct_driver_graph |"
+        "| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  |  |  |  |  |  |  | direct_driver_graph |"
     ) in report
     assert "ratio SVG" in report
 
@@ -368,6 +372,7 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
             "grid_dim": 3,
         },
         "scalar_args": {"scalar0": 1.5},
+        "tensor_args": {"c": "tmp0"},
         "tensor_tile": {
             "rows": 16,
             "cols": 16,
@@ -405,18 +410,19 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
             ],
             "resource_policies": ["sched=1,workers=2,wp=1,stream=1,block=256,grid=3"],
             "scalar_args": ["scalar0=1.5"],
+            "tensor_args": ["c=tmp0"],
             "tensor_tiles": ["16x16x16"],
             "has_markdown": True,
             "has_svg": True,
             "has_ratio_svg": False,
         }
     ]
-    assert "Smoke mode | Dispatch | Scheduler errors | Resource policy | Scalar args |" in report
+    assert "Smoke mode | Dispatch | Scheduler errors | Resource policy | Scalar args | Tensor args |" in report
     assert "| tensor-descriptor-smoke | smoke | tensor-smoke | combined | unknown | 2 |" in report
     assert "| 4096 | 16x16x16 | dag/tensor_tile | 3,1,2,1 |" in report
     assert "count=0,code=0,task=0, count=1,code=7,task=3 |" in report
     assert "sched=1,workers=2,wp=1,stream=1,block=256,grid=3 |" in report
-    assert "scalar0=1.5 |" in report
+    assert "scalar0=1.5 | c=tmp0 |" in report
 
 
 def test_cuda_artifact_index_sorts_numeric_sizes_before_strings(tmp_path):
@@ -934,6 +940,29 @@ def test_cuda_pair_persistent_smoke_builds_scalar_affine_workflow(tmp_path):
     assert "scalar_affine" in local
     assert "--dag-shape scalar_affine" in remote[-1]
     assert "persistent-scalar_affine-smoke-abc123/h200.json" in remote[-1]
+
+
+def test_cuda_pair_persistent_smoke_builds_triad_workflow(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape="triad",
+        task_count=3,
+        queue_capacity=2,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+
+    assert "persistent-triad-smoke-abc123" in str(local)
+    assert "--dag-shape" in local
+    assert "triad" in local
+    assert "--dag-shape triad" in remote[-1]
+    assert "persistent-triad-smoke-abc123/h200.json" in remote[-1]
 
 
 def test_cuda_pair_persistent_smoke_can_sync_local_tree_and_dry_run(tmp_path):
@@ -1461,6 +1490,28 @@ def test_scalar_affine_dag_shape_uses_two_scalar_descriptor_fields():
     assert tasks[0].scalar1 == ctypes.c_float(0.5).value
 
 
+def test_triad_dag_shape_uses_third_tensor_descriptor_field():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    _, _, tasks = cuda_persistent_smoke._make_dag_shape(
+        "triad",
+        64,
+        101,
+        102,
+        201,
+        202,
+        203,
+        204,
+        301,
+    )
+
+    assert [task.func_id for task in tasks] == [6, 2, 1]
+    assert tasks[0].a == 101
+    assert tasks[0].b == 102
+    assert tasks[0].c == 201
+    assert tasks[0].out == 202
+
+
 def test_persistent_dag_compiler_path_uses_kernel_compiler(tmp_path, monkeypatch):
     cuda_persistent_smoke = _load_persistent_smoke_module()
     seen = {}
@@ -1492,13 +1543,14 @@ def test_persistent_dag_compiler_path_uses_kernel_compiler(tmp_path, monkeypatch
     assert seen["platform"] == "cuda"
     assert seen["arch"] == "compute_90"
     assert seen["nvcc"] == "/usr/local/cuda/bin/nvcc"
-    assert [task["func_id"] for task in seen["task_sources"]] == [1, 2, 3, 4, 5]
+    assert [task["func_id"] for task in seen["task_sources"]] == [1, 2, 3, 4, 5, 6]
     assert [task["task_name"] for task in seen["task_sources"]] == [
         "add_f32",
         "mul_f32",
         "matmul_tile_f32",
         "axpy_f32",
         "affine_f32",
+        "triad_f32",
     ]
     assert {task["body_style"] for task in seen["task_sources"]} == {"task_body"}
     assert all("PtoCudaPersistentDagTask" in task["context_definition"] for task in seen["task_sources"])

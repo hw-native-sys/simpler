@@ -102,6 +102,13 @@ def _scalar_args(row: dict[str, Any]) -> str:
     return ",".join(f"{key}={scalars[key]}" for key in sorted(scalars))
 
 
+def _tensor_args(row: dict[str, Any]) -> str:
+    tensors = row.get("tensor_args")
+    if not isinstance(tensors, dict) or not tensors:
+        return "-"
+    return ",".join(f"{key}={tensors[key]}" for key in sorted(tensors))
+
+
 def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
     lines = [
         "# CUDA Smoke Report",
@@ -111,12 +118,12 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
         (
             "| Artifact | Status | Runtime | Mode | N | PTX arch | Device ns | "
             "Host ns | Tensor shape | Tiles | Dispatch | Scheduler errors | "
-            "Resource policy | Scalar args |"
+            "Resource policy | Scalar args | Tensor args |"
         ),
         (
             "| -------- | ------ | ------- | ---- | - | -------- | --------- | "
             "------- | ------------ | ----- | -------- | ---------------- | "
-            "--------------- | ----------- |"
+            "--------------- | ----------- | ----------- |"
         ),
     ]
     for row in payloads:
@@ -126,7 +133,7 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
             f"`{row.get('ptx_arch', 'unknown')}` | {row.get('device_wall_ns', '-')} | "
             f"{row.get('host_wall_ns', '-')} | {_shape(row)} | {_tile_count(row)} | "
             f"`{_dispatch(row)}` | `{_scheduler_errors(row)}` | `{_resource_policy(row)}` | "
-            f"`{_scalar_args(row)}` |"
+            f"`{_scalar_args(row)}` | `{_tensor_args(row)}` |"
         )
 
     lines.extend(["", "## PTX Sources", ""])
@@ -139,7 +146,7 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
 def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
     width = 760
     bar_height = 28
-    row_gap = 48
+    row_gap = 62
     left = 170
     right = 40
     top = 70
@@ -163,6 +170,7 @@ def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
         scheduler_errors = _scheduler_errors(row)
         resource_policy = _resource_policy(row)
         scalar_args = _scalar_args(row)
+        tensor_args = _tensor_args(row)
         lines.extend(
             [
                 f'<text x="24" y="{y + 19}" font-family="sans-serif" font-size="13">{html.escape(name)}</text>',
@@ -185,6 +193,11 @@ def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
                     f'<text x="{left}" y="{y + bar_height + 42}" '
                     'font-family="sans-serif" font-size="11" fill="#555">'
                     f"scalars: {html.escape(scalar_args)}</text>"
+                ),
+                (
+                    f'<text x="{left}" y="{y + bar_height + 56}" '
+                    'font-family="sans-serif" font-size="11" fill="#555">'
+                    f"tensors: {html.escape(tensor_args)}</text>"
                 ),
             ]
         )

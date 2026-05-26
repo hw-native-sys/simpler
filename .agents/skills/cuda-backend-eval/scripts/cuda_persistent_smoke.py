@@ -721,6 +721,18 @@ task->out[i] = task->scalar0 * task->a[i] + task->scalar1 * task->b[i];
 """.strip(),
         ),
     ),
+    CudaPersistentTaskBodyFunction(
+        func_id=6,
+        task_body=CudaTaskBody(
+            name="triad_f32",
+            context_definition=_PERSISTENT_DAG_CONTEXT_DEFINITION,
+            body="""
+const PtoCudaPersistentDagTask *task = ctx->task;
+unsigned long long i = ctx->i;
+task->out[i] = task->a[i] * task->b[i] + task->c[i];
+""".strip(),
+        ),
+    ),
 ]
 _PERSISTENT_DAG_SOURCE = render_persistent_dag_source(_PERSISTENT_DAG_TASK_FUNCTIONS)
 
@@ -816,6 +828,7 @@ class CudaPersistentDagTask(ctypes.Structure):
         ("a_batch_stride", ctypes.c_uint64),
         ("b_batch_stride", ctypes.c_uint64),
         ("out_batch_stride", ctypes.c_uint64),
+        ("c", ctypes.c_void_p),
     ]
 
 
@@ -1324,6 +1337,48 @@ def _make_dag_shape(
                 ),
             ),
         )
+    if dag_shape == "triad":
+        task_count = 3
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 2
+        task_t = CudaPersistentDagTask * task_count
+        return (
+            host_fanin_t(0, 0, 2),
+            dependents_t(2, 2),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=6,
+                    a=dev_a,
+                    b=dev_b,
+                    c=dev_tmp0,
+                    out=dev_tmp1,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp2,
+                    n=n,
+                    dependent_begin=1,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp1,
+                    b=dev_tmp2,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=0,
+                    initial_fanin=2,
+                ),
+            ),
+        )
     if dag_shape == "bad_func_id":
         task_count = 1
         host_fanin_t = ctypes.c_uint32 * task_count
@@ -1623,7 +1678,10 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
     else:
         host_a = array_a_t(*[float(i) for i in range(a_len)])
         host_b = array_b_t(*[float(2 * i) for i in range(b_len)])
-    host_tmp0 = array_t()
+    if config.dag_shape == "triad":
+        host_tmp0 = array_t(*[float(3 * i) for i in range(output_len)])
+    else:
+        host_tmp0 = array_t()
     host_tmp1 = array_t()
     host_tmp2 = array_t()
     host_tmp3 = array_t()
@@ -1693,6 +1751,8 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             (dev_ready_flags, ctypes.byref(host_flags), ctypes.sizeof(host_flags), "ready flags"),
             (dev_counters, ctypes.byref(host_counters), ctypes.sizeof(host_counters), "counters"),
         ]
+        if config.dag_shape == "triad":
+            copies.insert(2, (dev_tmp0, ctypes.byref(host_tmp0), output_nbytes, "tmp0/c"))
         for dst, src, size, label in copies:
             if runtime.copy_to_device_ctx(ctx, dst, src, size) != 0:
                 raise RuntimeError(f"copy_to_device dag {label} failed")
@@ -1786,6 +1846,11 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
         if config.dag_shape == "scalar_affine":
             expected_tmp0 = [_f32(_f32(1.5 * host_a[i]) + _f32(0.5 * host_b[i])) for i in range(n)]
             expected_out = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
+        if config.dag_shape == "triad":
+            expected_tmp0 = [_f32(3 * i) for i in range(n)]
+            expected_tmp1 = [_f32(host_a[i] * host_b[i] + expected_tmp0[i]) for i in range(n)]
+            expected_tmp2 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
+            expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
         if config.dag_shape == "tensor_tile":
             expected_tmp0 = _matmul_expected(host_a, host_b, n, config.tensor_tile)
             expected_tmp1 = [_f32(expected_tmp0[i] + host_a[i]) for i in range(n)]
@@ -1795,7 +1860,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             raise RuntimeError("dag tmp0 mismatch")
         if list(host_tmp1) != expected_tmp1:
             raise RuntimeError("dag tmp1 mismatch")
-        if config.dag_shape in {"chain", "scratch_reuse", "tensor_tile"} and list(host_tmp2) != expected_tmp2:
+        if config.dag_shape in {"chain", "scratch_reuse", "tensor_tile", "triad"} and list(host_tmp2) != expected_tmp2:
             raise RuntimeError("dag tmp2 mismatch")
         if config.dag_shape in {"chain", "scratch_reuse"} and list(host_tmp3) != expected_tmp3:
             raise RuntimeError("dag tmp3 mismatch")
@@ -1855,6 +1920,8 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             result["scalar_args"] = {"scalar0": 1.5}
         if config.dag_shape == "scalar_affine":
             result["scalar_args"] = {"scalar0": 1.5, "scalar1": 0.5}
+        if config.dag_shape == "triad":
+            result["tensor_args"] = {"c": "tmp0"}
         return result
     finally:
         for ptr in allocated:
@@ -1906,6 +1973,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913
         "scalar_axpy",
         "scratch_reuse",
         "tensor_tile",
+        "triad",
     }:
         raise ValueError(f"unknown dag shape: {dag_shape}")
     if worker_blocks_per_task <= 0:
@@ -1929,6 +1997,8 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913
         raise RuntimeError("worker_blocks_per_task > 1 requires nvcc-built persistent direct PTX")
     if mode == "dag" and dag_shape == "tensor_tile" and ptx_source.startswith("embedded-"):
         raise RuntimeError("tensor_tile DAG shape requires nvcc-built generated-dispatch PTX")
+    if mode == "dag" and dag_shape == "triad" and ptx_source.startswith("embedded-"):
+        raise RuntimeError("triad DAG shape requires nvcc-built generated-dispatch PTX")
     ptx_buf = ctypes.create_string_buffer(ptx + b"\0")
 
     runtime, binaries = _load_persistent_runtime()
@@ -2102,6 +2172,7 @@ def main() -> None:
             "scalar_axpy",
             "scratch_reuse",
             "tensor_tile",
+            "triad",
         ],
         default="fork_join",
     )

@@ -215,6 +215,18 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2 --dag-shape scalar_affine
 ```
 
+Use `--dag-shape triad` to validate the third tensor pointer field in the
+persistent DAG task descriptor. The first DAG task reads `c` from `tmp0` and
+computes `out = a * b + c` before downstream generated-dispatch tasks consume
+its output.
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 3 --n 4096 --arch compute_80 \
+    --mode dag --queue-capacity 2 --dag-shape triad
+```
+
 Run the corresponding benchmark baseline directly after changing the
 two-scalar DAG descriptor or generated-dispatch benchmark wiring:
 
@@ -243,10 +255,12 @@ unreliable or the remote `origin` URL is not accessible.
 The JSON payload and compact report include `resource_policy` fields for
 `scheduler_blocks`, `worker_blocks`, `worker_blocks_per_task`, `stream_id`,
 `block_dim`, and `grid_dim`. Scalar DAG payloads also include `scalar_args`
-so mixed tensor/scalar descriptors are visible in the Markdown and SVG
-reports.
+and third-tensor DAG payloads include `tensor_args`, so descriptor arguments
+are visible in the Markdown and SVG reports.
 The current two-scalar descriptor capture is under
 `tmp/cuda-backend/persistent-scalar_affine-smoke-469f55cd/`.
+The current third-tensor descriptor capture is under
+`tmp/cuda-backend/persistent-triad-smoke-3a3bcdb1/`.
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such
 as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.
