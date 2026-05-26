@@ -585,7 +585,15 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
         }
 
-        if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
+        // directa-stage2: restrict aicore_mailbox polling to remote-cluster
+        // scheds (exec_idx 2/3 in directa 1+4: cluster 3 on die 1). Local
+        // cluster scheds (exec_idx 0/1, cluster 2 — same cluster as orch)
+        // skip the mailbox entirely. This keeps the mailbox cache line
+        // resident in the remote cluster, removes 2 of 4 readers from the
+        // try_lock contention, and frees the local-cluster scheds to focus
+        // on dispatch and ring advance.
+        bool is_mailbox_poller = (thread_idx >= 2 && thread_idx < sched_thread_num_);
+        if (is_mailbox_poller && rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || sched_->async_wait_list.pending_completion_count > 0)) {
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
                 rt_->aicore_mailbox, sched_, local_bufs, deferred_release_slot_states, deferred_release_count,

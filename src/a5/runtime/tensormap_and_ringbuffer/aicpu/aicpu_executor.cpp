@@ -42,6 +42,7 @@
 #include "common/unified_log.h"
 
 // Register-based communication
+#include "aicpu/platform_aicpu_affinity.h"  // CPU-deterministic exec_idx
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
 
@@ -211,7 +212,12 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
 int32_t AicpuExecutor::run(Runtime *runtime) {
-    int32_t thread_idx = thread_idx_++;
+    // Use the CPU-deterministic exec_idx from the affinity gate so that
+    // "thread_idx 2/3" reliably maps to ALLOWED_CPUS[2]/[3] (the remote
+    // cluster in directa-stage1). Fall back to the dispatch counter on
+    // platforms where the gate is inactive (sim).
+    int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
+    int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : thread_idx_++;
     int32_t run_rc = 0;
     LOG_INFO_V0("Thread %d: Start", thread_idx);
 
