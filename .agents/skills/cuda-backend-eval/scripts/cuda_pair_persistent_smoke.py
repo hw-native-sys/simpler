@@ -36,6 +36,9 @@ class PairedPersistentSmokeConfig:
     task_count: int = 3
     queue_capacity: int = 2
     worker_blocks_per_task: int = 1
+    tensor_rows: int = 16
+    tensor_cols: int = 16
+    tensor_inner: int = 16
     local_arch: str = "compute_80"
     remote_arch: str = "compute_90"
     local_python: str = sys.executable
@@ -54,6 +57,8 @@ def _git_commit(runner: Runner = subprocess.run) -> str:
 
 
 def _artifact_label(config: PairedPersistentSmokeConfig, suffix: str) -> str:
+    if config.dag_shape == "tensor_tile":
+        return f"persistent-tensor_tile-{config.tensor_rows}x{config.tensor_cols}x{config.tensor_inner}-smoke-{suffix}"
     return f"persistent-{config.dag_shape}-smoke-{suffix}"
 
 
@@ -119,6 +124,17 @@ def _smoke_args(*, device: int, arch: str, output_json: Path, config: PairedPers
                 config.dag_shape,
             ]
         )
+        if config.dag_shape == "tensor_tile":
+            args.extend(
+                [
+                    "--tensor-rows",
+                    str(config.tensor_rows),
+                    "--tensor-cols",
+                    str(config.tensor_cols),
+                    "--tensor-inner",
+                    str(config.tensor_inner),
+                ]
+            )
     elif config.mode == "queue":
         args.extend(["--queue-capacity", str(config.queue_capacity)])
     return args
@@ -278,6 +294,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-count", type=int, default=3)
     parser.add_argument("--queue-capacity", type=int, default=2)
     parser.add_argument("--worker-blocks-per-task", type=int, default=1)
+    parser.add_argument("--tensor-rows", type=int, default=16)
+    parser.add_argument("--tensor-cols", type=int, default=16)
+    parser.add_argument("--tensor-inner", type=int, default=16)
     parser.add_argument("--local-arch", default="compute_80")
     parser.add_argument("--remote-arch", default="compute_90")
     parser.add_argument("--local-python", default=sys.executable)
@@ -307,6 +326,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         task_count=args.task_count,
         queue_capacity=args.queue_capacity,
         worker_blocks_per_task=args.worker_blocks_per_task,
+        tensor_rows=args.tensor_rows,
+        tensor_cols=args.tensor_cols,
+        tensor_inner=args.tensor_inner,
         local_arch=args.local_arch,
         remote_arch=args.remote_arch,
         local_python=args.local_python,

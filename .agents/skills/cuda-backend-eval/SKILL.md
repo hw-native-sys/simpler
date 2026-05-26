@@ -150,6 +150,9 @@ This writes `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
 `tmp/cuda-backend/persistent-<shape>-smoke-<commit>/`, then refreshes
 `tmp/cuda-backend/index.md`. Use `--sync-remote-tree` when remote Git fetch is
 unreliable or the remote `origin` URL is not accessible.
+For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
+`--tensor-inner`; the artifact directory includes the descriptor shape, such
+as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.
 
 The generated-dispatch DAG smoke also carries device-side scheduler
 diagnostics. A normal pass returns `device_scheduler_errors` with zero counts.

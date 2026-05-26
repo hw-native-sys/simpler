@@ -170,8 +170,8 @@ Evidence:
   renders the compact smoke report and refreshes the artifact index.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py`
   automates no-torch persistent-device DAG smoke captures on local A100 and
-  remote H200, including optional remote tree sync, compact report rendering,
-  and artifact-index refresh.
+  remote H200, including optional remote tree sync, tensor-tile descriptor
+  flags, compact report rendering, and artifact-index refresh.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_artifact_index.py` indexes
   local `tmp/cuda-backend/` artifacts, including tensor-tile shapes,
   persistent smoke modes, dispatch sequences, and scheduler error counters.
@@ -628,6 +628,26 @@ Result: `tmp/cuda-backend/persistent-chain-smoke-e1fa429b/` contains
 `cuda-smoke-report.svg`. The A100 row returned `status=pass`,
 `ptx_arch=compute_80`, `device_wall_ns=29696`; the H200 row returned
 `status=pass`, `ptx_arch=compute_90`, `device_wall_ns=33152`.
+
+After adding tensor descriptor flags to the paired persistent-smoke runner,
+the non-square tensor-tile DAG smoke was captured on local A100 and remote
+H200 with tree sync:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape tensor_tile --task-count 4 --queue-capacity 2 \
+    --n 4096 --tensor-rows 8 --tensor-cols 4 --tensor-inner 12 \
+    --sync-remote-tree
+```
+
+Result: `tmp/cuda-backend/persistent-tensor_tile-8x4x12-smoke-ad45b69c/`
+contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The A100 row returned `status=pass`,
+`ptx_arch=compute_80`, `device_wall_ns=82944`; the H200 row returned
+`status=pass`, `ptx_arch=compute_90`, `device_wall_ns=49536`. Both rows
+reported `dispatch_func_ids=[3,1,2,1]`, tensor shape `8x4x12`, `128` tiles,
+and zero device scheduler errors.
 
 The preflight and CUDA scene-test subset was also run on the remote H200
 checkout after pushing this change:

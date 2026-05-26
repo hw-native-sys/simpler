@@ -800,6 +800,40 @@ def test_cuda_pair_persistent_smoke_builds_chain_a100_h200_workflow(tmp_path):
     assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
 
 
+def test_cuda_pair_persistent_smoke_builds_tensor_tile_descriptor_workflow(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape="tensor_tile",
+        task_count=4,
+        n=768,
+        tensor_rows=8,
+        tensor_cols=4,
+        tensor_inner=12,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    report = cuda_pair_persistent_smoke.build_report_command(config, "abc123")
+
+    assert "persistent-tensor_tile-8x4x12-smoke-abc123" in str(local)
+    assert "--tensor-rows" in local
+    assert "8" in local
+    assert "--tensor-cols" in local
+    assert "4" in local
+    assert "--tensor-inner" in local
+    assert "12" in local
+    assert "--dag-shape tensor_tile" in remote[-1]
+    assert "--tensor-rows 8" in remote[-1]
+    assert "--tensor-cols 4" in remote[-1]
+    assert "--tensor-inner 12" in remote[-1]
+    assert "persistent-tensor_tile-8x4x12-smoke-abc123" in report
+
+
 def test_cuda_pair_persistent_smoke_can_sync_local_tree_and_dry_run(tmp_path):
     cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
     calls = []
