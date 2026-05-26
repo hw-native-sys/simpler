@@ -555,6 +555,16 @@ def test_cuda_capture_validator_reports_missing_baseline_and_artifact(tmp_path):
     assert "missing report file cuda-benchmark-ratios.svg" in errors
 
 
+def test_cuda_capture_validator_paired_current_requires_quad_baseline():
+    cuda_validate_capture = _load_capture_validator_module()
+    args = cuda_validate_capture.parse_args(["capture.json", "--preset", "paired-current"])
+
+    cuda_validate_capture._apply_preset(args)
+
+    assert "pto_persistent_dag_quad" in args.require_baseline
+    assert args.expected_result_count == 666
+
+
 def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     cuda_pair_benchmark = _load_pair_benchmark_module()
     config = cuda_pair_benchmark.PairedBenchmarkConfig(
@@ -1810,6 +1820,24 @@ def test_quad_dag_shape_uses_two_extra_tensor_descriptor_fields():
     assert tasks[0].c == 201
     assert tasks[0].d == 204
     assert tasks[0].out == 202
+
+
+def test_quad_dag_expected_value_matches_cuda_fused_multiply_add():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    i = 4383
+    a = cuda_persistent_smoke._f32(i)
+    b = cuda_persistent_smoke._f32(2 * i)
+    c = cuda_persistent_smoke._f32(3 * i)
+    d = cuda_persistent_smoke._f32(4 * i)
+    separately_rounded = cuda_persistent_smoke._f32(
+        cuda_persistent_smoke._f32(a * b) + cuda_persistent_smoke._f32(c * d)
+    )
+
+    expected = cuda_persistent_smoke._fma_f32(a, b, cuda_persistent_smoke._f32(c * d))
+
+    assert expected != separately_rounded
+    assert expected == 268949664.0
 
 
 def test_unary_square_dag_shape_uses_single_input_task_body():

@@ -886,6 +886,20 @@ def _f32(value: float) -> float:
     return ctypes.c_float(value).value
 
 
+def _fma_f32(a: float, b: float, c: float) -> float:
+    return _f32(float(a) * float(b) + float(c))
+
+
+def _first_mismatch(actual: list[float], expected: list[float]) -> str:
+    if len(actual) != len(expected):
+        return f"len actual={len(actual)} expected={len(expected)}"
+    for idx, actual_value in enumerate(actual):
+        expected_value = expected[idx]
+        if actual_value != expected_value:
+            return f"idx={idx} actual={actual_value} expected={expected_value}"
+    return "no mismatch"
+
+
 def _make_tensor_tile_descriptor(rows: int = 16, cols: int = 16, inner: int = 16) -> dict[str, int]:
     if rows <= 0 or cols <= 0 or inner <= 0:
         raise ValueError("tensor tile rows, cols, and inner must be positive")
@@ -2031,7 +2045,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 expected_tmp0 = [_f32(3 * i) for i in range(n)]
                 expected_tmp3 = [_f32(4 * i) for i in range(n)]
                 expected_tmp1 = [
-                    _f32(_f32(host_a[i] * host_b[i]) + _f32(expected_tmp0[i] * expected_tmp3[i])) for i in range(n)
+                    _fma_f32(host_a[i], host_b[i], _f32(expected_tmp0[i] * expected_tmp3[i])) for i in range(n)
                 ]
                 expected_tmp2 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
@@ -2045,9 +2059,11 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 expected_tmp2 = [_f32(expected_tmp0[i] * host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
             if list(host_tmp0) != expected_tmp0:
-                raise RuntimeError(f"dag tmp0 mismatch on launch {launch_idx}")
+                mismatch = _first_mismatch(list(host_tmp0), expected_tmp0)
+                raise RuntimeError(f"dag tmp0 mismatch on launch {launch_idx}: {mismatch}")
             if list(host_tmp1) != expected_tmp1:
-                raise RuntimeError(f"dag tmp1 mismatch on launch {launch_idx}")
+                mismatch = _first_mismatch(list(host_tmp1), expected_tmp1)
+                raise RuntimeError(f"dag tmp1 mismatch on launch {launch_idx}: {mismatch}")
             if (
                 config.dag_shape in {"chain", "scratch_reuse", "tensor_tile", "triad", "quad"}
                 and list(host_tmp2) != expected_tmp2

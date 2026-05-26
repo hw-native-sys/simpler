@@ -180,18 +180,20 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_scalar_axpy`;
 - `pto_persistent_dag_scalar_affine`;
 - `pto_persistent_dag_triad`;
+- `pto_persistent_dag_quad`;
 - `pto_persistent_dag_unary_square`;
 - `pto_persistent_dag_tensor`;
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest paired capture at commit `832d24bf` uses the `8x4x12` tensor
+The latest paired capture at commit `ba99b593` uses the `8x4x12` tensor
 descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
 and worker-grid values `32,64,128,256`. It includes the compiler-backed
 host-schedule row, unary square host-schedule row, and
 `pto_persistent_dag_scalar_axpy`, `pto_persistent_dag_scalar_affine`, and
-`pto_persistent_dag_triad` on both A100 and H200. It also includes the
-`pto_persistent_dag_unary_square` row that validates unary persistent DAG
+`pto_persistent_dag_triad` on both A100 and H200. It also includes
+`pto_persistent_dag_quad`, validating fourth tensor task descriptor fields,
+and `pto_persistent_dag_unary_square`, validating unary persistent DAG
 arguments in the full paired benchmark path.
 
 Evidence:
@@ -1030,8 +1032,8 @@ Result: A100 `status=pass`, `ptx_arch=compute_80`,
 `dispatch_func_ids=[5,2,1]`, the same scalar args, zero scheduler errors,
 and `device_wall_ns=30560`.
 
-The full paired benchmark was then refreshed with scalar affine and triad rows
-in the default persistent baseline set:
+The full paired benchmark was then refreshed with scalar affine, triad, quad,
+and unary-square rows in the default persistent baseline set:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -1040,18 +1042,20 @@ PYTHONPATH=$PWD:$PWD/python \
     --sync-remote-tree
 ```
 
-Result: `tmp/cuda-backend/combined-current-832d24bf/` contains
+Result: `tmp/cuda-backend/combined-current-ba99b593/` contains
 `cuda-benchmark.json`, `cuda-benchmark.md`, `cuda-benchmark.svg`, and
-`cuda-benchmark-ratios.svg`. The combined JSON has `648` samples, including
+`cuda-benchmark-ratios.svg`. The combined JSON has `666` samples, including
 `18` `pto_persistent_dag_scalar_affine` samples and `18`
-`pto_persistent_dag_triad` samples, and `18`
+`pto_persistent_dag_triad` samples, `18`
+`pto_persistent_dag_quad` samples, and `18`
 `pto_persistent_dag_unary_square` samples. The compact DAG table reports
-unary-square ratios versus `pto_persistent_dag` of `1.20x`, `7.18x`, and
-`1.38x` on A100 for `N=1024,65536,1048576`, and `1.01x`, `1.47x`, and
-`1.37x` on H200 for the same sizes. The A100 `N=65536` scalar-affine, triad,
-unary-square, and tensor rows are much slower than the base DAG in this
-capture, so they are recorded as correctness evidence and should be rechecked
-before using them as throughput conclusions.
+quad ratios versus `pto_persistent_dag` of `1.05x`, `1.19x`, and `1.19x` on
+A100 for `N=1024,65536,1048576`, and `0.98x`, `1.07x`, and `1.01x` on H200
+for the same sizes. The quad smoke and paired benchmark golden path now
+matches NVCC's generated `mul.f32` plus `fma.rn.f32` sequence for
+`a * b + c * d`, so the fourth tensor descriptor row is recorded as
+correctness and scheduler-shape evidence. Throughput conclusions still need a
+tuned tensor workload.
 
 The combined capture was validated with:
 
@@ -1059,11 +1063,11 @@ The combined capture was validated with:
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python \
     .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-832d24bf/cuda-benchmark.json \
+    tmp/cuda-backend/combined-current-ba99b593/cuda-benchmark.json \
     --preset paired-current
 ```
 
-Result: `validated tmp/cuda-backend/combined-current-832d24bf/cuda-benchmark.json`.
+Result: `validated tmp/cuda-backend/combined-current-ba99b593/cuda-benchmark.json`.
 
 After adding `persistent_dag_unary_square_f32` to the normal SceneTestCase L2
 persistent-device argument builders, the CUDA scene-test file was rerun
