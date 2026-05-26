@@ -52,6 +52,7 @@ class PairedPersistentSmokeConfig:
     remote_git_fetch_timeout: int = 60
     refresh_remote: bool = True
     sync_remote_tree: bool = False
+    validate_smoke: bool = True
 
 
 def _git_commit(runner: Runner = subprocess.run) -> str:
@@ -240,6 +241,55 @@ def build_report_command(config: PairedPersistentSmokeConfig, suffix: str) -> li
     ]
 
 
+def _expected_completed_count(config: PairedPersistentSmokeConfig) -> int:
+    if config.mode != "dag":
+        return config.task_count
+    return {
+        "chain": 5,
+        "scratch_reuse": 6,
+        "tensor_tile": 4,
+    }.get(config.dag_shape, 3)
+
+
+def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
+    if config.mode != "dag":
+        return None
+    return {
+        "graph_descriptor": "9,2,1",
+    }.get(config.dag_shape)
+
+
+def build_validate_command(config: PairedPersistentSmokeConfig, suffix: str) -> list[str]:
+    output_dir = _output_dir(config, suffix)
+    command = [
+        "env",
+        f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}",
+        config.local_python,
+        ".agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py",
+        str(output_dir / "a100.json"),
+        str(output_dir / "h200.json"),
+        "--require-artifact",
+        "a100",
+        "--require-artifact",
+        "h200",
+        "--expected-runtime",
+        "persistent_device",
+        "--expected-mode",
+        config.mode,
+        "--expected-repeat-runs",
+        str(config.repeat_runs),
+        "--expected-completed-count",
+        str(_expected_completed_count(config)),
+        "--require-report-files",
+    ]
+    if config.mode == "dag":
+        command.extend(["--expected-dag-shape", config.dag_shape])
+    expected_dispatch = _expected_dispatch(config)
+    if expected_dispatch is not None:
+        command.extend(["--expected-dispatch", expected_dispatch])
+    return command
+
+
 def build_index_command(config: PairedPersistentSmokeConfig) -> list[str]:
     return [
         "env",
@@ -271,9 +321,11 @@ def run_paired_persistent_smoke(
             build_remote_smoke_command(config, suffix),
             build_scp_command(config, suffix),
             build_report_command(config, suffix),
-            build_index_command(config),
         ]
     )
+    if config.validate_smoke:
+        commands.append(build_validate_command(config, suffix))
+    commands.append(build_index_command(config))
     for command in commands:
         print(" ".join(shlex.quote(part) for part in command), flush=True)
         if not dry_run:
@@ -333,6 +385,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remote-git-fetch-timeout", type=int, default=60)
     parser.add_argument("--skip-remote-refresh", action="store_true")
     parser.add_argument("--sync-remote-tree", action="store_true")
+    parser.add_argument("--skip-validation", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -368,6 +421,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         remote_git_fetch_timeout=args.remote_git_fetch_timeout,
         refresh_remote=not args.skip_remote_refresh and not args.sync_remote_tree,
         sync_remote_tree=args.sync_remote_tree,
+        validate_smoke=not args.skip_validation,
     )
     run_paired_persistent_smoke(config, dry_run=args.dry_run)
 

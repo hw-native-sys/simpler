@@ -176,7 +176,9 @@ The current paired benchmark shape uses:
 - local A100 PTX arch: `compute_80`
 - remote H200 PTX arch: `compute_90`
 
-Validate paired smoke artifacts before citing them:
+The paired persistent smoke runner validates smoke artifacts before refreshing
+the local index. Use `--skip-validation` only for intentional negative
+scheduler-diagnostic captures. Standalone smoke validation uses:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \

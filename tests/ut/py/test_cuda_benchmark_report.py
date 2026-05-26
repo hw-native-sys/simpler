@@ -1114,6 +1114,7 @@ def test_cuda_pair_persistent_smoke_builds_chain_a100_h200_workflow(tmp_path):
 
     local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
     remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
     scp = cuda_pair_persistent_smoke.build_scp_command(config, "abc123")
     report = cuda_pair_persistent_smoke.build_report_command(config, "abc123")
     index = cuda_pair_persistent_smoke.build_index_command(config)
@@ -1162,6 +1163,21 @@ def test_cuda_pair_persistent_smoke_builds_chain_a100_h200_workflow(tmp_path):
     assert str(tmp_path / "cuda-backend" / "persistent-chain-smoke-abc123" / "a100.json") in report
     assert str(tmp_path / "cuda-backend" / "persistent-chain-smoke-abc123" / "h200.json") in report
     assert "persistent-chain-smoke-abc123" in report
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py" in validate
+    assert str(tmp_path / "cuda-backend" / "persistent-chain-smoke-abc123" / "a100.json") in validate
+    assert str(tmp_path / "cuda-backend" / "persistent-chain-smoke-abc123" / "h200.json") in validate
+    assert "--require-artifact" in validate
+    assert "a100" in validate
+    assert "h200" in validate
+    assert "--expected-runtime" in validate
+    assert "persistent_device" in validate
+    assert "--expected-mode" in validate
+    assert "dag" in validate
+    assert "--expected-dag-shape" in validate
+    assert "chain" in validate
+    assert "--expected-completed-count" in validate
+    assert "5" in validate
+    assert "--require-report-files" in validate
     assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
 
 
@@ -1334,6 +1350,7 @@ def test_cuda_pair_persistent_smoke_accepts_graph_descriptor_repeat_runs(tmp_pat
 
     local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
     remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
 
     assert config.dag_shape == "graph_descriptor"
     assert config.repeat_runs == 2
@@ -1346,6 +1363,10 @@ def test_cuda_pair_persistent_smoke_accepts_graph_descriptor_repeat_runs(tmp_pat
     assert "--dag-shape graph_descriptor" in remote[-1]
     assert "--repeat-runs 2" in remote[-1]
     assert "persistent-graph_descriptor-repeat2-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-repeat-runs" in validate
+    assert "2" in validate
+    assert "--expected-dispatch" in validate
+    assert "9,2,1" in validate
 
 
 def test_cuda_pair_persistent_smoke_builds_scalar_affine_workflow(tmp_path):
@@ -1439,7 +1460,7 @@ def test_cuda_pair_persistent_smoke_can_sync_local_tree_and_dry_run(tmp_path):
     commands = cuda_pair_persistent_smoke.run_paired_persistent_smoke(config, runner=fake_runner, dry_run=True)
 
     assert calls == [(["git", "rev-parse", "--short", "HEAD"], {"check": True, "capture_output": True, "text": True})]
-    assert len(commands) == 6
+    assert len(commands) == 7
     sync = commands[1]
     assert sync[:3] == ["rsync", "-a", "--delete"]
     assert sync[-2:] == [f"{Path.cwd()}/", "h200-box:/remote/pto-cu/"]
@@ -1449,6 +1470,10 @@ def test_cuda_pair_persistent_smoke_can_sync_local_tree_and_dry_run(tmp_path):
     assert "persistent-scratch_reuse-smoke-local123" in commands[2][-1]
     assert "persistent-scratch_reuse-smoke-local123" in commands[3][1]
     assert any("persistent-scratch_reuse-smoke-local123" in part for part in commands[4])
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py" in commands[5]
+    assert "--expected-completed-count" in commands[5]
+    assert "6" in commands[5]
+    assert commands[6][-2:] == ["--root", str(tmp_path / "cuda-backend")]
 
 
 def test_find_nvcc_uses_cuda_home_when_nvcc_is_not_on_path(tmp_path, monkeypatch):

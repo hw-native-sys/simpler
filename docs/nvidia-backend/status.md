@@ -230,7 +230,8 @@ Evidence:
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py`
   automates no-torch persistent-device DAG smoke captures on local A100 and
   remote H200, including optional remote tree sync, tensor-tile descriptor
-  flags, compact report rendering, and artifact-index refresh.
+  flags, compact report rendering, smoke artifact validation, and
+  artifact-index refresh.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`
   checks paired benchmark captures for expected machines, selected baselines,
   sizes, repeats, sample count, and generated report files before docs are

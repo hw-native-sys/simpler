@@ -332,10 +332,12 @@ PYTHONPATH=$PWD:$PWD/python \
 
 This writes `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
 `cuda-smoke-report.svg` under
-`tmp/cuda-backend/persistent-<shape>-smoke-<commit>/`, then refreshes
-`tmp/cuda-backend/index.md`. Use `--sync-remote-tree` when remote Git fetch is
-unreliable or the remote `origin` URL is not accessible.
-Validate paired persistent smoke artifacts before citing them:
+`tmp/cuda-backend/persistent-<shape>-smoke-<commit>/`, validates the paired
+smoke artifact, then refreshes `tmp/cuda-backend/index.md`. Use
+`--sync-remote-tree` when remote Git fetch is unreliable or the remote
+`origin` URL is not accessible. Use `--skip-validation` only for intentional
+negative scheduler-diagnostic captures.
+The paired runner validates persistent smoke artifacts with the equivalent of:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -946,6 +948,8 @@ and the Markdown/SVG report files.
 Use `cuda_validate_smoke.py` for paired smoke artifacts. It checks required
 artifacts, pass status, zero device scheduler errors, expected runtime/mode,
 dispatch IDs, repeat-run lifecycle counts, and generated smoke report files.
+`cuda_pair_persistent_smoke.py` runs this validator automatically unless
+`--skip-validation` is set.
 
 When worker-grid rows are present, the report includes a
 `Best Worker Grid Rows` table that picks the lowest median device time for
