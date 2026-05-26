@@ -296,11 +296,49 @@ dependencies).
 
 ---
 
-## 7. Architecture Touchpoints
+## 7. Big-Fanin Submits: Overflow Chain
+
+A `DepGenRecord` carries up to **64** explicit_deps inline. Submits with
+more than 64 explicit deps spill into a chain of `DepGenOverflowRecord`
+slots that overlay normal record slots in the buffer.
+
+| Submit `explicit_dep_count` | Chain shape | Per-submit slots used |
+| --------------------------- | ----------- | --------------------- |
+| `0 ≤ dc ≤ 64` | base only — fast path, no chain bookkeeping | 1 |
+| `65 ≤ dc ≤ 390` | base (64 deps) + 1 overflow (up to 326 deps) | 2 |
+| `391 ≤ dc ≤ 716` | base + 2 overflow | 3 |
+| general | base + `⌈(dc − 64) / 326⌉` overflow | `1 + ⌈(dc − 64) / 326⌉` |
+
+**Wire format.** An overflow record reinterprets the same 2624-byte slot
+as `{ task_id (8) + flags (4) + dep_count (2) + _reserved (2) + deps[326] }` —
+no tensor blobs (those live on the base record). Replay distinguishes
+the two views by `flags & DEP_GEN_FLAG_OVERFLOW`. Chain records always
+share the base's `task_id`, and the last one sets
+`DEP_GEN_FLAG_LAST_OVERFLOW` so replay knows the chain is complete
+without peeking ahead.
+
+**Atomicity.** The AICPU writer reserves *all* chain slots up front: if
+the current buffer can't hold the full chain, it switches buffer first.
+`buf->count` is published with a single store at the end, so the host
+either sees the old count (chain invisible) or the new count with the
+full chain committed. Chain records are therefore always contiguous
+within one buffer — replay scans linearly and ties them back to the
+base via `task_id`.
+
+**Truncation tail.** A submit whose chain exceeds the buffer's slot
+budget (`PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 32` slots → roughly
+`64 + 31 × 326 = 10170` deps max in the best case) is logged via
+`LOG_ERROR` and truncated to the largest dc that fits. Runtime
+correctness is unaffected — `Arg::set_dependencies` keeps the full dep
+list; only the dep_gen replay graph loses the tail.
+
+---
+
+## 8. Architecture Touchpoints
 
 | Layer | File | Role |
 | ----- | ---- | ---- |
-| Shared-mem layout | `src/a2a3/platform/include/common/dep_gen.h` | `DepGenRecord` (2240 B, cache-line aligned) + SPSC ring + per-thread ready queue |
+| Shared-mem layout | `src/a2a3/platform/include/common/dep_gen.h` | `DepGenRecord` (2624 B base, cache-line aligned, ≤64 inline explicit_deps) + `DepGenOverflowRecord` chain view (≤326 deps per slot) + SPSC ring + per-thread ready queue |
 | AICPU writer | `src/a2a3/platform/{include,src}/aicpu/dep_gen_collector_aicpu.{h,cpp}` | Single-instance write path; weak-fallback exported to host build |
 | Host collector | `src/a2a3/platform/{include/host,src/host}/dep_gen_collector.{h,cpp}` | `ProfilerBase<DepGenCollector, DepGenModule>` — drains ring → `records_` vector |
 | Capture call site | `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. Dep-only tasks land in the record stream with valid tensor/dep info but no kernel_id field (the schema does not carry kernel_id), so replay treats them as ordinary dep nodes — viewers do not currently distinguish dummy from real tasks. |

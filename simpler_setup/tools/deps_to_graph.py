@@ -536,6 +536,15 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
     lines = [
         "digraph deps {",
         f"  rankdir={direction};",
+        # `concentrate=true` merges shared edge prefixes through virtual
+        # nodes. Without it, deep DAGs with heavy fan-in (e.g. dep_gen
+        # capture of a >300-wide barrier reached through a tensormap
+        # producer chain) explode the dot position-assignment pass into
+        # ~N²/2 internal virtual nodes and SIGSEGV graphviz. With it,
+        # parallel edges collapse and the layout completes; rank ordering
+        # (the LR DAG shape) is unaffected — only the visual edge routing
+        # is denser.
+        "  concentrate=true;",
         '  node [fontname="Helvetica", fontsize=10];',
         '  edge [color="#888"];',
     ]

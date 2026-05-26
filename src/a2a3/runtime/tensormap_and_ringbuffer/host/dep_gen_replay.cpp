@@ -98,6 +98,10 @@ int32_t count_outputs(const DepGenRecord *records, size_t n) {
     int32_t total = 0;
     for (size_t i = 0; i < n; i++) {
         const DepGenRecord &r = records[i];
+        // Overflow chain slots are reinterpret_cast views with no tensor data;
+        // their `tensor_count` bytes are actually the overflow `dep_count` field,
+        // which would mislead the loop below if read as a tensor count.
+        if (r.flags & DEP_GEN_FLAG_OVERFLOW) continue;
         for (uint16_t j = 0; j < r.tensor_count; j++) {
             auto t = static_cast<TensorArgType>(r.arg_types[j]);
             if (t == TensorArgType::INOUT || t == TensorArgType::OUTPUT_EXISTING) {
@@ -509,8 +513,18 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     std::unordered_set<uint64_t> oracle_preds;
     std::unordered_set<uint64_t> annot_preds;
 
+    // Scratch buffer for assembling full dep lists across overflow chains.
+    // Declared outside the loop so it can be reused (clear() keeps capacity).
+    std::vector<uint64_t> full_deps_buf;
+
     for (size_t rec_i = 0; rec_i < num_records; rec_i++) {
         const DepGenRecord &rec = records[rec_i];
+
+        // Overflow chain records are consumed by the preceding base; skip
+        // them in the main scan so we don't double-process or read the
+        // overflow's reinterpreted bytes as tensor/dep info.
+        if (rec.flags & DEP_GEN_FLAG_OVERFLOW) continue;
+
         PTO2TaskId task_id{rec.task_id};
         bool in_manual_scope = (rec.flags & DEP_GEN_FLAG_IN_MANUAL_SCOPE) != 0;
 
@@ -526,9 +540,81 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
             atype_buf[i] = static_cast<TensorArgType>(rec.arg_types[i]);
         }
 
-        int32_t dc = static_cast<int32_t>(rec.explicit_dep_count);
-        if (dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
-            dc = DEP_GEN_MAX_EXPLICIT_DEPS;
+        // Assemble the full dep list. Fast path: ≤ DEP_GEN_MAX_EXPLICIT_DEPS,
+        // no chain, point straight at rec.explicit_deps. Slow path: gather
+        // base + chain into full_deps_buf and point at the buffer.
+        //
+        // `explicit_dep_count` / `over->dep_count` originate from device
+        // shared memory and are bounded by the writer to the array sizes, but
+        // we clamp on read too so a corrupted record never drives an OOB read
+        // off the end of rec.explicit_deps[64] / over->deps[326].
+        const uint64_t *deps_data;
+        int32_t dc;
+        if (rec.flags & DEP_GEN_FLAG_HAS_OVERFLOW) {
+            full_deps_buf.clear();
+            uint16_t base_dc = rec.explicit_dep_count;
+            if (base_dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
+                LOG_ERROR(
+                    "dep_gen replay: clamping base explicit_dep_count %u > %d at rec_idx=%zu (task_id=%" PRIu64 ")",
+                    base_dc, DEP_GEN_MAX_EXPLICIT_DEPS, rec_i, rec.task_id
+                );
+                base_dc = DEP_GEN_MAX_EXPLICIT_DEPS;
+            }
+            full_deps_buf.reserve(static_cast<size_t>(base_dc) + DEP_GEN_OVERFLOW_DEPS_PER_RECORD);
+            full_deps_buf.insert(full_deps_buf.end(), rec.explicit_deps, rec.explicit_deps + base_dc);
+            bool chain_complete = false;
+            for (size_t j = rec_i + 1; j < num_records; j++) {
+                const DepGenRecord &maybe = records[j];
+                if (!(maybe.flags & DEP_GEN_FLAG_OVERFLOW)) {
+                    LOG_ERROR(
+                        "dep_gen replay: unterminated overflow chain at rec_idx=%zu (task_id=%" PRIu64 ")", rec_i,
+                        rec.task_id
+                    );
+                    break;
+                }
+                if (maybe.task_id != rec.task_id) {
+                    LOG_ERROR(
+                        "dep_gen replay: orphan overflow at rec_idx=%zu (expected task_id=%" PRIu64 ", found %" PRIu64
+                        ")",
+                        j, rec.task_id, maybe.task_id
+                    );
+                    break;
+                }
+                const auto *over = reinterpret_cast<const DepGenOverflowRecord *>(&maybe);
+                uint16_t over_dc = over->dep_count;
+                if (over_dc > DEP_GEN_OVERFLOW_DEPS_PER_RECORD) {
+                    LOG_ERROR(
+                        "dep_gen replay: clamping overflow dep_count %u > %d at rec_idx=%zu (task_id=%" PRIu64 ")",
+                        over_dc, DEP_GEN_OVERFLOW_DEPS_PER_RECORD, j, rec.task_id
+                    );
+                    over_dc = DEP_GEN_OVERFLOW_DEPS_PER_RECORD;
+                }
+                full_deps_buf.insert(full_deps_buf.end(), over->deps, over->deps + over_dc);
+                if (over->flags & DEP_GEN_FLAG_LAST_OVERFLOW) {
+                    chain_complete = true;
+                    break;
+                }
+            }
+            if (!chain_complete) {
+                LOG_ERROR(
+                    "dep_gen replay: chain for task_id=%" PRIu64 " missing LAST_OVERFLOW marker — "
+                    "using partial dep list (%zu deps)",
+                    rec.task_id, full_deps_buf.size()
+                );
+            }
+            deps_data = full_deps_buf.data();
+            dc = static_cast<int32_t>(full_deps_buf.size());
+        } else {
+            deps_data = rec.explicit_deps;
+            uint16_t base_dc = rec.explicit_dep_count;
+            if (base_dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
+                LOG_ERROR(
+                    "dep_gen replay: clamping no-chain explicit_dep_count %u > %d at rec_idx=%zu (task_id=%" PRIu64 ")",
+                    base_dc, DEP_GEN_MAX_EXPLICIT_DEPS, rec_i, rec.task_id
+                );
+                base_dc = DEP_GEN_MAX_EXPLICIT_DEPS;
+            }
+            dc = static_cast<int32_t>(base_dc);
         }
 
         DepInputs inputs;
@@ -536,7 +622,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         inputs.tensors = tref_buf;
         inputs.arg_types = atype_buf;
         inputs.explicit_dep_count = dc;
-        inputs.explicit_deps = reinterpret_cast<const PTO2TaskId *>(rec.explicit_deps);
+        inputs.explicit_deps = reinterpret_cast<const PTO2TaskId *>(deps_data);
 
         // Register tasks[] entry (with per-arg slot info) and any unseen
         // tensors[] entries up-front. Tensors are registered from the
@@ -576,9 +662,11 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         // ============ STEP 1 — explicit_deps (call-site emit) ============
         // Same loop on both passes; they MUST produce identical sets here
         // because they read the same record. Annot records explicit edges
-        // with consumer_arg_idx = -1 (not tied to any tensor arg).
+        // with consumer_arg_idx = -1 (not tied to any tensor arg). Reads
+        // from deps_data (base record's explicit_deps[] on fast path, the
+        // gathered base+chain buffer on overflow path).
         for (int32_t i = 0; i < dc; i++) {
-            uint64_t pred_raw = rec.explicit_deps[i];
+            uint64_t pred_raw = deps_data[i];
             if (oracle_preds.insert(pred_raw).second) {
                 // First time this pred is seen at runtime call site.
             }
