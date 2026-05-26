@@ -435,12 +435,11 @@ build/cache/cuda/onboard/persistent_device/callables/{hash}/
 
 Required Python/build changes:
 
-- replace global `TARGETS = ("host", "aicpu", "aicore")` with per-platform or
-  per-runtime target discovery;
+- continue replacing the global `TARGETS = ("host", "aicpu", "aicore")`
+  assumption with per-runtime target discovery;
 - finish generalizing `RuntimeBinaries`; the current transitional
-  `role_paths` map exposes Ascend's legacy roles and CUDA's compatibility
-  `device` role, but CUDA build configs still emit through the legacy target
-  names;
+  `role_paths` map exposes Ascend's legacy roles and CUDA's native `host` /
+  `device` roles while preserving legacy path attributes;
 - add a CUDA callable compiler that owns wrapper generation and final device
   link;
 - add manifest fields to `ChipCallable` or introduce a CUDA callable payload

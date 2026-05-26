@@ -216,13 +216,13 @@ hardware names:
 - `scheduler`: optional alias for the `persistent_device` scheduler module.
 
 For a low-risk transition, `RuntimeBinaries` can keep `aicpu_path` and
-`aicore_path` temporarily while CUDA ignores or repurposes the `aicpu` slot.
-That transition has started with `RuntimeBinaries.role_paths` and
+`aicore_path` temporarily as compatibility aliases. That transition has
+started with `RuntimeBinaries.role_paths` and
 `RuntimeBinaries.path_for_role(...)`: Ascend exposes `host`, `aicpu`, and
-`aicore`, while CUDA exposes `host` plus a compatibility `device` role that
-currently points at `aicpu_path`. The cleaner end state is a target-binary map
-keyed only by runtime roles, with Ascend build configs declaring `host`,
-`aicpu`, `aicore` and CUDA declaring `host`, `device`.
+`aicore`, while CUDA build configs now declare `host` and `device`. The
+cleaner end state is a target-binary map keyed only by runtime roles, with
+Ascend build configs declaring `host`, `aicpu`, `aicore` and CUDA declaring
+`host`, `device`.
 
 Add a `CudaNvccToolchain`:
 

@@ -159,11 +159,42 @@ class RuntimeBuilder:
         source_dirs = [str((config_dir / p).resolve()) for p in cfg["source_dirs"]]
         return include_dirs, source_dirs
 
+    def _target_names(self, build_config: dict) -> tuple[str, ...]:
+        if self._arch == "cuda" and "device" in build_config:
+            return tuple(target for target in ("host", "device") if target in build_config)
+        return TARGETS
+
     def _target_role_paths(self, paths: dict[str, Path]) -> dict[str, Path]:
-        role_paths = dict(paths)
         if self._arch == "cuda":
-            role_paths["device"] = paths["aicpu"]
-        return role_paths
+            device_path = paths.get("device", paths.get("aicpu"))
+            if device_path is not None:
+                return {"host": paths["host"], "device": device_path}
+        return dict(paths)
+
+    def _runtime_binaries_from_paths(
+        self,
+        paths: dict[str, Path],
+        simpler_log_path: Path,
+        sim_context_path: Optional[Path],
+    ) -> RuntimeBinaries:
+        device_path = paths.get("device")
+        aicpu_path = paths.get("aicpu", device_path)
+        aicore_path = paths.get("aicore", device_path)
+        if aicpu_path is None or aicore_path is None:
+            missing = []
+            if aicpu_path is None:
+                missing.append("aicpu")
+            if aicore_path is None:
+                missing.append("aicore")
+            raise KeyError(f"Missing runtime binary path(s): {', '.join(missing)}")
+        return RuntimeBinaries(
+            host_path=paths["host"],
+            aicpu_path=aicpu_path,
+            aicore_path=aicore_path,
+            simpler_log_path=simpler_log_path,
+            sim_context_path=sim_context_path,
+            role_paths=self._target_role_paths(paths),
+        )
 
     def _lookup_binaries(self, name: str, output_dir: Path) -> RuntimeBinaries:
         """Look up pre-built binaries from output_dir.
@@ -175,9 +206,10 @@ class RuntimeBuilder:
             FileNotFoundError: If any binary is missing.
         """
         compiler = self._runtime_compiler
+        build_config = load_build_config(self._runtimes[name])
         paths = {}
         missing = []
-        for target in TARGETS:
+        for target in self._target_names(build_config):
             target_obj = getattr(compiler, f"{target}_target")
             binary = output_dir / target_obj.get_binary_name()
             paths[target] = binary
@@ -208,14 +240,7 @@ class RuntimeBuilder:
                 "Run 'pip install .' or pass --build to compile it."
             )
 
-        return RuntimeBinaries(
-            host_path=paths["host"],
-            aicpu_path=paths["aicpu"],
-            aicore_path=paths["aicore"],
-            simpler_log_path=simpler_log_path,
-            sim_context_path=sim_context_path,
-            role_paths=self._target_role_paths(paths),
-        )
+        return self._runtime_binaries_from_paths(paths, simpler_log_path, sim_context_path)
 
     def get_binaries(self, name: str, build: bool = False) -> RuntimeBinaries:
         """Return paths to compiled runtime binaries.
@@ -246,6 +271,7 @@ class RuntimeBuilder:
         config_path = self._runtimes[name]
         config_dir = config_path.parent
         build_config = load_build_config(config_path)
+        target_names = self._target_names(build_config)
 
         compiler = self._runtime_compiler
 
@@ -272,38 +298,22 @@ class RuntimeBuilder:
                     output_dir=output_dir,
                 )
 
-        logger.info("Compiling AICore, AICPU, Host in parallel...")
+        logger.info("Compiling runtime targets in parallel: %s", ", ".join(target_names))
 
         # libsimpler_log.so must finish before the host runtime is built —
         # the host CMake links against it via -lsimpler_log -L<output_dir>.
         simpler_log_path = self.ensure_simpler_log(build=True)
 
         with ThreadPoolExecutor(max_workers=4) as executor:
-            fut_host = executor.submit(_compile_target, "host")
-            fut_aicpu = executor.submit(_compile_target, "aicpu")
-            fut_aicore = executor.submit(_compile_target, "aicore")
+            fut_targets = {target: executor.submit(_compile_target, target) for target in target_names}
             fut_sim_ctx = executor.submit(self.ensure_sim_context, build=True) if variant == "sim" else None
 
-            host_path = fut_host.result()
-            aicpu_path = fut_aicpu.result()
-            aicore_path = fut_aicore.result()
+            paths = {target: future.result() for target, future in fut_targets.items()}
             sim_context_path = fut_sim_ctx.result() if fut_sim_ctx else None
 
-        self._place_compile_commands(name)
+        self._place_compile_commands(name, target_names)
         logger.info("Build complete!")
-        paths = {
-            "host": host_path,
-            "aicpu": aicpu_path,
-            "aicore": aicore_path,
-        }
-        return RuntimeBinaries(
-            host_path=host_path,
-            aicpu_path=aicpu_path,
-            aicore_path=aicore_path,
-            simpler_log_path=simpler_log_path,
-            sim_context_path=sim_context_path,
-            role_paths=self._target_role_paths(paths),
-        )
+        return self._runtime_binaries_from_paths(paths, simpler_log_path, sim_context_path)
 
     def _resolve_sim_context_path(self) -> Optional[Path]:
         """Return path to libcpu_sim_context.so for sim platforms, None for onboard.
@@ -376,7 +386,7 @@ class RuntimeBuilder:
             )
             return Path(result)  # type: ignore[arg-type]
 
-    def _place_compile_commands(self, runtime_name: str) -> None:
+    def _place_compile_commands(self, runtime_name: str, target_names: tuple[str, ...] = TARGETS) -> None:
         """Merge compile_commands.json from build/cache/ targets into source dirs.
 
         Placement follows the old gen_compile_commands.py defaults:
@@ -390,7 +400,7 @@ class RuntimeBuilder:
         """
         arch, variant = self._arch, self._variant
         entries = []
-        for target in TARGETS:
+        for target in target_names:
             cc = self._CACHE_DIR / arch / variant / runtime_name / target / "compile_commands.json"
             if cc.exists():
                 try:

@@ -13,15 +13,18 @@ design work so evaluation results are not mistaken for a complete backend.
   `host_schedule` and `persistent_device`.
 - `RuntimeBinaries` now exposes a role-keyed view through `role_paths` and
   `path_for_role(...)`. Ascend platforms map the existing `host`, `aicpu`,
-  and `aicore` roles directly. CUDA keeps the legacy path fields for
-  compatibility and adds a transitional `device` role that points at the
-  compatibility AICPU slot.
+  and `aicore` roles directly. CUDA build configs now declare native `host`
+  and `device` targets; the legacy `aicpu_path` and `aicore_path` fields are
+  compatibility aliases to the CUDA `device` artifact.
 
 Evidence:
 
 - `tests/ut/py/test_cuda_backend.py`
+- `tests/ut/py/test_runtime_builder.py`
+- `tests/ut/py/test_runtime_compiler.py`
 - `src/cuda/runtime/host_schedule/build_config.py`
 - `src/cuda/runtime/persistent_device/build_config.py`
+- `src/cuda/platform/onboard/device/CMakeLists.txt`
 - `src/cuda/platform/onboard/host/pto_runtime_c_api.cpp`
 
 ### Host-Schedule Runtime
@@ -668,6 +671,39 @@ Result: `6 passed, 2 skipped`. The skips are the real-data scene cases that
 still require `torch` in the remote Python environment; the compile/plumbing
 and preflight checks passed.
 
+After adding native CUDA `device` build roles, both CUDA runtimes were rebuilt
+locally and on H200. `RuntimeBuilder(platform="cuda")` reported
+`libcuda_device_runtime.so` for the `device` role in `host_schedule` and
+`persistent_device`; the legacy `aicpu_path` and `aicore_path` attributes
+aliased the same device artifact.
+
+The local A100 no-build host-schedule Worker smoke passed after the rebuild:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_smoke.py \
+    --runner worker --device 0 --n 1024 --block-dim 256 \
+    --arch compute_80 --no-build
+```
+
+Result: `status=pass`, `mode=worker/add`, `ptx_arch=compute_80`,
+`device_wall_ns=40960`.
+
+The local A100 and remote H200 persistent-device DAG smokes also passed after
+building the native `device` role:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 3 --n 1024 --arch compute_80 \
+    --mode dag --queue-capacity 2
+```
+
+Result: A100 `status=pass`, `device_wall_ns=30720`,
+`device_scheduler_errors={"count":0,"code":0,"task_id":0}`; H200
+`status=pass`, `ptx_arch=compute_90`, `device_wall_ns=24896`, zero scheduler
+errors.
+
 ## Remaining Gaps
 
 ### Kernel Compiler Integration
@@ -687,21 +723,21 @@ Needed:
 
 ### Target Role Cleanup
 
-CUDA still builds through the legacy host/aicpu/aicore target list, but
-runtime consumers can now read binaries through roles instead of direct
-hardware slot names. The current compatibility mapping is:
+CUDA now builds native `host` and `device` target roles when a runtime build
+config declares `device`, and runtime consumers can read binaries through
+roles instead of direct hardware slot names. The current compatibility mapping
+is:
 
 - Ascend: `host`, `aicpu`, and `aicore` map to their existing artifacts.
-- CUDA: `host` maps to the host runtime artifact, and `device` maps to the
-  compatibility AICPU artifact until CUDA build configs declare native device
-  targets.
+- CUDA: `host` maps to `libhost_runtime.so`, `device` maps to
+  `libcuda_device_runtime.so`, and legacy `aicpu_path` / `aicore_path`
+  attributes alias the same CUDA device artifact.
 
-The remaining cleanup is to remove the need for CUDA to pretend it owns
-AICPU/AICore artifacts at build-config time.
+The remaining cleanup is to replace compatibility path attributes with a
+role-only binary map at the API boundary.
 
 Needed:
 
-- native CUDA build roles for device images;
 - optional `scheduler` role once `persistent_device` has a separately named
   scheduler/runtime image;
 - migration of CUDA call sites away from direct `aicpu_path` and

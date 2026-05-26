@@ -8,7 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 
 BUILD_CONFIG = {
-    "aicore": {"include_dirs": ["runtime"], "source_dirs": ["aicore"]},
-    "aicpu": {"include_dirs": ["runtime"], "source_dirs": ["aicpu"]},
+    "device": {"include_dirs": ["runtime"], "source_dirs": ["device", "runtime"]},
     "host": {"include_dirs": ["runtime"], "source_dirs": ["host", "runtime"]},
 }
