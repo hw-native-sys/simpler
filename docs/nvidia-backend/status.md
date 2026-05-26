@@ -151,6 +151,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `direct_driver_graph`;
 - `pto_host_schedule`;
 - `pto_host_schedule_compiler`;
+- `pto_host_schedule_unary_square`;
 - `pto_persistent_device`;
 - `pto_persistent_queue`;
 - `pto_persistent_dag`;
@@ -165,6 +166,8 @@ The latest paired capture at commit `93636997` uses the `8x4x12` tensor
 descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
 and worker-grid values `32,64,128,256`. It includes the compiler-backed
 host-schedule row and `pto_persistent_dag_scalar_axpy` on both A100 and H200.
+The unary host-schedule benchmark baseline was added after this full paired
+capture and has separate single-baseline A100/H200 evidence below.
 
 Evidence:
 
@@ -748,6 +751,22 @@ Result: A100 `status=pass`, `ptx_arch=compute_80`,
 `status=pass`, `ptx_arch=compute_90`, `dispatch_func_ids=[4,2,1]`,
 `scalar_args={"scalar0":1.5}`, zero scheduler errors.
 
+After promoting the unary host-schedule ABI to a benchmark baseline, the new
+single-baseline path was checked on both GPUs:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_host_schedule_unary_square \
+    --sizes 1024 --arch compute_80
+```
+
+Result: A100 `status=pass`, `ptx_arch=compute_80`,
+`ptx_source=kernel-compiler-task-body-wrapper-unary-square-compute_80`,
+`device_wall_ns=8192`; H200 `status=pass`, `ptx_arch=compute_90`,
+`ptx_source=kernel-compiler-task-body-wrapper-unary-square-compute_90`,
+`device_wall_ns=13888`.
+
 ## Remaining Gaps
 
 ### Kernel Compiler Integration
@@ -756,9 +775,10 @@ Host-schedule task-body compilation and persistent-device generated dispatch
 now have first `KernelCompiler` entry points. Both paths can consume
 `CudaTaskBody` style sources. CUDA prepared-callable artifacts can be staged
 through the L2 Python `Worker` registration path. The normal scene-test flow
-can compile and run host-schedule CUDA vector-add, binary elementwise, scalar
-scale, and axpy callable specs and persistent-device fork/join, chain, reuse,
-scalar AXPY, and tensor-tile DAG callable specs end to end.
+can compile and run host-schedule CUDA vector-add, binary elementwise, unary
+square, scalar scale, and axpy callable specs and persistent-device
+fork/join, chain, reuse, scalar AXPY, and tensor-tile DAG callable specs end
+to end.
 
 Needed:
 

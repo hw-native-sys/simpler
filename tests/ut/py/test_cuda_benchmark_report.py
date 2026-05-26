@@ -1957,10 +1957,11 @@ def test_run_benchmark_uses_in_process_samples(monkeypatch):
     assert seen == [
         ("pto_host_schedule", 3, 1024, 128, "compute_80"),
         ("pto_host_schedule_compiler", 3, 1024, 128, "compute_80"),
+        ("pto_host_schedule_unary_square", 3, 1024, 128, "compute_80"),
         ("direct_driver", 3, 1024, 128, "compute_80"),
         ("direct_driver_graph", 3, 1024, 128, "compute_80"),
     ]
-    assert len(payload["results"]) == 4
+    assert len(payload["results"]) == 5
 
 
 def test_run_single_sample_dispatches_compiler_host_schedule(monkeypatch):
@@ -1992,6 +1993,35 @@ def test_run_single_sample_dispatches_compiler_host_schedule(monkeypatch):
     assert result["baseline"] == "pto_host_schedule_compiler"
 
 
+def test_run_single_sample_dispatches_unary_square_host_schedule(monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = {}
+
+    def fake_run_pto_unary_square_sample(device, n, block_dim, arch):
+        seen["args"] = (device, n, block_dim, arch)
+        return {
+            "baseline": "pto_host_schedule_unary_square",
+            "n": n,
+            "block_dim": block_dim,
+            "host_wall_ns": 20,
+            "device_wall_ns": 10,
+            "status": "pass",
+        }
+
+    monkeypatch.setattr(cuda_benchmark, "run_pto_unary_square_sample", fake_run_pto_unary_square_sample)
+
+    result = cuda_benchmark.run_single_sample(
+        baseline="pto_host_schedule_unary_square",
+        device=3,
+        n=1024,
+        block_dim=128,
+        arch="compute_80",
+    )
+
+    assert seen["args"] == (3, 1024, 128, "compute_80")
+    assert result["baseline"] == "pto_host_schedule_unary_square"
+
+
 def test_compile_compiler_host_schedule_artifact_uses_discovered_nvcc(tmp_path, monkeypatch):
     cuda_benchmark = _load_benchmark_module()
     seen = {}
@@ -2016,6 +2046,38 @@ def test_compile_compiler_host_schedule_artifact_uses_discovered_nvcc(tmp_path, 
     assert seen["nvcc"] == "/usr/local/cuda/bin/nvcc"
     assert seen["task_name"] == "vector_add"
     assert Path(seen["source_path"]).name == "vector_add.pto.cu"
+
+
+def test_compile_unary_square_host_schedule_artifact_uses_unary_abi(tmp_path, monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = {}
+
+    class FakeKernelCompiler:
+        def __init__(self, platform):
+            seen["platform"] = platform
+
+        def compile_cuda_host_schedule(self, source_path, **kwargs):
+            seen["source_path"] = source_path
+            seen.update(kwargs)
+            return "artifact"
+
+    monkeypatch.setattr(cuda_benchmark, "_find_nvcc", lambda: "/usr/local/cuda/bin/nvcc")
+    monkeypatch.setattr(cuda_benchmark, "KernelCompiler", FakeKernelCompiler)
+
+    artifact = cuda_benchmark._compile_unary_square_host_schedule_artifact(tmp_path, "compute_90")
+
+    assert artifact == "artifact"
+    assert seen["platform"] == "cuda"
+    assert seen["arch"] == "compute_90"
+    assert seen["nvcc"] == "/usr/local/cuda/bin/nvcc"
+    assert seen["task_name"] == "vector_square"
+    assert seen["host_parameters"] == (
+        "const float *a",
+        "float *out",
+        "unsigned long long n",
+    )
+    assert seen["host_context_initializer"] == "a, out, n"
+    assert "ctx->a[i] * ctx->a[i]" in Path(seen["source_path"]).read_text()
 
 
 def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
@@ -2052,6 +2114,7 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
     assert seen == [
         "pto_host_schedule",
         "pto_host_schedule_compiler",
+        "pto_host_schedule_unary_square",
         "direct_driver",
         "direct_driver_graph",
         "pto_persistent_device",
@@ -2062,7 +2125,7 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_persistent_dag_scalar_axpy",
         "pto_persistent_dag_tensor",
     ]
-    assert len(payload["results"]) == 11
+    assert len(payload["results"]) == 12
 
 
 def test_run_single_sample_dispatches_scalar_axpy_dag(monkeypatch):
@@ -2212,6 +2275,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
     assert seen == [
         ("pto_host_schedule", 1),
         ("pto_host_schedule_compiler", 1),
+        ("pto_host_schedule_unary_square", 1),
         ("direct_driver", 1),
         ("direct_driver_graph", 1),
         ("pto_persistent_device", 1),
@@ -2226,7 +2290,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_queue_batch", 6),
     ]
     assert payload["metadata"]["batch_tasks"] == 6
-    assert len(payload["results"]) == 14
+    assert len(payload["results"]) == 15
 
 
 def test_run_benchmark_can_include_worker_grid_batch_mode(monkeypatch):

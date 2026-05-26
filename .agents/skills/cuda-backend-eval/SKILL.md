@@ -431,6 +431,8 @@ same vector-add PTX kernel through two launch paths:
 - `pto_host_schedule_compiler`: the same host runtime path, but the PTX comes
   from `KernelCompiler(platform="cuda").compile_cuda_host_schedule(...)` and
   the shared task-body wrapper generator.
+- `pto_host_schedule_unary_square`: the same generated host runtime path for
+  the unary `(a, out, n)` ABI, using a square task body.
 - `direct_driver`: a thin CUDA Driver API baseline in Python `ctypes`.
 - `direct_driver_graph`: the same Driver API kernel replayed through a CUDA
   Graph, with graph instantiation outside the timed interval.
@@ -560,6 +562,16 @@ path check of the scalar descriptor DAG on one GPU:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --single-baseline pto_persistent_dag_scalar_axpy \
+    --sizes 1024 --arch compute_80
+```
+
+Use `--single-baseline pto_host_schedule_unary_square` for a quick benchmark
+path check of the unary host-schedule ABI:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_host_schedule_unary_square \
     --sizes 1024 --arch compute_80
 ```
 

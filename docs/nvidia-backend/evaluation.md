@@ -45,6 +45,8 @@ regenerated from the combined JSON with
 - `pto_host_schedule`: PTO CUDA host runtime C API and manifest dispatch.
 - `pto_host_schedule_compiler`: same host runtime path using a
   `KernelCompiler(platform="cuda")` generated task-body wrapper and cached PTX.
+- `pto_host_schedule_unary_square`: same generated host runtime path for the
+  unary `(a, out, n)` ABI, using a square task body.
 - `pto_persistent_device`: descriptor-array persistent executor.
 - `pto_persistent_queue`: scheduler block plus bounded device ring queue.
 - `pto_persistent_dag`: generated-dispatch-like task selection with fan-in
