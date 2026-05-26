@@ -28,6 +28,7 @@ from simpler.worker import Worker
 from simpler_setup.cuda_callable_compiler import CudaHostScheduleCallable as CudaHostCallable
 from simpler_setup.cuda_callable_compiler import (
     CudaVectorAddArgs,
+    CudaVectorAxpyArgs,
     CudaVectorScaleArgs,
     prepare_cuda_host_schedule_callable,
 )
@@ -203,6 +204,8 @@ def _worker_task_body(op: str) -> str:
         expression = "ctx->a[i] * ctx->b[i]"
     elif op == "scale":
         expression = "ctx->a[i] * ctx->alpha"
+    elif op == "axpy":
+        expression = "ctx->alpha * ctx->a[i] + ctx->b[i]"
     else:
         raise ValueError(f"unknown worker smoke op: {op}")
     return f"""
@@ -220,6 +223,8 @@ def _worker_expected_output(op: str, n: int) -> list[float]:
         return [float(i * (2 * i)) for i in range(n)]
     if op == "scale":
         return [float(i * 1.5) for i in range(n)]
+    if op == "axpy":
+        return [float(1.5 * i + (2 * i)) for i in range(n)]
     raise ValueError(f"unknown worker smoke op: {op}")
 
 
@@ -228,6 +233,16 @@ def _worker_context_definition(op: str) -> str:
         return """
 struct PtoTaskContext {
     const float *a;
+    float *out;
+    float alpha;
+    unsigned long long n;
+};
+""".strip()
+    if op == "axpy":
+        return """
+struct PtoTaskContext {
+    const float *a;
+    const float *b;
     float *out;
     float alpha;
     unsigned long long n;
@@ -251,6 +266,14 @@ def _worker_host_parameters(op: str) -> tuple[str, ...]:
             "float alpha",
             "unsigned long long n",
         )
+    if op == "axpy":
+        return (
+            "const float *a",
+            "const float *b",
+            "float *out",
+            "float alpha",
+            "unsigned long long n",
+        )
     return (
         "const float *a",
         "const float *b",
@@ -262,12 +285,16 @@ def _worker_host_parameters(op: str) -> tuple[str, ...]:
 def _worker_host_context_initializer(op: str) -> str:
     if op == "scale":
         return "a, out, alpha, n"
+    if op == "axpy":
+        return "a, b, out, alpha, n"
     return "a, b, out, n"
 
 
 def _worker_host_op(op: str) -> int:
     if op == "scale":
         return 2
+    if op == "axpy":
+        return 3
     return 1
 
 
@@ -400,6 +427,8 @@ def run_worker_smoke(device: int, n: int, block_dim: int, arch: str, build: bool
 
             if op == "scale":
                 args = CudaVectorScaleArgs(a=dev_a, out=dev_out, alpha=1.5, n=n)
+            elif op == "axpy":
+                args = CudaVectorAxpyArgs(a=dev_a, b=dev_b, out=dev_out, alpha=1.5, n=n)
             else:
                 args = CudaVectorAddArgs(a=dev_a, b=dev_b, out=dev_out, n=n)
             config = CallConfig()
@@ -446,7 +475,12 @@ def main() -> None:
     parser.add_argument("--block-dim", type=int, default=256)
     parser.add_argument("--arch", default="compute_80")
     parser.add_argument("--runner", choices=("direct_c_api", "worker"), default="direct_c_api")
-    parser.add_argument("--op", choices=("add", "mul", "scale"), default="add", help="Worker task body operation")
+    parser.add_argument(
+        "--op",
+        choices=("add", "mul", "scale", "axpy"),
+        default="add",
+        help="Worker task body operation",
+    )
     parser.add_argument("--no-build", action="store_true", help="Use existing runtime binaries without rebuilding")
     parser.add_argument("--output-json", type=Path, help="Optional path to write the smoke JSON payload")
     args = parser.parse_args()

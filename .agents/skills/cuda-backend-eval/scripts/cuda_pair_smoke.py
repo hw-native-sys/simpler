@@ -249,7 +249,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remote-device", type=int, default=0)
     parser.add_argument("--n", type=int, default=1024)
     parser.add_argument("--block-dim", type=int, default=256)
-    parser.add_argument("--op", choices=("add", "mul", "scale"), default="add")
+    parser.add_argument("--op", choices=("add", "mul", "scale", "axpy"), default="add")
     parser.add_argument("--local-arch", default="compute_80")
     parser.add_argument("--remote-arch", default="compute_90")
     parser.add_argument("--local-python", default=sys.executable)

@@ -164,6 +164,7 @@ public:
             return -1;
         }
         if (header->op != PTO_CUDA_HOST_OP_VECTOR_ADD_F32 && header->op != PTO_CUDA_HOST_OP_VECTOR_SCALE_F32 &&
+            header->op != PTO_CUDA_HOST_OP_VECTOR_AXPY_F32 &&
             header->op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS &&
             header->op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_GRID &&
             header->op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_QUEUE &&
@@ -171,7 +172,8 @@ public:
             return -1;
         }
         uint32_t stream_id = 0;
-        if ((header->op == PTO_CUDA_HOST_OP_VECTOR_ADD_F32 || header->op == PTO_CUDA_HOST_OP_VECTOR_SCALE_F32) &&
+        if ((header->op == PTO_CUDA_HOST_OP_VECTOR_ADD_F32 || header->op == PTO_CUDA_HOST_OP_VECTOR_SCALE_F32 ||
+             header->op == PTO_CUDA_HOST_OP_VECTOR_AXPY_F32) &&
             header->version >= 2) {
             stream_id = callable->stream_id;
         }
@@ -236,6 +238,7 @@ public:
         }
         PreparedCallable &prepared = it->second;
         if (prepared.op != PTO_CUDA_HOST_OP_VECTOR_ADD_F32 && prepared.op != PTO_CUDA_HOST_OP_VECTOR_SCALE_F32 &&
+            prepared.op != PTO_CUDA_HOST_OP_VECTOR_AXPY_F32 &&
             prepared.op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS &&
             prepared.op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_GRID &&
             prepared.op != PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_QUEUE &&
@@ -270,7 +273,7 @@ public:
         uint32_t worker_blocks_per_task = 1;
         const PtoCudaPersistentVectorAddQueueState *queue_state = nullptr;
         const PtoCudaPersistentDagState *dag_state = nullptr;
-        void *kernel_args[4] = {};
+        void *kernel_args[5] = {};
         if (prepared.op == PTO_CUDA_HOST_OP_VECTOR_ADD_F32) {
             auto *typed_args = static_cast<const PtoCudaVectorAddArgs *>(args);
             if (typed_args->a == nullptr || typed_args->b == nullptr || typed_args->out == nullptr ||
@@ -302,6 +305,24 @@ public:
             kernel_args[1] = &out;
             kernel_args[2] = &alpha;
             kernel_args[3] = &n;
+        } else if (prepared.op == PTO_CUDA_HOST_OP_VECTOR_AXPY_F32) {
+            auto *typed_args = static_cast<const PtoCudaVectorAxpyArgs *>(args);
+            if (typed_args->a == nullptr || typed_args->b == nullptr || typed_args->out == nullptr ||
+                typed_args->n == 0) {
+                cudaEventDestroy(start);
+                cudaEventDestroy(stop);
+                return -1;
+            }
+            a = typed_args->a;
+            b = typed_args->b;
+            out = typed_args->out;
+            alpha = typed_args->alpha;
+            n = typed_args->n;
+            kernel_args[0] = &a;
+            kernel_args[1] = &b;
+            kernel_args[2] = &out;
+            kernel_args[3] = &alpha;
+            kernel_args[4] = &n;
         } else if (prepared.op == PTO_CUDA_PERSISTENT_OP_VECTOR_ADD_F32_TASKS) {
             auto *typed_args = static_cast<const PtoCudaPersistentVectorAddArgs *>(args);
             if (typed_args->tasks == nullptr || typed_args->task_count == 0) {

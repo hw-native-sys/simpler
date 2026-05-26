@@ -73,6 +73,17 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-json tmp/cuda-backend/worker-scale-smoke/a100.json
 ```
 
+Use `--op axpy` to validate the mixed tensor/scalar host-schedule ABI
+`(a, b, out, alpha, n)`:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_smoke.py \
+    --runner worker --op axpy --device 0 --n 1024 --block-dim 256 \
+    --arch compute_80 \
+    --output-json tmp/cuda-backend/worker-axpy-smoke/a100.json
+```
+
 Use `cuda_smoke_report.py` to turn captured smoke JSON from A100 and H200 into
 Markdown and SVG evidence. Persistent-device reports include dispatch
 `func_id` sequences and device-side scheduler error counters:
@@ -352,8 +363,9 @@ a compiler/runtime slice; L2 `Worker.register(...)` can prepare that raw
 manifest blob, and L2 `Worker.run(...)` can launch raw CUDA argument structs
 that expose `buffer_ptr()` / `buffer_size()`. The normal `SceneTestCase` L2
 path can now build `CALLABLE["cuda"]` host-schedule specs and run the current
-`arg_builder: vector_add_f32`, `arg_builder: elementwise_binary_f32`, and
-`arg_builder: elementwise_scale_f32` adapters from CPU `TaskArgsBuilder`
+`arg_builder: vector_add_f32`, `arg_builder: elementwise_binary_f32`,
+`arg_builder: elementwise_scale_f32`, and
+`arg_builder: elementwise_axpy_f32` adapters from CPU `TaskArgsBuilder`
 tensors and scalars through real CUDA device buffers.
 Use the neutral `elementwise_binary_f32` name when the compiled task body is
 not addition but still uses the current `(a, b, out, n)` launch ABI. The same
@@ -474,7 +486,7 @@ the full benchmark:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
-    --op scale --sync-remote-tree --build-runtime
+    --op axpy --sync-remote-tree --build-runtime
 ```
 
 It mirrors the benchmark runner's remote refresh, `--skip-remote-refresh`,

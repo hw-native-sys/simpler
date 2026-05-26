@@ -18,6 +18,7 @@
 enum PtoCudaHostScheduleOp : uint32_t {
     PTO_CUDA_HOST_OP_VECTOR_ADD_F32 = 1,
     PTO_CUDA_HOST_OP_VECTOR_SCALE_F32 = 2,
+    PTO_CUDA_HOST_OP_VECTOR_AXPY_F32 = 3,
 };
 
 struct PtoCudaHostCallable {
@@ -41,6 +42,14 @@ struct PtoCudaVectorAddArgs {
 
 struct PtoCudaVectorScaleArgs {
     const float *a;
+    float *out;
+    float alpha;
+    uint64_t n;
+};
+
+struct PtoCudaVectorAxpyArgs {
+    const float *a;
+    const float *b;
     float *out;
     float alpha;
     uint64_t n;

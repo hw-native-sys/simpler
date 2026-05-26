@@ -112,10 +112,13 @@ CPU tensors, and validates real copied-back CUDA output data.
 The host-schedule scene path also accepts the neutral
 `elementwise_binary_f32` adapter for non-addition task bodies that still use
 the current `(a, b, out, n)` launch ABI. It also accepts
-`elementwise_scale_f32` for scalar `(a, out, alpha, n)` task bodies.
+`elementwise_scale_f32` for scalar `(a, out, alpha, n)` task bodies and
+`elementwise_axpy_f32` for mixed tensor/scalar `(a, b, out, alpha, n)` task
+bodies.
 The no-torch Worker smoke can validate that same non-addition host-schedule
-ABI with `--op mul` and scalar ABI with `--op scale`, which keeps H200
-coverage available when the remote Python environment lacks `torch`.
+ABI with `--op mul`, scalar ABI with `--op scale`, and mixed tensor/scalar
+ABI with `--op axpy`, which keeps H200 coverage available when the remote
+Python environment lacks `torch`.
 
 Evidence:
 
@@ -713,14 +716,14 @@ Host-schedule task-body compilation and persistent-device generated dispatch
 now have first `KernelCompiler` entry points. Both paths can consume
 `CudaTaskBody` style sources. CUDA prepared-callable artifacts can be staged
 through the L2 Python `Worker` registration path. The normal scene-test flow
-can compile and run host-schedule CUDA vector-add, binary elementwise, and
-scalar scale callable specs and persistent-device fork/join, chain, reuse, and
-tensor-tile DAG callable specs end to end.
+can compile and run host-schedule CUDA vector-add, binary elementwise, scalar
+scale, and axpy callable specs and persistent-device fork/join, chain, reuse,
+and tensor-tile DAG callable specs end to end.
 
 Needed:
 
 - broader CUDA scene-test argument builders beyond the current binary
-  elementwise, scalar scale, and persistent DAG tracer bullets.
+  elementwise, scalar scale, axpy, and persistent DAG tracer bullets.
 
 ### Target Role Cleanup
 

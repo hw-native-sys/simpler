@@ -382,18 +382,30 @@ def _build_cuda_host_schedule_args(
     device_buffers: _CudaSceneDeviceBuffers,
     cuda_spec: dict,
 ):
-    from simpler_setup.cuda_callable_compiler import CudaVectorAddArgs, CudaVectorScaleArgs  # noqa: PLC0415
+    from simpler_setup.cuda_callable_compiler import (  # noqa: PLC0415
+        CudaVectorAddArgs,
+        CudaVectorAxpyArgs,
+        CudaVectorScaleArgs,
+    )
 
     arg_builder = cuda_spec.get("arg_builder", "vector_add_f32")
-    if arg_builder not in {"vector_add_f32", "elementwise_binary_f32", "elementwise_scale_f32"}:
+    if arg_builder not in {
+        "vector_add_f32",
+        "elementwise_binary_f32",
+        "elementwise_scale_f32",
+        "elementwise_axpy_f32",
+    }:
         raise NotImplementedError(f"Unsupported CUDA scene-test arg_builder: {arg_builder}")
 
     tensor_names = [spec.name for spec in test_args.specs if isinstance(spec, Tensor)]
     names = list(cuda_spec.get("args", tensor_names[:3]))
-    if len(names) != 3:
-        raise ValueError(f"CUDA {arg_builder} scene tests require exactly three tensor args")
+    expected_arg_count = 4 if arg_builder == "elementwise_axpy_f32" else 3
+    if len(names) != expected_arg_count:
+        raise ValueError(f"CUDA {arg_builder} scene tests require exactly {expected_arg_count} args")
     if arg_builder == "elementwise_scale_f32":
         missing = [name for name in names[:2] if name not in device_buffers.ptrs]
+    elif arg_builder == "elementwise_axpy_f32":
+        missing = [name for name in names[:3] if name not in device_buffers.ptrs]
     else:
         missing = [name for name in names if name not in device_buffers.ptrs]
     if missing:
@@ -406,6 +418,16 @@ def _build_cuda_host_schedule_args(
         return CudaVectorScaleArgs(
             a=device_buffers.ptrs[names[0]],
             out=device_buffers.ptrs[names[1]],
+            alpha=float(alpha_value),
+            n=n,
+        )
+    if arg_builder == "elementwise_axpy_f32":
+        alpha = getattr(test_args, names[3])
+        alpha_value = alpha.value if hasattr(alpha, "value") else alpha
+        return CudaVectorAxpyArgs(
+            a=device_buffers.ptrs[names[0]],
+            b=device_buffers.ptrs[names[1]],
+            out=device_buffers.ptrs[names[2]],
             alpha=float(alpha_value),
             n=n,
         )
