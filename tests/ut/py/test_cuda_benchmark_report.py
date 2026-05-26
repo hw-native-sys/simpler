@@ -245,6 +245,8 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
         "ptx_source": "nvcc-persistent-generated-dispatch-compute_80",
         "device_wall_ns": 102400,
         "host_wall_ns": 122260,
+        "repeat_runs": 2,
+        "launch_completed_counts": [4, 4],
         "dispatch_func_ids": [3, 1, 2, 1],
         "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
         "resource_policy": {
@@ -281,16 +283,19 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
     markdown = cuda_smoke_report.render_markdown_report(payload, label="tensor-smoke")
     svg = cuda_smoke_report.render_svg_report(payload, label="tensor-smoke")
 
-    assert "| Dispatch | Scheduler errors | Resource policy | Scalar args | Tensor args |" in markdown
+    assert (
+        "| Dispatch | Scheduler errors | Repeat runs | Launch completions | "
+        "Resource policy | Scalar args | Tensor args |" in markdown
+    )
     assert "| a100 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_80` | 102400 | 122260 |" in markdown
     assert "| h200 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_90` | 70464 | 79788 |" in markdown
     assert (
-        "| `3,1,2,1` | `count=0,code=0,task=0` | "
+        "| `3,1,2,1` | `count=0,code=0,task=0` | `2` | `4,4` | "
         "`sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | "
         "`scalar0=1.5` | `c=tmp0` |" in markdown
     )
     assert (
-        "| `3,1,2,1` | `count=1,code=7,task=3` | "
+        "| `3,1,2,1` | `count=1,code=7,task=3` | `2` | `4,4` | "
         "`sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | "
         "`scalar0=1.5` | `c=tmp0` |" in markdown
     )
@@ -300,6 +305,7 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
     assert "h200" in svg
     assert "errors: count=1,code=7,task=3" in svg
     assert "policy: sched=1,workers=2,wp=1,stream=1,block=256,grid=3" in svg
+    assert "lifecycle: repeat=2,completed=4,4" in svg
     assert "scalars: scalar0=1.5" in svg
     assert "tensors: c=tmp0" in svg
 

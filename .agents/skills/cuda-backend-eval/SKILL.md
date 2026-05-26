@@ -129,7 +129,8 @@ PYTHONPATH=$PWD:$PWD/python \
 
 Use `cuda_smoke_report.py` to turn captured smoke JSON from A100 and H200 into
 Markdown and SVG evidence. Persistent-device reports include dispatch
-`func_id` sequences and device-side scheduler error counters:
+`func_id` sequences, device-side scheduler error counters, resource policy,
+task argument metadata, and repeat-run lifecycle counters when present:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -888,7 +889,9 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 The smoke reporter writes `cuda-smoke-report.md` and
-`cuda-smoke-report.svg`, keeping the raw JSON under `tmp/`.
+`cuda-smoke-report.svg`, keeping the raw JSON under `tmp/`. Persistent smoke
+reports include lifecycle fields such as `repeat_runs` and
+`launch_completed_counts` when the JSON payloads carry them.
 
 The report's ratio column uses the matched host-schedule row for the same
 machine, vector length, and task count. Same-work batch rows are therefore

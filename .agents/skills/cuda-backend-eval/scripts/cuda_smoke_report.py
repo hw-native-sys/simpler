@@ -81,6 +81,24 @@ def _scheduler_errors(row: dict[str, Any]) -> str:
     return f"count={count},code={code},task={task_id}"
 
 
+def _repeat_runs(row: dict[str, Any]) -> str:
+    repeat_runs = row.get("repeat_runs")
+    if repeat_runs is None:
+        return "-"
+    return str(repeat_runs)
+
+
+def _launch_completed_counts(row: dict[str, Any]) -> str:
+    counts = row.get("launch_completed_counts")
+    if not isinstance(counts, list):
+        return "-"
+    return ",".join(str(count) for count in counts)
+
+
+def _lifecycle(row: dict[str, Any]) -> str:
+    return f"repeat={_repeat_runs(row)},completed={_launch_completed_counts(row)}"
+
+
 def _resource_policy(row: dict[str, Any]) -> str:
     policy = row.get("resource_policy")
     if not isinstance(policy, dict):
@@ -118,12 +136,14 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
         (
             "| Artifact | Status | Runtime | Mode | N | PTX arch | Device ns | "
             "Host ns | Tensor shape | Tiles | Dispatch | Scheduler errors | "
-            "Resource policy | Scalar args | Tensor args |"
+            "Repeat runs | Launch completions | Resource policy | Scalar args | "
+            "Tensor args |"
         ),
         (
             "| -------- | ------ | ------- | ---- | - | -------- | --------- | "
             "------- | ------------ | ----- | -------- | ---------------- | "
-            "--------------- | ----------- | ----------- |"
+            "----------- | ------------------ | --------------- | ----------- | "
+            "----------- |"
         ),
     ]
     for row in payloads:
@@ -132,7 +152,9 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
             f"{row.get('runtime', 'unknown')} | {_mode(row)} | {row.get('n', '-')} | "
             f"`{row.get('ptx_arch', 'unknown')}` | {row.get('device_wall_ns', '-')} | "
             f"{row.get('host_wall_ns', '-')} | {_shape(row)} | {_tile_count(row)} | "
-            f"`{_dispatch(row)}` | `{_scheduler_errors(row)}` | `{_resource_policy(row)}` | "
+            f"`{_dispatch(row)}` | `{_scheduler_errors(row)}` | "
+            f"`{_repeat_runs(row)}` | `{_launch_completed_counts(row)}` | "
+            f"`{_resource_policy(row)}` | "
             f"`{_scalar_args(row)}` | `{_tensor_args(row)}` |"
         )
 
@@ -146,7 +168,7 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
 def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
     width = 760
     bar_height = 28
-    row_gap = 62
+    row_gap = 76
     left = 170
     right = 40
     top = 70
@@ -168,6 +190,7 @@ def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
         bar_width = int(chart_width * value / max_value) if max_value else 0
         name = str(row.get("_artifact", "unknown"))
         scheduler_errors = _scheduler_errors(row)
+        lifecycle = _lifecycle(row)
         resource_policy = _resource_policy(row)
         scalar_args = _scalar_args(row)
         tensor_args = _tensor_args(row)
@@ -187,15 +210,20 @@ def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
                 (
                     f'<text x="{left}" y="{y + bar_height + 28}" '
                     'font-family="sans-serif" font-size="11" fill="#555">'
-                    f"policy: {html.escape(resource_policy)}</text>"
+                    f"lifecycle: {html.escape(lifecycle)}</text>"
                 ),
                 (
                     f'<text x="{left}" y="{y + bar_height + 42}" '
                     'font-family="sans-serif" font-size="11" fill="#555">'
-                    f"scalars: {html.escape(scalar_args)}</text>"
+                    f"policy: {html.escape(resource_policy)}</text>"
                 ),
                 (
                     f'<text x="{left}" y="{y + bar_height + 56}" '
+                    'font-family="sans-serif" font-size="11" fill="#555">'
+                    f"scalars: {html.escape(scalar_args)}</text>"
+                ),
+                (
+                    f'<text x="{left}" y="{y + bar_height + 70}" '
                     'font-family="sans-serif" font-size="11" fill="#555">'
                     f"tensors: {html.escape(tensor_args)}</text>"
                 ),

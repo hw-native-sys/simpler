@@ -219,8 +219,9 @@ Evidence:
   Markdown, and SVG reports.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_smoke_report.py` writes
   compact smoke Markdown and SVG reports, including persistent-device dispatch
-  `func_id` sequences, device scheduler error counters, and resource-policy
-  metadata plus scalar and tensor task arguments when present.
+  `func_id` sequences, device scheduler error counters, repeat-run lifecycle
+  counters, and resource-policy metadata plus scalar and tensor task
+  arguments when present.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py` automates
   the local A100 run, remote H200 run, artifact copy, merge, and index refresh.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py` automates the
