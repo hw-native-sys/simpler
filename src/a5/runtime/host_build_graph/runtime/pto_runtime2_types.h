@@ -9,8 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_
-#define SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_
+#ifndef SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_
+#define SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_
 
 // =============================================================================
 // Profiling Configuration
@@ -29,4 +29,4 @@
 #define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
 #define PTO2_MAX_RING_DEPTH 4        // Number of task-id ring layers
 
-#endif  // SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_
+#endif  // SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_

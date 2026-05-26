@@ -20,7 +20,15 @@
 #ifndef PLATFORM_AICPU_TENSOR_DUMP_AICPU_H_
 #define PLATFORM_AICPU_TENSOR_DUMP_AICPU_H_
 
+#include <stdint.h>
+
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
+
+#ifdef __cplusplus
 #include <cinttypes>
+#endif
 
 #include "common/memory_barrier.h"
 #include "common/tensor_dump.h"
@@ -64,6 +72,10 @@ void set_dump_tensor_enabled(bool enable);
  * @return true if tensor dump is enabled
  */
 bool is_dump_tensor_enabled();
+void set_dump_tensor_selective_mode(bool enable);
+bool is_dump_tensor_selective_mode();
+void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask mask);
+TensorDumpArgMask get_dump_tensor_task_mask(uint64_t task_id);
 
 #ifdef __cplusplus
 }
@@ -73,6 +85,8 @@ bool is_dump_tensor_enabled();
 bool get_tensor_dump_role_from_direction(ArgDirection dir, TensorDumpRole *role);
 int32_t count_callable_tensor_args(const CoreCallable &callable);
 bool should_dump_tensor_at_stage(TensorDumpRole role, TensorDumpStage stage);
+bool should_dump_task(TensorDumpArgMask arg_mask);
+bool should_dump_tensor_arg(TensorDumpArgMask arg_mask, int32_t arg_index);
 bool try_log_tensor_dump_layout_mismatch();
 int dump_tensor_record(int thread_idx, const TensorDumpInfo &info);
 
@@ -82,6 +96,13 @@ inline void dump_tensors_for_task(
     GetFunctionBinAddrFn get_function_bin_addr
 ) {
     const auto &pl = *slot_state.payload;
+    TensorDumpArgMask dump_arg_mask = TENSOR_DUMP_ARG_MASK_NONE;
+    if (is_dump_tensor_selective_mode()) {
+        dump_arg_mask = get_dump_tensor_task_mask(slot_state.task->task_id.raw);
+    }
+    if (!should_dump_task(dump_arg_mask)) {
+        return;
+    }
     const CoreCallable *callables[MaxSubtaskSlots] = {};
     int32_t total_tensor_args = 0;
 
@@ -125,7 +146,8 @@ inline void dump_tensors_for_task(
                 continue;
             }
             TensorDumpRole role;
-            if (get_tensor_dump_role_from_direction(dir, &role) && should_dump_tensor_at_stage(role, stage)) {
+            if (get_tensor_dump_role_from_direction(dir, &role) && should_dump_tensor_at_stage(role, stage) &&
+                should_dump_tensor_arg(dump_arg_mask, payload_index)) {
                 const auto &t = pl.tensors[payload_index];
                 TensorDumpInfo info = {};
                 info.buffer_addr = t.buffer.addr;
@@ -241,7 +263,6 @@ inline void dump_tensors_for_task(
         tensor_arg_index++;
     }
 }
-#endif
 
 /**
  * Initialize tensor dump.
@@ -278,5 +299,7 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info);
  * @param thread_idx Thread index
  */
 void dump_tensor_flush(int thread_idx);
+
+#endif
 
 #endif  // PLATFORM_AICPU_TENSOR_DUMP_AICPU_H_

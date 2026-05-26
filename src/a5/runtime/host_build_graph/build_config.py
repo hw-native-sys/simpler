@@ -11,7 +11,7 @@
 
 BUILD_CONFIG = {
     "aicore": {"include_dirs": ["runtime"], "source_dirs": ["aicore", "runtime"]},
-    "aicpu": {"include_dirs": ["runtime"], "source_dirs": ["aicpu", "runtime"]},
-    "host": {"include_dirs": ["runtime", "orchestration"], "source_dirs": ["host", "runtime"]},
+    "aicpu": {"include_dirs": ["runtime", ".."], "source_dirs": ["aicpu", "runtime"]},
+    "host": {"include_dirs": ["runtime", "orchestration", ".."], "source_dirs": ["host", "runtime"]},
     "orchestration": {"include_dirs": ["runtime", "orchestration"], "source_dirs": []},
 }

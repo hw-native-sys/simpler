@@ -36,6 +36,9 @@
 #include "pto_types.h"
 #include "tensor.h"
 
+extern "C" void set_dump_tensor_selective_mode(bool enable);
+extern "C" void set_dump_tensor_task_mask(uint64_t task_id, uint64_t mask);
+
 // Verify the captured Tensor blob size in DepGenRecord matches the runtime
 // Tensor layout. The platform header defines DEP_GEN_TENSOR_SIZE without
 // including runtime/tensor.h, so this check lives at the orch callsite.
@@ -674,6 +677,14 @@ static TaskOutputTensors submit_task_common(
     }
 
     payload.init(args, result, prepared.alloc_result, layout);
+#if PTO2_PROFILING
+    if (args.tensor_dump_selective_requested()) {
+        set_dump_tensor_selective_mode(true);
+    }
+    if (args.tensor_dump_arg_mask() != 0) {
+        set_dump_tensor_task_mask(task_id.raw, args.tensor_dump_arg_mask());
+    }
+#endif
 
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 #if PTO2_ORCH_PROFILING

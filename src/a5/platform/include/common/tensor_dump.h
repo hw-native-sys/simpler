@@ -48,6 +48,7 @@
 #include <cstdint>
 
 #include "common/platform_config.h"
+#include "host_build_graph/runtime/pto_runtime2_types.h"
 
 // =============================================================================
 // Constants
@@ -73,6 +74,17 @@ enum class TensorDumpStage : uint8_t {
     BEFORE_DISPATCH = 0,
     AFTER_COMPLETION = 1,
 };
+
+using TensorDumpArgMask = uint64_t;
+
+// Bitmask stored in the platform-owned mask pool when orchestration selects
+// specific task tensor arguments for dump. Bit N corresponds to tensors[N].
+// Zero preserves legacy "dump all tasks" behavior unless selective mode is enabled.
+constexpr TensorDumpArgMask TENSOR_DUMP_ARG_MASK_NONE = 0;
+constexpr uint32_t TENSOR_DUMP_ARG_MASK_BITS = 64;
+constexpr uint32_t TENSOR_DUMP_MASK_POOL_MAX_RINGS = PTO2_MAX_RING_DEPTH;
+constexpr uint32_t TENSOR_DUMP_MASK_POOL_MAX_SLOTS = PTO2_TASK_WINDOW_SIZE;
+constexpr uint32_t TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK = TENSOR_DUMP_MASK_POOL_MAX_SLOTS - 1;
 
 // =============================================================================
 // TensorDumpRecord - Single Tensor Dump Entry (128B = 2 cache lines)

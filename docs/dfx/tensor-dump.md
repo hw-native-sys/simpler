@@ -60,7 +60,44 @@ executors read the same handshake bit to insert a
 `pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
 `AFTER_COMPLETION` snapshots see the kernel's final writes.
 
-### 3.2 Output
+### 3.2 Select Specific Task Tensors
+
+By default, `--dump-tensor` dumps every task's tensor inputs and
+outputs. Device-side orchestration can opt into tensor-argument selection
+by enabling selective mode at the beginning of the orchestration and
+marking the tensor arguments on each `Arg` before submission:
+
+```cpp
+enable_dump_tensor_selective();
+
+Arg args;
+args.add_input(x);
+args.add_input(y);
+args.add_output(z);
+args.dump(x, y, z);
+rt_submit_aiv_task(FUNC_ADD, args);
+```
+
+`dump(...)` selects tensor arguments from the current `Arg`; it does not
+execute a dump immediately. The selected tensors must already belong to
+that `Arg`. The runtime uses the argument direction already provided by
+`add_input()`, `add_output()`, or `add_inout()` to decide when each
+selected tensor is captured:
+
+- input tensors are dumped before dispatch.
+- output tensors are dumped after completion.
+- inout tensors follow the existing inout dump behavior.
+
+With `enable_dump_tensor_selective()`, tasks without any `dump(...)` marker
+are skipped during AICPU collection. For marked tasks, only the selected
+tensor arguments are dumped. Without `enable_dump_tensor_selective()`, the
+legacy full-dump behavior is unchanged even if an `Arg` carries a
+`dump(...)` marker.
+
+`--dump-tensor` remains the top-level enable switch; `Arg::dump(...)`
+only narrows what gets recorded after tensor dump is enabled.
+
+### 3.3 Output
 
 The dump artifacts land under the per-task output prefix
 (`CallConfig::output_prefix`, set by
