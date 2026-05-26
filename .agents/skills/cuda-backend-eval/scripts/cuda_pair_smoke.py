@@ -43,6 +43,7 @@ class PairedSmokeConfig:
     remote_git_fetch_timeout: int = 60
     refresh_remote: bool = True
     sync_remote_tree: bool = False
+    build_runtime: bool = False
 
 
 def _git_commit(runner: Runner = subprocess.run) -> str:
@@ -91,7 +92,7 @@ def _remote_git_commit(config: PairedSmokeConfig, runner: Runner = subprocess.ru
 
 
 def _smoke_args(*, device: int, arch: str, output_json: Path, config: PairedSmokeConfig) -> list[str]:
-    return [
+    args = [
         "--runner",
         "worker",
         "--op",
@@ -104,10 +105,12 @@ def _smoke_args(*, device: int, arch: str, output_json: Path, config: PairedSmok
         str(config.block_dim),
         "--arch",
         arch,
-        "--no-build",
         "--output-json",
         str(output_json),
     ]
+    if not config.build_runtime:
+        args.insert(-2, "--no-build")
+    return args
 
 
 def build_local_smoke_command(config: PairedSmokeConfig, suffix: str) -> list[str]:
@@ -246,7 +249,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remote-device", type=int, default=0)
     parser.add_argument("--n", type=int, default=1024)
     parser.add_argument("--block-dim", type=int, default=256)
-    parser.add_argument("--op", choices=("add", "mul"), default="add")
+    parser.add_argument("--op", choices=("add", "mul", "scale"), default="add")
     parser.add_argument("--local-arch", default="compute_80")
     parser.add_argument("--remote-arch", default="compute_90")
     parser.add_argument("--local-python", default=sys.executable)
@@ -257,6 +260,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remote-git-fetch-timeout", type=int, default=60)
     parser.add_argument("--skip-remote-refresh", action="store_true")
     parser.add_argument("--sync-remote-tree", action="store_true")
+    parser.add_argument("--build-runtime", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -283,6 +287,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         remote_git_fetch_timeout=args.remote_git_fetch_timeout,
         refresh_remote=not args.skip_remote_refresh and not args.sync_remote_tree,
         sync_remote_tree=args.sync_remote_tree,
+        build_runtime=args.build_runtime,
     )
     run_paired_smoke(config, dry_run=args.dry_run)
 

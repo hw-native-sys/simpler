@@ -69,8 +69,8 @@ Evidence:
 - `SceneTestCase` L2 compilation accepts `CALLABLE["cuda"]` specs for
   `host_schedule`, compiles them through `KernelCompiler(platform="cuda")`,
   registers the prepared raw callable through the normal L2 `Worker`, builds
-  `CudaVectorAddArgs` from normal `TaskArgsBuilder` CPU tensors, and validates
-  real copied-back CUDA output data.
+  `CudaVectorAddArgs` and `CudaVectorScaleArgs` from normal `TaskArgsBuilder`
+  CPU tensors/scalars, and validates real copied-back CUDA output data.
 
 ### Persistent-Device Runtime
 
@@ -104,10 +104,11 @@ normal L2 `Worker`, builds `persistent_dag_fork_join_f32` and
 CPU tensors, and validates real copied-back CUDA output data.
 The host-schedule scene path also accepts the neutral
 `elementwise_binary_f32` adapter for non-addition task bodies that still use
-the current `(a, b, out, n)` launch ABI.
+the current `(a, b, out, n)` launch ABI. It also accepts
+`elementwise_scale_f32` for scalar `(a, out, alpha, n)` task bodies.
 The no-torch Worker smoke can validate that same non-addition host-schedule
-ABI with `--op mul`, which keeps H200 coverage available when the remote
-Python environment lacks `torch`.
+ABI with `--op mul` and scalar ABI with `--op scale`, which keeps H200
+coverage available when the remote Python environment lacks `torch`.
 
 Evidence:
 
@@ -312,6 +313,20 @@ Result: A100 `status=pass`, `mode=worker/mul`, `ptx_arch=compute_80`,
 `device_wall_ns=20480`; H200 `status=pass`, `mode=worker/mul`,
 `ptx_arch=compute_90`, `device_wall_ns=20000`. The generated artifacts are
 under `tmp/cuda-backend/worker-mul-smoke-d5788710/`.
+
+The scalar host-schedule Worker smoke was captured on both GPUs with runtime
+rebuild enabled:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
+    --op scale --sync-remote-tree --build-runtime
+```
+
+Result: A100 `status=pass`, `mode=worker/scale`, `ptx_arch=compute_80`,
+`device_wall_ns=8192`; H200 `status=pass`, `mode=worker/scale`,
+`ptx_arch=compute_90`, `device_wall_ns=12544`. The generated artifacts are
+under `tmp/cuda-backend/worker-scale-smoke-4240a4ba/`.
 
 The docs and skill updates were checked with targeted `pre-commit` runs and
 `git diff --check` before commit.
@@ -584,14 +599,14 @@ Host-schedule task-body compilation and persistent-device generated dispatch
 now have first `KernelCompiler` entry points. Both paths can consume
 `CudaTaskBody` style sources. CUDA prepared-callable artifacts can be staged
 through the L2 Python `Worker` registration path. The normal scene-test flow
-can compile and run host-schedule CUDA vector-add and binary elementwise
-callable specs and
-persistent-device fork/join DAG callable specs end to end.
+can compile and run host-schedule CUDA vector-add, binary elementwise, and
+scalar scale callable specs and persistent-device fork/join DAG callable specs
+end to end.
 
 Needed:
 
 - broader CUDA scene-test argument builders beyond the current binary
-  elementwise, `persistent_dag_fork_join_f32`, and
+  elementwise, scalar scale, `persistent_dag_fork_join_f32`, and
   `persistent_dag_tensor_tile_f32` tracer bullets.
 
 ### Target Role Cleanup

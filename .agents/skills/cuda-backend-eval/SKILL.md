@@ -62,6 +62,17 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-json tmp/cuda-backend/worker-mul-smoke/a100.json
 ```
 
+Use `--op scale` to validate the scalar host-schedule ABI
+`(a, out, alpha, n)`:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_smoke.py \
+    --runner worker --op scale --device 0 --n 1024 --block-dim 256 \
+    --arch compute_80 \
+    --output-json tmp/cuda-backend/worker-scale-smoke/a100.json
+```
+
 Use `cuda_smoke_report.py` to turn captured smoke JSON from A100 and H200 into
 Markdown and SVG evidence:
 
@@ -86,7 +97,9 @@ PYTHONPATH=$PWD:$PWD/python \
 This writes `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
 `cuda-smoke-report.svg` under
 `tmp/cuda-backend/worker-<op>-smoke-<commit>/`, then refreshes
-`tmp/cuda-backend/index.md`.
+`tmp/cuda-backend/index.md`. Add `--build-runtime` after changing CUDA runtime
+C++ so the local and remote runtime shared objects are rebuilt before the
+smoke runs.
 
 Run the persistent-device tracer-bullet smoke:
 
@@ -320,8 +333,9 @@ a compiler/runtime slice; L2 `Worker.register(...)` can prepare that raw
 manifest blob, and L2 `Worker.run(...)` can launch raw CUDA argument structs
 that expose `buffer_ptr()` / `buffer_size()`. The normal `SceneTestCase` L2
 path can now build `CALLABLE["cuda"]` host-schedule specs and run the current
-`arg_builder: vector_add_f32` and `arg_builder: elementwise_binary_f32`
-adapters from CPU `TaskArgsBuilder` tensors through real CUDA device buffers.
+`arg_builder: vector_add_f32`, `arg_builder: elementwise_binary_f32`, and
+`arg_builder: elementwise_scale_f32` adapters from CPU `TaskArgsBuilder`
+tensors and scalars through real CUDA device buffers.
 Use the neutral `elementwise_binary_f32` name when the compiled task body is
 not addition but still uses the current `(a, b, out, n)` launch ABI. The same
 path can build
@@ -439,11 +453,12 @@ the full benchmark:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
-    --op mul --sync-remote-tree
+    --op scale --sync-remote-tree --build-runtime
 ```
 
 It mirrors the benchmark runner's remote refresh, `--skip-remote-refresh`,
-`--sync-remote-tree`, and `--dry-run` controls, but only captures
+`--sync-remote-tree`, and `--dry-run` controls. It also supports
+`--build-runtime` for source changes under `src/cuda/`. It captures
 host-schedule Worker smoke JSON on A100/H200, renders a compact smoke report,
 and refreshes the artifact index.
 

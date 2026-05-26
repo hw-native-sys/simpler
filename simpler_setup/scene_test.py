@@ -382,21 +382,33 @@ def _build_cuda_host_schedule_args(
     device_buffers: _CudaSceneDeviceBuffers,
     cuda_spec: dict,
 ):
-    from simpler_setup.cuda_callable_compiler import CudaVectorAddArgs  # noqa: PLC0415
+    from simpler_setup.cuda_callable_compiler import CudaVectorAddArgs, CudaVectorScaleArgs  # noqa: PLC0415
 
     arg_builder = cuda_spec.get("arg_builder", "vector_add_f32")
-    if arg_builder not in {"vector_add_f32", "elementwise_binary_f32"}:
+    if arg_builder not in {"vector_add_f32", "elementwise_binary_f32", "elementwise_scale_f32"}:
         raise NotImplementedError(f"Unsupported CUDA scene-test arg_builder: {arg_builder}")
 
     tensor_names = [spec.name for spec in test_args.specs if isinstance(spec, Tensor)]
     names = list(cuda_spec.get("args", tensor_names[:3]))
     if len(names) != 3:
         raise ValueError(f"CUDA {arg_builder} scene tests require exactly three tensor args")
-    missing = [name for name in names if name not in device_buffers.ptrs]
+    if arg_builder == "elementwise_scale_f32":
+        missing = [name for name in names[:2] if name not in device_buffers.ptrs]
+    else:
+        missing = [name for name in names if name not in device_buffers.ptrs]
     if missing:
         raise ValueError(f"CUDA {arg_builder} args reference unknown tensors: {', '.join(missing)}")
 
     n = int(cuda_spec.get("n", getattr(test_args, names[0]).numel()))
+    if arg_builder == "elementwise_scale_f32":
+        alpha = getattr(test_args, names[2])
+        alpha_value = alpha.value if hasattr(alpha, "value") else alpha
+        return CudaVectorScaleArgs(
+            a=device_buffers.ptrs[names[0]],
+            out=device_buffers.ptrs[names[1]],
+            alpha=float(alpha_value),
+            n=n,
+        )
     return CudaVectorAddArgs(
         a=device_buffers.ptrs[names[0]],
         b=device_buffers.ptrs[names[1]],

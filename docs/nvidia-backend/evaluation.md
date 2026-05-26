@@ -103,14 +103,15 @@ without requiring `torch` on the H200 environment:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
-    --op mul --sync-remote-tree
+    --op scale --sync-remote-tree --build-runtime
 ```
 
 It captures host-schedule Worker smoke JSON on both GPUs, renders
 `cuda-smoke-report.md` and `cuda-smoke-report.svg`, and refreshes
 `tmp/cuda-backend/index.md`. It supports the same remote refresh,
 `--skip-remote-refresh`, `--sync-remote-tree`, and `--dry-run` controls as the
-paired benchmark runner.
+paired benchmark runner. Use `--build-runtime` after changing CUDA runtime C++
+so the synced H200 checkout does not run stale shared objects.
 
 Refresh the local artifact index after adding or merging captures:
 

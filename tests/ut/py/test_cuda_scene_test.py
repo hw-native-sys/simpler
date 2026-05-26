@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from typing import Any, cast
 
 import pytest
@@ -18,10 +19,12 @@ from simpler.task_interface import ArgDirection
 from simpler_setup.cuda_callable_compiler import (
     CudaHostScheduleCallableArtifact,
     CudaPersistentCallableArtifact,
+    CudaVectorScaleArgs,
     PreparedCudaCallable,
 )
 from simpler_setup.cuda_preflight import cuda_skip_reason
 from simpler_setup.scene_test import (
+    Scalar,
     SceneTestCase,
     TaskArgsBuilder,
     Tensor,
@@ -47,6 +50,13 @@ if (i < ctx->n) {
 }
 """.lstrip()
 
+_VECTOR_SCALE_BODY = """
+unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+if (i < ctx->n) {
+    ctx->out[i] = ctx->a[i] * ctx->alpha;
+}
+""".lstrip()
+
 _VECTOR_ADD_CONTEXT = """
 struct PtoTaskContext {
     const float *a;
@@ -56,10 +66,26 @@ struct PtoTaskContext {
 };
 """.strip()
 
+_VECTOR_SCALE_CONTEXT = """
+struct PtoTaskContext {
+    const float *a;
+    float *out;
+    float alpha;
+    unsigned long long n;
+};
+""".strip()
+
 _VECTOR_ADD_HOST_PARAMS = (
     "const float *a",
     "const float *b",
     "float *out",
+    "unsigned long long n",
+)
+
+_VECTOR_SCALE_HOST_PARAMS = (
+    "const float *a",
+    "float *out",
+    "float alpha",
     "unsigned long long n",
 )
 
@@ -151,6 +177,25 @@ def _cuda_elementwise_binary_spec(source, *, task_name, arch="compute_80", grid_
             "signature": [ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
             "arg_builder": "elementwise_binary_f32",
             "args": ["a", "b", "out"],
+        }
+    }
+
+
+def _cuda_elementwise_scale_spec(source, *, task_name, arch="compute_80", grid_dim=4, block_dim=256):
+    return {
+        "cuda": {
+            "source": str(source),
+            "task_name": task_name,
+            "arch": arch,
+            "context_definition": _VECTOR_SCALE_CONTEXT,
+            "host_parameters": _VECTOR_SCALE_HOST_PARAMS,
+            "host_context_initializer": "a, out, alpha, n",
+            "grid_dim": grid_dim,
+            "block_dim": block_dim,
+            "op": 2,
+            "signature": [ArgDirection.IN, ArgDirection.OUT],
+            "arg_builder": "elementwise_scale_f32",
+            "args": ["a", "out", "alpha"],
         }
     }
 
@@ -339,6 +384,26 @@ def test_scene_test_builds_cuda_elementwise_binary_args():
     assert args.n == 17
 
 
+def test_scene_test_builds_cuda_elementwise_scale_args():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+        Scalar("alpha", ctypes.c_float(1.5)),
+    )
+    cuda_spec = {
+        "arg_builder": "elementwise_scale_f32",
+        "args": ["a", "out", "alpha"],
+    }
+
+    args = _build_cuda_host_schedule_args(test_args, cast(Any, _FakeCudaBuffers()), cuda_spec)
+
+    assert isinstance(args, CudaVectorScaleArgs)
+    assert args.a == 101
+    assert args.out == 303
+    assert args.alpha == pytest.approx(1.5)
+    assert args.n == 17
+
+
 @requires_cuda
 def test_scene_test_runs_cuda_host_schedule_vector_add_with_real_data(tmp_path):
     torch = pytest.importorskip("torch")
@@ -413,6 +478,45 @@ def test_scene_test_runs_cuda_host_schedule_elementwise_binary_with_real_data(tm
     try:
         callable_obj = scene.build_callable("cuda")
         scene._run_and_validate_l2(worker, callable_obj, CudaVectorMulScene.CASES[0])
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_host_schedule_elementwise_scale_with_real_data(tmp_path):
+    torch = pytest.importorskip("torch")
+
+    source = tmp_path / "vector_scale.pto.cu"
+    source.write_text(_VECTOR_SCALE_BODY)
+
+    @scene_test(level=2, runtime="host_schedule")
+    class CudaVectorScaleScene(SceneTestCase):
+        CALLABLE = _cuda_elementwise_scale_spec(source, task_name="vector_scale")
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024, "alpha": 1.5},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            return TaskArgsBuilder(
+                Tensor("a", torch.arange(n, dtype=torch.float32) + 1.0),
+                Tensor("out", torch.zeros(n, dtype=torch.float32)),
+                Scalar("alpha", ctypes.c_float(params["alpha"])),
+            )
+
+        def compute_golden(self, args, params):
+            args.out[:] = args.a * params["alpha"]
+
+    scene = CudaVectorScaleScene()
+    worker = CudaVectorScaleScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(worker, callable_obj, CudaVectorScaleScene.CASES[0])
     finally:
         worker.close()
 

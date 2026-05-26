@@ -26,7 +26,11 @@ from simpler.task_interface import CallConfig
 from simpler.worker import Worker
 
 from simpler_setup.cuda_callable_compiler import CudaHostScheduleCallable as CudaHostCallable
-from simpler_setup.cuda_callable_compiler import CudaVectorAddArgs, prepare_cuda_host_schedule_callable
+from simpler_setup.cuda_callable_compiler import (
+    CudaVectorAddArgs,
+    CudaVectorScaleArgs,
+    prepare_cuda_host_schedule_callable,
+)
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.runtime_builder import RuntimeBuilder
 
@@ -197,6 +201,8 @@ def _worker_task_body(op: str) -> str:
         expression = "ctx->a[i] + ctx->b[i]"
     elif op == "mul":
         expression = "ctx->a[i] * ctx->b[i]"
+    elif op == "scale":
+        expression = "ctx->a[i] * ctx->alpha"
     else:
         raise ValueError(f"unknown worker smoke op: {op}")
     return f"""
@@ -212,7 +218,57 @@ def _worker_expected_output(op: str, n: int) -> list[float]:
         return [float(3 * i) for i in range(n)]
     if op == "mul":
         return [float(i * (2 * i)) for i in range(n)]
+    if op == "scale":
+        return [float(i * 1.5) for i in range(n)]
     raise ValueError(f"unknown worker smoke op: {op}")
+
+
+def _worker_context_definition(op: str) -> str:
+    if op == "scale":
+        return """
+struct PtoTaskContext {
+    const float *a;
+    float *out;
+    float alpha;
+    unsigned long long n;
+};
+""".strip()
+    return """
+struct PtoTaskContext {
+    const float *a;
+    const float *b;
+    float *out;
+    unsigned long long n;
+};
+""".strip()
+
+
+def _worker_host_parameters(op: str) -> tuple[str, ...]:
+    if op == "scale":
+        return (
+            "const float *a",
+            "float *out",
+            "float alpha",
+            "unsigned long long n",
+        )
+    return (
+        "const float *a",
+        "const float *b",
+        "float *out",
+        "unsigned long long n",
+    )
+
+
+def _worker_host_context_initializer(op: str) -> str:
+    if op == "scale":
+        return "a, out, alpha, n"
+    return "a, b, out, n"
+
+
+def _worker_host_op(op: str) -> int:
+    if op == "scale":
+        return 2
+    return 1
 
 
 def run_smoke(device: int, n: int, block_dim: int, arch: str, build: bool = True) -> dict:
@@ -311,27 +367,16 @@ def run_worker_smoke(device: int, n: int, block_dim: int, arch: str, build: bool
             task_name=f"vector_{op}_worker_smoke",
             arch=arch,
             cache_root=work_dir / "cache",
-            context_definition="""
-struct PtoTaskContext {
-    const float *a;
-    const float *b;
-    float *out;
-    unsigned long long n;
-};
-""".strip(),
-            host_parameters=(
-                "const float *a",
-                "const float *b",
-                "float *out",
-                "unsigned long long n",
-            ),
-            host_context_initializer="a, b, out, n",
+            context_definition=_worker_context_definition(op),
+            host_parameters=_worker_host_parameters(op),
+            host_context_initializer=_worker_host_context_initializer(op),
         )
 
     prepared = prepare_cuda_host_schedule_callable(
         artifact,
         grid_dim=(n + block_dim - 1) // block_dim,
         block_dim=block_dim,
+        op=_worker_host_op(op),
     )
 
     worker = Worker(level=2, device_id=device, platform="cuda", runtime="host_schedule", build=build)
@@ -346,13 +391,17 @@ struct PtoTaskContext {
         nbytes = ctypes.sizeof(host_a)
 
         dev_a = worker.malloc(nbytes)
-        dev_b = worker.malloc(nbytes)
+        dev_b = worker.malloc(nbytes) if op != "scale" else None
         dev_out = worker.malloc(nbytes)
         try:
             worker.copy_to(dev_a, ctypes.addressof(host_a), nbytes)
-            worker.copy_to(dev_b, ctypes.addressof(host_b), nbytes)
+            if dev_b is not None:
+                worker.copy_to(dev_b, ctypes.addressof(host_b), nbytes)
 
-            args = CudaVectorAddArgs(a=dev_a, b=dev_b, out=dev_out, n=n)
+            if op == "scale":
+                args = CudaVectorScaleArgs(a=dev_a, out=dev_out, alpha=1.5, n=n)
+            else:
+                args = CudaVectorAddArgs(a=dev_a, b=dev_b, out=dev_out, n=n)
             config = CallConfig()
             config.block_dim = block_dim
             timing = worker.run(cid, args, config)
@@ -362,7 +411,8 @@ struct PtoTaskContext {
                 raise RuntimeError(f"vector-{op} output mismatch")
         finally:
             worker.free(dev_a)
-            worker.free(dev_b)
+            if dev_b is not None:
+                worker.free(dev_b)
             worker.free(dev_out)
     finally:
         worker.close()
@@ -396,7 +446,7 @@ def main() -> None:
     parser.add_argument("--block-dim", type=int, default=256)
     parser.add_argument("--arch", default="compute_80")
     parser.add_argument("--runner", choices=("direct_c_api", "worker"), default="direct_c_api")
-    parser.add_argument("--op", choices=("add", "mul"), default="add", help="Worker task body operation")
+    parser.add_argument("--op", choices=("add", "mul", "scale"), default="add", help="Worker task body operation")
     parser.add_argument("--no-build", action="store_true", help="Use existing runtime binaries without rebuilding")
     parser.add_argument("--output-json", type=Path, help="Optional path to write the smoke JSON payload")
     args = parser.parse_args()

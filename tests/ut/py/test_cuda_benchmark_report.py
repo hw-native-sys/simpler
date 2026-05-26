@@ -625,6 +625,24 @@ def test_cuda_pair_smoke_can_sync_local_tree_and_dry_run(tmp_path):
     assert any("worker-add-smoke-local123" in part for part in commands[4])
 
 
+def test_cuda_pair_smoke_can_request_runtime_build(tmp_path):
+    cuda_pair_smoke = _load_pair_smoke_module()
+    config = cuda_pair_smoke.PairedSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        build_runtime=True,
+    )
+
+    local = cuda_pair_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_smoke.build_remote_smoke_command(config, "abc123")
+
+    assert "--no-build" not in local
+    assert "--no-build" not in remote[-1]
+
+
 def test_find_nvcc_uses_cuda_home_when_nvcc_is_not_on_path(tmp_path, monkeypatch):
     cuda_smoke = _load_smoke_module()
     cuda_home = tmp_path / "cuda-12.8"
@@ -647,6 +665,15 @@ def test_cuda_worker_smoke_generates_multiply_task_body():
 
     assert "ctx->out[i] = ctx->a[i] * ctx->b[i];" in body
     assert "ctx->a[i] + ctx->b[i]" not in body
+
+
+def test_cuda_worker_smoke_generates_scale_task_body():
+    cuda_smoke = _load_smoke_module()
+
+    body = cuda_smoke._worker_task_body("scale")
+
+    assert "ctx->out[i] = ctx->a[i] * ctx->alpha;" in body
+    assert "ctx->b[i]" not in body
 
 
 def test_cuda_smoke_main_writes_output_json(tmp_path, monkeypatch, capsys):
@@ -701,6 +728,57 @@ def test_cuda_smoke_main_writes_output_json(tmp_path, monkeypatch, capsys):
     assert written["mode"] == "worker/mul"
     assert written["device"] == 1
     assert written["ptx_arch"] == "compute_90"
+
+
+def test_cuda_smoke_main_accepts_scale_output_json(tmp_path, monkeypatch, capsys):
+    cuda_smoke = _load_smoke_module()
+    output = tmp_path / "scale-smoke.json"
+
+    monkeypatch.setattr(
+        cuda_smoke,
+        "run_worker_smoke",
+        lambda device, n, block_dim, arch, build, op: {
+            "status": "pass",
+            "runner": "worker",
+            "runtime": "host_schedule",
+            "mode": f"worker/{op}",
+            "op": op,
+            "device": device,
+            "n": n,
+            "block_dim": block_dim,
+            "ptx_arch": arch,
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cuda_smoke.py",
+            "--runner",
+            "worker",
+            "--op",
+            "scale",
+            "--device",
+            "1",
+            "--n",
+            "64",
+            "--block-dim",
+            "32",
+            "--arch",
+            "compute_90",
+            "--no-build",
+            "--output-json",
+            str(output),
+        ],
+    )
+
+    cuda_smoke.main()
+
+    printed = json.loads(capsys.readouterr().out)
+    written = json.loads(output.read_text())
+    assert printed == written
+    assert written["op"] == "scale"
+    assert written["mode"] == "worker/scale"
 
 
 def test_persistent_direct_launch_can_use_multiple_worker_blocks_per_task():
