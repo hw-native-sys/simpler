@@ -108,15 +108,18 @@ The DAG rows validate the persistent-device scheduler path rather than equal
 work throughput. Chain and reuse add dependency levels and extra arithmetic.
 The tensor row replaces one elementwise task with tiled GEMM work, so its
 large-vector ratio is expected to be several times slower than the simple DAG.
+This full capture predates the two-scalar affine benchmark row; the focused
+single-baseline A100/H200 validation is recorded in
+[status.md](status.md#latest-local-verification).
 
-| GPU | N | Chain/DAG | Reuse/DAG | Scalar AXPY/DAG | Tensor/DAG |
-| --- | - | --------- | --------- | --------------- | ---------- |
-| A100 | 1024 | 1.50x | 1.50x | 0.95x | 1.65x |
-| A100 | 65536 | 1.59x | 1.58x | 0.99x | 3.70x |
-| A100 | 1048576 | 2.99x | 2.98x | 0.96x | 5.51x |
-| H200 | 1024 | 1.37x | 1.40x | 1.09x | 1.31x |
-| H200 | 65536 | 1.79x | 1.80x | 1.00x | 2.97x |
-| H200 | 1048576 | 1.79x | 1.79x | 0.99x | 3.06x |
+| GPU | N | Chain/DAG | Reuse/DAG | Scalar AXPY/DAG | Scalar Affine/DAG | Tensor/DAG |
+| --- | - | --------- | --------- | --------------- | ----------------- | ---------- |
+| A100 | 1024 | 1.50x | 1.50x | 0.95x | - | 1.65x |
+| A100 | 65536 | 1.59x | 1.58x | 0.99x | - | 3.70x |
+| A100 | 1048576 | 2.99x | 2.98x | 0.96x | - | 5.51x |
+| H200 | 1024 | 1.37x | 1.40x | 1.09x | - | 1.31x |
+| H200 | 65536 | 1.79x | 1.80x | 1.00x | - | 2.97x |
+| H200 | 1048576 | 1.79x | 1.79x | 0.99x | - | 3.06x |
 
 The key correctness signal is that all DAG variants use generated dispatch
 and runtime graph descriptors without changing the persistent launch path.

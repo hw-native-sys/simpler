@@ -159,6 +159,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_chain`;
 - `pto_persistent_dag_reuse`;
 - `pto_persistent_dag_scalar_axpy`;
+- `pto_persistent_dag_scalar_affine`;
 - `pto_persistent_dag_tensor`;
 - same-work batch rows;
 - worker-grid batch rows.
@@ -167,7 +168,9 @@ The latest paired capture at commit `db0acd4c` uses the `8x4x12` tensor
 descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
 and worker-grid values `32,64,128,256`. It includes the compiler-backed
 host-schedule row, unary square host-schedule row, and
-`pto_persistent_dag_scalar_axpy` on both A100 and H200.
+`pto_persistent_dag_scalar_axpy` on both A100 and H200. The
+`pto_persistent_dag_scalar_affine` row has since been promoted into the
+benchmark runner and checked as a focused single-baseline run on both GPUs.
 
 Evidence:
 
@@ -816,6 +819,25 @@ contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
 the H200 row returned `status=pass`, `ptx_arch=compute_90`,
 `dispatch_func_ids=[5,2,1]`, the same scalar args, and
 `device_wall_ns=35584`. Both rows reported zero device scheduler errors.
+
+After promoting the two-scalar affine DAG to a benchmark baseline, the focused
+report tests passed locally and the new single-baseline path was checked on
+both GPUs:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_scalar_affine \
+    --sizes 4096 --arch compute_80
+```
+
+Result: A100 `status=pass`, `ptx_arch=compute_80`,
+`dispatch_func_ids=[5,2,1]`,
+`scalar_args={"scalar0":1.5,"scalar1":0.5}`,
+`device_scheduler_errors={"count":0,"code":0,"task_id":0}`,
+`device_wall_ns=31744`; H200 `status=pass`, `ptx_arch=compute_90`,
+`dispatch_func_ids=[5,2,1]`, the same scalar args, zero scheduler errors,
+and `device_wall_ns=30560`.
 
 ## Remaining Gaps
 

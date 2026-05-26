@@ -59,6 +59,9 @@ regenerated from the combined JSON with
 - `pto_persistent_dag_scalar_axpy`: generated-dispatch DAG that reads a
   `scalar0` task descriptor field for mixed tensor/scalar AXPY work before
   downstream fan-in.
+- `pto_persistent_dag_scalar_affine`: generated-dispatch DAG that reads
+  `scalar0` and `scalar1` task descriptor fields for two-scalar affine work
+  before downstream fan-in.
 - `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a tiled
   GEMM task followed by residual, gate, and fan-in elementwise tasks.
 - `*_batch`: same-work rows comparing repeated host launches with one

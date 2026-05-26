@@ -193,6 +193,16 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2 --dag-shape scalar_affine
 ```
 
+Run the corresponding benchmark baseline directly after changing the
+two-scalar DAG descriptor or generated-dispatch benchmark wiring:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_scalar_affine \
+    --sizes 4096 --arch compute_80
+```
+
 Use `cuda_pair_persistent_smoke.py` when the same persistent DAG smoke should
 be captured on local A100 and remote H200 with Markdown/SVG evidence:
 

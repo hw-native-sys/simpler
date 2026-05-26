@@ -40,6 +40,7 @@ DAG_BASELINES = (
     "pto_persistent_dag_chain",
     "pto_persistent_dag_reuse",
     "pto_persistent_dag_scalar_axpy",
+    "pto_persistent_dag_scalar_affine",
     "pto_persistent_dag_tensor",
 )
 
@@ -83,6 +84,12 @@ def _median(summary: Summary, key: SummaryKey) -> int:
 
 def _ratio(numerator: int, denominator: int) -> str:
     return f"{numerator / denominator:.2f}x"
+
+
+def _ratio_for_key(summary: Summary, key: SummaryKey, denominator: int) -> str:
+    if key not in summary:
+        return "-"
+    return _ratio(_median(summary, key), denominator)
 
 
 def _table(headers: Sequence[str], rows: Sequence[Sequence[str | int]]) -> str:
@@ -180,10 +187,14 @@ def render_dag_shape_table(payload: Payload) -> str:
                     _ratio(chain, dag),
                     _ratio(reuse, dag),
                     _ratio(scalar, dag),
+                    _ratio_for_key(summary, (machine, "pto_persistent_dag_scalar_affine", n, 3, 1), dag),
                     _ratio(tensor, dag),
                 ]
             )
-    return _table(["GPU", "N", "Chain/DAG", "Reuse/DAG", "Scalar AXPY/DAG", "Tensor/DAG"], rows)
+    return _table(
+        ["GPU", "N", "Chain/DAG", "Reuse/DAG", "Scalar AXPY/DAG", "Scalar Affine/DAG", "Tensor/DAG"],
+        rows,
+    )
 
 
 def render_summary(payload: Payload) -> str:
