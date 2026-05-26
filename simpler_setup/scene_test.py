@@ -526,11 +526,12 @@ class _CudaPersistentDagSceneBuffers:
             "persistent_dag_tensor_tile_f32",
             "persistent_dag_triad_f32",
             "persistent_dag_quad_f32",
+            "persistent_dag_generic_args_f32",
             "persistent_dag_unary_square_f32",
         }
         if arg_builder not in persistent_builders:
             raise NotImplementedError(f"Unsupported CUDA persistent scene-test arg_builder: {arg_builder}")
-        if arg_builder == "persistent_dag_quad_f32":
+        if arg_builder in {"persistent_dag_quad_f32", "persistent_dag_generic_args_f32"}:
             expected_arg_count = 5
         elif arg_builder == "persistent_dag_triad_f32":
             expected_arg_count = 4
@@ -542,7 +543,7 @@ class _CudaPersistentDagSceneBuffers:
         if missing:
             raise ValueError(f"CUDA persistent DAG args reference unknown tensors: {', '.join(missing)}")
 
-        if arg_builder == "persistent_dag_quad_f32":
+        if arg_builder in {"persistent_dag_quad_f32", "persistent_dag_generic_args_f32"}:
             a_name, b_name, c_name, d_name, out_name = self.output_names
         elif arg_builder == "persistent_dag_triad_f32":
             a_name, b_name, c_name, out_name = self.output_names
@@ -862,6 +863,65 @@ class _CudaPersistentDagSceneBuffers:
                     dependent_begin=0,
                     dependent_count=1,
                     initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=self.tensor_buffers.ptrs[a_name],
+                    b=self.tensor_buffers.ptrs[b_name],
+                    out=self.dev_tmp1,
+                    n=n,
+                    dependent_begin=1,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=self.dev_tmp0,
+                    b=self.dev_tmp1,
+                    out=self.tensor_buffers.ptrs[out_name],
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=0,
+                    initial_fanin=2,
+                ),
+            )
+            self.host_fanin = (ctypes.c_uint32 * 3)(0, 0, 2)
+        elif arg_builder == "persistent_dag_generic_args_f32":
+            assert c_name is not None
+            assert d_name is not None
+            tensor_arg_names = list(self.cuda_spec.get("tensor_args", [c_name, d_name]))
+            scalar_arg_values = list(self.cuda_spec.get("scalar_args", [1.5, 0.25]))
+            if len(tensor_arg_names) > 4:
+                raise ValueError("CUDA persistent_dag_generic_args_f32 supports at most four tensor_args")
+            if len(scalar_arg_values) > 4:
+                raise ValueError("CUDA persistent_dag_generic_args_f32 supports at most four scalar_args")
+            missing_tensor_args = [name for name in tensor_arg_names if name not in self.tensor_buffers.ptrs]
+            if missing_tensor_args:
+                raise ValueError(
+                    "CUDA persistent_dag_generic_args_f32 tensor_args reference unknown tensors: "
+                    + ", ".join(missing_tensor_args)
+                )
+            tensor_args_t = ctypes.c_void_p * 4
+            scalar_args_t = ctypes.c_float * 4
+            tensor_arg_ptrs = [self.tensor_buffers.ptrs[name] for name in tensor_arg_names]
+            scalar_args = [float(value) for value in scalar_arg_values]
+            dependents_t = ctypes.c_uint32 * 2
+            self.host_dependents = dependents_t(2, 2)
+            task_t = CudaPersistentDagTask * 3
+            self.host_tasks = task_t(
+                CudaPersistentDagTask(
+                    func_id=9,
+                    a=self.tensor_buffers.ptrs[a_name],
+                    b=self.tensor_buffers.ptrs[b_name],
+                    out=self.dev_tmp0,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=1,
+                    initial_fanin=0,
+                    tensor_args=tensor_args_t(*(tensor_arg_ptrs + [0] * (4 - len(tensor_arg_ptrs)))),
+                    scalar_args=scalar_args_t(*(scalar_args + [0.0] * (4 - len(scalar_args)))),
+                    tensor_arg_count=len(tensor_arg_ptrs),
+                    scalar_arg_count=len(scalar_args),
                 ),
                 CudaPersistentDagTask(
                     func_id=2,

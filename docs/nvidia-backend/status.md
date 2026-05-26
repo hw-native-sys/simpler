@@ -128,13 +128,14 @@ normal L2 `Worker`, builds `persistent_dag_fork_join_f32`,
 `persistent_dag_scalar_axpy_f32` and `persistent_dag_scalar_affine_f32` mixed
 tensor/scalar descriptors, `persistent_dag_tensor_tile_f32` state objects,
 `persistent_dag_triad_f32` third-tensor descriptors,
-`persistent_dag_quad_f32` fourth-tensor descriptors, and
-`persistent_dag_unary_square_f32` unary descriptors from normal
+`persistent_dag_quad_f32` fourth-tensor descriptors,
+`persistent_dag_generic_args_f32` generic tensor/scalar argument descriptors,
+and `persistent_dag_unary_square_f32` unary descriptors from normal
 `TaskArgsBuilder` CPU tensors, and validates real copied-back CUDA output
 data. The no-torch persistent smoke path also validates a generated-dispatch
 triad descriptor with a third tensor pointer field, a quad descriptor with
-third and fourth tensor pointer fields, and a generated-dispatch unary-square
-descriptor with a single tensor input.
+third and fourth tensor pointer fields, a generic-argument descriptor, and a
+generated-dispatch unary-square descriptor with a single tensor input.
 The host-schedule scene path also accepts the neutral
 `elementwise_binary_f32` adapter for non-addition task bodies that still use
 the current `(a, b, out, n)` launch ABI. It accepts `elementwise_unary_f32`
@@ -1154,6 +1155,18 @@ joins with an independent `a * b` branch. Result:
 `cuda-smoke-report.svg`. Both runs reported zero scheduler errors and
 argument metadata
 `scalar_args[0]=1.5,scalar_args[1]=0.25,tensor_args[0]=tmp0,tensor_args[1]=tmp3`.
+The same descriptor shape now also has normal `SceneTestCase` L2 coverage
+through `persistent_dag_generic_args_f32`, using ctypes-backed CPU tensors so
+the path remains usable on the H200 host without requiring `torch`. The
+focused local command passed on A100:
+
+```bash
+.venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+  -q -k generic_args_with_ctypes --platform cuda
+```
+
+The same command was run on H200 after syncing the working tree to
+`bizhaoh200`; it passed with `1 passed, 35 deselected`.
 
 ## Remaining Gaps
 
@@ -1259,9 +1272,9 @@ it is not yet a full TensorMap/ringbuffer analogue.
 
 Needed:
 
-- graph-level use of the generic tensor/scalar argument slots from normal PTO
-  task graph lowering, beyond the current hand-built `generic_args` smoke;
 - graph construction from normal PTO task graphs;
+- a general graph-lowering implementation for variable-arity task descriptors,
+  beyond the current explicit `persistent_dag_generic_args_f32` adapter;
 - broader lifecycle validation beyond the current scratch-reuse and
   direct/queue/DAG prepared-callable repeat-run smokes;
 - broader resource policy beyond the current single scheduler block,

@@ -262,6 +262,15 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2 --dag-shape generic_args
 ```
 
+Run the corresponding no-torch L2 `SceneTestCase` path after changing generic
+persistent argument lowering:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k generic_args_with_ctypes --platform cuda
+```
+
 Use `--dag-shape unary_square` to validate a generated-dispatch task body
 that reads only one tensor input from the persistent DAG descriptor. The
 first DAG task computes `tmp0 = a * a`, then downstream add tasks consume its
@@ -580,7 +589,8 @@ path can build
 `arg_builder: persistent_dag_scalar_affine_f32`,
 `arg_builder: persistent_dag_tensor_tile_f32`,
 `arg_builder: persistent_dag_triad_f32`,
-`arg_builder: persistent_dag_quad_f32`, and
+`arg_builder: persistent_dag_quad_f32`,
+`arg_builder: persistent_dag_generic_args_f32`, and
 `arg_builder: persistent_dag_unary_square_f32` adapters through the L2
 `Worker`.
 For real host-schedule smoke coverage, pass a context definition plus

@@ -274,17 +274,18 @@ DAG specs. The current adapters construct `vector_add_f32`,
 `persistent_dag_fork_join_f32`, `persistent_dag_chain_f32`,
 `persistent_dag_reuse_f32`, `persistent_dag_scalar_axpy_f32`,
 `persistent_dag_tensor_tile_f32`, `persistent_dag_triad_f32`, and
-`persistent_dag_quad_f32`, and `persistent_dag_unary_square_f32` raw
-argument/state structs from
+`persistent_dag_quad_f32`, `persistent_dag_generic_args_f32`, and
+`persistent_dag_unary_square_f32` raw argument/state structs from
 `TaskArgsBuilder` CPU tensors and scalars. The remaining work is to add
 broader CUDA argument builders beyond those tracer bullets.
 
 The descriptor now also carries bounded generic argument slots:
 `tensor_args[4]`, `scalar_args[4]`, `tensor_arg_count`, and
-`scalar_arg_count`. The current `generic_args` smoke uses those slots to pass
+`scalar_arg_count`. The current `generic_args` smoke and
+`persistent_dag_generic_args_f32` SceneTestCase adapter use those slots to pass
 two auxiliary tensors and two scalars to a generated-dispatch task body
-without adding more fixed `c`/`d`-style fields. This is still a descriptor
-tracer bullet rather than full PTO graph lowering, but it sets the ABI
+without adding more fixed `c`/`d`-style fields. This is still an explicit
+descriptor adapter rather than full PTO graph lowering, but it sets the ABI
 direction for persistent tasks whose arity differs from the early hand-coded
 vector cases.
 

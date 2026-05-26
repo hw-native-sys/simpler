@@ -263,6 +263,17 @@ unsigned long long i = ctx->i;
 task->out[i] = task->a[i] * task->b[i] + task->c[i] * task->d[i];
 """.strip()
 
+_PERSISTENT_GENERIC_ARGS_BODY = """
+const PtoCudaPersistentDagTask *task = ctx->task;
+unsigned long long i = ctx->i;
+if (task->tensor_arg_count < 2U || task->scalar_arg_count < 2U) {
+  return;
+}
+task->out[i] = task->scalar_args[0] * task->a[i] +
+               task->tensor_args[0][i] +
+               task->scalar_args[1] * task->tensor_args[1][i];
+""".strip()
+
 _PERSISTENT_SQUARE_BODY = """
 const PtoCudaPersistentDagTask *task = ctx->task;
 unsigned long long i = ctx->i;
@@ -698,6 +709,47 @@ def _cuda_persistent_quad_spec(quad_source, add_source, mul_source, *, arch="com
             "arg_builder": "persistent_dag_quad_f32",
             "args": ["a", "b", "c", "d", "out"],
             "queue_capacity": 2,
+        }
+    }
+
+
+def _cuda_persistent_generic_args_spec(generic_source, add_source, mul_source, *, arch="compute_80", block_dim=256):
+    return {
+        "cuda": {
+            "runtime": "persistent_device",
+            "arch": arch,
+            "task_sources": [
+                {
+                    "func_id": 9,
+                    "task_name": "generic_args_f32",
+                    "source_path": str(generic_source),
+                    "body_style": "task_body",
+                    "context_definition": _PERSISTENT_CONTEXT,
+                },
+                {
+                    "func_id": 2,
+                    "task_name": "mul_f32",
+                    "source_path": str(mul_source),
+                    "body_style": "task_body",
+                    "context_definition": _PERSISTENT_CONTEXT,
+                },
+                {
+                    "func_id": 1,
+                    "task_name": "add_f32",
+                    "source_path": str(add_source),
+                    "body_style": "task_body",
+                    "context_definition": _PERSISTENT_CONTEXT,
+                },
+            ],
+            "grid_dim": 4,
+            "block_dim": block_dim,
+            "shared_mem_bytes": 0,
+            "signature": [ArgDirection.IN, ArgDirection.IN, ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
+            "arg_builder": "persistent_dag_generic_args_f32",
+            "args": ["a", "b", "c", "d", "out"],
+            "queue_capacity": 2,
+            "tensor_args": ["c", "d"],
+            "scalar_args": [1.5, 0.25],
         }
     }
 
@@ -1154,6 +1206,45 @@ def test_scene_test_builds_cuda_persistent_quad_args():
     assert buffers.host_tasks[0].b == buffers.tensor_buffers.ptrs["b"]
     assert buffers.host_tasks[0].c == buffers.tensor_buffers.ptrs["c"]
     assert buffers.host_tasks[0].d == buffers.tensor_buffers.ptrs["d"]
+    assert buffers.host_tasks[2].a == buffers.host_tasks[0].out
+    assert buffers.host_tasks[2].b == buffers.host_tasks[1].out
+    assert buffers.host_tasks[2].out == buffers.tensor_buffers.ptrs["out"]
+
+
+def test_scene_test_builds_cuda_persistent_generic_args():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("c", _FakeTensor(17)),
+        Tensor("d", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_generic_args_f32",
+        "args": ["a", "b", "c", "d", "out"],
+        "queue_capacity": 2,
+        "tensor_args": ["c", "d"],
+        "scalar_args": [1.5, 0.25],
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert len(buffers.host_tasks) == 3
+    assert list(buffers.host_fanin) == [0, 0, 2]
+    assert list(buffers.host_dependents) == [2, 2]
+    assert [(task.func_id, task.dependent_begin, task.dependent_count) for task in buffers.host_tasks] == [
+        (9, 0, 1),
+        (2, 1, 1),
+        (1, 2, 0),
+    ]
+    assert buffers.host_tasks[0].a == buffers.tensor_buffers.ptrs["a"]
+    assert buffers.host_tasks[0].b == buffers.tensor_buffers.ptrs["b"]
+    assert list(buffers.host_tasks[0].tensor_args)[:2] == [
+        buffers.tensor_buffers.ptrs["c"],
+        buffers.tensor_buffers.ptrs["d"],
+    ]
+    assert list(buffers.host_tasks[0].scalar_args)[:2] == pytest.approx([1.5, 0.25])
+    assert buffers.host_tasks[0].tensor_arg_count == 2
+    assert buffers.host_tasks[0].scalar_arg_count == 2
     assert buffers.host_tasks[2].a == buffers.host_tasks[0].out
     assert buffers.host_tasks[2].b == buffers.host_tasks[1].out
     assert buffers.host_tasks[2].out == buffers.tensor_buffers.ptrs["out"]
@@ -1882,6 +1973,67 @@ def test_scene_test_runs_cuda_persistent_device_quad_with_ctypes_data(tmp_path):
         d_values = args.d.to_list()
         actual = args.out.to_list()
         expected = [2.0 * a_values[idx] * b_values[idx] + c_values[idx] * d_values[idx] for idx in range(len(actual))]
+        assert actual == pytest.approx(expected)
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_generic_args_with_ctypes_data(tmp_path):
+    generic_source = tmp_path / "generic_args.pto.cu"
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    generic_source.write_text(_PERSISTENT_GENERIC_ARGS_BODY)
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentGenericArgsCtypesScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_generic_args_spec(generic_source, add_source, mul_source)
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            args = TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.5 for i in range(n))),
+                Tensor("c", _CtypesFloatTensor(float(i) * 0.25 for i in range(n))),
+                Tensor("d", _CtypesFloatTensor(float(i) * 0.125 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+            )
+            self.last_args = args
+            return args
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit post-run validation")
+
+    scene = CudaPersistentGenericArgsCtypesScene()
+    worker = CudaPersistentGenericArgsCtypesScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(
+            worker,
+            callable_obj,
+            CudaPersistentGenericArgsCtypesScene.CASES[0],
+            skip_golden=True,
+        )
+        args = scene.last_args
+        a_values = args.a.to_list()
+        b_values = args.b.to_list()
+        c_values = args.c.to_list()
+        d_values = args.d.to_list()
+        actual = args.out.to_list()
+        expected = [
+            1.5 * a_values[idx] + c_values[idx] + 0.25 * d_values[idx] + a_values[idx] * b_values[idx]
+            for idx in range(len(actual))
+        ]
         assert actual == pytest.approx(expected)
     finally:
         worker.close()
