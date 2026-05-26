@@ -38,6 +38,7 @@ class PairedPersistentSmokeConfig:
     worker_blocks_per_task: int = 1
     worker_blocks: int | None = None
     stream_id: int = 0
+    repeat_runs: int = 1
     tensor_rows: int = 16
     tensor_cols: int = 16
     tensor_inner: int = 16
@@ -59,9 +60,13 @@ def _git_commit(runner: Runner = subprocess.run) -> str:
 
 
 def _artifact_label(config: PairedPersistentSmokeConfig, suffix: str) -> str:
+    repeat = f"-repeat{config.repeat_runs}" if config.repeat_runs > 1 else ""
     if config.dag_shape == "tensor_tile":
-        return f"persistent-tensor_tile-{config.tensor_rows}x{config.tensor_cols}x{config.tensor_inner}-smoke-{suffix}"
-    return f"persistent-{config.dag_shape}-smoke-{suffix}"
+        return (
+            f"persistent-tensor_tile-{config.tensor_rows}x"
+            f"{config.tensor_cols}x{config.tensor_inner}{repeat}-smoke-{suffix}"
+        )
+    return f"persistent-{config.dag_shape}{repeat}-smoke-{suffix}"
 
 
 def _output_dir(config: PairedPersistentSmokeConfig, suffix: str) -> Path:
@@ -116,6 +121,8 @@ def _smoke_args(*, device: int, arch: str, output_json: Path, config: PairedPers
         str(config.worker_blocks_per_task),
         "--stream-id",
         str(config.stream_id),
+        "--repeat-runs",
+        str(config.repeat_runs),
         "--output-json",
         str(output_json),
     ]
@@ -306,6 +313,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--worker-blocks-per-task", type=int, default=1)
     parser.add_argument("--worker-blocks", type=int, default=None)
     parser.add_argument("--stream-id", type=int, default=0)
+    parser.add_argument("--repeat-runs", type=int, default=1)
     parser.add_argument("--tensor-rows", type=int, default=16)
     parser.add_argument("--tensor-cols", type=int, default=16)
     parser.add_argument("--tensor-inner", type=int, default=16)
@@ -340,6 +348,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         worker_blocks_per_task=args.worker_blocks_per_task,
         worker_blocks=args.worker_blocks,
         stream_id=args.stream_id,
+        repeat_runs=args.repeat_runs,
         tensor_rows=args.tensor_rows,
         tensor_cols=args.tensor_cols,
         tensor_inner=args.tensor_inner,

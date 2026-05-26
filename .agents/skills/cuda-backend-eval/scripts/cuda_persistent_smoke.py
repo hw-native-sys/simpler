@@ -949,6 +949,7 @@ class DagSmokeConfig:
     start: float
     dag_shape: str
     tensor_tile: dict[str, int]
+    repeat_runs: int
 
 
 def _compile_persistent_ptx(
@@ -1763,18 +1764,13 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
         raise RuntimeError("dag device allocation failed")
 
     try:
-        copies = [
+        static_copies = [
             (dev_a, ctypes.byref(host_a), a_nbytes, "a"),
             (dev_b, ctypes.byref(host_b), b_nbytes, "b"),
             (dev_tasks, ctypes.byref(tasks), ctypes.sizeof(tasks), "tasks"),
             (dev_dependents, ctypes.byref(dependents), ctypes.sizeof(dependents), "dependents"),
-            (dev_fanin, ctypes.byref(host_fanin), ctypes.sizeof(host_fanin), "fanin"),
-            (dev_ready_flags, ctypes.byref(host_flags), ctypes.sizeof(host_flags), "ready flags"),
-            (dev_counters, ctypes.byref(host_counters), ctypes.sizeof(host_counters), "counters"),
         ]
-        if config.dag_shape == "triad":
-            copies.insert(2, (dev_tmp0, ctypes.byref(host_tmp0), output_nbytes, "tmp0/c"))
-        for dst, src, size, label in copies:
+        for dst, src, size, label in static_copies:
             if runtime.copy_to_device_ctx(ctx, dst, src, size) != 0:
                 raise RuntimeError(f"copy_to_device dag {label} failed")
 
@@ -1796,6 +1792,32 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
         )
         if runtime.copy_to_device_ctx(ctx, dev_state, ctypes.byref(state), ctypes.sizeof(state)) != 0:
             raise RuntimeError("copy_to_device dag state failed")
+
+        initial_fanin = [int(value) for value in host_fanin]
+        zero_output = array_t()
+
+        def reset_launch_state() -> tuple[Any, Any]:
+            launch_fanin_t = ctypes.c_uint32 * len(initial_fanin)
+            launch_fanin = launch_fanin_t(*initial_fanin)
+            launch_flags = host_flags_t(*([0] * queue_capacity))
+            launch_counters = host_counters_t(0, 0, 0, 0, 0, 0)
+            reset_copies = [
+                (dev_fanin, ctypes.byref(launch_fanin), ctypes.sizeof(launch_fanin), "fanin"),
+                (dev_ready_flags, ctypes.byref(launch_flags), ctypes.sizeof(launch_flags), "ready flags"),
+                (dev_counters, ctypes.byref(launch_counters), ctypes.sizeof(launch_counters), "counters"),
+                (dev_tmp1, ctypes.byref(zero_output), output_nbytes, "tmp1"),
+                (dev_tmp2, ctypes.byref(zero_output), output_nbytes, "tmp2"),
+                (dev_tmp3, ctypes.byref(zero_output), output_nbytes, "tmp3"),
+                (dev_out, ctypes.byref(zero_output), output_nbytes, "out"),
+            ]
+            if config.dag_shape == "triad":
+                reset_copies.append((dev_tmp0, ctypes.byref(host_tmp0), output_nbytes, "tmp0/c"))
+            else:
+                reset_copies.append((dev_tmp0, ctypes.byref(zero_output), output_nbytes, "tmp0"))
+            for dst, src, size, label in reset_copies:
+                if runtime.copy_to_device_ctx(ctx, dst, src, size) != 0:
+                    raise RuntimeError(f"copy_to_device dag {label} failed")
+            return launch_fanin, launch_counters
 
         scheduler_blocks = 1
         worker_blocks = config.worker_blocks
@@ -1819,77 +1841,97 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             stream_id=config.stream_id,
         )
         args = CudaPersistentDagArgs(state=dev_state)
-        timing = PtoRunTiming()
         if runtime.prepare_callable(ctx, 0, prepared.byref()) != 0:
             raise RuntimeError("prepare_callable dag failed")
-        if runtime.run_prepared(ctx, None, 0, ctypes.byref(args), 256, 0, 0, 0, 0, 0, None, ctypes.byref(timing)) != 0:
-            raise RuntimeError("run_prepared dag failed")
+        launch_completed_counts = []
+        launch_host_wall_ns = []
+        launch_device_wall_ns = []
+        completed_count = 0
+        error_count = 0
+        error_code = 0
+        error_task_id = 0
+        for launch_idx in range(config.repeat_runs):
+            host_fanin, host_counters = reset_launch_state()
+            timing = PtoRunTiming()
+            if (
+                runtime.run_prepared(ctx, None, 0, ctypes.byref(args), 256, 0, 0, 0, 0, 0, None, ctypes.byref(timing))
+                != 0
+            ):
+                raise RuntimeError("run_prepared dag failed")
 
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp0), dev_tmp0, output_nbytes) != 0:
-            raise RuntimeError("copy_from_device dag tmp0 failed")
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp1), dev_tmp1, output_nbytes) != 0:
-            raise RuntimeError("copy_from_device dag tmp1 failed")
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp2), dev_tmp2, output_nbytes) != 0:
-            raise RuntimeError("copy_from_device dag tmp2 failed")
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp3), dev_tmp3, output_nbytes) != 0:
-            raise RuntimeError("copy_from_device dag tmp3 failed")
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_out), dev_out, output_nbytes) != 0:
-            raise RuntimeError("copy_from_device dag out failed")
-        if (
-            runtime.copy_from_device_ctx(ctx, ctypes.byref(host_counters), dev_counters, ctypes.sizeof(host_counters))
-            != 0
-        ):
-            raise RuntimeError("copy_from_device dag counters failed")
-        if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_fanin), dev_fanin, ctypes.sizeof(host_fanin)) != 0:
-            raise RuntimeError("copy_from_device dag fanin failed")
+            if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp0), dev_tmp0, output_nbytes) != 0:
+                raise RuntimeError("copy_from_device dag tmp0 failed")
+            if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp1), dev_tmp1, output_nbytes) != 0:
+                raise RuntimeError("copy_from_device dag tmp1 failed")
+            if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp2), dev_tmp2, output_nbytes) != 0:
+                raise RuntimeError("copy_from_device dag tmp2 failed")
+            if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_tmp3), dev_tmp3, output_nbytes) != 0:
+                raise RuntimeError("copy_from_device dag tmp3 failed")
+            if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_out), dev_out, output_nbytes) != 0:
+                raise RuntimeError("copy_from_device dag out failed")
+            if (
+                runtime.copy_from_device_ctx(
+                    ctx, ctypes.byref(host_counters), dev_counters, ctypes.sizeof(host_counters)
+                )
+                != 0
+            ):
+                raise RuntimeError("copy_from_device dag counters failed")
+            if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_fanin), dev_fanin, ctypes.sizeof(host_fanin)) != 0:
+                raise RuntimeError("copy_from_device dag fanin failed")
 
-        error_count = int(host_counters[3])
-        error_code = int(host_counters[4])
-        error_task_id = int(host_counters[5])
-        if error_count != 0:
-            raise RuntimeError(
-                f"persistent dag scheduler error code={error_code} task_id={error_task_id} count={error_count}"
-            )
+            error_count = int(host_counters[3])
+            error_code = int(host_counters[4])
+            error_task_id = int(host_counters[5])
+            if error_count != 0:
+                raise RuntimeError(
+                    f"persistent dag scheduler error code={error_code} task_id={error_task_id} count={error_count}"
+                )
 
-        expected_tmp0 = [_f32(host_a[i] + host_b[i]) for i in range(n)]
-        expected_tmp1 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
-        expected_tmp2 = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
-        expected_tmp3 = [_f32(expected_tmp2[i] * host_b[i]) for i in range(n)]
-        expected_out = expected_tmp2
-        if config.dag_shape == "chain":
-            expected_out = [_f32(expected_tmp2[i] + expected_tmp3[i]) for i in range(n)]
-        if config.dag_shape == "scratch_reuse":
-            expected_tmp0 = [_f32(expected_tmp2[i] + host_a[i]) for i in range(n)]
-            expected_out = [_f32(expected_tmp0[i] + expected_tmp3[i]) for i in range(n)]
-        if config.dag_shape == "scalar_axpy":
-            expected_tmp0 = [_f32(_f32(1.5 * host_a[i]) + host_b[i]) for i in range(n)]
-            expected_out = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
-        if config.dag_shape == "scalar_affine":
-            expected_tmp0 = [_f32(_f32(1.5 * host_a[i]) + _f32(0.5 * host_b[i])) for i in range(n)]
-            expected_out = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
-        if config.dag_shape == "triad":
-            expected_tmp0 = [_f32(3 * i) for i in range(n)]
-            expected_tmp1 = [_f32(host_a[i] * host_b[i] + expected_tmp0[i]) for i in range(n)]
-            expected_tmp2 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
-            expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
-        if config.dag_shape == "tensor_tile":
-            expected_tmp0 = _matmul_expected(host_a, host_b, n, config.tensor_tile)
-            expected_tmp1 = [_f32(expected_tmp0[i] + host_a[i]) for i in range(n)]
-            expected_tmp2 = [_f32(expected_tmp0[i] * host_b[i]) for i in range(n)]
-            expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
-        if list(host_tmp0) != expected_tmp0:
-            raise RuntimeError("dag tmp0 mismatch")
-        if list(host_tmp1) != expected_tmp1:
-            raise RuntimeError("dag tmp1 mismatch")
-        if config.dag_shape in {"chain", "scratch_reuse", "tensor_tile", "triad"} and list(host_tmp2) != expected_tmp2:
-            raise RuntimeError("dag tmp2 mismatch")
-        if config.dag_shape in {"chain", "scratch_reuse"} and list(host_tmp3) != expected_tmp3:
-            raise RuntimeError("dag tmp3 mismatch")
-        if list(host_out) != expected_out:
-            raise RuntimeError("dag output mismatch")
-        completed_count = int(host_counters[2])
-        if completed_count != task_count:
-            raise RuntimeError(f"persistent dag completed {completed_count}/{task_count} tasks")
+            expected_tmp0 = [_f32(host_a[i] + host_b[i]) for i in range(n)]
+            expected_tmp1 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
+            expected_tmp2 = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
+            expected_tmp3 = [_f32(expected_tmp2[i] * host_b[i]) for i in range(n)]
+            expected_out = expected_tmp2
+            if config.dag_shape == "chain":
+                expected_out = [_f32(expected_tmp2[i] + expected_tmp3[i]) for i in range(n)]
+            if config.dag_shape == "scratch_reuse":
+                expected_tmp0 = [_f32(expected_tmp2[i] + host_a[i]) for i in range(n)]
+                expected_out = [_f32(expected_tmp0[i] + expected_tmp3[i]) for i in range(n)]
+            if config.dag_shape == "scalar_axpy":
+                expected_tmp0 = [_f32(_f32(1.5 * host_a[i]) + host_b[i]) for i in range(n)]
+                expected_out = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
+            if config.dag_shape == "scalar_affine":
+                expected_tmp0 = [_f32(_f32(1.5 * host_a[i]) + _f32(0.5 * host_b[i])) for i in range(n)]
+                expected_out = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
+            if config.dag_shape == "triad":
+                expected_tmp0 = [_f32(3 * i) for i in range(n)]
+                expected_tmp1 = [_f32(host_a[i] * host_b[i] + expected_tmp0[i]) for i in range(n)]
+                expected_tmp2 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
+                expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
+            if config.dag_shape == "tensor_tile":
+                expected_tmp0 = _matmul_expected(host_a, host_b, n, config.tensor_tile)
+                expected_tmp1 = [_f32(expected_tmp0[i] + host_a[i]) for i in range(n)]
+                expected_tmp2 = [_f32(expected_tmp0[i] * host_b[i]) for i in range(n)]
+                expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
+            if list(host_tmp0) != expected_tmp0:
+                raise RuntimeError(f"dag tmp0 mismatch on launch {launch_idx}")
+            if list(host_tmp1) != expected_tmp1:
+                raise RuntimeError(f"dag tmp1 mismatch on launch {launch_idx}")
+            if (
+                config.dag_shape in {"chain", "scratch_reuse", "tensor_tile", "triad"}
+                and list(host_tmp2) != expected_tmp2
+            ):
+                raise RuntimeError(f"dag tmp2 mismatch on launch {launch_idx}")
+            if config.dag_shape in {"chain", "scratch_reuse"} and list(host_tmp3) != expected_tmp3:
+                raise RuntimeError(f"dag tmp3 mismatch on launch {launch_idx}")
+            if list(host_out) != expected_out:
+                raise RuntimeError(f"dag output mismatch on launch {launch_idx}")
+            completed_count = int(host_counters[2])
+            if completed_count != task_count:
+                raise RuntimeError(f"persistent dag completed {completed_count}/{task_count} tasks")
+            launch_completed_counts.append(completed_count)
+            launch_host_wall_ns.append(timing.host_wall_ns)
+            launch_device_wall_ns.append(timing.device_wall_ns)
         if runtime.unregister_callable(ctx, 0) != 0:
             raise RuntimeError("unregister_callable dag failed")
 
@@ -1906,6 +1948,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "worker_blocks": worker_blocks,
             "worker_blocks_per_task": 1,
             "stream_id": config.stream_id,
+            "repeat_runs": config.repeat_runs,
             "resource_policy": {
                 "scheduler_blocks": scheduler_blocks,
                 "worker_blocks": worker_blocks,
@@ -1915,6 +1958,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 "grid_dim": scheduler_blocks + worker_blocks,
             },
             "completed_count": completed_count,
+            "launch_completed_counts": launch_completed_counts,
             "device_scheduler_errors": {
                 "count": error_count,
                 "code": error_code,
@@ -1925,8 +1969,10 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "ptx_arch": config.arch,
             "ptx_source": config.ptx_source,
             "source_kind": "generated-dispatch",
-            "host_wall_ns": timing.host_wall_ns,
-            "device_wall_ns": timing.device_wall_ns,
+            "host_wall_ns": sum(launch_host_wall_ns),
+            "device_wall_ns": sum(launch_device_wall_ns),
+            "launch_host_wall_ns": launch_host_wall_ns,
+            "launch_device_wall_ns": launch_device_wall_ns,
             "elapsed_s": time.time() - config.start,
             "host_runtime": str(config.binaries.host_path),
         }
@@ -1979,6 +2025,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913
     tensor_rows: int = 16,
     tensor_cols: int = 16,
     tensor_inner: int = 16,
+    repeat_runs: int = 1,
 ) -> dict:
     if mode not in {"dag", "direct", "queue"}:
         raise ValueError(f"unknown persistent mode: {mode}")
@@ -2008,6 +2055,8 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913
         raise ValueError("worker_blocks is only supported for queue and dag modes")
     if stream_id < 0:
         raise ValueError("stream_id must be non-negative")
+    if repeat_runs <= 0:
+        raise ValueError("repeat_runs must be positive")
     tensor_tile = _make_tensor_tile_descriptor(rows=tensor_rows, cols=tensor_cols, inner=tensor_inner)
     if queue_capacity is None:
         queue_capacity = task_count
@@ -2051,6 +2100,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913
                     start=start,
                     dag_shape=dag_shape,
                     tensor_tile=tensor_tile,
+                    repeat_runs=repeat_runs,
                 )
             )
 
@@ -2180,6 +2230,7 @@ def main() -> None:
     parser.add_argument("--worker-blocks-per-task", type=int, default=1)
     parser.add_argument("--worker-blocks", type=int, default=None)
     parser.add_argument("--stream-id", type=int, default=0)
+    parser.add_argument("--repeat-runs", type=int, default=1)
     parser.add_argument(
         "--dag-shape",
         choices=[
@@ -2220,6 +2271,7 @@ def main() -> None:
             tensor_rows=args.tensor_rows,
             tensor_cols=args.tensor_cols,
             tensor_inner=args.tensor_inner,
+            repeat_runs=args.repeat_runs,
         ),
         indent=2,
         sort_keys=True,

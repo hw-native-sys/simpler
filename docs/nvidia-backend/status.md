@@ -573,6 +573,22 @@ The H200 initial-fan-in mismatch check returned the expected diagnostic:
 The H200 no-root check returned the expected diagnostic:
 `persistent dag scheduler error code=6 task_id=0 count=1`.
 
+The persistent DAG callable lifecycle path now has a repeat-run smoke that
+prepares the generated-dispatch callable once, resets the graph state, and
+launches the same callable twice:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 5 --n 4096 --arch compute_80 \
+    --mode dag --queue-capacity 2 --dag-shape chain --repeat-runs 2
+```
+
+Result: local A100 returned `launch_completed_counts=[5,5]`,
+`launch_device_wall_ns=[44032,41984]`, and zero scheduler errors. Remote H200
+returned `launch_completed_counts=[5,5]`,
+`launch_device_wall_ns=[48512,40672]`, and zero scheduler errors.
+
 After adding invalid-dependent, dependent-range, fan-in-underflow,
 initial-fan-in, and no-root scheduler diagnostics, the focused CUDA test set
 was rerun locally:
@@ -586,7 +602,7 @@ was rerun locally:
   tests/ut/py/test_cuda_benchmark_report.py -q
 ```
 
-Result: `160 passed`.
+Result: `162 passed`.
 
 After adding shared CUDA preflight skip reporting, the local A100-focused test
 set was rerun:
@@ -1004,7 +1020,8 @@ Needed:
 - broader generalized task argument ABI beyond the current tensor-shape and
   scalar descriptor fields and one extra tensor pointer field;
 - graph construction from normal PTO task graphs;
-- lifecycle validation beyond the current scratch-reuse smoke;
+- broader lifecycle validation beyond the current scratch-reuse and prepared
+  callable repeat-run smokes;
 - broader resource policy beyond the current single scheduler block,
   configurable queue/DAG worker blocks, direct worker-blocks-per-task, and
   callable stream id tracer bullet;

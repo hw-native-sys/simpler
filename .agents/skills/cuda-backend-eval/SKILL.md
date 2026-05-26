@@ -443,6 +443,18 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2 --dag-shape chain
 ```
 
+Pass `--repeat-runs` with DAG mode to reuse one prepared persistent callable
+across multiple launches while resetting the runtime graph state between
+launches. This validates callable lifecycle separately from scratch-buffer
+reuse inside one graph:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 5 --n 4096 --arch compute_80 \
+    --mode dag --queue-capacity 2 --dag-shape chain --repeat-runs 2
+```
+
 Run the six-task persistent DAG scratch-reuse smoke. This graph reuses `tmp0`
 after its last dependent has completed and validates the final reused-buffer
 contents:
