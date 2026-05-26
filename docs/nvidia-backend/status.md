@@ -121,12 +121,13 @@ and composes the generated dispatch entry.
 normal L2 `Worker`, builds `persistent_dag_fork_join_f32`,
 `persistent_dag_chain_f32`, `persistent_dag_reuse_f32`, and
 `persistent_dag_scalar_axpy_f32` and `persistent_dag_scalar_affine_f32` mixed
-tensor/scalar descriptors, plus `persistent_dag_tensor_tile_f32` state
-objects from normal `TaskArgsBuilder` CPU tensors, and validates real
-copied-back CUDA output data. The no-torch persistent smoke path also
-validates a generated-dispatch triad descriptor with a third tensor pointer
-field and a generated-dispatch unary-square descriptor with a single tensor
-input.
+tensor/scalar descriptors, `persistent_dag_tensor_tile_f32` state objects,
+`persistent_dag_triad_f32` third-tensor descriptors, and
+`persistent_dag_unary_square_f32` unary descriptors from normal
+`TaskArgsBuilder` CPU tensors, and validates real copied-back CUDA output
+data. The no-torch persistent smoke path also validates a generated-dispatch
+triad descriptor with a third tensor pointer field and a generated-dispatch
+unary-square descriptor with a single tensor input.
 The host-schedule scene path also accepts the neutral
 `elementwise_binary_f32` adapter for non-addition task bodies that still use
 the current `(a, b, out, n)` launch ABI. It accepts `elementwise_unary_f32`
@@ -1062,6 +1063,32 @@ PYTHONPATH=$PWD:$PWD/python \
 
 Result: `validated tmp/cuda-backend/combined-current-0eed34ff/cuda-benchmark.json`.
 
+After adding `persistent_dag_unary_square_f32` to the normal SceneTestCase L2
+persistent-device argument builders, the CUDA scene-test file was rerun
+locally on A100:
+
+```bash
+.venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py -q
+```
+
+Result: `30 passed`. The new unary persistent scene slice also uses a
+ctypes-backed real-data case so it can run on the H200 checkout without
+`torch`.
+
+The same unary scene-test slice was run on the remote H200 checkout after
+syncing the current local tree:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+     -q -k unary_square'
+```
+
+Result: `2 passed, 28 deselected`.
+
 ## Remaining Gaps
 
 ### Kernel Compiler Integration
@@ -1074,7 +1101,8 @@ can compile and run host-schedule CUDA vector-add, binary elementwise, unary
 square, scalar scale, axpy, two-scalar affine, and three-input triad callable
 specs and persistent-device
 fork/join, chain, reuse, scalar AXPY, scalar affine, and tensor-tile DAG
-callable specs, plus third-tensor persistent triad callable specs, end to end.
+callable specs, plus third-tensor persistent triad and unary-square callable
+specs, end to end.
 
 Needed:
 

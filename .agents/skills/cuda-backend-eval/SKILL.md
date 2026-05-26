@@ -537,9 +537,11 @@ path can build
 `arg_builder: persistent_dag_chain_f32`,
 `arg_builder: persistent_dag_reuse_f32`,
 `arg_builder: persistent_dag_scalar_axpy_f32`,
-`arg_builder: persistent_dag_scalar_affine_f32`, and
-`arg_builder: persistent_dag_tensor_tile_f32`, and
-`arg_builder: persistent_dag_triad_f32` adapters through the L2 `Worker`.
+`arg_builder: persistent_dag_scalar_affine_f32`,
+`arg_builder: persistent_dag_tensor_tile_f32`,
+`arg_builder: persistent_dag_triad_f32`, and
+`arg_builder: persistent_dag_unary_square_f32` adapters through the L2
+`Worker`.
 For real host-schedule smoke coverage, pass a context definition plus
 `host_parameters`/`host_context_initializer` so the generated `__global__`
 wrapper matches the current vector-add launch ABI and can be loaded by

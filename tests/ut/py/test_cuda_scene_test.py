@@ -229,6 +229,12 @@ unsigned long long i = ctx->i;
 task->out[i] = task->a[i] * task->b[i] + task->c[i];
 """.strip()
 
+_PERSISTENT_SQUARE_BODY = """
+const PtoCudaPersistentDagTask *task = ctx->task;
+unsigned long long i = ctx->i;
+task->out[i] = task->a[i] * task->a[i];
+""".strip()
+
 _PERSISTENT_MATMUL_TILE_BODY = """
 const PtoCudaPersistentDagTask *task = ctx->task;
 unsigned long long i = ctx->i;
@@ -604,6 +610,38 @@ def _cuda_persistent_triad_spec(triad_source, add_source, mul_source, *, arch="c
     }
 
 
+def _cuda_persistent_unary_square_spec(square_source, add_source, *, arch="compute_80", block_dim=256):
+    return {
+        "cuda": {
+            "runtime": "persistent_device",
+            "arch": arch,
+            "task_sources": [
+                {
+                    "func_id": 7,
+                    "task_name": "square_f32",
+                    "source_path": str(square_source),
+                    "body_style": "task_body",
+                    "context_definition": _PERSISTENT_CONTEXT,
+                },
+                {
+                    "func_id": 1,
+                    "task_name": "add_f32",
+                    "source_path": str(add_source),
+                    "body_style": "task_body",
+                    "context_definition": _PERSISTENT_CONTEXT,
+                },
+            ],
+            "grid_dim": 4,
+            "block_dim": block_dim,
+            "shared_mem_bytes": 0,
+            "signature": [ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
+            "arg_builder": "persistent_dag_unary_square_f32",
+            "args": ["a", "b", "out"],
+            "queue_capacity": 2,
+        }
+    }
+
+
 def _cuda_persistent_chain_spec(add_source, mul_source, *, arch="compute_80", block_dim=256):
     spec = _cuda_persistent_dag_spec(add_source, mul_source, arch=arch, block_dim=block_dim)
     spec["cuda"]["arg_builder"] = "persistent_dag_chain_f32"
@@ -970,6 +1008,36 @@ def test_scene_test_builds_cuda_persistent_triad_args():
     assert buffers.host_tasks[0].c == buffers.tensor_buffers.ptrs["c"]
     assert buffers.host_tasks[2].a == buffers.host_tasks[0].out
     assert buffers.host_tasks[2].b == buffers.host_tasks[1].out
+    assert buffers.host_tasks[2].out == buffers.tensor_buffers.ptrs["out"]
+
+
+def test_scene_test_builds_cuda_persistent_unary_square_args():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_unary_square_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert len(buffers.host_tasks) == 3
+    assert list(buffers.host_fanin) == [0, 1, 1]
+    assert list(buffers.host_dependents) == [1, 2]
+    assert [(task.func_id, task.dependent_begin, task.dependent_count) for task in buffers.host_tasks] == [
+        (7, 0, 1),
+        (1, 1, 1),
+        (1, 2, 0),
+    ]
+    assert buffers.host_tasks[0].a == buffers.tensor_buffers.ptrs["a"]
+    assert buffers.host_tasks[0].b is None
+    assert buffers.host_tasks[1].a == buffers.host_tasks[0].out
+    assert buffers.host_tasks[1].b == buffers.tensor_buffers.ptrs["b"]
+    assert buffers.host_tasks[2].a == buffers.host_tasks[1].out
+    assert buffers.host_tasks[2].b == buffers.tensor_buffers.ptrs["a"]
     assert buffers.host_tasks[2].out == buffers.tensor_buffers.ptrs["out"]
 
 
@@ -1567,6 +1635,58 @@ def test_scene_test_runs_cuda_persistent_device_triad_with_ctypes_data(tmp_path)
         expected = [
             2.0 * args.a.to_list()[idx] * args.b.to_list()[idx] + args.c.to_list()[idx] for idx in range(len(actual))
         ]
+        assert actual == pytest.approx(expected)
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_unary_square_with_ctypes_data(tmp_path):
+    square_source = tmp_path / "square.pto.cu"
+    add_source = tmp_path / "add.pto.cu"
+    square_source.write_text(_PERSISTENT_SQUARE_BODY)
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentUnarySquareCtypesScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_unary_square_spec(square_source, add_source)
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            args = TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.25 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+            )
+            self.last_args = args
+            return args
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit post-run validation")
+
+    scene = CudaPersistentUnarySquareCtypesScene()
+    worker = CudaPersistentUnarySquareCtypesScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(
+            worker,
+            callable_obj,
+            CudaPersistentUnarySquareCtypesScene.CASES[0],
+            skip_golden=True,
+        )
+        args = scene.last_args
+        a_values = args.a.to_list()
+        b_values = args.b.to_list()
+        actual = args.out.to_list()
+        expected = [a_values[idx] * a_values[idx] + b_values[idx] + a_values[idx] for idx in range(len(actual))]
         assert actual == pytest.approx(expected)
     finally:
         worker.close()
