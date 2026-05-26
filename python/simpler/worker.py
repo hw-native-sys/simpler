@@ -934,16 +934,33 @@ class Worker:
             no COW constraint).  When called post-init, ChipCallables are
             prepared on the device immediately; pre-init registrations are
             batched and prepared at the end of ``init()``.
+
+        See docs/python-callable-serialization.md for the Python dynamic
+        register path and docs/callable-ipc-dynamic-register.md for the
+        ChipCallable binary path.
         """
         if self.level == 2 and not isinstance(target, ChipCallable):
             raise TypeError("Worker.register: level 2 only supports ChipCallable targets")
         if self.level >= 3:
-            self._wait_hierarchical_start_if_needed()
             if not isinstance(target, ChipCallable):
                 if not callable(target):
                     raise TypeError("Worker.register: non-ChipCallable target must be callable")
-                if self._initialized and getattr(self, "_hierarchical_started", False):
-                    return self._post_start_register_python(target)
+            with self._hierarchical_start_cv:
+                while self._hierarchical_start_state == "starting":
+                    self._hierarchical_start_cv.wait()
+                if self._hierarchical_start_state == "failed":
+                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+                if self._hierarchical_start_state != "started" and not getattr(
+                    self, "_hierarchical_started", False
+                ):
+                    with self._registry_lock:
+                        cid = self._allocate_cid()
+                        self._callable_registry[cid] = target
+                        if not isinstance(target, ChipCallable):
+                            self._py_callable_cids_seen.add(cid)
+                    return cid
+            if not isinstance(target, ChipCallable):
+                return self._post_start_register_python(target)
 
         with self._registry_lock:
             cid = self._allocate_cid()
@@ -971,15 +988,6 @@ class Worker:
             assert self._chip_worker is not None
             self._chip_worker.prepare_callable(cid, target)
         return cid
-
-    def _wait_hierarchical_start_if_needed(self) -> None:
-        if self.level < 3:
-            return
-        with self._hierarchical_start_cv:
-            while self._hierarchical_start_state == "starting":
-                self._hierarchical_start_cv.wait()
-            if self._hierarchical_start_state == "failed":
-                raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
 
     def _python_worker_types(self) -> list[WorkerType]:
         worker_types: list[WorkerType] = []
@@ -1023,13 +1031,12 @@ class Worker:
             return []
         assert self._worker is not None
         errors: list[str] = []
-        payload_bytes = payload if payload is not None else None
         for worker_type in worker_types:
             results = self._worker.broadcast_control_all(
                 worker_type,
                 int(sub_cmd),
                 int(cid),
-                payload_bytes,
+                payload,
                 timeout_s=self._py_control_timeout_s,
             )
             for result in results:
@@ -1108,6 +1115,7 @@ class Worker:
         assert self._worker is not None
         if cid in self._py_callable_cids_seen:
             self._broadcast_py_control(self._python_worker_types(), _CTRL_PY_UNREGISTER, cid, strict=True)
+            self._py_callable_cids_seen.discard(cid)
         self._worker.broadcast_register_all(int(cid), int(target.buffer_ptr()), int(target.buffer_size()))
 
     def unregister(self, cid: int) -> None:
@@ -1128,7 +1136,24 @@ class Worker:
         Raises:
           KeyError: cid was never registered.
         """
-        self._wait_hierarchical_start_if_needed()
+        if self.level >= 3:
+            with self._hierarchical_start_cv:
+                while self._hierarchical_start_state == "starting":
+                    self._hierarchical_start_cv.wait()
+                if self._hierarchical_start_state == "failed":
+                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+                if self._hierarchical_start_state != "started" and not getattr(
+                    self, "_hierarchical_started", False
+                ):
+                    with self._registry_lock:
+                        if cid not in self._callable_registry:
+                            raise KeyError(f"Worker.unregister: cid={cid} not registered")
+                        if cid in self._pending_unregister_cids:
+                            raise KeyError(f"Worker.unregister: cid={cid} already pending unregister")
+                        target = self._callable_registry.pop(cid)
+                        if not isinstance(target, ChipCallable):
+                            self._py_callable_cids_seen.discard(cid)
+                    return
         target = None
         with self._registry_lock:
             if cid not in self._callable_registry:
@@ -1294,23 +1319,24 @@ class Worker:
 
     def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
         """Fork child processes and start C++ scheduler. Called on first run()."""
-        with self._hierarchical_start_cv:
-            while self._hierarchical_start_state == "starting":
-                self._hierarchical_start_cv.wait()
-            if self._hierarchical_start_state == "started":
-                return
-            if self._hierarchical_start_state == "failed":
-                raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
-            self._hierarchical_start_state = "starting"
-
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
 
         try:
-            # Fork children from an immutable snapshot. Dynamic register callers
-            # that race this startup wait and then use the post-start path.
-            with self._registry_lock:
-                registry = dict(self._callable_registry)
+            # Fork children from an immutable snapshot. The state transition
+            # and snapshot are one gate, so dynamic register/unregister callers
+            # cannot return through the pre-start path after this point.
+            with self._hierarchical_start_cv:
+                while self._hierarchical_start_state == "starting":
+                    self._hierarchical_start_cv.wait()
+                if self._hierarchical_start_state == "started":
+                    return
+                if self._hierarchical_start_state == "failed":
+                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+                self._hierarchical_start_state = "starting"
+                with self._registry_lock:
+                    registry = dict(self._callable_registry)
+                self._hierarchical_start_cv.notify_all()
 
             # Fork SubWorker processes (MUST be before any C++ threads)
             for i in range(n_sub):

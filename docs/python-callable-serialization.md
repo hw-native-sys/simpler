@@ -318,11 +318,13 @@ The startup race is handled by a one-time hierarchical startup state, not by a
 run-wide quiescent guard:
 
 - `_hierarchical_start_state` is protected by a dedicated
-  `_hierarchical_start_mu` / `_hierarchical_start_cv`, separate from
-  `_registry_lock`.
-- Startup begins as `not_started`, moves to `starting` before
-  `_start_hierarchical()` takes the registry snapshot, and moves to `started`
-  only after child mailboxes are registered with the C++ Worker.
+  `_hierarchical_start_mu` / `_hierarchical_start_cv`; `_registry_lock`
+  protects only the registry contents.
+- Startup begins as `not_started`. `_start_hierarchical()` holds
+  `_hierarchical_start_cv`, then `_registry_lock`, while it moves to
+  `starting` and takes the registry snapshot. It releases `_registry_lock`
+  before any `os.fork()`, and moves to `started` only after child mailboxes
+  are registered with the C++ Worker.
 - A Python callable register/unregister that observes `starting` waits on a
   condition variable without holding `_registry_lock`. After startup succeeds,
   it uses the post-start control path; after startup fails, it raises.

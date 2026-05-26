@@ -207,6 +207,74 @@ class TestLifecycle:
                 hw._hierarchical_start_cv.wait = original_wait
             hw.close()
 
+    def test_register_blocks_startup_snapshot_from_not_started_window(self):
+        hw = Worker(level=3, num_sub_workers=0)
+        hw.init()
+
+        real_registry_lock = hw._registry_lock
+        register_waiting = threading.Event()
+        release_register = threading.Event()
+        startup_snapshot_attempted = threading.Event()
+        result: list[int] = []
+        errors: list[BaseException] = []
+
+        class BlockingRegistryLock:
+            def __enter__(self):
+                thread_name = threading.current_thread().name
+                if thread_name == "register-thread":
+                    register_waiting.set()
+                    if not release_register.wait(timeout=2.0):
+                        raise TimeoutError("test timed out waiting to release register")
+                elif thread_name == "startup-thread":
+                    startup_snapshot_attempted.set()
+                return real_registry_lock.__enter__()
+
+            def __exit__(self, exc_type, exc, tb):
+                return real_registry_lock.__exit__(exc_type, exc, tb)
+
+            def locked(self):
+                return real_registry_lock.locked()
+
+        hw._registry_lock = BlockingRegistryLock()
+
+        def do_register():
+            try:
+                result.append(hw.register(lambda args: None))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def do_startup():
+            try:
+                hw._start_hierarchical()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        register_thread = threading.Thread(target=do_register, name="register-thread")
+        startup_thread = threading.Thread(target=do_startup, name="startup-thread")
+        try:
+            register_thread.start()
+            assert register_waiting.wait(timeout=2.0)
+
+            startup_thread.start()
+            assert not startup_snapshot_attempted.wait(timeout=0.2)
+
+            release_register.set()
+            register_thread.join(timeout=2.0)
+            startup_thread.join(timeout=2.0)
+
+            assert not register_thread.is_alive()
+            assert not startup_thread.is_alive()
+            assert errors == []
+            assert result == [0]
+            assert startup_snapshot_attempted.is_set()
+            assert hw._hierarchical_start_state == "started"
+        finally:
+            release_register.set()
+            register_thread.join(timeout=2.0)
+            startup_thread.join(timeout=2.0)
+            hw._registry_lock = real_registry_lock
+            hw.close()
+
     def test_register_chip_callable_after_init_no_chips_succeeds(self):
         # With no chip children (device_ids unset), the C++ broadcast is a
         # no-op (next_level_threads_ is empty) — exercises the facade path
@@ -846,6 +914,16 @@ class TestLifecycle:
         assert cid == 0
         assert calls[0] == ("py_clear", [WorkerType.SUB], _CTRL_PY_UNREGISTER, 0, True)
         assert calls[1][0] == "binary_register"
+        assert 0 not in hw._py_callable_cids_seen
+
+        hw._callable_registry.pop(0)
+        calls.clear()
+
+        cid = hw.register(ChipCallable.build(signature=[], func_name="y", binary=b"\x00", children=[]))
+
+        assert cid == 0
+        assert len(calls) == 1
+        assert calls[0][0:2] == ("binary_register", 0)
 
     def test_chip_register_reuse_fails_before_binary_register_when_python_clear_fails(self):
         calls = []
