@@ -219,6 +219,10 @@ if (i < ctx->n) {{
 """.lstrip()
 
 
+def _float32(value: float) -> float:
+    return ctypes.c_float(value).value
+
+
 def _worker_expected_output(op: str, n: int) -> list[float]:
     if op == "add":
         return [float(3 * i) for i in range(n)]
@@ -227,7 +231,7 @@ def _worker_expected_output(op: str, n: int) -> list[float]:
     if op == "scale":
         return [float(i * 1.5) for i in range(n)]
     if op == "square":
-        return [float(i * i) for i in range(n)]
+        return [_float32(_float32(float(i)) * _float32(float(i))) for i in range(n)]
     if op == "axpy":
         return [float(1.5 * i + (2 * i)) for i in range(n)]
     raise ValueError(f"unknown worker smoke op: {op}")

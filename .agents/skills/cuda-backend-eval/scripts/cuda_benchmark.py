@@ -483,6 +483,14 @@ struct PtoTaskContext {
     )
 
 
+def _float32(value: float) -> float:
+    return ctypes.c_float(value).value
+
+
+def _expected_unary_square_output(n: int) -> list[float]:
+    return [_float32(_float32(float(i)) * _float32(float(i))) for i in range(n)]
+
+
 def run_pto_compiler_sample(device: int, n: int, block_dim: int, arch: str) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="pto_cuda_compiler_") as td:
         work_dir = Path(td)
@@ -637,7 +645,7 @@ def run_pto_unary_square_sample(device: int, n: int, block_dim: int, arch: str) 
                     raise RuntimeError("run_prepared failed")
                 if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_out), dev_out, nbytes) != 0:
                     raise RuntimeError("copy_from_device failed")
-                if list(host_out) != [float(i * i) for i in range(n)]:
+                if list(host_out) != _expected_unary_square_output(n):
                     raise RuntimeError("unary square host-schedule output mismatch")
                 if runtime.unregister_callable(ctx, 0) != 0:
                     raise RuntimeError("unregister_callable failed")

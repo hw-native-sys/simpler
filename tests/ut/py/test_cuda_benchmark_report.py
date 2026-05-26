@@ -972,6 +972,15 @@ def test_cuda_worker_smoke_generates_square_task_body():
     assert "ctx->alpha" not in body
 
 
+def test_cuda_worker_smoke_square_expected_output_uses_float32_rounding():
+    cuda_smoke = _load_smoke_module()
+
+    expected = cuda_smoke._worker_expected_output("square", 65536)
+
+    assert expected[-1] == ctypes.c_float(float(65535) * float(65535)).value
+    assert expected[-1] != float(65535 * 65535)
+
+
 def test_cuda_worker_smoke_generates_axpy_task_body():
     cuda_smoke = _load_smoke_module()
 
@@ -1313,6 +1322,37 @@ def test_cuda_current_summary_renders_launch_table():
     assert "| GPU | N | PTO host ns | Compiler ns | Driver ns | Graph ns | Compiler/PTO | Graph/PTO |" in table
     assert "| A100 | 1024 | 1000 | 900 | 1200 | 500 | 0.90x | 0.50x |" in table
     assert "| H200 | 1024 | 800 | 840 | 880 | 400 | 1.05x | 0.50x |" in table
+
+
+def test_cuda_current_summary_renders_unary_square_table():
+    cuda_current_summary = _load_current_summary_module()
+    payload = {
+        "results": [
+            {
+                "machine": "hina",
+                "baseline": "pto_host_schedule_unary_square",
+                "n": 65536,
+                "device_wall_ns": 3000,
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_host_schedule_unary_square",
+                "n": 65536,
+                "device_wall_ns": 1000,
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_host_schedule_unary_square",
+                "n": 65536,
+                "device_wall_ns": 2000,
+            },
+        ],
+    }
+
+    table = cuda_current_summary.render_unary_square_table(payload)
+
+    assert "| GPU | N | Unary square ns |" in table
+    assert "| A100 | 65536 | 2000 |" in table
 
 
 def test_cuda_current_summary_renders_worker_and_dag_tables():
@@ -2020,6 +2060,15 @@ def test_run_single_sample_dispatches_unary_square_host_schedule(monkeypatch):
 
     assert seen["args"] == (3, 1024, 128, "compute_80")
     assert result["baseline"] == "pto_host_schedule_unary_square"
+
+
+def test_unary_square_benchmark_expected_output_uses_float32_rounding():
+    cuda_benchmark = _load_benchmark_module()
+
+    expected = cuda_benchmark._expected_unary_square_output(65536)
+
+    assert expected[-1] == ctypes.c_float(float(65535) * float(65535)).value
+    assert expected[-1] != float(65535 * 65535)
 
 
 def test_compile_compiler_host_schedule_artifact_uses_discovered_nvcc(tmp_path, monkeypatch):

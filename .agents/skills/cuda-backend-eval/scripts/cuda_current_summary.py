@@ -121,6 +121,22 @@ def render_launch_table(payload: Payload) -> str:
     )
 
 
+def render_unary_square_table(payload: Payload) -> str:
+    summary = summarize_results(payload)
+    rows: list[list[str | int]] = []
+    for machine in _machines(summary):
+        keys = [key for key in summary if key[0] == machine and key[1] == "pto_host_schedule_unary_square"]
+        for _, _, n, _, _ in sorted(keys, key=lambda key: key[2]):
+            rows.append(
+                [
+                    _machine_label(machine),
+                    n,
+                    _median(summary, (machine, "pto_host_schedule_unary_square", n, 1, 1)),
+                ]
+            )
+    return _table(["GPU", "N", "Unary square ns"], rows)
+
+
 def render_worker_grid_table(payload: Payload) -> str:
     summary = summarize_results(payload)
     rows: list[list[str | int]] = []
@@ -175,6 +191,8 @@ def render_summary(payload: Payload) -> str:
         [
             "## Launch Baselines",
             render_launch_table(payload),
+            "## Unary Host-Schedule Row",
+            render_unary_square_table(payload),
             "## Worker Grid Rows",
             render_worker_grid_table(payload),
             "## Persistent DAG Shapes",
@@ -188,7 +206,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("json_path", type=Path)
     parser.add_argument(
         "--section",
-        choices=("all", "launch", "worker-grid", "dag-shapes"),
+        choices=("all", "launch", "unary-square", "worker-grid", "dag-shapes"),
         default="all",
     )
     return parser.parse_args(argv)
@@ -199,6 +217,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     payload = json.loads(args.json_path.read_text())
     if args.section == "launch":
         print(render_launch_table(payload))
+    elif args.section == "unary-square":
+        print(render_unary_square_table(payload))
     elif args.section == "worker-grid":
         print(render_worker_grid_table(payload))
     elif args.section == "dag-shapes":
