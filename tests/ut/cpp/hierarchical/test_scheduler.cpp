@@ -18,7 +18,9 @@
 #include <cstring>
 #include <iterator>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "call_config.h"
@@ -56,9 +58,19 @@ struct MockMailboxWorker {
         uint64_t tensor_key;  // first tensor's `data` field (unique per submit in tests)
     };
 
+    struct ControlRecord {
+        uint64_t command;
+        uint64_t offset;
+        uint64_t nbytes;
+        std::vector<uint8_t> payload;
+    };
+
     alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
     std::vector<Record> dispatched;
     std::mutex dispatched_mu;
+    std::vector<ControlRecord> controls;
+    std::vector<uint8_t> shared_memory_data;
+    std::mutex control_mu;
 
     std::mutex run_mu;
     std::condition_variable run_cv;
@@ -165,12 +177,46 @@ private:
             } else if (s == MailboxState::CONTROL_REQUEST) {
                 // Acknowledge the control request so a future test using
                 // WorkerThread::control_* doesn't hang on the spin-poll.
-                // No memory operation is simulated — result stays zero.
                 int32_t zero_err = 0;
                 std::memcpy(mailbox.data() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
                 std::memset(mailbox.data() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
                 uint64_t zero_result = 0;
                 std::memcpy(mailbox.data() + CTRL_OFF_RESULT, &zero_result, sizeof(uint64_t));
+                uint64_t command = 0;
+                uint64_t offset = 0;
+                uint64_t nbytes = 0;
+                std::memcpy(&command, mailbox.data() + MAILBOX_OFF_CALLABLE, sizeof(uint64_t));
+                std::memcpy(&offset, mailbox.data() + CTRL_OFF_ARG1, sizeof(uint64_t));
+                std::memcpy(&nbytes, mailbox.data() + CTRL_OFF_ARG2, sizeof(uint64_t));
+                {
+                    std::lock_guard<std::mutex> lk(control_mu);
+                    ControlRecord rec{command, offset, nbytes, {}};
+                    if (command == CTRL_SHARED_MEMORY_INFO) {
+                        uint64_t data_bytes = shared_memory_data.size();
+                        uint64_t signal_count = 2;
+                        uint64_t flags = 0;
+                        std::memcpy(mailbox.data() + CTRL_OFF_ARG2, &data_bytes, sizeof(uint64_t));
+                        std::memcpy(mailbox.data() + CTRL_OFF_ARG3, &signal_count, sizeof(uint64_t));
+                        std::memcpy(mailbox.data() + CTRL_OFF_ARG4, &flags, sizeof(uint64_t));
+                    } else if (command == CTRL_SHARED_MEMORY_WRITE && nbytes != 0) {
+                        rec.payload.resize(static_cast<size_t>(nbytes));
+                        std::memcpy(rec.payload.data(), mailbox.data() + CTRL_OFF_PAYLOAD, static_cast<size_t>(nbytes));
+                        if (offset + nbytes > shared_memory_data.size()) shared_memory_data.resize(offset + nbytes);
+                        std::memcpy(
+                            shared_memory_data.data() + offset, mailbox.data() + CTRL_OFF_PAYLOAD,
+                            static_cast<size_t>(nbytes)
+                        );
+                    } else if (command == CTRL_SHARED_MEMORY_READ) {
+                        if (offset + nbytes <= shared_memory_data.size() && nbytes != 0) {
+                            std::memcpy(
+                                mailbox.data() + CTRL_OFF_PAYLOAD, shared_memory_data.data() + offset,
+                                static_cast<size_t>(nbytes)
+                            );
+                        }
+                        std::memcpy(mailbox.data() + CTRL_OFF_RESULT, &nbytes, sizeof(uint64_t));
+                    }
+                    controls.push_back(std::move(rec));
+                }
                 write_state(MailboxState::CONTROL_DONE);
             } else if (s == MailboxState::SHUTDOWN) {
                 return;
@@ -264,6 +310,88 @@ struct SchedulerFixture : public ::testing::Test {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+TEST_F(SchedulerFixture, SharedMemoryReadChunksOverMailboxPayload) {
+    const uint64_t offset = 5;
+    const size_t nbytes = CTRL_PAYLOAD_CAPACITY * 2 + 17;
+    mock_worker.shared_memory_data.resize(static_cast<size_t>(offset) + nbytes);
+    for (size_t i = 0; i < mock_worker.shared_memory_data.size(); ++i) {
+        mock_worker.shared_memory_data[i] = static_cast<uint8_t>(i % 251);
+    }
+
+    auto *wt = manager.get_worker(WorkerType::NEXT_LEVEL, 0);
+    ASSERT_NE(wt, nullptr);
+    std::vector<uint8_t> out = wt->control_shared_memory_read(0x42, offset, nbytes);
+
+    ASSERT_EQ(out.size(), nbytes);
+    EXPECT_EQ(
+        out, std::vector<uint8_t>(
+                 mock_worker.shared_memory_data.begin() + static_cast<ptrdiff_t>(offset),
+                 mock_worker.shared_memory_data.begin() + static_cast<ptrdiff_t>(offset + nbytes)
+             )
+    );
+    std::lock_guard<std::mutex> lk(mock_worker.control_mu);
+    ASSERT_EQ(mock_worker.controls.size(), 4u);
+    EXPECT_EQ(mock_worker.controls[0].command, CTRL_SHARED_MEMORY_INFO);
+    EXPECT_EQ(mock_worker.controls[1].command, CTRL_SHARED_MEMORY_READ);
+    EXPECT_EQ(mock_worker.controls[1].offset, offset);
+    EXPECT_EQ(mock_worker.controls[1].nbytes, CTRL_PAYLOAD_CAPACITY);
+    EXPECT_EQ(mock_worker.controls[2].offset, offset + CTRL_PAYLOAD_CAPACITY);
+    EXPECT_EQ(mock_worker.controls[2].nbytes, CTRL_PAYLOAD_CAPACITY);
+    EXPECT_EQ(mock_worker.controls[3].offset, offset + CTRL_PAYLOAD_CAPACITY * 2);
+    EXPECT_EQ(mock_worker.controls[3].nbytes, 17u);
+}
+
+TEST_F(SchedulerFixture, SharedMemoryReadRejectsOutOfRangeBeforeChunkRead) {
+    mock_worker.shared_memory_data.resize(32);
+
+    auto *wt = manager.get_worker(WorkerType::NEXT_LEVEL, 0);
+    ASSERT_NE(wt, nullptr);
+    EXPECT_THROW(static_cast<void>(wt->control_shared_memory_read(0x42, 28, 8)), std::out_of_range);
+
+    std::lock_guard<std::mutex> lk(mock_worker.control_mu);
+    ASSERT_EQ(mock_worker.controls.size(), 1u);
+    EXPECT_EQ(mock_worker.controls[0].command, CTRL_SHARED_MEMORY_INFO);
+}
+
+TEST_F(SchedulerFixture, SharedMemoryWriteChunksOverMailboxPayload) {
+    const uint64_t offset = 7;
+    std::vector<uint8_t> payload(CTRL_PAYLOAD_CAPACITY * 2 + 19);
+    for (size_t i = 0; i < payload.size(); ++i)
+        payload[i] = static_cast<uint8_t>(i % 253);
+
+    auto *wt = manager.get_worker(WorkerType::NEXT_LEVEL, 0);
+    ASSERT_NE(wt, nullptr);
+    wt->control_shared_memory_write(0x43, offset, payload.data(), payload.size());
+
+    std::lock_guard<std::mutex> lk(mock_worker.control_mu);
+    ASSERT_EQ(mock_worker.controls.size(), 3u);
+    EXPECT_EQ(mock_worker.controls[0].command, CTRL_SHARED_MEMORY_WRITE);
+    EXPECT_EQ(mock_worker.controls[0].offset, offset);
+    EXPECT_EQ(mock_worker.controls[0].nbytes, CTRL_PAYLOAD_CAPACITY);
+    EXPECT_EQ(
+        mock_worker.controls[0].payload, std::vector<uint8_t>(payload.begin(), payload.begin() + CTRL_PAYLOAD_CAPACITY)
+    );
+    EXPECT_EQ(mock_worker.controls[1].offset, offset + CTRL_PAYLOAD_CAPACITY);
+    EXPECT_EQ(mock_worker.controls[1].nbytes, CTRL_PAYLOAD_CAPACITY);
+    EXPECT_EQ(
+        mock_worker.controls[1].payload,
+        std::vector<uint8_t>(payload.begin() + CTRL_PAYLOAD_CAPACITY, payload.begin() + CTRL_PAYLOAD_CAPACITY * 2)
+    );
+    EXPECT_EQ(mock_worker.controls[2].offset, offset + CTRL_PAYLOAD_CAPACITY * 2);
+    EXPECT_EQ(mock_worker.controls[2].nbytes, 19u);
+    EXPECT_EQ(
+        mock_worker.controls[2].payload,
+        std::vector<uint8_t>(payload.begin() + CTRL_PAYLOAD_CAPACITY * 2, payload.end())
+    );
+    EXPECT_EQ(
+        std::vector<uint8_t>(
+            mock_worker.shared_memory_data.begin() + static_cast<ptrdiff_t>(offset),
+            mock_worker.shared_memory_data.begin() + static_cast<ptrdiff_t>(offset + payload.size())
+        ),
+        payload
+    );
+}
 
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
     auto args_a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);

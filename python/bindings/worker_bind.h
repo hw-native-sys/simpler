@@ -30,6 +30,8 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "ring.h"
 #include "orchestrator.h"
@@ -160,6 +162,104 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("size"), "Copy worker src to host dst."
         )
         .def(
+            "open_channel",
+            [](Orchestrator &self, int worker_id, uint32_t cpu_to_l2_lanes, uint32_t l2_to_cpu_lanes,
+               uint32_t lane_depth, uint32_t max_message_bytes) {
+                return self.open_channel(worker_id, cpu_to_l2_lanes, l2_to_cpu_lanes, lane_depth, max_message_bytes);
+            },
+            nb::arg("worker_id"), nb::arg("cpu_to_l2_lanes") = 1, nb::arg("l2_to_cpu_lanes") = 1,
+            nb::arg("lane_depth") = 64, nb::arg("max_message_bytes") = 256,
+            "Open a host/device message channel on a next-level worker."
+        )
+        .def(
+            "close_channel",
+            [](Orchestrator &self, int worker_id, uint64_t channel) {
+                self.close_channel(worker_id, channel);
+            },
+            nb::arg("worker_id"), nb::arg("channel"), "Close a host/device message channel."
+        )
+        .def(
+            "channel_send",
+            [](Orchestrator &self, int worker_id, uint64_t channel, uint32_t route, nb::bytes data,
+               uint64_t correlation_id) {
+                self.channel_send(worker_id, channel, route, data.c_str(), data.size(), correlation_id);
+            },
+            nb::arg("worker_id"), nb::arg("channel"), nb::arg("route"), nb::arg("data"), nb::arg("correlation_id") = 0,
+            "Send a message through a host/device channel."
+        )
+        .def(
+            "channel_recv",
+            [](Orchestrator &self, int worker_id, uint64_t channel, size_t capacity, uint32_t timeout_us) {
+                uint32_t route = 0;
+                uint64_t correlation_id = 0;
+                auto data = self.channel_recv(worker_id, channel, capacity, timeout_us, &route, &correlation_id);
+                return nb::make_tuple(
+                    nb::bytes(reinterpret_cast<const char *>(data.data()), data.size()), route, correlation_id
+                );
+            },
+            nb::arg("worker_id"), nb::arg("channel"), nb::arg("capacity") = 256, nb::arg("timeout_us") = 0,
+            "Receive a message through a host/device channel."
+        )
+        .def(
+            "open_shared_memory",
+            [](Orchestrator &self, int worker_id, uint64_t data_bytes, uint32_t signal_count, uint32_t flags) {
+                return self.open_shared_memory(worker_id, data_bytes, signal_count, flags);
+            },
+            nb::arg("worker_id"), nb::arg("data_bytes"), nb::arg("signal_count") = 2, nb::arg("flags") = 0,
+            "Open a host/device shared-memory region on a next-level worker."
+        )
+        .def(
+            "close_shared_memory",
+            [](Orchestrator &self, int worker_id, uint64_t memory) {
+                self.close_shared_memory(worker_id, memory);
+            },
+            nb::arg("worker_id"), nb::arg("memory"), "Close a host/device shared-memory region."
+        )
+        .def(
+            "shared_memory_info",
+            [](Orchestrator &self, int worker_id, uint64_t memory) {
+                HostDeviceMemoryInfo info = self.shared_memory_info(worker_id, memory);
+                return nb::make_tuple(info.host_ptr, info.device_ptr, info.data_bytes, info.signal_count, info.flags);
+            },
+            nb::arg("worker_id"), nb::arg("memory"),
+            "Return shared-memory metadata. host_ptr is 0 for hierarchical mailbox callers."
+        )
+        .def(
+            "shared_memory_read",
+            [](Orchestrator &self, int worker_id, uint64_t memory, uint64_t offset, size_t nbytes) {
+                auto data = self.shared_memory_read(worker_id, memory, offset, nbytes);
+                return nb::bytes(reinterpret_cast<const char *>(data.data()), data.size());
+            },
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("offset"), nb::arg("nbytes"),
+            "Read shared-memory bytes via chunked mailbox RPC. Returns a full materialized bytes object; this is "
+            "not streaming or zero-copy."
+        )
+        .def(
+            "shared_memory_write",
+            [](Orchestrator &self, int worker_id, uint64_t memory, uint64_t offset, nb::bytes data) {
+                std::string payload(data.c_str(), data.size());
+                std::vector<uint8_t> bytes(payload.begin(), payload.end());
+                self.shared_memory_write(worker_id, memory, offset, bytes);
+            },
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("offset"), nb::arg("data"),
+            "Write shared-memory bytes via chunked mailbox RPC. This is not streaming or zero-copy."
+        )
+        .def(
+            "shared_memory_notify",
+            [](Orchestrator &self, int worker_id, uint64_t memory, uint32_t signal_id, uint64_t value) {
+                self.shared_memory_notify(worker_id, memory, signal_id, value);
+            },
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("signal_id"), nb::arg("value")
+        )
+        .def(
+            "shared_memory_wait",
+            [](Orchestrator &self, int worker_id, uint64_t memory, uint32_t signal_id, uint64_t target,
+               uint32_t timeout_us) {
+                self.shared_memory_wait(worker_id, memory, signal_id, target, timeout_us);
+            },
+            nb::arg("worker_id"), nb::arg("memory"), nb::arg("signal_id"), nb::arg("target"), nb::arg("timeout_us") = 0
+        )
+        .def(
             "alloc",
             [](Orchestrator &self, const std::vector<uint32_t> &shape, DataType dtype) {
                 return self.alloc(shape, dtype);
@@ -269,6 +369,38 @@ inline void bind_worker(nb::module_ &m) {
     m.attr("MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
     m.attr("MAILBOX_OFF_ERROR_MSG") = static_cast<int>(MAILBOX_OFF_ERROR_MSG);
     m.attr("MAILBOX_ERROR_MSG_SIZE") = static_cast<int>(MAILBOX_ERROR_MSG_SIZE);
+    m.attr("MAILBOX_OFF_ARGS") = static_cast<int>(MAILBOX_OFF_ARGS);
+    m.attr("MAILBOX_ARGS_CAPACITY") = static_cast<int>(MAILBOX_ARGS_CAPACITY);
+    m.attr("CTRL_MALLOC") = static_cast<uint64_t>(CTRL_MALLOC);
+    m.attr("CTRL_FREE") = static_cast<uint64_t>(CTRL_FREE);
+    m.attr("CTRL_COPY_TO") = static_cast<uint64_t>(CTRL_COPY_TO);
+    m.attr("CTRL_COPY_FROM") = static_cast<uint64_t>(CTRL_COPY_FROM);
+    m.attr("CTRL_PREPARE") = static_cast<uint64_t>(CTRL_PREPARE);
+    m.attr("CTRL_REGISTER") = static_cast<uint64_t>(CTRL_REGISTER);
+    m.attr("CTRL_UNREGISTER") = static_cast<uint64_t>(CTRL_UNREGISTER);
+    m.attr("CTRL_ALLOC_DOMAIN") = static_cast<uint64_t>(CTRL_ALLOC_DOMAIN);
+    m.attr("CTRL_RELEASE_DOMAIN") = static_cast<uint64_t>(CTRL_RELEASE_DOMAIN);
+    m.attr("CTRL_COMM_INIT") = static_cast<uint64_t>(CTRL_COMM_INIT);
+    m.attr("CTRL_OPEN_CHANNEL") = static_cast<uint64_t>(CTRL_OPEN_CHANNEL);
+    m.attr("CTRL_CLOSE_CHANNEL") = static_cast<uint64_t>(CTRL_CLOSE_CHANNEL);
+    m.attr("CTRL_CHANNEL_SEND") = static_cast<uint64_t>(CTRL_CHANNEL_SEND);
+    m.attr("CTRL_CHANNEL_RECV") = static_cast<uint64_t>(CTRL_CHANNEL_RECV);
+    m.attr("CTRL_OPEN_SHARED_MEMORY") = static_cast<uint64_t>(CTRL_OPEN_SHARED_MEMORY);
+    m.attr("CTRL_CLOSE_SHARED_MEMORY") = static_cast<uint64_t>(CTRL_CLOSE_SHARED_MEMORY);
+    m.attr("CTRL_SHARED_MEMORY_INFO") = static_cast<uint64_t>(CTRL_SHARED_MEMORY_INFO);
+    m.attr("CTRL_SHARED_MEMORY_READ") = static_cast<uint64_t>(CTRL_SHARED_MEMORY_READ);
+    m.attr("CTRL_SHARED_MEMORY_WRITE") = static_cast<uint64_t>(CTRL_SHARED_MEMORY_WRITE);
+    m.attr("CTRL_SHARED_MEMORY_NOTIFY") = static_cast<uint64_t>(CTRL_SHARED_MEMORY_NOTIFY);
+    m.attr("CTRL_SHARED_MEMORY_WAIT") = static_cast<uint64_t>(CTRL_SHARED_MEMORY_WAIT);
+    m.attr("CTRL_OFF_ARG0") = static_cast<int>(CTRL_OFF_ARG0);
+    m.attr("CTRL_OFF_ARG1") = static_cast<int>(CTRL_OFF_ARG1);
+    m.attr("CTRL_OFF_ARG2") = static_cast<int>(CTRL_OFF_ARG2);
+    m.attr("CTRL_OFF_RESULT") = static_cast<int>(CTRL_OFF_RESULT);
+    m.attr("CTRL_OFF_ARG3") = static_cast<int>(CTRL_OFF_ARG3);
+    m.attr("CTRL_OFF_ARG4") = static_cast<int>(CTRL_OFF_ARG4);
+    m.attr("CTRL_OFF_PAYLOAD") = static_cast<int>(CTRL_OFF_PAYLOAD);
+    m.attr("CTRL_PAYLOAD_CAPACITY") = static_cast<int>(CTRL_PAYLOAD_CAPACITY);
+    m.attr("CTRL_SHM_NAME_BYTES") = static_cast<int>(CTRL_SHM_NAME_BYTES);
     m.attr("MAX_RING_DEPTH") = static_cast<int32_t>(MAX_RING_DEPTH);
     m.attr("MAX_SCOPE_DEPTH") = static_cast<int32_t>(MAX_SCOPE_DEPTH);
 

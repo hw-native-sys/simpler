@@ -32,6 +32,8 @@ nanobind_add_module(_task_interface ${BINDING_SOURCES} ${HIERARCHICAL_SOURCES})
 
 target_sources(_task_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_worker.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/worker/host_device_channel.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/worker/host_device_memory.cpp
 )
 
 target_include_directories(_task_interface PRIVATE

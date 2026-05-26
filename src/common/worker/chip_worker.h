@@ -19,6 +19,8 @@
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
+#include "host_device_channel.h"
+#include "host_device_memory.h"
 #include "pto_runtime_c_api.h"
 #include "types.h"
 
@@ -80,6 +82,31 @@ public:
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
+    uint64_t open_channel(const HostDeviceChannelConfig &cfg);
+    void close_channel(uint64_t ch);
+    void channel_send(
+        uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
+    );
+    std::vector<uint8_t>
+    channel_recv(uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *out_route, uint64_t *out_correlation_id);
+    void channel_send_l2_for_test(
+        uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
+    );
+    std::vector<uint8_t> channel_recv_l2_for_test(
+        uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *out_route, uint64_t *out_correlation_id
+    );
+
+    uint64_t open_shared_memory(const HostDeviceMemoryConfig &cfg);
+    void close_shared_memory(uint64_t mem);
+    HostDeviceMemoryInfo shared_memory_info(uint64_t mem);
+    std::vector<uint8_t> shared_memory_read(uint64_t mem, uint64_t offset, size_t nbytes);
+    void shared_memory_write(uint64_t mem, uint64_t offset, const void *data, size_t nbytes);
+    void shared_memory_notify(uint64_t mem, uint32_t signal_id, uint64_t value);
+    void shared_memory_wait(uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us);
+    std::vector<uint8_t> shared_memory_read_l2_for_test(uint64_t mem, uint64_t offset, size_t nbytes);
+    void shared_memory_write_l2_for_test(uint64_t mem, uint64_t offset, const void *data, size_t nbytes);
+    void shared_memory_notify_l2_for_test(uint64_t mem, uint32_t signal_id, uint64_t value);
+    void shared_memory_wait_l2_for_test(uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us);
 
     /// Distributed communication primitives (optional — only available when
     /// the bound runtime exports comm_*).  Wraps the backend-neutral C API
@@ -134,6 +161,17 @@ private:
     using DeviceFreeCtxFn = void (*)(void *, void *);
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
+    using OpenHostDeviceChannelCtxFn = void *(*)(void *, const HostDeviceChannelConfig *);
+    using CloseHostDeviceChannelCtxFn = int (*)(void *, void *);
+    using HostDeviceSendCtxFn = int (*)(void *, void *, uint32_t, const void *, size_t, uint64_t, uint32_t);
+    using HostDeviceRecvCtxFn = int (*)(void *, void *, void *, size_t, size_t *, uint64_t *, uint32_t *, uint32_t);
+    using OpenHostDeviceMemoryCtxFn = void *(*)(void *, const HostDeviceMemoryConfig *);
+    using CloseHostDeviceMemoryCtxFn = int (*)(void *, void *);
+    using HostDeviceMemoryInfoCtxFn = int (*)(void *, void *, HostDeviceMemoryInfo *);
+    using HostDeviceMemoryReadCtxFn = int (*)(void *, void *, uint64_t, void *, size_t);
+    using HostDeviceMemoryWriteCtxFn = int (*)(void *, void *, uint64_t, const void *, size_t);
+    using HostDeviceMemoryNotifyCtxFn = int (*)(void *, void *, uint32_t, uint64_t);
+    using HostDeviceMemoryWaitCtxFn = int (*)(void *, void *, uint32_t, uint64_t, uint32_t);
     using GetRuntimeSizeFn = size_t (*)();
     // From host_runtime.so. Single platform-side init that does (a) thread
     // attach + device-id record, (b) executor binary takeover, (c) onboard
@@ -183,6 +221,17 @@ private:
     DeviceFreeCtxFn device_free_ctx_fn_ = nullptr;
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
+    OpenHostDeviceChannelCtxFn open_host_device_channel_ctx_fn_ = nullptr;
+    CloseHostDeviceChannelCtxFn close_host_device_channel_ctx_fn_ = nullptr;
+    HostDeviceSendCtxFn host_device_send_ctx_fn_ = nullptr;
+    HostDeviceRecvCtxFn host_device_recv_ctx_fn_ = nullptr;
+    OpenHostDeviceMemoryCtxFn open_host_device_memory_ctx_fn_ = nullptr;
+    CloseHostDeviceMemoryCtxFn close_host_device_memory_ctx_fn_ = nullptr;
+    HostDeviceMemoryInfoCtxFn host_device_memory_info_ctx_fn_ = nullptr;
+    HostDeviceMemoryReadCtxFn host_device_memory_read_ctx_fn_ = nullptr;
+    HostDeviceMemoryWriteCtxFn host_device_memory_write_ctx_fn_ = nullptr;
+    HostDeviceMemoryNotifyCtxFn host_device_memory_notify_ctx_fn_ = nullptr;
+    HostDeviceMemoryWaitCtxFn host_device_memory_wait_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     SimplerInitFn simpler_init_fn_ = nullptr;
     PrepareCallableFn prepare_callable_fn_ = nullptr;

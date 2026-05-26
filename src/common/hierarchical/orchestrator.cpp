@@ -54,6 +54,80 @@ void Orchestrator::copy_from(int worker_id, uint64_t dst, uint64_t src, size_t s
     wt->control_copy_from(dst, src, size);
 }
 
+uint64_t Orchestrator::open_channel(
+    int worker_id, uint32_t cpu_to_l2_lanes, uint32_t l2_to_cpu_lanes, uint32_t lane_depth, uint32_t max_message_bytes
+) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::open_channel: invalid worker_id");
+    return wt->control_open_channel(cpu_to_l2_lanes, l2_to_cpu_lanes, lane_depth, max_message_bytes);
+}
+
+void Orchestrator::close_channel(int worker_id, uint64_t ch) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::close_channel: invalid worker_id");
+    wt->control_close_channel(ch);
+}
+
+void Orchestrator::channel_send(
+    int worker_id, uint64_t ch, uint32_t route, const void *data, size_t size, uint64_t correlation_id
+) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::channel_send: invalid worker_id");
+    wt->control_channel_send(ch, route, data, size, correlation_id);
+}
+
+std::vector<uint8_t> Orchestrator::channel_recv(
+    int worker_id, uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *route, uint64_t *correlation_id
+) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::channel_recv: invalid worker_id");
+    return wt->control_channel_recv(ch, capacity, timeout_us, route, correlation_id);
+}
+
+uint64_t Orchestrator::open_shared_memory(int worker_id, uint64_t data_bytes, uint32_t signal_count, uint32_t flags) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::open_shared_memory: invalid worker_id");
+    return wt->control_open_shared_memory(data_bytes, signal_count, flags);
+}
+
+void Orchestrator::close_shared_memory(int worker_id, uint64_t mem) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::close_shared_memory: invalid worker_id");
+    wt->control_close_shared_memory(mem);
+}
+
+HostDeviceMemoryInfo Orchestrator::shared_memory_info(int worker_id, uint64_t mem) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::shared_memory_info: invalid worker_id");
+    return wt->control_shared_memory_info(mem);
+}
+
+std::vector<uint8_t> Orchestrator::shared_memory_read(int worker_id, uint64_t mem, uint64_t offset, size_t nbytes) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::shared_memory_read: invalid worker_id");
+    return wt->control_shared_memory_read(mem, offset, nbytes);
+}
+
+void Orchestrator::shared_memory_write(int worker_id, uint64_t mem, uint64_t offset, const std::vector<uint8_t> &data) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::shared_memory_write: invalid worker_id");
+    wt->control_shared_memory_write(mem, offset, data.data(), data.size());
+}
+
+void Orchestrator::shared_memory_notify(int worker_id, uint64_t mem, uint32_t signal_id, uint64_t value) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::shared_memory_notify: invalid worker_id");
+    wt->control_shared_memory_notify(mem, signal_id, value);
+}
+
+void Orchestrator::shared_memory_wait(
+    int worker_id, uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
+) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::shared_memory_wait: invalid worker_id");
+    wt->control_shared_memory_wait(mem, signal_id, target, timeout_us);
+}
+
 TaskSlotState &Orchestrator::slot_state(TaskSlot s) {
     TaskSlotState *p = allocator_->slot_state(s);
     if (!p) throw std::runtime_error("Orchestrator::slot_state: invalid slot id");

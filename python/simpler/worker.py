@@ -65,6 +65,38 @@ from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Optional
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    CTRL_ALLOC_DOMAIN,
+    CTRL_CHANNEL_RECV,
+    CTRL_CHANNEL_SEND,
+    CTRL_CLOSE_CHANNEL,
+    CTRL_CLOSE_SHARED_MEMORY,
+    CTRL_COMM_INIT,
+    CTRL_COPY_FROM,
+    CTRL_COPY_TO,
+    CTRL_FREE,
+    CTRL_MALLOC,
+    CTRL_OFF_ARG0,
+    CTRL_OFF_ARG1,
+    CTRL_OFF_ARG2,
+    CTRL_OFF_ARG3,
+    CTRL_OFF_ARG4,
+    CTRL_OFF_PAYLOAD,
+    CTRL_OFF_RESULT,
+    CTRL_OPEN_CHANNEL,
+    CTRL_OPEN_SHARED_MEMORY,
+    CTRL_PAYLOAD_CAPACITY,
+    CTRL_PREPARE,
+    CTRL_REGISTER,
+    CTRL_RELEASE_DOMAIN,
+    CTRL_SHARED_MEMORY_INFO,
+    CTRL_SHARED_MEMORY_NOTIFY,
+    CTRL_SHARED_MEMORY_READ,
+    CTRL_SHARED_MEMORY_WAIT,
+    CTRL_SHARED_MEMORY_WRITE,
+    CTRL_SHM_NAME_BYTES,
+    CTRL_UNREGISTER,
+    MAILBOX_ARGS_CAPACITY,
+    MAILBOX_OFF_ARGS,
     MAX_REGISTERED_CALLABLE_IDS,
     RunTiming,
     _mailbox_load_i32,
@@ -116,12 +148,14 @@ _CFG_FMT = struct.Struct("=iiiiii1024s")
 # Args region starts after CONFIG, rounded up to 8 bytes so the first
 # ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
-_OFF_ARGS = (_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
+_PY_OFF_ARGS = (_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
+assert _PY_OFF_ARGS == MAILBOX_OFF_ARGS, "CallConfig mailbox layout drifted"
+_OFF_ARGS = MAILBOX_OFF_ARGS
 assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for ContinuousTensor.data"
-# MAILBOX_ARGS_CAPACITY mirrors the C++ constexpr in worker_manager.h so the
-# Python reader can bounds-check incoming args blobs. Source-of-truth for the
-# constants on the right is the nanobind binding (cannot drift).
-_MAILBOX_ARGS_CAPACITY = MAILBOX_SIZE - _OFF_ARGS - MAILBOX_ERROR_MSG_SIZE
+# MAILBOX_ARGS_CAPACITY comes from the nanobind binding so the Python reader
+# can bounds-check incoming args blobs against the C++ mailbox layout.
+_MAILBOX_ARGS_CAPACITY = MAILBOX_ARGS_CAPACITY
+assert _MAILBOX_ARGS_CAPACITY == MAILBOX_SIZE - _OFF_ARGS - MAILBOX_ERROR_MSG_SIZE
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
 
@@ -133,40 +167,53 @@ _CONTROL_REQUEST = 4
 _CONTROL_DONE = 5
 
 # Control sub-commands (written at _OFF_CALLABLE as uint64)
-_CTRL_MALLOC = 0
-_CTRL_FREE = 1
-_CTRL_COPY_TO = 2
-_CTRL_COPY_FROM = 3
+_CTRL_MALLOC = CTRL_MALLOC
+_CTRL_FREE = CTRL_FREE
+_CTRL_COPY_TO = CTRL_COPY_TO
+_CTRL_COPY_FROM = CTRL_COPY_FROM
 # Pre-warm a chip child for cid=arg0 by calling
 # `prepare_callable(cid, registry[cid])` so the first run() does
 # not pay the H2D upload cost.  Sent from the parent right after init()
 # (or whenever a new ChipCallable cid is registered).
-_CTRL_PREPARE = 4
+_CTRL_PREPARE = CTRL_PREPARE
 # Dynamic post-init register of a ChipCallable. Parent stages the bytes
 # in a per-register POSIX shm and writes (cid, shm_name) into the mailbox;
 # the child mmaps the shm and calls prepare_callable_from_blob(cid, addr).
 # See docs/callable-ipc-dynamic-register.md for the design.
-_CTRL_REGISTER = 5
+_CTRL_REGISTER = CTRL_REGISTER
 # Symmetric unregister: drop the cid from chip-child state so the AICPU
 # orch_so_table_ slot can be reused. Payload is just the cid; no shm.
-_CTRL_UNREGISTER = 6
+_CTRL_UNREGISTER = CTRL_UNREGISTER
 # Dynamic CommDomain allocate / release (collective across the participating
 # subset).  Parent stages the request in a POSIX shm whose name is at
 # OFF_ARGS+0; for alloc, it also pre-allocates a reply shm whose name is at
 # OFF_ARGS+32.  Both shms have a fixed header (see _DOMAIN_REQ_HEADER /
 # _DOMAIN_REPLY_HEADER) followed by variable buffer/rank data.
-_CTRL_ALLOC_DOMAIN = 7
-_CTRL_RELEASE_DOMAIN = 8
+_CTRL_ALLOC_DOMAIN = CTRL_ALLOC_DOMAIN
+_CTRL_RELEASE_DOMAIN = CTRL_RELEASE_DOMAIN
 # Lazy base-comm init driven from Orchestrator.allocate_domain on first use.
 # Request shm carries `<II` header (rank, nranks) + NUL-terminated
 # rootinfo_path bytes.  Chip child calls cw.comm_init(rank, nranks,
 # rootinfo_path) and caches the handle on the ChipWorker so subsequent
 # CTRL_ALLOC_DOMAIN calls can find it.
-_CTRL_COMM_INIT = 9
+_CTRL_COMM_INIT = CTRL_COMM_INIT
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
 assert _COMM_INIT_HEADER.size == 8
+_CTRL_OPEN_CHANNEL = CTRL_OPEN_CHANNEL
+_CTRL_CLOSE_CHANNEL = CTRL_CLOSE_CHANNEL
+_CTRL_CHANNEL_SEND = CTRL_CHANNEL_SEND
+_CTRL_CHANNEL_RECV = CTRL_CHANNEL_RECV
+_CTRL_OPEN_SHARED_MEMORY = CTRL_OPEN_SHARED_MEMORY
+_CTRL_CLOSE_SHARED_MEMORY = CTRL_CLOSE_SHARED_MEMORY
+_CTRL_SHARED_MEMORY_INFO = CTRL_SHARED_MEMORY_INFO
+_CTRL_SHARED_MEMORY_READ = CTRL_SHARED_MEMORY_READ
+_CTRL_SHARED_MEMORY_WRITE = CTRL_SHARED_MEMORY_WRITE
+_CTRL_SHARED_MEMORY_NOTIFY = CTRL_SHARED_MEMORY_NOTIFY
+_CTRL_SHARED_MEMORY_WAIT = CTRL_SHARED_MEMORY_WAIT
+_CTRL_TEST_CHANNEL_SEND_L2 = 0x545354000001
+_CTRL_TEST_CHANNEL_RECV_L2 = 0x545354000002
 
 # Reserved 32-byte region at the start of OFF_ARGS used by _CTRL_REGISTER to
 # carry the NUL-terminated POSIX shm name. POSIX shm names on Linux are
@@ -176,7 +223,7 @@ assert _COMM_INIT_HEADER.size == 8
 # _CTRL_ALLOC_DOMAIN uses two such slots back to back at OFF_ARGS (request
 # shm at offset 0, reply shm at offset CTRL_SHM_NAME_BYTES).  _CTRL_RELEASE_DOMAIN
 # uses only the first slot.
-_CTRL_SHM_NAME_BYTES = 32
+_CTRL_SHM_NAME_BYTES = CTRL_SHM_NAME_BYTES
 
 # Domain-allocation request shm layout: 32-byte header + buffer_nbytes (u64) +
 # rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
@@ -198,10 +245,14 @@ assert _DOMAIN_REPLY_HEADER.size == 24
 #   offset 24:                  uint64  arg1 (host_ptr for copy)
 #   offset 32:                  uint64  arg2 (nbytes for copy)
 #   offset 40:                  uint64  result (returned ptr from malloc)
-_CTRL_OFF_ARG0 = 16
-_CTRL_OFF_ARG1 = 24
-_CTRL_OFF_ARG2 = 32
-_CTRL_OFF_RESULT = 40
+_CTRL_OFF_ARG0 = CTRL_OFF_ARG0
+_CTRL_OFF_ARG1 = CTRL_OFF_ARG1
+_CTRL_OFF_ARG2 = CTRL_OFF_ARG2
+_CTRL_OFF_RESULT = CTRL_OFF_RESULT
+_CTRL_OFF_ARG3 = CTRL_OFF_ARG3
+_CTRL_OFF_ARG4 = CTRL_OFF_ARG4
+_CTRL_OFF_PAYLOAD = CTRL_OFF_PAYLOAD
+_CTRL_PAYLOAD_CAPACITY = CTRL_PAYLOAD_CAPACITY
 
 
 def _mailbox_addr(shm: SharedMemory) -> int:
@@ -448,7 +499,7 @@ def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id:
     prepared.add(cid)
 
 
-def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands + SHUTDOWN form the unified state machine; cannot collapse without obscuring dispatch
+def _run_chip_main_loop(  # noqa: PLR0912, PLR0915 -- TASK_READY + 6 control sub-commands + SHUTDOWN form the unified state machine; cannot collapse without obscuring dispatch
     cw: ChipWorker,
     buf: memoryview,
     mailbox_addr: int,
@@ -575,6 +626,86 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     _handle_ctrl_release_domain(cw, buf)
                 elif sub_cmd == _CTRL_COMM_INIT:
                     _handle_ctrl_comm_init(cw, buf)
+                elif sub_cmd == _CTRL_OPEN_CHANNEL:
+                    c2l = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0])
+                    l2c = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    depth = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    max_bytes = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0])
+                    ch = cw.open_channel(c2l, l2c, depth, max_bytes)
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ch)
+                elif sub_cmd == _CTRL_CLOSE_CHANNEL:
+                    ch = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    cw.close_channel(ch)
+                elif sub_cmd == _CTRL_CHANNEL_SEND:
+                    ch = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    route = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    n = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    cid = struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0]
+                    cw.channel_send(ch, route, bytes(buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + n]), cid)
+                elif sub_cmd == _CTRL_CHANNEL_RECV:
+                    ch = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    capacity = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    timeout_us = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    data, route, cid = cw.channel_recv(ch, capacity, timeout_us)
+                    buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + len(data)] = data
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, len(data))
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG3, route)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG4, cid)
+                elif sub_cmd == _CTRL_TEST_CHANNEL_SEND_L2:
+                    ch = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    route = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    n = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    cid = struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0]
+                    cw.channel_send_l2_for_test(ch, route, bytes(buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + n]), cid)
+                elif sub_cmd == _CTRL_TEST_CHANNEL_RECV_L2:
+                    ch = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    capacity = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    timeout_us = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    data, route, cid = cw.channel_recv_l2_for_test(ch, capacity, timeout_us)
+                    buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + len(data)] = data
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, len(data))
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG3, route)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG4, cid)
+                elif sub_cmd == _CTRL_OPEN_SHARED_MEMORY:
+                    data_bytes = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0])
+                    signal_count = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    flags = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    mem = cw.open_shared_memory(data_bytes, signal_count, flags)
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, mem)
+                elif sub_cmd == _CTRL_CLOSE_SHARED_MEMORY:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    cw.close_shared_memory(mem)
+                elif sub_cmd == _CTRL_SHARED_MEMORY_INFO:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    _host_ptr, device_ptr, data_bytes, signal_count, flags = cw.shared_memory_info(mem)
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, 0)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG1, device_ptr)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG2, data_bytes)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG3, signal_count)
+                    struct.pack_into("Q", buf, _CTRL_OFF_ARG4, flags)
+                elif sub_cmd == _CTRL_SHARED_MEMORY_READ:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    offset = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    n = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    data = cw.shared_memory_read(mem, offset, n)
+                    buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + len(data)] = data
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, len(data))
+                elif sub_cmd == _CTRL_SHARED_MEMORY_WRITE:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    offset = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    n = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    cw.shared_memory_write(mem, offset, bytes(buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + n]))
+                elif sub_cmd == _CTRL_SHARED_MEMORY_NOTIFY:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    signal_id = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    value = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    cw.shared_memory_notify(mem, signal_id, value)
+                elif sub_cmd == _CTRL_SHARED_MEMORY_WAIT:
+                    mem = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    signal_id = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0])
+                    target = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0])
+                    timeout_us = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0])
+                    cw.shared_memory_wait(mem, signal_id, target, timeout_us)
             except Exception as e:  # noqa: BLE001
                 code = 1
                 if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
@@ -1614,6 +1745,59 @@ class Worker:
         if worker_id < 0 or worker_id >= len(self._chip_shms):
             raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
 
+    def _chip_control(
+        self, worker_id: int, sub_cmd: int, arg0: int = 0, arg1: int = 0, arg2: int = 0, arg3: int = 0
+    ) -> int:
+        """Send a control command without payload. Returns the uint64 result field."""
+        return self._chip_control_payload(worker_id, sub_cmd, arg0=arg0, arg1=arg1, arg2=arg2, arg3=arg3)[0]
+
+    def _chip_control_payload(
+        self,
+        worker_id: int,
+        sub_cmd: int,
+        arg0: int = 0,
+        arg1: int = 0,
+        arg2: int = 0,
+        arg3: int = 0,
+        payload: bytes = b"",
+        recv_capacity: int = 0,
+    ) -> tuple[int, bytes, int, int, int, int]:
+        """Send a control command with a mailbox payload. Returns result, payload, arg1, arg2, arg3, arg4."""
+        if worker_id < 0 or worker_id >= len(self._chip_shms):
+            raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
+        if len(payload) > _CTRL_PAYLOAD_CAPACITY:
+            raise ValueError(f"control payload too large: {len(payload)} > {_CTRL_PAYLOAD_CAPACITY}")
+        if recv_capacity > _CTRL_PAYLOAD_CAPACITY:
+            raise ValueError(f"recv capacity too large: {recv_capacity} > {_CTRL_PAYLOAD_CAPACITY}")
+        shm = self._chip_shms[worker_id]
+        buf = shm.buf
+        assert buf is not None
+        state_addr = _buffer_field_addr(buf, _OFF_STATE)
+        _write_error(buf, 0, "")
+        struct.pack_into("Q", buf, _OFF_CALLABLE, sub_cmd)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG0, arg0)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG1, arg1)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG2, arg2)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG3, arg3)
+        if payload:
+            buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + len(payload)] = payload
+        _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
+        while _mailbox_load_i32(state_addr) != _CONTROL_DONE:
+            pass
+        error = struct.unpack_from("i", buf, _OFF_ERROR)[0]
+        if error != 0:
+            err_msg = _read_error_msg(buf)
+            _mailbox_store_i32(state_addr, _IDLE)
+            raise RuntimeError(f"chip control command {sub_cmd} failed on worker {worker_id}: {err_msg}")
+        result = struct.unpack_from("Q", buf, _CTRL_OFF_RESULT)[0]
+        out_arg1 = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+        out_arg2 = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+        out_arg3 = struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0]
+        out_arg4 = struct.unpack_from("Q", buf, _CTRL_OFF_ARG4)[0]
+        out_payload = bytes(buf[_CTRL_OFF_PAYLOAD : _CTRL_OFF_PAYLOAD + min(int(result), recv_capacity)])
+        _mailbox_store_i32(state_addr, _IDLE)
+        return int(result), out_payload, int(out_arg1), int(out_arg2), int(out_arg3), int(out_arg4)
+
     def malloc(self, size: int, worker_id: int = 0) -> int:
         """Allocate memory on next-level chip worker *worker_id*. Returns a pointer."""
         if self.level == 2:
@@ -1652,6 +1836,210 @@ class Worker:
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
         self._orch.copy_from(worker_id, dst, src, size)
+
+    def open_channel(
+        self,
+        worker_id: int = 0,
+        cpu_to_l2_lanes: int = 1,
+        l2_to_cpu_lanes: int = 1,
+        lane_depth: int = 64,
+        max_message_bytes: int = 256,
+    ) -> int:
+        """Open a bounded L3/L2 message channel on next-level worker *worker_id*."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.open_channel(cpu_to_l2_lanes, l2_to_cpu_lanes, lane_depth, max_message_bytes)
+        return self._chip_control_payload(
+            worker_id,
+            _CTRL_OPEN_CHANNEL,
+            arg0=cpu_to_l2_lanes,
+            arg1=l2_to_cpu_lanes,
+            arg2=lane_depth,
+            arg3=max_message_bytes,
+        )[0]
+
+    def close_channel(self, channel: int, worker_id: int = 0) -> None:
+        """Close a channel returned by ``open_channel``."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.close_channel(channel)
+            return
+        self._chip_control(worker_id, _CTRL_CLOSE_CHANNEL, arg0=channel)
+
+    def channel_send(
+        self,
+        channel: int,
+        route: int,
+        data: bytes,
+        correlation_id: int = 0,
+        worker_id: int = 0,
+    ) -> None:
+        """Send one inline message from L3 CPU toward L2."""
+        payload = bytes(data)
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.channel_send(channel, route, payload, correlation_id)
+            return
+        self._chip_control_payload(
+            worker_id,
+            _CTRL_CHANNEL_SEND,
+            arg0=channel,
+            arg1=route,
+            arg2=len(payload),
+            arg3=correlation_id,
+            payload=payload,
+        )
+
+    def channel_recv(
+        self, channel: int, capacity: int = 256, timeout_us: int = 0, worker_id: int = 0
+    ) -> tuple[bytes, int, int]:
+        """Receive one inline message from L2 toward L3 CPU."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.channel_recv(channel, capacity, timeout_us)
+        nbytes, payload, _arg1, _arg2, route, correlation_id = self._chip_control_payload(
+            worker_id,
+            _CTRL_CHANNEL_RECV,
+            arg0=channel,
+            arg1=capacity,
+            arg2=timeout_us,
+            recv_capacity=capacity,
+        )
+        return payload[:nbytes], route, correlation_id
+
+    def open_shared_memory(self, data_bytes: int, signal_count: int = 2, flags: int = 0, worker_id: int = 0) -> int:
+        """Open a host/device shared-memory region on next-level worker *worker_id*."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.open_shared_memory(data_bytes, signal_count, flags)
+        return self._chip_control_payload(
+            worker_id,
+            _CTRL_OPEN_SHARED_MEMORY,
+            arg0=data_bytes,
+            arg1=signal_count,
+            arg2=flags,
+        )[0]
+
+    def close_shared_memory(self, memory: int, worker_id: int = 0) -> None:
+        """Close a shared-memory region returned by ``open_shared_memory``."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.close_shared_memory(memory)
+            return
+        self._chip_control(worker_id, _CTRL_CLOSE_SHARED_MEMORY, arg0=memory)
+
+    def shared_memory_info(self, memory: int, worker_id: int = 0) -> tuple[int, int, int, int, int]:
+        """Return shared-memory metadata.
+
+        For L3 mailbox access, ``host_ptr`` is always ``0`` because the
+        parent process has no directly dereferenceable host mapping.
+        """
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.shared_memory_info(memory)
+        _host_ptr, _payload, device_ptr, data_bytes, signal_count, flags = self._chip_control_payload(
+            worker_id, _CTRL_SHARED_MEMORY_INFO, arg0=memory
+        )
+        return 0, int(device_ptr), int(data_bytes), int(signal_count), int(flags)
+
+    def shared_memory_read(self, memory: int, offset: int, nbytes: int, worker_id: int = 0) -> bytes:
+        """Read bytes from a shared-memory data region.
+
+        L3 mailbox access chunks large reads internally; it is still an RPC
+        copy helper, not a parent-process direct mapping or streaming data
+        plane. The returned ``bytes`` materializes the full requested range.
+        """
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.shared_memory_read(memory, offset, nbytes)
+        if nbytes < 0:
+            raise ValueError("shared_memory_read: nbytes must be non-negative")
+        if offset < 0:
+            raise ValueError("shared_memory_read: offset must be non-negative")
+        _host_ptr, _device_ptr, data_bytes, _signal_count, _flags = self.shared_memory_info(memory, worker_id=worker_id)
+        if offset > data_bytes or nbytes > data_bytes - offset:
+            raise ValueError(
+                f"shared_memory_read out of range: offset={offset}, nbytes={nbytes}, data_bytes={data_bytes}"
+            )
+        out = bytearray()
+        remaining = int(nbytes)
+        current_offset = int(offset)
+        while remaining > 0 or (nbytes == 0 and not out):
+            chunk = min(remaining, _CTRL_PAYLOAD_CAPACITY)
+            out_nbytes, payload, _arg1, _arg2, _arg3, _arg4 = self._chip_control_payload(
+                worker_id,
+                _CTRL_SHARED_MEMORY_READ,
+                arg0=memory,
+                arg1=current_offset,
+                arg2=chunk,
+                recv_capacity=chunk,
+            )
+            if int(out_nbytes) != chunk:
+                raise RuntimeError(f"shared_memory_read short read: expected {chunk}, got {out_nbytes}")
+            if len(payload) < chunk:
+                raise RuntimeError(f"shared_memory_read short payload: expected {chunk}, got {len(payload)}")
+            out.extend(payload[:out_nbytes])
+            if nbytes == 0:
+                break
+            current_offset += chunk
+            remaining -= chunk
+        return bytes(out)
+
+    def shared_memory_write(self, memory: int, offset: int, data: bytes, worker_id: int = 0) -> None:
+        """Write bytes into a shared-memory data region.
+
+        L3 mailbox access chunks large writes internally; it is still an RPC
+        copy helper, not a parent-process direct mapping.
+        """
+        payload = bytes(data)
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.shared_memory_write(memory, offset, payload)
+            return
+        if len(payload) == 0:
+            self._chip_control_payload(
+                worker_id,
+                _CTRL_SHARED_MEMORY_WRITE,
+                arg0=memory,
+                arg1=offset,
+                arg2=0,
+                payload=b"",
+            )
+            return
+        current_offset = int(offset)
+        written = 0
+        while written < len(payload):
+            chunk = payload[written : written + _CTRL_PAYLOAD_CAPACITY]
+            self._chip_control_payload(
+                worker_id,
+                _CTRL_SHARED_MEMORY_WRITE,
+                arg0=memory,
+                arg1=current_offset,
+                arg2=len(chunk),
+                payload=chunk,
+            )
+            current_offset += len(chunk)
+            written += len(chunk)
+
+    def shared_memory_notify(self, memory: int, signal_id: int, value: int, worker_id: int = 0) -> None:
+        """Publish a software signal value for a shared-memory region."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.shared_memory_notify(memory, signal_id, value)
+            return
+        self._chip_control(worker_id, _CTRL_SHARED_MEMORY_NOTIFY, arg0=memory, arg1=signal_id, arg2=value)
+
+    def shared_memory_wait(
+        self, memory: int, signal_id: int, target: int, timeout_us: int = 0, worker_id: int = 0
+    ) -> None:
+        """Wait until a shared-memory software signal reaches ``target``."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.shared_memory_wait(memory, signal_id, target, timeout_us)
+            return
+        self._chip_control(
+            worker_id, _CTRL_SHARED_MEMORY_WAIT, arg0=memory, arg1=signal_id, arg2=target, arg3=timeout_us
+        )
 
     # ------------------------------------------------------------------
     # run — uniform entry point

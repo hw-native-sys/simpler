@@ -45,6 +45,7 @@
 #include "scope.h"
 #include "tensormap.h"
 #include "types.h"
+#include "../worker/pto_runtime_c_api.h"
 
 class WorkerManager;
 
@@ -91,6 +92,23 @@ public:
     void free(int worker_id, uint64_t ptr);
     void copy_to(int worker_id, uint64_t dst, uint64_t src, size_t size);
     void copy_from(int worker_id, uint64_t dst, uint64_t src, size_t size);
+    uint64_t open_channel(
+        int worker_id, uint32_t cpu_to_l2_lanes, uint32_t l2_to_cpu_lanes, uint32_t lane_depth,
+        uint32_t max_message_bytes
+    );
+    void close_channel(int worker_id, uint64_t ch);
+    void
+    channel_send(int worker_id, uint64_t ch, uint32_t route, const void *data, size_t size, uint64_t correlation_id);
+    std::vector<uint8_t> channel_recv(
+        int worker_id, uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *route, uint64_t *correlation_id
+    );
+    uint64_t open_shared_memory(int worker_id, uint64_t data_bytes, uint32_t signal_count, uint32_t flags);
+    void close_shared_memory(int worker_id, uint64_t mem);
+    HostDeviceMemoryInfo shared_memory_info(int worker_id, uint64_t mem);
+    std::vector<uint8_t> shared_memory_read(int worker_id, uint64_t mem, uint64_t offset, size_t nbytes);
+    void shared_memory_write(int worker_id, uint64_t mem, uint64_t offset, const std::vector<uint8_t> &data);
+    void shared_memory_notify(int worker_id, uint64_t mem, uint32_t signal_id, uint64_t value);
+    void shared_memory_wait(int worker_id, uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us);
 
     // Submit a NEXT_LEVEL task. `callable_id` is a cid registered via
     // Worker.register(): the chip child looks it up in its COW-inherited

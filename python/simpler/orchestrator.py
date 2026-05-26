@@ -232,6 +232,89 @@ class Orchestrator:
         """Copy *size* bytes from worker *src* to host *dst*."""
         self._o.copy_from(int(worker_id), int(dst), int(src), int(size))
 
+    def open_channel(
+        self,
+        worker_id: int,
+        cpu_to_l2_lanes: int = 1,
+        l2_to_cpu_lanes: int = 1,
+        lane_depth: int = 64,
+        max_message_bytes: int = 256,
+    ) -> int:
+        """Open a bounded L3/L2 message channel on next-level worker *worker_id*."""
+        return int(
+            self._o.open_channel(
+                int(worker_id),
+                int(cpu_to_l2_lanes),
+                int(l2_to_cpu_lanes),
+                int(lane_depth),
+                int(max_message_bytes),
+            )
+        )
+
+    def close_channel(self, worker_id: int, channel: int) -> None:
+        """Close a channel returned by ``open_channel``."""
+        self._o.close_channel(int(worker_id), int(channel))
+
+    def channel_send(
+        self,
+        worker_id: int,
+        channel: int,
+        route: int,
+        data: bytes,
+        correlation_id: int = 0,
+    ) -> None:
+        """Send one inline message from L3 CPU toward L2."""
+        self._o.channel_send(int(worker_id), int(channel), int(route), bytes(data), int(correlation_id))
+
+    def channel_recv(
+        self, worker_id: int, channel: int, capacity: int = 256, timeout_us: int = 0
+    ) -> tuple[bytes, int, int]:
+        """Receive one inline message from L2 toward L3 CPU."""
+        data, route, correlation_id = self._o.channel_recv(int(worker_id), int(channel), int(capacity), int(timeout_us))
+        return bytes(data), int(route), int(correlation_id)
+
+    def open_shared_memory(self, worker_id: int, data_bytes: int, signal_count: int = 2, flags: int = 0) -> int:
+        """Open a host/device shared-memory region on next-level worker *worker_id*."""
+        return int(self._o.open_shared_memory(int(worker_id), int(data_bytes), int(signal_count), int(flags)))
+
+    def close_shared_memory(self, worker_id: int, memory: int) -> None:
+        """Close a shared-memory region returned by ``open_shared_memory``."""
+        self._o.close_shared_memory(int(worker_id), int(memory))
+
+    def shared_memory_info(self, worker_id: int, memory: int) -> tuple[int, int, int, int, int]:
+        """Return ``(host_ptr, device_ptr, data_bytes, signal_count, flags)``.
+
+        ``host_ptr`` is always ``0`` because the L3 parent has no directly
+        dereferenceable host mapping for chip-child shared memory.
+        """
+        host_ptr, device_ptr, data_bytes, signal_count, flags = self._o.shared_memory_info(int(worker_id), int(memory))
+        return int(host_ptr), int(device_ptr), int(data_bytes), int(signal_count), int(flags)
+
+    def shared_memory_read(self, worker_id: int, memory: int, offset: int, nbytes: int) -> bytes:
+        """Read bytes from a shared-memory data region.
+
+        L3 access chunks large reads through mailbox RPC; it is not a direct
+        parent-process mapping or streaming data plane. The returned
+        ``bytes`` materializes the full requested range.
+        """
+        return bytes(self._o.shared_memory_read(int(worker_id), int(memory), int(offset), int(nbytes)))
+
+    def shared_memory_write(self, worker_id: int, memory: int, offset: int, data: bytes) -> None:
+        """Write bytes into a shared-memory data region.
+
+        L3 access chunks large writes through mailbox RPC; it is not a direct
+        parent-process mapping or streaming data plane.
+        """
+        self._o.shared_memory_write(int(worker_id), int(memory), int(offset), bytes(data))
+
+    def shared_memory_notify(self, worker_id: int, memory: int, signal_id: int, value: int) -> None:
+        """Publish a software signal value for a shared-memory region."""
+        self._o.shared_memory_notify(int(worker_id), int(memory), int(signal_id), int(value))
+
+    def shared_memory_wait(self, worker_id: int, memory: int, signal_id: int, target: int, timeout_us: int = 0) -> None:
+        """Wait until a shared-memory software signal reaches ``target``."""
+        self._o.shared_memory_wait(int(worker_id), int(memory), int(signal_id), int(target), int(timeout_us))
+
     def alloc(self, shape: Sequence[int], dtype: DataType) -> ContinuousTensor:
         """Allocate a runtime-managed intermediate buffer.
 

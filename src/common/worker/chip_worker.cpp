@@ -11,6 +11,8 @@
 
 #include "chip_worker.h"
 
+#include <cerrno>
+#include <cstring>
 #include <dlfcn.h>
 
 #include <fstream>
@@ -51,6 +53,23 @@ std::vector<uint8_t> read_binary_file(const std::string &path) {
         throw std::runtime_error("Failed to read binary file: " + path);
     }
     return buf;
+}
+
+std::string errno_suffix(int err) {
+    if (err == 0) return "";
+    return std::string(": ") + std::strerror(err) + " (errno=" + std::to_string(err) + ")";
+}
+
+std::string channel_cfg_summary(const HostDeviceChannelConfig &cfg) {
+    return "cpu_to_l2_lanes=" + std::to_string(cfg.lane_count_cpu_to_l2) +
+           ", l2_to_cpu_lanes=" + std::to_string(cfg.lane_count_l2_to_cpu) +
+           ", lane_depth=" + std::to_string(cfg.lane_depth) +
+           ", max_message_bytes=" + std::to_string(cfg.max_message_bytes) + ", flags=" + std::to_string(cfg.flags);
+}
+
+std::string memory_cfg_summary(const HostDeviceMemoryConfig &cfg) {
+    return "data_bytes=" + std::to_string(cfg.data_bytes) + ", signal_count=" + std::to_string(cfg.signal_count) +
+           ", flags=" + std::to_string(cfg.flags);
 }
 
 }  // namespace
@@ -99,6 +118,22 @@ void ChipWorker::init(
         device_free_ctx_fn_ = load_symbol<DeviceFreeCtxFn>(handle, "device_free_ctx");
         copy_to_device_ctx_fn_ = load_symbol<CopyToDeviceCtxFn>(handle, "copy_to_device_ctx");
         copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
+        open_host_device_channel_ctx_fn_ =
+            load_symbol<OpenHostDeviceChannelCtxFn>(handle, "open_host_device_channel_ctx");
+        close_host_device_channel_ctx_fn_ =
+            load_symbol<CloseHostDeviceChannelCtxFn>(handle, "close_host_device_channel_ctx");
+        host_device_send_ctx_fn_ = load_symbol<HostDeviceSendCtxFn>(handle, "host_device_send_ctx");
+        host_device_recv_ctx_fn_ = load_symbol<HostDeviceRecvCtxFn>(handle, "host_device_recv_ctx");
+        open_host_device_memory_ctx_fn_ = load_symbol<OpenHostDeviceMemoryCtxFn>(handle, "open_host_device_memory_ctx");
+        close_host_device_memory_ctx_fn_ =
+            load_symbol<CloseHostDeviceMemoryCtxFn>(handle, "close_host_device_memory_ctx");
+        host_device_memory_info_ctx_fn_ = load_symbol<HostDeviceMemoryInfoCtxFn>(handle, "host_device_memory_info_ctx");
+        host_device_memory_read_ctx_fn_ = load_symbol<HostDeviceMemoryReadCtxFn>(handle, "host_device_memory_read_ctx");
+        host_device_memory_write_ctx_fn_ =
+            load_symbol<HostDeviceMemoryWriteCtxFn>(handle, "host_device_memory_write_ctx");
+        host_device_memory_notify_ctx_fn_ =
+            load_symbol<HostDeviceMemoryNotifyCtxFn>(handle, "host_device_memory_notify_ctx");
+        host_device_memory_wait_ctx_fn_ = load_symbol<HostDeviceMemoryWaitCtxFn>(handle, "host_device_memory_wait_ctx");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
         prepare_callable_fn_ = load_symbol<PrepareCallableFn>(handle, "prepare_callable");
@@ -169,6 +204,17 @@ void ChipWorker::init(
         device_free_ctx_fn_ = nullptr;
         copy_to_device_ctx_fn_ = nullptr;
         copy_from_device_ctx_fn_ = nullptr;
+        open_host_device_channel_ctx_fn_ = nullptr;
+        close_host_device_channel_ctx_fn_ = nullptr;
+        host_device_send_ctx_fn_ = nullptr;
+        host_device_recv_ctx_fn_ = nullptr;
+        open_host_device_memory_ctx_fn_ = nullptr;
+        close_host_device_memory_ctx_fn_ = nullptr;
+        host_device_memory_info_ctx_fn_ = nullptr;
+        host_device_memory_read_ctx_fn_ = nullptr;
+        host_device_memory_write_ctx_fn_ = nullptr;
+        host_device_memory_notify_ctx_fn_ = nullptr;
+        host_device_memory_wait_ctx_fn_ = nullptr;
         get_runtime_size_fn_ = nullptr;
         simpler_init_fn_ = nullptr;
         prepare_callable_fn_ = nullptr;
@@ -207,6 +253,17 @@ void ChipWorker::init(
         device_free_ctx_fn_ = nullptr;
         copy_to_device_ctx_fn_ = nullptr;
         copy_from_device_ctx_fn_ = nullptr;
+        open_host_device_channel_ctx_fn_ = nullptr;
+        close_host_device_channel_ctx_fn_ = nullptr;
+        host_device_send_ctx_fn_ = nullptr;
+        host_device_recv_ctx_fn_ = nullptr;
+        open_host_device_memory_ctx_fn_ = nullptr;
+        close_host_device_memory_ctx_fn_ = nullptr;
+        host_device_memory_info_ctx_fn_ = nullptr;
+        host_device_memory_read_ctx_fn_ = nullptr;
+        host_device_memory_write_ctx_fn_ = nullptr;
+        host_device_memory_notify_ctx_fn_ = nullptr;
+        host_device_memory_wait_ctx_fn_ = nullptr;
         get_runtime_size_fn_ = nullptr;
         simpler_init_fn_ = nullptr;
         prepare_callable_fn_ = nullptr;
@@ -257,6 +314,17 @@ void ChipWorker::finalize() {
     device_free_ctx_fn_ = nullptr;
     copy_to_device_ctx_fn_ = nullptr;
     copy_from_device_ctx_fn_ = nullptr;
+    open_host_device_channel_ctx_fn_ = nullptr;
+    close_host_device_channel_ctx_fn_ = nullptr;
+    host_device_send_ctx_fn_ = nullptr;
+    host_device_recv_ctx_fn_ = nullptr;
+    open_host_device_memory_ctx_fn_ = nullptr;
+    close_host_device_memory_ctx_fn_ = nullptr;
+    host_device_memory_info_ctx_fn_ = nullptr;
+    host_device_memory_read_ctx_fn_ = nullptr;
+    host_device_memory_write_ctx_fn_ = nullptr;
+    host_device_memory_notify_ctx_fn_ = nullptr;
+    host_device_memory_wait_ctx_fn_ = nullptr;
     get_runtime_size_fn_ = nullptr;
     prepare_callable_fn_ = nullptr;
     run_prepared_fn_ = nullptr;
@@ -479,6 +547,222 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
         copy_from_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dst), reinterpret_cast<const void *>(src), size);
     if (rc != 0) {
         throw std::runtime_error("copy_from failed with code " + std::to_string(rc));
+    }
+}
+
+uint64_t ChipWorker::open_channel(const HostDeviceChannelConfig &cfg) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    size_t required = host_device_channel_required_bytes(&cfg);
+    if (required == 0) {
+        throw std::runtime_error("open_channel invalid config or size overflow: " + channel_cfg_summary(cfg));
+    }
+    errno = 0;
+    void *ch = open_host_device_channel_ctx_fn_(device_ctx_, &cfg);
+    if (ch == nullptr) {
+        int err = errno;
+        throw std::runtime_error(
+            "open_channel failed" + errno_suffix(err) + "; required_bytes=" + std::to_string(required) + "; " +
+            channel_cfg_summary(cfg)
+        );
+    }
+    return reinterpret_cast<uint64_t>(ch);
+}
+
+void ChipWorker::close_channel(uint64_t ch) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = close_host_device_channel_ctx_fn_(device_ctx_, reinterpret_cast<void *>(ch));
+    if (rc != 0) {
+        throw std::runtime_error("close_channel failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::channel_send(
+    uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
+) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = host_device_send_ctx_fn_(
+        device_ctx_, reinterpret_cast<void *>(ch), route, data, nbytes, correlation_id, timeout_us
+    );
+    if (rc != 0) {
+        throw std::runtime_error("channel_send failed with code " + std::to_string(rc));
+    }
+}
+
+std::vector<uint8_t> ChipWorker::channel_recv(
+    uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *out_route, uint64_t *out_correlation_id
+) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    std::vector<uint8_t> buf(capacity);
+    size_t out_nbytes = 0;
+    uint64_t correlation_id = 0;
+    uint32_t route = 0;
+    int rc = host_device_recv_ctx_fn_(
+        device_ctx_, reinterpret_cast<void *>(ch), buf.data(), buf.size(), &out_nbytes, &correlation_id, &route,
+        timeout_us
+    );
+    if (rc != 0) {
+        throw std::runtime_error("channel_recv failed with code " + std::to_string(rc));
+    }
+    buf.resize(out_nbytes);
+    if (out_route != nullptr) *out_route = route;
+    if (out_correlation_id != nullptr) *out_correlation_id = correlation_id;
+    return buf;
+}
+
+void ChipWorker::channel_send_l2_for_test(
+    uint64_t ch, uint32_t route, const void *data, size_t nbytes, uint64_t correlation_id, uint32_t timeout_us
+) {
+    int rc = host_device_channel_send_l2_for_test(
+        reinterpret_cast<HostDeviceChannel *>(ch), route, data, nbytes, correlation_id, timeout_us
+    );
+    if (rc != 0) {
+        throw std::runtime_error("channel_send_l2_for_test failed with code " + std::to_string(rc));
+    }
+}
+
+std::vector<uint8_t> ChipWorker::channel_recv_l2_for_test(
+    uint64_t ch, size_t capacity, uint32_t timeout_us, uint32_t *out_route, uint64_t *out_correlation_id
+) {
+    std::vector<uint8_t> buf(capacity);
+    size_t out_nbytes = 0;
+    uint64_t correlation_id = 0;
+    uint32_t route = 0;
+    int rc = host_device_channel_recv_l2_for_test(
+        reinterpret_cast<HostDeviceChannel *>(ch), buf.data(), buf.size(), &out_nbytes, &correlation_id, &route,
+        timeout_us
+    );
+    if (rc != 0) {
+        throw std::runtime_error("channel_recv_l2_for_test failed with code " + std::to_string(rc));
+    }
+    buf.resize(out_nbytes);
+    if (out_route != nullptr) *out_route = route;
+    if (out_correlation_id != nullptr) *out_correlation_id = correlation_id;
+    return buf;
+}
+uint64_t ChipWorker::open_shared_memory(const HostDeviceMemoryConfig &cfg) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    size_t required = host_device_memory_required_bytes(&cfg);
+    if (required == 0) {
+        throw std::runtime_error("open_shared_memory invalid config or size overflow: " + memory_cfg_summary(cfg));
+    }
+    errno = 0;
+    void *mem = open_host_device_memory_ctx_fn_(device_ctx_, &cfg);
+    if (mem == nullptr) {
+        int err = errno;
+        throw std::runtime_error(
+            "open_shared_memory failed" + errno_suffix(err) + "; required_bytes=" + std::to_string(required) + "; " +
+            memory_cfg_summary(cfg)
+        );
+    }
+    return reinterpret_cast<uint64_t>(mem);
+}
+
+void ChipWorker::close_shared_memory(uint64_t mem) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = close_host_device_memory_ctx_fn_(device_ctx_, reinterpret_cast<void *>(mem));
+    if (rc != 0) {
+        throw std::runtime_error("close_shared_memory failed with code " + std::to_string(rc));
+    }
+}
+
+HostDeviceMemoryInfo ChipWorker::shared_memory_info(uint64_t mem) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    HostDeviceMemoryInfo info{};
+    int rc = host_device_memory_info_ctx_fn_(device_ctx_, reinterpret_cast<void *>(mem), &info);
+    if (rc != 0) {
+        throw std::runtime_error("shared_memory_info failed with code " + std::to_string(rc));
+    }
+    return info;
+}
+
+std::vector<uint8_t> ChipWorker::shared_memory_read(uint64_t mem, uint64_t offset, size_t nbytes) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    std::vector<uint8_t> buf(nbytes);
+    int rc =
+        host_device_memory_read_ctx_fn_(device_ctx_, reinterpret_cast<void *>(mem), offset, buf.data(), buf.size());
+    if (rc != 0) {
+        throw std::runtime_error("shared_memory_read failed with code " + std::to_string(rc));
+    }
+    return buf;
+}
+
+void ChipWorker::shared_memory_write(uint64_t mem, uint64_t offset, const void *data, size_t nbytes) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = host_device_memory_write_ctx_fn_(device_ctx_, reinterpret_cast<void *>(mem), offset, data, nbytes);
+    if (rc != 0) {
+        throw std::runtime_error("shared_memory_write failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::shared_memory_notify(uint64_t mem, uint32_t signal_id, uint64_t value) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = host_device_memory_notify_ctx_fn_(device_ctx_, reinterpret_cast<void *>(mem), signal_id, value);
+    if (rc != 0) {
+        throw std::runtime_error("shared_memory_notify failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::shared_memory_wait(uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = host_device_memory_wait_ctx_fn_(device_ctx_, reinterpret_cast<void *>(mem), signal_id, target, timeout_us);
+    if (rc != 0) {
+        throw std::runtime_error("shared_memory_wait failed with code " + std::to_string(rc));
+    }
+}
+
+std::vector<uint8_t> ChipWorker::shared_memory_read_l2_for_test(uint64_t mem, uint64_t offset, size_t nbytes) {
+    std::vector<uint8_t> buf(nbytes);
+    int rc =
+        host_device_memory_read_l2_for_test(reinterpret_cast<HostDeviceMemory *>(mem), offset, buf.data(), buf.size());
+    if (rc != 0) {
+        throw std::runtime_error("shared_memory_read_l2_for_test failed with code " + std::to_string(rc));
+    }
+    return buf;
+}
+
+void ChipWorker::shared_memory_write_l2_for_test(uint64_t mem, uint64_t offset, const void *data, size_t nbytes) {
+    int rc = host_device_memory_write_l2_for_test(reinterpret_cast<HostDeviceMemory *>(mem), offset, data, nbytes);
+    if (rc != 0) {
+        throw std::runtime_error("shared_memory_write_l2_for_test failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::shared_memory_notify_l2_for_test(uint64_t mem, uint32_t signal_id, uint64_t value) {
+    int rc = host_device_memory_notify_l2_for_test(reinterpret_cast<HostDeviceMemory *>(mem), signal_id, value);
+    if (rc != 0) {
+        throw std::runtime_error("shared_memory_notify_l2_for_test failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::shared_memory_wait_l2_for_test(
+    uint64_t mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
+) {
+    int rc =
+        host_device_memory_wait_l2_for_test(reinterpret_cast<HostDeviceMemory *>(mem), signal_id, target, timeout_us);
+    if (rc != 0) {
+        throw std::runtime_error("shared_memory_wait_l2_for_test failed with code " + std::to_string(rc));
     }
 }
 

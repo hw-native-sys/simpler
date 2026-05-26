@@ -21,8 +21,11 @@
 #include "prepare_callable_common.h"
 #include "task_args.h"
 
+#include <cerrno>
+#include <dlfcn.h>
 #include <pthread.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <utility>
@@ -30,6 +33,8 @@
 
 #include "common/unified_log.h"
 #include "device_runner.h"
+#include "host_device_channel.h"
+#include "host_device_memory.h"
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
@@ -38,6 +43,51 @@
 // require CANN's toolchain include path on the host build. Resolved at link
 // time against libunified_dlog.so / libascendalog.so.
 extern "C" int dlog_setlevel(int moduleId, int level, int enableEvent);
+
+namespace {
+std::atomic<void *> g_hdch_hal_handle{nullptr};
+constexpr unsigned int HDCH_DEV_SVM_MAP_HOST = 2U;
+
+using HdchHalHostRegisterFn = int (*)(void *dev_ptr, size_t size, unsigned int flags, int device_id, void **host_ptr);
+using HdchHalHostUnregisterFn = int (*)(void *host_ptr, int device_id);
+std::atomic<HdchHalHostRegisterFn> g_hal_host_register{nullptr};
+std::atomic<HdchHalHostUnregisterFn> g_hal_host_unregister{nullptr};
+
+int hdch_load_hal_if_needed() {
+    if (g_hdch_hal_handle.load(std::memory_order_acquire) != nullptr) return 0;
+    void *handle = dlopen("libascend_hal.so", RTLD_NOW | RTLD_GLOBAL);
+    if (handle == nullptr) return -1;
+
+    auto reg = reinterpret_cast<HdchHalHostRegisterFn>(dlsym(handle, "halHostRegister"));
+    auto unreg = reinterpret_cast<HdchHalHostUnregisterFn>(dlsym(handle, "halHostUnregister"));
+    if (reg == nullptr || unreg == nullptr) {
+        dlclose(handle);
+        return -1;
+    }
+
+    g_hal_host_register.store(reg, std::memory_order_release);
+    g_hal_host_unregister.store(unreg, std::memory_order_release);
+    void *expected = nullptr;
+    if (g_hdch_hal_handle.compare_exchange_strong(
+            expected, handle, std::memory_order_acq_rel, std::memory_order_acquire
+        )) {
+        return 0;
+    }
+    dlclose(handle);
+    return 0;
+}
+
+HdchHalHostRegisterFn hdch_get_halHostRegister() {
+    if (g_hdch_hal_handle.load(std::memory_order_acquire) == nullptr) return nullptr;
+    return g_hal_host_register.load(std::memory_order_acquire);
+}
+
+HdchHalHostUnregisterFn hdch_get_halHostUnregister() {
+    if (g_hdch_hal_handle.load(std::memory_order_acquire) == nullptr) return nullptr;
+    return g_hal_host_unregister.load(std::memory_order_acquire);
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -213,6 +263,196 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
     } catch (...) {
         return -1;
     }
+}
+
+HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg) {
+    if (ctx == NULL) {
+        errno = EINVAL;
+        return NULL;
+    }
+    size_t bytes = host_device_channel_required_bytes(cfg);
+    if (bytes == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    auto *runner = static_cast<DeviceRunner *>(ctx);
+    void *dev_ptr = nullptr;
+    void *host_ptr = nullptr;
+    try {
+        dev_ptr = runner->allocate_tensor(bytes);
+        if (dev_ptr == nullptr) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        if (hdch_load_hal_if_needed() != 0) {
+            runner->free_tensor(dev_ptr);
+            errno = EIO;
+            return NULL;
+        }
+        HdchHalHostRegisterFn fn = hdch_get_halHostRegister();
+        if (fn == nullptr || fn(dev_ptr, bytes, HDCH_DEV_SVM_MAP_HOST, runner->device_id(), &host_ptr) != 0 ||
+            host_ptr == nullptr) {
+            runner->free_tensor(dev_ptr);
+            errno = EIO;
+            return NULL;
+        }
+        HostDeviceChannel *ch = host_device_channel_wrap(dev_ptr, host_ptr, bytes, cfg, 0, nullptr);
+        if (ch == nullptr) {
+            HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+            if (unreg != nullptr) unreg(host_ptr, runner->device_id());
+            runner->free_tensor(dev_ptr);
+            errno = ENOMEM;
+            return NULL;
+        }
+        return static_cast<HostDeviceChannelHandle>(ch);
+    } catch (...) {
+        if (host_ptr != nullptr) {
+            HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+            if (unreg != nullptr) unreg(host_ptr, runner->device_id());
+        }
+        if (dev_ptr != nullptr) runner->free_tensor(dev_ptr);
+        errno = EIO;
+        return NULL;
+    }
+}
+
+int close_host_device_channel_ctx(DeviceContextHandle ctx, HostDeviceChannelHandle raw_ch) {
+    if (ctx == NULL || raw_ch == NULL) return HDCH_ERR_INVALID;
+    auto *runner = static_cast<DeviceRunner *>(ctx);
+    auto *ch = static_cast<HostDeviceChannel *>(raw_ch);
+    try {
+        HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+        if (unreg != nullptr && ch->host_base != nullptr) {
+            unreg(ch->host_base, runner->device_id());
+        }
+        void *dev_ptr = ch->device_base;
+        host_device_channel_destroy(ch);
+        if (dev_ptr != nullptr) runner->free_tensor(dev_ptr);
+        return HDCH_OK;
+    } catch (...) {
+        return HDCH_ERR_BACKEND;
+    }
+}
+
+int host_device_send_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, uint32_t route, const void *data, size_t nbytes,
+    uint64_t correlation_id, uint32_t timeout_us
+) {
+    (void)ctx;
+    return host_device_channel_send_cpu(
+        static_cast<HostDeviceChannel *>(ch), route, data, nbytes, correlation_id, timeout_us
+    );
+}
+
+int host_device_recv_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, void *dst, size_t dst_capacity, size_t *out_nbytes,
+    uint64_t *out_correlation_id, uint32_t *out_route, uint32_t timeout_us
+) {
+    (void)ctx;
+    return host_device_channel_recv_cpu(
+        static_cast<HostDeviceChannel *>(ch), dst, dst_capacity, out_nbytes, out_correlation_id, out_route, timeout_us
+    );
+}
+HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, const HostDeviceMemoryConfig *cfg) {
+    if (ctx == NULL) {
+        errno = EINVAL;
+        return NULL;
+    }
+    size_t bytes = host_device_memory_required_bytes(cfg);
+    if (bytes == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    auto *runner = static_cast<DeviceRunner *>(ctx);
+    void *dev_ptr = nullptr;
+    void *host_ptr = nullptr;
+    try {
+        dev_ptr = runner->allocate_tensor(bytes);
+        if (dev_ptr == nullptr) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        if (hdch_load_hal_if_needed() != 0) {
+            runner->free_tensor(dev_ptr);
+            errno = EIO;
+            return NULL;
+        }
+        HdchHalHostRegisterFn fn = hdch_get_halHostRegister();
+        if (fn == nullptr || fn(dev_ptr, bytes, HDCH_DEV_SVM_MAP_HOST, runner->device_id(), &host_ptr) != 0 ||
+            host_ptr == nullptr) {
+            runner->free_tensor(dev_ptr);
+            errno = EIO;
+            return NULL;
+        }
+        HostDeviceMemory *mem = host_device_memory_wrap(dev_ptr, host_ptr, bytes, cfg, 0, nullptr);
+        if (mem == nullptr) {
+            HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+            if (unreg != nullptr) unreg(host_ptr, runner->device_id());
+            runner->free_tensor(dev_ptr);
+            errno = ENOMEM;
+            return NULL;
+        }
+        return static_cast<HostDeviceMemoryHandle>(mem);
+    } catch (...) {
+        if (host_ptr != nullptr) {
+            HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+            if (unreg != nullptr) unreg(host_ptr, runner->device_id());
+        }
+        if (dev_ptr != nullptr) runner->free_tensor(dev_ptr);
+        errno = EIO;
+        return NULL;
+    }
+}
+
+int close_host_device_memory_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle raw_mem) {
+    if (ctx == NULL || raw_mem == NULL) return HDMEM_ERR_INVALID;
+    auto *runner = static_cast<DeviceRunner *>(ctx);
+    auto *mem = static_cast<HostDeviceMemory *>(raw_mem);
+    try {
+        HdchHalHostUnregisterFn unreg = hdch_get_halHostUnregister();
+        if (unreg != nullptr && mem->host_base != nullptr) {
+            unreg(mem->host_base, runner->device_id());
+        }
+        void *dev_ptr = mem->device_base;
+        host_device_memory_destroy(mem);
+        if (dev_ptr != nullptr) runner->free_tensor(dev_ptr);
+        return HDMEM_OK;
+    } catch (...) {
+        return HDMEM_ERR_BACKEND;
+    }
+}
+
+int host_device_memory_info_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, HostDeviceMemoryInfo *info) {
+    (void)ctx;
+    return host_device_memory_info(static_cast<HostDeviceMemory *>(mem), info);
+}
+
+int host_device_memory_read_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, void *dst, size_t nbytes
+) {
+    (void)ctx;
+    return host_device_memory_read(static_cast<HostDeviceMemory *>(mem), offset, dst, nbytes);
+}
+
+int host_device_memory_write_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, const void *src, size_t nbytes
+) {
+    (void)ctx;
+    return host_device_memory_write(static_cast<HostDeviceMemory *>(mem), offset, src, nbytes);
+}
+
+int host_device_memory_notify_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value
+) {
+    (void)ctx;
+    return host_device_memory_notify(static_cast<HostDeviceMemory *>(mem), signal_id, value);
+}
+
+int host_device_memory_wait_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
+) {
+    (void)ctx;
+    return host_device_memory_wait(static_cast<HostDeviceMemory *>(mem), signal_id, target, timeout_us);
 }
 
 int finalize_device(DeviceContextHandle ctx) {

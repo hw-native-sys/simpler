@@ -47,6 +47,30 @@ extern "C" {
 
 typedef void *RuntimeHandle;
 typedef void *DeviceContextHandle;
+typedef void *HostDeviceChannelHandle;
+typedef void *HostDeviceMemoryHandle;
+
+typedef struct {
+    uint32_t lane_count_cpu_to_l2;
+    uint32_t lane_count_l2_to_cpu;
+    uint32_t lane_depth;
+    uint32_t max_message_bytes;
+    uint32_t flags;
+} HostDeviceChannelConfig;
+
+typedef struct {
+    uint64_t data_bytes;
+    uint32_t signal_count;
+    uint32_t flags;
+} HostDeviceMemoryConfig;
+
+typedef struct {
+    uint64_t host_ptr;
+    uint64_t device_ptr;
+    uint64_t data_bytes;
+    uint32_t signal_count;
+    uint32_t flags;
+} HostDeviceMemoryInfo;
 
 /**
  * Timing breakdown for a single run_prepared() invocation.
@@ -104,6 +128,57 @@ int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_
 
 /** Copy device memory to a host pointer within the given device context. */
 int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size);
+
+/** Open a bounded host/device message channel backed by host-mapped device memory. */
+HostDeviceChannelHandle open_host_device_channel_ctx(DeviceContextHandle ctx, const HostDeviceChannelConfig *cfg);
+
+/** Close a channel returned by open_host_device_channel_ctx. */
+int close_host_device_channel_ctx(DeviceContextHandle ctx, HostDeviceChannelHandle ch);
+
+/** Send one inline message from L3 CPU toward L2. */
+int host_device_send_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, uint32_t route, const void *data, size_t nbytes,
+    uint64_t correlation_id, uint32_t timeout_us
+);
+
+/** Receive one inline message from L2 toward L3 CPU. */
+int host_device_recv_ctx(
+    DeviceContextHandle ctx, HostDeviceChannelHandle ch, void *dst, size_t dst_capacity, size_t *out_nbytes,
+    uint64_t *out_correlation_id, uint32_t *out_route, uint32_t timeout_us
+);
+
+/** Open a host/device shared-memory region with software signal slots. */
+HostDeviceMemoryHandle open_host_device_memory_ctx(DeviceContextHandle ctx, const HostDeviceMemoryConfig *cfg);
+
+/** Close a memory region returned by open_host_device_memory_ctx. */
+int close_host_device_memory_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem);
+
+/** Return host/device data pointers and region metadata for a shared-memory region.
+ *
+ * host_ptr is valid only in the process that owns the host mapping. Hierarchical
+ * mailbox callers that do not own that mapping expose host_ptr as 0.
+ */
+int host_device_memory_info_ctx(DeviceContextHandle ctx, HostDeviceMemoryHandle mem, HostDeviceMemoryInfo *info);
+
+/** Copy from shared-memory data region into host dst. */
+int host_device_memory_read_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, void *dst, size_t nbytes
+);
+
+/** Copy from host src into shared-memory data region. */
+int host_device_memory_write_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint64_t offset, const void *src, size_t nbytes
+);
+
+/** Publish a software signal value after caller-visible writes. */
+int host_device_memory_notify_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t value
+);
+
+/** Wait until a software signal value reaches target, or return -EAGAIN/-EWOULDBLOCK style error. */
+int host_device_memory_wait_ctx(
+    DeviceContextHandle ctx, HostDeviceMemoryHandle mem, uint32_t signal_id, uint64_t target, uint32_t timeout_us
+);
 
 /**
  * One-shot platform-side init. Called once by ChipWorker::init() right
