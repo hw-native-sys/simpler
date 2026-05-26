@@ -174,16 +174,12 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest paired capture at commit `5f80dbdd` uses the `8x4x12` tensor
+The latest paired capture at commit `b060039c` uses the `8x4x12` tensor
 descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
 and worker-grid values `32,64,128,256`. It includes the compiler-backed
 host-schedule row, unary square host-schedule row, and
-`pto_persistent_dag_scalar_axpy` and `pto_persistent_dag_scalar_affine` on
-both A100 and H200.
-The benchmark script's default persistent set now also includes
-`pto_persistent_dag_triad`; the latest full paired capture predates that row,
-so it is represented by a focused single-baseline artifact until the next full
-refresh.
+`pto_persistent_dag_scalar_axpy`, `pto_persistent_dag_scalar_affine`, and
+`pto_persistent_dag_triad` on both A100 and H200.
 
 Evidence:
 
@@ -917,8 +913,8 @@ Result: A100 `status=pass`, `ptx_arch=compute_80`,
 `dispatch_func_ids=[5,2,1]`, the same scalar args, zero scheduler errors,
 and `device_wall_ns=30560`.
 
-The full paired benchmark was then refreshed with the scalar affine row in
-the default persistent baseline set:
+The full paired benchmark was then refreshed with scalar affine and triad rows
+in the default persistent baseline set:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -927,13 +923,14 @@ PYTHONPATH=$PWD:$PWD/python \
     --sync-remote-tree
 ```
 
-Result: `tmp/cuda-backend/combined-current-5f80dbdd/` contains
+Result: `tmp/cuda-backend/combined-current-b060039c/` contains
 `cuda-benchmark.json`, `cuda-benchmark.md`, `cuda-benchmark.svg`, and
-`cuda-benchmark-ratios.svg`. The combined JSON has `612` samples, including
-`18` `pto_persistent_dag_scalar_affine` samples. The compact DAG table reports
-scalar affine ratios versus `pto_persistent_dag` of `1.05x`, `1.00x`, and
-`1.00x` on A100 for `N=1024,65536,1048576`, and `0.99x`, `0.99x`, and
-`1.00x` on H200 for the same sizes.
+`cuda-benchmark-ratios.svg`. The combined JSON has `630` samples, including
+`18` `pto_persistent_dag_scalar_affine` samples and `18`
+`pto_persistent_dag_triad` samples. The compact DAG table reports triad ratios
+versus `pto_persistent_dag` of `1.00x`, `1.02x`, and `1.07x` on A100 for
+`N=1024,65536,1048576`, and `0.85x`, `1.00x`, and `1.00x` on H200 for the
+same sizes.
 
 ## Remaining Gaps
 
