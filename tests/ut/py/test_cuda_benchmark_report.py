@@ -895,6 +895,29 @@ def test_cuda_pair_persistent_smoke_builds_scalar_axpy_workflow(tmp_path):
     assert "persistent-scalar_axpy-smoke-abc123/h200.json" in remote[-1]
 
 
+def test_cuda_pair_persistent_smoke_builds_scalar_affine_workflow(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape="scalar_affine",
+        task_count=3,
+        queue_capacity=2,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+
+    assert "persistent-scalar_affine-smoke-abc123" in str(local)
+    assert "--dag-shape" in local
+    assert "scalar_affine" in local
+    assert "--dag-shape scalar_affine" in remote[-1]
+    assert "persistent-scalar_affine-smoke-abc123/h200.json" in remote[-1]
+
+
 def test_cuda_pair_persistent_smoke_can_sync_local_tree_and_dry_run(tmp_path):
     cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
     calls = []
@@ -1254,6 +1277,26 @@ def test_tensor_tile_dag_shape_uses_caller_provided_descriptor():
     assert tasks[0].out_batch_stride == 32
 
 
+def test_scalar_affine_dag_shape_uses_two_scalar_descriptor_fields():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    _, _, tasks = cuda_persistent_smoke._make_dag_shape(
+        "scalar_affine",
+        64,
+        101,
+        102,
+        201,
+        202,
+        203,
+        204,
+        301,
+    )
+
+    assert [task.func_id for task in tasks] == [5, 2, 1]
+    assert tasks[0].scalar0 == ctypes.c_float(1.5).value
+    assert tasks[0].scalar1 == ctypes.c_float(0.5).value
+
+
 def test_persistent_dag_compiler_path_uses_kernel_compiler(tmp_path, monkeypatch):
     cuda_persistent_smoke = _load_persistent_smoke_module()
     seen = {}
@@ -1285,12 +1328,13 @@ def test_persistent_dag_compiler_path_uses_kernel_compiler(tmp_path, monkeypatch
     assert seen["platform"] == "cuda"
     assert seen["arch"] == "compute_90"
     assert seen["nvcc"] == "/usr/local/cuda/bin/nvcc"
-    assert [task["func_id"] for task in seen["task_sources"]] == [1, 2, 3, 4]
+    assert [task["func_id"] for task in seen["task_sources"]] == [1, 2, 3, 4, 5]
     assert [task["task_name"] for task in seen["task_sources"]] == [
         "add_f32",
         "mul_f32",
         "matmul_tile_f32",
         "axpy_f32",
+        "affine_f32",
     ]
     assert {task["body_style"] for task in seen["task_sources"]} == {"task_body"}
     assert all("PtoCudaPersistentDagTask" in task["context_definition"] for task in seen["task_sources"])

@@ -241,6 +241,22 @@ def test_render_persistent_dag_source_includes_scalar_descriptor_metadata():
     assert "task->scalar0 * task->a[i] + task->b[i]" in source
 
 
+def test_render_persistent_dag_source_includes_second_scalar_descriptor():
+    source = render_persistent_dag_source(
+        [
+            CudaPersistentTaskFunction(
+                func_id=5,
+                name="affine_f32",
+                body="task->out[i] = task->scalar0 * task->a[i] + task->scalar1 * task->b[i];",
+            )
+        ]
+    )
+
+    assert "float scalar0;" in source
+    assert "float scalar1;" in source
+    assert "task->scalar1 * task->b[i]" in source
+
+
 def test_render_persistent_dag_source_records_device_scheduler_errors():
     source = render_persistent_dag_source(
         [

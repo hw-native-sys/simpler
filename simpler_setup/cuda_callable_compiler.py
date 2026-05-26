@@ -208,6 +208,7 @@ class CudaPersistentDagTask(ctypes.Structure):
         ("dependent_count", ctypes.c_uint32),
         ("initial_fanin", ctypes.c_uint32),
         ("scalar0", ctypes.c_float),
+        ("scalar1", ctypes.c_float),
         ("rows", ctypes.c_uint32),
         ("cols", ctypes.c_uint32),
         ("inner", ctypes.c_uint32),
@@ -529,6 +530,7 @@ struct PtoCudaPersistentDagTask {{
     unsigned int dependent_count;
     unsigned int initial_fanin;
     float scalar0;
+    float scalar1;
     unsigned int rows;
     unsigned int cols;
     unsigned int inner;

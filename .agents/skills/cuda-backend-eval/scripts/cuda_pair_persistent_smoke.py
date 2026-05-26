@@ -292,6 +292,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "bad_initial_fanin",
             "chain",
             "fork_join",
+            "scalar_affine",
             "scalar_axpy",
             "scratch_reuse",
             "tensor_tile",
