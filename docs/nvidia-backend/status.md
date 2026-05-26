@@ -162,12 +162,11 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest paired capture at commit `93636997` uses the `8x4x12` tensor
+The latest paired capture at commit `db0acd4c` uses the `8x4x12` tensor
 descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
 and worker-grid values `32,64,128,256`. It includes the compiler-backed
-host-schedule row and `pto_persistent_dag_scalar_axpy` on both A100 and H200.
-The unary host-schedule benchmark baseline was added after this full paired
-capture and has separate single-baseline A100/H200 evidence below.
+host-schedule row, unary square host-schedule row, and
+`pto_persistent_dag_scalar_axpy` on both A100 and H200.
 
 Evidence:
 
@@ -373,7 +372,7 @@ under `tmp/cuda-backend/worker-square-smoke-4cdde399/`.
 The docs and skill updates were checked with targeted `pre-commit` runs and
 `git diff --check` before commit.
 
-The paired benchmark capture was refreshed at commit `93636997` after
+The paired benchmark capture was refreshed at commit `db0acd4c` after
 syncing the local checkout to the remote H200 host:
 
 ```bash
@@ -382,10 +381,11 @@ PYTHONPATH=$PWD:$PWD/python \
     --sync-remote-tree
 ```
 
-Result: A100 `label=a100-current-93636997`, `ptx_arch=compute_80`; H200
-`label=h200-current-93636997`, `ptx_arch=compute_90`. Both reports use
-`ptx_source=nvcc-*`, include generated compiler and persistent-device rows,
-and are merged in `tmp/cuda-backend/combined-current-93636997/`.
+Result: A100 `label=a100-current-db0acd4c`, `ptx_arch=compute_80`; H200
+`label=h200-current-db0acd4c`, `ptx_arch=compute_90`. Both reports use
+`ptx_source=nvcc-*`, include generated compiler, unary host-schedule, and
+persistent-device rows, and are merged in
+`tmp/cuda-backend/combined-current-db0acd4c/`.
 
 The local A100 persistent DAG smoke was run through the persistent-device
 `KernelCompiler` entry point with task-body style DAG sources:
@@ -766,6 +766,22 @@ Result: A100 `status=pass`, `ptx_arch=compute_80`,
 `device_wall_ns=8192`; H200 `status=pass`, `ptx_arch=compute_90`,
 `ptx_source=kernel-compiler-task-body-wrapper-unary-square-compute_90`,
 `device_wall_ns=13888`.
+
+After adding the unary row to the default paired benchmark, the validator was
+updated to compare CUDA `float32` square results. The previous exact Python
+integer-square comparison failed at `N=65536` because CUDA stores
+single-precision output:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_host_schedule_unary_square \
+    --sizes 65536 --arch compute_80
+```
+
+Result: A100 `status=pass`, `ptx_arch=compute_80`,
+`ptx_source=kernel-compiler-task-body-wrapper-unary-square-compute_80`,
+`device_wall_ns=848864`.
 
 ## Remaining Gaps
 
