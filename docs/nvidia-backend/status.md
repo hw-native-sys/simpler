@@ -161,7 +161,8 @@ Evidence:
 - `.agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py` writes JSON,
   Markdown, and SVG reports.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_smoke_report.py` writes
-  compact smoke Markdown and SVG reports.
+  compact smoke Markdown and SVG reports, including persistent-device dispatch
+  `func_id` sequences and device scheduler error counters when present.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py` automates
   the local A100 run, remote H200 run, artifact copy, merge, and index refresh.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py` automates the

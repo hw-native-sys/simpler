@@ -74,7 +74,8 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 Use `cuda_smoke_report.py` to turn captured smoke JSON from A100 and H200 into
-Markdown and SVG evidence:
+Markdown and SVG evidence. Persistent-device reports include dispatch
+`func_id` sequences and device-side scheduler error counters:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \

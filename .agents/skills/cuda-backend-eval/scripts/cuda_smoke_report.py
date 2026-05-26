@@ -64,21 +64,45 @@ def _mode(row: dict[str, Any]) -> str:
     return mode
 
 
+def _dispatch(row: dict[str, Any]) -> str:
+    ids = row.get("dispatch_func_ids")
+    if not isinstance(ids, list) or not ids:
+        return "-"
+    return ",".join(str(item) for item in ids)
+
+
+def _scheduler_errors(row: dict[str, Any]) -> str:
+    errors = row.get("device_scheduler_errors")
+    if not isinstance(errors, dict):
+        return "-"
+    count = errors.get("count", 0)
+    code = errors.get("code", 0)
+    task_id = errors.get("task_id", 0)
+    return f"count={count},code={code},task={task_id}"
+
+
 def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
     lines = [
         "# CUDA Smoke Report",
         "",
         f"- Label: `{label}`",
         "",
-        "| Artifact | Status | Runtime | Mode | N | PTX arch | Device ns | Host ns | Tensor shape | Tiles |",
-        "| -------- | ------ | ------- | ---- | - | -------- | --------- | ------- | ------------ | ----- |",
+        (
+            "| Artifact | Status | Runtime | Mode | N | PTX arch | Device ns | "
+            "Host ns | Tensor shape | Tiles | Dispatch | Scheduler errors |"
+        ),
+        (
+            "| -------- | ------ | ------- | ---- | - | -------- | --------- | "
+            "------- | ------------ | ----- | -------- | ---------------- |"
+        ),
     ]
     for row in payloads:
         lines.append(
             f"| {row.get('_artifact', 'unknown')} | {row.get('status', 'unknown')} | "
             f"{row.get('runtime', 'unknown')} | {_mode(row)} | {row.get('n', '-')} | "
             f"`{row.get('ptx_arch', 'unknown')}` | {row.get('device_wall_ns', '-')} | "
-            f"{row.get('host_wall_ns', '-')} | {_shape(row)} | {_tile_count(row)} |"
+            f"{row.get('host_wall_ns', '-')} | {_shape(row)} | {_tile_count(row)} | "
+            f"`{_dispatch(row)}` | `{_scheduler_errors(row)}` |"
         )
 
     lines.extend(["", "## PTX Sources", ""])
@@ -112,6 +136,7 @@ def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
         value = int(row.get("device_wall_ns", 0) or 0)
         bar_width = int(chart_width * value / max_value) if max_value else 0
         name = str(row.get("_artifact", "unknown"))
+        scheduler_errors = _scheduler_errors(row)
         lines.extend(
             [
                 f'<text x="24" y="{y + 19}" font-family="sans-serif" font-size="13">{html.escape(name)}</text>',
@@ -119,6 +144,11 @@ def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
                 (
                     f'<text x="{left + bar_width + 8}" y="{y + 19}" '
                     f'font-family="sans-serif" font-size="13">{value} ns</text>'
+                ),
+                (
+                    f'<text x="{left}" y="{y + bar_height + 14}" '
+                    'font-family="sans-serif" font-size="11" fill="#555">'
+                    f"errors: {html.escape(scheduler_errors)}</text>"
                 ),
             ]
         )
