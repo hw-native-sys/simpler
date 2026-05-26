@@ -401,6 +401,52 @@ def test_cuda_pair_benchmark_can_reuse_remote_checkout(tmp_path):
     assert "h200-current-abc123" in remote_shell
 
 
+def test_cuda_pair_benchmark_reused_checkout_uses_remote_commit(tmp_path):
+    cuda_pair_benchmark = _load_pair_benchmark_module()
+    calls = []
+
+    def fake_runner(command, **kwargs):
+        calls.append((command, kwargs))
+        if command == ["git", "rev-parse", "--short", "HEAD"]:
+            return subprocess.CompletedProcess(command, 0, stdout="local123\n", stderr="")
+        if command[0] == "ssh" and "git rev-parse --short HEAD" in command[-1]:
+            return subprocess.CompletedProcess(command, 0, stdout="remote456\n", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    config = cuda_pair_benchmark.PairedBenchmarkConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        refresh_remote=False,
+    )
+
+    commands = cuda_pair_benchmark.run_paired_benchmark(config, runner=fake_runner, dry_run=True)
+
+    assert calls == [
+        (["git", "rev-parse", "--short", "HEAD"], {"check": True, "capture_output": True, "text": True}),
+        (
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                "h200-box",
+                "cd /remote/pto-cu && git rev-parse --short HEAD",
+            ],
+            {"check": True, "capture_output": True, "text": True},
+        ),
+    ]
+    assert "a100-current-local123" in commands[0]
+    assert "h200-current-remote456" in commands[1][-1]
+    assert "h200-current-remote456" in commands[2][2]
+    assert str(tmp_path / "cuda-backend" / "a100-current-local123" / "cuda-benchmark.json") in commands[3]
+    assert str(tmp_path / "cuda-backend" / "h200-current-remote456" / "cuda-benchmark.json") in commands[3]
+    assert "combined-current-local123-remote456" in commands[3]
+
+
 def test_cuda_pair_benchmark_dry_run_does_not_launch_benchmarks(tmp_path):
     cuda_pair_benchmark = _load_pair_benchmark_module()
     calls = []

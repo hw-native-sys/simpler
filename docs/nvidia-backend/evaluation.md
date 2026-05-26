@@ -81,7 +81,11 @@ low-speed settings by default so a bad network fetch fails instead of
 stranding the paired run, and the fetch is wrapped in a shell `timeout`.
 When the remote checkout has already been updated by another path and Git
 HTTPS is unhealthy on `bizhaoh200`, add `--skip-remote-refresh` to reuse that
-checkout and still run the paired A100/H200 capture.
+checkout and still run the paired A100/H200 capture. In skip-refresh mode,
+the runner reads the remote checkout commit and uses it in the H200 artifact
+name; if local and remote commits differ, the combined artifact name includes
+both commits. A skip-refresh dry run still performs the read-only remote
+commit probe so the printed artifact paths are accurate.
 
 Refresh the local artifact index after adding or merging captures:
 

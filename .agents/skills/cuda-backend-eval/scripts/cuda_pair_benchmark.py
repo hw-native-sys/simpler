@@ -57,6 +57,23 @@ def _git_commit(runner: Runner = subprocess.run) -> str:
     return result.stdout.strip()
 
 
+def build_remote_git_commit_command(config: PairedBenchmarkConfig) -> list[str]:
+    return [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={config.ssh_connect_timeout}",
+        config.remote,
+        f"cd {shlex.quote(config.remote_workdir)} && git rev-parse --short HEAD",
+    ]
+
+
+def _remote_git_commit(config: PairedBenchmarkConfig, runner: Runner = subprocess.run) -> str:
+    result = runner(build_remote_git_commit_command(config), check=True, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
 def _benchmark_args(
     *,
     device: int,
@@ -156,8 +173,8 @@ def build_remote_benchmark_command(config: PairedBenchmarkConfig, commit: str) -
     ]
 
 
-def build_scp_command(config: PairedBenchmarkConfig, commit: str) -> list[str]:
-    label = f"h200-current-{commit}"
+def build_scp_command(config: PairedBenchmarkConfig, remote_commit: str) -> list[str]:
+    label = f"h200-current-{remote_commit}"
     return [
         "scp",
         "-r",
@@ -166,19 +183,26 @@ def build_scp_command(config: PairedBenchmarkConfig, commit: str) -> list[str]:
     ]
 
 
-def build_merge_command(config: PairedBenchmarkConfig, commit: str) -> list[str]:
+def build_merge_command(
+    config: PairedBenchmarkConfig, local_commit: str, remote_commit: str | None = None
+) -> list[str]:
+    if remote_commit is None:
+        remote_commit = local_commit
+    combined_label = f"combined-current-{local_commit}"
+    if remote_commit != local_commit:
+        combined_label = f"{combined_label}-{remote_commit}"
     return [
         "env",
         f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}",
         config.local_python,
         ".agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py",
         "--merge-json",
-        str(config.output_root / f"a100-current-{commit}" / "cuda-benchmark.json"),
-        str(config.output_root / f"h200-current-{commit}" / "cuda-benchmark.json"),
+        str(config.output_root / f"a100-current-{local_commit}" / "cuda-benchmark.json"),
+        str(config.output_root / f"h200-current-{remote_commit}" / "cuda-benchmark.json"),
         "--label",
-        f"combined-current-{commit}",
+        combined_label,
         "--output-dir",
-        str(config.output_root / f"combined-current-{commit}"),
+        str(config.output_root / combined_label),
     ]
 
 
@@ -199,12 +223,15 @@ def run_paired_benchmark(
     runner: Runner = subprocess.run,
     dry_run: bool = False,
 ) -> list[list[str]]:
-    commit = _git_commit(runner)
+    local_commit = _git_commit(runner)
+    remote_commit = local_commit
+    if not config.refresh_remote:
+        remote_commit = _remote_git_commit(config, runner)
     commands = [
-        build_local_benchmark_command(config, commit),
-        build_remote_benchmark_command(config, commit),
-        build_scp_command(config, commit),
-        build_merge_command(config, commit),
+        build_local_benchmark_command(config, local_commit),
+        build_remote_benchmark_command(config, remote_commit),
+        build_scp_command(config, remote_commit),
+        build_merge_command(config, local_commit, remote_commit),
         build_index_command(config),
     ]
     for command in commands:

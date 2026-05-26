@@ -376,7 +376,11 @@ fetch is also wrapped in `timeout`; override it with
 `--remote-git-fetch-timeout`. If the remote checkout is already prepared and
 Git HTTPS is unhealthy on `bizhaoh200`, pass `--skip-remote-refresh` to reuse
 that checkout and run only the H200 benchmark command before copying artifacts
-back.
+back. In that mode the runner reads `git rev-parse --short HEAD` from the
+remote checkout and uses that remote commit in the H200 artifact name. If the
+local and remote commits differ, the combined artifact name includes both
+commits. A skip-refresh dry run still performs the read-only remote
+`git rev-parse --short HEAD` probe so the printed artifact paths are accurate.
 
 Use `--dry-run` to print the commands without launching benchmarks. The current
 committed summary uses the `38ff341e` artifact names in
