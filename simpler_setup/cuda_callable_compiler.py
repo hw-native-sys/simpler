@@ -178,6 +178,7 @@ class CudaPersistentDeviceCallable(ctypes.Structure):
         ("grid_dim", ctypes.c_uint32),
         ("block_dim", ctypes.c_uint32),
         ("shared_mem_bytes", ctypes.c_size_t),
+        ("stream_id", ctypes.c_uint32),
     ]
 
 
@@ -301,6 +302,7 @@ def prepare_cuda_persistent_device_callable(
     grid_dim: int,
     block_dim: int,
     shared_mem_bytes: int = 0,
+    stream_id: int = 0,
     op: int = _CUDA_PERSISTENT_OP_DAG_F32_RING,
 ) -> PreparedCudaCallable:
     """Build a persistent-device `prepare_callable` manifest from an artifact."""
@@ -308,7 +310,7 @@ def prepare_cuda_persistent_device_callable(
     image_buffer = _create_c_string_buffer(artifact.ptx)
     entry_name_buffer = _create_c_string_buffer(artifact.entry_name.encode("utf-8"))
     manifest = CudaPersistentDeviceCallable(
-        version=1,
+        version=2,
         op=op,
         image=ctypes.cast(image_buffer, ctypes.c_void_p),
         image_size=ctypes.sizeof(image_buffer),
@@ -316,6 +318,7 @@ def prepare_cuda_persistent_device_callable(
         grid_dim=grid_dim,
         block_dim=block_dim,
         shared_mem_bytes=shared_mem_bytes,
+        stream_id=stream_id,
     )
     return PreparedCudaCallable(
         runtime="persistent_device",

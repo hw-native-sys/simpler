@@ -198,6 +198,14 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
         "host_wall_ns": 122260,
         "dispatch_func_ids": [3, 1, 2, 1],
         "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+        "resource_policy": {
+            "scheduler_blocks": 1,
+            "worker_blocks": 2,
+            "worker_blocks_per_task": 1,
+            "stream_id": 1,
+            "block_dim": 256,
+            "grid_dim": 3,
+        },
         "tensor_tile": {
             "rows": 16,
             "cols": 16,
@@ -222,16 +230,17 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
     markdown = cuda_smoke_report.render_markdown_report(payload, label="tensor-smoke")
     svg = cuda_smoke_report.render_svg_report(payload, label="tensor-smoke")
 
-    assert "| Dispatch | Scheduler errors |" in markdown
+    assert "| Dispatch | Scheduler errors | Resource policy |" in markdown
     assert "| a100 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_80` | 102400 | 122260 |" in markdown
     assert "| h200 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_90` | 70464 | 79788 |" in markdown
-    assert "| `3,1,2,1` | `count=0,code=0,task=0` |" in markdown
-    assert "| `3,1,2,1` | `count=1,code=7,task=3` |" in markdown
+    assert "| `3,1,2,1` | `count=0,code=0,task=0` | `sched=1,workers=2,wp=1,stream=1,block=256,grid=3` |" in markdown
+    assert "| `3,1,2,1` | `count=1,code=7,task=3` | `sched=1,workers=2,wp=1,stream=1,block=256,grid=3` |" in markdown
     assert "nvcc-persistent-generated-dispatch-compute_90" in markdown
     assert "<svg" in svg
     assert "tensor-smoke" in svg
     assert "h200" in svg
     assert "errors: count=1,code=7,task=3" in svg
+    assert "policy: sched=1,workers=2,wp=1,stream=1,block=256,grid=3" in svg
 
 
 def test_cuda_smoke_scripts_use_shared_callable_manifest_types():
@@ -291,7 +300,7 @@ def test_cuda_artifact_index_renders_markdown_and_writes_default_index(tmp_path)
     assert output == tmp_path / "index.md"
     assert "# CUDA Backend Artifact Index" in report
     assert (
-        "| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  |  |  |  | direct_driver_graph |"
+        "| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  |  |  |  |  | direct_driver_graph |"
     ) in report
     assert "ratio SVG" in report
 
@@ -342,6 +351,14 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
         "n": 4096,
         "dispatch_func_ids": [3, 1, 2, 1],
         "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+        "resource_policy": {
+            "scheduler_blocks": 1,
+            "worker_blocks": 2,
+            "worker_blocks_per_task": 1,
+            "stream_id": 1,
+            "block_dim": 256,
+            "grid_dim": 3,
+        },
         "tensor_tile": {
             "rows": 16,
             "cols": 16,
@@ -377,16 +394,18 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
                 "count=0,code=0,task=0",
                 "count=1,code=7,task=3",
             ],
+            "resource_policies": ["sched=1,workers=2,wp=1,stream=1,block=256,grid=3"],
             "tensor_tiles": ["16x16x16"],
             "has_markdown": True,
             "has_svg": True,
             "has_ratio_svg": False,
         }
     ]
-    assert "Smoke mode | Dispatch | Scheduler errors |" in report
+    assert "Smoke mode | Dispatch | Scheduler errors | Resource policy |" in report
     assert "| tensor-descriptor-smoke | smoke | tensor-smoke | combined | unknown | 2 |" in report
     assert "| 4096 | 16x16x16 | dag/tensor_tile | 3,1,2,1 |" in report
     assert "count=0,code=0,task=0, count=1,code=7,task=3 |" in report
+    assert "sched=1,workers=2,wp=1,stream=1,block=256,grid=3 |" in report
 
 
 def test_cuda_artifact_index_sorts_numeric_sizes_before_strings(tmp_path):
@@ -751,6 +770,8 @@ def test_cuda_pair_persistent_smoke_builds_chain_a100_h200_workflow(tmp_path):
         dag_shape="chain",
         task_count=5,
         queue_capacity=3,
+        worker_blocks=2,
+        stream_id=1,
     )
 
     local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
@@ -769,6 +790,10 @@ def test_cuda_pair_persistent_smoke_builds_chain_a100_h200_workflow(tmp_path):
     assert "5" in local
     assert "--queue-capacity" in local
     assert "3" in local
+    assert "--worker-blocks" in local
+    assert "2" in local
+    assert "--stream-id" in local
+    assert "1" in local
     assert "--arch" in local
     assert "compute_80" in local
     assert str(tmp_path / "cuda-backend" / "persistent-chain-smoke-abc123" / "a100.json") in local
@@ -785,6 +810,8 @@ def test_cuda_pair_persistent_smoke_builds_chain_a100_h200_workflow(tmp_path):
     assert ".agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py" in remote_shell
     assert "--mode dag" in remote_shell
     assert "--dag-shape chain" in remote_shell
+    assert "--worker-blocks 2" in remote_shell
+    assert "--stream-id 1" in remote_shell
     assert "--arch compute_90" in remote_shell
     assert "persistent-chain-smoke-abc123/h200.json" in remote_shell
 
@@ -1080,6 +1107,8 @@ def test_persistent_direct_launch_can_use_multiple_worker_blocks_per_task():
     assert launch.scheduler_blocks == 0
     assert launch.worker_blocks == 12
     assert launch.manifest.grid_dim == 12
+    assert launch.manifest.version == 2
+    assert launch.manifest.stream_id == 0
     assert launch.args.worker_blocks_per_task == 4
 
 

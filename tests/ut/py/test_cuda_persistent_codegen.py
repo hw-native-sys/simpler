@@ -321,17 +321,19 @@ def test_prepare_cuda_persistent_device_callable_uses_generated_dispatch_entry(t
         op=1003,
         grid_dim=5,
         block_dim=256,
+        stream_id=2,
     )
 
     assert prepared.runtime == "persistent_device"
     assert prepared.artifact is artifact
-    assert prepared.manifest.version == 1
+    assert prepared.manifest.version == 2
     assert prepared.manifest.op == 1003
     assert prepared.manifest.image_size == len(artifact.ptx) + 1
     assert prepared.manifest.entry_name == b"pto_persistent_dag_f32_executor"
     assert prepared.manifest.grid_dim == 5
     assert prepared.manifest.block_dim == 256
     assert prepared.manifest.shared_mem_bytes == 0
+    assert prepared.manifest.stream_id == 2
     assert prepared.byref()
     assert prepared.buffer_ptr() == ctypes.addressof(prepared.manifest)
     assert prepared.buffer_size() == ctypes.sizeof(prepared.manifest)

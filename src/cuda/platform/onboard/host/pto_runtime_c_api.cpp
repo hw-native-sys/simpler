@@ -172,9 +172,7 @@ public:
             return -1;
         }
         uint32_t stream_id = 0;
-        if ((header->op == PTO_CUDA_HOST_OP_VECTOR_ADD_F32 || header->op == PTO_CUDA_HOST_OP_VECTOR_SCALE_F32 ||
-             header->op == PTO_CUDA_HOST_OP_VECTOR_AXPY_F32) &&
-            header->version >= 2) {
+        if (header->version >= 2) {
             stream_id = callable->stream_id;
         }
         if (stream_id >= streams_.size()) {

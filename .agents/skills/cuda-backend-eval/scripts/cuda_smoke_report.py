@@ -81,6 +81,20 @@ def _scheduler_errors(row: dict[str, Any]) -> str:
     return f"count={count},code={code},task={task_id}"
 
 
+def _resource_policy(row: dict[str, Any]) -> str:
+    policy = row.get("resource_policy")
+    if not isinstance(policy, dict):
+        return "-"
+    return (
+        f"sched={policy.get('scheduler_blocks', '-')},"
+        f"workers={policy.get('worker_blocks', '-')},"
+        f"wp={policy.get('worker_blocks_per_task', '-')},"
+        f"stream={policy.get('stream_id', '-')},"
+        f"block={policy.get('block_dim', '-')},"
+        f"grid={policy.get('grid_dim', '-')}"
+    )
+
+
 def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
     lines = [
         "# CUDA Smoke Report",
@@ -89,11 +103,13 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
         "",
         (
             "| Artifact | Status | Runtime | Mode | N | PTX arch | Device ns | "
-            "Host ns | Tensor shape | Tiles | Dispatch | Scheduler errors |"
+            "Host ns | Tensor shape | Tiles | Dispatch | Scheduler errors | "
+            "Resource policy |"
         ),
         (
             "| -------- | ------ | ------- | ---- | - | -------- | --------- | "
-            "------- | ------------ | ----- | -------- | ---------------- |"
+            "------- | ------------ | ----- | -------- | ---------------- | "
+            "--------------- |"
         ),
     ]
     for row in payloads:
@@ -102,7 +118,7 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
             f"{row.get('runtime', 'unknown')} | {_mode(row)} | {row.get('n', '-')} | "
             f"`{row.get('ptx_arch', 'unknown')}` | {row.get('device_wall_ns', '-')} | "
             f"{row.get('host_wall_ns', '-')} | {_shape(row)} | {_tile_count(row)} | "
-            f"`{_dispatch(row)}` | `{_scheduler_errors(row)}` |"
+            f"`{_dispatch(row)}` | `{_scheduler_errors(row)}` | `{_resource_policy(row)}` |"
         )
 
     lines.extend(["", "## PTX Sources", ""])
@@ -115,7 +131,7 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
 def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
     width = 760
     bar_height = 28
-    row_gap = 18
+    row_gap = 34
     left = 170
     right = 40
     top = 70
@@ -137,6 +153,7 @@ def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
         bar_width = int(chart_width * value / max_value) if max_value else 0
         name = str(row.get("_artifact", "unknown"))
         scheduler_errors = _scheduler_errors(row)
+        resource_policy = _resource_policy(row)
         lines.extend(
             [
                 f'<text x="24" y="{y + 19}" font-family="sans-serif" font-size="13">{html.escape(name)}</text>',
@@ -149,6 +166,11 @@ def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
                     f'<text x="{left}" y="{y + bar_height + 14}" '
                     'font-family="sans-serif" font-size="11" fill="#555">'
                     f"errors: {html.escape(scheduler_errors)}</text>"
+                ),
+                (
+                    f'<text x="{left}" y="{y + bar_height + 28}" '
+                    'font-family="sans-serif" font-size="11" fill="#555">'
+                    f"policy: {html.escape(resource_policy)}</text>"
                 ),
             ]
         )

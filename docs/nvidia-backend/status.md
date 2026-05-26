@@ -93,6 +93,9 @@ execution modes:
 - device-side scheduler diagnostics for unsupported generated-dispatch
   `func_id` values, invalid dependent task IDs, and out-of-range dependent
   spans, fan-in underflow, and initial-fan-in mismatch.
+- explicit resource-policy smoke metadata for the current single scheduler
+  block, configurable queue/DAG worker blocks, direct-mode worker blocks per
+  task, and callable `stream_id`.
 
 The persistent DAG path compiles generated CUDA source with `nvcc` and stores
 the generated source, PTX, and manifest under
@@ -168,7 +171,8 @@ Evidence:
   Markdown, and SVG reports.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_smoke_report.py` writes
   compact smoke Markdown and SVG reports, including persistent-device dispatch
-  `func_id` sequences and device scheduler error counters when present.
+  `func_id` sequences, device scheduler error counters, and resource-policy
+  metadata when present.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py` automates
   the local A100 run, remote H200 run, artifact copy, merge, and index refresh.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py` automates the
@@ -760,7 +764,9 @@ Needed:
 - generalized task argument ABI;
 - graph construction from normal PTO task graphs;
 - lifecycle validation beyond the current scratch-reuse smoke;
-- resource policy for scheduler blocks, worker blocks, and stream use;
+- broader resource policy beyond the current single scheduler block,
+  configurable queue/DAG worker blocks, direct worker-blocks-per-task, and
+  callable stream id tracer bullet;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
   invalid-dependent-ID, dependent-range, fan-in-underflow, and
   initial-fan-in diagnostics.

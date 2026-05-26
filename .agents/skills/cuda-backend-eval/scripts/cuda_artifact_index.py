@@ -83,6 +83,20 @@ def _scheduler_errors(payload: dict[str, Any]) -> str | None:
     return f"count={errors.get('count', 0)},code={errors.get('code', 0)},task={errors.get('task_id', 0)}"
 
 
+def _resource_policy(payload: dict[str, Any]) -> str | None:
+    policy = payload.get("resource_policy")
+    if not isinstance(policy, dict):
+        return None
+    return (
+        f"sched={policy.get('scheduler_blocks', '-')},"
+        f"workers={policy.get('worker_blocks', '-')},"
+        f"wp={policy.get('worker_blocks_per_task', '-')},"
+        f"stream={policy.get('stream_id', '-')},"
+        f"block={policy.get('block_dim', '-')},"
+        f"grid={policy.get('grid_dim', '-')}"
+    )
+
+
 def _read_artifact(path: Path, root: Path) -> dict[str, Any]:
     payload = json.loads((path / "cuda-benchmark.json").read_text())
     metadata = payload.get("metadata", {})
@@ -138,6 +152,9 @@ def _read_smoke_artifact(path: Path, root: Path) -> dict[str, Any]:
         "scheduler_errors": _sorted_unique(
             {errors for payload in payloads for errors in (_scheduler_errors(payload),) if errors is not None}
         ),
+        "resource_policies": _sorted_unique(
+            {policy for payload in payloads for policy in (_resource_policy(payload),) if policy is not None}
+        ),
         "tensor_tiles": _tensor_tile_shapes(payloads),
         "has_markdown": True,
         "has_svg": (path / "cuda-smoke-report.svg").exists(),
@@ -178,12 +195,12 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
         (
             "| Path | Kind | Label | Machine | Commit | Results | Sizes | "
             "Tensor tile | Smoke mode | Dispatch | Scheduler errors | "
-            "Baselines | Markdown | SVG | ratio SVG |"
+            "Resource policy | Baselines | Markdown | SVG | ratio SVG |"
         ),
         (
             "| ---- | ---- | ----- | ------- | ------ | ------- | ----- | "
             "----------- | ---------- | -------- | ---------------- | "
-            "--------- | -------- | --- | --------- |"
+            "--------------- | --------- | -------- | --- | --------- |"
         ),
     ]
     for entry in entries:
@@ -194,6 +211,7 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
             f"{_format_list(entry.get('smoke_modes', []))} | "
             f"{_format_list(entry.get('dispatches', []))} | "
             f"{_format_list(entry.get('scheduler_errors', []))} | "
+            f"{_format_list(entry.get('resource_policies', []))} | "
             f"{_format_list(entry['baselines'])} | "
             f"{_checkmark(entry['has_markdown'])} | {_checkmark(entry['has_svg'])} | "
             f"{_checkmark(entry['has_ratio_svg'])} |"

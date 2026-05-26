@@ -36,6 +36,8 @@ class PairedPersistentSmokeConfig:
     task_count: int = 3
     queue_capacity: int = 2
     worker_blocks_per_task: int = 1
+    worker_blocks: int | None = None
+    stream_id: int = 0
     tensor_rows: int = 16
     tensor_cols: int = 16
     tensor_inner: int = 16
@@ -112,9 +114,13 @@ def _smoke_args(*, device: int, arch: str, output_json: Path, config: PairedPers
         config.mode,
         "--worker-blocks-per-task",
         str(config.worker_blocks_per_task),
+        "--stream-id",
+        str(config.stream_id),
         "--output-json",
         str(output_json),
     ]
+    if config.worker_blocks is not None:
+        args.extend(["--worker-blocks", str(config.worker_blocks)])
     if config.mode == "dag":
         args.extend(
             [
@@ -294,6 +300,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-count", type=int, default=3)
     parser.add_argument("--queue-capacity", type=int, default=2)
     parser.add_argument("--worker-blocks-per-task", type=int, default=1)
+    parser.add_argument("--worker-blocks", type=int, default=None)
+    parser.add_argument("--stream-id", type=int, default=0)
     parser.add_argument("--tensor-rows", type=int, default=16)
     parser.add_argument("--tensor-cols", type=int, default=16)
     parser.add_argument("--tensor-inner", type=int, default=16)
@@ -326,6 +334,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         task_count=args.task_count,
         queue_capacity=args.queue_capacity,
         worker_blocks_per_task=args.worker_blocks_per_task,
+        worker_blocks=args.worker_blocks,
+        stream_id=args.stream_id,
         tensor_rows=args.tensor_rows,
         tensor_cols=args.tensor_cols,
         tensor_inner=args.tensor_inner,

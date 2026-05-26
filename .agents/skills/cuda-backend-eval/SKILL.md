@@ -129,6 +129,18 @@ PYTHONPATH=$PWD:$PWD/python \
     --device 0 --task-count 4 --n 1024 --arch compute_80 --mode queue
 ```
 
+Pass `--worker-blocks` and `--stream-id` to validate the current
+persistent-device resource policy: one scheduler block, configurable queue/DAG
+worker blocks, direct-mode `--worker-blocks-per-task`, and CUDA callable stream
+selection.
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 6 --n 1024 --arch compute_80 \
+    --mode queue --queue-capacity 2 --worker-blocks 2 --stream-id 1
+```
+
 Run the bounded-ring persistent smoke with wraparound:
 
 ```bash
@@ -153,7 +165,8 @@ be captured on local A100 and remote H200 with Markdown/SVG evidence:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
-    --dag-shape chain --task-count 5 --queue-capacity 3 --sync-remote-tree
+    --dag-shape chain --task-count 5 --queue-capacity 3 \
+    --worker-blocks 2 --stream-id 1 --sync-remote-tree
 ```
 
 This writes `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
@@ -161,6 +174,9 @@ This writes `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
 `tmp/cuda-backend/persistent-<shape>-smoke-<commit>/`, then refreshes
 `tmp/cuda-backend/index.md`. Use `--sync-remote-tree` when remote Git fetch is
 unreliable or the remote `origin` URL is not accessible.
+The JSON payload and compact report include `resource_policy` fields for
+`scheduler_blocks`, `worker_blocks`, `worker_blocks_per_task`, `stream_id`,
+`block_dim`, and `grid_dim`.
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such
 as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.
