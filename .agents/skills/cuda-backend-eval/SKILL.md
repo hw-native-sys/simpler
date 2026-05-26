@@ -871,8 +871,9 @@ The indexer scans benchmark `cuda-benchmark.json` files and smoke
 `cuda-smoke-report.md` directories, then writes `tmp/cuda-backend/index.md`
 with each artifact's kind, metadata, baselines, vector sizes, tensor-tile
 descriptor shapes, persistent smoke modes, dispatch sequences, scheduler
-error counters, and generated report/chart presence. It is a local audit aid
-under `tmp/`; do not commit it with raw benchmark or smoke data.
+error counters, repeat-run counts, per-launch completion counts, and generated
+report/chart presence. It is a local audit aid under `tmp/`; do not commit it
+with raw benchmark or smoke data.
 
 Render compact smoke JSON reports when a result is a smoke validation rather
 than a full benchmark:

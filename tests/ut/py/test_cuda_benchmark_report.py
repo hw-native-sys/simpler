@@ -361,7 +361,8 @@ def test_cuda_artifact_index_renders_markdown_and_writes_default_index(tmp_path)
     assert output == tmp_path / "index.md"
     assert "# CUDA Backend Artifact Index" in report
     assert (
-        "| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  |  |  |  |  |  |  | direct_driver_graph |"
+        "| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  |  |  |  |  |  |  |  |  | "
+        "direct_driver_graph |"
     ) in report
     assert "ratio SVG" in report
 
@@ -457,6 +458,8 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
                 "count=0,code=0,task=0",
                 "count=1,code=7,task=3",
             ],
+            "repeat_runs": [],
+            "launch_completed_counts": [],
             "resource_policies": ["sched=1,workers=2,wp=1,stream=1,block=256,grid=3"],
             "scalar_args": ["scalar0=1.5"],
             "tensor_args": ["c=tmp0"],
@@ -466,12 +469,45 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
             "has_ratio_svg": False,
         }
     ]
-    assert "Smoke mode | Dispatch | Scheduler errors | Resource policy | Scalar args | Tensor args |" in report
+    assert (
+        "Smoke mode | Dispatch | Scheduler errors | Repeat runs | Launch completions | "
+        "Resource policy | Scalar args | Tensor args |"
+    ) in report
     assert "| tensor-descriptor-smoke | smoke | tensor-smoke | combined | unknown | 2 |" in report
     assert "| 4096 | 16x16x16 | dag/tensor_tile | 3,1,2,1 |" in report
     assert "count=0,code=0,task=0, count=1,code=7,task=3 |" in report
     assert "sched=1,workers=2,wp=1,stream=1,block=256,grid=3 |" in report
     assert "scalar0=1.5 | c=tmp0 |" in report
+
+
+def test_cuda_artifact_index_records_persistent_smoke_lifecycle_reuse(tmp_path):
+    cuda_artifact_index = _load_artifact_index_module()
+    artifact_dir = tmp_path / "graph-descriptor-repeat-smoke"
+    artifact_dir.mkdir()
+    smoke_payload = {
+        "status": "pass",
+        "runtime": "persistent_device",
+        "mode": "dag",
+        "dag_shape": "graph_descriptor",
+        "n": 1024,
+        "repeat_runs": 2,
+        "launch_completed_counts": [3, 3],
+        "dispatch_func_ids": [9, 2, 1],
+        "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+    }
+    (artifact_dir / "a100.json").write_text(json.dumps(smoke_payload) + "\n")
+    (artifact_dir / "h200.json").write_text(json.dumps(smoke_payload) + "\n")
+    (artifact_dir / "cuda-smoke-report.md").write_text(
+        "# CUDA Smoke Report\n\n- Label: `graph-descriptor-repeat-smoke`\n"
+    )
+
+    [entry] = cuda_artifact_index.scan_artifacts(tmp_path)
+    report = cuda_artifact_index.render_markdown([entry])
+
+    assert entry["repeat_runs"] == [2]
+    assert entry["launch_completed_counts"] == ["3,3"]
+    assert "Repeat runs | Launch completions" in report
+    assert "| dag/graph_descriptor | 9,2,1 | count=0,code=0,task=0 | 2 | 3,3 |" in report
 
 
 def test_cuda_artifact_index_sorts_numeric_sizes_before_strings(tmp_path):

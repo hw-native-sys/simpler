@@ -236,7 +236,8 @@ Evidence:
   refreshed.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_artifact_index.py` indexes
   local `tmp/cuda-backend/` artifacts, including tensor-tile shapes,
-  persistent smoke modes, dispatch sequences, and scheduler error counters.
+  persistent smoke modes, dispatch sequences, scheduler error counters,
+  repeat-run counts, and per-launch completion counts.
 - `.agents/skills/cuda-backend-eval/SKILL.md` documents the current paired
   A100/H200 recipe.
 

@@ -83,6 +83,20 @@ def _scheduler_errors(payload: dict[str, Any]) -> str | None:
     return f"count={errors.get('count', 0)},code={errors.get('code', 0)},task={errors.get('task_id', 0)}"
 
 
+def _repeat_runs(payload: dict[str, Any]) -> int | None:
+    repeat_runs = payload.get("repeat_runs")
+    if not isinstance(repeat_runs, int):
+        return None
+    return repeat_runs
+
+
+def _launch_completed_counts(payload: dict[str, Any]) -> str | None:
+    counts = payload.get("launch_completed_counts")
+    if not isinstance(counts, list):
+        return None
+    return ",".join(str(count) for count in counts)
+
+
 def _resource_policy(payload: dict[str, Any]) -> str | None:
     policy = payload.get("resource_policy")
     if not isinstance(policy, dict):
@@ -166,6 +180,12 @@ def _read_smoke_artifact(path: Path, root: Path) -> dict[str, Any]:
         "scheduler_errors": _sorted_unique(
             {errors for payload in payloads for errors in (_scheduler_errors(payload),) if errors is not None}
         ),
+        "repeat_runs": _sorted_unique(
+            {repeat for payload in payloads for repeat in (_repeat_runs(payload),) if repeat is not None}
+        ),
+        "launch_completed_counts": _sorted_unique(
+            {counts for payload in payloads for counts in (_launch_completed_counts(payload),) if counts is not None}
+        ),
         "resource_policies": _sorted_unique(
             {policy for payload in payloads for policy in (_resource_policy(payload),) if policy is not None}
         ),
@@ -215,14 +235,14 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
         (
             "| Path | Kind | Label | Machine | Commit | Results | Sizes | "
             "Tensor tile | Smoke mode | Dispatch | Scheduler errors | "
-            "Resource policy | Scalar args | Tensor args | Baselines | "
-            "Markdown | SVG | ratio SVG |"
+            "Repeat runs | Launch completions | Resource policy | Scalar args | "
+            "Tensor args | Baselines | Markdown | SVG | ratio SVG |"
         ),
         (
             "| ---- | ---- | ----- | ------- | ------ | ------- | ----- | "
             "----------- | ---------- | -------- | ---------------- | "
-            "--------------- | ----------- | ----------- | --------- | "
-            "-------- | --- | --------- |"
+            "----------- | ------------------ | --------------- | ----------- | "
+            "----------- | --------- | -------- | --- | --------- |"
         ),
     ]
     for entry in entries:
@@ -233,6 +253,8 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
             f"{_format_list(entry.get('smoke_modes', []))} | "
             f"{_format_list(entry.get('dispatches', []))} | "
             f"{_format_list(entry.get('scheduler_errors', []))} | "
+            f"{_format_list(entry.get('repeat_runs', []))} | "
+            f"{_format_list(entry.get('launch_completed_counts', []))} | "
             f"{_format_list(entry.get('resource_policies', []))} | "
             f"{_format_list(entry.get('scalar_args', []))} | "
             f"{_format_list(entry.get('tensor_args', []))} | "
