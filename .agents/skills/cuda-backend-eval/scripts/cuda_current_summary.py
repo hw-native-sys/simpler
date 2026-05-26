@@ -42,6 +42,7 @@ DAG_BASELINES = (
     "pto_persistent_dag_scalar_axpy",
     "pto_persistent_dag_scalar_affine",
     "pto_persistent_dag_triad",
+    "pto_persistent_dag_unary_square",
     "pto_persistent_dag_tensor",
 )
 
@@ -190,6 +191,7 @@ def render_dag_shape_table(payload: Payload) -> str:
                     _ratio(scalar, dag),
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_scalar_affine", n, 3, 1), dag),
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_triad", n, 3, 1), dag),
+                    _ratio_for_key(summary, (machine, "pto_persistent_dag_unary_square", n, 3, 1), dag),
                     _ratio(tensor, dag),
                 ]
             )
@@ -202,6 +204,7 @@ def render_dag_shape_table(payload: Payload) -> str:
             "Scalar AXPY/DAG",
             "Scalar Affine/DAG",
             "Triad/DAG",
+            "Unary Square/DAG",
             "Tensor/DAG",
         ],
         rows,

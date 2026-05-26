@@ -175,6 +175,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_scalar_axpy`;
 - `pto_persistent_dag_scalar_affine`;
 - `pto_persistent_dag_triad`;
+- `pto_persistent_dag_unary_square`;
 - `pto_persistent_dag_tensor`;
 - same-work batch rows;
 - worker-grid batch rows.
@@ -184,7 +185,9 @@ descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
 and worker-grid values `32,64,128,256`. It includes the compiler-backed
 host-schedule row, unary square host-schedule row, and
 `pto_persistent_dag_scalar_axpy`, `pto_persistent_dag_scalar_affine`, and
-`pto_persistent_dag_triad` on both A100 and H200.
+`pto_persistent_dag_triad` on both A100 and H200. The unary-square persistent
+DAG row was added after this paired capture and has been checked through
+single-baseline A100/H200 runs.
 
 Evidence:
 
@@ -970,6 +973,22 @@ contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
 `ptx_arch=compute_90`, the same dispatch IDs, and `device_wall_ns=31136`.
 Both rows reported zero device scheduler errors.
 
+After promoting the unary-square DAG to a benchmark baseline, the new
+single-baseline path was checked on both GPUs:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_unary_square \
+    --sizes 4096 --arch compute_80
+```
+
+Result: A100 `status=pass`, `ptx_arch=compute_80`,
+`dispatch_func_ids=[7,1,1]`,
+`device_scheduler_errors={"count":0,"code":0,"task_id":0}`, and
+`device_wall_ns=43008`; H200 `status=pass`, `ptx_arch=compute_90`, the same
+dispatch IDs, zero scheduler errors, and `device_wall_ns=45184`.
+
 After promoting the triad DAG to a benchmark baseline, the new single-baseline
 path was checked on both GPUs:
 
@@ -1026,6 +1045,10 @@ versus `pto_persistent_dag` of `1.00x`, `0.14x`, and `1.02x` on A100 for
 same sizes. The A100 `N=65536` triad ratio is an unusually fast row in this
 capture, so it is recorded as correctness evidence and should be rechecked
 before using it as a throughput conclusion.
+
+With the unary-square persistent DAG baseline added to the default benchmark
+set, the next full paired refresh should produce `648` combined samples under
+the same sizes, repeats, batch task counts, and worker-grid values.
 
 The combined capture was validated with:
 

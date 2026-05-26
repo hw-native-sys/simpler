@@ -817,7 +817,7 @@ def run_persistent_sample(
             task_count = 6
         elif dag_shape == "chain":
             task_count = 5
-        elif dag_shape in {"scalar_axpy", "scalar_affine", "triad"}:
+        elif dag_shape in {"scalar_axpy", "scalar_affine", "triad", "unary_square"}:
             task_count = 3
         elif mode == "dag":
             task_count = 3
@@ -937,6 +937,15 @@ def run_single_sample(  # noqa: PLR0912
             mode="dag",
             baseline=baseline,
             dag_shape="triad",
+        )
+    if baseline == "pto_persistent_dag_unary_square":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="unary_square",
         )
     if baseline == "pto_persistent_dag_tensor":
         return run_persistent_sample(
@@ -1093,6 +1102,7 @@ def run_benchmark(
                     "pto_persistent_dag_scalar_axpy",
                     "pto_persistent_dag_scalar_affine",
                     "pto_persistent_dag_triad",
+                    "pto_persistent_dag_unary_square",
                     "pto_persistent_dag_tensor",
                 ):
                     sample_kwargs: dict[str, Any] = {}
@@ -1507,6 +1517,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         "pto_persistent_dag_scalar_axpy": "#c75c2d",
         "pto_persistent_dag_scalar_affine": "#f28e2b",
         "pto_persistent_dag_triad": "#d9822b",
+        "pto_persistent_dag_unary_square": "#e3a857",
         "pto_persistent_dag_tensor": "#e76f51",
         "pto_persistent_device": "#9467bd",
         "pto_persistent_device_batch": "#7b52ab",
@@ -1739,6 +1750,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  to validate two-scalar persistent DAG arguments.",
             "- `pto_persistent_dag_triad` uses the third tensor task descriptor field",
             "  to validate three-input persistent DAG arguments.",
+            "- `pto_persistent_dag_unary_square` uses a one-input square task body",
+            "  to validate unary persistent DAG arguments.",
             (
                 f"- `pto_persistent_dag_tensor` uses the configured {tensor_tile_shape} tiled GEMM"
                 if tensor_tile_shape is not None
@@ -1816,6 +1829,7 @@ def main() -> None:
             "pto_persistent_dag_scalar_axpy",
             "pto_persistent_dag_scalar_affine",
             "pto_persistent_dag_triad",
+            "pto_persistent_dag_unary_square",
             "pto_persistent_dag_tensor",
             "pto_host_schedule_batch",
             "pto_persistent_device_batch",

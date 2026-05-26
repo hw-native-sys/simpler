@@ -33,6 +33,7 @@ PAIRED_CURRENT_BASELINES = (
     "pto_persistent_dag_scalar_axpy",
     "pto_persistent_dag_tensor",
     "pto_persistent_dag_triad",
+    "pto_persistent_dag_unary_square",
     "pto_persistent_device",
     "pto_persistent_device_batch",
     "pto_persistent_device_grid_batch",
@@ -195,7 +196,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
     if args.expected_repeats is None:
         args.expected_repeats = 3
     if args.expected_result_count is None:
-        args.expected_result_count = 630
+        args.expected_result_count = 648
     args.require_report_files = True
 
 

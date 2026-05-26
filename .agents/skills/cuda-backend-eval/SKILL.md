@@ -576,6 +576,9 @@ same vector-add PTX kernel through two launch paths:
 - `pto_persistent_dag_triad`: generated-dispatch DAG with a `c` tensor task
   descriptor field, validating three-input persistent DAG arguments in the
   benchmark path.
+- `pto_persistent_dag_unary_square`: generated-dispatch DAG with a one-input
+  square task body, validating unary persistent DAG arguments in the
+  benchmark path.
 - `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a tiled
   GEMM task followed by elementwise residual, gate, and fan-in tasks. The
   benchmark uses the default 16x16x16 descriptor unless
@@ -701,6 +704,16 @@ PYTHONPATH=$PWD:$PWD/python \
     --sizes 4096 --arch compute_80
 ```
 
+Use `--single-baseline pto_persistent_dag_unary_square` for a quick
+benchmark path check of the unary persistent DAG on one GPU:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_unary_square \
+    --sizes 4096 --arch compute_80
+```
+
 Use `--single-baseline pto_host_schedule_unary_square` for a quick benchmark
 path check of the unary host-schedule ABI:
 
@@ -774,7 +787,7 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 The preset checks the expected A100/H200 machines, current selected
-baselines, sizes `1024,65536,1048576`, three repeats, `630` combined samples,
+baselines, sizes `1024,65536,1048576`, three repeats, `648` combined samples,
 and the Markdown/SVG report files.
 
 When worker-grid rows are present, the report includes a
