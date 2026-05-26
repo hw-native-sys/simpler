@@ -950,9 +950,7 @@ class Worker:
                     self._hierarchical_start_cv.wait()
                 if self._hierarchical_start_state == "failed":
                     raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
-                if self._hierarchical_start_state != "started" and not getattr(
-                    self, "_hierarchical_started", False
-                ):
+                if self._hierarchical_start_state != "started" and not getattr(self, "_hierarchical_started", False):
                     with self._registry_lock:
                         cid = self._allocate_cid()
                         self._callable_registry[cid] = target
@@ -1118,6 +1116,26 @@ class Worker:
             self._py_callable_cids_seen.discard(cid)
         self._worker.broadcast_register_all(int(cid), int(target.buffer_ptr()), int(target.buffer_size()))
 
+    def _pre_start_unregister_if_needed(self, cid: int) -> bool:
+        if self.level < 3:
+            return False
+        with self._hierarchical_start_cv:
+            while self._hierarchical_start_state == "starting":
+                self._hierarchical_start_cv.wait()
+            if self._hierarchical_start_state == "failed":
+                raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+            if self._hierarchical_start_state == "started" or getattr(self, "_hierarchical_started", False):
+                return False
+            with self._registry_lock:
+                if cid not in self._callable_registry:
+                    raise KeyError(f"Worker.unregister: cid={cid} not registered")
+                if cid in self._pending_unregister_cids:
+                    raise KeyError(f"Worker.unregister: cid={cid} already pending unregister")
+                target = self._callable_registry.pop(cid)
+                if not isinstance(target, ChipCallable):
+                    self._py_callable_cids_seen.discard(cid)
+            return True
+
     def unregister(self, cid: int) -> None:
         """Drop *cid* from the registry and propagate to chip children.
 
@@ -1136,24 +1154,8 @@ class Worker:
         Raises:
           KeyError: cid was never registered.
         """
-        if self.level >= 3:
-            with self._hierarchical_start_cv:
-                while self._hierarchical_start_state == "starting":
-                    self._hierarchical_start_cv.wait()
-                if self._hierarchical_start_state == "failed":
-                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
-                if self._hierarchical_start_state != "started" and not getattr(
-                    self, "_hierarchical_started", False
-                ):
-                    with self._registry_lock:
-                        if cid not in self._callable_registry:
-                            raise KeyError(f"Worker.unregister: cid={cid} not registered")
-                        if cid in self._pending_unregister_cids:
-                            raise KeyError(f"Worker.unregister: cid={cid} already pending unregister")
-                        target = self._callable_registry.pop(cid)
-                        if not isinstance(target, ChipCallable):
-                            self._py_callable_cids_seen.discard(cid)
-                    return
+        if self._pre_start_unregister_if_needed(cid):
+            return
         target = None
         with self._registry_lock:
             if cid not in self._callable_registry:
