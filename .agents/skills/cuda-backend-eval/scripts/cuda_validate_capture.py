@@ -25,6 +25,7 @@ PAIRED_CURRENT_BASELINES = (
     "pto_host_schedule",
     "pto_host_schedule_batch",
     "pto_host_schedule_compiler",
+    "pto_host_schedule_quad",
     "pto_host_schedule_unary_square",
     "pto_persistent_dag",
     "pto_persistent_dag_chain",
@@ -197,7 +198,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
     if args.expected_repeats is None:
         args.expected_repeats = 3
     if args.expected_result_count is None:
-        args.expected_result_count = 666
+        args.expected_result_count = 684
     args.require_report_files = True
 
 

@@ -135,16 +135,25 @@ def render_unary_square_table(payload: Payload) -> str:
     summary = summarize_results(payload)
     rows: list[list[str | int]] = []
     for machine in _machines(summary):
-        keys = [key for key in summary if key[0] == machine and key[1] == "pto_host_schedule_unary_square"]
-        for _, _, n, _, _ in sorted(keys, key=lambda key: key[2]):
+        sizes = {
+            key[2]
+            for key in summary
+            if key[0] == machine and key[1] in {"pto_host_schedule_unary_square", "pto_host_schedule_quad"}
+        }
+        for n in sorted(sizes):
             rows.append(
                 [
                     _machine_label(machine),
                     n,
-                    _median(summary, (machine, "pto_host_schedule_unary_square", n, 1, 1)),
+                    _median(summary, (machine, "pto_host_schedule_unary_square", n, 1, 1))
+                    if (machine, "pto_host_schedule_unary_square", n, 1, 1) in summary
+                    else "-",
+                    _median(summary, (machine, "pto_host_schedule_quad", n, 1, 1))
+                    if (machine, "pto_host_schedule_quad", n, 1, 1) in summary
+                    else "-",
                 ]
             )
-    return _table(["GPU", "N", "Unary square ns"], rows)
+    return _table(["GPU", "N", "Unary square ns", "Quad ns"], rows)
 
 
 def render_worker_grid_table(payload: Payload) -> str:
@@ -219,7 +228,7 @@ def render_summary(payload: Payload) -> str:
         [
             "## Launch Baselines",
             render_launch_table(payload),
-            "## Unary Host-Schedule Row",
+            "## Host-Schedule Shape Rows",
             render_unary_square_table(payload),
             "## Worker Grid Rows",
             render_worker_grid_table(payload),

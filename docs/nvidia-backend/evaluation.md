@@ -8,12 +8,12 @@ local A100 runs, and remote H200 runs.
 
 ## Current Evidence
 
-The latest paired A100/H200 capture was taken at commit `ba99b593`:
+The latest paired A100/H200 capture was taken at commit `c0dc1372`:
 
 - [Current capture](evaluation-current.md) summarizes the latest
-  `8x4x12` tensor-descriptor sweep, selected baselines, scalar AXPY,
-  scalar affine, triad, quad, and unary-square descriptor rows, and headline
-  interpretation.
+  `8x4x12` tensor-descriptor sweep, selected baselines, host-schedule unary
+  and quad rows, scalar AXPY, scalar affine, triad, quad, and unary-square
+  descriptor rows, and headline interpretation.
 - [Historical captures](evaluation-history.md) preserve the previous
   accumulated benchmark notes, including earlier graph, stream, task-count,
   worker-grid, DAG-chain, scratch-reuse, and tensor-tile captures.
@@ -21,9 +21,9 @@ The latest paired A100/H200 capture was taken at commit `ba99b593`:
 The latest raw artifacts remain under `tmp/` and are intentionally not
 committed:
 
-- `tmp/cuda-backend/a100-current-ba99b593/`
-- `tmp/cuda-backend/h200-current-ba99b593/`
-- `tmp/cuda-backend/combined-current-ba99b593/`
+- `tmp/cuda-backend/a100-current-c0dc1372/`
+- `tmp/cuda-backend/h200-current-c0dc1372/`
+- `tmp/cuda-backend/combined-current-c0dc1372/`
 - `tmp/cuda-backend/persistent-scalar_affine-smoke-469f55cd/`
 - `tmp/cuda-backend/worker-square-smoke-4cdde399/`
 - `tmp/cuda-backend/worker-quad-smoke-4327698e/`
@@ -52,6 +52,8 @@ with `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`.
   `KernelCompiler(platform="cuda")` generated task-body wrapper and cached PTX.
 - `pto_host_schedule_unary_square`: same generated host runtime path for the
   unary `(a, out, n)` ABI, using a square task body.
+- `pto_host_schedule_quad`: same generated host runtime path for the
+  four-input `(a, b, c, d, out, n)` ABI.
 - `pto_persistent_device`: descriptor-array persistent executor.
 - `pto_persistent_queue`: scheduler block plus bounded device ring queue.
 - `pto_persistent_dag`: generated-dispatch-like task selection with fan-in
@@ -148,7 +150,7 @@ Validate the current paired capture before copying numbers into
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-ba99b593/cuda-benchmark.json \
+    tmp/cuda-backend/combined-current-c0dc1372/cuda-benchmark.json \
     --preset paired-current
 ```
 

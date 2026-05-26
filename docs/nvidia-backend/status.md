@@ -174,6 +174,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_host_schedule`;
 - `pto_host_schedule_compiler`;
 - `pto_host_schedule_unary_square`;
+- `pto_host_schedule_quad`;
 - `pto_persistent_device`;
 - `pto_persistent_queue`;
 - `pto_persistent_dag`;
@@ -188,10 +189,10 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest paired capture at commit `ba99b593` uses the `8x4x12` tensor
+The latest paired capture at commit `c0dc1372` uses the `8x4x12` tensor
 descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
 and worker-grid values `32,64,128,256`. It includes the compiler-backed
-host-schedule row, unary square host-schedule row, and
+host-schedule row, unary square host-schedule row, quad host-schedule row, and
 `pto_persistent_dag_scalar_axpy`, `pto_persistent_dag_scalar_affine`, and
 `pto_persistent_dag_triad` on both A100 and H200. It also includes
 `pto_persistent_dag_quad`, validating fourth tensor task descriptor fields,
@@ -1113,6 +1114,31 @@ H200 reported `status=pass`, `ptx_arch=compute_90`, and
 `device_wall_ns=18752`. The local A100 quad smoke was also checked at
 `N=65536` to exercise the same CUDA fused multiply-add rounding path used by
 `ctx->a[i] * ctx->b[i] + ctx->c[i] * ctx->d[i]`.
+
+After promoting the four-input host-schedule ABI to a benchmark baseline, the
+focused single-baseline path was checked on both GPUs:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_host_schedule_quad --sizes 4096 \
+    --repeats 1 --arch compute_80
+```
+
+The same command was run on H200 with `--arch compute_90`. Result:
+`tmp/cuda-backend/host-quad-baseline-working/` contains `a100.json` and
+`h200.json`. The A100 row reported `status=pass`,
+`ptx_source=kernel-compiler-task-body-wrapper-quad-compute_80`, and
+`device_wall_ns=8192`; H200 reported `status=pass`,
+`ptx_source=kernel-compiler-task-body-wrapper-quad-compute_90`, and
+`device_wall_ns=24960`.
+
+The full paired current benchmark was refreshed at commit `c0dc1372`.
+Result: `tmp/cuda-backend/combined-current-c0dc1372/` contains the raw JSON,
+Markdown report, median-device SVG, and ratio SVG. The combined JSON has
+`684` samples, including `18` `pto_host_schedule_quad` samples and `18`
+`pto_persistent_dag_quad` samples. The paired-current validator reported:
+`validated tmp/cuda-backend/combined-current-c0dc1372/cuda-benchmark.json`.
 
 ## Remaining Gaps
 

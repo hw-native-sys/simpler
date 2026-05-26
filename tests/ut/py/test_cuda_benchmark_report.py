@@ -561,8 +561,9 @@ def test_cuda_capture_validator_paired_current_requires_quad_baseline():
 
     cuda_validate_capture._apply_preset(args)
 
+    assert "pto_host_schedule_quad" in args.require_baseline
     assert "pto_persistent_dag_quad" in args.require_baseline
-    assert args.expected_result_count == 666
+    assert args.expected_result_count == 684
 
 
 def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
@@ -1994,13 +1995,19 @@ def test_cuda_current_summary_renders_unary_square_table():
                 "n": 65536,
                 "device_wall_ns": 2000,
             },
+            {
+                "machine": "hina",
+                "baseline": "pto_host_schedule_quad",
+                "n": 65536,
+                "device_wall_ns": 2500,
+            },
         ],
     }
 
     table = cuda_current_summary.render_unary_square_table(payload)
 
-    assert "| GPU | N | Unary square ns |" in table
-    assert "| A100 | 65536 | 2000 |" in table
+    assert "| GPU | N | Unary square ns | Quad ns |" in table
+    assert "| A100 | 65536 | 2000 | 2500 |" in table
 
 
 def test_cuda_current_summary_renders_worker_and_dag_tables():
@@ -2873,10 +2880,11 @@ def test_run_benchmark_uses_in_process_samples(monkeypatch):
         ("pto_host_schedule", 3, 1024, 128, "compute_80"),
         ("pto_host_schedule_compiler", 3, 1024, 128, "compute_80"),
         ("pto_host_schedule_unary_square", 3, 1024, 128, "compute_80"),
+        ("pto_host_schedule_quad", 3, 1024, 128, "compute_80"),
         ("direct_driver", 3, 1024, 128, "compute_80"),
         ("direct_driver_graph", 3, 1024, 128, "compute_80"),
     ]
-    assert len(payload["results"]) == 5
+    assert len(payload["results"]) == 6
 
 
 def test_run_single_sample_dispatches_compiler_host_schedule(monkeypatch):
@@ -2935,6 +2943,35 @@ def test_run_single_sample_dispatches_unary_square_host_schedule(monkeypatch):
 
     assert seen["args"] == (3, 1024, 128, "compute_80")
     assert result["baseline"] == "pto_host_schedule_unary_square"
+
+
+def test_run_single_sample_dispatches_quad_host_schedule(monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = {}
+
+    def fake_run_pto_quad_sample(device, n, block_dim, arch):
+        seen["args"] = (device, n, block_dim, arch)
+        return {
+            "baseline": "pto_host_schedule_quad",
+            "n": n,
+            "block_dim": block_dim,
+            "host_wall_ns": 20,
+            "device_wall_ns": 10,
+            "status": "pass",
+        }
+
+    monkeypatch.setattr(cuda_benchmark, "run_pto_quad_sample", fake_run_pto_quad_sample)
+
+    result = cuda_benchmark.run_single_sample(
+        baseline="pto_host_schedule_quad",
+        device=3,
+        n=1024,
+        block_dim=128,
+        arch="compute_80",
+    )
+
+    assert seen["args"] == (3, 1024, 128, "compute_80")
+    assert result["baseline"] == "pto_host_schedule_quad"
 
 
 def test_unary_square_benchmark_expected_output_uses_float32_rounding():
@@ -3039,6 +3076,7 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_host_schedule",
         "pto_host_schedule_compiler",
         "pto_host_schedule_unary_square",
+        "pto_host_schedule_quad",
         "direct_driver",
         "direct_driver_graph",
         "pto_persistent_device",
@@ -3053,7 +3091,7 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_persistent_dag_unary_square",
         "pto_persistent_dag_tensor",
     ]
-    assert len(payload["results"]) == 16
+    assert len(payload["results"]) == 17
 
 
 def test_run_single_sample_dispatches_scalar_axpy_dag(monkeypatch):
@@ -3452,6 +3490,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_host_schedule", 1),
         ("pto_host_schedule_compiler", 1),
         ("pto_host_schedule_unary_square", 1),
+        ("pto_host_schedule_quad", 1),
         ("direct_driver", 1),
         ("direct_driver_graph", 1),
         ("pto_persistent_device", 1),
@@ -3470,7 +3509,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_queue_batch", 6),
     ]
     assert payload["metadata"]["batch_tasks"] == 6
-    assert len(payload["results"]) == 19
+    assert len(payload["results"]) == 20
 
 
 def test_run_benchmark_can_include_worker_grid_batch_mode(monkeypatch):

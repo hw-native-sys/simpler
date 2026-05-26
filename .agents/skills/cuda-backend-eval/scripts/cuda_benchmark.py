@@ -31,6 +31,7 @@ from cuda_persistent_smoke import run_persistent_smoke
 from cuda_smoke import (
     CudaHostCallable,
     CudaVectorAddArgs,
+    CudaVectorQuaternaryArgs,
     CudaVectorUnaryArgs,
     PtoRunTiming,
     _compile_ptx,
@@ -483,12 +484,61 @@ struct PtoTaskContext {
     )
 
 
+def _compile_quad_host_schedule_artifact(work_dir: Path, arch: str):
+    task_src = work_dir / "vector_quad.pto.cu"
+    task_src.write_text(
+        """
+unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+if (i < ctx->n) {
+    ctx->out[i] = ctx->a[i] * ctx->b[i] + ctx->c[i] * ctx->d[i];
+}
+""".lstrip()
+    )
+    nvcc = _find_nvcc()
+    if nvcc is None:
+        raise RuntimeError("nvcc is required for pto_host_schedule_quad")
+    return KernelCompiler(platform="cuda").compile_cuda_host_schedule(
+        str(task_src),
+        task_name="vector_quad",
+        arch=arch,
+        cache_root=work_dir / "cache",
+        nvcc=nvcc,
+        context_definition="""
+struct PtoTaskContext {
+    const float *a;
+    const float *b;
+    const float *c;
+    const float *d;
+    float *out;
+    unsigned long long n;
+};
+""".strip(),
+        host_parameters=(
+            "const float *a",
+            "const float *b",
+            "const float *c",
+            "const float *d",
+            "float *out",
+            "unsigned long long n",
+        ),
+        host_context_initializer="a, b, c, d, out, n",
+    )
+
+
 def _float32(value: float) -> float:
     return ctypes.c_float(value).value
 
 
+def _fma_f32(a: float, b: float, c: float) -> float:
+    return _float32(float(a) * float(b) + float(c))
+
+
 def _expected_unary_square_output(n: int) -> list[float]:
     return [_float32(_float32(float(i)) * _float32(float(i))) for i in range(n)]
+
+
+def _expected_quad_output(n: int) -> list[float]:
+    return [_fma_f32(float(i), float(2 * i), _float32(float(3 * i) * float(4 * i))) for i in range(n)]
 
 
 def run_pto_compiler_sample(device: int, n: int, block_dim: int, arch: str) -> dict[str, Any]:
@@ -665,6 +715,110 @@ def run_pto_unary_square_sample(device: int, n: int, block_dim: int, arch: str) 
         "block_dim": block_dim,
         "ptx_arch": arch,
         "ptx_source": f"kernel-compiler-{artifact.source_kind}-unary-square-{arch}",
+        "host_wall_ns": int(timing.host_wall_ns),
+        "device_wall_ns": int(timing.device_wall_ns),
+        "elapsed_s": time.time() - start,
+        "host_runtime": str(binaries.host_path),
+        "compiler_cache_hit": artifact.cache_hit,
+    }
+
+
+def run_pto_quad_sample(device: int, n: int, block_dim: int, arch: str) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="pto_cuda_quad_") as td:
+        work_dir = Path(td)
+        artifact = _compile_quad_host_schedule_artifact(work_dir, arch)
+
+        runtime, binaries = _load_runtime(True)
+        ctx = runtime.create_device_context()
+        if not ctx:
+            raise RuntimeError("create_device_context returned null")
+
+        start = time.time()
+        try:
+            if runtime.simpler_init(ctx, device, None, 0, None, 0) != 0:
+                raise RuntimeError("simpler_init failed")
+
+            array_t = ctypes.c_float * n
+            host_a = array_t(*[float(i) for i in range(n)])
+            host_b = array_t(*[float(2 * i) for i in range(n)])
+            host_c = array_t(*[float(3 * i) for i in range(n)])
+            host_d = array_t(*[float(4 * i) for i in range(n)])
+            host_out = array_t()
+            nbytes = ctypes.sizeof(host_a)
+
+            dev_a = runtime.device_malloc_ctx(ctx, nbytes)
+            dev_b = runtime.device_malloc_ctx(ctx, nbytes)
+            dev_c = runtime.device_malloc_ctx(ctx, nbytes)
+            dev_d = runtime.device_malloc_ctx(ctx, nbytes)
+            dev_out = runtime.device_malloc_ctx(ctx, nbytes)
+            if not (dev_a and dev_b and dev_c and dev_d and dev_out):
+                raise RuntimeError("device allocation failed")
+
+            try:
+                if runtime.copy_to_device_ctx(ctx, dev_a, ctypes.byref(host_a), nbytes) != 0:
+                    raise RuntimeError("copy_to_device a failed")
+                if runtime.copy_to_device_ctx(ctx, dev_b, ctypes.byref(host_b), nbytes) != 0:
+                    raise RuntimeError("copy_to_device b failed")
+                if runtime.copy_to_device_ctx(ctx, dev_c, ctypes.byref(host_c), nbytes) != 0:
+                    raise RuntimeError("copy_to_device c failed")
+                if runtime.copy_to_device_ctx(ctx, dev_d, ctypes.byref(host_d), nbytes) != 0:
+                    raise RuntimeError("copy_to_device d failed")
+
+                prepared = prepare_cuda_host_schedule_callable(
+                    artifact,
+                    grid_dim=(n + block_dim - 1) // block_dim,
+                    block_dim=block_dim,
+                    shared_mem_bytes=0,
+                    op=7,
+                )
+                if runtime.prepare_callable(ctx, 0, prepared.byref()) != 0:
+                    raise RuntimeError("prepare_callable failed")
+
+                args = CudaVectorQuaternaryArgs(a=dev_a, b=dev_b, c=dev_c, d=dev_d, out=dev_out, n=n)
+                timing = PtoRunTiming()
+                if (
+                    runtime.run_prepared(
+                        ctx,
+                        None,
+                        0,
+                        ctypes.byref(args),
+                        block_dim,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        None,
+                        ctypes.byref(timing),
+                    )
+                    != 0
+                ):
+                    raise RuntimeError("run_prepared failed")
+                if runtime.copy_from_device_ctx(ctx, ctypes.byref(host_out), dev_out, nbytes) != 0:
+                    raise RuntimeError("copy_from_device failed")
+                if list(host_out) != _expected_quad_output(n):
+                    raise RuntimeError("quad host-schedule output mismatch")
+                if runtime.unregister_callable(ctx, 0) != 0:
+                    raise RuntimeError("unregister_callable failed")
+            finally:
+                runtime.device_free_ctx(ctx, dev_a)
+                runtime.device_free_ctx(ctx, dev_b)
+                runtime.device_free_ctx(ctx, dev_c)
+                runtime.device_free_ctx(ctx, dev_d)
+                runtime.device_free_ctx(ctx, dev_out)
+        finally:
+            runtime.finalize_device(ctx)
+            runtime.destroy_device_context(ctx)
+
+    return {
+        "baseline": "pto_host_schedule_quad",
+        "status": "pass",
+        "device": device,
+        "n": n,
+        "task_count": 1,
+        "block_dim": block_dim,
+        "ptx_arch": arch,
+        "ptx_source": f"kernel-compiler-{artifact.source_kind}-quad-{arch}",
         "host_wall_ns": int(timing.host_wall_ns),
         "device_wall_ns": int(timing.device_wall_ns),
         "elapsed_s": time.time() - start,
@@ -867,6 +1021,8 @@ def run_single_sample(  # noqa: PLR0912
         return run_pto_compiler_sample(device=device, n=n, block_dim=block_dim, arch=arch)
     if baseline == "pto_host_schedule_unary_square":
         return run_pto_unary_square_sample(device=device, n=n, block_dim=block_dim, arch=arch)
+    if baseline == "pto_host_schedule_quad":
+        return run_pto_quad_sample(device=device, n=n, block_dim=block_dim, arch=arch)
     if baseline == "pto_host_schedule_batch":
         return run_pto_batch_sample(device=device, n=n, block_dim=block_dim, arch=arch, task_count=task_count)
     if baseline == "direct_driver":
@@ -1086,6 +1242,16 @@ def run_benchmark(
             )
             pto_unary.update({"machine": metadata["machine"], "repeat": repeat})
             results.append(pto_unary)
+
+            pto_quad = run_single_sample(
+                baseline="pto_host_schedule_quad",
+                device=device,
+                n=n,
+                block_dim=block_dim,
+                arch=arch,
+            )
+            pto_quad.update({"machine": metadata["machine"], "repeat": repeat})
+            results.append(pto_quad)
 
             direct = run_single_sample(baseline="direct_driver", device=device, n=n, block_dim=block_dim, arch=arch)
             direct.update({"machine": metadata["machine"], "repeat": repeat})
@@ -1518,6 +1684,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         "pto_host_schedule": "#2f6fbb",
         "pto_host_schedule_compiler": "#4f8fd3",
         "pto_host_schedule_unary_square": "#74a9cf",
+        "pto_host_schedule_quad": "#9ecae1",
         "pto_host_schedule_batch": "#1f4e89",
         "direct_driver": "#2a9d65",
         "direct_driver_graph": "#8ab17d",
@@ -1729,6 +1896,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  wrapper and cached PTX artifact.",
             "- `pto_host_schedule_unary_square` measures the unary `(a, out, n)`",
             "  host-schedule ABI with a generated square task body.",
+            "- `pto_host_schedule_quad` measures the four-input `(a, b, c, d, out, n)`",
+            "  host-schedule ABI with a generated task body.",
             "- `pto_host_schedule_batch` measures the same host-schedule vector-add",
             "  callable launched repeatedly on one context for a fixed task count.",
             "- `pto_persistent_device` measures the tracer-bullet persistent executor",
@@ -1832,6 +2001,7 @@ def main() -> None:
             "pto_host_schedule",
             "pto_host_schedule_compiler",
             "pto_host_schedule_unary_square",
+            "pto_host_schedule_quad",
             "direct_driver",
             "direct_driver_graph",
             "pto_persistent_device",

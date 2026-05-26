@@ -583,6 +583,8 @@ same vector-add PTX kernel through two launch paths:
   the shared task-body wrapper generator.
 - `pto_host_schedule_unary_square`: the same generated host runtime path for
   the unary `(a, out, n)` ABI, using a square task body.
+- `pto_host_schedule_quad`: the same generated host runtime path for the
+  four-input `(a, b, c, d, out, n)` ABI.
 - `direct_driver`: a thin CUDA Driver API baseline in Python `ctypes`.
 - `direct_driver_graph`: the same Driver API kernel replayed through a CUDA
   Graph, with graph instantiation outside the timed interval.
@@ -682,7 +684,7 @@ local commit. It syncs `.git` so the remote benchmark metadata reports the
 same commit as the synced source tree.
 
 Use `--dry-run` to print the commands without launching benchmarks. The current
-committed summary uses the `ba99b593` artifact names in
+committed summary uses the `c0dc1372` artifact names in
 `docs/nvidia-backend/evaluation-current.md`.
 
 For a lighter no-torch real-data check, run the paired Worker smoke instead of
@@ -764,6 +766,16 @@ PYTHONPATH=$PWD:$PWD/python \
     --sizes 1024 --arch compute_80
 ```
 
+Use `--single-baseline pto_host_schedule_quad` for a quick benchmark path
+check of the four-input host-schedule ABI:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_host_schedule_quad \
+    --sizes 4096 --arch compute_80
+```
+
 Refresh the local artifact index after adding or merging captures:
 
 ```bash
@@ -810,7 +822,7 @@ directly from a combined benchmark JSON payload:
 ```bash
 PYTHONPATH=$PWD:$PWD/python:.agents/skills/cuda-backend-eval/scripts \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_current_summary.py \
-    tmp/cuda-backend/combined-current-ba99b593/cuda-benchmark.json
+    tmp/cuda-backend/combined-current-c0dc1372/cuda-benchmark.json
 ```
 
 Use `--section launch`, `--section unary-square`, `--section worker-grid`, or
@@ -822,12 +834,12 @@ Validate the paired-current capture before copying numbers into docs:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-ba99b593/cuda-benchmark.json \
+    tmp/cuda-backend/combined-current-c0dc1372/cuda-benchmark.json \
     --preset paired-current
 ```
 
 The preset checks the expected A100/H200 machines, current selected
-baselines, sizes `1024,65536,1048576`, three repeats, `666` combined samples,
+baselines, sizes `1024,65536,1048576`, three repeats, `684` combined samples,
 and the Markdown/SVG report files.
 
 When worker-grid rows are present, the report includes a
