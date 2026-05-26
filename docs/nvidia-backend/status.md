@@ -130,12 +130,13 @@ tensor/scalar descriptors, `persistent_dag_tensor_tile_f32` state objects,
 `persistent_dag_triad_f32` third-tensor descriptors,
 `persistent_dag_quad_f32` fourth-tensor descriptors,
 `persistent_dag_generic_args_f32` generic tensor/scalar argument descriptors,
-and `persistent_dag_unary_square_f32` unary descriptors from normal
-`TaskArgsBuilder` CPU tensors, and validates real copied-back CUDA output
-data. The no-torch persistent smoke path also validates a generated-dispatch
-triad descriptor with a third tensor pointer field, a quad descriptor with
-third and fourth tensor pointer fields, a generic-argument descriptor, and a
-generated-dispatch unary-square descriptor with a single tensor input.
+`persistent_dag_graph_f32` explicit graph descriptors, and
+`persistent_dag_unary_square_f32` unary descriptors from normal `TaskArgsBuilder`
+CPU tensors, and validates real copied-back CUDA output data. The no-torch
+persistent smoke path also validates a generated-dispatch triad descriptor
+with a third tensor pointer field, a quad descriptor with third and fourth
+tensor pointer fields, a generic-argument descriptor, and a generated-dispatch
+unary-square descriptor with a single tensor input.
 The host-schedule scene path also accepts the neutral
 `elementwise_binary_f32` adapter for non-addition task bodies that still use
 the current `(a, b, out, n)` launch ABI. It accepts `elementwise_unary_f32`
@@ -1227,7 +1228,38 @@ specs, end to end.
 The fourth-tensor persistent quad callable spec also runs end to end through
 ctypes-backed real data. The host-schedule quad callable spec also runs
 through both the normal `SceneTestCase` L2 path and the no-torch Worker smoke
-path.
+path. A generic `persistent_dag_graph_f32` adapter can now lower explicit
+runtime graph descriptors with per-task `func_id`, dependency lists, fan-in,
+temporary buffers, generic tensor slots, and scalar slots through the same L2
+`SceneTestCase` path.
+
+The graph-descriptor adapter was checked with focused local tests:
+
+```bash
+.venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+  -q -k builds_cuda_persistent_graph_args --platform cuda
+
+.venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+  -q -k graph_with_ctypes --platform cuda
+```
+
+Result: both tests passed locally on A100. The full CUDA scene-test file was
+also rerun locally and reported `38 passed`.
+
+The same real-data ctypes graph test was run on the remote H200 after syncing
+the working tree:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+     -q -k graph_with_ctypes --platform cuda'
+```
+
+Result: `1 passed, 37 deselected`. The remote command also printed the known
+PTO-ISA SSH refresh warning before the selected CUDA test passed.
 
 Needed:
 
@@ -1315,8 +1347,8 @@ it is not yet a full TensorMap/ringbuffer analogue.
 Needed:
 
 - graph construction from normal PTO task graphs;
-- a general graph-lowering implementation for variable-arity task descriptors,
-  beyond the current explicit `persistent_dag_generic_args_f32` adapter;
+- broader graph-lowering coverage beyond the current explicit
+  `persistent_dag_graph_f32` descriptor adapter;
 - broader lifecycle validation beyond the current scratch-reuse and
   direct/queue/DAG prepared-callable repeat-run smokes;
 - broader resource policy beyond the current single scheduler block,

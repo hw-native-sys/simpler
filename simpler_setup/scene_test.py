@@ -528,22 +528,33 @@ class _CudaPersistentDagSceneBuffers:
             "persistent_dag_quad_f32",
             "persistent_dag_generic_args_f32",
             "persistent_dag_unary_square_f32",
+            "persistent_dag_graph_f32",
         }
         if arg_builder not in persistent_builders:
             raise NotImplementedError(f"Unsupported CUDA persistent scene-test arg_builder: {arg_builder}")
-        if arg_builder in {"persistent_dag_quad_f32", "persistent_dag_generic_args_f32"}:
+        if arg_builder == "persistent_dag_graph_f32":
+            expected_arg_count = None
+        elif arg_builder in {"persistent_dag_quad_f32", "persistent_dag_generic_args_f32"}:
             expected_arg_count = 5
         elif arg_builder == "persistent_dag_triad_f32":
             expected_arg_count = 4
         else:
             expected_arg_count = 3
-        if len(self.output_names) != expected_arg_count:
+        if expected_arg_count is not None and len(self.output_names) != expected_arg_count:
             raise ValueError(f"CUDA {arg_builder} scene tests require {expected_arg_count} tensor args")
         missing = [name for name in self.output_names if name not in self.tensor_buffers.ptrs]
         if missing:
             raise ValueError(f"CUDA persistent DAG args reference unknown tensors: {', '.join(missing)}")
 
-        if arg_builder in {"persistent_dag_quad_f32", "persistent_dag_generic_args_f32"}:
+        if arg_builder == "persistent_dag_graph_f32":
+            a_name = self.output_names[0]
+            b_name = self.output_names[1] if len(self.output_names) > 1 else self.output_names[0]
+            out_name = str(self.cuda_spec.get("output", self.output_names[-1]))
+            c_name = None
+            d_name = None
+            if out_name not in self.tensor_buffers.ptrs:
+                raise ValueError(f"CUDA persistent DAG graph output references unknown tensor: {out_name}")
+        elif arg_builder in {"persistent_dag_quad_f32", "persistent_dag_generic_args_f32"}:
             a_name, b_name, c_name, d_name, out_name = self.output_names
         elif arg_builder == "persistent_dag_triad_f32":
             a_name, b_name, c_name, out_name = self.output_names
@@ -982,6 +993,8 @@ class _CudaPersistentDagSceneBuffers:
                 ),
             )
             self.host_fanin = (ctypes.c_uint32 * 3)(0, 1, 1)
+        elif arg_builder == "persistent_dag_graph_f32":
+            self._setup_graph_descriptor(ctypes, CudaPersistentDagTask, n, output_nbytes)
         else:
             descriptor = self._tensor_tile_descriptor(n)
             self.dev_tmp2 = self._malloc(output_nbytes)
@@ -1110,6 +1123,126 @@ class _CudaPersistentDagSceneBuffers:
         for field, value in descriptor.items():
             setattr(task, field, value)
         return task
+
+    def _setup_graph_descriptor(self, ctypes_module, task_type, n: int, output_nbytes: int) -> None:
+        graph = self.cuda_spec.get("graph")
+        if not isinstance(graph, dict):
+            raise ValueError("CUDA persistent_dag_graph_f32 requires a graph descriptor")
+        task_specs = list(graph.get("tasks", []))
+        if not task_specs:
+            raise ValueError("CUDA persistent_dag_graph_f32 requires at least one graph task")
+
+        ptrs = dict(self.tensor_buffers.ptrs)
+        temporary_items = list(dict(self.cuda_spec.get("temporaries", {})).items())
+        for idx, (name, size_source) in enumerate(temporary_items):
+            if idx == 0:
+                ptr = self.dev_tmp0
+            elif idx == 1:
+                ptr = self.dev_tmp1
+            else:
+                ptr = self._malloc(self._temporary_nbytes(size_source, output_nbytes))
+            ptrs[str(name)] = ptr
+
+        dependents: list[int] = []
+        fanin = [0 for _ in task_specs]
+        for task_id, task_spec in enumerate(task_specs):
+            task_dependents = list(task_spec.get("dependents", []))
+            for dependent in task_dependents:
+                dependent_id = int(dependent)
+                if dependent_id < 0 or dependent_id >= len(task_specs):
+                    raise ValueError(
+                        "CUDA persistent_dag_graph_f32 dependent task id "
+                        f"{dependent_id} for task {task_id} is outside the graph"
+                    )
+                dependents.append(dependent_id)
+                fanin[dependent_id] += 1
+
+        for task_id, task_spec in enumerate(task_specs):
+            if "initial_fanin" in task_spec:
+                fanin[task_id] = int(task_spec["initial_fanin"])
+
+        dependents_t = ctypes_module.c_uint32 * len(dependents)
+        self.host_dependents = dependents_t(*dependents)
+        task_t = task_type * len(task_specs)
+        task_values = []
+        dependent_begin = 0
+        for task_spec in task_specs:
+            task_dependents = list(task_spec.get("dependents", []))
+            task_values.append(
+                self._make_graph_task(
+                    ctypes_module,
+                    task_type,
+                    task_spec,
+                    ptrs,
+                    n,
+                    dependent_begin,
+                    len(task_dependents),
+                    fanin[len(task_values)],
+                )
+            )
+            dependent_begin += len(task_dependents)
+
+        self.host_tasks = task_t(*task_values)
+        fanin_t = ctypes_module.c_uint32 * len(fanin)
+        self.host_fanin = fanin_t(*fanin)
+
+    def _temporary_nbytes(self, size_source, default_nbytes: int) -> int:
+        if isinstance(size_source, int):
+            return size_source
+        if isinstance(size_source, str):
+            if size_source not in self.tensor_buffers.sizes:
+                raise ValueError(f"CUDA persistent DAG temporary size references unknown tensor: {size_source}")
+            return self.tensor_buffers.sizes[size_source]
+        return default_nbytes
+
+    def _make_graph_task(
+        self,
+        ctypes_module,
+        task_type,
+        task_spec: dict,
+        ptrs: dict[str, int],
+        n: int,
+        dependent_begin: int,
+        dependent_count: int,
+        initial_fanin: int,
+    ):
+        tensor_args = list(task_spec.get("tensor_args", []))
+        scalar_args = [float(value) for value in task_spec.get("scalar_args", [])]
+        if len(tensor_args) > 4:
+            raise ValueError("CUDA persistent_dag_graph_f32 supports at most four tensor_args per task")
+        if len(scalar_args) > 4:
+            raise ValueError("CUDA persistent_dag_graph_f32 supports at most four scalar_args per task")
+
+        tensor_args_t = ctypes_module.c_void_p * 4
+        scalar_args_t = ctypes_module.c_float * 4
+        tensor_arg_ptrs = [self._graph_ptr(ptrs, name) for name in tensor_args]
+        return task_type(
+            func_id=int(task_spec["func_id"]),
+            a=self._graph_ptr(ptrs, task_spec.get("a")),
+            b=self._graph_ptr(ptrs, task_spec.get("b")),
+            c=self._graph_ptr(ptrs, task_spec.get("c")),
+            d=self._graph_ptr(ptrs, task_spec.get("d")),
+            out=self._graph_ptr(ptrs, task_spec.get("out")),
+            n=int(task_spec.get("n", n)),
+            dependent_begin=dependent_begin,
+            dependent_count=dependent_count,
+            initial_fanin=initial_fanin,
+            scalar0=float(task_spec.get("scalar0", 0.0)),
+            scalar1=float(task_spec.get("scalar1", 0.0)),
+            tensor_args=tensor_args_t(*(tensor_arg_ptrs + [0] * (4 - len(tensor_arg_ptrs)))),
+            scalar_args=scalar_args_t(*(scalar_args + [0.0] * (4 - len(scalar_args)))),
+            tensor_arg_count=len(tensor_arg_ptrs),
+            scalar_arg_count=len(scalar_args),
+        )
+
+    @staticmethod
+    def _graph_ptr(ptrs: dict[str, int], name) -> int:
+        if name is None:
+            return 0
+        key = str(name)
+        if key not in ptrs:
+            raise ValueError(f"CUDA persistent_dag_graph_f32 references unknown tensor or temporary: {key}")
+        return ptrs[key]
 
     def reset_for_run(self) -> None:
         import ctypes  # noqa: PLC0415

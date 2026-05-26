@@ -273,11 +273,12 @@ DAG specs. The current adapters construct `vector_add_f32`,
 `elementwise_scale_f32`, `elementwise_axpy_f32`,
 `persistent_dag_fork_join_f32`, `persistent_dag_chain_f32`,
 `persistent_dag_reuse_f32`, `persistent_dag_scalar_axpy_f32`,
-`persistent_dag_tensor_tile_f32`, `persistent_dag_triad_f32`, and
-`persistent_dag_quad_f32`, `persistent_dag_generic_args_f32`, and
-`persistent_dag_unary_square_f32` raw argument/state structs from
-`TaskArgsBuilder` CPU tensors and scalars. The remaining work is to add
-broader CUDA argument builders beyond those tracer bullets.
+`persistent_dag_tensor_tile_f32`, `persistent_dag_triad_f32`,
+`persistent_dag_quad_f32`, `persistent_dag_generic_args_f32`,
+`persistent_dag_graph_f32`, and `persistent_dag_unary_square_f32` raw
+argument/state structs from `TaskArgsBuilder` CPU tensors and scalars. The
+remaining work is to add broader CUDA argument builders beyond those tracer
+bullets.
 
 The descriptor now also carries bounded generic argument slots:
 `tensor_args[4]`, `scalar_args[4]`, `tensor_arg_count`, and
@@ -287,7 +288,11 @@ two auxiliary tensors and two scalars to a generated-dispatch task body
 without adding more fixed `c`/`d`-style fields. This is still an explicit
 descriptor adapter rather than full PTO graph lowering, but it sets the ABI
 direction for persistent tasks whose arity differs from the early hand-coded
-vector cases.
+vector cases. The `persistent_dag_graph_f32` adapter can now lower an
+explicit scene-test graph descriptor with per-task dependencies, fan-in,
+temporary buffers, and the same generic tensor/scalar slots. It is a
+descriptor-level stepping stone toward PTO graph lowering, not yet automatic
+construction from normal PTO task graphs.
 
 ## Static NVCC Linking Feasibility
 

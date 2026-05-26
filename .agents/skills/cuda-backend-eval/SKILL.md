@@ -590,9 +590,14 @@ path can build
 `arg_builder: persistent_dag_tensor_tile_f32`,
 `arg_builder: persistent_dag_triad_f32`,
 `arg_builder: persistent_dag_quad_f32`,
-`arg_builder: persistent_dag_generic_args_f32`, and
+`arg_builder: persistent_dag_generic_args_f32`,
+`arg_builder: persistent_dag_graph_f32`, and
 `arg_builder: persistent_dag_unary_square_f32` adapters through the L2
 `Worker`.
+Use `persistent_dag_graph_f32` when a test should pass an explicit runtime
+graph descriptor with per-task `func_id`, `a`/`b`/`c`/`d`/`out`,
+`dependents`, optional `initial_fanin`, `tensor_args`, and `scalar_args`
+fields instead of selecting one of the fixed tracer-bullet DAG adapters.
 For real host-schedule smoke coverage, pass a context definition plus
 `host_parameters`/`host_context_initializer` so the generated `__global__`
 wrapper matches the current vector-add launch ABI and can be loaded by
