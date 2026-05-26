@@ -262,6 +262,19 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2 --dag-shape generic_args
 ```
 
+Use `--dag-shape graph_descriptor` to validate the same generated-dispatch
+task bodies through an explicit runtime graph descriptor. This mirrors the
+`persistent_dag_graph_f32` SceneTestCase adapter: each task supplies its
+`func_id`, dependency list, fan-in, tensor/scalar slots, and temporary/output
+bindings as descriptor data.
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 3 --n 4096 --arch compute_80 \
+    --mode dag --queue-capacity 2 --dag-shape graph_descriptor
+```
+
 Run the corresponding no-torch L2 `SceneTestCase` path after changing generic
 persistent argument lowering:
 
@@ -642,6 +655,9 @@ same vector-add PTX kernel through two launch paths:
 - `pto_persistent_dag_generic_args`: generated-dispatch DAG with generic
   tensor/scalar descriptor slots, validating variable-arity persistent DAG
   arguments in the benchmark path.
+- `pto_persistent_dag_graph`: generated-dispatch DAG using an explicit
+  runtime graph descriptor, validating the generic graph-lowering path shared
+  with `persistent_dag_graph_f32`.
 - `pto_persistent_dag_unary_square`: generated-dispatch DAG with a one-input
   square task body, validating unary persistent DAG arguments in the
   benchmark path.
@@ -790,6 +806,16 @@ PYTHONPATH=$PWD:$PWD/python \
     --sizes 4096 --arch compute_80
 ```
 
+Use `--single-baseline pto_persistent_dag_graph` for a quick benchmark path
+check of the explicit graph-descriptor persistent DAG on one GPU:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_graph \
+    --sizes 4096 --arch compute_80
+```
+
 Use `--single-baseline pto_persistent_dag_unary_square` for a quick
 benchmark path check of the unary persistent DAG on one GPU:
 
@@ -883,7 +909,7 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 The preset checks the expected A100/H200 machines, current selected
-baselines, sizes `1024,65536,1048576`, three repeats, `702` combined samples,
+baselines, sizes `1024,65536,1048576`, three repeats, `720` combined samples,
 and the Markdown/SVG report files.
 
 When worker-grid rows are present, the report includes a

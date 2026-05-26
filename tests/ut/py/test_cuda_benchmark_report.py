@@ -204,6 +204,35 @@ def _write_artifact_payload(path: Path, label: str, machine: str, baseline: str)
     (path / "cuda-benchmark.json").write_text(json.dumps(payload) + "\n")
 
 
+def test_persistent_smoke_builds_graph_descriptor_dag_shape():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    fanin, dependents, tasks = cuda_persistent_smoke._make_dag_shape(
+        "graph_descriptor",
+        17,
+        0x1000,
+        0x2000,
+        0x3000,
+        0x4000,
+        0x5000,
+        0x6000,
+        0x7000,
+    )
+
+    assert list(fanin) == [0, 0, 2]
+    assert list(dependents) == [2, 2]
+    assert [task.func_id for task in tasks] == [9, 2, 1]
+    assert [task.initial_fanin for task in tasks] == [0, 0, 2]
+    assert [task.dependent_count for task in tasks] == [1, 1, 0]
+    assert tasks[0].out == 0x4000
+    assert tasks[2].a == tasks[0].out
+    assert tasks[2].b == tasks[1].out
+    assert list(tasks[0].tensor_args)[:2] == [0x3000, 0x6000]
+    assert list(tasks[0].scalar_args)[:2] == [1.5, 0.25]
+    assert tasks[0].tensor_arg_count == 2
+    assert tasks[0].scalar_arg_count == 2
+
+
 def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
     cuda_smoke_report = _load_smoke_report_module()
     a100 = {
@@ -564,7 +593,8 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     assert "pto_host_schedule_quad" in args.require_baseline
     assert "pto_persistent_dag_quad" in args.require_baseline
     assert "pto_persistent_dag_generic_args" in args.require_baseline
-    assert args.expected_result_count == 702
+    assert "pto_persistent_dag_graph" in args.require_baseline
+    assert args.expected_result_count == 720
 
 
 def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
@@ -2114,6 +2144,13 @@ def test_cuda_current_summary_renders_worker_and_dag_tables():
             },
             {
                 "machine": "hina",
+                "baseline": "pto_persistent_dag_graph",
+                "n": 65536,
+                "task_count": 3,
+                "device_wall_ns": 2300,
+            },
+            {
+                "machine": "hina",
                 "baseline": "pto_persistent_dag_unary_square",
                 "n": 65536,
                 "task_count": 3,
@@ -2133,7 +2170,10 @@ def test_cuda_current_summary_renders_worker_and_dag_tables():
     dag_table = cuda_current_summary.render_dag_shape_table(payload)
 
     assert "| A100 | 65536 | 6 | 128 | 3000 | 0.30x |" in worker_table
-    assert ("| A100 | 65536 | 1.50x | 2.00x | 1.25x | 1.30x | 1.35x | 1.40x | 1.10x | 1.20x | 2.50x |") in dag_table
+    assert (
+        "| A100 | 65536 | 1.50x | 2.00x | 1.25x | 1.30x | 1.35x | 1.40x | "
+        "1.10x | 1.15x | 1.20x | 2.50x |"
+    ) in dag_table
 
 
 def test_cuda_current_summary_keeps_old_captures_without_scalar_affine():
@@ -2176,9 +2216,9 @@ def test_cuda_current_summary_keeps_old_captures_without_scalar_affine():
 
     assert (
         "| GPU | N | Chain/DAG | Reuse/DAG | Scalar AXPY/DAG | Scalar Affine/DAG | Triad/DAG | "
-        "Quad/DAG | Generic Args/DAG | Unary Square/DAG | Tensor/DAG |"
+        "Quad/DAG | Generic Args/DAG | Graph Descriptor/DAG | Unary Square/DAG | Tensor/DAG |"
     ) in dag_table
-    assert "| A100 | 65536 | 1.50x | 2.00x | 1.25x | - | - | - | - | - | 2.50x |" in dag_table
+    assert "| A100 | 65536 | 1.50x | 2.00x | 1.25x | - | - | - | - | - | - | 2.50x |" in dag_table
 
 
 def test_summarize_results_groups_by_machine_and_baseline():
@@ -2736,6 +2776,41 @@ def test_render_report_describes_dag_generic_args_rows():
     assert "pto_persistent_dag_generic_args" in svg
 
 
+def test_render_report_describes_dag_graph_rows():
+    cuda_benchmark = _load_benchmark_module()
+    payload = {
+        "metadata": {
+            "label": "dag-graph-unit",
+            "git_commit": "abc123",
+            "paper_setup": "microbenchmarks only",
+        },
+        "results": [
+            {"machine": "a100-local", "baseline": "pto_host_schedule", "n": 1024, "device_wall_ns": 1000},
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_dag_graph",
+                "n": 1024,
+                "task_count": 3,
+                "dag_shape": "graph_descriptor",
+                "graph_descriptor": {
+                    "tasks": 3,
+                    "dependents": [2, 2],
+                    "fanin": [0, 0, 2],
+                },
+                "device_wall_ns": 2300,
+            },
+        ],
+    }
+
+    report = cuda_benchmark.render_markdown_report(payload)
+    svg = cuda_benchmark.render_svg(cuda_benchmark.summarize_results(payload))
+
+    expected_row = "| a100-local | pto_persistent_dag_graph | 1024 | 3 | 1 | 1 | 2300 | 2300 | - |"
+    assert expected_row in report
+    assert "`pto_persistent_dag_graph` uses an explicit runtime graph descriptor" in report
+    assert "pto_persistent_dag_graph" in svg
+
+
 def test_render_report_describes_tensor_tile_metadata():
     cuda_benchmark = _load_benchmark_module()
     payload = {
@@ -2833,6 +2908,13 @@ def test_render_report_highlights_dag_shape_rows():
             },
             {
                 "machine": "a100-local",
+                "baseline": "pto_persistent_dag_graph",
+                "n": 4096,
+                "task_count": 3,
+                "device_wall_ns": 1100,
+            },
+            {
+                "machine": "a100-local",
                 "baseline": "pto_persistent_dag_unary_square",
                 "n": 4096,
                 "task_count": 3,
@@ -2851,6 +2933,7 @@ def test_render_report_highlights_dag_shape_rows():
     assert ("| a100-local | 4096 | pto_persistent_dag_triad | 3 | 1500 | 1.50x |") in report
     assert ("| a100-local | 4096 | pto_persistent_dag_quad | 3 | 1600 | 1.60x |") in report
     assert ("| a100-local | 4096 | pto_persistent_dag_generic_args | 3 | 1250 | 1.25x |") in report
+    assert ("| a100-local | 4096 | pto_persistent_dag_graph | 3 | 1100 | 1.10x |") in report
     assert ("| a100-local | 4096 | pto_persistent_dag_unary_square | 3 | 1200 | 1.20x |") in report
     assert ("| a100-local | 4096 | pto_persistent_dag_tensor | 4 | 4200 | 4.20x |") in report
 
@@ -3163,10 +3246,11 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_persistent_dag_triad",
         "pto_persistent_dag_quad",
         "pto_persistent_dag_generic_args",
+        "pto_persistent_dag_graph",
         "pto_persistent_dag_unary_square",
         "pto_persistent_dag_tensor",
     ]
-    assert len(payload["results"]) == 18
+    assert len(payload["results"]) == 19
 
 
 def test_run_single_sample_dispatches_scalar_axpy_dag(monkeypatch):
@@ -3541,6 +3625,69 @@ def test_run_single_sample_dispatches_generic_args_dag(monkeypatch):
     assert result["generic_args"] == {"tensor_args": {"0": "tmp0", "1": "tmp3"}, "scalar_args": [1.5, 0.25]}
 
 
+def test_run_single_sample_dispatches_graph_descriptor_dag(monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = {}
+
+    def fake_run_persistent_sample(
+        device,
+        n,
+        arch,
+        mode="direct",
+        task_count=None,
+        baseline=None,
+        worker_blocks_per_task=1,
+        dag_shape="fork_join",
+        tensor_tile=None,
+    ):
+        seen.update(
+            {
+                "device": device,
+                "n": n,
+                "arch": arch,
+                "mode": mode,
+                "task_count": task_count,
+                "baseline": baseline,
+                "worker_blocks_per_task": worker_blocks_per_task,
+                "dag_shape": dag_shape,
+                "tensor_tile": tensor_tile,
+            }
+        )
+        return {
+            "baseline": baseline,
+            "n": n,
+            "task_count": task_count or 3,
+            "dag_shape": dag_shape,
+            "graph_descriptor": {"tasks": 3, "dependents": [2, 2], "fanin": [0, 0, 2]},
+            "device_wall_ns": 10,
+            "status": "pass",
+        }
+
+    monkeypatch.setattr(cuda_benchmark, "run_persistent_sample", fake_run_persistent_sample)
+
+    result = cuda_benchmark.run_single_sample(
+        baseline="pto_persistent_dag_graph",
+        device=3,
+        n=1024,
+        block_dim=128,
+        arch="compute_80",
+    )
+
+    assert seen == {
+        "device": 3,
+        "n": 1024,
+        "arch": "compute_80",
+        "mode": "dag",
+        "task_count": None,
+        "baseline": "pto_persistent_dag_graph",
+        "worker_blocks_per_task": 1,
+        "dag_shape": "graph_descriptor",
+        "tensor_tile": None,
+    }
+    assert result["baseline"] == "pto_persistent_dag_graph"
+    assert result["graph_descriptor"] == {"tasks": 3, "dependents": [2, 2], "fanin": [0, 0, 2]}
+
+
 def test_run_benchmark_passes_tensor_descriptor_to_tensor_dag(monkeypatch):
     cuda_benchmark = _load_benchmark_module()
     seen = []
@@ -3641,6 +3788,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_dag_triad", 1),
         ("pto_persistent_dag_quad", 1),
         ("pto_persistent_dag_generic_args", 1),
+        ("pto_persistent_dag_graph", 1),
         ("pto_persistent_dag_unary_square", 1),
         ("pto_persistent_dag_tensor", 1),
         ("pto_host_schedule_batch", 6),
@@ -3648,7 +3796,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_queue_batch", 6),
     ]
     assert payload["metadata"]["batch_tasks"] == 6
-    assert len(payload["results"]) == 21
+    assert len(payload["results"]) == 22
 
 
 def test_run_benchmark_can_include_worker_grid_batch_mode(monkeypatch):

@@ -190,6 +190,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_triad`;
 - `pto_persistent_dag_quad`;
 - `pto_persistent_dag_generic_args`;
+- `pto_persistent_dag_graph`;
 - `pto_persistent_dag_unary_square`;
 - `pto_persistent_dag_tensor`;
 - same-work batch rows;
@@ -204,7 +205,9 @@ host-schedule row, unary square host-schedule row, quad host-schedule row, and
 `pto_persistent_dag_quad`, validating fourth tensor task descriptor fields,
 `pto_persistent_dag_generic_args`, validating indexed generic tensor/scalar
 argument slots, and `pto_persistent_dag_unary_square`, validating unary
-persistent DAG arguments in the full paired benchmark path.
+persistent DAG arguments in the full paired benchmark path. The
+`pto_persistent_dag_graph` row has focused A100/H200 coverage and is queued
+for the next full paired-current refresh.
 
 Evidence:
 
@@ -1260,6 +1263,41 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 Result: `1 passed, 37 deselected`. The remote command also printed the known
 PTO-ISA SSH refresh warning before the selected CUDA test passed.
+
+The explicit graph-descriptor path has now been promoted into the benchmark
+scripts as `pto_persistent_dag_graph`, using `dag_shape=graph_descriptor`.
+This row uses the generated-dispatch `func_id` sequence `[9,2,1]`, generic
+tensor slots `tensor_args[0]=tmp0,tensor_args[1]=tmp3`, scalar slots
+`scalar_args[0]=1.5,scalar_args[1]=0.25`, and the explicit runtime graph
+metadata `fanin=[0,0,2]` and `dependents=[2,2]`.
+
+Focused local test coverage for the benchmark/report wiring:
+
+```bash
+.venv/bin/python -m pytest tests/ut/py/test_cuda_benchmark_report.py \
+  -q --platform cuda
+```
+
+Result: `108 passed`.
+
+The focused single-baseline path was checked on A100:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_graph --sizes 4096 \
+    --repeats 1 --arch compute_80
+```
+
+The same command was run on H200 with `--arch compute_90` and the remote venv
+Python. Result:
+`tmp/cuda-backend/persistent-graph-baseline-working/` contains `a100.json`,
+`h200.json`, `cuda-smoke-report.md`, and `cuda-smoke-report.svg`. The A100
+row reported `status=pass`,
+`ptx_source=nvcc-persistent-generated-dispatch-compute_80`,
+`dispatch_func_ids=[9,2,1]`, and `device_wall_ns=36864`; H200 reported
+`status=pass`, `ptx_source=nvcc-persistent-generated-dispatch-compute_90`,
+`dispatch_func_ids=[9,2,1]`, and `device_wall_ns=31424`.
 
 Needed:
 

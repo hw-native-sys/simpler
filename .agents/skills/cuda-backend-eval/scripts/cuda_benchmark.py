@@ -971,7 +971,15 @@ def run_persistent_sample(
             task_count = 6
         elif dag_shape == "chain":
             task_count = 5
-        elif dag_shape in {"scalar_axpy", "scalar_affine", "triad", "quad", "generic_args", "unary_square"}:
+        elif dag_shape in {
+            "scalar_axpy",
+            "scalar_affine",
+            "triad",
+            "quad",
+            "generic_args",
+            "graph_descriptor",
+            "unary_square",
+        }:
             task_count = 3
         elif mode == "dag":
             task_count = 3
@@ -1111,6 +1119,15 @@ def run_single_sample(  # noqa: PLR0912
             mode="dag",
             baseline=baseline,
             dag_shape="generic_args",
+        )
+    if baseline == "pto_persistent_dag_graph":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="graph_descriptor",
         )
     if baseline == "pto_persistent_dag_unary_square":
         return run_persistent_sample(
@@ -1288,6 +1305,7 @@ def run_benchmark(
                     "pto_persistent_dag_triad",
                     "pto_persistent_dag_quad",
                     "pto_persistent_dag_generic_args",
+                    "pto_persistent_dag_graph",
                     "pto_persistent_dag_unary_square",
                     "pto_persistent_dag_tensor",
                 ):
@@ -1706,6 +1724,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         "pto_persistent_dag_triad": "#d9822b",
         "pto_persistent_dag_quad": "#b66d2c",
         "pto_persistent_dag_generic_args": "#a65f2c",
+        "pto_persistent_dag_graph": "#7f5b42",
         "pto_persistent_dag_unary_square": "#e3a857",
         "pto_persistent_dag_tensor": "#e76f51",
         "pto_persistent_device": "#9467bd",
@@ -1945,6 +1964,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  to validate four-input persistent DAG arguments.",
             "- `pto_persistent_dag_generic_args` uses generic tensor/scalar task descriptor slots",
             "  to validate variable-arity persistent DAG arguments.",
+            "- `pto_persistent_dag_graph` uses an explicit runtime graph descriptor",
+            "  to validate the generic graph-lowering path used by SceneTestCase.",
             "- `pto_persistent_dag_unary_square` uses a one-input square task body",
             "  to validate unary persistent DAG arguments.",
             (
@@ -2027,6 +2048,7 @@ def main() -> None:
             "pto_persistent_dag_triad",
             "pto_persistent_dag_quad",
             "pto_persistent_dag_generic_args",
+            "pto_persistent_dag_graph",
             "pto_persistent_dag_unary_square",
             "pto_persistent_dag_tensor",
             "pto_host_schedule_batch",
