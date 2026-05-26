@@ -112,6 +112,7 @@ and composes the generated dispatch entry.
 `KernelCompiler` entry point, registers the prepared raw callable through the
 normal L2 `Worker`, builds `persistent_dag_fork_join_f32`,
 `persistent_dag_chain_f32`, `persistent_dag_reuse_f32`, and
+`persistent_dag_scalar_axpy_f32` mixed tensor/scalar descriptors, plus
 `persistent_dag_tensor_tile_f32` state objects from normal `TaskArgsBuilder`
 CPU tensors, and validates real copied-back CUDA output data.
 The host-schedule scene path also accepts the neutral

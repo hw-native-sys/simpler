@@ -403,7 +403,8 @@ path can build
 `persistent_device` generated-dispatch DAG specs and run the
 `arg_builder: persistent_dag_fork_join_f32`,
 `arg_builder: persistent_dag_chain_f32`,
-`arg_builder: persistent_dag_reuse_f32`, and
+`arg_builder: persistent_dag_reuse_f32`,
+`arg_builder: persistent_dag_scalar_axpy_f32`, and
 `arg_builder: persistent_dag_tensor_tile_f32` adapters through the L2
 `Worker`.
 For real host-schedule smoke coverage, pass a context definition plus
