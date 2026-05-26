@@ -32,6 +32,8 @@
 #include <fstream>
 #include <string>
 
+#include "utils/elf_build_id.h"
+
 // dlog wrapper so error paths show up in device log without depending on
 // our common/unified_log machinery (this SO is loaded standalone by CANN).
 extern "C" void DlogRecord(int moduleId, int level, const char *fmt, ...);
@@ -46,9 +48,10 @@ void DispatcherLog(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (&DlogRecord != nullptr) {
-        DlogRecord(kDlogModuleCcecpu, kDlogLevelError, "[simpler-dispatcher] %s", buf);
-    }
+    // DlogRecord is a non-weak extern: if it failed to resolve, this SO
+    // would not have dlopen'd in the first place, so an address-vs-nullptr
+    // guard here is dead code (and is folded to `true` by most compilers).
+    DlogRecord(kDlogModuleCcecpu, kDlogLevelError, "[simpler-dispatcher] %s", buf);
 }
 }  // namespace simpler_dispatcher
 
@@ -78,19 +81,18 @@ static_assert(offsetof(DeviceArgs, inner_so_len) == 128, "DeviceArgs::inner_so_l
 
 namespace simpler_dispatcher {
 
-// FNV-1a over first 64 bytes XOR'd with len. Host's MakeInnerSoBasename
-// uses the same algorithm so both sides produce the same filename without
-// any other channel of communication.
+// ELF Build-ID-derived 64-bit fingerprint (linker SHA-1 truncated to 8
+// bytes by `-Wl,--build-id`). Falls back to full-buffer FNV-1a if the SO
+// was somehow linked without a build-id note. Host's
+// load_aicpu_op.cpp::FingerprintBytes calls the same helper, so both sides
+// produce identical fingerprints with no other channel of communication.
+//
+// The earlier "FNV-1a over the first 64 bytes XOR len" scheme collided in
+// practice on same-toolchain runtime SOs whose ELF headers + size matched
+// — wrong-code risk on the multi-runtime path. Build-IDs are strong by
+// linker contract: identical Build-IDs imply byte-identical SOs.
 uint64_t Fingerprint(const char *data, uint64_t len) {
-    constexpr uint64_t kFnvOffset = 0xcbf29ce484222325ULL;
-    constexpr uint64_t kFnvPrime = 0x100000001b3ULL;
-    uint64_t h = kFnvOffset;
-    size_t n = len < 64 ? len : 64;
-    for (size_t i = 0; i < n; ++i) {
-        h ^= static_cast<unsigned char>(data[i]);
-        h *= kFnvPrime;
-    }
-    return h ^ len;
+    return simpler::common::utils::elf_build_id_64(data, static_cast<std::size_t>(len));
 }
 
 // Preinstall path — HwHiAiUser owns this dir, the sched thread can write here.
@@ -148,17 +150,21 @@ bool WriteBytes(const std::string &path, const char *data, uint64_t len) {
 extern "C" {
 
 // Stubs — libaicpu_extend_kernels::SetTileFwkKernelMap dlsym's all three at
-// load time; absence makes the whole SO unmappable. We only reach Init.
+// load time; absence makes the whole SO unmappable. We only reach Init in
+// practice, but return 0 (success) here to mirror the happy-path return of
+// the old AICPU kernel stubs we replaced. If a future CANN version begins
+// invoking Static as a warm-up probe, returning failure would be a silent
+// regression versus the prior behavior.
 __attribute__((visibility("default"))) int StaticTileFwkBackendKernelServer(void *args) {
     (void)args;
-    simpler_dispatcher::DispatcherLog("Static: stub (should not be called)");
-    return 1;
+    simpler_dispatcher::DispatcherLog("Static: stub (not expected to be called)");
+    return 0;
 }
 
 __attribute__((visibility("default"))) uint32_t DynTileFwkBackendKernelServer(void *args) {
     (void)args;
-    simpler_dispatcher::DispatcherLog("Server: stub (dispatcher is upload-only, should not be called)");
-    return 1;
+    simpler_dispatcher::DispatcherLog("Server: stub (dispatcher is upload-only, not expected to be called)");
+    return 0;
 }
 
 // Init: write the bundled runtime SO bytes to a fingerprint-named file under

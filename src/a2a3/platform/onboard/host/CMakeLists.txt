@@ -122,15 +122,6 @@ target_include_directories(host_runtime
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
 )
 
-# Stable dispatcher basename. The dispatcher SO is bundled with the host
-# runtime and resolved next to host_runtime.so via dladdr at runtime;
-# LoadAicpuOp::BootstrapDispatcher uploads it (along with the per-runtime
-# AICPU kernel SO bytes) into the main aicpu_scheduler at host process
-# startup via libaicpu_extend_kernels — no tar.gz, no sudo.
-target_compile_definitions(host_runtime PRIVATE
-    SIMPLER_AICPU_BASENAME="libsimpler_aicpu_dispatcher.so"
-)
-
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
     target_link_directories(host_runtime PRIVATE ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64)
 endif()

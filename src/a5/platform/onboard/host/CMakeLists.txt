@@ -98,11 +98,6 @@ target_include_directories(host_runtime
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
 )
 
-# Stable dispatcher basename (see a2a3 CMakeLists for rationale).
-target_compile_definitions(host_runtime PRIVATE
-    SIMPLER_AICPU_BASENAME="libsimpler_aicpu_dispatcher.so"
-)
-
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
 # when performance profiling is enabled

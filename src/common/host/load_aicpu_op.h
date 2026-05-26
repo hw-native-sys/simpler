@@ -88,14 +88,16 @@ public:
     /**
      * @brief One-shot bootstrap: upload runtime SO to preinstall via dispatcher.
      *
-     * @param dispatcher_so_path  Host path to libsimpler_aicpu_dispatcher.so
+     * @param dispatcher_so_data  Dispatcher SO bytes (caller-owned, must outlive call)
+     * @param dispatcher_so_len   Dispatcher SO size
      * @param inner_so_data       Runtime SO bytes (caller-owned, must outlive call)
      * @param inner_so_len        Runtime SO size
      * @param stream              Stream on which to enqueue the bootstrap
      * @return 0 on success, error code on failure
      */
     int BootstrapDispatcher(
-        const std::string &dispatcher_so_path, const void *inner_so_data, size_t inner_so_len, rtStream_t stream
+        const void *dispatcher_so_data, size_t dispatcher_so_len, const void *inner_so_data, size_t inner_so_len,
+        rtStream_t stream
     );
 
     /**

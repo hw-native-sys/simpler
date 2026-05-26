@@ -10,14 +10,18 @@ path under a content-fingerprint filename:
 ```
 
 The dispatcher SO itself is **never** persisted to disk and **never** dispatches
-at per-task launch time. After bootstrap, the host launches the runtime SO
-directly via `rtAicpuKernelLaunchExWithArgs` (kernel_type = `KERNEL_TYPE_AICPU`),
-which routes through the main `aicpu_scheduler` and dlopens the preinstall file.
+at per-task launch time. After bootstrap, the host registers the preinstall
+file via `rtsBinaryLoadFromFile` (Mode B JSON load, cpuKernelMode=0) and
+resolves `simpler_aicpu_init` / `simpler_aicpu_exec` once via
+`rtsFuncGetByName`; per-task launches go through `rtsLaunchCpuKernel` on the
+cached `rtFuncHandle`s. The main `aicpu_scheduler` owns the dlopen of the
+preinstall file; the dispatcher is out of the picture once bootstrap returns.
 
-The source is runtime-agnostic, so it is built once and installed at
-`build/lib/<arch>/onboard/<runtime>/libsimpler_aicpu_dispatcher.so` (a sibling
-of each runtime's host_runtime.so). A single process binding multiple runtimes
-shares one dispatcher SO on disk.
+The source is runtime-agnostic. It is built per-arch under
+`build/lib/<arch>/onboard/<runtime>/libsimpler_aicpu_dispatcher.so` as a
+sibling of each runtime's host_runtime.so. A single process binding multiple
+runtimes can share one dispatcher SO on disk; the host process-level
+fingerprint cache deduplicates bootstrap calls by inner-SO Build-ID.
 
 ## Exported entry points
 

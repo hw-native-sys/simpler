@@ -16,18 +16,19 @@
 
 #include <unistd.h>
 
-#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <unordered_set>
 #include <vector>
 
 #include "acl/acl.h"
 #include "common/unified_log.h"
 #include "runtime/rt.h"
+#include "utils/elf_build_id.h"
 
 namespace host {
 
@@ -49,34 +50,12 @@ std::string MakeUniqueOpType(const char *base, uint64_t fp) {
     return buf;
 }
 
-uint64_t FingerprintBytes(const void *data, size_t len) {
-    constexpr uint64_t kFnvOffset = 0xcbf29ce484222325ULL;
-    constexpr uint64_t kFnvPrime = 0x100000001b3ULL;
-    uint64_t h = kFnvOffset;
-    size_t n = len < 64 ? len : 64;
-    auto *p = reinterpret_cast<const unsigned char *>(data);
-    for (size_t i = 0; i < n; ++i) {
-        h ^= p[i];
-        h *= kFnvPrime;
-    }
-    return h ^ static_cast<uint64_t>(len);
-}
-
-bool ReadFileBytes(const std::string &path, std::vector<char> &out) {
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in.is_open()) {
-        LOG_ERROR("ReadFileBytes: cannot open %s: %s", path.c_str(), strerror(errno));
-        return false;
-    }
-    std::streamsize len = in.tellg();
-    in.seekg(0);
-    out.resize(static_cast<size_t>(len));
-    if (!in.read(out.data(), len)) {
-        LOG_ERROR("ReadFileBytes: read failed for %s", path.c_str());
-        return false;
-    }
-    return true;
-}
+// ELF Build-ID-derived 64-bit fingerprint. Dispatcher SO uses the same
+// helper on the device side, so both sides agree on the preinstall
+// basename without any other channel of communication. See
+// src/common/utils/elf_build_id.h for the fallback behavior when the SO
+// was linked without a build-id note.
+uint64_t FingerprintBytes(const void *data, size_t len) { return simpler::common::utils::elf_build_id_64(data, len); }
 
 struct DeviceBuf {
     void *ptr = nullptr;
@@ -88,19 +67,31 @@ struct DeviceBuf {
 
 // Process-level cache of inner-SO fingerprints we've already bootstrapped.
 // Multiple DeviceRunner instances in the same process share one entry per
-// runtime here; same-content uploads short-circuit. No mutex — host-side
-// LoadAicpuOp construction is always serialized by the caller (Python GIL or
-// sequential per-ChipWorker init), so concurrent insert never happens.
+// runtime here; same-content uploads short-circuit. Guarded by a mutex so
+// that callers releasing the Python GIL (e.g. nanobind methods marked
+// `nb::call_guard<nb::gil_scoped_release>`) cannot race on the set's
+// internals. The lock is uncontended on the steady-state path and only
+// touched at DeviceRunner init time, so the overhead is negligible
+// compared to keeping the invariant alive in a comment.
 std::unordered_set<uint64_t> &BootstrappedFps() {
     static std::unordered_set<uint64_t> kSet;
     return kSet;
+}
+std::mutex &BootstrappedFpsMutex() {
+    static std::mutex m;
+    return m;
 }
 
 }  // namespace
 
 int LoadAicpuOp::BootstrapDispatcher(
-    const std::string &dispatcher_so_path, const void *inner_so_data, size_t inner_so_len, rtStream_t stream
+    const void *dispatcher_so_data, size_t dispatcher_so_len, const void *inner_so_data, size_t inner_so_len,
+    rtStream_t stream
 ) {
+    if (dispatcher_so_data == nullptr || dispatcher_so_len == 0) {
+        LOG_ERROR("BootstrapDispatcher: empty dispatcher SO bytes");
+        return -1;
+    }
     if (inner_so_data == nullptr || inner_so_len == 0) {
         LOG_ERROR("BootstrapDispatcher: empty inner SO bytes");
         return -1;
@@ -108,14 +99,22 @@ int LoadAicpuOp::BootstrapDispatcher(
     inner_fp_ = FingerprintBytes(inner_so_data, inner_so_len);
     inner_so_basename_ = MakeInnerSoBasename(inner_fp_);
 
-    if (BootstrappedFps().count(inner_fp_) > 0) {
-        LOG_INFO_V2("BootstrapDispatcher: inner SO fp=%016lx already bootstrapped, skipping", inner_fp_);
-        return 0;
+    {
+        std::lock_guard<std::mutex> lk(BootstrappedFpsMutex());
+        if (BootstrappedFps().count(inner_fp_) > 0) {
+            LOG_INFO_V2("BootstrapDispatcher: inner SO fp=%016lx already bootstrapped, skipping", inner_fp_);
+            return 0;
+        }
     }
+    // Note: we deliberately drop the lock for the heavy bootstrap work and
+    // re-take it for the post-insert below. Two threads racing on the same
+    // fingerprint will each perform a bootstrap, which is harmless: CANN's
+    // libaicpu_extend_kernels has a one-shot `firstCreatSo_` latch, and the
+    // atomic tmp+rename in WriteBytes is idempotent across same-content
+    // racers. Holding the lock across the upload would serialize all
+    // multi-runtime ChipWorker init in the process — a real regression.
 
-    std::vector<char> dispatcher_bytes;
-    if (!ReadFileBytes(dispatcher_so_path, dispatcher_bytes)) return -1;
-    size_t dispatcher_len = dispatcher_bytes.size();
+    size_t dispatcher_len = dispatcher_so_len;
     const char *inner_bytes = reinterpret_cast<const char *>(inner_so_data);
     size_t inner_len = inner_so_len;
 
@@ -126,9 +125,7 @@ int LoadAicpuOp::BootstrapDispatcher(
         LOG_ERROR("BootstrapDispatcher: aclrtMalloc(dispatcher) failed: %d", rc);
         return rc;
     }
-    rc = aclrtMemcpy(
-        dev_dispatcher.ptr, dispatcher_len, dispatcher_bytes.data(), dispatcher_len, ACL_MEMCPY_HOST_TO_DEVICE
-    );
+    rc = aclrtMemcpy(dev_dispatcher.ptr, dispatcher_len, dispatcher_so_data, dispatcher_len, ACL_MEMCPY_HOST_TO_DEVICE);
     if (rc != ACL_SUCCESS) {
         LOG_ERROR("BootstrapDispatcher: aclrtMemcpy(dispatcher) failed: %d", rc);
         return rc;
@@ -204,7 +201,10 @@ int LoadAicpuOp::BootstrapDispatcher(
         "BootstrapDispatcher: bundled dispatcher (%zu B) + inner SO (%zu B) uploaded; inner SO at %s", dispatcher_len,
         inner_len, inner_so_basename_.c_str()
     );
-    BootstrappedFps().insert(inner_fp_);
+    {
+        std::lock_guard<std::mutex> lk(BootstrappedFpsMutex());
+        BootstrappedFps().insert(inner_fp_);
+    }
     return 0;
 }
 
@@ -228,6 +228,13 @@ void LoadAicpuOp::Finalize() {
 LoadAicpuOp::~LoadAicpuOp() { Finalize(); }
 
 bool LoadAicpuOp::GenerateAicpuOpJson(const std::string &json_path, const std::string &kernel_so) {
+    // Inputs are a closed set: opType / functionName are KernelNames::*
+    // constants suffixed with a hex fingerprint, kernelSo is also hex-only,
+    // and the remaining fields are hard-coded literals. No characters that
+    // require JSON escaping can appear, so manual string concatenation is
+    // safe. If you add a field whose value can be user-derived (paths,
+    // user-supplied identifiers, etc.), switch to a real JSON serializer
+    // before letting it through.
     std::ofstream json_file(json_path);
     if (!json_file.is_open()) {
         LOG_ERROR("Failed to open JSON file for writing: %s", json_path.c_str());
@@ -284,6 +291,33 @@ int LoadAicpuOp::Init() {
         return -1;
     }
 
+    // RAII cleanups: any non-zero return path below unwinds via these guards.
+    // .release() flips them off once the corresponding state becomes part of
+    // the LoadAicpuOp's steady-state ownership.
+    struct JsonGuard {
+        std::string &path;
+        bool active = true;
+        ~JsonGuard() {
+            if (active && !path.empty()) {
+                std::remove(path.c_str());
+                path.clear();
+            }
+        }
+        void release() { active = false; }
+    } json_guard{json_file_path_};
+
+    struct BinaryGuard {
+        void *&handle;
+        bool active = true;
+        ~BinaryGuard() {
+            if (active && handle != nullptr) {
+                (void)rtsBinaryUnload(handle);
+                handle = nullptr;
+            }
+        }
+        void release() { active = false; }
+    } binary_guard{binary_handle_};
+
     rtLoadBinaryOption_t option = {};
     option.optionId = RT_LOAD_BINARY_OPT_CPU_KERNEL_MODE;
     option.value.cpuKernelMode = 0;
@@ -297,8 +331,7 @@ int LoadAicpuOp::Init() {
     rtError_t rc = rtsBinaryLoadFromFile(json_file_path_.c_str(), &load_config, &binary_handle_);
     if (rc != RT_ERROR_NONE) {
         LOG_ERROR("rtsBinaryLoadFromFile failed for %s: %d", json_file_path_.c_str(), rc);
-        std::remove(json_file_path_.c_str());
-        json_file_path_.clear();
+        // binary_handle_ stays null; json_guard removes the JSON file.
         return rc;
     }
     LOG_INFO_V2("LoadAicpuOp: Loaded inner SO via JSON, handle=%p", binary_handle_);
@@ -310,11 +343,17 @@ int LoadAicpuOp::Init() {
         rc = rtsFuncGetByName(binary_handle_, lookup_name.c_str(), &func_handle);
         if (rc != RT_ERROR_NONE) {
             LOG_ERROR("rtsFuncGetByName failed for %s: %d", lookup_name.c_str(), rc);
+            // binary_guard unloads the partially-registered binary, json_guard
+            // removes the JSON file. Symmetric with the rtsBinaryLoadFromFile
+            // failure branch above.
             return rc;
         }
         func_handles_[name] = func_handle;
         LOG_INFO_V2("LoadAicpuOp: resolved handle for %s (opType=%s): %p", name, lookup_name.c_str(), func_handle);
     }
+
+    binary_guard.release();
+    json_guard.release();
     return 0;
 }
 

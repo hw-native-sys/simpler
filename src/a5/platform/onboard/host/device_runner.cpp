@@ -31,22 +31,6 @@
 #include <string>
 #include <vector>
 
-static std::string resolve_dispatcher_so_path() {
-    // Dispatcher SO sits next to host_runtime.so (the SO this function lives
-    // in). dladdr gives us host_runtime.so's path; the dispatcher basename
-    // SIMPLER_AICPU_BASENAME is baked in at build time.
-    Dl_info info;
-    if (dladdr(reinterpret_cast<void *>(resolve_dispatcher_so_path), &info) == 0 || info.dli_fname == nullptr) {
-        return SIMPLER_AICPU_BASENAME;
-    }
-    std::string path = info.dli_fname;
-    size_t pos = path.rfind('/');
-    if (pos == std::string::npos) {
-        return SIMPLER_AICPU_BASENAME;
-    }
-    return path.substr(0, pos + 1) + SIMPLER_AICPU_BASENAME;
-}
-
 #include "callable.h"
 #include "callable_protocol.h"
 #include "utils/elf_build_id.h"
@@ -364,15 +348,23 @@ int DeviceRunner::ensure_binaries_loaded() {
         return -1;
     }
 
+    if (dispatcher_so_binary_.empty()) {
+        LOG_ERROR(
+            "DeviceRunner: dispatcher SO bytes not provided; pass dispatcher_path through ChipWorker.init "
+            "(RuntimeBinaries.dispatcher_path)"
+        );
+        return -1;
+    }
+
     // Bundle dispatcher SO + inner SO bytes into one Mode A KFC call:
     // libaicpu_extend_kernels invokes our dispatcher, which writes the inner
     // SO bytes to simpler_inner_<fp>.so in preinstall. Dispatcher itself never
     // persists. Per-task launches afterwards go through Mode B
     // (rtsBinaryLoadFromFile + rtsFuncGetByName + rtsLaunchCpuKernel) directly
     // against the preinstall file.
-    std::string dispatcher_so_path = resolve_dispatcher_so_path();
     int rc = load_aicpu_op_.BootstrapDispatcher(
-        dispatcher_so_path, aicpu_so_binary_.data(), aicpu_so_binary_.size(), stream_aicpu_
+        dispatcher_so_binary_.data(), dispatcher_so_binary_.size(), aicpu_so_binary_.data(), aicpu_so_binary_.size(),
+        stream_aicpu_
     );
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::BootstrapDispatcher failed: %d", rc);
@@ -387,8 +379,9 @@ int DeviceRunner::ensure_binaries_loaded() {
     }
     LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_init/exec handles ready)");
 
-    // Keep so_info_ allocation matching upstream behavior (see a2a3 sibling
-    // for rationale).
+    // H2D copy aicpu kernel SO bytes and stamp the resulting device pointer
+    // into device_args_.aicpu_so_bin/len (see a2a3 sibling — load-bearing on
+    // a5 onboard even though our own AICPU SO doesn't read these fields).
     rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
@@ -402,6 +395,15 @@ int DeviceRunner::ensure_binaries_loaded() {
         so_info_.finalize();
         return rc;
     }
+
+    // Release host bytes — Mode B per-task launches use the cached rtFuncHandle
+    // on LoadAicpuOp; dispatcher SO bytes are never referenced again; the
+    // aicpu kernel SO's host buffer is also free to drop now that so_info_
+    // already H2D'd the bytes above.
+    dispatcher_so_binary_.clear();
+    dispatcher_so_binary_.shrink_to_fit();
+    aicpu_so_binary_.clear();
+    aicpu_so_binary_.shrink_to_fit();
 
     binaries_loaded_ = true;
     LOG_INFO_V0("DeviceRunner: binaries loaded");
@@ -957,7 +959,7 @@ int DeviceRunner::finalize() {
     // are released by runtime_args_cleanup RAII so they also unwind on errors.
     kernel_args_.finalize_device_args();
 
-    // Cleanup AICPU SO
+    // Cleanup AICPU SO H2D allocation
     so_info_.finalize();
 
     // load_aicpu_op_ has no per-task device-side state to release (Mode A

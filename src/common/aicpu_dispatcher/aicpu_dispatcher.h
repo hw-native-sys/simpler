@@ -35,11 +35,12 @@
  *      The sched thread (HwHiAiUser) owns this dir, so the write succeeds.
  *   4. host computes the same fingerprint locally to derive the same
  *      preinstall filename.
- *   5. Per-task launches: host calls `rtAicpuKernelLaunchExWithArgs`
- *      (kernel_type = `KERNEL_TYPE_AICPU`, so_name = `simpler_inner_<fp>.so`,
- *      kernel_name = `simpler_aicpu_init`/`_exec`). The main aicpu_scheduler
- *      dlopens the preinstall file once and caches the handle; dispatcher is
- *      no longer in the picture.
+ *   5. Per-task launches (Mode B): host calls `rtsBinaryLoadFromFile` to
+ *      JSON-register the preinstall file (cpuKernelMode=0), resolves
+ *      `simpler_aicpu_init` / `simpler_aicpu_exec` via `rtsFuncGetByName`,
+ *      then dispatches each task through `rtsLaunchCpuKernel` on the cached
+ *      `rtFuncHandle`. The main aicpu_scheduler owns the dlopen of the
+ *      preinstall file; this dispatcher SO is no longer in the picture.
  *
  * Multi-runtime in one host process: each DeviceRunner bootstraps with the
  * same dispatcher bytes + its own runtime SO bytes. A process-level

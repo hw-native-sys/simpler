@@ -38,10 +38,12 @@ extern "C" int aicpu_execute(Runtime *arg);
 /**
  * AICPU kernel initialization entry point.
  *
- * Called once by simpler_dispatcher in the Init phase. The dispatcher
- * dlsym's "simpler_aicpu_init" inside this inner SO (an internal
- * dispatcher↔inner protocol — independent of CANN's preinstalled
- * libaicpu_extend_kernels contract, which only binds the dispatcher itself).
+ * Called once per run by the main aicpu_scheduler. Host registers this SO
+ * via `rtsBinaryLoadFromFile` (Mode B JSON load, cpuKernelMode=0) and
+ * resolves this symbol via `rtsFuncGetByName`; the per-task launch goes
+ * through `rtsLaunchCpuKernel` on the cached `rtFuncHandle`. The bootstrap
+ * dispatcher only writes this SO to the preinstall path — it does not
+ * dlsym these symbols itself.
  *
  * @param arg Pointer to KernelArgs structure
  * @return 0 on success, -1 on error
@@ -72,8 +74,9 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
 /**
  * AICPU kernel main execution entry point.
  *
- * Called per-thread by simpler_dispatcher in the Run phase via dlsym
- * "simpler_aicpu_exec" on the inner SO.
+ * Called per-thread by the main aicpu_scheduler via the cached
+ * `rtFuncHandle` resolved during host-side Mode B init (see
+ * `simpler_aicpu_init` docstring for the load path).
  *
  * @param arg Pointer to KernelArgs structure containing runtime_args
  * @return 0 on success, non-zero on error

@@ -69,13 +69,21 @@ def _invalidate_cache_if_stale(target_cache_dir: Path, current_commit: str) -> N
 
 @dataclass
 class RuntimeBinaries:
-    """Paths to the compiled runtime binaries."""
+    """Paths to the compiled runtime binaries.
+
+    ``dispatcher_path`` points at ``libsimpler_aicpu_dispatcher.so`` and is
+    required for onboard platforms (host bootstrap reads its bytes and ships
+    them to the device alongside the inner SO). Sim platforms have no
+    dispatcher; the field is ``None`` there. ``_lookup_binaries`` resolves
+    and validates the path against the build output directory.
+    """
 
     host_path: Path
     aicpu_path: Path
     aicore_path: Path
     simpler_log_path: Path
     sim_context_path: Optional[Path] = None
+    dispatcher_path: Optional[Path] = None
 
 
 class RuntimeBuilder:
@@ -186,12 +194,24 @@ class RuntimeBuilder:
                 "Run 'pip install .' or pass --build to compile it."
             )
 
+        # Resolve and validate libsimpler_aicpu_dispatcher.so for onboard
+        # platforms. runtime_compiler stages one copy per arch into
+        # <LIB_DIR>/<arch>/dispatcher/ (shared across all runtimes); sim
+        # platforms have no dispatcher.
+        dispatcher_path = self._resolve_dispatcher_path()
+        if dispatcher_path is not None and not dispatcher_path.is_file():
+            raise FileNotFoundError(
+                f"Pre-built libsimpler_aicpu_dispatcher.so not found at {dispatcher_path}.\n"
+                "Run 'pip install .' or pass --build to compile it."
+            )
+
         return RuntimeBinaries(
             host_path=paths["host"],
             aicpu_path=paths["aicpu"],
             aicore_path=paths["aicore"],
             simpler_log_path=simpler_log_path,
             sim_context_path=sim_context_path,
+            dispatcher_path=dispatcher_path,
         )
 
     def get_binaries(self, name: str, build: bool = False) -> RuntimeBinaries:
@@ -216,6 +236,11 @@ class RuntimeBuilder:
 
         arch, variant = self._arch, self._variant
         output_dir = self._LIB_DIR / arch / variant / name
+        # Per-arch shared destination for libsimpler_aicpu_dispatcher.so. The
+        # dispatcher has no runtime-specific code, so all runtimes on a given
+        # arch reuse the same SO instead of carrying a copy each (~50 KB × N).
+        # None on sim — sim variants have no dispatcher.
+        dispatcher_staging_dir = self._LIB_DIR / arch / "dispatcher" if variant != "sim" else None
 
         if not build:
             return self._lookup_binaries(name, output_dir)
@@ -247,7 +272,7 @@ class RuntimeBuilder:
                     source_dirs,
                     build_dir=str(cache_dir),
                     output_dir=output_dir,
-                    runtime_name=name,
+                    dispatcher_dest=dispatcher_staging_dir if target == "aicpu" else None,
                 )
 
         logger.info("Compiling AICore, AICPU, Host in parallel...")
@@ -269,13 +294,34 @@ class RuntimeBuilder:
 
         self._place_compile_commands(name)
         logger.info("Build complete!")
+        # runtime_compiler stages libsimpler_aicpu_dispatcher.so into the
+        # per-arch shared directory when target=='aicpu'. Surface it through
+        # RuntimeBinaries so ChipWorker.init can pass the path to
+        # LoadAicpuOp::BootstrapDispatcher.
+        dispatcher_path = self._resolve_dispatcher_path()
+        if dispatcher_path is not None and not dispatcher_path.is_file():
+            dispatcher_path = None
         return RuntimeBinaries(
             host_path=host_path,
             aicpu_path=aicpu_path,
             aicore_path=aicore_path,
             simpler_log_path=simpler_log_path,
             sim_context_path=sim_context_path,
+            dispatcher_path=dispatcher_path,
         )
+
+    def _resolve_dispatcher_path(self) -> Optional[Path]:
+        """Return path to libsimpler_aicpu_dispatcher.so for onboard variants.
+
+        Returns ``None`` for sim variants (no dispatcher needed: sim's AICPU
+        runs in-process). For onboard, runtime_compiler stages one shared
+        copy per arch under ``build/lib/<arch>/dispatcher/`` (the dispatcher
+        has no runtime-specific code, so all onboard runtimes on a given
+        arch use the same SO). Validated separately by ``_lookup_binaries``.
+        """
+        if self._variant == "sim":
+            return None
+        return self._LIB_DIR / self._arch / "dispatcher" / "libsimpler_aicpu_dispatcher.so"
 
     def _resolve_sim_context_path(self) -> Optional[Path]:
         """Return path to libcpu_sim_context.so for sim platforms, None for onboard.
