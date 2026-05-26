@@ -584,10 +584,11 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2 --dag-shape chain --repeat-runs 2
 ```
 
-Result: local A100 returned `launch_completed_counts=[5,5]`,
-`launch_device_wall_ns=[44032,41984]`, and zero scheduler errors. Remote H200
-returned `launch_completed_counts=[5,5]`,
-`launch_device_wall_ns=[48512,40672]`, and zero scheduler errors.
+Result: `tmp/cuda-backend/persistent-chain-repeat2-smoke-4bcd56c4/`
+contains A100 and H200 JSON plus Markdown/SVG reports. Local A100 returned
+`launch_completed_counts=[5,5]`, `launch_device_wall_ns=[44032,41984]`, and
+zero scheduler errors. Remote H200 returned `launch_completed_counts=[5,5]`,
+`launch_device_wall_ns=[45760,39616]`, and zero scheduler errors.
 
 After adding invalid-dependent, dependent-range, fan-in-underflow,
 initial-fan-in, and no-root scheduler diagnostics, the focused CUDA test set
