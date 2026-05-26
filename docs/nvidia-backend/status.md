@@ -169,6 +169,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_reuse`;
 - `pto_persistent_dag_scalar_axpy`;
 - `pto_persistent_dag_scalar_affine`;
+- `pto_persistent_dag_triad`;
 - `pto_persistent_dag_tensor`;
 - same-work batch rows;
 - worker-grid batch rows.
@@ -179,6 +180,10 @@ and worker-grid values `32,64,128,256`. It includes the compiler-backed
 host-schedule row, unary square host-schedule row, and
 `pto_persistent_dag_scalar_axpy` and `pto_persistent_dag_scalar_affine` on
 both A100 and H200.
+The benchmark script's default persistent set now also includes
+`pto_persistent_dag_triad`; the latest full paired capture predates that row,
+so it is represented by a focused single-baseline artifact until the next full
+refresh.
 
 Evidence:
 
@@ -875,6 +880,23 @@ Result: `tmp/cuda-backend/persistent-triad-smoke-3a3bcdb1/` contains
 `tensor_args={"c":"tmp0"}`, `device_wall_ns=27648`; the H200 row returned
 `status=pass`, `ptx_arch=compute_90`, the same dispatch IDs and tensor args,
 and `device_wall_ns=24832`. Both rows reported zero device scheduler errors.
+
+After promoting the triad DAG to a benchmark baseline, the new single-baseline
+path was checked on both GPUs:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_triad \
+    --sizes 4096 --arch compute_80
+```
+
+Result: `tmp/cuda-backend/persistent-triad-baseline/` contains A100 and H200
+JSON plus Markdown/SVG reports. A100 returned `status=pass`,
+`ptx_arch=compute_80`, `dispatch_func_ids=[6,2,1]`,
+`tensor_args={"c":"tmp0"}`, and `device_wall_ns=34816`; H200 returned
+`status=pass`, `ptx_arch=compute_90`, the same dispatch IDs and tensor args,
+and `device_wall_ns=33536`. Both rows reported zero device scheduler errors.
 
 After promoting the two-scalar affine DAG to a benchmark baseline, the focused
 report tests passed locally and the new single-baseline path was checked on

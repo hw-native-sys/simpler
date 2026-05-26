@@ -513,6 +513,9 @@ same vector-add PTX kernel through two launch paths:
 - `pto_persistent_dag_scalar_axpy`: generated-dispatch DAG with a `scalar0`
   task descriptor field, validating mixed tensor/scalar persistent DAG
   arguments in the benchmark path.
+- `pto_persistent_dag_triad`: generated-dispatch DAG with a `c` tensor task
+  descriptor field, validating three-input persistent DAG arguments in the
+  benchmark path.
 - `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a tiled
   GEMM task followed by elementwise residual, gate, and fan-in tasks. The
   benchmark uses the default 16x16x16 descriptor unless
@@ -626,6 +629,16 @@ PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --single-baseline pto_persistent_dag_scalar_axpy \
     --sizes 1024 --arch compute_80
+```
+
+Use `--single-baseline pto_persistent_dag_triad` for a quick benchmark path
+check of the third-tensor descriptor DAG on one GPU:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_triad \
+    --sizes 4096 --arch compute_80
 ```
 
 Use `--single-baseline pto_host_schedule_unary_square` for a quick benchmark

@@ -62,6 +62,8 @@ regenerated from the combined JSON with
 - `pto_persistent_dag_scalar_affine`: generated-dispatch DAG that reads
   `scalar0` and `scalar1` task descriptor fields for two-scalar affine work
   before downstream fan-in.
+- `pto_persistent_dag_triad`: generated-dispatch DAG that reads a third tensor
+  task descriptor field for three-input triad work before downstream fan-in.
 - `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a tiled
   GEMM task followed by residual, gate, and fan-in elementwise tasks.
 - `*_batch`: same-work rows comparing repeated host launches with one
