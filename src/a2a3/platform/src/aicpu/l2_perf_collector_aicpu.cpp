@@ -259,10 +259,14 @@ int l2_perf_aicpu_complete_record(
     }
 
     // Read AICore-published timing from the per-core staging ring.
+    // AICore↔AICPU is hardware-coherent on GM; AICore's dcci pushes the slot
+    // to GM before signaling FIN, so AICPU sees it without invalidate. The
+    // caller's COND read (MMIO Device-nGnRnE) and these slot reads (Normal
+    // cacheable) have no data/address dependency on ARM64 — the `rmb()`
+    // prevents speculative slot loads from being satisfied before COND
+    // indicates FIN. (See src/a2a3/docs/cache-coherency.md.)
     L2PerfRecord *slot = &ring->dual_issue_slots[expected_reg_task_id % PLATFORM_L2_AICORE_RING_SIZE];
-    // One PoC cache line: matches AICore l2_perf_aicore_record_task() dcci(..., SINGLE_CACHE_LINE, ...)
-    // and aicpu/cache_ops.cpp step size; timing fields live in the first line.
-    cache_invalidate_range(slot, 64);
+    rmb();
     if (static_cast<uint32_t>(slot->task_id) != expected_reg_task_id) {
         // Hard error: the runtime's completion-before-dispatch invariant
         // guarantees AICore must have published this slot before AICPU sees

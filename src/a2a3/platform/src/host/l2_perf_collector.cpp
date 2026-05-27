@@ -105,6 +105,7 @@ int L2PerfCollector::initialize(
     l2_perf_level_ = l2_perf_level;
     output_prefix_ = output_prefix;
     total_perf_collected_ = 0;
+    total_phase_collected_ = 0;
 
     // Stash the memory context on the base up-front so alloc_single_buffer
     // sees consistent values during init. shm_host_ stays nullptr until the
@@ -871,6 +872,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, const L2Pe
     core_to_thread_.clear();
     has_phase_data_ = false;
     total_perf_collected_ = 0;
+    total_phase_collected_ = 0;
     clear_memory_context();
 
     LOG_DEBUG("Performance profiling cleanup complete");
