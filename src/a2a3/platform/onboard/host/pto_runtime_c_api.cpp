@@ -259,11 +259,11 @@ int simpler_init(
         std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
         runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
         // Dispatcher SO bytes are passed alongside the executors. Onboard
-        // requires a non-empty buffer: BootstrapDispatcher reads from it on
-        // the first run() to upload the dispatcher + inner SO bundle through
+        // requires a non-empty buffer: BootstrapDispatcher reads from it to
+        // upload the dispatcher + inner SO bundle through
         // libaicpu_extend_kernels. If the caller drives _ChipWorker.init
-        // directly without a dispatcher path, this stays empty and any later
-        // run() fails fast in ensure_binaries_loaded with a clear message.
+        // directly without a dispatcher path, this stays empty and the
+        // ensure_device_initialized call below fails fast with a clear message.
         if (dispatcher_binary != NULL && dispatcher_size > 0) {
             std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
             runner->set_dispatcher_binary(std::move(dispatcher_vec));
@@ -271,6 +271,19 @@ int simpler_init(
     } catch (...) {
         return -1;
     }
+
+    // Eagerly run the one-shot device setup: create persistent AICPU/AICore
+    // streams, upload the dispatcher + inner SO bundle, and resolve the per-
+    // symbol rtFuncHandle for per-task launch — so the first prepare_callable
+    // / run_prepared does not pay any of these costs. Streams live until
+    // finalize_device; the cached rtFuncHandle on LoadAicpuOp and the
+    // preinstall file both live until ~DeviceRunner.
+    try {
+        rc = runner->ensure_device_initialized();
+    } catch (...) {
+        return -1;
+    }
+    if (rc != 0) return rc;
     return 0;
 }
 

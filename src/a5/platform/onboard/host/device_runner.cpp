@@ -240,8 +240,9 @@ std::thread DeviceRunner::create_thread(std::function<void()> fn) {
 }
 
 int DeviceRunner::ensure_device_initialized() {
-    // First attach the current thread and create fresh run-scoped streams.
-    // device_id_ was set in attach_current_thread() during simpler_init.
+    // Attach the current thread to the device and create the persistent
+    // AICPU/AICore streams (destroyed in finalize()). device_id_ was set in
+    // attach_current_thread() during simpler_init.
     int rc = prepare_run_context(device_id_);
     if (rc != 0) {
         return rc;
@@ -304,8 +305,6 @@ int DeviceRunner::prepare_run_context(int device_id) {
         return 0;
     }
 
-    release_run_context();
-
     // Create streams
     rc = rtStreamCreate(&stream_aicpu_, 0);
     if (rc != 0) {
@@ -326,14 +325,10 @@ int DeviceRunner::prepare_run_context(int device_id) {
 }
 
 void DeviceRunner::release_run_context() {
-    if (stream_aicpu_ != nullptr) {
-        rtStreamDestroy(stream_aicpu_);
-        stream_aicpu_ = nullptr;
-    }
-    if (stream_aicore_ != nullptr) {
-        rtStreamDestroy(stream_aicore_);
-        stream_aicore_ = nullptr;
-    }
+    // Streams now live for the lifetime of the DeviceRunner (created at
+    // simpler_init time via ensure_device_initialized, destroyed in finalize).
+    // Per-run release is intentionally a no-op so prepare_run_context's stream
+    // check short-circuits across all prepare_callable / run_prepared calls.
 }
 
 int DeviceRunner::ensure_binaries_loaded() {
@@ -977,6 +972,22 @@ int DeviceRunner::finalize() {
     }
 
     release_run_context();
+
+    // Streams are persistent for the DeviceRunner's lifetime; destroy them here.
+    // Intentionally no pre-destroy sync: when a run hits the AICore op-timeout
+    // chain (PR #718), the AICPU stream surfaces ACL_ERROR_RT_AICPU_EXCEPTION
+    // (507018) at run-path sync; calling aclrtSynchronizeStream* again on the
+    // error-state stream at finalize wedges subsequent tests (observed: 507018
+    // / 507899 / 507901 cascade across the whole st-onboard-a2a3 suite).
+    // rtStreamDestroy on an error-state stream is the supported teardown path.
+    if (stream_aicpu_ != nullptr) {
+        rtStreamDestroy(stream_aicpu_);
+        stream_aicpu_ = nullptr;
+    }
+    if (stream_aicore_ != nullptr) {
+        rtStreamDestroy(stream_aicore_);
+        stream_aicore_ = nullptr;
+    }
 
     // Cleanup kernel args (deviceArgs); device-side KernelArgs + runtime args
     // are released by runtime_args_cleanup RAII so they also unwind on errors.

@@ -271,12 +271,13 @@ public:
 
     /**
      * Take ownership of the dispatcher SO bytes. Called by simpler_init when
-     * the caller provided a dispatcher path; ensure_binaries_loaded() hands
-     * the buffer to LoadAicpuOp::BootstrapDispatcher on the first run.
-     * Leaving this unset (empty buffer) makes ensure_binaries_loaded() fail
-     * with a clear message — callers that drive _ChipWorker.init directly
-     * without a dispatcher path get a deterministic error at run() time
-     * rather than a confusing dladdr-derived path.
+     * the caller provided a dispatcher path; the eager
+     * ensure_device_initialized() in simpler_init hands the buffer to
+     * LoadAicpuOp::BootstrapDispatcher at init time. Leaving this unset
+     * (empty buffer) makes ensure_binaries_loaded() fail with a clear
+     * message — callers that drive _ChipWorker.init directly without a
+     * dispatcher path get a deterministic error at simpler_init time rather
+     * than a confusing dladdr-derived path.
      */
     void set_dispatcher_binary(std::vector<uint8_t> dispatcher_so_binary) {
         dispatcher_so_binary_ = std::move(dispatcher_so_binary);
@@ -403,11 +404,33 @@ public:
     /**
      * Release run-scoped resources owned by the current thread.
      *
-     * This destroys AICPU/AICore streams but intentionally preserves device
-     * allocations, uploaded binaries, and other session state so they can be
-     * finalized later before rtDeviceReset().
+     * No-op since streams now live for the DeviceRunner's lifetime (created at
+     * simpler_init via ensure_device_initialized, destroyed in finalize).
+     * Retained as a name so the c_api RAII guards keep their existing shape.
      */
     void release_run_context();
+
+    /**
+     * One-shot device initialization. Performs, in order:
+     *   1. rtSetDevice + rtStreamCreate for AICPU and AICore streams. Streams
+     *      live for the DeviceRunner's lifetime and are destroyed in finalize.
+     *   2. Bundles dispatcher SO bytes + inner AICPU kernel SO bytes through
+     *      `LoadAicpuOp::BootstrapDispatcher` so the inner SO is written to
+     *      the device-side preinstall path.
+     *   3. Registers the inner SO via `LoadAicpuOp::Init`
+     *      (`rtsBinaryLoadFromFile` + `rtsFuncGetByName`) and caches the
+     *      resulting per-symbol `rtFuncHandle` for per-task `rtsLaunchCpuKernel`.
+     *   4. Allocates the device-side AicpuSoInfo H2D copy and stamps
+     *      `device_args_.aicpu_so_bin/len` (load-bearing on a5 onboard).
+     *
+     * Called once from `simpler_init` after the executor + dispatcher bytes are
+     * cached on the runner. Idempotent: subsequent calls short-circuit on
+     * binaries_loaded_. Reads device_id_ recorded by attach_current_thread.
+     *
+     * @return 0 on success, error code on failure (e.g. dispatcher SO bytes
+     *         not provided, CANN stream create / register failures).
+     */
+    int ensure_device_initialized();
 
     /**
      * Stage a per-callable_id orchestration SO into device memory and remember
@@ -597,20 +620,6 @@ private:
 
     // PMU profiling (per-task AICore hardware counters)
     PmuCollector pmu_collector_;
-
-    /**
-     * Ensure device is initialized (lazy initialization)
-     *
-     * Checks if device is already initialized. If not, performs:
-     * - Attach the current thread to the device
-     * - Create AICPU and AICore streams
-     * - Load AICPU SO to device memory
-     * - Initialize device args
-     *
-     * Reads the bound device id and executor binaries from runner state.
-     * @return 0 on success, error code on failure
-     */
-    int ensure_device_initialized();
 
     /**
      * Query the maximum block_dim the stream can host.
