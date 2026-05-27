@@ -30,7 +30,7 @@ from pathlib import Path
 
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 
-_REQUIRED_TASK_FIELDS = ("task_id", "func_id", "core_id", "core_type", "start_time_us", "end_time_us", "fanout")
+_REQUIRED_TASK_FIELDS = ("task_id", "func_id", "core_id", "core_type", "start_time_us", "end_time_us")
 
 
 def validate_perf_artifact(case_label: str, *, expected_task_count: int | None = None) -> None:
@@ -53,7 +53,6 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
 
     with perf.open() as f:
         data = json.load(f)
-    assert data.get("version") in (1, 2, 3, 4), f"unexpected version: {data.get('version')}"
     tasks = data.get("tasks")
     assert isinstance(tasks, list), "tasks field missing or not a list"
     assert len(tasks) > 0, f"perf records empty under {perf}"

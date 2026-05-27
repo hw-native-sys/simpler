@@ -15,9 +15,9 @@
  *
  * Captures the inputs to every Orchestrator::submit_task call into a streaming
  * ring of DepGenRecord. The host side replays these records offline to
- * reconstruct the full task dependency graph (deps.json), bypassing the race
- * window in L2PerfRecord::fanout[] (where an early-finishing producer would
- * have its record sealed before later-submitted consumers can register).
+ * reconstruct the full task dependency graph (deps.json). deps.json is the
+ * sole source of truth for fanout edges; the L2 swimlane hot path no longer
+ * carries fanout to keep AICPU off the per-task GM-store critical path.
  *
  * Streaming buffer design mirrors PMU / L2Perf / TensorDump (single source of
  * algorithmic truth in src/a2a3/platform/include/host/profiling_common/profiler_base.h):

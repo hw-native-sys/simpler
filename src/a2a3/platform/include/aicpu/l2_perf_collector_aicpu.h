@@ -73,8 +73,9 @@ void l2_perf_aicpu_init(int worker_count);
  * `dual_issue_slots[expected_reg_task_id % PLATFORM_L2_AICORE_RING_SIZE]`,
  * validates the task_id match, fills all AICPU-side fields, commits into
  * the current records buffer, and rotates the records buffer internally
- * once it fills up. Callers must pre-extract fanout into a plain uint64_t
- * array (platform layer cannot depend on runtime linked-list types).
+ * once it fills up. Fanout edges live in the static DAG (deps.json from
+ * dep_gen) and are joined by the host's swimlane converter post-run, so
+ * this commit path does not touch fanout.
  *
  * Per-core counter accounting:
  *   total_record_count++       — every commit attempt (success or failure)
@@ -95,12 +96,10 @@ void l2_perf_aicpu_init(int worker_count);
  * @param core_type             Core type (AIC/AIV)
  * @param dispatch_time         AICPU timestamp when task was dispatched
  * @param finish_time           AICPU timestamp when task completion was observed
- * @param fanout                Pre-extracted successor task ID array (nullptr if none)
- * @param fanout_count          Number of entries in fanout array (0 if none)
  */
 int l2_perf_aicpu_complete_record(
     int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
-    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
+    uint64_t dispatch_time, uint64_t finish_time
 );
 
 /**

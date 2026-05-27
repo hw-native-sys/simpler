@@ -592,9 +592,10 @@ int L2PerfCollector::export_swimlane_json() {
     }
 
     // Step 7: Write JSON data
-    int version = static_cast<int>(l2_perf_level_);
+    // Fanout fields are emitted as empty/zero — the device-side hot path no
+    // longer carries them. Downstream (swimlane_converter.py) joins fanout
+    // from the sibling deps.json (dep_gen output).
     outfile << "{\n";
-    outfile << "  \"version\": " << version << ",\n";
     outfile << "  \"tasks\": [\n";
 
     for (size_t i = 0; i < tagged_records.size(); ++i) {
@@ -620,18 +621,9 @@ int L2PerfCollector::export_swimlane_json() {
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
         outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
         outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
-        outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
-        outfile << "      \"fanout\": [";
-        int safe_fanout_count =
-            (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT) ? record.fanout_count : 0;
-        for (int j = 0; j < safe_fanout_count; ++j) {
-            outfile << record.fanout[j];
-            if (j < safe_fanout_count - 1) {
-                outfile << ", ";
-            }
-        }
-        outfile << "],\n";
-        outfile << "      \"fanout_count\": " << record.fanout_count << "\n";
+        outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << "\n";
+        // Fanout is no longer carried on the device hot path — dep_gen replay
+        // (deps.json) is the sole source of truth, joined in by tooling.
         outfile << "    }";
         if (i < tagged_records.size() - 1) {
             outfile << ",";

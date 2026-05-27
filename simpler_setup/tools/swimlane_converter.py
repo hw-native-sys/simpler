@@ -92,8 +92,7 @@ def read_perf_data(filepath):
         filepath: Path to input JSON file
 
     Returns:
-        dict: Parsed performance data with keys:
-            - version
+        dict: Parsed performance data with key:
             - tasks (list)
 
     Raises:
@@ -102,50 +101,44 @@ def read_perf_data(filepath):
     with open(filepath) as f:
         data = json.load(f)
 
-    # Validate required fields
-    required_fields = ["version", "tasks"]
-    for field in required_fields:
-        if field not in data:
-            raise ValueError(f"Missing required field: {field}")
-
-    # Validate version
-    if data["version"] not in [1, 2, 3, 4]:
-        raise ValueError(f"Unsupported version: {data['version']} (expected 1, 2, 3, or 4)")
+    if "tasks" not in data:
+        raise ValueError("Missing required field: tasks")
 
     return data
 
 
-def load_deps_json(perf_records_path):
-    """Load deps.json (dep_gen replay output) co-located with ``l2_perf_records.json``.
+def load_deps_json(deps_path):
+    """Load a dep_gen replay output (``deps.json``).
 
-    deps.json supersedes ``task["fanout"]``: fanout is sealed at the moment the
-    producer's L2PerfRecord retires, so consumers submitted after a fast producer
-    completes can never get attributed to it. dep_gen's replay reconstructs the
-    complete graph by replaying every captured ``submit_task`` through a host
-    PTO2TensorMap.
+    deps.json is the sole source of truth for the task graph in this tool:
+    the device hot path no longer records per-task fanout (see PR #863). The
+    typical workflow is a dep_gen run once per topology (``--enable-dep-gen``)
+    to produce ``deps.json``, then any number of ``--enable-l2-swimlane`` runs
+    that join their per-task timing against that captured graph.
 
     Returns:
-        dict[int, list[int]] mapping ``pred_raw → [succ_raw, ...]`` (i.e. the
-        same shape as ``task["fanout"]``), or ``None`` if no deps.json is present.
-        Tasks with no successors are absent from the dict (mirrors ``defaultdict``
-        semantics on lookup miss).
+        dict[int, list[int]] mapping ``pred_raw → [succ_raw, ...]``, or
+        ``None`` if the file is missing, unreadable, or not v2-shaped. Tasks
+        with no successors are absent from the dict (``defaultdict``-like
+        lookup-miss semantics).
     """
-    deps_path = Path(perf_records_path).parent / "deps.json"
+    deps_path = Path(deps_path)
     if not deps_path.exists():
         return None
     try:
         with deps_path.open() as f:
             data = json.load(f)
     except (OSError, ValueError) as e:
-        print(f"Warning: failed to read {deps_path}: {e}; falling back to fanout", file=sys.stderr)
+        print(f"Warning: failed to read {deps_path}: {e}", file=sys.stderr)
         return None
     edges = data.get("edges")
     if not isinstance(edges, list):
+        print(f"Warning: {deps_path} has no 'edges' array", file=sys.stderr)
         return None
     version = data.get("version")
     if version != 2:
         print(
-            f"Warning: deps.json version={version!r}; only v2 is supported. Falling back to fanout[].",
+            f"Warning: {deps_path} version={version!r}; only v2 is supported.",
             file=sys.stderr,
         )
         return None
@@ -396,7 +389,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         tasks: List of task dicts with fields:
             - task_id, func_id, core_id, core_type
             - start_time_us, end_time_us, duration_us
-            - fanout, fanout_count
             - dispatch_time_us (optional, AICPU dispatch timestamp)
             - finish_time_us (optional, AICPU finish timestamp)
         output_path: Path to output JSON file
@@ -477,9 +469,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         ts = task["start_time_us"]
         dur = task["duration_us"]
 
-        # Build fanout hint string (packed ids → rXtY / tY for readability)
-        fanout_str = "[" + ", ".join(format_task_display(x) for x in task["fanout"]) + "]"
-
         # Get function name if available
         func_id = task["func_id"]
         tdisp = format_task_display(task["task_id"])
@@ -488,6 +477,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             task_name = f"{func_name}({tdisp})"
         else:
             task_name = f"func_{_func_id_to_letter(func_id)}({tdisp})"
+
+        # Build fanout hint string (packed ids → rXtY / tY for readability)
+        # from deps.json — the device hot path no longer carries fanout.
+        fanout_str = (
+            "["
+            + ", ".join(format_task_display(x) for x in (deps_edges.get(task["task_id"], []) if deps_edges else []))
+            + "]"
+        )
 
         events.append(
             {
@@ -620,9 +617,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             task_to_aicpu_event_id[(task["task_id"], task["core_id"])] = event_id
             event_id += 1
 
-    # Flow events (Flow events "s" and "f" for dependencies). When deps.json
-    # was produced by dep_gen replay, prefer its edges over task["fanout"] —
-    # fanout is the truncated, race-prone view (see load_deps_json's docstring).
+    # Flow events (Flow events "s" and "f" for dependencies). Edges come from
+    # deps.json (dep_gen replay); without one we emit no flow events at all,
+    # since the device hot path no longer carries fanout (PR #863).
     # Edges where the predecessor's end_time outlives the successor's start_time
     # are flagged as happens-before violations and emitted with a distinct flow
     # name so Perfetto colors them differently from clean dependency arrows.
@@ -631,11 +628,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         task_map[t["task_id"]].append(t)
     flow_id = 0
     hb_violation_count = 0
-
-    def _succs_for(task):
-        if deps_edges is not None:
-            return deps_edges.get(task["task_id"], [])
-        return task["fanout"]
+    edges_by_pred = deps_edges or {}
 
     for task in tasks:
         src_tid = core_to_tid[task["core_id"]]
@@ -646,7 +639,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         # Use a small offset (0.01 us) for visual clarity
         flow_start_us = src_ts_end - 0.01
 
-        for succ_task_id in _succs_for(task):
+        for succ_task_id in edges_by_pred.get(task["task_id"], []):
             if succ_task_id not in task_map:
                 if verbose:
                     print(
@@ -699,8 +692,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 flow_id += 1
 
     if verbose:
-        edge_source = "deps.json" if deps_edges is not None else "task.fanout"
-        print(f"  Flow events: {flow_id} edges (source: {edge_source})")
+        if deps_edges is not None:
+            print(f"  Flow events: {flow_id} edges (source: deps.json)")
+        else:
+            print("  Flow events: 0 (no deps.json — re-run dep_gen and pass --deps-json to add arrows)")
         if hb_violation_count > 0:
             print(f"  Happens-before violations: {hb_violation_count} edge(s) flagged as 'hb_violation'")
 
@@ -841,7 +836,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             src_tid = task_to_aicpu_tid.get((task["task_id"], task["core_id"]), core_to_tid[task["core_id"]])
             src_aicpu_eid = task_to_aicpu_event_id.get((task["task_id"], task["core_id"]))
 
-            for succ_task_id in _succs_for(task):
+            for succ_task_id in edges_by_pred.get(task["task_id"], []):
                 if succ_task_id not in task_map:
                     continue
 
@@ -1108,6 +1103,13 @@ Examples:
         "--func-names",
         help="Path to func_id_names_*.json (SceneTest format) for func_id to function name mapping",
     )
+    parser.add_argument(
+        "--deps-json",
+        help=(
+            "Path to a dep_gen replay deps.json (defaults to sibling of the perf JSON). "
+            "Without one the trace has no dependency arrows — re-run with --enable-dep-gen first."
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     return parser
 
@@ -1145,11 +1147,10 @@ def _resolve_output_path(args, input_path):
 
 
 def _print_verbose_data_info(data, verbose):
-    """Print verbose summary of loaded performance data including v2 phase counts."""
+    """Print verbose summary of loaded performance data including phase counts."""
     if not verbose:
         return
     print("\n=== Performance Data ===")
-    print(f"  Version: {data['version']}")
     print(f"  Task Count: {len(data['tasks'])}")
     if data["tasks"]:
         start_times = [t["start_time_us"] for t in data["tasks"]]
@@ -1158,8 +1159,6 @@ def _print_verbose_data_info(data, verbose):
         max_time = max(end_times)
         print(f"  Time Range: {min_time:.3f} us - {max_time:.3f} us (span: {max_time - min_time:.3f} us)")
     print()
-    if data["version"] != 2:
-        return
     scheduler_phases = data.get("aicpu_scheduler_phases")
     orchestrator_phases = data.get("aicpu_orchestrator_phases")
     core_to_thread = data.get("core_to_thread")
@@ -1227,9 +1226,17 @@ def main():
 
         output_path = _resolve_output_path(args, input_path)
 
-        deps_edges = load_deps_json(input_path)
-        if args.verbose and deps_edges is not None:
-            print(f"  Using deps.json edges ({sum(len(v) for v in deps_edges.values())} total)")
+        deps_path = Path(args.deps_json) if args.deps_json else Path(input_path).parent / "deps.json"
+        deps_edges = load_deps_json(deps_path)
+        if deps_edges is not None:
+            if args.verbose:
+                print(f"  Using deps.json edges ({sum(len(v) for v in deps_edges.values())} total) from {deps_path}")
+        else:
+            print(
+                f"Warning: no usable deps.json at {deps_path}; Perfetto trace will have no dependency arrows. "
+                f"Run a dep_gen capture (--enable-dep-gen) and pass --deps-json <path> to add them.",
+                file=sys.stderr,
+            )
 
         generate_chrome_trace_json(
             data["tasks"],
@@ -1250,13 +1257,15 @@ def main():
 
         print_task_statistics(data["tasks"], func_names)
 
-        # The deep-dive reads only the perf JSON and (optionally) the colocated
-        # deps.json — sibling auto-discovery happens inside run_sched_overhead_analysis.
+        # The deep-dive reads the perf JSON plus deps.json (for per-thread
+        # fanout / fanin aggregates). Forward the resolved deps path so an
+        # explicit --deps-json overrides sibling auto-discovery there too.
         print("\n=== Scheduler Overhead Deep Dive ===")
         deep_dive_rc = run_sched_overhead_analysis(
             input_path,
             print_sources=True,
             perf_data=data,
+            deps_json_path=deps_path if deps_edges is not None else None,
         )
         if deep_dive_rc != 0:
             print(

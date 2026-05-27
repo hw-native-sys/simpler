@@ -24,12 +24,10 @@
  * device run completes, so going through the filesystem would just be
  * extra I/O and an extra file in the output directory.
  *
- * deps.json supersedes ``L2PerfRecord::fanout[]`` for tools that need the
- * *complete* dependency graph: fanout is sealed when a producer finishes, so
- * consumers submitted after a fast producer retires never get attributed to
- * it (the race window that motivated dep_gen). Replay sees every submit and
- * so reconstructs the graph the runtime would have built if no producer ever
- * raced ahead.
+ * deps.json is the sole source of truth for fanout: the L2 swimlane hot
+ * path no longer records ``L2PerfRecord::fanout[]`` (taking the per-task
+ * 1 KB GM store off the scheduler critical path). Replay sees every
+ * submit and reconstructs the complete dependency graph.
  *
  * Output format (deps.json, v2):
  *

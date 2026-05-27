@@ -47,7 +47,19 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_rec
 
 # Verbose mode (for debugging)
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json -v
+
+# Reuse a deps.json captured in an earlier dep_gen run (different output dir)
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json \
+    --deps-json outputs/<case>_<earlier_ts>/deps.json
 ```
+
+> Dependency arrows in the Perfetto trace come from `deps.json` (dep_gen
+> replay). The device hot path no longer records fanout, so the typical
+> workflow is **two runs**: a one-time `--enable-dep-gen` capture per
+> topology to produce `deps.json`, then any number of
+> `--enable-l2-swimlane` runs that consume it. If no `deps.json` is found
+> alongside the perf JSON (and `--deps-json` isn't passed), the trace
+> still renders but has no arrows; the converter prints a warning.
 
 ### Command-Line Options
 
@@ -57,6 +69,7 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_rec
 | `--output` | `-o` | Output JSON file (default: outputs/merged_swimlane_`<timestamp>`.json) |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
 | `--func-names` | | Path to func_id_names_*.json (SceneTest format) for function name mapping |
+| `--deps-json` | | Path to a dep_gen `deps.json` (defaults to sibling of input). Without one, no dependency arrows are drawn. |
 | `--verbose` | `-v` | Enable verbose output |
 
 ### Outputs
@@ -154,7 +167,7 @@ Output is emitted in three parts:
 - **Part 2: AICPU scheduler loop breakdown** — per-scheduler-thread loop statistics, per-phase (scan / complete / dispatch / idle) time ratios, pop_hit / pop_miss totals, and (when deps.json is available) per-thread fanout / fanin aggregates
 - **Part 3: Tail OH distribution & cause analysis** — Tail OH quantile distribution (P10–P99), correlation between scheduler loop iteration time and Tail OH, and data-driven insights into the dominant phase
 
-The perf JSON must be a v2 capture with non-empty `aicpu_scheduler_phases` (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
+The perf JSON must have non-empty `aicpu_scheduler_phases` (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
 
 ---
 
@@ -270,7 +283,6 @@ The analysis tools share the same input format - the `l2_perf_records_*.json` fi
 
 ```json
 {
-  "version": 1,
   "tasks": [
     {
       "task_id": 0,
@@ -279,13 +291,14 @@ The analysis tools share the same input format - the `l2_perf_records_*.json` fi
       "core_type": "aic",
       "start_time_us": 100.0,
       "end_time_us": 250.5,
-      "duration_us": 150.5,
-      "fanout": [1, 2],
-      "fanout_count": 2
+      "duration_us": 150.5
     }
   ]
 }
 ```
+
+Dependency edges come from `deps.json` (dep_gen replay) at post-process time —
+not from the perf JSON. See [`swimlane_converter --deps-json`](#swimlane_converter).
 
 ### Kernel Config Format
 

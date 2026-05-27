@@ -554,10 +554,9 @@ static TaskOutputTensors submit_task_common(
 
     // dep_gen capture point: snapshot the orch submit_task inputs while the
     // tensormap is still in its pre-lookup state for this task. Replay reads
-    // these records offline to reconstruct the complete dep graph, sidestepping
-    // the race window in L2PerfRecord::fanout[] where an early-finishing
-    // producer's record gets sealed before later-submitted consumers can
-    // register themselves.
+    // these records offline to reconstruct the complete dep graph — the sole
+    // source of truth for fanout now that the swimlane hot path no longer
+    // records it.
     if (is_dep_gen_enabled()) {
         const void *tensor_ptrs[MAX_TENSOR_ARGS];
         // TensorArgType is `enum class : int32_t` (4 bytes); the on-disk record

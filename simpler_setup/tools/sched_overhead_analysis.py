@@ -10,7 +10,7 @@
 """Scheduler overhead analysis for PTO2.
 
 Inputs:
-  1. Per-task perf profiling data (l2_perf_records_*.json), v2 schema with
+  1. Per-task perf profiling data (l2_perf_records_*.json) with
      ``aicpu_scheduler_phases`` populated by ``--enable-l2-swimlane``.
   2. deps.json (optional, dep_gen replay output) colocated with the perf JSON,
      used to derive per-thread fanout / fanin DAG stats.
@@ -153,18 +153,16 @@ def auto_select_l2_perf_records_json():
 
 
 def parse_scheduler_from_json_phases(data):
-    """Extract scheduler Phase breakdown from l2_perf_records JSON (version >= 2).
+    """Extract scheduler Phase breakdown from l2_perf_records JSON.
 
     Computes per-thread loop counts, task counts, and phase totals
-    from aicpu_scheduler_phases records.
+    from aicpu_scheduler_phases records (present at l2_perf_level >= 3).
 
     Returns:
         dict: Thread data keyed by thread index, with per-phase us / pct,
               pop_hit / pop_miss, loops, completed, tasks_per_loop. Returns
               empty dict if phase data is not available.
     """
-    if data.get("version", 1) < 2:
-        return {}
     phases_by_thread = data.get("aicpu_scheduler_phases", [])
     if not phases_by_thread:
         return {}
@@ -487,7 +485,7 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     else:
         pop_hit = pop_miss = 0
         pop_hit_rate = 0.0
-        print("  Pop: (no per-emit pop deltas in input — needs --enable-l2-swimlane on a v2 JSON capture)")
+        print("  Pop: (no per-emit pop deltas in input — needs --enable-l2-swimlane)")
 
     print()
     print("=" * 90)
