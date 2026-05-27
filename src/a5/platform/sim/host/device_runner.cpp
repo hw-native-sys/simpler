@@ -118,8 +118,16 @@ int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, siz
     // combined size can exceed the device allocator's largest contiguous
     // block. Each arena commits exactly one region, so its base() is the
     // pooled pointer the caller wants.
+    //
+    // Idempotent for the production case (sizes do not change across a
+    // worker's lifetime). If a caller asks for a larger layout on any
+    // region, redo just that region — already-committed peers stay alive
+    // so their callers don't have to re-acquire.
     auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
+            // hbg's runtime_arena path: caller passed 0 and never reserved
+            // a region. Leave the arena uncommitted; acquire_pooled_* will
+            // return nullptr.
             if (arena.is_committed() && cached_size != 0) {
                 arena.release();
                 cached_size = 0;
@@ -133,6 +141,9 @@ int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, siz
         cached_size = 0;
         arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
         if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+            // commit() failure leaves committed_=false, so the next entry's
+            // is_committed() guard skips the release branch. release() is
+            // idempotent on a never-committed arena (zeroes cursor_).
             arena.release();
             return -1;
         }

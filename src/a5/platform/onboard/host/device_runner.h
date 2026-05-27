@@ -180,27 +180,26 @@ public:
     ~DeviceRunner();
 
     /**
-     * Lay out and commit the per-Worker static device arena that backs the
-     * PTO2 GM heap, the PTO2 shared memory, and the trb prebuilt runtime
-     * arena in a single underlying allocation. Must be called before any
-     * acquire_pooled_*. Idempotent on identical sizes. `runtime_arena_size`
-     * is 0 for the hbg path (no prebuilt runtime arena). Returns 0 on
-     * success, -1 on failure.
+     * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
+     * memory, trb prebuilt runtime arena) as three independent device
+     * allocations. Must be called before any acquire_pooled_*. Idempotent
+     * on identical sizes. `runtime_arena_size` is 0 for the hbg path (no
+     * prebuilt runtime arena) — the corresponding arena stays uncommitted.
+     * Returns 0 on success, -1 on failure.
      */
     int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
     /**
      * Return the pooled GM heap / PTO2 SM / runtime arena pointer.
-     * setup_static_arena must have been called earlier in this Worker;
+     * setup_static_arena must have already committed the relevant region;
      * otherwise these return nullptr. All pointers are stable for the
-     * Worker's lifetime; the single underlying device buffer is released in
-     * `finalize()`.
+     * Worker's lifetime; the three underlying device buffers are released
+     * in `finalize()`.
      *
      * acquire_pooled_runtime_arena() is trb-only — the runtime arena region
-     * is only reserved when setup_static_arena was called with
-     * runtime_arena_size > 0. hbg's runtime_maker never calls this; doing so
-     * after setup_static_arena(...,0) returns an unreserved-offset region_ptr
-     * (undefined). Keep the call site discipline at the runtime_maker layer.
+     * is only committed when setup_static_arena was called with
+     * runtime_arena_size > 0. Calling it on the hbg path
+     * (setup_static_arena(...,0)) returns nullptr (well-defined).
      */
     void *acquire_pooled_gm_heap();
     void *acquire_pooled_gm_sm();
@@ -528,7 +527,8 @@ private:
     // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime
     // arena). Split out from a single backing allocation because the
     // combined size can exceed the device allocator's largest contiguous
-    // block. Released explicitly in finalize() before mem_alloc_.finalize()
+    // block — three separate device_malloc calls are friendlier than one
+    // big one. Released explicitly in finalize() before mem_alloc_.finalize()
     // so the underlying buffers do not get freed twice.
     //
     // `runtime_arena_pool_` stays unreserved when setup_static_arena was

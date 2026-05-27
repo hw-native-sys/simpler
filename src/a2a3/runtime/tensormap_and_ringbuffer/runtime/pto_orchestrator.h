@@ -153,7 +153,7 @@ struct PTO2OrchestratorState {
 
     // Phase 3b: write the arena-internal pointer fields (scope_tasks,
     // scope_begins, rings[].fanin_pool.base, tensor_map.{buckets,entry_pool,
-    // free_entry_list,task_entry_heads,orch}, scheduler reference).
+    // free_entry_list,task_entry_heads}, scheduler reference).
     // Idempotent — host runs once on the image, AICPU runs once after attach.
     void wire_arena_pointers(const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SchedulerState *scheduler);
 

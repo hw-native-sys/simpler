@@ -48,7 +48,7 @@
 #define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER 108  // 36 AIC + 72 AIV cores
 #define RUNTIME_MAX_FUNC_ID 1024
-#define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 1MB max for orchestration SO
+#define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
 
 // Default ready queue shards: one shard per worker thread (total minus orchestrator)
@@ -127,23 +127,22 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
-    // Lay out three pooled regions in a single backing device allocation:
-    // GM heap, PTO2 shared memory, and the trb prebuilt runtime arena.
-    // `runtime_arena_size == 0` skips the last region (hbg path: hbg has no
-    // prebuilt runtime arena). Returns 0 on success, -1 on allocation
-    // failure.
+    // Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
+    // memory, trb prebuilt runtime arena) as three independent device
+    // allocations. `runtime_arena_size == 0` skips the third region (hbg
+    // path: hbg has no prebuilt runtime arena). Idempotent on identical
+    // sizes; returns 0 on success, -1 on allocation failure.
     int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
     // Return the per-Worker pooled pointer for the PTO2 GM heap / shared
-    // memory / prebuilt runtime arena. The static arena must already be
-    // committed via setup_static_arena; the returned pointer is owned by
-    // the DeviceRunner and freed in `DeviceRunner::finalize()` — do NOT
-    // pass it to device_free or record it in `tensor_pairs_`.
+    // memory / prebuilt runtime arena. setup_static_arena must have already
+    // committed the relevant region; the returned pointer is owned by the
+    // DeviceRunner and freed in `DeviceRunner::finalize()` — do NOT pass it
+    // to device_free or record it in `tensor_pairs_`.
     //
-    // acquire_pooled_runtime_arena is trb-only — the host side reserves the
-    // runtime-arena region only when setup_static_arena is invoked with
-    // runtime_arena_size > 0. hbg's runtime_maker.cpp must not call it
-    // (setup_static_arena(...,0) leaves the offset unreserved, and the
-    // returned region_ptr would be undefined).
+    // acquire_pooled_runtime_arena is trb-only — the runtime-arena region is
+    // only committed when setup_static_arena was invoked with
+    // runtime_arena_size > 0. Calling it on the hbg path
+    // (setup_static_arena(...,0)) returns nullptr (not undefined).
     void *(*acquire_pooled_gm_heap)();
     void *(*acquire_pooled_gm_sm)();
     void *(*acquire_pooled_runtime_arena)();

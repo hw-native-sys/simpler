@@ -78,22 +78,23 @@ public:
     ~DeviceRunner();
 
     /**
-     * Lay out and commit the per-Worker static device arena that backs the
-     * PTO2 GM heap, the PTO2 shared memory, and the trb prebuilt runtime
-     * arena in a single underlying allocation. Must be called before any
-     * acquire_pooled_*. Idempotent on identical sizes. `runtime_arena_size`
-     * is 0 for the hbg path (no prebuilt runtime arena). Returns 0 on
-     * success, -1 on failure.
+     * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
+     * memory, trb prebuilt runtime arena) as three independent device
+     * allocations. Must be called before any acquire_pooled_*. Idempotent
+     * on identical sizes. `runtime_arena_size` is 0 for the hbg path
+     * (leaves that arena uncommitted). Returns 0 on success, -1 on
+     * failure.
      */
     int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
     /**
      * Return the pooled GM heap / PTO2 SM / runtime arena pointer.
-     * setup_static_arena must have been called earlier in this Worker;
+     * setup_static_arena must have already committed the relevant region;
      * otherwise these return nullptr.
      *
-     * acquire_pooled_runtime_arena() is trb-only — the region exists only
-     * when setup_static_arena was called with runtime_arena_size > 0.
+     * acquire_pooled_runtime_arena() is trb-only — the region is only
+     * committed when setup_static_arena was called with
+     * runtime_arena_size > 0. Calling it on the hbg path returns nullptr.
      */
     void *acquire_pooled_gm_heap();
     void *acquire_pooled_gm_sm();
@@ -292,7 +293,8 @@ private:
     // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime
     // arena). Split out from a single backing allocation because the
     // combined size can exceed the device allocator's largest contiguous
-    // block. Released explicitly in finalize() before mem_alloc_.finalize()
+    // block — three separate device_malloc calls are friendlier than one
+    // big one. Released explicitly in finalize() before mem_alloc_.finalize()
     // so the underlying buffers do not get freed twice.
     //
     // `runtime_arena_pool_` stays unreserved when setup_static_arena was
