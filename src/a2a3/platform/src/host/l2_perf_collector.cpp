@@ -40,11 +40,16 @@
 
 /**
  * Check if a phase ID belongs to a scheduler phase (vs orchestrator phase).
- * Scheduler phases: SCHED_COMPLETE(0), SCHED_DISPATCH(1), SCHED_SCAN(2), SCHED_IDLE_WAIT(3)
- * Orchestrator phases: ORCH_SYNC(16) through ORCH_SCOPE_END(24)
+ * Scheduler phases: SCHED_COMPLETE(0), SCHED_DISPATCH(1).
+ * Legacy IDs 2 (SCHED_SCAN, never emitted in this runtime) and 3
+ * (SCHED_IDLE_WAIT, no longer emitted) may appear in old captures and are
+ * still classified as scheduler-side so the host parser routes them through
+ * the scheduler branch (where they are then dropped, since idle is
+ * reconstructed from record gaps).
+ * Orchestrator phases: ORCH_SYNC(16) through ORCH_SCOPE_END(24).
  */
 static bool is_scheduler_phase(AicpuPhaseId id) {
-    return static_cast<uint32_t>(id) < static_cast<uint32_t>(AicpuPhaseId::SCHED_PHASE_COUNT);
+    return static_cast<uint32_t>(id) < static_cast<uint32_t>(AicpuPhaseId::ORCH_SYNC);
 }
 
 L2PerfCollector::~L2PerfCollector() {
@@ -642,11 +647,11 @@ int L2PerfCollector::export_swimlane_json() {
                 return "complete";
             case AicpuPhaseId::SCHED_DISPATCH:
                 return "dispatch";
-            case AicpuPhaseId::SCHED_SCAN:
-                return "scan";
-            case AicpuPhaseId::SCHED_IDLE_WAIT:
-                return "idle";
             default:
+                // Legacy SCHED_IDLE_WAIT (3) and SCHED_SCAN (2) land here on
+                // old captures; host tools skip "unknown" sched records and
+                // rebuild idle from gaps between known records on the
+                // same thread.
                 return "unknown";
             }
         };

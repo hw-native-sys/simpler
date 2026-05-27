@@ -363,8 +363,8 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
         cycles_to_us(sched_end_ts - l2_perf.sched_start_ts)
     );
 
-    uint64_t sched_total = l2_perf.sched_wiring_cycle + l2_perf.sched_complete_cycle + l2_perf.sched_scan_cycle +
-                           l2_perf.sched_dispatch_cycle + l2_perf.sched_idle_cycle;
+    uint64_t sched_total = l2_perf.sched_wiring_cycle + l2_perf.sched_complete_cycle + l2_perf.sched_dispatch_cycle +
+                           l2_perf.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
 
 #if PTO2_SCHED_PROFILING
@@ -464,11 +464,6 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
         LOG_INFO_V9(
             "Thread %d:     setup        : %.3fus (%.1f%%)", thread_idx,
             cycles_to_us(l2_perf.sched_dispatch_setup_cycle), l2_perf.sched_dispatch_setup_cycle * 100.0 / d_parent
-        );
-
-        LOG_INFO_V9(
-            "Thread %d:   scan           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_perf.sched_scan_cycle),
-            l2_perf.sched_scan_cycle * 100.0 / sched_total
         );
 
 #if PTO2_SCHED_PROFILING

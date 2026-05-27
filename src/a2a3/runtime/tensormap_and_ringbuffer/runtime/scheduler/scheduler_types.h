@@ -340,7 +340,6 @@ struct SlotTransition {
 struct alignas(64) SchedL2PerfCounters {
     bool l2_perf_enabled{false};
     uint64_t sched_start_ts{0};
-    uint64_t sched_scan_cycle{0};
     uint64_t sched_complete_cycle{0};
     uint64_t sched_dispatch_cycle{0};
     uint64_t sched_wiring_cycle{0};

@@ -31,7 +31,12 @@ available.
   the L2 record so dependency arrows show up in the Perfetto
   view.
 - **AICPU scheduler phases** — per-iteration breakdown into
-  `complete` / `dispatch` / `scan` / `idle`.
+  `complete` / `dispatch`. Idle iterations no longer emit a record
+  on a2a3; the host tooling reconstructs idle spans from the gap
+  between consecutive work records on the same thread. Legacy
+  captures (and a5) may still carry `scan` / `idle` records — both
+  are silently dropped by the parser (idle is double-painted
+  by the gap reconstruction; `scan` was never emitted in a2a3).
 - **Orchestrator phase summary** — cumulative cycle counts for
   the orchestrator's nine sub-steps (sync / alloc / params /
   lookup / heap / insert / fanin / finalize / scope_end).
@@ -132,7 +137,7 @@ Phase records (per scheduler thread, level >= 3 for
 | Field | Meaning |
 | ----- | ------- |
 | `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds |
-| `phase` | Lowercase phase name. Scheduler: `complete` / `dispatch` / `scan` / `idle`. Orchestrator: `orch_*` (sync / alloc / params / lookup / heap / insert / fanin / finalize / scope_end). |
+| `phase` | Lowercase phase name. Scheduler: `complete` / `dispatch` (`scan` / `idle` may appear in legacy captures and a5; both are dropped by the parser). Orchestrator: `orch_*` (sync / alloc / params / lookup / heap / insert / fanin / finalize / scope_end). |
 | `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
 | `tasks_processed` (scheduler) / `task_id` (orchestrator) | Phase-specific union field |
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |

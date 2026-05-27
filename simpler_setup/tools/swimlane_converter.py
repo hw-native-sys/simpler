@@ -708,12 +708,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             {"args": {"sort_index": 2}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 3}
         )
 
-        # Phase color mapping
+        # Phase color mapping. The Perfetto sched lane only renders the
+        # two work phases (complete, dispatch). Idle is the wall-clock gap
+        # between consecutive work bars — Perfetto's empty-track regions
+        # already convey that visually, so we don't paint a synthetic bar
+        # for it. (Idle is still tallied numerically by
+        # sched_overhead_analysis.py Part 2 via gap reconstruction.)
         phase_colors = {
             "complete": "good",  # green
             "dispatch": "terrible",  # red
-            "scan": "thread_state_running",  # blue
-            "idle": "yellow",  # yellow
         }
 
         for thread_idx, thread_records in enumerate(scheduler_phases):
@@ -731,29 +734,35 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 }
             )
 
+            # Render only the work phases (complete / dispatch). Legacy
+            # captures may carry "idle" / "scan" records from older builds;
+            # drop them so the lane shows only actual work.
             for record in thread_records:
                 phase = record.get("phase", "unknown")
+                if phase not in ("complete", "dispatch"):
+                    continue
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]
                 dur = end_us - start_us
                 tasks_processed = record.get("tasks_processed", 0)
 
-                event = {
-                    "args": {
-                        "phase": phase,
-                        "loop_iter": record.get("loop_iter", 0),
-                        "tasks_processed": tasks_processed,
-                    },
-                    "cat": "scheduler",
-                    "cname": phase_colors.get(phase, "generic_work"),
-                    "name": f"{phase}({tasks_processed})",
-                    "ph": "X",
-                    "pid": 3,
-                    "tid": tid,
-                    "ts": start_us,
-                    "dur": dur,
-                }
-                events.append(event)
+                events.append(
+                    {
+                        "args": {
+                            "phase": phase,
+                            "loop_iter": record.get("loop_iter", 0),
+                            "tasks_processed": tasks_processed,
+                        },
+                        "cat": "scheduler",
+                        "cname": phase_colors.get(phase, "generic_work"),
+                        "name": f"{phase}({tasks_processed})",
+                        "ph": "X",
+                        "pid": 3,
+                        "tid": tid,
+                        "ts": start_us,
+                        "dur": dur,
+                    }
+                )
 
     # AICPU Orchestrator lane (l2_perf_level >= 4)
     #

@@ -306,16 +306,21 @@ struct L2PerfDataHeader {
 /**
  * AICPU phase identifier
  *
- * Scheduler phases (0-3): four phases in each scheduler loop iteration.
+ * Scheduler phases (0-1): the two work-emitting phases per scheduler loop
+ * iteration. Idle iterations no longer emit a record — host tooling recovers
+ * idle spans from the gap between consecutive sched records on the same
+ * thread (see swimlane_converter.py / sched_overhead_analysis.py).
+ *
  * Orchestrator phases (16-24): sub-steps within each submit_task() call.
+ *
+ * IDs 2-3 were SCHED_SCAN (unused in this runtime) and SCHED_IDLE_WAIT in
+ * older builds. Legacy capture JSON may still carry phase_id=3 records; the
+ * host parser skips them since idle is now reconstructed from record gaps.
  */
 enum class AicpuPhaseId : uint32_t {
-    // Scheduler phases (0-3)
-    SCHED_COMPLETE = 0,     // Process completed tasks (fanout traversal)
-    SCHED_DISPATCH = 1,     // Dispatch ready tasks to idle cores
-    SCHED_SCAN = 2,         // Incremental scan for root tasks
-    SCHED_IDLE_WAIT = 3,    // Idle/spinning (no progress)
-    SCHED_PHASE_COUNT = 4,  // Sentinel: number of scheduler phases
+    // Scheduler phases
+    SCHED_COMPLETE = 0,  // Process completed tasks (fanin traversal)
+    SCHED_DISPATCH = 1,  // Dispatch ready tasks to idle cores
     // Orchestrator phases (16-24)
     ORCH_SYNC = 16,      // tensormap sync
     ORCH_ALLOC = 17,     // task_ring_alloc
@@ -337,7 +342,8 @@ enum class AicpuPhaseId : uint32_t {
  * extra1 / extra2 carry phase-specific stats; meaning is keyed by phase_id:
  *   SCHED_DISPATCH: extra1 = pop_hit delta since last emit
  *                   extra2 = pop_miss delta since last emit
- *   All other phases: extras are 0 (reserved for future per-phase metrics).
+ *   SCHED_COMPLETE: extras are 0.
+ *   Orchestrator phases: extras are 0 (reserved for future per-phase metrics).
  */
 struct AicpuPhaseRecord {
     uint64_t start_time;    // Phase start timestamp
