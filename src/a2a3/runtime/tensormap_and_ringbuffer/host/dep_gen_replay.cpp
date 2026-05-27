@@ -11,9 +11,9 @@
 
 /**
  * @file dep_gen_replay.cpp
- * @brief Replay in-memory DepGenRecord stream → deps.json (v2, tensor-annotated)
- *        via a host-resident PTO2TensorMap, with a differential check against
- *        the runtime template `compute_task_fanin`.
+ * @brief Replay in-memory DepGenRecord stream → deps.json (strided tensor
+ *        representation, tensor-annotated) via a host-resident PTO2TensorMap,
+ *        with a differential check against the runtime template `compute_task_fanin`.
  *
  * Two passes run per record against two parallel PTO2TensorMap instances that
  * evolve in lockstep:
@@ -113,7 +113,7 @@ int32_t count_outputs(const DepGenRecord *records, size_t n) {
 }
 
 // ---------------------------------------------------------------------------
-// v2 schema accumulators
+// JSON output accumulators (in-memory tables that get serialized at the end)
 // ---------------------------------------------------------------------------
 
 // Edge categories — matches the three places a runtime fanin edge is born.
@@ -240,7 +240,7 @@ uint64_t make_tensor_id(uint64_t buffer_addr, int32_t version) {
     return h;
 }
 
-// Register a tensor in the v2 tensors[] table on first sight of (addr,
+// Register a tensor in the tensors[] table on first sight of (addr,
 // version). buffer_numel describes the underlying storage size in elements;
 // per-edge fields describe the slice via (start_offset, strides[]). Subsequent
 // sightings of the same (addr, version) are no-ops.
@@ -288,7 +288,7 @@ void fill_producer(EdgeAnnot &e, const PTO2TensorMapEntry &entry) {
 }
 
 // ---------------------------------------------------------------------------
-// JSON writer (v2)
+// JSON writer
 // ---------------------------------------------------------------------------
 
 void write_uint_array(std::ofstream &out, const uint32_t *data, uint32_t n) {
@@ -300,7 +300,7 @@ void write_uint_array(std::ofstream &out, const uint32_t *data, uint32_t n) {
     out << ']';
 }
 
-bool write_deps_json_v2(
+bool write_deps_json(
     const char *path, const std::vector<TaskTableEntry> &tasks, const std::vector<TensorTableEntry> &tensors,
     const std::vector<EdgeAnnot> &edges
 ) {
@@ -309,13 +309,11 @@ bool write_deps_json_v2(
         LOG_ERROR("dep_gen replay: failed to open '%s' for write", path);
         return false;
     }
-    // Schema v3: strided tensor representation.
-    //   tensors[*]:   buffer_numel replaces raw_shapes (storage size in elements)
-    //   edges[*]:     consumer/producer_offset[]  ->  start_offset (uint64) + strides[] (int32)
-    //   tasks[*].args[*]: offset[]  ->  start_offset + strides[]
-    out << "{\"version\":3";
-
-    out << ",\"tasks\":[";
+    // Strided tensor representation. tensors[].buffer_numel is the underlying
+    // storage element count; tasks[].args[] and edges[] carry per-slice
+    // geometry as (start_offset uint64, strides[] uint32 — runtime invariant
+    // forbids zero / negative strides, see runtime/tensor.h).
+    out << "{\"tasks\":[";
     for (size_t i = 0; i < tasks.size(); i++) {
         if (i > 0) out << ',';
         const auto &t = tasks[i];
@@ -448,7 +446,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         LOG_ERROR("dep_gen replay: num_records=%zu but records pointer is null", num_records);
         return -1;
     }
-    LOG_INFO_V0("dep_gen replay: processing %zu in-memory records (v2, dual-pass)", num_records);
+    LOG_INFO_V0("dep_gen replay: processing %zu in-memory records (dual-pass)", num_records);
 
     // Per-ring task window sizes — tensormap masks slot indices and requires
     // each to be a power of two. Auto-size from the records themselves so each
@@ -495,7 +493,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         return -3;
     }
 
-    // v2 accumulators.
+    // JSON output accumulators.
     std::vector<TaskTableEntry> task_table;
     std::vector<TensorTableEntry> tensor_table;
     std::unordered_map<uint64_t, size_t> tensor_index;  // tensor_id → table idx
@@ -763,12 +761,12 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     tm_oracle.destroy();
     tm_annot.destroy();
 
-    if (!write_deps_json_v2(deps_json_path, task_table, tensor_table, annot_edges)) {
+    if (!write_deps_json(deps_json_path, task_table, tensor_table, annot_edges)) {
         return -5;
     }
     LOG_INFO_V0(
-        "dep_gen replay: wrote deps.json v2 to %s (tasks=%zu, tensors=%zu, edges=%zu)", deps_json_path,
-        task_table.size(), tensor_table.size(), annot_edges.size()
+        "dep_gen replay: wrote deps.json to %s (tasks=%zu, tensors=%zu, edges=%zu)", deps_json_path, task_table.size(),
+        tensor_table.size(), annot_edges.size()
     );
     return 0;
 }

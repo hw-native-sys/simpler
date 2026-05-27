@@ -166,8 +166,9 @@ Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 ```
 
 Per-thread fanout / fanin edge counts and ready-queue pop hit / miss
-stats live in the v2 JSON `aicpu_scheduler_phases[]` and `deps.json`;
-consume them via `simpler_setup/tools/sched_overhead_analysis.py`.
+stats live in `aicpu_scheduler_phases[]` (in `l2_perf_records.json`
+captured at l2_perf_level >= 3) and `deps.json`; consume them via
+`simpler_setup/tools/sched_overhead_analysis.py`.
 
 ---
 

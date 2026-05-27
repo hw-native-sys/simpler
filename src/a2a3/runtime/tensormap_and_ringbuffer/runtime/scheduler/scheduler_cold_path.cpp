@@ -431,9 +431,10 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
             cycles_to_us(l2_perf.sched_complete_perf_cycle), l2_perf.sched_complete_perf_cycle * 100.0 / c_parent
         );
 
-        // pop_hit / pop_miss per-emit deltas live in each v2 JSON dispatch
-        // record's extras; sum-of-deltas equals the run-cumulative tracked
-        // in this struct (final-drain emit covers the trailing-idle tail).
+        // pop_hit / pop_miss per-emit deltas live in each dispatch-phase
+        // record's extras in aicpu_scheduler_phases[]; sum-of-deltas equals
+        // the run-cumulative tracked in this struct (final-drain emit covers
+        // the trailing-idle tail).
         LOG_INFO_V9(
             "Thread %d:   dispatch       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_perf.sched_dispatch_cycle),
             l2_perf.sched_dispatch_cycle * 100.0 / sched_total

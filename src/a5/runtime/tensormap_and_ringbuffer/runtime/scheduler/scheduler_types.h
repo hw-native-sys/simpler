@@ -350,9 +350,10 @@ struct alignas(64) SchedL2PerfCounters {
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
     uint32_t phase_dispatch_count{0};
-    // Run-cumulative pop counters; the v2 JSON dispatch-record emitter writes
-    // per-emit deltas computed as (current - pop_*_at_last_emit) and the
-    // end-of-run cold-path log reads the cumulatives directly.
+    // Run-cumulative pop counters; the dispatch-phase record emitter
+    // (aicpu_scheduler_phases[]) writes per-emit deltas computed as
+    // (current - pop_*_at_last_emit) and the end-of-run cold-path log reads
+    // the cumulatives directly.
     uint64_t pop_hit{0};
     uint64_t pop_miss{0};
     uint64_t pop_hit_at_last_emit{0};

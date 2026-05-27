@@ -162,7 +162,6 @@ class TestDepGenChain(SceneTestCase):
 
         with deps_path.open() as f:
             deps = json.load(f)
-        assert deps.get("version") == 3, f"deps.json version {deps.get('version')} != 3"
 
         raw_edges = deps.get("edges", [])
         # Project annotated edges → (pred, succ) — we only care about graph

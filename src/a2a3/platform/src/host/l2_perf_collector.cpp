@@ -592,9 +592,9 @@ int L2PerfCollector::export_swimlane_json() {
     }
 
     // Step 7: Write JSON data
-    int version = static_cast<int>(l2_perf_level_);
+    int l2_perf_level = static_cast<int>(l2_perf_level_);
     outfile << "{\n";
-    outfile << "  \"version\": " << version << ",\n";
+    outfile << "  \"l2_perf_level\": " << l2_perf_level << ",\n";
     outfile << "  \"tasks\": [\n";
 
     for (size_t i = 0; i < tagged_records.size(); ++i) {
