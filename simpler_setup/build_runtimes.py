@@ -131,7 +131,7 @@ def build_all(
                 raise
 
     for platform in platforms:
-        arch, _ = parse_platform(platform)
+        arch, variant = parse_platform(platform)
         runtimes = discover_runtimes(arch)
 
         if not runtimes:
@@ -151,12 +151,6 @@ def build_all(
             except Exception as e:
                 logger.error(f"  Failed to build {platform}/{runtime_name}: {e}")
                 raise
-
-        # No device-side deployment step here. The dispatcher SO is uploaded
-        # into the main aicpu_scheduler at runtime, on the first
-        # DeviceRunner::ensure_binaries_loaded call, via
-        # LoadAicpuOp::BootstrapDispatcher (see src/common/host/load_aicpu_op.cpp
-        # and src/common/aicpu_dispatcher/aicpu_dispatcher.h for architecture).
 
 
 def main():

@@ -23,8 +23,8 @@
 #include "runtime.h"
 
 // Run-wall capture: g_device_start_cycle is set once in
-// simpler_aicpu_init (single-threaded launch); each thread
-// of the multi-threaded simpler_aicpu_exec writes the converted
+// DynTileFwkBackendKernelServerInit (single-threaded launch); each thread
+// of the multi-threaded DynTileFwkBackendKernelServer writes the converted
 // (end - start) into KernelArgs.device_wall_ns on exit. Plain stores —
 // last-writer-wins is fine for wall measurement.
 static uint64_t g_device_start_cycle = 0;
@@ -32,20 +32,27 @@ static uint64_t g_device_start_cycle = 0;
 // Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp)
 extern "C" int aicpu_execute(Runtime *arg);
 
+extern "C" __attribute__((visibility("default"))) int StaticTileFwkBackendKernelServer(void *arg) {
+    if (arg == nullptr) {
+        LOG_ERROR("%s", "Invalid kernel arguments: null pointer");
+        return -1;
+    }
+
+    return 0;
+}
+
 /**
- * AICPU kernel initialization entry point.
+ * AICPU kernel initialization entry point
  *
- * Called once per run by the main aicpu_scheduler. Host registers this SO
- * via `rtsBinaryLoadFromFile` (Mode B JSON load, cpuKernelMode=0) and
- * resolves this symbol via `rtsFuncGetByName`; the per-task launch goes
- * through `rtsLaunchCpuKernel` on the cached `rtFuncHandle`. The bootstrap
- * dispatcher only writes this SO to the preinstall path — it does not
- * dlsym these symbols itself.
+ * This function is called once during kernel initialization by the CANN
+ * runtime. It initializes logging and validates kernel arguments.
+ *
+ * Note: Function name is hardcoded in libaicpu_extend_kernels.so
  *
  * @param arg Pointer to KernelArgs structure
  * @return 0 on success, -1 on error
  */
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *arg) {
+extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelServerInit(void *arg) {
     init_log_switch();
     if (arg == nullptr) {
         LOG_ERROR("%s", "Invalid kernel arguments: null pointer");
@@ -67,16 +74,17 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
 }
 
 /**
- * AICPU kernel main execution entry point.
+ * AICPU kernel main execution entry point
  *
- * Called per-thread by the main aicpu_scheduler via the cached
- * `rtFuncHandle` resolved during host-side Mode B init (see
- * `simpler_aicpu_init` docstring for the load path).
+ * This is the main entry point for the AICPU runtime executor kernel.
+ * It extracts the Runtime from KernelArgs and delegates to AicpuExecute.
+ *
+ * Note: Function name is hardcoded in libaicpu_extend_kernels.so
  *
  * @param arg Pointer to KernelArgs structure containing runtime_args
  * @return 0 on success, non-zero on error
  */
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
+extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelServer(void *arg) {
     if (arg == nullptr) {
         LOG_ERROR("%s", "Invalid kernel arguments: null pointer");
         return -1;
@@ -113,13 +121,13 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         return 0;
     }
 
-    LOG_INFO_V0("%s", "simpler_aicpu_exec: Calling aicpu_execute with Runtime");
+    LOG_INFO_V0("%s", "DynTileFwkBackendKernelServer: Calling aicpu_execute with Runtime");
     int rc = aicpu_execute(runtime);
     if (rc != 0) {
-        LOG_ERROR("simpler_aicpu_exec: aicpu_execute failed with rc=%d", rc);
+        LOG_ERROR("DynTileFwkBackendKernelServer: aicpu_execute failed with rc=%d", rc);
         return rc;
     }
-    LOG_INFO_V0("%s", "simpler_aicpu_exec: aicpu_execute completed successfully");
+    LOG_INFO_V0("%s", "DynTileFwkBackendKernelServer: aicpu_execute completed successfully");
 
     // Stamp end into the device_wall buffer. Last-writer-wins across threads.
     uint64_t my_end = get_sys_cnt_aicpu();

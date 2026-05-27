@@ -22,8 +22,6 @@
 
 #include <dlfcn.h>
 
-#include "load_aicpu_op.h"
-
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -348,45 +346,14 @@ int DeviceRunner::ensure_binaries_loaded() {
         return -1;
     }
 
-    if (dispatcher_so_binary_.empty()) {
-        LOG_ERROR(
-            "DeviceRunner: dispatcher SO bytes not provided; pass dispatcher_path through ChipWorker.init "
-            "(RuntimeBinaries.dispatcher_path)"
-        );
-        return -1;
-    }
-
-    // Bundle dispatcher SO + inner SO bytes into one Mode A KFC call:
-    // libaicpu_extend_kernels invokes our dispatcher, which writes the inner
-    // SO bytes to simpler_inner_<fp>.so in preinstall. Dispatcher itself never
-    // persists. Per-task launches afterwards go through Mode B
-    // (rtsBinaryLoadFromFile + rtsFuncGetByName + rtsLaunchCpuKernel) directly
-    // against the preinstall file.
-    int rc = load_aicpu_op_.BootstrapDispatcher(
-        dispatcher_so_binary_.data(), dispatcher_so_binary_.size(), aicpu_so_binary_.data(), aicpu_so_binary_.size(),
-        stream_aicpu_
-    );
-    if (rc != 0) {
-        LOG_ERROR("LoadAicpuOp::BootstrapDispatcher failed: %d", rc);
-        return rc;
-    }
-    LOG_INFO_V2("DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap");
-
-    rc = load_aicpu_op_.Init();
-    if (rc != 0) {
-        LOG_ERROR("LoadAicpuOp::Init failed: %d", rc);
-        return rc;
-    }
-    LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_init/exec handles ready)");
-
-    // H2D copy aicpu kernel SO bytes and stamp the resulting device pointer
-    // into device_args_.aicpu_so_bin/len (see a2a3 sibling — load-bearing on
-    // a5 onboard even though our own AICPU SO doesn't read these fields).
-    rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
+    // Load AICPU SO
+    int rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
         return rc;
     }
+
+    // Initialize device args
     device_args_.aicpu_so_bin = so_info_.aicpu_so_bin;
     device_args_.aicpu_so_len = so_info_.aicpu_so_len;
     rc = kernel_args_.init_device_args(device_args_, mem_alloc_);
@@ -395,15 +362,6 @@ int DeviceRunner::ensure_binaries_loaded() {
         so_info_.finalize();
         return rc;
     }
-
-    // Release host bytes — Mode B per-task launches use the cached rtFuncHandle
-    // on LoadAicpuOp; dispatcher SO bytes are never referenced again; the
-    // aicpu kernel SO's host buffer is also free to drop now that so_info_
-    // already H2D'd the bytes above.
-    dispatcher_so_binary_.clear();
-    dispatcher_so_binary_.shrink_to_fit();
-    aicpu_so_binary_.clear();
-    aicpu_so_binary_.shrink_to_fit();
 
     binaries_loaded_ = true;
     LOG_INFO_V0("DeviceRunner: binaries loaded");
@@ -648,16 +606,16 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         pmu_collector_.start(thread_factory);
     }
 
-    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::InitName, 1);
+    LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServerInit ===");
+    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
         return rc;
     }
 
-    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
+    LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServer ===");
     rc = launch_aicpu_kernel(
-        stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
+        stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
     );
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
@@ -980,12 +938,9 @@ int DeviceRunner::finalize() {
     // are released by runtime_args_cleanup RAII so they also unwind on errors.
     kernel_args_.finalize_device_args();
 
-    // Cleanup AICPU SO H2D allocation
+    // Cleanup AICPU SO
     so_info_.finalize();
 
-    // load_aicpu_op_ has no per-task device-side state to release (Mode A
-    // type 2 launches don't keep handles). The dispatcher itself was a
-    // transient libaicpu_extend_kernels dlopen — nothing to unload from host.
     binaries_loaded_ = false;
 
     // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
@@ -1067,11 +1022,27 @@ int DeviceRunner::finalize() {
 }
 
 int DeviceRunner::launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num) {
-    // kernel_name is host::KernelNames::InitName / RunName — the runtime SO's
-    // actual exported symbol (simpler_aicpu_init / simpler_aicpu_exec). The
-    // Mode A type 2 launch in LaunchBuiltInOp embeds it in the args struct
-    // for the main aicpu_scheduler to dlsym.
-    return load_aicpu_op_.LaunchBuiltInOp(stream, k_args, aicpu_num, kernel_name);
+    struct Args {
+        KernelArgs k_args;
+        char kernel_name[32];
+        const char so_name[32] = {"libaicpu_extend_kernels.so"};
+        const char op_name[32] = {""};
+    } args;
+
+    args.k_args = *k_args;
+    std::strncpy(args.kernel_name, kernel_name, sizeof(args.kernel_name) - 1);
+    args.kernel_name[sizeof(args.kernel_name) - 1] = '\0';
+
+    rtAicpuArgsEx_t rt_args;
+    std::memset(&rt_args, 0, sizeof(rt_args));
+    rt_args.args = &args;
+    rt_args.argsSize = sizeof(args);
+    rt_args.kernelNameAddrOffset = offsetof(struct Args, kernel_name);
+    rt_args.soNameAddrOffset = offsetof(struct Args, so_name);
+
+    return rtAicpuKernelLaunchExWithArgs(
+        rtKernelType_t::KERNEL_TYPE_AICPU_KFC, "AST_DYN_AICPU", aicpu_num, &rt_args, nullptr, stream, 0
+    );
 }
 
 int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {

@@ -226,7 +226,7 @@ int finalize_device(DeviceContextHandle ctx) {
 
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
+    const uint8_t *aicore_binary, size_t aicore_size
 ) {
     if (ctx == NULL) return -1;
 
@@ -258,16 +258,6 @@ int simpler_init(
         std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
         std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
         runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
-        // Dispatcher SO bytes are passed alongside the executors. Onboard
-        // requires a non-empty buffer: BootstrapDispatcher reads from it on
-        // the first run() to upload the dispatcher + inner SO bundle through
-        // libaicpu_extend_kernels. If the caller drives _ChipWorker.init
-        // directly without a dispatcher path, this stays empty and any later
-        // run() fails fast in ensure_binaries_loaded with a clear message.
-        if (dispatcher_binary != NULL && dispatcher_size > 0) {
-            std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
-            runner->set_dispatcher_binary(std::move(dispatcher_vec));
-        }
     } catch (...) {
         return -1;
     }

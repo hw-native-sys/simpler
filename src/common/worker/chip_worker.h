@@ -42,8 +42,7 @@ public:
     /// globals. The Python `ChipWorker` wrapper does this with `ctypes.CDLL(...,
     /// mode=RTLD_GLOBAL)`.
     void init(
-        const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-        const std::string &dispatcher_path, int device_id
+        const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path, int device_id
     );
 
     /// Tear down everything: device resources and runtime library.
@@ -139,8 +138,7 @@ private:
     // From host_runtime.so. Single platform-side init that does (a) thread
     // attach + device-id record, (b) executor binary takeover, (c) onboard
     // CANN dlog sync. Reads the current log level off HostLogger itself.
-    using SimplerInitFn =
-        int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t);
+    using SimplerInitFn = int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t);
     using PrepareCallableFn = int (*)(void *, int32_t, const void *);
     using RunPreparedFn =
         int (*)(void *, void *, int32_t, const void *, int, int, int, int, int, int, const char *, PtoRunTiming *);

@@ -58,8 +58,7 @@ std::vector<uint8_t> read_binary_file(const std::string &path) {
 ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
-    const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-    const std::string &dispatcher_path, int device_id
+    const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path, int device_id
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -156,19 +155,8 @@ void ChipWorker::init(
     try {
         std::vector<uint8_t> aicpu_bytes = read_binary_file(aicpu_path);
         std::vector<uint8_t> aicore_bytes = read_binary_file(aicore_path);
-        // dispatcher_path is empty on sim (no dispatcher) and on tests that
-        // exercise _ChipWorker.init directly without a RuntimeBinaries.
-        // simpler_init treats a null/empty buffer as "no dispatcher" — onboard
-        // ensure_binaries_loaded raises with a clear message if the bootstrap
-        // is actually attempted, sim ignores it entirely.
-        std::vector<uint8_t> dispatcher_bytes;
-        if (!dispatcher_path.empty()) {
-            dispatcher_bytes = read_binary_file(dispatcher_path);
-        }
-        const uint8_t *dispatcher_ptr = dispatcher_bytes.empty() ? nullptr : dispatcher_bytes.data();
         init_rc = simpler_init_fn_(
-            device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(), aicore_bytes.size(),
-            dispatcher_ptr, dispatcher_bytes.size()
+            device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(), aicore_bytes.size()
         );
     } catch (...) {
         destroy_device_context_fn_(device_ctx_);

@@ -20,7 +20,6 @@ list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/device_comm")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher")
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
         list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${INC_DIR}")
@@ -85,53 +84,3 @@ target_link_directories(aicpu_kernel
 
 # Output name
 set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME aicpu_kernel)
-
-# Build dispatcher SO — bootstrap-only upload helper. The dispatcher has NO
-# runtime-specific code; libaicpu_extend_kernels loads it once via
-# rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC), invokes
-# DynTileFwkBackendKernelServerInit, which writes the bundled inner SO bytes
-# (passed via the extended DeviceArgs at offsets 120/128) to
-# /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>.so under
-# a content-fingerprint basename. After bootstrap the host registers the
-# preinstall file via Mode B (rtsBinaryLoadFromFile + rtsFuncGetByName) and
-# launches per-task through rtsLaunchCpuKernel; the dispatcher SO itself is
-# never referenced again.
-#
-# Output name is fixed ("simpler_aicpu_dispatcher"). See
-# src/common/aicpu_dispatcher/{aicpu_dispatcher.h,README.md} for the
-# extended DeviceArgs layout and the FNV-1a/Build-ID fingerprint protocol.
-set(AICPU_DISPATCHER_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher/aicpu_dispatcher.cpp"
-)
-add_library(aicpu_dispatcher SHARED ${AICPU_DISPATCHER_SOURCES})
-
-target_compile_options(aicpu_dispatcher
-    PRIVATE
-        -Wall
-        -Wextra
-        -rdynamic
-        -O3
-        -fPIC
-        -g
-        $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>
-)
-
-target_include_directories(aicpu_dispatcher
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CUSTOM_INCLUDE_DIRS}
-        # src/common is needed so `#include "utils/elf_build_id.h"` resolves;
-        # host_runtime.so already has this on its include path (see host
-        # CMakeLists), and the dispatcher uses the same header to fingerprint
-        # the inner SO bytes by their ELF Build-ID rather than a 64-byte FNV
-        # over the (mostly-shared) ELF header.
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common
-        ${ASCEND_HOME_PATH}/include
-)
-
-target_link_libraries(aicpu_dispatcher PRIVATE dl)
-
-set_target_properties(aicpu_dispatcher PROPERTIES
-    LINK_FLAGS "-Wl,--build-id"
-    OUTPUT_NAME "simpler_aicpu_dispatcher"
-)
