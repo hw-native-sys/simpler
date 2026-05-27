@@ -7,6 +7,9 @@ fork/shm behavior working.
 
 1. Endpoint interface and local adapter.
    - Add `WorkerEndpoint`.
+   - Include read-only `WorkerEndpoint::caps()` capability metadata for
+     endpoint eligibility. `caps()` returns logical features only and must not
+     expose HCOMM/RDMA/socket handles to Scheduler or Orchestrator code.
    - Define `WorkerEndpoint::run()` to return an explicit outcome: success,
      task failure, or endpoint failure.
    - Move current mailbox code into `LocalMailboxEndpoint`.
@@ -82,8 +85,15 @@ fork/shm behavior working.
    - Treat import-path callables as the baseline remote mode.
    - Support PR #839 serialized Python callable payloads only as a negotiated
      feature with serializer version, payload limit, Python ABI/runtime, and
-     dependency/runtime-environment compatibility checks.
-   - Implement `register_remote(..., workers=...)`.
+     dependency/runtime-environment compatibility checks. Follow the payload
+     contract in `docs/python-callable-serialization.md`.
+   - Extend the existing public `register(callable, workers=...)` flow so
+     `RemoteCallable` descriptors can target remote endpoints. Do not add a
+     separate public remote-only registration API.
+   - Require the first implementation to reject `RemoteCallable` registration
+     without an explicit non-empty `workers=[...]` list. Leave named remote
+     pools and placement policies as future API work, and do not define
+     implicit broadcast to all remote endpoints as a contract.
    - Implement multi-endpoint all-or-nothing registration with prepare, commit,
      and abort controls. Keep the parent cid invisible until every selected
      endpoint commits, and mark uncertain endpoints failed rather than leaving a
@@ -116,11 +126,15 @@ fork/shm behavior working.
 
 8. Remote control-plane parity.
    - Map existing NEXT_LEVEL controls onto typed remote frames:
-     prepare, register, unregister, comm init, domain alloc, and domain
-     release.
+     prepare, register, unregister, remote buffer allocation, remote buffer
+     free, copy to remote, copy from remote, export buffer, import buffer, and
+     release import.
+   - Reserve remote `COMM_INIT`, `ALLOC_DOMAIN`, and `RELEASE_DOMAIN` opcodes
+     for the later Remote CommDomain phase; the first task-dispatch cut rejects
+     them as unsupported controls.
    - Keep local mailbox sub-command ids local-only.
-   - Add tests for post-bootstrap ChipCallable registration and dynamic domain
-     allocation through the remote session runner.
+   - Add tests for post-bootstrap ChipCallable registration and remote buffer
+     controls through the session runner.
 
 9. Remote buffer registry.
    - Add `ALLOC_REMOTE_BUFFER`, `FREE_REMOTE_BUFFER`, `COPY_TO_REMOTE`, and
@@ -130,21 +144,25 @@ fork/shm behavior working.
    - Tie physical free and release-import to post-drain cleanup after all
      captured refs drop.
 
-10. RoCE transport.
-    - Implement connection setup, SEND/RECV frames, registered staging buffers,
-      and timeout/error paths.
+10. A2 RoCE HCOMM profile.
+    - Implement HCOMM endpoint/channel setup with `COMM_PROTOCOL_ROCE`, HCOMM
+      RPC command rings, registered staging buffers, and timeout/error paths.
+    - Keep bootstrap sockets limited to session setup and HCOMM bring-up.
+      After HCOMM RPC is ready, task metadata, controls, completions, and
+      shutdown use the HCOMM RPC adapter.
     - Add a hardware-gated smoke test with one remote L3 worker.
 
-11. HCCS transport.
-    - Implement the same transport contract through platform HCCS APIs.
-    - Reuse the RoCE frame and buffer registry tests.
+11. A3 HCCS HCOMM profile.
+    - Implement the same HCOMM adapter contract with the HCCS protocol profile.
+    - Reuse the A2 frame, HCOMM RPC, and buffer registry tests.
 
-12. A5 UB transport.
-    - Add UB export/import metadata.
-    - Implement LD/ST doorbell and completion path with fences.
-    - Keep RDMA fallback for bulk transfers.
+12. A5 UB HCOMM profile.
+    - Add UB export/import metadata through the HCOMM adapter.
+    - Implement LD/ST doorbell and completion paths only when the selected
+      profile proves the mapping and fence rules are valid.
+    - Keep RDMA/HCOMM fallback for bulk transfers.
 
-13. Remote `allocate_domain()`.
+13. Remote `allocate_domain()` future work.
     - Extend `CommDomainHandle` to carry remote endpoint ids.
     - Allocate/import windows collectively across remote workers.
     - Preserve deferred release after `drain()`.
@@ -188,18 +206,20 @@ fork/shm behavior working.
 - A2 RoCE remote buffer copy round trip.
 - A3 HCCS single remote L3 task.
 - A5 UB LD/ST doorbell plus RDMA fallback.
-- Remote domain allocation and deferred release across two remote L3 workers.
+- Remote domain allocation and deferred release across two remote L3 workers
+  after Remote CommDomain enters scope.
 
 ## Open Decisions
 
 - Exact platform HAL names for HCCS and UB export/import.
 - Authentication and isolation for remote daemon sessions.
-- Exact compatibility metadata required for PR #839 serialized Python callable
-  payloads beyond serializer version and Python ABI/runtime.
+- Exact remote compatibility metadata required for PR #839 serialized Python
+  callable payloads beyond the local payload contract, serializer version, and
+  Python ABI/runtime.
 - How endpoint health feeds scheduler-level eligibility after the transport
   reports a failed health lane.
 - How much of `CommContext` should remain shared with PTO-ISA once remote UB
-  address metadata is added.
+  address metadata is added, when Remote CommDomain enters scope.
 
 The first cut should land endpoint abstraction, endpoint eligibility,
 remote callable registration, failure poisoning, and the simulation runner

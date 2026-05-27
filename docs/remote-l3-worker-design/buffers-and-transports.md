@@ -206,58 +206,74 @@ range index as part of the transport bring-up. `offset_end`/`nbytes` remains in
 `RemoteTensorDesc` for bounds checks and for a future range-overlap TensorMap
 upgrade, but it is not part of the first dependency key.
 
-## RemoteTransport Interface
+## HCOMM Adapter Contract
 
-All backends implement the same transport contract:
+Remote L3 uses HCOMM for steady-state communication in the first
+implementation. The bootstrap socket is only a setup path for session
+validation and HCOMM bring-up. Once HCOMM RPC is ready, task metadata,
+CONTROL, CONTROL_REPLY, COMPLETION, and SHUTDOWN frames use the HCOMM RPC
+adapter; tensor data and remote buffer copies use the HCOMM data adapter.
 
-```cpp
-class RemoteTransport {
-public:
-    virtual void connect(const RemoteEndpointSpec &) = 0;
-    virtual void post_task(uint64_t seq, Span<const uint8_t> frame) = 0;
-    virtual Frame wait_completion(uint64_t seq, Timeout timeout) = 0;
-    virtual ControlReply control(const ControlRequest &) = 0;
-    virtual RemoteMemory export_memory(BufferId) = 0;
-    virtual ImportedMemory import_memory(const RemoteMemory &) = 0;
-    virtual void close() = 0;
-};
+The endpoint owns the adapter objects. `Orchestrator`, Scheduler, and
+`WorkerThread` see only `WorkerEndpoint::run()`, `WorkerEndpoint::control()`,
+and logical capability bits from `WorkerEndpoint::caps()`.
+
+The adapter family provides this logical contract:
+
+```text
+BootstrapSocketAdapter:
+  open(control_uri)
+  exchange hello/capability/HCOMM bootstrap frames
+  close after HCOMM_RPC_READY
+
+HcommRpcAdapter:
+  submit TASK or CONTROL frame on the ordered command lane
+  wait for matching COMPLETION or CONTROL_REPLY
+  send SHUTDOWN when no command is in flight
+
+HcommAdapter:
+  register/export/import memory
+  submit read/write/copy plans
+  wait/fence completion
+  release registrations and imports
 ```
 
-`post_task()` and `control()` enqueue request frames on the endpoint's ordered
-command lane. Data-plane transfers may use RDMA/HCCS/UB paths, but TASK
+HCOMM RPC enqueues request frames on the endpoint's ordered command lane.
+Data-plane transfers may use RoCE, HCCS, or UB HCOMM profiles, but TASK
 doorbells, CONTROL frames, replies, completions, and shutdown state are ordered
-by the command lane. Reply frames carry the request sequence they answer.
-`wait_completion()` waits for an explicit remote `COMPLETION` frame; RDMA write
-completion alone is never a task completion signal. `control()` sends a
-`CONTROL` frame and returns only after the matching `CONTROL_REPLY` arrives or a
-timeout/disconnect is converted into a failed reply. Liveness is handled by an
-independent health lane or transport keepalive; it is not queued behind the
-ordered command lane.
+by the command lane. Reply frames carry the request sequence they answer. A
+task completes only after an explicit remote `COMPLETION` frame; data-copy
+completion alone is never a task completion signal. `control()` returns only
+after the matching `CONTROL_REPLY` arrives or a timeout/disconnect is converted
+into a failed reply. Liveness is handled by an independent health lane or
+transport keepalive; it is not queued behind the ordered command lane.
 
-## A2 RoCE
+## A2 RoCE HCOMM Profile
 
-- Use RDMA SEND/RECV for small frames and completion records.
-- Keep TASK doorbells, control frames, control replies, and completions on one
-  per-endpoint ordered SEND/RECV command lane.
-- Use a separate health SEND/RECV lane or transport keepalive for liveness.
-- Use registered pinned staging buffers for large callable blobs and bulk data.
-- Export buffers as `(addr, length, rkey, qp/session metadata)`.
-- Complete tasks only after a SEND completion frame from the session runner.
+- Use HCOMM with `COMM_PROTOCOL_ROCE`.
+- Carry command frames and completion records through HCOMM RPC rings and
+  notify/fence operations.
+- Use a separate health HCOMM lane or transport keepalive for liveness.
+- Use registered staging buffers for large callable blobs and bulk data.
+- Export buffers as HCOMM memory descriptors plus RoCE-specific channel
+  metadata.
+- Complete tasks only after an HCOMM RPC `COMPLETION` frame from the session
+  runner.
 - Bound every wait with a timeout and convert disconnects into endpoint
   failure completions.
 
-## A3 HCCS
+## A3 HCCS HCOMM Profile
 
-- Keep the same `RemoteTransport` contract as RoCE.
-- Implement memory export/import through the HCCS-capable platform HAL.
+- Keep the same HCOMM adapter contract as A2.
+- Implement memory export/import through the HCCS-capable HCOMM profile.
 - Preserve the same command-lane ordering rules: task/control frames are
   observed in sequence order, command frame visible before doorbell, and remote
   writes complete before completion frame.
 - Provide health independently from command-lane progress so long-running TASK
   execution does not cause false endpoint failure.
-- Reuse the frame codec and buffer registry tests from the RoCE path.
+- Reuse the frame codec, HCOMM RPC, and buffer registry tests from the A2 path.
 
-## A5 UB
+## A5 UB HCOMM Profile
 
 - Export both RDMA metadata and, when available, an LD/ST mapping token.
 - Use LD/ST for doorbells and small completion records only when the mapping

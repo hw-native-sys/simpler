@@ -4,6 +4,12 @@ This document defines the remote wire protocol used by
 `RemoteL3Endpoint`. The local fork/shm path keeps the existing mailbox layout
 behind `LocalMailboxEndpoint`.
 
+The bootstrap socket carries only setup and HCOMM bring-up frames. After HCOMM
+RPC is ready, steady-state TASK, CONTROL, CONTROL_REPLY, COMPLETION, and
+SHUTDOWN frames travel through the HCOMM RPC adapter. Tensor data moves through
+the HCOMM data adapter and is referenced from TASK frames by descriptors, not
+by host pointers.
+
 ## Frames
 
 Remote transport must not reuse the raw 4096-byte mailbox format. Define a
@@ -104,7 +110,7 @@ and health lanes. `HELLO` does not carry the bootstrap manifest.
 session_id
 endpoint_id
 protocol_version
-transport kind
+comm profile
 feature flags
 ready_state
 ```
@@ -124,6 +130,12 @@ callable_id: int32
 config: CallConfigWire v1
 args: RemoteTaskArgsWire v1
 ```
+
+TASK frames carry tensor metadata and remote descriptors after parent-side
+dependency inference has already consumed `TaskArgs` tags. Tags are
+Orchestrator input, not the remote L3 wire contract. The endpoint uses the
+sidecar descriptors captured at submit time to materialize local
+`ContinuousTensor` values on the session runner.
 
 `RemoteTaskArgsWire v1` contains:
 
@@ -250,9 +262,16 @@ Required remote controls:
 - `EXPORT_BUFFER`
 - `IMPORT_BUFFER`
 - `RELEASE_IMPORT`
+
+Reserved future controls for Remote CommDomain:
+
 - `COMM_INIT`
 - `ALLOC_DOMAIN`
 - `RELEASE_DOMAIN`
+
+The first Remote L3 task-dispatch cut rejects the reserved domain controls
+with an unsupported-control reply. They become required only when Remote
+CommDomain enters scope.
 
 The register-family controls are namespace-aware.
 `PREPARE_REGISTER_CALLABLE` carries:
@@ -279,7 +298,9 @@ Rules:
   inner `submit_sub` / recursive orchestration; `CHIP_CALLABLE` follows the
   existing prepare/register path for chip workers.
 - `PYTHON_IMPORT` payloads carry a bounded UTF-8 `module:qualname` string.
-- `PYTHON_SERIALIZED` payloads are produced by the PR #839 callable serializer.
+- `PYTHON_SERIALIZED` payloads are produced by the PR #839 callable serializer
+  described in
+  [../python-callable-serialization.md](../python-callable-serialization.md).
   They are valid only when parent and session negotiate serializer version,
   payload limits, Python ABI/runtime compatibility, and dependency/runtime
   compatibility. Support is optional; `PYTHON_IMPORT` remains the required

@@ -11,6 +11,11 @@ Detailed protocol, buffer, transport, and rollout notes live in:
 - [buffers-and-transports.md](remote-l3-worker-design/buffers-and-transports.md)
 - [implementation-plan.md](remote-l3-worker-design/implementation-plan.md)
 
+Related callable registration and serialization contracts:
+
+- [callable-ipc-dynamic-register.md](callable-ipc-dynamic-register.md)
+- [python-callable-serialization.md](python-callable-serialization.md)
+
 The current implementation uses pre-forked local child processes and a
 4096-byte shared-memory mailbox. That model depends on copy-on-write callable
 registries, identical virtual addresses for `MAP_SHARED` regions, and
@@ -23,7 +28,8 @@ Goals:
 - Preserve the Orchestrator/Scheduler DAG model.
 - Replace the local mailbox endpoint under `WorkerThread` with a pluggable
   NEXT_LEVEL endpoint.
-- Support remote data-plane backends for A2 RoCE, A3 HCCS, and A5 UB.
+- Support HCOMM-backed remote communication profiles for A2 RoCE, A3 HCCS,
+  and A5 UB.
 - Carry task dispatch, control commands, completion, error messages, and
   buffer lifetime over the remote endpoint.
 
@@ -35,6 +41,11 @@ Non-goals:
   arbitrary closures.
 - Replacing the local fork/shm path for chip and sub workers.
 - Changing the L2 `ChipWorker::run` ABI.
+- Exposing `RemoteL3Endpoint`, HCOMM, RDMA, or socket details to
+  `Orchestrator`; endpoint selection and materialization stay behind
+  `WorkerEndpoint`.
+- Redesigning remote `CommDomain` or the device `CommContext` ABI in the first
+  Remote L3 task-dispatch cut.
 
 Remote callable registration follows the same public cid lifecycle defined for
 local dynamic Python registration by PR #839: registration becomes visible to
@@ -47,10 +58,12 @@ process-local pointers, or exact serialized payload wire shape.
 
 The required baseline remote callable descriptor is an import path such as
 `pkg.module:orch_fn`. A serialized Python callable payload produced by the
-PR #839 serializer is a negotiated remote capability, not an unconditional
-baseline. When enabled, it travels as a versioned remote CONTROL payload and
-must negotiate serializer version, payload limits, Python ABI/runtime
-compatibility, and dependency/runtime-environment compatibility.
+PR #839 serializer described in
+[python-callable-serialization.md](python-callable-serialization.md) is a
+negotiated remote capability, not an unconditional baseline. When enabled, it
+travels as a versioned remote CONTROL payload and must negotiate serializer
+version, payload limits, Python ABI/runtime compatibility, and
+dependency/runtime-environment compatibility.
 
 ## Current Seams
 
@@ -82,12 +95,26 @@ tensor identity must be resolved before a slot becomes ready, because
 TensorMap dependency inference and buffer-reference capture happen at submit
 time.
 
+`Orchestrator` consumes tags, computes dependency keys, and stores endpoint
+eligibility metadata. It must not call `RemoteL3Endpoint`, HCOMM, RDMA, or
+socket APIs directly. `WorkerThread` and `WorkerEndpoint` own the child
+boundary and materialization mechanics.
+
 ## Target Architecture
 
-Introduce a transport-neutral endpoint under `WorkerThread` with `run`,
-`control`, and `shutdown` operations. `LocalMailboxEndpoint` wraps the current
-shm mailbox code without changing wire behavior. `RemoteL3Endpoint` implements
-the same interface over the framed remote protocol.
+Introduce a communication-neutral `WorkerEndpoint` under `WorkerThread` with
+`caps`, `run`, `control`, and `shutdown` operations. `LocalMailboxEndpoint`
+wraps the current shm mailbox code without changing wire behavior.
+`RemoteL3Endpoint` implements the same interface with a bootstrap socket for
+session setup, then HCOMM-backed RPC and data adapters for steady-state
+traffic.
+
+`caps()` is part of the endpoint contract because submit-time eligibility must
+know whether an endpoint can run a cid and consume the tensors in a slot. It is
+read-only capability metadata, not a transport escape hatch: the Scheduler sees
+logical features such as callable kinds, memory directions, address spaces, and
+health state, while `RemoteL3Endpoint` remains the only layer that knows the
+selected HCOMM protocol or adapter handles.
 
 On dispatch, `WorkerThread` builds a task packet from `TaskSlotState`, calls
 the endpoint, reports endpoint errors, and notifies the Scheduler with an
@@ -129,7 +156,7 @@ Use a two-process remote model:
    traffic.
 7. The runner then performs the remote protocol `HELLO`/ready handshake over
    the ordered command lane. `HELLO` confirms session identity, endpoint
-   identity, protocol version, transport kind, and negotiated features; it does
+   identity, protocol version, comm profile, and negotiated features; it does
    not carry the bootstrap manifest.
 8. Session shutdown rejects new frames, completes or fails in-flight tasks,
    drains cleanup, closes the inner Worker, and exits the runner process.
@@ -157,19 +184,24 @@ Required contracts:
 
 - Every local or remote NEXT_LEVEL child has a stable `endpoint_id` equal to
   its logical worker id in `WorkerManager`.
-- `register()` continues to register local callables for local fork/shm
-  endpoints.
-- `register_remote(remote_callable, workers=...)` allocates an outer cid in the
-  parent `Worker(level=4)` id space, but binds that cid to one or more remote
-  endpoint ids.
+- `register(callable, workers=...)` is the single public registration API.
+  Local Python/callable objects keep the existing local registration path.
+  `RemoteCallable` descriptors use the remote control path and bind the
+  allocated parent cid to one or more remote endpoint ids.
+- The first implementation requires `RemoteCallable` registration to pass an
+  explicit non-empty `workers=[...]` list. Future releases may replace raw
+  worker ids with named remote pools or placement policies, but implicit
+  broadcast to all remote endpoints is not part of the contract.
 - Bootstrap manifests are generated by the parent. Users provide remote
   callable descriptors; users do not hand-author raw `cid -> callable` maps.
 - Remote callable descriptors have two Python forms:
   - `PYTHON_IMPORT`: a bounded `module:qualname` import path. This is required
     for the remote L3 baseline.
   - `PYTHON_SERIALIZED`: a versioned payload produced by the PR #839 callable
-    serializer. This is allowed only when parent and session negotiate the
-    serializer version, payload limits, Python ABI/runtime compatibility, and
+    serializer described in
+    [python-callable-serialization.md](python-callable-serialization.md). This
+    is allowed only when parent and session negotiate the serializer version,
+    payload limits, Python ABI/runtime compatibility, and
     dependency/runtime-environment compatibility.
 - Remote L3 uses two independent cid namespaces:
   - **Outer remote cid namespace**: parent-assigned cids carried in L4 TASK
@@ -190,7 +222,7 @@ Required contracts:
   callable payloads preserve the same cid lifecycle but remain an optional
   negotiated feature because they require Ray-like environment and serializer
   compatibility checks that local fork/COW registration does not need.
-- Multi-endpoint `register_remote(..., workers=[...])` is all-or-nothing by
+- Multi-endpoint `register(..., workers=[...])` is all-or-nothing by
   default. The parent sends a prepare phase to every selected endpoint, commits
   the cid only after every prepare succeeds, and exposes the cid to future TASK
   frames only after every commit reply succeeds. If any endpoint fails prepare
@@ -233,7 +265,7 @@ l3 = RemoteWorkerSpec(
 )
 
 l3_worker_id = w4.add_remote_worker(l3)
-l3_cid = w4.register_remote(
+l3_cid = w4.register(
     RemoteCallable("my_pkg.remote_orch:l3_orch"),
     workers=[l3_worker_id],
 )
@@ -269,7 +301,7 @@ callable registry:
   inner L3 registry:
     inner cid -> ChipCallable blob metadata, when needed
     inner cid -> Python sub/orch callable descriptor, when needed
-transport kind: roce | hccs | ub | sim
+comm policy: roce | hccs | ub | sim
 feature flags
 ```
 
@@ -305,9 +337,10 @@ Session execution rules:
   the current one-`WorkerThread`-per-child local scheduling model and keeps
   ordering, buffer lifetime, and cid visibility simple.
 - State-changing CONTROL frames such as register, unregister, buffer free,
-  import release, comm init, and domain allocation serialize with TASK
-  execution on the ordered command lane. They are not applied concurrently with
-  a running TASK on the same endpoint.
+  copy, export/import, and import release serialize with TASK execution on the
+  ordered command lane. They are not applied concurrently with a running TASK
+  on the same endpoint. Future Remote CommDomain controls follow the same
+  ordering rule when they enter scope.
 - Bulk data movement may use a separate data plane, but the state change that
   makes staged bytes, callable payloads, or imported handles visible is ordered
   by the command lane.
@@ -403,7 +436,12 @@ field, no sequence number, and assumes shared virtual memory.
 
 Remote endpoints use a versioned frame protocol with `HELLO`, `TASK`,
 `CONTROL`, `CONTROL_REPLY`, `COMPLETION`, `HEALTH`, and `SHUTDOWN` frames. The
-local path keeps the existing mailbox layout behind `LocalMailboxEndpoint`.
+bootstrap socket carries only session setup and HCOMM bring-up frames. After
+HCOMM RPC is ready, steady-state control, task metadata, completions, and
+shutdown use the HCOMM-backed RPC adapter; tensor data and remote buffer
+operations use the HCOMM data adapter. The local path keeps the existing
+mailbox layout behind `LocalMailboxEndpoint`.
+
 Remote frames use canonical little-endian field encoding for `CallConfig`,
 `ContinuousTensor`, tensor descriptors, strings, counts, and enums; they do not
 memcpy local C++ POD structs onto the wire. Each endpoint has one ordered
@@ -427,7 +465,7 @@ The recommended first cut is conservative:
    `HELLO READY`.
 6. Prove local behavior is unchanged and remote sim behavior handles success,
    failure, cid mapping, timeouts, health, and buffer cleanup.
-7. Add hardware transports behind the same protocol.
+7. Add A2 RoCE, A3 HCCS, and A5 UB profiles behind the HCOMM adapter layer.
 
 See
 [implementation-plan.md](remote-l3-worker-design/implementation-plan.md)
