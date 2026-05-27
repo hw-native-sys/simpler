@@ -48,8 +48,16 @@ def _invalidate_cache_if_stale(target_cache_dir: Path, current_commit: str) -> N
     cannot detect that source files changed. Comparing the HEAD commit stored
     at last build time against the current HEAD is a reliable signal that
     sources may have changed and a clean rebuild is needed.
+
+    When the current commit can't be determined (no git, transient failure),
+    fall through to a clean rebuild — a fresh compile is cheap relative to
+    the risk of linking against stale objects.
     """
     if not current_commit:
+        if target_cache_dir.is_dir():
+            logger.info("git HEAD unavailable, clearing cmake cache: %s", target_cache_dir)
+            shutil.rmtree(target_cache_dir)
+        target_cache_dir.mkdir(parents=True, exist_ok=True)
         return
     commit_file = target_cache_dir / _GIT_COMMIT_FILE
     if commit_file.is_file():
