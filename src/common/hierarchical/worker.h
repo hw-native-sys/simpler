@@ -105,6 +105,23 @@ public:
     void control_comm_init(int worker_id, const std::string &request_shm_name) {
         manager_.control_comm_init(worker_id, request_shm_name.c_str());
     }
+    uint64_t control_open_mapped_region(int worker_id, uint64_t data_bytes, uint32_t signal_count, uint32_t flags) {
+        return manager_.control_open_mapped_region(worker_id, data_bytes, signal_count, flags);
+    }
+    void control_close_mapped_region(int worker_id, uint64_t handle) {
+        manager_.control_close_mapped_region(worker_id, handle);
+    }
+    void control_mapped_region_payload(int worker_id, uint64_t sub_cmd, const std::string &shm_name) {
+        manager_.control_mapped_region_payload(worker_id, sub_cmd, shm_name.c_str());
+    }
+    void control_mapped_region_notify(int worker_id, uint64_t handle, uint32_t signal_id, uint32_t value) {
+        manager_.control_mapped_region_notify(worker_id, handle, signal_id, value);
+    }
+    void control_mapped_region_wait(
+        int worker_id, uint64_t handle, uint32_t signal_id, uint32_t target, uint32_t timeout_us
+    ) {
+        manager_.control_mapped_region_wait(worker_id, handle, signal_id, target, timeout_us);
+    }
 
     // Broadcast CTRL_REGISTER / CTRL_UNREGISTER for a ChipCallable cid to
     // every NEXT_LEVEL child in parallel. `blob_ptr`/`blob_size` describe

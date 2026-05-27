@@ -22,6 +22,9 @@
 #include "device_runner.h"
 #include "pto_runtime_c_api.h"
 
+#include "host_device_comm/host_device_mapped_region.h"
+#include "host_device_mapped_region_onboard.h"
+
 extern "C" {
 
 DeviceContextHandle create_device_context(void) {
@@ -63,6 +66,52 @@ int destroy_comm_stream_ctx(DeviceContextHandle ctx, void *stream) {
     } catch (...) {
         return -1;
     }
+}
+
+int open_host_device_mapped_region_ctx(
+    DeviceContextHandle ctx, const HostDeviceMappedRegionConfig *cfg, HostDeviceMappedRegionHandle *out_region
+) {
+    return host_device_mapped_region_open_common(ctx, cfg, out_region, a2a3_onboard_host_device_mapped_region_allocate);
+}
+
+int close_host_device_mapped_region_ctx(DeviceContextHandle ctx, HostDeviceMappedRegionHandle region) {
+    return host_device_mapped_region_close_common(ctx, region);
+}
+
+int host_device_mapped_region_info_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, HostDeviceMappedRegionInfo *info
+) {
+    int rc = host_device_mapped_region_info_common(ctx, region, info);
+    if (rc == 0) {
+        info->host_data_ptr = 0;
+        info->host_signal_ptr = 0;
+    }
+    return rc;
+}
+
+int host_device_mapped_region_datacopy_h2region_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint64_t offset, const void *src, size_t nbytes
+) {
+    return host_device_mapped_region_datacopy_h2region_common(ctx, region, offset, src, nbytes);
+}
+
+int host_device_mapped_region_datacopy_region2h_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint64_t offset, void *dst, size_t nbytes
+) {
+    return host_device_mapped_region_datacopy_region2h_common(ctx, region, offset, dst, nbytes);
+}
+
+int host_device_mapped_region_notify_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint32_t signal_id, uint32_t value
+) {
+    return host_device_mapped_region_notify_common(ctx, region, signal_id, value);
+}
+
+int host_device_mapped_region_wait_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint32_t signal_id, uint32_t target,
+    uint32_t timeout_us
+) {
+    return host_device_mapped_region_wait_common(ctx, region, signal_id, target, timeout_us);
 }
 
 }  // extern "C"

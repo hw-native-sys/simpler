@@ -9,7 +9,7 @@
 """Tests for CallConfig and ChipWorker state machine."""
 
 import pytest
-from _task_interface import CallConfig, _ChipWorker  # pyright: ignore[reportMissingImports]
+from _task_interface import CallConfig, MappedRegionInfo, _ChipWorker  # pyright: ignore[reportMissingImports]
 
 # ============================================================================
 # CallConfig tests
@@ -135,6 +135,34 @@ class TestChipWorkerStateMachine:
         worker = _ChipWorker()
         with pytest.raises(RuntimeError, match="not initialized"):
             worker.unregister_callable(0)
+
+    def test_mapped_region_methods_before_init_raise(self):
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.open_mapped_region(8, 1, 0)
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.mapped_region_info(1)
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.mapped_region_datacopy_h2region(1, 0, b"x")
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.mapped_region_datacopy_region2h(1, 0, 1)
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.mapped_region_notify(1, 0, 1)
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.mapped_region_wait(1, 0, 1, 0)
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.close_mapped_region(1)
+
+    def test_mapped_region_info_is_structured(self):
+        info = MappedRegionInfo(0, 0x1000, 16, 0, 0x2000, 2, 256, 0)
+        assert info.host_data_ptr == 0
+        assert info.device_data_ptr == 0x1000
+        assert info.data_bytes == 16
+        assert info.host_signal_ptr == 0
+        assert info.device_signal_ptr == 0x2000
+        assert info.signal_count == 2
+        assert info.total_bytes == 256
+        assert info.flags == 0
 
 
 # ============================================================================

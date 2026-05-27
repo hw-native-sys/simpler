@@ -179,6 +179,107 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
     return 0;
 }
 
+int DeviceRunner::host_register_device_memory(void *dev_ptr, size_t bytes, void **host_ptr) {
+    if (dev_ptr == nullptr || host_ptr == nullptr || bytes == 0) {
+        return -1;
+    }
+    *host_ptr = nullptr;
+    if (device_id_ < 0) {
+        LOG_ERROR("host_register_device_memory requires an attached device");
+        return -1;
+    }
+    if (load_hal_if_needed() != 0) {
+        LOG_ERROR("Failed to load ascend_hal for mapped region: %s", dlerror());
+        return -1;
+    }
+    HalHostRegisterFn fn = get_halHostRegister();
+    if (fn == nullptr) {
+        LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
+        return -1;
+    }
+    int rc = fn(dev_ptr, bytes, DEV_SVM_MAP_HOST, device_id_, host_ptr);
+    if (rc != 0) {
+        LOG_ERROR(
+            "halHostRegister mapped region failed: dev_ptr=%p size=%zu device=%d rc=%d", dev_ptr, bytes, device_id_, rc
+        );
+    }
+    return rc;
+}
+
+int DeviceRunner::host_unregister_device_memory(void *host_ptr) {
+    if (host_ptr == nullptr) {
+        return 0;
+    }
+    if (device_id_ < 0) {
+        LOG_ERROR("host_unregister_device_memory requires an attached device");
+        return -1;
+    }
+    HalHostUnregisterFn fn = get_halHostUnregister();
+    if (fn == nullptr) {
+        LOG_ERROR("halHostUnregister symbol not found: %s", dlerror());
+        return -1;
+    }
+    int rc = fn(host_ptr, device_id_);
+    if (rc != 0) {
+        LOG_ERROR("halHostUnregister mapped region failed: host_ptr=%p device=%d rc=%d", host_ptr, device_id_, rc);
+    }
+    return rc;
+}
+
+namespace {
+
+void clean_host_cache_range(void *host_ptr, size_t bytes) {
+    if (host_ptr == nullptr || bytes == 0) {
+        return;
+    }
+#if defined(__aarch64__)
+    constexpr uintptr_t kCacheLineBytes = 64;
+    uintptr_t start = reinterpret_cast<uintptr_t>(host_ptr) & ~(kCacheLineBytes - 1U);
+    uintptr_t end = (reinterpret_cast<uintptr_t>(host_ptr) + bytes + kCacheLineBytes - 1U) & ~(kCacheLineBytes - 1U);
+    for (uintptr_t p = start; p < end; p += kCacheLineBytes) {
+        __asm__ __volatile__("dc cvac, %0" ::"r"(p) : "memory");
+    }
+    __asm__ __volatile__("dsb sy" ::: "memory");
+    __asm__ __volatile__("isb" ::: "memory");
+#elif defined(__x86_64__)
+    __asm__ __volatile__("" ::: "memory");
+#else
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
+
+void clean_invalidate_host_cache_range(void *host_ptr, size_t bytes) {
+    if (host_ptr == nullptr || bytes == 0) {
+        return;
+    }
+#if defined(__aarch64__)
+    constexpr uintptr_t kCacheLineBytes = 64;
+    uintptr_t start = reinterpret_cast<uintptr_t>(host_ptr) & ~(kCacheLineBytes - 1U);
+    uintptr_t end = (reinterpret_cast<uintptr_t>(host_ptr) + bytes + kCacheLineBytes - 1U) & ~(kCacheLineBytes - 1U);
+    for (uintptr_t p = start; p < end; p += kCacheLineBytes) {
+        __asm__ __volatile__("dc civac, %0" ::"r"(p) : "memory");
+    }
+    __asm__ __volatile__("dsb sy" ::: "memory");
+    __asm__ __volatile__("isb" ::: "memory");
+#elif defined(__x86_64__)
+    __asm__ __volatile__("" ::: "memory");
+#else
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
+
+}  // namespace
+
+int DeviceRunner::flush_host_cache_range(void *host_ptr, size_t bytes) {
+    clean_host_cache_range(host_ptr, bytes);
+    return 0;
+}
+
+int DeviceRunner::invalidate_host_cache_range(void *host_ptr, size_t bytes) {
+    clean_invalidate_host_cache_range(host_ptr, bytes);
+    return 0;
+}
+
 // `ensure_binaries_loaded`, `query_max_block_dim`, and `validate_block_dim`
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.

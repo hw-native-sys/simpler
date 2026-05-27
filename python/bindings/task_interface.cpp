@@ -18,9 +18,12 @@
  */
 
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
+
+#include <Python.h>
 
 #include <cstring>
 #include <sstream>
@@ -39,6 +42,50 @@
 #include "tensor_arg.h"
 
 namespace nb = nanobind;
+
+namespace {
+
+struct MappedRegionInfo {
+    uint64_t host_data_ptr;
+    uint64_t device_data_ptr;
+    uint64_t data_bytes;
+    uint64_t host_signal_ptr;
+    uint64_t device_signal_ptr;
+    uint32_t signal_count;
+    uint64_t total_bytes;
+    uint32_t flags;
+
+    MappedRegionInfo(
+        uint64_t host_data_ptr_, uint64_t device_data_ptr_, uint64_t data_bytes_, uint64_t host_signal_ptr_,
+        uint64_t device_signal_ptr_, uint32_t signal_count_, uint64_t total_bytes_, uint32_t flags_
+    ) :
+        host_data_ptr(host_data_ptr_),
+        device_data_ptr(device_data_ptr_),
+        data_bytes(data_bytes_),
+        host_signal_ptr(host_signal_ptr_),
+        device_signal_ptr(device_signal_ptr_),
+        signal_count(signal_count_),
+        total_bytes(total_bytes_),
+        flags(flags_) {}
+};
+
+MappedRegionInfo make_mapped_region_info(const HostDeviceMappedRegionInfo &info) {
+    return MappedRegionInfo{
+        info.host_data_ptr,     info.device_data_ptr, info.data_bytes,  info.host_signal_ptr,
+        info.device_signal_ptr, info.signal_count,    info.total_bytes, info.flags,
+    };
+}
+
+void raise_python_exception_for_mapped_region_error(const std::exception &e) {
+    std::string msg = e.what();
+    if (msg.find("timed out") != std::string::npos) {
+        PyErr_SetString(PyExc_TimeoutError, msg.c_str());
+        throw nb::python_error();
+    }
+    throw;
+}
+
+}  // namespace
 
 // ============================================================================
 // Module definition
@@ -713,6 +760,29 @@ NB_MODULE(_task_interface, m) {
             return os.str();
         });
 
+    nb::class_<MappedRegionInfo>(m, "MappedRegionInfo")
+        .def(
+            nb::init<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint64_t, uint32_t>(),
+            nb::arg("host_data_ptr"), nb::arg("device_data_ptr"), nb::arg("data_bytes"), nb::arg("host_signal_ptr"),
+            nb::arg("device_signal_ptr"), nb::arg("signal_count"), nb::arg("total_bytes"), nb::arg("flags")
+        )
+        .def_ro("host_data_ptr", &MappedRegionInfo::host_data_ptr)
+        .def_ro("device_data_ptr", &MappedRegionInfo::device_data_ptr)
+        .def_ro("data_bytes", &MappedRegionInfo::data_bytes)
+        .def_ro("host_signal_ptr", &MappedRegionInfo::host_signal_ptr)
+        .def_ro("device_signal_ptr", &MappedRegionInfo::device_signal_ptr)
+        .def_ro("signal_count", &MappedRegionInfo::signal_count)
+        .def_ro("total_bytes", &MappedRegionInfo::total_bytes)
+        .def_ro("flags", &MappedRegionInfo::flags)
+        .def("__repr__", [](const MappedRegionInfo &info) {
+            std::ostringstream os;
+            os << "MappedRegionInfo(device_data_ptr=0x" << std::hex << info.device_data_ptr << ", device_signal_ptr=0x"
+               << info.device_signal_ptr << std::dec << ", data_bytes=" << info.data_bytes
+               << ", signal_count=" << info.signal_count << ", total_bytes=" << info.total_bytes
+               << ", flags=" << info.flags << ")";
+            return os.str();
+        });
+
     // --- ChipWorker ---
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())
@@ -810,6 +880,69 @@ NB_MODULE(_task_interface, m) {
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
         .def("copy_from", &ChipWorker::copy_from, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
+        .def(
+            "open_mapped_region",
+            [](ChipWorker &self, uint64_t data_bytes, uint32_t signal_count, uint32_t flags) {
+                return self.open_mapped_region(data_bytes, signal_count, flags);
+            },
+            nb::arg("data_bytes"), nb::arg("signal_count") = 1, nb::arg("flags") = 0
+        )
+        .def("close_mapped_region", &ChipWorker::close_mapped_region, nb::arg("handle"))
+        .def(
+            "mapped_region_info",
+            [](ChipWorker &self, uint64_t handle) {
+                return make_mapped_region_info(self.mapped_region_info(handle));
+            },
+            nb::arg("handle")
+        )
+        .def(
+            "mapped_region_datacopy_h2region",
+            [](ChipWorker &self, uint64_t handle, uint64_t offset, nb::object obj) {
+                if (PyUnicode_Check(obj.ptr())) {
+                    throw std::invalid_argument("mapped_region_datacopy_h2region requires a bytes-like object");
+                }
+                Py_buffer view{};
+                if (PyObject_GetBuffer(obj.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
+                    throw nb::python_error();
+                }
+                try {
+                    self.mapped_region_datacopy_h2region(handle, offset, view.buf, static_cast<size_t>(view.len));
+                } catch (const std::exception &e) {
+                    PyBuffer_Release(&view);
+                    raise_python_exception_for_mapped_region_error(e);
+                }
+                PyBuffer_Release(&view);
+            },
+            nb::arg("handle"), nb::arg("offset"), nb::arg("buffer")
+        )
+        .def(
+            "mapped_region_datacopy_region2h",
+            [](ChipWorker &self, uint64_t handle, uint64_t offset, size_t nbytes) {
+                std::string out(nbytes, '\0');
+                try {
+                    self.mapped_region_datacopy_region2h(handle, offset, out.data(), nbytes);
+                } catch (const std::exception &e) {
+                    raise_python_exception_for_mapped_region_error(e);
+                }
+                return nb::bytes(out.data(), out.size());
+            },
+            nb::arg("handle"), nb::arg("offset"), nb::arg("nbytes")
+        )
+        .def(
+            "mapped_region_notify", &ChipWorker::mapped_region_notify, nb::arg("handle"), nb::arg("signal_id"),
+            nb::arg("value")
+        )
+        .def(
+            "mapped_region_wait",
+            [](ChipWorker &self, uint64_t handle, uint32_t signal_id, uint32_t target, uint32_t timeout_us) {
+                try {
+                    self.mapped_region_wait(handle, signal_id, target, timeout_us);
+                } catch (const std::exception &e) {
+                    raise_python_exception_for_mapped_region_error(e);
+                }
+            },
+            nb::arg("handle"), nb::arg("signal_id"), nb::arg("target"), nb::arg("timeout_us")
+        )
         .def(
             "comm_init", &ChipWorker::comm_init, nb::arg("rank"), nb::arg("nranks"), nb::arg("rootinfo_path"),
             "Initialize a communicator for this rank.  ChipWorker owns ACL + stream "

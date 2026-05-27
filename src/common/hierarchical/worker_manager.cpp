@@ -323,11 +323,13 @@ WorkerThread *WorkerManager::pick_idle_excluding(WorkerType type, const std::vec
 // WorkerThread — memory control (orch thread, concurrent with worker thread)
 // =============================================================================
 
-static void write_control_args(char *mbox, uint64_t sub_cmd, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0) {
+static void
+write_control_args(char *mbox, uint64_t sub_cmd, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0) {
     std::memcpy(mbox + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     std::memcpy(mbox + CTRL_OFF_ARG0, &a0, sizeof(uint64_t));
     std::memcpy(mbox + CTRL_OFF_ARG1, &a1, sizeof(uint64_t));
     std::memcpy(mbox + CTRL_OFF_ARG2, &a2, sizeof(uint64_t));
+    std::memcpy(mbox + CTRL_OFF_ARG3, &a3, sizeof(uint64_t));
 }
 
 static uint64_t read_control_result(const char *mbox) {
@@ -335,6 +337,8 @@ static uint64_t read_control_result(const char *mbox) {
     std::memcpy(&r, mbox + CTRL_OFF_RESULT, sizeof(uint64_t));
     return r;
 }
+
+static void write_shm_name_pair(char *mbox, const char *request_shm_name, const char *reply_shm_name);
 
 // Issue a control sub-command and block until the child publishes
 // CONTROL_DONE. Caller must hold `mailbox_mu_`. On a non-zero error code
@@ -440,6 +444,54 @@ void WorkerThread::control_copy_from(uint64_t dst, uint64_t src, size_t size) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_COPY_FROM, dst, src, static_cast<uint64_t>(size));
     run_control_command("control_copy_from");
+}
+
+uint64_t WorkerThread::control_open_mapped_region(uint64_t data_bytes, uint32_t signal_count, uint32_t flags) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(
+        mbox(), CTRL_OPEN_MAPPED_REGION, data_bytes, static_cast<uint64_t>(signal_count), static_cast<uint64_t>(flags)
+    );
+    run_control_command("control_open_mapped_region");
+    return read_control_result(mbox());
+}
+
+void WorkerThread::control_close_mapped_region(uint64_t handle) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_CLOSE_MAPPED_REGION, handle);
+    run_control_command("control_close_mapped_region");
+}
+
+void WorkerThread::control_mapped_region_payload(uint64_t sub_cmd, const char *shm_name) {
+    if (sub_cmd != CTRL_MAPPED_REGION_INFO && sub_cmd != CTRL_MAPPED_REGION_DATACOPY_H2REGION &&
+        sub_cmd != CTRL_MAPPED_REGION_DATACOPY_REGION2H) {
+        throw std::runtime_error("control_mapped_region_payload: invalid sub-command");
+    }
+    if (!shm_name || !*shm_name) {
+        throw std::runtime_error("control_mapped_region_payload: shm name must be non-empty");
+    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    write_shm_name_pair(mbox(), shm_name, "");
+    run_control_command("control_mapped_region_payload");
+}
+
+void WorkerThread::control_mapped_region_notify(uint64_t handle, uint32_t signal_id, uint32_t value) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(
+        mbox(), CTRL_MAPPED_REGION_NOTIFY, handle, static_cast<uint64_t>(signal_id), static_cast<uint64_t>(value)
+    );
+    run_control_command("control_mapped_region_notify");
+}
+
+void WorkerThread::control_mapped_region_wait(
+    uint64_t handle, uint32_t signal_id, uint32_t target, uint32_t timeout_us
+) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(
+        mbox(), CTRL_MAPPED_REGION_WAIT, handle, static_cast<uint64_t>(signal_id), static_cast<uint64_t>(target),
+        static_cast<uint64_t>(timeout_us)
+    );
+    run_control_command("control_mapped_region_wait");
 }
 
 // Stage two NUL-terminated shm names at MAILBOX_OFF_ARGS: request first
@@ -622,6 +674,49 @@ void WorkerManager::control_comm_init(int worker_id, const char *request_shm_nam
         throw std::runtime_error("control_comm_init: invalid worker_id " + std::to_string(worker_id));
     }
     wt->control_comm_init(request_shm_name);
+}
+
+uint64_t
+WorkerManager::control_open_mapped_region(int worker_id, uint64_t data_bytes, uint32_t signal_count, uint32_t flags) {
+    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_open_mapped_region: invalid worker_id " + std::to_string(worker_id));
+    }
+    return wt->control_open_mapped_region(data_bytes, signal_count, flags);
+}
+
+void WorkerManager::control_close_mapped_region(int worker_id, uint64_t handle) {
+    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_close_mapped_region: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_close_mapped_region(handle);
+}
+
+void WorkerManager::control_mapped_region_payload(int worker_id, uint64_t sub_cmd, const char *shm_name) {
+    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_mapped_region_payload: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_mapped_region_payload(sub_cmd, shm_name);
+}
+
+void WorkerManager::control_mapped_region_notify(int worker_id, uint64_t handle, uint32_t signal_id, uint32_t value) {
+    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_mapped_region_notify: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_mapped_region_notify(handle, signal_id, value);
+}
+
+void WorkerManager::control_mapped_region_wait(
+    int worker_id, uint64_t handle, uint32_t signal_id, uint32_t target, uint32_t timeout_us
+) {
+    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_mapped_region_wait: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_mapped_region_wait(handle, signal_id, target, timeout_us);
 }
 
 void WorkerManager::broadcast_register_all(int32_t cid, const void *blob_ptr, size_t blob_size) {

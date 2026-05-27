@@ -38,7 +38,7 @@ Python process (ChipWorker)
     |     +-- rtRegisterAllKernel(aicore_binary)      ← CANN kernel registration
     |     +-- rtAicpuKernelLaunchExWithArgs(...)       ← device-side execution
     |
-    +-- dlopen("libascend_hal.so", RTLD_NOW | RTLD_LOCAL)  ← CANN HAL (profiling only)
+    +-- dlopen("libascend_hal.so", RTLD_NOW | RTLD_LOCAL)  ← CANN HAL
 ```
 
 Key difference: onboard does **not** dlopen AICPU/AICore as host-side SOs.
@@ -93,9 +93,11 @@ execution.
 
 ### CANN HAL: `RTLD_NOW | RTLD_LOCAL`
 
-`libascend_hal.so` is loaded only for performance profiling (SVM memory
-mapping via `halHostRegister`/`halHostUnregister`). The handle is cached
-in a file-scope `g_hal_handle` and never explicitly dlclosed.
+`libascend_hal.so` is loaded for onboard HAL services that need SVM memory
+mapping, including performance profiling buffers and a2a3
+`HostDeviceMappedRegion` host mappings via
+`halHostRegister`/`halHostUnregister`. The handle is cached in a file-scope
+`g_hal_handle` and never explicitly dlclosed.
 
 ## All dlsym(RTLD_DEFAULT) Calls
 

@@ -12,6 +12,7 @@
 #include "chip_worker.h"
 
 #include <dlfcn.h>
+#include <errno.h>
 
 #include <fstream>
 #include <stdexcept>
@@ -126,6 +127,15 @@ void ChipWorker::init(
             load_symbol<CommReleaseDomainWindowsFn>(handle, "comm_release_domain_windows");
         comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
         comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
+        open_mapped_region_fn_ = load_symbol<OpenMappedRegionFn>(handle, "open_host_device_mapped_region_ctx");
+        close_mapped_region_fn_ = load_symbol<CloseMappedRegionFn>(handle, "close_host_device_mapped_region_ctx");
+        mapped_region_info_fn_ = load_symbol<MappedRegionInfoFn>(handle, "host_device_mapped_region_info_ctx");
+        mapped_region_datacopy_h2region_fn_ =
+            load_symbol<MappedRegionDatacopyH2RegionFn>(handle, "host_device_mapped_region_datacopy_h2region_ctx");
+        mapped_region_datacopy_region2h_fn_ =
+            load_symbol<MappedRegionDatacopyRegion2HFn>(handle, "host_device_mapped_region_datacopy_region2h_ctx");
+        mapped_region_notify_fn_ = load_symbol<MappedRegionNotifyFn>(handle, "host_device_mapped_region_notify_ctx");
+        mapped_region_wait_fn_ = load_symbol<MappedRegionWaitFn>(handle, "host_device_mapped_region_wait_ctx");
     } catch (...) {
         dlclose(handle);
         throw;
@@ -200,6 +210,13 @@ void ChipWorker::init(
         comm_release_domain_windows_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        open_mapped_region_fn_ = nullptr;
+        close_mapped_region_fn_ = nullptr;
+        mapped_region_info_fn_ = nullptr;
+        mapped_region_datacopy_h2region_fn_ = nullptr;
+        mapped_region_datacopy_region2h_fn_ = nullptr;
+        mapped_region_notify_fn_ = nullptr;
+        mapped_region_wait_fn_ = nullptr;
         runtime_buf_.clear();
         throw;
     }
@@ -239,6 +256,13 @@ void ChipWorker::init(
         comm_release_domain_windows_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        open_mapped_region_fn_ = nullptr;
+        close_mapped_region_fn_ = nullptr;
+        mapped_region_info_fn_ = nullptr;
+        mapped_region_datacopy_h2region_fn_ = nullptr;
+        mapped_region_datacopy_region2h_fn_ = nullptr;
+        mapped_region_notify_fn_ = nullptr;
+        mapped_region_wait_fn_ = nullptr;
         runtime_buf_.clear();
         throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
@@ -288,6 +312,13 @@ void ChipWorker::finalize() {
     comm_release_domain_windows_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
+    open_mapped_region_fn_ = nullptr;
+    close_mapped_region_fn_ = nullptr;
+    mapped_region_info_fn_ = nullptr;
+    mapped_region_datacopy_h2region_fn_ = nullptr;
+    mapped_region_datacopy_region2h_fn_ = nullptr;
+    mapped_region_notify_fn_ = nullptr;
+    mapped_region_wait_fn_ = nullptr;
     runtime_buf_.clear();
     initialized_ = false;
     device_id_ = -1;
@@ -493,6 +524,95 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
     if (rc != 0) {
         throw std::runtime_error("copy_from failed with code " + std::to_string(rc));
     }
+}
+
+void ChipWorker::check_mapped_region_rc(int rc, const char *op_name) {
+    if (rc == 0) {
+        return;
+    }
+    std::string msg = op_name;
+    msg += " failed with code ";
+    msg += std::to_string(rc);
+    if (rc == -EINVAL) {
+        throw std::invalid_argument(msg);
+    }
+    throw std::runtime_error(msg);
+}
+
+uint64_t ChipWorker::open_mapped_region(uint64_t data_bytes, uint32_t signal_count, uint32_t flags) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    HostDeviceMappedRegionConfig cfg{data_bytes, signal_count, flags};
+    HostDeviceMappedRegionHandle region = nullptr;
+    int rc = open_mapped_region_fn_(device_ctx_, &cfg, &region);
+    check_mapped_region_rc(rc, "open_mapped_region");
+    if (region == nullptr) {
+        throw std::runtime_error("open_mapped_region returned null handle");
+    }
+    return reinterpret_cast<uint64_t>(region);
+}
+
+void ChipWorker::close_mapped_region(uint64_t handle) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = close_mapped_region_fn_(device_ctx_, reinterpret_cast<HostDeviceMappedRegionHandle>(handle));
+    check_mapped_region_rc(rc, "close_mapped_region");
+}
+
+HostDeviceMappedRegionInfo ChipWorker::mapped_region_info(uint64_t handle) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    HostDeviceMappedRegionInfo info{};
+    int rc = mapped_region_info_fn_(device_ctx_, reinterpret_cast<HostDeviceMappedRegionHandle>(handle), &info);
+    check_mapped_region_rc(rc, "mapped_region_info");
+    info.host_data_ptr = 0;
+    info.host_signal_ptr = 0;
+    return info;
+}
+
+void ChipWorker::mapped_region_datacopy_h2region(uint64_t handle, uint64_t offset, const void *src, size_t nbytes) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = mapped_region_datacopy_h2region_fn_(
+        device_ctx_, reinterpret_cast<HostDeviceMappedRegionHandle>(handle), offset, src, nbytes
+    );
+    check_mapped_region_rc(rc, "mapped_region_datacopy_h2region");
+}
+
+void ChipWorker::mapped_region_datacopy_region2h(uint64_t handle, uint64_t offset, void *dst, size_t nbytes) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = mapped_region_datacopy_region2h_fn_(
+        device_ctx_, reinterpret_cast<HostDeviceMappedRegionHandle>(handle), offset, dst, nbytes
+    );
+    check_mapped_region_rc(rc, "mapped_region_datacopy_region2h");
+}
+
+void ChipWorker::mapped_region_notify(uint64_t handle, uint32_t signal_id, uint32_t value) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc =
+        mapped_region_notify_fn_(device_ctx_, reinterpret_cast<HostDeviceMappedRegionHandle>(handle), signal_id, value);
+    check_mapped_region_rc(rc, "mapped_region_notify");
+}
+
+void ChipWorker::mapped_region_wait(uint64_t handle, uint32_t signal_id, uint32_t target, uint32_t timeout_us) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    int rc = mapped_region_wait_fn_(
+        device_ctx_, reinterpret_cast<HostDeviceMappedRegionHandle>(handle), signal_id, target, timeout_us
+    );
+    if (rc == -EAGAIN || rc == -EWOULDBLOCK) {
+        throw std::runtime_error("mapped_region_wait timed out");
+    }
+    check_mapped_region_rc(rc, "mapped_region_wait");
 }
 
 uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo_path) {

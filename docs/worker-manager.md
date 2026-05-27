@@ -183,7 +183,56 @@ mailbox_size_ = HEADER_SIZE                    // 8 B (state + error)
 
 Per-worker total: ~2 KB. Typical pool: 4-8 workers → ~8-16 KB shm total.
 
-### 3.4 Shutdown
+### 3.4 Control-plane commands
+
+The mailbox is also the per-child control channel. When the parent writes
+`CONTROL_REQUEST`, offset 8 carries a `CTRL_*` sub-command instead of a task
+callable id. The child loop handles the command in the same polling state
+machine as `TASK_READY`, writes `MAILBOX_OFF_ERROR` / `MAILBOX_OFF_ERROR_MSG`
+and any scalar result, then publishes `CONTROL_DONE`.
+
+Task dispatch and control commands share one mailbox. Parent-side
+`dispatch_process()` and every `control_*()` method serialize on the same
+`mailbox_mu_`, so a control request issued while a task is running waits for
+that task's mailbox round trip to finish before it claims the state field.
+This is a WorkerManager-level RPC contract; individual features only define
+their own `CTRL_*` sub-command and payload schema.
+
+The fixed control slot layout is:
+
+```text
+offset 8:   uint64 control sub-command
+offset 16:  uint64 arg0
+offset 24:  uint64 arg1
+offset 32:  uint64 arg2
+offset 40:  uint64 arg3
+offset 48:  uint64 result
+```
+
+The meaning of `arg0..arg3` is sub-command-specific. Commands that return one
+scalar or pointer write it at `CTRL_OFF_RESULT`; commands with larger request
+or reply payloads pass fixed-width POSIX shared-memory names through
+`MAILBOX_OFF_ARGS`.
+
+Current control-plane users include:
+
+- Device memory control from the orchestrator:
+  `CTRL_MALLOC`, `CTRL_FREE`, `CTRL_COPY_TO`, and `CTRL_COPY_FROM`.
+- Callable lifecycle control:
+  `CTRL_PREPARE`, `CTRL_REGISTER`, `CTRL_UNREGISTER`,
+  `CTRL_PY_REGISTER`, and `CTRL_PY_UNREGISTER`.
+- Communication-domain setup:
+  `CTRL_COMM_INIT`, `CTRL_ALLOC_DOMAIN`, and `CTRL_RELEASE_DOMAIN`.
+- Host/device mapped-region operations:
+  `CTRL_OPEN_MAPPED_REGION`, `CTRL_CLOSE_MAPPED_REGION`,
+  `CTRL_MAPPED_REGION_INFO`, datacopy, notify, and wait commands. 
+
+When adding a new control command, keep the mailbox fields limited to small
+fixed arguments and move variable-sized payloads into side-band shared memory.
+The child must always publish `CONTROL_DONE` with a clear error code/message
+before the parent releases the mailbox back to `IDLE`.
+
+### 3.5 Shutdown
 
 `WorkerManager::shutdown_children()` writes `SHUTDOWN` to every registered
 mailbox; each child loop sees it on its next poll and exits. The Python

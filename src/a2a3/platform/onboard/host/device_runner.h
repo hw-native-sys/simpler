@@ -92,6 +92,28 @@ public:
     // `launch_aicore_kernel` are inherited from `DeviceRunnerBase`.
 
     /**
+     * Map device memory into a host-visible aperture via Ascend HAL.
+     *
+     * @param dev_ptr    Device allocation returned by allocate_tensor().
+     * @param bytes      Mapping size in bytes.
+     * @param host_ptr   Output host mapping pointer.
+     * @return 0 on success, non-zero HAL/runtime error on failure.
+     */
+    int host_register_device_memory(void *dev_ptr, size_t bytes, void **host_ptr);
+
+    /**
+     * Unmap a host-visible aperture created by host_register_device_memory().
+     *
+     * @param host_ptr  Host mapping pointer returned by HAL.
+     * @return 0 on success, non-zero HAL/runtime error on failure.
+     */
+    int host_unregister_device_memory(void *host_ptr);
+
+    int flush_host_cache_range(void *host_ptr, size_t bytes);
+
+    int invalidate_host_cache_range(void *host_ptr, size_t bytes);
+
+    /**
      * Execute a runtime
      *
      * This method:
