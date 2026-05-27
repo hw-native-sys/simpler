@@ -248,6 +248,7 @@ void SchedulerContext::dispatch_shape(
     int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, PTO2LocalReadyBuffer &local_buf,
     CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
+
 #if PTO2_SCHED_PROFILING
     auto &l2_perf = sched_l2_perf_[thread_idx];
 #endif
@@ -270,15 +271,18 @@ void SchedulerContext::dispatch_shape(
             if (slot_state->active_mask.requires_sync_start()) {
                 if (is_pending) {
                     sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
                     continue;
                 }
                 int32_t available = cores.count();
                 if (available < slot_state->logical_block_num) {
                     if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
                         sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
                     }
                     for (int rem = bi + 1; rem < got; rem++) {
                         sched_->ready_queues[static_cast<int32_t>(shape)].push(batch[rem]);
+                        LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
                     }
                     entered_drain = true;
                     break;
@@ -287,6 +291,7 @@ void SchedulerContext::dispatch_shape(
 
             if (!cores.has_value()) {
                 sched_->ready_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
+                LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
                 break;
             }
 
@@ -309,6 +314,7 @@ void SchedulerContext::dispatch_shape(
 
             if (slot_state->next_block_idx < slot_state->logical_block_num) {
                 sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                LOG_INFO_V9("Thread %d - Pushed task", thread_idx);
             }
 
             for (int32_t b = 0; b < claim; b++) {
@@ -448,6 +454,37 @@ void SchedulerContext::dispatch_ready_tasks(
     }
 }
 
+
+void SchedulerContext::initializePerfCounters()
+{
+    // One-time init: assign perf buffers (one thread does it; others wait)
+    if (!pto2_init_done_.exchange(true, std::memory_order_acq_rel))
+    {
+        LOG_INFO_V0("Initializing scheduler perf counters");
+
+#if PTO2_PROFILING
+        if (is_dump_tensor_enabled()) {
+            dump_tensor_init(orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_);
+        }
+#endif
+
+#if PTO2_PROFILING
+        // Initialize PMU: program events, start counters, and pop initial buffers
+        if (is_pmu_enabled()) {
+            pmu_aicpu_init(physical_core_ids_, cores_total_num_);
+            LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
+        }
+#endif
+
+        LOG_INFO_V0("Initialized scheduler perf counters");
+        pto2_init_complete_.store(true, std::memory_order_release);
+    } else {
+        while (!pto2_init_complete_.load(std::memory_order_acquire)) {
+            SPIN_WAIT_HINT();
+        }
+    }
+}
+
 // =============================================================================
 // Main scheduler dispatch loop
 // =============================================================================
@@ -473,32 +510,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         "Thread %d: hank=%p, window_size=%lu", thread_idx, static_cast<void *>(hank),
         static_cast<uint64_t>(header->rings[0].task_window_size)
     );
-
-    // One-time init: assign perf buffers (one thread does it; others wait)
-    if (!pto2_init_done_.exchange(true, std::memory_order_acq_rel)) {
-        LOG_INFO_V0("Thread %d: doing one-time init", thread_idx);
-
-#if PTO2_PROFILING
-        if (is_dump_tensor_enabled()) {
-            dump_tensor_init(orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_);
-        }
-#endif
-
-#if PTO2_PROFILING
-        // Initialize PMU: program events, start counters, and pop initial buffers
-        if (is_pmu_enabled()) {
-            pmu_aicpu_init(physical_core_ids_, cores_total_num_);
-            LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
-        }
-#endif
-
-        LOG_INFO_V0("Thread %d: one-time init done", thread_idx);
-        pto2_init_complete_.store(true, std::memory_order_release);
-    } else {
-        while (!pto2_init_complete_.load(std::memory_order_acquire)) {
-            SPIN_WAIT_HINT();
-        }
-    }
 
     LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
     int32_t cur_thread_completed = 0;

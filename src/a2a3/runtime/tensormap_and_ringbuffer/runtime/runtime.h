@@ -54,6 +54,8 @@
 
 // Default ready queue shards: one shard per worker thread (total minus orchestrator)
 constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
+constexpr int RUNTIME_DEFAULT_WARMUP_ITERATION_COUNT = 0;
+constexpr int RUNTIME_DEFAULT_TIMING_ITERATION_COUNT = 0;
 
 // =============================================================================
 // Data Structures
@@ -200,6 +202,11 @@ public:
     // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
     // Controlled via PTO2_ORCH_TO_SCHED environment variable.
     bool orch_to_sched;
+    
+    // Timing parameters (for precise performance estimation)
+    bool is_timing_enabled;
+    int warmup_iteration_count;
+    int timing_iteration_count;
 
 private:
     // Kernel binary tracking for cleanup
@@ -224,7 +231,6 @@ private:
     bool register_new_callable_id_;
     char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
     char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
-
 public:
     /**
      * Constructor - zero-initialize all arrays
@@ -234,6 +240,10 @@ public:
     // =========================================================================
     // Performance Profiling
     // =========================================================================
+
+    inline bool    get_timing_enabled() const { return is_timing_enabled; };
+    inline int32_t get_warmup_iteration_count() const { return warmup_iteration_count; };
+    inline int32_t get_timing_iteration_count() const { return timing_iteration_count; };
 
     // =========================================================================
     // Device orchestration (for AICPU thread 3)
@@ -258,6 +268,7 @@ public:
     void set_active_callable_id(int32_t callable_id, bool is_new);
     int32_t get_active_callable_id() const;
     bool register_new_callable_id() const;
+    void notify_callable_id_registered();
     void set_device_orch_func_name(const char *name);
     const char *get_device_orch_func_name() const;
     void set_device_orch_config_name(const char *name);
