@@ -365,11 +365,8 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
     });
 
     try {
-        int rc = runner->prepare_run_context(runner->device_id());
+        int rc = runner->attach_current_thread(runner->device_id());
         if (rc != 0) return rc;
-        auto run_context_guard = RAIIScopeGuard([runner]() {
-            runner->release_run_context();
-        });
 
         PreparedCallableArtifacts artifacts;
         rc = prepare_callable_impl(
@@ -426,11 +423,8 @@ int run_prepared(
     const auto host_t0 = std::chrono::steady_clock::now();
 
     try {
-        int rc = runner->prepare_run_context(runner->device_id());
+        int rc = runner->attach_current_thread(runner->device_id());
         if (rc != 0) return rc;
-        auto run_context_guard = RAIIScopeGuard([runner]() {
-            runner->release_run_context();
-        });
 
         Runtime *r = new (runtime) Runtime();
         r->host_api.device_malloc = device_malloc;

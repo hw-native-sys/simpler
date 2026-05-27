@@ -240,15 +240,43 @@ std::thread DeviceRunner::create_thread(std::function<void()> fn) {
 }
 
 int DeviceRunner::ensure_device_initialized() {
-    // Attach the current thread to the device and create the persistent
-    // AICPU/AICore streams (destroyed in finalize()). device_id_ was set in
-    // attach_current_thread() during simpler_init.
-    int rc = prepare_run_context(device_id_);
+    // Attach the current thread to the device (device_id_ was set in
+    // attach_current_thread() during simpler_init) and create the persistent
+    // AICPU/AICore streams. Streams live for the DeviceRunner's lifetime and
+    // are destroyed in finalize().
+    int rc = attach_current_thread(device_id_);
     if (rc != 0) {
         return rc;
     }
 
-    // Then ensure binaries are loaded
+    bool aicpu_created_here = false;
+    bool aicore_created_here = false;
+    if (stream_aicpu_ == nullptr) {
+        rc = rtStreamCreate(&stream_aicpu_, 0);
+        if (rc != 0) {
+            LOG_ERROR("rtStreamCreate (AICPU) failed: %d", rc);
+            return rc;
+        }
+        aicpu_created_here = true;
+    }
+    if (stream_aicore_ == nullptr) {
+        rc = rtStreamCreate(&stream_aicore_, 0);
+        if (rc != 0) {
+            LOG_ERROR("rtStreamCreate (AICore) failed: %d", rc);
+            // Roll back only the AICPU stream we just created, not a
+            // pre-existing persistent one.
+            if (aicpu_created_here) {
+                rtStreamDestroy(stream_aicpu_);
+                stream_aicpu_ = nullptr;
+            }
+            return rc;
+        }
+        aicore_created_here = true;
+    }
+    if (aicpu_created_here || aicore_created_here) {
+        LOG_INFO_V0("DeviceRunner: device=%d set, streams created", device_id_);
+    }
+
     return ensure_binaries_loaded();
 }
 
@@ -293,42 +321,6 @@ void DeviceRunner::configure_aicore_op_timeout() {
             (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, (unsigned long long)actual_timeout
         );
     }
-}
-
-int DeviceRunner::prepare_run_context(int device_id) {
-    int rc = attach_current_thread(device_id);
-    if (rc != 0) {
-        return rc;
-    }
-
-    if (stream_aicpu_ != nullptr && stream_aicore_ != nullptr) {
-        return 0;
-    }
-
-    // Create streams
-    rc = rtStreamCreate(&stream_aicpu_, 0);
-    if (rc != 0) {
-        LOG_ERROR("rtStreamCreate (AICPU) failed: %d", rc);
-        return rc;
-    }
-
-    rc = rtStreamCreate(&stream_aicore_, 0);
-    if (rc != 0) {
-        LOG_ERROR("rtStreamCreate (AICore) failed: %d", rc);
-        rtStreamDestroy(stream_aicpu_);
-        stream_aicpu_ = nullptr;
-        return rc;
-    }
-
-    LOG_INFO_V0("DeviceRunner: device=%d set, streams created", device_id);
-    return 0;
-}
-
-void DeviceRunner::release_run_context() {
-    // Streams now live for the lifetime of the DeviceRunner (created at
-    // simpler_init time via ensure_device_initialized, destroyed in finalize).
-    // Per-run release is intentionally a no-op so prepare_run_context's stream
-    // check short-circuits across all prepare_callable / run_prepared calls.
 }
 
 int DeviceRunner::ensure_binaries_loaded() {
@@ -378,7 +370,7 @@ int DeviceRunner::ensure_binaries_loaded() {
     // into device_args_.aicpu_so_bin/len. Our own runtime AICPU SO never
     // reads these fields, but the H2D allocation is load-bearing on a5
     // onboard — dropping it surfaces 507899 stream-create failures from
-    // the next prepare_run_context call.
+    // the next rtStreamCreate call.
     rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
@@ -970,8 +962,6 @@ int DeviceRunner::finalize() {
         LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
         return rc;
     }
-
-    release_run_context();
 
     // Streams are persistent for the DeviceRunner's lifetime; destroy them here.
     // Intentionally no pre-destroy sync: when a run hits the AICore op-timeout

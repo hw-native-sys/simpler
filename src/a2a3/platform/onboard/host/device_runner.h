@@ -62,9 +62,9 @@
  * rtsLaunchCpuKernel against the cached rtFuncHandle on LoadAicpuOp and
  * do not read these fields, but the device-side AicpuSoInfo allocation
  * pointed to by them is still load-bearing on a5 onboard: dropping it
- * surfaces 507899 stream-create failures on the next prepare_run_context
- * call. The exact reason is opaque CANN-internal state, so we keep the
- * H2D copy as part of the device-side ABI contract.
+ * surfaces 507899 stream-create failures on the next rtStreamCreate call.
+ * The exact reason is opaque CANN-internal state, so we keep the H2D copy
+ * as part of the device-side ABI contract.
  */
 struct DeviceArgs {
     uint64_t unused[12] = {0};
@@ -443,26 +443,6 @@ public:
     int destroy_comm_stream(void *stream);
 
     /**
-     * Ensure the current thread has fresh run-scoped streams.
-     *
-     * This attaches the current thread to the target device and lazily creates
-     * the AICPU/AICore streams used by a single run.
-     *
-     * @param device_id  Device ID (0-15)
-     * @return 0 on success, error code on failure
-     */
-    int prepare_run_context(int device_id);
-
-    /**
-     * Release run-scoped resources owned by the current thread.
-     *
-     * No-op since streams now live for the DeviceRunner's lifetime (created at
-     * simpler_init via ensure_device_initialized, destroyed in finalize).
-     * Retained as a name so the c_api RAII guards keep their existing shape.
-     */
-    void release_run_context();
-
-    /**
      * One-shot device initialization. Performs, in order:
      *   1. rtSetDevice + rtStreamCreate for AICPU and AICore streams. Streams
      *      live for the DeviceRunner's lifetime and are destroyed in finalize.
@@ -755,8 +735,9 @@ private:
     /**
      * Load AICPU SO and initialize device args
      *
-     * Called by run() after prepare_run_context(). Reads aicpu_so_binary_ /
-     * aicore_kernel_binary_ off the runner.
+     * Called from ensure_device_initialized() after the persistent streams
+     * are created. Reads aicpu_so_binary_ / aicore_kernel_binary_ off the
+     * runner.
      *
      * @return 0 on success, error code on failure
      */
