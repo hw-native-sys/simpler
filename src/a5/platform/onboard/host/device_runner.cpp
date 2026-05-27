@@ -195,29 +195,41 @@ static int prof_free_cb(void *dev_ptr) { return rtFree(dev_ptr); }
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
-int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size) {
+int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
     if (static_arena_.is_committed()) {
-        if (gm_heap_size <= cached_gm_heap_size_ && gm_sm_size <= cached_gm_sm_size_) return 0;
+        // Idempotent for the production case (sizes do not change across a
+        // worker's lifetime). If a caller asks for a larger layout, redo it.
+        if (gm_heap_size <= cached_gm_heap_size_ && gm_sm_size <= cached_gm_sm_size_ &&
+            runtime_arena_size <= cached_runtime_arena_size_) {
+            return 0;
+        }
         static_arena_.release();
         gm_heap_region_off_ = SIZE_MAX;
         gm_sm_region_off_ = SIZE_MAX;
+        runtime_arena_region_off_ = SIZE_MAX;
         cached_gm_heap_size_ = 0;
         cached_gm_sm_size_ = 0;
+        cached_runtime_arena_size_ = 0;
     }
     gm_heap_region_off_ = static_arena_.reserve(gm_heap_size, DeviceArena::kDefaultBaseAlign);
     gm_sm_region_off_ = static_arena_.reserve(gm_sm_size, DeviceArena::kDefaultBaseAlign);
+    if (runtime_arena_size > 0) {
+        runtime_arena_region_off_ = static_arena_.reserve(runtime_arena_size, DeviceArena::kDefaultBaseAlign);
+    }
     if (static_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-        // Roll back the two reserves: commit() failure leaves committed_=false,
+        // Roll back the reserves: commit() failure leaves committed_=false,
         // so the next entry would skip the release branch and stack new
         // reserves on top of the stale cursor. release() is idempotent on a
         // never-committed arena (just zeroes cursor_ / region_count_).
         static_arena_.release();
         gm_heap_region_off_ = SIZE_MAX;
         gm_sm_region_off_ = SIZE_MAX;
+        runtime_arena_region_off_ = SIZE_MAX;
         return -1;
     }
     cached_gm_heap_size_ = gm_heap_size;
     cached_gm_sm_size_ = gm_sm_size;
+    cached_runtime_arena_size_ = runtime_arena_size;
     return 0;
 }
 
@@ -229,6 +241,15 @@ void *DeviceRunner::acquire_pooled_gm_heap() {
 void *DeviceRunner::acquire_pooled_gm_sm() {
     if (!static_arena_.is_committed()) return nullptr;
     return static_arena_.region_ptr(gm_sm_region_off_);
+}
+
+void *DeviceRunner::acquire_pooled_runtime_arena() {
+    if (!static_arena_.is_committed()) return nullptr;
+    // hbg calls setup_static_arena(...,0) and never reserves a runtime-arena
+    // region — fail loudly if a caller asks for it anyway, rather than
+    // returning region_ptr(SIZE_MAX) (base + SIZE_MAX is undefined).
+    if (runtime_arena_region_off_ == SIZE_MAX) return nullptr;
+    return static_arena_.region_ptr(runtime_arena_region_off_);
 }
 
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
@@ -1045,8 +1066,10 @@ int DeviceRunner::finalize() {
     static_arena_.release();
     gm_heap_region_off_ = SIZE_MAX;
     gm_sm_region_off_ = SIZE_MAX;
+    runtime_arena_region_off_ = SIZE_MAX;
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
+    cached_runtime_arena_size_ = 0;
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();

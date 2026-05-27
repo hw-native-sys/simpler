@@ -125,8 +125,10 @@ struct AicpuExecutor {
     std::atomic<int32_t> finished_count_{0};
     std::atomic<bool> runtime_init_ready_{false};
 
-    // Per-Worker arena backing the PTO2Runtime + sm_handle + orch/sched/mailbox
-    // sub-regions (created in runtime_create_from_sm, released in runtime_destroy).
+    // Per-Worker arena attaching to the pooled prebuilt runtime image. Host
+    // populates the layout + data on its own arena, rtMemcpys into a pooled
+    // device buffer owned by DeviceRunner, and the AICPU attach()es to that
+    // buffer on each boot — no AICPU-side commit, no per-boot rtMalloc.
     // Default-constructed: libc-backed backend, no ctx.
     DeviceArena runtime_arena_;
 
@@ -466,28 +468,60 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
             );
 
-            void *sm_ptr = runtime->get_gm_sm_ptr();
-            void *gm_heap = runtime->get_gm_heap_ptr();
+            // gm_heap pointer / dep_pool_capacity are encoded into the prebuilt
+            // runtime arena image at host build time, so we no longer fetch
+            // them here. They remain on the host Runtime instance and on the
+            // PTO2Runtime header for diagnostic purposes only.
+            (void)dep_pool_capacity;
 
+            void *sm_ptr = runtime->get_gm_sm_ptr();
             uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
-            rt = runtime_create_from_sm(
-                PTO2_MODE_EXECUTE, sm_ptr, sm_size, task_window_size, gm_heap, heap_size, runtime_arena_,
-                dep_pool_capacity
-            );
-            if (!rt) {
-                LOG_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
-                // Unblock scheduler threads before returning so they don't spin forever.
+
+            // Prebuilt-arena fast path. Host has pre-populated the entire
+            // runtime arena (PTO2Runtime + orchestrator/scheduler/tensor_map
+            // sub-regions + sm_handle wrapper + mailbox) and uploaded it via
+            // rtMemcpy into the pooled runtime_arena buffer. We attach to it,
+            // wire arena-internal pointers to their device addresses, reset
+            // the SM, and finalize the few device-only fields the host could
+            // not know at image-build time.
+            void *prebuilt_arena = runtime->get_prebuilt_arena_base();
+            size_t off_runtime = runtime->get_prebuilt_runtime_offset();
+            if (prebuilt_arena == nullptr) {
+                LOG_ERROR("Thread %d: prebuilt_arena_base is null", thread_idx);
+                runtime_init_ready_.store(true, std::memory_order_release);
+                return -1;
+            }
+            runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
+            rt = reinterpret_cast<PTO2Runtime *>(static_cast<char *>(prebuilt_arena) + off_runtime);
+
+            // Wire every arena-internal pointer field (host wrote host-mirror
+            // addresses; we overwrite them with device addresses).
+            runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+
+            // Reset SM state. setup_pointers + init_header_per_ring restore
+            // ring flow-control counters, layout metadata, error flags, and
+            // the per-slot ring->slot_states[] (bind_ring + reset_for_reuse +
+            // fanin_count/active_mask zero — previously done inside
+            // RingSchedState::init).
+            memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
+            if (!rt->sm_handle->init(sm_ptr, sm_size, task_window_size, heap_size)) {
+                LOG_ERROR("Thread %d: sm_handle->init failed", thread_idx);
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
+            // AICore completion mailbox lives in the arena; reset it each
+            // boot so stale completion notifications from a previous run do
+            // not leak.
+            memset(rt->aicore_mailbox, 0, sizeof(*rt->aicore_mailbox));
+
+            // Fill ops / core counts (host can't resolve s_runtime_ops's
+            // device address nor know the SchedulerContext's core fan-out).
+            runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
+
 #if PTO2_PROFILING
             rt->orchestrator.l2_perf_level = get_l2_perf_level();
 #endif
-
-            // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
-            rt->orchestrator.total_cluster_count = sched_ctx_.aic_count();
-            rt->orchestrator.total_aiv_count = sched_ctx_.aiv_count();
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
             runtime->set_slot_states_ptr(nullptr);

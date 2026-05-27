@@ -92,7 +92,7 @@
 
 // Task management
 // NOTE: PTO2_TASK_WINDOW_SIZE is now a per-ring default value.
-// Actual window size is passed at runtime to runtime_create_from_sm().
+// Actual window size is passed at runtime to runtime_reserve_layout().
 // Use pto2_task_slot(sched, task_id) for slot calculation.
 #define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
 

@@ -146,9 +146,10 @@ struct HostApi {
     // pto_runtime_c_api.cpp can populate the same HostApi struct regardless of
     // which runtime variant it is built against. Unset for this variant; do
     // not call.
-    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size);
+    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
     void *(*acquire_pooled_gm_heap)();
     void *(*acquire_pooled_gm_sm)();
+    void *(*acquire_pooled_runtime_arena)();
     // Single-shot upload of the entire ChipCallable buffer. `callable` is a
     // `const ChipCallable *` (declared void* to avoid pulling task_interface
     // headers into runtime.h). DeviceRunner walks child_offsets_ to compute

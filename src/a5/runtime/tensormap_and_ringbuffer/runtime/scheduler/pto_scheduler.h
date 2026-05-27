@@ -409,7 +409,14 @@ struct alignas(64) PTO2ReadyQueue {
 //                     initialize sequence counters
 //   destroy: forget the slots pointer (arena owns the buffer)
 size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity);
-bool ready_queue_init_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity);
+// Writes everything *except* the arena-internal `slots` pointer field
+// (sequences/positions on the slot array, capacity, mask). Uses
+// arena.region_ptr(slots_off) only to address the slot array for writes;
+// does NOT store the pointer in `queue->slots`. Call
+// `ready_queue_wire_arena_pointers` afterwards to set the field itself.
+bool ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity);
+// Stores queue->slots = arena.region_ptr(slots_off). Idempotent.
+void ready_queue_wire_arena_pointers(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off);
 void ready_queue_destroy(PTO2ReadyQueue *queue);
 
 // =============================================================================
@@ -449,19 +456,29 @@ struct alignas(64) PTO2SpscQueue {
         return arena.reserve(capacity * sizeof(PTO2TaskSlotState *), PTO2_ALIGN_SIZE);
     }
 
-    // Bind buffer pointer + reset indices. The capacity must be a power of two
-    // and match the value passed to reserve_layout.
-    bool init_from_layout(DeviceArena &arena, size_t buffer_off, uint64_t capacity) {
+    // Writes everything except the arena-internal `buffer_` pointer field
+    // (zeros the slot pointer array, mask/head/tail). The host pre-builds the
+    // image without storing a host address in buffer_; the AICPU wires
+    // buffer_ at boot via wire_arena_pointers().
+    bool init_data_from_layout(DeviceArena &arena, size_t buffer_off, uint64_t capacity) {
         if (capacity == 0 || (capacity & (capacity - 1)) != 0) return false;
-        buffer_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
+        auto *buf = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
+        // calloc'd-equivalent: zero the slot pointers so spurious early pops
+        // observe nullptr.
         for (uint64_t i = 0; i < capacity; i++)
-            buffer_[i] = nullptr;
+            buf[i] = nullptr;
         mask_ = capacity - 1;
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
         tail_cached_ = 0;
         head_cached_ = 0;
         return true;
+    }
+
+    // Wire the arena-internal pointer. Called by both host (with host arena)
+    // and AICPU (with device arena attached to the prebuilt image).
+    void wire_arena_pointers(DeviceArena &arena, size_t buffer_off) {
+        buffer_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
     }
 
     // Arena owns the buffer; here we only forget our pointer.
@@ -561,7 +578,12 @@ struct PTO2SchedulerState {
         // --- Cache Line 1+: Thread 0 only (wiring dep_pool) ---
         alignas(64) PTO2DepListPool dep_pool;
 
-        bool init(PTO2SharedMemoryHeader *sm_header, int32_t ring_id);
+        // Initialize arena-internal data + arena-external pointers; does NOT
+        // store dep_pool.base (that lives in the runtime arena and is wired
+        // by SchedulerState::wire_arena_pointers). The `ring` field stores
+        // the device address of the SM ring header — computed via offset
+        // arithmetic, no SM dereference.
+        bool init_data_from_layout(void *sm_dev_base, int32_t ring_id);
         void destroy();
 
         void sync_to_sm() { ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release); }
@@ -1040,10 +1062,23 @@ struct PTO2SchedulerState {
 
     // Phase 1: declare every sub-region (ready_queue slots, dummy queue slots,
     // per-ring dep_pool entries, wiring SPSC buffer) on the supplied arena.
+    // Capacities are baked into the returned layout; init_data_from_layout uses
+    // the same values.
     static PTO2SchedulerLayout reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
-    // Phase 3: bind region pointers and initialize state.
-    bool init_from_layout(const PTO2SchedulerLayout &layout, DeviceArena &arena, PTO2SharedMemoryHeader *sm_header);
+    // Phase 3a: write everything *except* arena-internal pointer fields.
+    // `sm_dev_base` is the device address of the SM (only stored, never
+    // dereferenced here). Safe to call on a host arena that holds the
+    // prebuilt image buffer. (The orchestrator counterpart takes
+    // task_window_size for ring task_descriptors address arithmetic; the
+    // scheduler only needs the SM header / ring header base addresses,
+    // both window-size-independent.)
+    bool init_data_from_layout(const PTO2SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base);
+
+    // Phase 3b: write the arena-internal pointer fields
+    // (ready_queues[].slots, dummy_ready_queue.slots, dep_pool.base for each
+    // ring, wiring.queue.buffer_). Called on both host and device sides.
+    void wire_arena_pointers(const PTO2SchedulerLayout &layout, DeviceArena &arena);
 
     // Forget per-region pointers; arena owns the backing memory.
     void destroy();

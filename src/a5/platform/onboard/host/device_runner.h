@@ -179,19 +179,30 @@ public:
 
     /**
      * Lay out and commit the per-Worker static device arena that backs the
-     * PTO2 GM heap and PTO2 shared memory in a single underlying allocation.
-     * Must be called before acquire_pooled_gm_heap / acquire_pooled_gm_sm.
-     * Idempotent on identical sizes. Returns 0 on success, -1 on failure.
+     * PTO2 GM heap, the PTO2 shared memory, and the trb prebuilt runtime
+     * arena in a single underlying allocation. Must be called before any
+     * acquire_pooled_*. Idempotent on identical sizes. `runtime_arena_size`
+     * is 0 for the hbg path (no prebuilt runtime arena). Returns 0 on
+     * success, -1 on failure.
      */
-    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size);
+    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
     /**
-     * Return the pooled GM heap / PTO2 SM pointer. setup_static_arena must
-     * have been called earlier in this Worker; otherwise these return
-     * nullptr. Pointers are stable for the lifetime of the Worker.
+     * Return the pooled GM heap / PTO2 SM / runtime arena pointer.
+     * setup_static_arena must have been called earlier in this Worker;
+     * otherwise these return nullptr. All pointers are stable for the
+     * Worker's lifetime; the single underlying device buffer is released in
+     * `finalize()`.
+     *
+     * acquire_pooled_runtime_arena() is trb-only — the runtime arena region
+     * is only reserved when setup_static_arena was called with
+     * runtime_arena_size > 0. hbg's runtime_maker never calls this; doing so
+     * after setup_static_arena(...,0) returns an unreserved-offset region_ptr
+     * (undefined). Keep the call site discipline at the runtime_maker layer.
      */
     void *acquire_pooled_gm_heap();
     void *acquire_pooled_gm_sm();
+    void *acquire_pooled_runtime_arena();
 
     /**
      * Create a thread bound to this device.
@@ -523,10 +534,12 @@ private:
     DeviceArena static_arena_;
     size_t gm_heap_region_off_{SIZE_MAX};
     size_t gm_sm_region_off_{SIZE_MAX};
+    size_t runtime_arena_region_off_{SIZE_MAX};
     // Cached sizes for setup_static_arena's "fits" check — avoids calling
     // region_size() on the arena's public API for the two regions we own.
     size_t cached_gm_heap_size_{0};
     size_t cached_gm_sm_size_{0};
+    size_t cached_runtime_arena_size_{0};
 
     // Device resources
     rtStream_t stream_aicpu_{nullptr};

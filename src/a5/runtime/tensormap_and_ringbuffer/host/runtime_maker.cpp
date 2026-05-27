@@ -36,8 +36,10 @@
 #include <cstring>
 
 #include "../common/pto_runtime_status.h"
+#include "../runtime/pto_runtime2.h"
 #include "../runtime/pto_shared_memory.h"
 #include "../runtime/runtime.h"
+#include "device_arena.h"
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -271,15 +273,27 @@ extern "C" int bind_prepared_to_runtime_impl(
     uint64_t eff_heap_size = runtime->heap_size ? runtime->heap_size : PTO2_HEAP_SIZE;
     uint64_t eff_task_window_size = runtime->task_window_size ? runtime->task_window_size : PTO2_TASK_WINDOW_SIZE;
 
-    // Lay out the per-Worker static device arena. GM heap (orchestrator output
-    // buffers, all rings combined) and PTO2 shared memory live in a single
-    // backing allocation; setup_static_arena reserves both regions and
-    // commits in one shot. Owned by DeviceRunner across runs — do NOT record
-    // in tensor_pairs_; the free is deferred to DeviceRunner::finalize().
+    // Lay out the per-Worker static device arena. GM heap, PTO2 shared memory,
+    // and the prebuilt runtime arena all live in a single backing allocation;
+    // setup_static_arena reserves the three regions and commits in one shot.
+    // Owned by DeviceRunner across runs — do NOT record in tensor_pairs_; the
+    // free is deferred to DeviceRunner::finalize(). The runtime-arena size is
+    // determined by replaying the reserve sequence on a host-side arena.
     uint64_t total_heap_size = eff_heap_size * PTO2_MAX_RING_DEPTH;
     uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(eff_task_window_size);
+    int32_t eff_dep_pool_capacity =
+        runtime->dep_pool_size ? static_cast<int32_t>(runtime->dep_pool_size) : PTO2_DEP_LIST_POOL_SIZE;
+
+    int64_t t_prebuilt_start = _now_ms();
+    DeviceArena host_arena;  // libc malloc backend by default
+    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(host_arena, eff_task_window_size, eff_dep_pool_capacity);
+    if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+        LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
+        return -1;
+    }
+
     int64_t t_setup_start = _now_ms();
-    if (runtime->host_api.setup_static_arena(total_heap_size, sm_size) != 0) {
+    if (runtime->host_api.setup_static_arena(total_heap_size, sm_size, layout.arena_size) != 0) {
         LOG_ERROR("Failed to setup pooled static arena");
         return -1;
     }
@@ -303,8 +317,47 @@ extern "C" int bind_prepared_to_runtime_impl(
     }
     runtime->set_gm_sm_ptr(sm_ptr);
 
+    void *runtime_arena_dev = runtime->host_api.acquire_pooled_runtime_arena();
+    if (runtime_arena_dev == nullptr) {
+        LOG_ERROR("Failed to acquire pooled runtime arena");
+        return -1;
+    }
+
     // Set up device orchestration state
     runtime->set_orch_args(device_args);
+
+    // -------------------------------------------------------------------------
+    // Build the prebuilt runtime-arena image on host.
+    //
+    // We pre-compute every byte the AICPU's runtime arena would otherwise have
+    // to write at boot: layout offsets, sub-structure init data, and pointers
+    // back to the SM / GM heap. Then we rtMemcpy the image into the pooled
+    // runtime-arena region that DeviceRunner keeps alive across runs. AICPU
+    // boot becomes attach + wire (cheap pointer fixup) + sm_handle->init (SM
+    // reset) + a handful of device-only field fixups.
+    // -------------------------------------------------------------------------
+    PTO2Runtime *rt =
+        runtime_init_data_from_layout(host_arena, layout, PTO2_MODE_EXECUTE, sm_ptr, sm_size, gm_heap, eff_heap_size);
+    if (rt == nullptr) {
+        LOG_ERROR("runtime_init_data_from_layout failed");
+        return -1;
+    }
+    runtime_wire_arena_pointers(host_arena, layout, rt);
+
+    // Stash the layout inside the PTO2Runtime image so the AICPU can recover
+    // every arena-internal offset after rtMemcpy. The runtime arena's device
+    // base does NOT travel in this image — it's on the host Runtime
+    // (set_prebuilt_arena below), since the AICPU needs that pointer
+    // *before* it can dereference the image.
+    rt->prebuilt_layout = layout;
+
+    int rc_upload = runtime->host_api.copy_to_device(runtime_arena_dev, host_arena.base(), layout.arena_size);
+    if (rc_upload != 0) {
+        LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
+        return -1;
+    }
+    runtime->set_prebuilt_arena(runtime_arena_dev, layout.off_runtime);
+    int64_t t_prebuilt_end = _now_ms();
 
     LOG_INFO_V0("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
 
@@ -313,6 +366,7 @@ extern "C" int bind_prepared_to_runtime_impl(
     LOG_INFO_V0("TIMING: static_arena_setup = %" PRId64 "ms", t_setup_end - t_setup_start);
     LOG_INFO_V0("TIMING: gm_heap_acquire = %" PRId64 "ms", t_heap_end - t_heap_start);
     LOG_INFO_V0("TIMING: shared_mem_acquire = %" PRId64 "ms", t_sm_end - t_sm_start);
+    LOG_INFO_V0("TIMING: prebuilt_runtime_arena = %" PRId64 "ms", t_prebuilt_end - t_prebuilt_start);
     LOG_INFO_V0("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
 
     return 0;
