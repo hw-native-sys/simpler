@@ -330,13 +330,18 @@ private:
     __attribute__((noinline, cold)) void
     log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
 
+    __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
+        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
+    );
+
     // Reverse lookup: given a global core_id, find which scheduler thread's
     // tracker owns it. Returns -1 if not found. Linear scan — only used on
     // the cold diagnostic path.
     int32_t find_core_owner_thread(int32_t core_id) const;
 
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
-        int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations
+        int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
+        int32_t last_progress_count
 #if PTO2_PROFILING
         ,
         uint64_t sched_start_ts

@@ -327,8 +327,30 @@ void SchedulerContext::log_stall_diagnostics(
     }
 }
 
+void SchedulerContext::log_shutdown_stall_snapshot(
+    int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
+) {
+    LOG_WARN(
+        "[SHUTDOWN_SNAPSHOT trigger_thread=%d reason=scheduler_timeout idle_iterations=%d] "
+        "dumping all scheduler threads before emergency shutdown",
+        trigger_thread_idx, trigger_idle_iterations
+    );
+    int32_t thread_count = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
+    if (thread_count < 0 || thread_count > MAX_AICPU_THREADS) {
+        LOG_ERROR(
+            "[SHUTDOWN_SNAPSHOT trigger_thread=%d] invalid thread_count=%d, clamping to [0,%d]", trigger_thread_idx,
+            thread_count, MAX_AICPU_THREADS
+        );
+        thread_count = thread_count < 0 ? 0 : MAX_AICPU_THREADS;
+    }
+    for (int32_t t = 0; t < thread_count; t++) {
+        log_stall_diagnostics(t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count);
+    }
+}
+
 int32_t SchedulerContext::handle_timeout_exit(
-    int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations
+    int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
+    int32_t last_progress_count
 #if PTO2_PROFILING
     ,
     uint64_t sched_start_ts
@@ -340,6 +362,7 @@ int32_t SchedulerContext::handle_timeout_exit(
     );
     latch_scheduler_error(header, thread_idx, PTO2_ERROR_SCHEDULER_TIMEOUT);
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+        log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
         emergency_shutdown(runtime);
     }
 #if PTO2_PROFILING

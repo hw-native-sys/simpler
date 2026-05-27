@@ -757,7 +757,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
             if (idle_iterations >= MAX_IDLE_ITERATIONS) {
                 return handle_timeout_exit(
-                    thread_idx, header, runtime, idle_iterations
+                    thread_idx, header, runtime, idle_iterations, last_progress_count
 #if PTO2_PROFILING
                     ,
                     l2_perf.sched_start_ts
