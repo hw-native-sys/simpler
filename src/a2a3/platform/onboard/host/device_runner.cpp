@@ -512,22 +512,18 @@ int DeviceRunner::ensure_binaries_loaded() {
     }
     LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_init/exec handles ready)");
 
-    // H2D copy aicpu kernel SO bytes and stamp the resulting device pointer
-    // into device_args_.aicpu_so_bin/len. Our own runtime AICPU SO never
-    // reads these fields, but the H2D allocation is load-bearing on a5
-    // onboard — dropping it surfaces 507899 stream-create failures from
-    // the next rtStreamCreate call.
-    rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
-    if (rc != 0) {
-        LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
-        return rc;
-    }
-    device_args_.aicpu_so_bin = so_info_.aicpu_so_bin;
-    device_args_.aicpu_so_len = so_info_.aicpu_so_len;
+    // EXPERIMENT: skip the runtime AICPU SO H2D entirely on a2a3 onboard
+    // to find out if the "load-bearing" claim documented for a5 also
+    // applies here, or if a2a3 doesn't actually need this allocation.
+    // Per-task AICPU launches go via rtsLaunchCpuKernel against the cached
+    // rtFuncHandle on LoadAicpuOp; nothing on our side reads
+    // device_args_.aicpu_so_bin/len.
+    // device_args_.aicpu_so_bin/len stay 0 — kernel_args_.init_device_args
+    // still H2Ds the rest of DeviceArgs (the unused[12]) so the device-side
+    // KernelArgs.device_args pointer is valid.
     rc = kernel_args_.init_device_args(device_args_, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("init_device_args failed: %d", rc);
-        so_info_.finalize();
         return rc;
     }
 

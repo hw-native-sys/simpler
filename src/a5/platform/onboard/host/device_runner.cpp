@@ -401,22 +401,18 @@ int DeviceRunner::ensure_binaries_loaded() {
     }
     LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_init/exec handles ready)");
 
-    // H2D copy aicpu kernel SO bytes and stamp the resulting device pointer
-    // into device_args_.aicpu_so_bin/len. Our own runtime AICPU SO never
-    // reads these fields, but the H2D allocation is load-bearing on a5
-    // onboard — dropping it surfaces 507899 stream-create failures from
-    // the next rtStreamCreate call.
-    rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
-    if (rc != 0) {
-        LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
-        return rc;
-    }
-    device_args_.aicpu_so_bin = so_info_.aicpu_so_bin;
-    device_args_.aicpu_so_len = so_info_.aicpu_so_len;
+    // EXPERIMENT: skip the runtime AICPU SO H2D entirely on a5 onboard
+    // to test whether the documented "load-bearing on a5" finding still
+    // holds against current HEAD (#864/#870 are in). If a5 CI passes
+    // here, both archs are free to drop AicpuSoInfo. If a5 CI fails
+    // (expected: 507899 cascade), revert just this arch — confirms the
+    // a5-specific CANN bookkeeping requirement.
+    // device_args_.aicpu_so_bin/len stay 0 — kernel_args_.init_device_args
+    // still H2Ds the rest of DeviceArgs so the device-side KernelArgs
+    // pointer is valid.
     rc = kernel_args_.init_device_args(device_args_, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("init_device_args failed: %d", rc);
-        so_info_.finalize();
         return rc;
     }
 
