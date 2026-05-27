@@ -708,7 +708,7 @@ NB_MODULE(_task_interface, m) {
         .def(nb::init<>())
         .def(
             "init", &ChipWorker::init, nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"),
-            nb::arg("device_id")
+            nb::arg("dispatcher_path"), nb::arg("device_id")
         )
         .def("finalize", &ChipWorker::finalize)
         .def(

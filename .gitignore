@@ -40,3 +40,7 @@ compile_commands.json
 python/_task_interface*.so
 python/_task_interface*.dylib
 .claude/scheduled_tasks.lock
+
+# Log files
+*.log
+profiling_logs_*/

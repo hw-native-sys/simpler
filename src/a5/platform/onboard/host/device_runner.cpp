@@ -22,6 +22,8 @@
 
 #include <dlfcn.h>
 
+#include "load_aicpu_op.h"
+
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -346,14 +348,47 @@ int DeviceRunner::ensure_binaries_loaded() {
         return -1;
     }
 
-    // Load AICPU SO
-    int rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
+    if (dispatcher_so_binary_.empty()) {
+        LOG_ERROR(
+            "DeviceRunner: dispatcher SO bytes not provided; pass dispatcher_path through ChipWorker.init "
+            "(RuntimeBinaries.dispatcher_path)"
+        );
+        return -1;
+    }
+
+    // One-shot bootstrap: libaicpu_extend_kernels invokes our dispatcher,
+    // which writes the runtime AICPU SO bytes to simpler_inner_<fp>.so in
+    // the device-side preinstall path. The dispatcher SO itself is never
+    // persisted. Subsequent per-task AICPU launches resolve symbols via
+    // rtsBinaryLoadFromFile + rtsFuncGetByName + rtsLaunchCpuKernel
+    // directly against that preinstall file.
+    int rc = load_aicpu_op_.BootstrapDispatcher(
+        dispatcher_so_binary_.data(), dispatcher_so_binary_.size(), aicpu_so_binary_.data(), aicpu_so_binary_.size(),
+        stream_aicpu_
+    );
+    if (rc != 0) {
+        LOG_ERROR("LoadAicpuOp::BootstrapDispatcher failed: %d", rc);
+        return rc;
+    }
+    LOG_INFO_V2("DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap");
+
+    rc = load_aicpu_op_.Init();
+    if (rc != 0) {
+        LOG_ERROR("LoadAicpuOp::Init failed: %d", rc);
+        return rc;
+    }
+    LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_init/exec handles ready)");
+
+    // H2D copy aicpu kernel SO bytes and stamp the resulting device pointer
+    // into device_args_.aicpu_so_bin/len. Our own runtime AICPU SO never
+    // reads these fields, but the H2D allocation is load-bearing on a5
+    // onboard — dropping it surfaces 507899 stream-create failures from
+    // the next prepare_run_context call.
+    rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
         return rc;
     }
-
-    // Initialize device args
     device_args_.aicpu_so_bin = so_info_.aicpu_so_bin;
     device_args_.aicpu_so_len = so_info_.aicpu_so_len;
     rc = kernel_args_.init_device_args(device_args_, mem_alloc_);
@@ -362,6 +397,15 @@ int DeviceRunner::ensure_binaries_loaded() {
         so_info_.finalize();
         return rc;
     }
+
+    // Release host bytes — per-task launches use the cached rtFuncHandle on
+    // LoadAicpuOp; dispatcher SO bytes are never referenced again; the
+    // aicpu kernel SO's host buffer is free to drop now that so_info_
+    // already H2D'd the bytes above.
+    dispatcher_so_binary_.clear();
+    dispatcher_so_binary_.shrink_to_fit();
+    aicpu_so_binary_.clear();
+    aicpu_so_binary_.shrink_to_fit();
 
     binaries_loaded_ = true;
     LOG_INFO_V0("DeviceRunner: binaries loaded");
@@ -606,16 +650,16 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         pmu_collector_.start(thread_factory);
     }
 
-    LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServerInit ===");
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
+    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
+    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::InitName, 1);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
         return rc;
     }
 
-    LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServer ===");
+    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
     rc = launch_aicpu_kernel(
-        stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
+        stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
     );
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
@@ -938,9 +982,15 @@ int DeviceRunner::finalize() {
     // are released by runtime_args_cleanup RAII so they also unwind on errors.
     kernel_args_.finalize_device_args();
 
-    // Cleanup AICPU SO
+    // Cleanup AICPU SO H2D allocation
     so_info_.finalize();
 
+    // load_aicpu_op_ has no per-task host-side state to release —
+    // rtsLaunchCpuKernel does not hand back any per-launch handle, and the
+    // dispatcher itself was a transient libaicpu_extend_kernels dlopen.
+    // aicore_bin_handle_ was registered once via rtRegisterAllKernel; CANN
+    // releases its device-side state when the device context tears down.
+    aicore_bin_handle_ = nullptr;
     binaries_loaded_ = false;
 
     // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
@@ -1022,49 +1072,36 @@ int DeviceRunner::finalize() {
 }
 
 int DeviceRunner::launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num) {
-    struct Args {
-        KernelArgs k_args;
-        char kernel_name[32];
-        const char so_name[32] = {"libaicpu_extend_kernels.so"};
-        const char op_name[32] = {""};
-    } args;
-
-    args.k_args = *k_args;
-    std::strncpy(args.kernel_name, kernel_name, sizeof(args.kernel_name) - 1);
-    args.kernel_name[sizeof(args.kernel_name) - 1] = '\0';
-
-    rtAicpuArgsEx_t rt_args;
-    std::memset(&rt_args, 0, sizeof(rt_args));
-    rt_args.args = &args;
-    rt_args.argsSize = sizeof(args);
-    rt_args.kernelNameAddrOffset = offsetof(struct Args, kernel_name);
-    rt_args.soNameAddrOffset = offsetof(struct Args, so_name);
-
-    return rtAicpuKernelLaunchExWithArgs(
-        rtKernelType_t::KERNEL_TYPE_AICPU_KFC, "AST_DYN_AICPU", aicpu_num, &rt_args, nullptr, stream, 0
-    );
+    // kernel_name is host::KernelNames::InitName / RunName — the runtime SO's
+    // actual exported symbol (simpler_aicpu_init / simpler_aicpu_exec).
+    // LaunchBuiltInOp dispatches via rtsLaunchCpuKernel on the cached
+    // rtFuncHandle resolved by LoadAicpuOp::Init at first-time bootstrap.
+    return load_aicpu_op_.LaunchBuiltInOp(stream, k_args, aicpu_num, kernel_name);
 }
 
 int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
-    if (aicore_kernel_binary_.empty()) {
-        LOG_ERROR("AICore kernel binary is empty");
-        return -1;
-    }
-
-    size_t bin_size = aicore_kernel_binary_.size();
-    const void *bin_data = aicore_kernel_binary_.data();
-
-    rtDevBinary_t binary;
-    std::memset(&binary, 0, sizeof(binary));
-    binary.magic = RT_DEV_BINARY_MAGIC_ELF;
-    binary.version = 0;
-    binary.data = bin_data;
-    binary.length = bin_size;
-    void *bin_handle = nullptr;
-    int rc = rtRegisterAllKernel(&binary, &bin_handle);
-    if (rc != RT_ERROR_NONE) {
-        LOG_ERROR("rtRegisterAllKernel failed: %d", rc);
-        return rc;
+    // Lazy-register the AICore binary on first call; reuse cached handle
+    // thereafter. CANN has no public rtUnregisterAllKernel, so re-registering
+    // every run would pin another device-side copy of the ELF (~365KB on a5)
+    // and quickly exhaust HBM — surfaced in CI as 207001 at
+    // rtKernelLaunchWithHandleV2 with a 507899 cascade at rtStreamCreate.
+    if (aicore_bin_handle_ == nullptr) {
+        if (aicore_kernel_binary_.empty()) {
+            LOG_ERROR("AICore kernel binary is empty");
+            return -1;
+        }
+        rtDevBinary_t binary;
+        std::memset(&binary, 0, sizeof(binary));
+        binary.magic = RT_DEV_BINARY_MAGIC_ELF;
+        binary.version = 0;
+        binary.data = aicore_kernel_binary_.data();
+        binary.length = aicore_kernel_binary_.size();
+        int rc = rtRegisterAllKernel(&binary, &aicore_bin_handle_);
+        if (rc != RT_ERROR_NONE) {
+            LOG_ERROR("rtRegisterAllKernel failed: %d", rc);
+            aicore_bin_handle_ = nullptr;
+            return rc;
+        }
     }
 
     struct Args {
@@ -1080,7 +1117,7 @@ int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
     rtTaskCfgInfo_t cfg = {};
     cfg.schemMode = RT_SCHEM_MODE_BATCH;
 
-    rc = rtKernelLaunchWithHandleV2(bin_handle, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
+    int rc = rtKernelLaunchWithHandleV2(aicore_bin_handle_, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
     if (rc != RT_ERROR_NONE) {
         LOG_ERROR("rtKernelLaunchWithHandleV2 failed: %d", rc);
         return rc;

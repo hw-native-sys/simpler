@@ -51,19 +51,40 @@
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/dep_gen_collector.h"
+#include "load_aicpu_op.h"
 #include "runtime.h"
 
 /**
- * DeviceArgs structure for AICPU device arguments
+ * DeviceArgs structure for AICPU device arguments.
  *
- * This structure contains pointers to device memory for the AICPU shared
- * object. The layout is hardcoded in libaicpu_extend_kernels.so, which expects
- * specific offsets for aicpu_so_bin and aicpu_so_len fields.
+ * Layout is fixed by libaicpu_extend_kernels.so at the offsets for
+ * aicpu_so_bin / aicpu_so_len. Per-task AICPU launches go through
+ * rtsLaunchCpuKernel against the cached rtFuncHandle on LoadAicpuOp and
+ * do not read these fields, but the device-side AicpuSoInfo allocation
+ * pointed to by them is still load-bearing on a5 onboard: dropping it
+ * surfaces 507899 stream-create failures on the next prepare_run_context
+ * call. The exact reason is opaque CANN-internal state, so we keep the
+ * H2D copy as part of the device-side ABI contract.
  */
 struct DeviceArgs {
     uint64_t unused[12] = {0};
     uint64_t aicpu_so_bin{0};
     uint64_t aicpu_so_len{0};
+};
+
+/**
+ * Host→device copy of the runtime AICPU SO bytes that backs
+ * DeviceArgs.aicpu_so_bin / aicpu_so_len. The bytes are not dereferenced
+ * by our own kernels; the H2D allocation itself is the load-bearing part.
+ * See DeviceArgs comment for the failure mode if dropped.
+ */
+struct AicpuSoInfo {
+    uint64_t aicpu_so_bin{0};
+    uint64_t aicpu_so_len{0};
+    MemoryAllocator *allocator_{nullptr};
+
+    int init(const std::vector<uint8_t> &aicpu_so_binary, MemoryAllocator &allocator);
+    int finalize();
 };
 
 /**
@@ -147,34 +168,6 @@ struct KernelArgsHelper {
      */
     operator KernelArgs *() { return &args; }
     KernelArgs *operator&() { return &args; }
-};
-
-/**
- * AICPU shared object information and management
- *
- * This class manages loading and device memory allocation for AICPU
- * shared object (.so) files.
- */
-struct AicpuSoInfo {
-    uint64_t aicpu_so_bin{0};
-    uint64_t aicpu_so_len{0};
-    MemoryAllocator *allocator_{nullptr};
-
-    /**
-     * Load shared object binary data and copy to device memory
-     *
-     * @param aicpu_so_binary  Binary data of the AICPU shared object
-     * @param allocator      Memory allocator to use
-     * @return 0 on success, error code on failure
-     */
-    int init(const std::vector<uint8_t> &aicpu_so_binary, MemoryAllocator &allocator);
-
-    /**
-     * Free device memory allocated for shared object
-     *
-     * @return 0 on success, error code on failure
-     */
-    int finalize();
 };
 
 /**
@@ -286,6 +279,19 @@ public:
     void set_executors(std::vector<uint8_t> aicpu_so_binary, std::vector<uint8_t> aicore_kernel_binary) {
         aicpu_so_binary_ = std::move(aicpu_so_binary);
         aicore_kernel_binary_ = std::move(aicore_kernel_binary);
+    }
+
+    /**
+     * Take ownership of the dispatcher SO bytes. Called by simpler_init when
+     * the caller provided a dispatcher path; ensure_binaries_loaded() hands
+     * the buffer to LoadAicpuOp::BootstrapDispatcher on the first run.
+     * Leaving this unset (empty buffer) makes ensure_binaries_loaded() fail
+     * with a clear message — callers that drive _ChipWorker.init directly
+     * without a dispatcher path get a deterministic error at run() time
+     * rather than a confusing dladdr-derived path.
+     */
+    void set_dispatcher_binary(std::vector<uint8_t> dispatcher_so_binary) {
+        dispatcher_so_binary_ = std::move(dispatcher_so_binary);
     }
 
     /** The device id captured by simpler_init's attach_current_thread call. */
@@ -565,9 +571,33 @@ private:
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results in destructor
     // Executor binaries — populated once via set_executors() during
-    // simpler_init, owned by this runner for the rest of its lifetime.
+    // simpler_init. aicore_kernel_binary_ is consumed once by
+    // launch_aicore_kernel() (rtRegisterAllKernel returns aicore_bin_handle_,
+    // cached and reused on every subsequent launch). Caching is required:
+    // CANN has no public rtUnregisterAllKernel, so re-registering on every
+    // run would pin another device-side copy of the ELF and quickly exhaust
+    // HBM (manifested in CI as 207001 at rtKernelLaunchWithHandleV2 with a
+    // 507899 cascade at rtStreamCreate). aicpu_so_binary_ is released by
+    // ensure_binaries_loaded() after bootstrap; bootstrap is the only
+    // consumer and per-task launches go through the cached rtFuncHandle on
+    // LoadAicpuOp, not the host bytes.
     std::vector<uint8_t> aicpu_so_binary_;
     std::vector<uint8_t> aicore_kernel_binary_;
+    // AICore kernel handle from rtRegisterAllKernel — lazily populated by
+    // launch_aicore_kernel() and reused across all runs. nullptr means not
+    // yet registered. Reset to nullptr in finalize(); CANN releases the
+    // device-side state implicitly when the device context tears down.
+    void *aicore_bin_handle_{nullptr};
+    // Dispatcher SO bytes — populated once via set_dispatcher_binary() during
+    // simpler_init. Consumed exclusively by BootstrapDispatcher on the first
+    // run() and released by ensure_binaries_loaded() right after. Empty buffer
+    // is permitted at init time (callers that drive ChipWorker.init without a
+    // dispatcher path); ensure_binaries_loaded() then fails fast with a clear
+    // message if/when bootstrap is actually attempted.
+    std::vector<uint8_t> dispatcher_so_binary_;
+
+    // AICPU op loader — handles dispatcher bootstrap and per-task launches.
+    host::LoadAicpuOp load_aicpu_op_;
 
     // Memory management
     MemoryAllocator mem_alloc_;

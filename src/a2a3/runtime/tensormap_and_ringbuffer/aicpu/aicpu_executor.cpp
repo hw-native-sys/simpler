@@ -266,7 +266,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     return -1;
                 }
 
-                // Try multiple paths that may allow execution on AICPU
+                // Try multiple paths that may allow execution on AICPU.
                 char so_path[256];
                 bool file_created = false;
                 const char *candidate_dirs[] = {

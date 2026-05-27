@@ -319,7 +319,9 @@ class ChipWorker:
             device_id: NPU device ID to attach the calling thread to.
             bins: A `simpler_setup.runtime_builder.RuntimeBinaries` (or any
                 object exposing host_path / aicpu_path / aicore_path /
-                simpler_log_path / sim_context_path).
+                simpler_log_path / sim_context_path / dispatcher_path).
+                ``dispatcher_path`` is required for onboard platforms and
+                ignored on sim (set to None).
             log_level: Severity floor (0=DEBUG..4=NUL). Defaults to a snapshot
                 of the simpler logger via `_log.get_current_config()`.
             log_info_v: INFO verbosity threshold (0..9). Same default.
@@ -354,10 +356,15 @@ class ChipWorker:
             _preload_global(str(bins.sim_context_path))
 
         # 3. host_runtime.so is dlopen'd RTLD_LOCAL inside _impl.init.
+        #    dispatcher_path is passed as an empty string on sim (where bins
+        #    has dispatcher_path=None); the onboard simpler_init reads it
+        #    via LoadAicpuOp::BootstrapDispatcher, sim ignores it.
+        dispatcher_path = getattr(bins, "dispatcher_path", None)
         self._impl.init(
             str(bins.host_path),
             str(bins.aicpu_path),
             str(bins.aicore_path),
+            "" if dispatcher_path is None else str(dispatcher_path),
             int(device_id),
         )
 

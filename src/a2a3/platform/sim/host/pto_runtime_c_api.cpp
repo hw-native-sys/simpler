@@ -217,8 +217,15 @@ int destroy_comm_stream_ctx(DeviceContextHandle ctx, void *stream) {
 
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
 ) {
+    // Sim has no AICPU dispatcher (the simulator runs AICPU in-process). Accept
+    // the parameters for ABI parity with the onboard implementation and ignore
+    // them — callers that pass dispatcher bytes get the same shape as onboard,
+    // and the dispatcher / preinstall load path on sim isn't taken anyway.
+    (void)dispatcher_binary;
+    (void)dispatcher_size;
+
     if (ctx == NULL) return -1;
 
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);

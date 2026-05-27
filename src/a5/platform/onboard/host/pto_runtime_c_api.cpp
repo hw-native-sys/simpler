@@ -295,7 +295,7 @@ int comm_destroy(void *handle) {
 
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
 ) {
     if (ctx == NULL) return -1;
 
@@ -324,6 +324,13 @@ int simpler_init(
         std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
         std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
         runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
+        // Dispatcher SO bytes — see a2a3 sibling for rationale. Empty buffer
+        // is permitted at simpler_init time; ensure_binaries_loaded surfaces
+        // the error if/when the bootstrap is actually attempted.
+        if (dispatcher_binary != NULL && dispatcher_size > 0) {
+            std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
+            runner->set_dispatcher_binary(std::move(dispatcher_vec));
+        }
     } catch (...) {
         return -1;
     }
