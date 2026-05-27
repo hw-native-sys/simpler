@@ -97,29 +97,32 @@ uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
 // Cycle accumulation is unconditional under PTO2_ORCH_PROFILING (that's what
-// the flag is for). Swim-lane recording is an opt-in add-on gated at runtime
-// by l2_perf_level so callers can collect totals without paying GM-store cost.
-// When the swim-lane write fires, _t0 is re-sampled from the counter *after*
-// the write so its cost is not attributed to the next phase's accumulator.
+// the flag is for) and feeds the per-sub-step `g_orch_*_cycle` cumulatives
+// printed in the cold-path log.
+//
+// Per-submit ORCH_SUBMIT record is the only swim-lane emit on the orch
+// path — one record per submit_task() / alloc_tensors() call spanning
+// the entire [start, end] window. Per-sub-step phase records were dropped
+// in favour of the cumulatives + per-submit envelope; the dispatcher
+// already inserts one record at the end of each submit path via
+// CYCLE_COUNT_ORCH_SUBMIT_RECORD.
 #define CYCLE_COUNT_START()                                                \
     bool _prof_active = (orch->l2_perf_level >= L2PerfLevel::ORCH_PHASES); \
-    uint64_t _t0 = get_sys_cnt_aicpu(), _t1
+    uint64_t _t0 = get_sys_cnt_aicpu(), _t1;                               \
+    uint64_t _submit_start_ts = _t0
 #define CYCLE_COUNT_LAP(acc)       \
     do {                           \
         _t1 = get_sys_cnt_aicpu(); \
         acc += (_t1 - _t0);        \
         _t0 = _t1;                 \
     } while (0)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                           \
-    do {                                                                                     \
-        _t1 = get_sys_cnt_aicpu();                                                           \
-        acc += (_t1 - _t0);                                                                  \
-        if (_prof_active) {                                                                  \
-            l2_perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
-            _t0 = get_sys_cnt_aicpu();                                                       \
-        } else {                                                                             \
-            _t0 = _t1;                                                                       \
-        }                                                                                    \
+#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                \
+    do {                                                                                   \
+        if (_prof_active) {                                                                \
+            l2_perf_aicpu_record_orch_phase(                                               \
+                AicpuPhaseId::ORCH_SUBMIT, _submit_start_ts, _t1, g_orch_submit_idx, (tid) \
+            );                                                                             \
+        }                                                                                  \
     } while (0)
 #elif PTO2_PROFILING
 #include "aicpu/device_time.h"
@@ -131,22 +134,24 @@ l2_perf_aicpu_record_orch_phase(AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint
 static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_START()                                                \
     bool _prof_active = (orch->l2_perf_level >= L2PerfLevel::ORCH_PHASES); \
-    uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0
+    uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0;        \
+    uint64_t _submit_start_ts = _t0
 #define CYCLE_COUNT_LAP(acc) \
     do {                     \
     } while (0)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                           \
-    do {                                                                                     \
-        if (_prof_active) {                                                                  \
-            _t1 = get_sys_cnt_aicpu();                                                       \
-            l2_perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
-            _t0 = _t1;                                                                       \
-        }                                                                                    \
+#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                \
+    do {                                                                                   \
+        if (_prof_active) {                                                                \
+            _t1 = get_sys_cnt_aicpu();                                                     \
+            l2_perf_aicpu_record_orch_phase(                                               \
+                AicpuPhaseId::ORCH_SUBMIT, _submit_start_ts, _t1, g_orch_submit_idx, (tid) \
+            );                                                                             \
+        }                                                                                  \
     } while (0)
 #else
 #define CYCLE_COUNT_START()
 #define CYCLE_COUNT_LAP(acc)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)
+#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)
 #endif
 
 static int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) {
@@ -519,7 +524,6 @@ void PTO2OrchestratorState::end_scope() {
 #if PTO2_ORCH_PROFILING
     uint64_t _se1 = get_sys_cnt_aicpu();
     g_orch_scope_end_cycle += (_se1 - _se0);
-    // l2_perf_aicpu_record_orch_phase(AicpuPhaseId::ORCH_SCOPE_END, _se0, _se1, g_orch_submit_idx, -1);
 #endif
 }
 
@@ -586,7 +590,7 @@ static TaskOutputTensors submit_task_common(
 
     PTO2FaninBuilder fanin_builder(orch->rings[ring_id].fanin_pool);
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id.raw);
+    CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
 #if PTO2_PROFILING
     if (layout.total_output_size > 0) {
@@ -601,7 +605,7 @@ static TaskOutputTensors submit_task_common(
 
     orch->tensor_map.sync_tensormap(task_id, sm_last_task_alive);
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
+    CYCLE_COUNT_LAP(g_orch_sync_cycle);
 
     for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
@@ -639,12 +643,12 @@ static TaskOutputTensors submit_task_common(
         return result;
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id.raw);
+    CYCLE_COUNT_LAP(g_orch_lookup_cycle);
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
     register_task_outputs(dep_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_insert_cycle, AicpuPhaseId::ORCH_INSERT, task_id.raw);
+    CYCLE_COUNT_LAP(g_orch_insert_cycle);
 
     // === STEP 5: Batch-write to GM (single cache line burst) ===
     // Deferred from allocation phase to avoid scattered GM writes that get
@@ -685,7 +689,7 @@ static TaskOutputTensors submit_task_common(
     }
 #endif
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
+    CYCLE_COUNT_LAP(g_orch_args_cycle);
 #if PTO2_ORCH_PROFILING
     g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
 #endif
@@ -699,7 +703,8 @@ static TaskOutputTensors submit_task_common(
         SPIN_WAIT_HINT();
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN, task_id.raw);
+    CYCLE_COUNT_LAP(g_orch_fanin_cycle);
+    CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);
 
 #if PTO2_PROFILING
     orch->tasks_submitted++;
@@ -848,7 +853,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     PTO2TaskDescriptor &task = *prepared.task;
     PTO2TaskPayload &payload = *prepared.payload;
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, prepared.task_id.raw);
+    CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
 #if PTO2_PROFILING
     if (layout.total_output_size > 0) {
@@ -870,7 +875,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     payload.fanin_actual_count = 0;
     payload.fanin_spill_start = 0;
     payload.fanin_spill_pool = &orch->rings[prepared.task_id.ring()].fanin_pool;
-    CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, prepared.task_id.raw);
+    CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     if (prepared.slot_state != nullptr) {
         // Hidden alloc tasks complete inline in the orchestrator before any
@@ -885,7 +890,8 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     }
     orch->inline_completed_tasks++;
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN, prepared.task_id.raw);
+    CYCLE_COUNT_LAP(g_orch_fanin_cycle);
+    CYCLE_COUNT_ORCH_SUBMIT_RECORD(prepared.task_id.raw);
 
 #if PTO2_PROFILING
     orch->tasks_submitted++;

@@ -159,14 +159,18 @@ void l2_perf_aicpu_record_phase(
 void l2_perf_aicpu_set_orch_thread_idx(int thread_idx);
 
 /**
- * Record a single orchestrator phase
+ * Record one orchestrator submit envelope
  *
- * Appends an AicpuPhaseRecord for one sub-step of submit_task().
- * Uses the orchestrator's dedicated buffer slot (set via set_orch_thread_idx).
+ * Appends an AicpuPhaseRecord covering an entire submit_task() / alloc_tensors()
+ * call. Uses the orchestrator's dedicated buffer slot (set via
+ * set_orch_thread_idx). Per-sub-step phase records (ORCH_SYNC..ORCH_FANIN)
+ * were dropped — the per-step cumulatives (`g_orch_*_cycle`) in the
+ * cold-path log carry the breakdown that those records were duplicating.
  *
- * @param phase_id Orchestrator phase identifier (ORCH_SYNC..ORCH_SCOPE_END)
- * @param start_time Phase start timestamp
- * @param end_time Phase end timestamp
+ * @param phase_id Always AicpuPhaseId::ORCH_SUBMIT. (Param kept for API
+ *                 stability; legacy values are ignored by the host parser.)
+ * @param start_time Submit start timestamp
+ * @param end_time Submit end timestamp
  * @param submit_idx Task submission index (acts as loop_iter)
  * @param task_id Task identifier. For tensormap_and_ringbuffer, this is the full PTO2 encoding:
  * (ring_id << 32) | local_id, enabling cross-view correlation between orchestrator and scheduler swimlanes.

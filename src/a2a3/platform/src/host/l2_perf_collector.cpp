@@ -41,16 +41,22 @@
 /**
  * Check if a phase ID belongs to a scheduler phase (vs orchestrator phase).
  * Scheduler phases: SCHED_COMPLETE(0), SCHED_DISPATCH(1).
- * Legacy IDs 2 (SCHED_SCAN, never emitted in this runtime) and 3
- * (SCHED_IDLE_WAIT, no longer emitted) may appear in old captures and are
- * still classified as scheduler-side so the host parser routes them through
- * the scheduler branch (where they are then dropped, since idle is
- * reconstructed from record gaps).
- * Orchestrator phases: ORCH_SYNC(16) through ORCH_SCOPE_END(24).
+ * Orchestrator phases: ORCH_SUBMIT(25) — one record per submit_task() call,
+ * folded from 6 historical sub-step phases (ORCH_SYNC..ORCH_FANIN). Old
+ * captures may carry the per-sub-step ids (16-24) — they fall through the
+ * orch branch and the JSON writer labels them "unknown"; downstream tools
+ * drop "unknown" records.
+ *
+ * The boundary is the historical orch id base (16), not ORCH_SUBMIT itself:
+ * legacy ids 16-24 must be routed orch-side so they don't accidentally
+ * masquerade as scheduler-side phases when decoding old captures.
+ *
+ * Legacy IDs 2 (SCHED_SCAN, never emitted) and 3 (SCHED_IDLE_WAIT, dropped
+ * by PR #869) classify as scheduler-side; the host parser then drops them
+ * because idle is reconstructed from record gaps.
  */
-static bool is_scheduler_phase(AicpuPhaseId id) {
-    return static_cast<uint32_t>(id) < static_cast<uint32_t>(AicpuPhaseId::ORCH_SYNC);
-}
+static constexpr uint32_t kAicpuOrchPhaseIdBase = 16;
+static bool is_scheduler_phase(AicpuPhaseId id) { return static_cast<uint32_t>(id) < kAicpuOrchPhaseIdBase; }
 
 L2PerfCollector::~L2PerfCollector() {
     stop();
@@ -658,25 +664,11 @@ int L2PerfCollector::export_swimlane_json() {
 
         auto orch_phase_name = [](AicpuPhaseId id) -> const char * {
             switch (id) {
-            case AicpuPhaseId::ORCH_SYNC:
-                return "orch_sync";
-            case AicpuPhaseId::ORCH_ALLOC:
-                return "orch_alloc";
-            case AicpuPhaseId::ORCH_PARAMS:
-                return "orch_params";
-            case AicpuPhaseId::ORCH_LOOKUP:
-                return "orch_lookup";
-            case AicpuPhaseId::ORCH_HEAP:
-                return "orch_heap";
-            case AicpuPhaseId::ORCH_INSERT:
-                return "orch_insert";
-            case AicpuPhaseId::ORCH_FANIN:
-                return "orch_fanin";
-            case AicpuPhaseId::ORCH_FINALIZE:
-                return "orch_finalize";
-            case AicpuPhaseId::ORCH_SCOPE_END:
-                return "orch_scope_end";
+            case AicpuPhaseId::ORCH_SUBMIT:
+                return "orch_submit";
             default:
+                // Legacy per-sub-step orch ids 17-24 land here on old captures;
+                // host tools drop "unknown" records.
                 return "unknown";
             }
         };

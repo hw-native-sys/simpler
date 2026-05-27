@@ -37,9 +37,14 @@ available.
   captures (and a5) may still carry `scan` / `idle` records — both
   are silently dropped by the parser (idle is double-painted
   by the gap reconstruction; `scan` was never emitted in a2a3).
-- **Orchestrator phase summary** — cumulative cycle counts for
-  the orchestrator's nine sub-steps (sync / alloc / params /
-  lookup / heap / insert / fanin / finalize / scope_end).
+- **Orchestrator submit envelope** — one record per `submit_task()`
+  / `alloc_tensors()` call covering the whole submit's
+  `[start, end]` window (`orch_submit` phase). Per-sub-step
+  cumulative cycles (sync / alloc / params / lookup / insert /
+  fanin) still live in the cold-path device log via the
+  `g_orch_*_cycle` counters — that's where you go for "which
+  sub-step dominates overall"; the per-submit record covers
+  "which submit was slow".
 - **Standard outputs** — raw `l2_perf_records.json`, plus a
   Perfetto-loadable `merged_swimlane_*.json` produced by
   `swimlane_converter`.
@@ -137,7 +142,7 @@ Phase records (per scheduler thread, level >= 3 for
 | Field | Meaning |
 | ----- | ------- |
 | `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds |
-| `phase` | Lowercase phase name. Scheduler: `complete` / `dispatch` (`scan` / `idle` may appear in legacy captures and a5; both are dropped by the parser). Orchestrator: `orch_*` (sync / alloc / params / lookup / heap / insert / fanin / finalize / scope_end). |
+| `phase` | Lowercase phase name. Scheduler: `complete` / `dispatch` (`scan` / `idle` may appear in legacy captures and a5; both are dropped by the parser). Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
 | `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
 | `tasks_processed` (scheduler) / `task_id` (orchestrator) | Phase-specific union field |
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
@@ -228,11 +233,12 @@ What the swimlane shows:
   between predecessor and successor tasks.
 - **Scheduler-loop time decomposition.** Per-iteration AICPU
   phase records show how long the scheduler spent in each of
-  its four phases.
-- **Orchestrator overhead breakdown.** Cumulative cycle counts
-  for the nine orchestrator sub-steps (sync, alloc, params,
-  lookup, heap, insert, fanin, finalize, scope_end), useful for
-  spotting where graph-build cost lives.
+  its two work phases (complete / dispatch); idle is recovered
+  from the gap between records.
+- **Orchestrator overhead breakdown.** Per-submit envelope
+  records (`orch_submit`) pin "which submit is slow"; cumulative
+  cycle counts in the cold-path device log (`g_orch_*_cycle`)
+  cover the per-sub-step breakdown for "which sub-step dominates".
 
 ## 5. Design Highlights
 

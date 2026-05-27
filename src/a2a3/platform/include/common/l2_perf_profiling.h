@@ -311,26 +311,34 @@ struct L2PerfDataHeader {
  * idle spans from the gap between consecutive sched records on the same
  * thread (see swimlane_converter.py / sched_overhead_analysis.py).
  *
- * Orchestrator phases (16-24): sub-steps within each submit_task() call.
+ * Orchestrator phase (25): one record per submit_task() / alloc_tensors()
+ * call captures the entire submit's [start, end] wall-clock window.
+ * Per-sub-step cycle splits (ALLOC / SYNC / LOOKUP / INSERT / PARAMS /
+ * FANIN) still live in the device cold-path log as cumulative counters
+ * (`g_orch_*_cycle`) — they are the right tool for "which sub-step
+ * dominates overall", while the per-submit record covers "which submit
+ * was slow".
  *
- * IDs 2-3 were SCHED_SCAN (unused in this runtime) and SCHED_IDLE_WAIT in
- * older builds. Legacy capture JSON may still carry phase_id=3 records; the
- * host parser skips them since idle is now reconstructed from record gaps.
+ * ORCH_SUBMIT is intentionally numbered above the legacy range so older
+ * captures' per-sub-step records do not get re-interpreted as full-submit
+ * envelopes by the new host parser (in particular: id 16 used to be
+ * ORCH_SYNC — picking 16 for ORCH_SUBMIT would silently relabel every
+ * legacy sync record as a submit envelope, breaking backward decoding).
+ *
+ * Legacy IDs:
+ *   - 2, 3: SCHED_SCAN (never emitted) / SCHED_IDLE_WAIT — host parser
+ *           silently drops them on old captures (idle reconstructed from
+ *           gaps between work records).
+ *   - 16-24: pre-fold per-sub-step orch phases (ORCH_SYNC..ORCH_SCOPE_END).
+ *           Old captures may carry them; host parser maps to "unknown"
+ *           and tools drop them.
  */
 enum class AicpuPhaseId : uint32_t {
-    // Scheduler phases
+    // Scheduler phases (per scheduler loop iter)
     SCHED_COMPLETE = 0,  // Process completed tasks (fanin traversal)
     SCHED_DISPATCH = 1,  // Dispatch ready tasks to idle cores
-    // Orchestrator phases (16-24)
-    ORCH_SYNC = 16,      // tensormap sync
-    ORCH_ALLOC = 17,     // task_ring_alloc
-    ORCH_PARAMS = 18,    // param copy
-    ORCH_LOOKUP = 19,    // tensormap lookup + dep
-    ORCH_HEAP = 20,      // heap alloc
-    ORCH_INSERT = 21,    // tensormap insert
-    ORCH_FANIN = 22,     // fanin + early-ready
-    ORCH_FINALIZE = 23,  // scheduler init + SM
-    ORCH_SCOPE_END = 24  // scope_end
+    // Orchestrator phase (per submit_task() call)
+    ORCH_SUBMIT = 25,  // Entire submit_task() span (placed above legacy 16-24 to avoid collision)
 };
 
 /**

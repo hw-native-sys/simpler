@@ -788,17 +788,19 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 {"args": {"name": name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 4, "tid": tid}
             )
 
-        # Per-task orchestrator phase bars
+        # Per-task orchestrator phase bars. As of PR-X the device folds
+        # all 6 sub-step phases into one ORCH_SUBMIT record covering the
+        # submit's entire [start, end] window. Legacy per-sub-step phase
+        # strings remain in the color map so old captures still render.
         orch_phase_colors = {
-            "orch_sync": "thread_state_iowait",  # orange
-            "orch_alloc": "terrible",  # red
-            "orch_params": "good",  # green
-            "orch_lookup": "thread_state_running",  # blue
-            "orch_heap": "yellow",
+            "orch_submit": "rail_animation",  # purple — primary
+            # Legacy per-sub-step phases (old captures only):
+            "orch_sync": "thread_state_iowait",
+            "orch_alloc": "terrible",
+            "orch_params": "good",
+            "orch_lookup": "thread_state_running",
             "orch_insert": "olive",
             "orch_fanin": "rail_animation",
-            "orch_finalize": "cq_build_passed",
-            "orch_scope_end": "generic_work",
         }
 
         for orch_idx, thread_records in enumerate(orchestrator_phases):
@@ -997,11 +999,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 flow_id += 1
 
     # Orchestrator → scheduler dispatch:
-    # - Prefer orch_fanin end → dispatch (explicit deps / fanin path).
-    # - If no orch_fanin for this task, use orch_params end → dispatch.
+    # Anchor each task's dispatch arrow on the end of its orch_submit record
+    # (covers the entire submit_task() span). Legacy captures with the older
+    # per-sub-step phases (orch_fanin / orch_params) are accepted as fallbacks.
     if orchestrator_phases and scheduler_phases:
-        orch_fanin_by_task = {}
-        orch_params_by_task = {}
+        orch_anchor_by_task = {}
         for orch_idx, thread_records in enumerate(orchestrator_phases):
             for record in thread_records:
                 phase = record.get("phase")
@@ -1011,12 +1013,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 tid_k = normalize_pto2_task_id_int(task_id)
                 if tid_k is None:
                     continue
-                if phase == "orch_fanin":
-                    orch_fanin_by_task[tid_k] = (record, orch_idx)
-                elif phase == "orch_params" and tid_k not in orch_params_by_task:
-                    orch_params_by_task[tid_k] = (record, orch_idx)
+                # First-seen orch_submit wins; legacy orch_fanin / orch_params
+                # only fill in when no orch_submit exists for that task. The
+                # explicit "not already submit→dispatch" guard preserves first-
+                # seen semantics even if a (defensive) duplicate orch_submit
+                # ever appears for the same task.
+                existing = orch_anchor_by_task.get(tid_k)
+                if phase == "orch_submit" and (existing is None or existing[2] != "submit→dispatch"):
+                    orch_anchor_by_task[tid_k] = (record, orch_idx, "submit→dispatch")
+                elif existing is None and phase == "orch_fanin":
+                    orch_anchor_by_task[tid_k] = (record, orch_idx, "fanin→dispatch")
+                elif existing is None and phase == "orch_params":
+                    orch_anchor_by_task[tid_k] = (record, orch_idx, "params→dispatch")
 
-        if has_aicpu_data and (orch_fanin_by_task or orch_params_by_task):
+        if has_aicpu_data and orch_anchor_by_task:
             for task in tasks:
                 tid = normalize_pto2_task_id_int(task.get("task_id"))
                 if tid is None:
@@ -1032,16 +1042,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
 
                 sched_tid = 3000 + matched_thread
 
-                row_pair = orch_fanin_by_task.get(tid)
-                flow_name = "fanin→dispatch"
-                if row_pair is None:
-                    row_pair = orch_params_by_task.get(tid)
-                    flow_name = "params→dispatch"
-
-                if row_pair is None:
+                anchor = orch_anchor_by_task.get(tid)
+                if anchor is None:
                     continue
 
-                anchor_rec, orch_idx = row_pair
+                anchor_rec, orch_idx, flow_name = anchor
                 anchor_us = anchor_rec["end_time_us"]
 
                 orch_tid = 4000 + orch_idx
@@ -1178,8 +1183,11 @@ def _print_verbose_data_info(data, verbose):
     if orchestrator_phases:
         print(f"  Orchestrator threads: {len(orchestrator_phases)}")
         print(f"  Total orchestrator phase records: {sum(len(t) for t in orchestrator_phases)}")
-        # submit_count is derivable as the number of orch_fanin records (one per submit).
-        submit_count = sum(1 for thread in orchestrator_phases for r in thread if r.get("phase") == "orch_fanin")
+        # submit_count is derivable as the number of orch_submit records (one per submit).
+        # Legacy captures fall back to orch_fanin (was last phase of submit pre-fold).
+        submit_count = sum(1 for thread in orchestrator_phases for r in thread if r.get("phase") == "orch_submit")
+        if submit_count == 0:
+            submit_count = sum(1 for thread in orchestrator_phases for r in thread if r.get("phase") == "orch_fanin")
         if submit_count:
             print(f"  Orchestrator: {submit_count} tasks submitted")
     if core_to_thread:
