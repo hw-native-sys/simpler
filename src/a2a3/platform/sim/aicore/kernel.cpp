@@ -33,14 +33,14 @@
 static pthread_key_t g_reg_base_key;
 static pthread_key_t g_core_id_key;
 static pthread_key_t g_aicore_profiling_flag_key;
-static pthread_key_t g_aicore_l2_perf_ring_key;
+static pthread_key_t g_aicore_rotation_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
 static void create_tls_keys() {
     pthread_key_create(&g_reg_base_key, nullptr);
     pthread_key_create(&g_core_id_key, nullptr);
     pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
-    pthread_key_create(&g_aicore_l2_perf_ring_key, nullptr);
+    pthread_key_create(&g_aicore_rotation_key, nullptr);
 }
 
 volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key)); }
@@ -61,11 +61,11 @@ __aicore__ uint32_t get_aicore_profiling_flag() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
 }
 
-__aicore__ void set_aicore_l2_perf_ring(__gm__ L2PerfAicoreRing *ring) {
-    pthread_setspecific(g_aicore_l2_perf_ring_key, reinterpret_cast<void *>(ring));
+__aicore__ void set_aicore_rotation(__gm__ AicoreRotation *rotation) {
+    pthread_setspecific(g_aicore_rotation_key, reinterpret_cast<void *>(rotation));
 }
-__aicore__ __gm__ L2PerfAicoreRing *get_aicore_l2_perf_ring() {
-    return reinterpret_cast<__gm__ L2PerfAicoreRing *>(pthread_getspecific(g_aicore_l2_perf_ring_key));
+__aicore__ __gm__ AicoreRotation *get_aicore_rotation() {
+    return reinterpret_cast<__gm__ AicoreRotation *>(pthread_getspecific(g_aicore_rotation_key));
 }
 
 // Core identity setter function pointers — set by DeviceRunner after dlopen.
@@ -107,10 +107,10 @@ extern "C" void aicore_execute_wrapper(
     // Publish per-core profiling state before the executor runs.
     set_aicore_profiling_flag(enable_profiling_flag);
     if (aicore_ring_addr != 0) {
-        uint64_t *ring_table = reinterpret_cast<uint64_t *>(aicore_ring_addr);
-        set_aicore_l2_perf_ring(reinterpret_cast<__gm__ L2PerfAicoreRing *>(ring_table[block_idx]));
+        uint64_t *rotation_table = reinterpret_cast<uint64_t *>(aicore_ring_addr);
+        set_aicore_rotation(reinterpret_cast<__gm__ AicoreRotation *>(rotation_table[block_idx]));
     } else {
-        set_aicore_l2_perf_ring(nullptr);
+        set_aicore_rotation(nullptr);
     }
 
     // Set core identity for pto-isa TPUSH/TPOP simulation.

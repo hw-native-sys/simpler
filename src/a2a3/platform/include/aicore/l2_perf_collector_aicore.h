@@ -32,33 +32,83 @@
 // ============= Public Interface =============
 
 /**
- * Record task execution performance data
- *
- * Writes timing metrics into the per-core staging ring at
- * `dual_issue_slots[task_id % PLATFORM_L2_AICORE_RING_SIZE]`. The ring is
- * stable for the entire run (its address never changes), so AICore is fully
- * decoupled from the AICPU's records-buffer rotation.
- *
- * AICore writes L2PerfRecord.task_id as the register dispatch token (low 32 bits, zero-extended).
- * For tensormap_and_ringbuffer, AICPU overwrites with the full (ring_id << 32) | local_id
- * encoding after handshake match.
- *
- * @param ring Per-core staging ring pointer (resolved at AICore kernel
- *             entry from KernelArgs::aicore_ring_addr[block_idx] via
- *             set_aicore_l2_perf_ring()/get_aicore_l2_perf_ring())
- * @param task_id Register dispatch id (DATA_MAIN_BASE), stored in task_id low 32 bits
- * @param start_time Start timestamp
- * @param end_time End timestamp
+ * AICore-local rotation state. Tracks which buffer this core is currently
+ * writing into and which slot is next. Reset by `l2_perf_aicore_record_task`
+ * when it observes a generation bump on the shared `AicoreRotation` channel
+ * (AICPU rotates by writing `current_buf_ptr` + bumping `generation`, so the
+ * AICore-local state self-recovers without any AICore-side spin-wait).
  */
-__aicore__ __attribute__((always_inline)) static inline void
-l2_perf_aicore_record_task(__gm__ L2PerfAicoreRing *ring, uint32_t task_id, uint64_t start_time, uint64_t end_time) {
-    __gm__ L2PerfRecord *record = &ring->dual_issue_slots[task_id % PLATFORM_L2_AICORE_RING_SIZE];
+struct AicoreLocalState {
+    __gm__ L2PerfAicoreBuffer *cached_buf = nullptr;
+    // Must start != AICPU's initial generation (1) so the first record_task
+    // call observes a generation mismatch and loads the buffer pointer.
+    uint32_t cached_generation = 0;
+    uint32_t slot_within_buf = 0;
+};
 
+/**
+ * Record task execution performance data.
+ *
+ * AICore writes a slim L2PerfAicoreRecord into its currently-published
+ * per-core L2PerfAicoreBuffer at `records[slot_within_buf++]`. The
+ * publication channel is an AicoreRotation cache line addressed via
+ * `KernelArgs::aicore_ring_addr[block_idx]` (now points to AicoreRotation,
+ * not directly to a buffer). AICPU updates `rotation->current_buf_ptr` and
+ * bumps `rotation->generation` at dispatch boundaries; AICore detects the
+ * change by `dcci`-ing the rotation line per task and comparing generation
+ * to its locally cached copy.
+ *
+ * AICPU and AICore never read each other's data on the hot path. The host
+ * post-processor joins the AICore stream (multi-buffer per core, in order)
+ * with the AICPU stream by `reg_task_id` at flush time. See
+ * `docs/dfx/l2-swimlane-profiling.md`.
+ *
+ * Race avoidance: AICPU rotates strictly before `write_reg(DATA_MAIN_BASE)`
+ * for the first task of a new BUFFER_SIZE batch. The runtime's
+ * completion-before-dispatch invariant guarantees all prior tasks have FIN'd,
+ * so AICore has already finished writing their records before AICPU enqueues
+ * the old buffer to the ready queue.
+ *
+ * @param rotation Per-core AicoreRotation channel (cached at kernel entry
+ *                 from KernelArgs::aicore_ring_addr[block_idx])
+ * @param local    Per-core AICore-local state (caller-owned static)
+ * @param task_id  Register dispatch id (DATA_MAIN_BASE), low 32 bits
+ * @param start_time Start timestamp (get_sys_cnt)
+ * @param end_time   End timestamp
+ */
+__aicore__ __attribute__((always_inline)) static inline void l2_perf_aicore_record_task(
+    __gm__ AicoreRotation *rotation, AicoreLocalState *local, uint32_t task_id, uint64_t start_time, uint64_t end_time
+) {
+    // Re-fetch rotation channel each task; cheap relative to the
+    // baseline `dcci(payload, ENTIRE_DATA_CACHE)` we already pay per task.
+    dcci(rotation, SINGLE_CACHE_LINE);
+    if (rotation->generation != local->cached_generation) {
+        local->cached_generation = rotation->generation;
+        local->cached_buf = reinterpret_cast<__gm__ L2PerfAicoreBuffer *>(rotation->current_buf_ptr);
+        local->slot_within_buf = 0;
+    }
+    if (local->cached_buf == nullptr) {
+        // Rotation channel published a null pointer (AICPU couldn't pop a
+        // fresh buffer from free_queue). Drop silently — AICPU side already
+        // bumped dropped_record_count.
+        return;
+    }
+
+    uint32_t slot = local->slot_within_buf;
+    if (slot >= PLATFORM_AICORE_BUFFER_SIZE) {
+        // Defensive: AICPU should rotate before this can happen. If it
+        // didn't, refuse to write past the end rather than corrupt adjacent
+        // memory.
+        return;
+    }
+
+    __gm__ L2PerfAicoreRecord *record = &local->cached_buf->records[slot];
     record->start_time = start_time;
     record->end_time = end_time;
-    record->task_id = static_cast<uint64_t>(task_id);
+    record->task_id = task_id;
+    local->slot_within_buf = slot + 1;
 
-    // Flush cache to make data visible to AICPU
+    // Flush record to GM so host can read it after the buffer is enqueued.
     dcci(record, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
 }

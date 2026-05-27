@@ -29,6 +29,7 @@
 #include <fstream>
 #include <iomanip>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common/memory_barrier.h"
@@ -184,19 +185,6 @@ int L2PerfCollector::initialize(
         state->current_buf_ptr = 0;
         state->current_buf_seq = 0;
 
-        // Allocate the per-core stable AICore staging ring. Lifetime spans
-        // the whole run — never pushed into free_queue, never recycled.
-        // AICPU caches state->aicore_ring_ptr at init and forwards it to
-        // the handshake; AICore reads timing-publication target from there.
-        void *ring_host_ptr = nullptr;
-        void *ring_dev_ptr = alloc_single_buffer(sizeof(L2PerfAicoreRing), &ring_host_ptr);
-        if (ring_dev_ptr == nullptr) {
-            LOG_ERROR("Failed to allocate L2PerfAicoreRing for core %d", i);
-            return -1;
-        }
-        memset(ring_host_ptr, 0, sizeof(L2PerfAicoreRing));
-        state->aicore_ring_ptr = reinterpret_cast<uint64_t>(ring_dev_ptr);
-
         for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
             void *dev_buf_ptr = alloc_single_buffer(sizeof(L2PerfBuffer), &host_buf_ptr);
@@ -218,28 +206,67 @@ int L2PerfCollector::initialize(
         state->free_queue.tail = 1;
         wmb();
     }
+
+    // Step 5b: Initialize L2PerfAicoreBufferStates — per-core AICore rotation
+    // channel + buffer pool. Same SPSC pattern as the AICPU pool above.
+    for (int i = 0; i < num_aicore; i++) {
+        L2PerfAicoreBufferState *ac_state = get_aicore_buffer_state(perf_host_ptr, num_aicore, i);
+        memset(ac_state, 0, sizeof(L2PerfAicoreBufferState));
+
+        for (int s = 0; s < PLATFORM_AICORE_BUFFERS_PER_CORE; s++) {
+            void *host_buf_ptr = nullptr;
+            void *dev_buf_ptr = alloc_single_buffer(sizeof(L2PerfAicoreBuffer), &host_buf_ptr);
+            if (dev_buf_ptr == nullptr) {
+                LOG_ERROR("Failed to allocate L2PerfAicoreBuffer for core %d, buffer %d", i, s);
+                return -1;
+            }
+            L2PerfAicoreBuffer *buf = reinterpret_cast<L2PerfAicoreBuffer *>(host_buf_ptr);
+            memset(buf, 0, sizeof(L2PerfAicoreBuffer));
+            buf->count = 0;
+
+            if (s == 0) {
+                ac_state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(dev_buf_ptr);
+            } else {
+                manager_.push_recycled(static_cast<int>(ProfBufferType::AICORE), dev_buf_ptr);
+            }
+        }
+        wmb();
+        ac_state->free_queue.tail = 1;
+        wmb();
+    }
     LOG_DEBUG(
-        "Initialized %d L2PerfBufferStates: 1 buffer/core, %d in recycled pool, 1 AICore ring/core", num_aicore,
-        num_aicore * (PLATFORM_PROF_BUFFERS_PER_CORE - 1)
+        "Initialized buffer pools: %d L2PerfBuffers/core + %d L2PerfAicoreBuffers/core (1 in free_queue, "
+        "rest in recycled pool)",
+        PLATFORM_PROF_BUFFERS_PER_CORE, PLATFORM_AICORE_BUFFERS_PER_CORE
     );
 
-    // Step 5b: Standalone uint64_t[num_aicore] table holding per-core ring
-    // addresses. AICore reads ring_table[block_idx] via KernelArgs::aicore_ring_addr
-    // and feeds it into the platform's set_l2_perf_aicore_ring().
+    // Step 5c: Standalone uint64_t[num_aicore] table holding per-core
+    // AicoreRotation device addresses (= &ac_state->rotation). AICore reads
+    // rotation_table[block_idx] via KernelArgs::aicore_ring_addr and feeds it
+    // into the platform's set_aicore_rotation().
     {
         size_t table_bytes = static_cast<size_t>(num_aicore) * sizeof(uint64_t);
-        void *ring_table_host = nullptr;
-        void *ring_table_dev = alloc_single_buffer(table_bytes, &ring_table_host);
-        if (ring_table_dev == nullptr) {
-            LOG_ERROR("Failed to allocate aicore_ring_addr table (%zu bytes)", table_bytes);
+        void *rotation_table_host = nullptr;
+        void *rotation_table_dev = alloc_single_buffer(table_bytes, &rotation_table_host);
+        if (rotation_table_dev == nullptr) {
+            LOG_ERROR("Failed to allocate aicore_ring_addr (rotation) table (%zu bytes)", table_bytes);
             return -1;
         }
-        uint64_t *ring_table = reinterpret_cast<uint64_t *>(ring_table_host);
+        uint64_t *rotation_table = reinterpret_cast<uint64_t *>(rotation_table_host);
+
+        // Compute the per-core device address of &state->rotation. We have
+        // the host-mapped shm region; the device equivalent is at the same
+        // offset from perf_dev_ptr.
+        auto host_to_dev = [&](void *host_addr) -> uint64_t {
+            uintptr_t offset = reinterpret_cast<uintptr_t>(host_addr) - reinterpret_cast<uintptr_t>(perf_host_ptr);
+            return reinterpret_cast<uint64_t>(perf_dev_ptr) + offset;
+        };
+
         for (int i = 0; i < num_aicore; i++) {
-            L2PerfBufferState *state = get_perf_buffer_state(perf_host_ptr, i);
-            ring_table[i] = state->aicore_ring_ptr;
+            L2PerfAicoreBufferState *ac_state = get_aicore_buffer_state(perf_host_ptr, num_aicore, i);
+            rotation_table[i] = host_to_dev(&ac_state->rotation);
         }
-        aicore_ring_addr_table_dev_ = ring_table_dev;
+        aicore_ring_addr_table_dev_ = rotation_table_dev;
     }
 
     // Step 6: Initialize PhaseBufferStates — 1 buffer per thread in free_queue, rest to recycled pool
@@ -288,6 +315,7 @@ int L2PerfCollector::initialize(
     shm_host_ = perf_host_ptr;
 
     collected_perf_records_.assign(num_aicore_, {});
+    collected_aicore_records_.assign(num_aicore_, {});
     collected_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
 
     LOG_INFO_V0("Performance profiling initialized (dynamic buffer mode)");
@@ -333,11 +361,63 @@ void L2PerfCollector::copy_phase_buffer(const ReadyBufferInfo &info) {
     }
 }
 
+// AICore record buffers arrive on the ready queue in per-core rotation order
+// (AICPU enqueues them at PLATFORM_AICORE_BUFFER_SIZE dispatch boundaries +
+// once at flush). Within a single buffer, AICore wrote records[0..buf->count)
+// in the order tasks ran on that core (completion-before-dispatch invariant
+// + AICPU stamps buf->count just before enqueue). Flattening in arrival
+// order gives us the per-core task stream that join_aicore_records()
+// indexes by reg_task_id.
+//
+// Defensive filter: skip records whose `start_time == 0`. AICore writes
+// `get_sys_cnt_aicore()` (a free-running cycle counter, always non-zero in
+// practice) at task end, so a zero start_time means the slot was never
+// written by AICore for this session. This handles two edge cases without
+// special-casing them:
+//   - Recycled buffer where AICore wrote fewer records than the count stamp
+//     (e.g., the rare dispatch-boundary race for sub-microsecond kernels
+//     where AICore's next record_task fires before AICPU's rotation has
+//     propagated). The "missing" slot's previous contents are zero because
+//     allocate_single_buffer memsets at allocation.
+//   - Flush-path partial buffer whose tail wasn't reached.
+void L2PerfCollector::copy_aicore_buffer(const ReadyBufferInfo &info) {
+    L2PerfAicoreBuffer *buf = reinterpret_cast<L2PerfAicoreBuffer *>(info.host_buffer_ptr);
+    rmb();
+    uint32_t core_index = info.index;
+    if (core_index >= static_cast<uint32_t>(num_aicore_)) {
+        return;
+    }
+    uint32_t count = buf->count;
+    if (count > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) {
+        count = PLATFORM_AICORE_BUFFER_SIZE;
+    }
+    auto &dst = collected_aicore_records_[core_index];
+    dst.reserve(dst.size() + count);
+    uint32_t skipped = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const L2PerfAicoreRecord &r = buf->records[i];
+        if (r.start_time == 0) {
+            skipped++;
+            continue;
+        }
+        dst.push_back(r);
+    }
+    if (skipped > 0) {
+        LOG_WARN(
+            "Core %u: skipped %u AICore record slot(s) with start_time=0 (race-window write or "
+            "recycled-buffer tail). buf seq=%u count=%u",
+            core_index, skipped, info.buffer_seq, count
+        );
+    }
+}
+
 void L2PerfCollector::on_buffer_collected(const ReadyBufferInfo &info) {
     if (info.type == ProfBufferType::PERF_RECORD) {
         copy_perf_buffer(info);
-    } else {
+    } else if (info.type == ProfBufferType::PHASE) {
         copy_phase_buffer(info);
+    } else {
+        copy_aicore_buffer(info);
     }
 }
 
@@ -357,14 +437,14 @@ void L2PerfCollector::reconcile_counters() {
 
     rmb();
 
-    // Three-bucket invariant for one pool: every commit attempt bumps
-    // total_record_count; capacity-driven drops (no free buffer / queue
-    // full / flush failure) bump dropped_record_count; AICore↔AICPU ring
-    // task_id mismatches bump mismatch_record_count (a hard error class —
-    // the runtime invariant guarantees this should be 0). So
-    //   silent_loss = device_total - (collected + dropped + mismatch)
-    // and any non-zero silent loss flags an unaccounted gap on top of
-    // the already-classified dropped/mismatch losses.
+    // Two-bucket invariant (post-AICore-as-producer): every commit attempt
+    // bumps total_record_count; capacity-driven drops (no free buffer /
+    // queue full / flush failure) bump dropped_record_count.
+    //   silent_loss = device_total - (collected + dropped)
+    // and any non-zero silent loss flags an unaccounted gap on top of the
+    // already-classified dropped losses. `mismatch_record_count` remains in
+    // L2PerfBufferState for ABI continuity but is no longer written — the
+    // AICore staging-slot read it guarded was removed.
     //
     // Sanity sub-check: after stop(), any active buffer with records must
     // have been flushed by AICPU (success → current_buf_ptr=0; failure →
@@ -416,9 +496,9 @@ void L2PerfCollector::reconcile_counters() {
         }
         if (mismatch_device > 0) {
             LOG_ERROR(
-                "L2Perf reconcile: %lu %s records lost to ring/task_id mismatch — "
-                "completion-before-dispatch invariant violated (AICore/AICPU race or "
-                "PLATFORM_L2_AICORE_RING_SIZE undersized for current issue depth)",
+                "L2Perf reconcile: %lu %s records carry non-zero mismatch_record_count — "
+                "this counter is no longer written post-AICore-as-producer; non-zero "
+                "indicates stale device state or a corrupted L2PerfBufferState",
                 static_cast<unsigned long>(mismatch_device), kind
             );
         }
@@ -524,7 +604,109 @@ void L2PerfCollector::read_phase_header_metadata() {
     LOG_INFO_V0("Phase metadata collection complete: has_phase_data=%s", has_phase_data_ ? "yes" : "no");
 }
 
+// AICore-as-producer post-processing: walk each L2PerfRecord we collected
+// and patch start/end/duration from the per-core stream of AICore records
+// that arrived through the ready queue. AICore rotation guarantees each
+// per-core stream is a complete prefix of "all dispatched tasks on this
+// core" with no wrap loss (the AICore buffer pool is recycled via
+// free_queue while the session runs, so an arbitrarily long session works).
+//
+// We build a small `reg_task_id → (start, end)` map per core (size on the
+// order of N_tasks_per_core) and patch each L2PerfRecord by its
+// reg_task_id field. Using a map instead of direct indexing tolerates
+// AICPU-side L2PerfBuffer drops (a missing L2PerfRecord doesn't break
+// alignment) and lets the same code work for both runtimes.
+void L2PerfCollector::join_aicore_records() {
+    if (shm_host_ == nullptr) {
+        return;
+    }
+    rmb();
+
+    uint64_t total_patched = 0;
+    uint64_t total_unmatched = 0;
+
+    // reg_task_id is per-core monotonic. For sessions that don't run long
+    // enough to wrap the 31-bit `dispatch_seq & TASK_ID_MASK`, a direct
+    // vector index beats a hashmap on both build and lookup. Cap the vector
+    // length to keep memory bounded; if a core ever produces an outlier
+    // reg_task_id (recycled session, manual reset), fall back to the
+    // hashmap so we don't allocate gigabytes.
+    constexpr uint32_t kDirectIndexCap = 1u << 24;  // 16 M slots = 256 MB / core max
+
+    for (int core_idx = 0; core_idx < num_aicore_; core_idx++) {
+        const auto &ac_stream = collected_aicore_records_[core_idx];
+        if (collected_perf_records_[core_idx].empty()) {
+            continue;
+        }
+
+        uint32_t max_reg = 0;
+        for (const auto &r : ac_stream) {
+            if (r.task_id > max_reg) max_reg = r.task_id;
+        }
+        for (const auto &lr : collected_perf_records_[core_idx]) {
+            if (lr.reg_task_id > max_reg) max_reg = lr.reg_task_id;
+        }
+
+        uint64_t patched = 0;
+        uint64_t unmatched = 0;
+
+        if (max_reg < kDirectIndexCap) {
+            std::vector<std::pair<uint64_t, uint64_t>> ts_by_task(static_cast<size_t>(max_reg) + 1, {0, 0});
+            for (const auto &r : ac_stream) {
+                ts_by_task[r.task_id] = {r.start_time, r.end_time};
+            }
+            for (auto &lr : collected_perf_records_[core_idx]) {
+                const auto &entry = ts_by_task[lr.reg_task_id];
+                if (entry.first == 0 && entry.second == 0) {
+                    unmatched++;
+                    continue;
+                }
+                lr.start_time = entry.first;
+                lr.end_time = entry.second;
+                lr.duration = (lr.end_time > lr.start_time) ? (lr.end_time - lr.start_time) : 0;
+                patched++;
+            }
+        } else {
+            std::unordered_map<uint32_t, std::pair<uint64_t, uint64_t>> ts_by_task;
+            ts_by_task.reserve(ac_stream.size() * 2);
+            for (const auto &r : ac_stream) {
+                ts_by_task[r.task_id] = {r.start_time, r.end_time};
+            }
+            for (auto &lr : collected_perf_records_[core_idx]) {
+                auto it = ts_by_task.find(lr.reg_task_id);
+                if (it == ts_by_task.end()) {
+                    unmatched++;
+                    continue;
+                }
+                lr.start_time = it->second.first;
+                lr.end_time = it->second.second;
+                lr.duration = (lr.end_time > lr.start_time) ? (lr.end_time - lr.start_time) : 0;
+                patched++;
+            }
+        }
+
+        total_patched += patched;
+        total_unmatched += unmatched;
+        if (unmatched > 0) {
+            LOG_WARN(
+                "Core %d: %lu L2PerfRecord(s) had no matching AICore entry (AICore buffer drops on rotation? "
+                "PLATFORM_AICORE_BUFFERS_PER_CORE=%d may be undersized for host drain rate)",
+                core_idx, static_cast<unsigned long>(unmatched), PLATFORM_AICORE_BUFFERS_PER_CORE
+            );
+        }
+    }
+
+    LOG_INFO_V0(
+        "AICore-as-producer join: patched=%lu, unmatched=%lu", static_cast<unsigned long>(total_patched),
+        static_cast<unsigned long>(total_unmatched)
+    );
+}
+
 int L2PerfCollector::export_swimlane_json() {
+    // Step 0: Join AICore-emitted start/end/task_id records into the AICPU
+    // record stream (AICore-as-producer design).
+    join_aicore_records();
+
     // Step 1: Validate collected data
     bool has_any_records = false;
     for (const auto &core_records : collected_perf_records_) {
@@ -570,10 +752,14 @@ int L2PerfCollector::export_swimlane_json() {
         return a.record->task_id < b.record->task_id;
     });
 
-    // Step 4: Calculate base time (minimum timestamp across all records)
+    // Step 4: Calculate base time (minimum timestamp across all records).
+    // Records whose AICore timing was never filled in by join_aicore_records()
+    // (e.g. AICore buffer wrap) leave start_time = 0 and would otherwise
+    // anchor the entire swimlane at cycle 0 — gate them out alongside the
+    // dispatch_time check.
     uint64_t base_time_cycles = UINT64_MAX;
     for (const auto &tagged : tagged_records) {
-        if (tagged.record->start_time < base_time_cycles) {
+        if (tagged.record->start_time > 0 && tagged.record->start_time < base_time_cycles) {
             base_time_cycles = tagged.record->start_time;
         }
         if (tagged.record->dispatch_time > 0 && tagged.record->dispatch_time < base_time_cycles) {
@@ -612,8 +798,31 @@ int L2PerfCollector::export_swimlane_json() {
     outfile << "  \"l2_perf_level\": " << l2_perf_level << ",\n";
     outfile << "  \"tasks\": [\n";
 
+    // First pass: filter unmatched records (start_time == 0) so we emit a
+    // valid JSON without trailing-comma fix-ups. Unmatched records arise when
+    // the AICore-side rotation dropped a buffer (free queue empty) and that
+    // task's AICore record never made it to the host, leaving the AICPU-side
+    // L2PerfRecord with `start_time == 0`. Subtracting base_time_cycles from
+    // 0 would underflow to a huge double timestamp, painting an off-the-chart
+    // bar in the swimlane viewer; safer to drop the record. The drop count is
+    // already surfaced via `dropped_record_count` and the join warning logged
+    // in join_aicore_records().
+    std::vector<size_t> emit_indices;
+    emit_indices.reserve(tagged_records.size());
+    size_t unmatched_dropped = 0;
     for (size_t i = 0; i < tagged_records.size(); ++i) {
-        const auto &tagged = tagged_records[i];
+        if (tagged_records[i].record->start_time == 0) {
+            unmatched_dropped++;
+            continue;
+        }
+        emit_indices.push_back(i);
+    }
+    if (unmatched_dropped > 0) {
+        LOG_WARN("Dropped %zu task record(s) with unmatched AICore timing from swimlane export", unmatched_dropped);
+    }
+
+    for (size_t e = 0; e < emit_indices.size(); ++e) {
+        const auto &tagged = tagged_records[emit_indices[e]];
         const auto &record = *tagged.record;
 
         // Convert times to microseconds
@@ -639,7 +848,7 @@ int L2PerfCollector::export_swimlane_json() {
         // Fanout is no longer carried on the device hot path — dep_gen replay
         // (deps.json) is the sole source of truth, joined in by tooling.
         outfile << "    }";
-        if (i < tagged_records.size() - 1) {
+        if (e + 1 < emit_indices.size()) {
             outfile << ",";
         }
         outfile << "\n";
@@ -798,30 +1007,35 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, const L2Pe
         release_one_buffer(p, unregister_cb, free_cb);
     });
 
-    // Per-core: current buffer + staging ring + free_queue slots — these
-    // were owned by the AICPU side, not the framework.
-    for (int i = 0; i < num_aicore_; i++) {
-        L2PerfBufferState *state = get_perf_buffer_state(shm_host_, i);
-
-        release_one_buffer(reinterpret_cast<void *>(state->current_buf_ptr), unregister_cb, free_cb);
-        state->current_buf_ptr = 0;
-
-        release_one_buffer(reinterpret_cast<void *>(state->aicore_ring_ptr), unregister_cb, free_cb);
-        state->aicore_ring_ptr = 0;
-
+    // Per-core: current buffer + free_queue slots — these were owned by
+    // the AICPU side, not the framework. Same drain pattern for both the
+    // L2PerfBuffer pool and the L2PerfAicoreBuffer pool.
+    auto drain_free_queue = [&](L2PerfFreeQueue &fq) {
         rmb();
-        uint32_t head = state->free_queue.head;
-        uint32_t tail = state->free_queue.tail;
+        uint32_t head = fq.head;
+        uint32_t tail = fq.tail;
         uint32_t queued = tail - head;
         if (queued > PLATFORM_PROF_SLOT_COUNT) {
             queued = PLATFORM_PROF_SLOT_COUNT;
         }
         for (uint32_t k = 0; k < queued; k++) {
             uint32_t slot = (head + k) % PLATFORM_PROF_SLOT_COUNT;
-            release_one_buffer(reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]), unregister_cb, free_cb);
-            state->free_queue.buffer_ptrs[slot] = 0;
+            release_one_buffer(reinterpret_cast<void *>(fq.buffer_ptrs[slot]), unregister_cb, free_cb);
+            fq.buffer_ptrs[slot] = 0;
         }
-        state->free_queue.head = tail;
+        fq.head = tail;
+    };
+
+    for (int i = 0; i < num_aicore_; i++) {
+        L2PerfBufferState *state = get_perf_buffer_state(shm_host_, i);
+        release_one_buffer(reinterpret_cast<void *>(state->current_buf_ptr), unregister_cb, free_cb);
+        state->current_buf_ptr = 0;
+        drain_free_queue(state->free_queue);
+
+        L2PerfAicoreBufferState *ac_state = get_aicore_buffer_state(shm_host_, num_aicore_, i);
+        release_one_buffer(reinterpret_cast<void *>(ac_state->rotation.current_buf_ptr), unregister_cb, free_cb);
+        ac_state->rotation.current_buf_ptr = 0;
+        drain_free_queue(ac_state->free_queue);
     }
 
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;

@@ -59,10 +59,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
 
-    // Per-core staging ring is published once at kernel entry from
-    // KernelArgs::aicore_ring_addr — cache the pointer locally here so the
-    // hot loop never re-reads platform state.
-    __gm__ L2PerfAicoreRing *l2_perf_ring = l2_perf_enabled ? get_aicore_l2_perf_ring() : nullptr;
+    // Per-core AicoreRotation channel; see tensormap_and_ringbuffer/.../aicore_executor.cpp.
+    __gm__ AicoreRotation *l2_perf_rotation = l2_perf_enabled ? get_aicore_rotation() : nullptr;
+    AicoreLocalState l2_perf_local = {nullptr, 0, 0};
 
     volatile uint32_t task_id = AICPU_IDLE_TASK_ID;
     volatile uint32_t last_task_id = AICPU_IDLE_TASK_ID;
@@ -103,7 +102,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             if (l2_perf_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                l2_perf_aicore_record_task(l2_perf_ring, actual_task_id, start_time, end_time);
+                l2_perf_aicore_record_task(l2_perf_rotation, &l2_perf_local, actual_task_id, start_time, end_time);
             }
 
             last_task_id = task_id;

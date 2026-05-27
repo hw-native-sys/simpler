@@ -109,16 +109,6 @@ constexpr int PLATFORM_MAX_CORES = PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BL
 constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 
 /**
- * Per-core AICore→AICPU staging ring slot count.
- *
- * AICore writes each task's timing into ring->dual_issue_slots[task_id %
- * PLATFORM_L2_AICORE_RING_SIZE]. Must be a power of two and ≥ the in-flight
- * issue depth on a single core. Today's runtime is dual-issue, so 2 slots
- * suffice; raise to the next power of two when issue depth grows.
- */
-constexpr int PLATFORM_L2_AICORE_RING_SIZE = 2;
-
-/**
  * Number of buffer slots per core/thread for dynamic profiling
  * Host dynamically allocates buffers and writes addresses into these slots.
  * Device reads slot addresses when switching buffers.
@@ -134,18 +124,29 @@ constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
 constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
 
 /**
+ * L2PerfAicoreBuffer pre-allocation count per AICore (AICore-as-producer pool).
+ * 1 goes into the free_queue at init, the rest into the recycled pool.
+ * Mirrors PLATFORM_PROF_BUFFERS_PER_CORE in role; smaller because AICore records
+ * are slim (32 B each) and the buffer is also smaller per the rotation design.
+ */
+constexpr int PLATFORM_AICORE_BUFFERS_PER_CORE = 4;
+
+/**
  * PhaseBuffer pre-allocation count per AICPU thread.
  * 1 goes into the free_queue at init, the rest into the recycled pool.
  */
 constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
 
 /**
- * Ready queue capacity for performance data collection
+ * Ready queue capacity for performance data collection.
  * Queue holds ReadyQueueEntry structs for buffers ready to be read by Host.
- * Sized to match pre-allocation total across all cores and threads.
+ * Sized to match pre-allocation total across all cores and threads, summed
+ * over the three buffer kinds (AICPU L2PerfBuffer, PhaseBuffer,
+ * AICore L2PerfAicoreBuffer).
  */
-constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
-    PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE + PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_BUFFERS_PER_THREAD;
+constexpr int PLATFORM_PROF_READYQUEUE_SIZE = PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE +
+                                              PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_BUFFERS_PER_THREAD +
+                                              PLATFORM_MAX_CORES * PLATFORM_AICORE_BUFFERS_PER_CORE;
 
 /**
  * System counter frequency (get_sys_cnt)

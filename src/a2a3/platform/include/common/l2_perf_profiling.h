@@ -97,68 +97,90 @@ enum class L2PerfLevel : uint32_t {
  */
 struct L2PerfRecord {
     // Timing information (device clock timestamps)
-    uint64_t start_time;  // Task start timestamp (get_sys_cnt)
-    uint64_t end_time;    // Task end timestamp
-    uint64_t duration;    // Execution duration (end - start)
+    uint64_t start_time;  // Task start timestamp (get_sys_cnt) — host-filled at flush from AICore buffer
+    uint64_t end_time;    // Task end timestamp — host-filled at flush from AICore buffer
+    uint64_t duration;    // Execution duration (end - start) — host-filled at flush
 
-    // AICPU-side timestamps (written by AICPU, not AICore)
+    // AICPU-side timestamps (written by AICPU directly)
     uint64_t dispatch_time;  // AICPU timestamp: when task was dispatched to AICore
     uint64_t finish_time;    // AICPU timestamp: when AICPU observed task completion
 
-    // AICore writes the register dispatch token (low 32 bits only) zero-extended into task_id.
-    // For tensormap_and_ringbuffer, AICPU overwrites with the full PTO2 encoding
-    // (ring_id << 32) | local_id after FIN/perf row match.
-    // For host_build_graph, task_id stays as the plain integer task index (ring_id = 0).
+    // Full PTO2 task id (host-visible identity, what swimlane export and
+    // dep_gen join keys use). For tensormap_and_ringbuffer this is
+    // (ring_id << 32) | local_id; for host_build_graph it is the plain
+    // integer task index.
     uint64_t task_id;
-    uint32_t func_id;    // Kernel function identifier
-    CoreType core_type;  // Core type (AIC/AIV)
+    uint32_t func_id;      // Kernel function identifier
+    CoreType core_type;    // Core type (AIC/AIV)
+    uint32_t reg_task_id;  // Register dispatch token (monotonic per core).
+                           // Used by the host as the join key against
+                           // L2PerfAicoreRecord.task_id, which is what
+                           // AICore writes into the slim record.
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(L2PerfRecord) % 64 == 0, "L2PerfRecord must be 64-byte aligned for optimal cache performance");
 
 // =============================================================================
-// L2PerfAicoreRing - Stable AICore→AICPU Staging Ring (per core, never rotated)
+// L2PerfAicoreRecord - Slim AICore-Only Record (written by AICore, read by Host)
 // =============================================================================
 
 /**
- * Per-core staging ring written exclusively by AICore.
+ * Slim per-task record written by AICore directly into its own per-core
+ * output buffer (no staging slot, no AICPU read). AICPU never touches this
+ * record. The host post-processor joins it against the AICPU-side
+ * L2PerfRecord on `task_id` at flush time.
  *
- * AICore stores each task's timing in `dual_issue_slots[reg_task_id %
- * PLATFORM_L2_AICORE_RING_SIZE]` and never touches any other L2Perf memory.
- * The ring is allocated once by the host, addressed through
- * `L2PerfBufferState[block_idx].aicore_ring_ptr` (also published into the
- * `KernelArgs::aicore_ring_addr` table the AICore kernel entry forwards
- * into `set_aicore_l2_perf_ring()`), and lives for the entire run — its
- * address is never reassigned, decoupling AICore writes from the AICPU's
- * records-buffer rotation.
- *
- * Sizing: PLATFORM_L2_AICORE_RING_SIZE must be ≥ in-flight issue depth on a
- * single core (see runtime "completion-before-dispatch" invariant). The
- * default 2 covers today's dual-issue dispatch.
+ * Layout: 24B payload + 8B pad → 32B (half a cache line). Two records pack
+ * into one cache line so AICore's per-task store is at most a single line
+ * commit + dcci.
  */
-struct L2PerfAicoreRing {
-    L2PerfRecord dual_issue_slots[PLATFORM_L2_AICORE_RING_SIZE];
-} __attribute__((aligned(64)));
+struct L2PerfAicoreRecord {
+    uint64_t start_time;  // Task start timestamp (get_sys_cnt)
+    uint64_t end_time;    // Task end timestamp
+    uint32_t task_id;     // Register dispatch token (low 32 bits)
+    uint32_t _pad;
+} __attribute__((aligned(32)));
+
+static_assert(sizeof(L2PerfAicoreRecord) == 32, "L2PerfAicoreRecord must be 32B");
 
 // =============================================================================
-// L2PerfBuffer - Fixed-Size Record Buffer (AICPU-only)
+// TypedBuffer<Record, N> - Templated Fixed-Size Profiling Buffer
 // =============================================================================
 
 /**
- * Fixed-size performance record buffer
+ * Generic fixed-capacity profiling buffer: contiguous record array followed
+ * by a producer-written count. Layout matches the legacy L2PerfBuffer so the
+ * host allocator and the AICPU consumer can treat all concrete instances
+ * uniformly.
  *
- * Capacity: PLATFORM_PROF_BUFFER_SIZE (defined in platform_config.h)
- * Allocated dynamically by Host, pushed into per-core free_queue, rotated
- * by AICPU when full.
- *
- * Owned and written exclusively by AICPU: AICore never touches this memory.
- * AICPU reads timing from L2PerfAicoreRing::dual_issue_slots, fills in the
- * AICPU-side fields, then commits into records[count++].
+ * Concrete instantiations live below as `using` aliases.
+ *   - L2PerfBuffer        — AICPU-written, rotated, ready-queue tagged is_phase=0
+ *   - L2PerfAicoreBuffer  — AICore-written, NOT rotated (sized for the full
+ *                           session), read by host at flush time
  */
-struct L2PerfBuffer {
-    L2PerfRecord records[PLATFORM_PROF_BUFFER_SIZE];  // Committed records (AICPU writes)
-    volatile uint32_t count;                          // Current committed record count
+template <typename Record, size_t N>
+struct TypedBuffer {
+    Record records[N];
+    volatile uint32_t count;
 } __attribute__((aligned(64)));
+
+using L2PerfBuffer = TypedBuffer<L2PerfRecord, PLATFORM_PROF_BUFFER_SIZE>;
+
+// AICore buffer is rotated like L2PerfBuffer: a small fixed capacity per
+// buffer plus a per-core pool, so an arbitrarily long session never wraps.
+// Per-buffer capacity is a power of two so the AICore-local
+// `slot_within_buf` increment lowers to a bitwise AND for boundary checks.
+constexpr int PLATFORM_AICORE_BUFFER_SIZE = 1024;
+static_assert(
+    (PLATFORM_AICORE_BUFFER_SIZE & (PLATFORM_AICORE_BUFFER_SIZE - 1)) == 0,
+    "PLATFORM_AICORE_BUFFER_SIZE must be a power of two"
+);
+
+// PLATFORM_AICORE_BUFFERS_PER_CORE is declared in platform_config.h so the
+// ready-queue capacity formula there can include the AICore pool's worst-case
+// burst depth alongside the AICPU and Phase pools.
+
+using L2PerfAicoreBuffer = TypedBuffer<L2PerfAicoreRecord, PLATFORM_AICORE_BUFFER_SIZE>;
 
 // =============================================================================
 // L2PerfFreeQueue - SPSC Lock-Free Queue for Free Buffers
@@ -193,48 +215,52 @@ static_assert(sizeof(L2PerfFreeQueue) == 128, "L2PerfFreeQueue must be 128 bytes
 // =============================================================================
 
 /**
- * Per-core or per-thread buffer state for dynamic profiling
+ * Per-core or per-thread buffer state for dynamic profiling.
  *
  * Contains:
  * - free_queue: SPSC queue of available buffer addresses
- * - current_buf_ptr: Currently active buffer being written (0 = no active buffer)
+ * - current_buf_ptr: Currently active buffer being written (0 = no active
+ *   buffer). AICPU writes L2PerfRecord into it; rotated by AICPU when full.
  * - current_buf_seq: Monotonic sequence number for ordering
- * - aicore_ring_ptr: Stable per-core L2PerfAicoreRing address (L2PerfRecord
- *   profiling only; unused by Phase profiling). Set by host at init, read by
- *   AICPU in `l2_perf_aicpu_complete_record` to read the AICore-published
- *   timing slots. Never reassigned during the run.
- * - total_record_count / dropped_record_count / mismatch_record_count:
- *   per-core/-thread tallies AICPU keeps so the host can cross-check
- *   `collected + dropped + mismatch == device_total` at end-of-run. Replaces
- *   the previous L2PerfDataHeader::total_tasks signal — the host no longer
- *   needs to know task count up front. `mismatch_record_count` accounts for
- *   ring slot/task_id invariant violations (a hard error class, distinct
- *   from capacity drops).
+ * - aicore_ring_ptr: Per-core L2PerfAicoreBuffer device address (L2PerfRecord
+ *   profiling only; 0 for Phase). Allocated once by the host, addressed
+ *   through this field; AICore reads timing-publication target via
+ *   KernelArgs::aicore_ring_addr (a flat uint64_t[num_cores] table the host
+ *   builds from this field). Never reassigned during the run. AICPU does
+ *   NOT touch it on the hot path post-AICore-as-producer; the host reads
+ *   it at flush time and joins the slim AICore records into the L2PerfRecord
+ *   stream by reg_task_id.
+ * - total_record_count / dropped_record_count: per-core/-thread tallies
+ *   AICPU keeps so the host can cross-check `collected + dropped ==
+ *   device_total` at end-of-run.
+ * - mismatch_record_count: legacy field for the pre-AICore-as-producer
+ *   ring-slot mismatch class. No longer written; kept for ABI continuity.
  *
  * Used in two contexts:
  * - Per-core L2PerfRecord profiling (current_buf_ptr → L2PerfBuffer,
- *   aicore_ring_ptr → L2PerfAicoreRing)
+ *   aicore_ring_ptr → L2PerfAicoreBuffer)
  * - Per-thread Phase profiling (current_buf_ptr → PhaseBuffer,
- *   aicore_ring_ptr / mismatch_record_count unused)
+ *   aicore_ring_ptr unused)
  *
  * Writers:
  * - free_queue.tail: Host writes (pushes new buffers)
  * - free_queue.head: Device writes (pops buffers)
  * - current_buf_ptr: Device writes (after pop), Host reads (for flush/collect)
  * - current_buf_seq: Device writes (monotonic counter)
- * - aicore_ring_ptr: Host writes once at init, AICPU reads
- * - total_record_count / dropped_record_count / mismatch_record_count:
- *   Device writes, Host reads at drain time (no concurrency on a per-state
- *   basis since each state belongs to a single core/thread)
+ * - aicore_ring_ptr: Host writes once at init; AICPU never reads on the
+ *   hot path; host reads at flush time to do the AICore-side join.
+ * - total_record_count / dropped_record_count: Device writes, Host reads
+ *   at drain time (no concurrency on a per-state basis since each state
+ *   belongs to a single core/thread).
  */
 struct L2PerfBufferState {
     L2PerfFreeQueue free_queue;               // SPSC queue of free buffer addresses
-    volatile uint64_t current_buf_ptr;        // Current active buffer (0 = none)
-    volatile uint64_t aicore_ring_ptr;        // Stable AICore staging ring (L2Perf only; 0 for Phase)
+    volatile uint64_t current_buf_ptr;        // Current active L2PerfBuffer (0 = none)
+    volatile uint64_t aicore_ring_ptr;        // Per-core L2PerfAicoreBuffer (L2Perf only; 0 for Phase)
     volatile uint32_t current_buf_seq;        // Sequence number for ordering
     volatile uint32_t total_record_count;     // Records the AICPU attempted to write to this state
     volatile uint32_t dropped_record_count;   // Records dropped (queue full / overwrite / no buffer)
-    volatile uint32_t mismatch_record_count;  // Records lost to ring/task_id invariant violation (hard errors)
+    volatile uint32_t mismatch_record_count;  // Legacy: ring/task_id mismatches (no longer written, kept for ABI)
     uint32_t pad[8];                          // Pad to 192 bytes (aligned to cache line)
 } __attribute__((aligned(64)));
 
@@ -244,22 +270,80 @@ static_assert(sizeof(L2PerfBufferState) == 192, "L2PerfBufferState must be 192 b
 using PhaseBufferState = L2PerfBufferState;  // Per-thread Phase profiling
 
 // =============================================================================
+// AicoreRotation - Per-Core AICore Buffer Rotation Channel
+// =============================================================================
+
+/**
+ * Single cache-line struct AICore reads on every task to decide which
+ * L2PerfAicoreBuffer to write into. AICPU updates it when rotating; AICore
+ * detects the change via the generation counter and resets its local slot.
+ *
+ *   Writer: AICPU (host writes initial values at init)
+ *   Reader: AICore (dcci's this line per task — cheap relative to baseline
+ *           dcci(payload, ENTIRE_DATA_CACHE))
+ *
+ * Race avoidance: AICPU rotates strictly at dispatch boundaries (immediately
+ * before write_reg(DATA_MAIN_BASE) for task K when K % BUFFER_SIZE == 0). The
+ * runtime's completion-before-dispatch invariant guarantees all tasks < K
+ * have FIN'd, so AICore has already finished writing their records into the
+ * old buffer before AICPU enqueues it to ready_queue.
+ */
+struct AicoreRotation {
+    volatile uint64_t current_buf_ptr;  // Device address of the active L2PerfAicoreBuffer
+    volatile uint32_t generation;       // Bumps on each rotation; AICore compares to detect changes
+    uint32_t _pad_a;
+    uint32_t _pad_b[12];
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(AicoreRotation) == 64, "AicoreRotation must be one cache line");
+
+// =============================================================================
+// L2PerfAicoreBufferState - Per-Core AICore Pool State
+// =============================================================================
+
+/**
+ * Per-core AICore-side rotation state. Owns:
+ *   - rotation: the cache line AICore polls
+ *   - free_queue: SPSC queue of recycled L2PerfAicoreBuffer*; host pushes,
+ *                 AICPU pops when rotating
+ *   - total_record_count / dropped_record_count: AICPU-maintained tallies
+ *
+ * Note that AICore records flow through the existing per-thread ready_queue
+ * in L2PerfDataHeader (with ReadyQueueEntry::is_phase=2). This keeps the
+ * mgmt-thread drain path uniform with the L2PerfBuffer / PhaseBuffer paths.
+ */
+struct L2PerfAicoreBufferState {
+    AicoreRotation rotation;                 // 64B — cache-line independent
+    L2PerfFreeQueue free_queue;              // 128B
+    volatile uint32_t total_record_count;    // AICPU dispatches that should have been recorded
+    volatile uint32_t dropped_record_count;  // Buffers dropped (free_queue empty at rotation time)
+    volatile uint32_t current_buf_seq;       // Monotonic per-core rotation counter
+    uint32_t pad[13];                        // → 256B total
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(L2PerfAicoreBufferState) == 256, "L2PerfAicoreBufferState must be 256 bytes");
+
+// =============================================================================
 // ReadyQueueEntry - Queue Entry for Ready Buffers
 // =============================================================================
 
 /**
  * Ready queue entry
  *
- * When a buffer on a core/thread is full, AICPU adds this entry to the queue.
- * Host memory manager retrieves entries from the queue.
+ * When a buffer on a core/thread is full, the producer (AICPU for kinds 0/1,
+ * AICPU on behalf of AICore for kind 2) pushes this entry. Host memory
+ * manager retrieves entries from the queue.
  *
- * Entry types (distinguished by is_phase flag):
- * - L2PerfRecord entry: core_index = core ID, is_phase = 0
- * - Phase entry:      core_index = thread_idx, is_phase = 1
+ * Entry kinds (carried in the is_phase field — name is historical, semantic
+ * is "buffer kind"):
+ *   0: L2PerfBuffer       (per-core,   AICPU writes)
+ *   1: PhaseBuffer        (per-thread, AICPU writes)
+ *   2: L2PerfAicoreBuffer (per-core,   AICore writes, AICPU enqueues at
+ *                          rotation time)
  */
 struct ReadyQueueEntry {
     uint32_t core_index;  // Core index (0 ~ num_cores-1), or thread_idx for phase entries
-    uint32_t is_phase;    // 0 = L2PerfRecord, 1 = Phase
+    uint32_t is_phase;    // Buffer kind: 0=L2PerfBuffer, 1=PhaseBuffer, 2=L2PerfAicoreBuffer
     uint64_t buffer_ptr;  // Device pointer to the full buffer
     uint32_t buffer_seq;  // Sequence number for ordering
     uint32_t pad;         // Alignment padding
@@ -447,33 +531,50 @@ inline L2PerfBufferState *get_perf_buffer_state(void *base_ptr, int core_index) 
 }
 
 /**
- * Calculate total memory size including phase profiling region (buffer states only)
+ * Calculate total memory size including AICore states and phase profiling
+ * region (buffer states only, not the record payloads themselves).
+ *
+ * Layout (after the fixed L2PerfDataHeader):
+ *   [L2PerfBufferState × num_cores]
+ *   [L2PerfAicoreBufferState × num_cores]
+ *   [AicpuPhaseHeader]
+ *   [PhaseBufferState × num_sched_threads]
  *
  * @param num_cores Number of AICore instances
  * @param num_sched_threads Number of phase profiling threads (scheduler + orchestrator)
  * @return Total bytes needed for header + all buffer states
  */
 inline size_t calc_perf_data_size_with_phases(int num_cores, int num_sched_threads) {
-    return calc_perf_data_size(num_cores) + sizeof(AicpuPhaseHeader) + num_sched_threads * sizeof(PhaseBufferState);
+    return calc_perf_data_size(num_cores) + num_cores * sizeof(L2PerfAicoreBufferState) + sizeof(AicpuPhaseHeader) +
+           num_sched_threads * sizeof(PhaseBufferState);
 }
 
 /**
- * Get AicpuPhaseHeader pointer (located after L2PerfBufferState array)
- *
- * @param base_ptr Shared memory base address
- * @param num_cores Number of AICore instances
- * @return AicpuPhaseHeader pointer
+ * Get L2PerfAicoreBufferState array start address (located immediately
+ * after the L2PerfBufferState array, before the AicpuPhaseHeader).
+ */
+inline L2PerfAicoreBufferState *get_aicore_buffer_states(void *base_ptr, int num_cores) {
+    return reinterpret_cast<L2PerfAicoreBufferState *>(
+        reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(num_cores)
+    );
+}
+
+inline L2PerfAicoreBufferState *get_aicore_buffer_state(void *base_ptr, int num_cores, int core_index) {
+    return &get_aicore_buffer_states(base_ptr, num_cores)[core_index];
+}
+
+/**
+ * Get AicpuPhaseHeader pointer (located after the L2PerfAicoreBufferState array).
  */
 inline AicpuPhaseHeader *get_phase_header(void *base_ptr, int num_cores) {
-    return reinterpret_cast<AicpuPhaseHeader *>(reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(num_cores));
+    return reinterpret_cast<AicpuPhaseHeader *>(
+        reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(num_cores) +
+        num_cores * sizeof(L2PerfAicoreBufferState)
+    );
 }
 
 /**
  * Get PhaseBufferState array start address (located after AicpuPhaseHeader)
- *
- * @param base_ptr Shared memory base address
- * @param num_cores Number of AICore instances
- * @return PhaseBufferState array pointer
  */
 inline PhaseBufferState *get_phase_buffer_states(void *base_ptr, int num_cores) {
     return reinterpret_cast<PhaseBufferState *>(
@@ -481,14 +582,6 @@ inline PhaseBufferState *get_phase_buffer_states(void *base_ptr, int num_cores) 
     );
 }
 
-/**
- * Get PhaseBufferState for specified thread
- *
- * @param base_ptr Shared memory base address
- * @param num_cores Number of AICore instances
- * @param thread_idx Thread index
- * @return PhaseBufferState pointer
- */
 inline PhaseBufferState *get_phase_buffer_state(void *base_ptr, int num_cores, int thread_idx) {
     return &get_phase_buffer_states(base_ptr, num_cores)[thread_idx];
 }

@@ -43,15 +43,15 @@
 // linker dedup the otherwise-duplicate symbol definitions across the two
 // compilation units.
 [[block_local]] static uint32_t s_aicore_profiling_flag;
-[[block_local]] static __gm__ L2PerfAicoreRing *s_aicore_l2_perf_ring;
+[[block_local]] static __gm__ AicoreRotation *s_aicore_rotation;
 
 __attribute__((weak)) __aicore__ void set_aicore_profiling_flag(uint32_t flag) { s_aicore_profiling_flag = flag; }
 __attribute__((weak)) __aicore__ uint32_t get_aicore_profiling_flag() { return s_aicore_profiling_flag; }
 
-__attribute__((weak)) __aicore__ void set_aicore_l2_perf_ring(__gm__ L2PerfAicoreRing *ring) {
-    s_aicore_l2_perf_ring = ring;
+__attribute__((weak)) __aicore__ void set_aicore_rotation(__gm__ AicoreRotation *rotation) {
+    s_aicore_rotation = rotation;
 }
-__attribute__((weak)) __aicore__ __gm__ L2PerfAicoreRing *get_aicore_l2_perf_ring() { return s_aicore_l2_perf_ring; }
+__attribute__((weak)) __aicore__ __gm__ AicoreRotation *get_aicore_rotation() { return s_aicore_rotation; }
 
 extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 
@@ -68,7 +68,7 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  *
  * Each core (AIC or AIV) gets its own handshake buffer indexed by block_idx.
  * Profiling state flows from KernelArgs into platform-owned per-core slots
- * via set_aicore_profiling_flag() / set_aicore_l2_perf_ring(); the runtime's
+ * via set_aicore_profiling_flag() / set_aicore_rotation(); the runtime's
  * Handshake stays profiling-free and aicore_execute keeps its original
  * signature.
  *
@@ -88,11 +88,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
 
     // Publish per-core profiling state into platform-owned slots before the
     // executor runs. AICore reads via get_aicore_profiling_flag() /
-    // get_aicore_l2_perf_ring() — never touches Handshake for profiling.
+    // get_aicore_rotation() — never touches Handshake for profiling.
     set_aicore_profiling_flag(k_args->enable_profiling_flag);
     if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE)) {
-        __gm__ uint64_t *ring_table = reinterpret_cast<__gm__ uint64_t *>(k_args->aicore_ring_addr);
-        set_aicore_l2_perf_ring(reinterpret_cast<__gm__ L2PerfAicoreRing *>(ring_table[block_idx]));
+        __gm__ uint64_t *rotation_table = reinterpret_cast<__gm__ uint64_t *>(k_args->aicore_ring_addr);
+        set_aicore_rotation(reinterpret_cast<__gm__ AicoreRotation *>(rotation_table[block_idx]));
     }
 
     aicore_execute(k_args->runtime_args, block_idx, core_type);
