@@ -1071,15 +1071,18 @@ int DeviceRunner::finalize() {
     cached_gm_sm_size_ = 0;
     cached_runtime_arena_size_ = 0;
 
-    // Free all remaining allocations
-    mem_alloc_.finalize();
-    clear_cpu_sim_shared_storage();
-
-    // Free the 8-byte device_wall buffer (allocated lazily in run()).
+    // Free the 8-byte device_wall buffer (allocated lazily in run()) before
+    // mem_alloc_.finalize(): free_tensor() routes back through mem_alloc_,
+    // so doing it after finalize would be a use-after-finalize.
     if (device_wall_dev_ptr_ != nullptr) {
         free_tensor(device_wall_dev_ptr_);
         device_wall_dev_ptr_ = nullptr;
     }
+
+    // Free all remaining allocations
+    mem_alloc_.finalize();
+    clear_cpu_sim_shared_storage();
+
     device_id_ = -1;
     worker_count_ = 0;
     last_runtime_ = nullptr;

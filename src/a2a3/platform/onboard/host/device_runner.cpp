@@ -287,19 +287,12 @@ int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, siz
         cached_size = requested_size;
         return 0;
     };
+    // Failure of a later region leaves earlier peers committed on purpose:
+    // pooled pointers previously returned to callers must stay valid even if
+    // this resize attempt aborts.
     if (commit_region(gm_heap_arena_, cached_gm_heap_size_, gm_heap_size) != 0) return -1;
-    if (commit_region(gm_sm_arena_, cached_gm_sm_size_, gm_sm_size) != 0) {
-        gm_heap_arena_.release();
-        cached_gm_heap_size_ = 0;
-        return -1;
-    }
-    if (commit_region(runtime_arena_pool_, cached_runtime_arena_size_, runtime_arena_size) != 0) {
-        gm_heap_arena_.release();
-        gm_sm_arena_.release();
-        cached_gm_heap_size_ = 0;
-        cached_gm_sm_size_ = 0;
-        return -1;
-    }
+    if (commit_region(gm_sm_arena_, cached_gm_sm_size_, gm_sm_size) != 0) return -1;
+    if (commit_region(runtime_arena_pool_, cached_runtime_arena_size_, runtime_arena_size) != 0) return -1;
     return 0;
 }
 

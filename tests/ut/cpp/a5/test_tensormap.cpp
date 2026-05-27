@@ -105,18 +105,19 @@ TEST_F(TensorMapTest, InitValidState) {
     EXPECT_EQ(tmap.valid_count(), 0);
 }
 
-TEST_F(TensorMapTest, InitRequiresPowerOfTwoBuckets) {
-    // Non-power-of-2 bucket counts trip an always_assert inside reserve_layout
-    // (asserting EXPECT_DEATH is impossible in release builds where
-    // always_assert may compile out). Smoke-test only the success path here.
-    PTO2TensorMap bad{};
-    DeviceArena bad_arena;
+TEST_F(TensorMapTest, InitWithPowerOfTwoBucketsSucceeds) {
+    // The reject path for non-power-of-2 bucket counts is enforced via an
+    // always_assert inside reserve_layout. It is not asserted here because
+    // EXPECT_DEATH cannot run reliably in release builds where always_assert
+    // may compile out. Cover only the accepted (power-of-2) shape.
+    PTO2TensorMap ok{};
+    DeviceArena ok_arena;
     int32_t ws[PTO2_MAX_RING_DEPTH] = {8, 8, 8, 8};
-    auto layout = PTO2TensorMap::reserve_layout(bad_arena, 8, 64, ws);
-    ASSERT_NE(bad_arena.commit(), nullptr);
-    EXPECT_TRUE(bad.init_data_from_layout(layout, bad_arena));
-    bad.wire_arena_pointers(layout, bad_arena);
-    bad.destroy();
+    auto layout = PTO2TensorMap::reserve_layout(ok_arena, 8, 64, ws);
+    ASSERT_NE(ok_arena.commit(), nullptr);
+    EXPECT_TRUE(ok.init_data_from_layout(layout, ok_arena));
+    ok.wire_arena_pointers(layout, ok_arena);
+    ok.destroy();
 }
 
 // =============================================================================

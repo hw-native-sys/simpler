@@ -281,8 +281,16 @@ extern "C" int bind_prepared_to_runtime_impl(
     // determined by replaying the reserve sequence on a host-side arena.
     uint64_t total_heap_size = eff_heap_size * PTO2_MAX_RING_DEPTH;
     uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(eff_task_window_size);
-    int32_t eff_dep_pool_capacity =
-        runtime->dep_pool_size ? static_cast<int32_t>(runtime->dep_pool_size) : PTO2_DEP_LIST_POOL_SIZE;
+    // dep_pool_size comes from a uint64 env var; reject values that don't fit
+    // the int32_t layout-sizing path rather than silently truncating.
+    int32_t eff_dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
+    if (runtime->dep_pool_size != 0) {
+        if (runtime->dep_pool_size > static_cast<uint64_t>(INT32_MAX)) {
+            LOG_ERROR("PTO2_RING_DEP_POOL=%" PRIu64 " exceeds INT32_MAX", runtime->dep_pool_size);
+            return -1;
+        }
+        eff_dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
+    }
 
     int64_t t_prebuilt_start = _now_ms();
     DeviceArena host_arena;  // libc malloc backend by default

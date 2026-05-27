@@ -1085,6 +1085,15 @@ int DeviceRunner::finalize() {
     cached_gm_sm_size_ = 0;
     cached_runtime_arena_size_ = 0;
 
+    // Free the 8-byte device_wall buffer (allocated lazily in run()) while
+    // mem_alloc_ and the device context are still live. free_tensor() routes
+    // through mem_alloc_.free(), so it must run before finalize() and before
+    // rtDeviceReset() tears down the device runtime.
+    if (device_wall_dev_ptr_ != nullptr) {
+        free_tensor(device_wall_dev_ptr_);
+        device_wall_dev_ptr_ = nullptr;
+    }
+
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
 
@@ -1094,11 +1103,6 @@ int DeviceRunner::finalize() {
         return rc;
     }
 
-    // Free the 8-byte device_wall buffer (allocated lazily in run()).
-    if (device_wall_dev_ptr_ != nullptr) {
-        free_tensor(device_wall_dev_ptr_);
-        device_wall_dev_ptr_ = nullptr;
-    }
     device_id_ = -1;
     block_dim_ = 0;
     worker_count_ = 0;
