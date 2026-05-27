@@ -137,47 +137,6 @@ int KernelArgsHelper::finalize_device_kernel_args() {
 }
 
 // =============================================================================
-// AicpuSoInfo Implementation
-// =============================================================================
-
-int AicpuSoInfo::init(const std::vector<uint8_t> &aicpu_so_binary, MemoryAllocator &allocator) {
-    allocator_ = &allocator;
-
-    if (aicpu_so_binary.empty()) {
-        LOG_ERROR("AICPU binary is empty");
-        return -1;
-    }
-
-    size_t file_size = aicpu_so_binary.size();
-    void *d_aicpu_data = allocator_->alloc(file_size);
-    if (d_aicpu_data == nullptr) {
-        LOG_ERROR("Alloc failed for AICPU SO");
-        return -1;
-    }
-
-    int rc = rtMemcpy(d_aicpu_data, file_size, aicpu_so_binary.data(), file_size, RT_MEMCPY_HOST_TO_DEVICE);
-    if (rc != 0) {
-        LOG_ERROR("rtMemcpy failed: %d", rc);
-        allocator_->free(d_aicpu_data);
-        d_aicpu_data = nullptr;
-        return rc;
-    }
-
-    aicpu_so_bin = reinterpret_cast<uint64_t>(d_aicpu_data);
-    aicpu_so_len = file_size;
-    return 0;
-}
-
-int AicpuSoInfo::finalize() {
-    if (aicpu_so_bin != 0 && allocator_ != nullptr) {
-        int rc = allocator_->free(reinterpret_cast<void *>(aicpu_so_bin));
-        aicpu_so_bin = 0;
-        return rc;
-    }
-    return 0;
-}
-
-// =============================================================================
 // DeviceRunner Implementation
 // =============================================================================
 
@@ -401,29 +360,25 @@ int DeviceRunner::ensure_binaries_loaded() {
     }
     LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_init/exec handles ready)");
 
-    // H2D copy aicpu kernel SO bytes and stamp the resulting device pointer
-    // into device_args_.aicpu_so_bin/len. Our own runtime AICPU SO never
-    // reads these fields, but the H2D allocation is load-bearing on a5
-    // onboard — dropping it surfaces 507899 stream-create failures from
-    // the next rtStreamCreate call.
-    rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
-    if (rc != 0) {
-        LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
-        return rc;
-    }
-    device_args_.aicpu_so_bin = so_info_.aicpu_so_bin;
-    device_args_.aicpu_so_len = so_info_.aicpu_so_len;
+    // H2D the per-task DeviceArgs struct itself. device_args_.aicpu_so_bin/len
+    // stay zero — our own per-task AICPU code (launched via rtsLaunchCpuKernel
+    // against the cached rtFuncHandle on LoadAicpuOp) never reads them, and
+    // the dispatcher-bootstrap KernelArgs (KERNEL_TYPE_AICPU_KFC) builds its
+    // own DeviceArgs view inside BootstrapDispatcher rather than reading
+    // ours. The "load-bearing on a5" finding documented prior to #864/#870
+    // no longer reproduces against current HEAD — see PR removing
+    // AicpuSoInfo (CI on both archs green).
     rc = kernel_args_.init_device_args(device_args_, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("init_device_args failed: %d", rc);
-        so_info_.finalize();
         return rc;
     }
 
-    // Release host bytes — per-task launches use the cached rtFuncHandle on
-    // LoadAicpuOp; dispatcher SO bytes are never referenced again; the
-    // aicpu kernel SO's host buffer is free to drop now that so_info_
-    // already H2D'd the bytes above.
+    // Release host bytes — bootstrap is done. Per-task launches go through
+    // the cached rtFuncHandle owned by LoadAicpuOp; dispatcher SO bytes are
+    // never referenced again; the aicpu kernel SO's host buffer is no longer
+    // needed either (we used to H2D it through AicpuSoInfo as a CANN-internal
+    // bookkeeping workaround; that's gone).
     dispatcher_so_binary_.clear();
     dispatcher_so_binary_.shrink_to_fit();
     aicpu_so_binary_.clear();
@@ -1017,9 +972,6 @@ int DeviceRunner::finalize() {
     // Cleanup kernel args (deviceArgs); device-side KernelArgs + runtime args
     // are released by runtime_args_cleanup RAII so they also unwind on errors.
     kernel_args_.finalize_device_args();
-
-    // Cleanup AICPU SO H2D allocation
-    so_info_.finalize();
 
     // load_aicpu_op_ has no per-task host-side state to release —
     // rtsLaunchCpuKernel does not hand back any per-launch handle, and the

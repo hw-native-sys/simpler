@@ -17,7 +17,6 @@
  * Key Components:
  * - DeviceArgs: AICPU device argument structure
  * - KernelArgsHelper: Helper for managing kernel arguments with device memory
- * - AicpuSoInfo: AICPU shared object (.so) file management
  * - DeviceRunner: kernel launching and execution
  */
 
@@ -57,34 +56,20 @@
 /**
  * DeviceArgs structure for AICPU device arguments.
  *
- * Layout is fixed by libaicpu_extend_kernels.so at the offsets for
- * aicpu_so_bin / aicpu_so_len. Per-task AICPU launches go through
- * rtsLaunchCpuKernel against the cached rtFuncHandle on LoadAicpuOp and
- * do not read these fields, but the device-side AicpuSoInfo allocation
- * pointed to by them is still load-bearing on a5 onboard: dropping it
- * surfaces 507899 stream-create failures on the next rtStreamCreate call.
- * The exact reason is opaque CANN-internal state, so we keep the H2D copy
- * as part of the device-side ABI contract.
+ * Layout offsets are still nominally fixed by libaicpu_extend_kernels.so for
+ * aicpu_so_bin / aicpu_so_len (at offsets 96 / 104), but per-task AICPU
+ * launches go through rtsLaunchCpuKernel against the cached rtFuncHandle on
+ * LoadAicpuOp — none of our code reads these fields. The fields are kept
+ * (zero-initialized, never assigned) so the H2D struct layout matches the
+ * historical contract on both archs; an earlier "the H2D allocation pointed
+ * to by aicpu_so_bin is load-bearing on a5 onboard" finding no longer
+ * reproduces against current HEAD (post #864/#870), so the runner-side
+ * AicpuSoInfo allocation was removed.
  */
 struct DeviceArgs {
     uint64_t unused[12] = {0};
     uint64_t aicpu_so_bin{0};
     uint64_t aicpu_so_len{0};
-};
-
-/**
- * Host→device copy of the runtime AICPU SO bytes that backs
- * DeviceArgs.aicpu_so_bin / aicpu_so_len. The bytes are not dereferenced
- * by our own kernels; the H2D allocation itself is the load-bearing part.
- * See DeviceArgs comment for the failure mode if dropped.
- */
-struct AicpuSoInfo {
-    uint64_t aicpu_so_bin{0};
-    uint64_t aicpu_so_len{0};
-    MemoryAllocator *allocator_{nullptr};
-
-    int init(const std::vector<uint8_t> &aicpu_so_binary, MemoryAllocator &allocator);
-    int finalize();
 };
 
 /**
@@ -463,8 +448,9 @@ public:
      *   3. Registers the inner SO via `LoadAicpuOp::Init`
      *      (`rtsBinaryLoadFromFile` + `rtsFuncGetByName`) and caches the
      *      resulting per-symbol `rtFuncHandle` for per-task `rtsLaunchCpuKernel`.
-     *   4. Allocates the device-side AicpuSoInfo H2D copy and stamps
-     *      `device_args_.aicpu_so_bin/len` (load-bearing on a5 onboard).
+     *   4. H2D-copies the (zeroed) per-task DeviceArgs struct via
+     *      `kernel_args_.init_device_args`. device_args_.aicpu_so_bin/len
+     *      stay 0 — no consumer reads them on the per-task path.
      *
      * Called once from `simpler_init` after the executor + dispatcher bytes are
      * cached on the runner. Idempotent: subsequent calls short-circuit on
@@ -645,7 +631,6 @@ private:
     // Device resources
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
-    AicpuSoInfo so_info_;
     KernelArgsHelper kernel_args_;
 
     // Platform-level device wall buffer: 8-byte device-resident slot whose
