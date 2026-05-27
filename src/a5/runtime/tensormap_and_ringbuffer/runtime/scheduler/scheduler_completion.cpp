@@ -83,28 +83,41 @@ void SchedulerContext::complete_slot_task(
 #endif
     bool mixed_complete = sched_->on_subtask_complete(slot_state);
     if (slot_state.payload != nullptr) {
-        int32_t reg_err = PTO2_ERROR_NONE;
-        AsyncWaitList::RegisterResult reg_result;
         volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
         AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
-        do {
-            reg_result = sched_->async_wait_list.register_deferred(slot_state, async_ctx, mixed_complete, reg_err);
-            if (reg_result == AsyncWaitList::RegisterResult::Skipped) {
-                SPIN_WAIT_HINT();
+        // Fast path: when the kernel did not register any completion
+        // condition for this task AND the global wait list / pending queue
+        // are empty, register_deferred would acquire busy, find no entry,
+        // observe deferred_count==0, and return NotDeferred. Skip the CAS
+        // outright. Race-safe: AICore publishes slab.count BEFORE the FIN
+        // state we read via the COND register, so a deferred_count==0 here
+        // means the kernel never called register_completion_condition for
+        // this task.
+        bool skip_register = (*async_ctx.completion_count == 0 &&
+                              sched_->async_wait_list.count == 0 &&
+                              sched_->async_wait_list.pending_completion_count == 0);
+        if (!skip_register) {
+            int32_t reg_err = PTO2_ERROR_NONE;
+            AsyncWaitList::RegisterResult reg_result;
+            do {
+                reg_result = sched_->async_wait_list.register_deferred(slot_state, async_ctx, mixed_complete, reg_err);
+                if (reg_result == AsyncWaitList::RegisterResult::Skipped) {
+                    SPIN_WAIT_HINT();
+                }
+            } while (reg_result == AsyncWaitList::RegisterResult::Skipped);
+
+            if (reg_result == AsyncWaitList::RegisterResult::Error) {
+                int32_t expected = PTO2_ERROR_NONE;
+                sched_->sm_header->sched_error_code.compare_exchange_strong(
+                    expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
+                );
+                completed_.store(true, std::memory_order_release);
+                return;
             }
-        } while (reg_result == AsyncWaitList::RegisterResult::Skipped);
 
-        if (reg_result == AsyncWaitList::RegisterResult::Error) {
-            int32_t expected = PTO2_ERROR_NONE;
-            sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
-            );
-            completed_.store(true, std::memory_order_release);
-            return;
-        }
-
-        if (mixed_complete && reg_result == AsyncWaitList::RegisterResult::Registered) {
-            return;
+            if (mixed_complete && reg_result == AsyncWaitList::RegisterResult::Registered) {
+                return;
+            }
         }
     }
     if (mixed_complete) {
