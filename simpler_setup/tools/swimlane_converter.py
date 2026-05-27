@@ -92,7 +92,8 @@ def read_perf_data(filepath):
         filepath: Path to input JSON file
 
     Returns:
-        dict: Parsed performance data with key:
+        dict: Parsed performance data with keys:
+            - l2_perf_level
             - tasks (list)
 
     Raises:
@@ -101,8 +102,13 @@ def read_perf_data(filepath):
     with open(filepath) as f:
         data = json.load(f)
 
-    if "tasks" not in data:
-        raise ValueError("Missing required field: tasks")
+    required_fields = ["l2_perf_level", "tasks"]
+    for field in required_fields:
+        if field not in data:
+            raise ValueError(f"Missing required field: {field}")
+
+    if data["l2_perf_level"] not in [1, 2, 3, 4]:
+        raise ValueError(f"Unsupported l2_perf_level: {data['l2_perf_level']} (expected 1, 2, 3, or 4)")
 
     return data
 
@@ -134,13 +140,6 @@ def load_deps_json(deps_path):
     edges = data.get("edges")
     if not isinstance(edges, list):
         print(f"Warning: {deps_path} has no 'edges' array", file=sys.stderr)
-        return None
-    version = data.get("version")
-    if version != 2:
-        print(
-            f"Warning: {deps_path} version={version!r}; only v2 is supported.",
-            file=sys.stderr,
-        )
         return None
     # The converter only needs flow-event endpoints (not the per-edge tensor
     # annotations). Project annotated edges down to a (pred, succ) set and
@@ -394,15 +393,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         output_path: Path to output JSON file
         func_id_to_name: Optional dict mapping func_id to function name
         verbose: Print progress information
-        scheduler_phases: Optional list of per-thread phase record lists (version 2)
-        orchestrator_phases: Optional list of per-task orchestrator phase records (version 2)
+        scheduler_phases: Optional list of per-thread phase record lists (l2_perf_level >= 3)
+        orchestrator_phases: Optional list of per-task orchestrator phase records (l2_perf_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
 
     Generates processes in the trace:
         - pid=1 "AICore View": start_time_us to end_time_us (kernel execution)
         - pid=2 "AICPU View": dispatch_time_us to finish_time_us (AICPU perspective)
-        - pid=3 "AICPU Scheduler": scheduler phase bars (version 2)
-        - pid=4 "AICPU Orchestrator": orchestrator phase bars or summary (version 2)
+        - pid=3 "AICPU Scheduler": scheduler phase bars (l2_perf_level >= 3)
+        - pid=4 "AICPU Orchestrator": orchestrator phase bars or summary (l2_perf_level >= 4)
     """
     if verbose:
         print("Generating Chrome Trace JSON...")
@@ -699,7 +698,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         if hb_violation_count > 0:
             print(f"  Happens-before violations: {hb_violation_count} edge(s) flagged as 'hb_violation'")
 
-    # AICPU Scheduler phase events (version 2)
+    # AICPU Scheduler phase events (l2_perf_level >= 3)
     if scheduler_phases:
         # Process metadata
         events.append(
@@ -756,7 +755,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 }
                 events.append(event)
 
-    # AICPU Orchestrator lane (version 2)
+    # AICPU Orchestrator lane (l2_perf_level >= 4)
     #
     # Per-event AicpuPhaseRecord[] is the single source of truth for
     # orchestrator timing. There is no separate aggregate summary — the
@@ -1147,10 +1146,12 @@ def _resolve_output_path(args, input_path):
 
 
 def _print_verbose_data_info(data, verbose):
-    """Print verbose summary of loaded performance data including phase counts."""
+    """Print verbose summary of loaded performance data, including phase counts
+    when present (l2_perf_level >= SCHED_PHASES)."""
     if not verbose:
         return
     print("\n=== Performance Data ===")
+    print(f"  L2 perf level: {data['l2_perf_level']}")
     print(f"  Task Count: {len(data['tasks'])}")
     if data["tasks"]:
         start_times = [t["start_time_us"] for t in data["tasks"]]

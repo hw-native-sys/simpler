@@ -92,7 +92,8 @@ int SchedulerContext::pop_ready_tasks_batch(
     int count = sched_->get_ready_tasks_batch(shape, local_buf, out, max_count);
 #endif
     // pop_hit / pop_miss are PTO2_PROFILING-gated (not the inner verbose tier)
-    // so the v2 JSON dispatch records carry queue-health stats on default builds.
+    // so dispatch-phase records in aicpu_scheduler_phases[] carry queue-health
+    // stats on default builds.
     if (count > 0) {
         l2_perf.pop_hit += count;
     } else {

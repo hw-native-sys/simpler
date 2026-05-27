@@ -11,7 +11,8 @@
 
 Inputs:
   1. Per-task perf profiling data (l2_perf_records_*.json) with
-     ``aicpu_scheduler_phases`` populated by ``--enable-l2-swimlane``.
+     ``aicpu_scheduler_phases`` populated by ``--enable-l2-swimlane`` at
+     level >= 3.
   2. deps.json (optional, dep_gen replay output) colocated with the perf JSON,
      used to derive per-thread fanout / fanin DAG stats.
 
@@ -29,8 +30,9 @@ from pathlib import Path
 
 
 def _to_uint64(v):
-    """Coerce JSON-encoded uint64 (int or string after the deps.json v2 schema
-    bump in #769) to a Python int. Returns None when unparseable."""
+    """Coerce a JSON-encoded uint64 (int, or string — deps.json quotes uint64s
+    so JavaScript-based consumers don't lose precision past 2^53 - 1) to a
+    Python int. Returns None when unparseable."""
     try:
         n = int(v)
     except (TypeError, ValueError):
@@ -292,7 +294,7 @@ def run_analysis(  # noqa: PLR0912, PLR0915
         print_sources: Whether to print selected input files.
         perf_data: Optional pre-parsed perf JSON dict. When provided, skip
             re-reading from disk — main() already parses the file to probe
-            for v2 phase data, so passing the result through saves a second
+            for phase data, so passing the result through saves a second
             load on large artifacts.
         deps_json_path: Optional deps.json (dep_gen replay output) co-located
             with the perf JSON. When present, per-thread fanout / fanin
@@ -485,7 +487,7 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     else:
         pop_hit = pop_miss = 0
         pop_hit_rate = 0.0
-        print("  Pop: (no per-emit pop deltas in input — needs --enable-l2-swimlane)")
+        print("  Pop: (no per-emit pop deltas in input — needs --enable-l2-swimlane at level >= 3)")
 
     print()
     print("=" * 90)

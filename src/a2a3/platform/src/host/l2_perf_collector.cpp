@@ -595,7 +595,9 @@ int L2PerfCollector::export_swimlane_json() {
     // Fanout fields are emitted as empty/zero — the device-side hot path no
     // longer carries them. Downstream (swimlane_converter.py) joins fanout
     // from the sibling deps.json (dep_gen output).
+    int l2_perf_level = static_cast<int>(l2_perf_level_);
     outfile << "{\n";
+    outfile << "  \"l2_perf_level\": " << l2_perf_level << ",\n";
     outfile << "  \"tasks\": [\n";
 
     for (size_t i = 0; i < tagged_records.size(); ++i) {

@@ -142,15 +142,15 @@ class TestDepGen(SceneTestCase):
             return
         with deps_path.open() as f:
             deps = json.load(f)
-        # v3 schema: annotated edges with tasks[] / tensors[] sidecars carrying
-        # strided slice descriptors (start_offset + stride[]). Project annotated
-        # edges down to a (pred, succ) set for the existing structural checks;
-        # the annotation sanity check below verifies the tensor metadata path.
-        assert deps.get("version") == 3, f"deps.json version {deps.get('version')} != 3"
+        # Strided-Tensor schema: annotated edges with tasks[] / tensors[]
+        # sidecars carrying strided slice descriptors (start_offset +
+        # stride[]). Project annotated edges down to a (pred, succ) set for
+        # the existing structural checks; the annotation sanity check below
+        # verifies the tensor metadata path.
         raw_edges = deps.get("edges", [])
         deps_edges = set()
         for e in raw_edges:
-            assert isinstance(e, dict), f"v2 edge must be an object, got {type(e).__name__}: {e!r}"
+            assert isinstance(e, dict), f"deps.json edge must be an object, got {type(e).__name__}: {e!r}"
             pred, succ = e.get("pred"), e.get("succ")
             if pred is None or succ is None:
                 continue
@@ -174,13 +174,13 @@ class TestDepGen(SceneTestCase):
         bad = {e for e in deps_edges if e[0] not in valid_ids or e[1] not in valid_ids}
         assert not bad, f"deps.json contains edges referencing unknown task ids: {bad}"
 
-        # ---- v2 annotated-edge sanity ----
-        # Replay always emits the v2 schema with the tensor-info sidecar; the
-        # differential check inside the replay would have failed the run before
-        # we got here if the annotated pass disagreed with compute_task_fanin.
-        # These assertions just confirm the schema actually carries the
-        # expected blocks (so e.g. a future "always write empty arrays" bug
-        # would surface here, not silently in a downstream viewer).
+        # ---- Annotated-edge sanity ----
+        # Replay always emits the tensor-info sidecar; the differential check
+        # inside the replay would have failed the run before we got here if
+        # the annotated pass disagreed with compute_task_fanin. These
+        # assertions just confirm the schema actually carries the expected
+        # blocks (so e.g. a future "always write empty arrays" bug would
+        # surface here, not silently in a downstream viewer).
         tasks = deps.get("tasks", [])
         tensors = deps.get("tensors", [])
         task_ids = {int(t["task_id"]) for t in tasks if "task_id" in t}

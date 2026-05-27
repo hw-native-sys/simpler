@@ -53,6 +53,7 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
 
     with perf.open() as f:
         data = json.load(f)
+    assert data.get("l2_perf_level") in (1, 2, 3, 4), f"unexpected l2_perf_level: {data.get('l2_perf_level')}"
     tasks = data.get("tasks")
     assert isinstance(tasks, list), "tasks field missing or not a list"
     assert len(tasks) > 0, f"perf records empty under {perf}"

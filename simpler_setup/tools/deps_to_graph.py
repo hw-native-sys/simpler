@@ -46,7 +46,7 @@ from pathlib import Path
 def _normalize_task_id(v):
     """Unsigned 64-bit task id (matches deps.json edges and l2_perf task_id).
 
-    Accepts ints (legacy) and strings (current schema): deps.json v2 emits all
+    Accepts ints (legacy) and strings (current schema): deps.json emits all
     uint64 fields as quoted strings to dodge JSON-number precision loss in
     JavaScript-based consumers, since tensor_ids (FNV hashes) and buffer
     addresses routinely exceed Number.MAX_SAFE_INTEGER (2^53 - 1)."""
@@ -107,31 +107,26 @@ def _make_task_formatter(nodes):
 
 
 def _load_deps_edges(deps_path):
-    """Parse deps.json (v2) into renderer-friendly pieces.
+    """Parse deps.json into renderer-friendly pieces.
 
     Returns a 5-tuple:
         edges: sorted list of unique (pred, succ) pairs — what the graph
-            renders as arrows. v2 may have multiple annotated edges sharing
-            the same (pred, succ) (distinct arg / source / slice); they
-            collapse to one arrow here.
+            renders as arrows. Multiple annotated edges sharing the same
+            (pred, succ) (distinct arg / source / slice) collapse to one
+            arrow here.
         nodes: sorted list of all referenced task ids.
         annotations: dict[(pred, succ) -> list[dict]] of annotation rows
-            (one per annotated edge in v2), keyed in insertion order so
+            (one per annotated edge), keyed in insertion order so
             ``--show-tensor-info`` can resolve per-edge tensor identities
             and target the right input port on the consumer node.
-        tensor_table: dict[tensor_id -> dict] from the v2 tensors[] block.
-        task_table: dict[task_id -> dict] from the v2 tasks[] block,
+        tensor_table: dict[tensor_id -> dict] from the tensors[] block.
+        task_table: dict[task_id -> dict] from the tasks[] block,
             carrying the per-arg input/output slot info that the
             ``--show-tensor-info`` view renders as compartments inside each
             task node.
-
-    Raises ValueError if ``version`` is not 3 — older versions are no longer supported.
     """
     with open(deps_path) as f:
         data = json.load(f)
-    version = data.get("version")
-    if version != 3:
-        raise ValueError(f"deps.json version={version!r}; only v3 is supported (regenerate with current dep_gen)")
     edges_raw = data.get("edges", [])
     seen: set[tuple[int, int]] = set()
     edges: list[tuple[int, int]] = []
@@ -400,9 +395,8 @@ def _arg_row_html(arg, tensor_table, side):
     tname = _short_tensor_label(tid, tensor_table)
     dtype = arg.get("dtype")
     shape = arg.get("shape")
-    # v3 schema: per-slot strided descriptor (start_offset is uint64 quoted as
-    # string, stride is per-dim int32 array). Older v2 args used a multi-dim
-    # `offset` array — viewers consuming older logs should bump producer first.
+    # Strided-Tensor per-slot descriptor: start_offset is uint64 quoted as
+    # string, stride is per-dim int32 array.
     start_offset = arg.get("start_offset")
     strides = arg.get("strides")
     buffer_numel = None
@@ -573,7 +567,7 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
         # port; pick one representative annotation per (pred, succ) for the
         # producer-port match (multiple annotations sharing the pair all
         # target the same arg in practice — distinct args produce distinct
-        # edges in v2).
+        # edges).
         rows = annotations.get((pred, succ), [])
         if not rows:
             lines.append(f"  {_node_id(pred)} -> {_node_id(succ)};")
