@@ -174,7 +174,9 @@ struct KernelArgsHelper {
 class DeviceRunner {
 public:
     DeviceRunner() :
-        static_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
+        gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+        gm_sm_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+        runtime_arena_pool_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
     ~DeviceRunner();
 
     /**
@@ -522,21 +524,26 @@ private:
     // Memory management
     MemoryAllocator mem_alloc_;
 
-    // Per-Worker arena backing the PTO2 GM heap + PTO2 shared memory in a
-    // single device allocation. Released explicitly in finalize() before
-    // mem_alloc_.finalize() so it does not free pointers a second time.
+    // Three independent per-Worker arenas, each backing a single pooled
+    // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime
+    // arena). Split out from a single backing allocation because the
+    // combined size can exceed the device allocator's largest contiguous
+    // block. Released explicitly in finalize() before mem_alloc_.finalize()
+    // so the underlying buffers do not get freed twice.
+    //
+    // `runtime_arena_pool_` stays unreserved when setup_static_arena was
+    // invoked with runtime_arena_size == 0 (hbg path).
     //
     // Trampolines forward DeviceArena's alloc/free calls to mem_alloc_.
     static void *arena_alloc_trampoline(void *ctx, size_t size) {
         return static_cast<MemoryAllocator *>(ctx)->alloc(size);
     }
     static void arena_free_trampoline(void *ctx, void *p) { static_cast<MemoryAllocator *>(ctx)->free(p); }
-    DeviceArena static_arena_;
-    size_t gm_heap_region_off_{SIZE_MAX};
-    size_t gm_sm_region_off_{SIZE_MAX};
-    size_t runtime_arena_region_off_{SIZE_MAX};
-    // Cached sizes for setup_static_arena's "fits" check — avoids calling
-    // region_size() on the arena's public API for the two regions we own.
+    DeviceArena gm_heap_arena_;
+    DeviceArena gm_sm_arena_;
+    DeviceArena runtime_arena_pool_;
+    // Cached sizes for setup_static_arena's "fits" check — avoids re-allocating
+    // a buffer when a later worker init asks for an equal-or-smaller layout.
     size_t cached_gm_heap_size_{0};
     size_t cached_gm_sm_size_{0};
     size_t cached_runtime_arena_size_{0};
