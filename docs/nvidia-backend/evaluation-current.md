@@ -159,6 +159,27 @@ to three descriptor families that are closer to model-kernel tile shapes. The
 kernel body is still scalar tiled GEMM followed by elementwise residual/gate
 work, so the result should not be read as tensor-core throughput.
 
+## Supplemental Tensor Baseline Sweep
+
+The first multi-baseline tensor shape sweep was captured at commit `6f9a0b78`
+under `tmp/cuda-backend/tensor-shape-sweep-6f9a0b78/`. It runs one repeat for
+two WMMA-compatible descriptors and compares the scalar tensor DAG,
+`pto_persistent_dag_tensor_core`, and `cublas_sgemm` in one Markdown/SVG
+report. Each row uses `N=256`.
+
+| GPU | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns |
+| --- | ----- | ---------------- | -------------- | --------- |
+| A100 | 16x16x16 | 35840 | 36864 | 48128 |
+| A100 | 16x16x64 | 40960 | 39936 | 49152 |
+| H200 | 16x16x16 | 36128 | 33280 | 57983 |
+| H200 | 16x16x64 | 45984 | 40096 | 54976 |
+
+The tensor-core rows use dispatch `10,1,2,1`, while the scalar tensor rows use
+`3,1,2,1`. cuBLAS rows have no PTO dispatch sequence because they run through
+CUDA Runtime API plus cuBLAS directly. This report is still a compact
+microbenchmark with one repeat; it is useful for keeping the selected tensor
+baseline comparison visible, not for throughput tuning.
+
 ## Tensor-Core Callable Smoke
 
 The first tensor-core persistent DAG smoke was captured at commit `390eda4f`.

@@ -251,6 +251,13 @@ around a warm cuBLAS `cublasSgemmStridedBatched` call over the configured
 `32960 ns`. This row is a CUDA library launch/compute comparison point, not a
 PTO runtime path.
 
+The tensor shape sweep script now accepts `--baselines`, so one paired
+A100/H200 sweep can compare scalar tensor DAG, WMMA tensor-core DAG, and
+cuBLAS SGEMM rows. The first compact comparison report at commit `6f9a0b78`
+uses `16x16x16` and `16x16x64` descriptors with `N=256` and one repeat. The
+artifact under `tmp/cuda-backend/tensor-shape-sweep-6f9a0b78/` writes raw
+rows, a median summary table, and an SVG chart.
+
 Evidence:
 
 - [evaluation.md](evaluation.md) is the evaluation landing page.
