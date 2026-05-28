@@ -315,6 +315,53 @@ def _format_number(value: int | float) -> str:
     return str(value)
 
 
+def _format_gflops(value: float | None) -> str:
+    return "-" if value is None else f"{value:.2f}"
+
+
+def _shape_dims(row: dict[str, Any], shape: str) -> tuple[int, int, int] | None:
+    tensor_tile = row.get("tensor_tile")
+    if isinstance(tensor_tile, dict):
+        rows = tensor_tile.get("rows")
+        cols = tensor_tile.get("cols")
+        inner = tensor_tile.get("inner")
+        if (
+            isinstance(rows, int)
+            and isinstance(cols, int)
+            and isinstance(inner, int)
+        ):
+            return rows, cols, inner
+    parts = shape.split("x")
+    if len(parts) != 3:
+        return None
+    try:
+        rows, cols, inner = (int(part) for part in parts)
+    except ValueError:
+        return None
+    return rows, cols, inner
+
+
+def _tensor_flops(
+    row: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+) -> int | None:
+    dims = _shape_dims(row, str(row.get("shape", "-")))
+    if dims is None:
+        return None
+    rows, cols, inner = dims
+    tensor_tile = row.get("tensor_tile")
+    tile_count = tensor_tile.get("tile_count") if isinstance(tensor_tile, dict) else None
+    if not isinstance(tile_count, int):
+        n = _row_n(row, metadata)
+        if not isinstance(n, int):
+            return None
+        output_elements = rows * cols
+        if output_elements <= 0 or n % output_elements != 0:
+            return None
+        tile_count = n // output_elements
+    return 2 * tile_count * rows * cols * inner
+
+
 def _source_paper_summary(metadata: dict[str, Any]) -> str:
     papers = metadata.get("source_papers") or SOURCE_PAPERS
     parts = []
@@ -340,7 +387,10 @@ def _row_n(row: dict[str, Any], metadata: dict[str, Any] | None = None) -> int |
         return "-"
 
 
-def _median_summary_rows(results: list[dict[str, Any]], metadata: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def _median_summary_rows(
+    results: list[dict[str, Any]],
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
     for row in results:
         if row.get("status") != "pass":
@@ -353,11 +403,16 @@ def _median_summary_rows(results: list[dict[str, Any]], metadata: dict[str, Any]
             str(row.get("shape", "-")),
             _tile_count(row),
         )
-        group = groups.setdefault(key, {"device": [], "host": []})
+        group = groups.setdefault(key, {"device": [], "host": [], "flops": []})
         group["device"].append(int(row.get("device_wall_ns", 0)))
         group["host"].append(int(row.get("host_wall_ns", 0)))
+        flops = _tensor_flops(row, metadata)
+        if flops is not None:
+            group["flops"].append(flops)
     summary: list[dict[str, Any]] = []
     for (artifact, machine, baseline, n, shape, tiles), values in groups.items():
+        median_device = statistics.median(values["device"])
+        flops = values["flops"][0] if values["flops"] else None
         summary.append(
             {
                 "artifact": artifact,
@@ -365,8 +420,13 @@ def _median_summary_rows(results: list[dict[str, Any]], metadata: dict[str, Any]
                 "baseline": baseline,
                 "n": n,
                 "shape": shape,
-                "median_device_wall_ns": statistics.median(values["device"]),
+                "median_device_wall_ns": median_device,
                 "median_host_wall_ns": statistics.median(values["host"]),
+                "median_gflops": (
+                    float(flops) / float(median_device)
+                    if flops is not None and median_device
+                    else None
+                ),
                 "samples": len(values["device"]),
                 "tiles": tiles,
             }
@@ -416,15 +476,15 @@ def render_markdown(payload: dict[str, Any]) -> str:
                 "",
                 "## Median Summary",
                 "",
-                "| Artifact | Machine | Baseline | N | Shape | Median device ns | Median host ns | Samples |",
-                "| -------- | ------- | -------- | - | ----- | ---------------- | -------------- | ------- |",
+                "| Artifact | Machine | Baseline | N | Shape | Median device ns | Median host ns | Median GF/s | Samples |",
+                "| -------- | ------- | -------- | - | ----- | ---------------- | -------------- | ----------- | ------- |",
             ]
         )
         for row in summary_rows:
             lines.append(
                 f"| {row['artifact']} | {row['machine']} | {row['baseline']} | {row['n']} | {row['shape']} | "
                 f"{_format_number(row['median_device_wall_ns'])} | {_format_number(row['median_host_wall_ns'])} | "
-                f"{row['samples']} |"
+                f"{_format_gflops(row['median_gflops'])} | {row['samples']} |"
             )
     lines.append("")
     return "\n".join(lines)

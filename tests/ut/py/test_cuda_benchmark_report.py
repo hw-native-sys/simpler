@@ -1239,8 +1239,8 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
     )
     assert "| h200 | h200 | cublas_sgemm | 8192 | 8x4x12 | 0 | pass | 800 | 1200 | 128 | `3,1,2,1` |" in markdown
     assert "## Median Summary" in markdown
-    assert "| a100 | hina | pto_persistent_dag_tensor | 4096 | 8x4x12 | 1000 | 1500 | 1 |" in markdown
-    assert "| h200 | h200 | cublas_sgemm | 8192 | 8x4x12 | 800 | 1200 | 1 |" in markdown
+    assert "| a100 | hina | pto_persistent_dag_tensor | 4096 | 8x4x12 | 1000 | 1500 | 98.30 | 1 |" in markdown
+    assert "| h200 | h200 | cublas_sgemm | 8192 | 8x4x12 | 800 | 1200 | 122.88 | 1 |" in markdown
     assert "tensor-shape-sweep-abc123" in svg
     assert "Median device ns" in svg
     assert "samples=1" in svg
@@ -3073,11 +3073,12 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
     table = cuda_current_summary.render_tensor_sweep_table(payload)
 
     assert (
-        "| GPU | N | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns | Tensor-core/scalar | cuBLAS/scalar |"
+        "| GPU | N | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns | Scalar GF/s | Tensor-core GF/s | "
+        "cuBLAS GF/s | Tensor-core/scalar | cuBLAS/scalar |"
         in table
     )
-    assert "| A100 | 256 | 16x16x16 | 1100 | 900 | 1500 | 0.82x | 1.36x |" in table
-    assert "| H200 | 256 | 16x16x16 | 800 | 1000 | 1600 | 1.25x | 2.00x |" in table
+    assert "| A100 | 256 | 16x16x16 | 1100 | 900 | 1500 | 7.45 | 9.10 | 5.46 | 0.82x | 1.36x |" in table
+    assert "| H200 | 256 | 16x16x16 | 800 | 1000 | 1600 | 10.24 | 8.19 | 5.12 | 1.25x | 2.00x |" in table
 
 
 def test_summarize_results_groups_by_machine_and_baseline():

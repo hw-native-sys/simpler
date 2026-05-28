@@ -258,11 +258,17 @@ size-sweep report at commit `e79edba2` uses a `16x16x16` descriptor with
 `N=256`, `4096`, and `65536`, three repeats, and the artifact under
 `tmp/cuda-backend/tensor-shape-sweep-e79edba2/`. It writes raw rows,
 VDCores/MPK provenance metadata, per-baseline workload descriptions, a median
-summary table, and a median-device-time SVG chart with sample counts. Median
-device times are: A100 scalar/tensor-core/cuBLAS at `N=256`
+summary table with normalized GFLOP/s, and a median-device-time SVG chart with
+sample counts. Median device times are: A100 scalar/tensor-core/cuBLAS at
+`N=256`
 `47104/47104/43007 ns`, `N=4096` `79872/71680/36864 ns`, and `N=65536`
 `587616/470368/38911 ns`; H200 at `N=256` `30560/28160/50496 ns`, `N=4096`
-`88576/49888/37055 ns`, and `N=65536` `1032896/390368/36127 ns`.
+`88576/49888/37055 ns`, and `N=65536` `1032896/390368/36127 ns`. Normalized
+throughput at `N=65536` is A100 scalar/tensor-core/cuBLAS
+`3.57/4.46/53.90` GFLOP/s and H200 `2.03/5.37/58.05` GFLOP/s. The PTO
+tensor-core row improves over the scalar tensor row as repeated tile work
+grows, while the cuBLAS baseline shows the remaining gap to a tuned CUDA
+library path.
 `cuda_validate_tensor_sweep.py` checked the expected A100/H200 rows,
 baselines, sizes, shape, three repeats, report files, and PTO dispatch
 sequences before the numbers were copied into docs.

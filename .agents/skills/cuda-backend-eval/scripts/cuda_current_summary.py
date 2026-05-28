@@ -106,6 +106,10 @@ def _format_number(value: int | float) -> str:
     return str(value)
 
 
+def _format_gflops(value: float | None) -> str:
+    return "-" if value is None else f"{value:.2f}"
+
+
 def _table(headers: Sequence[str], rows: Sequence[Sequence[str | int]]) -> str:
     lines = [
         "| " + " | ".join(headers) + " |",
@@ -243,6 +247,29 @@ def _tensor_row_n(row: Mapping[str, Any], payload: Payload) -> str:
     return str(n)
 
 
+def _tensor_flops(n: str, shape: str) -> int | None:
+    parts = shape.split("x")
+    if len(parts) != 3:
+        return None
+    try:
+        _, _, inner = (int(part) for part in parts)
+        output_elements = int(n)
+    except ValueError:
+        return None
+    return 2 * output_elements * inner
+
+
+def _tensor_gflops(
+    n: str,
+    shape: str,
+    device_wall_ns: int | float | None,
+) -> float | None:
+    flops = _tensor_flops(n, shape)
+    if flops is None or not device_wall_ns:
+        return None
+    return float(flops) / float(device_wall_ns)
+
+
 def _tensor_sweep_medians(payload: Payload) -> dict[tuple[str, str, str, str], int | float]:
     groups: dict[tuple[str, str, str, str], list[int]] = {}
     for row in payload.get("results", []):
@@ -272,6 +299,9 @@ def render_tensor_sweep_table(payload: Payload) -> str:
         scalar = medians[scalar_key]
         tensor_core = medians.get(tensor_core_key)
         cublas = medians.get(cublas_key)
+        scalar_gflops = _tensor_gflops(n, shape, scalar)
+        tensor_core_gflops = _tensor_gflops(n, shape, tensor_core)
+        cublas_gflops = _tensor_gflops(n, shape, cublas)
         rows.append(
             [
                 _machine_label(machine),
@@ -280,6 +310,9 @@ def render_tensor_sweep_table(payload: Payload) -> str:
                 _format_number(scalar),
                 _format_number(tensor_core) if tensor_core is not None else "-",
                 _format_number(cublas) if cublas is not None else "-",
+                _format_gflops(scalar_gflops),
+                _format_gflops(tensor_core_gflops),
+                _format_gflops(cublas_gflops),
                 _ratio(tensor_core, scalar) if tensor_core is not None else "-",
                 _ratio(cublas, scalar) if cublas is not None else "-",
             ]
@@ -292,6 +325,9 @@ def render_tensor_sweep_table(payload: Payload) -> str:
             "Scalar tensor ns",
             "Tensor-core ns",
             "cuBLAS ns",
+            "Scalar GF/s",
+            "Tensor-core GF/s",
+            "cuBLAS GF/s",
             "Tensor-core/scalar",
             "cuBLAS/scalar",
         ],

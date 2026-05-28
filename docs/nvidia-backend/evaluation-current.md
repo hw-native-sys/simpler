@@ -169,25 +169,27 @@ and `65536`, comparing the scalar tensor DAG,
 report. The Markdown keeps raw repeat rows plus medians, records VDCores/MPK
 source-paper provenance and per-baseline workload descriptions, and the SVG
 plots median device time with sample counts. The table below reports median
-device time across the three samples.
+device time and normalized GFLOP/s across the three samples.
 
-| GPU | N | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns | Tensor-core/scalar | cuBLAS/scalar |
-| --- | - | ----- | ---------------- | -------------- | --------- | ------------------ | ------------- |
-| A100 | 256 | 16x16x16 | 47104 | 47104 | 43007 | 1.00x | 0.91x |
-| A100 | 4096 | 16x16x16 | 79872 | 71680 | 36864 | 0.90x | 0.46x |
-| A100 | 65536 | 16x16x16 | 587616 | 470368 | 38911 | 0.80x | 0.07x |
-| H200 | 256 | 16x16x16 | 30560 | 28160 | 50496 | 0.92x | 1.65x |
-| H200 | 4096 | 16x16x16 | 88576 | 49888 | 37055 | 0.56x | 0.42x |
-| H200 | 65536 | 16x16x16 | 1032896 | 390368 | 36127 | 0.38x | 0.03x |
+| GPU | N | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns | Scalar GF/s | Tensor-core GF/s | cuBLAS GF/s | Tensor-core/scalar | cuBLAS/scalar |
+| --- | - | - | - | - | - | - | - | - | - | - |
+| A100 | 256 | 16x16x16 | 47104 | 47104 | 43007 | 0.17 | 0.17 | 0.19 | 1.00x | 0.91x |
+| A100 | 4096 | 16x16x16 | 79872 | 71680 | 36864 | 1.64 | 1.83 | 3.56 | 0.90x | 0.46x |
+| A100 | 65536 | 16x16x16 | 587616 | 470368 | 38911 | 3.57 | 4.46 | 53.90 | 0.80x | 0.07x |
+| H200 | 256 | 16x16x16 | 30560 | 28160 | 50496 | 0.27 | 0.29 | 0.16 | 0.92x | 1.65x |
+| H200 | 4096 | 16x16x16 | 88576 | 49888 | 37055 | 1.48 | 2.63 | 3.54 | 0.56x | 0.42x |
+| H200 | 65536 | 16x16x16 | 1032896 | 390368 | 36127 | 2.03 | 5.37 | 58.05 | 0.38x | 0.03x |
 
 The tensor-core rows use dispatch `10,1,2,1`, while the scalar tensor rows use
 `3,1,2,1`. cuBLAS rows have no PTO dispatch sequence because they run through
 CUDA Runtime API plus cuBLAS directly. The tensor-core PTO row improves over
-the scalar tensor DAG as the number of tiles grows, especially on H200, while
-the cuBLAS path stays much lower for large `N` because it uses the tuned
-library implementation rather than one generated persistent scheduler task per
-tile. This remains a compact descriptor/scheduler comparison rather than a
-tuned GEMM throughput result.
+the scalar tensor DAG as the number of tiles grows, especially on H200, but
+the normalized throughput still stays in the single-digit GFLOP/s range
+because the current PTO path schedules one small generated task per tile. The
+cuBLAS path reaches about `54` GFLOP/s on A100 and `58` GFLOP/s on H200 at
+`N=65536` because it uses a tuned library implementation. This remains a
+compact descriptor/scheduler comparison rather than a tuned GEMM throughput
+result.
 
 ## Tensor-Core Callable Smoke
 
