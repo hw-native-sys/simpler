@@ -969,6 +969,11 @@ Use `persistent_dag_graph_f32` when a test should pass an explicit runtime
 graph descriptor with per-task `func_id`, `a`/`b`/`c`/`d`/`out`,
 `dependents`, optional `initial_fanin`, `tensor_args`, and `scalar_args`
 fields instead of selecting one of the fixed tracer-bullet DAG adapters.
+Graph tasks may alternatively pass tagged `task_args` entries with
+`input`, `output`, `output_existing`, or `inout` tags. The adapter lowers the
+first four inputs to `a`/`b`/`c`/`d`, appends any additional inputs to
+`tensor_args`, and lowers the single output to `out`; this is the preferred
+test form when checking the first TaskArgs-like lowering slice.
 Graph task scalar fields may be numeric literals or scalar names from the
 scene's `TaskArgsBuilder`: `scalar0`, `scalar1`, and every `scalar_args`
 entry are resolved while building the host task descriptor.
@@ -985,6 +990,14 @@ Graph tasks whose `out` names are not existing input/output tensors are
 allocated as temporary buffers automatically, so tests only need an explicit
 `temporaries` map when a temporary needs a size different from the output
 tensor size.
+Run the tagged graph SceneTestCase path after changing this lowering:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k tagged_graph --platform cuda
+```
+
 Graph tasks may also pass `out_storage` when the logical graph output should
 reuse an existing scratch buffer. Keep `out` unique for tensor-flow dependency
 inference and set `out_storage` to the physical buffer name, for example

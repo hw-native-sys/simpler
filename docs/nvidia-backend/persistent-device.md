@@ -324,6 +324,15 @@ them, while omitted task edges are inferred from tensor flow. It is a
 descriptor-level stepping stone toward PTO graph lowering, not yet automatic
 construction from normal PTO task graphs.
 
+The same graph adapter also accepts a small tagged `task_args` form that is
+closer to the normal PTO task argument model. Each entry names a tensor or
+temporary and tags it as `input`, `output`, `output_existing`, or `inout`.
+The scene-test adapter lowers those tags into the current bounded CUDA
+descriptor fields: the first four inputs become `a`/`b`/`c`/`d`, additional
+inputs append to `tensor_args`, and the single output becomes `out`. This is
+still host-side descriptor construction, but it reduces the gap between
+normal task-argument metadata and the persistent-device runtime ABI.
+
 Graph descriptors also separate logical task outputs from physical scratch
 storage through optional `out_storage`. The logical `out` name remains the
 producer key used for tensor-flow dependency inference, while `out_storage`

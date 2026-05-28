@@ -1218,6 +1218,7 @@ class _CudaPersistentDagSceneBuffers:
         task_specs = list(graph.get("tasks", []))
         if not task_specs:
             raise ValueError("CUDA persistent_dag_graph_f32 requires at least one graph task")
+        task_specs = [self._normalize_graph_task_spec(task_spec) for task_spec in task_specs]
 
         ptrs = dict(self.tensor_buffers.ptrs)
         temporary_items = list(dict(self.cuda_spec.get("temporaries", {})).items())
@@ -1319,6 +1320,46 @@ class _CudaPersistentDagSceneBuffers:
         names = [task_spec.get(field) for field in ("a", "b", "c", "d")]
         names.extend(task_spec.get("tensor_args", []))
         return [str(name) for name in names if name is not None]
+
+    @staticmethod
+    def _normalize_graph_task_spec(task_spec: dict[str, Any]) -> dict[str, Any]:
+        task_args = task_spec.get("task_args")
+        if task_args is None:
+            return task_spec
+
+        normalized = dict(task_spec)
+        normalized.pop("task_args", None)
+        inputs: list[str] = []
+        outputs: list[str] = []
+        for index, task_arg in enumerate(task_args):
+            if not isinstance(task_arg, dict):
+                raise ValueError("CUDA persistent_dag_graph_f32 task_args entries must be dictionaries")
+            name = task_arg.get("tensor", task_arg.get("name"))
+            if name is None:
+                raise ValueError("CUDA persistent_dag_graph_f32 task_args entries must name a tensor or temporary")
+            tag = str(task_arg.get("tag", "input")).lower()
+            if tag in {"input", "in"}:
+                inputs.append(str(name))
+            elif tag in {"output", "output_existing", "out"}:
+                outputs.append(str(name))
+            elif tag == "inout":
+                inputs.append(str(name))
+                outputs.append(str(name))
+            else:
+                raise ValueError(
+                    f"CUDA persistent_dag_graph_f32 task_args entry {index} has unsupported tag: {task_arg.get('tag')}"
+                )
+
+        for field, name in zip(("a", "b", "c", "d"), inputs):
+            normalized.setdefault(field, name)
+        extra_inputs = inputs[4:]
+        if extra_inputs:
+            normalized["tensor_args"] = list(normalized.get("tensor_args", [])) + extra_inputs
+        if len(outputs) > 1:
+            raise ValueError("CUDA persistent_dag_graph_f32 task_args supports one output per graph task")
+        if outputs:
+            normalized.setdefault("out", outputs[0])
+        return normalized
 
     def _temporary_nbytes(self, size_source, default_nbytes: int) -> int:
         if isinstance(size_source, int):
