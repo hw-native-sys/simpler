@@ -484,9 +484,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     TASSIGN(w_wide_tile, 0x10000);
     TASSIGN(w_sum_tile, 0x20000);
     TASSIGN(w_tmp_tile, 0x21000);
-    TASSIGN(idx_wide_tile, 0x30000);
-    TASSIGN(idx_sum_tile, 0x40000);
-    TASSIGN(idx_tmp_tile, 0x41000);
+    TASSIGN(idx_wide_tile, 0x10000);
+    TASSIGN(idx_sum_tile, 0x20000);
+    TASSIGN(idx_tmp_tile, 0x21000);
 
     // Stage out x: per-row 1xD copies.
     for (int e = 0; e < L; ++e) {
@@ -526,6 +526,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
     }
+
+    // Drain the weight loop's last TSTORE before reusing the same UB slots
+    // for idx_*. Without this fence, the idx TLOAD could overwrite UB while
+    // the trailing w TSTORE is still in flight on MTE3.
+    pipe_barrier(PIPE_ALL);
 
     // Stage out idx: same TROWSUM compaction as the weight channel, on the
     // INT32 [R, IDX_PAD] wide window. sum-along-PAD recovers slot [0] because
