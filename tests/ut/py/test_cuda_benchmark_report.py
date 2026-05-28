@@ -7370,6 +7370,47 @@ def test_run_persistent_sample_defaults_tensor_core_tile_to_four_tasks(monkeypat
     assert result["baseline"] == "pto_persistent_dag_tensor_core"
 
 
+def test_run_persistent_sample_accepts_multi_wmma_tensor_core_tile(monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = {}
+
+    def fake_run_persistent_smoke(**kwargs):
+        seen.update(kwargs)
+        return {
+            "baseline": "pto_persistent_dag_tensor_core",
+            "n": kwargs["n"],
+            "task_count": kwargs["task_count"],
+            "dag_shape": kwargs["dag_shape"],
+            "tensor_tile": {
+                "rows": kwargs["tensor_rows"],
+                "cols": kwargs["tensor_cols"],
+                "inner": kwargs["tensor_inner"],
+                "tile_count": 2,
+            },
+            "device_wall_ns": 10,
+            "status": "pass",
+        }
+
+    monkeypatch.setattr(cuda_benchmark, "run_persistent_smoke", fake_run_persistent_smoke)
+
+    result = cuda_benchmark.run_persistent_sample(
+        device=3,
+        n=1024,
+        arch="compute_80",
+        mode="dag",
+        baseline="pto_persistent_dag_tensor_core",
+        dag_shape="tensor_core_tile",
+        tensor_tile={"rows": 32, "cols": 16, "inner": 16},
+    )
+
+    assert seen["task_count"] == 4
+    assert seen["dag_shape"] == "tensor_core_tile"
+    assert seen["tensor_rows"] == 32
+    assert seen["tensor_cols"] == 16
+    assert seen["tensor_inner"] == 16
+    assert result["tensor_tile"]["rows"] == 32
+
+
 def test_run_persistent_sample_rejects_incompatible_tensor_core_tile(monkeypatch):
     cuda_benchmark = _load_benchmark_module()
 
@@ -7386,11 +7427,11 @@ def test_run_persistent_sample_rejects_incompatible_tensor_core_tile(monkeypatch
             mode="dag",
             baseline="pto_persistent_dag_tensor_core",
             dag_shape="tensor_core_tile",
-            tensor_tile={"rows": 8, "cols": 4, "inner": 12},
+            tensor_tile={"rows": 32, "cols": 8, "inner": 16},
         )
     except ValueError as exc:
         assert "tensor_core" in str(exc)
-        assert "--tensor-rows 16" in str(exc)
+        assert "multiples of 16" in str(exc)
     else:
         raise AssertionError("expected ValueError for incompatible tensor-core tile")
 

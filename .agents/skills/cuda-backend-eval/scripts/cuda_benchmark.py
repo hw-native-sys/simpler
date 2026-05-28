@@ -2979,9 +2979,15 @@ def _parse_tensor_tile(rows: int, cols: int, inner: int) -> dict[str, int]:
 
 
 def _validate_tensor_core_tile(tensor_tile: dict[str, int]) -> None:
-    if tensor_tile["rows"] != 16 or tensor_tile["cols"] != 16 or tensor_tile["inner"] % 8 != 0:
+    if (
+        tensor_tile["rows"] % 16 != 0
+        or tensor_tile["cols"] % 16 != 0
+        or tensor_tile["inner"] <= 0
+        or tensor_tile["inner"] % 8 != 0
+    ):
         raise ValueError(
-            "pto_persistent_dag_tensor_core requires --tensor-rows 16 --tensor-cols 16 and tensor-inner divisible by 8"
+            "pto_persistent_dag_tensor_core requires tensor rows/cols in multiples of 16 "
+            "and tensor-inner divisible by 8"
         )
 
 

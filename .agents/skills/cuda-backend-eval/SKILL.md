@@ -867,10 +867,11 @@ non-square descriptor. `n` must be a multiple of `rows * cols`; the smoke
 allocates separate A, B, and output extents so A/B strides can differ from the
 output tile size while later elementwise tasks still run over `n` values.
 
-Run the tensor-core persistent DAG smoke to validate the first block-wide
-generated-dispatch task body. This shape uses CUDA WMMA
-`m16n16k8` with TF32 inputs and F32 accumulation for the first task, then the
-same residual, gate, and fan-in elementwise tasks as `tensor_tile`:
+Run the tensor-core persistent DAG smoke to validate the block-wide
+generated-dispatch task body. This shape uses CUDA WMMA `m16n16k8` with TF32
+inputs and F32 accumulation for the first task, then the same residual, gate,
+and fan-in elementwise tasks as `tensor_tile`. It supports descriptors whose
+rows and columns are multiples of `16`, with inner dimension divisible by `8`:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -885,6 +886,11 @@ The paired runner validates dispatch `10,1,2,1`, tensor descriptor
 The report includes a `Tensor core` column such as
 `wmma:m16n16k8:tf32->f32`. Treat this as a tensor-core callable smoke, not yet
 as a tuned throughput result.
+Use `--tensor-rows 32 --tensor-cols 16 --tensor-inner 16` when the WMMA task
+should execute multiple 16x16 output fragments per descriptor. The paired
+capture under `tmp/cuda-backend/tensor-core-wide-working/` validates A100/H200
+repeat-run completions, generated reports, and zero scheduler errors for that
+shape.
 
 The DAG smoke compiles generated CUDA source through
 `KernelCompiler(platform="cuda").compile_cuda_persistent_device(...)`. The
@@ -950,8 +956,8 @@ PYTHONPATH=$PWD:$PWD/python \
 
 Use `persistent_dag_tensor_core_tile_f32` for the normal L2 scene-test path
 when the first DAG task should be a block-wide WMMA
-`m16n16k8:tf32->f32` task. It requires a `16x16xK` tensor descriptor with
-`K` divisible by `8`.
+`m16n16k8:tf32->f32` task. It requires rows and columns in multiples of `16`
+and `K` divisible by `8`.
 CUDA `persistent_device` scene-test specs can pass `stream_id` in the
 `CALLABLE["cuda"]` spec; this is forwarded to the prepared callable manifest
 and selects the CUDA runtime stream used by `Worker.run`.
@@ -1369,7 +1375,8 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 Run a compact tensor-baseline comparison sweep with shapes compatible with the
-current WMMA task:
+current WMMA task. Use `32x16x16` or another `16`-multiple row/column shape
+when the WMMA task should execute multiple output fragments per descriptor:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \

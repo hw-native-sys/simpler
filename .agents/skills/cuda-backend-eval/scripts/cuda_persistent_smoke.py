@@ -796,25 +796,29 @@ if (task->tensor_arg_count >= 4U && task->scalar_arg_count >= 4U) {
         name="wmma_m16n16k8_f32",
         threading="block",
         body="""
-if (task->rows != 16U || task->cols != 16U || task->inner == 0U || (task->inner % 8U) != 0U) {
+if ((task->rows % 16U) != 0U || (task->cols % 16U) != 0U || task->inner == 0U || (task->inner % 8U) != 0U) {
   return;
 }
 using namespace nvcuda;
 unsigned long long tile_count = task->n / task->out_batch_stride;
 for (unsigned long long tile_id = 0; tile_id < tile_count; ++tile_id) {
-  wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a_frag;
-  wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> b_frag;
-  wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc_frag;
-  wmma::fill_fragment(acc_frag, 0.0f);
   unsigned long long a_base = tile_id * task->a_batch_stride;
   unsigned long long b_base = tile_id * task->b_batch_stride;
   unsigned long long out_base = tile_id * task->out_batch_stride;
-  for (unsigned int k = 0; k < task->inner; k += 8U) {
-    wmma::load_matrix_sync(a_frag, task->a + a_base + k, task->lda);
-    wmma::load_matrix_sync(b_frag, task->b + b_base + k * task->ldb, task->ldb);
-    wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+  for (unsigned int row = 0; row < task->rows; row += 16U) {
+    for (unsigned int col = 0; col < task->cols; col += 16U) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a_frag;
+      wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> b_frag;
+      wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc_frag;
+      wmma::fill_fragment(acc_frag, 0.0f);
+      for (unsigned int k = 0; k < task->inner; k += 8U) {
+        wmma::load_matrix_sync(a_frag, task->a + a_base + row * task->lda + k, task->lda);
+        wmma::load_matrix_sync(b_frag, task->b + b_base + k * task->ldb + col, task->ldb);
+        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+      }
+      wmma::store_matrix_sync(task->out + out_base + row * task->ldc + col, acc_frag, task->ldc, wmma::mem_row_major);
+    }
   }
-  wmma::store_matrix_sync(task->out + out_base, acc_frag, task->ldc, wmma::mem_row_major);
 }
 """.strip(),
     ),

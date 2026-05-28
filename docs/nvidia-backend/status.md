@@ -386,6 +386,47 @@ dispatch sequences, and zero scheduler errors. The A100 rows measured
 `9119 ns` and `8543 ns`. The graph row is a launch-path comparison point
 around cuBLAS graph replay, not a tuned GEMM throughput claim.
 
+The WMMA tensor-core task body now handles a grid of 16x16 output fragments
+instead of only one fragment per descriptor. Focused TDD first failed because
+`pto_persistent_dag_tensor_core` rejected `32x16x16`; after generalizing the
+descriptor contract and generated-dispatch task body, the paired smoke:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape tensor_core_tile --task-count 4 --n 1024 \
+    --tensor-rows 32 --tensor-cols 16 --tensor-inner 16 \
+    --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/tensor-core-wide-working
+```
+
+validated A100 and H200 JSON, Markdown, and SVG artifacts at
+`tmp/cuda-backend/tensor-core-wide-working/persistent-tensor_core_tile-32x16x16-repeat2-smoke-ef475c2d/`.
+Both GPUs reported dispatch `10,1,2,1`, tensor tile `32x16x16`,
+`tile_count=2`, repeat completions `[4,4]`, and zero scheduler errors. The
+A100 device total was `77824 ns`; H200 was `61152 ns`.
+
+The compact paired benchmark then used the same `32x16x16` descriptor with
+`N=1024`, one repeat, no batch rows, and the normal selected baseline set:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
+    --sizes 1024 --repeats 1 --batch-tasks '' \
+    --tensor-rows 32 --tensor-cols 16 --tensor-inner 16 \
+    --sync-remote-tree \
+    --output-root tmp/cuda-backend/tensor-core-wide-benchmark-working
+```
+
+The capture under
+`tmp/cuda-backend/tensor-core-wide-benchmark-working/combined-current-ef475c2d/`
+validated `58` rows, report files, command examples, source-paper metadata,
+tensor descriptors, PTO dispatch sequences, and zero scheduler errors. In the
+tensor-throughput table, A100 measured
+`pto_persistent_dag_tensor_core=36864 ns`,
+`cublas_sgemm=37888 ns`, and `cublas_sgemm_graph=7168 ns`; H200 measured
+`33280 ns`, `38591 ns`, and `9216 ns` for the same rows.
+
 The tensor shape sweep script now accepts `--baselines` and `--sizes`, so one
 paired A100/H200 sweep can compare scalar tensor DAG, the explicit graph
 tensor DAG, WMMA tensor-core DAG, and cuBLAS SGEMM rows across descriptor
@@ -2590,17 +2631,18 @@ The tensor DAG row validates descriptor metadata and generated dispatch, but
 the GEMM body is a scalar microbenchmark rather than a tuned tensor-core
 kernel. The first paired tensor-shape sweep now covers `8x4x12`,
 `16x16x64`, and `32x16x64` descriptors on A100 and H200. The first
-`tensor_core_tile` smoke and selected-baseline benchmark row also validate a
-block-wide WMMA generated-dispatch task body on both GPUs. The benchmark
-report now includes a signed DAG-increment table and SVG, so scheduler-vs-task
-work separation exists for current microbenchmarks. The remaining gap is
-tuned tensor execution and comparative throughput, not descriptor-shape or
-first tensor-core callable plumbing.
+`tensor_core_tile` smoke and selected-baseline benchmark row now validate a
+WMMA generated-dispatch task body on both GPUs for one-fragment and
+multi-fragment descriptors. The benchmark report includes a signed
+DAG-increment table and SVG, so scheduler-vs-task work separation exists for
+current microbenchmarks. The remaining gap is tuned tensor execution and
+comparative throughput at model-relevant sizes, not descriptor-shape or first
+tensor-core callable plumbing.
 
 Needed:
 
 - tensor-core or library-backed callable body tuning beyond the current
-  single-tile WMMA benchmark row;
+  small multi-fragment WMMA benchmark row;
 - broader model-kernel shape families once the tensor-core/library path
   exists;
 - real tuned-kernel throughput rows beyond the current scheduler-adjusted
