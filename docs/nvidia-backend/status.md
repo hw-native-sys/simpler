@@ -332,7 +332,8 @@ producing `68` combined rows under
 `tmp/cuda-backend/tagged-inout-benchmark-working/combined-current-55a144de/`.
 The validator checked required baselines, dispatch sequences, tensor
 descriptor metadata, source-paper provenance, command examples, generated
-Markdown/SVG reports, and zero scheduler errors. The tagged-inout row reported
+Markdown/SVG reports, graph task-argument metadata, and zero scheduler errors.
+The tagged-inout row reported
 dispatch `[1,1,1]`, `graph_descriptor.fanin=[0,1,1]`,
 `graph_descriptor.dependents=[1,2]`, completed count `3`,
 `graph_task_args.task1=inout:tmp1,input:b`, A100
@@ -539,7 +540,7 @@ Evidence:
   checks paired benchmark captures for expected machines, selected baselines,
   sizes, repeats, sample count, generated report files, source-paper
   metadata, sanitized command examples, dispatch IDs, tensor-tile shapes, and
-  scratch-reuse metadata before docs are refreshed.
+  graph task-argument and scratch-reuse metadata before docs are refreshed.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py` checks
   paired smoke captures for required A100/H200 artifacts, pass status, zero
   scheduler errors, expected runtime/mode, dispatch IDs, repeat-run lifecycle

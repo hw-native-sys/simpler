@@ -1269,6 +1269,51 @@ def test_cuda_capture_validator_requires_scratch_reuse_metadata():
     )
 
 
+def test_cuda_capture_validator_requires_graph_task_args_metadata():
+    cuda_validate_capture = _load_capture_validator_module()
+    payload = _paired_capture_payload()
+    payload["results"].append(
+        {
+            "machine": "hina",
+            "baseline": "pto_persistent_dag_graph_tagged_inout",
+            "n": 1024,
+            "repeat": 0,
+            "status": "pass",
+            "device_wall_ns": 1024,
+            "graph_task_args": {
+                "task0": "input:a,input:b,output:tmp1",
+                "task1": "input:tmp1,input:b,output:tmp2",
+                "task2": "input:tmp1,input:a,output_existing:out",
+            },
+        }
+    )
+
+    expected = "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    errors = cuda_validate_capture.validate_capture(
+        payload,
+        required_graph_task_args={"pto_persistent_dag_graph_tagged_inout": expected},
+    )
+
+    assert (
+        "expected graph_task_args "
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;"
+        "task2=input:tmp1,input:a,output_existing:out for machine=hina "
+        "baseline=pto_persistent_dag_graph_tagged_inout n=1024, found "
+        "task0=input:a,input:b,output:tmp1;task1=input:tmp1,input:b,output:tmp2;"
+        "task2=input:tmp1,input:a,output_existing:out"
+    ) in errors
+
+    payload["results"][-1]["graph_task_args"]["task1"] = "inout:tmp1,input:b"
+
+    assert (
+        cuda_validate_capture.validate_capture(
+            payload,
+            required_graph_task_args={"pto_persistent_dag_graph_tagged_inout": expected},
+        )
+        == []
+    )
+
+
 def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     cuda_validate_capture = _load_capture_validator_module()
     args = cuda_validate_capture.parse_args(["capture.json", "--preset", "paired-current"])
@@ -1293,6 +1338,11 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     assert "pto_persistent_dag_graph_scratch_reuse=1,2,1,2,1,1" in args.require_dispatch
     assert "pto_persistent_dag_graph_scratch_reuse=reused_buffer=tmp0,reuse_task=4" in args.require_scratch_reuse
     assert "pto_persistent_dag_graph_tagged_inout=1,1,1" in args.require_dispatch
+    assert (
+        "pto_persistent_dag_graph_tagged_inout="
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;"
+        "task2=input:tmp1,input:a,output_existing:out"
+    ) in args.require_graph_task_args
     assert "pto_persistent_dag_graph_diamond=9,2,1,2,1" in args.require_dispatch
     assert "pto_persistent_dag_tensor_core=10,1,2,1" in args.require_dispatch
     assert "pto_persistent_dag_tensor=16x16x16" in args.require_tensor_tile
@@ -1329,6 +1379,11 @@ def test_cuda_capture_validator_compact_current_preset_matches_docs_gate():
     assert "pto_persistent_dag_graph_scratch_reuse=1,2,1,2,1,1" in args.require_dispatch
     assert "pto_persistent_dag_graph_scratch_reuse=reused_buffer=tmp0,reuse_task=4" in args.require_scratch_reuse
     assert "pto_persistent_dag_graph_tagged_inout=1,1,1" in args.require_dispatch
+    assert (
+        "pto_persistent_dag_graph_tagged_inout="
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;"
+        "task2=input:tmp1,input:a,output_existing:out"
+    ) in args.require_graph_task_args
     assert "pto_persistent_dag_graph_tensor=3,1,2,1" in args.require_dispatch
     assert "pto_persistent_dag_tensor_core=10,1,2,1" in args.require_dispatch
     assert "pto_persistent_dag_graph_tensor=16x16x16" in args.require_tensor_tile
@@ -2082,6 +2137,11 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     assert "pto_persistent_dag_graph_scratch_reuse=reused_buffer=tmp0,reuse_task=4" in validate
     assert "pto_persistent_dag_graph_diamond=9,2,1,2,1" in validate
     assert "pto_persistent_dag_graph_tagged_inout=1,1,1" in validate
+    assert (
+        "pto_persistent_dag_graph_tagged_inout="
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;"
+        "task2=input:tmp1,input:a,output_existing:out"
+    ) in validate
     assert "pto_persistent_dag_tensor=3,1,2,1" in validate
     assert "pto_persistent_dag_graph_tensor=3,1,2,1" in validate
     assert "pto_persistent_dag_tensor_core=10,1,2,1" in validate

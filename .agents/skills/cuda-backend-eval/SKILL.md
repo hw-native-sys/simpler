@@ -1377,7 +1377,10 @@ SVG reports.
 Use `--single-baseline pto_persistent_dag_graph_tagged_inout` for a quick
 benchmark path check of explicit graph task-argument tags. This path validates
 `input`, `output`, `inout`, and `output_existing` mappings through the
-persistent DAG benchmark row with dispatch `1,1,1`:
+persistent DAG benchmark row with dispatch `1,1,1`. Paired-current benchmark
+validation now requires the tagged row to carry
+`task1=inout:tmp1,input:b` in `graph_task_args`, so a numerically passing row
+that silently loses the inout tag is rejected before docs are refreshed:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -1641,8 +1644,8 @@ PYTHONPATH=$PWD:$PWD/python \
 The compact current-head gate checks the expected A100/H200 machines,
 selected tensor baselines, the host-schedule generic-args baseline, graph
 generic-args4 baseline, graph-chain baseline, graph-scratch-reuse baseline,
-graph-tagged-inout baseline, size `1024`, one repeat, `68` combined samples,
-and the Markdown/SVG report files.
+graph-tagged-inout baseline and task-argument tags, size `1024`, one repeat,
+`68` combined samples, and the Markdown/SVG report files.
 A historical compact gate artifact with graph-scratch-reuse benchmark coverage
 is under `tmp/cuda-backend/combined-current-dbb01406/`; validate older
 captures with explicit `--require-*` checks if the current preset has gained

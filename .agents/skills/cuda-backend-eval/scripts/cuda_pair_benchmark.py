@@ -90,6 +90,11 @@ TENSOR_TILE_BASELINES: tuple[str, ...] = (
 EXPECTED_SCRATCH_REUSE_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_scratch_reuse": "reused_buffer=tmp0,reuse_task=4",
 }
+EXPECTED_GRAPH_TASK_ARGS_BY_BASELINE: dict[str, str] = {
+    "pto_persistent_dag_graph_tagged_inout": (
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -369,6 +374,12 @@ def build_validate_command(
         if baseline in EXPECTED_SCRATCH_REUSE_BY_BASELINE
         for part in ("--require-scratch-reuse", f"{baseline}={EXPECTED_SCRATCH_REUSE_BY_BASELINE[baseline]}")
     ]
+    graph_task_args = [
+        part
+        for baseline in _selected_baselines(config)
+        if baseline in EXPECTED_GRAPH_TASK_ARGS_BY_BASELINE
+        for part in ("--require-graph-task-args", f"{baseline}={EXPECTED_GRAPH_TASK_ARGS_BY_BASELINE[baseline]}")
+    ]
     return [
         "env",
         f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}",
@@ -385,6 +396,7 @@ def build_validate_command(
         *dispatch_args,
         *tensor_tile_args,
         *scratch_reuse_args,
+        *graph_task_args,
         "--require-report-files",
         "--require-command-examples",
         "--require-zero-scheduler-errors",

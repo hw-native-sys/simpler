@@ -99,6 +99,11 @@ PAIRED_CURRENT_TENSOR_TILES = {
 PAIRED_CURRENT_SCRATCH_REUSE = {
     "pto_persistent_dag_graph_scratch_reuse": "reused_buffer=tmp0,reuse_task=4",
 }
+PAIRED_CURRENT_GRAPH_TASK_ARGS = {
+    "pto_persistent_dag_graph_tagged_inout": (
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    ),
+}
 
 
 def _as_list(values: Sequence[str] | None) -> list[str]:
@@ -157,6 +162,13 @@ def _scratch_reuse_text(row: dict[str, Any]) -> str:
     keys = [key for key in ("reused_buffer", "reuse_task") if key in scratch_reuse]
     keys.extend(key for key in sorted(scratch_reuse) if key not in keys)
     return ",".join(f"{key}={scratch_reuse[key]}" for key in keys)
+
+
+def _graph_task_args_text(row: dict[str, Any]) -> str:
+    task_args = row.get("graph_task_args")
+    if not isinstance(task_args, dict):
+        return "-"
+    return ";".join(f"{key}={task_args[key]}" for key in sorted(task_args))
 
 
 def _validate_required_machines(rows: list[dict[str, Any]], required_machines: Sequence[str]) -> list[str]:
@@ -367,6 +379,23 @@ def _validate_scratch_reuse(rows: list[dict[str, Any]], required_scratch_reuse: 
     return errors
 
 
+def _validate_graph_task_args(rows: list[dict[str, Any]], required_graph_task_args: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+    for row in rows:
+        baseline = row.get("baseline")
+        expected = required_graph_task_args.get(str(baseline))
+        if expected is None:
+            continue
+        found = _graph_task_args_text(row)
+        if found != expected:
+            machine = row.get("machine", "unknown")
+            n = row.get("n", "unknown")
+            errors.append(
+                f"expected graph_task_args {expected} for machine={machine} baseline={baseline} n={n}, found {found}"
+            )
+    return errors
+
+
 def validate_capture(  # noqa: PLR0913
     payload: dict[str, Any],
     *,
@@ -382,6 +411,7 @@ def validate_capture(  # noqa: PLR0913
     required_dispatch: dict[str, str] | None = None,
     required_tensor_tiles: dict[str, str] | None = None,
     required_scratch_reuse: dict[str, str] | None = None,
+    required_graph_task_args: dict[str, str] | None = None,
     source_paper_root: Path | None = None,
 ) -> list[str]:
     rows = _results(payload)
@@ -416,6 +446,7 @@ def validate_capture(  # noqa: PLR0913
     errors.extend(_validate_dispatch(rows, required_dispatch or {}))
     errors.extend(_validate_tensor_tiles(rows, required_tensor_tiles or {}))
     errors.extend(_validate_scratch_reuse(rows, required_scratch_reuse or {}))
+    errors.extend(_validate_graph_task_args(rows, required_graph_task_args or {}))
 
     if source_paper_root is not None:
         errors.extend(_validate_source_papers(payload, source_root=source_paper_root))
@@ -449,6 +480,10 @@ def _apply_preset(args: argparse.Namespace) -> None:
         args.require_scratch_reuse = [
             f"{baseline}={metadata}" for baseline, metadata in PAIRED_CURRENT_SCRATCH_REUSE.items()
         ]
+    if not args.require_graph_task_args:
+        args.require_graph_task_args = [
+            f"{baseline}={metadata}" for baseline, metadata in PAIRED_CURRENT_GRAPH_TASK_ARGS.items()
+        ]
     args.require_report_files = True
     args.require_zero_scheduler_errors = True
     if args.preset == "compact-current":
@@ -481,6 +516,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-dispatch", action="append")
     parser.add_argument("--require-tensor-tile", action="append")
     parser.add_argument("--require-scratch-reuse", action="append")
+    parser.add_argument("--require-graph-task-args", action="append")
     parser.add_argument("--require-source-papers", action="store_true")
     return parser.parse_args(argv)
 
@@ -495,6 +531,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         required_scratch_reuse = _parse_required_mapping(
             args.require_scratch_reuse,
             flag="--require-scratch-reuse",
+        )
+        required_graph_task_args = _parse_required_mapping(
+            args.require_graph_task_args,
+            flag="--require-graph-task-args",
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -513,6 +553,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         required_dispatch=required_dispatch,
         required_tensor_tiles=required_tensor_tiles,
         required_scratch_reuse=required_scratch_reuse,
+        required_graph_task_args=required_graph_task_args,
         source_paper_root=Path.cwd() if args.require_source_papers else None,
     )
     if errors:

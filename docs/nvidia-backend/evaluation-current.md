@@ -181,7 +181,8 @@ The combined JSON has `68` samples. The validator checked A100/H200 machine
 names, size `1024`, one repeat, selected tensor baselines, the tagged-inout
 graph baseline, source-paper provenance, sanitized command examples, generated
 Markdown/SVG reports, expected generated-dispatch sequences, tensor descriptor
-metadata, and zero scheduler errors for PTO persistent DAG rows.
+metadata, graph task-argument metadata, and zero scheduler errors for PTO
+persistent DAG rows.
 
 Tagged-inout rows:
 
