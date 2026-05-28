@@ -571,7 +571,10 @@ Use `--dag-shape graph_descriptor_scratch_reuse --repeat-runs 2` to validate
 that an explicit runtime graph descriptor can represent the scratch-reuse DAG
 shape. This records fan-in `[0,0,2,1,1,2]`, dependents
 `[2,2,3,4,5,5]`, dispatch `1,2,1,2,1,1`, and `scratch_reuse` metadata for
-the reused `tmp0` buffer. The current capture is under
+the reused `tmp0` buffer. The paired validator now requires
+`scratch_reuse=reused_buffer=tmp0,reuse_task=4`, and the smoke Markdown/SVG
+report renders that alias so the physical storage reuse is visible in the
+artifact. The current capture is under
 `tmp/cuda-backend/persistent-graph_descriptor_scratch_reuse-repeat2-smoke-d8f6d0bf/`.
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such

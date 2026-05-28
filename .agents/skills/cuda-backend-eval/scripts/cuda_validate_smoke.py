@@ -62,6 +62,7 @@ class SmokeValidationExpectation:
     graph_fanin: str | None = None
     graph_dependents: str | None = None
     graph_task_args: str | None = None
+    scratch_reuse: str | None = None
     resource_policy: ResourcePolicyExpectation | None = None
     require_report_files: bool = False
 
@@ -243,6 +244,15 @@ def _graph_task_args(payload: dict[str, Any]) -> str | None:
     return ";".join(f"{key}={task_args[key]}" for key in sorted(task_args))
 
 
+def _scratch_reuse(payload: dict[str, Any]) -> str | None:
+    scratch_reuse = payload.get("scratch_reuse")
+    if not isinstance(scratch_reuse, dict):
+        return None
+    keys = [key for key in ("reused_buffer", "reuse_task") if key in scratch_reuse]
+    keys.extend(key for key in sorted(scratch_reuse) if key not in keys)
+    return ",".join(f"{key}={scratch_reuse[key]}" for key in keys)
+
+
 def _validate_graph_task_args(
     payloads: list[dict[str, Any]],
     *,
@@ -256,6 +266,22 @@ def _validate_graph_task_args(
         actual = _graph_task_args(payload)
         if actual != expected_task_args:
             errors.append(f"expected graph_task_args {expected_task_args} for artifact={artifact}, found {actual}")
+    return errors
+
+
+def _validate_scratch_reuse(
+    payloads: list[dict[str, Any]],
+    *,
+    expected_scratch_reuse: str | None,
+) -> list[str]:
+    errors: list[str] = []
+    if expected_scratch_reuse is None:
+        return errors
+    for payload in payloads:
+        artifact = payload.get("_artifact", "unknown")
+        actual = _scratch_reuse(payload)
+        if actual != expected_scratch_reuse:
+            errors.append(f"expected scratch_reuse {expected_scratch_reuse} for artifact={artifact}, found {actual}")
     return errors
 
 
@@ -331,6 +357,7 @@ def validate_smoke(
         )
     )
     errors.extend(_validate_graph_task_args(payloads, expected_task_args=expectation.graph_task_args))
+    errors.extend(_validate_scratch_reuse(payloads, expected_scratch_reuse=expectation.scratch_reuse))
     errors.extend(
         _validate_lifecycle(
             payloads,
@@ -357,6 +384,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-graph-fanin")
     parser.add_argument("--expected-graph-dependents")
     parser.add_argument("--expected-graph-task-args")
+    parser.add_argument("--expected-scratch-reuse")
     parser.add_argument("--expected-scheduler-blocks", type=int)
     parser.add_argument("--expected-worker-blocks", type=int)
     parser.add_argument("--expected-worker-blocks-per-task", type=int)
@@ -397,6 +425,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             graph_fanin=args.expected_graph_fanin,
             graph_dependents=args.expected_graph_dependents,
             graph_task_args=args.expected_graph_task_args,
+            scratch_reuse=args.expected_scratch_reuse,
             resource_policy=_resource_policy_expectation(args),
             require_report_files=args.require_report_files,
         ),

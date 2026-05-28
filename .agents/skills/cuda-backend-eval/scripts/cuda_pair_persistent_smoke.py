@@ -329,6 +329,14 @@ def _expected_graph_task_args(config: PairedPersistentSmokeConfig) -> str | None
     }.get(config.dag_shape)
 
 
+def _expected_scratch_reuse(config: PairedPersistentSmokeConfig) -> str | None:
+    if config.mode != "dag":
+        return None
+    if config.dag_shape in {"scratch_reuse", "graph_descriptor_scratch_reuse"}:
+        return "reused_buffer=tmp0,reuse_task=4"
+    return None
+
+
 def _expected_scheduler_blocks(config: PairedPersistentSmokeConfig) -> int:
     if config.mode == "direct":
         return 0
@@ -395,6 +403,9 @@ def build_validate_command(config: PairedPersistentSmokeConfig, suffix: str) -> 
     expected_graph_task_args = _expected_graph_task_args(config)
     if expected_graph_task_args is not None:
         command.extend(["--expected-graph-task-args", expected_graph_task_args])
+    expected_scratch_reuse = _expected_scratch_reuse(config)
+    if expected_scratch_reuse is not None:
+        command.extend(["--expected-scratch-reuse", expected_scratch_reuse])
     return command
 
 

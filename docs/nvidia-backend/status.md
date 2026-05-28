@@ -2731,12 +2731,16 @@ Needed:
   (`tmp/cuda-backend/lifecycle-graph-working/persistent-lifecycle-matrix-b50a80dd/`).
   The lifecycle matrix validator checks required scenarios, A100/H200
   artifacts, repeat-run completion counts, DAG-chain dispatch,
-  graph-scratch-reuse dispatch, report files, and zero device scheduler
-  errors. In the current capture, graph-scratch-reuse validates
+  graph-scratch-reuse dispatch, scratch-reuse metadata, report files, and
+  zero device scheduler errors. The paired persistent-smoke validator now
+  requires `scratch_reuse=reused_buffer=tmp0,reuse_task=4`, and the smoke
+  Markdown/SVG report renders that physical alias beside task metadata. In
+  the current capture, graph-scratch-reuse validates
   `launch_completed_counts=[6,6]`, dispatch `1,2,1,2,1,1`, graph fan-in
-  `0,0,2,1,1,2`, dependents `2,2,3,4,5,5`, and device times of `76800 ns`
-  on A100 and `63552 ns` on H200, so the remaining lifecycle gap is normal
-  PTO graph breadth rather than prepared-callable reset coverage;
+  `0,0,2,1,1,2`, dependents `2,2,3,4,5,5`, scratch reuse of `tmp0` at task
+  `4`, and device times of `76800 ns` on A100 and `63552 ns` on H200, so the
+  remaining lifecycle gap is normal PTO graph breadth rather than
+  prepared-callable reset coverage;
 - broader resource policy beyond the current single scheduler block,
   configurable queue/DAG worker blocks, direct worker-blocks-per-task,
   callable stream id tracer bullet, and configurable block dimension. The

@@ -566,6 +566,7 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
         },
         "scalar_args": {"scalar0": 1.5},
         "tensor_args": {"c": "tmp0"},
+        "scratch_reuse": {"reused_buffer": "tmp0", "reuse_task": 4},
         "graph_task_args": {
             "task0": "input:a,input:b,output:tmp1",
             "task1": "input:a,input:b,output:tmp2",
@@ -602,7 +603,7 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
 
     assert (
         "| Tensor core | Dispatch | Scheduler errors | Repeat runs | Launch completions | "
-        "Resource policy | Scalar args | Tensor args | Graph task args |" in markdown
+        "Resource policy | Scalar args | Tensor args | Scratch reuse | Graph task args |" in markdown
     )
     assert "| a100 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_80` | 102400 | 122260 |" in markdown
     assert "| h200 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_90` | 70464 | 79788 |" in markdown
@@ -610,12 +611,13 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
         "| `wmma:m16n16k8:tf32->f32` | `3,1,2,1` | `count=0,code=0,task=0` | `2` | `4,4` | "
         "`sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | "
         "`scalar0=1.5` | `c=tmp0` | "
+        "`reused_buffer=tmp0,reuse_task=4` | "
         "`task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2` |" in markdown
     )
     assert (
         "| `3,1,2,1` | `count=1,code=7,task=3` | `2` | `4,4` | "
         "`sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | "
-        "`scalar0=1.5` | `c=tmp0` |" in markdown
+        "`scalar0=1.5` | `c=tmp0` | `reused_buffer=tmp0,reuse_task=4` |" in markdown
     )
     assert "nvcc-persistent-generated-dispatch-compute_90" in markdown
     assert "<svg" in svg
@@ -626,6 +628,7 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
     assert "lifecycle: repeat=2,completed=4,4" in svg
     assert "scalars: scalar0=1.5" in svg
     assert "tensors: c=tmp0" in svg
+    assert "scratch: reused_buffer=tmp0,reuse_task=4" in svg
     assert "task args: task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2" in svg
 
 
@@ -1741,6 +1744,38 @@ def test_cuda_smoke_validator_checks_graph_task_args_metadata(tmp_path):
         "expected graph_task_args "
         "task0=input:a,input:b,output:tmp1;task2=input:tmp1,input:tmp2,output_existing:out "
         "for artifact=a100, found task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2"
+    ) in errors
+
+
+def test_cuda_smoke_validator_checks_scratch_reuse_metadata(tmp_path):
+    cuda_validate_smoke = _load_smoke_validator_module()
+    artifact_dir = tmp_path / "persistent-graph-descriptor-scratch-reuse-smoke"
+    artifact_dir.mkdir()
+    payload = {
+        "status": "pass",
+        "runtime": "persistent_device",
+        "mode": "dag",
+        "dag_shape": "graph_descriptor_scratch_reuse",
+        "n": 1024,
+        "repeat_runs": 2,
+        "launch_completed_counts": [6, 6],
+        "dispatch_func_ids": [1, 2, 1, 2, 1, 1],
+        "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+        "scratch_reuse": {"reused_buffer": "tmp1", "reuse_task": 4},
+    }
+    (artifact_dir / "a100.json").write_text(json.dumps(payload) + "\n")
+
+    payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json"])
+    errors = cuda_validate_smoke.validate_smoke(
+        payloads,
+        expectation=cuda_validate_smoke.SmokeValidationExpectation(
+            scratch_reuse="reused_buffer=tmp0,reuse_task=4",
+        ),
+    )
+
+    assert (
+        "expected scratch_reuse reused_buffer=tmp0,reuse_task=4 "
+        "for artifact=a100, found reused_buffer=tmp1,reuse_task=4"
     ) in errors
 
 
@@ -3461,6 +3496,8 @@ def test_cuda_pair_persistent_smoke_accepts_scratch_reuse_graph_descriptor(tmp_p
     assert "0,0,2,1,1,2" in validate
     assert "--expected-graph-dependents" in validate
     assert "2,2,3,4,5,5" in validate
+    assert "--expected-scratch-reuse" in validate
+    assert "reused_buffer=tmp0,reuse_task=4" in validate
 
 
 def test_cuda_pair_persistent_smoke_builds_scalar_affine_workflow(tmp_path):
