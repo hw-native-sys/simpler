@@ -535,6 +535,10 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
         },
         "scalar_args": {"scalar0": 1.5},
         "tensor_args": {"c": "tmp0"},
+        "graph_task_args": {
+            "task0": "input:a,input:b,output:tmp1",
+            "task1": "input:a,input:b,output:tmp2",
+        },
         "tensor_core": {
             "api": "wmma",
             "mma_shape": "m16n16k8",
@@ -567,14 +571,15 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
 
     assert (
         "| Tensor core | Dispatch | Scheduler errors | Repeat runs | Launch completions | "
-        "Resource policy | Scalar args | Tensor args |" in markdown
+        "Resource policy | Scalar args | Tensor args | Graph task args |" in markdown
     )
     assert "| a100 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_80` | 102400 | 122260 |" in markdown
     assert "| h200 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_90` | 70464 | 79788 |" in markdown
     assert (
         "| `wmma:m16n16k8:tf32->f32` | `3,1,2,1` | `count=0,code=0,task=0` | `2` | `4,4` | "
         "`sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | "
-        "`scalar0=1.5` | `c=tmp0` |" in markdown
+        "`scalar0=1.5` | `c=tmp0` | "
+        "`task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2` |" in markdown
     )
     assert (
         "| `3,1,2,1` | `count=1,code=7,task=3` | `2` | `4,4` | "
@@ -590,6 +595,7 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
     assert "lifecycle: repeat=2,completed=4,4" in svg
     assert "scalars: scalar0=1.5" in svg
     assert "tensors: c=tmp0" in svg
+    assert "task args: task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2" in svg
 
 
 def test_cuda_smoke_scripts_use_shared_callable_manifest_types():
@@ -655,7 +661,7 @@ def test_cuda_artifact_index_renders_markdown_and_writes_default_index(tmp_path)
     assert output == tmp_path / "index.md"
     assert "# CUDA Backend Artifact Index" in report
     assert (
-        "| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  |  |  |  |  |  |  |  |  | "
+        "| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  |  |  |  |  |  |  |  |  |  | "
         " | no | direct_driver_graph |"
     ) in report
     assert "ratio SVG" in report
@@ -815,6 +821,10 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
         },
         "scalar_args": {"scalar0": 1.5},
         "tensor_args": {"c": "tmp0"},
+        "graph_task_args": {
+            "task0": "input:a,input:b,output:tmp1",
+            "task1": "input:a,input:b,output:tmp2",
+        },
         "tensor_tile": {
             "rows": 16,
             "cols": 16,
@@ -855,6 +865,7 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
             "resource_policies": ["sched=1,workers=2,wp=1,stream=1,block=256,grid=3"],
             "scalar_args": ["scalar0=1.5"],
             "tensor_args": ["c=tmp0"],
+            "graph_task_args": ["task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2"],
             "tensor_tiles": ["16x16x16"],
             "has_markdown": True,
             "has_svg": True,
@@ -871,7 +882,7 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
     assert "| 4096 | 16x16x16 | dag/tensor_tile | 3,1,2,1 |" in report
     assert "count=0,code=0,task=0, count=1,code=7,task=3 |" in report
     assert "sched=1,workers=2,wp=1,stream=1,block=256,grid=3 |" in report
-    assert "scalar0=1.5 | c=tmp0 |" in report
+    assert "scalar0=1.5 | c=tmp0 | task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2 |" in report
 
 
 def test_cuda_artifact_index_records_persistent_smoke_lifecycle_reuse(tmp_path):

@@ -166,7 +166,8 @@ PYTHONPATH=$PWD:$PWD/python \
 Use `cuda_smoke_report.py` to turn captured smoke JSON from A100 and H200 into
 Markdown and SVG evidence. Persistent-device reports include dispatch
 `func_id` sequences, device-side scheduler error counters, resource policy,
-task argument metadata, and repeat-run lifecycle counters when present:
+tensor/scalar task argument metadata, tagged graph `graph_task_args`
+metadata, and repeat-run lifecycle counters when present:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \

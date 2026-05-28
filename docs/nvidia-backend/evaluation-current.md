@@ -583,9 +583,12 @@ PYTHONPATH=$PWD:$PWD/python \
 | H200 | `9,2,1` | `0,0,2` | `2,2` | `3,3` | 40000 | 4919518 | pass |
 
 Both rows reported zero device scheduler errors and generated Markdown/SVG
-smoke reports. This is still host-side descriptor construction, but it proves
-the tagged task-argument representation can feed the same persistent-device
-scheduler path on A100 and H200.
+smoke reports. The regenerated report and artifact index include a
+`Graph task args` field, so the visible evidence shows both the lowered
+fan-in/dependent topology and the original tagged task-argument roles. This is
+still host-side descriptor construction, but it proves the tagged
+task-argument representation can feed the same persistent-device scheduler
+path on A100 and H200.
 
 The diamond graph-descriptor paired smoke at artifact label `072e396c`
 validates a wider explicit descriptor shape than the three-task
