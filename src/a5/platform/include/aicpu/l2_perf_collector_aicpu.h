@@ -115,7 +115,7 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
  * @param worker_count Number of AICore workers (used to locate phase region)
  * @param num_sched_threads Number of scheduler threads
  */
-void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads);
+void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads, int num_total_aicpu_threads = 0);
 
 /**
  * Record a single scheduler phase

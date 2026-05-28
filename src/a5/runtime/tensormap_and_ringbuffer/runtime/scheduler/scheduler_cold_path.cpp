@@ -903,7 +903,9 @@ int32_t SchedulerContext::init(
         l2_perf_aicpu_init(runtime->worker_count);
         l2_perf_level_ = get_l2_perf_level();
         if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-            l2_perf_aicpu_init_phase(runtime->worker_count, sched_thread_num_);
+            // Pass aicpu_thread_num_ (sched + wiring + orch) so phase buffers
+            // get allocated for every exec_idx, not just sched + 1 orch.
+            l2_perf_aicpu_init_phase(runtime->worker_count, sched_thread_num_, aicpu_thread_num_);
         }
     }
 #endif
@@ -1033,16 +1035,10 @@ void SchedulerContext::wiring_thread_run(Runtime *runtime, int32_t thread_idx) {
     (void)runtime;
     LOG_INFO_V0("Thread %d: wiring_thread_run start", thread_idx);
 
-    constexpr int32_t SPIN_BUDGET = 64;
-    int32_t idle_spins = 0;
-
     while (!completed_.load(std::memory_order_acquire)) {
-        bool made_progress = false;
-
         // 1. Drain orch wiring queue (force-drain after orch_done so any
         //    last-second submissions don't stall).
-        int wired = sched_->drain_wiring_queue(orchestrator_done_);
-        if (wired > 0) made_progress = true;
+        sched_->drain_wiring_queue(orchestrator_done_);
 
         // 2. Advance per-ring last_task_alive past CONSUMED slots and publish
         //    to SM. Wiring is the sole writer; the advance_lock CAS still
@@ -1055,18 +1051,9 @@ void SchedulerContext::wiring_thread_run(Runtime *runtime, int32_t thread_idx) {
             if (rss.advance_lock.compare_exchange_strong(
                     expected, 1, std::memory_order_acquire, std::memory_order_relaxed
                 )) {
-                int32_t before = rss.last_task_alive;
                 rss.advance_ring_pointers();
-                if (rss.last_task_alive != before) made_progress = true;
                 rss.advance_lock.store(0, std::memory_order_release);
             }
-        }
-
-        if (made_progress) {
-            idle_spins = 0;
-        } else if (++idle_spins >= SPIN_BUDGET) {
-            SPIN_WAIT_HINT();
-            idle_spins = 0;
         }
     }
 

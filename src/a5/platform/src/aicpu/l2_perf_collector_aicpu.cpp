@@ -377,7 +377,7 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
     LOG_INFO_V0("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
-void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads) {
+void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads, int num_total_aicpu_threads) {
     void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
     if (l2_perf_base == nullptr) {
         LOG_ERROR("l2_perf_data_base is NULL, cannot initialize phase profiling");
@@ -394,9 +394,13 @@ void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads) {
 
     memset(s_phase_header->core_to_thread, -1, sizeof(s_phase_header->core_to_thread));
 
-    // Cache per-thread record pointers and clear buffers
-    // Include all threads: scheduler + orchestrator (orchestrators may become schedulers)
-    int total_threads = num_sched_threads + 1;
+    // Cache per-thread record pointers and clear buffers.
+    // total_threads must cover every exec_idx that may emit phase records:
+    // schedulers, optional wiring thread, and the orchestrator. When the caller
+    // passes num_total_aicpu_threads explicitly we use it; otherwise fall back
+    // to "scheduler + 1 orch" for back-compat with the legacy single-orch layout.
+    int total_threads =
+        (num_total_aicpu_threads > 0) ? num_total_aicpu_threads : num_sched_threads + 1;
     if (total_threads > PLATFORM_MAX_AICPU_THREADS) {
         total_threads = PLATFORM_MAX_AICPU_THREADS;
     }
