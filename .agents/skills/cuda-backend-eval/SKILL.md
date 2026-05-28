@@ -713,6 +713,10 @@ task edges from tensor flow: earlier `out` names become producers for later
 `a`/`b`/`c`/`d` or `tensor_args` reads. Use this form when testing the first
 step toward PTO-style dependency inference while still providing an explicit
 descriptor.
+Graph tasks whose `out` names are not existing input/output tensors are
+allocated as temporary buffers automatically, so tests only need an explicit
+`temporaries` map when a temporary needs a size different from the output
+tensor size.
 For real host-schedule smoke coverage, pass a context definition plus
 `host_parameters`/`host_context_initializer` so the generated `__global__`
 wrapper matches the current vector-add launch ABI and can be loaded by

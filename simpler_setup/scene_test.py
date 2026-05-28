@@ -1144,14 +1144,29 @@ class _CudaPersistentDagSceneBuffers:
 
         ptrs = dict(self.tensor_buffers.ptrs)
         temporary_items = list(dict(self.cuda_spec.get("temporaries", {})).items())
-        for idx, (name, size_source) in enumerate(temporary_items):
-            if idx == 0:
+        temporary_count = 0
+
+        def add_temporary(name, size_source) -> None:
+            nonlocal temporary_count
+            key = str(name)
+            if key in ptrs:
+                return
+            if temporary_count == 0:
                 ptr = self.dev_tmp0
-            elif idx == 1:
+            elif temporary_count == 1:
                 ptr = self.dev_tmp1
             else:
                 ptr = self._malloc(self._temporary_nbytes(size_source, output_nbytes))
-            ptrs[str(name)] = ptr
+            ptrs[key] = ptr
+            temporary_count += 1
+
+        for name, size_source in temporary_items:
+            add_temporary(name, size_source)
+
+        for task_spec in task_specs:
+            out_name = task_spec.get("out")
+            if out_name is not None:
+                add_temporary(out_name, output_nbytes)
 
         graph_dependents = self._graph_dependents_from_task_specs(task_specs)
         dependents: list[int] = []

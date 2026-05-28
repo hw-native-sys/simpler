@@ -298,9 +298,12 @@ descriptor adapter rather than full PTO graph lowering, but it sets the ABI
 direction for persistent tasks whose arity differs from the early hand-coded
 vector cases. The `persistent_dag_graph_f32` adapter can now lower an
 explicit scene-test graph descriptor with per-task dependencies, fan-in,
-temporary buffers, and the same generic tensor/scalar slots. When graph tasks
-omit `dependents`, the adapter infers edges from tensor flow by tracking
-which earlier task produced a tensor or temporary read later through
+temporary buffers, and the same generic tensor/scalar slots. Graph task
+outputs that do not name existing input/output tensors are allocated as
+default-sized temporary buffers automatically, so explicit `temporaries`
+metadata is only needed for non-default sizes. When graph tasks omit
+`dependents`, the adapter infers edges from tensor flow by tracking which
+earlier task produced a tensor or temporary read later through
 `a`/`b`/`c`/`d` or `tensor_args`. It is a descriptor-level stepping stone
 toward PTO graph lowering, not yet automatic construction from normal PTO
 task graphs.
