@@ -913,14 +913,27 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 Use `cuda_tensor_shape_sweep.py` to run paired A100/H200
-`pto_persistent_dag_tensor` samples over model-shaped tensor tile descriptors.
-This is still a scalar tiled GEMM DAG, so treat it as shape and scheduler
-evidence rather than tensor-core throughput evidence:
+samples over model-shaped tensor tile descriptors. By default it runs
+`pto_persistent_dag_tensor`; pass `--baselines` to include
+`pto_persistent_dag_tensor_core` and `cublas_sgemm` for a scalar-vs-WMMA-vs-
+library comparison on compatible descriptors. Treat the scalar tiled GEMM rows
+as shape and scheduler evidence rather than tensor-core throughput evidence:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_tensor_shape_sweep.py \
     --shapes 8x4x12,16x16x64,32x16x64 --n 4096 --repeats 3 \
+    --sync-remote-tree
+```
+
+Run a compact tensor-baseline comparison sweep with shapes compatible with the
+current WMMA task:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_tensor_shape_sweep.py \
+    --baselines pto_persistent_dag_tensor,pto_persistent_dag_tensor_core,cublas_sgemm \
+    --shapes 16x16x16,16x16x64 --n 256 --repeats 1 \
     --sync-remote-tree
 ```
 

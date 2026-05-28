@@ -15,6 +15,7 @@ import argparse
 import html
 import json
 import shlex
+import statistics
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -23,6 +24,14 @@ from pathlib import Path
 from typing import Any
 
 Runner = Callable[..., subprocess.CompletedProcess]
+
+_ALLOWED_BASELINES = frozenset(
+    {
+        "pto_persistent_dag_tensor",
+        "pto_persistent_dag_tensor_core",
+        "cublas_sgemm",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -46,6 +55,7 @@ class TensorShapeSweepConfig:
     remote_device: int = 0
     n: int = 4096
     repeats: int = 3
+    baselines: tuple[str, ...] = ("pto_persistent_dag_tensor",)
     shapes: tuple[TensorShape, ...] = (
         TensorShape(rows=8, cols=4, inner=12),
         TensorShape(rows=16, cols=16, inner=64),
@@ -78,17 +88,28 @@ def parse_shapes(raw: str) -> tuple[TensorShape, ...]:
     return tuple(shapes)
 
 
+def parse_baselines(raw: str) -> tuple[str, ...]:
+    baselines = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if not baselines:
+        raise ValueError("at least one tensor shape sweep baseline is required")
+    unknown = [baseline for baseline in baselines if baseline not in _ALLOWED_BASELINES]
+    if unknown:
+        allowed = ", ".join(sorted(_ALLOWED_BASELINES))
+        raise ValueError(f"unknown tensor shape sweep baseline(s): {', '.join(unknown)}; allowed: {allowed}")
+    return baselines
+
+
 def _git_commit(runner: Runner = subprocess.run) -> str:
     result = runner(["git", "rev-parse", "--short", "HEAD"], check=True, capture_output=True, text=True)
     return result.stdout.strip()
 
 
-def _sample_args(*, device: int, arch: str, n: int, shape: TensorShape) -> list[str]:
+def _sample_args(*, device: int, arch: str, n: int, shape: TensorShape, baseline: str) -> list[str]:
     return [
         "--device",
         str(device),
         "--single-baseline",
-        "pto_persistent_dag_tensor",
+        baseline,
         "--sizes",
         str(n),
         "--arch",
@@ -102,13 +123,27 @@ def _sample_args(*, device: int, arch: str, n: int, shape: TensorShape) -> list[
     ]
 
 
-def build_local_sample_command(config: TensorShapeSweepConfig, shape: TensorShape) -> list[str]:
+def _default_baseline(config: TensorShapeSweepConfig) -> str:
+    return config.baselines[0]
+
+
+def build_local_sample_command(
+    config: TensorShapeSweepConfig,
+    shape: TensorShape,
+    baseline: str | None = None,
+) -> list[str]:
     return [
         "env",
         f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}",
         config.local_python,
         ".agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py",
-        *_sample_args(device=config.local_device, arch=config.local_arch, n=config.n, shape=shape),
+        *_sample_args(
+            device=config.local_device,
+            arch=config.local_arch,
+            n=config.n,
+            shape=shape,
+            baseline=baseline or _default_baseline(config),
+        ),
     ]
 
 
@@ -146,11 +181,21 @@ def _remote_prefix(config: TensorShapeSweepConfig) -> list[str]:
     return commands
 
 
-def build_remote_sample_command(config: TensorShapeSweepConfig, shape: TensorShape) -> list[str]:
+def build_remote_sample_command(
+    config: TensorShapeSweepConfig,
+    shape: TensorShape,
+    baseline: str | None = None,
+) -> list[str]:
     benchmark = [
         config.remote_python,
         ".agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py",
-        *_sample_args(device=config.remote_device, arch=config.remote_arch, n=config.n, shape=shape),
+        *_sample_args(
+            device=config.remote_device,
+            arch=config.remote_arch,
+            n=config.n,
+            shape=shape,
+            baseline=baseline or _default_baseline(config),
+        ),
     ]
     remote_env = "CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH PYTHONPATH=$PWD:$PWD/python"
     commands = _remote_prefix(config)
@@ -179,6 +224,7 @@ def _run_sample(
     *,
     artifact: str,
     shape: TensorShape,
+    baseline: str,
     repeat: int,
     runner: Runner,
     dry_run: bool,
@@ -187,6 +233,7 @@ def _run_sample(
     if dry_run:
         return {
             "artifact": artifact,
+            "baseline": baseline,
             "shape": shape.label,
             "repeat": repeat,
             "status": "dry-run",
@@ -199,6 +246,7 @@ def _run_sample(
     sample = _sample_from_stdout(result.stdout)
     sample["artifact"] = artifact
     sample.setdefault("machine", artifact)
+    sample.setdefault("baseline", baseline)
     sample["shape"] = shape.label
     sample["repeat"] = repeat
     return sample
@@ -219,6 +267,44 @@ def _tile_count(row: dict[str, Any]) -> str:
     return str(tile_count) if tile_count is not None else "-"
 
 
+def _format_number(value: int | float) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _median_summary_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for row in results:
+        if row.get("status") != "pass":
+            continue
+        key = (
+            str(row.get("artifact", "-")),
+            str(row.get("machine") or row.get("artifact", "-")),
+            str(row.get("baseline", "-")),
+            str(row.get("shape", "-")),
+            _tile_count(row),
+        )
+        group = groups.setdefault(key, {"device": [], "host": []})
+        group["device"].append(int(row.get("device_wall_ns", 0)))
+        group["host"].append(int(row.get("host_wall_ns", 0)))
+    summary: list[dict[str, Any]] = []
+    for (artifact, machine, baseline, shape, tiles), values in groups.items():
+        summary.append(
+            {
+                "artifact": artifact,
+                "machine": machine,
+                "baseline": baseline,
+                "shape": shape,
+                "median_device_wall_ns": statistics.median(values["device"]),
+                "median_host_wall_ns": statistics.median(values["host"]),
+                "samples": len(values["device"]),
+                "tiles": tiles,
+            }
+        )
+    return sorted(summary, key=lambda row: (row["shape"], row["baseline"], row["artifact"]))
+
+
 def render_markdown(payload: dict[str, Any]) -> str:
     metadata = payload["metadata"]
     lines = [
@@ -228,20 +314,41 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"- Commit: `{metadata['git_commit']}`",
         f"- N: `{metadata['n']}`",
         f"- Repeats: `{metadata['repeats']}`",
+        f"- Baselines: {', '.join(f'`{baseline}`' for baseline in metadata.get('baselines', []))}.",
         "- Workload: `pto_persistent_dag_tensor` scalar tiled GEMM DAG.",
         "- Scope: early model-shaped tile sweep, not a tuned tensor-core result.",
         "",
-        "| Artifact | Machine | Shape | Repeat | Status | Device ns | Host ns | Tiles | Dispatch |",
-        "| -------- | ------- | ----- | ------ | ------ | --------- | ------- | ----- | -------- |",
+        "| Artifact | Machine | Baseline | Shape | Repeat | Status | Device ns | Host ns | Tiles | Dispatch |",
+        "| -------- | ------- | -------- | ----- | ------ | ------ | --------- | ------- | ----- | -------- |",
     ]
-    results = sorted(payload["results"], key=lambda row: (row["shape"], row["artifact"], row["repeat"]))
+    results = sorted(
+        payload["results"],
+        key=lambda row: (row["shape"], row.get("baseline", ""), row["artifact"], row["repeat"]),
+    )
     for row in results:
         machine = row.get("machine") or row.get("artifact", "-")
         lines.append(
-            f"| {row.get('artifact', '-')} | {machine} | {row['shape']} | "
+            f"| {row.get('artifact', '-')} | {machine} | {row.get('baseline', '-')} | {row['shape']} | "
             f"{row['repeat']} | {row.get('status', '-')} | {row.get('device_wall_ns', '-')} | "
             f"{row.get('host_wall_ns', '-')} | {_tile_count(row)} | `{_dispatch(row)}` |"
         )
+    summary_rows = _median_summary_rows(results)
+    if summary_rows:
+        lines.extend(
+            [
+                "",
+                "## Median Summary",
+                "",
+                "| Artifact | Machine | Baseline | Shape | Median device ns | Median host ns | Samples |",
+                "| -------- | ------- | -------- | ----- | ---------------- | -------------- | ------- |",
+            ]
+        )
+        for row in summary_rows:
+            lines.append(
+                f"| {row['artifact']} | {row['machine']} | {row['baseline']} | {row['shape']} | "
+                f"{_format_number(row['median_device_wall_ns'])} | {_format_number(row['median_host_wall_ns'])} | "
+                f"{row['samples']} |"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -260,15 +367,25 @@ def render_svg(payload: dict[str, Any]) -> str:
     ]
     bar_x = 250
     bar_max = 560
+    colors = {
+        "pto_persistent_dag_tensor": "#2a9d8f",
+        "pto_persistent_dag_tensor_core": "#d1495b",
+        "cublas_sgemm": "#006d77",
+    }
     for idx, row in enumerate(results):
         y = 64 + idx * row_height
         value = int(row.get("device_wall_ns", 0))
         bar_width = int(bar_max * value / max_device_ns) if max_device_ns else 0
-        label = f'{row.get("artifact", "-")} {row.get("shape", "-")} r{row.get("repeat", "-")}'
+        baseline = row.get("baseline", "-")
+        color = colors.get(baseline, "#2a9d8f")
+        label = (
+            f'{row.get("artifact", "-")} {baseline} '
+            f'{row.get("shape", "-")} r{row.get("repeat", "-")}'
+        )
         lines.append(
             f'<text x="24" y="{y + 16}" font-family="monospace" font-size="12">{html.escape(label)}</text>'
         )
-        lines.append(f'<rect x="{bar_x}" y="{y}" width="{bar_width}" height="18" fill="#2a9d8f"/>')
+        lines.append(f'<rect x="{bar_x}" y="{y}" width="{bar_width}" height="18" fill="{color}"/>')
         lines.append(
             f'<text x="{bar_x + bar_width + 8}" y="{y + 14}" font-family="monospace" font-size="12">{value}</text>'
         )
@@ -297,34 +414,38 @@ def run_tensor_shape_sweep(
         if not dry_run:
             runner(sync_command, check=True)
     results: list[dict[str, Any]] = []
-    for shape in config.shapes:
-        for repeat in range(config.repeats):
-            results.append(
-                _run_sample(
-                    build_local_sample_command(config, shape),
-                    artifact="a100",
-                    shape=shape,
-                    repeat=repeat,
-                    runner=runner,
-                    dry_run=dry_run,
+    for baseline in config.baselines:
+        for shape in config.shapes:
+            for repeat in range(config.repeats):
+                results.append(
+                    _run_sample(
+                        build_local_sample_command(config, shape, baseline),
+                        artifact="a100",
+                        shape=shape,
+                        baseline=baseline,
+                        repeat=repeat,
+                        runner=runner,
+                        dry_run=dry_run,
+                    )
                 )
-            )
-            results.append(
-                _run_sample(
-                    build_remote_sample_command(config, shape),
-                    artifact="h200",
-                    shape=shape,
-                    repeat=repeat,
-                    runner=runner,
-                    dry_run=dry_run,
+                results.append(
+                    _run_sample(
+                        build_remote_sample_command(config, shape, baseline),
+                        artifact="h200",
+                        shape=shape,
+                        baseline=baseline,
+                        repeat=repeat,
+                        runner=runner,
+                        dry_run=dry_run,
+                    )
                 )
-            )
     payload = {
         "metadata": {
             "label": f"tensor-shape-sweep-{commit}",
             "git_commit": commit,
             "n": config.n,
             "repeats": config.repeats,
+            "baselines": list(config.baselines),
             "shapes": [shape.label for shape in config.shapes],
             "paper_setup": "Model-shaped tensor tile sweep inspired by VDCores/MPK evaluation shapes.",
         },
@@ -347,6 +468,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remote-device", type=int, default=0)
     parser.add_argument("--n", type=int, default=4096)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--baselines", default="pto_persistent_dag_tensor")
     parser.add_argument("--shapes", default="8x4x12,16x16x64,32x16x64")
     parser.add_argument("--local-arch", default="compute_80")
     parser.add_argument("--remote-arch", default="compute_90")
@@ -373,6 +495,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         remote_device=args.remote_device,
         n=args.n,
         repeats=args.repeats,
+        baselines=parse_baselines(args.baselines),
         shapes=parse_shapes(args.shapes),
         local_arch=args.local_arch,
         remote_arch=args.remote_arch,
