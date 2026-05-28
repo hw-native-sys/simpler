@@ -392,6 +392,21 @@ cuBLAS path reaches about `54` GFLOP/s on A100 and `58` GFLOP/s on H200 at
 compact descriptor/scheduler comparison rather than a tuned GEMM throughput
 result.
 
+A current-head one-repeat follow-up under
+`tmp/cuda-backend/tensor-shape-sweep-0e84fd26/` adds
+`pto_persistent_dag_graph_tensor` to the same tensor-baseline sweep family.
+It uses the `16x16x16` descriptor at `N=256` and `4096`, validates sanitized
+command examples, VDCores/MPK source-paper metadata, report files, and PTO
+dispatch sequences, and keeps the explicit graph tensor row beside scalar
+tensor, WMMA tensor-core, and cuBLAS rows.
+
+| GPU | N | Shape | Scalar tensor ns | Graph tensor ns | Tensor-core ns | cuBLAS ns | Scalar GF/s | Graph tensor GF/s | Tensor-core GF/s | cuBLAS GF/s | Graph/scalar | Tensor-core/scalar | cuBLAS/scalar |
+| --- | - | ----- | ---------------- | --------------- | -------------- | --------- | ----------- | ----------------- | ---------------- | ----------- | ------------ | ------------------ | ------------- |
+| A100 | 256 | 16x16x16 | 47104 | 47104 | 45056 | 48128 | 0.17 | 0.17 | 0.18 | 0.17 | 1.00x | 0.96x | 1.02x |
+| A100 | 4096 | 16x16x16 | 80896 | 80896 | 82944 | 39935 | 1.62 | 1.62 | 1.58 | 3.28 | 1.00x | 1.03x | 0.49x |
+| H200 | 256 | 16x16x16 | 29568 | 32800 | 27040 | 51711 | 0.28 | 0.25 | 0.30 | 0.16 | 1.11x | 0.91x | 1.75x |
+| H200 | 4096 | 16x16x16 | 89472 | 89152 | 51872 | 35904 | 1.46 | 1.47 | 2.53 | 3.65 | 1.00x | 0.58x | 0.40x |
+
 ### Current-Head Reproducibility Check
 
 A follow-up one-repeat compact tensor sweep at commit `a5fd4bfd` validates the

@@ -291,10 +291,11 @@ around a warm cuBLAS `cublasSgemmStridedBatched` call over the configured
 PTO runtime path.
 
 The tensor shape sweep script now accepts `--baselines` and `--sizes`, so one
-paired A100/H200 sweep can compare scalar tensor DAG, WMMA tensor-core DAG,
-and cuBLAS SGEMM rows across descriptor shapes and problem sizes. The current
-size-sweep report at commit `e79edba2` uses a `16x16x16` descriptor with
-`N=256`, `4096`, and `65536`, three repeats, and the artifact under
+paired A100/H200 sweep can compare scalar tensor DAG, the explicit graph
+tensor DAG, WMMA tensor-core DAG, and cuBLAS SGEMM rows across descriptor
+shapes and problem sizes. The multi-repeat size-sweep report at commit
+`e79edba2` uses a `16x16x16` descriptor with `N=256`, `4096`, and `65536`,
+three repeats, and the artifact under
 `tmp/cuda-backend/tensor-shape-sweep-e79edba2/`. It writes raw rows,
 VDCores/MPK provenance metadata, per-baseline workload descriptions, a median
 summary table with normalized GFLOP/s, and SVG charts for median device time
@@ -309,6 +310,16 @@ throughput at `N=65536` is A100 scalar/tensor-core/cuBLAS
 tensor-core row improves over the scalar tensor row as repeated tile work
 grows, while the cuBLAS baseline shows the remaining gap to a tuned CUDA
 library path.
+A current-head one-repeat graph-tensor sweep at
+`tmp/cuda-backend/tensor-shape-sweep-0e84fd26/` adds
+`pto_persistent_dag_graph_tensor` to the same `16x16x16` tensor-baseline
+comparison at `N=256` and `4096`. The validated median device times were:
+A100 scalar/graph/tensor-core/cuBLAS `47104/47104/45056/48128 ns` at
+`N=256` and `80896/80896/82944/39935 ns` at `N=4096`; H200
+`29568/32800/27040/51711 ns` at `N=256` and
+`89472/89152/51872/35904 ns` at `N=4096`. The graph tensor row uses the same
+dispatch `3,1,2,1` as the scalar tensor row while exercising the explicit
+runtime graph descriptor path.
 `cuda_validate_tensor_sweep.py` checked the expected A100/H200 rows,
 baselines, sizes, shape, three repeats, report files, and PTO dispatch
 sequences before the numbers were copied into docs. New tensor-sweep captures

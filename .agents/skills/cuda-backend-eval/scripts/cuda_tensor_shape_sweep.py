@@ -28,6 +28,7 @@ Runner = Callable[..., subprocess.CompletedProcess]
 _ALLOWED_BASELINES = frozenset(
     {
         "pto_persistent_dag_tensor",
+        "pto_persistent_dag_graph_tensor",
         "pto_persistent_dag_tensor_core",
         "cublas_sgemm",
     }
@@ -50,6 +51,7 @@ PAPER_SETUP = (
 )
 WORKLOAD_DESCRIPTIONS = {
     "pto_persistent_dag_tensor": "PTO persistent DAG with scalar tiled GEMM work.",
+    "pto_persistent_dag_graph_tensor": "PTO persistent DAG with explicit graph scalar tiled GEMM work.",
     "pto_persistent_dag_tensor_core": "PTO persistent DAG with a block-wide WMMA TF32/F32 task.",
     "cublas_sgemm": "CUDA Runtime API plus cuBLAS SGEMM over the same descriptor.",
 }
@@ -347,11 +349,7 @@ def _shape_dims(row: dict[str, Any], shape: str) -> tuple[int, int, int] | None:
         rows = tensor_tile.get("rows")
         cols = tensor_tile.get("cols")
         inner = tensor_tile.get("inner")
-        if (
-            isinstance(rows, int)
-            and isinstance(cols, int)
-            and isinstance(inner, int)
-        ):
+        if isinstance(rows, int) and isinstance(cols, int) and isinstance(inner, int):
             return rows, cols, inner
     parts = shape.split("x")
     if len(parts) != 3:
@@ -408,17 +406,15 @@ def _command_example_lines(metadata: dict[str, Any]) -> list[str]:
         "remote_sample": "Remote sample command",
         "sync_remote_tree": "Remote tree sync command",
     }
-    return [
-        f"- {label}: `{examples[key]}`"
-        for key, label in labels.items()
-        if isinstance(examples.get(key), str)
-    ]
+    return [f"- {label}: `{examples[key]}`" for key, label in labels.items() if isinstance(examples.get(key), str)]
 
 
 def _row_n(row: dict[str, Any], metadata: dict[str, Any] | None = None) -> int | str:
     n = row.get("n")
     if n is None and metadata is not None:
         n = metadata.get("n")
+    if n is None:
+        return "-"
     try:
         return int(n)
     except (TypeError, ValueError):
@@ -460,11 +456,7 @@ def _median_summary_rows(
                 "shape": shape,
                 "median_device_wall_ns": median_device,
                 "median_host_wall_ns": statistics.median(values["host"]),
-                "median_gflops": (
-                    float(flops) / float(median_device)
-                    if flops is not None and median_device
-                    else None
-                ),
+                "median_gflops": (float(flops) / float(median_device) if flops is not None and median_device else None),
                 "samples": len(values["device"]),
                 "tiles": tiles,
             }
@@ -515,8 +507,10 @@ def render_markdown(payload: dict[str, Any]) -> str:
                 "",
                 "## Median Summary",
                 "",
-                "| Artifact | Machine | Baseline | N | Shape | Median device ns | Median host ns | Median GF/s | Samples |",
-                "| -------- | ------- | -------- | - | ----- | ---------------- | -------------- | ----------- | ------- |",
+                "| Artifact | Machine | Baseline | N | Shape | Median device ns | "
+                "Median host ns | Median GF/s | Samples |",
+                "| -------- | ------- | -------- | - | ----- | ---------------- | "
+                "-------------- | ----------- | ------- |",
             ]
         )
         for row in summary_rows:
@@ -556,16 +550,14 @@ def render_svg(payload: dict[str, Any]) -> str:
         baseline = row.get("baseline", "-")
         color = colors.get(baseline, "#2a9d8f")
         label = (
-            f'{row.get("artifact", "-")} {baseline} n={row.get("n", "-")} {row.get("shape", "-")} '
-            f'samples={row.get("samples", "-")}'
+            f"{row.get('artifact', '-')} {baseline} n={row.get('n', '-')} {row.get('shape', '-')} "
+            f"samples={row.get('samples', '-')}"
         )
-        lines.append(
-            f'<text x="24" y="{y + 16}" font-family="monospace" font-size="12">{html.escape(label)}</text>'
-        )
+        lines.append(f'<text x="24" y="{y + 16}" font-family="monospace" font-size="12">{html.escape(label)}</text>')
         lines.append(f'<rect x="{bar_x}" y="{y}" width="{bar_width}" height="18" fill="{color}"/>')
         lines.append(
             f'<text x="{bar_x + bar_width + 8}" y="{y + 14}" font-family="monospace" font-size="12">'
-            f'{_format_number(value)}</text>'
+            f"{_format_number(value)}</text>"
         )
     lines.append("</svg>")
     return "\n".join(lines) + "\n"
@@ -599,16 +591,14 @@ def render_throughput_svg(payload: dict[str, Any]) -> str:
         baseline = row.get("baseline", "-")
         color = colors.get(baseline, "#2a9d8f")
         label = (
-            f'{row.get("artifact", "-")} {baseline} n={row.get("n", "-")} {row.get("shape", "-")} '
-            f'samples={row.get("samples", "-")}'
+            f"{row.get('artifact', '-')} {baseline} n={row.get('n', '-')} {row.get('shape', '-')} "
+            f"samples={row.get('samples', '-')}"
         )
-        lines.append(
-            f'<text x="24" y="{y + 16}" font-family="monospace" font-size="12">{html.escape(label)}</text>'
-        )
+        lines.append(f'<text x="24" y="{y + 16}" font-family="monospace" font-size="12">{html.escape(label)}</text>')
         lines.append(f'<rect x="{bar_x}" y="{y}" width="{bar_width}" height="18" fill="{color}"/>')
         lines.append(
             f'<text x="{bar_x + bar_width + 8}" y="{y + 14}" font-family="monospace" font-size="12">'
-            f'{_format_gflops(value)}</text>'
+            f"{_format_gflops(value)}</text>"
         )
     lines.append("</svg>")
     return "\n".join(lines) + "\n"

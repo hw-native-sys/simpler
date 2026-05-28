@@ -21,6 +21,7 @@ from typing import Any
 COMPACT_TENSOR_BASELINE_ARTIFACTS = ("a100", "h200")
 COMPACT_TENSOR_BASELINE_BASELINES = (
     "pto_persistent_dag_tensor",
+    "pto_persistent_dag_graph_tensor",
     "pto_persistent_dag_tensor_core",
     "cublas_sgemm",
 )
@@ -35,6 +36,7 @@ COMPACT_TENSOR_BASELINE_RESULT_COUNT = (
 )
 COMPACT_TENSOR_BASELINE_DISPATCH = {
     "pto_persistent_dag_tensor": "3,1,2,1",
+    "pto_persistent_dag_graph_tensor": "3,1,2,1",
     "pto_persistent_dag_tensor_core": "10,1,2,1",
 }
 REQUIRED_SOURCE_PAPER_IDS = ("arXiv:2605.03190", "arXiv:2512.22219v1")
@@ -173,7 +175,9 @@ def _validate_dispatch(rows: list[dict[str, Any]], required_dispatch: dict[str, 
         if found != expected:
             artifact = row.get("artifact", "unknown")
             n = row.get("n", "unknown")
-            errors.append(f"expected dispatch {expected} for artifact={artifact} baseline={baseline} n={n}, found {found}")
+            errors.append(
+                f"expected dispatch {expected} for artifact={artifact} baseline={baseline} n={n}, found {found}"
+            )
     return errors
 
 
@@ -185,11 +189,7 @@ def _validate_report_files(artifact_dir: Path | None) -> list[str]:
 
 def _validate_command_examples(payload: dict[str, Any]) -> list[str]:
     metadata = payload.get("metadata")
-    examples = (
-        metadata.get("command_examples")
-        if isinstance(metadata, dict)
-        else None
-    )
+    examples = metadata.get("command_examples") if isinstance(metadata, dict) else None
     errors: list[str] = []
     if not isinstance(examples, dict):
         return [
@@ -214,41 +214,26 @@ def _validate_command_examples(payload: dict[str, Any]) -> list[str]:
 
     sync_sample = examples.get("sync_remote_tree")
     if isinstance(sync_sample, str) and str(Path.cwd()) in sync_sample:
-        errors.append(
-            "metadata.command_examples.sync_remote_tree contains local checkout path"
-        )
+        errors.append("metadata.command_examples.sync_remote_tree contains local checkout path")
 
     return errors
 
 
 def _validate_source_papers(payload: dict[str, Any], *, source_root: Path) -> list[str]:
     metadata = payload.get("metadata")
-    paper_setup = (
-        metadata.get("paper_setup")
-        if isinstance(metadata, dict)
-        else None
-    )
-    source_papers = (
-        metadata.get("source_papers")
-        if isinstance(metadata, dict)
-        else None
-    )
+    paper_setup = metadata.get("paper_setup") if isinstance(metadata, dict) else None
+    source_papers = metadata.get("source_papers") if isinstance(metadata, dict) else None
     errors: list[str] = []
     if not isinstance(paper_setup, str) or not paper_setup:
         errors.append("missing metadata.paper_setup")
     if not isinstance(source_papers, list):
         return [
             *errors,
-            *[
-                f"missing metadata.source_papers {paper_id}"
-                for paper_id in REQUIRED_SOURCE_PAPER_IDS
-            ],
+            *[f"missing metadata.source_papers {paper_id}" for paper_id in REQUIRED_SOURCE_PAPER_IDS],
         ]
 
     papers_by_id = {
-        paper.get("id"): paper
-        for paper in source_papers
-        if isinstance(paper, dict) and paper.get("id") is not None
+        paper.get("id"): paper for paper in source_papers if isinstance(paper, dict) and paper.get("id") is not None
     }
     for paper_id in REQUIRED_SOURCE_PAPER_IDS:
         paper = papers_by_id.get(paper_id)
@@ -257,16 +242,14 @@ def _validate_source_papers(payload: dict[str, Any], *, source_root: Path) -> li
             continue
         path = paper.get("path")
         if not isinstance(path, str) or not path.startswith("tmp/sources/"):
-            errors.append(
-                f"metadata.source_papers {paper_id} path must stay under tmp/sources/"
-            )
+            errors.append(f"metadata.source_papers {paper_id} path must stay under tmp/sources/")
             continue
         if not (source_root / path).is_file():
             errors.append(f"missing metadata.source_papers {paper_id} file {path}")
     return errors
 
 
-def validate_tensor_sweep(
+def validate_tensor_sweep(  # noqa: PLR0913
     payload: dict[str, Any],
     *,
     artifact_dir: Path | None = None,

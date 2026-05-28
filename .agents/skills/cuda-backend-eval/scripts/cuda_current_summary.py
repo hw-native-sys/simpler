@@ -295,14 +295,17 @@ def render_tensor_sweep_table(payload: Payload) -> str:
     )
     for machine, n, shape in machine_sizes_shapes:
         scalar_key = (machine, "pto_persistent_dag_tensor", n, shape)
+        graph_tensor_key = (machine, "pto_persistent_dag_graph_tensor", n, shape)
         tensor_core_key = (machine, "pto_persistent_dag_tensor_core", n, shape)
         cublas_key = (machine, "cublas_sgemm", n, shape)
         if scalar_key not in medians:
             continue
         scalar = medians[scalar_key]
+        graph_tensor = medians.get(graph_tensor_key)
         tensor_core = medians.get(tensor_core_key)
         cublas = medians.get(cublas_key)
         scalar_gflops = _tensor_gflops(n, shape, scalar)
+        graph_tensor_gflops = _tensor_gflops(n, shape, graph_tensor)
         tensor_core_gflops = _tensor_gflops(n, shape, tensor_core)
         cublas_gflops = _tensor_gflops(n, shape, cublas)
         rows.append(
@@ -311,11 +314,14 @@ def render_tensor_sweep_table(payload: Payload) -> str:
                 n,
                 shape,
                 _format_number(scalar),
+                _format_number(graph_tensor) if graph_tensor is not None else "-",
                 _format_number(tensor_core) if tensor_core is not None else "-",
                 _format_number(cublas) if cublas is not None else "-",
                 _format_gflops(scalar_gflops),
+                _format_gflops(graph_tensor_gflops),
                 _format_gflops(tensor_core_gflops),
                 _format_gflops(cublas_gflops),
+                _ratio(graph_tensor, scalar) if graph_tensor is not None else "-",
                 _ratio(tensor_core, scalar) if tensor_core is not None else "-",
                 _ratio(cublas, scalar) if cublas is not None else "-",
             ]
@@ -326,11 +332,14 @@ def render_tensor_sweep_table(payload: Payload) -> str:
             "N",
             "Shape",
             "Scalar tensor ns",
+            "Graph tensor ns",
             "Tensor-core ns",
             "cuBLAS ns",
             "Scalar GF/s",
+            "Graph tensor GF/s",
             "Tensor-core GF/s",
             "cuBLAS GF/s",
+            "Graph/scalar",
             "Tensor-core/scalar",
             "cuBLAS/scalar",
         ],

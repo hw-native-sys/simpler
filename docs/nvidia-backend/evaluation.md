@@ -28,9 +28,8 @@ tensor baseline sweep uses `e79edba2`:
   `8x4x12`, `16x16x64`, and `32x16x64` tensor-shape sweep for
   `pto_persistent_dag_tensor`.
 - [Current capture](evaluation-current.md) records a compact tensor-baseline
-  size sweep comparing scalar tensor DAG, WMMA tensor-core DAG, and cuBLAS
-  SGEMM rows for a `16x16x16` descriptor at `N=256`, `4096`, and `65536`,
-  with three samples per GPU/size/baseline.
+  size sweep comparing scalar tensor DAG, explicit-graph scalar tensor DAG,
+  WMMA tensor-core DAG, and cuBLAS SGEMM rows for a `16x16x16` descriptor.
 - [Current capture](evaluation-current.md) records the compact `d361006f`
   paired gate that validates the default `16x16x16` tensor descriptor with
   scalar tensor DAG, WMMA tensor-core DAG, and cuBLAS rows in one current-head
@@ -78,6 +77,7 @@ committed:
 - `tmp/cuda-backend/persistent-graph_tensor_tile-16x16x16-repeat2-working/`
 - `tmp/cuda-backend/combined-graph-tensor-current-working/`
 - `tmp/cuda-backend/tensor-shape-sweep-c0ada3ad/`
+- `tmp/cuda-backend/tensor-shape-sweep-0e84fd26/`
 - `tmp/cuda-backend/persistent-tensor_core_tile-16x16x16-smoke-390eda4f/`
 - `tmp/cuda-backend/a100-tensor-core-current-0879aa9e/`
 - `tmp/cuda-backend/h200-tensor-core-current-0879aa9e/`
