@@ -1199,6 +1199,10 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
                 {"id": "arXiv:2605.03190", "label": "VDCores"},
                 {"id": "arXiv:2512.22219v1", "label": "MPK persistent kernel"},
             ],
+            "command_examples": {
+                "local_sample": "env PYTHONPATH=$PWD:$PWD/python .venv/bin/python cuda_benchmark.py",
+                "remote_sample": "ssh h200-box 'cd /remote/pto-cu && cuda_benchmark.py'",
+            },
         },
         "results": [
             {
@@ -1240,6 +1244,8 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
     assert "- Workload: `pto_persistent_dag_tensor` scalar tiled GEMM DAG." not in markdown
     assert "- Baselines: `pto_persistent_dag_tensor`, `cublas_sgemm`." in markdown
     assert "- Sizes: `4096`, `8192`" in markdown
+    assert "- Local sample command: `env PYTHONPATH=$PWD:$PWD/python .venv/bin/python cuda_benchmark.py`" in markdown
+    assert "- Remote sample command: `ssh h200-box 'cd /remote/pto-cu && cuda_benchmark.py'`" in markdown
     assert (
         "| a100 | hina | pto_persistent_dag_tensor | 4096 | 8x4x12 | 0 | pass | 1000 | 1500 | 128 | `3,1,2,1` |"
         in markdown
@@ -1299,6 +1305,15 @@ def test_cuda_tensor_shape_sweep_dry_run_records_source_papers(tmp_path):
             "path": "tmp/sources/arxiv-2512.22219v1-mirage-persistent-kernel.txt",
         },
     ]
+    command_examples = payload["metadata"]["command_examples"]
+    assert "local_sample" in command_examples
+    assert "remote_sample" in command_examples
+    assert "sync_remote_tree" not in command_examples
+    assert "$PWD:$PWD/python" in command_examples["local_sample"]
+    assert str(Path.cwd()) not in command_examples["local_sample"]
+    assert "--single-baseline pto_persistent_dag_tensor_core" in command_examples["local_sample"]
+    assert "ssh" in command_examples["remote_sample"]
+    assert "--arch compute_90" in command_examples["remote_sample"]
 
 
 def test_cuda_tensor_shape_sweep_main_renders_existing_json(tmp_path, capsys):

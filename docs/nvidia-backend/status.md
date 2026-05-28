@@ -299,8 +299,9 @@ Evidence:
   artifact-index refresh.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_tensor_shape_sweep.py`
   automates paired A100/H200 tensor baseline sweeps over model-shaped tensor
-  descriptors, records VDCores/MPK provenance in generated metadata, and
-  writes JSON, Markdown, and SVG artifacts under `tmp/cuda-backend/`.
+  descriptors, records VDCores/MPK provenance and sanitized command examples
+  in generated metadata, and writes JSON, Markdown, and SVG artifacts under
+  `tmp/cuda-backend/`.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_current_summary.py` renders
   the compact benchmark tables and the compact tensor-sweep median table used
   by [evaluation-current.md](evaluation-current.md) from raw JSON artifacts.

@@ -250,6 +250,28 @@ def build_remote_sample_command(
     ]
 
 
+def _display_command(command: Sequence[str]) -> str:
+    return shlex.join(command).replace(str(Path.cwd()), "$PWD")
+
+
+def build_command_examples(config: TensorShapeSweepConfig) -> dict[str, str]:
+    sizes = config.sizes or (config.n,)
+    shape = config.shapes[0]
+    baseline = config.baselines[0]
+    n = sizes[0]
+    examples = {
+        "local_sample": _display_command(
+            build_local_sample_command(config, shape, baseline, n=n),
+        ),
+        "remote_sample": _display_command(
+            build_remote_sample_command(config, shape, baseline, n=n),
+        ),
+    }
+    if config.sync_remote_tree:
+        examples["sync_remote_tree"] = _display_command(build_remote_sync_command(config))
+    return examples
+
+
 def _sample_from_stdout(stdout: str) -> dict[str, Any]:
     for line in reversed(stdout.splitlines()):
         line = line.strip()
@@ -377,6 +399,22 @@ def _source_paper_summary(metadata: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+def _command_example_lines(metadata: dict[str, Any]) -> list[str]:
+    examples = metadata.get("command_examples")
+    if not isinstance(examples, dict):
+        return []
+    labels = {
+        "local_sample": "Local sample command",
+        "remote_sample": "Remote sample command",
+        "sync_remote_tree": "Remote tree sync command",
+    }
+    return [
+        f"- {label}: `{examples[key]}`"
+        for key, label in labels.items()
+        if isinstance(examples.get(key), str)
+    ]
+
+
 def _row_n(row: dict[str, Any], metadata: dict[str, Any] | None = None) -> int | str:
     n = row.get("n")
     if n is None and metadata is not None:
@@ -447,6 +485,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"- Baselines: {', '.join(f'`{baseline}`' for baseline in metadata.get('baselines', []))}.",
         f"- Source setup: {_source_paper_summary(metadata)}.",
         f"- Paper alignment: {metadata.get('paper_setup', PAPER_SETUP)}",
+        *_command_example_lines(metadata),
         "- Workloads:",
         *[
             f"  - `{baseline}`: {WORKLOAD_DESCRIPTIONS.get(baseline, 'custom tensor sweep baseline.')}"
@@ -652,6 +691,7 @@ def run_tensor_shape_sweep(
             "shapes": [shape.label for shape in config.shapes],
             "paper_setup": PAPER_SETUP,
             "source_papers": list(SOURCE_PAPERS),
+            "command_examples": build_command_examples(config),
         },
         "results": results,
     }
