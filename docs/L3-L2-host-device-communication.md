@@ -343,6 +343,16 @@ should define their own metadata in the mapped data area.
 Signal values should be monotonic within one protocol epoch. Wrap-around
 handling is not part of this primitive.
 
+Each signal slot should have a single publisher within a protocol epoch. Do
+not have host code and device code publish to the same signal slot at the same
+time; use separate slots for opposite directions, such as host-publishes slot
+0 and device-publishes slot 1.
+
+If a future protocol needs host and device code to publish through the same
+signal slot, it must add a stronger ownership protocol. Either invalidate the
+slot before `notify` checks and updates it, or encode ownership explicitly with
+metadata such as an epoch or owner field.
+
 `wait` has two modes:
 
 - `timeout_us == 0`: non-blocking probe.

@@ -14,6 +14,18 @@
 
 #include "host_device_comm/host_device_mapped_region.h"
 
+/**
+ * Allocate a host/device mapped region for simulation.
+ *
+ * @param ctx          Device context handle; unused by the simulator allocator.
+ * @param total_bytes  Total allocation size in bytes. Must be non-zero.
+ * @param platform     Output platform callbacks and release state.
+ * @param host_base    Output host-visible base pointer.
+ * @param device_base  Output device-visible base pointer; identical to host_base in simulation.
+ * @return 0 on success, -EINVAL for invalid arguments, or -ENOMEM on allocation failure.
+ *
+ * The returned allocation is 64-byte aligned and owned by platform->release.
+ */
 int host_device_mapped_region_allocate_sim(
     DeviceContextHandle ctx, uint64_t total_bytes, HostDeviceMappedRegionPlatform *platform, void **host_base,
     void **device_base

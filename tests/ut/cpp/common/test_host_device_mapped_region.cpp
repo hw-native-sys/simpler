@@ -1,4 +1,5 @@
 #include "host_device_comm/host_device_mapped_region.h"
+#include "host_device_comm/host_device_mapped_region_sim.h"
 
 #include <errno.h>
 #include <gtest/gtest.h>
@@ -121,9 +122,46 @@ TEST(HostDeviceMappedRegion, PublicAbiLayoutIsStable) {
     EXPECT_EQ(offsetof(HostDeviceMappedRegionInfo, host_signal_ptr), 24u);
     EXPECT_EQ(offsetof(HostDeviceMappedRegionInfo, device_signal_ptr), 32u);
     EXPECT_EQ(offsetof(HostDeviceMappedRegionInfo, signal_count), 40u);
+    EXPECT_EQ(offsetof(HostDeviceMappedRegionInfo, reserved0), 44u);
     EXPECT_EQ(offsetof(HostDeviceMappedRegionInfo, total_bytes), 48u);
     EXPECT_EQ(offsetof(HostDeviceMappedRegionInfo, flags), 56u);
+    EXPECT_EQ(offsetof(HostDeviceMappedRegionInfo, reserved1), 60u);
     EXPECT_EQ(sizeof(HostDeviceMappedRegionInfo), 64u);
+}
+
+TEST(HostDeviceMappedRegionSim, RejectsInvalidAllocationArguments) {
+    auto ctx = reinterpret_cast<DeviceContextHandle>(0x10);
+
+    EXPECT_EXIT(
+        {
+            int rc = host_device_mapped_region_allocate_sim(ctx, 64, nullptr, nullptr, nullptr);
+            std::exit(rc == -EINVAL ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+    EXPECT_EXIT(
+        {
+            HostDeviceMappedRegionPlatform platform{};
+            void *device_base = nullptr;
+            int rc = host_device_mapped_region_allocate_sim(ctx, 64, &platform, nullptr, &device_base);
+            std::exit(rc == -EINVAL ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+    EXPECT_EXIT(
+        {
+            HostDeviceMappedRegionPlatform platform{};
+            void *host_base = nullptr;
+            int rc = host_device_mapped_region_allocate_sim(ctx, 64, &platform, &host_base, nullptr);
+            std::exit(rc == -EINVAL ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+
+    HostDeviceMappedRegionPlatform platform{};
+    void *host_base = nullptr;
+    void *device_base = nullptr;
+    EXPECT_EQ(host_device_mapped_region_allocate_sim(ctx, 0, &platform, &host_base, &device_base), -EINVAL);
 }
 
 TEST(HostDeviceMappedRegion, InternalLayoutIsStable) {

@@ -20,6 +20,9 @@ int host_device_mapped_region_allocate_sim(
     void **device_base
 ) {
     (void)ctx;
+    if (platform == nullptr || host_base == nullptr || device_base == nullptr || total_bytes == 0) {
+        return -EINVAL;
+    }
     void *ptr = nullptr;
     if (posix_memalign(&ptr, 64, static_cast<size_t>(total_bytes)) != 0) {
         return -ENOMEM;

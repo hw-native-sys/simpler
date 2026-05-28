@@ -86,10 +86,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             break;
         }
     }
+    if (!observed) {
+        return;
+    }
 
     invalidate_range(data, nbytes);
     for (uint32_t i = 0; i < nbytes; ++i) {
-        uint8_t mask = observed ? static_cast<uint8_t>(seq + i * 3U) : static_cast<uint8_t>(0xA5U);
+        uint8_t mask = static_cast<uint8_t>(seq + i * 3U);
         data[nbytes + i] = static_cast<uint8_t>(data[i] ^ mask);
     }
     flush_range(data + nbytes, nbytes);

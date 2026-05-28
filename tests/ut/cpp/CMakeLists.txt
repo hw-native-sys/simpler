@@ -316,6 +316,7 @@ add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 add_executable(test_host_device_mapped_region
     common/test_host_device_mapped_region.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/host_device_comm/host_device_mapped_region.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/host_device_comm/host_device_mapped_region_sim.cpp
 )
 target_include_directories(test_host_device_mapped_region PRIVATE
     ${GTEST_INCLUDE_DIRS}

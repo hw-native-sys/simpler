@@ -13,7 +13,6 @@
 
 #include <errno.h>
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -35,8 +34,10 @@ static_assert(offsetof(HostDeviceMappedRegionInfo, data_bytes) == 16);
 static_assert(offsetof(HostDeviceMappedRegionInfo, host_signal_ptr) == 24);
 static_assert(offsetof(HostDeviceMappedRegionInfo, device_signal_ptr) == 32);
 static_assert(offsetof(HostDeviceMappedRegionInfo, signal_count) == 40);
+static_assert(offsetof(HostDeviceMappedRegionInfo, reserved0) == 44);
 static_assert(offsetof(HostDeviceMappedRegionInfo, total_bytes) == 48);
 static_assert(offsetof(HostDeviceMappedRegionInfo, flags) == 56);
+static_assert(offsetof(HostDeviceMappedRegionInfo, reserved1) == 60);
 static_assert(sizeof(HostDeviceMappedRegionInfo) == 64);
 
 namespace {
@@ -53,6 +54,7 @@ struct HostDeviceMappedRegion {
     uint64_t signal_offset = 0;
     uint32_t signal_count = 0;
     uint32_t flags = 0;
+    std::mutex signal_mu;
     std::mutex op_mu;
     std::condition_variable op_cv;
     uint32_t active_ops = 0;
@@ -427,20 +429,24 @@ int host_device_mapped_region_notify_common(
         return -EINVAL;
     }
     auto *slot = signal_slot(region, signal_id);
-    auto *atomic_value = reinterpret_cast<std::atomic<uint32_t> *>(const_cast<uint32_t *>(&slot->value));
-    uint32_t current = atomic_value->load(std::memory_order_acquire);
-    if (value < current) {
-        release_region_op(region);
-        return -EINVAL;
-    }
-    atomic_value->store(value, std::memory_order_release);
-    int rc = flush_host_range(region, slot, sizeof(*slot));
-    if (rc != 0) {
-        release_region_op(region);
-        return -EIO;
+    int rc = 0;
+    {
+        std::lock_guard<std::mutex> lock(region->signal_mu);
+        uint32_t current = slot->value;
+        if (value < current) {
+            rc = -EINVAL;
+        } else {
+            if (value > current) {
+                slot->value = value;
+            }
+            rc = flush_host_range(region, slot, sizeof(*slot));
+            if (rc != 0) {
+                rc = -EIO;
+            }
+        }
     }
     release_region_op(region);
-    return 0;
+    return rc;
 }
 
 int host_device_mapped_region_wait_common(
@@ -456,13 +462,21 @@ int host_device_mapped_region_wait_common(
     }
     HostDeviceMappedRegionSignalSlot *slot = signal_slot(region, signal_id);
 
-    int rc = invalidate_host_range(region, slot, sizeof(*slot));
-    if (rc != 0) {
+    auto check_signal = [&]() -> int {
+        std::lock_guard<std::mutex> lock(region->signal_mu);
+        int rc = invalidate_host_range(region, slot, sizeof(*slot));
+        if (rc != 0) {
+            return -EIO;
+        }
+        return slot->value >= target ? 1 : 0;
+    };
+
+    int rc = check_signal();
+    if (rc < 0) {
         release_region_op(region);
-        return -EIO;
+        return rc;
     }
-    auto *atomic_value = reinterpret_cast<std::atomic<uint32_t> *>(const_cast<uint32_t *>(&slot->value));
-    if (atomic_value->load(std::memory_order_acquire) >= target) {
+    if (rc > 0) {
         release_region_op(region);
         return 0;
     }
@@ -473,12 +487,12 @@ int host_device_mapped_region_wait_common(
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeout_us);
     do {
-        rc = invalidate_host_range(region, slot, sizeof(*slot));
-        if (rc != 0) {
+        rc = check_signal();
+        if (rc < 0) {
             release_region_op(region);
-            return -EIO;
+            return rc;
         }
-        if (atomic_value->load(std::memory_order_acquire) >= target) {
+        if (rc > 0) {
             release_region_op(region);
             return 0;
         }

@@ -71,8 +71,14 @@ struct MappedRegionInfo {
 
 MappedRegionInfo make_mapped_region_info(const HostDeviceMappedRegionInfo &info) {
     return MappedRegionInfo{
-        info.host_data_ptr,     info.device_data_ptr, info.data_bytes,  info.host_signal_ptr,
-        info.device_signal_ptr, info.signal_count,    info.total_bytes, info.flags,
+        0,
+        info.device_data_ptr,
+        info.data_bytes,
+        0,
+        info.device_signal_ptr,
+        info.signal_count,
+        info.total_bytes,
+        info.flags,
     };
 }
 
