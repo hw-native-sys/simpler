@@ -583,6 +583,21 @@ def write_report(payload: dict[str, Any], output_dir: Path) -> None:
     (output_dir / "cuda-tensor-shape-throughput.svg").write_text(render_throughput_svg(payload))
 
 
+def print_report_paths(output_dir: Path) -> None:
+    print(output_dir / "cuda-tensor-shape-sweep.json")
+    print(output_dir / "cuda-tensor-shape-sweep.md")
+    print(output_dir / "cuda-tensor-shape-sweep.svg")
+    print(output_dir / "cuda-tensor-shape-throughput.svg")
+
+
+def render_existing_report(input_json: Path, output_dir: Path | None = None) -> dict[str, Any]:
+    payload = json.loads(input_json.read_text())
+    target_dir = output_dir or input_json.parent
+    write_report(payload, target_dir)
+    print_report_paths(target_dir)
+    return payload
+
+
 def run_tensor_shape_sweep(
     config: TensorShapeSweepConfig,
     *,
@@ -641,10 +656,7 @@ def run_tensor_shape_sweep(
         "results": results,
     }
     write_report(payload, output_dir)
-    print(output_dir / "cuda-tensor-shape-sweep.json")
-    print(output_dir / "cuda-tensor-shape-sweep.md")
-    print(output_dir / "cuda-tensor-shape-sweep.svg")
-    print(output_dir / "cuda-tensor-shape-throughput.svg")
+    print_report_paths(output_dir)
     return payload
 
 
@@ -672,11 +684,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-remote-refresh", action="store_true")
     parser.add_argument("--sync-remote-tree", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--render-json", type=Path)
+    parser.add_argument("--render-output-dir", type=Path)
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.render_json is not None:
+        render_existing_report(args.render_json, args.render_output_dir)
+        return
     config = TensorShapeSweepConfig(
         remote=args.remote,
         remote_workdir=args.remote_workdir,

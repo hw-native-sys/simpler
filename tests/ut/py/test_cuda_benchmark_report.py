@@ -1301,6 +1301,54 @@ def test_cuda_tensor_shape_sweep_dry_run_records_source_papers(tmp_path):
     ]
 
 
+def test_cuda_tensor_shape_sweep_main_renders_existing_json(tmp_path, capsys):
+    cuda_tensor_shape_sweep = _load_tensor_shape_sweep_module()
+    payload = {
+        "metadata": {
+            "label": "tensor-shape-sweep-existing",
+            "git_commit": "abc123",
+            "n": 4096,
+            "sizes": [4096],
+            "repeats": 1,
+            "shapes": ["8x4x12"],
+            "baselines": ["pto_persistent_dag_tensor"],
+            "source_papers": [],
+        },
+        "results": [
+            {
+                "artifact": "a100",
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_tensor",
+                "n": 4096,
+                "shape": "8x4x12",
+                "repeat": 0,
+                "status": "pass",
+                "device_wall_ns": 1000,
+                "host_wall_ns": 1500,
+                "tensor_tile": {"rows": 8, "cols": 4, "inner": 12, "tile_count": 128},
+            }
+        ],
+    }
+    input_json = tmp_path / "input.json"
+    output_dir = tmp_path / "rerendered"
+    input_json.write_text(json.dumps(payload) + "\n")
+
+    cuda_tensor_shape_sweep.main(
+        [
+            "--render-json",
+            str(input_json),
+            "--render-output-dir",
+            str(output_dir),
+        ]
+    )
+
+    printed = capsys.readouterr().out
+    assert str(output_dir / "cuda-tensor-shape-sweep.json") in printed
+    assert str(output_dir / "cuda-tensor-shape-throughput.svg") in printed
+    assert "98.30" in (output_dir / "cuda-tensor-shape-sweep.md").read_text()
+    assert "Median GF/s" in (output_dir / "cuda-tensor-shape-throughput.svg").read_text()
+
+
 def test_cuda_pair_benchmark_can_reuse_remote_checkout(tmp_path):
     cuda_pair_benchmark = _load_pair_benchmark_module()
     config = cuda_pair_benchmark.PairedBenchmarkConfig(

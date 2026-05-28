@@ -958,6 +958,15 @@ repeat rows plus a median summary table with normalized GFLOP/s; the SVG
 files plot median device time and median GFLOP/s per GPU/N/shape/baseline
 with sample counts.
 
+Regenerate reports from an existing tensor-sweep JSON without rerunning the
+A100/H200 measurements:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_tensor_shape_sweep.py \
+    --render-json tmp/cuda-backend/tensor-shape-sweep-<commit>/cuda-tensor-shape-sweep.json
+```
+
 Validate the compact tensor-baseline sweep before copying numbers into docs:
 
 ```bash
