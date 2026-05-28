@@ -1748,6 +1748,47 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                 ),
             ),
         )
+    if dag_shape == "graph_descriptor_tagged_inout":
+        task_count = 3
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 2
+        task_t = CudaPersistentDagTask * task_count
+        return (
+            host_fanin_t(0, 1, 1),
+            dependents_t(1, 2),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp1,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp1,
+                    b=dev_b,
+                    out=dev_tmp1,
+                    n=n,
+                    dependent_begin=1,
+                    dependent_count=1,
+                    initial_fanin=1,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp1,
+                    b=dev_a,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=0,
+                    initial_fanin=1,
+                ),
+            ),
+        )
     if dag_shape in {
         "generic_args",
         "generic_args4",
@@ -2429,6 +2470,10 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 ]
                 expected_tmp2 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
+            if config.dag_shape == "graph_descriptor_tagged_inout":
+                expected_tmp0 = [0.0 for _ in range(n)]
+                expected_tmp1 = [_f32(_f32(host_a[i] + host_b[i]) + host_b[i]) for i in range(n)]
+                expected_out = [_f32(expected_tmp1[i] + host_a[i]) for i in range(n)]
             if config.dag_shape in graph_arg_shapes:
                 expected_tmp0 = [_f32(3 * i) for i in range(n)]
                 expected_tmp3 = [_f32(4 * i) for i in range(n)]
@@ -2588,6 +2633,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_reordered",
             "graph_descriptor_scratch_reuse",
             "graph_descriptor_tagged",
+            "graph_descriptor_tagged_inout",
             "graph_tensor_tile",
         }:
             result["graph_descriptor"] = {
@@ -2614,6 +2660,12 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                     "task0": "input:a,input:b,output:tmp1",
                     "task1": "input:a,input:b,output:tmp2",
                     "task2": "input:tmp1,input:tmp2,output_existing:out",
+                }
+            if config.dag_shape == "graph_descriptor_tagged_inout":
+                result["graph_task_args"] = {
+                    "task0": "input:a,input:b,output:tmp1",
+                    "task1": "inout:tmp1,input:b",
+                    "task2": "input:tmp1,input:a,output_existing:out",
                 }
         return result
     finally:
@@ -2702,6 +2754,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_reordered",
         "graph_descriptor_scratch_reuse",
         "graph_descriptor_tagged",
+        "graph_descriptor_tagged_inout",
         "graph_tensor_tile",
         "quad",
         "scalar_affine",
@@ -2755,6 +2808,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_descriptor_generic_args4",
             "graph_descriptor_reordered",
             "graph_descriptor_tagged",
+            "graph_descriptor_tagged_inout",
         }
         and ptx_source.startswith("embedded-")
     ):
@@ -2961,6 +3015,7 @@ def main() -> None:
             "graph_descriptor_reordered",
             "graph_descriptor_scratch_reuse",
             "graph_descriptor_tagged",
+            "graph_descriptor_tagged_inout",
             "graph_tensor_tile",
             "quad",
             "scalar_affine",

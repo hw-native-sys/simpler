@@ -1749,6 +1749,27 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 Results: descriptor-only `1 passed, 69 deselected`; local A100 real-data
 `1 passed, 69 deselected`; remote H200 real-data `1 passed, 69 deselected`
 with the known PTO-ISA SSH refresh warning.
+The same tagged `inout` graph shape is now part of the no-torch paired
+persistent-smoke workflow as `graph_descriptor_tagged_inout`:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_tagged_inout --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/tagged-inout-working
+```
+
+Result:
+`tmp/cuda-backend/tagged-inout-working/persistent-graph_descriptor_tagged_inout-repeat2-smoke-a8b7819c/`
+contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The paired validator required dispatch `[1,1,1]`,
+graph fan-in `[0,1,1]`, dependents `[1,2]`, tagged task args
+`input:a,input:b,output:tmp1`, `inout:tmp1,input:b`, and
+`input:tmp1,input:a,output_existing:out`, repeat completions `[3,3]`,
+resource policy `scheduler_blocks=1`, `worker_blocks=3`, `block_dim=256`,
+and zero scheduler errors on both GPUs. A100 reported per-launch device times
+`[46080,25600]` and H200 reported `[28960,20512]`.
 The same tagged graph shape is now also in the paired persistent-smoke report
 flow as `graph_descriptor_tagged`, with A100/H200 JSON plus Markdown/SVG
 artifacts under

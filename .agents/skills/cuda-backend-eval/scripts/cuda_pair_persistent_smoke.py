@@ -278,6 +278,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "graph_descriptor_reordered": "1,9,2",
         "graph_descriptor_scratch_reuse": "1,2,1,2,1,1",
         "graph_descriptor_tagged": "9,2,1",
+        "graph_descriptor_tagged_inout": "1,1,1",
         "graph_tensor_tile": "3,1,2,1",
         "quad": "8,2,1",
         "scalar_affine": "5,2,1",
@@ -308,18 +309,24 @@ def _expected_graph_descriptor(config: PairedPersistentSmokeConfig) -> tuple[str
         "graph_descriptor_reordered": ("2,0,0", "0,0"),
         "graph_descriptor_scratch_reuse": ("0,0,2,1,1,2", "2,2,3,4,5,5"),
         "graph_descriptor_tagged": ("0,0,2", "2,2"),
+        "graph_descriptor_tagged_inout": ("0,1,1", "1,2"),
         "graph_tensor_tile": ("0,1,1,2", "1,2,3,3"),
     }.get(config.dag_shape)
 
 
 def _expected_graph_task_args(config: PairedPersistentSmokeConfig) -> str | None:
-    if config.mode != "dag" or config.dag_shape != "graph_descriptor_tagged":
+    if config.mode != "dag":
         return None
-    return (
-        "task0=input:a,input:b,output:tmp1;"
-        "task1=input:a,input:b,output:tmp2;"
-        "task2=input:tmp1,input:tmp2,output_existing:out"
-    )
+    return {
+        "graph_descriptor_tagged": (
+            "task0=input:a,input:b,output:tmp1;"
+            "task1=input:a,input:b,output:tmp2;"
+            "task2=input:tmp1,input:tmp2,output_existing:out"
+        ),
+        "graph_descriptor_tagged_inout": (
+            "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+        ),
+    }.get(config.dag_shape)
 
 
 def _expected_scheduler_blocks(config: PairedPersistentSmokeConfig) -> int:
@@ -464,6 +471,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "graph_descriptor_reordered",
             "graph_descriptor_scratch_reuse",
             "graph_descriptor_tagged",
+            "graph_descriptor_tagged_inout",
             "graph_tensor_tile",
             "quad",
             "scalar_affine",

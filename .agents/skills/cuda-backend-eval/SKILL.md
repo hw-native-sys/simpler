@@ -503,9 +503,9 @@ AXPY/scale/affine, triad, quad, unary-square, `generic_args`,
 `generic_args4`, `graph_descriptor`, `graph_descriptor_chain`,
 `graph_descriptor_generic_args4`, `graph_descriptor_reordered`,
 `graph_descriptor_diamond`, `graph_descriptor_scratch_reuse`,
-`graph_descriptor_tagged`, and `graph_tensor_tile`. The validator therefore
-rejects A100/H200 artifacts that pass numerically through a different
-generated task path.
+`graph_descriptor_tagged`, `graph_descriptor_tagged_inout`, and
+`graph_tensor_tile`. The validator therefore rejects A100/H200 artifacts that
+pass numerically through a different generated task path.
 
 For tensor-tile smokes, the paired runner also passes
 `--expected-tensor-tile ROWSxCOLSxINNER` so the validator rejects artifacts
@@ -515,9 +515,10 @@ For explicit graph-descriptor smokes, it also passes
 `--expected-graph-fanin` and `--expected-graph-dependents`, so reordered,
 diamond, scratch-reuse, and graph tensor captures must prove the recorded
 runtime graph topology.
-For `graph_descriptor_tagged`, it additionally passes
-`--expected-graph-task-args`, so tagged graph captures must prove the
-TaskArgs-like roles that were lowered into the runtime descriptor.
+For `graph_descriptor_tagged` and `graph_descriptor_tagged_inout`, it
+additionally passes `--expected-graph-task-args`, so tagged graph captures
+must prove the TaskArgs-like roles that were lowered into the runtime
+descriptor.
 
 The JSON payload and compact report include `resource_policy` fields for
 `scheduler_blocks`, `worker_blocks`, `worker_blocks_per_task`, `stream_id`,
@@ -1015,6 +1016,16 @@ duplicate logical tensor producers or in-place graph updates:
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
     -q -k tagged_inout_graph --platform cuda
+```
+
+Use the paired smoke runner for A100/H200 artifact evidence of the same
+tagged `inout` graph-descriptor shape:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_tagged_inout --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree
 ```
 
 Graph tasks may also pass `out_storage` when the logical graph output should
