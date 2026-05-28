@@ -209,6 +209,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_graph`;
 - `pto_persistent_dag_unary_square`;
 - `pto_persistent_dag_tensor`;
+- `pto_persistent_dag_graph_tensor`;
 - same-work batch rows;
 - worker-grid batch rows.
 
@@ -1581,6 +1582,18 @@ Result summary: A100 reported `device_wall_ns=98304`, H200 reported
 `device_wall_ns=67968`, and both reported zero scheduler errors,
 `launch_completed_counts=[4,4]`, dispatch `[3,1,2,1]`, and
 `graph_descriptor.dependents=[1,2,3,3]`.
+
+The explicit graph tensor-tile path is also exposed as the
+`pto_persistent_dag_graph_tensor` benchmark baseline. It uses
+`dag_shape=graph_tensor_tile`, receives the same `--tensor-rows`,
+`--tensor-cols`, and `--tensor-inner` descriptor flags as the scalar tensor
+DAG, and records both graph dependency metadata and tensor descriptor metadata
+in the benchmark JSON and Markdown report. A one-repeat A100/H200 sample at
+`N=512`, `16x16x16` is under
+`tmp/cuda-backend/combined-graph-tensor-current-working/`. The capture
+validated source-paper metadata, sanitized command examples, generated report
+files, zero scheduler errors, and expected dispatch `[3,1,2,1]`. The sample
+device times were `51200 ns` on A100 and `38080 ns` on H200.
 
 The persistent scalar-scale scene-test adapter was then added to cover the
 single-tensor plus scalar descriptor shape on the persistent-device runtime.

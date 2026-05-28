@@ -42,6 +42,7 @@ BASELINE_ROWS: tuple[str, ...] = (
     "pto_persistent_dag_graph",
     "pto_persistent_dag_unary_square",
     "pto_persistent_dag_tensor",
+    "pto_persistent_dag_graph_tensor",
     "pto_persistent_dag_tensor_core",
     "cublas_sgemm",
 )

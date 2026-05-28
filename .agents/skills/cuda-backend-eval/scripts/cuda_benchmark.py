@@ -1193,7 +1193,7 @@ def run_persistent_sample(
     if dag_shape == "tensor_core_tile":
         _validate_tensor_core_tile(tensor_tile or {"rows": 16, "cols": 16, "inner": 16})
     if task_count is None:
-        if dag_shape in {"tensor_tile", "tensor_core_tile"}:
+        if dag_shape in {"graph_tensor_tile", "tensor_tile", "tensor_core_tile"}:
             task_count = 4
         elif dag_shape == "scratch_reuse":
             task_count = 6
@@ -1386,6 +1386,16 @@ def run_single_sample(  # noqa: PLR0912
             dag_shape="tensor_tile",
             tensor_tile=tensor_tile,
         )
+    if baseline == "pto_persistent_dag_graph_tensor":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="graph_tensor_tile",
+            tensor_tile=tensor_tile,
+        )
     if baseline == "pto_persistent_dag_tensor_core":
         return run_persistent_sample(
             device=device,
@@ -1560,12 +1570,19 @@ def run_benchmark(
                     "pto_persistent_dag_graph",
                     "pto_persistent_dag_unary_square",
                     "pto_persistent_dag_tensor",
+                    "pto_persistent_dag_graph_tensor",
                     "pto_persistent_dag_tensor_core",
                     "cublas_sgemm",
                 ):
                     sample_kwargs: dict[str, Any] = {}
                     if (
-                        baseline in {"pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core", "cublas_sgemm"}
+                        baseline
+                        in {
+                            "pto_persistent_dag_tensor",
+                            "pto_persistent_dag_graph_tensor",
+                            "pto_persistent_dag_tensor_core",
+                            "cublas_sgemm",
+                        }
                         and tensor_tile is not None
                     ):
                         sample_kwargs["tensor_tile"] = tensor_tile
@@ -2026,6 +2043,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         "pto_persistent_dag_graph": "#7f5b42",
         "pto_persistent_dag_unary_square": "#e3a857",
         "pto_persistent_dag_tensor": "#e76f51",
+        "pto_persistent_dag_graph_tensor": "#c7522a",
         "pto_persistent_dag_tensor_core": "#d1495b",
         "cublas_sgemm": "#006d77",
         "pto_persistent_device": "#9467bd",
@@ -2340,6 +2358,14 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             ),
             "  descriptor followed by elementwise residual, gate, and fan-in tasks.",
             (
+                f"- `pto_persistent_dag_graph_tensor` uses an explicit graph descriptor with a configured "
+                f"{tensor_tile_shape} tiled GEMM"
+                if tensor_tile_shape is not None
+                else "- `pto_persistent_dag_graph_tensor` uses an explicit graph descriptor with a default "
+                "16x16x16 tiled GEMM"
+            ),
+            "  descriptor followed by the same residual, gate, and fan-in tasks.",
+            (
                 f"- `pto_persistent_dag_tensor_core` uses a WMMA tensor-core task with a configured "
                 f"{tensor_tile_shape} descriptor"
                 if tensor_tile_shape is not None
@@ -2454,6 +2480,7 @@ def main() -> None:
             "pto_persistent_dag_graph",
             "pto_persistent_dag_unary_square",
             "pto_persistent_dag_tensor",
+            "pto_persistent_dag_graph_tensor",
             "pto_persistent_dag_tensor_core",
             "cublas_sgemm",
             "pto_host_schedule_batch",
@@ -2536,7 +2563,12 @@ def main() -> None:
                     tensor_tile=(
                         tensor_tile
                         if args.single_baseline
-                        in {"pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core", "cublas_sgemm"}
+                        in {
+                            "pto_persistent_dag_tensor",
+                            "pto_persistent_dag_graph_tensor",
+                            "pto_persistent_dag_tensor_core",
+                            "cublas_sgemm",
+                        }
                         else None
                     ),
                 ),

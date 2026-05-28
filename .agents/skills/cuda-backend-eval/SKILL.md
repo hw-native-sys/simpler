@@ -854,6 +854,9 @@ same vector-add PTX kernel through two launch paths:
   GEMM task followed by elementwise residual, gate, and fan-in tasks. The
   benchmark uses the default 16x16x16 descriptor unless
   `--tensor-rows`, `--tensor-cols`, and `--tensor-inner` are supplied.
+- `pto_persistent_dag_graph_tensor`: four-task generated-dispatch DAG using
+  an explicit runtime graph descriptor for the same tiled GEMM, residual,
+  gate, and fan-in task sequence as `pto_persistent_dag_tensor`.
 - `pto_persistent_dag_tensor_core`: four-task generated-dispatch DAG with a
   block-wide WMMA `m16n16k8` TF32 tensor-core task followed by the same
   elementwise residual, gate, and fan-in tasks. Use this for the first
@@ -935,9 +938,10 @@ same commit as the synced source tree.
 
 Use `--dry-run` to print the commands without launching benchmarks. The paired
 benchmark default tensor descriptor is `16x16x16` so the scalar tensor DAG,
-WMMA tensor-core DAG, and cuBLAS rows can run together. The current committed
-summary keeps the full `61cf96cd` capture plus the compact current-head
-`0b3c1699` gate in `docs/nvidia-backend/evaluation-current.md`.
+explicit graph tensor DAG, WMMA tensor-core DAG, and cuBLAS rows can run
+together. The current committed summary keeps the full `61cf96cd` capture plus
+the compact current-head `0b3c1699` gate in
+`docs/nvidia-backend/evaluation-current.md`.
 
 For a lighter no-torch real-data check, run the paired Worker smoke instead of
 the full benchmark:
@@ -967,8 +971,25 @@ The script writes:
 For tensor-DAG and tensor-library experiments, pass `--tensor-rows`,
 `--tensor-cols`, and `--tensor-inner` to the benchmark script. These flags
 affect `pto_persistent_dag_tensor`, `pto_persistent_dag_tensor_core`, and
-`cublas_sgemm`; other baselines keep their normal vector-add work. The
-generated Markdown report records the descriptor as `rows x cols x inner`.
+`pto_persistent_dag_graph_tensor`, and `cublas_sgemm`; other baselines keep
+their normal vector-add work. The generated Markdown report records the
+descriptor as `rows x cols x inner`.
+
+Use `--single-baseline pto_persistent_dag_graph_tensor` for a quick
+benchmark path check of the explicit graph tensor-tile DAG on one GPU:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_graph_tensor \
+    --sizes 512 --repeats 1 --arch compute_80 \
+    --tensor-rows 16 --tensor-cols 16 --tensor-inner 16
+```
+
+The current A100/H200 sample report for that row is under
+`tmp/cuda-backend/combined-graph-tensor-current-working/`. It validates
+source-paper metadata, sanitized command examples, report files, dispatch
+`3,1,2,1`, tensor descriptor `16x16x16`, and zero scheduler errors.
 
 Use `--single-baseline pto_persistent_dag_scalar_axpy` for a quick benchmark
 path check of the scalar descriptor DAG on one GPU:

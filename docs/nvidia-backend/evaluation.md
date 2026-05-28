@@ -35,6 +35,10 @@ tensor baseline sweep uses `e79edba2`:
   paired gate that validates the default `16x16x16` tensor descriptor with
   scalar tensor DAG, WMMA tensor-core DAG, and cuBLAS rows in one current-head
   A100/H200 report.
+- The supplemental graph tensor-tile sample under
+  `tmp/cuda-backend/combined-graph-tensor-current-working/` validates
+  `pto_persistent_dag_graph_tensor`, the explicit graph-descriptor variant of
+  the scalar tiled-GEMM DAG, on A100 and H200.
 - [Current capture](evaluation-current.md) records the first selected
   benchmark row for `pto_persistent_dag_tensor_core`, a WMMA
   `m16n16k8` TF32/F32 generated-dispatch task followed by the same residual,
@@ -72,6 +76,7 @@ committed:
 - `tmp/cuda-backend/persistent-graph_descriptor-repeat2-smoke-5139ba23/`
 - `tmp/cuda-backend/persistent-tensor_tile-8x4x12-repeat2-smoke-223425b6/`
 - `tmp/cuda-backend/persistent-graph_tensor_tile-16x16x16-repeat2-working/`
+- `tmp/cuda-backend/combined-graph-tensor-current-working/`
 - `tmp/cuda-backend/tensor-shape-sweep-c0ada3ad/`
 - `tmp/cuda-backend/persistent-tensor_core_tile-16x16x16-smoke-390eda4f/`
 - `tmp/cuda-backend/a100-tensor-core-current-0879aa9e/`
@@ -155,6 +160,8 @@ with `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`.
   square task body before downstream fan-in.
 - `pto_persistent_dag_tensor`: four-task generated-dispatch DAG with a tiled
   GEMM task followed by residual, gate, and fan-in elementwise tasks.
+- `pto_persistent_dag_graph_tensor`: explicit graph-descriptor variant of the
+  tiled GEMM, residual, gate, and fan-in DAG.
 - `pto_persistent_dag_tensor_core`: four-task generated-dispatch DAG with a
   block-wide WMMA `m16n16k8` TF32/F32 task followed by residual, gate, and
   fan-in elementwise tasks.
