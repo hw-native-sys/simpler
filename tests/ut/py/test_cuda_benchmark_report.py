@@ -872,6 +872,33 @@ def test_cuda_capture_validator_requires_sanitized_command_examples():
     assert cuda_validate_capture.validate_capture(payload, require_command_examples=True) == []
 
 
+def test_cuda_capture_validator_requires_zero_scheduler_errors():
+    cuda_validate_capture = _load_capture_validator_module()
+    payload = _paired_capture_payload()
+    payload["results"].append(
+        {
+            "machine": "hina",
+            "baseline": "pto_persistent_dag",
+            "n": 1024,
+            "repeat": 0,
+            "status": "pass",
+            "device_wall_ns": 1024,
+            "device_scheduler_errors": {"count": 1, "code": 7, "task_id": 2},
+        }
+    )
+
+    errors = cuda_validate_capture.validate_capture(
+        payload,
+        require_zero_scheduler_errors=True,
+    )
+
+    assert "scheduler error machine=hina baseline=pto_persistent_dag n=1024 count=1 code=7 task_id=2" in errors
+
+    payload["results"][-1]["device_scheduler_errors"] = {"count": 0, "code": 0, "task_id": 0}
+
+    assert cuda_validate_capture.validate_capture(payload, require_zero_scheduler_errors=True) == []
+
+
 def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     cuda_validate_capture = _load_capture_validator_module()
     args = cuda_validate_capture.parse_args(["capture.json", "--preset", "paired-current"])
@@ -1313,6 +1340,7 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     assert "cublas_sgemm" in validate
     assert "--require-command-examples" in validate
     assert "--require-source-papers" in validate
+    assert "--require-zero-scheduler-errors" in validate
     assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
 
 

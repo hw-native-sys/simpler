@@ -324,6 +324,7 @@ def build_validate_command(
         *baseline_args,
         "--require-report-files",
         "--require-command-examples",
+        "--require-zero-scheduler-errors",
         "--require-source-papers",
     ]
 

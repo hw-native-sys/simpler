@@ -305,8 +305,8 @@ files exist under `tmp/sources/`.
 Benchmark captures now use the same VDCores/MPK `source_papers` metadata
 contract and sanitized command-example metadata contract as tensor sweeps.
 They can be gated with `cuda_validate_capture.py` plus
-`--require-command-examples` and `--require-source-papers` before new
-paired-current numbers are published.
+`--require-command-examples`, `--require-zero-scheduler-errors`, and
+`--require-source-papers` before new paired-current numbers are published.
 The existing real-data paired A100/H200 capture from commit `61cf96cd` was
 re-rendered through the updated report path under
 `tmp/cuda-backend/combined-current-61cf96cd-command-source-gate/`, and the

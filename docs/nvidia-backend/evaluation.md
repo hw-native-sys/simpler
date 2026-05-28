@@ -227,7 +227,8 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-size 1024 --expected-repeats 1 --expected-result-count 50 \
     --require-baseline pto_persistent_dag_tensor_core \
     --require-baseline cublas_sgemm --require-report-files \
-    --require-command-examples --require-source-papers
+    --require-command-examples --require-zero-scheduler-errors \
+    --require-source-papers
 ```
 
 The default full paired benchmark shape uses:

@@ -215,7 +215,33 @@ def _validate_command_examples(payload: dict[str, Any]) -> list[str]:
     return errors
 
 
-def validate_capture(
+def _validate_zero_scheduler_errors(rows: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    for row in rows:
+        scheduler_errors = row.get("device_scheduler_errors")
+        baseline = row.get("baseline", "unknown")
+        machine = row.get("machine", "unknown")
+        size = row.get("n", "unknown")
+        if scheduler_errors is None:
+            if isinstance(baseline, str) and baseline.startswith("pto_persistent_dag"):
+                errors.append(f"missing scheduler errors machine={machine} baseline={baseline} n={size}")
+            continue
+        if not isinstance(scheduler_errors, dict):
+            errors.append(f"invalid scheduler errors machine={machine} baseline={baseline} n={size}")
+            continue
+        count = scheduler_errors.get("count", 0)
+        code = scheduler_errors.get("code", 0)
+        task_id = scheduler_errors.get("task_id", 0)
+        if count != 0 or code != 0 or task_id != 0:
+            errors.append(
+                "scheduler error "
+                f"machine={machine} baseline={baseline} n={size} "
+                f"count={count} code={code} task_id={task_id}"
+            )
+    return errors
+
+
+def validate_capture(  # noqa: PLR0913
     payload: dict[str, Any],
     *,
     artifact_dir: Path | None = None,
@@ -226,6 +252,7 @@ def validate_capture(
     expected_result_count: int | None = None,
     require_report_files: bool = False,
     require_command_examples: bool = False,
+    require_zero_scheduler_errors: bool = False,
     source_paper_root: Path | None = None,
 ) -> list[str]:
     rows = _results(payload)
@@ -254,6 +281,9 @@ def validate_capture(
     if require_command_examples:
         errors.extend(_validate_command_examples(payload))
 
+    if require_zero_scheduler_errors:
+        errors.extend(_validate_zero_scheduler_errors(rows))
+
     if source_paper_root is not None:
         errors.extend(_validate_source_papers(payload, source_root=source_paper_root))
 
@@ -274,6 +304,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
     if args.expected_result_count is None:
         args.expected_result_count = 720
     args.require_report_files = True
+    args.require_zero_scheduler_errors = True
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -287,6 +318,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-result-count", type=int)
     parser.add_argument("--require-report-files", action="store_true")
     parser.add_argument("--require-command-examples", action="store_true")
+    parser.add_argument("--require-zero-scheduler-errors", action="store_true")
     parser.add_argument("--require-source-papers", action="store_true")
     return parser.parse_args(argv)
 
@@ -305,6 +337,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_result_count=args.expected_result_count,
         require_report_files=args.require_report_files,
         require_command_examples=args.require_command_examples,
+        require_zero_scheduler_errors=args.require_zero_scheduler_errors,
         source_paper_root=Path.cwd() if args.require_source_papers else None,
     )
     if errors:

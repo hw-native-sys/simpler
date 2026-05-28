@@ -1152,7 +1152,8 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-size 1024 --expected-repeats 1 --expected-result-count 50 \
     --require-baseline pto_persistent_dag_tensor_core \
     --require-baseline cublas_sgemm --require-report-files \
-    --require-command-examples --require-source-papers
+    --require-command-examples --require-zero-scheduler-errors \
+    --require-source-papers
 ```
 
 The compact current-head gate checks the expected A100/H200 machines,
@@ -1163,7 +1164,8 @@ flags. `--require-command-examples` checks that
 local and remote sample commands are reconstructable without local checkout
 paths. `--require-source-papers` checks that the report records the
 VDCores/MPK source IDs and that the referenced files exist under
-`tmp/sources/`.
+`tmp/sources/`. `--require-zero-scheduler-errors` checks that PTO persistent
+DAG rows include device scheduler counters and that each counter set is zero.
 
 Use `cuda_validate_smoke.py` for paired smoke artifacts. It checks required
 artifacts, pass status, zero device scheduler errors, expected runtime/mode,
