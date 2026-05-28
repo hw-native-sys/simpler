@@ -1686,10 +1686,11 @@ graph task `out` names that do not match existing input/output tensors, so the
 `temporaries` map is only needed for non-default temporary sizes. It also
 supports a first dependency-inference slice: when a graph task omits
 `dependents`, the adapter infers its outgoing edges from tensor flow by
-mapping earlier `out` producers to later `a`/`b`/`c`/`d` and `tensor_args`
-reads. The inference is per task, so mixed descriptors can keep explicit
-dependency lists for some tasks while inferring omitted edges for the
-remaining tasks.
+binding `a`/`b`/`c`/`d` and `tensor_args` reads to the nearest previous
+producer for that tensor name, or to a later producer when the descriptor is
+intentionally out of topological order. The inference is per task, so mixed
+descriptors can keep explicit dependency lists for some tasks while inferring
+omitted edges for the remaining tasks.
 The graph adapter now accepts a tagged `task_args` task form as a first
 TaskArgs-like lowering slice: `input`, `output`, `output_existing`, and
 `inout` tags are lowered to the existing bounded CUDA graph descriptor fields
@@ -1721,6 +1722,33 @@ Results: the descriptor-only test reported `1 passed, 67 deselected`; the
 local A100 real-data tagged graph scene reported `1 passed, 67 deselected`;
 and the H200 real-data tagged graph scene reported `1 passed, 67 deselected`
 after the known PTO-ISA SSH refresh warning.
+Tagged `inout` graph lowering was then covered with a failing descriptor test
+that first produced fan-in `[0,0,1]`, leaving the in-place update as an
+incorrect root. After changing tensor-flow inference to prefer the nearest
+previous producer for duplicate logical tensor names, the tagged inout
+descriptor and real-data ctypes scene passed locally on A100, and the same
+selector passed on H200 after syncing the tree:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py -q \
+  -k tagged_inout_graph -m 'not requires_hardware'
+
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py -q -k tagged_inout_graph \
+  --platform cuda
+
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+     -q -rs -k tagged_inout_graph --platform cuda'
+```
+
+Results: descriptor-only `1 passed, 69 deselected`; local A100 real-data
+`1 passed, 69 deselected`; remote H200 real-data `1 passed, 69 deselected`
+with the known PTO-ISA SSH refresh warning.
 The same tagged graph shape is now also in the paired persistent-smoke report
 flow as `graph_descriptor_tagged`, with A100/H200 JSON plus Markdown/SVG
 artifacts under
@@ -2635,9 +2663,10 @@ Needed:
   `persistent_dag_graph_f32` descriptor adapter, which already covers
   automatic default temporary allocation, logical-output/storage-output
   separation for scratch reuse, order-independent tensor-flow dependency
-  inference, tagged TaskArgs-like graph task lowering, tagged graph-descriptor
-  paired smoke, and five-task chain, five-task fan-out/fan-in, and six-task
-  scratch-reuse graph descriptor smokes;
+  inference, tagged TaskArgs-like graph task lowering including `inout`
+  producer chaining, tagged graph-descriptor paired smoke, and five-task
+  chain, five-task fan-out/fan-in, and six-task scratch-reuse graph descriptor
+  smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, and direct/queue/DAG
   prepared-callable repeat-run smokes. The paired lifecycle matrix runner now

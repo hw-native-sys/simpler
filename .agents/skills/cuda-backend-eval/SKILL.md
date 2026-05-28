@@ -992,10 +992,10 @@ Graph tasks may also pass tensor-tile descriptor fields: `rows`, `cols`,
 `out_batch_stride`. Use this when the explicit graph descriptor should run a
 scalar tiled-GEMM task before downstream residual, gate, and fan-in tasks.
 If every graph task omits `dependents`, the SceneTestCase CUDA adapter infers
-task edges from tensor flow: earlier `out` names become producers for later
-`a`/`b`/`c`/`d` or `tensor_args` reads. Use this form when testing the first
-step toward PTO-style dependency inference while still providing an explicit
-descriptor.
+task edges from tensor flow: reads bind to the nearest previous producer for
+that tensor name, or to a later producer when the descriptor is intentionally
+out of topological order. Use this form when testing the first step toward
+PTO-style dependency inference while still providing an explicit descriptor.
 Graph tasks whose `out` names are not existing input/output tensors are
 allocated as temporary buffers automatically, so tests only need an explicit
 `temporaries` map when a temporary needs a size different from the output
@@ -1006,6 +1006,15 @@ Run the tagged graph SceneTestCase path after changing this lowering:
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
     -q -k tagged_graph --platform cuda
+```
+
+Run the tagged `inout` graph selector after changing dependency inference for
+duplicate logical tensor producers or in-place graph updates:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k tagged_inout_graph --platform cuda
 ```
 
 Graph tasks may also pass `out_storage` when the logical graph output should

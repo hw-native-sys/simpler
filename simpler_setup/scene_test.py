@@ -1295,18 +1295,19 @@ class _CudaPersistentDagSceneBuffers:
 
     @staticmethod
     def _graph_dependents_from_task_specs(task_specs: list[dict[str, Any]]) -> list[list[int]]:
-        producers: dict[str, int] = {}
+        producers: dict[str, list[int]] = {}
         for task_id, task_spec in enumerate(task_specs):
             out_name = task_spec.get("out")
             if out_name is not None:
-                producers[str(out_name)] = task_id
+                producers.setdefault(str(out_name), []).append(task_id)
 
         inferred_dependents = [[] for _ in task_specs]
         for task_id, task_spec in enumerate(task_specs):
             producer_ids = {
                 producer_id
                 for name in _CudaPersistentDagSceneBuffers._graph_task_read_names(task_spec)
-                if (producer_id := producers.get(name)) is not None and producer_id != task_id
+                if (producer_id := _CudaPersistentDagSceneBuffers._graph_read_producer(producers, name, task_id))
+                is not None
             }
             for producer_id in sorted(producer_ids):
                 inferred_dependents[producer_id].append(task_id)
@@ -1314,6 +1315,17 @@ class _CudaPersistentDagSceneBuffers:
             list(task_spec["dependents"]) if "dependents" in task_spec else inferred_dependents[task_id]
             for task_id, task_spec in enumerate(task_specs)
         ]
+
+    @staticmethod
+    def _graph_read_producer(producers: dict[str, list[int]], name: str, task_id: int) -> int | None:
+        candidates = producers.get(name, [])
+        previous = [producer_id for producer_id in candidates if producer_id < task_id]
+        if previous:
+            return previous[-1]
+        future = [producer_id for producer_id in candidates if producer_id > task_id]
+        if future:
+            return future[0]
+        return None
 
     @staticmethod
     def _graph_task_read_names(task_spec: dict[str, Any]) -> list[str]:
