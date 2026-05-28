@@ -302,9 +302,15 @@ direction for persistent tasks whose arity differs from the early hand-coded
 vector cases. The `persistent_dag_graph_f32` adapter can now lower an
 explicit scene-test graph descriptor with per-task dependencies, fan-in,
 temporary buffers, and the same generic tensor/scalar slots. Graph task
-outputs that do not name existing input/output tensors are allocated as
-default-sized temporary buffers automatically, so explicit `temporaries`
-metadata is only needed for non-default sizes. When graph tasks omit
+scalar fields accept both numeric literals and `TaskArgsBuilder` scalar names:
+`scalar0`, `scalar1`, and each `scalar_args` entry are resolved when the
+scene-test adapter builds the host-side task descriptor. This keeps explicit
+graph descriptors aligned with the normal scene-test scalar argument flow
+instead of baking all scalar values into the descriptor literal.
+Graph task outputs that do not name existing input/output tensors are
+allocated as default-sized temporary buffers automatically, so explicit
+`temporaries` metadata is only needed for non-default sizes. When graph tasks
+omit
 `dependents`, the adapter infers edges from tensor flow by first mapping all
 task outputs in the descriptor and then connecting producers to tasks that
 read those tensors through `a`/`b`/`c`/`d` or `tensor_args`. This no longer

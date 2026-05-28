@@ -1329,6 +1329,23 @@ class _CudaPersistentDagSceneBuffers:
             return self.tensor_buffers.sizes[size_source]
         return default_nbytes
 
+    def _graph_scalar_value(self, value) -> float:
+        if isinstance(value, str):
+            try:
+                value = getattr(self.test_args, value)
+            except AttributeError as exc:
+                raise ValueError(
+                    f"CUDA persistent_dag_graph_f32 scalar field references unknown scalar argument: {value}"
+                ) from exc
+        if hasattr(value, "value"):
+            value = value.value
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "CUDA persistent_dag_graph_f32 scalar fields must be numeric literals or scalar argument names"
+            ) from exc
+
     def _make_graph_task(
         self,
         ctypes_module,
@@ -1341,7 +1358,7 @@ class _CudaPersistentDagSceneBuffers:
         initial_fanin: int,
     ):
         tensor_args = list(task_spec.get("tensor_args", []))
-        scalar_args = [float(value) for value in task_spec.get("scalar_args", [])]
+        scalar_args = [self._graph_scalar_value(value) for value in task_spec.get("scalar_args", [])]
         if len(tensor_args) > 4:
             raise ValueError("CUDA persistent_dag_graph_f32 supports at most four tensor_args per task")
         if len(scalar_args) > 4:
@@ -1361,8 +1378,8 @@ class _CudaPersistentDagSceneBuffers:
             dependent_begin=dependent_begin,
             dependent_count=dependent_count,
             initial_fanin=initial_fanin,
-            scalar0=float(task_spec.get("scalar0", 0.0)),
-            scalar1=float(task_spec.get("scalar1", 0.0)),
+            scalar0=self._graph_scalar_value(task_spec.get("scalar0", 0.0)),
+            scalar1=self._graph_scalar_value(task_spec.get("scalar1", 0.0)),
             tensor_args=tensor_args_t(*(tensor_arg_ptrs + [0] * (4 - len(tensor_arg_ptrs)))),
             scalar_args=scalar_args_t(*(scalar_args + [0.0] * (4 - len(scalar_args)))),
             tensor_arg_count=len(tensor_arg_ptrs),

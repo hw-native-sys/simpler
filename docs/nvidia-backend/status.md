@@ -140,8 +140,12 @@ normal L2 `Worker`, builds `persistent_dag_fork_join_f32`,
 descriptors, and
 `persistent_dag_unary_square_f32` unary descriptors, and
 `persistent_dag_tensor_core_tile_f32` WMMA tensor-core descriptors from normal
-`TaskArgsBuilder` CPU tensors, and validates real copied-back CUDA output
-data. The scene-test persistent-device compiler path also forwards callable
+`TaskArgsBuilder` CPU tensors and scalars, and validates real copied-back CUDA
+output data. The explicit graph descriptor adapter resolves per-task
+`scalar0`, `scalar1`, and generic `scalar_args` entries from either numeric
+literals or `TaskArgsBuilder` scalar names, so graph descriptors use the same
+scalar argument flow as the fixed scalar descriptor adapters. The scene-test
+persistent-device compiler path also forwards callable
 `stream_id` into the prepared CUDA manifest, so these L2 tests can run on a
 selected non-default runtime stream. After each persistent-device scene-test
 launch, the L2 path now copies back device scheduler counters and raises on
@@ -1925,6 +1929,23 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 Result: `1 passed, 45 deselected`. The command printed the known PTO-ISA SSH
 refresh warning before passing.
+
+The explicit graph descriptor scalar fields now also resolve scalar argument
+names from `TaskArgsBuilder`, not just numeric literals in the descriptor. The
+focused TDD selector first failed because `_make_graph_task` called
+`float("alpha")` for a graph task `scalar0` field. After adding scalar-name
+resolution, the local A100 selector passed:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py -q \
+  -k 'graph_scalar_scale or scalar_field_names' --platform cuda
+```
+
+Result: `2 passed, 64 deselected`. The same real-data graph scalar-scale
+ctypes selector passed on remote H200 after syncing the tree:
+`1 passed, 65 deselected`, with the known PTO-ISA SSH refresh warning printed
+before pytest.
 
 The tensor-core tile descriptor was then added to the same normal L2
 `SceneTestCase` path as `persistent_dag_tensor_core_tile_f32`. Its first task

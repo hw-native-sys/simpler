@@ -944,6 +944,9 @@ Use `persistent_dag_graph_f32` when a test should pass an explicit runtime
 graph descriptor with per-task `func_id`, `a`/`b`/`c`/`d`/`out`,
 `dependents`, optional `initial_fanin`, `tensor_args`, and `scalar_args`
 fields instead of selecting one of the fixed tracer-bullet DAG adapters.
+Graph task scalar fields may be numeric literals or scalar names from the
+scene's `TaskArgsBuilder`: `scalar0`, `scalar1`, and every `scalar_args`
+entry are resolved while building the host task descriptor.
 Graph tasks may also pass tensor-tile descriptor fields: `rows`, `cols`,
 `inner`, `lda`, `ldb`, `ldc`, `a_batch_stride`, `b_batch_stride`, and
 `out_batch_stride`. Use this when the explicit graph descriptor should run a
@@ -967,6 +970,15 @@ Run the no-torch graph tensor-tile ctypes scene on A100 or H200 with:
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
     -q -k graph_tensor_tile_with_ctypes_data --platform cuda
+```
+
+Run the graph scalar-name ctypes scene after changing graph descriptor scalar
+lowering:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k 'graph_scalar_scale or scalar_field_names' --platform cuda
 ```
 
 For real host-schedule smoke coverage, pass a context definition plus
