@@ -71,6 +71,7 @@ committed:
 - `tmp/cuda-backend/tensor-descriptor-smoke-6c49c5cf/`
 - `tmp/cuda-backend/persistent-graph_descriptor-repeat2-smoke-5139ba23/`
 - `tmp/cuda-backend/persistent-tensor_tile-8x4x12-repeat2-smoke-223425b6/`
+- `tmp/cuda-backend/persistent-graph_tensor_tile-16x16x16-repeat2-working/`
 - `tmp/cuda-backend/tensor-shape-sweep-c0ada3ad/`
 - `tmp/cuda-backend/persistent-tensor_core_tile-16x16x16-smoke-390eda4f/`
 - `tmp/cuda-backend/a100-tensor-core-current-0879aa9e/`

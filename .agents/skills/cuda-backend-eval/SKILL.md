@@ -393,9 +393,9 @@ For generated-dispatch DAG shapes, the paired runner passes
 `--expected-dispatch` for the known `func_id` sequence. This covers `chain`,
 `fork_join`, `scratch_reuse`, tensor-tile and tensor-core-tile shapes, scalar
 AXPY/scale/affine, triad, quad, unary-square, `generic_args`,
-`graph_descriptor`, and `graph_descriptor_reordered`. The validator therefore
-rejects A100/H200 artifacts that pass numerically through a different
-generated task path.
+`graph_descriptor`, `graph_descriptor_reordered`, and `graph_tensor_tile`.
+The validator therefore rejects A100/H200 artifacts that pass numerically
+through a different generated task path.
 
 For tensor-tile smokes, the paired runner also passes
 `--expected-tensor-tile ROWSxCOLSxINNER` so the validator rejects artifacts
@@ -427,6 +427,22 @@ The current capture is under
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such
 as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.
+Use `--dag-shape graph_tensor_tile` when the smoke should validate the same
+tiled-GEMM/residual/gate/fan-in task sequence through the explicit graph
+descriptor path. It records both `graph_descriptor` dependency metadata and
+the `tensor_tile` descriptor in the JSON and report:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_tensor_tile --task-count 4 --queue-capacity 2 \
+    --repeat-runs 2 --n 512 \
+    --tensor-rows 16 --tensor-cols 16 --tensor-inner 16 \
+    --sync-remote-tree
+```
+
+The current working-tree capture is under
+`tmp/cuda-backend/persistent-graph_tensor_tile-16x16x16-repeat2-working/`.
 
 The generated-dispatch DAG smoke also carries device-side scheduler
 diagnostics. A normal pass returns `device_scheduler_errors` with zero counts.

@@ -23,7 +23,7 @@ Runner = Callable[..., subprocess.CompletedProcess]
 
 
 def _is_tensor_tile_shape(dag_shape: str) -> bool:
-    return dag_shape in {"tensor_core_tile", "tensor_tile"}
+    return dag_shape in {"graph_tensor_tile", "tensor_core_tile", "tensor_tile"}
 
 
 @dataclass(frozen=True)
@@ -250,6 +250,7 @@ def _expected_completed_count(config: PairedPersistentSmokeConfig) -> int:
         return config.task_count
     return {
         "chain": 5,
+        "graph_tensor_tile": 4,
         "scratch_reuse": 6,
         "tensor_core_tile": 4,
         "tensor_tile": 4,
@@ -265,6 +266,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "generic_args": "9,2,1",
         "graph_descriptor": "9,2,1",
         "graph_descriptor_reordered": "1,9,2",
+        "graph_tensor_tile": "3,1,2,1",
         "quad": "8,2,1",
         "scalar_affine": "5,2,1",
         "scalar_axpy": "4,2,1",
@@ -384,6 +386,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "generic_args",
             "graph_descriptor",
             "graph_descriptor_reordered",
+            "graph_tensor_tile",
             "quad",
             "scalar_affine",
             "scalar_axpy",

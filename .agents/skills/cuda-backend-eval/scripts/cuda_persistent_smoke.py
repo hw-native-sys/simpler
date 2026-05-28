@@ -993,7 +993,7 @@ _TENSOR_TILE_DESCRIPTOR = _make_tensor_tile_descriptor()
 
 
 def _is_tensor_tile_shape(dag_shape: str) -> bool:
-    return dag_shape in {"tensor_core_tile", "tensor_tile"}
+    return dag_shape in {"graph_tensor_tile", "tensor_core_tile", "tensor_tile"}
 
 
 def _tensor_tile_buffer_lengths(n: int, descriptor: dict[str, int]) -> dict[str, int]:
@@ -1319,7 +1319,7 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                 ),
             ),
         )
-    if dag_shape in {"tensor_core_tile", "tensor_tile"}:
+    if dag_shape in {"graph_tensor_tile", "tensor_core_tile", "tensor_tile"}:
         descriptor = tensor_tile or _TENSOR_TILE_DESCRIPTOR
         task_count = 4
         host_fanin_t = ctypes.c_uint32 * task_count
@@ -2326,6 +2326,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 in {
                     "chain",
                     "scratch_reuse",
+                    "graph_tensor_tile",
                     "tensor_core_tile",
                     "tensor_tile",
                     "triad",
@@ -2421,14 +2422,15 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             }
             result["tensor_args"] = {"tensor_args[0]": "tmp0", "tensor_args[1]": "tmp3"}
             result["scalar_args"] = {"scalar_args[0]": 1.5, "scalar_args[1]": 0.25}
-        if config.dag_shape in {"graph_descriptor", "graph_descriptor_reordered"}:
+        if config.dag_shape in {"graph_descriptor", "graph_descriptor_reordered", "graph_tensor_tile"}:
             result["graph_descriptor"] = {
                 "tasks": task_count,
                 "dependents": [int(value) for value in dependents],
                 "fanin": initial_fanin,
             }
-            result["tensor_args"] = {"tensor_args[0]": "tmp0", "tensor_args[1]": "tmp3"}
-            result["scalar_args"] = {"scalar_args[0]": 1.5, "scalar_args[1]": 0.25}
+            if config.dag_shape != "graph_tensor_tile":
+                result["tensor_args"] = {"tensor_args[0]": "tmp0", "tensor_args[1]": "tmp3"}
+                result["scalar_args"] = {"scalar_args[0]": 1.5, "scalar_args[1]": 0.25}
         return result
     finally:
         for ptr in allocated:
@@ -2509,6 +2511,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "generic_args",
         "graph_descriptor",
         "graph_descriptor_reordered",
+        "graph_tensor_tile",
         "quad",
         "scalar_affine",
         "scalar_axpy",
@@ -2746,6 +2749,7 @@ def main() -> None:
             "generic_args",
             "graph_descriptor",
             "graph_descriptor_reordered",
+            "graph_tensor_tile",
             "quad",
             "scalar_affine",
             "scalar_axpy",

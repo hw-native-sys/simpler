@@ -1549,6 +1549,39 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 Result: `1 passed, 53 deselected`. The command printed the known PTO-ISA SSH
 refresh warning before passing.
 
+The same explicit graph tensor-tile shape is now part of the persistent smoke
+tooling as `--dag-shape graph_tensor_tile`. It records both graph dependency
+metadata and tensor-tile descriptor metadata in the smoke JSON, then validates
+the paired A100/H200 artifacts with expected dispatch `3,1,2,1`, completed
+count `4`, repeat count `2`, tensor descriptor `16x16x16`, and generated
+Markdown/SVG report files.
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 4 --n 512 --arch compute_80 \
+    --mode dag --queue-capacity 2 --dag-shape graph_tensor_tile \
+    --repeat-runs 2 --tensor-rows 16 --tensor-cols 16 --tensor-inner 16 \
+    --output-json tmp/cuda-backend/persistent-graph_tensor_tile-16x16x16-repeat2-working/a100.json
+```
+
+The H200 run used the same command after syncing the working tree, with
+`--arch compute_90` and output
+`tmp/cuda-backend/persistent-graph_tensor_tile-16x16x16-repeat2-working/h200.json`.
+The report and validator commands then produced:
+
+```text
+tmp/cuda-backend/persistent-graph_tensor_tile-16x16x16-repeat2-working/cuda-smoke-report.md
+tmp/cuda-backend/persistent-graph_tensor_tile-16x16x16-repeat2-working/cuda-smoke-report.svg
+validated tmp/cuda-backend/persistent-graph_tensor_tile-16x16x16-repeat2-working/a100.json,
+tmp/cuda-backend/persistent-graph_tensor_tile-16x16x16-repeat2-working/h200.json
+```
+
+Result summary: A100 reported `device_wall_ns=98304`, H200 reported
+`device_wall_ns=67968`, and both reported zero scheduler errors,
+`launch_completed_counts=[4,4]`, dispatch `[3,1,2,1]`, and
+`graph_descriptor.dependents=[1,2,3,3]`.
+
 The persistent scalar-scale scene-test adapter was then added to cover the
 single-tensor plus scalar descriptor shape on the persistent-device runtime.
 It compiles a generated-dispatch `func_id=11` task body, runs it before the
