@@ -1121,21 +1121,41 @@ int DeviceRunner::finalize() {
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
 
-    // Reset device and finalize ACL AFTER all device memory is freed.
-    // Gated on acl_ready_ so rt-only runtimes that never called
-    // ensure_acl_ready() do not try to aclFinalize an un-init'd ACL state.
-    if (acl_ready_ && device_id_ >= 0) {
-        int reset_rc = aclrtResetDevice(device_id_);
-        if (reset_rc != 0) {
-            LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
-            rc = reset_rc;
+    // Reset device AFTER all device memory is freed. Two paths:
+    //
+    // - acl_ready_=true (HCCL / comm path):  aclrtResetDevice + aclFinalize
+    //   tear down both the device runtime and the ACL bring-up that
+    //   ensure_acl_ready() did.
+    //
+    // - acl_ready_=false (pure rt path, the common case for non-HCCL tests):
+    //   rtDeviceReset is still needed to clear any per-device runtime state
+    //   the test left behind — without this, an AICPU exception / stuck
+    //   kernel on this DeviceRunner wedges the device for the next
+    //   ChipWorker that initializes on the same id (rtStreamCreate then
+    //   returns 507899). a5 has been doing this unconditionally; a2a3 was
+    //   missing the rt-path reset, which is the root cause of the chronic
+    //   "test_dedup_shared_so_independent_unregister → 507899 cascade"
+    //   pattern seen across PR CI all session.
+    if (device_id_ >= 0) {
+        if (acl_ready_) {
+            int reset_rc = aclrtResetDevice(device_id_);
+            if (reset_rc != 0) {
+                LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
+                rc = reset_rc;
+            }
+            int finalize_rc = aclFinalize();
+            if (finalize_rc != 0) {
+                LOG_ERROR("aclFinalize failed during finalize: %d", finalize_rc);
+                if (rc == 0) rc = finalize_rc;
+            }
+            acl_ready_ = false;
+        } else {
+            int reset_rc = rtDeviceReset(device_id_);
+            if (reset_rc != 0) {
+                LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, reset_rc);
+                if (rc == 0) rc = reset_rc;
+            }
         }
-        int finalize_rc = aclFinalize();
-        if (finalize_rc != 0) {
-            LOG_ERROR("aclFinalize failed during finalize: %d", finalize_rc);
-            if (rc == 0) rc = finalize_rc;
-        }
-        acl_ready_ = false;
     }
 
     // Free the 8-byte device_wall buffer (allocated lazily in run()).
