@@ -168,8 +168,9 @@ and `65536`, comparing the scalar tensor DAG,
 `pto_persistent_dag_tensor_core`, and `cublas_sgemm` in one Markdown/SVG
 report. The Markdown keeps raw repeat rows plus medians, records VDCores/MPK
 source-paper provenance and per-baseline workload descriptions, and the SVG
-plots median device time with sample counts. The table below reports median
-device time and normalized GFLOP/s across the three samples.
+plots cover median device time and median GFLOP/s with sample counts. The
+table below reports median device time and normalized GFLOP/s across the
+three samples.
 
 | GPU | N | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns | Scalar GF/s | Tensor-core GF/s | cuBLAS GF/s | Tensor-core/scalar | cuBLAS/scalar |
 | --- | - | - | - | - | - | - | - | - | - | - |

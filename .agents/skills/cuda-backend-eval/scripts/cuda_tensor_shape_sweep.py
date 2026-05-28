@@ -532,11 +532,55 @@ def render_svg(payload: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_throughput_svg(payload: dict[str, Any]) -> str:
+    summary_rows = _median_summary_rows(list(payload["results"]), payload.get("metadata"))
+    max_gflops = max((float(row.get("median_gflops") or 0) for row in summary_rows), default=1)
+    width = 900
+    row_height = 28
+    height = 96 + max(1, len(summary_rows)) * row_height
+    title = html.escape(payload["metadata"]["label"])
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="24" y="32" font-family="monospace" font-size="16">{title}</text>',
+        '<text x="24" y="54" font-family="monospace" font-size="12">Median GF/s</text>',
+    ]
+    bar_x = 340
+    bar_max = 480
+    colors = {
+        "pto_persistent_dag_tensor": "#2a9d8f",
+        "pto_persistent_dag_tensor_core": "#d1495b",
+        "cublas_sgemm": "#006d77",
+    }
+    for idx, row in enumerate(summary_rows):
+        y = 76 + idx * row_height
+        value = row.get("median_gflops")
+        numeric_value = float(value or 0)
+        bar_width = int(bar_max * numeric_value / max_gflops) if max_gflops else 0
+        baseline = row.get("baseline", "-")
+        color = colors.get(baseline, "#2a9d8f")
+        label = (
+            f'{row.get("artifact", "-")} {baseline} n={row.get("n", "-")} {row.get("shape", "-")} '
+            f'samples={row.get("samples", "-")}'
+        )
+        lines.append(
+            f'<text x="24" y="{y + 16}" font-family="monospace" font-size="12">{html.escape(label)}</text>'
+        )
+        lines.append(f'<rect x="{bar_x}" y="{y}" width="{bar_width}" height="18" fill="{color}"/>')
+        lines.append(
+            f'<text x="{bar_x + bar_width + 8}" y="{y + 14}" font-family="monospace" font-size="12">'
+            f'{_format_gflops(value)}</text>'
+        )
+    lines.append("</svg>")
+    return "\n".join(lines) + "\n"
+
+
 def write_report(payload: dict[str, Any], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "cuda-tensor-shape-sweep.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     (output_dir / "cuda-tensor-shape-sweep.md").write_text(render_markdown(payload))
     (output_dir / "cuda-tensor-shape-sweep.svg").write_text(render_svg(payload))
+    (output_dir / "cuda-tensor-shape-throughput.svg").write_text(render_throughput_svg(payload))
 
 
 def run_tensor_shape_sweep(
@@ -600,6 +644,7 @@ def run_tensor_shape_sweep(
     print(output_dir / "cuda-tensor-shape-sweep.json")
     print(output_dir / "cuda-tensor-shape-sweep.md")
     print(output_dir / "cuda-tensor-shape-sweep.svg")
+    print(output_dir / "cuda-tensor-shape-throughput.svg")
     return payload
 
 

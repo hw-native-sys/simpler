@@ -413,6 +413,7 @@ def test_cuda_artifact_index_scans_benchmark_outputs(tmp_path):
             "tensor_tiles": [],
             "has_markdown": True,
             "has_svg": True,
+            "has_throughput_svg": False,
             "has_ratio_svg": True,
             "has_dag_delta_svg": True,
         }
@@ -508,6 +509,7 @@ def test_cuda_artifact_index_scans_tensor_shape_sweep_outputs(tmp_path):
     (artifact_dir / "cuda-tensor-shape-sweep.json").write_text(json.dumps(payload) + "\n")
     (artifact_dir / "cuda-tensor-shape-sweep.md").write_text("# report\n")
     (artifact_dir / "cuda-tensor-shape-sweep.svg").write_text("<svg></svg>\n")
+    (artifact_dir / "cuda-tensor-shape-throughput.svg").write_text("<svg></svg>\n")
 
     entries = cuda_artifact_index.scan_artifacts(tmp_path)
     report = cuda_artifact_index.render_markdown(entries)
@@ -525,6 +527,7 @@ def test_cuda_artifact_index_scans_tensor_shape_sweep_outputs(tmp_path):
             "tensor_tiles": ["16x16x16", "16x16x64"],
             "has_markdown": True,
             "has_svg": True,
+            "has_throughput_svg": True,
             "has_ratio_svg": False,
             "has_dag_delta_svg": False,
         }
@@ -600,6 +603,7 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
             "tensor_tiles": ["16x16x16"],
             "has_markdown": True,
             "has_svg": True,
+            "has_throughput_svg": False,
             "has_ratio_svg": False,
             "has_dag_delta_svg": False,
         }
@@ -818,6 +822,7 @@ def test_cuda_tensor_sweep_validator_accepts_complete_artifact(tmp_path):
     (artifact_dir / "cuda-tensor-shape-sweep.json").write_text(json.dumps(payload) + "\n")
     (artifact_dir / "cuda-tensor-shape-sweep.md").write_text("# report\n")
     (artifact_dir / "cuda-tensor-shape-sweep.svg").write_text("<svg></svg>\n")
+    (artifact_dir / "cuda-tensor-shape-throughput.svg").write_text("<svg></svg>\n")
 
     errors = cuda_validate_tensor_sweep.validate_tensor_sweep(
         payload,
@@ -879,6 +884,7 @@ def test_cuda_tensor_sweep_validator_reports_missing_rows_and_metadata(tmp_path)
     assert "missing baseline pto_persistent_dag_tensor_core artifact=h200 n=256 shape=16x16x64" in errors
     assert "missing report file cuda-tensor-shape-sweep.md" in errors
     assert "missing report file cuda-tensor-shape-sweep.svg" in errors
+    assert "missing report file cuda-tensor-shape-throughput.svg" in errors
 
 
 def test_cuda_tensor_sweep_validator_requires_each_size():
@@ -1225,6 +1231,7 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
 
     markdown = cuda_tensor_shape_sweep.render_markdown(payload)
     svg = cuda_tensor_shape_sweep.render_svg(payload)
+    throughput_svg = cuda_tensor_shape_sweep.render_throughput_svg(payload)
 
     assert "- Source setup: `arXiv:2605.03190` VDCores; `arXiv:2512.22219v1` MPK persistent kernel." in markdown
     assert "- Workloads:" in markdown
@@ -1247,6 +1254,10 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
     assert "8x4x12" in svg
     assert "cublas_sgemm" in svg
     assert "r0" not in svg
+    assert "Median GF/s" in throughput_svg
+    assert "98.30" in throughput_svg
+    assert "122.88" in throughput_svg
+    assert "cublas_sgemm" in throughput_svg
 
 
 def test_cuda_tensor_shape_sweep_dry_run_records_source_papers(tmp_path):

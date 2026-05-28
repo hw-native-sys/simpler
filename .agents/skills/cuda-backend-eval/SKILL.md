@@ -951,10 +951,12 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 The sweep writes `cuda-tensor-shape-sweep.json`,
-`cuda-tensor-shape-sweep.md`, and `cuda-tensor-shape-sweep.svg` under
+`cuda-tensor-shape-sweep.md`, `cuda-tensor-shape-sweep.svg`, and
+`cuda-tensor-shape-throughput.svg` under
 `tmp/cuda-backend/tensor-shape-sweep-<commit>/`. The Markdown keeps raw
 repeat rows plus a median summary table with normalized GFLOP/s; the SVG
-plots the median device time per GPU/N/shape/baseline with sample counts.
+files plot median device time and median GFLOP/s per GPU/N/shape/baseline
+with sample counts.
 
 Validate the compact tensor-baseline sweep before copying numbers into docs:
 

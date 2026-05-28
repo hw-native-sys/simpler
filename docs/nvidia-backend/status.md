@@ -258,8 +258,9 @@ size-sweep report at commit `e79edba2` uses a `16x16x16` descriptor with
 `N=256`, `4096`, and `65536`, three repeats, and the artifact under
 `tmp/cuda-backend/tensor-shape-sweep-e79edba2/`. It writes raw rows,
 VDCores/MPK provenance metadata, per-baseline workload descriptions, a median
-summary table with normalized GFLOP/s, and a median-device-time SVG chart with
-sample counts. Median device times are: A100 scalar/tensor-core/cuBLAS at
+summary table with normalized GFLOP/s, and SVG charts for median device time
+and median GFLOP/s with sample counts. Median device times are: A100
+scalar/tensor-core/cuBLAS at
 `N=256`
 `47104/47104/43007 ns`, `N=4096` `79872/71680/36864 ns`, and `N=65536`
 `587616/470368/38911 ns`; H200 at `N=256` `30560/28160/50496 ns`, `N=4096`

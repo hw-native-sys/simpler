@@ -41,6 +41,7 @@ REPORT_FILES = (
     "cuda-tensor-shape-sweep.json",
     "cuda-tensor-shape-sweep.md",
     "cuda-tensor-shape-sweep.svg",
+    "cuda-tensor-shape-throughput.svg",
 )
 
 
