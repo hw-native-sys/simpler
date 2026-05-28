@@ -131,7 +131,7 @@ def build_all(
                 logger.error(f"Failed to build cpu_sim_context: {e}")
                 raise
 
-    # Collect all (platform, runtime_name) tasks, validating each platform first.
+    # Collect all (platform, runtime_name) tasks to run in parallel
     tasks: list[tuple[str, str]] = []
     for platform in platforms:
         arch, _ = parse_platform(platform)
