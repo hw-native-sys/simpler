@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,44 @@ REPORT_FILES = (
     "cuda-smoke-report.md",
     "cuda-smoke-report.svg",
 )
+
+
+@dataclass(frozen=True)
+class ResourcePolicyExpectation:
+    scheduler_blocks: int | None = None
+    worker_blocks: int | None = None
+    worker_blocks_per_task: int | None = None
+    stream_id: int | None = None
+    block_dim: int | None = None
+    grid_dim: int | None = None
+
+    def fields(self) -> tuple[tuple[str, int | None], ...]:
+        return (
+            ("scheduler_blocks", self.scheduler_blocks),
+            ("worker_blocks", self.worker_blocks),
+            ("worker_blocks_per_task", self.worker_blocks_per_task),
+            ("stream_id", self.stream_id),
+            ("block_dim", self.block_dim),
+            ("grid_dim", self.grid_dim),
+        )
+
+    def is_empty(self) -> bool:
+        return all(expected is None for _, expected in self.fields())
+
+
+@dataclass(frozen=True)
+class SmokeValidationExpectation:
+    artifact_dir: Path | None = None
+    required_artifacts: Sequence[str] = ()
+    runtime: str | None = None
+    mode: str | None = None
+    dag_shape: str | None = None
+    repeat_runs: int | None = None
+    completed_count: int | None = None
+    dispatch: str | None = None
+    tensor_tile: str | None = None
+    resource_policy: ResourcePolicyExpectation | None = None
+    require_report_files: bool = False
 
 
 def _artifact_label(path: Path) -> str:
@@ -82,8 +121,7 @@ def _validate_status(payloads: list[dict[str, Any]]) -> list[str]:
         if payload.get("status") == "pass":
             continue
         errors.append(
-            f"non-pass artifact={payload.get('_artifact', 'unknown')} "
-            f"status={payload.get('status', 'unknown')}"
+            f"non-pass artifact={payload.get('_artifact', 'unknown')} status={payload.get('status', 'unknown')}"
         )
     return errors
 
@@ -136,6 +174,29 @@ def _validate_common_fields(
     return errors
 
 
+def _validate_resource_policy(
+    payloads: list[dict[str, Any]],
+    *,
+    expected_policy: ResourcePolicyExpectation | None,
+) -> list[str]:
+    errors: list[str] = []
+    if expected_policy is None or expected_policy.is_empty():
+        return errors
+    for payload in payloads:
+        artifact = payload.get("_artifact", "unknown")
+        policy = payload.get("resource_policy")
+        if not isinstance(policy, dict):
+            errors.append(f"missing resource_policy for artifact={artifact}")
+            continue
+        for field_name, expected in expected_policy.fields():
+            if expected is not None and policy.get(field_name) != expected:
+                errors.append(
+                    f"expected resource_policy.{field_name} {expected} for artifact={artifact}, "
+                    f"found {policy.get(field_name, 'unknown')}"
+                )
+    return errors
+
+
 def _validate_lifecycle(
     payloads: list[dict[str, Any]],
     *,
@@ -176,42 +237,39 @@ def _validate_report_files(artifact_dir: Path | None) -> list[str]:
 def validate_smoke(
     payloads: list[dict[str, Any]],
     *,
-    artifact_dir: Path | None = None,
-    required_artifacts: Sequence[str] = (),
-    expected_runtime: str | None = None,
-    expected_mode: str | None = None,
-    expected_dag_shape: str | None = None,
-    expected_repeat_runs: int | None = None,
-    expected_completed_count: int | None = None,
-    expected_dispatch: str | None = None,
-    expected_tensor_tile: str | None = None,
-    require_report_files: bool = False,
+    expectation: SmokeValidationExpectation,
 ) -> list[str]:
     errors: list[str] = []
     if not payloads:
         errors.append("missing smoke payloads")
-    errors.extend(_validate_required_artifacts(payloads, required_artifacts))
+    errors.extend(_validate_required_artifacts(payloads, expectation.required_artifacts))
     errors.extend(_validate_status(payloads))
     errors.extend(_validate_scheduler_errors(payloads))
     errors.extend(
         _validate_common_fields(
             payloads,
-            expected_runtime=expected_runtime,
-            expected_mode=expected_mode,
-            expected_dag_shape=expected_dag_shape,
-            expected_dispatch=expected_dispatch,
-            expected_tensor_tile=expected_tensor_tile,
+            expected_runtime=expectation.runtime,
+            expected_mode=expectation.mode,
+            expected_dag_shape=expectation.dag_shape,
+            expected_dispatch=expectation.dispatch,
+            expected_tensor_tile=expectation.tensor_tile,
+        )
+    )
+    errors.extend(
+        _validate_resource_policy(
+            payloads,
+            expected_policy=expectation.resource_policy,
         )
     )
     errors.extend(
         _validate_lifecycle(
             payloads,
-            expected_repeat_runs=expected_repeat_runs,
-            expected_completed_count=expected_completed_count,
+            expected_repeat_runs=expectation.repeat_runs,
+            expected_completed_count=expectation.completed_count,
         )
     )
-    if require_report_files:
-        errors.extend(_validate_report_files(artifact_dir))
+    if expectation.require_report_files:
+        errors.extend(_validate_report_files(expectation.artifact_dir))
     return errors
 
 
@@ -226,8 +284,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-completed-count", type=int)
     parser.add_argument("--expected-dispatch")
     parser.add_argument("--expected-tensor-tile")
+    parser.add_argument("--expected-scheduler-blocks", type=int)
+    parser.add_argument("--expected-worker-blocks", type=int)
+    parser.add_argument("--expected-worker-blocks-per-task", type=int)
+    parser.add_argument("--expected-stream-id", type=int)
+    parser.add_argument("--expected-block-dim", type=int)
+    parser.add_argument("--expected-grid-dim", type=int)
     parser.add_argument("--require-report-files", action="store_true")
     return parser.parse_args(argv)
+
+
+def _resource_policy_expectation(args: argparse.Namespace) -> ResourcePolicyExpectation:
+    return ResourcePolicyExpectation(
+        scheduler_blocks=args.expected_scheduler_blocks,
+        worker_blocks=args.expected_worker_blocks,
+        worker_blocks_per_task=args.expected_worker_blocks_per_task,
+        stream_id=args.expected_stream_id,
+        block_dim=args.expected_block_dim,
+        grid_dim=args.expected_grid_dim,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -236,16 +311,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     artifact_dir = args.json_paths[0].parent if args.json_paths else None
     errors = validate_smoke(
         payloads,
-        artifact_dir=artifact_dir,
-        required_artifacts=_as_list(args.require_artifact),
-        expected_runtime=args.expected_runtime,
-        expected_mode=args.expected_mode,
-        expected_dag_shape=args.expected_dag_shape,
-        expected_repeat_runs=args.expected_repeat_runs,
-        expected_completed_count=args.expected_completed_count,
-        expected_dispatch=args.expected_dispatch,
-        expected_tensor_tile=args.expected_tensor_tile,
-        require_report_files=args.require_report_files,
+        expectation=SmokeValidationExpectation(
+            artifact_dir=artifact_dir,
+            required_artifacts=_as_list(args.require_artifact),
+            runtime=args.expected_runtime,
+            mode=args.expected_mode,
+            dag_shape=args.expected_dag_shape,
+            repeat_runs=args.expected_repeat_runs,
+            completed_count=args.expected_completed_count,
+            dispatch=args.expected_dispatch,
+            tensor_tile=args.expected_tensor_tile,
+            resource_policy=_resource_policy_expectation(args),
+            require_report_files=args.require_report_files,
+        ),
     )
     if errors:
         for error in errors:

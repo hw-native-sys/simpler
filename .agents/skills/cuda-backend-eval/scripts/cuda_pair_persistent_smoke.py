@@ -285,8 +285,24 @@ def _expected_tensor_tile(config: PairedPersistentSmokeConfig) -> str | None:
     return None
 
 
+def _expected_scheduler_blocks(config: PairedPersistentSmokeConfig) -> int:
+    if config.mode == "direct":
+        return 0
+    return 1
+
+
+def _expected_worker_blocks(config: PairedPersistentSmokeConfig) -> int:
+    if config.mode == "direct":
+        return max(1, config.task_count * config.worker_blocks_per_task)
+    if config.worker_blocks is not None:
+        return config.worker_blocks
+    return max(1, config.task_count)
+
+
 def build_validate_command(config: PairedPersistentSmokeConfig, suffix: str) -> list[str]:
     output_dir = _output_dir(config, suffix)
+    expected_scheduler_blocks = _expected_scheduler_blocks(config)
+    expected_worker_blocks = _expected_worker_blocks(config)
     command = [
         "env",
         f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}",
@@ -306,6 +322,18 @@ def build_validate_command(config: PairedPersistentSmokeConfig, suffix: str) -> 
         str(config.repeat_runs),
         "--expected-completed-count",
         str(_expected_completed_count(config)),
+        "--expected-scheduler-blocks",
+        str(expected_scheduler_blocks),
+        "--expected-worker-blocks",
+        str(expected_worker_blocks),
+        "--expected-worker-blocks-per-task",
+        str(config.worker_blocks_per_task),
+        "--expected-stream-id",
+        str(config.stream_id),
+        "--expected-block-dim",
+        "256",
+        "--expected-grid-dim",
+        str(expected_scheduler_blocks + expected_worker_blocks),
         "--require-report-files",
     ]
     if config.mode == "dag":

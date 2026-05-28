@@ -185,6 +185,17 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode queue --queue-capacity 2 --worker-blocks 2 --stream-id 1
 ```
 
+For paired A100/H200 evidence of the same policy, use the persistent runner.
+It validates the recorded `resource_policy` fields in both JSON artifacts:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape chain --task-count 5 --queue-capacity 3 \
+    --worker-blocks 2 --stream-id 1 --repeat-runs 2 \
+    --sync-remote-tree
+```
+
 Run the bounded-ring persistent smoke with wraparound:
 
 ```bash
@@ -386,6 +397,9 @@ PYTHONPATH=$PWD:$PWD/python \
     --expected-runtime persistent_device --expected-mode dag \
     --expected-dag-shape graph_descriptor --expected-repeat-runs 2 \
     --expected-completed-count 3 --expected-dispatch 9,2,1 \
+    --expected-scheduler-blocks 1 --expected-worker-blocks 3 \
+    --expected-worker-blocks-per-task 1 --expected-stream-id 0 \
+    --expected-block-dim 256 --expected-grid-dim 4 \
     --require-report-files
 ```
 
@@ -409,6 +423,12 @@ and tensor DAG payloads include `tensor_args`, so descriptor arguments are
 visible in the Markdown and SVG reports. The `generic_args` payload also
 includes a nested `generic_args` summary showing the indexed generic tensor
 and scalar slots used by the task descriptor.
+The paired persistent runner now passes the expected resource-policy fields
+to `cuda_validate_smoke.py`, so A100/H200 smoke artifacts are rejected when
+the CUDA persistent scheduler runs with a different worker-grid or stream
+policy than the command requested.
+The current paired resource-policy capture is under
+`tmp/cuda-backend/persistent-chain-repeat2-smoke-4b220bb7/`.
 The current two-scalar descriptor capture is under
 `tmp/cuda-backend/persistent-scalar_affine-smoke-469f55cd/`.
 The current single-input scalar-scale descriptor capture is under

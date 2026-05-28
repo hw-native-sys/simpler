@@ -2030,7 +2030,11 @@ Needed:
   prepared-callable repeat-run smokes;
 - broader resource policy beyond the current single scheduler block,
   configurable queue/DAG worker blocks, direct worker-blocks-per-task, and
-  callable stream id tracer bullet;
+  callable stream id tracer bullet. The current paired A100/H200 resource
+  policy smoke validates a five-task DAG-chain repeat run with
+  `scheduler_blocks=1`, `worker_blocks=2`, `worker_blocks_per_task=1`,
+  `stream_id=1`, `block_dim=256`, and `grid_dim=3`, so the remaining gap is
+  policy breadth rather than artifact validation;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
   invalid-dependent-ID, dependent-range, fan-in-underflow, initial-fan-in, and
   no-root/unreachable-task diagnostics.

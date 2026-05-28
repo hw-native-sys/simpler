@@ -1282,15 +1282,17 @@ def test_cuda_smoke_validator_accepts_paired_lifecycle_artifact(tmp_path):
     payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json", artifact_dir / "h200.json"])
     errors = cuda_validate_smoke.validate_smoke(
         payloads,
-        artifact_dir=artifact_dir,
-        required_artifacts=["a100", "h200"],
-        expected_runtime="persistent_device",
-        expected_mode="dag",
-        expected_dag_shape="graph_descriptor",
-        expected_repeat_runs=2,
-        expected_completed_count=3,
-        expected_dispatch="9,2,1",
-        require_report_files=True,
+        expectation=cuda_validate_smoke.SmokeValidationExpectation(
+            artifact_dir=artifact_dir,
+            required_artifacts=["a100", "h200"],
+            runtime="persistent_device",
+            mode="dag",
+            dag_shape="graph_descriptor",
+            repeat_runs=2,
+            completed_count=3,
+            dispatch="9,2,1",
+            require_report_files=True,
+        ),
     )
 
     assert errors == []
@@ -1317,14 +1319,61 @@ def test_cuda_smoke_validator_checks_tensor_tile_shape(tmp_path):
     payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json"])
     errors = cuda_validate_smoke.validate_smoke(
         payloads,
-        expected_runtime="persistent_device",
-        expected_mode="dag",
-        expected_dag_shape="tensor_tile",
-        expected_completed_count=4,
-        expected_tensor_tile="8x4x12",
+        expectation=cuda_validate_smoke.SmokeValidationExpectation(
+            runtime="persistent_device",
+            mode="dag",
+            dag_shape="tensor_tile",
+            completed_count=4,
+            tensor_tile="8x4x12",
+        ),
     )
 
     assert "expected tensor tile 8x4x12 for artifact=a100, found 8x4x16" in errors
+
+
+def test_cuda_smoke_validator_checks_resource_policy(tmp_path):
+    cuda_validate_smoke = _load_smoke_validator_module()
+    artifact_dir = tmp_path / "persistent-resource-policy-smoke"
+    artifact_dir.mkdir()
+    payload = {
+        "status": "pass",
+        "runtime": "persistent_device",
+        "mode": "dag",
+        "dag_shape": "chain",
+        "n": 1024,
+        "repeat_runs": 1,
+        "launch_completed_counts": [5],
+        "dispatch_func_ids": [1, 2, 1, 2, 1],
+        "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+        "resource_policy": {
+            "scheduler_blocks": 1,
+            "worker_blocks": 2,
+            "worker_blocks_per_task": 1,
+            "stream_id": 1,
+            "block_dim": 256,
+            "grid_dim": 3,
+        },
+    }
+    (artifact_dir / "a100.json").write_text(json.dumps(payload) + "\n")
+
+    payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json"])
+    errors = cuda_validate_smoke.validate_smoke(
+        payloads,
+        expectation=cuda_validate_smoke.SmokeValidationExpectation(
+            resource_policy=cuda_validate_smoke.ResourcePolicyExpectation(
+                scheduler_blocks=1,
+                worker_blocks=4,
+                worker_blocks_per_task=1,
+                stream_id=0,
+                block_dim=256,
+                grid_dim=3,
+            ),
+        ),
+    )
+
+    assert "expected resource_policy.worker_blocks 4 for artifact=a100, found 2" in errors
+    assert "expected resource_policy.stream_id 0 for artifact=a100, found 1" in errors
+    assert "expected resource_policy.scheduler_blocks 1 for artifact=a100" not in errors
 
 
 def test_cuda_smoke_validator_reports_lifecycle_and_report_errors(tmp_path):
@@ -1351,15 +1400,17 @@ def test_cuda_smoke_validator_reports_lifecycle_and_report_errors(tmp_path):
     payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json"])
     errors = cuda_validate_smoke.validate_smoke(
         payloads,
-        artifact_dir=artifact_dir,
-        required_artifacts=["a100", "h200"],
-        expected_runtime="persistent_device",
-        expected_mode="dag",
-        expected_dag_shape="graph_descriptor",
-        expected_repeat_runs=2,
-        expected_completed_count=3,
-        expected_dispatch="9,2,1",
-        require_report_files=True,
+        expectation=cuda_validate_smoke.SmokeValidationExpectation(
+            artifact_dir=artifact_dir,
+            required_artifacts=["a100", "h200"],
+            runtime="persistent_device",
+            mode="dag",
+            dag_shape="graph_descriptor",
+            repeat_runs=2,
+            completed_count=3,
+            dispatch="9,2,1",
+            require_report_files=True,
+        ),
     )
 
     assert "missing artifact h200" in errors
@@ -2202,6 +2253,16 @@ def test_cuda_pair_persistent_smoke_builds_chain_a100_h200_workflow(tmp_path):
     assert "chain" in validate
     assert "--expected-completed-count" in validate
     assert "5" in validate
+    assert "--expected-scheduler-blocks" in validate
+    assert "1" in validate
+    assert "--expected-worker-blocks" in validate
+    assert "2" in validate
+    assert "--expected-worker-blocks-per-task" in validate
+    assert "--expected-stream-id" in validate
+    assert "--expected-block-dim" in validate
+    assert "256" in validate
+    assert "--expected-grid-dim" in validate
+    assert "3" in validate
     assert "--require-report-files" in validate
     assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
 
