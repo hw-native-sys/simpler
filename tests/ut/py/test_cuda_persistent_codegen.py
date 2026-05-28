@@ -358,6 +358,9 @@ def test_render_persistent_dag_source_records_device_scheduler_errors():
     assert "++initial_ready_count;" in source
     assert "initial_ready_count == 0U" in source
     assert "pto_dag_record_error(state, 6U, 0U);" in source
+    assert "__device__ unsigned int pto_dag_first_unready_task" in source
+    assert "published == completed" in source
+    assert "pto_dag_record_error(state, 7U, pto_dag_first_unready_task(state));" in source
     assert "atomicAdd(state->error_count, 0U) != 0U" in source
 
 

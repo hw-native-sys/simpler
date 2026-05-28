@@ -26,8 +26,8 @@ from cuda_smoke import PtoRunTiming, _bind_runtime, _find_nvcc
 
 from simpler_setup.cuda_callable_compiler import (
     CudaPersistentCallableArtifact,
-    CudaPersistentTaskFunction,
     CudaPersistentTaskBodyFunction,
+    CudaPersistentTaskFunction,
     CudaTaskBody,
     prepare_cuda_persistent_device_callable,
     render_persistent_dag_source,
@@ -1764,6 +1764,37 @@ def _make_dag_shape(  # noqa: PLR0912
                 )
             ),
         )
+    if dag_shape == "bad_unreachable":
+        task_count = 2
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 1
+        task_t = CudaPersistentDagTask * task_count
+        return (
+            host_fanin_t(0, 1),
+            dependents_t(0),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp0,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=0,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp0,
+                    b=dev_b,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=0,
+                    initial_fanin=1,
+                ),
+            ),
+        )
     raise ValueError(f"unknown dag shape: {dag_shape}")
 
 
@@ -2364,6 +2395,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "bad_func_id",
         "bad_initial_fanin",
         "bad_no_root",
+        "bad_unreachable",
         "chain",
         "fork_join",
         "generic_args",
@@ -2592,6 +2624,7 @@ def main() -> None:
             "bad_func_id",
             "bad_initial_fanin",
             "bad_no_root",
+            "bad_unreachable",
             "chain",
             "fork_join",
             "generic_args",

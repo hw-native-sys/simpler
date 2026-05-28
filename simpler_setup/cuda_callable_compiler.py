@@ -687,6 +687,15 @@ __device__ unsigned int pto_dag_try_decrement_fanin(
     }}
 }}
 
+__device__ unsigned int pto_dag_first_unready_task(const PtoCudaPersistentDagState *state) {{
+    for (unsigned int idx = 0; static_cast<unsigned long long>(idx) < state->task_count; ++idx) {{
+        if (state->fanin[idx] != 0U) {{
+            return idx;
+        }}
+    }}
+    return 0U;
+}}
+
 {rendered_tasks}
 
 {rendered_dispatch}
@@ -710,6 +719,15 @@ extern "C" __global__ void pto_persistent_dag_f32_executor(const PtoCudaPersiste
             }}
             if (state->task_count != 0ULL && initial_ready_count == 0U) {{
                 pto_dag_record_error(state, 6U, 0U);
+            }}
+            while (atomicAdd(state->completed_count, 0U) < state->task_count &&
+                   atomicAdd(state->error_count, 0U) == 0U) {{
+                unsigned int published = atomicAdd(state->queue_tail, 0U);
+                unsigned int completed = atomicAdd(state->completed_count, 0U);
+                if (published == completed && static_cast<unsigned long long>(completed) < state->task_count) {{
+                    pto_dag_record_error(state, 7U, pto_dag_first_unready_task(state));
+                    break;
+                }}
             }}
         }}
         return;

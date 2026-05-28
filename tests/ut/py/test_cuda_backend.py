@@ -1016,6 +1016,44 @@ else:
 
 
 @requires_cuda
+def test_cuda_persistent_device_smoke_reports_unreachable_dag_errors():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+try:
+    run_persistent_smoke(
+        device=0,
+        task_count=2,
+        n=1024,
+        arch="compute_80",
+        mode="dag",
+        queue_capacity=1,
+        dag_shape="bad_unreachable",
+        worker_blocks=2,
+    )
+except RuntimeError as exc:
+    message = str(exc)
+    assert "persistent dag scheduler error" in message
+    assert "code=7" in message
+    assert "task_id=1" in message
+else:
+    raise AssertionError("expected persistent DAG unreachable-task scheduler error")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+@requires_cuda
 def test_cuda_persistent_device_smoke_runs_dispatch_dag_chain():
     script = """
 import sys

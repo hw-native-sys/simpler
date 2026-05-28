@@ -135,7 +135,9 @@ descriptors carry a `func_id`, dependent ranges, an initial fan-in count, and
 optional tensor shape/stride metadata for tiled callables. The persistent
 executor seeds zero-fan-in tasks, dispatches task bodies through a generated
 `func_id` switch, decrements dependent fan-in counters when tasks complete,
-and pushes newly ready dependents back into the ring. The smoke path now uses
+pushes newly ready dependents back into the ring, and keeps one scheduler
+block alive to report malformed graphs that exhaust ready work before every
+task completes. The smoke path now uses
 `KernelCompiler(platform="cuda").compile_cuda_persistent_device(...)` to
 generate the shared task-body wrappers and dispatch switch before compiling
 the executor source with `nvcc`. The compiler writes the generated source, PTX,

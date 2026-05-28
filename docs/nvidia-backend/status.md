@@ -108,6 +108,9 @@ execution modes:
 - device-side scheduler diagnostics for unsupported generated-dispatch
   `func_id` values, invalid dependent task IDs, and out-of-range dependent
   spans, fan-in underflow, and initial-fan-in mismatch.
+- device-side scheduler diagnostics for malformed graphs that have no
+  zero-fan-in root, or that publish some ready roots but exhaust work before
+  every task completes.
 - explicit resource-policy smoke metadata for the current single scheduler
   block, configurable queue/DAG worker blocks, direct-mode worker blocks per
   task, and callable `stream_id`.
@@ -692,6 +695,21 @@ PYTHONPATH=$PWD:$PWD/python \
 Result: expected non-zero exit with `persistent dag scheduler error code=6
 task_id=0 count=1`.
 
+The synthetic unreachable-task shape was run locally to verify that a runtime
+graph descriptor cannot deadlock workers by publishing one root but leaving
+another task behind a dangling fan-in counter:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 2 --n 1024 --arch compute_80 \
+    --mode dag --queue-capacity 1 --dag-shape bad_unreachable \
+    --worker-blocks 2
+```
+
+Result: expected non-zero exit with `persistent dag scheduler error code=7
+task_id=1 count=1`.
+
 The same scheduler-diagnostic slice was verified on the remote H200 checkout
 after pushing this change:
 
@@ -729,6 +747,24 @@ The H200 initial-fan-in mismatch check returned the expected diagnostic:
 The H200 no-root check returned the expected diagnostic:
 `persistent dag scheduler error code=6 task_id=0 count=1`.
 
+The H200 unreachable-task check returned the expected diagnostic:
+`persistent dag scheduler error code=7 task_id=1 count=1`.
+
+The current unreachable-task slice was also checked on H200 through pytest
+after syncing the working tree:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_backend.py \
+     -q -rs -k "unreachable or smoke_runs_dispatch_dag" --platform cuda'
+```
+
+Result: `10 passed, 25 deselected`. The command printed the known PTO-ISA SSH
+refresh warning before passing.
+
 The persistent callable lifecycle path has repeat-run smoke support that
 prepares the callable once and launches it multiple times. Direct mode reuses
 the prepared callable, queue mode resets the ready queue counters and flags,
@@ -762,19 +798,18 @@ Local A100 returned `launch_completed_counts=[4,4]` and
 `launch_completed_counts=[4,4]` and `launch_device_wall_ns=[25280,14272]`.
 
 After adding invalid-dependent, dependent-range, fan-in-underflow,
-initial-fan-in, and no-root scheduler diagnostics, the focused CUDA test set
-was rerun locally:
+initial-fan-in, no-root, and unreachable-task scheduler diagnostics, the CUDA
+backend/codegen tests were rerun locally:
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest \
   tests/ut/py/test_cuda_backend.py \
-  tests/ut/py/test_cuda_persistent_codegen.py \
-  tests/ut/py/test_cuda_kernel_compiler.py \
-  tests/ut/py/test_cuda_scene_test.py \
-  tests/ut/py/test_cuda_benchmark_report.py -q
+  tests/ut/py/test_cuda_persistent_codegen.py -q --platform cuda
 ```
 
-Result: `165 passed`.
+Result: `55 passed`. The full local CUDA scene-test file was also rerun with
+`--platform cuda` and reported `42 passed`.
 
 After adding the third-tensor persistent DAG scene-test arg builder, the new
 ctypes-backed real-data scene test was checked on remote H200 without requiring
@@ -1674,7 +1709,7 @@ Needed:
   callable stream id tracer bullet;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
   invalid-dependent-ID, dependent-range, fan-in-underflow, initial-fan-in, and
-  no-root diagnostics.
+  no-root/unreachable-task diagnostics.
 
 ### Tuned Tensor Workloads
 
