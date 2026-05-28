@@ -313,7 +313,9 @@ tensor descriptor shape as the compact gate, producing `64` combined rows
 under `tmp/cuda-backend/combined-current-dbb01406/`. The validator checked
 source-paper provenance, sanitized command examples, report files, tensor
 descriptor metadata, dispatch sequences, zero scheduler errors, and the new
-graph-scratch-reuse row. That row reported
+graph-scratch-reuse row. The compact and paired-current presets now require
+`scratch_reuse=reused_buffer=tmp0,reuse_task=4` for that row. The captured row
+reported
 `graph_descriptor.fanin=[0,0,2,1,1,2]`,
 `graph_descriptor.dependents=[2,2,3,4,5,5]`, dispatch `[1,2,1,2,1,1]`,
 `scratch_reuse.reused_buffer=tmp0`, `scratch_reuse.reuse_task=4`, completed
@@ -535,7 +537,8 @@ Evidence:
 - `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`
   checks paired benchmark captures for expected machines, selected baselines,
   sizes, repeats, sample count, generated report files, source-paper
-  metadata, and sanitized command examples before docs are refreshed.
+  metadata, sanitized command examples, dispatch IDs, tensor-tile shapes, and
+  scratch-reuse metadata before docs are refreshed.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py` checks
   paired smoke captures for required A100/H200 artifacts, pass status, zero
   scheduler errors, expected runtime/mode, dispatch IDs, repeat-run lifecycle

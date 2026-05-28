@@ -87,6 +87,9 @@ TENSOR_TILE_BASELINES: tuple[str, ...] = (
     "cublas_sgemm",
     "cublas_sgemm_graph",
 )
+EXPECTED_SCRATCH_REUSE_BY_BASELINE: dict[str, str] = {
+    "pto_persistent_dag_graph_scratch_reuse": "reused_buffer=tmp0,reuse_task=4",
+}
 
 
 @dataclass(frozen=True)
@@ -360,6 +363,12 @@ def build_validate_command(
         if baseline in TENSOR_TILE_BASELINES
         for part in ("--require-tensor-tile", f"{baseline}={tensor_shape}")
     ]
+    scratch_reuse_args = [
+        part
+        for baseline in _selected_baselines(config)
+        if baseline in EXPECTED_SCRATCH_REUSE_BY_BASELINE
+        for part in ("--require-scratch-reuse", f"{baseline}={EXPECTED_SCRATCH_REUSE_BY_BASELINE[baseline]}")
+    ]
     return [
         "env",
         f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}",
@@ -375,6 +384,7 @@ def build_validate_command(
         *baseline_args,
         *dispatch_args,
         *tensor_tile_args,
+        *scratch_reuse_args,
         "--require-report-files",
         "--require-command-examples",
         "--require-zero-scheduler-errors",

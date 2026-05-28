@@ -1370,7 +1370,9 @@ PYTHONPATH=$PWD:$PWD/python \
 The current compact paired benchmark capture with this row is under
 `tmp/cuda-backend/combined-current-dbb01406/`. It uses `N=1024`, one repeat,
 `batch_tasks=2`, `worker_blocks_per_task=4`, validates source-paper
-provenance and zero scheduler errors, and includes Markdown plus SVG reports.
+provenance and zero scheduler errors, requires
+`scratch_reuse=reused_buffer=tmp0,reuse_task=4`, and includes Markdown plus
+SVG reports.
 
 Use `--single-baseline pto_persistent_dag_graph_tagged_inout` for a quick
 benchmark path check of explicit graph task-argument tags. This path validates
