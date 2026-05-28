@@ -1721,6 +1721,13 @@ Results: the descriptor-only test reported `1 passed, 67 deselected`; the
 local A100 real-data tagged graph scene reported `1 passed, 67 deselected`;
 and the H200 real-data tagged graph scene reported `1 passed, 67 deselected`
 after the known PTO-ISA SSH refresh warning.
+The same tagged graph shape is now also in the paired persistent-smoke report
+flow as `graph_descriptor_tagged`, with A100/H200 JSON plus Markdown/SVG
+artifacts under
+`tmp/cuda-backend/persistent-graph_descriptor_tagged-repeat2-smoke-d880e2b8/`.
+The paired validator accepted dispatch `9,2,1`, fan-in `[0,0,2]`,
+dependents `[2,2]`, repeat completions `[3,3]`, and zero scheduler errors on
+both GPUs.
 
 The host-schedule generic-args adapter was checked with a failing test first,
 then local A100 and remote H200 real-data ctypes scene tests:
@@ -2621,11 +2628,12 @@ Needed:
 
 - full graph construction from normal PTO task graphs;
 - broader graph-lowering coverage beyond the current
-  `persistent_dag_graph_f32` descriptor adapter, automatic default temporary
-  allocation, logical-output/storage-output separation for scratch reuse,
-  order-independent tensor-flow dependency-inference mode, tagged
-  TaskArgs-like graph task lowering, and five-task chain, five-task
-  fan-out/fan-in, and six-task scratch-reuse graph descriptor smokes;
+  `persistent_dag_graph_f32` descriptor adapter, which already covers
+  automatic default temporary allocation, logical-output/storage-output
+  separation for scratch reuse, order-independent tensor-flow dependency
+  inference, tagged TaskArgs-like graph task lowering, tagged graph-descriptor
+  paired smoke, and five-task chain, five-task fan-out/fan-in, and six-task
+  scratch-reuse graph descriptor smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, and direct/queue/DAG
   prepared-callable repeat-run smokes. The paired lifecycle matrix runner now

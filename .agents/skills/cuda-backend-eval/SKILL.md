@@ -501,9 +501,10 @@ For generated-dispatch DAG shapes, the paired runner passes
 AXPY/scale/affine, triad, quad, unary-square, `generic_args`,
 `generic_args4`, `graph_descriptor`, `graph_descriptor_chain`,
 `graph_descriptor_generic_args4`, `graph_descriptor_reordered`,
-`graph_descriptor_diamond`, `graph_descriptor_scratch_reuse`, and
-`graph_tensor_tile`. The validator therefore rejects A100/H200 artifacts that
-pass numerically through a different generated task path.
+`graph_descriptor_diamond`, `graph_descriptor_scratch_reuse`,
+`graph_descriptor_tagged`, and `graph_tensor_tile`. The validator therefore
+rejects A100/H200 artifacts that pass numerically through a different
+generated task path.
 
 For tensor-tile smokes, the paired runner also passes
 `--expected-tensor-tile ROWSxCOLSxINNER` so the validator rejects artifacts
@@ -542,6 +543,11 @@ The current four-slot generic-argument repeat-run capture is under
 The current graph-descriptor four-slot generic-argument repeat-run capture is
 under
 `tmp/cuda-backend/persistent-graph_descriptor_generic_args4-repeat2-smoke-11db2c9d/`.
+Use `--dag-shape graph_descriptor_tagged --repeat-runs 2` to validate the
+same three-task graph descriptor shape after lowering tagged TaskArgs-like
+entries (`input`, `output`, `output_existing`) into the CUDA descriptor
+fields. The current paired capture is under
+`tmp/cuda-backend/persistent-graph_descriptor_tagged-repeat2-smoke-d880e2b8/`.
 The current graph-descriptor DAG-chain repeat-run capture is under
 `tmp/cuda-backend/persistent-graph_descriptor_chain-repeat2-smoke-b94b555d/`.
 Use `--dag-shape graph_descriptor_reordered --repeat-runs 2` to validate that

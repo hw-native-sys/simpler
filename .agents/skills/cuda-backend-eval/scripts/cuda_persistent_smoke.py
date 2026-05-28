@@ -1748,7 +1748,13 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                 ),
             ),
         )
-    if dag_shape in {"generic_args", "generic_args4", "graph_descriptor", "graph_descriptor_generic_args4"}:
+    if dag_shape in {
+        "generic_args",
+        "generic_args4",
+        "graph_descriptor",
+        "graph_descriptor_generic_args4",
+        "graph_descriptor_tagged",
+    }:
         task_count = 3
         host_fanin_t = ctypes.c_uint32 * task_count
         dependents_t = ctypes.c_uint32 * 2
@@ -2177,6 +2183,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
         "graph_descriptor_diamond",
         "graph_descriptor_generic_args4",
         "graph_descriptor_reordered",
+        "graph_descriptor_tagged",
     }
     if config.dag_shape in {"triad", "quad", *graph_arg_shapes}:
         host_tmp0_seed = array_t(*[float(3 * i) for i in range(output_len)])
@@ -2472,6 +2479,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                     "graph_descriptor_generic_args4",
                     "graph_descriptor_reordered",
                     "graph_descriptor_scratch_reuse",
+                    "graph_descriptor_tagged",
                 }
                 and list(host_tmp2) != expected_tmp2
             ):
@@ -2579,6 +2587,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_generic_args4",
             "graph_descriptor_reordered",
             "graph_descriptor_scratch_reuse",
+            "graph_descriptor_tagged",
             "graph_tensor_tile",
         }:
             result["graph_descriptor"] = {
@@ -2591,6 +2600,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 "graph_descriptor_diamond",
                 "graph_descriptor_generic_args4",
                 "graph_descriptor_reordered",
+                "graph_descriptor_tagged",
             }:
                 tensor_args = {"tensor_args[0]": "tmp0", "tensor_args[1]": "tmp3"}
                 scalar_args = {"scalar_args[0]": 1.5, "scalar_args[1]": 0.25}
@@ -2599,6 +2609,12 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                     scalar_args.update({"scalar_args[2]": 0.125, "scalar_args[3]": 0.0625})
                 result["tensor_args"] = tensor_args
                 result["scalar_args"] = scalar_args
+            if config.dag_shape == "graph_descriptor_tagged":
+                result["graph_task_args"] = {
+                    "task0": "input:a,input:b,output:tmp1",
+                    "task1": "input:a,input:b,output:tmp2",
+                    "task2": "input:tmp1,input:tmp2,output_existing:out",
+                }
         return result
     finally:
         for ptr in allocated:
@@ -2685,6 +2701,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_generic_args4",
         "graph_descriptor_reordered",
         "graph_descriptor_scratch_reuse",
+        "graph_descriptor_tagged",
         "graph_tensor_tile",
         "quad",
         "scalar_affine",
@@ -2737,6 +2754,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
             "graph_descriptor_reordered",
+            "graph_descriptor_tagged",
         }
         and ptx_source.startswith("embedded-")
     ):
@@ -2942,6 +2960,7 @@ def main() -> None:
             "graph_descriptor_generic_args4",
             "graph_descriptor_reordered",
             "graph_descriptor_scratch_reuse",
+            "graph_descriptor_tagged",
             "graph_tensor_tile",
             "quad",
             "scalar_affine",

@@ -329,6 +329,39 @@ def test_persistent_smoke_builds_graph_descriptor_dag_shape():
     assert tasks[0].scalar_arg_count == 2
 
 
+def test_persistent_smoke_builds_tagged_graph_descriptor_dag_shape():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    fanin, dependents, tasks = cuda_persistent_smoke._make_dag_shape(
+        "graph_descriptor_tagged",
+        17,
+        0x1000,
+        0x2000,
+        0x3000,
+        0x4000,
+        0x5000,
+        0x6000,
+        0x7000,
+    )
+
+    assert list(fanin) == [0, 0, 2]
+    assert list(dependents) == [2, 2]
+    assert [task.func_id for task in tasks] == [9, 2, 1]
+    assert [task.initial_fanin for task in tasks] == [0, 0, 2]
+    assert [task.dependent_count for task in tasks] == [1, 1, 0]
+    assert tasks[0].a == 0x1000
+    assert tasks[0].b == 0x2000
+    assert tasks[0].out == 0x4000
+    assert tasks[1].out == 0x5000
+    assert tasks[2].a == tasks[0].out
+    assert tasks[2].b == tasks[1].out
+    assert tasks[2].out == 0x7000
+    assert list(tasks[0].tensor_args)[:2] == [0x3000, 0x6000]
+    assert list(tasks[0].scalar_args)[:2] == [1.5, 0.25]
+    assert tasks[0].tensor_arg_count == 2
+    assert tasks[0].scalar_arg_count == 2
+
+
 def test_persistent_smoke_builds_graph_descriptor_generic_args4_dag_shape():
     cuda_persistent_smoke = _load_persistent_smoke_module()
 
@@ -3037,6 +3070,45 @@ def test_cuda_pair_persistent_smoke_accepts_graph_descriptor_generic_args4_workf
     assert "persistent-graph_descriptor_generic_args4-smoke-abc123/h200.json" in remote[-1]
     assert "--expected-dispatch" in validate
     assert "9,2,1" in validate
+
+
+def test_cuda_pair_persistent_smoke_accepts_tagged_graph_descriptor_workflow(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+    args = cuda_pair_persistent_smoke.parse_args(
+        [
+            "--dag-shape",
+            "graph_descriptor_tagged",
+            "--repeat-runs",
+            "2",
+            "--sync-remote-tree",
+        ]
+    )
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape=args.dag_shape,
+        repeat_runs=args.repeat_runs,
+        sync_remote_tree=args.sync_remote_tree,
+        refresh_remote=not args.skip_remote_refresh and not args.sync_remote_tree,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
+
+    assert "persistent-graph_descriptor_tagged-repeat2-smoke-abc123" in str(local)
+    assert "graph_descriptor_tagged" in local
+    assert "--dag-shape graph_descriptor_tagged" in remote[-1]
+    assert "persistent-graph_descriptor_tagged-repeat2-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-dispatch" in validate
+    assert "9,2,1" in validate
+    assert "--expected-graph-fanin" in validate
+    assert "0,0,2" in validate
+    assert "--expected-graph-dependents" in validate
+    assert "2,2" in validate
 
 
 def test_cuda_pair_persistent_smoke_accepts_graph_descriptor_repeat_runs(tmp_path):

@@ -277,6 +277,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "graph_descriptor_generic_args4": "9,2,1",
         "graph_descriptor_reordered": "1,9,2",
         "graph_descriptor_scratch_reuse": "1,2,1,2,1,1",
+        "graph_descriptor_tagged": "9,2,1",
         "graph_tensor_tile": "3,1,2,1",
         "quad": "8,2,1",
         "scalar_affine": "5,2,1",
@@ -306,6 +307,7 @@ def _expected_graph_descriptor(config: PairedPersistentSmokeConfig) -> tuple[str
         "graph_descriptor_generic_args4": ("0,0,2", "2,2"),
         "graph_descriptor_reordered": ("2,0,0", "0,0"),
         "graph_descriptor_scratch_reuse": ("0,0,2,1,1,2", "2,2,3,4,5,5"),
+        "graph_descriptor_tagged": ("0,0,2", "2,2"),
         "graph_tensor_tile": ("0,1,1,2", "1,2,3,3"),
     }.get(config.dag_shape)
 
@@ -448,6 +450,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "graph_descriptor_generic_args4",
             "graph_descriptor_reordered",
             "graph_descriptor_scratch_reuse",
+            "graph_descriptor_tagged",
             "graph_tensor_tile",
             "quad",
             "scalar_affine",
