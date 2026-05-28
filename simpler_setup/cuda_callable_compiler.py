@@ -81,6 +81,7 @@ class CudaPersistentTaskFunction:
     func_id: int
     name: str
     body: str
+    threading: str = "element"
 
 
 @dataclass(frozen=True)
@@ -490,11 +491,19 @@ def _validate_task_functions(task_functions: Sequence[CudaPersistentFunctionSpec
         if task_name in seen_names:
             raise ValueError(f"duplicate CUDA task function name: {task_name}")
         seen_names.add(task_name)
+        if isinstance(task, CudaPersistentTaskFunction) and task.threading not in {"element", "block"}:
+            raise ValueError(f"invalid CUDA persistent task threading: {task.threading!r}")
     return ordered
 
 
 def _render_task_function(task: CudaPersistentTaskFunction) -> str:
     body = indent(task.body.strip() or "(void)task;", "        ")
+    if task.threading == "block":
+        return f"""
+__device__ void pto_task_{task.name}(const PtoCudaPersistentDagTask *task) {{
+{body}
+}}
+""".strip()
     return f"""
 __device__ void pto_task_{task.name}(const PtoCudaPersistentDagTask *task) {{
     for (unsigned long long i = threadIdx.x; i < task->n; i += blockDim.x) {{
@@ -576,6 +585,8 @@ def render_persistent_dag_source(task_functions: Sequence[CudaPersistentFunction
     rendered_dispatch = _render_dispatch(ordered)
 
     return f"""
+#include <mma.h>
+
 struct PtoCudaPersistentDagTask {{
     unsigned int func_id;
     const float *a;
@@ -753,7 +764,13 @@ extern "C" __global__ void pto_persistent_dag_f32_executor(const PtoCudaPersiste
 
 
 def _task_manifest(task_functions: Sequence[CudaPersistentFunctionSpec]) -> list[dict[str, int | str]]:
-    return [{"func_id": _persistent_func_id(task), "name": _persistent_task_name(task)} for task in task_functions]
+    manifest = []
+    for task in task_functions:
+        entry: dict[str, int | str] = {"func_id": _persistent_func_id(task), "name": _persistent_task_name(task)}
+        if isinstance(task, CudaPersistentTaskFunction) and task.threading != "element":
+            entry["threading"] = task.threading
+        manifest.append(entry)
+    return manifest
 
 
 def _task_body_function_manifest(task_functions: Sequence[CudaPersistentFunctionSpec]) -> list[dict[str, object]]:

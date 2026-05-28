@@ -581,6 +581,7 @@ class KernelCompiler:
                     func_id=func_id,
                     name=task_name,
                     body=source.read_text(),
+                    threading=item.get("threading", "element"),
                 )
             )
 

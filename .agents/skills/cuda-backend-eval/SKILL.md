@@ -598,6 +598,25 @@ non-square descriptor. `n` must be a multiple of `rows * cols`; the smoke
 allocates separate A, B, and output extents so A/B strides can differ from the
 output tile size while later elementwise tasks still run over `n` values.
 
+Run the tensor-core persistent DAG smoke to validate the first block-wide
+generated-dispatch task body. This shape uses CUDA WMMA
+`m16n16k8` with TF32 inputs and F32 accumulation for the first task, then the
+same residual, gate, and fan-in elementwise tasks as `tensor_tile`:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape tensor_core_tile --task-count 4 --queue-capacity 2 \
+    --n 256 --tensor-rows 16 --tensor-cols 16 --tensor-inner 16 \
+    --sync-remote-tree
+```
+
+The paired runner validates dispatch `10,1,2,1`, tensor descriptor
+`16x16x16`, zero scheduler errors, and generated Markdown/SVG report files.
+The report includes a `Tensor core` column such as
+`wmma:m16n16k8:tf32->f32`. Treat this as a tensor-core callable smoke, not yet
+as a tuned throughput result.
+
 The DAG smoke compiles generated CUDA source through
 `KernelCompiler(platform="cuda").compile_cuda_persistent_device(...)`. The
 returned JSON includes `source_kind: generated-dispatch` when that path is in

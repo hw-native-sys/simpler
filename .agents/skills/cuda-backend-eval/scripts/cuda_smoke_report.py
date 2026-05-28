@@ -127,6 +127,19 @@ def _tensor_args(row: dict[str, Any]) -> str:
     return ",".join(f"{key}={tensors[key]}" for key in sorted(tensors))
 
 
+def _tensor_core(row: dict[str, Any]) -> str:
+    tensor_core = row.get("tensor_core")
+    if not isinstance(tensor_core, dict):
+        return "-"
+    api = tensor_core.get("api")
+    mma_shape = tensor_core.get("mma_shape")
+    input_type = tensor_core.get("input")
+    accumulator = tensor_core.get("accumulator")
+    if not all((api, mma_shape, input_type, accumulator)):
+        return "-"
+    return f"{api}:{mma_shape}:{input_type}->{accumulator}"
+
+
 def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
     lines = [
         "# CUDA Smoke Report",
@@ -135,15 +148,15 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
         "",
         (
             "| Artifact | Status | Runtime | Mode | N | PTX arch | Device ns | "
-            "Host ns | Tensor shape | Tiles | Dispatch | Scheduler errors | "
-            "Repeat runs | Launch completions | Resource policy | Scalar args | "
-            "Tensor args |"
+            "Host ns | Tensor shape | Tiles | Tensor core | Dispatch | "
+            "Scheduler errors | Repeat runs | Launch completions | Resource policy | "
+            "Scalar args | Tensor args |"
         ),
         (
             "| -------- | ------ | ------- | ---- | - | -------- | --------- | "
-            "------- | ------------ | ----- | -------- | ---------------- | "
-            "----------- | ------------------ | --------------- | ----------- | "
-            "----------- |"
+            "------- | ------------ | ----- | ----------- | -------- | "
+            "---------------- | ----------- | ------------------ | --------------- | "
+            "----------- | ----------- |"
         ),
     ]
     for row in payloads:
@@ -152,7 +165,7 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
             f"{row.get('runtime', 'unknown')} | {_mode(row)} | {row.get('n', '-')} | "
             f"`{row.get('ptx_arch', 'unknown')}` | {row.get('device_wall_ns', '-')} | "
             f"{row.get('host_wall_ns', '-')} | {_shape(row)} | {_tile_count(row)} | "
-            f"`{_dispatch(row)}` | `{_scheduler_errors(row)}` | "
+            f"`{_tensor_core(row)}` | `{_dispatch(row)}` | `{_scheduler_errors(row)}` | "
             f"`{_repeat_runs(row)}` | `{_launch_completed_counts(row)}` | "
             f"`{_resource_policy(row)}` | "
             f"`{_scalar_args(row)}` | `{_tensor_args(row)}` |"

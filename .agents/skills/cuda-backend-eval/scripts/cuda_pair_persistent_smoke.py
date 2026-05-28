@@ -22,6 +22,10 @@ from pathlib import Path
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
+def _is_tensor_tile_shape(dag_shape: str) -> bool:
+    return dag_shape in {"tensor_core_tile", "tensor_tile"}
+
+
 @dataclass(frozen=True)
 class PairedPersistentSmokeConfig:
     remote: str = "bizhaoh200"
@@ -64,9 +68,9 @@ def _artifact_label(config: PairedPersistentSmokeConfig, suffix: str) -> str:
     repeat = f"-repeat{config.repeat_runs}" if config.repeat_runs > 1 else ""
     if config.mode != "dag":
         return f"persistent-{config.mode}{repeat}-smoke-{suffix}"
-    if config.dag_shape == "tensor_tile":
+    if _is_tensor_tile_shape(config.dag_shape):
         return (
-            f"persistent-tensor_tile-{config.tensor_rows}x"
+            f"persistent-{config.dag_shape}-{config.tensor_rows}x"
             f"{config.tensor_cols}x{config.tensor_inner}{repeat}-smoke-{suffix}"
         )
     return f"persistent-{config.dag_shape}{repeat}-smoke-{suffix}"
@@ -140,7 +144,7 @@ def _smoke_args(*, device: int, arch: str, output_json: Path, config: PairedPers
                 config.dag_shape,
             ]
         )
-        if config.dag_shape == "tensor_tile":
+        if _is_tensor_tile_shape(config.dag_shape):
             args.extend(
                 [
                     "--tensor-rows",
@@ -247,6 +251,7 @@ def _expected_completed_count(config: PairedPersistentSmokeConfig) -> int:
     return {
         "chain": 5,
         "scratch_reuse": 6,
+        "tensor_core_tile": 4,
         "tensor_tile": 4,
     }.get(config.dag_shape, 3)
 
@@ -256,11 +261,12 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         return None
     return {
         "graph_descriptor": "9,2,1",
+        "tensor_core_tile": "10,1,2,1",
     }.get(config.dag_shape)
 
 
 def _expected_tensor_tile(config: PairedPersistentSmokeConfig) -> str | None:
-    if config.mode == "dag" and config.dag_shape == "tensor_tile":
+    if config.mode == "dag" and _is_tensor_tile_shape(config.dag_shape):
         return f"{config.tensor_rows}x{config.tensor_cols}x{config.tensor_inner}"
     return None
 
@@ -369,6 +375,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "scalar_affine",
             "scalar_axpy",
             "scratch_reuse",
+            "tensor_core_tile",
             "tensor_tile",
             "triad",
             "unary_square",

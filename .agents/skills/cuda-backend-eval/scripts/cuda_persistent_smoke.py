@@ -26,6 +26,7 @@ from cuda_smoke import PtoRunTiming, _bind_runtime, _find_nvcc
 
 from simpler_setup.cuda_callable_compiler import (
     CudaPersistentCallableArtifact,
+    CudaPersistentTaskFunction,
     CudaPersistentTaskBodyFunction,
     CudaTaskBody,
     prepare_cuda_persistent_device_callable,
@@ -774,6 +775,33 @@ task->out[i] = task->scalar_args[0] * task->a[i] +
 """.strip(),
         ),
     ),
+    CudaPersistentTaskFunction(
+        func_id=10,
+        name="wmma_m16n16k8_f32",
+        threading="block",
+        body="""
+if (task->rows != 16U || task->cols != 16U || task->inner == 0U || (task->inner % 8U) != 0U) {
+  return;
+}
+using namespace nvcuda;
+unsigned long long tile_count = task->n / task->out_batch_stride;
+for (unsigned long long tile_id = 0; tile_id < tile_count; ++tile_id) {
+  wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a_frag;
+  wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> b_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc_frag;
+  wmma::fill_fragment(acc_frag, 0.0f);
+  unsigned long long a_base = tile_id * task->a_batch_stride;
+  unsigned long long b_base = tile_id * task->b_batch_stride;
+  unsigned long long out_base = tile_id * task->out_batch_stride;
+  for (unsigned int k = 0; k < task->inner; k += 8U) {
+    wmma::load_matrix_sync(a_frag, task->a + a_base + k, task->lda);
+    wmma::load_matrix_sync(b_frag, task->b + b_base + k * task->ldb, task->ldb);
+    wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+  }
+  wmma::store_matrix_sync(task->out + out_base, acc_frag, task->ldc, wmma::mem_row_major);
+}
+""".strip(),
+    ),
 ]
 _PERSISTENT_DAG_SOURCE = render_persistent_dag_source(_PERSISTENT_DAG_TASK_FUNCTIONS)
 
@@ -785,17 +813,29 @@ def _compile_persistent_dag_ptx(work_dir: Path, arch: str) -> tuple[bytes, str, 
 
     task_sources = []
     for task in _PERSISTENT_DAG_TASK_FUNCTIONS:
-        source_path = work_dir / f"persistent_dag_{task.func_id}_{task.task_body.name}.pto.cu"
-        source_path.write_text(task.task_body.body)
-        task_sources.append(
-            {
-                "func_id": task.func_id,
-                "task_name": task.task_body.name,
-                "source_path": str(source_path),
-                "body_style": "task_body",
-                "context_definition": task.task_body.context_definition,
-            }
-        )
+        if isinstance(task, CudaPersistentTaskBodyFunction):
+            source_path = work_dir / f"persistent_dag_{task.func_id}_{task.task_body.name}.pto.cu"
+            source_path.write_text(task.task_body.body)
+            task_sources.append(
+                {
+                    "func_id": task.func_id,
+                    "task_name": task.task_body.name,
+                    "source_path": str(source_path),
+                    "body_style": "task_body",
+                    "context_definition": task.task_body.context_definition,
+                }
+            )
+        else:
+            source_path = work_dir / f"persistent_dag_{task.func_id}_{task.name}.pto.cu"
+            source_path.write_text(task.body)
+            task_sources.append(
+                {
+                    "func_id": task.func_id,
+                    "task_name": task.name,
+                    "source_path": str(source_path),
+                    "threading": task.threading,
+                }
+            )
 
     artifact = KernelCompiler(platform="cuda").compile_cuda_persistent_device(
         task_sources,
@@ -938,6 +978,10 @@ def _make_tensor_tile_descriptor(rows: int = 16, cols: int = 16, inner: int = 16
 
 
 _TENSOR_TILE_DESCRIPTOR = _make_tensor_tile_descriptor()
+
+
+def _is_tensor_tile_shape(dag_shape: str) -> bool:
+    return dag_shape in {"tensor_core_tile", "tensor_tile"}
 
 
 def _tensor_tile_buffer_lengths(n: int, descriptor: dict[str, int]) -> dict[str, int]:
@@ -1263,18 +1307,19 @@ def _make_dag_shape(  # noqa: PLR0912
                 ),
             ),
         )
-    if dag_shape == "tensor_tile":
+    if dag_shape in {"tensor_core_tile", "tensor_tile"}:
         descriptor = tensor_tile or _TENSOR_TILE_DESCRIPTOR
         task_count = 4
         host_fanin_t = ctypes.c_uint32 * task_count
         dependents_t = ctypes.c_uint32 * 4
         task_t = CudaPersistentDagTask * task_count
+        func_id = 10 if dag_shape == "tensor_core_tile" else 3
         return (
             host_fanin_t(0, 1, 1, 2),
             dependents_t(1, 2, 3, 3),
             task_t(
                 make_task(
-                    3,
+                    func_id,
                     dev_a,
                     dev_b,
                     dev_tmp0,
@@ -1877,7 +1922,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
     n = config.n
     queue_capacity = config.queue_capacity
     tensor_lengths = None
-    if config.dag_shape == "tensor_tile":
+    if _is_tensor_tile_shape(config.dag_shape):
         tensor_lengths = _tensor_tile_buffer_lengths(n, config.tensor_tile)
         a_len = tensor_lengths["a"]
         b_len = tensor_lengths["b"]
@@ -1889,7 +1934,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
     array_a_t = ctypes.c_float * a_len
     array_b_t = ctypes.c_float * b_len
     array_t = ctypes.c_float * output_len
-    if config.dag_shape == "tensor_tile":
+    if _is_tensor_tile_shape(config.dag_shape):
         host_a = array_a_t(*[float((i % 5) + 1) for i in range(a_len)])
         host_b = array_b_t(*[float((i % 3) + 1) for i in range(b_len)])
     else:
@@ -2130,7 +2175,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 expected_tmp0 = [_f32(host_a[i] * host_a[i]) for i in range(n)]
                 expected_tmp1 = [_f32(expected_tmp0[i] + host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + host_a[i]) for i in range(n)]
-            if config.dag_shape == "tensor_tile":
+            if _is_tensor_tile_shape(config.dag_shape):
                 expected_tmp0 = _matmul_expected(host_a, host_b, n, config.tensor_tile)
                 expected_tmp1 = [_f32(expected_tmp0[i] + host_a[i]) for i in range(n)]
                 expected_tmp2 = [_f32(expected_tmp0[i] * host_b[i]) for i in range(n)]
@@ -2143,7 +2188,16 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 raise RuntimeError(f"dag tmp1 mismatch on launch {launch_idx}: {mismatch}")
             if (
                 config.dag_shape
-                in {"chain", "scratch_reuse", "tensor_tile", "triad", "quad", "generic_args", "graph_descriptor"}
+                in {
+                    "chain",
+                    "scratch_reuse",
+                    "tensor_core_tile",
+                    "tensor_tile",
+                    "triad",
+                    "quad",
+                    "generic_args",
+                    "graph_descriptor",
+                }
                 and list(host_tmp2) != expected_tmp2
             ):
                 raise RuntimeError(f"dag tmp2 mismatch on launch {launch_idx}")
@@ -2206,11 +2260,13 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
         }
         if config.dag_shape == "scratch_reuse":
             result["scratch_reuse"] = {"reused_buffer": "tmp0", "reuse_task": 4}
-        if config.dag_shape == "tensor_tile":
+        if _is_tensor_tile_shape(config.dag_shape):
             result["tensor_tile"] = {
                 **config.tensor_tile,
                 "tile_count": (tensor_lengths or _tensor_tile_buffer_lengths(n, config.tensor_tile))["tile_count"],
             }
+        if config.dag_shape == "tensor_core_tile":
+            result["tensor_core"] = {"api": "wmma", "mma_shape": "m16n16k8", "input": "tf32", "accumulator": "f32"}
         if config.dag_shape == "scalar_axpy":
             result["scalar_args"] = {"scalar0": 1.5}
         if config.dag_shape == "scalar_affine":
@@ -2316,6 +2372,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "scalar_affine",
         "scalar_axpy",
         "scratch_reuse",
+        "tensor_core_tile",
         "tensor_tile",
         "triad",
         "unary_square",
@@ -2342,8 +2399,8 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         ptx, ptx_source, persistent_artifact = _compile_persistent_ptx(Path(td), arch, mode)
     if mode == "direct" and worker_blocks_per_task > 1 and ptx_source.startswith("embedded-"):
         raise RuntimeError("worker_blocks_per_task > 1 requires nvcc-built persistent direct PTX")
-    if mode == "dag" and dag_shape == "tensor_tile" and ptx_source.startswith("embedded-"):
-        raise RuntimeError("tensor_tile DAG shape requires nvcc-built generated-dispatch PTX")
+    if mode == "dag" and _is_tensor_tile_shape(dag_shape) and ptx_source.startswith("embedded-"):
+        raise RuntimeError(f"{dag_shape} DAG shape requires nvcc-built generated-dispatch PTX")
     if mode == "dag" and dag_shape == "triad" and ptx_source.startswith("embedded-"):
         raise RuntimeError("triad DAG shape requires nvcc-built generated-dispatch PTX")
     if mode == "dag" and dag_shape == "quad" and ptx_source.startswith("embedded-"):
@@ -2543,6 +2600,7 @@ def main() -> None:
             "scalar_affine",
             "scalar_axpy",
             "scratch_reuse",
+            "tensor_core_tile",
             "tensor_tile",
             "triad",
             "unary_square",

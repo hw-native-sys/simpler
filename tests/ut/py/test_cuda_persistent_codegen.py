@@ -310,6 +310,23 @@ def test_render_persistent_dag_source_includes_generic_argument_slots():
     assert "task->scalar_args[1]" in source
 
 
+def test_render_persistent_dag_source_can_use_block_wide_task_functions():
+    source = render_persistent_dag_source(
+        [
+            CudaPersistentTaskFunction(
+                func_id=10,
+                name="wmma_tile_f32",
+                body="if (threadIdx.x < 32) { task->out[threadIdx.x] = 1.0f; }",
+                threading="block",
+            )
+        ]
+    )
+
+    assert "__device__ void pto_task_wmma_tile_f32" in source
+    assert "for (unsigned long long i = threadIdx.x; i < task->n; i += blockDim.x)" not in source
+    assert "if (threadIdx.x < 32)" in source
+
+
 def test_render_persistent_dag_source_records_device_scheduler_errors():
     source = render_persistent_dag_source(
         [

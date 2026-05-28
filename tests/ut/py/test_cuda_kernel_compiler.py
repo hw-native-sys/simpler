@@ -106,6 +106,43 @@ def test_cuda_kernel_compiler_compiles_persistent_device_task_sources(tmp_path, 
         "task->out[i] = task->a[i] * task->b[i];\n",
         "task->out[i] = task->a[i] + task->b[i];\n",
     ]
+    assert [task.threading for task in seen["task_functions"]] == ["element", "element"]
+
+
+def test_cuda_kernel_compiler_preserves_persistent_task_threading(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_compile_cuda_persistent_device(task_functions, arch, cache_root=None, nvcc="nvcc"):
+        seen["task_functions"] = task_functions
+        return SimpleNamespace(
+            cache_key="persistent-key",
+            cache_hit=False,
+            source_path=tmp_path / "generated_dispatch.cu",
+            ptx_path=tmp_path / "pto_callable.ptx",
+            manifest_path=tmp_path / "pto_callable.json",
+            ptx=b"persistent-ptx",
+            entry_name="pto_persistent_dag_f32_executor",
+            arch=arch,
+            source_kind="generated-dispatch",
+        )
+
+    monkeypatch.setattr(kernel_compiler, "compile_cuda_persistent_device", fake_compile_cuda_persistent_device)
+    src = tmp_path / "wmma.pto.cu"
+    src.write_text("if (threadIdx.x < 32) { task->out[threadIdx.x] = 1.0f; }\n")
+
+    KernelCompiler(platform="cuda").compile_cuda_persistent_device(
+        [
+            {
+                "func_id": 10,
+                "task_name": "wmma_tile_f32",
+                "source_path": str(src),
+                "threading": "block",
+            }
+        ],
+        arch="compute_90",
+    )
+
+    assert seen["task_functions"][0].threading == "block"
 
 
 def test_cuda_kernel_compiler_compiles_persistent_device_task_bodies(tmp_path, monkeypatch):

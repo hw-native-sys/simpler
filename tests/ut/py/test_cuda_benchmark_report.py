@@ -299,6 +299,12 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
         },
         "scalar_args": {"scalar0": 1.5},
         "tensor_args": {"c": "tmp0"},
+        "tensor_core": {
+            "api": "wmma",
+            "mma_shape": "m16n16k8",
+            "input": "tf32",
+            "accumulator": "f32",
+        },
         "tensor_tile": {
             "rows": 16,
             "cols": 16,
@@ -324,13 +330,13 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
     svg = cuda_smoke_report.render_svg_report(payload, label="tensor-smoke")
 
     assert (
-        "| Dispatch | Scheduler errors | Repeat runs | Launch completions | "
+        "| Tensor core | Dispatch | Scheduler errors | Repeat runs | Launch completions | "
         "Resource policy | Scalar args | Tensor args |" in markdown
     )
     assert "| a100 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_80` | 102400 | 122260 |" in markdown
     assert "| h200 | pass | persistent_device | dag/tensor_tile | 4096 | `compute_90` | 70464 | 79788 |" in markdown
     assert (
-        "| `3,1,2,1` | `count=0,code=0,task=0` | `2` | `4,4` | "
+        "| `wmma:m16n16k8:tf32->f32` | `3,1,2,1` | `count=0,code=0,task=0` | `2` | `4,4` | "
         "`sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | "
         "`scalar0=1.5` | `c=tmp0` |" in markdown
     )
@@ -1398,6 +1404,39 @@ def test_cuda_pair_persistent_smoke_builds_tensor_tile_descriptor_workflow(tmp_p
     assert "persistent-tensor_tile-8x4x12-smoke-abc123" in report
 
 
+def test_cuda_pair_persistent_smoke_builds_tensor_core_tile_workflow(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape="tensor_core_tile",
+        task_count=4,
+        n=256,
+        tensor_rows=16,
+        tensor_cols=16,
+        tensor_inner=16,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
+    report = cuda_pair_persistent_smoke.build_report_command(config, "abc123")
+
+    assert "persistent-tensor_core_tile-16x16x16-smoke-abc123" in str(local)
+    assert "--dag-shape tensor_core_tile" in remote[-1]
+    assert "--tensor-rows 16" in remote[-1]
+    assert "--expected-completed-count" in validate
+    assert "4" in validate
+    assert "--expected-dispatch" in validate
+    assert "10,1,2,1" in validate
+    assert "--expected-tensor-tile" in validate
+    assert "16x16x16" in validate
+    assert "persistent-tensor_core_tile-16x16x16-smoke-abc123" in report
+
+
 def test_cuda_pair_persistent_smoke_builds_scalar_axpy_workflow(tmp_path):
     cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
     config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
@@ -2171,6 +2210,29 @@ def test_tensor_tile_dag_shape_uses_caller_provided_descriptor():
     assert tasks[0].out_batch_stride == 32
 
 
+def test_tensor_core_tile_dag_shape_uses_block_wide_wmma_task():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    descriptor = cuda_persistent_smoke._make_tensor_tile_descriptor(rows=16, cols=16, inner=16)
+    _, _, tasks = cuda_persistent_smoke._make_dag_shape(
+        "tensor_core_tile",
+        256,
+        101,
+        102,
+        201,
+        202,
+        203,
+        204,
+        301,
+        tensor_tile=descriptor,
+    )
+
+    assert [task.func_id for task in tasks] == [10, 1, 2, 1]
+    assert tasks[0].rows == 16
+    assert tasks[0].cols == 16
+    assert tasks[0].inner == 16
+
+
 def test_scalar_affine_dag_shape_uses_two_scalar_descriptor_fields():
     cuda_persistent_smoke = _load_persistent_smoke_module()
 
@@ -2334,7 +2396,7 @@ def test_persistent_dag_compiler_path_uses_kernel_compiler(tmp_path, monkeypatch
     assert seen["platform"] == "cuda"
     assert seen["arch"] == "compute_90"
     assert seen["nvcc"] == "/usr/local/cuda/bin/nvcc"
-    assert [task["func_id"] for task in seen["task_sources"]] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert [task["func_id"] for task in seen["task_sources"]] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     assert [task["task_name"] for task in seen["task_sources"]] == [
         "add_f32",
         "mul_f32",
@@ -2345,9 +2407,20 @@ def test_persistent_dag_compiler_path_uses_kernel_compiler(tmp_path, monkeypatch
         "square_f32",
         "quad_f32",
         "generic_args_f32",
+        "wmma_m16n16k8_f32",
     ]
-    assert {task["body_style"] for task in seen["task_sources"]} == {"task_body"}
-    assert all("PtoCudaPersistentDagTask" in task["context_definition"] for task in seen["task_sources"])
+    assert {task.get("body_style", "raw") for task in seen["task_sources"]} == {"raw", "task_body"}
+    task_body_sources = [task for task in seen["task_sources"] if task.get("body_style") == "task_body"]
+    raw_sources = [task for task in seen["task_sources"] if task.get("body_style") != "task_body"]
+    assert all("PtoCudaPersistentDagTask" in task["context_definition"] for task in task_body_sources)
+    assert raw_sources == [
+        {
+            "func_id": 10,
+            "task_name": "wmma_m16n16k8_f32",
+            "source_path": raw_sources[0]["source_path"],
+            "threading": "block",
+        }
+    ]
     assert all(Path(task["source_path"]).is_file() for task in seen["task_sources"])
 
 
