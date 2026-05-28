@@ -242,20 +242,20 @@ sequence. The graph-diamond row reported dispatch `[9,2,1,2,1]`, five
 completed tasks, A100 `device_wall_ns=36864`, and H200
 `device_wall_ns=31744`.
 
-The latest current-head compact paired validation at commit `0b3c1699` uses
+The latest current-head compact paired validation at commit `2aedb40f` uses
 the default `16x16x16` tensor descriptor so the scalar tensor DAG,
 `pto_persistent_dag_tensor_core`, and `cublas_sgemm` rows are all runnable in
 the same paired report. It runs `N=1024`, one repeat, `batch_tasks=2`, and
-`worker_blocks_per_task=4`, producing `50` combined rows under
-`tmp/cuda-backend/combined-current-0b3c1699/`. The paired runner validated
+`worker_blocks_per_task=4`, producing `58` combined rows under
+`tmp/cuda-backend/combined-current-2aedb40f/`. The paired runner validated
 required baselines, expected generated-dispatch sequences, command examples,
 tensor descriptor metadata, source-paper provenance, and Markdown and SVG
-report files. Selected device times were A100
-host/base-DAG/tensor/tensor-core/cuBLAS/grid-batch
-`33792/61440/44032/59392/60416/41984 ns` and H200
-`14848/31936/44576/36096/40959/28768 ns`. The capture was run after adding
-persistent DAG no-progress diagnostics; all PTO persistent DAG rows reported
-zero device scheduler errors.
+report files. It also validates the host-schedule generic-args benchmark row.
+Selected A100 device times for host, host-generic, base-DAG,
+persistent-generic, tensor, tensor-core, cuBLAS, and grid-batch were
+`29696/43008/44032/29696/41984/41984/49152/40960 ns`; H200 reported
+`17920/36032/38112/31168/47008/32543/51520/32896 ns`. All PTO persistent DAG
+rows reported zero device scheduler errors.
 
 The compact paired benchmark gate at artifact label `a46db551` promotes
 `pto_persistent_dag_scalar_scale` into the selected benchmark path. It uses
@@ -1441,7 +1441,7 @@ descriptor ratios versus `pto_persistent_dag` are `0.95x`, `1.05x`, and
 `1.19x`, and `1.05x`. Treat the DAG-shape rows as correctness and scheduler
 shape evidence rather than tuned throughput claims.
 
-The compact paired-current gate was refreshed again at commit `d361006f`
+The compact paired-current gate was refreshed again at commit `8e868bfe`
 after the tensor-core scene-test and persistent `stream_id` plumbing changes.
 It uses the WMMA-compatible `16x16x16` tensor descriptor:
 
@@ -1465,6 +1465,23 @@ This capture validates all 28 selected baselines on A100 and H200, including
 host/base-DAG/tensor/tensor-core/cuBLAS/grid-batch were
 `29696/48128/38912/36864/53247/49152 ns`; H200 reported
 `14880/36512/48960/33632/37631/30176 ns`.
+
+The compact paired-current gate was refreshed at commit `2aedb40f` after
+adding the host-schedule generic-args benchmark row. It uses the same command
+shape, `N=1024`, one repeat, `batch_tasks=2`, `worker_blocks_per_task=4`, and
+the WMMA-compatible `16x16x16` tensor descriptor.
+
+Result: `tmp/cuda-backend/combined-current-2aedb40f/` contains
+`cuda-benchmark.json`, `cuda-benchmark.md`, `cuda-benchmark.svg`,
+`cuda-benchmark-ratios.svg`, `cuda-benchmark-dag-deltas.svg`, and
+`cuda-benchmark-throughput.svg`. The combined JSON has `58` samples and the
+compact-current validator reported:
+`validated tmp/cuda-backend/combined-current-2aedb40f/cuda-benchmark.json`.
+This capture validates all 29 selected baselines on A100 and H200, including
+`pto_host_schedule_generic_args`. Selected A100 device times for host,
+host-generic, base-DAG, persistent-generic, tensor, tensor-core, cuBLAS, and
+grid-batch were `29696/43008/44032/29696/41984/41984/49152/40960 ns`; H200
+reported `17920/36032/38112/31168/47008/32543/51520/32896 ns`.
 
 Earlier result: `tmp/cuda-backend/combined-current-d361006f/` contains
 `cuda-benchmark.json`, `cuda-benchmark.md`, `cuda-benchmark.svg`, and

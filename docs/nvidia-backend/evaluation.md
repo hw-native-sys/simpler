@@ -10,7 +10,7 @@ local A100 runs, and remote H200 runs.
 
 The latest full paired A100/H200 benchmark capture was taken at commit
 `61cf96cd`, and the latest compact current-head paired gate was taken at
-commit `d361006f`. Supplemental tensor-shape and tensor-core captures were
+commit `2aedb40f`. Supplemental tensor-shape and tensor-core captures were
 taken at commits `c0ada3ad` and `0879aa9e`. The first cuBLAS library baseline
 capture uses the `343924df` artifact label. The first multi-baseline tensor
 shape sweep used the `6f9a0b78` artifact label, and the latest multi-size
@@ -252,7 +252,7 @@ Validate the current paired capture before copying numbers into
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark.json \
+    tmp/cuda-backend/combined-current-2aedb40f/cuda-benchmark.json \
     --preset compact-current
 ```
 

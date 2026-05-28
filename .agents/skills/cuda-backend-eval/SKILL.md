@@ -1018,7 +1018,7 @@ Use `--dry-run` to print the commands without launching benchmarks. The paired
 benchmark default tensor descriptor is `16x16x16` so the scalar tensor DAG,
 explicit graph tensor DAG, WMMA tensor-core DAG, and cuBLAS rows can run
 together. The current committed summary keeps the full `61cf96cd` capture plus
-the compact current-head `0b3c1699` gate in
+the compact current-head `2aedb40f` gate in
 `docs/nvidia-backend/evaluation-current.md`.
 
 For a lighter no-torch real-data check, run the paired Worker smoke instead of
@@ -1341,7 +1341,7 @@ directly from a combined benchmark JSON payload:
 ```bash
 PYTHONPATH=$PWD:$PWD/python:.agents/skills/cuda-backend-eval/scripts \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_current_summary.py \
-    tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark.json
+    tmp/cuda-backend/combined-current-2aedb40f/cuda-benchmark.json
 ```
 
 Use `--section launch`, `--section unary-square`, `--section worker-grid`,
@@ -1371,15 +1371,16 @@ Validate the paired-current capture before copying numbers into docs:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark.json \
+    tmp/cuda-backend/combined-current-2aedb40f/cuda-benchmark.json \
     --preset compact-current
 ```
 
 The compact current-head gate checks the expected A100/H200 machines,
-selected tensor baselines, size `1024`, one repeat, `50` combined samples,
-and the Markdown/SVG report files. New paired-runner captures use a dynamic
-validator command because the selected benchmark rows can change with runner
-flags. `--require-command-examples` checks that
+selected tensor baselines, the host-schedule generic-args baseline, size
+`1024`, one repeat, `58` combined samples, and the Markdown/SVG report files.
+New paired-runner captures use a dynamic validator command because the
+selected benchmark rows can change with runner flags.
+`--require-command-examples` checks that
 local and remote sample commands are reconstructable without local checkout
 paths. `--require-source-papers` checks that the report records the
 VDCores/MPK source IDs and that the referenced files exist under
