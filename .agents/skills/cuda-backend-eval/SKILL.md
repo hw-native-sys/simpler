@@ -778,6 +778,8 @@ PYTHONPATH=$PWD:$PWD/python \
 This writes per-scenario smoke artifacts plus
 `tmp/cuda-backend/persistent-lifecycle-matrix-<commit>/cuda-lifecycle-matrix.md`,
 `cuda-lifecycle-matrix.svg`, and `cuda-lifecycle-matrix.json`.
+Use `--dry-run` to print every paired smoke command plus the final matrix
+validator and artifact-index commands without writing the matrix report.
 The current paired lifecycle matrix capture is under
 `tmp/cuda-backend/persistent-lifecycle-matrix-d9082288/`.
 Validate a lifecycle matrix before copying its fields into docs:

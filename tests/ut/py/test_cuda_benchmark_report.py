@@ -3206,6 +3206,14 @@ def test_cuda_persistent_lifecycle_matrix_builds_default_workflow(tmp_path):
     assert "--worker-blocks-per-task 2" in command_text
     assert "--worker-blocks 2" in command_text
     assert "--stream-id 1" in command_text
+    validate_script = ".agents/skills/cuda-backend-eval/scripts/cuda_validate_lifecycle_matrix.py"
+    validate_commands = [command for command in commands if validate_script in command]
+    assert len(validate_commands) == 1
+    matrix_json = tmp_path / "cuda-backend" / "persistent-lifecycle-matrix-abc123" / "cuda-lifecycle-matrix.json"
+    assert str(matrix_json) in validate_commands[0]
+    assert validate_commands[0][-2:] == ["--preset", "default"]
+    assert commands[-2] == validate_commands[0]
+    assert commands[-1][-2:] == ["--root", str(tmp_path / "cuda-backend")]
     assert not any("cuda-lifecycle-matrix.md" in part for command in commands for part in command)
 
 

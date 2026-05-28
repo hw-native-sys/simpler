@@ -335,25 +335,24 @@ def run_lifecycle_matrix(
             refresh_remote=refresh_remote,
         )
         commands.extend(paired_smoke.run_paired_persistent_smoke(paired_config, runner=runner, dry_run=dry_run))
+    output_dir = config.output_root / f"persistent-lifecycle-matrix-{suffix}"
+    validate_command = build_validate_command(config, suffix)
+    index_command = paired_smoke.build_index_command(
+        paired_smoke.PairedPersistentSmokeConfig(
+            output_root=config.output_root,
+            local_python=config.local_python,
+        )
+    )
     if not dry_run:
-        output_dir = config.output_root / f"persistent-lifecycle-matrix-{suffix}"
         rows = collect_lifecycle_rows(config, suffix)
         markdown_path, svg_path = write_lifecycle_report(rows, output_dir, f"persistent-lifecycle-matrix-{suffix}")
         print(markdown_path)
         print(svg_path)
-        validate_command = build_validate_command(config, suffix)
-        print(" ".join(shlex.quote(part) for part in validate_command), flush=True)
-        runner(validate_command, check=True)
-        commands.append(validate_command)
-        index_command = paired_smoke.build_index_command(
-            paired_smoke.PairedPersistentSmokeConfig(
-                output_root=config.output_root,
-                local_python=config.local_python,
-            )
-        )
-        print(" ".join(shlex.quote(part) for part in index_command), flush=True)
-        runner(index_command, check=True)
-        commands.append(index_command)
+    for command in (validate_command, index_command):
+        print(" ".join(shlex.quote(part) for part in command), flush=True)
+        if not dry_run:
+            runner(command, check=True)
+        commands.append(command)
     return commands
 
 
