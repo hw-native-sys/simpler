@@ -169,5 +169,6 @@ The smoke check itself only verifies imports and each entry point's `--help`. Fu
 ## See also
 
 - [`.claude/rules/venv-isolation.md`](../.claude/rules/venv-isolation.md) — venv setup and `--no-build-isolation` rationale
-- [`.claude/rules/architecture.md`](../.claude/rules/architecture.md) — codebase-level architecture map
+- [`.claude/rules/project-layout.md`](../.claude/rules/project-layout.md) — Python package layout, build system map, test layout
+- [`.claude/rules/ascend.md`](../.claude/rules/ascend.md) — hardware + software architecture pointers
 - [`docs/developer-guide.md`](developer-guide.md) — full directory structure and build workflow

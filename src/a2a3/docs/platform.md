@@ -1,6 +1,6 @@
 # Platform Backends (a2a3)
 
-Two platform backends under `src/a2a3/platform/`, providing different execution environments for the same runtime code.
+Two platform backends under `src/a2a3/platform/`, providing different execution environments for the same runtime code. For the underlying chip hardware layout (die / device-id mapping, AICPU and AICore counts, host bus), see [hardware.md](hardware.md).
 
 ## Comparison
 
@@ -51,4 +51,4 @@ Shared source implementations in `src/a2a3/platform/src/`.
 
 ## Cache Coherency on GM
 
-See [cache-coherency.md](cache-coherency.md) for the authoritative rules on when AICPU must invalidate before reading GM (host DMA / SDMA writes — yes; AICore writes — no, AICore's own `dcci` is sufficient). Misapplying these rules is the most common source of either stale-data bugs or wasted `dsb sy` cycles on hot profiling paths.
+See [docs/hardware/cache-coherency.md](../../../docs/hardware/cache-coherency.md) for the authoritative rules on when AICPU must invalidate before reading GM (host DMA / SDMA writes — yes; AICore writes — no, AICore's own `dcci` is sufficient). Misapplying these rules is the most common source of either stale-data bugs or wasted `dsb sy` cycles on hot profiling paths.

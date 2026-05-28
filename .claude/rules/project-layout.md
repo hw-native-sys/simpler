@@ -1,12 +1,6 @@
-# Architecture Quick Reference
+# Project Layout Quick Reference
 
-See [docs/chip-level-arch.md](../../docs/chip-level-arch.md) for the full diagram, API layers, execution flow, and handshake protocol. See [docs/hierarchical_level_runtime.md](../../docs/hierarchical_level_runtime.md) for the L0–L6 level model and component composition, and [docs/task-flow.md](../../docs/task-flow.md) for end-to-end data flow through the hierarchical runtime.
-
-## Key Concepts
-
-- **Three programs**: Host `.so`, AICPU `.so`, AICore `.o` — compiled independently, linked at runtime
-- **Two runtimes** under `src/{arch}/runtime/`: `host_build_graph`, `tensormap_and_ringbuffer`
-- **Two platform backends** under `src/{arch}/platform/`: `onboard/` (hardware), `sim/` (simulation)
+How this repo organizes Python packages, the build system, and example / test directories. For the *architecture* the code implements (hardware tiers, software three-program model), see [ascend.md](ascend.md).
 
 ## Python Package Layout
 

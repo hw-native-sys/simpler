@@ -153,8 +153,9 @@ CI was green before this PR, which means the existing test suite does
    existing code — does an equivalent already exist? Is the use case
    real (linked issue / user request) or speculative?
 2. **How does it fit existing design?** Identify the extension points it
-   touches. Does it follow the patterns in `.claude/rules/architecture.md`
-   and the surrounding files, or invent a new pattern?
+   touches. Does it follow the patterns in `.claude/rules/ascend.md` and
+   `.claude/rules/project-layout.md` and the surrounding files, or invent
+   a new pattern?
 3. **What is the blast radius?** Which files/runtimes/platforms does it
    touch? Are tests added for each platform it claims to support?
 4. **Is it complete?** Half-finished features (TODOs, stubs, disabled
@@ -168,7 +169,7 @@ CI was green before this PR, which means the existing test suite does
    `.claude/rules/doc-consistency.md` — are referenced identifiers,
    flags, and paths still valid?
 3. **Codestyle** (any type): apply `.claude/rules/codestyle.md` and any
-   arch-specific rules (`.claude/rules/ascend-device.md`, etc.).
+   arch-specific rules (`.claude/rules/ascend.md`, etc.).
 
 ## Step 7: Optional Cross-Check with External CLI Reviewers
 

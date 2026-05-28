@@ -1,15 +1,18 @@
-# Cache Coherency on a2a3 (GM ↔ AICore/AICPU)
+# Cache Coherency (GM ↔ AICore/AICPU)
 
 This page is the authoritative reference for **when to insert a cache
-operation** on a2a3 onboard hardware. Misapplying these rules either
-leaks stale data (correctness bug) or burns a `dsb sy` per record on a
-hot path (perf bug — see PR #863 lineage). Read it before touching any
-code that writes `dc civac`, `dc cvac`, `cache_invalidate_range`, or any
-`dcci` on AICore.
+operation** on Ascend onboard hardware. The coherency model is shared
+across the chip generations supported in this repo (a2a3, a5); cycle
+costs and a few code-path examples below are sampled on a2a3 unless
+stated otherwise. Misapplying these rules either leaks stale data
+(correctness bug) or burns a `dsb sy` per record on a hot path (perf
+bug — see PR #863 lineage). Read it before touching any code that
+writes `dc civac`, `dc cvac`, `cache_invalidate_range`, or any `dcci`
+on AICore.
 
 ## Who shares GM, and with what consistency
 
-GM (HBM) is read and written by four parties on a2a3 onboard. Their
+GM (HBM) is read and written by four parties on Ascend onboard. Their
 relationship to **AICPU's data cache** is **not symmetric** — that
 asymmetry is the entire reason this page exists.
 
@@ -31,10 +34,10 @@ and what code lives on each side.
 
 ## The two cache primitives
 
-| Primitive | Side | Purpose | Cost (rough, DAV_3510) |
-| --------- | ---- | ------- | ---------------------- |
+| Primitive | Side | Purpose | Cost (rough, a2a3 / DAV_3510) |
+| --------- | ---- | ------- | ----------------------------- |
 | `dcci` (`__attribute__((aicore))` intrinsic) | AICore | Push a cache line out to GM (clean+invalidate). Required after AICore stores that AICPU or peer AICore must read. | 1 cache line per call + a following `dsb` to commit ordering. |
-| `cache_invalidate_range(addr, size)` (`src/a2a3/platform/onboard/aicpu/cache_ops.cpp`) | AICPU | `dc civac` + `dsb sy` + `isb` over a byte range. Required before AICPU reads GM that **a non-coherent writer** (host DMA, SDMA) most recently published. | `dsb sy` dominates (tens to hundreds of cycles, fixed regardless of range). |
+| `cache_invalidate_range(addr, size)` (`src/{a2a3,a5}/platform/onboard/aicpu/cache_ops.cpp`) | AICPU | `dc civac` + `dsb sy` + `isb` over a byte range. Required before AICPU reads GM that **a non-coherent writer** (host DMA, SDMA) most recently published. | `dsb sy` dominates (tens to hundreds of cycles, fixed regardless of range). |
 
 `cache_invalidate_range` is the protocol-correct primitive for the
 **host-DMA → AICPU** case. It was introduced in PR #204 specifically
@@ -78,12 +81,13 @@ Two separate concerns, often conflated:
   `rmb()` between the COND check and the slot reads.
 
 Concretely, the L2 perf staging-slot read in
-`src/a2a3/platform/src/aicpu/l2_perf_collector_aicpu.cpp` does **not**
-call `cache_invalidate_range` on the slot, but it **does** call `rmb()`
-before reading `slot->task_id` and the timing fields. All of those
-fields are AICore writes covered by the AICore-side `dcci` in
+`src/{a2a3,a5}/platform/src/aicpu/l2_perf_collector_aicpu.cpp` does
+**not** call `cache_invalidate_range` on the slot, but it **does** call
+`rmb()` before reading `slot->task_id` and the timing fields. All of
+those fields are AICore writes covered by the AICore-side `dcci` in
 `l2_perf_aicore_record_task`. The same pattern applies to the PMU
-staging slot (`src/a2a3/platform/src/aicpu/pmu_collector_aicpu.cpp`).
+staging slot
+(`src/{a2a3,a5}/platform/src/aicpu/pmu_collector_aicpu.cpp`).
 
 ### Historical pitfall
 
@@ -125,7 +129,9 @@ that AICPU subsequently reads.
 ## The "SDMA → AICPU" path: treat as non-coherent until proven otherwise
 
 SDMA is a separate device-side DMA engine. It writes GM but is not
-known to snoop AICPU's data cache. Current runtime code (see
+known to snoop AICPU's data cache. SDMA backend code currently lives
+only under the a2a3 runtime tree, but the principle applies to any
+chip generation that exposes SDMA. Current runtime code (see
 `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/backend/sdma/sdma_completion_scheduler.h`
 and the SDMA-engine async-wait completion path in
 `runtime/pto_async_wait.h` / `runtime/scheduler/pto_scheduler.h`)
@@ -163,13 +169,13 @@ forever once they ship.
 
 ## Related code
 
-- `src/a2a3/platform/onboard/aicpu/cache_ops.cpp` — `cache_invalidate_range` implementation (`dc civac` / `dsb sy` / `isb`).
-- `src/a2a3/platform/sim/aicpu/cache_ops.cpp` — sim no-op.
+- `src/{a2a3,a5}/platform/onboard/aicpu/cache_ops.cpp` — `cache_invalidate_range` implementation (`dc civac` / `dsb sy` / `isb`).
+- `src/{a2a3,a5}/platform/sim/aicpu/cache_ops.cpp` — sim no-op.
 - AICore-side `dcci` usage lives in the L2 perf / PMU AICore collectors and any kernel that publishes to a GM slot AICPU reads.
 
 ## Related docs
 
-- [PMU staging-slot ordering](../../../docs/dfx/pmu-profiling.md) —
+- [PMU staging-slot ordering](../dfx/pmu-profiling.md) —
   detailed AICore-side `dcci` + barrier order for staging-slot writes.
-- [L2 swimlane profiling](../../../docs/dfx/l2-swimlane-profiling.md) —
+- [L2 swimlane profiling](../dfx/l2-swimlane-profiling.md) —
   the consumer of the rules above on the L2 perf path.
