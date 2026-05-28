@@ -1214,10 +1214,7 @@ class _CudaPersistentDagSceneBuffers:
 
     @staticmethod
     def _graph_dependents_from_task_specs(task_specs: list[dict[str, Any]]) -> list[list[int]]:
-        if any("dependents" in task_spec for task_spec in task_specs):
-            return [list(task_spec.get("dependents", [])) for task_spec in task_specs]
-
-        dependents = [[] for _ in task_specs]
+        inferred_dependents = [[] for _ in task_specs]
         producers: dict[str, int] = {}
         for task_id, task_spec in enumerate(task_specs):
             producer_ids = {
@@ -1226,12 +1223,15 @@ class _CudaPersistentDagSceneBuffers:
                 if name in producers
             }
             for producer_id in sorted(producer_ids):
-                dependents[producer_id].append(task_id)
+                inferred_dependents[producer_id].append(task_id)
 
             out_name = task_spec.get("out")
             if out_name is not None:
                 producers[str(out_name)] = task_id
-        return dependents
+        return [
+            list(task_spec["dependents"]) if "dependents" in task_spec else inferred_dependents[task_id]
+            for task_id, task_spec in enumerate(task_specs)
+        ]
 
     @staticmethod
     def _graph_task_read_names(task_spec: dict[str, Any]) -> list[str]:

@@ -1465,15 +1465,19 @@ temporary buffers, generic tensor slots, and scalar slots through the same L2
 `SceneTestCase` path. The adapter now allocates default-sized temporaries for
 graph task `out` names that do not match existing input/output tensors, so the
 `temporaries` map is only needed for non-default temporary sizes. It also
-supports a first dependency-inference slice: when every graph task omits
-`dependents`, it infers edges from tensor flow by mapping earlier `out`
-producers to later `a`/`b`/`c`/`d` and `tensor_args` reads.
+supports a first dependency-inference slice: when a graph task omits
+`dependents`, the adapter infers its outgoing edges from tensor flow by
+mapping earlier `out` producers to later `a`/`b`/`c`/`d` and `tensor_args`
+reads. The inference is per task, so mixed descriptors can keep explicit
+dependency lists for some tasks while inferring omitted edges for the
+remaining tasks.
 
 The graph-descriptor adapter was checked with focused local tests:
 
 ```bash
 .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
-  -q -k 'graph_args or graph_edges or graph_temporaries' --platform cuda
+  -q -k 'graph_args or graph_edges or graph_temporaries or mixed_graph' \
+  --platform cuda
 
 .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
   -q -k graph_with_ctypes --platform cuda
@@ -1481,7 +1485,22 @@ The graph-descriptor adapter was checked with focused local tests:
 
 Result: the focused descriptor and real-data graph tests passed locally on
 A100. The full CUDA scene-test file was also rerun locally and reported
-`46 passed`.
+`48 passed`.
+
+The mixed explicit/inferred graph path was also run on the remote H200 after
+syncing the working tree:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+     -q -rs -k mixed_graph_with_ctypes --platform cuda'
+```
+
+Result: `1 passed, 47 deselected`. The command printed the known PTO-ISA SSH
+refresh warning before passing.
 
 The same real-data ctypes graph test was run on the remote H200 after syncing
 the working tree:

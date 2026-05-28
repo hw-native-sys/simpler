@@ -285,6 +285,17 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k generic_args_with_ctypes --platform cuda
 ```
 
+Run the mixed explicit/inferred graph descriptor path after changing
+`persistent_dag_graph_f32` dependency inference. This selector exercises a
+graph where one task keeps explicit `dependents` and another task has its
+outgoing edge inferred from tensor flow:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k mixed_graph_with_ctypes --platform cuda
+```
+
 Use `--dag-shape unary_square` to validate a generated-dispatch task body
 that reads only one tensor input from the persistent DAG descriptor. The
 first DAG task computes `tmp0 = a * a`, then downstream add tasks consume its
