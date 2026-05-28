@@ -693,6 +693,24 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode queue --queue-capacity 2 --repeat-runs 2
 ```
 
+Use `cuda_persistent_lifecycle_matrix.py` when direct, queue, and DAG
+prepared-callable lifecycle evidence should be captured together on local A100
+and remote H200. The default matrix uses `repeat_runs=2`, `stream_id=1`,
+direct `worker_blocks_per_task=2`, and queue/DAG `worker_blocks=2`, then
+validates each paired smoke before writing one Markdown/SVG matrix report:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_persistent_lifecycle_matrix.py \
+    --sync-remote-tree
+```
+
+This writes per-scenario smoke artifacts plus
+`tmp/cuda-backend/persistent-lifecycle-matrix-<commit>/cuda-lifecycle-matrix.md`,
+`cuda-lifecycle-matrix.svg`, and `cuda-lifecycle-matrix.json`.
+The current paired lifecycle matrix capture is under
+`tmp/cuda-backend/persistent-lifecycle-matrix-d9082288/`.
+
 Run the six-task persistent DAG scratch-reuse smoke. This graph reuses `tmp0`
 after its last dependent has completed and validates the final reused-buffer
 contents:

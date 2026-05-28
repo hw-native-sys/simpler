@@ -2027,7 +2027,12 @@ Needed:
   allocation, and order-independent tensor-flow dependency-inference mode;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, and direct/queue/DAG
-  prepared-callable repeat-run smokes;
+  prepared-callable repeat-run smokes. The paired lifecycle matrix runner now
+  captures direct, queue, and DAG-chain repeat-run evidence across A100 and
+  H200 in one artifact set
+  (`tmp/cuda-backend/persistent-lifecycle-matrix-d9082288/`), so the remaining
+  lifecycle gap is normal PTO graph breadth rather than prepared-callable reset
+  coverage;
 - broader resource policy beyond the current single scheduler block,
   configurable queue/DAG worker blocks, direct worker-blocks-per-task, and
   callable stream id tracer bullet. The current paired A100/H200 resource

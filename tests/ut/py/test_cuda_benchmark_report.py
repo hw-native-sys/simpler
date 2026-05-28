@@ -159,6 +159,22 @@ def _load_pair_persistent_smoke_module():
         sys.modules.pop(spec.name, None)
 
 
+def _load_persistent_lifecycle_matrix_module():
+    script_dir = Path(__file__).resolve().parents[3] / ".agents" / "skills" / "cuda-backend-eval" / "scripts"
+    script_path = script_dir / "cuda_persistent_lifecycle_matrix.py"
+    sys.path.insert(0, str(script_dir))
+    try:
+        spec = importlib.util.spec_from_file_location("cuda_persistent_lifecycle_matrix", script_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop("cuda_persistent_lifecycle_matrix", None)
+        sys.path.remove(str(script_dir))
+
+
 def _load_current_summary_module():
     script_dir = Path(__file__).resolve().parents[3] / ".agents" / "skills" / "cuda-backend-eval" / "scripts"
     script_path = script_dir / "cuda_current_summary.py"
@@ -2718,6 +2734,105 @@ def test_cuda_pair_persistent_smoke_can_sync_local_tree_and_dry_run(tmp_path):
     assert "--expected-dispatch" in commands[5]
     assert "1,2,1,2,1,1" in commands[5]
     assert commands[6][-2:] == ["--root", str(tmp_path / "cuda-backend")]
+
+
+def test_cuda_persistent_lifecycle_matrix_builds_default_workflow(tmp_path):
+    cuda_lifecycle_matrix = _load_persistent_lifecycle_matrix_module()
+    calls = []
+
+    def fake_runner(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="abc123\n", stderr="")
+
+    config = cuda_lifecycle_matrix.LifecycleMatrixConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        sync_remote_tree=True,
+    )
+
+    commands = cuda_lifecycle_matrix.run_lifecycle_matrix(config, runner=fake_runner, dry_run=True)
+    command_text = "\n".join(" ".join(command) for command in commands)
+
+    assert calls[0] == (["git", "rev-parse", "--short", "HEAD"], {"check": True, "capture_output": True, "text": True})
+    assert sum(1 for command in commands if command[:3] == ["rsync", "-a", "--delete"]) == 1
+    assert "persistent-direct-repeat2-smoke-abc123/a100.json" in command_text
+    assert "persistent-queue-repeat2-smoke-abc123/a100.json" in command_text
+    assert "persistent-chain-repeat2-smoke-abc123/a100.json" in command_text
+    assert "--mode direct" in command_text
+    assert "--mode queue" in command_text
+    assert "--mode dag" in command_text
+    assert "--worker-blocks-per-task 2" in command_text
+    assert "--worker-blocks 2" in command_text
+    assert "--stream-id 1" in command_text
+    assert not any("cuda-lifecycle-matrix.md" in part for command in commands for part in command)
+
+
+def test_cuda_persistent_lifecycle_matrix_renders_report(tmp_path):
+    cuda_lifecycle_matrix = _load_persistent_lifecycle_matrix_module()
+    rows = [
+        {
+            "scenario": "direct",
+            "artifact": "a100",
+            "mode": "direct",
+            "status": "pass",
+            "runtime": "persistent_device",
+            "n": 1024,
+            "device_wall_ns": 4096,
+            "host_wall_ns": 8192,
+            "repeat_runs": 2,
+            "launch_completed_counts": [2, 2],
+            "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+            "resource_policy": {
+                "scheduler_blocks": 0,
+                "worker_blocks": 4,
+                "worker_blocks_per_task": 2,
+                "stream_id": 1,
+                "block_dim": 256,
+                "grid_dim": 4,
+            },
+        },
+        {
+            "scenario": "dag-chain",
+            "artifact": "h200",
+            "mode": "dag",
+            "dag_shape": "chain",
+            "status": "pass",
+            "runtime": "persistent_device",
+            "n": 1024,
+            "device_wall_ns": 2048,
+            "host_wall_ns": 4096,
+            "repeat_runs": 2,
+            "launch_completed_counts": [5, 5],
+            "dispatch_func_ids": [1, 2, 1, 2, 1],
+            "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+            "resource_policy": {
+                "scheduler_blocks": 1,
+                "worker_blocks": 2,
+                "worker_blocks_per_task": 1,
+                "stream_id": 1,
+                "block_dim": 256,
+                "grid_dim": 3,
+            },
+        },
+    ]
+
+    markdown_path, svg_path = cuda_lifecycle_matrix.write_lifecycle_report(
+        rows,
+        tmp_path,
+        "lifecycle-test",
+    )
+
+    report = markdown_path.read_text()
+    assert markdown_path.name == "cuda-lifecycle-matrix.md"
+    assert svg_path.name == "cuda-lifecycle-matrix.svg"
+    assert "| direct | a100 | pass | persistent_device | direct |" in report
+    assert "`sched=0,workers=4,wp=2,stream=1,block=256,grid=4`" in report
+    assert "| dag-chain | h200 | pass | persistent_device | dag/chain |" in report
+    assert "`1,2,1,2,1`" in report
+    assert "lifecycle-test" in svg_path.read_text()
 
 
 def test_find_nvcc_uses_cuda_home_when_nvcc_is_not_on_path(tmp_path, monkeypatch):
