@@ -135,7 +135,8 @@ tensor/scalar descriptors, `persistent_dag_tensor_tile_f32` state objects,
 `persistent_dag_triad_f32` third-tensor descriptors,
 `persistent_dag_quad_f32` fourth-tensor descriptors,
 `persistent_dag_generic_args_f32` generic tensor/scalar argument descriptors,
-`persistent_dag_graph_f32` explicit graph descriptors, and
+`persistent_dag_graph_f32` explicit and tensor-flow-inferred graph
+descriptors, and
 `persistent_dag_unary_square_f32` unary descriptors, and
 `persistent_dag_tensor_core_tile_f32` WMMA tensor-core descriptors from normal
 `TaskArgsBuilder` CPU tensors, and validates real copied-back CUDA output
@@ -1461,20 +1462,21 @@ through both the normal `SceneTestCase` L2 path and the no-torch Worker smoke
 path. A generic `persistent_dag_graph_f32` adapter can now lower explicit
 runtime graph descriptors with per-task `func_id`, dependency lists, fan-in,
 temporary buffers, generic tensor slots, and scalar slots through the same L2
-`SceneTestCase` path.
+`SceneTestCase` path. The adapter also supports a first dependency-inference
+slice: when every graph task omits `dependents`, it infers edges from tensor
+flow by mapping earlier `out` producers to later `a`/`b`/`c`/`d` and
+`tensor_args` reads.
 
 The graph-descriptor adapter was checked with focused local tests:
 
 ```bash
 .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
-  -q -k builds_cuda_persistent_graph_args --platform cuda
-
-.venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
-  -q -k graph_with_ctypes --platform cuda
+  -q -k 'graph_args or graph_edges or graph_with_ctypes' --platform cuda
 ```
 
-Result: both tests passed locally on A100. The full CUDA scene-test file was
-also rerun locally and reported `38 passed`.
+Result: the focused descriptor and real-data graph tests passed locally on
+A100. The full CUDA scene-test file was also rerun locally and reported
+`44 passed`.
 
 The same real-data ctypes graph test was run on the remote H200 after syncing
 the working tree:
@@ -1485,10 +1487,10 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
-     -q -k graph_with_ctypes --platform cuda'
+     -q -k inferred_graph_with_ctypes --platform cuda'
 ```
 
-Result: `1 passed, 37 deselected`. The remote command also printed the known
+Result: `1 passed, 43 deselected`. The remote command also printed the known
 PTO-ISA SSH refresh warning before the selected CUDA test passed.
 
 The tensor-core tile descriptor was then added to the same normal L2
@@ -1572,7 +1574,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
      --platform cuda'
 ```
 
-Result: `2 passed, 40 deselected`. The command printed the known PTO-ISA SSH
+Result: `3 passed, 41 deselected`. The command printed the known PTO-ISA SSH
 refresh warning before passing.
 
 The explicit graph-descriptor path has now been promoted into the benchmark
@@ -1724,8 +1726,9 @@ it is not yet a full TensorMap/ringbuffer analogue.
 Needed:
 
 - graph construction from normal PTO task graphs;
-- broader graph-lowering coverage beyond the current explicit
-  `persistent_dag_graph_f32` descriptor adapter;
+- broader graph-lowering coverage beyond the current
+  `persistent_dag_graph_f32` descriptor adapter and its first tensor-flow
+  dependency-inference mode;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor repeat-run, and direct/queue/DAG prepared-callable
   repeat-run smokes;

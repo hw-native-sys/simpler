@@ -1153,10 +1153,11 @@ class _CudaPersistentDagSceneBuffers:
                 ptr = self._malloc(self._temporary_nbytes(size_source, output_nbytes))
             ptrs[str(name)] = ptr
 
+        graph_dependents = self._graph_dependents_from_task_specs(task_specs)
         dependents: list[int] = []
         fanin = [0 for _ in task_specs]
         for task_id, task_spec in enumerate(task_specs):
-            task_dependents = list(task_spec.get("dependents", []))
+            task_dependents = graph_dependents[task_id]
             for dependent in task_dependents:
                 dependent_id = int(dependent)
                 if dependent_id < 0 or dependent_id >= len(task_specs):
@@ -1176,8 +1177,8 @@ class _CudaPersistentDagSceneBuffers:
         task_t = task_type * len(task_specs)
         task_values = []
         dependent_begin = 0
-        for task_spec in task_specs:
-            task_dependents = list(task_spec.get("dependents", []))
+        for task_id, task_spec in enumerate(task_specs):
+            task_dependents = graph_dependents[task_id]
             task_values.append(
                 self._make_graph_task(
                     ctypes_module,
@@ -1195,6 +1196,33 @@ class _CudaPersistentDagSceneBuffers:
         self.host_tasks = task_t(*task_values)
         fanin_t = ctypes_module.c_uint32 * len(fanin)
         self.host_fanin = fanin_t(*fanin)
+
+    @staticmethod
+    def _graph_dependents_from_task_specs(task_specs: list[dict[str, Any]]) -> list[list[int]]:
+        if any("dependents" in task_spec for task_spec in task_specs):
+            return [list(task_spec.get("dependents", [])) for task_spec in task_specs]
+
+        dependents = [[] for _ in task_specs]
+        producers: dict[str, int] = {}
+        for task_id, task_spec in enumerate(task_specs):
+            producer_ids = {
+                producers[name]
+                for name in _CudaPersistentDagSceneBuffers._graph_task_read_names(task_spec)
+                if name in producers
+            }
+            for producer_id in sorted(producer_ids):
+                dependents[producer_id].append(task_id)
+
+            out_name = task_spec.get("out")
+            if out_name is not None:
+                producers[str(out_name)] = task_id
+        return dependents
+
+    @staticmethod
+    def _graph_task_read_names(task_spec: dict[str, Any]) -> list[str]:
+        names = [task_spec.get(field) for field in ("a", "b", "c", "d")]
+        names.extend(task_spec.get("tensor_args", []))
+        return [str(name) for name in names if name is not None]
 
     def _temporary_nbytes(self, size_source, default_nbytes: int) -> int:
         if isinstance(size_source, int):

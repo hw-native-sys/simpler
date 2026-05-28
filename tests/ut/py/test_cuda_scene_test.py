@@ -867,6 +867,27 @@ def _cuda_persistent_graph_generic_args_spec(
     return spec
 
 
+def _cuda_persistent_inferred_graph_generic_args_spec(
+    generic_source,
+    add_source,
+    mul_source,
+    *,
+    arch="compute_80",
+    block_dim=256,
+):
+    spec = _cuda_persistent_graph_generic_args_spec(
+        generic_source,
+        add_source,
+        mul_source,
+        arch=arch,
+        block_dim=block_dim,
+    )
+    for task in spec["cuda"]["graph"]["tasks"]:
+        task.pop("dependents", None)
+        task.pop("initial_fanin", None)
+    return spec
+
+
 def _cuda_persistent_unary_square_spec(square_source, add_source, *, arch="compute_80", block_dim=256):
     return {
         "cuda": {
@@ -1415,6 +1436,45 @@ def test_scene_test_builds_cuda_persistent_graph_args():
     assert buffers.host_tasks[2].a == buffers.host_tasks[0].out
     assert buffers.host_tasks[2].b == buffers.host_tasks[1].out
     assert buffers.host_tasks[2].out == buffers.tensor_buffers.ptrs["out"]
+
+
+def test_scene_test_infers_cuda_persistent_graph_edges_from_tensor_flow():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("c", _FakeTensor(17)),
+        Tensor("d", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "c", "d", "out"],
+        "queue_capacity": 2,
+        "temporaries": {"tmp0": "out", "tmp1": "out"},
+        "graph": {
+            "tasks": [
+                {
+                    "func_id": 9,
+                    "a": "a",
+                    "b": "b",
+                    "out": "tmp0",
+                    "tensor_args": ["c", "d"],
+                    "scalar_args": [1.5, 0.25],
+                },
+                {"func_id": 2, "a": "a", "b": "b", "out": "tmp1"},
+                {"func_id": 1, "a": "tmp0", "b": "tmp1", "out": "out"},
+            ]
+        },
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert list(buffers.host_fanin) == [0, 0, 2]
+    assert list(buffers.host_dependents) == [2, 2]
+    assert [(task.func_id, task.dependent_begin, task.dependent_count) for task in buffers.host_tasks] == [
+        (9, 0, 1),
+        (2, 1, 1),
+        (1, 2, 0),
+    ]
 
 
 def test_scene_test_builds_cuda_persistent_unary_square_args():
@@ -2279,6 +2339,67 @@ def test_scene_test_runs_cuda_persistent_device_graph_with_ctypes_data(tmp_path)
             worker,
             callable_obj,
             CudaPersistentGraphCtypesScene.CASES[0],
+            skip_golden=True,
+        )
+        args = scene.last_args
+        a_values = args.a.to_list()
+        b_values = args.b.to_list()
+        c_values = args.c.to_list()
+        d_values = args.d.to_list()
+        actual = args.out.to_list()
+        expected = [
+            1.5 * a_values[idx] + c_values[idx] + 0.25 * d_values[idx] + a_values[idx] * b_values[idx]
+            for idx in range(len(actual))
+        ]
+        assert actual == pytest.approx(expected)
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_inferred_graph_with_ctypes_data(tmp_path):
+    generic_source = tmp_path / "generic_args.pto.cu"
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    generic_source.write_text(_PERSISTENT_GENERIC_ARGS_BODY)
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentInferredGraphCtypesScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_inferred_graph_generic_args_spec(generic_source, add_source, mul_source)
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            args = TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.5 for i in range(n))),
+                Tensor("c", _CtypesFloatTensor(float(i) * 0.25 for i in range(n))),
+                Tensor("d", _CtypesFloatTensor(float(i) * 0.125 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+            )
+            self.last_args = args
+            return args
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit post-run validation")
+
+    scene = CudaPersistentInferredGraphCtypesScene()
+    worker = CudaPersistentInferredGraphCtypesScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(
+            worker,
+            callable_obj,
+            CudaPersistentInferredGraphCtypesScene.CASES[0],
             skip_golden=True,
         )
         args = scene.last_args

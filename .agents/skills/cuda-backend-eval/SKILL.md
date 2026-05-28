@@ -708,6 +708,11 @@ Use `persistent_dag_graph_f32` when a test should pass an explicit runtime
 graph descriptor with per-task `func_id`, `a`/`b`/`c`/`d`/`out`,
 `dependents`, optional `initial_fanin`, `tensor_args`, and `scalar_args`
 fields instead of selecting one of the fixed tracer-bullet DAG adapters.
+If every graph task omits `dependents`, the SceneTestCase CUDA adapter infers
+task edges from tensor flow: earlier `out` names become producers for later
+`a`/`b`/`c`/`d` or `tensor_args` reads. Use this form when testing the first
+step toward PTO-style dependency inference while still providing an explicit
+descriptor.
 For real host-schedule smoke coverage, pass a context definition plus
 `host_parameters`/`host_context_initializer` so the generated `__global__`
 wrapper matches the current vector-add launch ABI and can be loaded by
