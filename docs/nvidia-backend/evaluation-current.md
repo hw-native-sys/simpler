@@ -180,6 +180,30 @@ Both rows report zero device scheduler errors, `completed_count=4`, and
 target-specific `nvcc` PTX (`compute_80` on A100, `compute_90` on H200). The
 generated Markdown/SVG report is in the artifact directory.
 
+## Tensor-Core Benchmark Row
+
+The first tensor-core row in the selected benchmark report was captured at
+commit `0879aa9e`. It uses the same compact A100/H200 benchmark report format
+as the full paired capture, but with one size (`N=256`), one repeat, no batch
+rows, and a `16x16x16` tensor descriptor. The raw JSON, Markdown, and SVG
+artifacts are under
+`tmp/cuda-backend/combined-tensor-core-current-0879aa9e/`.
+
+Tensor-core row details:
+
+- A100: `pto_persistent_dag_tensor_core`, `16x16x16`,
+  `wmma:m16n16k8:tf32->f32`, `37888 ns` device, `52277 ns` host,
+  `0.90x` versus `pto_persistent_dag`.
+- H200: `pto_persistent_dag_tensor_core`, `16x16x16`,
+  `wmma:m16n16k8:tf32->f32`, `38656 ns` device, `50211 ns` host,
+  `0.97x` versus `pto_persistent_dag`.
+
+For context, the scalar tensor DAG row in the same report measured `40960 ns`
+on A100 and `43392 ns` on H200. The tensor-core row therefore validates that
+WMMA callable bodies now participate in the normal selected-baseline report
+and chart flow, but it still measures one small generated task shape rather
+than a tuned tensor-core kernel.
+
 ## Reproduction Commands
 
 Local A100:
@@ -220,6 +244,19 @@ PYTHONPATH=$PWD:$PWD/python \
     --dag-shape tensor_core_tile --task-count 4 --queue-capacity 2 \
     --n 256 --tensor-rows 16 --tensor-cols 16 --tensor-inner 16 \
     --sync-remote-tree
+```
+
+Tensor-core selected-baseline report:
+
+```bash
+COMMIT=$(git rev-parse --short HEAD)
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --sizes 256 --repeats 1 --arch compute_80 --include-persistent \
+    --batch-tasks 0 --worker-blocks-per-task 1 \
+    --tensor-rows 16 --tensor-cols 16 --tensor-inner 16 \
+    --label a100-tensor-core-current-$COMMIT \
+    --output-dir tmp/cuda-backend/a100-tensor-core-current-$COMMIT
 ```
 
 Merge reports:

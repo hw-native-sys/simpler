@@ -229,6 +229,15 @@ runner validated both artifacts with zero scheduler errors, tensor descriptor
 This is callable and scheduler evidence for tensor-core task bodies, not a
 tuned throughput result.
 
+The first tensor-core selected-baseline benchmark row at commit `0879aa9e`
+runs `pto_persistent_dag_tensor_core` on local A100 and remote H200 with the
+same `16x16x16` descriptor. The compact selected-baseline report uses
+`N=256`, one repeat, no batch rows, and the usual JSON/Markdown/SVG benchmark
+outputs. The tensor-core DAG row measured `37888 ns` device time on A100 and
+`38656 ns` on H200, compared with `40960 ns` and `43392 ns` for the scalar
+`pto_persistent_dag_tensor` row in the same report. The raw artifacts are
+under `tmp/cuda-backend/combined-tensor-core-current-0879aa9e/`.
+
 Evidence:
 
 - [evaluation.md](evaluation.md) is the evaluation landing page.
@@ -1483,15 +1492,15 @@ The tensor DAG row validates descriptor metadata and generated dispatch, but
 the GEMM body is a scalar microbenchmark rather than a tuned tensor-core
 kernel. The first paired tensor-shape sweep now covers `8x4x12`,
 `16x16x64`, and `32x16x64` descriptors on A100 and H200. The first
-`tensor_core_tile` smoke also validates a block-wide WMMA generated-dispatch
-task body on both GPUs. The remaining gap is tuned tensor execution and
-comparative throughput, not descriptor-shape or first tensor-core callable
-plumbing.
+`tensor_core_tile` smoke and selected-baseline benchmark row also validate a
+block-wide WMMA generated-dispatch task body on both GPUs. The remaining gap
+is tuned tensor execution and comparative throughput, not descriptor-shape or
+first tensor-core callable plumbing.
 
 Needed:
 
 - tensor-core or library-backed callable body tuning beyond the current
-  single-tile WMMA smoke;
+  single-tile WMMA benchmark row;
 - broader model-kernel shape families once the tensor-core/library path
   exists;
 - evaluation rows that distinguish scheduler overhead from compute throughput.
