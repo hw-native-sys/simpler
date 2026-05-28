@@ -168,15 +168,17 @@ tensor DAG, `pto_persistent_dag_tensor_core`, and `cublas_sgemm` in one
 Markdown/SVG report. The Markdown keeps raw repeat rows plus medians, while
 the refreshed report also records VDCores/MPK source-paper provenance and
 per-baseline workload descriptions. The SVG plots median device time with
-sample counts. Each row uses `N=256`; the table below reports median device
+sample counts. The summary helper includes the problem size so future
+throughput-oriented sweeps can compare multiple `N` values without collapsing
+rows. Each current row uses `N=256`; the table below reports median device
 time across the three samples.
 
-| GPU | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns | Tensor-core/scalar | cuBLAS/scalar |
-| --- | ----- | ---------------- | -------------- | --------- | ------------------ | ------------- |
-| A100 | 16x16x16 | 47104 | 47104 | 73728 | 1.00x | 1.57x |
-| A100 | 16x16x64 | 51200 | 50176 | 74752 | 0.98x | 1.46x |
-| H200 | 16x16x16 | 31328 | 26848 | 51456 | 0.86x | 1.64x |
-| H200 | 16x16x64 | 41088 | 34144 | 55711 | 0.83x | 1.36x |
+| GPU | N | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns | Tensor-core/scalar | cuBLAS/scalar |
+| --- | - | ----- | ---------------- | -------------- | --------- | ------------------ | ------------- |
+| A100 | 256 | 16x16x16 | 47104 | 47104 | 73728 | 1.00x | 1.57x |
+| A100 | 256 | 16x16x64 | 51200 | 50176 | 74752 | 0.98x | 1.46x |
+| H200 | 256 | 16x16x16 | 31328 | 26848 | 51456 | 0.86x | 1.64x |
+| H200 | 256 | 16x16x64 | 41088 | 34144 | 55711 | 0.83x | 1.36x |
 
 The tensor-core rows use dispatch `10,1,2,1`, while the scalar tensor rows use
 `3,1,2,1`. cuBLAS rows have no PTO dispatch sequence because they run through

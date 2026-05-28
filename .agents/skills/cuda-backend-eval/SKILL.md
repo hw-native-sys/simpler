@@ -916,8 +916,10 @@ Use `cuda_tensor_shape_sweep.py` to run paired A100/H200
 samples over model-shaped tensor tile descriptors. By default it runs
 `pto_persistent_dag_tensor`; pass `--baselines` to include
 `pto_persistent_dag_tensor_core` and `cublas_sgemm` for a scalar-vs-WMMA-vs-
-library comparison on compatible descriptors. Treat the scalar tiled GEMM rows
-as shape and scheduler evidence rather than tensor-core throughput evidence:
+library comparison on compatible descriptors. Pass `--sizes` when the same
+baseline/shape set should be swept across multiple problem sizes. Treat the
+scalar tiled GEMM rows as shape and scheduler evidence rather than tensor-core
+throughput evidence:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -937,11 +939,22 @@ PYTHONPATH=$PWD:$PWD/python \
     --sync-remote-tree
 ```
 
+Run a size sweep for the same descriptor family when launch-dominated compact
+rows need to be compared with larger repeated tensor work:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_tensor_shape_sweep.py \
+    --baselines pto_persistent_dag_tensor,pto_persistent_dag_tensor_core,cublas_sgemm \
+    --shapes 16x16x16 --sizes 256,4096,65536 --repeats 3 \
+    --sync-remote-tree
+```
+
 The sweep writes `cuda-tensor-shape-sweep.json`,
 `cuda-tensor-shape-sweep.md`, and `cuda-tensor-shape-sweep.svg` under
 `tmp/cuda-backend/tensor-shape-sweep-<commit>/`. The Markdown keeps raw
 repeat rows plus a median summary table; the SVG plots the median device time
-per GPU/shape/baseline with sample counts.
+per GPU/N/shape/baseline with sample counts.
 
 Validate the compact tensor-baseline sweep before copying numbers into docs:
 

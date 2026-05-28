@@ -75,6 +75,7 @@ class TensorShapeSweepConfig:
     local_device: int = 0
     remote_device: int = 0
     n: int = 4096
+    sizes: tuple[int, ...] = ()
     repeats: int = 3
     baselines: tuple[str, ...] = ("pto_persistent_dag_tensor",)
     shapes: tuple[TensorShape, ...] = (
@@ -107,6 +108,21 @@ def parse_shapes(raw: str) -> tuple[TensorShape, ...]:
     if not shapes:
         raise ValueError("at least one tensor shape is required")
     return tuple(shapes)
+
+
+def parse_sizes(raw: str) -> tuple[int, ...]:
+    sizes: list[int] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        size = int(value)
+        if size <= 0:
+            raise ValueError(f"invalid tensor sweep size {part!r}; size must be positive")
+        sizes.append(size)
+    if not sizes:
+        raise ValueError("at least one tensor sweep size is required")
+    return tuple(sizes)
 
 
 def parse_baselines(raw: str) -> tuple[str, ...]:
@@ -152,6 +168,7 @@ def build_local_sample_command(
     config: TensorShapeSweepConfig,
     shape: TensorShape,
     baseline: str | None = None,
+    n: int | None = None,
 ) -> list[str]:
     return [
         "env",
@@ -161,7 +178,7 @@ def build_local_sample_command(
         *_sample_args(
             device=config.local_device,
             arch=config.local_arch,
-            n=config.n,
+            n=n if n is not None else config.n,
             shape=shape,
             baseline=baseline or _default_baseline(config),
         ),
@@ -206,6 +223,7 @@ def build_remote_sample_command(
     config: TensorShapeSweepConfig,
     shape: TensorShape,
     baseline: str | None = None,
+    n: int | None = None,
 ) -> list[str]:
     benchmark = [
         config.remote_python,
@@ -213,7 +231,7 @@ def build_remote_sample_command(
         *_sample_args(
             device=config.remote_device,
             arch=config.remote_arch,
-            n=config.n,
+            n=n if n is not None else config.n,
             shape=shape,
             baseline=baseline or _default_baseline(config),
         ),
@@ -244,6 +262,7 @@ def _run_sample(
     command: list[str],
     *,
     artifact: str,
+    n: int,
     shape: TensorShape,
     baseline: str,
     repeat: int,
@@ -255,6 +274,7 @@ def _run_sample(
         return {
             "artifact": artifact,
             "baseline": baseline,
+            "n": n,
             "shape": shape.label,
             "repeat": repeat,
             "status": "dry-run",
@@ -268,6 +288,7 @@ def _run_sample(
     sample["artifact"] = artifact
     sample.setdefault("machine", artifact)
     sample.setdefault("baseline", baseline)
+    sample.setdefault("n", n)
     sample["shape"] = shape.label
     sample["repeat"] = repeat
     return sample
@@ -309,8 +330,18 @@ def _source_paper_summary(metadata: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
-def _median_summary_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    groups: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+def _row_n(row: dict[str, Any], metadata: dict[str, Any] | None = None) -> int | str:
+    n = row.get("n")
+    if n is None and metadata is not None:
+        n = metadata.get("n")
+    try:
+        return int(n)
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _median_summary_rows(results: list[dict[str, Any]], metadata: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
     for row in results:
         if row.get("status") != "pass":
             continue
@@ -318,6 +349,7 @@ def _median_summary_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             str(row.get("artifact", "-")),
             str(row.get("machine") or row.get("artifact", "-")),
             str(row.get("baseline", "-")),
+            str(_row_n(row, metadata)),
             str(row.get("shape", "-")),
             _tile_count(row),
         )
@@ -325,12 +357,13 @@ def _median_summary_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         group["device"].append(int(row.get("device_wall_ns", 0)))
         group["host"].append(int(row.get("host_wall_ns", 0)))
     summary: list[dict[str, Any]] = []
-    for (artifact, machine, baseline, shape, tiles), values in groups.items():
+    for (artifact, machine, baseline, n, shape, tiles), values in groups.items():
         summary.append(
             {
                 "artifact": artifact,
                 "machine": machine,
                 "baseline": baseline,
+                "n": n,
                 "shape": shape,
                 "median_device_wall_ns": statistics.median(values["device"]),
                 "median_host_wall_ns": statistics.median(values["host"]),
@@ -338,7 +371,7 @@ def _median_summary_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "tiles": tiles,
             }
         )
-    return sorted(summary, key=lambda row: (row["shape"], row["baseline"], row["artifact"]))
+    return sorted(summary, key=lambda row: (row["n"], row["shape"], row["baseline"], row["artifact"]))
 
 
 def render_markdown(payload: dict[str, Any]) -> str:
@@ -349,6 +382,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"- Label: `{metadata['label']}`",
         f"- Commit: `{metadata['git_commit']}`",
         f"- N: `{metadata['n']}`",
+        f"- Sizes: {', '.join(f'`{size}`' for size in metadata.get('sizes', [metadata['n']]))}",
         f"- Repeats: `{metadata['repeats']}`",
         f"- Baselines: {', '.join(f'`{baseline}`' for baseline in metadata.get('baselines', []))}.",
         f"- Source setup: {_source_paper_summary(metadata)}.",
@@ -360,34 +394,35 @@ def render_markdown(payload: dict[str, Any]) -> str:
         ],
         "- Scope: early model-shaped tile sweep, not an end-to-end model benchmark.",
         "",
-        "| Artifact | Machine | Baseline | Shape | Repeat | Status | Device ns | Host ns | Tiles | Dispatch |",
-        "| -------- | ------- | -------- | ----- | ------ | ------ | --------- | ------- | ----- | -------- |",
+        "| Artifact | Machine | Baseline | N | Shape | Repeat | Status | Device ns | Host ns | Tiles | Dispatch |",
+        "| -------- | ------- | -------- | - | ----- | ------ | ------ | --------- | ------- | ----- | -------- |",
     ]
     results = sorted(
         payload["results"],
-        key=lambda row: (row["shape"], row.get("baseline", ""), row["artifact"], row["repeat"]),
+        key=lambda row: (_row_n(row, metadata), row["shape"], row.get("baseline", ""), row["artifact"], row["repeat"]),
     )
     for row in results:
         machine = row.get("machine") or row.get("artifact", "-")
         lines.append(
-            f"| {row.get('artifact', '-')} | {machine} | {row.get('baseline', '-')} | {row['shape']} | "
+            f"| {row.get('artifact', '-')} | {machine} | {row.get('baseline', '-')} | "
+            f"{_row_n(row, metadata)} | {row['shape']} | "
             f"{row['repeat']} | {row.get('status', '-')} | {row.get('device_wall_ns', '-')} | "
             f"{row.get('host_wall_ns', '-')} | {_tile_count(row)} | `{_dispatch(row)}` |"
         )
-    summary_rows = _median_summary_rows(results)
+    summary_rows = _median_summary_rows(results, metadata)
     if summary_rows:
         lines.extend(
             [
                 "",
                 "## Median Summary",
                 "",
-                "| Artifact | Machine | Baseline | Shape | Median device ns | Median host ns | Samples |",
-                "| -------- | ------- | -------- | ----- | ---------------- | -------------- | ------- |",
+                "| Artifact | Machine | Baseline | N | Shape | Median device ns | Median host ns | Samples |",
+                "| -------- | ------- | -------- | - | ----- | ---------------- | -------------- | ------- |",
             ]
         )
         for row in summary_rows:
             lines.append(
-                f"| {row['artifact']} | {row['machine']} | {row['baseline']} | {row['shape']} | "
+                f"| {row['artifact']} | {row['machine']} | {row['baseline']} | {row['n']} | {row['shape']} | "
                 f"{_format_number(row['median_device_wall_ns'])} | {_format_number(row['median_host_wall_ns'])} | "
                 f"{row['samples']} |"
             )
@@ -396,7 +431,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
 
 
 def render_svg(payload: dict[str, Any]) -> str:
-    summary_rows = _median_summary_rows(list(payload["results"]))
+    summary_rows = _median_summary_rows(list(payload["results"]), payload.get("metadata"))
     max_device_ns = max((float(row.get("median_device_wall_ns", 0)) for row in summary_rows), default=1)
     width = 900
     row_height = 28
@@ -422,7 +457,7 @@ def render_svg(payload: dict[str, Any]) -> str:
         baseline = row.get("baseline", "-")
         color = colors.get(baseline, "#2a9d8f")
         label = (
-            f'{row.get("artifact", "-")} {baseline} {row.get("shape", "-")} '
+            f'{row.get("artifact", "-")} {baseline} n={row.get("n", "-")} {row.get("shape", "-")} '
             f'samples={row.get("samples", "-")}'
         )
         lines.append(
@@ -458,36 +493,41 @@ def run_tensor_shape_sweep(
         if not dry_run:
             runner(sync_command, check=True)
     results: list[dict[str, Any]] = []
+    sizes = config.sizes or (config.n,)
     for baseline in config.baselines:
         for shape in config.shapes:
-            for repeat in range(config.repeats):
-                results.append(
-                    _run_sample(
-                        build_local_sample_command(config, shape, baseline),
-                        artifact="a100",
-                        shape=shape,
-                        baseline=baseline,
-                        repeat=repeat,
-                        runner=runner,
-                        dry_run=dry_run,
+            for n in sizes:
+                for repeat in range(config.repeats):
+                    results.append(
+                        _run_sample(
+                            build_local_sample_command(config, shape, baseline, n=n),
+                            artifact="a100",
+                            n=n,
+                            shape=shape,
+                            baseline=baseline,
+                            repeat=repeat,
+                            runner=runner,
+                            dry_run=dry_run,
+                        )
                     )
-                )
-                results.append(
-                    _run_sample(
-                        build_remote_sample_command(config, shape, baseline),
-                        artifact="h200",
-                        shape=shape,
-                        baseline=baseline,
-                        repeat=repeat,
-                        runner=runner,
-                        dry_run=dry_run,
+                    results.append(
+                        _run_sample(
+                            build_remote_sample_command(config, shape, baseline, n=n),
+                            artifact="h200",
+                            n=n,
+                            shape=shape,
+                            baseline=baseline,
+                            repeat=repeat,
+                            runner=runner,
+                            dry_run=dry_run,
+                        )
                     )
-                )
     payload = {
         "metadata": {
             "label": f"tensor-shape-sweep-{commit}",
             "git_commit": commit,
-            "n": config.n,
+            "n": sizes[0],
+            "sizes": list(sizes),
             "repeats": config.repeats,
             "baselines": list(config.baselines),
             "shapes": [shape.label for shape in config.shapes],
@@ -512,6 +552,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--local-device", type=int, default=0)
     parser.add_argument("--remote-device", type=int, default=0)
     parser.add_argument("--n", type=int, default=4096)
+    parser.add_argument("--sizes")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--baselines", default="pto_persistent_dag_tensor")
     parser.add_argument("--shapes", default="8x4x12,16x16x64,32x16x64")
@@ -538,7 +579,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         output_root=args.output_root,
         local_device=args.local_device,
         remote_device=args.remote_device,
-        n=args.n,
+        n=(parse_sizes(args.sizes)[0] if args.sizes else args.n),
+        sizes=parse_sizes(args.sizes) if args.sizes else (args.n,),
         repeats=args.repeats,
         baselines=parse_baselines(args.baselines),
         shapes=parse_shapes(args.shapes),

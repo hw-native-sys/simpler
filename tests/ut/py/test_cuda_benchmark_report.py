@@ -787,6 +787,7 @@ def _tensor_sweep_payload():
                             "artifact": artifact,
                             "machine": artifact,
                             "baseline": baseline,
+                            "n": 256,
                             "shape": shape,
                             "repeat": repeat,
                             "status": "pass",
@@ -823,6 +824,7 @@ def test_cuda_tensor_sweep_validator_accepts_complete_artifact(tmp_path):
         artifact_dir=artifact_dir,
         required_artifacts=["a100", "h200"],
         required_baselines=["pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core", "cublas_sgemm"],
+        required_sizes=[256],
         required_shapes=["16x16x16", "16x16x64"],
         expected_repeats=2,
         expected_result_count=24,
@@ -859,6 +861,7 @@ def test_cuda_tensor_sweep_validator_reports_missing_rows_and_metadata(tmp_path)
         artifact_dir=artifact_dir,
         required_artifacts=["a100", "h200"],
         required_baselines=["pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core", "cublas_sgemm"],
+        required_sizes=[256],
         required_shapes=["16x16x16", "16x16x64"],
         expected_repeats=2,
         expected_result_count=24,
@@ -867,12 +870,41 @@ def test_cuda_tensor_sweep_validator_reports_missing_rows_and_metadata(tmp_path)
     )
 
     assert "expected 24 results, found 22" in errors
-    assert "non-pass row artifact=a100 baseline=pto_persistent_dag_tensor shape=16x16x16" in errors
-    assert "expected tensor tile 16x16x16 for artifact=a100 baseline=pto_persistent_dag_tensor, found 16x16x32" in errors
-    assert "expected dispatch 3,1,2,1 for artifact=a100 baseline=pto_persistent_dag_tensor, found 9" in errors
-    assert "missing baseline pto_persistent_dag_tensor_core artifact=h200 shape=16x16x64" in errors
+    assert "non-pass row artifact=a100 baseline=pto_persistent_dag_tensor n=256 shape=16x16x16" in errors
+    assert (
+        "expected tensor tile 16x16x16 for artifact=a100 baseline=pto_persistent_dag_tensor n=256, "
+        "found 16x16x32"
+    ) in errors
+    assert "expected dispatch 3,1,2,1 for artifact=a100 baseline=pto_persistent_dag_tensor n=256, found 9" in errors
+    assert "missing baseline pto_persistent_dag_tensor_core artifact=h200 n=256 shape=16x16x64" in errors
     assert "missing report file cuda-tensor-shape-sweep.md" in errors
     assert "missing report file cuda-tensor-shape-sweep.svg" in errors
+
+
+def test_cuda_tensor_sweep_validator_requires_each_size():
+    cuda_validate_tensor_sweep = _load_tensor_sweep_validator_module()
+    payload = _tensor_sweep_payload()
+    payload["results"] = [
+        row
+        for row in payload["results"]
+        if not (
+            row["artifact"] == "h200"
+            and row["baseline"] == "cublas_sgemm"
+            and row["shape"] == "16x16x64"
+        )
+    ]
+
+    errors = cuda_validate_tensor_sweep.validate_tensor_sweep(
+        payload,
+        required_artifacts=["a100", "h200"],
+        required_baselines=["cublas_sgemm"],
+        required_sizes=[256, 4096],
+        required_shapes=["16x16x16", "16x16x64"],
+        expected_repeats=2,
+    )
+
+    assert "missing baseline cublas_sgemm artifact=a100 n=4096 shape=16x16x16" in errors
+    assert "missing baseline cublas_sgemm artifact=h200 n=256 shape=16x16x64" in errors
 
 
 def test_cuda_tensor_sweep_validator_compact_preset_keeps_dispatch_commas():
@@ -1087,6 +1119,26 @@ def test_cuda_tensor_shape_sweep_builds_single_baseline_commands(tmp_path):
     assert "--tensor-inner 64" in remote[-1]
 
 
+def test_cuda_tensor_shape_sweep_builds_size_specific_commands(tmp_path):
+    cuda_tensor_shape_sweep = _load_tensor_shape_sweep_module()
+    shape = cuda_tensor_shape_sweep.TensorShape(rows=16, cols=16, inner=16)
+    config = cuda_tensor_shape_sweep.TensorShapeSweepConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        sizes=(256, 4096),
+    )
+
+    local = cuda_tensor_shape_sweep.build_local_sample_command(config, shape, n=4096)
+    remote = cuda_tensor_shape_sweep.build_remote_sample_command(config, shape, n=256)
+
+    assert "--sizes" in local
+    assert "4096" in local
+    assert "--sizes 256" in remote[-1]
+
+
 def test_cuda_tensor_shape_sweep_builds_configured_baseline_commands(tmp_path):
     cuda_tensor_shape_sweep = _load_tensor_shape_sweep_module()
     shape = cuda_tensor_shape_sweep.TensorShape(rows=16, cols=16, inner=16)
@@ -1126,12 +1178,14 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
         cuda_tensor_shape_sweep.TensorShape(rows=8, cols=4, inner=12),
         cuda_tensor_shape_sweep.TensorShape(rows=16, cols=16, inner=64),
     )
+    assert cuda_tensor_shape_sweep.parse_sizes("256,4096") == (256, 4096)
 
     payload = {
         "metadata": {
             "label": "tensor-shape-sweep-abc123",
             "git_commit": "abc123",
             "n": 4096,
+            "sizes": [4096, 8192],
             "repeats": 2,
             "shapes": ["8x4x12"],
             "baselines": ["pto_persistent_dag_tensor", "cublas_sgemm"],
@@ -1145,6 +1199,7 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
                 "artifact": "a100",
                 "machine": "hina",
                 "baseline": "pto_persistent_dag_tensor",
+                "n": 4096,
                 "shape": "8x4x12",
                 "repeat": 0,
                 "status": "pass",
@@ -1156,6 +1211,7 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
             {
                 "artifact": "h200",
                 "baseline": "cublas_sgemm",
+                "n": 8192,
                 "shape": "8x4x12",
                 "repeat": 0,
                 "status": "pass",
@@ -1176,14 +1232,15 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
     assert "  - `cublas_sgemm`: CUDA Runtime API plus cuBLAS SGEMM over the same descriptor." in markdown
     assert "- Workload: `pto_persistent_dag_tensor` scalar tiled GEMM DAG." not in markdown
     assert "- Baselines: `pto_persistent_dag_tensor`, `cublas_sgemm`." in markdown
+    assert "- Sizes: `4096`, `8192`" in markdown
     assert (
-        "| a100 | hina | pto_persistent_dag_tensor | 8x4x12 | 0 | pass | 1000 | 1500 | 128 | `3,1,2,1` |"
+        "| a100 | hina | pto_persistent_dag_tensor | 4096 | 8x4x12 | 0 | pass | 1000 | 1500 | 128 | `3,1,2,1` |"
         in markdown
     )
-    assert "| h200 | h200 | cublas_sgemm | 8x4x12 | 0 | pass | 800 | 1200 | 128 | `3,1,2,1` |" in markdown
+    assert "| h200 | h200 | cublas_sgemm | 8192 | 8x4x12 | 0 | pass | 800 | 1200 | 128 | `3,1,2,1` |" in markdown
     assert "## Median Summary" in markdown
-    assert "| a100 | hina | pto_persistent_dag_tensor | 8x4x12 | 1000 | 1500 | 1 |" in markdown
-    assert "| h200 | h200 | cublas_sgemm | 8x4x12 | 800 | 1200 | 1 |" in markdown
+    assert "| a100 | hina | pto_persistent_dag_tensor | 4096 | 8x4x12 | 1000 | 1500 | 1 |" in markdown
+    assert "| h200 | h200 | cublas_sgemm | 8192 | 8x4x12 | 800 | 1200 | 1 |" in markdown
     assert "tensor-shape-sweep-abc123" in svg
     assert "Median device ns" in svg
     assert "samples=1" in svg
@@ -2951,6 +3008,7 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
                 "artifact": "a100",
                 "machine": "a100",
                 "baseline": "pto_persistent_dag_tensor",
+                "n": 256,
                 "shape": "16x16x16",
                 "device_wall_ns": 1000,
                 "status": "pass",
@@ -2959,6 +3017,7 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
                 "artifact": "a100",
                 "machine": "a100",
                 "baseline": "pto_persistent_dag_tensor",
+                "n": 256,
                 "shape": "16x16x16",
                 "device_wall_ns": 1200,
                 "status": "pass",
@@ -2967,6 +3026,7 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
                 "artifact": "a100",
                 "machine": "a100",
                 "baseline": "pto_persistent_dag_tensor_core",
+                "n": 256,
                 "shape": "16x16x16",
                 "device_wall_ns": 900,
                 "status": "pass",
@@ -2975,6 +3035,7 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
                 "artifact": "a100",
                 "machine": "a100",
                 "baseline": "cublas_sgemm",
+                "n": 256,
                 "shape": "16x16x16",
                 "device_wall_ns": 1500,
                 "status": "pass",
@@ -2983,6 +3044,7 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
                 "artifact": "h200",
                 "machine": "h200",
                 "baseline": "pto_persistent_dag_tensor",
+                "n": 256,
                 "shape": "16x16x16",
                 "device_wall_ns": 800,
                 "status": "pass",
@@ -2991,6 +3053,7 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
                 "artifact": "h200",
                 "machine": "h200",
                 "baseline": "pto_persistent_dag_tensor_core",
+                "n": 256,
                 "shape": "16x16x16",
                 "device_wall_ns": 1000,
                 "status": "pass",
@@ -2999,6 +3062,7 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
                 "artifact": "h200",
                 "machine": "h200",
                 "baseline": "cublas_sgemm",
+                "n": 256,
                 "shape": "16x16x16",
                 "device_wall_ns": 1600,
                 "status": "pass",
@@ -3009,11 +3073,11 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
     table = cuda_current_summary.render_tensor_sweep_table(payload)
 
     assert (
-        "| GPU | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns | Tensor-core/scalar | cuBLAS/scalar |"
+        "| GPU | N | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns | Tensor-core/scalar | cuBLAS/scalar |"
         in table
     )
-    assert "| A100 | 16x16x16 | 1100 | 900 | 1500 | 0.82x | 1.36x |" in table
-    assert "| H200 | 16x16x16 | 800 | 1000 | 1600 | 1.25x | 2.00x |" in table
+    assert "| A100 | 256 | 16x16x16 | 1100 | 900 | 1500 | 0.82x | 1.36x |" in table
+    assert "| H200 | 256 | 16x16x16 | 800 | 1000 | 1600 | 1.25x | 2.00x |" in table
 
 
 def test_summarize_results_groups_by_machine_and_baseline():

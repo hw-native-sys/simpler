@@ -24,6 +24,7 @@ COMPACT_TENSOR_BASELINE_BASELINES = (
     "pto_persistent_dag_tensor_core",
     "cublas_sgemm",
 )
+COMPACT_TENSOR_BASELINE_SIZES = (256,)
 COMPACT_TENSOR_BASELINE_SHAPES = ("16x16x16", "16x16x64")
 COMPACT_TENSOR_BASELINE_REPEATS = 3
 COMPACT_TENSOR_BASELINE_RESULT_COUNT = (
@@ -50,6 +51,10 @@ def _as_list(values: Sequence[str] | None) -> list[str]:
     for value in values:
         result.extend(part.strip() for part in value.split(",") if part.strip())
     return result
+
+
+def _as_int_list(values: Sequence[str] | None) -> list[int]:
+    return [int(value) for value in _as_list(values)]
 
 
 def _results(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -94,8 +99,9 @@ def _validate_status(rows: list[dict[str, Any]]) -> list[str]:
             continue
         artifact = row.get("artifact", "unknown")
         baseline = row.get("baseline", "unknown")
+        n = row.get("n", "unknown")
         shape = row.get("shape", "unknown")
-        errors.append(f"non-pass row artifact={artifact} baseline={baseline} shape={shape}")
+        errors.append(f"non-pass row artifact={artifact} baseline={baseline} n={n} shape={shape}")
     return errors
 
 
@@ -104,29 +110,35 @@ def _validate_required_rows(
     *,
     required_artifacts: Sequence[str],
     required_baselines: Sequence[str],
+    required_sizes: Sequence[int],
     required_shapes: Sequence[str],
     expected_repeats: int | None,
 ) -> list[str]:
     errors: list[str] = []
+    sizes: Sequence[int | None] = required_sizes or (None,)
     for artifact in required_artifacts:
         for baseline in required_baselines:
-            for shape in required_shapes:
-                matching = [
-                    row
-                    for row in rows
-                    if row.get("artifact") == artifact
-                    and row.get("baseline") == baseline
-                    and row.get("shape") == shape
-                ]
-                if not matching:
-                    errors.append(f"missing baseline {baseline} artifact={artifact} shape={shape}")
-                    continue
-                if expected_repeats is not None and len(_unique_repeats(matching)) != expected_repeats:
-                    found = len(_unique_repeats(matching))
-                    errors.append(
-                        f"expected {expected_repeats} repeats for artifact={artifact} "
-                        f"baseline={baseline} shape={shape}, found {found}"
-                    )
+            for size in sizes:
+                for shape in required_shapes:
+                    matching = [
+                        row
+                        for row in rows
+                        if row.get("artifact") == artifact
+                        and row.get("baseline") == baseline
+                        and (size is None or row.get("n") == size)
+                        and row.get("shape") == shape
+                    ]
+                    if not matching:
+                        size_text = "" if size is None else f" n={size}"
+                        errors.append(f"missing baseline {baseline} artifact={artifact}{size_text} shape={shape}")
+                        continue
+                    if expected_repeats is not None and len(_unique_repeats(matching)) != expected_repeats:
+                        found = len(_unique_repeats(matching))
+                        size_text = "" if size is None else f" n={size}"
+                        errors.append(
+                            f"expected {expected_repeats} repeats for artifact={artifact} "
+                            f"baseline={baseline}{size_text} shape={shape}, found {found}"
+                        )
     return errors
 
 
@@ -141,7 +153,10 @@ def _validate_tensor_tile_shapes(rows: list[dict[str, Any]]) -> list[str]:
         if found != shape:
             artifact = row.get("artifact", "unknown")
             baseline = row.get("baseline", "unknown")
-            errors.append(f"expected tensor tile {shape} for artifact={artifact} baseline={baseline}, found {found}")
+            n = row.get("n", "unknown")
+            errors.append(
+                f"expected tensor tile {shape} for artifact={artifact} baseline={baseline} n={n}, found {found}"
+            )
     return errors
 
 
@@ -155,7 +170,8 @@ def _validate_dispatch(rows: list[dict[str, Any]], required_dispatch: dict[str, 
         found = _dispatch_text(row)
         if found != expected:
             artifact = row.get("artifact", "unknown")
-            errors.append(f"expected dispatch {expected} for artifact={artifact} baseline={baseline}, found {found}")
+            n = row.get("n", "unknown")
+            errors.append(f"expected dispatch {expected} for artifact={artifact} baseline={baseline} n={n}, found {found}")
     return errors
 
 
@@ -171,6 +187,7 @@ def validate_tensor_sweep(
     artifact_dir: Path | None = None,
     required_artifacts: Sequence[str] = (),
     required_baselines: Sequence[str] = (),
+    required_sizes: Sequence[int] = (),
     required_shapes: Sequence[str] = (),
     expected_repeats: int | None = None,
     expected_result_count: int | None = None,
@@ -192,6 +209,7 @@ def validate_tensor_sweep(
             rows,
             required_artifacts=required_artifacts,
             required_baselines=required_baselines,
+            required_sizes=required_sizes,
             required_shapes=required_shapes,
             expected_repeats=expected_repeats,
         )
@@ -222,6 +240,8 @@ def _apply_preset(args: argparse.Namespace) -> None:
         args.require_artifact = list(COMPACT_TENSOR_BASELINE_ARTIFACTS)
     if not args.require_baseline:
         args.require_baseline = list(COMPACT_TENSOR_BASELINE_BASELINES)
+    if not args.require_size:
+        args.require_size = [str(size) for size in COMPACT_TENSOR_BASELINE_SIZES]
     if not args.require_shape:
         args.require_shape = list(COMPACT_TENSOR_BASELINE_SHAPES)
     if args.expected_repeats is None:
@@ -241,6 +261,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preset", choices=("none", "compact-tensor-baselines"), default="none")
     parser.add_argument("--require-artifact", action="append")
     parser.add_argument("--require-baseline", action="append")
+    parser.add_argument("--require-size", action="append")
     parser.add_argument("--require-shape", action="append")
     parser.add_argument("--expected-repeats", type=int)
     parser.add_argument("--expected-result-count", type=int)
@@ -263,6 +284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         artifact_dir=args.json_path.parent,
         required_artifacts=_as_list(args.require_artifact),
         required_baselines=_as_list(args.require_baseline),
+        required_sizes=_as_int_list(args.require_size),
         required_shapes=_as_list(args.require_shape),
         expected_repeats=args.expected_repeats,
         expected_result_count=args.expected_result_count,

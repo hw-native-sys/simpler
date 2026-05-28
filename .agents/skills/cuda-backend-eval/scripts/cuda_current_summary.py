@@ -238,29 +238,35 @@ def render_dag_shape_table(payload: Payload) -> str:
     )
 
 
-def _tensor_sweep_medians(payload: Payload) -> dict[tuple[str, str, str], int | float]:
-    groups: dict[tuple[str, str, str], list[int]] = {}
+def _tensor_row_n(row: Mapping[str, Any], payload: Payload) -> str:
+    n = row.get("n", payload.get("metadata", {}).get("n", "-"))
+    return str(n)
+
+
+def _tensor_sweep_medians(payload: Payload) -> dict[tuple[str, str, str, str], int | float]:
+    groups: dict[tuple[str, str, str, str], list[int]] = {}
     for row in payload.get("results", []):
         if row.get("status", "pass") != "pass":
             continue
         machine = str(row.get("machine") or row.get("artifact", "unknown"))
         baseline = str(row.get("baseline", "unknown"))
+        n = _tensor_row_n(row, payload)
         shape = str(row.get("shape", "unknown"))
-        groups.setdefault((machine, baseline, shape), []).append(int(row.get("device_wall_ns", 0)))
+        groups.setdefault((machine, baseline, n, shape), []).append(int(row.get("device_wall_ns", 0)))
     return {key: statistics.median(values) for key, values in groups.items()}
 
 
 def render_tensor_sweep_table(payload: Payload) -> str:
     medians = _tensor_sweep_medians(payload)
     rows: list[list[str | int]] = []
-    machine_shapes = sorted(
-        {(machine, shape) for machine, _, shape in medians},
-        key=lambda item: (_machine_label(item[0]), item[1], item[0]),
+    machine_sizes_shapes = sorted(
+        {(machine, n, shape) for machine, _, n, shape in medians},
+        key=lambda item: (_machine_label(item[0]), int(item[1]) if item[1].isdigit() else item[1], item[2], item[0]),
     )
-    for machine, shape in machine_shapes:
-        scalar_key = (machine, "pto_persistent_dag_tensor", shape)
-        tensor_core_key = (machine, "pto_persistent_dag_tensor_core", shape)
-        cublas_key = (machine, "cublas_sgemm", shape)
+    for machine, n, shape in machine_sizes_shapes:
+        scalar_key = (machine, "pto_persistent_dag_tensor", n, shape)
+        tensor_core_key = (machine, "pto_persistent_dag_tensor_core", n, shape)
+        cublas_key = (machine, "cublas_sgemm", n, shape)
         if scalar_key not in medians:
             continue
         scalar = medians[scalar_key]
@@ -269,6 +275,7 @@ def render_tensor_sweep_table(payload: Payload) -> str:
         rows.append(
             [
                 _machine_label(machine),
+                n,
                 shape,
                 _format_number(scalar),
                 _format_number(tensor_core) if tensor_core is not None else "-",
@@ -280,6 +287,7 @@ def render_tensor_sweep_table(payload: Payload) -> str:
     return _table(
         [
             "GPU",
+            "N",
             "Shape",
             "Scalar tensor ns",
             "Tensor-core ns",
