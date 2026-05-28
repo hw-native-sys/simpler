@@ -260,9 +260,19 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
     if config.mode != "dag":
         return None
     return {
+        "chain": "1,2,1,2,1",
+        "fork_join": "1,2,1",
+        "generic_args": "9,2,1",
         "graph_descriptor": "9,2,1",
+        "quad": "8,2,1",
+        "scalar_affine": "5,2,1",
+        "scalar_axpy": "4,2,1",
         "scalar_scale": "11,2,1",
+        "scratch_reuse": "1,2,1,2,1,1",
+        "tensor_tile": "3,1,2,1",
         "tensor_core_tile": "10,1,2,1",
+        "triad": "6,2,1",
+        "unary_square": "7,1,1",
     }.get(config.dag_shape)
 
 

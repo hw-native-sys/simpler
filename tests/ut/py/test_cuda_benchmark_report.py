@@ -2165,6 +2165,8 @@ def test_cuda_pair_persistent_smoke_builds_tensor_tile_descriptor_workflow(tmp_p
     assert "--tensor-rows 8" in remote[-1]
     assert "--tensor-cols 4" in remote[-1]
     assert "--tensor-inner 12" in remote[-1]
+    assert "--expected-dispatch" in validate
+    assert "3,1,2,1" in validate
     assert "--expected-tensor-tile" in validate
     assert "8x4x12" in validate
     assert "persistent-tensor_tile-8x4x12-smoke-abc123" in report
@@ -2218,12 +2220,15 @@ def test_cuda_pair_persistent_smoke_builds_scalar_axpy_workflow(tmp_path):
 
     local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
     remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
 
     assert "persistent-scalar_axpy-smoke-abc123" in str(local)
     assert "--dag-shape" in local
     assert "scalar_axpy" in local
     assert "--dag-shape scalar_axpy" in remote[-1]
     assert "persistent-scalar_axpy-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-dispatch" in validate
+    assert "4,2,1" in validate
 
 
 def test_cuda_pair_persistent_smoke_builds_scalar_scale_workflow(tmp_path):
@@ -2267,12 +2272,15 @@ def test_cuda_pair_persistent_smoke_builds_unary_square_workflow(tmp_path):
 
     local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
     remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
 
     assert "persistent-unary_square-smoke-abc123" in str(local)
     assert "--dag-shape" in local
     assert "unary_square" in local
     assert "--dag-shape unary_square" in remote[-1]
     assert "persistent-unary_square-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-dispatch" in validate
+    assert "7,1,1" in validate
 
 
 def test_cuda_pair_persistent_smoke_builds_generic_args_workflow(tmp_path):
@@ -2290,12 +2298,15 @@ def test_cuda_pair_persistent_smoke_builds_generic_args_workflow(tmp_path):
 
     local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
     remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
 
     assert "persistent-generic_args-smoke-abc123" in str(local)
     assert "--dag-shape" in local
     assert "generic_args" in local
     assert "--dag-shape generic_args" in remote[-1]
     assert "persistent-generic_args-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-dispatch" in validate
+    assert "9,2,1" in validate
 
 
 def test_cuda_pair_persistent_smoke_accepts_graph_descriptor_repeat_runs(tmp_path):
@@ -2358,12 +2369,15 @@ def test_cuda_pair_persistent_smoke_builds_scalar_affine_workflow(tmp_path):
 
     local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
     remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
 
     assert "persistent-scalar_affine-smoke-abc123" in str(local)
     assert "--dag-shape" in local
     assert "scalar_affine" in local
     assert "--dag-shape scalar_affine" in remote[-1]
     assert "persistent-scalar_affine-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-dispatch" in validate
+    assert "5,2,1" in validate
 
 
 def test_cuda_pair_persistent_smoke_builds_triad_workflow(tmp_path):
@@ -2381,12 +2395,15 @@ def test_cuda_pair_persistent_smoke_builds_triad_workflow(tmp_path):
 
     local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
     remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
 
     assert "persistent-triad-smoke-abc123" in str(local)
     assert "--dag-shape" in local
     assert "triad" in local
     assert "--dag-shape triad" in remote[-1]
     assert "persistent-triad-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-dispatch" in validate
+    assert "6,2,1" in validate
 
 
 def test_cuda_pair_persistent_smoke_builds_quad_workflow(tmp_path):
@@ -2404,12 +2421,15 @@ def test_cuda_pair_persistent_smoke_builds_quad_workflow(tmp_path):
 
     local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
     remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
 
     assert "persistent-quad-smoke-abc123" in str(local)
     assert "--dag-shape" in local
     assert "quad" in local
     assert "--dag-shape quad" in remote[-1]
     assert "persistent-quad-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-dispatch" in validate
+    assert "8,2,1" in validate
 
 
 def test_cuda_pair_persistent_smoke_can_sync_local_tree_and_dry_run(tmp_path):
@@ -2447,6 +2467,8 @@ def test_cuda_pair_persistent_smoke_can_sync_local_tree_and_dry_run(tmp_path):
     assert ".agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py" in commands[5]
     assert "--expected-completed-count" in commands[5]
     assert "6" in commands[5]
+    assert "--expected-dispatch" in commands[5]
+    assert "1,2,1,2,1,1" in commands[5]
     assert commands[6][-2:] == ["--root", str(tmp_path / "cuda-backend")]
 
 

@@ -1778,6 +1778,39 @@ explicit graph descriptor path can reuse one prepared generated-dispatch
 callable across two launches after resetting fan-in, ready flags, counters,
 and scratch/output buffers.
 
+The paired persistent-smoke runner now also requires expected generated
+dispatch sequences for the existing DAG shapes: `chain`, `fork_join`,
+`scratch_reuse`, tensor-tile and tensor-core-tile, scalar AXPY/scale/affine,
+triad, quad, unary-square, `generic_args`, and `graph_descriptor`. The focused
+unit selector for these paired workflow builders passed with `8 passed, 142
+deselected`, after first failing because the validation command omitted those
+`--expected-dispatch` checks.
+
+The generic-argument descriptor path was then captured with repeat-run
+lifecycle reuse on A100 and H200:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape generic_args --task-count 3 --queue-capacity 2 \
+    --repeat-runs 2 --sync-remote-tree
+```
+
+Result:
+`tmp/cuda-backend/persistent-generic_args-repeat2-smoke-6574c43b/` contains
+`a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The paired runner validated
+`runtime=persistent_device`, `mode=dag`, `dag_shape=generic_args`,
+`repeat_runs=2`, `launch_completed_counts=[3,3]`,
+`dispatch_func_ids=[9,2,1]`, zero scheduler errors, and generated report
+files. A100 reported per-launch device times `[44032,25600]`, total
+`device_wall_ns=69632`, and `host_wall_ns=106096`. H200 reported per-launch
+device times `[21088,19808]`, total `device_wall_ns=40896`, and
+`host_wall_ns=4953113`. This extends lifecycle evidence beyond the
+graph-descriptor repeat-run path to generic indexed tensor/scalar descriptor
+slots.
+
 Needed:
 
 - broader CUDA scene-test argument builders beyond the current binary
@@ -1868,8 +1901,8 @@ Needed:
   `persistent_dag_graph_f32` descriptor adapter, automatic default temporary
   allocation, and first tensor-flow dependency-inference mode;
 - broader lifecycle validation beyond the current scratch-reuse,
-  graph-descriptor repeat-run, and direct/queue/DAG prepared-callable
-  repeat-run smokes;
+  graph-descriptor and generic-argument repeat-run, and direct/queue/DAG
+  prepared-callable repeat-run smokes;
 - broader resource policy beyond the current single scheduler block,
   configurable queue/DAG worker blocks, direct worker-blocks-per-task, and
   callable stream id tracer bullet;

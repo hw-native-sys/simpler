@@ -389,6 +389,13 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-report-files
 ```
 
+For generated-dispatch DAG shapes, the paired runner passes
+`--expected-dispatch` for the known `func_id` sequence. This covers `chain`,
+`fork_join`, `scratch_reuse`, tensor-tile and tensor-core-tile shapes, scalar
+AXPY/scale/affine, triad, quad, unary-square, `generic_args`, and
+`graph_descriptor`. The validator therefore rejects A100/H200 artifacts that
+pass numerically through a different generated task path.
+
 For tensor-tile smokes, the paired runner also passes
 `--expected-tensor-tile ROWSxCOLSxINNER` so the validator rejects artifacts
 whose recorded descriptor shape does not match the requested
@@ -409,6 +416,8 @@ The current third-tensor descriptor capture is under
 `tmp/cuda-backend/persistent-triad-smoke-3a3bcdb1/`.
 The current generic-argument descriptor capture is under
 `tmp/cuda-backend/persistent-generic_args-smoke-7c99f607/`.
+The current generic-argument repeat-run lifecycle capture is under
+`tmp/cuda-backend/persistent-generic_args-repeat2-smoke-6574c43b/`.
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such
 as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.

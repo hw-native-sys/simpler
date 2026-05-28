@@ -53,6 +53,10 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/h200.json`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/cuda-smoke-report.md`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/cuda-smoke-report.svg`
+- `tmp/cuda-backend/persistent-generic_args-repeat2-smoke-6574c43b/a100.json`
+- `tmp/cuda-backend/persistent-generic_args-repeat2-smoke-6574c43b/h200.json`
+- `tmp/cuda-backend/persistent-generic_args-repeat2-smoke-6574c43b/cuda-smoke-report.md`
+- `tmp/cuda-backend/persistent-generic_args-repeat2-smoke-6574c43b/cuda-smoke-report.svg`
 
 ## Current-Head Compact Paired Gate
 
@@ -153,6 +157,39 @@ Both rows reported zero device scheduler errors and generated Markdown/SVG
 smoke reports. This capture is correctness evidence for the single-input
 scalar descriptor and generated-dispatch registration, not a benchmark
 replacement for the multi-baseline captures.
+
+## Supplemental Generic-Args Repeat-Run Smoke
+
+The `generic_args` persistent DAG smoke at artifact label `6574c43b`
+validates prepared-callable lifecycle reuse for the indexed tensor/scalar
+descriptor path. It prepares one generated-dispatch callable, then runs it
+twice after resetting fan-in, ready flags, counters, and scratch/output
+buffers. The dispatch sequence is `[9,2,1]`; task `9` reads
+`tensor_args[0]=tmp0`, `tensor_args[1]=tmp3`, `scalar_args[0]=1.5`, and
+`scalar_args[1]=0.25`.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py \
+    tmp/cuda-backend/persistent-generic_args-repeat2-smoke-6574c43b/a100.json \
+    tmp/cuda-backend/persistent-generic_args-repeat2-smoke-6574c43b/h200.json \
+    --require-artifact a100 --require-artifact h200 \
+    --expected-runtime persistent_device --expected-mode dag \
+    --expected-dag-shape generic_args --expected-repeat-runs 2 \
+    --expected-completed-count 3 --expected-dispatch 9,2,1 \
+    --require-report-files
+```
+
+| GPU | Dispatch | Repeat runs | Launch completions | Launch device ns | Device ns | Host ns | Status |
+| --- | -------- | ----------- | ------------------ | ---------------- | --------- | ------- | ------ |
+| A100 | `9,2,1` | 2 | `3,3` | `44032,25600` | 69632 | 106096 | pass |
+| H200 | `9,2,1` | 2 | `3,3` | `21088,19808` | 40896 | 4953113 | pass |
+
+Both rows reported zero device scheduler errors and generated Markdown/SVG
+smoke reports. The high H200 host time is launch-side noise in this single
+capture; the per-launch CUDA event times are the useful lifecycle signal.
 
 ## Launch Baselines
 
