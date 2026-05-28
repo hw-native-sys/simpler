@@ -192,6 +192,25 @@ cuBLAS path reaches about `54` GFLOP/s on A100 and `58` GFLOP/s on H200 at
 compact descriptor/scheduler comparison rather than a tuned GEMM throughput
 result.
 
+### Current-Head Reproducibility Check
+
+A follow-up one-repeat compact tensor sweep at commit `a5fd4bfd` validates the
+current report-generation and metadata gate after the tensor-sweep scripts
+started recording sanitized command examples. The artifact is under
+`tmp/cuda-backend/tensor-shape-sweep-a5fd4bfd/` and was validated with
+`--require-command-examples`, required A100/H200 rows, required report files,
+and PTO dispatch sequences.
+
+| GPU | N | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns |
+| --- | - | ----- | ---------------- | -------------- | --------- |
+| A100 | 256 | 16x16x16 | 47104 | 46080 | 41983 |
+| H200 | 256 | 16x16x16 | 31552 | 28544 | 51040 |
+
+This is a current-HEAD smoke/evidence capture rather than a replacement for
+the three-repeat size sweep above. It proves the exact command examples needed
+to reconstruct the local A100 and remote H200 setup are now present in the
+generated Markdown and JSON.
+
 ## Tensor-Core Callable Smoke
 
 The first tensor-core persistent DAG smoke was captured at commit `390eda4f`.

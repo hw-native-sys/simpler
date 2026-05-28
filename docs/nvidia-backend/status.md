@@ -276,6 +276,14 @@ sequences before the numbers were copied into docs. New tensor-sweep captures
 can also require sanitized local/remote command examples before publishing
 with `--require-command-examples`.
 
+A current-HEAD one-repeat compact tensor sweep at commit `a5fd4bfd` validated
+that gate against real local A100 and remote H200 data. The artifact under
+`tmp/cuda-backend/tensor-shape-sweep-a5fd4bfd/` includes sanitized local
+sample, remote sample, and remote tree-sync commands in generated Markdown and
+JSON. The validation required A100/H200 rows, scalar tensor DAG, WMMA tensor
+DAG, cuBLAS SGEMM, `N=256`, `16x16x16`, report files, command examples, and
+PTO dispatch sequences.
+
 Evidence:
 
 - [evaluation.md](evaluation.md) is the evaluation landing page.
