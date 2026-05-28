@@ -776,7 +776,8 @@ PYTHONPATH=$PWD:$PWD/python \
 
 This runs the local A100 benchmark, checks out the current branch on
 `bizhaoh200`, runs the H200 benchmark, copies the H200 artifact directory back,
-merges the two JSON reports, and refreshes `tmp/cuda-backend/index.md`.
+merges the two JSON reports, validates the combined artifact, and refreshes
+`tmp/cuda-backend/index.md`.
 The remote checkout step uses bounded Git HTTPS low-speed settings by default;
 override them with `--remote-git-low-speed-limit` and
 `--remote-git-low-speed-time` if the remote network is unusually slow. The
@@ -1110,7 +1111,9 @@ PYTHONPATH=$PWD:$PWD/python \
 
 The preset checks the expected A100/H200 machines, current selected
 baselines, sizes `1024,65536,1048576`, three repeats, `720` combined samples,
-and the Markdown/SVG report files. `--require-command-examples` checks that
+and the Markdown/SVG report files. New paired-runner captures use a dynamic
+validator command because the selected benchmark rows can change with runner
+flags. `--require-command-examples` checks that
 local and remote sample commands are reconstructable without local checkout
 paths. `--require-source-papers` checks that the report records the
 VDCores/MPK source IDs and that the referenced files exist under

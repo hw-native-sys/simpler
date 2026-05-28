@@ -1265,6 +1265,7 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     remote = cuda_pair_benchmark.build_remote_benchmark_command(config, "abc123")
     scp = cuda_pair_benchmark.build_scp_command(config, "abc123")
     merge = cuda_pair_benchmark.build_merge_command(config, "abc123")
+    validate = cuda_pair_benchmark.build_validate_command(config, "abc123")
     index = cuda_pair_benchmark.build_index_command(config)
 
     assert local[:2] == ["env", f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}"]
@@ -1296,7 +1297,42 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     assert str(tmp_path / "cuda-backend" / "a100-current-abc123" / "cuda-benchmark.json") in merge
     assert str(tmp_path / "cuda-backend" / "h200-current-abc123" / "cuda-benchmark.json") in merge
     assert "combined-current-abc123" in merge
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py" in validate
+    assert str(tmp_path / "cuda-backend" / "combined-current-abc123" / "cuda-benchmark.json") in validate
+    assert "--expected-result-count" in validate
+    assert "756" in validate
+    assert "--require-baseline" in validate
+    assert "pto_persistent_dag_tensor_core" in validate
+    assert "cublas_sgemm" in validate
+    assert "--require-command-examples" in validate
+    assert "--require-source-papers" in validate
     assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
+
+
+def test_cuda_pair_benchmark_validate_command_matches_configured_capture(tmp_path):
+    cuda_pair_benchmark = _load_pair_benchmark_module()
+    config = cuda_pair_benchmark.PairedBenchmarkConfig(
+        output_root=tmp_path / "cuda-backend",
+        sizes=(1024, 2048),
+        repeats=2,
+        batch_tasks=(2,),
+        worker_blocks_per_task=(4, 8),
+        local_python=".venv/bin/python",
+    )
+
+    validate = cuda_pair_benchmark.build_validate_command(config, "local123", "remote456")
+
+    assert any("combined-current-local123-remote456" in part for part in validate)
+    assert "--require-size" in validate
+    assert "1024,2048" in validate
+    assert "--expected-repeats" in validate
+    assert "2" in validate
+    assert "--expected-result-count" in validate
+    assert "208" in validate
+    assert "--require-baseline" in validate
+    baselines = [validate[index + 1] for index, part in enumerate(validate) if part == "--require-baseline"]
+    assert "pto_host_schedule_batch" in baselines
+    assert "pto_persistent_device_grid_batch" in baselines
 
 
 def test_cuda_pair_benchmark_merge_command_records_sanitized_examples(tmp_path):
@@ -1663,6 +1699,8 @@ def test_cuda_pair_benchmark_reused_checkout_uses_remote_commit(tmp_path):
     assert str(tmp_path / "cuda-backend" / "a100-current-local123" / "cuda-benchmark.json") in commands[3]
     assert str(tmp_path / "cuda-backend" / "h200-current-remote456" / "cuda-benchmark.json") in commands[3]
     assert "combined-current-local123-remote456" in commands[3]
+    assert any("combined-current-local123-remote456" in part for part in commands[4])
+    assert commands[5][-2:] == ["--root", str(tmp_path / "cuda-backend")]
 
 
 def test_cuda_pair_benchmark_can_sync_local_tree_to_remote(tmp_path):
@@ -1685,7 +1723,7 @@ def test_cuda_pair_benchmark_can_sync_local_tree_to_remote(tmp_path):
     commands = cuda_pair_benchmark.run_paired_benchmark(config, runner=fake_runner, dry_run=True)
 
     assert calls == [(["git", "rev-parse", "--short", "HEAD"], {"check": True, "capture_output": True, "text": True})]
-    assert len(commands) == 6
+    assert len(commands) == 7
     sync = commands[1]
     assert sync[:3] == ["rsync", "-a", "--delete"]
     assert "--exclude=.git" not in sync
@@ -1697,6 +1735,7 @@ def test_cuda_pair_benchmark_can_sync_local_tree_to_remote(tmp_path):
     assert "h200-current-local123" in remote_shell
     assert "h200-current-local123" in commands[3][2]
     assert "combined-current-local123" in commands[4]
+    assert any("combined-current-local123" in part for part in commands[5])
 
 
 def test_cuda_pair_benchmark_dry_run_does_not_launch_benchmarks(tmp_path):
@@ -1714,10 +1753,11 @@ def test_cuda_pair_benchmark_dry_run_does_not_launch_benchmarks(tmp_path):
     commands = cuda_pair_benchmark.run_paired_benchmark(config, runner=fake_runner, dry_run=True)
 
     assert calls == [(["git", "rev-parse", "--short", "HEAD"], {"check": True, "capture_output": True, "text": True})]
-    assert len(commands) == 5
+    assert len(commands) == 6
     assert commands[0][0] == "env"
     assert commands[1][0] == "ssh"
     assert commands[2][0] == "scp"
+    assert commands[4][0] == "env"
 
 
 def test_cuda_pair_smoke_builds_worker_mul_a100_h200_workflow(tmp_path):

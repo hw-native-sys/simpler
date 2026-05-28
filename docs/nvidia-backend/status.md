@@ -311,7 +311,7 @@ Evidence:
   tensor task arguments when present.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py` automates
   the local A100 run, remote H200 run, artifact copy, merge, command-example
-  metadata capture, and index refresh.
+  metadata capture, combined-artifact validation, and index refresh.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py` automates the
   no-torch host-schedule Worker smoke on local A100 and remote H200, then
   renders the compact smoke report and refreshes the artifact index.

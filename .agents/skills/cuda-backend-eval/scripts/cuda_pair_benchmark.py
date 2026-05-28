@@ -21,6 +21,36 @@ from pathlib import Path
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
+BASELINE_ROWS: tuple[str, ...] = (
+    "pto_host_schedule",
+    "pto_host_schedule_compiler",
+    "pto_host_schedule_unary_square",
+    "pto_host_schedule_quad",
+    "direct_driver",
+    "direct_driver_graph",
+    "pto_persistent_device",
+    "pto_persistent_queue",
+    "pto_persistent_dag",
+    "pto_persistent_dag_chain",
+    "pto_persistent_dag_reuse",
+    "pto_persistent_dag_scalar_axpy",
+    "pto_persistent_dag_scalar_affine",
+    "pto_persistent_dag_triad",
+    "pto_persistent_dag_quad",
+    "pto_persistent_dag_generic_args",
+    "pto_persistent_dag_graph",
+    "pto_persistent_dag_unary_square",
+    "pto_persistent_dag_tensor",
+    "pto_persistent_dag_tensor_core",
+    "cublas_sgemm",
+)
+BATCH_ROWS: tuple[str, ...] = (
+    "pto_host_schedule_batch",
+    "pto_persistent_device_batch",
+    "pto_persistent_queue_batch",
+)
+GRID_BATCH_ROW: str = "pto_persistent_device_grid_batch"
+
 
 @dataclass(frozen=True)
 class PairedBenchmarkConfig:
@@ -247,6 +277,57 @@ def build_merge_command(
     ]
 
 
+def _combined_label(local_commit: str, remote_commit: str | None = None) -> str:
+    if remote_commit is None:
+        remote_commit = local_commit
+    combined_label = f"combined-current-{local_commit}"
+    if remote_commit != local_commit:
+        combined_label = f"{combined_label}-{remote_commit}"
+    return combined_label
+
+
+def _selected_baselines(config: PairedBenchmarkConfig) -> list[str]:
+    baselines = list(BASELINE_ROWS)
+    if config.batch_tasks:
+        baselines.extend(BATCH_ROWS)
+        if config.worker_blocks_per_task:
+            baselines.append(GRID_BATCH_ROW)
+    return baselines
+
+
+def _expected_result_count(config: PairedBenchmarkConfig) -> int:
+    rows_per_size_repeat = len(BASELINE_ROWS)
+    rows_per_size_repeat += len(config.batch_tasks) * len(BATCH_ROWS)
+    rows_per_size_repeat += len(config.batch_tasks) * len(config.worker_blocks_per_task)
+    return 2 * len(config.sizes) * config.repeats * rows_per_size_repeat
+
+
+def build_validate_command(
+    config: PairedBenchmarkConfig,
+    local_commit: str,
+    remote_commit: str | None = None,
+) -> list[str]:
+    combined_label = _combined_label(local_commit, remote_commit)
+    baseline_args = [part for baseline in _selected_baselines(config) for part in ("--require-baseline", baseline)]
+    return [
+        "env",
+        f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}",
+        config.local_python,
+        ".agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py",
+        str(config.output_root / combined_label / "cuda-benchmark.json"),
+        "--require-size",
+        _csv(config.sizes),
+        "--expected-repeats",
+        str(config.repeats),
+        "--expected-result-count",
+        str(_expected_result_count(config)),
+        *baseline_args,
+        "--require-report-files",
+        "--require-command-examples",
+        "--require-source-papers",
+    ]
+
+
 def build_index_command(config: PairedBenchmarkConfig) -> list[str]:
     return [
         "env",
@@ -278,6 +359,7 @@ def run_paired_benchmark(
             build_remote_benchmark_command(config, remote_commit),
             build_scp_command(config, remote_commit),
             build_merge_command(config, local_commit, remote_commit),
+            build_validate_command(config, local_commit, remote_commit),
             build_index_command(config),
         ]
     )
