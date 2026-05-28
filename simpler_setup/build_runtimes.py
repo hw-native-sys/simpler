@@ -165,6 +165,12 @@ def build_all(
                 executor.shutdown(wait=True, cancel_futures=True)
                 raise
 
+        # No device-side deployment step here. The dispatcher SO is uploaded
+        # into the main aicpu_scheduler at runtime, on the first
+        # DeviceRunner::ensure_binaries_loaded call, via
+        # LoadAicpuOp::BootstrapDispatcher (see src/common/host/load_aicpu_op.cpp
+        # and src/common/aicpu_dispatcher/aicpu_dispatcher.h for architecture).
+
 
 def main():
     parser = argparse.ArgumentParser(description="Pre-build runtime binaries for available platforms")
