@@ -73,6 +73,13 @@ public:
     // Main scheduler thread entry: poll completion + dispatch ready tasks.
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
 
+    // Dedicated wiring-thread entry. Drains the orch wiring queue, advances
+    // per-ring last_task_alive past CONSUMED slots, and publishes K=16 batches
+    // to SM. Single-writer for all ring-management state (last_task_alive,
+    // dep_pool, sync_to_sm SM line); sched threads no longer touch the
+    // advance path.
+    void wiring_thread_run(Runtime *runtime, int32_t thread_idx);
+
     // Shutdown AICore registers for this thread's assigned cores.
     // Also runs PMU finalize (PTO2_PROFILING) before deinit when enabled.
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.

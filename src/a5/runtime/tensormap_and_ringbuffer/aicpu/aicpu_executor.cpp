@@ -242,18 +242,18 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     const bool is_orch = (thread_idx == aicpu_thread_num_ - 1);
     const bool is_wiring = (aicpu_thread_num_ >= 3) && (thread_idx == aicpu_thread_num_ - 2);
 
-    // Wiring-thread stub (step 1: no work yet — spin until shutdown signal).
-    // Future commits will move drain_wiring_queue / advance_ring_pointers /
-    // sync_to_sm / dep_pool.reclaim here.
+    // Wiring thread: drains orch wiring queue and owns per-ring advance.
+    // See SchedulerContext::wiring_thread_run.
     if (is_wiring) {
-        LOG_INFO_V0("Thread %d: wiring thread entry (stub)", thread_idx);
         while (!runtime_init_ready_.load(std::memory_order_acquire)) {
             SPIN_WAIT_HINT();
         }
-        while (!sched_ctx_.is_completed()) {
-            SPIN_WAIT_HINT();
+        if (rt == nullptr) {
+            LOG_ERROR("Thread %d: rt is null, wiring thread cannot start", thread_idx);
+        } else {
+            sched_ctx_.bind_runtime(rt);
+            sched_ctx_.wiring_thread_run(runtime, thread_idx);
         }
-        LOG_INFO_V0("Thread %d: wiring thread exit", thread_idx);
         // Skip the orch path entirely; sched path below will be skipped because
         // thread_idx is not < sched_thread_num_.
     }

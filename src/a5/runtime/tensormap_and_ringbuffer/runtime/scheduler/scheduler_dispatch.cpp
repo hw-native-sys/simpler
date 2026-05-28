@@ -715,16 +715,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             continue;
         }
 
-        // Phase 3: Drain wiring queue (thread 0 only)
-        if (thread_idx == 0) {
-            int wired = sched_->drain_wiring_queue(orchestrator_done_);
-            if (wired > 0) {
-                made_progress = true;
-#if PTO2_SCHED_PROFILING
-                l2_perf.phase_wiring_count += wired;
-#endif
-            }
-        }
+        // Phase 3: wiring queue is now drained by the dedicated wiring thread
+        // (see SchedulerContext::wiring_thread_run); sched threads no longer
+        // touch wiring state. Keeping the CYCLE_COUNT_LAP so sched_wiring_cycle
+        // stays in the profiling log (always zero now) without breaking
+        // downstream parsers.
 #if PTO2_PROFILING
         CYCLE_COUNT_LAP(l2_perf.sched_wiring_cycle);
 #endif

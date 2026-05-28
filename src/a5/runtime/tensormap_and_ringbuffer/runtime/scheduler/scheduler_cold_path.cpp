@@ -1020,6 +1020,80 @@ void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
 }
 
 // =============================================================================
+// Wiring thread entry. Owns the orch → ready_queue handoff and per-ring
+// advance state. Single writer for last_task_alive (no advance_lock CAS),
+// sole producer of ready_queue pushes (sched threads consume), and the only
+// caller of sync_to_sm.
+//
+// Exit condition: completed_ becomes true (sched detects all tasks done and
+// sets this). Even after orchestrator_done_, the wiring queue may hold tasks
+// that orch published just before signaling done — drain those first.
+// =============================================================================
+void SchedulerContext::wiring_thread_run(Runtime *runtime, int32_t thread_idx) {
+    (void)runtime;
+    LOG_INFO_V0("Thread %d: wiring_thread_run start", thread_idx);
+
+    constexpr int32_t SPIN_BUDGET = 64;
+    int32_t idle_spins = 0;
+
+    while (!completed_.load(std::memory_order_acquire)) {
+        bool made_progress = false;
+
+        // 1. Drain orch wiring queue (force-drain after orch_done so any
+        //    last-second submissions don't stall).
+        int wired = sched_->drain_wiring_queue(orchestrator_done_);
+        if (wired > 0) made_progress = true;
+
+        // 2. Advance per-ring last_task_alive past CONSUMED slots and publish
+        //    to SM. Wiring is the sole writer; the advance_lock CAS still
+        //    happens for now (cheap when uncontended) — followup commit can
+        //    drop it entirely.
+        for (int32_t r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            auto &rss = sched_->ring_sched_states[r];
+            if (rss.ring == nullptr) continue;
+            int32_t expected = 0;
+            if (rss.advance_lock.compare_exchange_strong(
+                    expected, 1, std::memory_order_acquire, std::memory_order_relaxed
+                )) {
+                int32_t before = rss.last_task_alive;
+                rss.advance_ring_pointers();
+                if (rss.last_task_alive != before) made_progress = true;
+                rss.advance_lock.store(0, std::memory_order_release);
+            }
+        }
+
+        if (made_progress) {
+            idle_spins = 0;
+        } else if (++idle_spins >= SPIN_BUDGET) {
+            SPIN_WAIT_HINT();
+            idle_spins = 0;
+        }
+    }
+
+    // Final drain pass: orch may have finished but a few tasks may still be
+    // waiting to be advanced/reclaimed for the SM final publish. Once
+    // completed_ is set there's no more work to wire, but flush the last
+    // advances so orch sees the final last_task_alive.
+    for (int32_t r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        auto &rss = sched_->ring_sched_states[r];
+        if (rss.ring == nullptr) continue;
+        int32_t expected = 0;
+        if (rss.advance_lock.compare_exchange_strong(
+                expected, 1, std::memory_order_acquire, std::memory_order_relaxed
+            )) {
+            rss.advance_ring_pointers();
+            // Force a final SM publish regardless of the K=16 throttle so the
+            // orchestrator (next round / shutdown) sees the latest counter.
+            rss.ring->fc.last_task_alive.store(rss.last_task_alive, std::memory_order_release);
+            rss.last_published_to_sm = rss.last_task_alive;
+            rss.advance_lock.store(0, std::memory_order_release);
+        }
+    }
+
+    LOG_INFO_V0("Thread %d: wiring_thread_run exit", thread_idx);
+}
+
+// =============================================================================
 // Post-orchestration bookkeeping. Runs on the orchestrator thread once the
 // build phase finishes; folds inline-completed tasks, flips orchestrator_done_,
 // and drives the orchestrator → scheduler core transition (or fatal shutdown).

@@ -811,15 +811,10 @@ struct PTO2SchedulerState {
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-        int32_t ring_id = slot_state.ring_id;
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
-        int32_t expected_lock = 0;
-        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
-                expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
-            )) {
-            ring_sched_states[ring_id].advance_ring_pointers();
-            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
-        }
+        // Advance is owned by the wiring thread (single writer); sched only
+        // publishes the CONSUMED transition via the CAS above. The wiring
+        // thread's main loop polls task_state and walks last_task_alive
+        // forward on its next iter.
     }
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
@@ -845,18 +840,8 @@ struct PTO2SchedulerState {
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-        int32_t ring_id = slot_state.ring_id;
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
-        int32_t expected_lock = 0;
-        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
-                expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
-            )) {
-            ring_sched_states[ring_id].advance_ring_pointers();
-            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
-            atomic_count += 2;  // try-lock CAS + unlock store
-        } else {
-            atomic_count += 1;  // failed try-lock CAS
-        }
+        // Advance is owned by the wiring thread (single writer); see the
+        // non-profiling variant above.
     }
 #endif
 
