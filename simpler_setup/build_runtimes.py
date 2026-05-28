@@ -150,7 +150,7 @@ def build_all(
         except (ValueError, FileNotFoundError) as e:
             logger.warning(f"  {platform}: cannot initialize builder: {e}")
             return
-        
+
         logger.info(f"  Building {platform}/{runtime_name}...")
         builder.get_binaries(runtime_name, build=True)
 
