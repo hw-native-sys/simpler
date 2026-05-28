@@ -382,6 +382,38 @@ def test_persistent_smoke_builds_reordered_graph_descriptor_dag_shape():
     assert list(tasks[1].scalar_args)[:2] == [1.5, 0.25]
 
 
+def test_persistent_smoke_builds_graph_descriptor_chain_dag_shape():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    fanin, dependents, tasks = cuda_persistent_smoke._make_dag_shape(
+        "graph_descriptor_chain",
+        17,
+        0x1000,
+        0x2000,
+        0x3000,
+        0x4000,
+        0x5000,
+        0x6000,
+        0x7000,
+    )
+
+    assert list(fanin) == [0, 0, 2, 1, 1]
+    assert list(dependents) == [2, 2, 3, 4]
+    assert [task.func_id for task in tasks] == [1, 2, 1, 2, 1]
+    assert [task.initial_fanin for task in tasks] == [0, 0, 2, 1, 1]
+    assert [task.dependent_count for task in tasks] == [1, 1, 1, 1, 0]
+    assert tasks[0].out == 0x3000
+    assert tasks[1].out == 0x4000
+    assert tasks[2].a == tasks[0].out
+    assert tasks[2].b == tasks[1].out
+    assert tasks[2].out == 0x5000
+    assert tasks[3].a == tasks[2].out
+    assert tasks[3].out == 0x6000
+    assert tasks[4].a == tasks[2].out
+    assert tasks[4].b == tasks[3].out
+    assert tasks[4].out == 0x7000
+
+
 def test_persistent_smoke_builds_graph_tensor_tile_dag_shape():
     cuda_persistent_smoke = _load_persistent_smoke_module()
     descriptor = cuda_persistent_smoke._make_tensor_tile_descriptor(rows=8, cols=4, inner=12)
@@ -2974,6 +3006,51 @@ def test_cuda_pair_persistent_smoke_accepts_graph_descriptor_repeat_runs(tmp_pat
     assert "2" in validate
     assert "--expected-dispatch" in validate
     assert "9,2,1" in validate
+
+
+def test_cuda_pair_persistent_smoke_accepts_graph_descriptor_chain(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+
+    args = cuda_pair_persistent_smoke.parse_args(
+        [
+            "--dag-shape",
+            "graph_descriptor_chain",
+            "--task-count",
+            "5",
+            "--repeat-runs",
+            "2",
+            "--sync-remote-tree",
+        ]
+    )
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape=args.dag_shape,
+        task_count=args.task_count,
+        repeat_runs=args.repeat_runs,
+        sync_remote_tree=args.sync_remote_tree,
+        refresh_remote=not args.skip_remote_refresh and not args.sync_remote_tree,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
+
+    assert "persistent-graph_descriptor_chain-repeat2-smoke-abc123" in str(local)
+    assert "graph_descriptor_chain" in local
+    assert "--dag-shape graph_descriptor_chain" in remote[-1]
+    assert "persistent-graph_descriptor_chain-repeat2-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-completed-count" in validate
+    assert "5" in validate
+    assert "--expected-dispatch" in validate
+    assert "1,2,1,2,1" in validate
+    assert "--expected-graph-fanin" in validate
+    assert "0,0,2,1,1" in validate
+    assert "--expected-graph-dependents" in validate
+    assert "2,2,3,4" in validate
 
 
 def test_cuda_pair_persistent_smoke_accepts_reordered_graph_descriptor(tmp_path):

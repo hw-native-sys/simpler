@@ -74,6 +74,7 @@ committed:
 - `tmp/cuda-backend/persistent-graph_descriptor_generic_args4-repeat2-smoke-11db2c9d/`
 - `tmp/cuda-backend/persistent-graph-generic-args4-baseline-working/`
 - `tmp/cuda-backend/persistent-graph_descriptor_reordered-repeat2-smoke-f877b7b3/`
+- `tmp/cuda-backend/persistent-graph_descriptor_chain-repeat2-smoke-b94b555d/`
 - `tmp/cuda-backend/persistent-graph_descriptor_scratch_reuse-repeat2-smoke-d8f6d0bf/`
 - `tmp/cuda-backend/worker-square-smoke-4cdde399/`
 - `tmp/cuda-backend/worker-quad-smoke-4327698e/`

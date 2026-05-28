@@ -1092,6 +1092,53 @@ assert result["source_kind"] == "generated-dispatch"
 
 
 @requires_cuda
+def test_cuda_persistent_device_smoke_runs_graph_descriptor_chain():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+result = run_persistent_smoke(
+    device=0,
+    task_count=5,
+    n=1024,
+    arch="compute_80",
+    mode="dag",
+    queue_capacity=3,
+    dag_shape="graph_descriptor_chain",
+    repeat_runs=2,
+)
+assert result["status"] == "pass"
+assert result["runtime"] == "persistent_device"
+assert result["mode"] == "dag"
+assert result["dag_shape"] == "graph_descriptor_chain"
+assert result["task_count"] == 5
+assert result["queue_capacity"] == 3
+assert result["completed_count"] == 5
+assert result["launch_completed_counts"] == [5, 5]
+assert result["dispatch_func_ids"] == [1, 2, 1, 2, 1]
+assert result["fanin_remaining"] == [0, 0, 0, 0, 0]
+assert result["device_scheduler_errors"] == {"count": 0, "code": 0, "task_id": 0}
+assert result["graph_descriptor"] == {
+    "tasks": 5,
+    "dependents": [2, 2, 3, 4],
+    "fanin": [0, 0, 2, 1, 1],
+}
+assert "tensor_args" not in result
+assert "scalar_args" not in result
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+@requires_cuda
 def test_cuda_persistent_device_smoke_reuses_prepared_dag_callable():
     script = """
 import sys

@@ -428,6 +428,17 @@ PYTHONPATH=$PWD:$PWD/python \
     --repeat-runs 2 --sync-remote-tree
 ```
 
+Use `--dag-shape graph_descriptor_chain --repeat-runs 2` to validate the
+five-task DAG-chain dependency shape as explicit graph descriptor metadata
+instead of as the fixed `chain` shape:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_chain --task-count 5 --queue-capacity 3 \
+    --repeat-runs 2 --sync-remote-tree
+```
+
 This writes `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
 `cuda-smoke-report.svg` under
 `tmp/cuda-backend/persistent-<shape>-smoke-<commit>/`, validates the paired
@@ -457,8 +468,8 @@ For generated-dispatch DAG shapes, the paired runner passes
 `--expected-dispatch` for the known `func_id` sequence. This covers `chain`,
 `fork_join`, `scratch_reuse`, tensor-tile and tensor-core-tile shapes, scalar
 AXPY/scale/affine, triad, quad, unary-square, `generic_args`,
-`generic_args4`, `graph_descriptor`, `graph_descriptor_generic_args4`,
-`graph_descriptor_reordered`,
+`generic_args4`, `graph_descriptor`, `graph_descriptor_chain`,
+`graph_descriptor_generic_args4`, `graph_descriptor_reordered`,
 `graph_descriptor_diamond`, `graph_descriptor_scratch_reuse`, and
 `graph_tensor_tile`. The validator therefore rejects A100/H200 artifacts that
 pass numerically through a different generated task path.
@@ -500,6 +511,8 @@ The current four-slot generic-argument repeat-run capture is under
 The current graph-descriptor four-slot generic-argument repeat-run capture is
 under
 `tmp/cuda-backend/persistent-graph_descriptor_generic_args4-repeat2-smoke-11db2c9d/`.
+The current graph-descriptor DAG-chain repeat-run capture is under
+`tmp/cuda-backend/persistent-graph_descriptor_chain-repeat2-smoke-b94b555d/`.
 Use `--dag-shape graph_descriptor_reordered --repeat-runs 2` to validate that
 graph-descriptor dependencies are inferred from tensor flow across the whole
 descriptor, even when the final consumer task appears before its producers.
