@@ -1,11 +1,31 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+import subprocess
+import sys
+import textwrap
+from array import array
+from typing import Any
+
 import pytest
+import simpler.worker as worker_mod
+from _task_interface import (  # pyright: ignore[reportMissingImports]
+    CTRL_OFF_ARG0,
+    CTRL_OFF_ARG1,
+    CTRL_OFF_ARG2,
+    CTRL_OFF_ARG3,
+    CTRL_OFF_RESULT,
+)
+from simpler.task_interface import MappedRegionInfo
+from simpler.worker import Worker
 
 
 def _run_python_snippet(code: str) -> None:
-    import subprocess
-    import sys
-    import textwrap
-
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(code)],
         text=True,
@@ -17,15 +37,6 @@ def _run_python_snippet(code: str) -> None:
 
 
 def test_worker_mailbox_control_offsets_match_cpp_contract():
-    import simpler.worker as worker_mod
-    from _task_interface import (  # pyright: ignore[reportMissingImports]
-        CTRL_OFF_ARG0,
-        CTRL_OFF_ARG1,
-        CTRL_OFF_ARG2,
-        CTRL_OFF_ARG3,
-        CTRL_OFF_RESULT,
-    )
-
     assert (worker_mod._CTRL_OFF_ARG0, worker_mod._CTRL_OFF_ARG1, worker_mod._CTRL_OFF_ARG2) == (16, 24, 32)
     assert worker_mod._CTRL_OFF_ARG3 == 40
     assert worker_mod._CTRL_OFF_RESULT == 48
@@ -38,9 +49,21 @@ def test_worker_mailbox_control_offsets_match_cpp_contract():
     )
 
 
+def test_worker_mapped_region_byte_view_accepts_bytes_for_non_byte_memoryview():
+    raw = memoryview(array("I", [0, 0, 0, 0]))
+
+    with pytest.raises(ValueError, match="different structures"):
+        raw[:] = b"\x00" * raw.nbytes
+
+    byte_view = worker_mod._mapped_region_byte_view(raw)
+    byte_view[:] = b"\x5a" * raw.nbytes
+
+    assert bytes(byte_view) == b"\x5a" * raw.nbytes
+
+
 class FakeChipWorker:
     def __init__(self):
-        self.calls = []
+        self.calls: list[tuple[Any, ...]] = []
 
     def open_mapped_region(self, data_bytes, signal_count=1, flags=0):
         self.calls.append(("open", data_bytes, signal_count, flags))
@@ -48,8 +71,6 @@ class FakeChipWorker:
 
     def mapped_region_info(self, handle):
         self.calls.append(("info", handle))
-        from simpler.task_interface import MappedRegionInfo
-
         return MappedRegionInfo(0, 0x1000, 16, 0, 0x2000, 2, 256, 0)
 
     def mapped_region_datacopy_h2region(self, handle, offset, data):
@@ -69,17 +90,16 @@ class FakeChipWorker:
         self.calls.append(("close", handle))
 
 
-def make_l2_worker_with_fake_chip():
-    from simpler.worker import Worker
-
+def make_l2_worker_with_fake_chip() -> tuple[Worker, FakeChipWorker]:
     worker = Worker(level=2)
-    worker._chip_worker = FakeChipWorker()
+    chip_worker = FakeChipWorker()
+    worker._chip_worker = chip_worker
     worker._initialized = True
-    return worker
+    return worker, chip_worker
 
 
 def test_worker_l2_mapped_region_round_trips_to_chip_worker():
-    worker = make_l2_worker_with_fake_chip()
+    worker, chip_worker = make_l2_worker_with_fake_chip()
 
     region = worker.open_mapped_region(16, signal_count=2)
     assert region.handle == 0xABC
@@ -101,7 +121,7 @@ def test_worker_l2_mapped_region_round_trips_to_chip_worker():
     worker.close_mapped_region(region)
 
     assert region.closed is True
-    assert worker._chip_worker.calls == [
+    assert chip_worker.calls == [
         ("open", 16, 2, 0),
         ("info", 0xABC),
         ("h2region", 0xABC, 4, b"abcd"),
@@ -113,7 +133,7 @@ def test_worker_l2_mapped_region_round_trips_to_chip_worker():
 
 
 def test_worker_mapped_region_rejects_mismatched_worker_id_and_closed_wrapper():
-    worker = make_l2_worker_with_fake_chip()
+    worker, chip_worker = make_l2_worker_with_fake_chip()
     region = worker.open_mapped_region(16, signal_count=1)
 
     with pytest.raises(ValueError, match="worker_id"):
@@ -124,12 +144,12 @@ def test_worker_mapped_region_rejects_mismatched_worker_id_and_closed_wrapper():
         worker.mapped_region_notify(region, 0, 1)
 
     worker.close_mapped_region(region)
-    assert worker._chip_worker.calls[-1] == ("close", 0xABC)
-    assert worker._chip_worker.calls.count(("close", 0xABC)) == 1
+    assert chip_worker.calls[-1] == ("close", 0xABC)
+    assert chip_worker.calls.count(("close", 0xABC)) == 1
 
 
 def test_worker_mapped_region_rejects_str_h2region_input():
-    worker = make_l2_worker_with_fake_chip()
+    worker, _ = make_l2_worker_with_fake_chip()
     region = worker.open_mapped_region(16, signal_count=1)
 
     with pytest.raises(ValueError, match="bytes-like"):

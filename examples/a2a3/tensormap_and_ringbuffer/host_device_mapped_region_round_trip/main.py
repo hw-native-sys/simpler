@@ -18,11 +18,11 @@ from pathlib import Path
 
 from simpler.task_interface import ArgDirection, CallConfig, ChipCallable, CoreCallable, TaskArgs
 from simpler.worker import Worker
+
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
 from simpler_setup.runtime_builder import RuntimeBuilder
-
 
 HERE = Path(__file__).resolve().parent
 KERNEL_DIR = HERE / "kernels"

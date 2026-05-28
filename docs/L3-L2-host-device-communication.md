@@ -11,7 +11,7 @@ test implementation details.
 
 For the surrounding runtime model, see
 [hierarchical_level_runtime.md](hierarchical_level_runtime.md) and
-[task-flow.md](task-flow.md). 
+[task-flow.md](task-flow.md).
 
 ## Why It Exists
 

@@ -70,17 +70,41 @@ from typing import Any, Optional
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     CTRL_CLOSE_MAPPED_REGION as _CPP_CTRL_CLOSE_MAPPED_REGION,
+)
+from _task_interface import (
     CTRL_MAPPED_REGION_DATACOPY_H2REGION as _CPP_CTRL_MAPPED_REGION_DATACOPY_H2REGION,
+)
+from _task_interface import (
     CTRL_MAPPED_REGION_DATACOPY_REGION2H as _CPP_CTRL_MAPPED_REGION_DATACOPY_REGION2H,
+)
+from _task_interface import (
     CTRL_MAPPED_REGION_INFO as _CPP_CTRL_MAPPED_REGION_INFO,
+)
+from _task_interface import (
     CTRL_MAPPED_REGION_NOTIFY as _CPP_CTRL_MAPPED_REGION_NOTIFY,
+)
+from _task_interface import (
     CTRL_MAPPED_REGION_WAIT as _CPP_CTRL_MAPPED_REGION_WAIT,
+)
+from _task_interface import (
     CTRL_OFF_ARG0 as _CPP_CTRL_OFF_ARG0,
+)
+from _task_interface import (
     CTRL_OFF_ARG1 as _CPP_CTRL_OFF_ARG1,
+)
+from _task_interface import (
     CTRL_OFF_ARG2 as _CPP_CTRL_OFF_ARG2,
+)
+from _task_interface import (
     CTRL_OFF_ARG3 as _CPP_CTRL_OFF_ARG3,
+)
+from _task_interface import (
     CTRL_OFF_RESULT as _CPP_CTRL_OFF_RESULT,
+)
+from _task_interface import (
     CTRL_OPEN_MAPPED_REGION as _CPP_CTRL_OPEN_MAPPED_REGION,
+)
+from _task_interface import (
     MAX_REGISTERED_CALLABLE_IDS,
     RunTiming,
     WorkerType,
@@ -253,6 +277,17 @@ assert _HDMR_HEADER.size == 64
 _HDMR_STATUS_OFFSET = 4 + 2 + 2 + 8 + 8 + 8
 _HDMR_INFO_PAYLOAD = struct.Struct("<QQQQQI4xQI4x")
 assert _HDMR_INFO_PAYLOAD.size == 64
+
+
+def _mapped_region_byte_view(buf: memoryview) -> memoryview:
+    if buf.format == "B" and buf.itemsize == 1:
+        return buf
+    return buf.cast("B")
+
+
+def _release_mapped_region_byte_view(buf: memoryview, raw_buf: memoryview) -> None:
+    if buf is not raw_buf:
+        buf.release()
 
 
 def _pack_py_callable_payload(target) -> bytes:
@@ -557,52 +592,56 @@ def _handle_ctrl_mapped_region_payload(cw: "ChipWorker", buf: memoryview, sub_cm
 
     shm = SharedMemory(name=shm_name)
     try:
-        shm_buf = shm.buf
-        assert shm_buf is not None
-        if shm.size < _HDMR_HEADER.size:
-            raise RuntimeError(f"mapped-region payload too small: {shm.size} bytes")
-        magic, version, op, region, offset, nbytes, _status, reserved = _HDMR_HEADER.unpack_from(shm_buf, 0)
-        if magic != _HDMR_MAGIC:
-            raise RuntimeError(f"mapped-region payload invalid magic: {magic!r}")
-        if version != _HDMR_VERSION:
-            raise RuntimeError(f"mapped-region payload unsupported version: {version}")
-        if op != expected_op:
-            raise RuntimeError(f"mapped-region payload op {op} does not match sub-command {int(sub_cmd)}")
-        if reserved != 0:
-            raise RuntimeError(f"mapped-region payload reserved field must be zero, got {reserved}")
-        required_size = _HDMR_HEADER.size + (0 if op == _HDMR_OP_INFO else int(nbytes))
-        if op == _HDMR_OP_INFO:
-            required_size = _HDMR_HEADER.size + _HDMR_INFO_PAYLOAD.size
-        if required_size > shm.size:
-            raise RuntimeError(f"mapped-region payload size mismatch: need {required_size}, shm={shm.size}")
-
-        status = 0
+        raw_buf = shm.buf
+        assert raw_buf is not None
+        shm_buf = _mapped_region_byte_view(raw_buf)
         try:
+            if shm.size < _HDMR_HEADER.size:
+                raise RuntimeError(f"mapped-region payload too small: {shm.size} bytes")
+            magic, version, op, region, offset, nbytes, _status, reserved = _HDMR_HEADER.unpack_from(shm_buf, 0)
+            if magic != _HDMR_MAGIC:
+                raise RuntimeError(f"mapped-region payload invalid magic: {magic!r}")
+            if version != _HDMR_VERSION:
+                raise RuntimeError(f"mapped-region payload unsupported version: {version}")
+            if op != expected_op:
+                raise RuntimeError(f"mapped-region payload op {op} does not match sub-command {int(sub_cmd)}")
+            if reserved != 0:
+                raise RuntimeError(f"mapped-region payload reserved field must be zero, got {reserved}")
+            required_size = _HDMR_HEADER.size + (0 if op == _HDMR_OP_INFO else int(nbytes))
             if op == _HDMR_OP_INFO:
-                info = cw.mapped_region_info(int(region))
-                _HDMR_INFO_PAYLOAD.pack_into(
-                    shm_buf,
-                    _HDMR_HEADER.size,
-                    0,
-                    int(info.device_data_ptr),
-                    int(info.data_bytes),
-                    0,
-                    int(info.device_signal_ptr),
-                    int(info.signal_count),
-                    int(info.total_bytes),
-                    int(info.flags),
-                )
-            elif op == _HDMR_OP_H2REGION:
-                payload = bytes(shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)])
-                cw.mapped_region_datacopy_h2region(int(region), int(offset), payload)
-            elif op == _HDMR_OP_REGION2H:
-                payload = cw.mapped_region_datacopy_region2h(int(region), int(offset), int(nbytes))
-                shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)] = payload
-            else:
-                status = -errno.EINVAL
-        except Exception as e:  # noqa: BLE001
-            status = _mapped_region_exception_status(e)
-        struct.pack_into("<i", shm_buf, _HDMR_STATUS_OFFSET, int(status))
+                required_size = _HDMR_HEADER.size + _HDMR_INFO_PAYLOAD.size
+            if required_size > shm.size:
+                raise RuntimeError(f"mapped-region payload size mismatch: need {required_size}, shm={shm.size}")
+
+            status = 0
+            try:
+                if op == _HDMR_OP_INFO:
+                    info = cw.mapped_region_info(int(region))
+                    _HDMR_INFO_PAYLOAD.pack_into(
+                        shm_buf,
+                        _HDMR_HEADER.size,
+                        0,
+                        int(info.device_data_ptr),
+                        int(info.data_bytes),
+                        0,
+                        int(info.device_signal_ptr),
+                        int(info.signal_count),
+                        int(info.total_bytes),
+                        int(info.flags),
+                    )
+                elif op == _HDMR_OP_H2REGION:
+                    payload = bytes(shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)])
+                    cw.mapped_region_datacopy_h2region(int(region), int(offset), payload)
+                elif op == _HDMR_OP_REGION2H:
+                    payload = cw.mapped_region_datacopy_region2h(int(region), int(offset), int(nbytes))
+                    shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)] = payload
+                else:
+                    status = -errno.EINVAL
+            except Exception as e:  # noqa: BLE001
+                status = _mapped_region_exception_status(e)
+            struct.pack_into("<i", shm_buf, _HDMR_STATUS_OFFSET, int(status))
+        finally:
+            _release_mapped_region_byte_view(shm_buf, raw_buf)
     finally:
         shm.close()
 
@@ -639,7 +678,7 @@ def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id:
     prepared.add(cid)
 
 
-def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands + SHUTDOWN form the unified state machine; cannot collapse without obscuring dispatch
+def _run_chip_main_loop(  # noqa: PLR0912,PLR0915 -- TASK_READY + control sub-commands + SHUTDOWN form the unified state machine; cannot collapse without obscuring dispatch
     cw: ChipWorker,
     buf: memoryview,
     mailbox_addr: int,
@@ -1463,7 +1502,7 @@ class Worker:
     def _raise_mapped_region_status(self, status: int) -> None:
         if status == 0:
             return
-        if status == -errno.EAGAIN or status == -errno.EWOULDBLOCK:
+        if status in (-errno.EAGAIN, -errno.EWOULDBLOCK):
             raise TimeoutError(f"mapped-region operation timed out with status {status}")
         if status == -errno.EINVAL:
             raise ValueError(f"mapped-region operation failed with status {status}")
@@ -1492,30 +1531,34 @@ class Worker:
         shm_size = _HDMR_HEADER.size + (_HDMR_INFO_PAYLOAD.size if op == _HDMR_OP_INFO else int(nbytes))
         shm = SharedMemory(name=self._mapped_region_shm_name(worker_id), create=True, size=shm_size)
         try:
-            shm_buf = shm.buf
-            assert shm_buf is not None
-            shm_buf[:] = b"\x00" * shm_size
-            _HDMR_HEADER.pack_into(
-                shm_buf,
-                0,
-                _HDMR_MAGIC,
-                _HDMR_VERSION,
-                int(op),
-                int(region_handle),
-                int(offset),
-                int(nbytes),
-                0,
-                0,
-            )
-            if payload:
-                shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + len(payload)] = payload
+            raw_buf = shm.buf
+            assert raw_buf is not None
+            shm_buf = _mapped_region_byte_view(raw_buf)
             try:
-                dw.control_mapped_region_payload(int(worker_id), int(sub_cmd), shm.name)
-            except RuntimeError as e:
-                self._raise_mapped_region_control_error(e)
-            status = struct.unpack_from("<i", shm_buf, _HDMR_STATUS_OFFSET)[0]
-            reply = bytes(shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)])
-            return int(status), reply
+                shm_buf[:] = b"\x00" * shm_size
+                _HDMR_HEADER.pack_into(
+                    shm_buf,
+                    0,
+                    _HDMR_MAGIC,
+                    _HDMR_VERSION,
+                    int(op),
+                    int(region_handle),
+                    int(offset),
+                    int(nbytes),
+                    0,
+                    0,
+                )
+                if payload:
+                    shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + len(payload)] = payload
+                try:
+                    dw.control_mapped_region_payload(int(worker_id), int(sub_cmd), shm.name)
+                except RuntimeError as e:
+                    self._raise_mapped_region_control_error(e)
+                status = struct.unpack_from("<i", shm_buf, _HDMR_STATUS_OFFSET)[0]
+                reply = bytes(shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)])
+                return int(status), reply
+            finally:
+                _release_mapped_region_byte_view(shm_buf, raw_buf)
         finally:
             try:
                 shm.close()

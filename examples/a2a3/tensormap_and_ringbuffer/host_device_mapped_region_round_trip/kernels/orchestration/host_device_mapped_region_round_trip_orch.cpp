@@ -24,7 +24,8 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     return host_device_mapped_region_round_trip_config(orch_args);
 }
 
-__attribute__((visibility("default"))) void host_device_mapped_region_round_trip_orch(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void
+host_device_mapped_region_round_trip_orch(const ChipStorageTaskArgs &orch_args) {
     Arg args;
     args.add_scalar(orch_args.scalar(0));
     args.add_scalar(orch_args.scalar(1));

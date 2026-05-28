@@ -33,7 +33,6 @@ from pathlib import Path
 
 import pytest
 
-
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[3]
 

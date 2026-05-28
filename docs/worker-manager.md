@@ -225,7 +225,7 @@ Current control-plane users include:
   `CTRL_COMM_INIT`, `CTRL_ALLOC_DOMAIN`, and `CTRL_RELEASE_DOMAIN`.
 - Host/device mapped-region operations:
   `CTRL_OPEN_MAPPED_REGION`, `CTRL_CLOSE_MAPPED_REGION`,
-  `CTRL_MAPPED_REGION_INFO`, datacopy, notify, and wait commands. 
+  `CTRL_MAPPED_REGION_INFO`, datacopy, notify, and wait commands.
 
 When adding a new control command, keep the mailbox fields limited to small
 fixed arguments and move variable-sized payloads into side-band shared memory.

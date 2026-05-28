@@ -13,14 +13,14 @@ from __future__ import annotations
 import os
 
 import pytest
+from simpler.worker import Worker
+
+from simpler_setup.runtime_builder import RuntimeBuilder
 
 
 @pytest.mark.requires_hardware("a2a3")
 @pytest.mark.platforms(["a2a3"])
 def test_a2a3_onboard_mapped_region_host_side_smoke(st_device_ids):
-    from simpler.worker import Worker
-    from simpler_setup.runtime_builder import RuntimeBuilder
-
     build = bool(os.environ.get("PTO_UT_BUILD"))
     _ = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer", build=build)
     device_id = int(st_device_ids[0])
