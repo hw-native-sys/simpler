@@ -1721,11 +1721,18 @@ at that point in descriptor order. Descriptor construction raises before
 launch if either role references an unknown tensor or temporary, avoiding a
 silent scratch allocation for values that are supposed to alias existing
 storage.
+The same lifecycle rule is now applied to explicit graph `out_storage`.
+Logical `out` names still create default-sized temporaries, but an
+`out_storage` alias must point at storage that has already been allocated or
+declared. This keeps scratch-buffer reuse explicit and prevents typos in the
+physical storage name from allocating a new buffer silently.
 The negative lifecycle cases are now covered by descriptor-only regression
-tests: unknown `output_existing` and unknown `inout` names fail before task
-struct construction. The combined tagged role selector reported
-`4 passed, 68 deselected`, and the valid tagged-inout real-data selector
-still reported `1 passed, 71 deselected` on local A100 and remote H200.
+tests: unknown `output_existing`, unknown `inout`, and unknown `out_storage`
+names fail before task struct construction. The combined tagged role selector
+reported `4 passed, 68 deselected`; the scratch-storage selector reported
+`2 passed, 71 deselected`; and the valid tagged-inout and scratch-reuse
+real-data selectors still reported `1 passed` each on local A100 and remote
+H200.
 
 The tagged graph lowering was checked with a failing test first, then local
 A100 and remote H200 real-data ctypes scene tests:

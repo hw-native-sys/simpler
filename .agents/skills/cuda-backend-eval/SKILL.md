@@ -1037,7 +1037,9 @@ PYTHONPATH=$PWD:$PWD/python \
 Graph tasks may also pass `out_storage` when the logical graph output should
 reuse an existing scratch buffer. Keep `out` unique for tensor-flow dependency
 inference and set `out_storage` to the physical buffer name, for example
-`out="tmp4", out_storage="tmp0"`.
+`out="tmp4", out_storage="tmp0"`. Unknown `out_storage` names should fail
+during descriptor construction; use plain `out` for graph tasks that create a
+new default-sized temporary.
 Run the no-torch graph tensor-tile ctypes scene on A100 or H200 with:
 
 ```bash

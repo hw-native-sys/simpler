@@ -2501,6 +2501,35 @@ def test_scene_test_builds_cuda_persistent_graph_with_reused_output_storage():
     assert buffers.host_tasks[5].out == buffers.tensor_buffers.ptrs["out"]
 
 
+def test_scene_test_rejects_unknown_cuda_persistent_graph_output_storage():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "graph": {
+            "tasks": [
+                {"func_id": 1, "a": "a", "b": "b", "out": "tmp0"},
+                {
+                    "func_id": 1,
+                    "a": "tmp0",
+                    "b": "a",
+                    "out": "tmp1",
+                    "out_storage": "typo_storage",
+                },
+                {"func_id": 1, "a": "tmp1", "b": "b", "out": "out"},
+            ]
+        },
+    }
+
+    with pytest.raises(ValueError, match="out_storage.*typo_storage"):
+        _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+
 def test_scene_test_resolves_cuda_persistent_graph_scalar_field_names():
     test_args = TaskArgsBuilder(
         Tensor("a", _FakeTensor(17)),

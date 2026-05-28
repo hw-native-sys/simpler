@@ -1305,12 +1305,13 @@ class _CudaPersistentDagSceneBuffers:
             return
 
         storage_name = task_spec.get("out_storage", out_name)
-        if task_spec.get("_out_requires_existing") and str(storage_name) not in ptrs:
+        requires_existing = task_spec.get("_out_requires_existing") or "out_storage" in task_spec
+        if requires_existing and str(storage_name) not in ptrs:
+            role = "out_storage" if "out_storage" in task_spec else "output_existing task_arg"
             raise ValueError(
-                "CUDA persistent_dag_graph_f32 output_existing task_arg references "
-                f"unknown tensor or temporary: {storage_name}"
+                f"CUDA persistent_dag_graph_f32 {role} references unknown tensor or temporary: {storage_name}"
             )
-        if not task_spec.get("_out_requires_existing"):
+        if not requires_existing:
             add_temporary(storage_name, output_nbytes)
         if str(out_name) != str(storage_name):
             ptrs[str(out_name)] = ptrs[str(storage_name)]
