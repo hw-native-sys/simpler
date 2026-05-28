@@ -138,7 +138,11 @@ tensor/scalar descriptors, `persistent_dag_tensor_tile_f32` state objects,
 `TaskArgsBuilder` CPU tensors, and validates real copied-back CUDA output
 data. The scene-test persistent-device compiler path also forwards callable
 `stream_id` into the prepared CUDA manifest, so these L2 tests can run on a
-selected non-default runtime stream. The no-torch
+selected non-default runtime stream. After each persistent-device scene-test
+launch, the L2 path now copies back device scheduler counters and raises on
+nonzero scheduler errors or incomplete DAG execution, so scheduler failures
+are visible even when a diagnostic test intentionally skips golden comparison.
+The no-torch
 persistent smoke path also validates a generated-dispatch triad descriptor
 with a third tensor pointer field, a quad descriptor with third and fourth
 tensor pointer fields, a generic-argument descriptor, and a generated-dispatch
@@ -1477,6 +1481,39 @@ Result: `2 passed, 39 deselected`.
 The same non-default-stream tensor-core ctypes scene test was then run on H200
 after syncing the working tree. Result: `1 passed, 40 deselected`; the command
 printed the known PTO-ISA SSH refresh warning before passing.
+
+The same normal L2 persistent-device scene-test path now also checks
+device-side scheduler diagnostics after `Worker.run`. A bad explicit graph
+with unsupported `func_id=99` raises
+`CUDA persistent DAG scheduler error code=1 task_id=0 count=1` even with
+`skip_golden=True`, while a good explicit graph still validates real copied
+data. Focused local A100 coverage:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k 'reports_cuda_persistent_scheduler_errors or graph_with_ctypes or tensor_core_tile_with_ctypes_data' \
+    --platform cuda
+```
+
+Result: `3 passed, 39 deselected`. The full local CUDA scene-test file was
+then rerun and reported `42 passed`.
+
+The diagnostic and good-graph ctypes tests were also run on H200 after
+syncing the working tree:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+     -q -rs -k "reports_cuda_persistent_scheduler_errors or graph_with_ctypes" \
+     --platform cuda'
+```
+
+Result: `2 passed, 40 deselected`. The command printed the known PTO-ISA SSH
+refresh warning before passing.
 
 The explicit graph-descriptor path has now been promoted into the benchmark
 scripts as `pto_persistent_dag_graph`, using `dag_shape=graph_descriptor`.

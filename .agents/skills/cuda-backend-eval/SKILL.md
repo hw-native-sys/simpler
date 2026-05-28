@@ -669,6 +669,10 @@ when the first DAG task should be a block-wide WMMA
 CUDA `persistent_device` scene-test specs can pass `stream_id` in the
 `CALLABLE["cuda"]` spec; this is forwarded to the prepared callable manifest
 and selects the CUDA runtime stream used by `Worker.run`.
+The L2 `SceneTestCase` persistent-device path also reads the device scheduler
+counters after each launch. It raises `RuntimeError` for nonzero scheduler
+errors or incomplete DAG completion, so negative scheduler-diagnostic tests can
+use `skip_golden=True` without silently accepting a failed device schedule.
 Use `persistent_dag_graph_f32` when a test should pass an explicit runtime
 graph descriptor with per-task `func_id`, `a`/`b`/`c`/`d`/`out`,
 `dependents`, optional `initial_fanin`, `tensor_args`, and `scalar_args`

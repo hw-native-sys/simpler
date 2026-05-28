@@ -2297,6 +2297,60 @@ def test_scene_test_runs_cuda_persistent_device_graph_with_ctypes_data(tmp_path)
 
 
 @requires_cuda
+def test_scene_test_reports_cuda_persistent_scheduler_errors_with_ctypes_data(tmp_path):
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+    callable_spec = _cuda_persistent_dag_spec(add_source, mul_source)
+    callable_spec["cuda"]["arg_builder"] = "persistent_dag_graph_f32"
+    callable_spec["cuda"]["temporaries"] = {"tmp0": "out"}
+    callable_spec["cuda"]["graph"] = {
+        "tasks": [
+            {"func_id": 99, "a": "a", "b": "b", "out": "tmp0", "dependents": [1]},
+            {"func_id": 1, "a": "tmp0", "b": "b", "out": "out", "initial_fanin": 1},
+        ]
+    }
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentBadGraphCtypesScene(SceneTestCase):
+        CALLABLE = callable_spec
+        CASES = [
+            {
+                "name": "n64",
+                "platforms": ["cuda"],
+                "params": {"n": 64},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            return TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.5 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+            )
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit scheduler diagnostics")
+
+    scene = CudaPersistentBadGraphCtypesScene()
+    worker = CudaPersistentBadGraphCtypesScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        with pytest.raises(RuntimeError, match="CUDA persistent DAG scheduler error code=1 task_id=0 count=1"):
+            scene._run_and_validate_l2(
+                worker,
+                callable_obj,
+                CudaPersistentBadGraphCtypesScene.CASES[0],
+                skip_golden=True,
+            )
+    finally:
+        worker.close()
+
+
+@requires_cuda
 def test_scene_test_runs_cuda_persistent_device_unary_square_with_ctypes_data(tmp_path):
     square_source = tmp_path / "square.pto.cu"
     add_source = tmp_path / "add.pto.cu"

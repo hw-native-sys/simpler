@@ -1273,6 +1273,21 @@ class _CudaPersistentDagSceneBuffers:
     def copy_outputs_from_device(self, output_names: list[str]) -> None:
         self.tensor_buffers.copy_outputs_from_device(output_names)
 
+    def read_counters(self) -> dict[str, int]:
+        import ctypes  # noqa: PLC0415
+
+        counters_t = ctypes.c_uint32 * 6
+        counters = counters_t()
+        self.worker.copy_from(ctypes.addressof(counters), self.dev_counters, ctypes.sizeof(counters))
+        return {
+            "queue_head": int(counters[0]),
+            "queue_tail": int(counters[1]),
+            "completed_count": int(counters[2]),
+            "error_count": int(counters[3]),
+            "error_code": int(counters[4]),
+            "error_task_id": int(counters[5]),
+        }
+
     def free(self) -> None:
         for ptr in self.ptrs:
             self.worker.free(ptr)
@@ -2186,6 +2201,18 @@ class SceneTestCase:
 
                 with _temporary_env(self._resolve_env()):
                     timing = worker.run(cid, device_buffers.args, config=config)
+                counters = device_buffers.read_counters()
+                if counters["error_count"] != 0:
+                    raise RuntimeError(
+                        "CUDA persistent DAG scheduler error "
+                        f"code={counters['error_code']} task_id={counters['error_task_id']} "
+                        f"count={counters['error_count']}"
+                    )
+                if counters["completed_count"] != len(device_buffers.host_tasks):
+                    raise RuntimeError(
+                        "CUDA persistent DAG completed "
+                        f"{counters['completed_count']} of {len(device_buffers.host_tasks)} tasks"
+                    )
                 device_buffers.copy_outputs_from_device(output_names)
                 if rounds > 1 and timing is not None:
                     timings.append((timing.host_wall_us, timing.device_wall_us))
