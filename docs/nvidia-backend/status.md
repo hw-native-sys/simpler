@@ -201,6 +201,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_chain`;
 - `pto_persistent_dag_reuse`;
 - `pto_persistent_dag_scalar_axpy`;
+- `pto_persistent_dag_scalar_scale`;
 - `pto_persistent_dag_scalar_affine`;
 - `pto_persistent_dag_triad`;
 - `pto_persistent_dag_quad`;
@@ -237,6 +238,16 @@ host/base-DAG/tensor/tensor-core/cuBLAS/grid-batch
 `14848/31936/44576/36096/40959/28768 ns`. The capture was run after adding
 persistent DAG no-progress diagnostics; all PTO persistent DAG rows reported
 zero device scheduler errors.
+
+The compact paired benchmark gate at artifact label `a46db551` promotes
+`pto_persistent_dag_scalar_scale` into the selected benchmark path. It uses
+`N=4096`, one repeat, no batch rows, and default `16x16x16` tensor descriptor
+metadata. The paired runner synced the working tree to H200, captured A100
+and H200 reports, merged `44` rows, and validated required baselines,
+source-paper provenance, command examples, report files, and zero scheduler
+errors under `tmp/cuda-backend/combined-current-a46db551/`. The scalar-scale
+row reported dispatch `[11,2,1]`, `scalar0=2.0`, `device_wall_ns=37888` on
+A100, and `device_wall_ns=27744` on H200.
 
 The supplemental tensor-shape sweep at commit `c0ada3ad` runs
 `pto_persistent_dag_tensor` on local A100 and remote H200 for `8x4x12`,
@@ -1567,6 +1578,28 @@ Result:
 scheduler errors, and generated report files. The A100 row reported
 `device_wall_ns=40960` and `host_wall_ns=61301`; H200 reported
 `device_wall_ns=25856` and `host_wall_ns=34808`.
+
+The same DAG shape was then promoted to the selected benchmark path as
+`pto_persistent_dag_scalar_scale`. Focused benchmark/report tests and a local
+A100 single-baseline sample were run:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_benchmark_report.py \
+    -q -k 'scalar_scale or worker_and_dag_tables or old_captures_without_scalar_affine or include_all_default_persistent or include_batch_mode' \
+    --platform cuda
+
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_scalar_scale \
+    --sizes 4096 --repeats 1 --arch compute_80 \
+    --label scalar-scale-baseline-a100
+```
+
+Results: the focused report tests passed with `6 passed, 144 deselected`; the
+local A100 single-baseline sample reported `status=pass`,
+`dispatch_func_ids=[11,2,1]`, `scalar0=2.0`, and
+`device_wall_ns=47104`.
 
 The same real-data ctypes graph test was run on the remote H200 after syncing
 the working tree:

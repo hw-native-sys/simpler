@@ -32,6 +32,7 @@ PAIRED_CURRENT_BASELINES = (
     "pto_persistent_dag_reuse",
     "pto_persistent_dag_scalar_affine",
     "pto_persistent_dag_scalar_axpy",
+    "pto_persistent_dag_scalar_scale",
     "pto_persistent_dag_tensor",
     "pto_persistent_dag_triad",
     "pto_persistent_dag_quad",

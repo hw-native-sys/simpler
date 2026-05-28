@@ -21,6 +21,9 @@ tensor baseline sweep uses `e79edba2`:
   and quad rows, scalar AXPY, scalar affine, triad, quad, generic-args, and
   graph-descriptor and unary-square descriptor rows, and headline
   interpretation.
+- [Current capture](evaluation-current.md) records the compact scalar-scale
+  benchmark gate that adds `pto_persistent_dag_scalar_scale` to the selected
+  paired benchmark path with A100/H200 report artifacts.
 - [Current capture](evaluation-current.md) also records the supplemental
   `8x4x12`, `16x16x64`, and `32x16x64` tensor-shape sweep for
   `pto_persistent_dag_tensor`.
@@ -55,6 +58,9 @@ committed:
 - `tmp/cuda-backend/a100-current-d361006f/`
 - `tmp/cuda-backend/h200-current-d361006f/`
 - `tmp/cuda-backend/combined-current-d361006f/`
+- `tmp/cuda-backend/a100-current-a46db551/`
+- `tmp/cuda-backend/h200-current-a46db551/`
+- `tmp/cuda-backend/combined-current-a46db551/`
 - `tmp/cuda-backend/persistent-scalar_affine-smoke-469f55cd/`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/`
 - `tmp/cuda-backend/worker-square-smoke-4cdde399/`
@@ -127,6 +133,8 @@ with `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`.
 - `pto_persistent_dag_scalar_axpy`: generated-dispatch DAG that reads a
   `scalar0` task descriptor field for mixed tensor/scalar AXPY work before
   downstream fan-in.
+- `pto_persistent_dag_scalar_scale`: generated-dispatch DAG that reads
+  `scalar0` with one tensor input before downstream fan-in.
 - `pto_persistent_dag_scalar_affine`: generated-dispatch DAG that reads
   `scalar0` and `scalar1` task descriptor fields for two-scalar affine work
   before downstream fan-in.

@@ -330,10 +330,15 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2 --dag-shape unary_square
 ```
 
-Run the corresponding benchmark baseline directly after changing the
-two-scalar DAG descriptor or generated-dispatch benchmark wiring:
+Run the corresponding benchmark baseline directly after changing a scalar DAG
+descriptor or generated-dispatch benchmark wiring:
 
 ```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_scalar_scale \
+    --sizes 4096 --arch compute_80
+
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --single-baseline pto_persistent_dag_scalar_affine \

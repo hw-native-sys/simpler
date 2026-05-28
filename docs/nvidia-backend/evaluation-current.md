@@ -40,6 +40,15 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark.svg`
 - `tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/a100-current-a46db551/cuda-benchmark.json`
+- `tmp/cuda-backend/a100-current-a46db551/cuda-benchmark.md`
+- `tmp/cuda-backend/h200-current-a46db551/cuda-benchmark.json`
+- `tmp/cuda-backend/h200-current-a46db551/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-current-a46db551/cuda-benchmark.json`
+- `tmp/cuda-backend/combined-current-a46db551/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-current-a46db551/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-current-a46db551/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/combined-current-a46db551/cuda-benchmark-dag-deltas.svg`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/a100.json`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/h200.json`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/cuda-smoke-report.md`
@@ -80,6 +89,39 @@ than the full `61cf96cd` capture and should not replace the three-size,
 three-repeat rows below for broad trend reading. The `0b3c1699` gate was
 captured after adding scheduler no-progress diagnostics; all PTO persistent
 DAG rows reported zero device scheduler errors.
+
+## Supplemental Scalar-Scale Benchmark
+
+The compact scalar-scale benchmark gate at artifact label `a46db551` adds
+`pto_persistent_dag_scalar_scale` to the selected paired benchmark path. It
+uses `N=4096`, one repeat, no batch rows, and the default `16x16x16` tensor
+descriptor metadata. The paired runner synced the local tree to `bizhaoh200`,
+captured A100 and H200 benchmark reports, merged `44` rows, and validated
+required baselines, command examples, source-paper provenance, zero scheduler
+errors, and generated Markdown/SVG report files.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    tmp/cuda-backend/combined-current-a46db551/cuda-benchmark.json \
+    --require-size 4096 --expected-repeats 1 --expected-result-count 44 \
+    --require-baseline pto_persistent_dag_scalar_scale \
+    --require-report-files --require-command-examples \
+    --require-zero-scheduler-errors --require-source-papers
+```
+
+| GPU | Baseline | Dispatch | Scalar args | Device ns | Host ns | Status |
+| --- | -------- | -------- | ----------- | --------- | ------- | ------ |
+| A100 | `pto_persistent_dag_scalar_scale` | `11,2,1` | `scalar0=2.0` | 37888 | 55626 | pass |
+| H200 | `pto_persistent_dag_scalar_scale` | `11,2,1` | `scalar0=2.0` | 27744 | 2498273 | pass |
+
+Both rows reported zero device scheduler errors and the report includes
+`cuda-benchmark.svg`, `cuda-benchmark-ratios.svg`, and
+`cuda-benchmark-dag-deltas.svg`. The high H200 host time is launch-side noise
+in this one-repeat compact gate; the device event time is the useful
+scheduler-path signal.
 
 ## Supplemental Scalar-Scale Smoke
 
