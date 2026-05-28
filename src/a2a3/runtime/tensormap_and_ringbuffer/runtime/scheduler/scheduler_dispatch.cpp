@@ -184,6 +184,11 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_offset, core_id, reg_task_id
     );
 
+    // Publish task data (slot_state / args writes done above) before AICore
+    // can observe the dispatched task_id. ARM64 needs an explicit store-store
+    // fence across Normal-cacheable -> Device-nGnRnE; the old write_reg()
+    // helper provided this implicitly via __sync_synchronize.
+    wmb();
     write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
     tracker.set_pending_occupied(core_offset);
 }

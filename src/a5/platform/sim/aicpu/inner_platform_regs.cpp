@@ -23,24 +23,13 @@
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
 
-uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
-    uint32_t offset = reg_offset(reg);
+volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg) {
     volatile uint8_t *reg_base = reinterpret_cast<volatile uint8_t *>(reg_base_addr);
-    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(reg_base, offset));
-
-    __sync_synchronize();
-    uint64_t value = static_cast<uint64_t>(*ptr);
-    __sync_synchronize();
-
-    return value;
+    return reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(reg_base, reg_offset(reg)));
 }
 
-void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
-    uint32_t offset = reg_offset(reg);
-    volatile uint8_t *reg_base = reinterpret_cast<volatile uint8_t *>(reg_base_addr);
-    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(reg_base, offset));
+uint64_t read_reg(uint64_t reg_base_addr, RegId reg) { return static_cast<uint64_t>(*get_reg_ptr(reg_base_addr, reg)); }
 
-    __sync_synchronize();
-    *ptr = static_cast<uint32_t>(value);
-    __sync_synchronize();
+void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
+    *get_reg_ptr(reg_base_addr, reg) = static_cast<uint32_t>(value);
 }

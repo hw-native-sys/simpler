@@ -71,7 +71,7 @@ enum class LoopAction : int8_t {
 
 struct alignas(64) CoreExecState {
     // --- Hot fields (completion + dispatch, every iteration) ---
-    uint64_t reg_addr;                      // offset  0: register address (set once in handshake)
+    uint64_t reg_addr;                      // offset  0: register base address (set once in handshake)
     PTO2TaskSlotState *running_slot_state;  // offset  8: slot state for running task (nullptr = empty)
     PTO2TaskSlotState *pending_slot_state;  // offset 16: slot state for pending task (nullptr = empty)
     int32_t running_reg_task_id;            // offset 24: register task ID (AICPU_TASK_INVALID = idle)
@@ -80,18 +80,20 @@ struct alignas(64) CoreExecState {
     PTO2SubtaskSlot running_subslot;        // offset 36: which subtask slot is running
     PTO2SubtaskSlot pending_subslot;        // offset 37: which subtask slot is pending
     uint8_t pad0_[2];                       // offset 38: alignment padding
+    // Precomputed COND register pointer; resolved once in handshake so the
+    // hot completion poll does a single volatile load instead of recomputing
+    // reg_base + reg_offset(COND) on every iteration.
+    volatile uint32_t *cond_ptr;  // offset 40: precomputed pointer to COND register
 #if PTO2_PROFILING
     // --- Profiling fields (dispatch path, compile-time gated) ---
-    uint32_t dispatch_count;              // offset 40: dispatched task count (buffer mgmt)
-    uint32_t pad1_;                       // offset 44: alignment padding for timestamp
     uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
     uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
 #else
     // --- Cold fields (init/diagnostics only, never in hot path) ---
-    int32_t worker_id;          // offset 40: index in runtime.workers[]
-    uint32_t physical_core_id;  // offset 44: hardware physical core ID
-    CoreType core_type;         // offset 48: AIC or AIV
-    uint8_t pad2_[12];          // offset 52: pad to 64 bytes
+    int32_t worker_id;          // offset 48: index in runtime.workers[]
+    uint32_t physical_core_id;  // offset 52: hardware physical core ID
+    CoreType core_type;         // offset 56: AIC or AIV (enum class : int32_t)
+    uint8_t pad2_[4];           // offset 60: pad to 64 bytes
 #endif
 };
 static_assert(sizeof(CoreExecState) == 64, "CoreExecState must occupy exactly one cache line");

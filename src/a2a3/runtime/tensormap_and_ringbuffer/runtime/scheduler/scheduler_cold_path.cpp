@@ -598,6 +598,7 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
         CoreType type = hank->core_type;
 
         core_exec_states_[i].reg_addr = reg_addr;
+        core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
 
 #if PTO2_PROFILING
         // Record physical_core_id for PMU init later (CoreExecState has no room

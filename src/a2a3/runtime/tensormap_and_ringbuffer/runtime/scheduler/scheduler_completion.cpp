@@ -14,6 +14,7 @@
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "common/l2_perf_profiling.h"
+#include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
@@ -214,7 +215,14 @@ void SchedulerContext::check_running_cores_for_completion(
         CoreExecState &core = core_exec_states_[core_id];
 
         // --- Judgment phase: read register, derive transition ---
-        uint64_t reg_val = read_reg(core.reg_addr, RegId::COND);
+        // Use the precomputed cond_ptr (resolved once in handshake) to skip
+        // the reg_offset switch and reg_addr addition on every poll.
+        uint64_t reg_val = static_cast<uint64_t>(*core.cond_ptr);
+        // ARM64 allows Device-nGnRnE -> Normal-cacheable load reorder; the
+        // rmb() pins any AICore-published cacheable reads downstream of the
+        // FIN observation. Replaces the post-`__sync_synchronize` that the
+        // old read_reg() helper carried implicitly.
+        rmb();
         int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
         int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
 

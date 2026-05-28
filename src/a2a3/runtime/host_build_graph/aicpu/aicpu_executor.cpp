@@ -287,6 +287,11 @@ inline bool AicpuExecutor::try_dispatch_task(
     // Set state before writing register to avoid race with AICore ACK
     pending_task_ids_[core_id] = task_id;
 
+    // Publish task data before AICore can observe the dispatched task_id.
+    // ARM64 needs an explicit store-store fence across Normal-cacheable ->
+    // Device-nGnRnE; the old write_reg() helper carried this implicitly via
+    // __sync_synchronize.
+    wmb();
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id));
 
     return true;
@@ -718,6 +723,11 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
             Handshake *h = &hank[core_id];
 
             uint64_t reg_val = read_reg(reg_addr, RegId::COND);
+            // ARM64 allows Device-nGnRnE -> Normal-cacheable load reorder;
+            // the rmb() pins any AICore-published cacheable reads downstream
+            // of the FIN observation. Replaces the post-`__sync_synchronize`
+            // that the old read_reg() helper carried implicitly.
+            rmb();
             int reg_task_id = EXTRACT_TASK_ID(reg_val);
             int reg_state = EXTRACT_TASK_STATE(reg_val);
 

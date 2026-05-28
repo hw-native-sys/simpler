@@ -71,7 +71,24 @@ uint64_t get_platform_pmu_reg_addrs();
 #endif
 
 /**
+ * Resolve a register identifier to its volatile MMIO pointer.
+ *
+ * Callers cache the result for hot-path register access (see scheduler
+ * completion polling).
+ *
+ * @param reg_base_addr  Base address of the AICore's register block
+ * @param reg            Register identifier
+ * @return Volatile pointer to the 32-bit register
+ */
+volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg);
+
+/**
  * Read a register value from an AICore's register block
+ *
+ * No memory barrier is emitted. Callers that read a hand-off bit
+ * written by AICore and then read AICore-published cacheable data
+ * must insert an explicit rmb() between the two loads (ARM64 allows
+ * Device-nGnRnE -> Normal-cacheable load reorder).
  *
  * @param reg_base_addr  Base address of the AICore's register block
  * @param reg            Register identifier (C++ enum class)
@@ -81,6 +98,10 @@ uint64_t read_reg(uint64_t reg_base_addr, RegId reg);
 
 /**
  * Write a value to an AICore's register
+ *
+ * No memory barrier is emitted. Callers publishing cacheable data
+ * that AICore will read after observing this register write must
+ * insert an explicit wmb() before the call.
  *
  * @param reg_base_addr  Base address of the AICore's register block
  * @param reg            Register identifier (C++ enum class)
