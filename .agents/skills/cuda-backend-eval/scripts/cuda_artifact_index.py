@@ -146,6 +146,40 @@ def _read_artifact(path: Path, root: Path) -> dict[str, Any]:
     }
 
 
+def _read_tensor_sweep_artifact(path: Path, root: Path) -> dict[str, Any]:
+    payload = json.loads((path / "cuda-tensor-shape-sweep.json").read_text())
+    metadata = payload.get("metadata", {})
+    results = payload.get("results", [])
+    machines = _sorted_unique({row.get("machine", "unknown") for row in results})
+    if len(machines) > 1:
+        machine = "combined"
+    elif machines:
+        machine = str(machines[0])
+    else:
+        machine = "unknown"
+    sizes = {row.get("n") for row in results if row.get("n") is not None}
+    if "n" in metadata:
+        sizes.add(metadata["n"])
+    shapes = {str(shape) for shape in metadata.get("shapes", [])}
+    shapes.update(str(row["shape"]) for row in results if "shape" in row)
+    shapes.update(_tensor_tile_shapes([payload]))
+    return {
+        "path": str(path.relative_to(root)),
+        "kind": "tensor_sweep",
+        "label": str(metadata.get("label", path.name)),
+        "machine": machine,
+        "git_commit": str(metadata.get("git_commit", "unknown")),
+        "result_count": len(results),
+        "baselines": _sorted_unique({row.get("baseline", "unknown") for row in results}),
+        "sizes": _sorted_unique(sizes),
+        "tensor_tiles": _sorted_unique(shapes),
+        "has_markdown": (path / "cuda-tensor-shape-sweep.md").exists(),
+        "has_svg": (path / "cuda-tensor-shape-sweep.svg").exists(),
+        "has_ratio_svg": False,
+        "has_dag_delta_svg": False,
+    }
+
+
 def _smoke_label(report: str, fallback: str) -> str:
     match = _SMOKE_LABEL_RE.search(report)
     if match:
@@ -209,12 +243,14 @@ def scan_artifacts(root: Path) -> list[dict[str, Any]]:
     if not root.exists():
         return []
     benchmark_dirs = {path.parent for path in root.rglob("cuda-benchmark.json") if path.is_file()}
+    tensor_sweep_dirs = {path.parent for path in root.rglob("cuda-tensor-shape-sweep.json") if path.is_file()}
     smoke_dirs = {
         path.parent
         for path in root.rglob("cuda-smoke-report.md")
-        if path.is_file() and path.parent not in benchmark_dirs
+        if path.is_file() and path.parent not in benchmark_dirs and path.parent not in tensor_sweep_dirs
     }
     entries = [_read_artifact(path, root) for path in benchmark_dirs]
+    entries.extend(_read_tensor_sweep_artifact(path, root) for path in tensor_sweep_dirs)
     entries.extend(_read_smoke_artifact(path, root) for path in smoke_dirs)
     return sorted(entries, key=lambda entry: entry["path"])
 

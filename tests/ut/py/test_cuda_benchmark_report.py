@@ -476,6 +476,65 @@ def test_cuda_artifact_index_records_benchmark_tensor_tiles(tmp_path):
     assert "| combined-tensorflags | benchmark | tensorflags | combined | abc123 | 1 | 64 | 8x4x12 |" in report
 
 
+def test_cuda_artifact_index_scans_tensor_shape_sweep_outputs(tmp_path):
+    cuda_artifact_index = _load_artifact_index_module()
+    artifact_dir = tmp_path / "tensor-shape-sweep-abc123"
+    artifact_dir.mkdir()
+    payload = {
+        "metadata": {
+            "label": "tensor-shape-sweep-abc123",
+            "git_commit": "abc123",
+            "n": 256,
+            "baselines": ["pto_persistent_dag_tensor", "cublas_sgemm"],
+            "shapes": ["16x16x16", "16x16x64"],
+        },
+        "results": [
+            {
+                "artifact": "a100",
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_tensor",
+                "shape": "16x16x16",
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 1},
+            },
+            {
+                "artifact": "h200",
+                "machine": "dasys-h200x8",
+                "baseline": "cublas_sgemm",
+                "shape": "16x16x64",
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 64, "tile_count": 1},
+            },
+        ],
+    }
+    (artifact_dir / "cuda-tensor-shape-sweep.json").write_text(json.dumps(payload) + "\n")
+    (artifact_dir / "cuda-tensor-shape-sweep.md").write_text("# report\n")
+    (artifact_dir / "cuda-tensor-shape-sweep.svg").write_text("<svg></svg>\n")
+
+    entries = cuda_artifact_index.scan_artifacts(tmp_path)
+    report = cuda_artifact_index.render_markdown(entries)
+
+    assert entries == [
+        {
+            "path": "tensor-shape-sweep-abc123",
+            "kind": "tensor_sweep",
+            "label": "tensor-shape-sweep-abc123",
+            "machine": "combined",
+            "git_commit": "abc123",
+            "result_count": 2,
+            "baselines": ["cublas_sgemm", "pto_persistent_dag_tensor"],
+            "sizes": [256],
+            "tensor_tiles": ["16x16x16", "16x16x64"],
+            "has_markdown": True,
+            "has_svg": True,
+            "has_ratio_svg": False,
+            "has_dag_delta_svg": False,
+        }
+    ]
+    assert (
+        "| tensor-shape-sweep-abc123 | tensor_sweep | tensor-shape-sweep-abc123 | "
+        "combined | abc123 | 2 | 256 | 16x16x16, 16x16x64 |"
+    ) in report
+
+
 def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
     cuda_artifact_index = _load_artifact_index_module()
     artifact_dir = tmp_path / "tensor-descriptor-smoke"
