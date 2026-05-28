@@ -407,9 +407,10 @@ For generated-dispatch DAG shapes, the paired runner passes
 `--expected-dispatch` for the known `func_id` sequence. This covers `chain`,
 `fork_join`, `scratch_reuse`, tensor-tile and tensor-core-tile shapes, scalar
 AXPY/scale/affine, triad, quad, unary-square, `generic_args`,
-`graph_descriptor`, `graph_descriptor_reordered`, and `graph_tensor_tile`.
-The validator therefore rejects A100/H200 artifacts that pass numerically
-through a different generated task path.
+`graph_descriptor`, `graph_descriptor_reordered`,
+`graph_descriptor_diamond`, and `graph_tensor_tile`. The validator therefore
+rejects A100/H200 artifacts that pass numerically through a different
+generated task path.
 
 For tensor-tile smokes, the paired runner also passes
 `--expected-tensor-tile ROWSxCOLSxINNER` so the validator rejects artifacts
@@ -444,6 +445,13 @@ graph-descriptor dependencies are inferred from tensor flow across the whole
 descriptor, even when the final consumer task appears before its producers.
 The current capture is under
 `tmp/cuda-backend/persistent-graph_descriptor_reordered-repeat2-smoke-f877b7b3/`.
+Use `--dag-shape graph_descriptor_diamond --repeat-runs 2` to validate an
+explicit runtime graph descriptor with two root producers, two fan-out
+consumers, and one final join. This shape reuses the same generated-dispatch
+task bodies as `graph_descriptor`, but records fan-in `[0,0,2,2,2]`,
+dependents `[2,3,2,3,4,4]`, and dispatch `9,2,1,2,1`. The current capture is
+under
+`tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/`.
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such
 as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.

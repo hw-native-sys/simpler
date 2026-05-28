@@ -2618,6 +2618,44 @@ def test_cuda_pair_persistent_smoke_accepts_reordered_graph_descriptor(tmp_path)
     assert "1,9,2" in validate
 
 
+def test_cuda_pair_persistent_smoke_accepts_diamond_graph_descriptor(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+
+    args = cuda_pair_persistent_smoke.parse_args(
+        [
+            "--dag-shape",
+            "graph_descriptor_diamond",
+            "--repeat-runs",
+            "2",
+            "--sync-remote-tree",
+        ]
+    )
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape=args.dag_shape,
+        repeat_runs=args.repeat_runs,
+        sync_remote_tree=args.sync_remote_tree,
+        refresh_remote=not args.skip_remote_refresh and not args.sync_remote_tree,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
+
+    assert "persistent-graph_descriptor_diamond-repeat2-smoke-abc123" in str(local)
+    assert "graph_descriptor_diamond" in local
+    assert "--dag-shape graph_descriptor_diamond" in remote[-1]
+    assert "persistent-graph_descriptor_diamond-repeat2-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-completed-count" in validate
+    assert "5" in validate
+    assert "--expected-dispatch" in validate
+    assert "9,2,1,2,1" in validate
+
+
 def test_cuda_pair_persistent_smoke_builds_scalar_affine_workflow(tmp_path):
     cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
     config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
@@ -3518,6 +3556,38 @@ def test_unary_square_dag_shape_uses_single_input_task_body():
     assert tasks[1].b == 102
     assert tasks[2].a == 202
     assert tasks[2].b == 101
+
+
+def test_diamond_graph_descriptor_dag_shape_fans_out_to_two_consumers():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    host_fanin, dependents, tasks = cuda_persistent_smoke._make_dag_shape(
+        "graph_descriptor_diamond",
+        64,
+        101,
+        102,
+        201,
+        202,
+        203,
+        204,
+        301,
+    )
+
+    assert list(host_fanin) == [0, 0, 2, 2, 2]
+    assert list(dependents) == [2, 3, 2, 3, 4, 4]
+    assert [task.func_id for task in tasks] == [9, 2, 1, 2, 1]
+    assert [task.dependent_count for task in tasks] == [2, 2, 1, 1, 0]
+    assert tasks[0].out == 202
+    assert tasks[1].out == 203
+    assert tasks[2].a == 202
+    assert tasks[2].b == 203
+    assert tasks[2].out == 201
+    assert tasks[3].a == 202
+    assert tasks[3].b == 203
+    assert tasks[3].out == 204
+    assert tasks[4].a == 201
+    assert tasks[4].b == 204
+    assert tasks[4].out == 301
 
 
 def test_bad_no_root_dag_shape_has_no_initial_ready_tasks():

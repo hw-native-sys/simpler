@@ -1672,6 +1672,73 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                 ),
             ),
         )
+    if dag_shape == "graph_descriptor_diamond":
+        task_count = 5
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 6
+        task_t = CudaPersistentDagTask * task_count
+        tensor_args_t = ctypes.c_void_p * 4
+        scalar_args_t = ctypes.c_float * 4
+        return (
+            host_fanin_t(0, 0, 2, 2, 2),
+            dependents_t(2, 3, 2, 3, 4, 4),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=9,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp1,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=2,
+                    initial_fanin=0,
+                    tensor_args=tensor_args_t(dev_tmp0, dev_tmp3, 0, 0),
+                    scalar_args=scalar_args_t(1.5, 0.25, 0.0, 0.0),
+                    tensor_arg_count=2,
+                    scalar_arg_count=2,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp2,
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=2,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp1,
+                    b=dev_tmp2,
+                    out=dev_tmp0,
+                    n=n,
+                    dependent_begin=4,
+                    dependent_count=1,
+                    initial_fanin=2,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=dev_tmp1,
+                    b=dev_tmp2,
+                    out=dev_tmp3,
+                    n=n,
+                    dependent_begin=5,
+                    dependent_count=1,
+                    initial_fanin=2,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp0,
+                    b=dev_tmp3,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=6,
+                    dependent_count=0,
+                    initial_fanin=2,
+                ),
+            ),
+        )
     if dag_shape in {"generic_args", "graph_descriptor"}:
         task_count = 3
         host_fanin_t = ctypes.c_uint32 * task_count
@@ -2072,15 +2139,25 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
     else:
         host_a = array_a_t(*[float(i) for i in range(a_len)])
         host_b = array_b_t(*[float(2 * i) for i in range(b_len)])
-    if config.dag_shape in {"triad", "quad", "generic_args", "graph_descriptor", "graph_descriptor_reordered"}:
-        host_tmp0 = array_t(*[float(3 * i) for i in range(output_len)])
+    graph_arg_shapes = {
+        "generic_args",
+        "graph_descriptor",
+        "graph_descriptor_diamond",
+        "graph_descriptor_reordered",
+    }
+    if config.dag_shape in {"triad", "quad", *graph_arg_shapes}:
+        host_tmp0_seed = array_t(*[float(3 * i) for i in range(output_len)])
+        host_tmp0 = array_t(*host_tmp0_seed)
     else:
+        host_tmp0_seed = None
         host_tmp0 = array_t()
     host_tmp1 = array_t()
     host_tmp2 = array_t()
-    if config.dag_shape in {"quad", "generic_args", "graph_descriptor", "graph_descriptor_reordered"}:
-        host_tmp3 = array_t(*[float(4 * i) for i in range(output_len)])
+    if config.dag_shape in {"quad", *graph_arg_shapes}:
+        host_tmp3_seed = array_t(*[float(4 * i) for i in range(output_len)])
+        host_tmp3 = array_t(*host_tmp3_seed)
     else:
+        host_tmp3_seed = None
         host_tmp3 = array_t()
     host_out = array_t()
     a_nbytes = ctypes.sizeof(host_a)
@@ -2184,12 +2261,14 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 (dev_tmp2, ctypes.byref(zero_output), output_nbytes, "tmp2"),
                 (dev_out, ctypes.byref(zero_output), output_nbytes, "out"),
             ]
-            if config.dag_shape in {"triad", "quad", "generic_args", "graph_descriptor", "graph_descriptor_reordered"}:
-                reset_copies.append((dev_tmp0, ctypes.byref(host_tmp0), output_nbytes, "tmp0/c"))
+            if config.dag_shape in {"triad", "quad", *graph_arg_shapes}:
+                reset_tmp0 = host_tmp0_seed if host_tmp0_seed is not None else host_tmp0
+                reset_copies.append((dev_tmp0, ctypes.byref(reset_tmp0), output_nbytes, "tmp0/c"))
             else:
                 reset_copies.append((dev_tmp0, ctypes.byref(zero_output), output_nbytes, "tmp0"))
-            if config.dag_shape in {"quad", "generic_args", "graph_descriptor", "graph_descriptor_reordered"}:
-                reset_copies.append((dev_tmp3, ctypes.byref(host_tmp3), output_nbytes, "tmp3/d"))
+            if config.dag_shape in {"quad", *graph_arg_shapes}:
+                reset_tmp3 = host_tmp3_seed if host_tmp3_seed is not None else host_tmp3
+                reset_copies.append((dev_tmp3, ctypes.byref(reset_tmp3), output_nbytes, "tmp3/d"))
             else:
                 reset_copies.append((dev_tmp3, ctypes.byref(zero_output), output_nbytes, "tmp3"))
             for dst, src, size, label in reset_copies:
@@ -2297,7 +2376,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 ]
                 expected_tmp2 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
-            if config.dag_shape in {"generic_args", "graph_descriptor", "graph_descriptor_reordered"}:
+            if config.dag_shape in graph_arg_shapes:
                 expected_tmp0 = [_f32(3 * i) for i in range(n)]
                 expected_tmp3 = [_f32(4 * i) for i in range(n)]
                 expected_tmp1 = [
@@ -2306,6 +2385,10 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 ]
                 expected_tmp2 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
+                if config.dag_shape == "graph_descriptor_diamond":
+                    expected_tmp0 = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
+                    expected_tmp3 = [_f32(expected_tmp1[i] * expected_tmp2[i]) for i in range(n)]
+                    expected_out = [_f32(expected_tmp0[i] + expected_tmp3[i]) for i in range(n)]
             if config.dag_shape == "unary_square":
                 expected_tmp0 = [_f32(host_a[i] * host_a[i]) for i in range(n)]
                 expected_tmp1 = [_f32(expected_tmp0[i] + host_b[i]) for i in range(n)]
@@ -2333,14 +2416,14 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                     "quad",
                     "generic_args",
                     "graph_descriptor",
+                    "graph_descriptor_diamond",
                     "graph_descriptor_reordered",
                 }
                 and list(host_tmp2) != expected_tmp2
             ):
                 raise RuntimeError(f"dag tmp2 mismatch on launch {launch_idx}")
             if (
-                config.dag_shape
-                in {"chain", "scratch_reuse", "quad", "generic_args", "graph_descriptor", "graph_descriptor_reordered"}
+                config.dag_shape in {"chain", "scratch_reuse", "quad", *graph_arg_shapes}
                 and list(host_tmp3) != expected_tmp3
             ):
                 raise RuntimeError(f"dag tmp3 mismatch on launch {launch_idx}")
@@ -2422,7 +2505,12 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             }
             result["tensor_args"] = {"tensor_args[0]": "tmp0", "tensor_args[1]": "tmp3"}
             result["scalar_args"] = {"scalar_args[0]": 1.5, "scalar_args[1]": 0.25}
-        if config.dag_shape in {"graph_descriptor", "graph_descriptor_reordered", "graph_tensor_tile"}:
+        if config.dag_shape in {
+            "graph_descriptor",
+            "graph_descriptor_diamond",
+            "graph_descriptor_reordered",
+            "graph_tensor_tile",
+        }:
             result["graph_descriptor"] = {
                 "tasks": task_count,
                 "dependents": [int(value) for value in dependents],
@@ -2510,6 +2598,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "fork_join",
         "generic_args",
         "graph_descriptor",
+        "graph_descriptor_diamond",
         "graph_descriptor_reordered",
         "graph_tensor_tile",
         "quad",
@@ -2552,7 +2641,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         raise RuntimeError("quad DAG shape requires nvcc-built generated-dispatch PTX")
     if (
         mode == "dag"
-        and dag_shape in {"generic_args", "graph_descriptor", "graph_descriptor_reordered"}
+        and dag_shape in {"generic_args", "graph_descriptor", "graph_descriptor_diamond", "graph_descriptor_reordered"}
         and ptx_source.startswith("embedded-")
     ):
         raise RuntimeError(f"{dag_shape} DAG shape requires nvcc-built generated-dispatch PTX")
@@ -2748,6 +2837,7 @@ def main() -> None:
             "fork_join",
             "generic_args",
             "graph_descriptor",
+            "graph_descriptor_diamond",
             "graph_descriptor_reordered",
             "graph_tensor_tile",
             "quad",

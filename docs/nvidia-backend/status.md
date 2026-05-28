@@ -1936,6 +1936,32 @@ errors, and generated report files. A100 reported per-launch device times
 H200 reported per-launch device times `[25632,20608]`, total
 `device_wall_ns=46240`, and `host_wall_ns=63520`.
 
+The diamond graph descriptor was then captured through the same paired smoke
+runner:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_diamond --task-count 5 \
+    --queue-capacity 3 --repeat-runs 2 --sync-remote-tree
+```
+
+Result:
+`tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/`
+contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The validator required
+`runtime=persistent_device`, `mode=dag`,
+`dag_shape=graph_descriptor_diamond`, `repeat_runs=2`,
+`launch_completed_counts=[5,5]`, `dispatch_func_ids=[9,2,1,2,1]`,
+`graph_descriptor.fanin=[0,0,2,2,2]`,
+`graph_descriptor.dependents=[2,3,2,3,4,4]`, zero scheduler errors, and
+generated report files. A100 reported per-launch device times
+`[49152,31744]`, total `device_wall_ns=80896`, and
+`host_wall_ns=111293`. H200 reported per-launch device times
+`[24096,23520]`, total `device_wall_ns=47616`, and
+`host_wall_ns=4912047`.
+
 Needed:
 
 - broader CUDA scene-test argument builders beyond the current binary
@@ -2024,7 +2050,8 @@ Needed:
 - graph construction from normal PTO task graphs;
 - broader graph-lowering coverage beyond the current
   `persistent_dag_graph_f32` descriptor adapter, automatic default temporary
-  allocation, and order-independent tensor-flow dependency-inference mode;
+  allocation, order-independent tensor-flow dependency-inference mode, and
+  five-task fan-out/fan-in graph descriptor smoke;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, and direct/queue/DAG
   prepared-callable repeat-run smokes. The paired lifecycle matrix runner now

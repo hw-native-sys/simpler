@@ -61,6 +61,10 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/persistent-graph_descriptor_reordered-repeat2-smoke-f877b7b3/h200.json`
 - `tmp/cuda-backend/persistent-graph_descriptor_reordered-repeat2-smoke-f877b7b3/cuda-smoke-report.md`
 - `tmp/cuda-backend/persistent-graph_descriptor_reordered-repeat2-smoke-f877b7b3/cuda-smoke-report.svg`
+- `tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/a100.json`
+- `tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/h200.json`
+- `tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/cuda-smoke-report.md`
+- `tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/cuda-smoke-report.svg`
 
 ## Current-Head Compact Paired Gate
 
@@ -225,6 +229,38 @@ PYTHONPATH=$PWD:$PWD/python \
 Both rows reported zero device scheduler errors and generated Markdown/SVG
 smoke reports. This is correctness evidence for graph lowering; the task body
 and arithmetic are the same as the generic-args graph descriptor.
+
+The diamond graph-descriptor paired smoke at artifact label `072e396c`
+validates a wider explicit descriptor shape than the three-task
+graph-descriptor and reordered-graph smokes. It has two root producers, two
+fan-out consumers, and one final join:
+`graph_descriptor.fanin=[0,0,2,2,2]`,
+`graph_descriptor.dependents=[2,3,2,3,4,4]`, and dispatch `9,2,1,2,1`.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py \
+    tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/a100.json \
+    tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/h200.json \
+    --require-artifact a100 --require-artifact h200 \
+    --expected-runtime persistent_device --expected-mode dag \
+    --expected-dag-shape graph_descriptor_diamond \
+    --expected-repeat-runs 2 --expected-completed-count 5 \
+    --expected-dispatch 9,2,1,2,1 --require-report-files
+```
+
+| GPU | Dispatch | Fan-in | Dependents | Launch completions | Device ns | Host ns | Status |
+| --- | -------- | ------ | ---------- | ------------------ | --------- | ------- | ------ |
+| A100 | `9,2,1,2,1` | `0,0,2,2,2` | `2,3,2,3,4,4` | `5,5` | 80896 | 111293 | pass |
+| H200 | `9,2,1,2,1` | `0,0,2,2,2` | `2,3,2,3,4,4` | `5,5` | 47616 | 4912047 | pass |
+
+The first paired run exposed a repeat-run reset bug because `tmp0` and
+`tmp3` are both input descriptor tensors and later scratch outputs in this
+shape. The fixed smoke keeps immutable seed buffers for launch reset, then
+the paired validator accepted both A100 and H200 rows with zero scheduler
+errors.
 
 ## Launch Baselines
 
