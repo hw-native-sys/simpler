@@ -273,8 +273,9 @@ library path.
 `cuda_validate_tensor_sweep.py` checked the expected A100/H200 rows,
 baselines, sizes, shape, three repeats, report files, and PTO dispatch
 sequences before the numbers were copied into docs. New tensor-sweep captures
-can also require sanitized local/remote command examples before publishing
-with `--require-command-examples`.
+can also require sanitized local/remote command examples and source-paper
+metadata before publishing with `--require-command-examples` and
+`--require-source-papers`.
 
 A current-HEAD one-repeat compact tensor sweep at commit `a5fd4bfd` validated
 that gate against real local A100 and remote H200 data. The artifact under
@@ -282,7 +283,7 @@ that gate against real local A100 and remote H200 data. The artifact under
 sample, remote sample, and remote tree-sync commands in generated Markdown and
 JSON. The validation required A100/H200 rows, scalar tensor DAG, WMMA tensor
 DAG, cuBLAS SGEMM, `N=256`, `16x16x16`, report files, command examples, and
-PTO dispatch sequences.
+source-paper metadata, and PTO dispatch sequences.
 
 Evidence:
 

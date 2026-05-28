@@ -929,6 +929,56 @@ def test_cuda_tensor_sweep_validator_requires_sanitized_command_examples():
     )
 
 
+def test_cuda_tensor_sweep_validator_requires_source_papers():
+    cuda_validate_tensor_sweep = _load_tensor_sweep_validator_module()
+    payload = _tensor_sweep_payload()
+
+    errors = cuda_validate_tensor_sweep.validate_tensor_sweep(
+        payload,
+        require_source_papers=True,
+    )
+
+    assert "missing metadata.paper_setup" in errors
+    assert "missing metadata.source_papers arXiv:2605.03190" in errors
+    assert "missing metadata.source_papers arXiv:2512.22219v1" in errors
+
+    payload["metadata"]["paper_setup"] = "paired A100/H200 tensor sweep"
+    payload["metadata"]["source_papers"] = [
+        {
+            "id": "arXiv:2605.03190",
+            "label": "VDCores",
+            "path": "/home/user/private.pdf",
+        },
+        {
+            "id": "arXiv:2512.22219v1",
+            "label": "MPK persistent kernel",
+            "path": "tmp/sources/arxiv-2512.22219v1-mirage-persistent-kernel.txt",
+        },
+    ]
+
+    errors = cuda_validate_tensor_sweep.validate_tensor_sweep(
+        payload,
+        require_source_papers=True,
+    )
+
+    assert (
+        "metadata.source_papers arXiv:2605.03190 path must stay under tmp/sources/"
+        in errors
+    )
+
+    payload["metadata"]["source_papers"][0]["path"] = (
+        "tmp/sources/arxiv-2605.03190-vdcores.txt"
+    )
+
+    assert (
+        cuda_validate_tensor_sweep.validate_tensor_sweep(
+            payload,
+            require_source_papers=True,
+        )
+        == []
+    )
+
+
 def test_cuda_tensor_sweep_validator_requires_each_size():
     cuda_validate_tensor_sweep = _load_tensor_sweep_validator_module()
     payload = _tensor_sweep_payload()

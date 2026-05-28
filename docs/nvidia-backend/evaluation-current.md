@@ -198,8 +198,8 @@ A follow-up one-repeat compact tensor sweep at commit `a5fd4bfd` validates the
 current report-generation and metadata gate after the tensor-sweep scripts
 started recording sanitized command examples. The artifact is under
 `tmp/cuda-backend/tensor-shape-sweep-a5fd4bfd/` and was validated with
-`--require-command-examples`, required A100/H200 rows, required report files,
-and PTO dispatch sequences.
+`--require-command-examples`, `--require-source-papers`, required A100/H200
+rows, required report files, and PTO dispatch sequences.
 
 | GPU | N | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns |
 | --- | - | ----- | ---------------- | -------------- | --------- |

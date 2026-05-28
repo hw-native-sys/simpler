@@ -37,6 +37,7 @@ COMPACT_TENSOR_BASELINE_DISPATCH = {
     "pto_persistent_dag_tensor": "3,1,2,1",
     "pto_persistent_dag_tensor_core": "10,1,2,1",
 }
+REQUIRED_SOURCE_PAPER_IDS = ("arXiv:2605.03190", "arXiv:2512.22219v1")
 REPORT_FILES = (
     "cuda-tensor-shape-sweep.json",
     "cuda-tensor-shape-sweep.md",
@@ -220,6 +221,48 @@ def _validate_command_examples(payload: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _validate_source_papers(payload: dict[str, Any]) -> list[str]:
+    metadata = payload.get("metadata")
+    paper_setup = (
+        metadata.get("paper_setup")
+        if isinstance(metadata, dict)
+        else None
+    )
+    source_papers = (
+        metadata.get("source_papers")
+        if isinstance(metadata, dict)
+        else None
+    )
+    errors: list[str] = []
+    if not isinstance(paper_setup, str) or not paper_setup:
+        errors.append("missing metadata.paper_setup")
+    if not isinstance(source_papers, list):
+        return [
+            *errors,
+            *[
+                f"missing metadata.source_papers {paper_id}"
+                for paper_id in REQUIRED_SOURCE_PAPER_IDS
+            ],
+        ]
+
+    papers_by_id = {
+        paper.get("id"): paper
+        for paper in source_papers
+        if isinstance(paper, dict) and paper.get("id") is not None
+    }
+    for paper_id in REQUIRED_SOURCE_PAPER_IDS:
+        paper = papers_by_id.get(paper_id)
+        if not isinstance(paper, dict):
+            errors.append(f"missing metadata.source_papers {paper_id}")
+            continue
+        path = paper.get("path")
+        if not isinstance(path, str) or not path.startswith("tmp/sources/"):
+            errors.append(
+                f"metadata.source_papers {paper_id} path must stay under tmp/sources/"
+            )
+    return errors
+
+
 def validate_tensor_sweep(
     payload: dict[str, Any],
     *,
@@ -233,6 +276,7 @@ def validate_tensor_sweep(
     required_dispatch: dict[str, str] | None = None,
     require_report_files: bool = False,
     require_command_examples: bool = False,
+    require_source_papers: bool = False,
 ) -> list[str]:
     rows = _results(payload)
     errors: list[str] = []
@@ -262,6 +306,9 @@ def validate_tensor_sweep(
 
     if require_command_examples:
         errors.extend(_validate_command_examples(payload))
+
+    if require_source_papers:
+        errors.extend(_validate_source_papers(payload))
 
     return errors
 
@@ -311,6 +358,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-dispatch", action="append")
     parser.add_argument("--require-report-files", action="store_true")
     parser.add_argument("--require-command-examples", action="store_true")
+    parser.add_argument("--require-source-papers", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -335,6 +383,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         required_dispatch=required_dispatch,
         require_report_files=args.require_report_files,
         require_command_examples=args.require_command_examples,
+        require_source_papers=args.require_source_papers,
     )
     if errors:
         for error in errors:
