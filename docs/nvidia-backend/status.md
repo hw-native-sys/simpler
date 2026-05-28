@@ -92,6 +92,8 @@ execution modes:
 - five-task DAG-chain runtime graph descriptor;
 - six-task scratch-reuse DAG descriptor;
 - tensor-tile DAG descriptor with rows/cols/inner/stride metadata;
+- tensor-core tile DAG descriptor with a block-wide CUDA WMMA
+  `m16n16k8`/TF32/F32 generated-dispatch task body;
 - scalar-argument DAG descriptors for mixed tensor/scalar AXPY-style and
   two-scalar affine task bodies.
 - third tensor-argument DAG descriptor for a generated-dispatch triad task
@@ -217,6 +219,16 @@ were `128`, `16`, and `8`, respectively. The raw JSON, Markdown, and SVG
 artifacts are under `tmp/cuda-backend/tensor-shape-sweep-c0ada3ad/`. This is
 still scalar tiled GEMM scheduler evidence, not tensor-core throughput.
 
+The first tensor-core persistent DAG smoke at commit `390eda4f` runs
+`tensor_core_tile` on local A100 and remote H200 with a `16x16x16` descriptor.
+The generated dispatch sequence is `[10,1,2,1]`; func_id `10` is a block-wide
+WMMA `m16n16k8` task body with TF32 inputs and F32 accumulation. The paired
+runner validated both artifacts with zero scheduler errors, tensor descriptor
+`16x16x16`, `completed_count=4`, and generated Markdown/SVG report files under
+`tmp/cuda-backend/persistent-tensor_core_tile-16x16x16-smoke-390eda4f/`.
+This is callable and scheduler evidence for tensor-core task bodies, not a
+tuned throughput result.
+
 Evidence:
 
 - [evaluation.md](evaluation.md) is the evaluation landing page.
@@ -228,8 +240,8 @@ Evidence:
 - `.agents/skills/cuda-backend-eval/scripts/cuda_smoke_report.py` writes
   compact smoke Markdown and SVG reports, including persistent-device dispatch
   `func_id` sequences, device scheduler error counters, repeat-run lifecycle
-  counters, and resource-policy metadata plus scalar and tensor task
-  arguments when present.
+  counters, resource-policy metadata, tensor-core metadata, and scalar and
+  tensor task arguments when present.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py` automates
   the local A100 run, remote H200 run, artifact copy, merge, and index refresh.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py` automates the
@@ -1470,12 +1482,16 @@ Needed:
 The tensor DAG row validates descriptor metadata and generated dispatch, but
 the GEMM body is a scalar microbenchmark rather than a tuned tensor-core
 kernel. The first paired tensor-shape sweep now covers `8x4x12`,
-`16x16x64`, and `32x16x64` descriptors on A100 and H200, so the remaining
-gap is tuned tensor execution rather than descriptor-shape plumbing.
+`16x16x64`, and `32x16x64` descriptors on A100 and H200. The first
+`tensor_core_tile` smoke also validates a block-wide WMMA generated-dispatch
+task body on both GPUs. The remaining gap is tuned tensor execution and
+comparative throughput, not descriptor-shape or first tensor-core callable
+plumbing.
 
 Needed:
 
-- tensor-core or library-backed callable body experiments;
+- tensor-core or library-backed callable body tuning beyond the current
+  single-tile WMMA smoke;
 - broader model-kernel shape families once the tensor-core/library path
   exists;
 - evaluation rows that distinguish scheduler overhead from compute throughput.

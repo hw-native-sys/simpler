@@ -159,6 +159,27 @@ to three descriptor families that are closer to model-kernel tile shapes. The
 kernel body is still scalar tiled GEMM followed by elementwise residual/gate
 work, so the result should not be read as tensor-core throughput.
 
+## Tensor-Core Callable Smoke
+
+The first tensor-core persistent DAG smoke was captured at commit `390eda4f`.
+It adds a block-wide generated-dispatch task body using CUDA WMMA
+`m16n16k8` with TF32 inputs and F32 accumulation. The task runs before the
+same residual, gate, and fan-in elementwise tasks used by `tensor_tile`, so
+this validates callable shape and scheduler integration rather than tuned GEMM
+throughput.
+
+Artifact:
+`tmp/cuda-backend/persistent-tensor_core_tile-16x16x16-smoke-390eda4f/`
+
+| GPU | Shape | Tensor core | Dispatch | Device ns | Host ns | Status |
+| --- | ----- | ----------- | -------- | --------- | ------- | ------ |
+| A100 | 16x16x16 | `wmma:m16n16k8:tf32->f32` | `10,1,2,1` | 46080 | 65963 | pass |
+| H200 | 16x16x16 | `wmma:m16n16k8:tf32->f32` | `10,1,2,1` | 31808 | 41308 | pass |
+
+Both rows report zero device scheduler errors, `completed_count=4`, and
+target-specific `nvcc` PTX (`compute_80` on A100, `compute_90` on H200). The
+generated Markdown/SVG report is in the artifact directory.
+
 ## Reproduction Commands
 
 Local A100:
@@ -188,6 +209,16 @@ Tensor shape sweep:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_tensor_shape_sweep.py \
     --shapes 8x4x12,16x16x64,32x16x64 --n 4096 --repeats 2 \
+    --sync-remote-tree
+```
+
+Tensor-core smoke:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape tensor_core_tile --task-count 4 --queue-capacity 2 \
+    --n 256 --tensor-rows 16 --tensor-cols 16 --tensor-inner 16 \
     --sync-remote-tree
 ```
 
