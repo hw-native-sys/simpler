@@ -1527,6 +1527,47 @@ Result: local A100 reported `2 passed, 48 deselected`; remote H200 reported
 full local CUDA scene-test file was also rerun after this adapter and reported
 `50 passed`.
 
+The same scalar-scale task body was promoted to the no-torch standalone
+persistent DAG smoke so it can be captured without the full scene-test
+framework. The smoke uses generated-dispatch `func_id` sequence `[11,2,1]`,
+with the first task computing `tmp0 = scalar0 * a`, an independent multiply
+branch computing `tmp1 = a * b`, and the final task adding both branches.
+Focused local coverage:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_benchmark_report.py \
+    -q -k 'scalar_scale' --platform cuda
+
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest \
+    tests/ut/py/test_cuda_backend.py::test_cuda_persistent_device_smoke_runs_dispatch_dag_scalar_scale \
+    -q --platform cuda
+```
+
+Results: `2 passed, 146 deselected` for the shape/paired-runner unit tests,
+and `1 passed` for the local A100 real-data CUDA smoke.
+
+The paired A100/H200 smoke was then captured with a tree sync:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape scalar_scale --task-count 3 --queue-capacity 2 \
+    --sync-remote-tree
+```
+
+Result:
+`tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/` contains
+`a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The paired runner validated both artifacts with
+`runtime=persistent_device`, `mode=dag`, `dag_shape=scalar_scale`,
+`completed_count=3`, `dispatch_func_ids=[11,2,1]`, `scalar0=2.0`, zero
+scheduler errors, and generated report files. The A100 row reported
+`device_wall_ns=40960` and `host_wall_ns=61301`; H200 reported
+`device_wall_ns=25856` and `host_wall_ns=34808`.
+
 The same real-data ctypes graph test was run on the remote H200 after syncing
 the working tree:
 

@@ -56,6 +56,7 @@ committed:
 - `tmp/cuda-backend/h200-current-d361006f/`
 - `tmp/cuda-backend/combined-current-d361006f/`
 - `tmp/cuda-backend/persistent-scalar_affine-smoke-469f55cd/`
+- `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/`
 - `tmp/cuda-backend/worker-square-smoke-4cdde399/`
 - `tmp/cuda-backend/worker-quad-smoke-4327698e/`
 - `tmp/cuda-backend/worker-mul-smoke-output-json/`

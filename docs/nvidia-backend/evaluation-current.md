@@ -40,6 +40,10 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark.svg`
 - `tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/a100.json`
+- `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/h200.json`
+- `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/cuda-smoke-report.md`
+- `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/cuda-smoke-report.svg`
 
 ## Current-Head Compact Paired Gate
 
@@ -76,6 +80,37 @@ than the full `61cf96cd` capture and should not replace the three-size,
 three-repeat rows below for broad trend reading. The `0b3c1699` gate was
 captured after adding scheduler no-progress diagnostics; all PTO persistent
 DAG rows reported zero device scheduler errors.
+
+## Supplemental Scalar-Scale Smoke
+
+The scalar-scale persistent DAG smoke at artifact label `e9c9f5f2` validates a
+single-input scalar task descriptor outside the scene-test framework. It uses
+dispatch sequence `[11,2,1]`: scale `tmp0 = scalar0 * a`, multiply
+`tmp1 = a * b`, then add `out = tmp0 + tmp1`.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py \
+    tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/a100.json \
+    tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/h200.json \
+    --require-artifact a100 --require-artifact h200 \
+    --expected-runtime persistent_device --expected-mode dag \
+    --expected-repeat-runs 1 --expected-completed-count 3 \
+    --require-report-files --expected-dag-shape scalar_scale \
+    --expected-dispatch 11,2,1
+```
+
+| GPU | PTX arch | Dispatch | Scalar args | Device ns | Host ns | Status |
+| --- | -------- | -------- | ----------- | --------- | ------- | ------ |
+| A100 | `compute_80` | `11,2,1` | `scalar0=2.0` | 40960 | 61301 | pass |
+| H200 | `compute_90` | `11,2,1` | `scalar0=2.0` | 25856 | 34808 | pass |
+
+Both rows reported zero device scheduler errors and generated Markdown/SVG
+smoke reports. This capture is correctness evidence for the single-input
+scalar descriptor and generated-dispatch registration, not a benchmark
+replacement for the multi-baseline captures.
 
 ## Launch Baselines
 

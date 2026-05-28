@@ -215,6 +215,18 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode dag --queue-capacity 2 --dag-shape scalar_axpy
 ```
 
+Use `--dag-shape scalar_scale` to validate the single-input scalar persistent
+DAG task descriptor. The first DAG task reads `scalar0` and computes
+`out = scalar0 * a` before downstream generated-dispatch tasks consume its
+output.
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
+    --device 0 --task-count 3 --n 4096 --arch compute_80 \
+    --mode dag --queue-capacity 2 --dag-shape scalar_scale
+```
+
 Use `--dag-shape scalar_affine` to validate two scalar fields in the
 persistent DAG task descriptor. The first DAG task reads `scalar0` and
 `scalar1` and computes `out = scalar0 * a + scalar1 * b` before downstream
@@ -386,6 +398,8 @@ includes a nested `generic_args` summary showing the indexed generic tensor
 and scalar slots used by the task descriptor.
 The current two-scalar descriptor capture is under
 `tmp/cuda-backend/persistent-scalar_affine-smoke-469f55cd/`.
+The current single-input scalar-scale descriptor capture is under
+`tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/`.
 The current third-tensor descriptor capture is under
 `tmp/cuda-backend/persistent-triad-smoke-3a3bcdb1/`.
 The current generic-argument descriptor capture is under

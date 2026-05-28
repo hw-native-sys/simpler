@@ -261,6 +261,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         return None
     return {
         "graph_descriptor": "9,2,1",
+        "scalar_scale": "11,2,1",
         "tensor_core_tile": "10,1,2,1",
     }.get(config.dag_shape)
 
@@ -374,6 +375,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "quad",
             "scalar_affine",
             "scalar_axpy",
+            "scalar_scale",
             "scratch_reuse",
             "tensor_core_tile",
             "tensor_tile",
