@@ -9,11 +9,12 @@ local A100 runs, and remote H200 runs.
 ## Current Evidence
 
 The latest full paired A100/H200 benchmark capture was taken at commit
-`61cf96cd`. Supplemental tensor-shape and tensor-core captures were taken at
-commits `c0ada3ad` and `0879aa9e`. The first cuBLAS library baseline capture
-uses the `343924df` artifact label. The first multi-baseline tensor shape
-sweep used the `6f9a0b78` artifact label, and the latest multi-size tensor
-baseline sweep uses `e79edba2`:
+`61cf96cd`, and the latest compact current-head paired gate was taken at
+commit `f0f43b2a`. Supplemental tensor-shape and tensor-core captures were
+taken at commits `c0ada3ad` and `0879aa9e`. The first cuBLAS library baseline
+capture uses the `343924df` artifact label. The first multi-baseline tensor
+shape sweep used the `6f9a0b78` artifact label, and the latest multi-size
+tensor baseline sweep uses `e79edba2`:
 
 - [Current capture](evaluation-current.md) summarizes the latest
   `8x4x12` tensor-descriptor sweep, selected baselines, host-schedule unary
@@ -27,6 +28,10 @@ baseline sweep uses `e79edba2`:
   size sweep comparing scalar tensor DAG, WMMA tensor-core DAG, and cuBLAS
   SGEMM rows for a `16x16x16` descriptor at `N=256`, `4096`, and `65536`,
   with three samples per GPU/size/baseline.
+- [Current capture](evaluation-current.md) records the compact `f0f43b2a`
+  paired gate that validates the default `16x16x16` tensor descriptor with
+  scalar tensor DAG, WMMA tensor-core DAG, and cuBLAS rows in one current-head
+  A100/H200 report.
 - [Current capture](evaluation-current.md) records the first selected
   benchmark row for `pto_persistent_dag_tensor_core`, a WMMA
   `m16n16k8` TF32/F32 generated-dispatch task followed by the same residual,
@@ -44,6 +49,9 @@ committed:
 - `tmp/cuda-backend/a100-current-61cf96cd/`
 - `tmp/cuda-backend/h200-current-61cf96cd/`
 - `tmp/cuda-backend/combined-current-61cf96cd/`
+- `tmp/cuda-backend/a100-current-f0f43b2a/`
+- `tmp/cuda-backend/h200-current-f0f43b2a/`
+- `tmp/cuda-backend/combined-current-f0f43b2a/`
 - `tmp/cuda-backend/persistent-scalar_affine-smoke-469f55cd/`
 - `tmp/cuda-backend/worker-square-smoke-4cdde399/`
 - `tmp/cuda-backend/worker-quad-smoke-4327698e/`
@@ -212,17 +220,20 @@ Validate the current paired capture before copying numbers into
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark.json \
-    --preset paired-current
+    tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark.json \
+    --require-size 1024 --expected-repeats 1 --expected-result-count 50 \
+    --require-baseline pto_persistent_dag_tensor_core \
+    --require-baseline cublas_sgemm --require-report-files \
+    --require-command-examples --require-source-papers
 ```
 
-The current paired benchmark shape uses:
+The default full paired benchmark shape uses:
 
 - sizes: `1024,65536,1048576`
 - repeats: `3`
 - batch tasks: `2,6,12`
 - worker blocks per task: `32,64,128,256`
-- tensor descriptor: `8x4x12`
+- tensor descriptor: `16x16x16`
 - local A100 PTX arch: `compute_80`
 - remote H200 PTX arch: `compute_90`
 

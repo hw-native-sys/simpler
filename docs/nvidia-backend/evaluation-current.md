@@ -1,7 +1,8 @@
 # CUDA Current Evaluation Capture
 
-This page summarizes the current paired A100/H200 CUDA backend capture from
-commit `61cf96cd`. The raw JSON, Markdown, and SVG reports are generated
+This page summarizes the latest full paired A100/H200 CUDA backend capture
+from commit `61cf96cd`, plus the current-head compact validation capture from
+commit `f0f43b2a`. The raw JSON, Markdown, and SVG reports are generated
 locally under `tmp/cuda-backend/` and intentionally remain uncommitted.
 
 The capture uses `nvcc` for target-specific PTX on both machines:
@@ -25,6 +26,43 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark.svg`
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark.json`
+- `tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark-ratios.svg`
+
+## Current-Head Compact Paired Gate
+
+The compact current-head paired gate at commit `f0f43b2a` uses a
+WMMA-compatible `16x16x16` tensor descriptor, `N=1024`, one repeat,
+`batch_tasks=2`, and `worker_blocks_per_task=4`. The paired runner synced the
+local tree to `bizhaoh200`, captured A100 and H200 reports, merged them, and
+validated the combined JSON with required baselines, source-paper provenance,
+sanitized command examples, and generated report files.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark.json \
+    --require-size 1024 --expected-repeats 1 --expected-result-count 50 \
+    --require-baseline pto_persistent_dag_tensor_core \
+    --require-baseline cublas_sgemm --require-report-files \
+    --require-command-examples --require-source-papers
+```
+
+Selected rows:
+
+| GPU | Host schedule ns | Base DAG ns | Tensor DAG ns | Tensor-core ns | cuBLAS ns | Grid batch ns |
+| --- | ---------------- | ----------- | ------------- | -------------- | --------- | ------------- |
+| A100 | 31744 | 46080 | 44032 | 37888 | 53247 | 36864 |
+| H200 | 39776 | 41280 | 35904 | 42816 | 37567 | 30496 |
+
+This capture is a gate for command construction, validation coverage, and
+real A100/H200 execution at the current commit. It is intentionally smaller
+than the full `61cf96cd` capture and should not replace the three-size,
+three-repeat rows below for broad trend reading.
 
 ## Launch Baselines
 
@@ -173,7 +211,7 @@ table below reports median device time and normalized GFLOP/s across the
 three samples.
 
 | GPU | N | Shape | Scalar tensor ns | Tensor-core ns | cuBLAS ns | Scalar GF/s | Tensor-core GF/s | cuBLAS GF/s | Tensor-core/scalar | cuBLAS/scalar |
-| --- | - | - | - | - | - | - | - | - | - | - |
+| --- | - | ----- | ---------------- | -------------- | --------- | ----------- | ---------------- | ----------- | ------------------ | ------------- |
 | A100 | 256 | 16x16x16 | 47104 | 47104 | 43007 | 0.17 | 0.17 | 0.19 | 1.00x | 0.91x |
 | A100 | 4096 | 16x16x16 | 79872 | 71680 | 36864 | 1.64 | 1.83 | 3.56 | 0.90x | 0.46x |
 | A100 | 65536 | 16x16x16 | 587616 | 470368 | 38911 | 3.57 | 4.46 | 53.90 | 0.80x | 0.07x |
@@ -293,7 +331,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --device 0 --sizes 1024,65536,1048576 --repeats 3 \
     --arch compute_80 --include-persistent --batch-tasks 2,6,12 \
     --worker-blocks-per-task 32,64,128,256 \
-    --tensor-rows 8 --tensor-cols 4 --tensor-inner 12 \
+    --tensor-rows 16 --tensor-cols 16 --tensor-inner 16 \
     --label a100-current-$(git rev-parse --short HEAD) \
     --output-dir tmp/cuda-backend/a100-current-$(git rev-parse --short HEAD)
 ```

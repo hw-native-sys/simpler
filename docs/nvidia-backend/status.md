@@ -198,7 +198,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest paired capture at commit `61cf96cd` uses the `8x4x12` tensor
+The latest full paired capture at commit `61cf96cd` uses the `8x4x12` tensor
 descriptor, sizes `1024,65536,1048576`, three repeats, task counts `2,6,12`,
 and worker-grid values `32,64,128,256`. It includes the compiler-backed
 host-schedule row, unary square host-schedule row, quad host-schedule row, and
@@ -210,6 +210,18 @@ argument slots, and `pto_persistent_dag_unary_square`, validating unary
 persistent DAG arguments in the full paired benchmark path. It also includes
 `pto_persistent_dag_graph`, validating the explicit runtime graph descriptor
 path in the full paired benchmark path.
+
+The latest current-head compact paired validation at commit `f0f43b2a` uses
+the default `16x16x16` tensor descriptor so the scalar tensor DAG,
+`pto_persistent_dag_tensor_core`, and `cublas_sgemm` rows are all runnable in
+the same paired report. It runs `N=1024`, one repeat, `batch_tasks=2`, and
+`worker_blocks_per_task=4`, producing `50` combined rows under
+`tmp/cuda-backend/combined-current-f0f43b2a/`. The paired runner validated
+required baselines, command examples, source-paper provenance, and report
+files. Selected device times were A100
+host/base-DAG/tensor/tensor-core/cuBLAS/grid-batch
+`31744/46080/44032/37888/53247/36864 ns` and H200
+`39776/41280/35904/42816/37567/30496 ns`.
 
 The supplemental tensor-shape sweep at commit `c0ada3ad` runs
 `pto_persistent_dag_tensor` on local A100 and remote H200 for `8x4x12`,
@@ -1338,6 +1350,27 @@ descriptor ratios versus `pto_persistent_dag` are `0.95x`, `1.05x`, and
 `1.00x` for `N=1024,65536,1048576`, while the A100 ratios are `1.08x`,
 `1.19x`, and `1.05x`. Treat the DAG-shape rows as correctness and scheduler
 shape evidence rather than tuned throughput claims.
+
+The compact paired-current gate was refreshed at commit `f0f43b2a` after
+changing the paired benchmark default tensor descriptor to the WMMA-compatible
+`16x16x16` shape:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
+    --sizes 1024 --repeats 1 --batch-tasks 2 \
+    --worker-blocks-per-task 4 --sync-remote-tree
+```
+
+Result: `tmp/cuda-backend/combined-current-f0f43b2a/` contains
+`cuda-benchmark.json`, `cuda-benchmark.md`, `cuda-benchmark.svg`, and
+`cuda-benchmark-ratios.svg`. The combined JSON has `50` samples and the
+paired-current validator reported:
+`validated tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark.json`.
+This capture proves the default paired workflow now keeps
+`pto_persistent_dag_tensor`, `pto_persistent_dag_tensor_core`, and
+`cublas_sgemm` in one validated current-head report on A100 and H200.
 
 ## Remaining Gaps
 
