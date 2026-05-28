@@ -272,7 +272,9 @@ grows, while the cuBLAS baseline shows the remaining gap to a tuned CUDA
 library path.
 `cuda_validate_tensor_sweep.py` checked the expected A100/H200 rows,
 baselines, sizes, shape, three repeats, report files, and PTO dispatch
-sequences before the numbers were copied into docs.
+sequences before the numbers were copied into docs. New tensor-sweep captures
+can also require sanitized local/remote command examples before publishing
+with `--require-command-examples`.
 
 Evidence:
 

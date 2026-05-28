@@ -887,6 +887,48 @@ def test_cuda_tensor_sweep_validator_reports_missing_rows_and_metadata(tmp_path)
     assert "missing report file cuda-tensor-shape-throughput.svg" in errors
 
 
+def test_cuda_tensor_sweep_validator_requires_sanitized_command_examples():
+    cuda_validate_tensor_sweep = _load_tensor_sweep_validator_module()
+    payload = _tensor_sweep_payload()
+
+    errors = cuda_validate_tensor_sweep.validate_tensor_sweep(
+        payload,
+        require_command_examples=True,
+    )
+
+    assert "missing metadata.command_examples.local_sample" in errors
+    assert "missing metadata.command_examples.remote_sample" in errors
+
+    payload["metadata"]["command_examples"] = {
+        "local_sample": (
+            f"env PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'} "
+            "cuda_benchmark.py"
+        ),
+        "remote_sample": "python3 cuda_benchmark.py",
+    }
+
+    errors = cuda_validate_tensor_sweep.validate_tensor_sweep(
+        payload,
+        require_command_examples=True,
+    )
+
+    assert "metadata.command_examples.local_sample contains local checkout path" in errors
+    assert "metadata.command_examples.remote_sample must use ssh" in errors
+
+    payload["metadata"]["command_examples"] = {
+        "local_sample": "env PYTHONPATH=$PWD:$PWD/python .venv/bin/python cuda_benchmark.py",
+        "remote_sample": "ssh bizhaoh200 'cd /remote/pto-cu && cuda_benchmark.py'",
+    }
+
+    assert (
+        cuda_validate_tensor_sweep.validate_tensor_sweep(
+            payload,
+            require_command_examples=True,
+        )
+        == []
+    )
+
+
 def test_cuda_tensor_sweep_validator_requires_each_size():
     cuda_validate_tensor_sweep = _load_tensor_sweep_validator_module()
     payload = _tensor_sweep_payload()

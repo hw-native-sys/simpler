@@ -975,7 +975,8 @@ Validate the compact tensor-baseline sweep before copying numbers into docs:
 PYTHONPATH=$PWD:$PWD/python \
   .agents/skills/cuda-backend-eval/scripts/cuda_validate_tensor_sweep.py \
     tmp/cuda-backend/tensor-shape-sweep-<commit>/cuda-tensor-shape-sweep.json \
-    --preset compact-tensor-baselines
+    --preset compact-tensor-baselines \
+    --require-command-examples
 ```
 
 Validate a size sweep by spelling out the required sizes and result count:
@@ -991,6 +992,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-size 256 --require-size 4096 --require-size 65536 \
     --require-shape 16x16x16 --expected-repeats 3 \
     --expected-result-count 54 --require-report-files \
+    --require-command-examples \
     --require-dispatch pto_persistent_dag_tensor=3,1,2,1 \
     --require-dispatch pto_persistent_dag_tensor_core=10,1,2,1
 ```
