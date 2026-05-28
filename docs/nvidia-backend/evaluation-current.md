@@ -2,7 +2,7 @@
 
 This page summarizes the latest full paired A100/H200 CUDA backend capture
 from commit `61cf96cd`, plus the current-head compact validation capture from
-commit `f0f43b2a`. The raw JSON, Markdown, and SVG reports are generated
+commit `d361006f`. The raw JSON, Markdown, and SVG reports are generated
 locally under `tmp/cuda-backend/` and intentionally remain uncommitted.
 
 The capture uses `nvcc` for target-specific PTX on both machines:
@@ -30,22 +30,27 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark.svg`
 - `tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/combined-current-d361006f/cuda-benchmark.json`
+- `tmp/cuda-backend/combined-current-d361006f/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-current-d361006f/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-current-d361006f/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/combined-current-d361006f/cuda-benchmark-dag-deltas.svg`
 
 ## Current-Head Compact Paired Gate
 
-The compact current-head paired gate at commit `f0f43b2a` uses a
+The compact current-head paired gate at commit `d361006f` uses a
 WMMA-compatible `16x16x16` tensor descriptor, `N=1024`, one repeat,
 `batch_tasks=2`, and `worker_blocks_per_task=4`. The paired runner synced the
 local tree to `bizhaoh200`, captured A100 and H200 reports, merged them, and
 validated the combined JSON with required baselines, source-paper provenance,
-sanitized command examples, and generated report files.
+sanitized command examples, and generated Markdown/SVG report files.
 
 Validation command:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark.json \
+    tmp/cuda-backend/combined-current-d361006f/cuda-benchmark.json \
     --require-size 1024 --expected-repeats 1 --expected-result-count 50 \
     --require-baseline pto_persistent_dag_tensor_core \
     --require-baseline cublas_sgemm --require-report-files \
@@ -56,8 +61,8 @@ Selected rows:
 
 | GPU | Host schedule ns | Base DAG ns | Tensor DAG ns | Tensor-core ns | cuBLAS ns | Grid batch ns |
 | --- | ---------------- | ----------- | ------------- | -------------- | --------- | ------------- |
-| A100 | 31744 | 46080 | 44032 | 37888 | 53247 | 36864 |
-| H200 | 39776 | 41280 | 35904 | 42816 | 37567 | 30496 |
+| A100 | 23552 | 46080 | 41984 | 38912 | 53247 | 50176 |
+| H200 | 5600 | 18880 | 46496 | 30400 | 8671 | 6112 |
 
 This capture is a gate for command construction, validation coverage, and
 real A100/H200 execution at the current commit. It is intentionally smaller

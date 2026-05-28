@@ -215,17 +215,17 @@ persistent DAG arguments in the full paired benchmark path. It also includes
 `pto_persistent_dag_graph`, validating the explicit runtime graph descriptor
 path in the full paired benchmark path.
 
-The latest current-head compact paired validation at commit `f0f43b2a` uses
+The latest current-head compact paired validation at commit `d361006f` uses
 the default `16x16x16` tensor descriptor so the scalar tensor DAG,
 `pto_persistent_dag_tensor_core`, and `cublas_sgemm` rows are all runnable in
 the same paired report. It runs `N=1024`, one repeat, `batch_tasks=2`, and
 `worker_blocks_per_task=4`, producing `50` combined rows under
-`tmp/cuda-backend/combined-current-f0f43b2a/`. The paired runner validated
-required baselines, command examples, source-paper provenance, and report
-files. Selected device times were A100
+`tmp/cuda-backend/combined-current-d361006f/`. The paired runner validated
+required baselines, command examples, source-paper provenance, and Markdown
+and SVG report files. Selected device times were A100
 host/base-DAG/tensor/tensor-core/cuBLAS/grid-batch
-`31744/46080/44032/37888/53247/36864 ns` and H200
-`39776/41280/35904/42816/37567/30496 ns`.
+`23552/46080/41984/38912/53247/50176 ns` and H200
+`5600/18880/46496/30400/8671/6112 ns`.
 
 The supplemental tensor-shape sweep at commit `c0ada3ad` runs
 `pto_persistent_dag_tensor` on local A100 and remote H200 for `8x4x12`,
@@ -1355,9 +1355,9 @@ descriptor ratios versus `pto_persistent_dag` are `0.95x`, `1.05x`, and
 `1.19x`, and `1.05x`. Treat the DAG-shape rows as correctness and scheduler
 shape evidence rather than tuned throughput claims.
 
-The compact paired-current gate was refreshed at commit `f0f43b2a` after
-changing the paired benchmark default tensor descriptor to the WMMA-compatible
-`16x16x16` shape:
+The compact paired-current gate was refreshed again at commit `d361006f`
+after the tensor-core scene-test and persistent `stream_id` plumbing changes.
+It uses the WMMA-compatible `16x16x16` tensor descriptor:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -1367,11 +1367,12 @@ PYTHONPATH=$PWD:$PWD/python \
     --worker-blocks-per-task 4 --sync-remote-tree
 ```
 
-Result: `tmp/cuda-backend/combined-current-f0f43b2a/` contains
+Result: `tmp/cuda-backend/combined-current-d361006f/` contains
 `cuda-benchmark.json`, `cuda-benchmark.md`, `cuda-benchmark.svg`, and
-`cuda-benchmark-ratios.svg`. The combined JSON has `50` samples and the
+`cuda-benchmark-ratios.svg`; it also writes
+`cuda-benchmark-dag-deltas.svg`. The combined JSON has `50` samples and the
 paired-current validator reported:
-`validated tmp/cuda-backend/combined-current-f0f43b2a/cuda-benchmark.json`.
+`validated tmp/cuda-backend/combined-current-d361006f/cuda-benchmark.json`.
 This capture proves the default paired workflow now keeps
 `pto_persistent_dag_tensor`, `pto_persistent_dag_tensor_core`, and
 `cublas_sgemm` in one validated current-head report on A100 and H200.
