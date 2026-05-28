@@ -437,7 +437,7 @@ def test_cuda_artifact_index_renders_markdown_and_writes_default_index(tmp_path)
     assert "# CUDA Backend Artifact Index" in report
     assert (
         "| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  |  |  |  |  |  |  |  |  | "
-        "direct_driver_graph |"
+        " | no | direct_driver_graph |"
     ) in report
     assert "ratio SVG" in report
     assert "DAG delta SVG" in report
@@ -488,6 +488,14 @@ def test_cuda_artifact_index_scans_tensor_shape_sweep_outputs(tmp_path):
             "n": 256,
             "baselines": ["pto_persistent_dag_tensor", "cublas_sgemm"],
             "shapes": ["16x16x16", "16x16x64"],
+            "source_papers": [
+                {"id": "arXiv:2605.03190", "label": "VDCores"},
+                {"id": "arXiv:2512.22219v1", "label": "MPK persistent kernel"},
+            ],
+            "command_examples": {
+                "local_sample": "env PYTHONPATH=$PWD:$PWD/python cuda_benchmark.py",
+                "remote_sample": "ssh h200-box cuda_benchmark.py",
+            },
         },
         "results": [
             {
@@ -525,6 +533,8 @@ def test_cuda_artifact_index_scans_tensor_shape_sweep_outputs(tmp_path):
             "baselines": ["cublas_sgemm", "pto_persistent_dag_tensor"],
             "sizes": [256],
             "tensor_tiles": ["16x16x16", "16x16x64"],
+            "source_papers": ["arXiv:2512.22219v1", "arXiv:2605.03190"],
+            "has_command_examples": True,
             "has_markdown": True,
             "has_svg": True,
             "has_throughput_svg": True,
@@ -536,6 +546,7 @@ def test_cuda_artifact_index_scans_tensor_shape_sweep_outputs(tmp_path):
         "| tensor-shape-sweep-abc123 | tensor_sweep | tensor-shape-sweep-abc123 | "
         "combined | abc123 | 2 | 256 | 16x16x16, 16x16x64 |"
     ) in report
+    assert "arXiv:2512.22219v1, arXiv:2605.03190 | yes |" in report
 
 
 def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):

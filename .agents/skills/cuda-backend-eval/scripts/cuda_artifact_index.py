@@ -59,6 +59,28 @@ def _tensor_tile_shapes(payloads: list[dict[str, Any]]) -> list[str]:
     return _sorted_unique(shapes)
 
 
+def _source_paper_ids(metadata: dict[str, Any]) -> list[str]:
+    papers = metadata.get("source_papers")
+    if not isinstance(papers, list):
+        return []
+    return _sorted_unique(
+        {
+            str(paper["id"])
+            for paper in papers
+            if isinstance(paper, dict) and isinstance(paper.get("id"), str)
+        }
+    )
+
+
+def _has_command_examples(metadata: dict[str, Any]) -> bool:
+    examples = metadata.get("command_examples")
+    return (
+        isinstance(examples, dict)
+        and isinstance(examples.get("local_sample"), str)
+        and isinstance(examples.get("remote_sample"), str)
+    )
+
+
 def _smoke_mode(payload: dict[str, Any]) -> str | None:
     mode = payload.get("mode")
     dag_shape = payload.get("dag_shape")
@@ -174,6 +196,8 @@ def _read_tensor_sweep_artifact(path: Path, root: Path) -> dict[str, Any]:
         "baselines": _sorted_unique({row.get("baseline", "unknown") for row in results}),
         "sizes": _sorted_unique(sizes),
         "tensor_tiles": _sorted_unique(shapes),
+        "source_papers": _source_paper_ids(metadata),
+        "has_command_examples": _has_command_examples(metadata),
         "has_markdown": (path / "cuda-tensor-shape-sweep.md").exists(),
         "has_svg": (path / "cuda-tensor-shape-sweep.svg").exists(),
         "has_throughput_svg": (path / "cuda-tensor-shape-throughput.svg").exists(),
@@ -277,15 +301,15 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
             "| Path | Kind | Label | Machine | Commit | Results | Sizes | "
             "Tensor tile | Smoke mode | Dispatch | Scheduler errors | "
             "Repeat runs | Launch completions | Resource policy | Scalar args | "
-            "Tensor args | Baselines | Markdown | SVG | throughput SVG | "
-            "ratio SVG | DAG delta SVG |"
+            "Tensor args | Source papers | Commands | Baselines | Markdown | "
+            "SVG | throughput SVG | ratio SVG | DAG delta SVG |"
         ),
         (
             "| ---- | ---- | ----- | ------- | ------ | ------- | ----- | "
             "----------- | ---------- | -------- | ---------------- | "
             "----------- | ------------------ | --------------- | ----------- | "
-            "----------- | --------- | -------- | --- | -------------- | "
-            "--------- | ------------- |"
+            "----------- | ------------- | -------- | --------- | -------- | "
+            "--- | -------------- | --------- | ------------- |"
         ),
     ]
     for entry in entries:
@@ -301,6 +325,8 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
             f"{_format_list(entry.get('resource_policies', []))} | "
             f"{_format_list(entry.get('scalar_args', []))} | "
             f"{_format_list(entry.get('tensor_args', []))} | "
+            f"{_format_list(entry.get('source_papers', []))} | "
+            f"{_checkmark(entry.get('has_command_examples', False))} | "
             f"{_format_list(entry['baselines'])} | "
             f"{_checkmark(entry['has_markdown'])} | {_checkmark(entry['has_svg'])} | "
             f"{_checkmark(entry.get('has_throughput_svg', False))} | "
