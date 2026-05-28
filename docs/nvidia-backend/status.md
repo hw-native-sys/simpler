@@ -197,6 +197,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_host_schedule_compiler`;
 - `pto_host_schedule_unary_square`;
 - `pto_host_schedule_quad`;
+- `pto_host_schedule_generic_args`;
 - `pto_persistent_device`;
 - `pto_persistent_queue`;
 - `pto_persistent_dag`;
@@ -1578,6 +1579,29 @@ Result: `tmp/cuda-backend/worker-generic_args-smoke-72c8186c/` contains
 `device_wall_ns=35840`, while the H200 row reported
 `ptx_source=kernel-compiler-worker-task-body-generic_args-compute_90` and
 `device_wall_ns=15488`.
+
+The same host-schedule generic-args path is now a benchmark baseline:
+`pto_host_schedule_generic_args`. It compiles a generated task-body wrapper
+for the generic tensor/scalar packet and uses the same indexed tensor/scalar
+values as the smoke path:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_host_schedule_generic_args \
+    --sizes 4096 --repeats 1 --arch compute_80 \
+    --label host-generic-args-baseline-a100
+```
+
+Result: `tmp/cuda-backend/host-generic-args-baseline-working/` contains
+`a100.json`, `h200.json`, `cuda-benchmark.json`, `cuda-benchmark.md`, and
+SVG report files. The capture validator accepted both A100 and H200 rows with
+`baseline=pto_host_schedule_generic_args`, `N=4096`, source-paper provenance,
+and report files. The A100 row reported
+`ptx_source=kernel-compiler-task-body-wrapper-generic-args-compute_80` and
+`device_wall_ns=32768`; the H200 row reported
+`ptx_source=kernel-compiler-task-body-wrapper-generic-args-compute_90` and
+`device_wall_ns=17664`.
 
 The graph-descriptor adapter was checked with focused local tests:
 

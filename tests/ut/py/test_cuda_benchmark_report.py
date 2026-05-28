@@ -1086,6 +1086,7 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     cuda_validate_capture._apply_preset(args)
 
     assert "pto_host_schedule_quad" in args.require_baseline
+    assert "pto_host_schedule_generic_args" in args.require_baseline
     assert "pto_persistent_dag_quad" in args.require_baseline
     assert "pto_persistent_dag_generic_args" in args.require_baseline
     assert "pto_persistent_dag_graph" in args.require_baseline
@@ -1096,7 +1097,7 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     assert "pto_persistent_dag_tensor_core=10,1,2,1" in args.require_dispatch
     assert "pto_persistent_dag_tensor=16x16x16" in args.require_tensor_tile
     assert "cublas_sgemm=16x16x16" in args.require_tensor_tile
-    assert args.expected_result_count == 810
+    assert args.expected_result_count == 828
 
 
 def test_cuda_capture_validator_compact_current_preset_matches_docs_gate():
@@ -1108,11 +1109,12 @@ def test_cuda_capture_validator_compact_current_preset_matches_docs_gate():
     assert args.require_machine == ["hina", "dasys-h200x8"]
     assert args.require_size == ["1024"]
     assert args.expected_repeats == 1
-    assert args.expected_result_count == 56
+    assert args.expected_result_count == 58
     assert args.require_report_files is True
     assert args.require_command_examples is True
     assert args.require_zero_scheduler_errors is True
     assert args.require_source_papers is True
+    assert "pto_host_schedule_generic_args" in args.require_baseline
     assert "pto_persistent_dag_scalar_scale" in args.require_baseline
     assert "pto_persistent_dag_graph_diamond" in args.require_baseline
     assert "pto_persistent_dag_graph_tensor" in args.require_baseline
@@ -1596,8 +1598,9 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     assert ".agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py" in validate
     assert str(tmp_path / "cuda-backend" / "combined-current-abc123" / "cuda-benchmark.json") in validate
     assert "--expected-result-count" in validate
-    assert "810" in validate
+    assert "828" in validate
     assert "--require-baseline" in validate
+    assert "pto_host_schedule_generic_args" in validate
     assert "pto_persistent_dag_graph_diamond" in validate
     assert "pto_persistent_dag_graph_tensor" in validate
     assert "pto_persistent_dag_tensor_core" in validate
@@ -1637,9 +1640,10 @@ def test_cuda_pair_benchmark_validate_command_matches_configured_capture(tmp_pat
     assert "--expected-repeats" in validate
     assert "2" in validate
     assert "--expected-result-count" in validate
-    assert "232" in validate
+    assert "240" in validate
     assert "--require-baseline" in validate
     baselines = [validate[index + 1] for index, part in enumerate(validate) if part == "--require-baseline"]
+    assert "pto_host_schedule_generic_args" in baselines
     assert "pto_persistent_dag_graph_diamond" in baselines
     assert "pto_persistent_dag_graph_tensor" in baselines
     assert "pto_host_schedule_batch" in baselines
@@ -5428,10 +5432,11 @@ def test_run_benchmark_uses_in_process_samples(monkeypatch):
         ("pto_host_schedule_compiler", 3, 1024, 128, "compute_80"),
         ("pto_host_schedule_unary_square", 3, 1024, 128, "compute_80"),
         ("pto_host_schedule_quad", 3, 1024, 128, "compute_80"),
+        ("pto_host_schedule_generic_args", 3, 1024, 128, "compute_80"),
         ("direct_driver", 3, 1024, 128, "compute_80"),
         ("direct_driver_graph", 3, 1024, 128, "compute_80"),
     ]
-    assert len(payload["results"]) == 6
+    assert len(payload["results"]) == 7
 
 
 def test_run_benchmark_records_source_paper_metadata(monkeypatch):
@@ -5666,6 +5671,7 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_host_schedule_compiler",
         "pto_host_schedule_unary_square",
         "pto_host_schedule_quad",
+        "pto_host_schedule_generic_args",
         "direct_driver",
         "direct_driver_graph",
         "pto_persistent_device",
@@ -5687,7 +5693,7 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_persistent_dag_tensor_core",
         "cublas_sgemm",
     ]
-    assert len(payload["results"]) == 24
+    assert len(payload["results"]) == 25
 
 
 def test_run_single_sample_dispatches_cublas_sgemm(monkeypatch):
@@ -6478,6 +6484,33 @@ def test_run_single_sample_dispatches_tensor_core_dag(monkeypatch):
     assert result["baseline"] == "pto_persistent_dag_tensor_core"
 
 
+def test_run_single_sample_dispatches_host_schedule_generic_args_baseline(monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = {}
+
+    def fake_run_pto_generic_args_sample(device, n, block_dim, arch):
+        seen.update({"device": device, "n": n, "block_dim": block_dim, "arch": arch})
+        return {"baseline": "pto_host_schedule_generic_args", "status": "pass"}
+
+    monkeypatch.setattr(
+        cuda_benchmark,
+        "run_pto_generic_args_sample",
+        fake_run_pto_generic_args_sample,
+        raising=False,
+    )
+
+    result = cuda_benchmark.run_single_sample(
+        baseline="pto_host_schedule_generic_args",
+        device=3,
+        n=64,
+        block_dim=128,
+        arch="compute_80",
+    )
+
+    assert seen == {"device": 3, "n": 64, "block_dim": 128, "arch": "compute_80"}
+    assert result["baseline"] == "pto_host_schedule_generic_args"
+
+
 def test_run_benchmark_passes_tensor_descriptor_to_tensor_dag(monkeypatch):
     cuda_benchmark = _load_benchmark_module()
     seen = []
@@ -6577,6 +6610,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_host_schedule_compiler", 1),
         ("pto_host_schedule_unary_square", 1),
         ("pto_host_schedule_quad", 1),
+        ("pto_host_schedule_generic_args", 1),
         ("direct_driver", 1),
         ("direct_driver_graph", 1),
         ("pto_persistent_device", 1),
@@ -6602,7 +6636,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_queue_batch", 6),
     ]
     assert payload["metadata"]["batch_tasks"] == 6
-    assert len(payload["results"]) == 27
+    assert len(payload["results"]) == 28
 
 
 def test_run_benchmark_can_include_worker_grid_batch_mode(monkeypatch):

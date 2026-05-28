@@ -1167,6 +1167,16 @@ PYTHONPATH=$PWD:$PWD/python \
     --sizes 4096 --arch compute_80
 ```
 
+Use `--single-baseline pto_host_schedule_generic_args` for a quick benchmark
+path check of the host-schedule generic tensor/scalar argument packet:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_host_schedule_generic_args \
+    --sizes 4096 --arch compute_80
+```
+
 Use `cuda_tensor_shape_sweep.py` to run paired A100/H200
 samples over model-shaped tensor tile descriptors. By default it runs
 `pto_persistent_dag_tensor`; pass `--baselines` to include

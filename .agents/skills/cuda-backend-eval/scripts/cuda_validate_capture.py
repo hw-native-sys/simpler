@@ -26,6 +26,7 @@ PAIRED_CURRENT_BASELINES = (
     "pto_host_schedule",
     "pto_host_schedule_batch",
     "pto_host_schedule_compiler",
+    "pto_host_schedule_generic_args",
     "pto_host_schedule_quad",
     "pto_host_schedule_unary_square",
     "pto_persistent_dag",
@@ -52,7 +53,7 @@ PAIRED_CURRENT_BASELINES = (
 PAIRED_CURRENT_SIZES = (1024, 65536, 1048576)
 COMPACT_CURRENT_SIZES = (1024,)
 COMPACT_CURRENT_EXPECTED_REPEATS = 1
-COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 56
+COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 58
 REQUIRED_SOURCE_PAPER_IDS = ("arXiv:2605.03190", "arXiv:2512.22219v1")
 REPORT_FILES = (
     "cuda-benchmark.md",
@@ -393,7 +394,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
     if args.expected_repeats is None:
         args.expected_repeats = COMPACT_CURRENT_EXPECTED_REPEATS if args.preset == "compact-current" else 3
     if args.expected_result_count is None:
-        args.expected_result_count = COMPACT_CURRENT_EXPECTED_RESULT_COUNT if args.preset == "compact-current" else 810
+        args.expected_result_count = COMPACT_CURRENT_EXPECTED_RESULT_COUNT if args.preset == "compact-current" else 828
     if not args.require_dispatch:
         args.require_dispatch = [f"{baseline}={dispatch}" for baseline, dispatch in PAIRED_CURRENT_DISPATCH.items()]
     if not args.require_tensor_tile:
