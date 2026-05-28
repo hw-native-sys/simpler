@@ -1714,6 +1714,18 @@ before temporary allocation, tensor-flow dependency inference, and task struct
 construction. This lets a scene test describe a persistent graph in terms of
 task-argument roles while still using the current statically compiled
 generated-dispatch callable.
+The role mapping now preserves the lifecycle distinction needed by CUDA
+memory planning: tagged `output` may create a default-sized temporary, but
+tagged `output_existing` and `inout` must name storage that is already known
+at that point in descriptor order. Descriptor construction raises before
+launch if either role references an unknown tensor or temporary, avoiding a
+silent scratch allocation for values that are supposed to alias existing
+storage.
+The negative lifecycle cases are now covered by descriptor-only regression
+tests: unknown `output_existing` and unknown `inout` names fail before task
+struct construction. The combined tagged role selector reported
+`4 passed, 68 deselected`, and the valid tagged-inout real-data selector
+still reported `1 passed, 71 deselected` on local A100 and remote H200.
 
 The tagged graph lowering was checked with a failing test first, then local
 A100 and remote H200 real-data ctypes scene tests:
@@ -1762,8 +1774,8 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
      -q -rs -k tagged_inout_graph --platform cuda'
 ```
 
-Results: descriptor-only `1 passed, 69 deselected`; local A100 real-data
-`1 passed, 69 deselected`; remote H200 real-data `1 passed, 69 deselected`
+Results: descriptor-only `1 passed, 71 deselected`; local A100 real-data
+`1 passed, 71 deselected`; remote H200 real-data `1 passed, 71 deselected`
 with the known PTO-ISA SSH refresh warning.
 The same tagged `inout` graph shape is now part of the no-torch paired
 persistent-smoke workflow as `graph_descriptor_tagged_inout`:

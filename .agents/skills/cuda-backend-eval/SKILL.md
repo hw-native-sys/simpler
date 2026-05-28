@@ -985,6 +985,12 @@ Graph tasks may alternatively pass tagged `task_args` entries with
 first four inputs to `a`/`b`/`c`/`d`, appends any additional inputs to
 `tensor_args`, and lowers the single output to `out`; this is the preferred
 test form when checking the first TaskArgs-like lowering slice.
+Use `output` only when a graph task creates a new default-sized temporary.
+Use `output_existing` or `inout` only for storage already known at that point
+in descriptor order, such as scene tensors, explicit temporaries, or
+temporaries produced by earlier graph tasks. Unknown `output_existing` or
+`inout` names should fail during descriptor construction instead of allocating
+scratch storage.
 Graph task scalar fields may be numeric literals or scalar names from the
 scene's `TaskArgsBuilder`: `scalar0`, `scalar1`, and every `scalar_args`
 entry are resolved while building the host task descriptor.

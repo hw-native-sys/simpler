@@ -2132,6 +2132,61 @@ def test_scene_test_builds_cuda_persistent_graph_from_tagged_inout_task_args():
     assert buffers.host_tasks[2].out == buffers.tensor_buffers.ptrs["out"]
 
 
+def test_scene_test_rejects_unknown_tagged_output_existing_task_arg():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "graph": {
+            "tasks": [
+                {
+                    "func_id": 1,
+                    "task_args": [
+                        {"tensor": "a", "tag": "input"},
+                        {"tensor": "b", "tag": "input"},
+                        {"tensor": "missing", "tag": "output_existing"},
+                    ],
+                },
+            ]
+        },
+    }
+
+    with pytest.raises(ValueError, match="output_existing.*missing"):
+        _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+
+def test_scene_test_rejects_unknown_tagged_inout_task_arg():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "graph": {
+            "tasks": [
+                {
+                    "func_id": 1,
+                    "task_args": [
+                        {"tensor": "missing", "tag": "inout"},
+                        {"tensor": "b", "tag": "input"},
+                    ],
+                },
+            ]
+        },
+    }
+
+    with pytest.raises(ValueError, match="inout.*missing"):
+        _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+
 def test_scene_test_builds_cuda_persistent_graph_generic_args_four_slots():
     test_args = TaskArgsBuilder(
         Tensor("a", _FakeTensor(17)),

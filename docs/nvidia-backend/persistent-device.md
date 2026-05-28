@@ -332,6 +332,10 @@ descriptor fields: the first four inputs become `a`/`b`/`c`/`d`, additional
 inputs append to `tensor_args`, and the single output becomes `out`. This is
 still host-side descriptor construction, but it reduces the gap between
 normal task-argument metadata and the persistent-device runtime ABI.
+Tagged `output` is the only role that may allocate a new default-sized
+temporary. Tagged `output_existing` and `inout` must name storage that is
+already known at that point in descriptor order, either an input/output tensor,
+an explicit temporary, or a temporary produced by an earlier graph task.
 
 Graph descriptors also separate logical task outputs from physical scratch
 storage through optional `out_storage`. The logical `out` name remains the

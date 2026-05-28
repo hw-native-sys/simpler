@@ -1242,12 +1242,7 @@ class _CudaPersistentDagSceneBuffers:
             add_temporary(name, size_source)
 
         for task_spec in task_specs:
-            out_name = task_spec.get("out")
-            if out_name is not None:
-                storage_name = task_spec.get("out_storage", out_name)
-                add_temporary(storage_name, output_nbytes)
-                if str(out_name) != str(storage_name):
-                    ptrs[str(out_name)] = ptrs[str(storage_name)]
+            self._bind_graph_task_output_storage(task_spec, ptrs, add_temporary, output_nbytes)
 
         graph_dependents = self._graph_dependents_from_task_specs(task_specs)
         dependents: list[int] = []
@@ -1292,6 +1287,33 @@ class _CudaPersistentDagSceneBuffers:
         self.host_tasks = task_t(*task_values)
         fanin_t = ctypes_module.c_uint32 * len(fanin)
         self.host_fanin = fanin_t(*fanin)
+
+    @staticmethod
+    def _bind_graph_task_output_storage(
+        task_spec: dict[str, Any],
+        ptrs: dict[str, int],
+        add_temporary,
+        output_nbytes: int,
+    ):
+        for name in task_spec.get("_inout_names", []):
+            if str(name) not in ptrs:
+                raise ValueError(
+                    f"CUDA persistent_dag_graph_f32 inout task_arg references unknown tensor or temporary: {name}"
+                )
+        out_name = task_spec.get("out")
+        if out_name is None:
+            return
+
+        storage_name = task_spec.get("out_storage", out_name)
+        if task_spec.get("_out_requires_existing") and str(storage_name) not in ptrs:
+            raise ValueError(
+                "CUDA persistent_dag_graph_f32 output_existing task_arg references "
+                f"unknown tensor or temporary: {storage_name}"
+            )
+        if not task_spec.get("_out_requires_existing"):
+            add_temporary(storage_name, output_nbytes)
+        if str(out_name) != str(storage_name):
+            ptrs[str(out_name)] = ptrs[str(storage_name)]
 
     @staticmethod
     def _graph_dependents_from_task_specs(task_specs: list[dict[str, Any]]) -> list[list[int]]:
@@ -1343,6 +1365,8 @@ class _CudaPersistentDagSceneBuffers:
         normalized.pop("task_args", None)
         inputs: list[str] = []
         outputs: list[str] = []
+        inout_names: list[str] = []
+        output_requires_existing = False
         for index, task_arg in enumerate(task_args):
             if not isinstance(task_arg, dict):
                 raise ValueError("CUDA persistent_dag_graph_f32 task_args entries must be dictionaries")
@@ -1352,11 +1376,16 @@ class _CudaPersistentDagSceneBuffers:
             tag = str(task_arg.get("tag", "input")).lower()
             if tag in {"input", "in"}:
                 inputs.append(str(name))
-            elif tag in {"output", "output_existing", "out"}:
+            elif tag in {"output", "out"}:
                 outputs.append(str(name))
+            elif tag == "output_existing":
+                outputs.append(str(name))
+                output_requires_existing = True
             elif tag == "inout":
                 inputs.append(str(name))
                 outputs.append(str(name))
+                inout_names.append(str(name))
+                output_requires_existing = True
             else:
                 raise ValueError(
                     f"CUDA persistent_dag_graph_f32 task_args entry {index} has unsupported tag: {task_arg.get('tag')}"
@@ -1371,6 +1400,10 @@ class _CudaPersistentDagSceneBuffers:
             raise ValueError("CUDA persistent_dag_graph_f32 task_args supports one output per graph task")
         if outputs:
             normalized.setdefault("out", outputs[0])
+        if output_requires_existing:
+            normalized["_out_requires_existing"] = True
+        if inout_names:
+            normalized["_inout_names"] = inout_names
         return normalized
 
     def _temporary_nbytes(self, size_source, default_nbytes: int) -> int:
