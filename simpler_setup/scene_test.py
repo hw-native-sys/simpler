@@ -527,6 +527,7 @@ class _CudaPersistentDagSceneBuffers:
             "persistent_dag_reuse_f32",
             "persistent_dag_scalar_affine_f32",
             "persistent_dag_scalar_axpy_f32",
+            "persistent_dag_scalar_scale_f32",
             "persistent_dag_triad_f32",
             "persistent_dag_quad_f32",
             "persistent_dag_generic_args_f32",
@@ -750,6 +751,45 @@ class _CudaPersistentDagSceneBuffers:
                     func_id=4,
                     a=self.tensor_buffers.ptrs[a_name],
                     b=self.tensor_buffers.ptrs[b_name],
+                    out=self.dev_tmp0,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=1,
+                    initial_fanin=0,
+                    scalar0=scalar0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=self.tensor_buffers.ptrs[a_name],
+                    b=self.tensor_buffers.ptrs[b_name],
+                    out=self.dev_tmp1,
+                    n=n,
+                    dependent_begin=1,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=self.dev_tmp0,
+                    b=self.dev_tmp1,
+                    out=self.tensor_buffers.ptrs[out_name],
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=0,
+                    initial_fanin=2,
+                ),
+            )
+            self.host_fanin = (ctypes.c_uint32 * 3)(0, 0, 2)
+        elif arg_builder == "persistent_dag_scalar_scale_f32":
+            scalar0 = float(self.cuda_spec.get("scalar0", 2.0))
+            dependents_t = ctypes.c_uint32 * 2
+            self.host_dependents = dependents_t(2, 2)
+            task_t = CudaPersistentDagTask * 3
+            self.host_tasks = task_t(
+                CudaPersistentDagTask(
+                    func_id=11,
+                    a=self.tensor_buffers.ptrs[a_name],
+                    b=0,
                     out=self.dev_tmp0,
                     n=n,
                     dependent_begin=0,

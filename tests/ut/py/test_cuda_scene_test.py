@@ -239,6 +239,12 @@ unsigned long long i = ctx->i;
 task->out[i] = task->a[i] * task->b[i];
 """.strip()
 
+_PERSISTENT_SCALE_BODY = """
+const PtoCudaPersistentDagTask *task = ctx->task;
+unsigned long long i = ctx->i;
+task->out[i] = task->scalar0 * task->a[i];
+""".strip()
+
 _PERSISTENT_AXPY_BODY = """
 const PtoCudaPersistentDagTask *task = ctx->task;
 unsigned long long i = ctx->i;
@@ -696,6 +702,15 @@ def _cuda_persistent_scalar_axpy_spec(axpy_source, add_source, mul_source, *, ar
             "scalar0": 1.5,
         }
     }
+
+
+def _cuda_persistent_scalar_scale_spec(scale_source, add_source, mul_source, *, arch="compute_80", block_dim=256):
+    spec = _cuda_persistent_scalar_axpy_spec(scale_source, add_source, mul_source, arch=arch, block_dim=block_dim)
+    spec["cuda"]["task_sources"][0]["func_id"] = 11
+    spec["cuda"]["task_sources"][0]["task_name"] = "scale_f32"
+    spec["cuda"]["arg_builder"] = "persistent_dag_scalar_scale_f32"
+    spec["cuda"]["scalar0"] = 2.0
+    return spec
 
 
 def _cuda_persistent_scalar_affine_spec(affine_source, add_source, mul_source, *, arch="compute_80", block_dim=256):
@@ -1290,6 +1305,38 @@ def test_scene_test_builds_cuda_persistent_scalar_axpy_args():
     assert buffers.host_tasks[0].scalar0 == pytest.approx(1.5)
     assert buffers.host_tasks[2].a == buffers.host_tasks[0].out
     assert buffers.host_tasks[2].b == buffers.host_tasks[1].out
+    assert buffers.host_tasks[2].out == buffers.tensor_buffers.ptrs["out"]
+
+
+def test_scene_test_builds_cuda_persistent_scalar_scale_args():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_scalar_scale_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "scalar0": 2.0,
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert len(buffers.host_tasks) == 3
+    assert list(buffers.host_fanin) == [0, 0, 2]
+    assert list(buffers.host_dependents) == [2, 2]
+    assert [(task.func_id, task.dependent_begin, task.dependent_count) for task in buffers.host_tasks] == [
+        (11, 0, 1),
+        (2, 1, 1),
+        (1, 2, 0),
+    ]
+    assert buffers.host_tasks[0].a == buffers.tensor_buffers.ptrs["a"]
+    assert buffers.host_tasks[0].b is None
+    assert buffers.host_tasks[0].scalar0 == pytest.approx(2.0)
+    assert buffers.host_tasks[0].out == buffers.dev_tmp0
+    assert buffers.host_tasks[1].out == buffers.dev_tmp1
+    assert buffers.host_tasks[2].a == buffers.dev_tmp0
+    assert buffers.host_tasks[2].b == buffers.dev_tmp1
     assert buffers.host_tasks[2].out == buffers.tensor_buffers.ptrs["out"]
 
 
@@ -2142,6 +2189,60 @@ def test_scene_test_runs_cuda_persistent_device_scalar_axpy_with_real_data(tmp_p
     try:
         callable_obj = scene.build_callable("cuda")
         scene._run_and_validate_l2(worker, callable_obj, CudaPersistentScalarAxpyScene.CASES[0])
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_scalar_scale_with_real_data(tmp_path):
+    scale_source = tmp_path / "scale.pto.cu"
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    scale_source.write_text(_PERSISTENT_SCALE_BODY)
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentScalarScaleScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_scalar_scale_spec(scale_source, add_source, mul_source)
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024, "scalar0": 2.0},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            args = TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.25 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+            )
+            self.last_args = args
+            return args
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit post-run validation")
+
+    scene = CudaPersistentScalarScaleScene()
+    worker = CudaPersistentScalarScaleScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(
+            worker,
+            callable_obj,
+            CudaPersistentScalarScaleScene.CASES[0],
+            skip_golden=True,
+        )
+        args = scene.last_args
+        a_values = args.a.to_list()
+        b_values = args.b.to_list()
+        actual = args.out.to_list()
+        expected = [2.0 * a_values[idx] + a_values[idx] * b_values[idx] for idx in range(len(actual))]
+        assert actual == pytest.approx(expected)
     finally:
         worker.close()
 

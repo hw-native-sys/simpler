@@ -285,6 +285,16 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k generic_args_with_ctypes --platform cuda
 ```
 
+Run the persistent scalar-scale L2 `SceneTestCase` path after changing
+single-tensor scalar descriptor lowering. This selector is no-torch and can
+run on the remote H200 venv:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k scalar_scale --platform cuda
+```
+
 Run the mixed explicit/inferred graph descriptor path after changing
 `persistent_dag_graph_f32` dependency inference. This selector exercises a
 graph where one task keeps explicit `dependents` and another task has its

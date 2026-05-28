@@ -94,8 +94,8 @@ execution modes:
 - tensor-tile DAG descriptor with rows/cols/inner/stride metadata;
 - tensor-core tile DAG descriptor with a block-wide CUDA WMMA
   `m16n16k8`/TF32/F32 generated-dispatch task body;
-- scalar-argument DAG descriptors for mixed tensor/scalar AXPY-style and
-  two-scalar affine task bodies.
+- scalar-argument DAG descriptors for single-tensor scale,
+  mixed tensor/scalar AXPY-style, and two-scalar affine task bodies.
 - third tensor-argument DAG descriptor for a generated-dispatch triad task
   body.
 - fourth tensor-argument DAG descriptor for a generated-dispatch quad task
@@ -130,8 +130,9 @@ and composes the generated dispatch entry.
 `KernelCompiler` entry point, registers the prepared raw callable through the
 normal L2 `Worker`, builds `persistent_dag_fork_join_f32`,
 `persistent_dag_chain_f32`, `persistent_dag_reuse_f32`, and
-`persistent_dag_scalar_axpy_f32` and `persistent_dag_scalar_affine_f32` mixed
-tensor/scalar descriptors, `persistent_dag_tensor_tile_f32` state objects,
+`persistent_dag_scalar_scale_f32`, `persistent_dag_scalar_axpy_f32`, and
+`persistent_dag_scalar_affine_f32` scalar descriptors,
+`persistent_dag_tensor_tile_f32` state objects,
 `persistent_dag_triad_f32` third-tensor descriptors,
 `persistent_dag_quad_f32` fourth-tensor descriptors,
 `persistent_dag_generic_args_f32` generic tensor/scalar argument descriptors,
@@ -1453,9 +1454,9 @@ through the L2 Python `Worker` registration path. The normal scene-test flow
 can compile and run host-schedule CUDA vector-add, binary elementwise, unary
 square, scalar scale, axpy, two-scalar affine, and three-input triad callable
 specs and persistent-device
-fork/join, chain, reuse, scalar AXPY, scalar affine, and tensor-tile DAG
-callable specs, plus third-tensor persistent triad and unary-square callable
-specs, end to end.
+fork/join, chain, reuse, scalar scale, scalar AXPY, scalar affine, and
+tensor-tile DAG callable specs, plus third-tensor persistent triad and
+unary-square callable specs, end to end.
 The fourth-tensor persistent quad callable spec also runs end to end through
 ctypes-backed real data. The host-schedule quad callable spec also runs
 through both the normal `SceneTestCase` L2 path and the no-torch Worker smoke
@@ -1501,6 +1502,30 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 Result: `1 passed, 47 deselected`. The command printed the known PTO-ISA SSH
 refresh warning before passing.
+
+The persistent scalar-scale scene-test adapter was then added to cover the
+single-tensor plus scalar descriptor shape on the persistent-device runtime.
+It compiles a generated-dispatch `func_id=11` task body, runs it before the
+existing multiply/add fan-in branch, and uses ctypes-backed CPU tensors so the
+same selector can run on H200 without `torch`.
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k scalar_scale --platform cuda
+
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+     -q -rs -k scalar_scale --platform cuda'
+```
+
+Result: local A100 reported `2 passed, 48 deselected`; remote H200 reported
+`2 passed, 48 deselected` after the known PTO-ISA SSH refresh warning. The
+full local CUDA scene-test file was also rerun after this adapter and reported
+`50 passed`.
 
 The same real-data ctypes graph test was run on the remote H200 after syncing
 the working tree:
@@ -1683,7 +1708,7 @@ Needed:
 
 - broader CUDA scene-test argument builders beyond the current binary
   elementwise, unary square, scalar scale, axpy, affine, triad, quad, and
-  persistent DAG tracer bullets.
+  persistent scalar/DAG tracer bullets.
 
 ### Fourth-Tensor Persistent DAG Verification
 
