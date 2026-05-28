@@ -50,6 +50,9 @@ PAIRED_CURRENT_BASELINES = (
     "pto_persistent_queue_batch",
 )
 PAIRED_CURRENT_SIZES = (1024, 65536, 1048576)
+COMPACT_CURRENT_SIZES = (1024,)
+COMPACT_CURRENT_EXPECTED_REPEATS = 1
+COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 56
 REQUIRED_SOURCE_PAPER_IDS = ("arXiv:2605.03190", "arXiv:2512.22219v1")
 REPORT_FILES = (
     "cuda-benchmark.md",
@@ -378,24 +381,28 @@ def validate_capture(  # noqa: PLR0913
 
 
 def _apply_preset(args: argparse.Namespace) -> None:
-    if args.preset != "paired-current":
+    if args.preset not in {"paired-current", "compact-current"}:
         return
     if not args.require_machine:
         args.require_machine = list(PAIRED_CURRENT_MACHINES)
     if not args.require_baseline:
         args.require_baseline = list(PAIRED_CURRENT_BASELINES)
     if not args.require_size:
-        args.require_size = [str(size) for size in PAIRED_CURRENT_SIZES]
+        sizes = COMPACT_CURRENT_SIZES if args.preset == "compact-current" else PAIRED_CURRENT_SIZES
+        args.require_size = [str(size) for size in sizes]
     if args.expected_repeats is None:
-        args.expected_repeats = 3
+        args.expected_repeats = COMPACT_CURRENT_EXPECTED_REPEATS if args.preset == "compact-current" else 3
     if args.expected_result_count is None:
-        args.expected_result_count = 810
+        args.expected_result_count = COMPACT_CURRENT_EXPECTED_RESULT_COUNT if args.preset == "compact-current" else 810
     if not args.require_dispatch:
         args.require_dispatch = [f"{baseline}={dispatch}" for baseline, dispatch in PAIRED_CURRENT_DISPATCH.items()]
     if not args.require_tensor_tile:
         args.require_tensor_tile = [f"{baseline}={shape}" for baseline, shape in PAIRED_CURRENT_TENSOR_TILES.items()]
     args.require_report_files = True
     args.require_zero_scheduler_errors = True
+    if args.preset == "compact-current":
+        args.require_command_examples = True
+        args.require_source_papers = True
 
 
 def _parse_required_mapping(values: Sequence[str] | None, *, flag: str) -> dict[str, str]:
@@ -411,7 +418,7 @@ def _parse_required_mapping(values: Sequence[str] | None, *, flag: str) -> dict[
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("json_path", type=Path)
-    parser.add_argument("--preset", choices=("none", "paired-current"), default="none")
+    parser.add_argument("--preset", choices=("none", "paired-current", "compact-current"), default="none")
     parser.add_argument("--require-machine", action="append")
     parser.add_argument("--require-baseline", action="append")
     parser.add_argument("--require-size", action="append")

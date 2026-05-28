@@ -1099,6 +1099,29 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     assert args.expected_result_count == 810
 
 
+def test_cuda_capture_validator_compact_current_preset_matches_docs_gate():
+    cuda_validate_capture = _load_capture_validator_module()
+    args = cuda_validate_capture.parse_args(["capture.json", "--preset", "compact-current"])
+
+    cuda_validate_capture._apply_preset(args)
+
+    assert args.require_machine == ["hina", "dasys-h200x8"]
+    assert args.require_size == ["1024"]
+    assert args.expected_repeats == 1
+    assert args.expected_result_count == 56
+    assert args.require_report_files is True
+    assert args.require_command_examples is True
+    assert args.require_zero_scheduler_errors is True
+    assert args.require_source_papers is True
+    assert "pto_persistent_dag_scalar_scale" in args.require_baseline
+    assert "pto_persistent_dag_graph_diamond" in args.require_baseline
+    assert "pto_persistent_dag_graph_tensor" in args.require_baseline
+    assert "pto_persistent_dag_graph_tensor=3,1,2,1" in args.require_dispatch
+    assert "pto_persistent_dag_tensor_core=10,1,2,1" in args.require_dispatch
+    assert "pto_persistent_dag_graph_tensor=16x16x16" in args.require_tensor_tile
+    assert "cublas_sgemm=16x16x16" in args.require_tensor_tile
+
+
 def _tensor_sweep_payload():
     results = []
     baselines = {

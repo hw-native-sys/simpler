@@ -2,7 +2,7 @@
 
 This page summarizes the latest full paired A100/H200 CUDA backend capture
 from commit `61cf96cd`, plus the current-head compact validation capture from
-commit `0b3c1699`. The raw JSON, Markdown, and SVG reports are generated
+commit `8e868bfe`. The raw JSON, Markdown, and SVG reports are generated
 locally under `tmp/cuda-backend/` and intentionally remain uncommitted.
 
 The capture uses `nvcc` for target-specific PTX on both machines:
@@ -42,6 +42,12 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark-dag-deltas.svg`
 - `tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark-throughput.svg`
+- `tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark.json`
+- `tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark.md`
+- `tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark.svg`
+- `tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark-throughput.svg`
 - `tmp/cuda-backend/combined-current-945016c3/cuda-benchmark.json`
 - `tmp/cuda-backend/combined-current-945016c3/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-current-945016c3/cuda-benchmark.svg`
@@ -76,51 +82,52 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 
 ## Current-Head Compact Paired Gate
 
-The compact current-head paired gate at commit `0b3c1699` uses a
+The compact current-head paired gate at commit `8e868bfe` uses a
 WMMA-compatible `16x16x16` tensor descriptor, `N=1024`, one repeat,
 `batch_tasks=2`, and `worker_blocks_per_task=4`. The paired runner synced the
 local tree to `bizhaoh200`, captured A100 and H200 reports, merged them, and
-validated the combined JSON with required baselines, source-paper provenance,
-sanitized command examples, and generated Markdown/SVG report files.
+validated the combined JSON with the compact-current preset. That preset
+checks all 28 selected baselines on A100 and H200, source-paper provenance,
+sanitized command examples, generated Markdown/SVG report files, dispatch
+sequences, tensor tile metadata, and zero scheduler errors.
 
 Validation command:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark.json \
-    --require-size 1024 --expected-repeats 1 --expected-result-count 50 \
-    --require-baseline pto_persistent_dag_tensor_core \
-    --require-baseline cublas_sgemm --require-report-files \
-    --require-command-examples --require-zero-scheduler-errors \
-    --require-source-papers \
-    --require-dispatch pto_persistent_dag_tensor_core=10,1,2,1 \
-    --require-tensor-tile pto_persistent_dag_tensor_core=16x16x16 \
-    --require-tensor-tile cublas_sgemm=16x16x16
+    tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark.json \
+    --preset compact-current
 ```
 
 Selected rows:
 
 | GPU | Host schedule ns | Base DAG ns | Tensor DAG ns | Tensor-core ns | cuBLAS ns | Grid batch ns |
 | --- | ---------------- | ----------- | ------------- | -------------- | --------- | ------------- |
-| A100 | 33792 | 61440 | 44032 | 59392 | 60416 | 41984 |
-| H200 | 14848 | 31936 | 44576 | 36096 | 40959 | 28768 |
+| A100 | 29696 | 48128 | 38912 | 36864 | 53247 | 49152 |
+| H200 | 14880 | 36512 | 48960 | 33632 | 37631 | 30176 |
+
+Additional graph and scalar rows:
+
+| GPU | Scalar scale ns | Graph diamond ns | Graph tensor ns |
+| --- | --------------- | ---------------- | --------------- |
+| A100 | 29696 | 33792 | 44032 |
+| H200 | 33568 | 35552 | 46848 |
 
 Selected tensor throughput from the same raw JSON:
 
 | GPU | N | Shape | Scalar ns | Graph ns | Tensor-core ns | cuBLAS ns | Scalar GF/s | Graph GF/s | Tensor-core GF/s | cuBLAS GF/s | Tensor-core/scalar | cuBLAS/scalar |
 | --- | - | ----- | --------- | -------- | -------------- | --------- | ----------- | ---------- | ---------------- | ----------- | ------------------ | ------------- |
-| A100 | 1024 | 16x16x16 | 44032 | - | 59392 | 60416 | 0.74 | - | 0.55 | 0.54 | 1.35x | 1.37x |
-| H200 | 1024 | 16x16x16 | 44576 | - | 36096 | 40959 | 0.74 | - | 0.91 | 0.80 | 0.81x | 0.92x |
+| A100 | 1024 | 16x16x16 | 38912 | 44032 | 36864 | 53247 | 0.84 | 0.74 | 0.89 | 0.62 | 0.95x | 1.37x |
+| H200 | 1024 | 16x16x16 | 48960 | 46848 | 33632 | 37631 | 0.67 | 0.70 | 0.97 | 0.87 | 0.69x | 0.77x |
 
 This capture is a gate for command construction, validation coverage, and
 real A100/H200 execution at the current commit. The current validator also
 checks expected generated-dispatch IDs and tensor descriptor shapes for tensor
 rows. It is intentionally smaller than the full `61cf96cd` capture and should
 not replace the three-size, three-repeat rows below for broad trend reading.
-The `0b3c1699` gate was captured after adding scheduler no-progress
-diagnostics; all PTO persistent DAG rows reported zero device scheduler
-errors.
+The `8e868bfe` gate was captured after adding the compact-current validator
+preset; all PTO persistent DAG rows reported zero device scheduler errors.
 
 ## Supplemental Scalar-Scale Benchmark
 

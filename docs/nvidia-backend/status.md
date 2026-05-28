@@ -1450,7 +1450,20 @@ PYTHONPATH=$PWD:$PWD/python \
     --worker-blocks-per-task 4 --sync-remote-tree
 ```
 
-Result: `tmp/cuda-backend/combined-current-d361006f/` contains
+Result: `tmp/cuda-backend/combined-current-8e868bfe/` contains
+`cuda-benchmark.json`, `cuda-benchmark.md`, `cuda-benchmark.svg`,
+`cuda-benchmark-ratios.svg`, `cuda-benchmark-dag-deltas.svg`, and
+`cuda-benchmark-throughput.svg`. The combined JSON has `56` samples and the
+compact-current validator reported:
+`validated tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark.json`.
+This capture validates all 28 selected baselines on A100 and H200, including
+`pto_persistent_dag_scalar_scale`, `pto_persistent_dag_graph_diamond`, and
+`pto_persistent_dag_graph_tensor`. Selected A100 device times for
+host/base-DAG/tensor/tensor-core/cuBLAS/grid-batch were
+`29696/48128/38912/36864/53247/49152 ns`; H200 reported
+`14880/36512/48960/33632/37631/30176 ns`.
+
+Earlier result: `tmp/cuda-backend/combined-current-d361006f/` contains
 `cuda-benchmark.json`, `cuda-benchmark.md`, `cuda-benchmark.svg`, and
 `cuda-benchmark-ratios.svg`; it also writes
 `cuda-benchmark-dag-deltas.svg`. New reports also write

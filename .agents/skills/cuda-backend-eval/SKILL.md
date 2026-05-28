@@ -1332,16 +1332,8 @@ Validate the paired-current capture before copying numbers into docs:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark.json \
-    --require-size 1024 --expected-repeats 1 --expected-result-count 50 \
-    --require-baseline pto_persistent_dag_tensor_core \
-    --require-baseline cublas_sgemm --require-report-files \
-    --require-command-examples --require-zero-scheduler-errors \
-    --require-source-papers \
-    --require-dispatch pto_persistent_dag_graph_diamond=9,2,1,2,1 \
-    --require-dispatch pto_persistent_dag_tensor_core=10,1,2,1 \
-    --require-tensor-tile pto_persistent_dag_tensor_core=16x16x16 \
-    --require-tensor-tile cublas_sgemm=16x16x16
+    tmp/cuda-backend/combined-current-8e868bfe/cuda-benchmark.json \
+    --preset compact-current
 ```
 
 The compact current-head gate checks the expected A100/H200 machines,
