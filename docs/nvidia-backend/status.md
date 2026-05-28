@@ -100,6 +100,26 @@ passed on remote H200 after syncing the tree and rebuilding the runtime:
 `1 passed, 38 deselected`, with the known PTO-ISA SSH refresh warning printed
 before pytest.
 
+The stream-concurrency benchmark now accepts `--stream-pool-size` and records
+the host stream-pool setting in report metadata. A paired A100/H200 capture
+used `--stream-pool-size 6`, two repeats, and the stream-concurrency
+microbenchmark:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+  --stream-concurrency --device 0 --repeats 2 --arch compute_80 \
+  --stream-pool-size 6 --label a100-stream-pool6-working \
+  --output-dir tmp/cuda-backend/a100-stream-pool6-working
+```
+
+The H200 command used `--arch compute_90` after syncing the working tree.
+The merged report is under `tmp/cuda-backend/stream-pool6-working/` and
+contains JSON, Markdown, and SVG report files. A100 reported median
+`pto_stream_parallel/pto_stream_serial = 0.51x`; H200 reported `0.48x`.
+The merged Markdown report includes `Host stream pool size: 6`, making the
+concurrency configuration explicit in the visual artifact set.
+
 ### Persistent-Device Runtime
 
 The CUDA `persistent_device` runtime is implemented as a set of tracer-bullet

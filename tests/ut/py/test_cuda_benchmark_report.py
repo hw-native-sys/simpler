@@ -5891,11 +5891,21 @@ def test_merge_payloads_preserves_results_and_records_sources():
     cuda_benchmark = _load_benchmark_module()
     payloads = [
         {
-            "metadata": {"label": "a100", "git_commit": "abc123", "tensor_tile": {"rows": 8, "cols": 4, "inner": 12}},
+            "metadata": {
+                "label": "a100",
+                "git_commit": "abc123",
+                "tensor_tile": {"rows": 8, "cols": 4, "inner": 12},
+                "stream_pool_size": 6,
+            },
             "results": [{"machine": "a100-local", "baseline": "direct_driver", "n": 1024, "device_wall_ns": 500}],
         },
         {
-            "metadata": {"label": "h200", "git_commit": "abc123", "tensor_tile": {"rows": 8, "cols": 4, "inner": 12}},
+            "metadata": {
+                "label": "h200",
+                "git_commit": "abc123",
+                "tensor_tile": {"rows": 8, "cols": 4, "inner": 12},
+                "stream_pool_size": 6,
+            },
             "results": [{"machine": "h200-remote", "baseline": "direct_driver", "n": 1024, "device_wall_ns": 300}],
         },
     ]
@@ -5906,6 +5916,7 @@ def test_merge_payloads_preserves_results_and_records_sources():
     assert merged["metadata"]["source_labels"] == ["a100", "h200"]
     assert merged["metadata"]["git_commits"] == ["abc123"]
     assert merged["metadata"]["tensor_tile"] == {"rows": 8, "cols": 4, "inner": 12}
+    assert merged["metadata"]["stream_pool_size"] == 6
     assert [paper["id"] for paper in merged["metadata"]["source_papers"]] == [
         "arXiv:2605.03190",
         "arXiv:2512.22219v1",
@@ -7553,6 +7564,7 @@ def test_render_report_describes_stream_concurrency_rows():
             "label": "stream-unit",
             "git_commit": "abc123",
             "paper_setup": "stream concurrency microbenchmark",
+            "stream_pool_size": 6,
         },
         "results": [
             {"machine": "a100-local", "baseline": "pto_stream_serial", "n": 2, "device_wall_ns": 2000},
@@ -7563,6 +7575,73 @@ def test_render_report_describes_stream_concurrency_rows():
     report = cuda_benchmark.render_markdown_report(payload)
 
     assert "pto_stream_serial" in report
+    assert "- Host stream pool size: `6`." in report
     assert "| a100-local | pto_stream_parallel | 2 | 1 | 1 | 1 | 1200 | 1200 | 0.60x |" in report
     assert "`pto_stream_parallel` measures two independent PTO launches" in report
     assert "stream rows use `pto_stream_serial` as their reference" in report
+
+
+def test_cuda_benchmark_stream_concurrency_cli_accepts_stream_pool_size(tmp_path, monkeypatch, capsys):
+    cuda_benchmark = _load_benchmark_module()
+    calls = []
+
+    def fake_run_stream_concurrency_benchmark(device, repeats, arch, label, stream_pool_size):
+        calls.append(
+            {
+                "device": device,
+                "repeats": repeats,
+                "arch": arch,
+                "label": label,
+                "stream_pool_size": stream_pool_size,
+            }
+        )
+        return {
+            "metadata": {
+                "label": label,
+                "git_commit": "abc123",
+                "stream_pool_size": stream_pool_size,
+            },
+            "results": [],
+        }
+
+    written = []
+    monkeypatch.setattr(cuda_benchmark, "run_stream_concurrency_benchmark", fake_run_stream_concurrency_benchmark)
+    monkeypatch.setattr(
+        cuda_benchmark, "write_report", lambda payload, output_dir: written.append((payload, output_dir))
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cuda_benchmark.py",
+            "--stream-concurrency",
+            "--stream-pool-size",
+            "6",
+            "--device",
+            "1",
+            "--repeats",
+            "3",
+            "--arch",
+            "compute_90",
+            "--label",
+            "stream-cli",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+
+    cuda_benchmark.main()
+    captured = capsys.readouterr()
+
+    assert calls == [
+        {
+            "device": 1,
+            "repeats": 3,
+            "arch": "compute_90",
+            "label": "stream-cli",
+            "stream_pool_size": 6,
+        }
+    ]
+    assert written[0][0]["metadata"]["stream_pool_size"] == 6
+    assert written[0][1] == tmp_path
+    assert '"stream_pool_size": 6' in captured.out

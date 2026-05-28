@@ -16,6 +16,7 @@ import ctypes
 import html
 import json
 import math
+import os
 import socket
 import statistics
 import subprocess
@@ -2002,7 +2003,9 @@ def _run_stream_concurrency_repeat(
         runtime.device_free_ctx(ctx, dev_out[1])
 
 
-def run_stream_concurrency_benchmark(device: int, repeats: int, arch: str, label: str) -> dict[str, Any]:
+def run_stream_concurrency_benchmark(
+    device: int, repeats: int, arch: str, label: str, stream_pool_size: int | None = None
+) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="pto_cuda_stream_") as td:
         ptx, ptx_source = _compile_slow_ptx(Path(td), arch)
     ptx_buf = ctypes.create_string_buffer(ptx + b"\0")
@@ -2024,21 +2027,33 @@ def run_stream_concurrency_benchmark(device: int, repeats: int, arch: str, label
         "source_papers": list(SOURCE_PAPERS),
         "host_runtime": str(binaries.host_path),
     }
+    if stream_pool_size is not None:
+        metadata["stream_pool_size"] = stream_pool_size
 
     results: list[dict[str, Any]] = []
-    for repeat in range(repeats):
-        ctx = runtime.create_device_context()
-        if not ctx:
-            raise RuntimeError("create_device_context returned null")
-        try:
-            if runtime.simpler_init(ctx, device, None, 0, None, 0) != 0:
-                raise RuntimeError("simpler_init failed")
-            results.extend(
-                _run_stream_concurrency_repeat(runtime, ctx, ptx_buf, len(ptx) + 1, metadata["machine"], repeat)
-            )
-        finally:
-            runtime.finalize_device(ctx)
-            runtime.destroy_device_context(ctx)
+    previous_stream_pool_size = os.environ.get("PTO_CUDA_STREAM_POOL_SIZE")
+    if stream_pool_size is not None:
+        os.environ["PTO_CUDA_STREAM_POOL_SIZE"] = str(stream_pool_size)
+    try:
+        for repeat in range(repeats):
+            ctx = runtime.create_device_context()
+            if not ctx:
+                raise RuntimeError("create_device_context returned null")
+            try:
+                if runtime.simpler_init(ctx, device, None, 0, None, 0) != 0:
+                    raise RuntimeError("simpler_init failed")
+                results.extend(
+                    _run_stream_concurrency_repeat(runtime, ctx, ptx_buf, len(ptx) + 1, metadata["machine"], repeat)
+                )
+            finally:
+                runtime.finalize_device(ctx)
+                runtime.destroy_device_context(ctx)
+    finally:
+        if stream_pool_size is not None:
+            if previous_stream_pool_size is None:
+                os.environ.pop("PTO_CUDA_STREAM_POOL_SIZE", None)
+            else:
+                os.environ["PTO_CUDA_STREAM_POOL_SIZE"] = previous_stream_pool_size
 
     return {"metadata": metadata, "results": results}
 
@@ -2284,6 +2299,14 @@ def merge_payloads(
     common_tensor_tile = None
     if tensor_tiles and all(tensor_tile == tensor_tiles[0] for tensor_tile in tensor_tiles):
         common_tensor_tile = tensor_tiles[0]
+    stream_pool_sizes = [
+        payload.get("metadata", {}).get("stream_pool_size")
+        for payload in payloads
+        if payload.get("metadata", {}).get("stream_pool_size") is not None
+    ]
+    common_stream_pool_size = None
+    if stream_pool_sizes and all(size == stream_pool_sizes[0] for size in stream_pool_sizes):
+        common_stream_pool_size = stream_pool_sizes[0]
 
     metadata: dict[str, Any] = {
         "label": label,
@@ -2302,6 +2325,8 @@ def merge_payloads(
     }
     if common_tensor_tile is not None:
         metadata["tensor_tile"] = common_tensor_tile
+    if common_stream_pool_size is not None:
+        metadata["stream_pool_size"] = common_stream_pool_size
     if command_examples:
         metadata["command_examples"] = dict(command_examples)
 
@@ -2510,18 +2535,39 @@ def render_tensor_throughput_svg(payload: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _metadata_tensor_tile_shape(metadata: dict[str, Any]) -> str | None:
+    tensor_tile = metadata.get("tensor_tile")
+    if not isinstance(tensor_tile, dict):
+        return None
+    rows = tensor_tile.get("rows")
+    cols = tensor_tile.get("cols")
+    inner = tensor_tile.get("inner")
+    if rows is None or cols is None or inner is None:
+        return None
+    return f"{rows}x{cols}x{inner}"
+
+
+def _metadata_detail_lines(metadata: dict[str, Any]) -> list[str]:
+    lines = []
+    source_papers = _source_paper_summary(metadata)
+    if source_papers:
+        lines.append(f"- Source papers: {source_papers}")
+    lines.extend(_command_example_lines(metadata))
+    if metadata.get("source_labels"):
+        lines.append(f"- Source reports: `{', '.join(metadata['source_labels'])}`")
+    tensor_tile_shape = _metadata_tensor_tile_shape(metadata)
+    if tensor_tile_shape is not None:
+        lines.append(f"- Tensor tile descriptor: `{tensor_tile_shape}`.")
+    if metadata.get("stream_pool_size") is not None:
+        lines.append(f"- Host stream pool size: `{metadata['stream_pool_size']}`.")
+    return lines
+
+
 def render_markdown_report(payload: dict[str, Any]) -> str:
     summary = summarize_results(payload)
     device_refs = _matched_device_refs(summary)
     metadata = payload.get("metadata", {})
-    tensor_tile = metadata.get("tensor_tile")
-    tensor_tile_shape = None
-    if isinstance(tensor_tile, dict):
-        rows = tensor_tile.get("rows")
-        cols = tensor_tile.get("cols")
-        inner = tensor_tile.get("inner")
-        if rows is not None and cols is not None and inner is not None:
-            tensor_tile_shape = f"{rows}x{cols}x{inner}"
+    tensor_tile_shape = _metadata_tensor_tile_shape(metadata)
     lines = [
         "# CUDA Backend Microbenchmark Report",
         "",
@@ -2536,14 +2582,7 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
         f"- NVIDIA: `{metadata.get('nvidia_smi', 'unknown')}`",
         f"- Setup note: {metadata.get('paper_setup', 'not provided')}",
     ]
-    source_papers = _source_paper_summary(metadata)
-    if source_papers:
-        lines.append(f"- Source papers: {source_papers}")
-    lines.extend(_command_example_lines(metadata))
-    if metadata.get("source_labels"):
-        lines.append(f"- Source reports: `{', '.join(metadata['source_labels'])}`")
-    if tensor_tile_shape is not None:
-        lines.append(f"- Tensor tile descriptor: `{tensor_tile_shape}`.")
+    lines.extend(_metadata_detail_lines(metadata))
     lines.extend(
         [
             "",
@@ -2872,6 +2911,12 @@ def main() -> None:
     parser.add_argument("--merge-json", type=Path, nargs="*", default=None)
     parser.add_argument("--command-example", action="append")
     parser.add_argument("--stream-concurrency", action="store_true")
+    parser.add_argument(
+        "--stream-pool-size",
+        type=int,
+        default=None,
+        help="set PTO_CUDA_STREAM_POOL_SIZE during --stream-concurrency captures",
+    )
     parser.add_argument("--include-persistent", action="store_true")
     parser.add_argument(
         "--batch-tasks",
@@ -2914,6 +2959,7 @@ def main() -> None:
             repeats=args.repeats,
             arch=args.arch,
             label=args.label,
+            stream_pool_size=args.stream_pool_size,
         )
         write_report(payload, args.output_dir)
         print(json.dumps(payload["metadata"], indent=2, sort_keys=True))

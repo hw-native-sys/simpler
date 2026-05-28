@@ -1635,19 +1635,24 @@ Run the host-schedule stream-concurrency microbenchmark:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --stream-concurrency --device 0 --repeats 5 --arch compute_80 \
+    --stream-pool-size 6 \
     --label a100-streams --output-dir tmp/cuda-backend/a100-streams
 ```
 
-For remote H200, use `--arch compute_90`. The scripts discover `nvcc` from
-`CUDA_HOME`, `CUDA_PATH`, `PATH`, and common `/usr/local/cuda*` toolkit paths.
-If `nvcc` is still unavailable, the script uses an embedded `sm_80` PTX
-fallback that the H200 driver JITs.
+For remote H200, use `--arch compute_90`. Use `--stream-pool-size` to record
+the host runtime stream pool size in JSON, Markdown, and SVG report artifacts.
+The scripts discover `nvcc` from `CUDA_HOME`, `CUDA_PATH`, `PATH`, and common
+`/usr/local/cuda*` toolkit paths. If `nvcc` is still unavailable, the script
+uses an embedded `sm_80` PTX fallback that the H200 driver JITs.
 
 The stream report compares `pto_stream_parallel` against `pto_stream_serial`.
 The current A100/H200 capture at `37bebf44` shows about `0.51x` parallel-vs-
 serial wall time on both machines, supporting multiple streams for the
 host-schedule runtime when independent callables are launched from separate
 host threads.
+The stream-pool-size capture under
+`tmp/cuda-backend/stream-pool6-working/` uses `--stream-pool-size 6`; it
+reported parallel/serial ratios of `0.51x` on A100 and `0.48x` on H200.
 
 The DAG-chain capture at `323f4587` adds `pto_persistent_dag_chain` to the
 normal `--include-persistent` benchmark. It shows the same generated-dispatch
