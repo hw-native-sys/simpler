@@ -89,6 +89,10 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/persistent-graph_descriptor_generic_args4-repeat2-smoke-11db2c9d/h200.json`
 - `tmp/cuda-backend/persistent-graph_descriptor_generic_args4-repeat2-smoke-11db2c9d/cuda-smoke-report.md`
 - `tmp/cuda-backend/persistent-graph_descriptor_generic_args4-repeat2-smoke-11db2c9d/cuda-smoke-report.svg`
+- `tmp/cuda-backend/persistent-graph-generic-args4-baseline-working/a100.json`
+- `tmp/cuda-backend/persistent-graph-generic-args4-baseline-working/h200.json`
+- `tmp/cuda-backend/persistent-graph-generic-args4-baseline-working/cuda-smoke-report.md`
+- `tmp/cuda-backend/persistent-graph-generic-args4-baseline-working/cuda-smoke-report.svg`
 - `tmp/cuda-backend/persistent-graph_descriptor_reordered-repeat2-smoke-f877b7b3/a100.json`
 - `tmp/cuda-backend/persistent-graph_descriptor_reordered-repeat2-smoke-f877b7b3/h200.json`
 - `tmp/cuda-backend/persistent-graph_descriptor_reordered-repeat2-smoke-f877b7b3/cuda-smoke-report.md`
@@ -98,19 +102,23 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/cuda-smoke-report.md`
 - `tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/cuda-smoke-report.svg`
 
-## Current-Head Compact Paired Gate
+## Previous Compact Paired Gate
 
-The compact current-head paired gate at commit `2aedb40f` uses a
+The compact paired gate at commit `2aedb40f` uses a
 WMMA-compatible `16x16x16` tensor descriptor, `N=1024`, one repeat,
 `batch_tasks=2`, and `worker_blocks_per_task=4`. The paired runner synced the
 local tree to `bizhaoh200`, captured A100 and H200 reports, merged them, and
-validated the combined JSON with the compact-current preset. That preset
+validated the combined JSON with the then-current compact preset. That capture
 checks all 29 selected baselines on A100 and H200, including
 `pto_host_schedule_generic_args`, source-paper provenance, sanitized command
 examples, generated Markdown/SVG report files, dispatch sequences, tensor tile
 metadata, and zero scheduler errors.
 
-Validation command:
+The current compact preset also requires
+`pto_persistent_dag_graph_generic_args4`, so the next full compact capture
+should contain 60 combined samples instead of this capture's 58 samples.
+
+Original validation command at capture time:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -141,10 +149,11 @@ Selected tensor throughput from the same raw JSON:
 | H200 | 1024 | 16x16x16 | 47008 | 45536 | 32543 | 51520 | 0.70 | 0.72 | 1.01 | 0.64 | 0.69x | 1.10x |
 
 This capture is a gate for command construction, validation coverage, and
-real A100/H200 execution at the current commit. The current validator also
-checks expected generated-dispatch IDs and tensor descriptor shapes for tensor
-rows. The combined JSON has `58` samples. It is intentionally smaller than
-the full `61cf96cd` capture and should not replace the three-size,
+real A100/H200 execution before the graph-generic-args4 benchmark promotion.
+The validator also checked expected generated-dispatch IDs and tensor
+descriptor shapes for tensor rows. The combined JSON has `58` samples. It is
+intentionally smaller than the full `61cf96cd` capture and should not replace
+the three-size,
 three-repeat rows below for broad trend reading. The `2aedb40f` gate was
 captured after adding the host-schedule generic-args benchmark row; all PTO
 persistent DAG rows reported zero device scheduler errors.
@@ -278,6 +287,38 @@ PYTHONPATH=$PWD:$PWD/python \
 Both rows reported zero device scheduler errors and generated Markdown/SVG
 smoke reports. The matching L2 `SceneTestCase` selection also passed on H200
 with `2 passed, 60 deselected` after the known PTO-ISA SSH refresh warning.
+
+## Supplemental Four-Slot Graph-Descriptor Benchmark
+
+The graph-descriptor four-slot path is now also a selected benchmark baseline
+as `pto_persistent_dag_graph_generic_args4`. A quick single-baseline capture
+uses `N=4096` and the same generated-dispatch sequence as the smoke artifact,
+but goes through `cuda_benchmark.py` so paired-current validation can require
+the row in future full captures.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py \
+    tmp/cuda-backend/persistent-graph-generic-args4-baseline-working/a100.json \
+    tmp/cuda-backend/persistent-graph-generic-args4-baseline-working/h200.json \
+    --require-artifact a100 --require-artifact h200 \
+    --expected-runtime persistent_device --expected-mode dag \
+    --expected-dag-shape graph_descriptor_generic_args4 \
+    --expected-completed-count 3 --expected-dispatch 9,2,1 \
+    --expected-scheduler-blocks 1 --expected-worker-blocks 3 \
+    --expected-worker-blocks-per-task 1 --expected-stream-id 0 \
+    --expected-block-dim 256 --expected-grid-dim 4 --require-report-files
+```
+
+| GPU | Baseline | N | Dispatch | Device ns | Host ns | Status |
+| --- | -------- | - | -------- | --------- | ------- | ------ |
+| A100 | `pto_persistent_dag_graph_generic_args4` | 4096 | `9,2,1` | 43008 | 58143 | pass |
+| H200 | `pto_persistent_dag_graph_generic_args4` | 4096 | `9,2,1` | 33664 | 43163 | pass |
+
+Both rows reported zero device scheduler errors, graph fan-in `[0,0,2]`,
+dependents `[2,2]`, and all four generic tensor/scalar slots.
 
 ## Supplemental Reordered Graph-Descriptor Smoke
 

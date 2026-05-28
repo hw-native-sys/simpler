@@ -1382,6 +1382,7 @@ def run_persistent_sample(
             "quad",
             "generic_args",
             "graph_descriptor",
+            "graph_descriptor_generic_args4",
             "unary_square",
         }:
             task_count = 3
@@ -1543,6 +1544,15 @@ def run_single_sample(  # noqa: PLR0912
             mode="dag",
             baseline=baseline,
             dag_shape="graph_descriptor",
+        )
+    if baseline == "pto_persistent_dag_graph_generic_args4":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="graph_descriptor_generic_args4",
         )
     if baseline == "pto_persistent_dag_graph_diamond":
         return run_persistent_sample(
@@ -1764,6 +1774,7 @@ def run_benchmark(
                     "pto_persistent_dag_quad",
                     "pto_persistent_dag_generic_args",
                     "pto_persistent_dag_graph",
+                    "pto_persistent_dag_graph_generic_args4",
                     "pto_persistent_dag_graph_diamond",
                     "pto_persistent_dag_unary_square",
                     "pto_persistent_dag_tensor",
@@ -2816,6 +2827,7 @@ def main() -> None:
             "pto_persistent_dag_quad",
             "pto_persistent_dag_generic_args",
             "pto_persistent_dag_graph",
+            "pto_persistent_dag_graph_generic_args4",
             "pto_persistent_dag_graph_diamond",
             "pto_persistent_dag_unary_square",
             "pto_persistent_dag_tensor",

@@ -1166,6 +1166,18 @@ PYTHONPATH=$PWD:$PWD/python \
     --sizes 4096 --arch compute_80
 ```
 
+Use `--single-baseline pto_persistent_dag_graph_generic_args4` for the
+explicit graph-descriptor path that also carries all four generic tensor and
+scalar slots. The current A100/H200 quick capture is under
+`tmp/cuda-backend/persistent-graph-generic-args4-baseline-working/`:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_graph_generic_args4 \
+    --sizes 4096 --arch compute_80
+```
+
 Use `--single-baseline pto_persistent_dag_graph_diamond` for a quick
 benchmark path check of the wider explicit graph descriptor with dispatch
 `9,2,1,2,1`:
@@ -1416,13 +1428,14 @@ Validate the paired-current capture before copying numbers into docs:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-2aedb40f/cuda-benchmark.json \
+    tmp/cuda-backend/<combined-capture>/cuda-benchmark.json \
     --preset compact-current
 ```
 
 The compact current-head gate checks the expected A100/H200 machines,
-selected tensor baselines, the host-schedule generic-args baseline, size
-`1024`, one repeat, `58` combined samples, and the Markdown/SVG report files.
+selected tensor baselines, the host-schedule generic-args baseline, graph
+generic-args4 baseline, size `1024`, one repeat, `60` combined samples, and
+the Markdown/SVG report files.
 New paired-runner captures use a dynamic validator command because the
 selected benchmark rows can change with runner flags.
 `--require-command-examples` checks that

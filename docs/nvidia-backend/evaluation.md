@@ -69,6 +69,7 @@ committed:
 - `tmp/cuda-backend/persistent-generic_args-repeat2-smoke-6574c43b/`
 - `tmp/cuda-backend/persistent-generic_args4-repeat2-smoke-7bac4e3e/`
 - `tmp/cuda-backend/persistent-graph_descriptor_generic_args4-repeat2-smoke-11db2c9d/`
+- `tmp/cuda-backend/persistent-graph-generic-args4-baseline-working/`
 - `tmp/cuda-backend/persistent-graph_descriptor_reordered-repeat2-smoke-f877b7b3/`
 - `tmp/cuda-backend/worker-square-smoke-4cdde399/`
 - `tmp/cuda-backend/worker-quad-smoke-4327698e/`
@@ -255,7 +256,7 @@ Validate the current paired capture before copying numbers into
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/combined-current-2aedb40f/cuda-benchmark.json \
+    tmp/cuda-backend/<combined-capture>/cuda-benchmark.json \
     --preset compact-current
 ```
 

@@ -2167,6 +2167,44 @@ device times `[23936,21344]`, total `device_wall_ns=45280`, and
 passed on H200 with `2 passed, 60 deselected` after the known PTO-ISA SSH
 refresh warning.
 
+The same shape is now promoted to a benchmark baseline named
+`pto_persistent_dag_graph_generic_args4`. Focused TDD checks first failed
+because `cuda_benchmark.py`, the paired benchmark runner, and the
+paired-current capture validator did not recognize the new row or its expected
+dispatch sequence. After the fix, the local benchmark/report tests passed:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_benchmark_report.py -q \
+  -k 'graph_generic_args4_dag or current_a100_h200_workflow or \
+      configured_capture or paired_current_requires_generic_args_baseline or \
+      compact_current_preset or include_persistent_baselines or \
+      same_work_batch_modes'
+```
+
+A quick A100/H200 single-baseline capture was then run through
+`cuda_benchmark.py`:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --device 0 --sizes 4096 --repeats 1 --arch compute_80 \
+    --single-baseline pto_persistent_dag_graph_generic_args4 \
+    --label graph-generic-args4-baseline-a100
+```
+
+Result:
+`tmp/cuda-backend/persistent-graph-generic-args4-baseline-working/` contains
+`a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The validator required `runtime=persistent_device`,
+`mode=dag`, `dag_shape=graph_descriptor_generic_args4`,
+`dispatch_func_ids=[9,2,1]`, zero scheduler errors, resource policy
+`scheduler_blocks=1`, `worker_blocks=3`, `block_dim=256`, and `grid_dim=4`.
+A100 reported `device_wall_ns=43008` and `host_wall_ns=58143`; H200 reported
+`device_wall_ns=33664` and `host_wall_ns=43163`. The current paired-current
+validator now expects this baseline and therefore expects `846` full paired
+samples or `60` compact paired samples.
+
 Graph-descriptor dependency inference now builds the producer map from the
 whole descriptor before inferring omitted `dependents`, so the scene-test graph
 adapter no longer requires topological task order. A focused unit test first
