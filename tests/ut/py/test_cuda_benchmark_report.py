@@ -2874,6 +2874,47 @@ def test_cuda_pair_persistent_smoke_accepts_diamond_graph_descriptor(tmp_path):
     assert "9,2,1,2,1" in validate
 
 
+def test_cuda_pair_persistent_smoke_accepts_scratch_reuse_graph_descriptor(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+
+    args = cuda_pair_persistent_smoke.parse_args(
+        [
+            "--dag-shape",
+            "graph_descriptor_scratch_reuse",
+            "--task-count",
+            "6",
+            "--repeat-runs",
+            "2",
+            "--sync-remote-tree",
+        ]
+    )
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape=args.dag_shape,
+        task_count=args.task_count,
+        repeat_runs=args.repeat_runs,
+        sync_remote_tree=args.sync_remote_tree,
+        refresh_remote=not args.skip_remote_refresh and not args.sync_remote_tree,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
+
+    assert "persistent-graph_descriptor_scratch_reuse-repeat2-smoke-abc123" in str(local)
+    assert "graph_descriptor_scratch_reuse" in local
+    assert "--dag-shape graph_descriptor_scratch_reuse" in remote[-1]
+    assert "persistent-graph_descriptor_scratch_reuse-repeat2-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-completed-count" in validate
+    assert "6" in validate
+    assert "--expected-dispatch" in validate
+    assert "1,2,1,2,1,1" in validate
+
+
 def test_cuda_pair_persistent_smoke_builds_scalar_affine_workflow(tmp_path):
     cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
     config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
@@ -3914,6 +3955,33 @@ def test_diamond_graph_descriptor_dag_shape_fans_out_to_two_consumers():
     assert tasks[4].a == 201
     assert tasks[4].b == 204
     assert tasks[4].out == 301
+
+
+def test_scratch_reuse_graph_descriptor_reuses_temporary_after_last_use():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    host_fanin, dependents, tasks = cuda_persistent_smoke._make_dag_shape(
+        "graph_descriptor_scratch_reuse",
+        64,
+        101,
+        102,
+        201,
+        202,
+        203,
+        204,
+        301,
+    )
+
+    assert list(host_fanin) == [0, 0, 2, 1, 1, 2]
+    assert list(dependents) == [2, 2, 3, 4, 5, 5]
+    assert [task.func_id for task in tasks] == [1, 2, 1, 2, 1, 1]
+    assert [task.dependent_count for task in tasks] == [1, 1, 2, 1, 1, 0]
+    assert tasks[0].out == 201
+    assert tasks[2].out == 203
+    assert tasks[4].out == 201
+    assert tasks[5].a == 201
+    assert tasks[5].b == 204
+    assert tasks[5].out == 301
 
 
 def test_bad_no_root_dag_shape_has_no_initial_ready_tasks():

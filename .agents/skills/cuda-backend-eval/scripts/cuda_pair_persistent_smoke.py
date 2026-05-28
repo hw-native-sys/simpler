@@ -251,6 +251,7 @@ def _expected_completed_count(config: PairedPersistentSmokeConfig) -> int:
     return {
         "chain": 5,
         "graph_descriptor_diamond": 5,
+        "graph_descriptor_scratch_reuse": 6,
         "graph_tensor_tile": 4,
         "scratch_reuse": 6,
         "tensor_core_tile": 4,
@@ -270,6 +271,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "graph_descriptor_diamond": "9,2,1,2,1",
         "graph_descriptor_generic_args4": "9,2,1",
         "graph_descriptor_reordered": "1,9,2",
+        "graph_descriptor_scratch_reuse": "1,2,1,2,1,1",
         "graph_tensor_tile": "3,1,2,1",
         "quad": "8,2,1",
         "scalar_affine": "5,2,1",
@@ -421,6 +423,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
             "graph_descriptor_reordered",
+            "graph_descriptor_scratch_reuse",
             "graph_tensor_tile",
             "quad",
             "scalar_affine",

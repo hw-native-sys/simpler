@@ -2264,6 +2264,44 @@ generated report files. A100 reported per-launch device times
 `[24096,23520]`, total `device_wall_ns=47616`, and
 `host_wall_ns=4912047`.
 
+The scratch-reuse graph descriptor was then added as
+`graph_descriptor_scratch_reuse`, so the explicit runtime graph path now
+covers the six-task scratch-reuse DAG shape as descriptor data instead of only
+through the fixed `scratch_reuse` shape. Focused TDD checks first failed
+because the paired runner rejected the new DAG shape and `_make_dag_shape`
+could not build it; after the fix, the focused unit selector passed:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_benchmark_report.py -q \
+  -k 'scratch_reuse_graph_descriptor'
+```
+
+Result: `2 passed, 178 deselected`.
+
+The paired A100/H200 smoke was captured with:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_scratch_reuse --task-count 6 \
+    --queue-capacity 3 --repeat-runs 2 --sync-remote-tree
+```
+
+Result:
+`tmp/cuda-backend/persistent-graph_descriptor_scratch_reuse-repeat2-smoke-d8f6d0bf/`
+contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The validator required
+`runtime=persistent_device`, `mode=dag`,
+`dag_shape=graph_descriptor_scratch_reuse`, `repeat_runs=2`,
+`launch_completed_counts=[6,6]`, `dispatch_func_ids=[1,2,1,2,1,1]`,
+`graph_descriptor.fanin=[0,0,2,1,1,2]`,
+`graph_descriptor.dependents=[2,2,3,4,5,5]`, zero scheduler errors, and
+generated report files. A100 reported per-launch device times
+`[55296,33792]`, total `device_wall_ns=89088`, and `host_wall_ns=121166`.
+H200 reported per-launch device times `[36640,29504]`, total
+`device_wall_ns=66144`, and `host_wall_ns=84089`.
+
 Needed:
 
 - broader CUDA scene-test argument builders beyond the current binary
@@ -2353,7 +2391,7 @@ Needed:
 - broader graph-lowering coverage beyond the current
   `persistent_dag_graph_f32` descriptor adapter, automatic default temporary
   allocation, order-independent tensor-flow dependency-inference mode, and
-  five-task fan-out/fan-in graph descriptor smoke;
+  five-task fan-out/fan-in and six-task scratch-reuse graph descriptor smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, and direct/queue/DAG
   prepared-callable repeat-run smokes. The paired lifecycle matrix runner now

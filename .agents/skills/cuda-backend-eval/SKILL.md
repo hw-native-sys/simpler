@@ -456,10 +456,11 @@ For generated-dispatch DAG shapes, the paired runner passes
 `--expected-dispatch` for the known `func_id` sequence. This covers `chain`,
 `fork_join`, `scratch_reuse`, tensor-tile and tensor-core-tile shapes, scalar
 AXPY/scale/affine, triad, quad, unary-square, `generic_args`,
-`graph_descriptor`, `graph_descriptor_reordered`,
-`graph_descriptor_diamond`, and `graph_tensor_tile`. The validator therefore
-rejects A100/H200 artifacts that pass numerically through a different
-generated task path.
+`generic_args4`, `graph_descriptor`, `graph_descriptor_generic_args4`,
+`graph_descriptor_reordered`,
+`graph_descriptor_diamond`, `graph_descriptor_scratch_reuse`, and
+`graph_tensor_tile`. The validator therefore rejects A100/H200 artifacts that
+pass numerically through a different generated task path.
 
 For tensor-tile smokes, the paired runner also passes
 `--expected-tensor-tile ROWSxCOLSxINNER` so the validator rejects artifacts
@@ -506,6 +507,12 @@ task bodies as `graph_descriptor`, but records fan-in `[0,0,2,2,2]`,
 dependents `[2,3,2,3,4,4]`, and dispatch `9,2,1,2,1`. The current capture is
 under
 `tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/`.
+Use `--dag-shape graph_descriptor_scratch_reuse --repeat-runs 2` to validate
+that an explicit runtime graph descriptor can represent the scratch-reuse DAG
+shape. This records fan-in `[0,0,2,1,1,2]`, dependents
+`[2,2,3,4,5,5]`, dispatch `1,2,1,2,1,1`, and `scratch_reuse` metadata for
+the reused `tmp0` buffer. The current capture is under
+`tmp/cuda-backend/persistent-graph_descriptor_scratch_reuse-repeat2-smoke-d8f6d0bf/`.
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such
 as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.

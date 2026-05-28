@@ -1252,7 +1252,7 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                 ),
             ),
         )
-    if dag_shape == "scratch_reuse":
+    if dag_shape in {"scratch_reuse", "graph_descriptor_scratch_reuse"}:
         task_count = 6
         host_fanin_t = ctypes.c_uint32 * task_count
         dependents_t = ctypes.c_uint32 * 6
@@ -2367,7 +2367,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             expected_out = expected_tmp2
             if config.dag_shape == "chain":
                 expected_out = [_f32(expected_tmp2[i] + expected_tmp3[i]) for i in range(n)]
-            if config.dag_shape == "scratch_reuse":
+            if config.dag_shape in {"scratch_reuse", "graph_descriptor_scratch_reuse"}:
                 expected_tmp0 = [_f32(expected_tmp2[i] + host_a[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp0[i] + expected_tmp3[i]) for i in range(n)]
             if config.dag_shape == "scalar_axpy":
@@ -2440,12 +2440,14 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                     "graph_descriptor_diamond",
                     "graph_descriptor_generic_args4",
                     "graph_descriptor_reordered",
+                    "graph_descriptor_scratch_reuse",
                 }
                 and list(host_tmp2) != expected_tmp2
             ):
                 raise RuntimeError(f"dag tmp2 mismatch on launch {launch_idx}")
             if (
-                config.dag_shape in {"chain", "scratch_reuse", "quad", *graph_arg_shapes}
+                config.dag_shape
+                in {"chain", "scratch_reuse", "graph_descriptor_scratch_reuse", "quad", *graph_arg_shapes}
                 and list(host_tmp3) != expected_tmp3
             ):
                 raise RuntimeError(f"dag tmp3 mismatch on launch {launch_idx}")
@@ -2501,7 +2503,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "elapsed_s": time.time() - config.start,
             "host_runtime": str(config.binaries.host_path),
         }
-        if config.dag_shape == "scratch_reuse":
+        if config.dag_shape in {"scratch_reuse", "graph_descriptor_scratch_reuse"}:
             result["scratch_reuse"] = {"reused_buffer": "tmp0", "reuse_task": 4}
         if _is_tensor_tile_shape(config.dag_shape):
             result["tensor_tile"] = {
@@ -2537,6 +2539,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
             "graph_descriptor_reordered",
+            "graph_descriptor_scratch_reuse",
             "graph_tensor_tile",
         }:
             result["graph_descriptor"] = {
@@ -2544,7 +2547,12 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 "dependents": [int(value) for value in dependents],
                 "fanin": initial_fanin,
             }
-            if config.dag_shape != "graph_tensor_tile":
+            if config.dag_shape in {
+                "graph_descriptor",
+                "graph_descriptor_diamond",
+                "graph_descriptor_generic_args4",
+                "graph_descriptor_reordered",
+            }:
                 tensor_args = {"tensor_args[0]": "tmp0", "tensor_args[1]": "tmp3"}
                 scalar_args = {"scalar_args[0]": 1.5, "scalar_args[1]": 0.25}
                 if config.dag_shape == "graph_descriptor_generic_args4":
@@ -2635,6 +2643,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_diamond",
         "graph_descriptor_generic_args4",
         "graph_descriptor_reordered",
+        "graph_descriptor_scratch_reuse",
         "graph_tensor_tile",
         "quad",
         "scalar_affine",
@@ -2884,6 +2893,7 @@ def main() -> None:
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
             "graph_descriptor_reordered",
+            "graph_descriptor_scratch_reuse",
             "graph_tensor_tile",
             "quad",
             "scalar_affine",

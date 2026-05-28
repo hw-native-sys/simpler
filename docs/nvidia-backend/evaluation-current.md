@@ -101,6 +101,10 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/h200.json`
 - `tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/cuda-smoke-report.md`
 - `tmp/cuda-backend/persistent-graph_descriptor_diamond-repeat2-smoke-072e396c/cuda-smoke-report.svg`
+- `tmp/cuda-backend/persistent-graph_descriptor_scratch_reuse-repeat2-smoke-d8f6d0bf/a100.json`
+- `tmp/cuda-backend/persistent-graph_descriptor_scratch_reuse-repeat2-smoke-d8f6d0bf/h200.json`
+- `tmp/cuda-backend/persistent-graph_descriptor_scratch_reuse-repeat2-smoke-d8f6d0bf/cuda-smoke-report.md`
+- `tmp/cuda-backend/persistent-graph_descriptor_scratch_reuse-repeat2-smoke-d8f6d0bf/cuda-smoke-report.svg`
 
 ## Previous Compact Paired Gate
 
@@ -382,6 +386,37 @@ The first paired run exposed a repeat-run reset bug because `tmp0` and
 shape. The fixed smoke keeps immutable seed buffers for launch reset, then
 the paired validator accepted both A100 and H200 rows with zero scheduler
 errors.
+
+The scratch-reuse graph-descriptor paired smoke at artifact label `d8f6d0bf`
+validates that the explicit runtime graph descriptor can express the same
+six-task scratch-reuse shape as the fixed `scratch_reuse` DAG. It records
+`graph_descriptor.fanin=[0,0,2,1,1,2]`,
+`graph_descriptor.dependents=[2,2,3,4,5,5]`, dispatch `1,2,1,2,1,1`, and
+`scratch_reuse.reused_buffer=tmp0`.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py \
+    tmp/cuda-backend/persistent-graph_descriptor_scratch_reuse-repeat2-smoke-d8f6d0bf/a100.json \
+    tmp/cuda-backend/persistent-graph_descriptor_scratch_reuse-repeat2-smoke-d8f6d0bf/h200.json \
+    --require-artifact a100 --require-artifact h200 \
+    --expected-runtime persistent_device --expected-mode dag \
+    --expected-dag-shape graph_descriptor_scratch_reuse \
+    --expected-repeat-runs 2 --expected-completed-count 6 \
+    --expected-dispatch 1,2,1,2,1,1 --require-report-files
+```
+
+| GPU | Dispatch | Fan-in | Dependents | Launch completions | Device ns | Host ns | Status |
+| --- | -------- | ------ | ---------- | ------------------ | --------- | ------- | ------ |
+| A100 | `1,2,1,2,1,1` | `0,0,2,1,1,2` | `2,2,3,4,5,5` | `6,6` | 89088 | 121166 | pass |
+| H200 | `1,2,1,2,1,1` | `0,0,2,1,1,2` | `2,2,3,4,5,5` | `6,6` | 66144 | 84089 | pass |
+
+Both rows reported zero device scheduler errors and generated Markdown/SVG
+smoke reports. This is graph-lowering breadth evidence rather than a new
+throughput baseline; the arithmetic and scratch lifetime match the fixed
+`scratch_reuse` DAG shape.
 
 ## Launch Baselines
 
