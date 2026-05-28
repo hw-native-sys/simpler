@@ -724,6 +724,11 @@ same vector-add PTX kernel through two launch paths:
   elementwise residual, gate, and fan-in tasks. Use this for the first
   tensor-core benchmark row; it still measures a single generated task shape,
   not a tuned model kernel.
+- `cublas_sgemm`: CUDA Runtime API plus cuBLAS
+  `cublasSgemmStridedBatched` over the configured tensor descriptor. Use this
+  as the first library-backed tensor baseline for the same report shape as the
+  PTO persistent tensor rows; it measures a warm cuBLAS handle and CUDA Runtime
+  events, not PTO runtime overhead.
 - `pto_host_schedule_batch`, `pto_persistent_device_batch`,
   `pto_persistent_device_grid_batch`, and `pto_persistent_queue_batch`:
   same-work batch rows enabled by `--batch-tasks N`. Pass a
@@ -821,11 +826,11 @@ The script writes:
 - `cuda-benchmark-dag-deltas.svg`: bar chart of each `pto_persistent_dag_*`
   row's device-time increment over the matched `pto_persistent_dag` row.
 
-For tensor-DAG experiments, pass `--tensor-rows`, `--tensor-cols`, and
-`--tensor-inner` to the benchmark script. These flags affect only
-`pto_persistent_dag_tensor`; other baselines keep their normal vector-add
-work. The generated Markdown report records the descriptor as
-`rows x cols x inner`.
+For tensor-DAG and tensor-library experiments, pass `--tensor-rows`,
+`--tensor-cols`, and `--tensor-inner` to the benchmark script. These flags
+affect `pto_persistent_dag_tensor`, `pto_persistent_dag_tensor_core`, and
+`cublas_sgemm`; other baselines keep their normal vector-add work. The
+generated Markdown report records the descriptor as `rows x cols x inner`.
 
 Use `--single-baseline pto_persistent_dag_scalar_axpy` for a quick benchmark
 path check of the scalar descriptor DAG on one GPU:
@@ -930,6 +935,17 @@ path check of the WMMA tensor-core generated-dispatch DAG:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --single-baseline pto_persistent_dag_tensor_core \
+    --sizes 256 --arch compute_80 \
+    --tensor-rows 16 --tensor-cols 16 --tensor-inner 16
+```
+
+Use `--single-baseline cublas_sgemm` for a quick CUDA library-backed tensor
+baseline check on one GPU:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline cublas_sgemm \
     --sizes 256 --arch compute_80 \
     --tensor-rows 16 --tensor-cols 16 --tensor-inner 16
 ```

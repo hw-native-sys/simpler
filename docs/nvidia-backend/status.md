@@ -241,6 +241,16 @@ reports now also write `cuda-benchmark-dag-deltas.svg`, which plots each
 `pto_persistent_dag_*` row's signed device-time increment over the matched
 `pto_persistent_dag` scheduler baseline.
 
+The first cuBLAS library-backed tensor baseline adds `cublas_sgemm` to the
+same compact selected-baseline report shape. It uses CUDA Runtime API events
+around a warm cuBLAS `cublasSgemmStridedBatched` call over the configured
+`16x16x16` descriptor. In the paired A100/H200 capture under
+`tmp/cuda-backend/combined-cublas-current-343924df/`, the row measured
+`48128 ns` device time on A100 and `58623 ns` on H200. The matched
+`pto_persistent_dag_tensor_core` rows in that report measured `33792 ns` and
+`32960 ns`. This row is a CUDA library launch/compute comparison point, not a
+PTO runtime path.
+
 Evidence:
 
 - [evaluation.md](evaluation.md) is the evaluation landing page.

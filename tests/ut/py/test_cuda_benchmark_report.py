@@ -3081,6 +3081,38 @@ def test_render_report_describes_dag_tensor_core_rows():
     assert "pto_persistent_dag_tensor_core" in svg
 
 
+def test_render_report_describes_cublas_sgemm_rows():
+    cuda_benchmark = _load_benchmark_module()
+    payload = {
+        "metadata": {
+            "label": "cublas-unit",
+            "git_commit": "abc123",
+            "paper_setup": "microbenchmarks only",
+            "tensor_tile": {"rows": 16, "cols": 16, "inner": 16},
+        },
+        "results": [
+            {"machine": "a100-local", "baseline": "pto_host_schedule", "n": 256, "device_wall_ns": 1000},
+            {
+                "machine": "a100-local",
+                "baseline": "cublas_sgemm",
+                "n": 256,
+                "task_count": 1,
+                "batch_count": 1,
+                "library": "cublas",
+                "device_wall_ns": 2400,
+            },
+        ],
+    }
+
+    report = cuda_benchmark.render_markdown_report(payload)
+    svg = cuda_benchmark.render_svg(cuda_benchmark.summarize_results(payload))
+
+    assert "| a100-local | cublas_sgemm | 256 | 1 | 1 | 1 | 2400 | 2400 | 2.40x |" in report
+    assert "`cublas_sgemm` measures cuBLAS SGEMM" in report
+    assert "16x16x16" in report
+    assert "cublas_sgemm" in svg
+
+
 def test_render_report_describes_dag_scalar_axpy_rows():
     cuda_benchmark = _load_benchmark_module()
     payload = {
@@ -3800,8 +3832,39 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_persistent_dag_unary_square",
         "pto_persistent_dag_tensor",
         "pto_persistent_dag_tensor_core",
+        "cublas_sgemm",
     ]
-    assert len(payload["results"]) == 20
+    assert len(payload["results"]) == 21
+
+
+def test_run_single_sample_dispatches_cublas_sgemm(monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = {}
+
+    def fake_run_cublas_sgemm_sample(device, n, tensor_tile):
+        seen.update({"device": device, "n": n, "tensor_tile": tensor_tile})
+        return {
+            "baseline": "cublas_sgemm",
+            "n": n,
+            "task_count": 1,
+            "device_wall_ns": 10,
+            "status": "pass",
+        }
+
+    tensor_tile = {"rows": 16, "cols": 16, "inner": 16}
+    monkeypatch.setattr(cuda_benchmark, "run_cublas_sgemm_sample", fake_run_cublas_sgemm_sample)
+
+    result = cuda_benchmark.run_single_sample(
+        baseline="cublas_sgemm",
+        device=3,
+        n=256,
+        block_dim=128,
+        arch="compute_80",
+        tensor_tile=tensor_tile,
+    )
+
+    assert seen == {"device": 3, "n": 256, "tensor_tile": tensor_tile}
+    assert result["baseline"] == "cublas_sgemm"
 
 
 def test_run_single_sample_dispatches_scalar_axpy_dag(monkeypatch):
@@ -4380,13 +4443,14 @@ def test_run_benchmark_passes_tensor_descriptor_to_tensor_dag(monkeypatch):
         tensor_tile=tensor_tile,
     )
 
-    tensor_baselines = {"pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core"}
+    tensor_baselines = {"pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core", "cublas_sgemm"}
     tensor_calls = [item for item in seen if item[0] in tensor_baselines]
     non_tensor_calls = [item for item in seen if item[0] not in tensor_baselines]
     assert payload["metadata"]["tensor_tile"] == tensor_tile
     assert tensor_calls == [
         ("pto_persistent_dag_tensor", tensor_tile),
         ("pto_persistent_dag_tensor_core", tensor_tile),
+        ("cublas_sgemm", tensor_tile),
     ]
     assert all(call[1] is None for call in non_tensor_calls)
 
@@ -4445,12 +4509,13 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_dag_unary_square", 1),
         ("pto_persistent_dag_tensor", 1),
         ("pto_persistent_dag_tensor_core", 1),
+        ("cublas_sgemm", 1),
         ("pto_host_schedule_batch", 6),
         ("pto_persistent_device_batch", 6),
         ("pto_persistent_queue_batch", 6),
     ]
     assert payload["metadata"]["batch_tasks"] == 6
-    assert len(payload["results"]) == 23
+    assert len(payload["results"]) == 24
 
 
 def test_run_benchmark_can_include_worker_grid_batch_mode(monkeypatch):

@@ -208,6 +208,29 @@ device-time increment over the matched `pto_persistent_dag` scheduler
 baseline, which is the current report view for separating scheduler overhead
 from additional generated-dispatch task work.
 
+## cuBLAS Library Baseline Row
+
+The first cuBLAS row in the selected benchmark report was captured in the
+`a100-cublas-current-343924df` and `h200-cublas-current-343924df` artifacts,
+then merged under `tmp/cuda-backend/combined-cublas-current-343924df/`. It
+uses the same compact report shape as the tensor-core row: one size
+(`N=256`), one repeat, no batch rows, and the `16x16x16` tensor descriptor.
+
+cuBLAS row details:
+
+- A100: `cublas_sgemm`, `16x16x16`,
+  `cublasSgemmStridedBatched`, batch count `1`, `48128 ns` device,
+  `64414 ns` host, `2.76x` versus `pto_host_schedule`.
+- H200: `cublas_sgemm`, `16x16x16`,
+  `cublasSgemmStridedBatched`, batch count `1`, `58623 ns` device,
+  `71677 ns` host, `2.34x` versus `pto_host_schedule`.
+
+For context, the same compact report measured `pto_persistent_dag_tensor_core`
+at `33792 ns` on A100 and `32960 ns` on H200. The cuBLAS row is intentionally
+a library-backed launch/compute baseline rather than PTO runtime work; at this
+small descriptor size it is dominated by cuBLAS launch and dispatch overhead,
+not GEMM throughput.
+
 ## Reproduction Commands
 
 Local A100:
@@ -261,6 +284,19 @@ PYTHONPATH=$PWD:$PWD/python \
     --tensor-rows 16 --tensor-cols 16 --tensor-inner 16 \
     --label a100-tensor-core-current-$COMMIT \
     --output-dir tmp/cuda-backend/a100-tensor-core-current-$COMMIT
+```
+
+cuBLAS selected-baseline report:
+
+```bash
+COMMIT=$(git rev-parse --short HEAD)
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --sizes 256 --repeats 1 --arch compute_80 --include-persistent \
+    --batch-tasks 0 --worker-blocks-per-task 1 \
+    --tensor-rows 16 --tensor-cols 16 --tensor-inner 16 \
+    --label a100-cublas-current-$COMMIT \
+    --output-dir tmp/cuda-backend/a100-cublas-current-$COMMIT
 ```
 
 Merge reports:

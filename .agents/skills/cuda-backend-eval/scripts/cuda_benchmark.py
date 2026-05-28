@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import math
 import socket
 import statistics
 import subprocess
@@ -158,6 +159,22 @@ extern "C" __global__ void pto_vector_add_f32(
 def _check_cuda(rc: int, op: str) -> None:
     if rc != 0:
         raise RuntimeError(f"{op} failed with CUDA driver code {rc}")
+
+
+def _check_cublas(rc: int, op: str) -> None:
+    if rc != 0:
+        raise RuntimeError(f"{op} failed with cuBLAS status {rc}")
+
+
+def _load_shared_library(names: tuple[str, ...]) -> ctypes.CDLL:
+    last_error: OSError | None = None
+    for name in names:
+        try:
+            return ctypes.CDLL(name)
+        except OSError as exc:
+            last_error = exc
+    joined = ", ".join(names)
+    raise RuntimeError(f"unable to load any of: {joined}") from last_error
 
 
 class CudaKernelNodeParams(ctypes.Structure):
@@ -403,6 +420,202 @@ class DirectCudaDriver:
             "device_wall_ns": int(elapsed_ms.value * 1_000_000),
             "status": "pass",
         }
+
+
+class RuntimeCublas:
+    """Small CUDA Runtime + cuBLAS wrapper for a library-backed baseline."""
+
+    def __init__(self, device: int):
+        self.cuda = _load_shared_library(("libcudart.so", "libcudart.so.13", "libcudart.so.12"))
+        self.cublas = _load_shared_library(("libcublas.so", "libcublas.so.13", "libcublas.so.12"))
+        self.handle = ctypes.c_void_p()
+        self.start_event = ctypes.c_void_p()
+        self.stop_event = ctypes.c_void_p()
+        self._bind()
+        self._init(device)
+
+    def _bind(self) -> None:
+        self.cuda.cudaSetDevice.argtypes = [ctypes.c_int]
+        self.cuda.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+        self.cuda.cudaFree.argtypes = [ctypes.c_void_p]
+        self.cuda.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        self.cuda.cudaDeviceSynchronize.argtypes = []
+        self.cuda.cudaEventCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        self.cuda.cudaEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.cuda.cudaEventSynchronize.argtypes = [ctypes.c_void_p]
+        self.cuda.cudaEventElapsedTime.argtypes = [
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self.cuda.cudaEventDestroy.argtypes = [ctypes.c_void_p]
+
+        self.cublas.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        self.cublas.cublasDestroy_v2.argtypes = [ctypes.c_void_p]
+        self.cublas.cublasSetMathMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        try:
+            self._sgemm_strided_batched = self.cublas.cublasSgemmStridedBatched_v2
+        except AttributeError:
+            self._sgemm_strided_batched = self.cublas.cublasSgemmStridedBatched
+        self._sgemm_strided_batched.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_longlong,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_longlong,
+            ctypes.c_int,
+        ]
+
+    def _init(self, device: int) -> None:
+        _check_cuda(self.cuda.cudaSetDevice(device), "cudaSetDevice")
+        _check_cublas(self.cublas.cublasCreate_v2(ctypes.byref(self.handle)), "cublasCreate")
+        _check_cublas(self.cublas.cublasSetMathMode(self.handle, 3), "cublasSetMathMode(tf32)")
+        _check_cuda(self.cuda.cudaEventCreate(ctypes.byref(self.start_event)), "cudaEventCreate(start)")
+        _check_cuda(self.cuda.cudaEventCreate(ctypes.byref(self.stop_event)), "cudaEventCreate(stop)")
+
+    def close(self) -> None:
+        if self.start_event:
+            self.cuda.cudaEventDestroy(self.start_event)
+            self.start_event = ctypes.c_void_p()
+        if self.stop_event:
+            self.cuda.cudaEventDestroy(self.stop_event)
+            self.stop_event = ctypes.c_void_p()
+        if self.handle:
+            self.cublas.cublasDestroy_v2(self.handle)
+            self.handle = ctypes.c_void_p()
+
+    def __enter__(self) -> RuntimeCublas:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def run_sgemm(self, n: int, tensor_tile: dict[str, int] | None) -> dict[str, Any]:
+        tile = tensor_tile or {"rows": 16, "cols": 16, "inner": 16}
+        rows = int(tile["rows"])
+        cols = int(tile["cols"])
+        inner = int(tile["inner"])
+        output_elements = rows * cols
+        batch_count = max(1, math.ceil(n / output_elements))
+        effective_n = batch_count * output_elements
+        a_elements = rows * inner * batch_count
+        b_elements = inner * cols * batch_count
+        c_elements = output_elements * batch_count
+
+        host_a_t = ctypes.c_float * a_elements
+        host_b_t = ctypes.c_float * b_elements
+        host_c_t = ctypes.c_float * c_elements
+        host_a = host_a_t(*[0.01 * float((i % 17) + 1) for i in range(a_elements)])
+        host_b = host_b_t(*[0.02 * float((i % 13) + 1) for i in range(b_elements)])
+        host_c = host_c_t()
+
+        dev_a = ctypes.c_void_p()
+        dev_b = ctypes.c_void_p()
+        dev_c = ctypes.c_void_p()
+        a_nbytes = ctypes.sizeof(host_a)
+        b_nbytes = ctypes.sizeof(host_b)
+        c_nbytes = ctypes.sizeof(host_c)
+        _check_cuda(self.cuda.cudaMalloc(ctypes.byref(dev_a), a_nbytes), "cudaMalloc(a)")
+        _check_cuda(self.cuda.cudaMalloc(ctypes.byref(dev_b), b_nbytes), "cudaMalloc(b)")
+        _check_cuda(self.cuda.cudaMalloc(ctypes.byref(dev_c), c_nbytes), "cudaMalloc(c)")
+        try:
+            _check_cuda(self.cuda.cudaMemcpy(dev_a, ctypes.cast(host_a, ctypes.c_void_p), a_nbytes, 1), "cudaMemcpy(a)")
+            _check_cuda(self.cuda.cudaMemcpy(dev_b, ctypes.cast(host_b, ctypes.c_void_p), b_nbytes, 1), "cudaMemcpy(b)")
+            alpha = ctypes.c_float(1.0)
+            beta = ctypes.c_float(0.0)
+
+            def launch() -> None:
+                _check_cublas(
+                    self._sgemm_strided_batched(
+                        self.handle,
+                        0,
+                        0,
+                        rows,
+                        cols,
+                        inner,
+                        ctypes.byref(alpha),
+                        dev_a,
+                        rows,
+                        rows * inner,
+                        dev_b,
+                        inner,
+                        inner * cols,
+                        ctypes.byref(beta),
+                        dev_c,
+                        rows,
+                        output_elements,
+                        batch_count,
+                    ),
+                    "cublasSgemmStridedBatched",
+                )
+
+            launch()
+            _check_cuda(self.cuda.cudaDeviceSynchronize(), "cudaDeviceSynchronize(warmup)")
+            host_start = time.time_ns()
+            _check_cuda(self.cuda.cudaEventRecord(self.start_event, None), "cudaEventRecord(start)")
+            launch()
+            _check_cuda(self.cuda.cudaEventRecord(self.stop_event, None), "cudaEventRecord(stop)")
+            _check_cuda(self.cuda.cudaEventSynchronize(self.stop_event), "cudaEventSynchronize(stop)")
+            host_wall_ns = time.time_ns() - host_start
+
+            elapsed_ms = ctypes.c_float()
+            _check_cuda(
+                self.cuda.cudaEventElapsedTime(ctypes.byref(elapsed_ms), self.start_event, self.stop_event),
+                "cudaEventElapsedTime",
+            )
+            _check_cuda(self.cuda.cudaMemcpy(ctypes.cast(host_c, ctypes.c_void_p), dev_c, c_nbytes, 2), "cudaMemcpy(c)")
+        finally:
+            self.cuda.cudaFree(dev_a)
+            self.cuda.cudaFree(dev_b)
+            self.cuda.cudaFree(dev_c)
+
+        max_abs_diff = 0.0
+        for batch in range(batch_count):
+            a_base = batch * rows * inner
+            b_base = batch * inner * cols
+            c_base = batch * output_elements
+            for col in range(cols):
+                for row in range(rows):
+                    expected = 0.0
+                    for k_idx in range(inner):
+                        expected += host_a[a_base + row + k_idx * rows] * host_b[b_base + k_idx + col * inner]
+                    actual = host_c[c_base + row + col * rows]
+                    max_abs_diff = max(max_abs_diff, abs(actual - expected))
+        if max_abs_diff > 1.0e-2:
+            raise RuntimeError(f"cuBLAS SGEMM output mismatch: max_abs_diff={max_abs_diff}")
+
+        return {
+            "baseline": "cublas_sgemm",
+            "n": effective_n,
+            "task_count": 1,
+            "block_dim": 0,
+            "host_wall_ns": host_wall_ns,
+            "device_wall_ns": int(elapsed_ms.value * 1_000_000),
+            "status": "pass",
+            "library": "cublas",
+            "operation": "sgemm_strided_batched",
+            "math_mode": "tf32_tensor_op",
+            "batch_count": batch_count,
+            "tensor_tile": {"rows": rows, "cols": cols, "inner": inner},
+            "max_abs_diff": max_abs_diff,
+        }
+
+
+def run_cublas_sgemm_sample(device: int, n: int, tensor_tile: dict[str, int] | None = None) -> dict[str, Any]:
+    with RuntimeCublas(device=device) as runner:
+        return runner.run_sgemm(n=n, tensor_tile=tensor_tile)
 
 
 def run_pto_sample(device: int, n: int, block_dim: int, arch: str) -> dict[str, Any]:
@@ -1158,6 +1371,8 @@ def run_single_sample(  # noqa: PLR0912
             dag_shape="tensor_core_tile",
             tensor_tile=tensor_tile,
         )
+    if baseline == "cublas_sgemm":
+        return run_cublas_sgemm_sample(device=device, n=n, tensor_tile=tensor_tile)
     if baseline == "pto_persistent_device_batch":
         return run_persistent_sample(
             device=device,
@@ -1319,10 +1534,11 @@ def run_benchmark(
                     "pto_persistent_dag_unary_square",
                     "pto_persistent_dag_tensor",
                     "pto_persistent_dag_tensor_core",
+                    "cublas_sgemm",
                 ):
                     sample_kwargs: dict[str, Any] = {}
                     if (
-                        baseline in {"pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core"}
+                        baseline in {"pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core", "cublas_sgemm"}
                         and tensor_tile is not None
                     ):
                         sample_kwargs["tensor_tile"] = tensor_tile
@@ -1748,6 +1964,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         "pto_persistent_dag_unary_square": "#e3a857",
         "pto_persistent_dag_tensor": "#e76f51",
         "pto_persistent_dag_tensor_core": "#d1495b",
+        "cublas_sgemm": "#006d77",
         "pto_persistent_device": "#9467bd",
         "pto_persistent_device_batch": "#7b52ab",
         "pto_persistent_device_grid_batch": "#5f3b9d",
@@ -2064,6 +2281,12 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
                 "16x16x16 descriptor"
             ),
             "  and the current `wmma:m16n16k8:tf32->f32` generated-dispatch body.",
+            (
+                f"- `cublas_sgemm` measures cuBLAS SGEMM over a configured {tensor_tile_shape}"
+                if tensor_tile_shape is not None
+                else "- `cublas_sgemm` measures cuBLAS SGEMM over a default 16x16x16"
+            ),
+            "  strided-batched descriptor using CUDA Runtime API events and a warm handle.",
             "- `pto_stream_serial` measures two independent PTO launches issued",
             "  sequentially on the host-schedule stream pool.",
             "- `pto_stream_parallel` measures two independent PTO launches issued",
@@ -2145,6 +2368,7 @@ def main() -> None:
             "pto_persistent_dag_unary_square",
             "pto_persistent_dag_tensor",
             "pto_persistent_dag_tensor_core",
+            "cublas_sgemm",
             "pto_host_schedule_batch",
             "pto_persistent_device_batch",
             "pto_persistent_device_grid_batch",
@@ -2212,7 +2436,8 @@ def main() -> None:
                     worker_blocks_per_task=worker_blocks_per_task_values[0],
                     tensor_tile=(
                         tensor_tile
-                        if args.single_baseline in {"pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core"}
+                        if args.single_baseline
+                        in {"pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core", "cublas_sgemm"}
                         else None
                     ),
                 ),
