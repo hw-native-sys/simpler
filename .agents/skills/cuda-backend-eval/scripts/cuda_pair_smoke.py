@@ -251,7 +251,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--block-dim", type=int, default=256)
     parser.add_argument(
         "--op",
-        choices=("add", "mul", "scale", "square", "axpy", "affine", "triad", "quad"),
+        choices=("add", "mul", "scale", "square", "axpy", "affine", "triad", "quad", "generic_args"),
         default="add",
     )
     parser.add_argument("--local-arch", default="compute_80")

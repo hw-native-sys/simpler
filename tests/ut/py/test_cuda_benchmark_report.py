@@ -2205,6 +2205,15 @@ def test_cuda_pair_smoke_accepts_quad_op():
     assert args.sync_remote_tree is True
 
 
+def test_cuda_pair_smoke_accepts_generic_args_op():
+    cuda_pair_smoke = _load_pair_smoke_module()
+
+    args = cuda_pair_smoke.parse_args(["--op", "generic_args", "--sync-remote-tree"])
+
+    assert args.op == "generic_args"
+    assert args.sync_remote_tree is True
+
+
 def test_cuda_pair_smoke_can_sync_local_tree_and_dry_run(tmp_path):
     cuda_pair_smoke = _load_pair_smoke_module()
     calls = []
@@ -3097,6 +3106,33 @@ def test_cuda_worker_smoke_triad_helpers_use_three_tensors():
     assert cuda_smoke._worker_host_op("triad") == 6
 
 
+def test_cuda_worker_smoke_generic_args_helpers_use_aux_tensor_and_scalar_slots():
+    cuda_smoke = _load_smoke_module()
+
+    body = cuda_smoke._worker_task_body("generic_args")
+
+    assert "ctx->scalar0 * ctx->a[i]" in body
+    assert "ctx->tensor0[i]" in body
+    assert "ctx->scalar1 * ctx->tensor1[i]" in body
+    assert cuda_smoke._worker_expected_output("generic_args", 4) == [0.0, 7.5, 15.0, 22.5]
+    assert "const float *tensor0;" in cuda_smoke._worker_context_definition("generic_args")
+    assert "float scalar1;" in cuda_smoke._worker_context_definition("generic_args")
+    assert cuda_smoke._worker_host_parameters("generic_args") == (
+        "const float *a",
+        "const float *b",
+        "float *out",
+        "const float *tensor0",
+        "const float *tensor1",
+        "float scalar0",
+        "float scalar1",
+        "unsigned long long n",
+    )
+    assert cuda_smoke._worker_host_context_initializer("generic_args") == (
+        "a, b, out, tensor0, tensor1, scalar0, scalar1, n"
+    )
+    assert cuda_smoke._worker_host_op("generic_args") == 8
+
+
 def test_cuda_smoke_main_writes_output_json(tmp_path, monkeypatch, capsys):
     cuda_smoke = _load_smoke_module()
     output = tmp_path / "smoke.json"
@@ -3404,6 +3440,57 @@ def test_cuda_smoke_main_accepts_triad_output_json(tmp_path, monkeypatch, capsys
     assert printed == written
     assert written["op"] == "triad"
     assert written["mode"] == "worker/triad"
+
+
+def test_cuda_smoke_main_accepts_generic_args_output_json(tmp_path, monkeypatch, capsys):
+    cuda_smoke = _load_smoke_module()
+    output = tmp_path / "generic-args-smoke.json"
+
+    monkeypatch.setattr(
+        cuda_smoke,
+        "run_worker_smoke",
+        lambda device, n, block_dim, arch, build, op: {
+            "status": "pass",
+            "runner": "worker",
+            "runtime": "host_schedule",
+            "mode": f"worker/{op}",
+            "op": op,
+            "device": device,
+            "n": n,
+            "block_dim": block_dim,
+            "ptx_arch": arch,
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cuda_smoke.py",
+            "--runner",
+            "worker",
+            "--op",
+            "generic_args",
+            "--device",
+            "1",
+            "--n",
+            "64",
+            "--block-dim",
+            "32",
+            "--arch",
+            "compute_90",
+            "--no-build",
+            "--output-json",
+            str(output),
+        ],
+    )
+
+    cuda_smoke.main()
+
+    printed = json.loads(capsys.readouterr().out)
+    written = json.loads(output.read_text())
+    assert printed == written
+    assert written["op"] == "generic_args"
+    assert written["mode"] == "worker/generic_args"
 
 
 def test_persistent_direct_launch_can_use_multiple_worker_blocks_per_task():

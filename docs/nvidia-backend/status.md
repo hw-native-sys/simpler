@@ -1561,6 +1561,24 @@ A100 real-data scene reported `1 passed, 55 deselected`, and the H200
 real-data scene reported `1 passed, 55 deselected` after the known PTO-ISA SSH
 refresh warning.
 
+The same generic host-schedule ABI is now covered by the no-torch Worker
+smoke runner, so it can be captured without the `SceneTestCase` framework:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
+    --op generic_args --sync-remote-tree --build-runtime
+```
+
+Result: `tmp/cuda-backend/worker-generic_args-smoke-72c8186c/` contains
+`a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The artifact validator accepted both rows with
+`runtime=host_schedule` and `mode=worker/generic_args`; the A100 row reported
+`ptx_source=kernel-compiler-worker-task-body-generic_args-compute_80` and
+`device_wall_ns=35840`, while the H200 row reported
+`ptx_source=kernel-compiler-worker-task-body-generic_args-compute_90` and
+`device_wall_ns=15488`.
+
 The graph-descriptor adapter was checked with focused local tests:
 
 ```bash

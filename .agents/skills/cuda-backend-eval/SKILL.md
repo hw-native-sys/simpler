@@ -127,6 +127,18 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-json tmp/cuda-backend/worker-quad-smoke/a100.json
 ```
 
+Use `--op generic_args` to validate the host-schedule generic tensor/scalar
+ABI. The generated task body reads indexed tensor slots and scalar slots
+through the runtime's generic argument packet:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_smoke.py \
+    --runner worker --op generic_args --device 0 --n 1024 \
+    --block-dim 256 --arch compute_80 \
+    --output-json tmp/cuda-backend/worker-generic_args-smoke/a100.json
+```
+
 Use `cuda_smoke_report.py` to turn captured smoke JSON from A100 and H200 into
 Markdown and SVG evidence. Persistent-device reports include dispatch
 `func_id` sequences, device-side scheduler error counters, resource policy,
@@ -1015,7 +1027,7 @@ the full benchmark:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_smoke.py \
-    --op triad --sync-remote-tree --build-runtime
+    --op generic_args --sync-remote-tree --build-runtime
 ```
 
 It mirrors the benchmark runner's remote refresh, `--skip-remote-refresh`,

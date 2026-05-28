@@ -30,6 +30,7 @@ from simpler_setup.cuda_callable_compiler import (
     CudaVectorAddArgs,
     CudaVectorAffineArgs,
     CudaVectorAxpyArgs,
+    CudaVectorGenericArgs,
     CudaVectorQuaternaryArgs,
     CudaVectorScaleArgs,
     CudaVectorTernaryArgs,
@@ -218,6 +219,8 @@ def _worker_task_body(op: str) -> str:
         expression = "ctx->a[i] * ctx->b[i] + ctx->c[i]"
     elif op == "quad":
         expression = "ctx->a[i] * ctx->b[i] + ctx->c[i] * ctx->d[i]"
+    elif op == "generic_args":
+        expression = "ctx->scalar0 * ctx->a[i] + ctx->tensor0[i] + ctx->scalar1 * ctx->tensor1[i] + ctx->b[i]"
     else:
         raise ValueError(f"unknown worker smoke op: {op}")
     return f"""
@@ -253,6 +256,8 @@ def _worker_expected_output(op: str, n: int) -> list[float]:
         return [float(i * (2 * i) + (3 * i)) for i in range(n)]
     if op == "quad":
         return [_fma_f32(float(i), float(2 * i), _float32(float(3 * i) * float(4 * i))) for i in range(n)]
+    if op == "generic_args":
+        return [float(7.5 * i) for i in range(n)]
     raise ValueError(f"unknown worker smoke op: {op}")
 
 
@@ -316,6 +321,19 @@ struct PtoTaskContext {
     unsigned long long n;
 };
 """.strip()
+    if op == "generic_args":
+        return """
+struct PtoTaskContext {
+    const float *a;
+    const float *b;
+    float *out;
+    const float *tensor0;
+    const float *tensor1;
+    float scalar0;
+    float scalar1;
+    unsigned long long n;
+};
+""".strip()
     return """
 struct PtoTaskContext {
     const float *a;
@@ -374,6 +392,17 @@ def _worker_host_parameters(op: str) -> tuple[str, ...]:
             "float *out",
             "unsigned long long n",
         )
+    if op == "generic_args":
+        return (
+            "const float *a",
+            "const float *b",
+            "float *out",
+            "const float *tensor0",
+            "const float *tensor1",
+            "float scalar0",
+            "float scalar1",
+            "unsigned long long n",
+        )
     return (
         "const float *a",
         "const float *b",
@@ -395,6 +424,8 @@ def _worker_host_context_initializer(op: str) -> str:
         return "a, b, c, out, n"
     if op == "quad":
         return "a, b, c, d, out, n"
+    if op == "generic_args":
+        return "a, b, out, tensor0, tensor1, scalar0, scalar1, n"
     return "a, b, out, n"
 
 
@@ -411,6 +442,8 @@ def _worker_host_op(op: str) -> int:
         return 6
     if op == "quad":
         return 7
+    if op == "generic_args":
+        return 8
     return 1
 
 
@@ -427,6 +460,19 @@ def _worker_raw_args(op: str, dev_a, dev_b, dev_c, dev_d, dev_out, n: int):
         return CudaVectorTernaryArgs(a=dev_a, b=dev_b, c=dev_c, out=dev_out, n=n)
     if op == "quad":
         return CudaVectorQuaternaryArgs(a=dev_a, b=dev_b, c=dev_c, d=dev_d, out=dev_out, n=n)
+    if op == "generic_args":
+        tensor_args_t = ctypes.c_void_p * 4
+        scalar_args_t = ctypes.c_float * 4
+        return CudaVectorGenericArgs(
+            a=dev_a,
+            b=dev_b,
+            out=dev_out,
+            tensor_args=tensor_args_t(dev_c, dev_d, 0, 0),
+            scalar_args=scalar_args_t(1.5, 0.25, 0.0, 0.0),
+            tensor_arg_count=2,
+            scalar_arg_count=2,
+            n=n,
+        )
     return CudaVectorAddArgs(a=dev_a, b=dev_b, out=dev_out, n=n)
 
 
@@ -552,8 +598,8 @@ def run_worker_smoke(device: int, n: int, block_dim: int, arch: str, build: bool
 
         dev_a = worker.malloc(nbytes)
         dev_b = worker.malloc(nbytes) if op not in {"scale", "square"} else None
-        dev_c = worker.malloc(nbytes) if op in {"triad", "quad"} else None
-        dev_d = worker.malloc(nbytes) if op == "quad" else None
+        dev_c = worker.malloc(nbytes) if op in {"triad", "quad", "generic_args"} else None
+        dev_d = worker.malloc(nbytes) if op in {"quad", "generic_args"} else None
         dev_out = worker.malloc(nbytes)
         try:
             worker.copy_to(dev_a, ctypes.addressof(host_a), nbytes)
@@ -616,7 +662,7 @@ def main() -> None:
     parser.add_argument("--runner", choices=("direct_c_api", "worker"), default="direct_c_api")
     parser.add_argument(
         "--op",
-        choices=("add", "mul", "scale", "square", "axpy", "affine", "triad", "quad"),
+        choices=("add", "mul", "scale", "square", "axpy", "affine", "triad", "quad", "generic_args"),
         default="add",
         help="Worker task body operation",
     )
