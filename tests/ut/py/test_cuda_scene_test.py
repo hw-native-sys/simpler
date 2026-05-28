@@ -21,6 +21,7 @@ from simpler_setup.cuda_callable_compiler import (
     CudaPersistentCallableArtifact,
     CudaVectorAffineArgs,
     CudaVectorAxpyArgs,
+    CudaVectorGenericArgs,
     CudaVectorQuaternaryArgs,
     CudaVectorScaleArgs,
     CudaVectorTernaryArgs,
@@ -88,6 +89,16 @@ _VECTOR_QUAD_BODY = """
 unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
 if (i < ctx->n) {
     ctx->out[i] = ctx->a[i] * ctx->b[i] + ctx->c[i] * ctx->d[i];
+}
+""".lstrip()
+
+_VECTOR_GENERIC_ARGS_BODY = """
+unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x;
+if (i < ctx->n) {
+    ctx->out[i] = ctx->scalar0 * ctx->a[i] +
+                  ctx->tensor0[i] +
+                  ctx->scalar1 * ctx->tensor1[i] +
+                  ctx->b[i];
 }
 """.lstrip()
 
@@ -166,6 +177,19 @@ struct PtoTaskContext {
 };
 """.strip()
 
+_VECTOR_GENERIC_ARGS_CONTEXT = """
+struct PtoTaskContext {
+    const float *a;
+    const float *b;
+    float *out;
+    const float *tensor0;
+    const float *tensor1;
+    float scalar0;
+    float scalar1;
+    unsigned long long n;
+};
+""".strip()
+
 _VECTOR_ADD_HOST_PARAMS = (
     "const float *a",
     "const float *b",
@@ -217,6 +241,17 @@ _VECTOR_QUAD_HOST_PARAMS = (
     "const float *c",
     "const float *d",
     "float *out",
+    "unsigned long long n",
+)
+
+_VECTOR_GENERIC_ARGS_HOST_PARAMS = (
+    "const float *a",
+    "const float *b",
+    "float *out",
+    "const float *tensor0",
+    "const float *tensor1",
+    "float scalar0",
+    "float scalar1",
     "unsigned long long n",
 )
 
@@ -539,6 +574,27 @@ def _cuda_elementwise_quad_spec(source, *, task_name, arch="compute_80", grid_di
             "signature": [ArgDirection.IN, ArgDirection.IN, ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
             "arg_builder": "elementwise_quad_f32",
             "args": ["a", "b", "c", "d", "out"],
+        }
+    }
+
+
+def _cuda_elementwise_generic_args_spec(source, *, task_name, arch="compute_80", grid_dim=4, block_dim=256):
+    return {
+        "cuda": {
+            "source": str(source),
+            "task_name": task_name,
+            "arch": arch,
+            "context_definition": _VECTOR_GENERIC_ARGS_CONTEXT,
+            "host_parameters": _VECTOR_GENERIC_ARGS_HOST_PARAMS,
+            "host_context_initializer": "a, b, out, tensor0, tensor1, scalar0, scalar1, n",
+            "grid_dim": grid_dim,
+            "block_dim": block_dim,
+            "op": 8,
+            "signature": [ArgDirection.IN, ArgDirection.IN, ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
+            "arg_builder": "elementwise_generic_args_f32",
+            "args": ["a", "b", "out"],
+            "tensor_args": ["c", "d"],
+            "scalar_args": ["alpha", "beta"],
         }
     }
 
@@ -1284,6 +1340,36 @@ def test_scene_test_builds_cuda_elementwise_quad_args():
     assert args.c == 404
     assert args.d == 505
     assert args.out == 303
+    assert args.n == 17
+
+
+def test_scene_test_builds_cuda_elementwise_generic_args():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("c", _FakeTensor(17)),
+        Tensor("d", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+        Scalar("alpha", ctypes.c_float(1.5)),
+        Scalar("beta", ctypes.c_float(0.25)),
+    )
+    cuda_spec = {
+        "arg_builder": "elementwise_generic_args_f32",
+        "args": ["a", "b", "out"],
+        "tensor_args": ["c", "d"],
+        "scalar_args": ["alpha", "beta"],
+    }
+
+    args = _build_cuda_host_schedule_args(test_args, cast(Any, _FakeCudaBuffers()), cuda_spec)
+
+    assert isinstance(args, CudaVectorGenericArgs)
+    assert args.a == 101
+    assert args.b == 202
+    assert args.out == 303
+    assert list(args.tensor_args)[:2] == [404, 505]
+    assert list(args.scalar_args)[:2] == pytest.approx([1.5, 0.25])
+    assert args.tensor_arg_count == 2
+    assert args.scalar_arg_count == 2
     assert args.n == 17
 
 
@@ -2164,6 +2250,64 @@ def test_scene_test_runs_cuda_host_schedule_elementwise_quad_with_real_data(tmp_
     try:
         callable_obj = scene.build_callable("cuda")
         scene._run_and_validate_l2(worker, callable_obj, CudaVectorQuadScene.CASES[0])
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_host_schedule_elementwise_generic_args_with_ctypes_data(tmp_path):
+    source = tmp_path / "vector_generic_args.pto.cu"
+    source.write_text(_VECTOR_GENERIC_ARGS_BODY)
+
+    @scene_test(level=2, runtime="host_schedule")
+    class CudaVectorGenericArgsScene(SceneTestCase):
+        CALLABLE = _cuda_elementwise_generic_args_spec(source, task_name="vector_generic_args")
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024, "alpha": 1.5, "beta": 0.25},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            args = TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.5 for i in range(n))),
+                Tensor("c", _CtypesFloatTensor(float(i) * 0.25 for i in range(n))),
+                Tensor("d", _CtypesFloatTensor(float(i) * 0.125 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+                Scalar("alpha", ctypes.c_float(params["alpha"])),
+                Scalar("beta", ctypes.c_float(params["beta"])),
+            )
+            self.last_args = args
+            return args
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit post-run validation")
+
+    scene = CudaVectorGenericArgsScene()
+    worker = CudaVectorGenericArgsScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(
+            worker,
+            callable_obj,
+            CudaVectorGenericArgsScene.CASES[0],
+            skip_golden=True,
+        )
+        args = scene.last_args
+        a_values = args.a.to_list()
+        b_values = args.b.to_list()
+        c_values = args.c.to_list()
+        d_values = args.d.to_list()
+        actual = args.out.to_list()
+        expected = [
+            1.5 * a_values[idx] + c_values[idx] + 0.25 * d_values[idx] + b_values[idx] for idx in range(len(actual))
+        ]
+        assert actual == pytest.approx(expected)
     finally:
         worker.close()
 

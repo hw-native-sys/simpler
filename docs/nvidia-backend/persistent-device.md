@@ -275,6 +275,7 @@ host-schedule CUDA callable specs and persistent-device generated-dispatch
 DAG specs. The current adapters construct `vector_add_f32`,
 `elementwise_binary_f32`, `elementwise_unary_f32`,
 `elementwise_scale_f32`, `elementwise_axpy_f32`,
+`elementwise_generic_args_f32`,
 `persistent_dag_fork_join_f32`, `persistent_dag_chain_f32`,
 `persistent_dag_reuse_f32`, `persistent_dag_scalar_scale_f32`,
 `persistent_dag_scalar_axpy_f32`,

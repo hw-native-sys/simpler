@@ -32,6 +32,7 @@ _PERSISTENT_CACHE_RELATIVE_PATH = Path("build") / "cache" / "cuda" / "onboard" /
 _CUDA_HOST_OP_VECTOR_ADD_F32 = 1
 _CUDA_HOST_OP_VECTOR_SCALE_F32 = 2
 _CUDA_HOST_OP_VECTOR_UNARY_F32 = 4
+_CUDA_HOST_OP_VECTOR_GENERIC_ARGS_F32 = 8
 _CUDA_PERSISTENT_OP_DAG_F32_RING = 1003
 
 
@@ -224,6 +225,25 @@ class CudaVectorQuaternaryArgs(ctypes.Structure):
         ("c", ctypes.c_void_p),
         ("d", ctypes.c_void_p),
         ("out", ctypes.c_void_p),
+        ("n", ctypes.c_uint64),
+    ]
+
+    def buffer_ptr(self) -> int:
+        return ctypes.addressof(self)
+
+    def buffer_size(self) -> int:
+        return ctypes.sizeof(self)
+
+
+class CudaVectorGenericArgs(ctypes.Structure):
+    _fields_ = [
+        ("a", ctypes.c_void_p),
+        ("b", ctypes.c_void_p),
+        ("out", ctypes.c_void_p),
+        ("tensor_args", ctypes.c_void_p * 4),
+        ("scalar_args", ctypes.c_float * 4),
+        ("tensor_arg_count", ctypes.c_uint32),
+        ("scalar_arg_count", ctypes.c_uint32),
         ("n", ctypes.c_uint64),
     ]
 

@@ -382,10 +382,13 @@ def _build_cuda_host_schedule_args(
     device_buffers: _CudaSceneDeviceBuffers,
     cuda_spec: dict,
 ):
+    import ctypes  # noqa: PLC0415
+
     from simpler_setup.cuda_callable_compiler import (  # noqa: PLC0415
         CudaVectorAddArgs,
         CudaVectorAffineArgs,
         CudaVectorAxpyArgs,
+        CudaVectorGenericArgs,
         CudaVectorQuaternaryArgs,
         CudaVectorScaleArgs,
         CudaVectorTernaryArgs,
@@ -402,6 +405,7 @@ def _build_cuda_host_schedule_args(
         "elementwise_affine_f32",
         "elementwise_triad_f32",
         "elementwise_quad_f32",
+        "elementwise_generic_args_f32",
     }
     if arg_builder not in supported_builders:
         raise NotImplementedError(f"Unsupported CUDA scene-test arg_builder: {arg_builder}")
@@ -415,6 +419,7 @@ def _build_cuda_host_schedule_args(
         "elementwise_affine_f32": 5,
         "elementwise_triad_f32": 4,
         "elementwise_quad_f32": 5,
+        "elementwise_generic_args_f32": 3,
     }.get(arg_builder, 3)
     if len(names) != expected_arg_count:
         raise ValueError(f"CUDA {arg_builder} scene tests require exactly {expected_arg_count} args")
@@ -422,6 +427,7 @@ def _build_cuda_host_schedule_args(
         "elementwise_scale_f32": 2,
         "elementwise_axpy_f32": 3,
         "elementwise_affine_f32": 3,
+        "elementwise_generic_args_f32": 3,
     }.get(arg_builder, expected_arg_count)
     missing = [name for name in names[:tensor_arg_count] if name not in device_buffers.ptrs]
     if missing:
@@ -481,6 +487,37 @@ def _build_cuda_host_schedule_args(
             c=device_buffers.ptrs[names[2]],
             d=device_buffers.ptrs[names[3]],
             out=device_buffers.ptrs[names[4]],
+            n=n,
+        )
+    if arg_builder == "elementwise_generic_args_f32":
+        tensor_arg_names = list(cuda_spec.get("tensor_args", []))
+        scalar_arg_names = list(cuda_spec.get("scalar_args", []))
+        if len(tensor_arg_names) != 2:
+            raise ValueError("CUDA elementwise_generic_args_f32 scene tests require exactly two tensor_args")
+        if len(scalar_arg_names) != 2:
+            raise ValueError("CUDA elementwise_generic_args_f32 scene tests require exactly two scalar_args")
+        missing_tensor_args = [name for name in tensor_arg_names if name not in device_buffers.ptrs]
+        if missing_tensor_args:
+            raise ValueError(
+                "CUDA elementwise_generic_args_f32 tensor_args reference unknown tensors: "
+                + ", ".join(missing_tensor_args)
+            )
+        tensor_args_t = ctypes.c_void_p * 4
+        scalar_args_t = ctypes.c_float * 4
+        tensor_arg_ptrs = [device_buffers.ptrs[name] for name in tensor_arg_names]
+        scalar_args = []
+        for name in scalar_arg_names:
+            scalar = getattr(test_args, name)
+            scalar_value = scalar.value if hasattr(scalar, "value") else scalar
+            scalar_args.append(float(scalar_value))
+        return CudaVectorGenericArgs(
+            a=device_buffers.ptrs[names[0]],
+            b=device_buffers.ptrs[names[1]],
+            out=device_buffers.ptrs[names[2]],
+            tensor_args=tensor_args_t(*(tensor_arg_ptrs + [0] * (4 - len(tensor_arg_ptrs)))),
+            scalar_args=scalar_args_t(*(scalar_args + [0.0] * (4 - len(scalar_args)))),
+            tensor_arg_count=len(tensor_arg_ptrs),
+            scalar_arg_count=len(scalar_args),
             n=n,
         )
     return CudaVectorAddArgs(

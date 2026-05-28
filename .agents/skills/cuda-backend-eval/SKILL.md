@@ -791,7 +791,8 @@ path can now build `CALLABLE["cuda"]` host-schedule specs and run the current
 `arg_builder: elementwise_axpy_f32`, and
 `arg_builder: elementwise_affine_f32`, and
 `arg_builder: elementwise_triad_f32`, and
-`arg_builder: elementwise_quad_f32` adapters from CPU
+`arg_builder: elementwise_quad_f32`, and
+`arg_builder: elementwise_generic_args_f32` adapters from CPU
 `TaskArgsBuilder` tensors and scalars through real CUDA device buffers.
 Use the neutral `elementwise_binary_f32` name when the compiled task body is
 not addition but still uses the current `(a, b, out, n)` launch ABI. The same
@@ -810,6 +811,22 @@ path can build
 `arg_builder: persistent_dag_graph_f32`, and
 `arg_builder: persistent_dag_unary_square_f32` adapters through the L2
 `Worker`.
+
+After changing the host-schedule generic tensor/scalar ABI, rebuild the CUDA
+host runtime and run the no-torch ctypes scene selector locally and on H200:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python - <<'PY'
+from simpler_setup.runtime_builder import RuntimeBuilder
+RuntimeBuilder(platform="cuda").get_binaries("host_schedule", build=True)
+PY
+
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k host_schedule_elementwise_generic_args_with_ctypes_data \
+    --platform cuda
+```
+
 Use `persistent_dag_tensor_core_tile_f32` for the normal L2 scene-test path
 when the first DAG task should be a block-wide WMMA
 `m16n16k8:tf32->f32` task. It requires a `16x16xK` tensor descriptor with

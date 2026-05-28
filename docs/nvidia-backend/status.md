@@ -160,8 +160,10 @@ for unary `(a, out, n)` task bodies, `elementwise_scale_f32` for scalar
 tensor/scalar `(a, b, out, alpha, n)` task bodies. It also accepts
 `elementwise_affine_f32` for two-scalar affine
 `(a, b, out, alpha, beta, n)` task bodies and `elementwise_triad_f32` for
-three-input `(a, b, c, out, n)` task bodies, and `elementwise_quad_f32` for
-four-input `(a, b, c, d, out, n)` task bodies.
+three-input `(a, b, c, out, n)` task bodies, `elementwise_quad_f32` for
+four-input `(a, b, c, d, out, n)` task bodies, and
+`elementwise_generic_args_f32` for the first host-schedule generic
+tensor/scalar argument slots.
 The no-torch Worker smoke can validate that same non-addition host-schedule
 ABI with `--op mul`, unary ABI with `--op square`, scalar ABI with
 `--op scale`, mixed tensor/scalar ABI with `--op axpy`, and two-scalar affine
@@ -1507,15 +1509,19 @@ now have first `KernelCompiler` entry points. Both paths can consume
 `CudaTaskBody` style sources. CUDA prepared-callable artifacts can be staged
 through the L2 Python `Worker` registration path. The normal scene-test flow
 can compile and run host-schedule CUDA vector-add, binary elementwise, unary
-square, scalar scale, axpy, two-scalar affine, and three-input triad callable
-specs and persistent-device
+square, scalar scale, axpy, two-scalar affine, three-input triad, quad, and
+generic tensor/scalar callable specs and persistent-device
 fork/join, chain, reuse, scalar scale, scalar AXPY, scalar affine, and
 tensor-tile DAG callable specs, plus third-tensor persistent triad and
 unary-square callable specs, end to end.
 The fourth-tensor persistent quad callable spec also runs end to end through
 ctypes-backed real data. The host-schedule quad callable spec also runs
 through both the normal `SceneTestCase` L2 path and the no-torch Worker smoke
-path. A generic `persistent_dag_graph_f32` adapter can now lower explicit
+path. The host-schedule generic-args callable spec now has a ctypes-backed
+scene test, so it runs on H200 without requiring `torch`; it lowers
+`tensor_args[0]`, `tensor_args[1]`, `scalar_args[0]`, and `scalar_args[1]`
+through the host runtime launch ABI. A generic `persistent_dag_graph_f32`
+adapter can now lower explicit
 runtime graph descriptors with per-task `func_id`, dependency lists, fan-in,
 temporary buffers, generic tensor slots, and scalar slots through the same L2
 `SceneTestCase` path. The adapter now allocates default-sized temporaries for
@@ -1527,6 +1533,33 @@ mapping earlier `out` producers to later `a`/`b`/`c`/`d` and `tensor_args`
 reads. The inference is per task, so mixed descriptors can keep explicit
 dependency lists for some tasks while inferring omitted edges for the
 remaining tasks.
+
+The host-schedule generic-args adapter was checked with a failing test first,
+then local A100 and remote H200 real-data ctypes scene tests:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py -q \
+  -k 'builds_cuda_elementwise_generic_args' --platform cuda
+
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py -q \
+  -k 'host_schedule_elementwise_generic_args_with_ctypes_data' \
+  --platform cuda
+
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+     -q -rs -k host_schedule_elementwise_generic_args_with_ctypes_data \
+     --platform cuda'
+```
+
+Results: the local unit check reported `1 passed, 55 deselected`, the local
+A100 real-data scene reported `1 passed, 55 deselected`, and the H200
+real-data scene reported `1 passed, 55 deselected` after the known PTO-ISA SSH
+refresh warning.
 
 The graph-descriptor adapter was checked with focused local tests:
 
@@ -1998,7 +2031,7 @@ Needed:
 
 - broader CUDA scene-test argument builders beyond the current binary
   elementwise, unary square, scalar scale, axpy, affine, triad, quad, and
-  persistent scalar/DAG tracer bullets.
+  first host-schedule generic-args and persistent scalar/DAG tracer bullets.
 
 ### Fourth-Tensor Persistent DAG Verification
 
