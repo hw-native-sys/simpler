@@ -881,6 +881,22 @@ PYTHONPATH=$PWD:$PWD/python \
     --sizes 4096 --arch compute_80
 ```
 
+Use `cuda_tensor_shape_sweep.py` to run paired A100/H200
+`pto_persistent_dag_tensor` samples over model-shaped tensor tile descriptors.
+This is still a scalar tiled GEMM DAG, so treat it as shape and scheduler
+evidence rather than tensor-core throughput evidence:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_tensor_shape_sweep.py \
+    --shapes 8x4x12,16x16x64,32x16x64 --n 4096 --repeats 3 \
+    --sync-remote-tree
+```
+
+The sweep writes `cuda-tensor-shape-sweep.json`,
+`cuda-tensor-shape-sweep.md`, and `cuda-tensor-shape-sweep.svg` under
+`tmp/cuda-backend/tensor-shape-sweep-<commit>/`.
+
 Refresh the local artifact index after adding or merging captures:
 
 ```bash

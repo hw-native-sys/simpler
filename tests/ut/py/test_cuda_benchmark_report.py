@@ -99,6 +99,26 @@ def _load_pair_benchmark_module():
         sys.modules.pop(spec.name, None)
 
 
+def _load_tensor_shape_sweep_module():
+    script_path = (
+        Path(__file__).resolve().parents[3]
+        / ".agents"
+        / "skills"
+        / "cuda-backend-eval"
+        / "scripts"
+        / "cuda_tensor_shape_sweep.py"
+    )
+    spec = importlib.util.spec_from_file_location("cuda_tensor_shape_sweep", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
 def _load_pair_smoke_module():
     script_path = (
         Path(__file__).resolve().parents[3]
@@ -817,6 +837,95 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     assert str(tmp_path / "cuda-backend" / "h200-current-abc123" / "cuda-benchmark.json") in merge
     assert "combined-current-abc123" in merge
     assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
+
+
+def test_cuda_tensor_shape_sweep_builds_single_baseline_commands(tmp_path):
+    cuda_tensor_shape_sweep = _load_tensor_shape_sweep_module()
+    shape = cuda_tensor_shape_sweep.TensorShape(rows=16, cols=16, inner=64)
+    config = cuda_tensor_shape_sweep.TensorShapeSweepConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        n=4096,
+    )
+
+    local = cuda_tensor_shape_sweep.build_local_sample_command(config, shape)
+    remote = cuda_tensor_shape_sweep.build_remote_sample_command(config, shape)
+
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py" in local
+    assert "--single-baseline" in local
+    assert "pto_persistent_dag_tensor" in local
+    assert "--sizes" in local
+    assert "4096" in local
+    assert "--arch" in local
+    assert "compute_80" in local
+    assert "--tensor-rows" in local
+    assert "16" in local
+    assert "--tensor-cols" in local
+    assert "--tensor-inner" in local
+    assert "64" in local
+
+    assert remote[:6] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "h200-box"]
+    assert "cd /remote/pto-cu" in remote[-1]
+    assert "--single-baseline pto_persistent_dag_tensor" in remote[-1]
+    assert "--arch compute_90" in remote[-1]
+    assert "--tensor-rows 16" in remote[-1]
+    assert "--tensor-cols 16" in remote[-1]
+    assert "--tensor-inner 64" in remote[-1]
+
+
+def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
+    cuda_tensor_shape_sweep = _load_tensor_shape_sweep_module()
+
+    shapes = cuda_tensor_shape_sweep.parse_shapes("8x4x12,16x16x64")
+    assert shapes == (
+        cuda_tensor_shape_sweep.TensorShape(rows=8, cols=4, inner=12),
+        cuda_tensor_shape_sweep.TensorShape(rows=16, cols=16, inner=64),
+    )
+
+    payload = {
+        "metadata": {
+            "label": "tensor-shape-sweep-abc123",
+            "git_commit": "abc123",
+            "n": 4096,
+            "repeats": 2,
+            "shapes": ["8x4x12"],
+        },
+        "results": [
+            {
+                "artifact": "a100",
+                "machine": "hina",
+                "shape": "8x4x12",
+                "repeat": 0,
+                "status": "pass",
+                "device_wall_ns": 1000,
+                "host_wall_ns": 1500,
+                "dispatch_func_ids": [3, 1, 2, 1],
+                "tensor_tile": {"rows": 8, "cols": 4, "inner": 12, "tile_count": 128},
+            },
+            {
+                "artifact": "h200",
+                "shape": "8x4x12",
+                "repeat": 0,
+                "status": "pass",
+                "device_wall_ns": 800,
+                "host_wall_ns": 1200,
+                "dispatch_func_ids": [3, 1, 2, 1],
+                "tensor_tile": {"rows": 8, "cols": 4, "inner": 12, "tile_count": 128},
+            },
+        ],
+    }
+
+    markdown = cuda_tensor_shape_sweep.render_markdown(payload)
+    svg = cuda_tensor_shape_sweep.render_svg(payload)
+
+    assert "- Workload: `pto_persistent_dag_tensor` scalar tiled GEMM DAG." in markdown
+    assert "| a100 | hina | 8x4x12 | 0 | pass | 1000 | 1500 | 128 | `3,1,2,1` |" in markdown
+    assert "| h200 | h200 | 8x4x12 | 0 | pass | 800 | 1200 | 128 | `3,1,2,1` |" in markdown
+    assert "tensor-shape-sweep-abc123" in svg
+    assert "8x4x12" in svg
 
 
 def test_cuda_pair_benchmark_can_reuse_remote_checkout(tmp_path):
