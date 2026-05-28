@@ -161,23 +161,6 @@ int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, siz
     return 0;
 }
 
-void *DeviceRunner::acquire_pooled_gm_heap() {
-    if (!gm_heap_arena_.is_committed()) return nullptr;
-    return gm_heap_arena_.base();
-}
-
-void *DeviceRunner::acquire_pooled_gm_sm() {
-    if (!gm_sm_arena_.is_committed()) return nullptr;
-    return gm_sm_arena_.base();
-}
-
-void *DeviceRunner::acquire_pooled_runtime_arena() {
-    // hbg calls setup_static_arena(...,0) and leaves runtime_arena_pool_
-    // uncommitted — fail loudly if a caller asks for it anyway.
-    if (!runtime_arena_pool_.is_committed()) return nullptr;
-    return runtime_arena_pool_.base();
-}
-
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     int dev_id = device_id_;
     return std::thread([dev_id, fn = std::move(fn)]() {
@@ -404,22 +387,6 @@ int DeviceRunner::ensure_binaries_loaded() {
     binaries_loaded_ = true;
     LOG_INFO_V0("DeviceRunner: binaries loaded");
     return 0;
-}
-
-void *DeviceRunner::allocate_tensor(size_t bytes) { return mem_alloc_.alloc(bytes); }
-
-void DeviceRunner::free_tensor(void *dev_ptr) {
-    if (dev_ptr != nullptr) {
-        mem_alloc_.free(dev_ptr);
-    }
-}
-
-int DeviceRunner::copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes) {
-    return rtMemcpy(dev_ptr, bytes, host_ptr, bytes, RT_MEMCPY_HOST_TO_DEVICE);
-}
-
-int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes) {
-    return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
 int DeviceRunner::query_max_block_dim(rtStream_t stream, uint32_t *out_cube, uint32_t *out_vector) {

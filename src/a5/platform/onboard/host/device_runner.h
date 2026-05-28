@@ -39,6 +39,7 @@
 #include "callable.h"
 #include "prepare_callable_common.h"
 #include "device_arena.h"
+#include "device_runner_base.h"     // common DeviceRunnerBase
 #include "device_runner_helpers.h"  // common DeviceArgs + KernelArgsHelper
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -69,12 +70,9 @@
  * - Coordinated execution of both kernel types
  * - Runtime execution workflow
  */
-class DeviceRunner {
+class DeviceRunner : public DeviceRunnerBase {
 public:
-    DeviceRunner() :
-        gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
-        gm_sm_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
-        runtime_arena_pool_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
+    DeviceRunner() = default;
     ~DeviceRunner();
 
     /**
@@ -84,65 +82,18 @@ public:
      * on identical sizes. `runtime_arena_size` is 0 for the hbg path (no
      * prebuilt runtime arena) — the corresponding arena stays uncommitted.
      * Returns 0 on success, -1 on failure.
+     *
+     * `allocate_tensor`, `free_tensor`, `copy_to_device`, `copy_from_device`,
+     * and `acquire_pooled_{gm_heap,gm_sm,runtime_arena}` are inherited from
+     * `DeviceRunnerBase`.
      */
     int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
-
-    /**
-     * Return the pooled GM heap / PTO2 SM / runtime arena pointer.
-     * setup_static_arena must have already committed the relevant region;
-     * otherwise these return nullptr. All pointers are stable for the
-     * Worker's lifetime; the three underlying device buffers are released
-     * in `finalize()`.
-     *
-     * acquire_pooled_runtime_arena() is trb-only — the runtime arena region
-     * is only committed when setup_static_arena was called with
-     * runtime_arena_size > 0. Calling it on the hbg path
-     * (setup_static_arena(...,0)) returns nullptr (well-defined).
-     */
-    void *acquire_pooled_gm_heap();
-    void *acquire_pooled_gm_sm();
-    void *acquire_pooled_runtime_arena();
 
     /**
      * Create a thread bound to this device.
      * The thread calls rtSetDevice(device_id) on entry.
      */
     std::thread create_thread(std::function<void()> fn);
-
-    /**
-     * Allocate device tensor memory
-     *
-     * @param bytes  Size of tensor in bytes
-     * @return Device pointer on success, nullptr on failure
-     */
-    void *allocate_tensor(size_t bytes);
-
-    /**
-     * Free device tensor memory
-     *
-     * @param dev_ptr  Device pointer to free
-     */
-    void free_tensor(void *dev_ptr);
-
-    /**
-     * Copy data from host to device
-     *
-     * @param dev_ptr   Device pointer
-     * @param host_ptr  Host pointer
-     * @param bytes    Number of bytes to copy
-     * @return 0 on success, error code on failure
-     */
-    int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
-
-    /**
-     * Copy data from device to host
-     *
-     * @param host_ptr  Host pointer
-     * @param dev_ptr   Device pointer
-     * @param bytes    Number of bytes to copy
-     * @return 0 on success, error code on failure
-     */
-    int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
 
     /**
      * Execute a runtime
@@ -423,28 +374,14 @@ private:
     // AICPU op loader — handles dispatcher bootstrap and per-task launches.
     host::LoadAicpuOp load_aicpu_op_;
 
-    // Memory management
-    MemoryAllocator mem_alloc_;
-
-    // Three independent per-Worker arenas, each backing a single pooled
-    // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime
-    // arena). Split out from a single backing allocation because the
-    // combined size can exceed the device allocator's largest contiguous
-    // block — three separate device_malloc calls are friendlier than one
-    // big one. Released explicitly in finalize() before mem_alloc_.finalize()
-    // so the underlying buffers do not get freed twice.
+    // `mem_alloc_`, `gm_heap_arena_`, `gm_sm_arena_`, `runtime_arena_pool_`,
+    // and the alloc/free trampolines are inherited from `DeviceRunnerBase`.
     //
-    // `runtime_arena_pool_` stays unreserved when setup_static_arena was
-    // invoked with runtime_arena_size == 0 (hbg path).
+    // Released explicitly in finalize() before mem_alloc_.finalize() so the
+    // underlying buffers do not get freed twice. `runtime_arena_pool_` stays
+    // unreserved when setup_static_arena was invoked with
+    // runtime_arena_size == 0 (hbg path).
     //
-    // Trampolines forward DeviceArena's alloc/free calls to mem_alloc_.
-    static void *arena_alloc_trampoline(void *ctx, size_t size) {
-        return static_cast<MemoryAllocator *>(ctx)->alloc(size);
-    }
-    static void arena_free_trampoline(void *ctx, void *p) { static_cast<MemoryAllocator *>(ctx)->free(p); }
-    DeviceArena gm_heap_arena_;
-    DeviceArena gm_sm_arena_;
-    DeviceArena runtime_arena_pool_;
     // Cached sizes for setup_static_arena's "fits" check — avoids re-allocating
     // a buffer when a later worker init asks for an equal-or-smaller layout.
     size_t cached_gm_heap_size_{0};
