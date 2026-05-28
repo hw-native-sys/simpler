@@ -70,6 +70,12 @@ EXPECTED_DISPATCH_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_tensor": "3,1,2,1",
     "pto_persistent_dag_tensor_core": "10,1,2,1",
 }
+TENSOR_TILE_BASELINES: tuple[str, ...] = (
+    "pto_persistent_dag_tensor",
+    "pto_persistent_dag_graph_tensor",
+    "pto_persistent_dag_tensor_core",
+    "cublas_sgemm",
+)
 
 
 @dataclass(frozen=True)
@@ -335,6 +341,13 @@ def build_validate_command(
         if baseline in EXPECTED_DISPATCH_BY_BASELINE
         for part in ("--require-dispatch", f"{baseline}={EXPECTED_DISPATCH_BY_BASELINE[baseline]}")
     ]
+    tensor_shape = f"{config.tensor_rows}x{config.tensor_cols}x{config.tensor_inner}"
+    tensor_tile_args = [
+        part
+        for baseline in _selected_baselines(config)
+        if baseline in TENSOR_TILE_BASELINES
+        for part in ("--require-tensor-tile", f"{baseline}={tensor_shape}")
+    ]
     return [
         "env",
         f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}",
@@ -349,6 +362,7 @@ def build_validate_command(
         str(_expected_result_count(config)),
         *baseline_args,
         *dispatch_args,
+        *tensor_tile_args,
         "--require-report-files",
         "--require-command-examples",
         "--require-zero-scheduler-errors",

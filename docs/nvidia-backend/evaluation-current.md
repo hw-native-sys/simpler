@@ -90,7 +90,10 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-baseline pto_persistent_dag_tensor_core \
     --require-baseline cublas_sgemm --require-report-files \
     --require-command-examples --require-zero-scheduler-errors \
-    --require-source-papers
+    --require-source-papers \
+    --require-dispatch pto_persistent_dag_tensor_core=10,1,2,1 \
+    --require-tensor-tile pto_persistent_dag_tensor_core=16x16x16 \
+    --require-tensor-tile cublas_sgemm=16x16x16
 ```
 
 Selected rows:
@@ -101,11 +104,13 @@ Selected rows:
 | H200 | 14848 | 31936 | 44576 | 36096 | 40959 | 28768 |
 
 This capture is a gate for command construction, validation coverage, and
-real A100/H200 execution at the current commit. It is intentionally smaller
-than the full `61cf96cd` capture and should not replace the three-size,
-three-repeat rows below for broad trend reading. The `0b3c1699` gate was
-captured after adding scheduler no-progress diagnostics; all PTO persistent
-DAG rows reported zero device scheduler errors.
+real A100/H200 execution at the current commit. The current validator also
+checks expected generated-dispatch IDs and tensor descriptor shapes for tensor
+rows. It is intentionally smaller than the full `61cf96cd` capture and should
+not replace the three-size, three-repeat rows below for broad trend reading.
+The `0b3c1699` gate was captured after adding scheduler no-progress
+diagnostics; all PTO persistent DAG rows reported zero device scheduler
+errors.
 
 ## Supplemental Scalar-Scale Benchmark
 

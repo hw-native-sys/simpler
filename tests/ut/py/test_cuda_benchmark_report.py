@@ -1041,6 +1041,41 @@ def test_cuda_capture_validator_requires_dispatch_sequence():
     )
 
 
+def test_cuda_capture_validator_requires_tensor_tile_shape():
+    cuda_validate_capture = _load_capture_validator_module()
+    payload = _paired_capture_payload()
+    payload["results"].append(
+        {
+            "machine": "hina",
+            "baseline": "pto_persistent_dag_tensor_core",
+            "n": 1024,
+            "repeat": 0,
+            "status": "pass",
+            "device_wall_ns": 1024,
+            "tensor_tile": {"rows": 16, "cols": 16, "inner": 32},
+        }
+    )
+
+    errors = cuda_validate_capture.validate_capture(
+        payload,
+        required_tensor_tiles={"pto_persistent_dag_tensor_core": "16x16x16"},
+    )
+
+    assert (
+        "expected tensor tile 16x16x16 for machine=hina baseline=pto_persistent_dag_tensor_core n=1024, found 16x16x32"
+    ) in errors
+
+    payload["results"][-1]["tensor_tile"]["inner"] = 16
+
+    assert (
+        cuda_validate_capture.validate_capture(
+            payload,
+            required_tensor_tiles={"pto_persistent_dag_tensor_core": "16x16x16"},
+        )
+        == []
+    )
+
+
 def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     cuda_validate_capture = _load_capture_validator_module()
     args = cuda_validate_capture.parse_args(["capture.json", "--preset", "paired-current"])
@@ -1056,6 +1091,8 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     assert "cublas_sgemm" in args.require_baseline
     assert "pto_persistent_dag_graph_diamond=9,2,1,2,1" in args.require_dispatch
     assert "pto_persistent_dag_tensor_core=10,1,2,1" in args.require_dispatch
+    assert "pto_persistent_dag_tensor=16x16x16" in args.require_tensor_tile
+    assert "cublas_sgemm=16x16x16" in args.require_tensor_tile
     assert args.expected_result_count == 810
 
 
@@ -1544,6 +1581,11 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     assert "pto_persistent_dag_tensor=3,1,2,1" in validate
     assert "pto_persistent_dag_graph_tensor=3,1,2,1" in validate
     assert "pto_persistent_dag_tensor_core=10,1,2,1" in validate
+    assert "--require-tensor-tile" in validate
+    assert "pto_persistent_dag_tensor=16x16x16" in validate
+    assert "pto_persistent_dag_graph_tensor=16x16x16" in validate
+    assert "pto_persistent_dag_tensor_core=16x16x16" in validate
+    assert "cublas_sgemm=16x16x16" in validate
     assert "--require-command-examples" in validate
     assert "--require-source-papers" in validate
     assert "--require-zero-scheduler-errors" in validate
@@ -1579,6 +1621,9 @@ def test_cuda_pair_benchmark_validate_command_matches_configured_capture(tmp_pat
     dispatch = [validate[index + 1] for index, part in enumerate(validate) if part == "--require-dispatch"]
     assert "pto_persistent_dag_graph_diamond=9,2,1,2,1" in dispatch
     assert "pto_persistent_dag_tensor_core=10,1,2,1" in dispatch
+    tensor_tiles = [validate[index + 1] for index, part in enumerate(validate) if part == "--require-tensor-tile"]
+    assert "pto_persistent_dag_tensor=16x16x16" in tensor_tiles
+    assert "cublas_sgemm=16x16x16" in tensor_tiles
 
 
 def test_cuda_pair_benchmark_merge_command_records_sanitized_examples(tmp_path):

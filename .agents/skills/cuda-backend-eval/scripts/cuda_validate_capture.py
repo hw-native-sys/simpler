@@ -74,6 +74,12 @@ PAIRED_CURRENT_DISPATCH = {
     "pto_persistent_dag_graph_tensor": "3,1,2,1",
     "pto_persistent_dag_tensor_core": "10,1,2,1",
 }
+PAIRED_CURRENT_TENSOR_TILES = {
+    "pto_persistent_dag_tensor": "16x16x16",
+    "pto_persistent_dag_graph_tensor": "16x16x16",
+    "pto_persistent_dag_tensor_core": "16x16x16",
+    "cublas_sgemm": "16x16x16",
+}
 
 
 def _as_list(values: Sequence[str] | None) -> list[str]:
@@ -111,6 +117,18 @@ def _dispatch_text(row: dict[str, Any]) -> str:
     if not isinstance(dispatch, list):
         return "-"
     return ",".join(str(value) for value in dispatch)
+
+
+def _tensor_tile_shape(row: dict[str, Any]) -> str:
+    tensor_tile = row.get("tensor_tile")
+    if not isinstance(tensor_tile, dict):
+        return "-"
+    rows = tensor_tile.get("rows")
+    cols = tensor_tile.get("cols")
+    inner = tensor_tile.get("inner")
+    if rows is None or cols is None or inner is None:
+        return "-"
+    return f"{rows}x{cols}x{inner}"
 
 
 def _validate_required_machines(rows: list[dict[str, Any]], required_machines: Sequence[str]) -> list[str]:
@@ -287,6 +305,23 @@ def _validate_dispatch(rows: list[dict[str, Any]], required_dispatch: dict[str, 
     return errors
 
 
+def _validate_tensor_tiles(rows: list[dict[str, Any]], required_tensor_tiles: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+    for row in rows:
+        baseline = row.get("baseline")
+        expected = required_tensor_tiles.get(str(baseline))
+        if expected is None:
+            continue
+        found = _tensor_tile_shape(row)
+        if found != expected:
+            machine = row.get("machine", "unknown")
+            n = row.get("n", "unknown")
+            errors.append(
+                f"expected tensor tile {expected} for machine={machine} baseline={baseline} n={n}, found {found}"
+            )
+    return errors
+
+
 def validate_capture(  # noqa: PLR0913
     payload: dict[str, Any],
     *,
@@ -300,6 +335,7 @@ def validate_capture(  # noqa: PLR0913
     require_command_examples: bool = False,
     require_zero_scheduler_errors: bool = False,
     required_dispatch: dict[str, str] | None = None,
+    required_tensor_tiles: dict[str, str] | None = None,
     source_paper_root: Path | None = None,
 ) -> list[str]:
     rows = _results(payload)
@@ -332,6 +368,7 @@ def validate_capture(  # noqa: PLR0913
         errors.extend(_validate_zero_scheduler_errors(rows))
 
     errors.extend(_validate_dispatch(rows, required_dispatch or {}))
+    errors.extend(_validate_tensor_tiles(rows, required_tensor_tiles or {}))
 
     if source_paper_root is not None:
         errors.extend(_validate_source_papers(payload, source_root=source_paper_root))
@@ -354,17 +391,19 @@ def _apply_preset(args: argparse.Namespace) -> None:
         args.expected_result_count = 810
     if not args.require_dispatch:
         args.require_dispatch = [f"{baseline}={dispatch}" for baseline, dispatch in PAIRED_CURRENT_DISPATCH.items()]
+    if not args.require_tensor_tile:
+        args.require_tensor_tile = [f"{baseline}={shape}" for baseline, shape in PAIRED_CURRENT_TENSOR_TILES.items()]
     args.require_report_files = True
     args.require_zero_scheduler_errors = True
 
 
-def _parse_required_dispatch(values: Sequence[str] | None) -> dict[str, str]:
+def _parse_required_mapping(values: Sequence[str] | None, *, flag: str) -> dict[str, str]:
     required: dict[str, str] = {}
     for value in values or ():
         if "=" not in value:
-            raise ValueError(f"invalid --require-dispatch {value!r}; expected BASELINE=ID,ID")
-        baseline, dispatch = value.split("=", 1)
-        required[baseline.strip()] = dispatch.strip()
+            raise ValueError(f"invalid {flag} {value!r}; expected BASELINE=VALUE")
+        baseline, expected = value.split("=", 1)
+        required[baseline.strip()] = expected.strip()
     return required
 
 
@@ -381,6 +420,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-command-examples", action="store_true")
     parser.add_argument("--require-zero-scheduler-errors", action="store_true")
     parser.add_argument("--require-dispatch", action="append")
+    parser.add_argument("--require-tensor-tile", action="append")
     parser.add_argument("--require-source-papers", action="store_true")
     return parser.parse_args(argv)
 
@@ -390,7 +430,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _apply_preset(args)
     payload = json.loads(args.json_path.read_text())
     try:
-        required_dispatch = _parse_required_dispatch(args.require_dispatch)
+        required_dispatch = _parse_required_mapping(args.require_dispatch, flag="--require-dispatch")
+        required_tensor_tiles = _parse_required_mapping(args.require_tensor_tile, flag="--require-tensor-tile")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -406,6 +447,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_command_examples=args.require_command_examples,
         require_zero_scheduler_errors=args.require_zero_scheduler_errors,
         required_dispatch=required_dispatch,
+        required_tensor_tiles=required_tensor_tiles,
         source_paper_root=Path.cwd() if args.require_source_papers else None,
     )
     if errors:

@@ -1335,7 +1335,9 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-command-examples --require-zero-scheduler-errors \
     --require-source-papers \
     --require-dispatch pto_persistent_dag_graph_diamond=9,2,1,2,1 \
-    --require-dispatch pto_persistent_dag_tensor_core=10,1,2,1
+    --require-dispatch pto_persistent_dag_tensor_core=10,1,2,1 \
+    --require-tensor-tile pto_persistent_dag_tensor_core=16x16x16 \
+    --require-tensor-tile cublas_sgemm=16x16x16
 ```
 
 The compact current-head gate checks the expected A100/H200 machines,
@@ -1352,6 +1354,10 @@ DAG rows include device scheduler counters and that each counter set is zero.
 expected device `func_id` sequence. The paired benchmark runner now adds these
 dispatch requirements automatically for known persistent DAG baselines,
 including scalar, graph-descriptor, tensor-tile, and tensor-core rows.
+`--require-tensor-tile` checks that tensor and cuBLAS benchmark rows recorded
+the requested tensor descriptor shape. The paired benchmark runner adds these
+requirements automatically from `--tensor-rows`, `--tensor-cols`, and
+`--tensor-inner`.
 
 Use `cuda_validate_smoke.py` for paired smoke artifacts. It checks required
 artifacts, pass status, zero device scheduler errors, expected runtime/mode,

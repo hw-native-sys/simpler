@@ -118,7 +118,10 @@ Validate a refreshed paired-current capture before updating committed docs
 with `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`.
 The paired benchmark runner wires that validator with expected generated
 `dispatch_func_ids` for known persistent DAG rows, so a numerically passing
-capture is still rejected if it ran the wrong CUDA device task sequence.
+capture is still rejected if it ran the wrong CUDA device task sequence. It
+also checks tensor descriptor metadata for tensor and cuBLAS rows, so a report
+captured with the wrong `--tensor-rows`, `--tensor-cols`, or `--tensor-inner`
+does not get copied into the current-evaluation tables.
 
 ## Baselines
 
@@ -250,7 +253,10 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-baseline pto_persistent_dag_tensor_core \
     --require-baseline cublas_sgemm --require-report-files \
     --require-command-examples --require-zero-scheduler-errors \
-    --require-source-papers
+    --require-source-papers \
+    --require-dispatch pto_persistent_dag_tensor_core=10,1,2,1 \
+    --require-tensor-tile pto_persistent_dag_tensor_core=16x16x16 \
+    --require-tensor-tile cublas_sgemm=16x16x16
 ```
 
 The default full paired benchmark shape uses:

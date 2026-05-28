@@ -246,8 +246,8 @@ the same paired report. It runs `N=1024`, one repeat, `batch_tasks=2`, and
 `worker_blocks_per_task=4`, producing `50` combined rows under
 `tmp/cuda-backend/combined-current-0b3c1699/`. The paired runner validated
 required baselines, expected generated-dispatch sequences, command examples,
-source-paper provenance, and Markdown and SVG report files. Selected device
-times were A100
+tensor descriptor metadata, source-paper provenance, and Markdown and SVG
+report files. Selected device times were A100
 host/base-DAG/tensor/tensor-core/cuBLAS/grid-batch
 `33792/61440/44032/59392/60416/41984 ns` and H200
 `14848/31936/44576/36096/40959/28768 ns`. The capture was run after adding
