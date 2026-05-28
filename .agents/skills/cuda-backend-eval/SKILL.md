@@ -1305,9 +1305,11 @@ PYTHONPATH=$PWD:$PWD/python:.agents/skills/cuda-backend-eval/scripts \
     tmp/cuda-backend/combined-current-0b3c1699/cuda-benchmark.json
 ```
 
-Use `--section launch`, `--section unary-square`, `--section worker-grid`, or
-`--section dag-shapes` to refresh only one table. This avoids hand-calculating
-the current-evaluation summary from raw JSON.
+Use `--section launch`, `--section unary-square`, `--section worker-grid`,
+`--section dag-shapes`, or `--section tensor-throughput` to refresh only one
+table. The tensor-throughput section summarizes selected benchmark tensor-DAG
+and cuBLAS rows as median GF/s from recorded tensor tile descriptors. This
+avoids hand-calculating the current-evaluation summary from raw JSON.
 
 Render the compact tensor-baseline sweep table directly from its raw sweep
 JSON:

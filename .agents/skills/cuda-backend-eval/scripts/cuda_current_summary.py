@@ -53,6 +53,12 @@ DAG_BASELINES = (
     "pto_persistent_dag_unary_square",
     "pto_persistent_dag_tensor",
 )
+BENCHMARK_TENSOR_BASELINES = (
+    "pto_persistent_dag_tensor",
+    "pto_persistent_dag_graph_tensor",
+    "pto_persistent_dag_tensor_core",
+    "cublas_sgemm",
+)
 
 
 def _machine_label(machine: str) -> str:
@@ -115,7 +121,7 @@ def _format_gflops(value: float | None) -> str:
 def _table(headers: Sequence[str], rows: Sequence[Sequence[str | int]]) -> str:
     lines = [
         "| " + " | ".join(headers) + " |",
-        "| " + " | ".join("---" if idx == 0 else "-" for idx, _ in enumerate(headers)) + " |",
+        "| " + " | ".join("-" * max(1, len(header)) for header in headers) + " |",
     ]
     lines.extend("| " + " | ".join(str(cell) for cell in row) + " |" for row in rows)
     return "\n".join(lines)
@@ -253,6 +259,18 @@ def _tensor_row_n(row: Mapping[str, Any], payload: Payload) -> str:
     return str(n)
 
 
+def _tensor_tile_shape(row: Mapping[str, Any]) -> str:
+    tile = row.get("tensor_tile")
+    if not isinstance(tile, Mapping):
+        return str(row.get("shape", "-"))
+    rows = tile.get("rows")
+    cols = tile.get("cols")
+    inner = tile.get("inner")
+    if rows is None or cols is None or inner is None:
+        return "-"
+    return f"{rows}x{cols}x{inner}"
+
+
 def _tensor_flops(n: str, shape: str) -> int | None:
     parts = shape.split("x")
     if len(parts) != 3:
@@ -287,6 +305,78 @@ def _tensor_sweep_medians(payload: Payload) -> dict[tuple[str, str, str, str], i
         shape = str(row.get("shape", "unknown"))
         groups.setdefault((machine, baseline, n, shape), []).append(int(row.get("device_wall_ns", 0)))
     return {key: statistics.median(values) for key, values in groups.items()}
+
+
+def _benchmark_tensor_medians(payload: Payload) -> dict[tuple[str, str, str, str], int | float]:
+    groups: dict[tuple[str, str, str, str], list[int]] = {}
+    for row in payload.get("results", []):
+        if row.get("status", "pass") != "pass":
+            continue
+        baseline = str(row.get("baseline", "unknown"))
+        if baseline not in BENCHMARK_TENSOR_BASELINES:
+            continue
+        machine = str(row.get("machine") or row.get("artifact", "unknown"))
+        n = _tensor_row_n(row, payload)
+        shape = _tensor_tile_shape(row)
+        if shape == "-":
+            continue
+        groups.setdefault((machine, baseline, n, shape), []).append(int(row.get("device_wall_ns", 0)))
+    return {key: statistics.median(values) for key, values in groups.items()}
+
+
+def render_benchmark_tensor_throughput_table(payload: Payload) -> str:
+    medians = _benchmark_tensor_medians(payload)
+    rows: list[list[str | int]] = []
+    machine_sizes_shapes = sorted(
+        {(machine, n, shape) for machine, _, n, shape in medians},
+        key=lambda item: (_machine_label(item[0]), int(item[1]) if item[1].isdigit() else item[1], item[2], item[0]),
+    )
+    for machine, n, shape in machine_sizes_shapes:
+        scalar_key = (machine, "pto_persistent_dag_tensor", n, shape)
+        graph_tensor_key = (machine, "pto_persistent_dag_graph_tensor", n, shape)
+        tensor_core_key = (machine, "pto_persistent_dag_tensor_core", n, shape)
+        cublas_key = (machine, "cublas_sgemm", n, shape)
+        if scalar_key not in medians:
+            continue
+        scalar = medians[scalar_key]
+        graph_tensor = medians.get(graph_tensor_key)
+        tensor_core = medians.get(tensor_core_key)
+        cublas = medians.get(cublas_key)
+        rows.append(
+            [
+                _machine_label(machine),
+                n,
+                shape,
+                _format_number(scalar),
+                _format_number(graph_tensor) if graph_tensor is not None else "-",
+                _format_number(tensor_core) if tensor_core is not None else "-",
+                _format_number(cublas) if cublas is not None else "-",
+                _format_gflops(_tensor_gflops(n, shape, scalar)),
+                _format_gflops(_tensor_gflops(n, shape, graph_tensor)),
+                _format_gflops(_tensor_gflops(n, shape, tensor_core)),
+                _format_gflops(_tensor_gflops(n, shape, cublas)),
+                _ratio(tensor_core, scalar) if tensor_core is not None else "-",
+                _ratio(cublas, scalar) if cublas is not None else "-",
+            ]
+        )
+    return _table(
+        [
+            "GPU",
+            "N",
+            "Shape",
+            "Scalar ns",
+            "Graph ns",
+            "Tensor-core ns",
+            "cuBLAS ns",
+            "Scalar GF/s",
+            "Graph GF/s",
+            "Tensor-core GF/s",
+            "cuBLAS GF/s",
+            "Tensor-core/scalar",
+            "cuBLAS/scalar",
+        ],
+        rows,
+    )
 
 
 def render_tensor_sweep_table(payload: Payload) -> str:
@@ -361,6 +451,8 @@ def render_summary(payload: Payload) -> str:
             render_worker_grid_table(payload),
             "## Persistent DAG Shapes",
             render_dag_shape_table(payload),
+            "## Selected Tensor Throughput",
+            render_benchmark_tensor_throughput_table(payload),
         ]
     )
 
@@ -370,7 +462,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("json_path", type=Path)
     parser.add_argument(
         "--section",
-        choices=("all", "launch", "unary-square", "worker-grid", "dag-shapes", "tensor-sweep"),
+        choices=(
+            "all",
+            "launch",
+            "unary-square",
+            "worker-grid",
+            "dag-shapes",
+            "tensor-throughput",
+            "tensor-sweep",
+        ),
         default="all",
     )
     return parser.parse_args(argv)
@@ -387,6 +487,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(render_worker_grid_table(payload))
     elif args.section == "dag-shapes":
         print(render_dag_shape_table(payload))
+    elif args.section == "tensor-throughput":
+        print(render_benchmark_tensor_throughput_table(payload))
     elif args.section == "tensor-sweep":
         print(render_tensor_sweep_table(payload))
     else:

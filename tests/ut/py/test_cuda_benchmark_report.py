@@ -4101,6 +4101,83 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
     )
 
 
+def test_cuda_current_summary_renders_benchmark_tensor_throughput_table():
+    cuda_current_summary = _load_current_summary_module()
+    payload = {
+        "results": [
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_tensor",
+                "n": 512,
+                "device_wall_ns": 2048,
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 2},
+                "status": "pass",
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_tensor_core",
+                "n": 512,
+                "device_wall_ns": 1024,
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 2},
+                "status": "pass",
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_graph_tensor",
+                "n": 512,
+                "device_wall_ns": 4096,
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 2},
+                "status": "pass",
+            },
+            {
+                "machine": "hina",
+                "baseline": "cublas_sgemm",
+                "n": 512,
+                "device_wall_ns": 8192,
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 2},
+                "status": "pass",
+            },
+            {
+                "machine": "dasys-h200x8",
+                "baseline": "pto_persistent_dag_tensor",
+                "n": 512,
+                "device_wall_ns": 1024,
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 2},
+                "status": "pass",
+            },
+            {
+                "machine": "dasys-h200x8",
+                "baseline": "pto_persistent_dag_tensor_core",
+                "n": 512,
+                "device_wall_ns": 2048,
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 2},
+                "status": "pass",
+            },
+            {
+                "machine": "dasys-h200x8",
+                "baseline": "cublas_sgemm",
+                "n": 512,
+                "device_wall_ns": 4096,
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 2},
+                "status": "pass",
+            },
+        ]
+    }
+
+    table = cuda_current_summary.render_benchmark_tensor_throughput_table(payload)
+
+    assert (
+        "| GPU | N | Shape | Scalar ns | Graph ns | Tensor-core ns | cuBLAS ns | Scalar GF/s | "
+        "Graph GF/s | Tensor-core GF/s | cuBLAS GF/s | Tensor-core/scalar | cuBLAS/scalar |"
+    ) in table
+    assert (
+        "| --- | - | ----- | --------- | -------- | -------------- | --------- | ----------- | "
+        "---------- | ---------------- | ----------- | ------------------ | ------------- |"
+    ) in table
+    assert "| A100 | 512 | 16x16x16 | 2048 | 4096 | 1024 | 8192 | 8.00 | 4.00 | 16.00 | 2.00 | 0.50x | 4.00x |" in table
+    assert "| H200 | 512 | 16x16x16 | 1024 | - | 2048 | 4096 | 16.00 | - | 8.00 | 4.00 | 2.00x | 4.00x |" in table
+
+
 def test_summarize_results_groups_by_machine_and_baseline():
     cuda_benchmark = _load_benchmark_module()
     payload = {

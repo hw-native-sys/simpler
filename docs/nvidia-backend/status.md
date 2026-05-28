@@ -392,8 +392,9 @@ Evidence:
   in generated metadata, and writes JSON, Markdown, and SVG artifacts under
   `tmp/cuda-backend/`.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_current_summary.py` renders
-  the compact benchmark tables and the compact tensor-sweep median table used
-  by [evaluation-current.md](evaluation-current.md) from raw JSON artifacts.
+  the compact benchmark tables, selected benchmark tensor-throughput table,
+  and compact tensor-sweep median table used by
+  [evaluation-current.md](evaluation-current.md) from raw JSON artifacts.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`
   checks paired benchmark captures for expected machines, selected baselines,
   sizes, repeats, sample count, generated report files, source-paper

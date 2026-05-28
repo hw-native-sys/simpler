@@ -106,6 +106,13 @@ Selected rows:
 | A100 | 33792 | 61440 | 44032 | 59392 | 60416 | 41984 |
 | H200 | 14848 | 31936 | 44576 | 36096 | 40959 | 28768 |
 
+Selected tensor throughput from the same raw JSON:
+
+| GPU | N | Shape | Scalar ns | Graph ns | Tensor-core ns | cuBLAS ns | Scalar GF/s | Graph GF/s | Tensor-core GF/s | cuBLAS GF/s | Tensor-core/scalar | cuBLAS/scalar |
+| --- | - | ----- | --------- | -------- | -------------- | --------- | ----------- | ---------- | ---------------- | ----------- | ------------------ | ------------- |
+| A100 | 1024 | 16x16x16 | 44032 | - | 59392 | 60416 | 0.74 | - | 0.55 | 0.54 | 1.35x | 1.37x |
+| H200 | 1024 | 16x16x16 | 44576 | - | 36096 | 40959 | 0.74 | - | 0.91 | 0.80 | 0.81x | 0.92x |
+
 This capture is a gate for command construction, validation coverage, and
 real A100/H200 execution at the current commit. The current validator also
 checks expected generated-dispatch IDs and tensor descriptor shapes for tensor
