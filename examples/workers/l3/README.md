@@ -64,6 +64,8 @@ Two things to know before reading the example:
 | [`multi_chip_dispatch/`](multi_chip_dispatch/) | Two chips + one SubWorker. An orchestration fn dispatches a `ChipCallable` to each chip, then submits a Python callable to collect/verify results. |
 | [`child_memory/`](child_memory/) | `orch.malloc` + `ContinuousTensor(child_memory=True)` to load a weight once and reuse it across multiple kernel invocations on the same chip. |
 | [`allreduce_distributed/`](allreduce_distributed/) | One communication domain allocated inside the orchestration via `orch.allocate_domain`, with PTO-ISA remote reads over the domain window. |
+| [`allgather_distributed/`](allgather_distributed/) | One communication domain via `orch.allocate_domain`; each rank stages its slice, synchronizes across ranks, then gathers every rank's window data into a full output. |
+| [`reduce_scatter_distributed/`](reduce_scatter_distributed/) | One communication domain via `orch.allocate_domain`; each rank stages all input chunks, synchronizes, then reduces the per-rank chunk across peers into a rank-local output. |
 | [`ffn_tp_parallel/`](ffn_tp_parallel/) | Local compute followed by one-domain cross-rank reduction through a domain scratch window. |
 | [`ep_dispatch_combine/`](ep_dispatch_combine/) | MoE-style dispatch/combine over a one-domain communication window. |
 | [`domain_rank_map/`](domain_rank_map/) | Small two-domain example showing domain-local ranks, missing-domain `KeyError`, separate window slices, and real per-domain allreduce. |
