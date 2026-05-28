@@ -152,11 +152,7 @@ def build_all(
             return
         
         logger.info(f"  Building {platform}/{runtime_name}...")
-        try:
-            builder.get_binaries(runtime_name, build=True)
-        except Exception as e:
-            logger.error(f"  Failed to build {platform}/{runtime_name}: {e}")
-            raise
+        builder.get_binaries(runtime_name, build=True)
 
     with ThreadPoolExecutor(max_workers=len(tasks) or 1) as executor:
         futures = {executor.submit(_build_runtime, p, r): (p, r) for p, r in tasks}
@@ -166,6 +162,7 @@ def build_all(
                 future.result()
             except Exception as e:
                 logger.error(f"  Failed to build {platform}/{runtime_name}: {e}")
+                executor.shutdown(wait=True, cancel_futures=True)
                 raise
 
 
