@@ -108,9 +108,9 @@ static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     }
 }
 
-static int setup_static_arena_wrapper(size_t gm_heap_size, size_t gm_sm_size) {
+static int setup_static_arena_wrapper(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
     try {
-        return current_runner()->setup_static_arena(gm_heap_size, gm_sm_size);
+        return current_runner()->setup_static_arena(gm_heap_size, gm_sm_size, runtime_arena_size);
     } catch (...) {
         return -1;
     }
@@ -127,6 +127,14 @@ static void *acquire_pooled_gm_heap_wrapper() {
 static void *acquire_pooled_gm_sm_wrapper() {
     try {
         return current_runner()->acquire_pooled_gm_sm();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+static void *acquire_pooled_runtime_arena_wrapper() {
+    try {
+        return current_runner()->acquire_pooled_runtime_arena();
     } catch (...) {
         return nullptr;
     }
@@ -226,7 +234,7 @@ int finalize_device(DeviceContextHandle ctx) {
 
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
 ) {
     if (ctx == NULL) return -1;
 
@@ -258,9 +266,32 @@ int simpler_init(
         std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
         std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
         runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
+        // Dispatcher SO bytes are passed alongside the executors. Onboard
+        // requires a non-empty buffer: BootstrapDispatcher reads from it to
+        // upload the dispatcher + inner SO bundle through
+        // libaicpu_extend_kernels. If the caller drives _ChipWorker.init
+        // directly without a dispatcher path, this stays empty and the
+        // ensure_device_initialized call below fails fast with a clear message.
+        if (dispatcher_binary != NULL && dispatcher_size > 0) {
+            std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
+            runner->set_dispatcher_binary(std::move(dispatcher_vec));
+        }
     } catch (...) {
         return -1;
     }
+
+    // Eagerly run the one-shot device setup: create persistent AICPU/AICore
+    // streams, upload the dispatcher + inner SO bundle, and resolve the per-
+    // symbol rtFuncHandle for per-task launch — so the first prepare_callable
+    // / run_prepared does not pay any of these costs. Streams live until
+    // finalize_device; the cached rtFuncHandle on LoadAicpuOp and the
+    // preinstall file both live until ~DeviceRunner.
+    try {
+        rc = runner->ensure_device_initialized();
+    } catch (...) {
+        return -1;
+    }
+    if (rc != 0) return rc;
     return 0;
 }
 
@@ -279,11 +310,8 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
     });
 
     try {
-        int rc = runner->prepare_run_context(runner->device_id());
+        int rc = runner->attach_current_thread(runner->device_id());
         if (rc != 0) return rc;
-        auto run_context_guard = RAIIScopeGuard([runner]() {
-            runner->release_run_context();
-        });
 
         PreparedCallableArtifacts artifacts;
         rc = prepare_callable_impl(
@@ -346,11 +374,8 @@ int run_prepared(
     const auto host_t0 = std::chrono::steady_clock::now();
 
     try {
-        int rc = runner->prepare_run_context(runner->device_id());
+        int rc = runner->attach_current_thread(runner->device_id());
         if (rc != 0) return rc;
-        auto run_context_guard = RAIIScopeGuard([runner]() {
-            runner->release_run_context();
-        });
 
         Runtime *r = new (runtime) Runtime();
         r->host_api.device_malloc = device_malloc;
@@ -360,6 +385,7 @@ int run_prepared(
         r->host_api.setup_static_arena = setup_static_arena_wrapper;
         r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
         r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
+        r->host_api.acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         // Restore kernel addrs + orch symbol names + active_callable_id; the

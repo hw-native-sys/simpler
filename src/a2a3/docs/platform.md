@@ -48,3 +48,7 @@ Platform-agnostic headers live in `src/a2a3/platform/include/`, split by target:
 - `common/` — Shared types and utilities (unified_log, tensor, common.h)
 
 Shared source implementations in `src/a2a3/platform/src/`.
+
+## Cache Coherency on GM
+
+See [cache-coherency.md](cache-coherency.md) for the authoritative rules on when AICPU must invalidate before reading GM (host DMA / SDMA writes — yes; AICore writes — no, AICore's own `dcci` is sufficient). Misapplying these rules is the most common source of either stale-data bugs or wasted `dsb sy` cycles on hot profiling paths.

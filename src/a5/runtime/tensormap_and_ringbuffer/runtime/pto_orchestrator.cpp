@@ -34,6 +34,9 @@
 #include "pto_types.h"
 #include "tensor.h"
 
+extern "C" void set_dump_tensor_selective_mode(bool enable);
+extern "C" void set_dump_tensor_task_mask(uint64_t task_id, uint64_t mask);
+
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
@@ -72,19 +75,30 @@ uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
-#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
+// Cycle accumulation is unconditional under PTO2_ORCH_PROFILING (that's what
+// the flag is for). Swim-lane recording is an opt-in add-on gated at runtime
+// by l2_perf_level so callers can collect totals without paying GM-store cost.
+// When the swim-lane write fires, _t0 is re-sampled from the counter *after*
+// the write so its cost is not attributed to the next phase's accumulator.
+#define CYCLE_COUNT_START()                                                \
+    bool _prof_active = (orch->l2_perf_level >= L2PerfLevel::ORCH_PHASES); \
+    uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc)       \
     do {                           \
         _t1 = get_sys_cnt_aicpu(); \
         acc += (_t1 - _t0);        \
         _t0 = _t1;                 \
     } while (0)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                       \
-    do {                                                                                 \
-        _t1 = get_sys_cnt_aicpu();                                                       \
-        acc += (_t1 - _t0);                                                              \
-        l2_perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
-        _t0 = _t1;                                                                       \
+#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                           \
+    do {                                                                                     \
+        _t1 = get_sys_cnt_aicpu();                                                           \
+        acc += (_t1 - _t0);                                                                  \
+        if (_prof_active) {                                                                  \
+            l2_perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
+            _t0 = get_sys_cnt_aicpu();                                                       \
+        } else {                                                                             \
+            _t0 = _t1;                                                                       \
+        }                                                                                    \
     } while (0)
 #elif PTO2_PROFILING
 #include "aicpu/device_time.h"
@@ -94,8 +108,8 @@ __attribute__((weak, visibility("hidden"))) void
 l2_perf_aicpu_record_orch_phase(AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
 static uint32_t g_orch_submit_idx = 0;
-#define CYCLE_COUNT_START()                       \
-    bool _prof_active = orch->enable_l2_swimlane; \
+#define CYCLE_COUNT_START()                                                \
+    bool _prof_active = (orch->l2_perf_level >= L2PerfLevel::ORCH_PHASES); \
     uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0
 #define CYCLE_COUNT_LAP(acc) \
     do {                     \
@@ -315,11 +329,22 @@ static bool prepare_task(
 
     prefetch_payload(out->payload, args.tensor_count(), args.scalar_count());
 
+    // Re-bind payload/task pointers each submit. Value is per-slot constant
+    // (same as &task_payloads[slot] / &task_descriptors[slot]), but writing
+    // here lets RingSchedState::init_data_from_layout() skip the
+    // O(window_size) bind loop. Both writes hit the same 64B slot_state
+    // cache line we're about to dirty below, so the extra cost is two
+    // stores on an already-hot line. Must precede the scheduler
+    // wiring.queue.push at the end of submit_task_common — that push is
+    // the first read of slot_state->task / slot_state->payload by another
+    // thread.
+    out->slot_state->bind_buffers(out->payload, out->task);
+
     // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
     //   fanout_lock=0, fanout_count=1, fanout_head=nullptr,
     //   fanin_refcount=0, fanout_refcount=0, completed_subtasks=0, next_block_idx=0
-    // Fields immutable after RingSchedState::init():
-    //   payload, task, ring_id
+    // Fields immutable after RingSchedState::init_data_from_layout():
+    //   ring_id
     // task_state left as CONSUMED by eager reset (safe for stale wait_for_tensor
     // observers); set to PENDING here when orchestrator actually reuses the slot.
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
@@ -333,88 +358,6 @@ static bool prepare_task(
 
     return true;
 }
-
-// =============================================================================
-// Orchestrator Initialization
-// =============================================================================
-
-PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(
-    DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH], int32_t dep_pool_capacity
-) {
-    PTO2OrchestratorLayout layout{};
-    layout.dep_pool_capacity = dep_pool_capacity;
-    layout.scope_tasks_cap = PTO2_SCOPE_TASKS_CAP;
-    layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
-
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        const size_t fanin_pool_bytes =
-            PTO2_ALIGN_UP(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
-        layout.off_fanin_pool[r] = arena.reserve(fanin_pool_bytes, PTO2_ALIGN_SIZE);
-    }
-    layout.off_scope_tasks = arena.reserve(
-        static_cast<size_t>(layout.scope_tasks_cap) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *)
-    );
-    layout.off_scope_begins =
-        arena.reserve(static_cast<size_t>(layout.scope_stack_capacity) * sizeof(int32_t), alignof(int32_t));
-    layout.tensor_map = PTO2TensorMap::reserve_layout_default(arena, task_window_sizes);
-    return layout;
-}
-
-bool PTO2OrchestratorState::init_from_layout(
-    const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SharedMemoryHeader *sm_header_arg, void *gm_heap,
-    uint64_t heap_size
-) {
-    auto *orch = this;
-    *orch = PTO2OrchestratorState{};
-
-    orch->sm_header = sm_header_arg;
-    orch->gm_heap_base = gm_heap;
-    orch->gm_heap_size = heap_size * PTO2_MAX_RING_DEPTH;
-    orch->fatal = false;
-
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + r * heap_size;
-        auto &ring = sm_header_arg->rings[r];
-
-        orch->rings[r].task_allocator.init(
-            ring.task_descriptors, ring.task_window_size, &ring.fc.current_task_index, &ring.fc.last_task_alive,
-            ring_heap_base, heap_size, &sm_header_arg->orch_error_code
-        );
-
-        const size_t fanin_pool_bytes =
-            PTO2_ALIGN_UP(static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
-        auto *fanin_entries = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
-        memset(fanin_entries, 0, fanin_pool_bytes);
-        orch->rings[r].fanin_pool.init(fanin_entries, layout.dep_pool_capacity, &sm_header_arg->orch_error_code);
-    }
-
-    if (!orch->tensor_map.init_from_layout(layout.tensor_map, arena)) {
-        return false;
-    }
-    orch->tensor_map.orch = orch;
-
-    orch->scope_tasks = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_scope_tasks));
-    orch->scope_begins = static_cast<int32_t *>(arena.region_ptr(layout.off_scope_begins));
-    orch->scope_tasks_size = 0;
-    orch->scope_tasks_capacity = layout.scope_tasks_cap;
-    orch->scope_stack_top = -1;
-    orch->scope_stack_capacity = layout.scope_stack_capacity;
-    orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
-
-    return true;
-}
-
-void PTO2OrchestratorState::destroy() {
-    auto *orch = this;
-    orch->tensor_map.destroy();
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        orch->rings[r].fanin_pool.base = nullptr;
-    }
-    orch->scope_tasks = nullptr;
-    orch->scope_begins = nullptr;
-}
-
-void PTO2OrchestratorState::set_scheduler(PTO2SchedulerState *scheduler) { this->scheduler = scheduler; }
 
 // =============================================================================
 // Scope Management
@@ -564,9 +507,6 @@ static TaskOutputTensors submit_task_common(
     auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
         PTO2TaskSlotState *prod_state =
             &orch->sm_header->rings[producer_task_id.ring()].get_slot_state_by_task_id(producer_task_id.local());
-        if (prod_state->task == nullptr || prod_state->task->task_id != producer_task_id) {
-            return true;  // producer slot reused for a different task — dep is moot
-        }
         return append_fanin_or_fail(orch, prod_state, &fanin_builder, ring_id);
     };
 
@@ -611,6 +551,14 @@ static TaskOutputTensors submit_task_common(
     }
 
     payload.init(args, result, prepared.alloc_result, layout);
+#if PTO2_PROFILING
+    if (args.tensor_dump_selective_requested()) {
+        set_dump_tensor_selective_mode(true);
+    }
+    if (args.tensor_dump_arg_mask() != 0) {
+        set_dump_tensor_task_mask(task_id.raw, args.tensor_dump_arg_mask());
+    }
+#endif
 
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 #if PTO2_ORCH_PROFILING

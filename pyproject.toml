@@ -15,6 +15,7 @@ build-backend = "scikit_build_core.build"
 name = "simpler"
 version = "0.1.0"
 requires-python = ">=3.9"
+dependencies = ["cloudpickle>=2.2"]
 
 [project.optional-dependencies]
 # ``torch>=2.3`` is required by ``simpler_setup.torch_interop`` (uses

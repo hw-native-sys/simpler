@@ -83,7 +83,8 @@ protected:
         int32_t window_sizes[PTO2_MAX_RING_DEPTH] = {WINDOW_SIZE, WINDOW_SIZE, WINDOW_SIZE, WINDOW_SIZE};
         auto layout = PTO2TensorMap::reserve_layout(arena, NUM_BUCKETS, POOL_SIZE, window_sizes);
         ASSERT_NE(arena.commit(), nullptr);
-        ASSERT_TRUE(tmap.init_from_layout(layout, arena));
+        ASSERT_TRUE(tmap.init_data_from_layout(layout, arena));
+        tmap.wire_arena_pointers(layout, arena);
     }
 
     void TearDown() override {
@@ -113,7 +114,8 @@ TEST_F(TensorMapTest, InitRequiresPowerOfTwoBuckets) {
     int32_t ws[PTO2_MAX_RING_DEPTH] = {8, 8, 8, 8};
     auto layout = PTO2TensorMap::reserve_layout(bad_arena, 8, 64, ws);
     ASSERT_NE(bad_arena.commit(), nullptr);
-    EXPECT_TRUE(bad.init_from_layout(layout, bad_arena));
+    EXPECT_TRUE(bad.init_data_from_layout(layout, bad_arena));
+    bad.wire_arena_pointers(layout, bad_arena);
     bad.destroy();
 }
 

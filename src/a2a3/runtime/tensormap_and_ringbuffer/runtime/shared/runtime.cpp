@@ -32,7 +32,7 @@ Runtime::Runtime() {
     // Initialize handshake buffers
     memset(workers, 0, sizeof(workers));
     worker_count = 0;
-    sche_cpu_num = 1;
+    aicpu_thread_num = 1;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     task_window_size = 0;
     heap_size = 0;
@@ -44,6 +44,8 @@ Runtime::Runtime() {
     gm_heap_ptr_ = nullptr;
     slot_states_ptr_ = nullptr;
     orch_args_storage_.clear();
+    prebuilt_arena_base_ = nullptr;
+    prebuilt_runtime_offset_ = 0;
 
     // Initialize device orchestration SO binary
     dev_orch_so_addr_ = 0;
@@ -73,6 +75,13 @@ void Runtime::set_gm_sm_ptr(void *p) { gm_sm_ptr_ = p; }
 void Runtime::set_gm_heap(void *p) { gm_heap_ptr_ = p; }
 void Runtime::set_slot_states_ptr(void *p) { slot_states_ptr_ = p; }
 void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { orch_args_storage_ = args; }
+
+void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {
+    prebuilt_arena_base_ = arena_base;
+    prebuilt_runtime_offset_ = runtime_off;
+}
+void *Runtime::get_prebuilt_arena_base() const { return prebuilt_arena_base_; }
+size_t Runtime::get_prebuilt_runtime_offset() const { return prebuilt_runtime_offset_; }
 
 // Device orchestration SO metadata (bytes live in a separate device buffer
 // owned by DeviceRunner; only the address/size travels in Runtime).

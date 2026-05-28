@@ -11,9 +11,9 @@
 
 /**
  * @file dep_gen_replay.cpp
- * @brief Replay in-memory DepGenRecord stream → deps.json (v2, tensor-annotated)
- *        via a host-resident PTO2TensorMap, with a differential check against
- *        the runtime template `compute_task_fanin`.
+ * @brief Replay in-memory DepGenRecord stream → deps.json (strided tensor
+ *        representation, tensor-annotated) via a host-resident PTO2TensorMap,
+ *        with a differential check against the runtime template `compute_task_fanin`.
  *
  * Two passes run per record against two parallel PTO2TensorMap instances that
  * evolve in lockstep:
@@ -98,6 +98,10 @@ int32_t count_outputs(const DepGenRecord *records, size_t n) {
     int32_t total = 0;
     for (size_t i = 0; i < n; i++) {
         const DepGenRecord &r = records[i];
+        // Overflow chain slots are reinterpret_cast views with no tensor data;
+        // their `tensor_count` bytes are actually the overflow `dep_count` field,
+        // which would mislead the loop below if read as a tensor count.
+        if (r.flags & DEP_GEN_FLAG_OVERFLOW) continue;
         for (uint16_t j = 0; j < r.tensor_count; j++) {
             auto t = static_cast<TensorArgType>(r.arg_types[j]);
             if (t == TensorArgType::INOUT || t == TensorArgType::OUTPUT_EXISTING) {
@@ -109,7 +113,7 @@ int32_t count_outputs(const DepGenRecord *records, size_t n) {
 }
 
 // ---------------------------------------------------------------------------
-// v2 schema accumulators
+// JSON output accumulators (in-memory tables that get serialized at the end)
 // ---------------------------------------------------------------------------
 
 // Edge categories — matches the three places a runtime fanin edge is born.
@@ -236,7 +240,7 @@ uint64_t make_tensor_id(uint64_t buffer_addr, int32_t version) {
     return h;
 }
 
-// Register a tensor in the v2 tensors[] table on first sight of (addr,
+// Register a tensor in the tensors[] table on first sight of (addr,
 // version). buffer_numel describes the underlying storage size in elements;
 // per-edge fields describe the slice via (start_offset, strides[]). Subsequent
 // sightings of the same (addr, version) are no-ops.
@@ -284,7 +288,7 @@ void fill_producer(EdgeAnnot &e, const PTO2TensorMapEntry &entry) {
 }
 
 // ---------------------------------------------------------------------------
-// JSON writer (v2)
+// JSON writer
 // ---------------------------------------------------------------------------
 
 void write_uint_array(std::ofstream &out, const uint32_t *data, uint32_t n) {
@@ -296,7 +300,7 @@ void write_uint_array(std::ofstream &out, const uint32_t *data, uint32_t n) {
     out << ']';
 }
 
-bool write_deps_json_v2(
+bool write_deps_json(
     const char *path, const std::vector<TaskTableEntry> &tasks, const std::vector<TensorTableEntry> &tensors,
     const std::vector<EdgeAnnot> &edges
 ) {
@@ -305,13 +309,11 @@ bool write_deps_json_v2(
         LOG_ERROR("dep_gen replay: failed to open '%s' for write", path);
         return false;
     }
-    // Schema v3: strided tensor representation.
-    //   tensors[*]:   buffer_numel replaces raw_shapes (storage size in elements)
-    //   edges[*]:     consumer/producer_offset[]  ->  start_offset (uint64) + strides[] (int32)
-    //   tasks[*].args[*]: offset[]  ->  start_offset + strides[]
-    out << "{\"version\":3";
-
-    out << ",\"tasks\":[";
+    // Strided tensor representation. tensors[].buffer_numel is the underlying
+    // storage element count; tasks[].args[] and edges[] carry per-slice
+    // geometry as (start_offset uint64, strides[] uint32 — runtime invariant
+    // forbids zero / negative strides, see runtime/tensor.h).
+    out << "{\"tasks\":[";
     for (size_t i = 0; i < tasks.size(); i++) {
         if (i > 0) out << ',';
         const auto &t = tasks[i];
@@ -444,7 +446,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         LOG_ERROR("dep_gen replay: num_records=%zu but records pointer is null", num_records);
         return -1;
     }
-    LOG_INFO_V0("dep_gen replay: processing %zu in-memory records (v2, dual-pass)", num_records);
+    LOG_INFO_V0("dep_gen replay: processing %zu in-memory records (dual-pass)", num_records);
 
     // Per-ring task window sizes — tensormap masks slot indices and requires
     // each to be a power of two. Auto-size from the records themselves so each
@@ -485,13 +487,17 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
     auto annot_layout =
         PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
-    if (replay_arena.commit() == nullptr || !tm_oracle.init_from_layout(oracle_layout, replay_arena) ||
-        !tm_annot.init_from_layout(annot_layout, replay_arena)) {
+    if (replay_arena.commit() == nullptr || !tm_oracle.init_data_from_layout(oracle_layout, replay_arena) ||
+        !tm_annot.init_data_from_layout(annot_layout, replay_arena)) {
         LOG_ERROR("dep_gen replay: tensormap.init failed (buckets=%d, pool=%d)", PTO2_TENSORMAP_NUM_BUCKETS, pool_size);
         return -3;
     }
+    // Replay tensormaps live entirely on host; only arena-internal pointer
+    // fields need wiring (no parent-orch back-reference exists anymore).
+    tm_oracle.wire_arena_pointers(oracle_layout, replay_arena);
+    tm_annot.wire_arena_pointers(annot_layout, replay_arena);
 
-    // v2 accumulators.
+    // JSON output accumulators.
     std::vector<TaskTableEntry> task_table;
     std::vector<TensorTableEntry> tensor_table;
     std::unordered_map<uint64_t, size_t> tensor_index;  // tensor_id → table idx
@@ -509,8 +515,18 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     std::unordered_set<uint64_t> oracle_preds;
     std::unordered_set<uint64_t> annot_preds;
 
+    // Scratch buffer for assembling full dep lists across overflow chains.
+    // Declared outside the loop so it can be reused (clear() keeps capacity).
+    std::vector<uint64_t> full_deps_buf;
+
     for (size_t rec_i = 0; rec_i < num_records; rec_i++) {
         const DepGenRecord &rec = records[rec_i];
+
+        // Overflow chain records are consumed by the preceding base; skip
+        // them in the main scan so we don't double-process or read the
+        // overflow's reinterpreted bytes as tensor/dep info.
+        if (rec.flags & DEP_GEN_FLAG_OVERFLOW) continue;
+
         PTO2TaskId task_id{rec.task_id};
         bool in_manual_scope = (rec.flags & DEP_GEN_FLAG_IN_MANUAL_SCOPE) != 0;
 
@@ -526,9 +542,81 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
             atype_buf[i] = static_cast<TensorArgType>(rec.arg_types[i]);
         }
 
-        int32_t dc = static_cast<int32_t>(rec.explicit_dep_count);
-        if (dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
-            dc = DEP_GEN_MAX_EXPLICIT_DEPS;
+        // Assemble the full dep list. Fast path: ≤ DEP_GEN_MAX_EXPLICIT_DEPS,
+        // no chain, point straight at rec.explicit_deps. Slow path: gather
+        // base + chain into full_deps_buf and point at the buffer.
+        //
+        // `explicit_dep_count` / `over->dep_count` originate from device
+        // shared memory and are bounded by the writer to the array sizes, but
+        // we clamp on read too so a corrupted record never drives an OOB read
+        // off the end of rec.explicit_deps[64] / over->deps[326].
+        const uint64_t *deps_data;
+        int32_t dc;
+        if (rec.flags & DEP_GEN_FLAG_HAS_OVERFLOW) {
+            full_deps_buf.clear();
+            uint16_t base_dc = rec.explicit_dep_count;
+            if (base_dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
+                LOG_ERROR(
+                    "dep_gen replay: clamping base explicit_dep_count %u > %d at rec_idx=%zu (task_id=%" PRIu64 ")",
+                    base_dc, DEP_GEN_MAX_EXPLICIT_DEPS, rec_i, rec.task_id
+                );
+                base_dc = DEP_GEN_MAX_EXPLICIT_DEPS;
+            }
+            full_deps_buf.reserve(static_cast<size_t>(base_dc) + DEP_GEN_OVERFLOW_DEPS_PER_RECORD);
+            full_deps_buf.insert(full_deps_buf.end(), rec.explicit_deps, rec.explicit_deps + base_dc);
+            bool chain_complete = false;
+            for (size_t j = rec_i + 1; j < num_records; j++) {
+                const DepGenRecord &maybe = records[j];
+                if (!(maybe.flags & DEP_GEN_FLAG_OVERFLOW)) {
+                    LOG_ERROR(
+                        "dep_gen replay: unterminated overflow chain at rec_idx=%zu (task_id=%" PRIu64 ")", rec_i,
+                        rec.task_id
+                    );
+                    break;
+                }
+                if (maybe.task_id != rec.task_id) {
+                    LOG_ERROR(
+                        "dep_gen replay: orphan overflow at rec_idx=%zu (expected task_id=%" PRIu64 ", found %" PRIu64
+                        ")",
+                        j, rec.task_id, maybe.task_id
+                    );
+                    break;
+                }
+                const auto *over = reinterpret_cast<const DepGenOverflowRecord *>(&maybe);
+                uint16_t over_dc = over->dep_count;
+                if (over_dc > DEP_GEN_OVERFLOW_DEPS_PER_RECORD) {
+                    LOG_ERROR(
+                        "dep_gen replay: clamping overflow dep_count %u > %d at rec_idx=%zu (task_id=%" PRIu64 ")",
+                        over_dc, DEP_GEN_OVERFLOW_DEPS_PER_RECORD, j, rec.task_id
+                    );
+                    over_dc = DEP_GEN_OVERFLOW_DEPS_PER_RECORD;
+                }
+                full_deps_buf.insert(full_deps_buf.end(), over->deps, over->deps + over_dc);
+                if (over->flags & DEP_GEN_FLAG_LAST_OVERFLOW) {
+                    chain_complete = true;
+                    break;
+                }
+            }
+            if (!chain_complete) {
+                LOG_ERROR(
+                    "dep_gen replay: chain for task_id=%" PRIu64 " missing LAST_OVERFLOW marker — "
+                    "using partial dep list (%zu deps)",
+                    rec.task_id, full_deps_buf.size()
+                );
+            }
+            deps_data = full_deps_buf.data();
+            dc = static_cast<int32_t>(full_deps_buf.size());
+        } else {
+            deps_data = rec.explicit_deps;
+            uint16_t base_dc = rec.explicit_dep_count;
+            if (base_dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
+                LOG_ERROR(
+                    "dep_gen replay: clamping no-chain explicit_dep_count %u > %d at rec_idx=%zu (task_id=%" PRIu64 ")",
+                    base_dc, DEP_GEN_MAX_EXPLICIT_DEPS, rec_i, rec.task_id
+                );
+                base_dc = DEP_GEN_MAX_EXPLICIT_DEPS;
+            }
+            dc = static_cast<int32_t>(base_dc);
         }
 
         DepInputs inputs;
@@ -536,7 +624,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         inputs.tensors = tref_buf;
         inputs.arg_types = atype_buf;
         inputs.explicit_dep_count = dc;
-        inputs.explicit_deps = reinterpret_cast<const PTO2TaskId *>(rec.explicit_deps);
+        inputs.explicit_deps = reinterpret_cast<const PTO2TaskId *>(deps_data);
 
         // Register tasks[] entry (with per-arg slot info) and any unseen
         // tensors[] entries up-front. Tensors are registered from the
@@ -576,9 +664,11 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         // ============ STEP 1 — explicit_deps (call-site emit) ============
         // Same loop on both passes; they MUST produce identical sets here
         // because they read the same record. Annot records explicit edges
-        // with consumer_arg_idx = -1 (not tied to any tensor arg).
+        // with consumer_arg_idx = -1 (not tied to any tensor arg). Reads
+        // from deps_data (base record's explicit_deps[] on fast path, the
+        // gathered base+chain buffer on overflow path).
         for (int32_t i = 0; i < dc; i++) {
-            uint64_t pred_raw = rec.explicit_deps[i];
+            uint64_t pred_raw = deps_data[i];
             if (oracle_preds.insert(pred_raw).second) {
                 // First time this pred is seen at runtime call site.
             }
@@ -675,12 +765,12 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     tm_oracle.destroy();
     tm_annot.destroy();
 
-    if (!write_deps_json_v2(deps_json_path, task_table, tensor_table, annot_edges)) {
+    if (!write_deps_json(deps_json_path, task_table, tensor_table, annot_edges)) {
         return -5;
     }
     LOG_INFO_V0(
-        "dep_gen replay: wrote deps.json v2 to %s (tasks=%zu, tensors=%zu, edges=%zu)", deps_json_path,
-        task_table.size(), tensor_table.size(), annot_edges.size()
+        "dep_gen replay: wrote deps.json to %s (tasks=%zu, tensors=%zu, edges=%zu)", deps_json_path, task_table.size(),
+        tensor_table.size(), annot_edges.size()
     );
     return 0;
 }

@@ -47,7 +47,8 @@ protected:
         memset(&queue, 0, sizeof(queue));
         const size_t off = PTO2SpscQueue::reserve_layout(arena, CAPACITY);
         ASSERT_NE(arena.commit(), nullptr);
-        ASSERT_TRUE(queue.init_from_layout(arena, off, CAPACITY));
+        ASSERT_TRUE(queue.init_data_from_layout(arena, off, CAPACITY));
+        queue.wire_arena_pointers(arena, off);
     }
 
     void TearDown() override {
@@ -74,9 +75,9 @@ TEST_F(SpscQueueTest, InitRejectsNonPowerOfTwo) {
     const size_t off = PTO2SpscQueue::reserve_layout(local, 1);  // dummy reservation so commit succeeds
     (void)off;
     ASSERT_NE(local.commit(), nullptr);
-    EXPECT_FALSE(bad.init_from_layout(local, off, 3));
-    EXPECT_FALSE(bad.init_from_layout(local, off, 7));
-    EXPECT_FALSE(bad.init_from_layout(local, off, 0));
+    EXPECT_FALSE(bad.init_data_from_layout(local, off, 3));
+    EXPECT_FALSE(bad.init_data_from_layout(local, off, 7));
+    EXPECT_FALSE(bad.init_data_from_layout(local, off, 0));
 }
 
 TEST_F(SpscQueueTest, InitAcceptsPowerOfTwo) {
@@ -85,9 +86,9 @@ TEST_F(SpscQueueTest, InitAcceptsPowerOfTwo) {
     const size_t off4 = PTO2SpscQueue::reserve_layout(local, 4);
     const size_t off1024 = PTO2SpscQueue::reserve_layout(local, 1024);
     ASSERT_NE(local.commit(), nullptr);
-    EXPECT_TRUE(q.init_from_layout(local, off4, 4));
+    EXPECT_TRUE(q.init_data_from_layout(local, off4, 4));
     q.destroy();
-    EXPECT_TRUE(q.init_from_layout(local, off1024, 1024));
+    EXPECT_TRUE(q.init_data_from_layout(local, off1024, 1024));
     q.destroy();
 }
 

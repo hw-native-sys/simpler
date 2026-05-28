@@ -140,9 +140,16 @@ struct HostApi {
     // pto_runtime_c_api.cpp can populate the same HostApi struct regardless of
     // which runtime variant it is built against. Unset for this variant; do
     // not call.
-    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size);
+    // PTO2 static-arena hooks. The host_build_graph runtime does not currently
+    // use these — the fields exist only so the platform layer's
+    // pto_runtime_c_api.cpp can populate the same HostApi struct regardless of
+    // which runtime variant it is built against. Unset for this variant; do
+    // not call. hbg-side callers pass runtime_arena_size == 0 (hbg has no
+    // prebuilt runtime arena).
+    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
     void *(*acquire_pooled_gm_heap)();
     void *(*acquire_pooled_gm_sm)();
+    void *(*acquire_pooled_runtime_arena)();
     // Single-shot upload of the entire ChipCallable buffer. `callable` is a
     // `const ChipCallable *` (declared void* to avoid pulling task_interface
     // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
@@ -208,8 +215,10 @@ public:
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
-    // Execution parameters for AICPU scheduling
-    int sche_cpu_num;  // Number of AICPU threads for scheduling
+    // Total AICPU threads launched on this run. host_build_graph has no
+    // orchestrator/scheduler split — every thread dispatches tasks in
+    // round-robin across the assigned cores. See AicpuExecutor::init.
+    int aicpu_thread_num;
 
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array

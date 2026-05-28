@@ -9,27 +9,20 @@
 # -----------------------------------------------------------------------------------------------------------
 """dep_gen capture + replay sim test.
 
-Re-runs the ``vector_example`` orchestration with ``--enable-dep-gen`` (and,
-in standalone mode, auto-adds ``--enable-l2-swimlane`` for the fanout ⊆ deps
-gate). Verifies the end-to-end dep_gen pipeline on a2a3sim:
+Re-runs the ``vector_example`` orchestration with ``--enable-dep-gen``.
+Verifies the end-to-end dep_gen pipeline on a2a3sim:
 
-  1. ``<output_prefix>/deps.json`` is produced by the host replay
-     (PTO2TensorMap replay → JSON edge list), and contains exactly the
-     6 edges documented in example_orchestration.cpp. The capture path
-     (host collector drains the device ring buffer into memory and feeds
-     the replay directly — no submit_trace.bin on disk) is exercised
-     implicitly: if it broke, deps.json would be empty or wrong.
-  2. **Validation gate** (when l2_perf_records.json is present, i.e.
-     ``--enable-l2-swimlane`` was also enabled): every edge in
-     L2PerfRecord::fanout[] also appears in deps.json. deps may have
-     MORE edges than fanout (race-window edges fanout missed); we never
-     assert symmetry — that's the entire reason dep_gen exists.
+  ``<output_prefix>/deps.json`` is produced by the host replay
+  (PTO2TensorMap replay → JSON edge list), and contains exactly the
+  6 edges documented in example_orchestration.cpp. The capture path
+  (host collector drains the device ring buffer into memory and feeds
+  the replay directly — no submit_trace.bin on disk) is exercised
+  implicitly: if it broke, deps.json would be empty or wrong.
 
-Pytest entry: needs ``--enable-dep-gen`` (capture+replay assertions) and
-``--enable-l2-swimlane`` (fanout ⊆ deps gate). Standalone entry: pass
-``--enable-dep-gen`` and the swimlane flag is added automatically so a
-plain ``python test_dep_gen_capture.py -p a2a3sim --enable-dep-gen``
-exercises the full gate.
+deps.json is now the sole source of truth for fanout edges — the device
+hot path no longer records L2PerfRecord::fanout[], so there is no
+"fanout ⊆ deps" cross-check to run. swimlane_converter.py joins
+deps.json into the Perfetto trace at post-process time.
 
 Compute correctness is delegated to the upstream ``vector_example`` test —
 this case re-uses the same orchestration to keep coverage focused on the
@@ -128,11 +121,8 @@ class TestDepGen(SceneTestCase):
     def _post_validate(self, case):
         """Skips if no per-case output_prefix dir exists (e.g. selector
         skipped this case at pytest level). When the dir + deps.json are
-        present, assert:
-
-          - deps.json contains the 6 edges documented in example_orchestration.cpp
-          - if l2_perf_records.json is also present (--enable-l2-swimlane on),
-            every fanout edge it records is a subset of the deps.json edge set
+        present, assert that deps.json contains the 6 edges documented in
+        example_orchestration.cpp.
         """
         case_name = case["name"]
         safe_label = _sanitize_for_filename(f"TestDepGen_{case_name}")
@@ -152,15 +142,15 @@ class TestDepGen(SceneTestCase):
             return
         with deps_path.open() as f:
             deps = json.load(f)
-        # v3 schema: annotated edges with tasks[] / tensors[] sidecars carrying
-        # strided slice descriptors (start_offset + stride[]). Project annotated
-        # edges down to a (pred, succ) set for the existing structural checks;
-        # the annotation sanity check below verifies the tensor metadata path.
-        assert deps.get("version") == 3, f"deps.json version {deps.get('version')} != 3"
+        # Strided-Tensor schema: annotated edges with tasks[] / tensors[]
+        # sidecars carrying strided slice descriptors (start_offset +
+        # stride[]). Project annotated edges down to a (pred, succ) set for
+        # the existing structural checks; the annotation sanity check below
+        # verifies the tensor metadata path.
         raw_edges = deps.get("edges", [])
         deps_edges = set()
         for e in raw_edges:
-            assert isinstance(e, dict), f"v2 edge must be an object, got {type(e).__name__}: {e!r}"
+            assert isinstance(e, dict), f"deps.json edge must be an object, got {type(e).__name__}: {e!r}"
             pred, succ = e.get("pred"), e.get("succ")
             if pred is None or succ is None:
                 continue
@@ -184,13 +174,13 @@ class TestDepGen(SceneTestCase):
         bad = {e for e in deps_edges if e[0] not in valid_ids or e[1] not in valid_ids}
         assert not bad, f"deps.json contains edges referencing unknown task ids: {bad}"
 
-        # ---- v2 annotated-edge sanity ----
-        # Replay always emits the v2 schema with the tensor-info sidecar; the
-        # differential check inside the replay would have failed the run before
-        # we got here if the annotated pass disagreed with compute_task_fanin.
-        # These assertions just confirm the schema actually carries the
-        # expected blocks (so e.g. a future "always write empty arrays" bug
-        # would surface here, not silently in a downstream viewer).
+        # ---- Annotated-edge sanity ----
+        # Replay always emits the tensor-info sidecar; the differential check
+        # inside the replay would have failed the run before we got here if
+        # the annotated pass disagreed with compute_task_fanin. These
+        # assertions just confirm the schema actually carries the expected
+        # blocks (so e.g. a future "always write empty arrays" bug would
+        # surface here, not silently in a downstream viewer).
         tasks = deps.get("tasks", [])
         tensors = deps.get("tensors", [])
         task_ids = {int(t["task_id"]) for t in tasks if "task_id" in t}
@@ -212,24 +202,6 @@ class TestDepGen(SceneTestCase):
             # Annotated edges must carry consumer-side strided slice info.
             assert "consumer_shape" in e and "consumer_start_offset" in e and "consumer_strides" in e, (
                 f"edge {e.get('pred')}->{e.get('succ')} (source={source}) missing consumer_shape/start_offset/strides"
-            )
-
-        # ---- fanout ⊆ deps validation gate ----
-        perf = out_dir / "l2_perf_records.json"
-        if perf.exists():
-            with perf.open() as f:
-                pdata = json.load(f)
-            fanout_edges = set()
-            for task in pdata.get("tasks", []):
-                src = int(task["task_id"])
-                for succ in task.get("fanout", []):
-                    fanout_edges.add((src, int(succ)))
-            missing_in_deps = fanout_edges - deps_edges
-            assert not missing_in_deps, (
-                f"fanout ⊆ deps gate FAILED: edges present in l2_perf_records.json "
-                f"fanout[] but absent from deps.json: {missing_in_deps}. "
-                f"This is a replay-side regression — the replay should be a "
-                f"superset of the runtime's fanout view."
             )
 
         # ---- Tool smoke: deps_to_graph ----
@@ -257,11 +229,4 @@ class TestDepGen(SceneTestCase):
 
 
 if __name__ == "__main__":
-    # ``_post_validate`` is invoked by the SceneTestCase framework after each
-    # case runs (pytest path AND standalone). Standalone main just adds the
-    # swimlane flag so the fanout ⊆ deps gate runs by default — both flags
-    # compose cleanly and the gate is the most informative assertion the test
-    # produces, so don't make the user remember to ask for it.
-    if "--enable-dep-gen" in sys.argv and "--enable-l2-swimlane" not in sys.argv:
-        sys.argv.append("--enable-l2-swimlane")
     SceneTestCase.run_module(__name__)

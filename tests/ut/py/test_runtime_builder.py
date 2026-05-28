@@ -260,6 +260,54 @@ class TestRuntimeBuilderGetBinaries:
             builder.get_binaries("test_rt", build=True)
 
 
+# --- _invalidate_cache_if_stale unit tests ---
+
+
+class TestInvalidateCacheIfStale:
+    """Test cmake cache invalidation behavior under varying git state."""
+
+    def test_clears_when_commit_mismatches(self, tmp_path):
+        from simpler_setup.runtime_builder import _GIT_COMMIT_FILE, _invalidate_cache_if_stale  # noqa: PLC0415
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / _GIT_COMMIT_FILE).write_text("old_sha\n")
+        (cache_dir / "stale_artifact.o").write_text("stale")
+
+        _invalidate_cache_if_stale(cache_dir, "new_sha")
+
+        assert not (cache_dir / "stale_artifact.o").exists()
+        assert (cache_dir / _GIT_COMMIT_FILE).read_text().strip() == "new_sha"
+
+    def test_keeps_when_commit_matches(self, tmp_path):
+        from simpler_setup.runtime_builder import _GIT_COMMIT_FILE, _invalidate_cache_if_stale  # noqa: PLC0415
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / _GIT_COMMIT_FILE).write_text("same_sha\n")
+        artifact = cache_dir / "kept_artifact.o"
+        artifact.write_text("fresh")
+
+        _invalidate_cache_if_stale(cache_dir, "same_sha")
+
+        assert artifact.exists()
+
+    def test_clears_when_commit_unavailable(self, tmp_path):
+        """No discoverable git HEAD should force a clean rebuild, not silently skip."""
+        from simpler_setup.runtime_builder import _GIT_COMMIT_FILE, _invalidate_cache_if_stale  # noqa: PLC0415
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / _GIT_COMMIT_FILE).write_text("old_sha\n")
+        (cache_dir / "stale_artifact.o").write_text("stale")
+
+        _invalidate_cache_if_stale(cache_dir, "")
+
+        assert not (cache_dir / "stale_artifact.o").exists()
+        assert not (cache_dir / _GIT_COMMIT_FILE).exists()
+        assert cache_dir.is_dir()
+
+
 # --- Full integration tests (real compilation) ---
 
 

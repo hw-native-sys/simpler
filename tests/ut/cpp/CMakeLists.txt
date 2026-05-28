@@ -90,6 +90,7 @@ add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/shared/pto_shared_memory.cpp
     ${A2A3_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_tensormap.cpp
+    ${A2A3_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
 target_include_directories(a2a3_rt_objs PUBLIC
@@ -191,6 +192,45 @@ function(add_a5_test name src)
         pthread
     )
     add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+# ---------------------------------------------------------------------------
+# A5 runtime sources, mirroring a2a3_rt_objs. Bundled into an OBJECT library
+# so the runtime .cpp files compile once and the resulting .o files are
+# reused across every a5 runtime test executable.
+# ---------------------------------------------------------------------------
+set(A5_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime)
+
+add_library(a5_rt_objs OBJECT
+    ${A5_RUNTIME_DIR}/pto_ring_buffer.cpp
+    ${A5_RUNTIME_DIR}/shared/pto_shared_memory.cpp
+    ${A5_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
+    ${A5_RUNTIME_DIR}/shared/pto_tensormap.cpp
+    ${A5_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+)
+target_include_directories(a5_rt_objs PUBLIC
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/orchestration
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
+)
+target_compile_options(a5_rt_objs PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
+
+function(add_a5_runtime_test name src)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE ${GTEST_INCLUDE_DIRS})
+    target_link_libraries(${name} PRIVATE
+        a5_rt_objs
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
 endfunction()
 
 function(add_task_interface_test name src)
@@ -312,6 +352,21 @@ add_a2a3_runtime_test(test_wiring           a2a3/test_wiring.cpp)
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------
 add_a5_test(test_a5_fatal a5/test_a5_fatal.cpp)
+
+# A5 trb runtime UTs — mirror of a2a3 trb runtime UTs, link against a5_rt_objs.
+# Target names carry the a5_ prefix because hierarchical/test_tensormap (and
+# the unprefixed a2a3 runtime targets test_scheduler_state / test_ready_queue
+# / ...) already own those bare names.
+add_a5_runtime_test(test_a5_task_allocator   a5/test_task_allocator.cpp)
+add_a5_runtime_test(test_a5_dep_list_pool    a5/test_dep_list_pool.cpp)
+add_a5_runtime_test(test_a5_scheduler_state  a5/test_scheduler_state.cpp)
+add_a5_runtime_test(test_a5_task_state       a5/test_task_state.cpp)
+add_a5_runtime_test(test_a5_ready_queue      a5/test_ready_queue.cpp)
+add_a5_runtime_test(test_a5_shared_memory    a5/test_shared_memory.cpp)
+add_a5_runtime_test(test_a5_tensormap        a5/test_tensormap.cpp)
+add_a5_runtime_test(test_a5_fanin_pool       a5/test_fanin_pool.cpp)
+add_a5_runtime_test(test_a5_spsc_queue       a5/test_spsc_queue.cpp)
+add_a5_runtime_test(test_a5_wiring           a5/test_wiring.cpp)
 
 # Host logger silent/off behavior — no runtime deps, just compile host_log.cpp
 # alongside the test (faster than dlopen'ing libsimpler_log.so for a unit test).

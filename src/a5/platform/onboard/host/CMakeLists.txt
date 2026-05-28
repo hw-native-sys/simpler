@@ -23,6 +23,9 @@ list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../c
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/device_comm")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/host")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host")
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
         list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${INC_DIR}")
@@ -43,6 +46,16 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/l2_perf_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/tensor_dump_collector.cpp"
+)
+# Add common/host sources (LoadAicpuOp)
+list(APPEND HOST_RUNTIME_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/host/load_aicpu_op.cpp"
+)
+# Add common/platform/onboard/host sources (shared between a2a3 / a5 onboard).
+# Currently scaffolding only — real content moves here in follow-up PRs
+# (see .docs/ONBOARD_HOST_COMMON_REFACTOR.md).
+list(APPEND HOST_RUNTIME_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_helpers.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
@@ -85,14 +98,11 @@ target_include_directories(host_runtime
         ${ASCEND_HOME_PATH}/include
         ${ASCEND_HOME_PATH}/pkg_inc
         ${ASCEND_HOME_PATH}/pkg_inc/runtime
+        # pkg_inc/runtime/runtime exposes rts_kernel.h + kernel.h (CANN 7.0+
+        # rtsLaunchCpuKernel API used by LoadAicpuOp).
+        ${ASCEND_HOME_PATH}/pkg_inc/runtime/runtime
         ${ASCEND_HOME_PATH}/pkg_inc/profiling
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
-)
-
-target_link_directories(host_runtime
-    PRIVATE
-        ${ASCEND_HOME_PATH}/lib64
-        ${ASCEND_HOME_PATH}/runtime/lib64
 )
 
 # Link against CANN runtime libraries
@@ -103,6 +113,12 @@ target_link_libraries(host_runtime
         runtime
         ascendcl
         dl
+)
+
+target_link_directories(host_runtime
+    PRIVATE
+        ${ASCEND_HOME_PATH}/lib64
+        ${ASCEND_HOME_PATH}/runtime/lib64
 )
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")

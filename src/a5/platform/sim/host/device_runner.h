@@ -72,24 +72,33 @@
 class DeviceRunner {
 public:
     DeviceRunner() :
-        static_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
+        gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+        gm_sm_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+        runtime_arena_pool_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
     ~DeviceRunner();
 
     /**
-     * Lay out and commit the per-Worker static device arena that backs the
-     * PTO2 GM heap and PTO2 shared memory in a single underlying allocation.
-     * Must be called before acquire_pooled_gm_heap / acquire_pooled_gm_sm.
-     * Idempotent on identical sizes. Returns 0 on success, -1 on failure.
+     * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
+     * memory, trb prebuilt runtime arena) as three independent device
+     * allocations. Must be called before any acquire_pooled_*. Idempotent
+     * on identical sizes. `runtime_arena_size` is 0 for the hbg path
+     * (leaves that arena uncommitted). Returns 0 on success, -1 on
+     * failure.
      */
-    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size);
+    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
     /**
-     * Return the pooled GM heap / PTO2 SM pointer. setup_static_arena must
-     * have been called earlier in this Worker; otherwise these return
-     * nullptr. Pointers are stable for the lifetime of the Worker.
+     * Return the pooled GM heap / PTO2 SM / runtime arena pointer.
+     * setup_static_arena must have already committed the relevant region;
+     * otherwise these return nullptr.
+     *
+     * acquire_pooled_runtime_arena() is trb-only — the region is only
+     * committed when setup_static_arena was called with
+     * runtime_arena_size > 0. Calling it on the hbg path returns nullptr.
      */
     void *acquire_pooled_gm_heap();
     void *acquire_pooled_gm_sm();
+    void *acquire_pooled_runtime_arena();
 
     /**
      * Create a thread bound to this device.
@@ -173,7 +182,10 @@ public:
      * corresponding `enable_*_` members directly. Moved off the generic
      * Runtime struct / run() arg list so all three travel the same way.
      */
-    void set_l2_swimlane_enabled(bool enable) { enable_l2_swimlane_ = enable; }
+    void set_l2_swimlane_enabled(int level) {
+        l2_perf_level_ = static_cast<L2PerfLevel>(level);
+        enable_l2_swimlane_ = (l2_perf_level_ != L2PerfLevel::DISABLED);
+    }
     void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
@@ -277,22 +289,30 @@ private:
     // Memory management
     MemoryAllocator mem_alloc_;
 
-    // Per-Worker arena backing the PTO2 GM heap + PTO2 shared memory in a
-    // single device allocation. Released explicitly in finalize() before
-    // mem_alloc_.finalize() so it does not free pointers a second time.
+    // Three independent per-Worker arenas, each backing a single pooled
+    // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime
+    // arena). Split out from a single backing allocation because the
+    // combined size can exceed the device allocator's largest contiguous
+    // block — three separate device_malloc calls are friendlier than one
+    // big one. Released explicitly in finalize() before mem_alloc_.finalize()
+    // so the underlying buffers do not get freed twice.
+    //
+    // `runtime_arena_pool_` stays unreserved when setup_static_arena was
+    // invoked with runtime_arena_size == 0 (hbg path).
     //
     // Trampolines forward DeviceArena's alloc/free to mem_alloc_.
     static void *arena_alloc_trampoline(void *ctx, size_t size) {
         return static_cast<MemoryAllocator *>(ctx)->alloc(size);
     }
     static void arena_free_trampoline(void *ctx, void *p) { static_cast<MemoryAllocator *>(ctx)->free(p); }
-    DeviceArena static_arena_;
-    size_t gm_heap_region_off_{SIZE_MAX};
-    size_t gm_sm_region_off_{SIZE_MAX};
-    // Cached sizes for setup_static_arena's "fits" check — avoids calling
-    // region_size() on the arena's public API for the two regions we own.
+    DeviceArena gm_heap_arena_;
+    DeviceArena gm_sm_arena_;
+    DeviceArena runtime_arena_pool_;
+    // Cached sizes for setup_static_arena's "fits" check — avoids re-allocating
+    // a buffer when a later worker init asks for an equal-or-smaller layout.
     size_t cached_gm_heap_size_{0};
     size_t cached_gm_sm_size_{0};
+    size_t cached_runtime_arena_size_{0};
 
     // Simulation state (no actual device resources)
     KernelArgs kernel_args_;
@@ -413,6 +433,7 @@ private:
     bool enable_l2_swimlane_{false};
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
+    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};             // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
 

@@ -24,33 +24,38 @@
  * device run completes, so going through the filesystem would just be
  * extra I/O and an extra file in the output directory.
  *
- * deps.json supersedes ``L2PerfRecord::fanout[]`` for tools that need the
- * *complete* dependency graph: fanout is sealed when a producer finishes, so
- * consumers submitted after a fast producer retires never get attributed to
- * it (the race window that motivated dep_gen). Replay sees every submit and
- * so reconstructs the graph the runtime would have built if no producer ever
- * raced ahead.
+ * deps.json is the sole source of truth for fanout: the L2 swimlane hot
+ * path no longer records ``L2PerfRecord::fanout[]`` (taking the per-task
+ * 1 KB GM store off the scheduler critical path). Replay sees every
+ * submit and reconstructs the complete dependency graph.
  *
- * Output format (deps.json, v2):
+ * Output format (deps.json, strided tensor representation):
  *
- *   {"version":2,
- *    "tasks":   [{"task_id":<u64>, "scope":"auto|manual"}, ...],
+ *   {"tasks":   [{"task_id":<u64>, "scope":"auto|manual",
+ *                 "args":[{"idx":<i32>, "type":"<arg_type>",
+ *                          "tensor_id":<u64>, "dtype":"...", "shape":[...],
+ *                          "start_offset":<u64>, "strides":[...]}, ...]}, ...],
  *    "tensors": [{"tensor_id":<u64>, "buffer_addr":<u64>, "version":<i32>,
- *                 "dtype":"FLOAT32", "ndims":<u32>, "raw_shapes":[...]}, ...],
+ *                 "dtype":"FLOAT32", "buffer_numel":<u64>}, ...],
  *    "edges":   [{"pred":<u64>, "succ":<u64>, "arg":<i32>,
  *                 "source":"explicit|creator|tensormap",
  *                 "overlap":"covered|other" (tensormap only),
  *                 "tensor_id":<u64> (non-explicit),
- *                 "consumer_dtype":"...", "consumer_shape":[...], "consumer_offset":[...],
- *                 "producer_shape":[...] (tensormap), "producer_offset":[...] (tensormap)},
+ *                 "consumer_dtype":"...", "consumer_shape":[...],
+ *                 "consumer_start_offset":<u64>, "consumer_strides":[...],
+ *                 "producer_shape":[...] (tensormap),
+ *                 "producer_start_offset":<u64> (tensormap),
+ *                 "producer_strides":[...] (tensormap)},
  *                ...]}
  *
  *   - All task ids are ``PTO2TaskId::raw`` values (``(ring_id << 32) | local_id``).
  *   - ``tensor_id`` is a stable FNV-1a hash of ``(buffer_addr, version)``.
+ *   - ``buffer_numel`` is the underlying storage element count; tensor shapes
+ *     are carried per-arg / per-edge alongside ``start_offset`` + ``strides``.
  *   - Distinct producers / arg indices / sources keep their own edges; per-record
  *     deduplication of producer ids mirrors the runtime
  *     ``PTO2FaninBuilder::append_fanin_or_fail`` semantics so the set of
- *     ``(pred, succ)`` pairs in v2 is identical to what the runtime would have
+ *     ``(pred, succ)`` pairs is identical to what the runtime would have
  *     recorded.
  *
  * Self-checking: the replay runs two parallel tensormap instances per record —

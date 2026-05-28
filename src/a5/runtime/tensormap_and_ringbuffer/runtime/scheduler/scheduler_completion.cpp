@@ -14,6 +14,7 @@
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "common/l2_perf_profiling.h"
+#include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
@@ -154,19 +155,22 @@ void SchedulerContext::complete_slot_task(
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        uint64_t finish_ts = get_sys_cnt_aicpu();
-
+        uint64_t finish_ts = 0;
         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
         int32_t fanout_n = 0;
-        PTO2DepListEntry *cur = slot_state.fanout_head;
-        while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
-            fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
-            cur = cur->next;
+
+        if (l2_perf_level_ >= L2PerfLevel::AICPU_TIMING) {
+            finish_ts = get_sys_cnt_aicpu();
+            PTO2DepListEntry *cur = slot_state.fanout_head;
+            while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
+                fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
+                cur = cur->next;
+            }
         }
 
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_perf_aicpu_complete_record(
-                core_id, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
+                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
                 slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
                 fanout_n
             ) != 0) {
@@ -230,7 +234,14 @@ void SchedulerContext::check_running_cores_for_completion(
         CoreExecState &core = core_exec_states_[core_id];
 
         // --- Judgment phase: read register, derive transition ---
-        uint64_t reg_val = read_reg(core.reg_addr, RegId::COND);
+        // Use the precomputed cond_ptr (resolved once in handshake) to skip
+        // the reg_offset switch and reg_addr addition on every poll.
+        uint64_t reg_val = static_cast<uint64_t>(*core.cond_ptr);
+        // ARM64 allows Device-nGnRnE -> Normal-cacheable load reorder; the
+        // rmb() pins any AICore-published cacheable reads downstream of the
+        // FIN observation. Replaces the post-`__sync_synchronize` that the
+        // old read_reg() helper carried implicitly.
+        rmb();
         int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
         int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
 

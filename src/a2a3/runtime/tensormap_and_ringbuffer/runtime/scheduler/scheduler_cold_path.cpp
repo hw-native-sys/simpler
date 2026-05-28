@@ -202,7 +202,7 @@ void format_core_status(
 }  // namespace
 
 int32_t SchedulerContext::find_core_owner_thread(int32_t core_id) const {
-    for (int32_t t = 0; t < thread_num_; t++) {
+    for (int32_t t = 0; t < aicpu_thread_num_; t++) {
         const int32_t *ids = core_trackers_[t].core_ids();
         int32_t n = core_trackers_[t].core_num();
         for (int32_t i = 0; i < n; i++) {
@@ -298,7 +298,7 @@ void SchedulerContext::log_stall_diagnostics(
     // CLUSTER lines: one per cluster this thread owns.
     // cluster_id = local_cluster_idx * active_sched_threads_ + thread_idx, matching the
     // round-robin assignment in assign_cores_to_threads / reassign_cores_for_all_threads.
-    int32_t ast = active_sched_threads_ > 0 ? active_sched_threads_ : thread_num_;
+    int32_t ast = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
     for (int32_t cli = 0; cli < tracker.get_cluster_count() && cli < STALL_DUMP_CORE_MAX; cli++) {
         int32_t offset = cli * 3;
         int32_t aic_id = tracker.get_aic_core_id(offset);
@@ -363,8 +363,8 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
         cycles_to_us(sched_end_ts - l2_perf.sched_start_ts)
     );
 
-    uint64_t sched_total = l2_perf.sched_wiring_cycle + l2_perf.sched_complete_cycle + l2_perf.sched_scan_cycle +
-                           l2_perf.sched_dispatch_cycle + l2_perf.sched_idle_cycle;
+    uint64_t sched_total = l2_perf.sched_wiring_cycle + l2_perf.sched_complete_cycle + l2_perf.sched_dispatch_cycle +
+                           l2_perf.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
 
 #if PTO2_SCHED_PROFILING
@@ -431,9 +431,10 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
             cycles_to_us(l2_perf.sched_complete_perf_cycle), l2_perf.sched_complete_perf_cycle * 100.0 / c_parent
         );
 
-        // pop_hit / pop_miss per-emit deltas live in each v2 JSON dispatch
-        // record's extras; sum-of-deltas equals the run-cumulative tracked
-        // in this struct (final-drain emit covers the trailing-idle tail).
+        // pop_hit / pop_miss per-emit deltas live in each dispatch-phase
+        // record's extras in aicpu_scheduler_phases[]; sum-of-deltas equals
+        // the run-cumulative tracked in this struct (final-drain emit covers
+        // the trailing-idle tail).
         LOG_INFO_V9(
             "Thread %d:   dispatch       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_perf.sched_dispatch_cycle),
             l2_perf.sched_dispatch_cycle * 100.0 / sched_total
@@ -463,11 +464,6 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
         LOG_INFO_V9(
             "Thread %d:     setup        : %.3fus (%.1f%%)", thread_idx,
             cycles_to_us(l2_perf.sched_dispatch_setup_cycle), l2_perf.sched_dispatch_setup_cycle * 100.0 / d_parent
-        );
-
-        LOG_INFO_V9(
-            "Thread %d:   scan           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_perf.sched_scan_cycle),
-            l2_perf.sched_scan_cycle * 100.0 / sched_total
         );
 
 #if PTO2_SCHED_PROFILING
@@ -602,6 +598,7 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
         CoreType type = hank->core_type;
 
         core_exec_states_[i].reg_addr = reg_addr;
+        core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
 
 #if PTO2_PROFILING
         // Record physical_core_id for PMU init later (CoreExecState has no room
@@ -638,7 +635,7 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
 bool SchedulerContext::assign_cores_to_threads() {
     // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
-    active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : thread_num_;
+    active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
     int32_t cluster_count = aic_count_;
 
     // Max clusters any single sched thread can hold: ceil(cluster_count / active_sched_threads_).
@@ -683,14 +680,16 @@ bool SchedulerContext::assign_cores_to_threads() {
         LOG_INFO_V0("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
     }
 
-    for (int32_t t = 0; t < thread_num_; t++) {
+    for (int32_t t = 0; t < aicpu_thread_num_; t++) {
         LOG_INFO_V0(
             "Thread %d: total %d cores (%d clusters)", t, core_trackers_[t].core_num(),
             core_trackers_[t].get_cluster_count()
         );
     }
 
-    LOG_INFO_V0("Config: threads=%d, cores=%d, cores_per_thread=%d", thread_num_, cores_total_num_, thread_cores_num);
+    LOG_INFO_V0(
+        "Config: threads=%d, cores=%d, cores_per_thread=%d", aicpu_thread_num_, cores_total_num_, thread_cores_num
+    );
     return true;
 }
 
@@ -699,12 +698,12 @@ bool SchedulerContext::assign_cores_to_threads() {
 // =============================================================================
 void SchedulerContext::reassign_cores_for_all_threads() {
     LOG_INFO_V0(
-        "Reassigning cores (cluster-aligned) for %d threads: %d AIC, %d AIV", thread_num_, aic_count_, aiv_count_
+        "Reassigning cores (cluster-aligned) for %d threads: %d AIC, %d AIV", aicpu_thread_num_, aic_count_, aiv_count_
     );
 
     // Collect running worker_ids from all current trackers
     bool running_cores[RUNTIME_MAX_WORKER] = {};
-    for (int32_t i = 0; i < thread_num_; i++) {
+    for (int32_t i = 0; i < aicpu_thread_num_; i++) {
         auto all_running = core_trackers_[i].get_all_running_cores();
         int32_t bp;
         while ((bp = all_running.pop_first()) >= 0) {
@@ -716,18 +715,18 @@ void SchedulerContext::reassign_cores_for_all_threads() {
     int32_t cluster_count = aic_count_;
     int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[ci % thread_num_]++;
+        clusters_per_thread[ci % aicpu_thread_num_]++;
     }
 
     // Re-init all trackers and reset core counts
-    for (int32_t i = 0; i < thread_num_; i++) {
+    for (int32_t i = 0; i < aicpu_thread_num_; i++) {
         core_trackers_[i].init(clusters_per_thread[i]);
     }
 
     // Assign clusters round-robin and restore running state
     int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = ci % thread_num_;
+        int32_t t = ci % aicpu_thread_num_;
 
         int32_t aic_wid = aic_worker_ids_[ci];
         int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
@@ -753,7 +752,7 @@ void SchedulerContext::reassign_cores_for_all_threads() {
 
     // Log final distribution
     LOG_INFO_V0("Core reassignment complete:");
-    for (int32_t t = 0; t < thread_num_; t++) {
+    for (int32_t t = 0; t < aicpu_thread_num_; t++) {
         int32_t aic_running = core_trackers_[t].get_running_count<CoreType::AIC>();
         int32_t aiv_running = core_trackers_[t].get_running_count<CoreType::AIV>();
         LOG_INFO_V0(
@@ -761,7 +760,7 @@ void SchedulerContext::reassign_cores_for_all_threads() {
             core_trackers_[t].get_cluster_count(), aic_running, aiv_running
         );
     }
-    active_sched_threads_ = thread_num_;
+    active_sched_threads_ = aicpu_thread_num_;
 }
 
 // =============================================================================
@@ -792,7 +791,7 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
 // Lifecycle: init / deinit
 // =============================================================================
 int32_t SchedulerContext::init(
-    Runtime *runtime, int32_t thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base
+    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base
 ) {
     always_assert(runtime != nullptr);
 
@@ -800,7 +799,7 @@ int32_t SchedulerContext::init(
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
 
     // Wire thread/transition configuration that handshake/assign need to read.
-    thread_num_ = thread_num;
+    aicpu_thread_num_ = aicpu_thread_num;
     sched_thread_num_ = sched_thread_num;
     orch_to_sched_ = orch_to_sched;
     regs_ = regs_base;
@@ -905,7 +904,7 @@ void SchedulerContext::deinit() {
     aic_count_ = 0;
     aiv_count_ = 0;
     cores_total_num_ = 0;
-    thread_num_ = 0;
+    aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
     active_sched_threads_ = 0;

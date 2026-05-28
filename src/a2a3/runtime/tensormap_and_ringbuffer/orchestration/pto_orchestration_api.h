@@ -138,6 +138,8 @@ struct PTO2Runtime {
     PTO2ScopeMode pending_scope_mode;
 };
 
+static inline void enable_dump_tensor_selective() { set_tensor_dump_selective_requested(true); }
+
 // =============================================================================
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================

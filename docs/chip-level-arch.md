@@ -140,7 +140,8 @@ worker = ChipWorker()
 worker.init(device_id=0, bins=bins)   # bins = RuntimeBuilder(platform).get_binaries(...)
 
 config = CallConfig()
-config.block_dim = 24
+# config.block_dim defaults to 0 = auto (DeviceRunner resolves to the max
+# the AICore stream allows). Set explicitly to pin a smaller value.
 config.aicpu_thread_num = 3
 config.enable_pmu = 0
 worker.run(callable, args, config)

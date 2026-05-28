@@ -40,12 +40,23 @@
 
 /**
  * Check if a phase ID belongs to a scheduler phase (vs orchestrator phase).
- * Scheduler phases: SCHED_COMPLETE(0), SCHED_DISPATCH(1), SCHED_SCAN(2), SCHED_IDLE_WAIT(3)
- * Orchestrator phases: ORCH_SYNC(16) through ORCH_SCOPE_END(24)
+ * Scheduler phases: SCHED_COMPLETE(0), SCHED_DISPATCH(1).
+ * Orchestrator phases: ORCH_SUBMIT(25) — one record per submit_task() call,
+ * folded from 6 historical sub-step phases (ORCH_SYNC..ORCH_FANIN). Old
+ * captures may carry the per-sub-step ids (16-24) — they fall through the
+ * orch branch and the JSON writer labels them "unknown"; downstream tools
+ * drop "unknown" records.
+ *
+ * The boundary is the historical orch id base (16), not ORCH_SUBMIT itself:
+ * legacy ids 16-24 must be routed orch-side so they don't accidentally
+ * masquerade as scheduler-side phases when decoding old captures.
+ *
+ * Legacy IDs 2 (SCHED_SCAN, never emitted) and 3 (SCHED_IDLE_WAIT, dropped
+ * by PR #869) classify as scheduler-side; the host parser then drops them
+ * because idle is reconstructed from record gaps.
  */
-static bool is_scheduler_phase(AicpuPhaseId id) {
-    return static_cast<uint32_t>(id) < static_cast<uint32_t>(AicpuPhaseId::SCHED_PHASE_COUNT);
-}
+static constexpr uint32_t kAicpuOrchPhaseIdBase = 16;
+static bool is_scheduler_phase(AicpuPhaseId id) { return static_cast<uint32_t>(id) < kAicpuOrchPhaseIdBase; }
 
 L2PerfCollector::~L2PerfCollector() {
     stop();
@@ -100,6 +111,7 @@ int L2PerfCollector::initialize(
     l2_perf_level_ = l2_perf_level;
     output_prefix_ = output_prefix;
     total_perf_collected_ = 0;
+    total_phase_collected_ = 0;
 
     // Stash the memory context on the base up-front so alloc_single_buffer
     // sees consistent values during init. shm_host_ stays nullptr until the
@@ -592,9 +604,12 @@ int L2PerfCollector::export_swimlane_json() {
     }
 
     // Step 7: Write JSON data
-    int version = static_cast<int>(l2_perf_level_);
+    // Fanout fields are emitted as empty/zero — the device-side hot path no
+    // longer carries them. Downstream (swimlane_converter.py) joins fanout
+    // from the sibling deps.json (dep_gen output).
+    int l2_perf_level = static_cast<int>(l2_perf_level_);
     outfile << "{\n";
-    outfile << "  \"version\": " << version << ",\n";
+    outfile << "  \"l2_perf_level\": " << l2_perf_level << ",\n";
     outfile << "  \"tasks\": [\n";
 
     for (size_t i = 0; i < tagged_records.size(); ++i) {
@@ -620,18 +635,9 @@ int L2PerfCollector::export_swimlane_json() {
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
         outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
         outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
-        outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
-        outfile << "      \"fanout\": [";
-        int safe_fanout_count =
-            (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT) ? record.fanout_count : 0;
-        for (int j = 0; j < safe_fanout_count; ++j) {
-            outfile << record.fanout[j];
-            if (j < safe_fanout_count - 1) {
-                outfile << ", ";
-            }
-        }
-        outfile << "],\n";
-        outfile << "      \"fanout_count\": " << record.fanout_count << "\n";
+        outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << "\n";
+        // Fanout is no longer carried on the device hot path — dep_gen replay
+        // (deps.json) is the sole source of truth, joined in by tooling.
         outfile << "    }";
         if (i < tagged_records.size() - 1) {
             outfile << ",";
@@ -648,36 +654,22 @@ int L2PerfCollector::export_swimlane_json() {
                 return "complete";
             case AicpuPhaseId::SCHED_DISPATCH:
                 return "dispatch";
-            case AicpuPhaseId::SCHED_SCAN:
-                return "scan";
-            case AicpuPhaseId::SCHED_IDLE_WAIT:
-                return "idle";
             default:
+                // Legacy SCHED_IDLE_WAIT (3) and SCHED_SCAN (2) land here on
+                // old captures; host tools skip "unknown" sched records and
+                // rebuild idle from gaps between known records on the
+                // same thread.
                 return "unknown";
             }
         };
 
         auto orch_phase_name = [](AicpuPhaseId id) -> const char * {
             switch (id) {
-            case AicpuPhaseId::ORCH_SYNC:
-                return "orch_sync";
-            case AicpuPhaseId::ORCH_ALLOC:
-                return "orch_alloc";
-            case AicpuPhaseId::ORCH_PARAMS:
-                return "orch_params";
-            case AicpuPhaseId::ORCH_LOOKUP:
-                return "orch_lookup";
-            case AicpuPhaseId::ORCH_HEAP:
-                return "orch_heap";
-            case AicpuPhaseId::ORCH_INSERT:
-                return "orch_insert";
-            case AicpuPhaseId::ORCH_FANIN:
-                return "orch_fanin";
-            case AicpuPhaseId::ORCH_FINALIZE:
-                return "orch_finalize";
-            case AicpuPhaseId::ORCH_SCOPE_END:
-                return "orch_scope_end";
+            case AicpuPhaseId::ORCH_SUBMIT:
+                return "orch_submit";
             default:
+                // Legacy per-sub-step orch ids 17-24 land here on old captures;
+                // host tools drop "unknown" records.
                 return "unknown";
             }
         };
@@ -872,6 +864,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, const L2Pe
     core_to_thread_.clear();
     has_phase_data_ = false;
     total_perf_collected_ = 0;
+    total_phase_collected_ = 0;
     clear_memory_context();
 
     LOG_DEBUG("Performance profiling cleanup complete");

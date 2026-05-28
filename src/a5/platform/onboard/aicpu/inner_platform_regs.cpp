@@ -15,28 +15,24 @@
  * halResMap maps each AICore as 3MB of contiguous MMIO. Hardware offsets
  * (e.g. DATA_MAIN_BASE=0xD0, COND=0x5108) are applied directly to the
  * virtual address with no remapping.
+ *
+ * Ordering: read_reg / write_reg emit only the volatile MMIO load/store.
+ * ARM64 Device-nGnRnE memory orders accesses within the same region; cross
+ * Device <-> Normal-cacheable ordering is the caller's responsibility
+ * (wmb() before a publishing register write, rmb() after observing a
+ * register hand-off bit).
  */
 
 #include <cstdint>
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
 
-uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
-    uint32_t offset = reg_offset(reg);
-    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(reg_base_addr + offset);
-
-    __sync_synchronize();
-    uint64_t value = static_cast<uint64_t>(*ptr);
-    __sync_synchronize();
-
-    return value;
+volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg) {
+    return reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg));
 }
 
-void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
-    uint32_t offset = reg_offset(reg);
-    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(reg_base_addr + offset);
+uint64_t read_reg(uint64_t reg_base_addr, RegId reg) { return static_cast<uint64_t>(*get_reg_ptr(reg_base_addr, reg)); }
 
-    __sync_synchronize();
-    *ptr = static_cast<uint32_t>(value);
-    __sync_synchronize();
+void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
+    *get_reg_ptr(reg_base_addr, reg) = static_cast<uint32_t>(value);
 }

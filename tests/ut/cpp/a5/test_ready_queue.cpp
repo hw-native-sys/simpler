@@ -44,6 +44,7 @@
 #include <thread>
 #include <vector>
 
+#include "device_arena.h"
 #include "scheduler/pto_scheduler.h"
 
 // =============================================================================
@@ -55,10 +56,19 @@ protected:
     static constexpr uint64_t CAPACITY = 16;  // Power of 2
 
     PTO2ReadyQueue queue;
+    DeviceArena arena;
 
-    void SetUp() override { ASSERT_TRUE(ready_queue_init(&queue, CAPACITY)); }
+    void SetUp() override {
+        const size_t off = ready_queue_reserve_layout(arena, CAPACITY);
+        ASSERT_NE(arena.commit(), nullptr);
+        ASSERT_TRUE(ready_queue_init_data_from_layout(&queue, arena, off, CAPACITY));
+        ready_queue_wire_arena_pointers(&queue, arena, off);
+    }
 
-    void TearDown() override { ready_queue_destroy(&queue); }
+    void TearDown() override {
+        ready_queue_destroy(&queue);
+        arena.release();
+    }
 };
 
 // =============================================================================
@@ -217,8 +227,18 @@ protected:
     PTO2ReadyQueue queue{};
     PTO2TaskSlotState dummy[8]{};
 
-    void SetUp() override { ASSERT_TRUE(ready_queue_init(&queue, QUEUE_CAP)); }
-    void TearDown() override { ready_queue_destroy(&queue); }
+    DeviceArena arena;
+
+    void SetUp() override {
+        const size_t off = ready_queue_reserve_layout(arena, QUEUE_CAP);
+        ASSERT_NE(arena.commit(), nullptr);
+        ASSERT_TRUE(ready_queue_init_data_from_layout(&queue, arena, off, QUEUE_CAP));
+        ready_queue_wire_arena_pointers(&queue, arena, off);
+    }
+    void TearDown() override {
+        ready_queue_destroy(&queue);
+        arena.release();
+    }
 };
 
 TEST_F(ReadyQueueBoundaryTest, ExactCapacityFillDrain) {
@@ -307,8 +327,18 @@ protected:
     static constexpr uint64_t CAPACITY = 1024;
     PTO2ReadyQueue queue;
 
-    void SetUp() override { ASSERT_TRUE(ready_queue_init(&queue, CAPACITY)); }
-    void TearDown() override { ready_queue_destroy(&queue); }
+    DeviceArena arena;
+
+    void SetUp() override {
+        const size_t off = ready_queue_reserve_layout(arena, CAPACITY);
+        ASSERT_NE(arena.commit(), nullptr);
+        ASSERT_TRUE(ready_queue_init_data_from_layout(&queue, arena, off, CAPACITY));
+        ready_queue_wire_arena_pointers(&queue, arena, off);
+    }
+    void TearDown() override {
+        ready_queue_destroy(&queue);
+        arena.release();
+    }
 };
 
 TEST_P(ReadyQueueMPMCTest, NoDuplicateNoLoss) {

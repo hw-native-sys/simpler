@@ -92,6 +92,30 @@ struct PTO2RuntimeOps {
 };
 
 /**
+ * Layout descriptor for the prebuilt runtime arena. Holds all sub-region
+ * offsets (orchestrator / scheduler / sm_handle wrapper / runtime header /
+ * AICore mailbox) plus the layout-defining capacities. Produced once on the
+ * host by runtime_reserve_layout(); consumed by runtime_init_data_from_layout
+ * and runtime_wire_arena_pointers.
+ */
+struct PTO2RuntimeArenaLayout {
+    size_t off_sm_handle{0};
+    PTO2OrchestratorLayout orch;
+    PTO2SchedulerLayout sched;
+    size_t off_runtime{0};
+    size_t off_mailbox{0};
+
+    // Cached parameters (re-used by init_data + wire stages).
+    uint64_t task_window_size{0};
+    uint64_t heap_size{0};
+    int32_t dep_pool_capacity{0};
+
+    // Total arena byte size post-commit. Used by host to size the prebuilt
+    // image buffer and as the rtMemcpy length.
+    size_t arena_size{0};
+};
+
+/**
  * PTO Runtime2 context
  *
  * Contains all state for orchestration and scheduling.
@@ -118,6 +142,16 @@ struct PTO2Runtime {
 
     // Statistics
     int64_t total_cycles;
+
+    // Prebuilt-arena fast path metadata. Carries every offset
+    // wire_arena_pointers needs at AICPU boot so the AICPU can reconstruct
+    // all arena-internal pointer fields without re-running init_data. The
+    // device base of the runtime arena travels separately on the host-side
+    // Runtime (Runtime::prebuilt_arena_base_), since the AICPU needs it
+    // *before* dereferencing this image. Populated on host by
+    // runtime_init_data_from_layout + runtime_wire_arena_pointers; read by
+    // aicpu_executor.cpp.
+    PTO2RuntimeArenaLayout prebuilt_layout;
 };
 
 // =============================================================================
@@ -125,38 +159,60 @@ struct PTO2Runtime {
 // =============================================================================
 
 /**
- * Create runtime from caller-provided GM SM buffer + GM heap.
- *
- * All AICPU-side runtime state (PTO2SharedMemoryHandle wrapper, PTO2Runtime,
- * AICoreCompletionMailbox, plus the orchestrator/scheduler/tensor_map
- * sub-regions) is laid out on the supplied arena and committed in a single
- * backing allocation — including the SM handle wrapper itself. The arena is
- * owned by the caller (typically the per-Worker AicpuExecutor);
- * runtime_destroy() calls arena.release() once to free the lot.
- *
- * `sm_base` / `sm_size` describe the SM buffer that host has already placed
- * for the runtime to use; the SM handle wrapper is constructed in-place on
- * an arena-reserved region pointing at that buffer.
- *
- * @param mode             Execution mode
- * @param sm_base          Pre-allocated SM buffer base (host-owned)
- * @param sm_size          Size of the SM buffer in bytes
- * @param task_window_size Per-ring task window size used to lay out SM
- * @param gm_heap          GM heap base for output buffers (or NULL if not used)
- * @param heap_size        GM heap size in bytes
- * @param arena            Caller-owned arena that sources all runtime sub-regions.
- *                         Must be freshly constructed (no prior commit) —
- *                         runtime_create_from_sm reserves + commits internally.
- * @return Runtime context, or NULL on failure
+ * Phase 1 — declare every sub-region (sm_handle wrapper, orchestrator /
+ * scheduler / tensor_map / mailbox / PTO2Runtime header) on the supplied
+ * arena. Pure arithmetic; does not touch device memory and may run on host.
+ * Returns the layout descriptor; caller commits/attaches the arena before
+ * Phase 2/3.
  */
-PTO2Runtime *runtime_create_from_sm(
-    PTO2RuntimeMode mode, void *sm_base, uint64_t sm_size, uint64_t task_window_size, void *gm_heap, uint64_t heap_size,
-    DeviceArena &arena, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
+PTO2RuntimeArenaLayout runtime_reserve_layout(
+    DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
 );
 
 /**
- * Destroy runtime and free all resources. arena.release() is the actual
- * memory free; the rt pointer is no longer valid afterward.
+ * Phase 2 — write the data half of the runtime arena: standalone fields,
+ * memset'd arena regions, sub-structure initializers, and SM-side device
+ * pointers. The arena must already be committed (or attached); writes go
+ * into arena.base() + sub-region offsets.
+ *
+ * `sm_dev_base` / `gm_heap_dev_base` are device addresses; we only store
+ * them (never dereference). Safe to run on a host arena that owns a host
+ * mirror of the runtime image — the resulting buffer is rtMemcpy-ready.
+ *
+ * Returns the PTO2Runtime* that sits at layout.off_runtime within the arena.
+ * Caller must follow up with runtime_wire_arena_pointers; rt->ops and the
+ * AICore-side count fields are left untouched and must be filled by the
+ * AICPU at boot.
+ */
+PTO2Runtime *runtime_init_data_from_layout(
+    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
+    void *gm_heap_dev_base, uint64_t heap_size
+);
+
+/**
+ * Phase 3 — wire every arena-internal pointer field (rt->sm_handle,
+ * rt->aicore_mailbox, orchestrator.{scope_tasks, scope_begins, scheduler,
+ * tensor_map.*, rings[].fanin_pool.base}, scheduler.{ready_queues, dep_pool,
+ * wiring.queue}) so each holds arena.base() + offset. Idempotent — runs on
+ * both host (writing host-mirror addresses) and AICPU (writing device
+ * addresses) sides.
+ */
+void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
+
+/**
+ * AICPU-only Phase 4 — fill in the few fields the host could not know at
+ * prebuilt-image build time: the ops table (s_runtime_ops is a device-side
+ * file-local global, host cannot resolve its device address) and the
+ * orchestrator's core counts (depend on the executor's scheduler context).
+ * Call once per boot after runtime_wire_arena_pointers.
+ */
+void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count);
+
+/**
+ * Destroy runtime. With the prebuilt-arena fast path the arena buffer is
+ * pooled across runs by DeviceRunner, so we never call arena.release()
+ * here — the destructor only forgets sub-structure pointers (idempotent
+ * cleanup).
  */
 void runtime_destroy(PTO2Runtime *rt, DeviceArena &arena);
 

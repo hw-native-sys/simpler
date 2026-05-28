@@ -47,7 +47,19 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_rec
 
 # Verbose mode (for debugging)
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json -v
+
+# Reuse a deps.json captured in an earlier dep_gen run (different output dir)
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json \
+    --deps-json outputs/<case>_<earlier_ts>/deps.json
 ```
+
+> Dependency arrows in the Perfetto trace come from `deps.json` (dep_gen
+> replay). The device hot path no longer records fanout, so the typical
+> workflow is **two runs**: a one-time `--enable-dep-gen` capture per
+> topology to produce `deps.json`, then any number of
+> `--enable-l2-swimlane` runs that consume it. If no `deps.json` is found
+> alongside the perf JSON (and `--deps-json` isn't passed), the trace
+> still renders but has no arrows; the converter prints a warning.
 
 ### Command-Line Options
 
@@ -57,6 +69,7 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_rec
 | `--output` | `-o` | Output JSON file (default: outputs/merged_swimlane_`<timestamp>`.json) |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
 | `--func-names` | | Path to func_id_names_*.json (SceneTest format) for function name mapping |
+| `--deps-json` | | Path to a dep_gen `deps.json` (defaults to sibling of input). Without one, no dependency arrows are drawn. |
 | `--verbose` | `-v` | Enable verbose output |
 
 ### Outputs
@@ -120,7 +133,7 @@ Analyze AICPU scheduler overhead and quantitatively decompose the sources of Tai
 
 `sched_overhead_analysis` reads two artifacts produced by the runtime:
 
-1. **Perf profiling data** (`l2_perf_records_*.json`, v2): per-task Exec / Head OH / Tail OH time breakdowns plus `aicpu_scheduler_phases` — per-thread, per-loop-iteration phase records carrying scan / complete / dispatch / idle timings and per-emit pop_hit / pop_miss deltas.
+1. **Perf profiling data** (`l2_perf_records_*.json`, l2_perf_level >= 3): per-task Exec / Head OH / Tail OH time breakdowns plus `aicpu_scheduler_phases` — per-thread, per-loop-iteration phase records carrying scan / complete / dispatch / idle timings and per-emit pop_hit / pop_miss deltas.
 2. **`deps.json`** (optional, dep_gen replay output): structural task DAG. When colocated with the perf JSON, Part 2 prints per-thread fanout / fanin aggregates derived from it.
 
 ### Basic Usage
@@ -154,7 +167,7 @@ Output is emitted in three parts:
 - **Part 2: AICPU scheduler loop breakdown** — per-scheduler-thread loop statistics, per-phase (scan / complete / dispatch / idle) time ratios, pop_hit / pop_miss totals, and (when deps.json is available) per-thread fanout / fanin aggregates
 - **Part 3: Tail OH distribution & cause analysis** — Tail OH quantile distribution (P10–P99), correlation between scheduler loop iteration time and Tail OH, and data-driven insights into the dominant phase
 
-The perf JSON must be a v2 capture with non-empty `aicpu_scheduler_phases` (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
+The perf JSON must be captured at l2_perf_level >= 3 so that `aicpu_scheduler_phases` is non-empty (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
 
 ---
 
@@ -270,22 +283,51 @@ The analysis tools share the same input format - the `l2_perf_records_*.json` fi
 
 ```json
 {
-  "version": 1,
+  "l2_perf_level": 4,
   "tasks": [
     {
       "task_id": 0,
       "func_id": 0,
-      "core_id": 0,
-      "core_type": "aic",
-      "start_time_us": 100.0,
-      "end_time_us": 250.5,
-      "duration_us": 150.5,
-      "fanout": [1, 2],
-      "fanout_count": 2
+      "core_id": 7,
+      "core_type": "aiv",
+      "ring_id": 0,
+      "start_time_us": 47.46,
+      "end_time_us": 55.9,
+      "duration_us": 8.44,
+      "dispatch_time_us": 45.94,
+      "finish_time_us": 60.52,
+      "fanout": [4294967299, 4294967297, 4294967296],
+      "fanout_count": 3
+    },
+    {
+      "task_id": 4294967296,
+      "func_id": 1,
+      "core_id": 7,
+      "core_type": "aiv",
+      "ring_id": 1,
+      "start_time_us": 68.68,
+      "end_time_us": 70.42,
+      "duration_us": 1.74,
+      "dispatch_time_us": 68.24,
+      "finish_time_us": 71.2,
+      "fanout": [4294967298],
+      "fanout_count": 1
     }
   ]
 }
 ```
+
+Dependency edges come from `deps.json` (dep_gen replay) at post-process time —
+not from the perf JSON. See [`swimlane_converter --deps-json`](#swimlane_converter).
+
+Top-level layout depends on `l2_perf_level`:
+
+- All levels: `l2_perf_level`, `tasks[]` (per-task fields above).
+- `>= 3`: also `aicpu_scheduler_phases[]` (per-thread phase records:
+  scan / complete / dispatch / idle) and `core_to_thread[]` (core_id →
+  scheduler thread index).
+- `>= 4`: also `aicpu_orchestrator_phases[]` (per-task orchestrator
+  phase records).
 
 ### Kernel Config Format
 
@@ -366,10 +408,11 @@ For batch-run hardware regression, see the dev-only script
 - Check the kernel_config.py file format
 - Make sure every KERNELS entry has a 'func_id' and 'name' field
 
-### Error: Unsupported version
+### Error: Unsupported l2_perf_level
 
-- The tools only support version 1 of the profiling data format
-- Regenerate the profiling data with the latest runtime
+- The tools accept l2_perf_level 1–4 (the integer captured at runtime
+  via `--enable-l2-swimlane <N>`)
+- Regenerate the profiling data with a supported level
 
 ### Error: Perf JSON missing required fields for scheduler overhead analysis
 
@@ -394,7 +437,7 @@ For batch-run hardware regression, see the dev-only script
 | ---- | ---- | ------- | ------ |
 | `l2_perf_records_*.json` | Runtime | Raw timing profiling data | JSON |
 | `merged_swimlane_*.json` | swimlane_converter | Perfetto visualization | Chrome Trace Event JSON |
-| `deps.json` | Runtime (dep_gen replay) | Structural task dependency graph + per-edge tensor info | JSON (v2) |
+| `deps.json` | Runtime (dep_gen replay) | Structural task dependency graph + per-edge tensor info | JSON |
 | `deps_graph.html` | deps_to_graph | Pan/zoom dependency graph viewer | HTML (self-contained) |
 
 ---

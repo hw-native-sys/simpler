@@ -20,6 +20,7 @@
 
 #include "aicpu/tensor_dump_aicpu.h"
 
+#include <cstdlib>
 #include <cstring>
 
 #include "common/memory_barrier.h"
@@ -53,10 +54,98 @@ extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dum
 extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
 
 static bool g_enable_dump_tensor = false;
+static bool g_dump_tensor_selective_mode = false;
+struct DumpTaskMaskEntry {
+    uint64_t task_id;
+    TensorDumpArgMask mask;
+};
+static constexpr uint64_t DUMP_TASK_MASK_EMPTY_TASK_ID = UINT64_MAX;
+static constexpr uint32_t DUMP_TASK_MASK_TABLE_CAPACITY = 32768;
+static DumpTaskMaskEntry *g_dump_mask_table = nullptr;
+static bool ensure_dump_mask_table() {
+    if (g_dump_mask_table != nullptr) {
+        return true;
+    }
+    g_dump_mask_table =
+        static_cast<DumpTaskMaskEntry *>(malloc(sizeof(DumpTaskMaskEntry) * DUMP_TASK_MASK_TABLE_CAPACITY));
+    if (g_dump_mask_table == nullptr) {
+        LOG_ERROR("Failed to allocate tensor dump selective mask table");
+        return false;
+    }
+    for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
+        g_dump_mask_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
+        g_dump_mask_table[i].mask = TENSOR_DUMP_ARG_MASK_NONE;
+    }
+    return true;
+}
 
-extern "C" void set_dump_tensor_enabled(bool enable) { g_enable_dump_tensor = enable; }
+static void clear_dump_mask_table() {
+    if (g_dump_mask_table == nullptr) {
+        return;
+    }
+    for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
+        g_dump_mask_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
+        g_dump_mask_table[i].mask = TENSOR_DUMP_ARG_MASK_NONE;
+    }
+}
+
+extern "C" void set_dump_tensor_enabled(bool enable) {
+    g_enable_dump_tensor = enable;
+    g_dump_tensor_selective_mode = false;
+    clear_dump_mask_table();
+}
 
 extern "C" bool is_dump_tensor_enabled() { return g_enable_dump_tensor; }
+
+extern "C" void set_dump_tensor_selective_mode(bool enable) { g_dump_tensor_selective_mode = enable; }
+
+extern "C" bool is_dump_tensor_selective_mode() { return g_dump_tensor_selective_mode; }
+
+extern "C" void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask mask) {
+    if (mask == TENSOR_DUMP_ARG_MASK_NONE) {
+        return;
+    }
+    if (!ensure_dump_mask_table()) {
+        return;
+    }
+    uint32_t ring_id = static_cast<uint32_t>(task_id >> 32);
+    if (ring_id >= TENSOR_DUMP_MASK_POOL_MAX_RINGS) {
+        return;
+    }
+    uint32_t slot = static_cast<uint32_t>(task_id) & TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK;
+    uint32_t idx = (ring_id * TENSOR_DUMP_MASK_POOL_MAX_SLOTS + slot) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1);
+    for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
+        DumpTaskMaskEntry &entry = g_dump_mask_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
+        if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID || entry.task_id == task_id) {
+            entry.task_id = task_id;
+            entry.mask = mask;
+            return;
+        }
+    }
+    LOG_ERROR("tensor dump selective mask table is full");
+}
+
+extern "C" TensorDumpArgMask get_dump_tensor_task_mask(uint64_t task_id) {
+    if (g_dump_mask_table == nullptr) {
+        return TENSOR_DUMP_ARG_MASK_NONE;
+    }
+    uint32_t ring_id = static_cast<uint32_t>(task_id >> 32);
+    if (ring_id >= TENSOR_DUMP_MASK_POOL_MAX_RINGS) {
+        return TENSOR_DUMP_ARG_MASK_NONE;
+    }
+    uint32_t slot = static_cast<uint32_t>(task_id) & TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK;
+    uint32_t idx = (ring_id * TENSOR_DUMP_MASK_POOL_MAX_SLOTS + slot) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1);
+    for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
+        const DumpTaskMaskEntry &entry = g_dump_mask_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
+        if (entry.task_id == task_id) {
+            return entry.mask;
+        }
+        if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID) {
+            return TENSOR_DUMP_ARG_MASK_NONE;
+        }
+    }
+    return TENSOR_DUMP_ARG_MASK_NONE;
+}
 
 bool get_tensor_dump_role_from_direction(ArgDirection dir, TensorDumpRole *role) {
     switch (dir) {
@@ -95,6 +184,21 @@ bool should_dump_tensor_at_stage(TensorDumpRole role, TensorDumpStage stage) {
         return true;
     }
     return false;
+}
+
+bool should_dump_task(TensorDumpArgMask arg_mask) {
+    if (!is_dump_tensor_selective_mode()) {
+        return true;
+    }
+    return arg_mask != TENSOR_DUMP_ARG_MASK_NONE;
+}
+
+bool should_dump_tensor_arg(TensorDumpArgMask arg_mask, int32_t arg_index) {
+    if (!is_dump_tensor_selective_mode()) {
+        return true;
+    }
+    if (arg_index < 0 || arg_index >= static_cast<int32_t>(TENSOR_DUMP_ARG_MASK_BITS)) return false;
+    return (arg_mask & (TensorDumpArgMask{1} << arg_index)) != 0;
 }
 
 bool try_log_tensor_dump_layout_mismatch() {

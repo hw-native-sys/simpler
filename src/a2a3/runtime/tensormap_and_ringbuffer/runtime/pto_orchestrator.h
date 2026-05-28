@@ -142,13 +142,20 @@ struct PTO2OrchestratorState {
         int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
     );
 
-    // Phase 3: bind region pointers, wire per-ring task_allocator + fanin_pool
-    // and tensor_map. Arena must be committed; layout must come from
-    // reserve_layout() against the same arena.
-    bool init_from_layout(
-        const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SharedMemoryHeader *sm_header, void *gm_heap,
-        uint64_t heap_size
+    // Phase 3a: write everything *except* arena-internal pointer fields.
+    // sm_dev_base is the SM device address (only stored, never dereferenced);
+    // task_window_size feeds the per-ring SM address arithmetic. Safe to call
+    // on a host arena that holds the prebuilt image.
+    bool init_data_from_layout(
+        const PTO2OrchestratorLayout &layout, DeviceArena &arena, void *sm_dev_base, void *gm_heap, uint64_t heap_size,
+        uint64_t task_window_size
     );
+
+    // Phase 3b: write the arena-internal pointer fields (scope_tasks,
+    // scope_begins, rings[].fanin_pool.base, tensor_map.{buckets,entry_pool,
+    // free_entry_list,task_entry_heads}, scheduler reference).
+    // Idempotent — host runs once on the image, AICPU runs once after attach.
+    void wire_arena_pointers(const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SchedulerState *scheduler);
 
     // Forget pointers; arena owns the backing buffers.
     void destroy();

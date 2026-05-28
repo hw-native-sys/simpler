@@ -292,7 +292,7 @@ class ChipWorker:
         worker = ChipWorker()
         worker.init(device_id=0, bins=bins)
         worker.prepare_callable(callable_id=0, callable=chip_callable)
-        worker.run(callable_id=0, args=orch_args, config=CallConfig(block_dim=24))
+        worker.run(callable_id=0, args=orch_args, config=CallConfig())  # block_dim defaults to 0 = auto
         worker.unregister_callable(callable_id=0)
         worker.finalize()
     """
@@ -319,7 +319,9 @@ class ChipWorker:
             device_id: NPU device ID to attach the calling thread to.
             bins: A `simpler_setup.runtime_builder.RuntimeBinaries` (or any
                 object exposing host_path / aicpu_path / aicore_path /
-                simpler_log_path / sim_context_path).
+                simpler_log_path / sim_context_path / dispatcher_path).
+                ``dispatcher_path`` is required for onboard platforms and
+                ignored on sim (set to None).
             log_level: Severity floor (0=DEBUG..4=NUL). Defaults to a snapshot
                 of the simpler logger via `_log.get_current_config()`.
             log_info_v: INFO verbosity threshold (0..9). Same default.
@@ -354,10 +356,15 @@ class ChipWorker:
             _preload_global(str(bins.sim_context_path))
 
         # 3. host_runtime.so is dlopen'd RTLD_LOCAL inside _impl.init.
+        #    dispatcher_path is passed as an empty string on sim (where bins
+        #    has dispatcher_path=None); the onboard simpler_init reads it
+        #    via LoadAicpuOp::BootstrapDispatcher, sim ignores it.
+        dispatcher_path = getattr(bins, "dispatcher_path", None)
         self._impl.init(
             str(bins.host_path),
             str(bins.aicpu_path),
             str(bins.aicore_path),
+            "" if dispatcher_path is None else str(dispatcher_path),
             int(device_id),
         )
 
@@ -384,7 +391,11 @@ class ChipWorker:
             callable_id: Stable id passed to a prior ``prepare_callable``.
             args: ChipStorageTaskArgs for this invocation.
             config: Optional CallConfig. If None, a default is created.
-            **kwargs: Overrides applied to config (e.g. block_dim=24).
+            **kwargs: Overrides applied to config (e.g. ``block_dim=8`` to
+                pin a smaller value than the default). Omit ``block_dim`` (or
+                set it to 0) to have DeviceRunner auto-resolve it to the max
+                the AICore stream allows (``aclrtGetStreamResLimit`` on
+                onboard, ``PLATFORM_MAX_BLOCKDIM`` on sim).
 
         Returns a :class:`RunTiming` with host + device wall.
         """

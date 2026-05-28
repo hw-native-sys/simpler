@@ -61,7 +61,8 @@ protected:
     void SetUp() override {
         const size_t off = ready_queue_reserve_layout(arena, CAPACITY);
         ASSERT_NE(arena.commit(), nullptr);
-        ASSERT_TRUE(ready_queue_init_from_layout(&queue, arena, off, CAPACITY));
+        ASSERT_TRUE(ready_queue_init_data_from_layout(&queue, arena, off, CAPACITY));
+        ready_queue_wire_arena_pointers(&queue, arena, off);
     }
 
     void TearDown() override {
@@ -231,7 +232,8 @@ protected:
     void SetUp() override {
         const size_t off = ready_queue_reserve_layout(arena, QUEUE_CAP);
         ASSERT_NE(arena.commit(), nullptr);
-        ASSERT_TRUE(ready_queue_init_from_layout(&queue, arena, off, QUEUE_CAP));
+        ASSERT_TRUE(ready_queue_init_data_from_layout(&queue, arena, off, QUEUE_CAP));
+        ready_queue_wire_arena_pointers(&queue, arena, off);
     }
     void TearDown() override {
         ready_queue_destroy(&queue);
@@ -330,7 +332,8 @@ protected:
     void SetUp() override {
         const size_t off = ready_queue_reserve_layout(arena, CAPACITY);
         ASSERT_NE(arena.commit(), nullptr);
-        ASSERT_TRUE(ready_queue_init_from_layout(&queue, arena, off, CAPACITY));
+        ASSERT_TRUE(ready_queue_init_data_from_layout(&queue, arena, off, CAPACITY));
+        ready_queue_wire_arena_pointers(&queue, arena, off);
     }
     void TearDown() override {
         ready_queue_destroy(&queue);

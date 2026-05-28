@@ -112,40 +112,66 @@ static int prof_free_cb(void *dev_ptr) {
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
-int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size) {
-    if (static_arena_.is_committed()) {
-        if (gm_heap_size <= cached_gm_heap_size_ && gm_sm_size <= cached_gm_sm_size_) return 0;
-        static_arena_.release();
-        gm_heap_region_off_ = SIZE_MAX;
-        gm_sm_region_off_ = SIZE_MAX;
-        cached_gm_heap_size_ = 0;
-        cached_gm_sm_size_ = 0;
-    }
-    gm_heap_region_off_ = static_arena_.reserve(gm_heap_size, DeviceArena::kDefaultBaseAlign);
-    gm_sm_region_off_ = static_arena_.reserve(gm_sm_size, DeviceArena::kDefaultBaseAlign);
-    if (static_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-        // Roll back the two reserves: commit() failure leaves committed_=false,
-        // so the next entry would skip the release branch and stack new
-        // reserves on top of the stale cursor. release() is idempotent on a
-        // never-committed arena (just zeroes cursor_ / region_count_).
-        static_arena_.release();
-        gm_heap_region_off_ = SIZE_MAX;
-        gm_sm_region_off_ = SIZE_MAX;
-        return -1;
-    }
-    cached_gm_heap_size_ = gm_heap_size;
-    cached_gm_sm_size_ = gm_sm_size;
+int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
+    // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
+    // runtime arena. Split out from a single large allocation because the
+    // combined size can exceed the device allocator's largest contiguous
+    // block. Each arena commits exactly one region, so its base() is the
+    // pooled pointer the caller wants.
+    //
+    // Idempotent for the production case (sizes do not change across a
+    // worker's lifetime). If a caller asks for a larger layout on any
+    // region, redo just that region — already-committed peers stay alive
+    // so their callers don't have to re-acquire.
+    auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+        if (requested_size == 0) {
+            // hbg's runtime_arena path: caller passed 0 and never reserved
+            // a region. Leave the arena uncommitted; acquire_pooled_* will
+            // return nullptr.
+            if (arena.is_committed() && cached_size != 0) {
+                arena.release();
+                cached_size = 0;
+            }
+            return 0;
+        }
+        if (arena.is_committed() && requested_size <= cached_size) {
+            return 0;
+        }
+        arena.release();
+        cached_size = 0;
+        arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
+        if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+            // commit() failure leaves committed_=false, so the next entry's
+            // is_committed() guard skips the release branch. release() is
+            // idempotent on a never-committed arena (zeroes cursor_).
+            arena.release();
+            return -1;
+        }
+        cached_size = requested_size;
+        return 0;
+    };
+    // Failure of a later region leaves earlier peers committed on purpose:
+    // pooled pointers previously returned to callers must stay valid even if
+    // this resize attempt aborts.
+    if (commit_region(gm_heap_arena_, cached_gm_heap_size_, gm_heap_size) != 0) return -1;
+    if (commit_region(gm_sm_arena_, cached_gm_sm_size_, gm_sm_size) != 0) return -1;
+    if (commit_region(runtime_arena_pool_, cached_runtime_arena_size_, runtime_arena_size) != 0) return -1;
     return 0;
 }
 
 void *DeviceRunner::acquire_pooled_gm_heap() {
-    if (!static_arena_.is_committed()) return nullptr;
-    return static_arena_.region_ptr(gm_heap_region_off_);
+    if (!gm_heap_arena_.is_committed()) return nullptr;
+    return gm_heap_arena_.base();
 }
 
 void *DeviceRunner::acquire_pooled_gm_sm() {
-    if (!static_arena_.is_committed()) return nullptr;
-    return static_arena_.region_ptr(gm_sm_region_off_);
+    if (!gm_sm_arena_.is_committed()) return nullptr;
+    return gm_sm_arena_.base();
+}
+
+void *DeviceRunner::acquire_pooled_runtime_arena() {
+    if (!runtime_arena_pool_.is_committed()) return nullptr;
+    return runtime_arena_pool_.base();
 }
 
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
@@ -345,6 +371,13 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // DeviceRunner::validate_block_dim). The scheduler assigns cores to
     // threads cluster-aligned round-robin, so block_dim need not be evenly
     // divisible by the scheduler thread count.
+    //
+    // block_dim == 0 is the CallConfig "auto" sentinel — resolve to the
+    // static max since sim has no per-stream resource query.
+    if (block_dim == 0) {
+        block_dim = PLATFORM_MAX_BLOCKDIM;
+        LOG_INFO_V0("block_dim auto-resolved to %d", block_dim);
+    }
     if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
         LOG_ERROR("block_dim (%d) must be in range [1, %d]", block_dim, PLATFORM_MAX_BLOCKDIM);
         return -1;
@@ -378,7 +411,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Initialize handshake buffers
     runtime.worker_count = num_aicore;
     worker_count_ = num_aicore;
-    runtime.sche_cpu_num = launch_aicpu_num;
+    runtime.aicpu_thread_num = launch_aicpu_num;
 
     // Calculate number of AIC cores
     int num_aic = block_dim;
@@ -922,14 +955,16 @@ int DeviceRunner::finalize() {
     // Close executor .so files (typically already closed by run(), this is a safety net)
     unload_executor_binaries();
 
-    // Release per-Worker static arena (GM heap + PTO2 SM in a single backing
-    // device allocation). Must precede mem_alloc_.finalize() so the arena
-    // frees through the still-live allocator, not after it.
-    static_arena_.release();
-    gm_heap_region_off_ = SIZE_MAX;
-    gm_sm_region_off_ = SIZE_MAX;
+    // Release the three per-Worker pooled arenas (GM heap, PTO2 SM, optional
+    // trb prebuilt runtime arena — each its own device_malloc). Must precede
+    // mem_alloc_.finalize() so the arenas free through the still-live
+    // allocator, not after it.
+    gm_heap_arena_.release();
+    gm_sm_arena_.release();
+    runtime_arena_pool_.release();
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
+    cached_runtime_arena_size_ = 0;
 
     // Free all remaining allocations
     mem_alloc_.finalize();
@@ -1061,7 +1096,7 @@ void DeviceRunner::finalize_collectors() {
 
 int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
+        num_aicore, device_id, l2_perf_level_, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
         kernel_args_.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
@@ -1072,7 +1107,7 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
-    int num_dump_threads = runtime.sche_cpu_num;
+    int num_dump_threads = runtime.aicpu_thread_num;
 
     int rc = dump_collector_.initialize(
         num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_

@@ -17,7 +17,6 @@
  * Key Components:
  * - DeviceArgs: AICPU device argument structure
  * - KernelArgsHelper: Helper for managing kernel arguments with device memory
- * - AicpuSoInfo: AICPU shared object (.so) file management
  * - DeviceRunner: kernel launching and execution
  */
 
@@ -40,6 +39,7 @@
 #include "callable.h"
 #include "prepare_callable_common.h"
 #include "device_arena.h"
+#include "device_runner_helpers.h"  // common DeviceArgs + KernelArgsHelper
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
 #include "common/l2_perf_profiling.h"
@@ -50,121 +50,11 @@
 #include "host/l2_perf_collector.h"
 #include "host/pmu_collector.h"
 #include "host/tensor_dump_collector.h"
+#include "load_aicpu_op.h"
 #include "runtime.h"
 
-/**
- * DeviceArgs structure for AICPU device arguments
- *
- * This structure contains pointers to device memory for the AICPU shared
- * object. The layout is hardcoded in libaicpu_extend_kernels.so, which expects
- * specific offsets for aicpu_so_bin and aicpu_so_len fields.
- */
-struct DeviceArgs {
-    uint64_t unused[12] = {0};
-    uint64_t aicpu_so_bin{0};
-    uint64_t aicpu_so_len{0};
-};
-
-/**
- * Helper class for managing KernelArgs with device memory
- *
- * This class wraps KernelArgs and provides host-side initialization methods
- * for allocating device memory and copying data to the device. It separates
- * the concerns of device memory management (host-only) from the structure
- * layout (shared with kernels).
- *
- * The helper provides implicit conversion to KernelArgs* for seamless use
- * with runtime APIs.
- */
-struct KernelArgsHelper {
-    KernelArgs args;
-    MemoryAllocator *allocator_{nullptr};
-    KernelArgs *device_k_args_{nullptr};  // Device pointer (populated by init_device_kernel_args)
-
-    /**
-     * Initialize device arguments by allocating device memory and copying data
-     *
-     * @param host_device_args  Host-side device arguments to copy
-     * @param allocator       Memory allocator to use
-     * @return 0 on success, error code on failure
-     */
-    int init_device_args(const DeviceArgs &host_device_args, MemoryAllocator &allocator);
-
-    /**
-     * Free device memory allocated for device arguments
-     *
-     * @return 0 on success, error code on failure
-     */
-    int finalize_device_args();
-
-    /**
-     * Initialize runtime arguments by allocating device memory and copying data
-     *
-     * @param host_runtime  Host-side runtime to copy to device
-     * @param allocator  Memory allocator to use
-     * @return 0 on success, error code on failure
-     */
-    int init_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator);
-
-    /**
-     * Free device memory allocated for runtime arguments
-     *
-     * @return 0 on success, error code on failure
-     */
-    int finalize_runtime_args();
-
-    /**
-     * Allocate device memory for the host-resident KernelArgs and copy the
-     * struct over. AICore's KERNEL_ENTRY expects a KernelArgs* (not a
-     * Runtime*) so it can read the profiling enablement bits + ring address
-     * tables and forward them into AICore platform state. Call this after
-     * every kernel_args.args.* field is populated for the run.
-     */
-    int init_device_kernel_args(MemoryAllocator &allocator);
-
-    /**
-     * Free device memory allocated for the device-resident KernelArgs copy.
-     */
-    int finalize_device_kernel_args();
-
-    /**
-     * Implicit conversion operators for seamless use with runtime APIs
-     *
-     * These operators allow KernelArgsHelper to be used wherever KernelArgs*
-     * is expected, enabling transparent device memory management while
-     * maintaining API compatibility.
-     */
-    operator KernelArgs *() { return &args; }
-    KernelArgs *operator&() { return &args; }
-};
-
-/**
- * AICPU shared object information and management
- *
- * This class manages loading and device memory allocation for AICPU
- * shared object (.so) files.
- */
-struct AicpuSoInfo {
-    uint64_t aicpu_so_bin{0};
-    uint64_t aicpu_so_len{0};
-    MemoryAllocator *allocator_{nullptr};
-
-    /**
-     * Load shared object binary data and copy to device memory
-     *
-     * @param aicpu_so_binary  Binary data of the AICPU shared object
-     * @param allocator      Memory allocator to use
-     * @return 0 on success, error code on failure
-     */
-    int init(const std::vector<uint8_t> &aicpu_so_binary, MemoryAllocator &allocator);
-
-    /**
-     * Free device memory allocated for shared object
-     *
-     * @return 0 on success, error code on failure
-     */
-    int finalize();
-};
+// DeviceArgs + KernelArgsHelper are defined in
+// src/common/platform/onboard/host/device_runner_helpers.h (included above).
 
 /**
  * Device runner for kernel execution
@@ -181,24 +71,36 @@ struct AicpuSoInfo {
 class DeviceRunner {
 public:
     DeviceRunner() :
-        static_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
+        gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+        gm_sm_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+        runtime_arena_pool_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
     ~DeviceRunner();
 
     /**
-     * Lay out and commit the per-Worker static device arena that backs the
-     * PTO2 GM heap and PTO2 shared memory in a single underlying allocation.
-     * Must be called before acquire_pooled_gm_heap / acquire_pooled_gm_sm.
-     * Idempotent on identical sizes. Returns 0 on success, -1 on failure.
+     * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
+     * memory, trb prebuilt runtime arena) as three independent device
+     * allocations. Must be called before any acquire_pooled_*. Idempotent
+     * on identical sizes. `runtime_arena_size` is 0 for the hbg path (no
+     * prebuilt runtime arena) — the corresponding arena stays uncommitted.
+     * Returns 0 on success, -1 on failure.
      */
-    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size);
+    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
     /**
-     * Return the pooled GM heap / PTO2 SM pointer. setup_static_arena must
-     * have been called earlier in this Worker; otherwise these return
-     * nullptr. Pointers are stable for the lifetime of the Worker.
+     * Return the pooled GM heap / PTO2 SM / runtime arena pointer.
+     * setup_static_arena must have already committed the relevant region;
+     * otherwise these return nullptr. All pointers are stable for the
+     * Worker's lifetime; the three underlying device buffers are released
+     * in `finalize()`.
+     *
+     * acquire_pooled_runtime_arena() is trb-only — the runtime arena region
+     * is only committed when setup_static_arena was called with
+     * runtime_arena_size > 0. Calling it on the hbg path
+     * (setup_static_arena(...,0)) returns nullptr (well-defined).
      */
     void *acquire_pooled_gm_heap();
     void *acquire_pooled_gm_sm();
+    void *acquire_pooled_runtime_arena();
 
     /**
      * Create a thread bound to this device.
@@ -276,6 +178,20 @@ public:
         aicore_kernel_binary_ = std::move(aicore_kernel_binary);
     }
 
+    /**
+     * Take ownership of the dispatcher SO bytes. Called by simpler_init when
+     * the caller provided a dispatcher path; the eager
+     * ensure_device_initialized() in simpler_init hands the buffer to
+     * LoadAicpuOp::BootstrapDispatcher at init time. Leaving this unset
+     * (empty buffer) makes ensure_binaries_loaded() fail with a clear
+     * message — callers that drive _ChipWorker.init directly without a
+     * dispatcher path get a deterministic error at simpler_init time rather
+     * than a confusing dladdr-derived path.
+     */
+    void set_dispatcher_binary(std::vector<uint8_t> dispatcher_so_binary) {
+        dispatcher_so_binary_ = std::move(dispatcher_so_binary);
+    }
+
     /** The device id captured by simpler_init's attach_current_thread call. */
     int device_id() const { return device_id_; }
 
@@ -285,7 +201,10 @@ public:
      * corresponding `enable_*_` members directly. Moved off the generic
      * Runtime struct / run() arg list so all three travel the same way.
      */
-    void set_l2_swimlane_enabled(bool enable) { enable_l2_swimlane_ = enable; }
+    void set_l2_swimlane_enabled(int level) {
+        l2_perf_level_ = static_cast<L2PerfLevel>(level);
+        enable_l2_swimlane_ = (l2_perf_level_ != L2PerfLevel::DISABLED);
+    }
     void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
@@ -381,24 +300,27 @@ public:
     int attach_current_thread(int device_id);
 
     /**
-     * Ensure the current thread has fresh run-scoped streams.
+     * One-shot device initialization. Performs, in order:
+     *   1. rtSetDevice + rtStreamCreate for AICPU and AICore streams. Streams
+     *      live for the DeviceRunner's lifetime and are destroyed in finalize.
+     *   2. Bundles dispatcher SO bytes + inner AICPU kernel SO bytes through
+     *      `LoadAicpuOp::BootstrapDispatcher` so the inner SO is written to
+     *      the device-side preinstall path.
+     *   3. Registers the inner SO via `LoadAicpuOp::Init`
+     *      (`rtsBinaryLoadFromFile` + `rtsFuncGetByName`) and caches the
+     *      resulting per-symbol `rtFuncHandle` for per-task `rtsLaunchCpuKernel`.
+     *   4. H2D-copies the (zeroed) per-task DeviceArgs struct via
+     *      `kernel_args_.init_device_args`. device_args_.aicpu_so_bin/len
+     *      stay 0 — no consumer reads them on the per-task path.
      *
-     * This attaches the current thread to the target device and lazily creates
-     * the AICPU/AICore streams used by a single run.
+     * Called once from `simpler_init` after the executor + dispatcher bytes are
+     * cached on the runner. Idempotent: subsequent calls short-circuit on
+     * binaries_loaded_. Reads device_id_ recorded by attach_current_thread.
      *
-     * @param device_id  Device ID (0-15)
-     * @return 0 on success, error code on failure
+     * @return 0 on success, error code on failure (e.g. dispatcher SO bytes
+     *         not provided, CANN stream create / register failures).
      */
-    int prepare_run_context(int device_id);
-
-    /**
-     * Release run-scoped resources owned by the current thread.
-     *
-     * This destroys AICPU/AICore streams but intentionally preserves device
-     * allocations, uploaded binaries, and other session state so they can be
-     * finalized later before rtDeviceReset().
-     */
-    void release_run_context();
+    int ensure_device_initialized();
 
     /**
      * Stage a per-callable_id orchestration SO into device memory and remember
@@ -471,34 +393,65 @@ private:
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results in destructor
     // Executor binaries — populated once via set_executors() during
-    // simpler_init, owned by this runner for the rest of its lifetime.
+    // simpler_init. aicore_kernel_binary_ is consumed once by
+    // launch_aicore_kernel() (rtRegisterAllKernel returns aicore_bin_handle_,
+    // cached and reused on every subsequent launch). Caching is required:
+    // CANN has no public rtUnregisterAllKernel, so re-registering on every
+    // run would pin another device-side copy of the ~365KB ELF and quickly
+    // exhaust HBM (manifested in CI as 207001 at rtKernelLaunchWithHandleV2
+    // and 507899 cascade at rtStreamCreate). aicpu_so_binary_ is released
+    // by ensure_binaries_loaded() after bootstrap; bootstrap is the only
+    // consumer and per-task launches go through the cached rtFuncHandle on
+    // LoadAicpuOp, not the host bytes.
     std::vector<uint8_t> aicpu_so_binary_;
     std::vector<uint8_t> aicore_kernel_binary_;
+    // AICore kernel handle from rtRegisterAllKernel — lazily populated by
+    // launch_aicore_kernel() and reused across all runs. nullptr means not
+    // yet registered. Reset to nullptr in finalize(); CANN releases the
+    // device-side state implicitly when the device context tears down.
+    void *aicore_bin_handle_{nullptr};
+    // Dispatcher SO bytes — populated once via set_dispatcher_binary() during
+    // simpler_init. Consumed exclusively by BootstrapDispatcher on the first
+    // run() and released by ensure_binaries_loaded() right after. Empty buffer
+    // is permitted at init time (callers that drive ChipWorker.init without a
+    // dispatcher path); ensure_binaries_loaded() then fails fast with a clear
+    // message if/when bootstrap is actually attempted.
+    std::vector<uint8_t> dispatcher_so_binary_;
+
+    // AICPU op loader — handles dispatcher bootstrap and per-task launches.
+    host::LoadAicpuOp load_aicpu_op_;
 
     // Memory management
     MemoryAllocator mem_alloc_;
 
-    // Per-Worker arena backing the PTO2 GM heap + PTO2 shared memory in a
-    // single device allocation. Released explicitly in finalize() before
-    // mem_alloc_.finalize() so it does not free pointers a second time.
+    // Three independent per-Worker arenas, each backing a single pooled
+    // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime
+    // arena). Split out from a single backing allocation because the
+    // combined size can exceed the device allocator's largest contiguous
+    // block — three separate device_malloc calls are friendlier than one
+    // big one. Released explicitly in finalize() before mem_alloc_.finalize()
+    // so the underlying buffers do not get freed twice.
+    //
+    // `runtime_arena_pool_` stays unreserved when setup_static_arena was
+    // invoked with runtime_arena_size == 0 (hbg path).
     //
     // Trampolines forward DeviceArena's alloc/free calls to mem_alloc_.
     static void *arena_alloc_trampoline(void *ctx, size_t size) {
         return static_cast<MemoryAllocator *>(ctx)->alloc(size);
     }
     static void arena_free_trampoline(void *ctx, void *p) { static_cast<MemoryAllocator *>(ctx)->free(p); }
-    DeviceArena static_arena_;
-    size_t gm_heap_region_off_{SIZE_MAX};
-    size_t gm_sm_region_off_{SIZE_MAX};
-    // Cached sizes for setup_static_arena's "fits" check — avoids calling
-    // region_size() on the arena's public API for the two regions we own.
+    DeviceArena gm_heap_arena_;
+    DeviceArena gm_sm_arena_;
+    DeviceArena runtime_arena_pool_;
+    // Cached sizes for setup_static_arena's "fits" check — avoids re-allocating
+    // a buffer when a later worker init asks for an equal-or-smaller layout.
     size_t cached_gm_heap_size_{0};
     size_t cached_gm_sm_size_{0};
+    size_t cached_runtime_arena_size_{0};
 
     // Device resources
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
-    AicpuSoInfo so_info_;
     KernelArgsHelper kernel_args_;
 
     // Platform-level device wall buffer: 8-byte device-resident slot whose
@@ -566,32 +519,34 @@ private:
     PmuCollector pmu_collector_;
 
     /**
-     * Ensure device is initialized (lazy initialization)
+     * Query the maximum block_dim the stream can host.
      *
-     * Checks if device is already initialized. If not, performs:
-     * - Attach the current thread to the device
-     * - Create AICPU and AICore streams
-     * - Load AICPU SO to device memory
-     * - Initialize device args
+     * Uses aclrtGetStreamResLimit(CUBE_CORE / VECTOR_CORE) and returns
+     * min(cube / AIC_PER_BLOCKDIM, vector / AIV_PER_BLOCKDIM). Falls back to
+     * the static PLATFORM_MAX_BLOCKDIM cap when the query is unavailable or
+     * reports no cores. Used both to validate explicit block_dim values and
+     * to resolve the CallConfig "auto" sentinel (block_dim == 0).
      *
-     * Reads the bound device id and executor binaries from runner state.
-     * @return 0 on success, error code on failure
+     * If non-null, `out_cube` / `out_vector` receive the raw ACL limits when
+     * the query succeeded, or 0 when it failed. Callers use this to
+     * distinguish the ACL-unavailable fallback path from the success path in
+     * error logs.
      */
-    int ensure_device_initialized();
+    int query_max_block_dim(rtStream_t stream, uint32_t *out_cube = nullptr, uint32_t *out_vector = nullptr);
 
     /**
      * Validate block_dim against the stream's CUBE/VECTOR core limits
-     * (aclrtGetStreamResLimit). When that query is unavailable or reports no
-     * cores, falls back to the static PLATFORM_MAX_BLOCKDIM cap.
-     * Returns 0 if block_dim fits, -1 otherwise (or if block_dim < 1).
+     * (via query_max_block_dim). Returns 0 if block_dim fits, -1 otherwise
+     * (or if block_dim < 1).
      */
     int validate_block_dim(rtStream_t stream, int block_dim);
 
     /**
      * Load AICPU SO and initialize device args
      *
-     * Called by run() after prepare_run_context(). Reads aicpu_so_binary_ /
-     * aicore_kernel_binary_ off the runner.
+     * Called from ensure_device_initialized() after the persistent streams
+     * are created. Reads aicpu_so_binary_ / aicore_kernel_binary_ off the
+     * runner.
      *
      * @return 0 on success, error code on failure
      */
@@ -651,6 +606,7 @@ private:
     bool enable_l2_swimlane_{false};
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
+    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};             // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
 

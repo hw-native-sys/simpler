@@ -57,18 +57,22 @@ const char *SchedulerContext::shape_name(PTO2ResourceShape shape) {
     return "UNKNOWN";
 }
 
-const PTO2ResourceShape *SchedulerContext::get_dispatch_order(int32_t thread_idx) {
-    static constexpr PTO2ResourceShape kEvenOrder[PTO2_NUM_RESOURCE_SHAPES] = {
-        PTO2ResourceShape::MIX,
-        PTO2ResourceShape::AIC,
-        PTO2ResourceShape::AIV,
-    };
-    static constexpr PTO2ResourceShape kOddOrder[PTO2_NUM_RESOURCE_SHAPES] = {
-        PTO2ResourceShape::MIX,
-        PTO2ResourceShape::AIV,
-        PTO2ResourceShape::AIC,
-    };
-    return (thread_idx % 2 == 0) ? kEvenOrder : kOddOrder;
+bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, PTO2ResourceShape shape) const {
+    // Cross-thread read of peer trackers without explicit synchronization. The
+    // backing `core_states_` is a naturally aligned uint64_t; aarch64 guarantees
+    // single-copy atomicity for an 8-byte aligned load, so no torn read. The
+    // value is consumed only as a scheduling *hint* — a stale read at worst
+    // causes one missed/extra pending dispatch, corrected on the next iteration.
+    // Drain-mode cross-thread writes are serialized by handle_drain_mode's ack
+    // barrier (all peers spin out of the dispatch path before any tracker
+    // mutation), so this routine is never racing the drain worker.
+    for (int32_t t = 0; t < active_sched_threads_; t++) {
+        if (t == self_thread_idx) continue;
+        if (core_trackers_[t].get_idle_core_offset_states(shape).has_value()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int SchedulerContext::pop_ready_tasks_batch(
@@ -88,7 +92,8 @@ int SchedulerContext::pop_ready_tasks_batch(
     int count = sched_->get_ready_tasks_batch(shape, local_buf, out, max_count);
 #endif
     // pop_hit / pop_miss are PTO2_PROFILING-gated (not the inner verbose tier)
-    // so the v2 JSON dispatch records carry queue-health stats on default builds.
+    // so dispatch-phase records in aicpu_scheduler_phases[] carry queue-health
+    // stats on default builds.
     if (count > 0) {
         l2_perf.pop_hit += count;
     } else {
@@ -179,6 +184,11 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_offset, core_id, reg_task_id
     );
 
+    // Publish task data (slot_state / args writes done above) before AICore
+    // can observe the dispatched task_id. ARM64 needs an explicit store-store
+    // fence across Normal-cacheable -> Device-nGnRnE; the old write_reg()
+    // helper provided this implicitly via __sync_synchronize.
+    wmb();
     write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
     tracker.set_pending_occupied(core_offset);
 }
@@ -325,6 +335,125 @@ void SchedulerContext::dispatch_shape(
     }
 }
 
+void SchedulerContext::dispatch_ready_tasks(
+    int32_t thread_idx, CoreTracker &tracker, PTO2LocalReadyBuffer (&local_bufs)[PTO2_NUM_RESOURCE_SHAPES],
+    bool pmu_active, bool &made_progress, bool &try_pushed
+) {
+    using Phase = CoreTracker::DispatchPhase;
+    constexpr int32_t MIX_I = static_cast<int32_t>(PTO2ResourceShape::MIX);
+
+    // MIX is handled explicitly at the top of each stage; only AIC/AIV cycle
+    // through this 2-elem array, with order toggled by thread parity for
+    // shape-level load balancing across threads.
+    static constexpr PTO2ResourceShape kAicAivOrder[2][2] = {
+        {PTO2ResourceShape::AIC, PTO2ResourceShape::AIV},
+        {PTO2ResourceShape::AIV, PTO2ResourceShape::AIC},
+    };
+    const PTO2ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
+
+#if PTO2_SCHED_PROFILING
+    auto &l2_perf = sched_l2_perf_[thread_idx];
+#endif
+
+    // Note: flush_local_bufs is invoked multiple times per pass (mid-function
+    // flush + RAII tail flush). local_overflow_count accumulates each batch
+    // separately — each entry is counted exactly once (count is zeroed after
+    // push_batch). The total reflects "entries this pass pushed to the global
+    // queue", which is slightly larger than the pre-refactor "buf residual at
+    // pass end" semantics — comparing PTO2_SCHED_PROFILING traces across
+    // commits, expect the post-refactor number to be greater-or-equal.
+    auto flush_local_bufs = [&]() {
+        for (int32_t s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
+            auto &lb = local_bufs[s];
+#if PTO2_SCHED_PROFILING
+            l2_perf.local_overflow_count += lb.count;
+#endif
+            if (lb.count > 0) {
+                sched_->ready_queues[s].push_batch(lb.slot_states, lb.count);
+                lb.count = 0;
+            }
+        }
+    };
+    // Every return path below must flush; wrap in RAII so we cannot forget.
+    // The mid-function flush between IDLE and PENDING is still called
+    // explicitly — guard only covers exit.
+    struct FlushGuard {
+        decltype(flush_local_bufs) &flush_fn;
+        ~FlushGuard() { flush_fn(); }
+    } flush_guard{flush_local_bufs};
+
+    bool entered_drain = false;
+
+    // ===== IDLE stage =====
+    dispatch_shape(
+        thread_idx, PTO2ResourceShape::MIX, Phase::IDLE, local_bufs[MIX_I], tracker, entered_drain, made_progress,
+        try_pushed
+    );
+    if (entered_drain) return;
+
+    // MIX-IDLE residual: AIC/AIV (both IDLE and PENDING) yield for this pass.
+    // MIX-PENDING below still runs — that is the core of "mix strict priority":
+    // pending slots are spent on mix before AIC/AIV get any chance.
+    bool skip_aic_aiv = has_residual_mix(local_bufs[MIX_I]);
+
+    if (!skip_aic_aiv) {
+        for (int i = 0; i < 2; i++) {
+            PTO2ResourceShape s = aic_aiv[i];
+            dispatch_shape(
+                thread_idx, s, Phase::IDLE, local_bufs[static_cast<int32_t>(s)], tracker, entered_drain, made_progress,
+                try_pushed
+            );
+            if (entered_drain) return;
+        }
+    }
+
+    // Flush between IDLE and PENDING so PENDING-stage queue-size checks and any
+    // peer-thread reads see the IDLE-stage release_fanin output.
+    flush_local_bufs();
+
+    if (pmu_active) return;
+
+    // ===== PENDING stage =====
+    // MIX-PENDING gate: skip when a peer has an idle MIX-capable cluster — that
+    // peer's next IDLE-MIX iteration will pull the mix task from the global
+    // queue (already flushed above) at lower latency than us pre-loading a
+    // pending slot here. Forward progress for MIX is preserved: at least one
+    // thread will run MIX-IDLE next pass and consume the residual.
+    //
+    // The gate is NOT subject to skip_aic_aiv — residual mix continues to drain
+    // via pending slots on this thread when no peer is idle.
+    if (!has_idle_in_other_threads(thread_idx, PTO2ResourceShape::MIX)) {
+        dispatch_shape(
+            thread_idx, PTO2ResourceShape::MIX, Phase::PENDING, local_bufs[MIX_I], tracker, entered_drain,
+            made_progress, try_pushed
+        );
+        if (entered_drain) return;
+    }
+
+    // Re-check after MIX-PENDING. If MIX-IDLE already set skip_aic_aiv, leave
+    // it set; otherwise, escalate iff PENDING-MIX left residual.
+    if (!skip_aic_aiv && has_residual_mix(local_bufs[MIX_I])) {
+        skip_aic_aiv = true;
+    }
+
+    // PENDING-MIX may have re-populated AIC/AIV local_bufs via release_fanin
+    // during in-flight completions; flush_guard ensures these don't carry
+    // across to the next iteration's IDLE stage.
+    if (skip_aic_aiv) return;
+
+    // AIC/AIV-PENDING gate: a peer-idle skip is a delay, not a loss — the peer
+    // will pull from the global queue on its next IDLE pass.
+    for (int i = 0; i < 2; i++) {
+        PTO2ResourceShape s = aic_aiv[i];
+        if (has_idle_in_other_threads(thread_idx, s)) continue;
+        dispatch_shape(
+            thread_idx, s, Phase::PENDING, local_bufs[static_cast<int32_t>(s)], tracker, entered_drain, made_progress,
+            try_pushed
+        );
+        if (entered_drain) return;
+    }
+}
+
 // =============================================================================
 // Main scheduler dispatch loop
 // =============================================================================
@@ -357,7 +486,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
         if (is_dump_tensor_enabled()) {
-            dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
+            dump_tensor_init(orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_);
         }
 #endif
 
@@ -569,34 +698,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
         }
 
-        // Phase 4: Two-phase dispatch (idle then pending)
-        const PTO2ResourceShape *dispatch_order = get_dispatch_order(thread_idx);
-        bool entered_drain = false;
-
-        for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES && !entered_drain; si++) {
-            PTO2ResourceShape shape = dispatch_order[si];
-            for (auto phase : {CoreTracker::DispatchPhase::IDLE, CoreTracker::DispatchPhase::PENDING}) {
-                if (phase == CoreTracker::DispatchPhase::PENDING && unlikely(pmu_active)) break;
-                dispatch_shape(
-                    thread_idx, shape, phase, local_bufs[static_cast<int32_t>(shape)], tracker, entered_drain,
-                    made_progress, try_pushed
-                );
-            }
-        }
-
-        // Requeue local buffers to global ready queue
-        for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES; si++) {
-            PTO2ResourceShape shape = dispatch_order[si];
-            auto &local_buf = local_bufs[static_cast<int32_t>(shape)];
-            auto &ready_queue = sched_->ready_queues[static_cast<int32_t>(shape)];
-#if PTO2_SCHED_PROFILING
-            l2_perf.local_overflow_count += local_buf.count;
-#endif
-            if (local_buf.count > 0) {
-                ready_queue.push_batch(local_buf.slot_states, local_buf.count);
-                local_buf.count = 0;
-            }
-        }
+        // Phase 4: MIX-strict-priority dispatch with phase-split and
+        // cross-thread idle gating. See dispatch_ready_tasks for the policy.
+        dispatch_ready_tasks(thread_idx, tracker, local_bufs, pmu_active, made_progress, try_pushed);
 
 #if PTO2_PROFILING
         if (!try_pushed) {
@@ -664,10 +768,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
 #if PTO2_PROFILING
             CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
+            // Idle iterations no longer emit a phase record. Host tooling
+            // recovers idle spans from the gap between consecutive sched
+            // phase records on the same thread. _t0_phase still advances
+            // so the next emitted COMPLETE/DISPATCH gets the correct
+            // start_time (the iter it actually ran in), not the start of
+            // the preceding idle stretch.
             if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-                l2_perf_aicpu_record_phase(
-                    thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, l2_perf.sched_loop_count, 0
-                );
                 _t0_phase = _t1;
             }
 #endif

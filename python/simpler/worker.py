@@ -11,8 +11,9 @@
 Callable identity is a ``cid`` (int), allocated exclusively by
 ``Worker.register(callable)``. ``Worker.run`` and the orchestrator's
 ``submit_next_level`` / ``submit_sub`` all take this cid — never the raw
-``ChipCallable`` / Python function. L≥3 ``register()`` must run **before**
-``init()`` so forked chip / sub children inherit the registry via COW.
+``ChipCallable`` / Python function. L≥3 Python callables registered before
+child startup are inherited through the fork-time snapshot; later
+registrations are serialized and sent through the mailbox control plane.
 
 Usage::
 
@@ -64,9 +65,11 @@ import time
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Optional
 
+import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RunTiming,
+    WorkerType,
     _mailbox_load_i32,
     _mailbox_store_i32,
     read_args_from_blob,
@@ -93,6 +96,7 @@ from .task_interface import (
 # that a hung child fails the suite instead of the CI job timing out.
 _BOOTSTRAP_WAIT_TIMEOUT_S = 120.0
 _BOOTSTRAP_POLL_INTERVAL_S = 0.001
+_PY_CONTROL_TIMEOUT_S = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +167,17 @@ _CTRL_RELEASE_DOMAIN = 8
 # rootinfo_path) and caches the handle on the ChipWorker so subsequent
 # CTRL_ALLOC_DOMAIN calls can find it.
 _CTRL_COMM_INIT = 9
+_CTRL_PY_REGISTER = 10
+_CTRL_PY_UNREGISTER = 11
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
 assert _COMM_INIT_HEADER.size == 8
+
+_PY_CALLABLE_MAGIC = b"SPYC"
+_PY_CALLABLE_VERSION = 1
+_PY_CALLABLE_SERIALIZER_CLOUDPICKLE = 1
+_PY_CALLABLE_HEADER = struct.Struct("<4sBBHQ")
 
 # Reserved 32-byte region at the start of OFF_ARGS used by _CTRL_REGISTER to
 # carry the NUL-terminated POSIX shm name. POSIX shm names on Linux are
@@ -202,6 +213,62 @@ _CTRL_OFF_ARG0 = 16
 _CTRL_OFF_ARG1 = 24
 _CTRL_OFF_ARG2 = 32
 _CTRL_OFF_RESULT = 40
+
+
+def _pack_py_callable_payload(target) -> bytes:
+    payload = cloudpickle.dumps(target)
+    return (
+        _PY_CALLABLE_HEADER.pack(
+            _PY_CALLABLE_MAGIC,
+            _PY_CALLABLE_VERSION,
+            _PY_CALLABLE_SERIALIZER_CLOUDPICKLE,
+            0,
+            len(payload),
+        )
+        + payload
+    )
+
+
+def _load_py_callable_from_shm(shm_name: str):
+    shm = SharedMemory(name=shm_name)
+    try:
+        shm_buf = shm.buf
+        assert shm_buf is not None
+        if shm.size < _PY_CALLABLE_HEADER.size:
+            raise RuntimeError(f"python callable payload too small: {shm.size} bytes")
+        magic, version, serializer, flags, payload_size = _PY_CALLABLE_HEADER.unpack_from(shm_buf, 0)
+        if magic != _PY_CALLABLE_MAGIC:
+            raise RuntimeError(f"invalid python callable payload magic: {magic!r}")
+        if version != _PY_CALLABLE_VERSION:
+            raise RuntimeError(f"unsupported python callable payload version: {version}")
+        if serializer != _PY_CALLABLE_SERIALIZER_CLOUDPICKLE:
+            raise RuntimeError(f"unsupported python callable serializer: {serializer}")
+        if flags != 0:
+            raise RuntimeError(f"unsupported python callable payload flags: {flags}")
+        expected_size = _PY_CALLABLE_HEADER.size + int(payload_size)
+        if expected_size > shm.size:
+            raise RuntimeError(f"python callable payload size mismatch: header={payload_size}, shm={shm.size}")
+        payload = bytes(shm_buf[_PY_CALLABLE_HEADER.size : expected_size])
+    finally:
+        shm.close()
+
+    fn = cloudpickle.loads(payload)
+    if not callable(fn):
+        raise RuntimeError(f"python callable payload decoded to non-callable {type(fn).__name__}")
+    return fn
+
+
+def _handle_py_callable_control(buf, registry: dict, sub_cmd: int, *, context: str) -> None:
+    cid = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]) & 0xFFFFFFFF
+    if cid >= MAX_REGISTERED_CALLABLE_IDS:
+        raise RuntimeError(f"{context}: cid {cid} out of range")
+    if sub_cmd == _CTRL_PY_REGISTER:
+        shm_name = _read_shm_name(buf, _OFF_ARGS)
+        registry[cid] = _load_py_callable_from_shm(shm_name)
+    elif sub_cmd == _CTRL_PY_UNREGISTER:
+        registry.pop(cid, None)
+    else:
+        raise RuntimeError(f"{context}: unknown control sub-command {int(sub_cmd)}")
 
 
 def _mailbox_addr(shm: SharedMemory) -> int:
@@ -299,6 +366,17 @@ def _sub_worker_loop(buf, registry: dict) -> None:
                     msg = _format_exc("sub_worker", e)
             _write_error(buf, code, msg)
             _mailbox_store_i32(state_addr, _TASK_DONE)
+        elif state == _CONTROL_REQUEST:
+            sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+            code = 0
+            msg = ""
+            try:
+                _handle_py_callable_control(buf, registry, int(sub_cmd), context="sub_worker")
+            except Exception as e:  # noqa: BLE001
+                code = 1
+                msg = _format_exc("sub_worker control", e)
+            _write_error(buf, code, msg)
+            _mailbox_store_i32(state_addr, _CONTROL_DONE)
         elif state == _SHUTDOWN:
             break
 
@@ -575,6 +653,8 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     _handle_ctrl_release_domain(cw, buf)
                 elif sub_cmd == _CTRL_COMM_INIT:
                     _handle_ctrl_comm_init(cw, buf)
+                else:
+                    raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
             except Exception as e:  # noqa: BLE001
                 code = 1
                 if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
@@ -709,16 +789,34 @@ def _child_worker_loop(
                     # cid_val onto the registry slot keeps the inner-side
                     # cid identical to the outer-side cid — both the L4
                     # scheduler and the L3 children index by the same int.
+                    registry.pop(int(cid_val), None)
                     inner_worker._register_at(int(cid_val), callable_obj)
                 elif sub_cmd == _CTRL_UNREGISTER:
                     cid_val = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]) & 0xFFFFFFFF
                     inner_worker.unregister(int(cid_val))
+                elif sub_cmd in (_CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER):
+                    _handle_py_callable_control(
+                        buf,
+                        registry,
+                        int(sub_cmd),
+                        context=f"child_worker level={inner_worker.level}",
+                    )
+                else:
+                    raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
             except Exception as e:  # noqa: BLE001
                 code = 1
                 op = (
                     "register"
                     if sub_cmd == _CTRL_REGISTER
-                    else ("unregister" if sub_cmd == _CTRL_UNREGISTER else f"ctrl={int(sub_cmd)}")
+                    else (
+                        "unregister"
+                        if sub_cmd == _CTRL_UNREGISTER
+                        else (
+                            "py_register"
+                            if sub_cmd == _CTRL_PY_REGISTER
+                            else ("py_unregister" if sub_cmd == _CTRL_PY_UNREGISTER else f"ctrl={int(sub_cmd)}")
+                        )
+                    )
                 )
                 msg = _format_exc(f"child_worker level={inner_worker.level} {op}", e)
             _write_error(buf, code, msg)
@@ -760,6 +858,12 @@ class Worker:
         # dispatch) is now handled at the C++ boundary via mailbox_mu_, so
         # no quiescent-state guard is needed.
         self._registry_lock = threading.Lock()
+        self._pending_unregister_cids: set[int] = set()
+        self._py_callable_cids_seen: set[int] = set()
+        self._py_control_timeout_s = float(config.get("py_control_timeout_s", _PY_CONTROL_TIMEOUT_S))
+        self._hierarchical_start_state = "not_started"
+        self._hierarchical_start_mu = threading.Lock()
+        self._hierarchical_start_cv = threading.Condition(self._hierarchical_start_mu)
 
         # Level-2 internals
         self._chip_worker: Optional[ChipWorker] = None
@@ -820,51 +924,128 @@ class Worker:
         ``orch.submit_sub(cid, …)``.
 
         Timing constraints:
-          - L3+: Python callables (sub fn / orch fn) must be registered
-            **before** ``init()`` so the COW-inherited registry is visible to
-            forked chip / sub children. ChipCallables may be registered either
-            before init (pre-warmed via ``_CTRL_PREPARE`` during ``init()``)
-            or after init (broadcast to chip children via
-            ``_Worker.broadcast_register_all``; see
-            docs/callable-ipc-dynamic-register.md). Post-init register at
-            L3+ is ChipCallable-only.
+          - L3+: registrations before child processes start are inherited
+            by forked children through the startup registry snapshot.
+            Registrations after child processes start use the mailbox
+            control plane: ChipCallables keep the binary path, while Python
+            callables are serialized with cloudpickle and broadcast to
+            Python-capable child groups.
           - L2: may be called either before or after ``init()`` (no fork,
             no COW constraint).  When called post-init, ChipCallables are
             prepared on the device immediately; pre-init registrations are
             batched and prepared at the end of ``init()``.
+
+        See docs/python-callable-serialization.md for the Python dynamic
+        register path and docs/callable-ipc-dynamic-register.md for the
+        ChipCallable binary path.
         """
+        if self.level == 2 and not isinstance(target, ChipCallable):
+            raise TypeError("Worker.register: level 2 only supports ChipCallable targets")
+        if self.level >= 3:
+            if not isinstance(target, ChipCallable):
+                if not callable(target):
+                    raise TypeError("Worker.register: non-ChipCallable target must be callable")
+            with self._hierarchical_start_cv:
+                while self._hierarchical_start_state == "starting":
+                    self._hierarchical_start_cv.wait()
+                if self._hierarchical_start_state == "failed":
+                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+                if self._hierarchical_start_state != "started" and not getattr(self, "_hierarchical_started", False):
+                    with self._registry_lock:
+                        cid = self._allocate_cid()
+                        self._callable_registry[cid] = target
+                        if not isinstance(target, ChipCallable):
+                            self._py_callable_cids_seen.add(cid)
+                    return cid
+            if not isinstance(target, ChipCallable):
+                return self._post_start_register_python(target)
+
         with self._registry_lock:
-            if self.level >= 3 and self._initialized and not isinstance(target, ChipCallable):
-                # L3+ post-init: only ChipCallable can cross the process
-                # boundary. Python callables (sub fn / orch fn) must be
-                # registered before init() so forked children inherit them.
-                raise NotImplementedError(
-                    "Worker.register() at level >= 3 must be called before init() "
-                    "for non-ChipCallable targets; only ChipCallable is supported "
-                    "post-init (see docs/callable-ipc-dynamic-register.md)"
-                )
             cid = self._allocate_cid()
             self._callable_registry[cid] = target
+            if self.level >= 3 and not isinstance(target, ChipCallable):
+                self._py_callable_cids_seen.add(cid)
 
-            # L3+ post-init ChipCallable: broadcast to chip / next-level
-            # children via C++. Done inside the registry lock so a concurrent
-            # register cannot allocate the same cid we are about to pop on
-            # failure. Per-WorkerThread mailbox_mu_ already provides the C++
-            # serialisation against in-flight dispatch.
-            if self.level >= 3 and self._initialized and isinstance(target, ChipCallable):
-                try:
-                    self._post_init_register(cid, target)
-                except Exception:
-                    self._callable_registry.pop(cid, None)
-                    raise
-                return cid
-
-            # L2 post-init: pre-warm immediately so the very first
-            # `Worker.run(cid, …)` is a clean cache hit.
-            if self.level == 2 and self._initialized and isinstance(target, ChipCallable):
-                assert self._chip_worker is not None
-                self._chip_worker.prepare_callable(cid, target)
+        # L3+ post-init ChipCallable: broadcast to chip / next-level children
+        # via C++ after parent-side cid allocation is complete. The registry
+        # entry keeps the cid reserved while mailbox_mu_ serializes the wire
+        # round trip against dispatch.
+        if self.level >= 3 and self._initialized and isinstance(target, ChipCallable):
+            try:
+                self._post_init_register(cid, target)
+            except Exception:
+                with self._registry_lock:
+                    if self._callable_registry.get(cid) is target:
+                        self._callable_registry.pop(cid, None)
+                raise
             return cid
+
+        # L2 post-init: pre-warm immediately so the very first
+        # `Worker.run(cid, …)` is a clean cache hit.
+        if self.level == 2 and self._initialized and isinstance(target, ChipCallable):
+            assert self._chip_worker is not None
+            self._chip_worker.prepare_callable(cid, target)
+        return cid
+
+    def _python_worker_types(self) -> list[WorkerType]:
+        worker_types: list[WorkerType] = []
+        if self._config.get("num_sub_workers", 0) > 0:
+            worker_types.append(WorkerType.SUB)
+        if self._next_level_workers:
+            worker_types.append(WorkerType.NEXT_LEVEL)
+        return worker_types
+
+    def _post_start_register_python(self, target) -> int:
+        worker_types = self._python_worker_types()
+        if not worker_types:
+            raise RuntimeError(
+                "Worker.register: no Python-capable child workers are configured "
+                "for dynamic Python callable registration"
+            )
+        payload = _pack_py_callable_payload(target)
+        with self._registry_lock:
+            cid = self._allocate_cid()
+            self._callable_registry[cid] = target
+            self._py_callable_cids_seen.add(cid)
+        try:
+            self._broadcast_py_control(worker_types, _CTRL_PY_REGISTER, cid, payload=payload, strict=True)
+        except Exception:
+            with self._registry_lock:
+                if self._callable_registry.get(cid) is target:
+                    self._callable_registry.pop(cid, None)
+            raise
+        return cid
+
+    def _broadcast_py_control(
+        self,
+        worker_types: list[WorkerType],
+        sub_cmd: int,
+        cid: int,
+        *,
+        payload: Optional[bytes] = None,
+        strict: bool,
+    ) -> list[str]:
+        if not worker_types:
+            return []
+        assert self._worker is not None
+        errors: list[str] = []
+        for worker_type in worker_types:
+            results = self._worker.broadcast_control_all(
+                worker_type,
+                int(sub_cmd),
+                int(cid),
+                payload,
+                timeout_s=self._py_control_timeout_s,
+            )
+            for result in results:
+                if not result.ok:
+                    errors.append(f"{result.worker_type}[{result.worker_index}]: {result.error_message}")
+        if errors and strict:
+            raise RuntimeError(
+                f"Worker control broadcast cid={cid} sub_cmd={sub_cmd} failed on "
+                f"{len(errors)} child workers; first error: {errors[0]}"
+            )
+        return errors
 
     def _allocate_cid(self) -> int:
         """Return the smallest unused cid in [0, MAX_REGISTERED_CALLABLE_IDS).
@@ -875,7 +1056,7 @@ class Worker:
         would silently overwrite the next gap-after-the-hole.
         """
         for i in range(MAX_REGISTERED_CALLABLE_IDS):
-            if i not in self._callable_registry:
+            if i not in self._callable_registry and i not in self._pending_unregister_cids:
                 return i
         # The AICPU side keeps a fixed-size orch_so_table_ keyed by cid;
         # raise here so the failure surfaces at register-time with a
@@ -897,18 +1078,21 @@ class Worker:
         on a single integer key. Plain ``register`` allocates the next
         free slot and is therefore unsuitable here.
         """
+        if not isinstance(target, ChipCallable):
+            raise TypeError("_register_at: target must be a ChipCallable")
         with self._registry_lock:
             if cid in self._callable_registry:
                 raise RuntimeError(f"_register_at: cid={cid} already occupied")
-            if not isinstance(target, ChipCallable):
-                raise TypeError("_register_at: target must be a ChipCallable")
             self._callable_registry[cid] = target
-            if self.level >= 3 and self._initialized:
-                try:
-                    self._post_init_register(cid, target)
-                except Exception:
-                    self._callable_registry.pop(cid, None)
-                    raise
+
+        if self.level >= 3 and self._initialized:
+            try:
+                self._post_init_register(cid, target)
+            except Exception:
+                with self._registry_lock:
+                    if self._callable_registry.get(cid) is target:
+                        self._callable_registry.pop(cid, None)
+                raise
 
     def _post_init_register(self, cid: int, target: ChipCallable) -> None:
         """Broadcast a new ChipCallable to every NEXT_LEVEL child via C++.
@@ -927,7 +1111,30 @@ class Worker:
         if not getattr(self, "_hierarchical_started", False):
             return
         assert self._worker is not None
+        if cid in self._py_callable_cids_seen:
+            self._broadcast_py_control(self._python_worker_types(), _CTRL_PY_UNREGISTER, cid, strict=True)
+            self._py_callable_cids_seen.discard(cid)
         self._worker.broadcast_register_all(int(cid), int(target.buffer_ptr()), int(target.buffer_size()))
+
+    def _pre_start_unregister_if_needed(self, cid: int) -> bool:
+        if self.level < 3:
+            return False
+        with self._hierarchical_start_cv:
+            while self._hierarchical_start_state == "starting":
+                self._hierarchical_start_cv.wait()
+            if self._hierarchical_start_state == "failed":
+                raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+            if self._hierarchical_start_state == "started" or getattr(self, "_hierarchical_started", False):
+                return False
+            with self._registry_lock:
+                if cid not in self._callable_registry:
+                    raise KeyError(f"Worker.unregister: cid={cid} not registered")
+                if cid in self._pending_unregister_cids:
+                    raise KeyError(f"Worker.unregister: cid={cid} already pending unregister")
+                target = self._callable_registry.pop(cid)
+                if not isinstance(target, ChipCallable):
+                    self._py_callable_cids_seen.discard(cid)
+            return True
 
     def unregister(self, cid: int) -> None:
         """Drop *cid* from the registry and propagate to chip children.
@@ -947,17 +1154,46 @@ class Worker:
         Raises:
           KeyError: cid was never registered.
         """
+        if self._pre_start_unregister_if_needed(cid):
+            return
+        target = None
         with self._registry_lock:
             if cid not in self._callable_registry:
                 raise KeyError(f"Worker.unregister: cid={cid} not registered")
+            if cid in self._pending_unregister_cids:
+                raise KeyError(f"Worker.unregister: cid={cid} already pending unregister")
+            target = self._callable_registry[cid]
             if self.level >= 3 and self._initialized and getattr(self, "_hierarchical_started", False):
-                self._broadcast_unregister(cid)
+                self._pending_unregister_cids.add(cid)
             elif self.level == 2 and self._initialized:
                 assert self._chip_worker is not None
                 self._chip_worker.unregister_callable(cid)
-            # Drop the registry entry unconditionally — even if a chip child
-            # reported an error, holding the slot would just waste cid budget.
-            self._callable_registry.pop(cid, None)
+                self._callable_registry.pop(cid, None)
+                return
+            else:
+                self._callable_registry.pop(cid, None)
+                return
+
+        try:
+            if isinstance(target, ChipCallable):
+                self._broadcast_unregister(cid)
+            else:
+                errors = self._broadcast_py_control(
+                    self._python_worker_types(),
+                    _CTRL_PY_UNREGISTER,
+                    cid,
+                    strict=False,
+                )
+                if errors:
+                    sys.stderr.write(
+                        f"Worker.unregister(cid={cid}): {len(errors)} Python children reported errors "
+                        f"(continuing best-effort). First error: {errors[0]}\n"
+                    )
+                    sys.stderr.flush()
+        finally:
+            with self._registry_lock:
+                self._callable_registry.pop(cid, None)
+                self._pending_unregister_cids.discard(cid)
 
     def _broadcast_unregister(self, cid: int) -> None:
         """Broadcast _CTRL_UNREGISTER via C++ to every NEXT_LEVEL child.
@@ -983,6 +1219,8 @@ class Worker:
         """
         if self.level < 4:
             raise RuntimeError("Worker.add_worker() requires level >= 4")
+        if self._config.get("device_ids", []):
+            raise RuntimeError("Worker.add_worker() cannot be combined with device_ids on the same Worker")
         if self._initialized:
             raise RuntimeError("Worker.add_worker() must be called before init()")
         if worker._initialized:
@@ -1030,6 +1268,8 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
         heap_ring_size = self._config.get("heap_ring_size", None)
+        if self.level >= 4 and device_ids:
+            raise RuntimeError("Worker level >= 4 must use add_worker(); device_ids are only supported on L3 Workers")
 
         # 1. Allocate sub-worker mailboxes (unified layout, MAILBOX_SIZE each).
         for _ in range(n_sub):
@@ -1081,97 +1321,118 @@ class Worker:
 
     def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
         """Fork child processes and start C++ scheduler. Called on first run()."""
-        if self._hierarchical_started:
-            return
-        self._hierarchical_started = True
-
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
 
-        # Fork SubWorker processes (MUST be before any C++ threads)
-        registry = self._callable_registry
-        for i in range(n_sub):
-            pid = os.fork()
-            if pid == 0:
-                buf = self._sub_shms[i].buf
-                assert buf is not None
-                _sub_worker_loop(buf, registry)
-                os._exit(0)
-            else:
-                self._sub_pids.append(pid)
+        try:
+            # Fork children from an immutable snapshot. The state transition
+            # and snapshot are one gate, so dynamic register/unregister callers
+            # cannot return through the pre-start path after this point.
+            with self._hierarchical_start_cv:
+                while self._hierarchical_start_state == "starting":
+                    self._hierarchical_start_cv.wait()
+                if self._hierarchical_start_state == "started":
+                    return
+                if self._hierarchical_start_state == "failed":
+                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+                self._hierarchical_start_state = "starting"
+                with self._registry_lock:
+                    registry = dict(self._callable_registry)
+                self._hierarchical_start_cv.notify_all()
 
-        # Fork ChipWorker processes (L3 with device_ids).  Always use the
-        # plain task-loop variant; the base communicator is established
-        # lazily on first ``orch.allocate_domain`` via CTRL_COMM_INIT.
-        chip_log_level, chip_log_info_v = _simpler_log.get_current_config()
-        if device_ids:
-            for idx, dev_id in enumerate(device_ids):
+            # Fork SubWorker processes (MUST be before any C++ threads)
+            for i in range(n_sub):
                 pid = os.fork()
                 if pid == 0:
-                    buf = self._chip_shms[idx].buf
+                    buf = self._sub_shms[i].buf
                     assert buf is not None
-                    _chip_process_loop(
-                        buf,
-                        self._l3_bins,
-                        dev_id,
-                        registry,
-                        chip_log_level,
-                        chip_log_info_v,
-                    )
+                    _sub_worker_loop(buf, registry)
                     os._exit(0)
                 else:
-                    self._chip_pids.append(pid)
+                    self._sub_pids.append(pid)
 
-        # Fork next-level Worker children (L4+ with Worker children).
-        # Each child process: init the inner Worker (which mmaps its own
-        # HeapRing and allocates its own child mailboxes), then enter
-        # _child_worker_loop. The inner Worker's own children are forked
-        # lazily on first run() inside _child_worker_loop, so the process
-        # tree nests correctly: L4 → L3 child → L3's chip/sub children.
-        for idx, inner_worker in enumerate(self._next_level_workers):
-            pid = os.fork()
-            if pid == 0:
-                buf = self._next_level_shms[idx].buf
-                assert buf is not None
-                inner_worker.init()
-                _child_worker_loop(buf, registry, inner_worker)
-                os._exit(0)
-            else:
-                self._next_level_pids.append(pid)
+            # Fork ChipWorker processes (L3 with device_ids).  Always use the
+            # plain task-loop variant; the base communicator is established
+            # lazily on first ``orch.allocate_domain`` via CTRL_COMM_INIT.
+            chip_log_level, chip_log_info_v = _simpler_log.get_current_config()
+            if device_ids:
+                for idx, dev_id in enumerate(device_ids):
+                    pid = os.fork()
+                    if pid == 0:
+                        buf = self._chip_shms[idx].buf
+                        assert buf is not None
+                        _chip_process_loop(
+                            buf,
+                            self._l3_bins,
+                            dev_id,
+                            registry,
+                            chip_log_level,
+                            chip_log_info_v,
+                        )
+                        os._exit(0)
+                    else:
+                        self._chip_pids.append(pid)
 
-        # _Worker was constructed in _init_hierarchical (pre-fork) so
-        # children inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode
-        # workers via the unified mailbox.
-        dw = self._worker
-        assert dw is not None
+            # Fork next-level Worker children (L4+ with Worker children).
+            # Each child process: init the inner Worker (which mmaps its own
+            # HeapRing and allocates its own child mailboxes), then enter
+            # _child_worker_loop. The inner Worker's own children are forked
+            # lazily on first run() inside _child_worker_loop, so the process
+            # tree nests correctly: L4 → L3 child → L3's chip/sub children.
+            for idx, inner_worker in enumerate(self._next_level_workers):
+                pid = os.fork()
+                if pid == 0:
+                    buf = self._next_level_shms[idx].buf
+                    assert buf is not None
+                    inner_worker.init()
+                    _child_worker_loop(buf, registry, inner_worker)
+                    os._exit(0)
+                else:
+                    self._next_level_pids.append(pid)
 
-        # Register chip workers as NEXT_LEVEL (L3)
-        if device_ids:
-            for shm in self._chip_shms:
+            # _Worker was constructed in _init_hierarchical (pre-fork) so
+            # children inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode
+            # workers via the unified mailbox.
+            dw = self._worker
+            assert dw is not None
+
+            # Register chip workers as NEXT_LEVEL (L3)
+            if device_ids:
+                for shm in self._chip_shms:
+                    dw.add_next_level_worker(_mailbox_addr(shm))
+
+            # Register Worker children as NEXT_LEVEL (L4+)
+            for shm in self._next_level_shms:
                 dw.add_next_level_worker(_mailbox_addr(shm))
 
-        # Register Worker children as NEXT_LEVEL (L4+)
-        for shm in self._next_level_shms:
-            dw.add_next_level_worker(_mailbox_addr(shm))
+            for shm in self._sub_shms:
+                dw.add_sub_worker(_mailbox_addr(shm))
 
-        for shm in self._sub_shms:
-            dw.add_sub_worker(_mailbox_addr(shm))
+            # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
+            dw.init()
 
-        # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
-        dw.init()
+            self._orch = Orchestrator(dw.get_orchestrator(), self)
 
-        self._orch = Orchestrator(dw.get_orchestrator(), self)
+            # Pre-warm every chip child: for each registered ChipCallable cid,
+            # send `_CTRL_PREPARE` to all chip children so the first
+            # `submit_next_level` does not pay the H2D upload cost.  Sub fns /
+            # orch fns do not need pre-warming — the registry is already
+            # COW-inherited.
+            if device_ids:
+                for cid, target in registry.items():
+                    if isinstance(target, ChipCallable):
+                        for worker_id in range(len(self._chip_shms)):
+                            dw.control_prepare(worker_id, int(cid))
 
-        # Pre-warm every chip child: for each registered ChipCallable cid,
-        # send `_CTRL_PREPARE` to all chip children so the first
-        # `submit_next_level` does not pay the H2D upload cost.  Sub fns /
-        # orch fns do not need pre-warming — the registry is already
-        # COW-inherited.
-        if device_ids:
-            for cid, target in self._callable_registry.items():
-                if isinstance(target, ChipCallable):
-                    for worker_id in range(len(self._chip_shms)):
-                        dw.control_prepare(worker_id, int(cid))
+            self._hierarchical_started = True
+            with self._hierarchical_start_cv:
+                self._hierarchical_start_state = "started"
+                self._hierarchical_start_cv.notify_all()
+        except Exception:
+            with self._hierarchical_start_cv:
+                self._hierarchical_start_state = "failed"
+                self._hierarchical_start_cv.notify_all()
+            raise
 
     # ------------------------------------------------------------------
     # Hierarchical abort

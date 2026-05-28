@@ -58,6 +58,13 @@ struct alignas(64) PTO2RingFlowControl {
     // === Cache Line 1: Written by Scheduler, Read by Orchestrator (for back-pressure) ===
     alignas(64) std::atomic<int32_t> last_task_alive;  // Task ring tail (oldest active task)
 
+    // Per-boot SM reset. PTO2TaskAllocator::init() seeds its private
+    // local_task_id_ from initial_local_task_id (default 0 in production)
+    // *without* dereferencing current_task_index — it relies on this reset
+    // running on every AICPU boot so 0 stays in sync. If you ever change
+    // the initial fc value or the boot ordering, update the default in
+    // PTO2TaskAllocator::init (pto_ring_buffer.h) in the same change, or
+    // submit IDs will be off by the divergence.
     void init() {
         current_task_index.store(0, std::memory_order_relaxed);
         last_task_alive.store(0, std::memory_order_relaxed);
@@ -187,3 +194,67 @@ private:
     void setup_pointers(uint64_t task_window_size);
     void setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
 };
+
+// =============================================================================
+// SM Device Layout Helpers
+// =============================================================================
+//
+// When the host pre-builds a runtime-arena image, it needs the device-side
+// addresses of several SM sub-fields (ring flow-control counters,
+// task_descriptors arrays, orch_error_code) so it can wire them into the
+// orchestrator / scheduler init_data path without dereferencing the SM —
+// the SM lives in device memory and cannot be touched from host.
+//
+// These helpers compute those addresses by offset arithmetic on the SM
+// device base. Pure pointer math, no loads/stores; safe to call from host.
+// The same arithmetic happens on AICPU too (via PTO2SharedMemoryHandle's
+// own setup_pointers), so values are guaranteed consistent across sides.
+namespace pto2_sm_layout {
+
+inline std::atomic<int32_t> *orch_error_code_addr(void *sm_dev_base) noexcept {
+    return reinterpret_cast<std::atomic<int32_t> *>(
+        static_cast<char *>(sm_dev_base) + offsetof(PTO2SharedMemoryHeader, orch_error_code)
+    );
+}
+
+inline PTO2SharedMemoryRingHeader *ring_header_addr(void *sm_dev_base, int ring_id) noexcept {
+    return reinterpret_cast<PTO2SharedMemoryRingHeader *>(
+        static_cast<char *>(sm_dev_base) + offsetof(PTO2SharedMemoryHeader, rings) +
+        static_cast<size_t>(ring_id) * sizeof(PTO2SharedMemoryRingHeader)
+    );
+}
+
+inline std::atomic<int32_t> *ring_current_task_index_addr(void *sm_dev_base, int ring_id) noexcept {
+    return reinterpret_cast<std::atomic<int32_t> *>(
+        reinterpret_cast<char *>(ring_header_addr(sm_dev_base, ring_id)) + offsetof(PTO2SharedMemoryRingHeader, fc) +
+        offsetof(PTO2RingFlowControl, current_task_index)
+    );
+}
+
+inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base, int ring_id) noexcept {
+    return reinterpret_cast<std::atomic<int32_t> *>(
+        reinterpret_cast<char *>(ring_header_addr(sm_dev_base, ring_id)) + offsetof(PTO2SharedMemoryRingHeader, fc) +
+        offsetof(PTO2RingFlowControl, last_task_alive)
+    );
+}
+
+// Walk the per-ring SM layout (same arithmetic as setup_pointers_per_ring)
+// to compute ring `ring_id`'s task_descriptors device address. Accepts a
+// per-ring window-size array so the helper's signature mirrors
+// `PTO2SharedMemoryHandle::setup_pointers_per_ring` and cannot silently
+// disagree with the SM layout when (hypothetically) ring sizes diverge.
+inline PTO2TaskDescriptor *ring_task_descriptors_addr(
+    void *sm_dev_base, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int ring_id
+) noexcept {
+    assert(ring_id >= 0 && ring_id < PTO2_MAX_RING_DEPTH && "pto2_sm_layout: ring_id out of range");
+    char *p = static_cast<char *>(sm_dev_base);
+    p += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
+    for (int r = 0; r < ring_id; r++) {
+        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+    }
+    return reinterpret_cast<PTO2TaskDescriptor *>(p);
+}
+
+}  // namespace pto2_sm_layout

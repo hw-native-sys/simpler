@@ -25,17 +25,26 @@ available.
 
 ## 2. Overview
 
-- **Per-task AICore timing** — `start_time`, `end_time`,
-  `duration`, plus AICPU-stamped `dispatch_time` / `finish_time`.
+- **Per-task AICore timing** — `start_time_us`, `end_time_us`,
+  `duration_us`, plus AICPU-stamped `dispatch_time_us` / `finish_time_us`.
 - **Per-task fanout chain** — successor `task_id`s recorded in
   the L2 record so dependency arrows show up in the Perfetto
   view.
 - **AICPU scheduler phases** — per-iteration breakdown into
-  `SCHED_COMPLETE` / `SCHED_DISPATCH` / `SCHED_SCAN` /
-  `SCHED_IDLE_WAIT`.
-- **Orchestrator phase summary** — cumulative cycle counts for
-  the orchestrator's nine sub-steps (sync / alloc / params /
-  lookup / heap / insert / fanin / finalize / scope_end).
+  `complete` / `dispatch`. Idle iterations no longer emit a record
+  on a2a3; the host tooling reconstructs idle spans from the gap
+  between consecutive work records on the same thread. Legacy
+  captures (and a5) may still carry `scan` / `idle` records — both
+  are silently dropped by the parser (idle is double-painted
+  by the gap reconstruction; `scan` was never emitted in a2a3).
+- **Orchestrator submit envelope** — one record per `submit_task()`
+  / `alloc_tensors()` call covering the whole submit's
+  `[start, end]` window (`orch_submit` phase). Per-sub-step
+  cumulative cycles (sync / alloc / params / lookup / insert /
+  fanin) still live in the cold-path device log via the
+  `g_orch_*_cycle` counters — that's where you go for "which
+  sub-step dominates overall"; the per-submit record covers
+  "which submit was slow".
 - **Standard outputs** — raw `l2_perf_records.json`, plus a
   Perfetto-loadable `merged_swimlane_*.json` produced by
   `swimlane_converter`.
@@ -43,7 +52,7 @@ available.
 Enable in one line:
 
 ```bash
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane
+python tests/st/<case>/test_<name>.py -p <platform> -d 0 --enable-l2-swimlane
 ```
 
 ## 3. How to Use
@@ -57,35 +66,27 @@ backward-compatible with the old boolean behavior).
 | Level | Collects | Notes |
 | ----- | -------- | ----- |
 | 0 | Nothing (disabled) | Default when flag is absent |
-| 1 | AICore timing only (start/end/task_id/func_id/core_type) | No AICPU timestamps, no fanout |
-| 2 | + dispatch_time, finish_time, fanout | Full per-task record |
-| 3 | + Scheduler phases (`SCHED_*`) | Skips orchestrator phases |
-| 4 | + Orchestrator phases | Full collection |
-
-> **Platform scope.** The tiered perf_level is currently
-> implemented on **a2a3 only**. The a5 backend (both `a5` onboard
-> and `a5sim`) has not been updated and still interprets
-> `--enable-l2-swimlane` as a plain boolean: bare flag = on,
-> absent = off. Passing an integer to a5 is silently treated as
-> "on" regardless of value.
+| 1 | AICore timing only (start_time_us/end_time_us/task_id/func_id/core_type) | No AICPU timestamps, no fanout |
+| 2 | + dispatch_time_us, finish_time_us, fanout | Full per-task record |
+| 3 | + scheduler phases (`aicpu_scheduler_phases[]`) | Skips orchestrator phases |
+| 4 | + orchestrator phases (`aicpu_orchestrator_phases[]`) | Full collection |
 
 ```bash
-# Standalone runner — full collection (level 4)
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane
+# Standalone runner
+python tests/st/<case>/test_<name>.py -p <platform> -d 0 --enable-l2-swimlane [PERF_LEVEL]
 
-# Standalone runner — AICore timing only (level 1)
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane 1
+# pytest — same flag shape
+pytest tests/st/<case> --platform <platform> -d 0 --enable-l2-swimlane [PERF_LEVEL]
 
-# Standalone runner — per-task with dispatch/fanout (level 2)
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-l2-swimlane 2
-
-# pytest — scheduler phases (level 3)
-pytest tests/st/<case> --platform a2a3 -d 0 --enable-l2-swimlane 3
-
-# a5 onboard / a5sim — boolean only (perf_level integer not honored on a5 yet)
-python tests/st/<case>/test_<name>.py -p a5 -d 0 --enable-l2-swimlane
-python tests/st/<case>/test_<name>.py -p a5sim --enable-l2-swimlane
+# Bare flag (no integer) — shorthand for level 4 (full collection)
+python tests/st/<case>/test_<name>.py -p <platform> -d 0 --enable-l2-swimlane
 ```
+
+- `<platform>` — one of `a2a3` / `a2a3sim` / `a5` / `a5sim`; the
+  integer perf_level interface is identical across them.
+- `[PERF_LEVEL]` — optional integer 0–4 (see table above). Omit the
+  argument entirely (bare `--enable-l2-swimlane`) for the level-4
+  shorthand; omit the flag entirely for level 0 (disabled).
 
 The flag sets `CallConfig::enable_l2_swimlane` to the chosen
 level. The host then allocates the per-core / per-thread shared
@@ -96,8 +97,8 @@ dispatch/finish timestamps and fanout are recorded only at
 level >= 2, scheduler phase records only at level >= 3, and
 orchestrator phase records only at level >= 4.
 
-The JSON output `"version"` field directly reflects the
-perf_level: `1` = AICore timing only, `2` = +dispatch/fanout,
+The JSON output `"l2_perf_level"` field is the captured perf_level:
+`1` = AICore timing only, `2` = +dispatch/fanout,
 `3` = +scheduler phases, `4` = +orchestrator phases.
 
 `--rounds > 1` collects only on the **first** round so warm-up
@@ -126,22 +127,29 @@ you pass to `swimlane_converter`. Important fields per task:
 
 | Field | Meaning |
 | ----- | ------- |
-| `task_id` | Runtime task id, hex (low 32 bits = AICore register token; full 64 bits filled by AICPU) |
+| `task_id` | Runtime task id (`(ring_id << 32) \| local_id`); also exposed split as`ring_id` |
 | `func_id` | Kernel function id |
-| `core_type` | `0` = AIC, `1` = AIV |
-| `start_time` / `end_time` / `duration` | AICore device-clock cycles (`get_sys_cnt`) |
-| `dispatch_time` | AICPU timestamp when this task was dispatched |
-| `finish_time` | AICPU timestamp when AICPU observed FIN |
-| `fanout[]` / `fanout_count` | Successor task ids, used by Perfetto dependency arrows |
+| `core_id` / `core_type` | Physical core index and `"aic"` / `"aiv"` string |
+| `start_time_us` / `end_time_us` / `duration_us` | AICore execution window in microseconds |
+| `dispatch_time_us` | AICPU timestamp when this task was dispatched (filled at level >= 2) |
+| `finish_time_us` | AICPU timestamp when AICPU observed FIN (filled at level >= 2) |
+| `fanout[]` / `fanout_count` | Successor task ids (level >= 2), used by Perfetto dependency arrows |
 
-Phase records (per scheduler thread):
+Phase records (per scheduler thread, level >= 3 for
+`aicpu_scheduler_phases[]` and level >= 4 for
+`aicpu_orchestrator_phases[]`):
 
 | Field | Meaning |
 | ----- | ------- |
-| `start_time` / `end_time` | Phase start / end timestamps |
-| `loop_iter` | Scheduler loop iteration number |
-| `phase_id` | One of `SCHED_COMPLETE` / `SCHED_DISPATCH` / `SCHED_SCAN` / `SCHED_IDLE_WAIT`, or `ORCH_*` for orchestrator phases |
+| `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds |
+| `phase` | Lowercase phase name. Scheduler: `complete` / `dispatch` (`scan` / `idle` may appear in legacy captures and a5; both are dropped by the parser). Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
+| `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
 | `tasks_processed` (scheduler) / `task_id` (orchestrator) | Phase-specific union field |
+| `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
+
+`core_to_thread[]` (level >= 3) maps `core_id` (array index) to the
+scheduler thread index that retired that core's tasks (`-1` =
+unassigned).
 
 ### 3.3 Convert and view in Perfetto
 
@@ -170,7 +178,7 @@ in. The trace contains:
   channel). Each task shows `func_name(t<task_id>)`; dependency
   arrows follow `fanout[]`.
 - **AICPU View** — scheduler thread lanes with per-iteration
-  phase blocks coloured by `phase_id`.
+  phase blocks coloured by `phase`.
 - **AICPU Scheduler** — orchestrator phase summary at the top.
 
 When the run also emitted a device log (`device-*` file under
@@ -214,21 +222,23 @@ schema and L3 example.
 What the swimlane shows:
 
 - **Per-task wall-clock placement.** Where each task ran on which
-  AICore, with start / end / duration in device cycles.
-- **Dispatch and finish overhead.** `dispatch_time` and
-  `finish_time` come from AICPU, so the gap between
-  `dispatch_time` and `start_time` is the AICPU→AICore
-  hand-off latency, and the gap between `end_time` and
-  `finish_time` is the FIN-observation latency.
+  AICore, with `start_time_us` / `end_time_us` / `duration_us` in
+  microseconds (converted from device cycles).
+- **Dispatch and finish overhead.** `dispatch_time_us` and
+  `finish_time_us` come from AICPU, so the gap between
+  `dispatch_time_us` and `start_time_us` is the AICPU→AICore
+  hand-off latency, and the gap between `end_time_us` and
+  `finish_time_us` is the FIN-observation latency.
 - **Dependency chains.** `fanout[]` lets Perfetto draw arrows
   between predecessor and successor tasks.
 - **Scheduler-loop time decomposition.** Per-iteration AICPU
   phase records show how long the scheduler spent in each of
-  its four phases.
-- **Orchestrator overhead breakdown.** Cumulative cycle counts
-  for the nine orchestrator sub-steps (sync, alloc, params,
-  lookup, heap, insert, fanin, finalize, scope_end), useful for
-  spotting where graph-build cost lives.
+  its two work phases (complete / dispatch); idle is recovered
+  from the gap between records.
+- **Orchestrator overhead breakdown.** Per-submit envelope
+  records (`orch_submit`) pin "which submit is slow"; cumulative
+  cycle counts in the cold-path device log (`g_orch_*_cycle`)
+  cover the per-sub-step breakdown for "which sub-step dominates".
 
 ## 5. Design Highlights
 
@@ -287,7 +297,7 @@ platform-owned AICore state, and never reassigned — so AICore is
 fully decoupled from any AICPU-side records-buffer rotation. AICPU,
 on observing FIN, validates the slot's register token, copies the slot
 record into the current `L2PerfBuffer::records[count]`, fills
-`func_id` / `core_type` / `dispatch_time` / `finish_time` / `fanout`,
+`func_id` / `core_type` / `dispatch_time_us` / `finish_time_us` / `fanout`,
 advances `count`, and rotates the records buffer in place when it
 fills up. The ring is sized to the runtime's in-flight issue depth
 (2 for dual-issue today; raise to the next power of two when issue
@@ -627,7 +637,7 @@ data (only `tensormap_and_ringbuffer` does, and only when
 `AicpuPhaseHeader` was not initialized. Verify the runtime sets
 the magic in its scheduler init path.
 
-**`dispatch_time` < `finish_time` mismatch.** Verify the runtime
+**`dispatch_time_us` < `finish_time_us` mismatch.** Verify the runtime
 overwrites `task_id` with the full encoding on FIN
 (`tensormap_and_ringbuffer` does
 `(ring_id << 32) | local_id`); a half-filled record means AICore

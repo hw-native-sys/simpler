@@ -132,7 +132,7 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  */
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
 );
 
 /**

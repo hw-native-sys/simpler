@@ -103,9 +103,9 @@ static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     }
 }
 
-static int setup_static_arena_wrapper(size_t gm_heap_size, size_t gm_sm_size) {
+static int setup_static_arena_wrapper(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
     try {
-        return current_runner()->setup_static_arena(gm_heap_size, gm_sm_size);
+        return current_runner()->setup_static_arena(gm_heap_size, gm_sm_size, runtime_arena_size);
     } catch (...) {
         return -1;
     }
@@ -122,6 +122,14 @@ static void *acquire_pooled_gm_heap_wrapper() {
 static void *acquire_pooled_gm_sm_wrapper() {
     try {
         return current_runner()->acquire_pooled_gm_sm();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+static void *acquire_pooled_runtime_arena_wrapper() {
+    try {
+        return current_runner()->acquire_pooled_runtime_arena();
     } catch (...) {
         return nullptr;
     }
@@ -217,8 +225,13 @@ int destroy_comm_stream_ctx(DeviceContextHandle ctx, void *stream) {
 
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
 ) {
+    // Sim has no AICPU dispatcher (the simulator runs AICPU in-process). See
+    // a2a3 sim sibling for rationale; parameters accepted for ABI parity.
+    (void)dispatcher_binary;
+    (void)dispatcher_size;
+
     if (ctx == NULL) return -1;
 
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
@@ -323,6 +336,7 @@ int run_prepared(
         r->host_api.setup_static_arena = setup_static_arena_wrapper;
         r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
         r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
+        r->host_api.acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         auto bind_result = runner->bind_prepared_callable_to_runtime(*r, callable_id);
@@ -345,7 +359,7 @@ int run_prepared(
             return rc;
         }
 
-        runner->set_l2_swimlane_enabled(enable_l2_swimlane != 0);
+        runner->set_l2_swimlane_enabled(enable_l2_swimlane);
         runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
         runner->set_pmu_enabled(enable_pmu);
         runner->set_output_prefix(output_prefix);

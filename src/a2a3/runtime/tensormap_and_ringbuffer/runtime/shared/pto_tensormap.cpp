@@ -81,43 +81,45 @@ PTO2TensorMap::reserve_layout_default(DeviceArena &arena, const int32_t new_task
     return reserve_layout(arena, PTO2_TENSORMAP_NUM_BUCKETS, PTO2_TENSORMAP_POOL_SIZE, new_task_window_sizes);
 }
 
-bool PTO2TensorMap::init_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena) {
+bool PTO2TensorMap::init_data_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena) {
     num_buckets = layout.num_buckets;
     pool_size = layout.pool_size;
 
-    buckets = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_buckets));
-    entry_pool = static_cast<PTO2TensorMapEntry *>(arena.region_ptr(layout.off_entry_pool));
-    free_entry_list = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_free_entry_list));
+    // Address arena regions for data writes; do not store these in struct
+    // fields (wire_arena_pointers does that).
+    auto *buckets_arena = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_buckets));
+    auto *entry_pool_arena = static_cast<PTO2TensorMapEntry *>(arena.region_ptr(layout.off_entry_pool));
+    auto *free_list_arena = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_free_entry_list));
 
     // buckets[]: empty == nullptr.
     for (int32_t i = 0; i < num_buckets; i++) {
-        buckets[i] = nullptr;
+        buckets_arena[i] = nullptr;
     }
 
     // entry_pool: zero-init equivalent to the previous calloc(entry_pool, ...).
     // The pool's persistent invariant after init is "bucket_index == -1 means
     // not linked", set explicitly below.
-    memset(entry_pool, 0, static_cast<size_t>(pool_size) * sizeof(PTO2TensorMapEntry));
+    memset(entry_pool_arena, 0, static_cast<size_t>(pool_size) * sizeof(PTO2TensorMapEntry));
     for (int32_t i = 0; i < pool_size; i++) {
-        entry_pool[i].bucket_index = -1;
-        entry_pool[i].next_in_bucket = nullptr;
-        entry_pool[i].prev_in_bucket = nullptr;
-        entry_pool[i].next_in_task = nullptr;
-        entry_pool[i].prev_in_task = nullptr;
-        entry_pool[i].producer_task_id = PTO2TaskId{};
+        entry_pool_arena[i].bucket_index = -1;
+        entry_pool_arena[i].next_in_bucket = nullptr;
+        entry_pool_arena[i].prev_in_bucket = nullptr;
+        entry_pool_arena[i].next_in_task = nullptr;
+        entry_pool_arena[i].prev_in_task = nullptr;
+        entry_pool_arena[i].producer_task_id = PTO2TaskId{};
     }
 
     // free_entry_list: zeroed (was calloc'd before); contents become meaningful
     // only after entries are freed back, so the body of the array stays as 0.
-    memset(free_entry_list, 0, static_cast<size_t>(pool_size) * sizeof(PTO2TensorMapEntry *));
+    memset(free_list_arena, 0, static_cast<size_t>(pool_size) * sizeof(PTO2TensorMapEntry *));
 
     next_entry_idx = 0;
     free_num = 0;
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        task_entry_heads[r] = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_task_entry_heads[r]));
+        auto *heads_arena = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_task_entry_heads[r]));
         for (int32_t i = 0; i < layout.task_window_sizes[r]; i++) {
-            task_entry_heads[r][i] = nullptr;
+            heads_arena[i] = nullptr;
         }
         task_window_sizes[r] = layout.task_window_sizes[r];
         last_task_alives[r] = 0;
@@ -125,6 +127,15 @@ bool PTO2TensorMap::init_from_layout(const PTO2TensorMapLayout &layout, DeviceAr
     }
 
     return true;
+}
+
+void PTO2TensorMap::wire_arena_pointers(const PTO2TensorMapLayout &layout, DeviceArena &arena) {
+    buckets = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_buckets));
+    entry_pool = static_cast<PTO2TensorMapEntry *>(arena.region_ptr(layout.off_entry_pool));
+    free_entry_list = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_free_entry_list));
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        task_entry_heads[r] = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_task_entry_heads[r]));
+    }
 }
 
 void PTO2TensorMap::destroy() {

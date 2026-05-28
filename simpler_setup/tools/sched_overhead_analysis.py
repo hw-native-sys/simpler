@@ -10,8 +10,9 @@
 """Scheduler overhead analysis for PTO2.
 
 Inputs:
-  1. Per-task perf profiling data (l2_perf_records_*.json), v2 schema with
-     ``aicpu_scheduler_phases`` populated by ``--enable-l2-swimlane``.
+  1. Per-task perf profiling data (l2_perf_records_*.json) with
+     ``aicpu_scheduler_phases`` populated by ``--enable-l2-swimlane`` at
+     level >= 3.
   2. deps.json (optional, dep_gen replay output) colocated with the perf JSON,
      used to derive per-thread fanout / fanin DAG stats.
 
@@ -29,8 +30,9 @@ from pathlib import Path
 
 
 def _to_uint64(v):
-    """Coerce JSON-encoded uint64 (int or string after the deps.json v2 schema
-    bump in #769) to a Python int. Returns None when unparseable."""
+    """Coerce a JSON-encoded uint64 (int, or string — deps.json quotes uint64s
+    so JavaScript-based consumers don't lose precision past 2^53 - 1) to a
+    Python int. Returns None when unparseable."""
     try:
         n = int(v)
     except (TypeError, ValueError):
@@ -153,58 +155,71 @@ def auto_select_l2_perf_records_json():
 
 
 def parse_scheduler_from_json_phases(data):
-    """Extract scheduler Phase breakdown from l2_perf_records JSON (version >= 2).
+    """Extract scheduler Phase breakdown from l2_perf_records JSON.
 
     Computes per-thread loop counts, task counts, and phase totals
-    from aicpu_scheduler_phases records.
+    from aicpu_scheduler_phases records (present at l2_perf_level >= 3).
 
     Returns:
         dict: Thread data keyed by thread index, with per-phase us / pct,
               pop_hit / pop_miss, loops, completed, tasks_per_loop. Returns
               empty dict if phase data is not available.
     """
-    if data.get("version", 1) < 2:
-        return {}
     phases_by_thread = data.get("aicpu_scheduler_phases", [])
     if not phases_by_thread:
         return {}
-
-    # Map JSON phase names to internal names
-    phase_map = {
-        "complete": "complete",
-        "dispatch": "dispatch",
-        "scan": "scan",
-        "idle": "idle",
-    }
 
     threads = {}
     for tid, records in enumerate(phases_by_thread):
         if not records:
             continue
 
-        phase_us = {p: 0.0 for p in ["complete", "scan", "dispatch", "idle"]}
+        # Only "complete" and "dispatch" emit records on a2a3 post-#869.
+        # Legacy a2a3 captures (or current a5 captures, which still emit
+        # SCHED_IDLE_WAIT) may carry "idle" / "scan" records; both are
+        # dropped because idle is reconstructed from gaps between work
+        # records on the same thread — for the a5/legacy case the gap
+        # exactly equals the dropped idle records' total span, so the
+        # numeric idle_us is preserved (only the per-iter granularity is
+        # lost, which Part 2 doesn't surface).
+        work_recs = sorted(
+            (r for r in records if r.get("phase") in ("complete", "dispatch")),
+            key=lambda r: r.get("start_time_us", 0),
+        )
+        if not work_recs:
+            continue
+
+        phase_us = {"complete": 0.0, "dispatch": 0.0, "idle": 0.0}
         total_tasks = 0
         max_loop_iter = 0
         pop_hit = 0
         pop_miss = 0
+        prev_end = None
 
-        for rec in records:
-            phase = phase_map.get(rec.get("phase", ""))
-            if phase is None:
-                continue
-            dur = rec.get("end_time_us", 0) - rec.get("start_time_us", 0)
+        for rec in work_recs:
+            phase = rec["phase"]
+            start = rec.get("start_time_us", 0)
+            end = rec.get("end_time_us", 0)
+            # Idle = wall-clock gap between this record and the previous
+            # work record on this thread. Pre-first-work and post-last-work
+            # spans are not captured here (see device's cumulative
+            # sched_idle_cycle in the cold-path summary log for those).
+            if prev_end is not None and start > prev_end:
+                phase_us["idle"] += start - prev_end
+            dur = end - start
             if dur > 0:
                 phase_us[phase] += dur
-            if rec.get("tasks_processed", 0) > 0 and phase == "complete":
-                total_tasks += rec["tasks_processed"]
-            loop_iter = rec.get("loop_iter", 0)
-            max_loop_iter = max(max_loop_iter, loop_iter)
+            if phase == "complete":
+                total_tasks += rec.get("tasks_processed", 0)
             # Per-emit queue-health deltas; only present on dispatch records.
             # Summing across records gives the run-cumulative pop_hit /
             # pop_miss (the runtime's final-drain emit closes the tail).
             if phase == "dispatch":
                 pop_hit += rec.get("pop_hit", 0)
                 pop_miss += rec.get("pop_miss", 0)
+            max_loop_iter = max(max_loop_iter, rec.get("loop_iter", 0))
+            if prev_end is None or end > prev_end:
+                prev_end = end
 
         total_us = sum(phase_us.values())
         loops = max_loop_iter
@@ -294,7 +309,7 @@ def run_analysis(  # noqa: PLR0912, PLR0915
         print_sources: Whether to print selected input files.
         perf_data: Optional pre-parsed perf JSON dict. When provided, skip
             re-reading from disk — main() already parses the file to probe
-            for v2 phase data, so passing the result through saves a second
+            for phase data, so passing the result through saves a second
             load on large artifacts.
         deps_json_path: Optional deps.json (dep_gen replay output) co-located
             with the perf JSON. When present, per-thread fanout / fanin
@@ -431,13 +446,14 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     print(fmt2.format("SUM", total_loops, total_completed, f"{avg_tpl:.1f}", f"{total_us:.1f}"))
     print()
 
-    # Phase breakdown
-    phases = ["complete", "scan", "dispatch", "idle"]
+    # Phase breakdown. Idle is reconstructed from gaps between work
+    # records on the same thread (no explicit idle record is emitted by
+    # the device anymore).
+    phases = ["complete", "dispatch", "idle"]
     phase_labels = {
         "complete": "Complete (poll handshake, resolve deps)",
-        "scan": "Scan (update perf header)",
         "dispatch": "Dispatch (pop queue, build payload, flush)",
-        "idle": "Idle (spinning, no progress)",
+        "idle": "Idle (spinning, no progress — reconstructed from gaps)",
     }
 
     fmt3 = "  {:<50} {:>11} {:>10} {:>14}"
@@ -487,7 +503,7 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     else:
         pop_hit = pop_miss = 0
         pop_hit_rate = 0.0
-        print("  Pop: (no per-emit pop deltas in input — needs --enable-l2-swimlane on a v2 JSON capture)")
+        print("  Pop: (no per-emit pop deltas in input — needs --enable-l2-swimlane at level >= 3)")
 
     print()
     print("=" * 90)
@@ -514,14 +530,19 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     avg_loop_us = total_us / total_loops if total_loops > 0 else 0
     avg_tail_oh = sum(tails) / n
     loop_ratio = avg_tail_oh / avg_loop_us if avg_loop_us > 0 else 0
-    print(f"  Avg scheduler loop iteration: {avg_loop_us:.1f} us (approx avg polling interval per loop)")
+    # %.3f instead of %.1f: idle is now reconstructed from gaps between work
+    # records on the same thread, so threads that did no work (only spinning)
+    # contribute their loop count without any measured us — the SUM-based
+    # average lands in the sub-us range on small captures and would round to
+    # 0.0 under .1f.
+    print(f"  Avg scheduler loop iteration: {avg_loop_us:.3f} us (approx avg polling interval per loop)")
     print()
-    print(f"  Avg Tail OH = {avg_tail_oh:.1f} us ~= {loop_ratio:.1f} x avg loop iteration ({avg_loop_us:.1f} us)")
+    print(f"  Avg Tail OH = {avg_tail_oh:.1f} us ~= {loop_ratio:.1f} x avg loop iteration ({avg_loop_us:.3f} us)")
     print(f"  -> On average, a completed task waits ~{loop_ratio:.1f} loop iterations before being detected")
     print()
 
     # Data-driven insight: find the dominant phase (excluding idle which is not useful work)
-    work_phases = {p: phase_totals.get(p, 0) for p in ["scan", "complete", "dispatch"]}
+    work_phases = {p: phase_totals.get(p, 0) for p in ["complete", "dispatch"]}
     dominant_phase = max(work_phases, key=lambda p: work_phases[p])
     dominant_pct = work_phases[dominant_phase] / total_us * 100 if total_us > 0 else 0
     key_phase_label = phase_labels[dominant_phase].split(" (")[0]
@@ -540,8 +561,6 @@ def run_analysis(  # noqa: PLR0912, PLR0915
                 print("  Fanout traversal and atomic ops dominate the complete phase.")
         else:
             print("  DAG stats unavailable (no deps.json); cannot attribute complete-phase cost further.")
-    elif dominant_phase == "scan":
-        print("  Scan phase overhead indicates frequent perf header updates.")
     print("=" * 90)
 
     return 0

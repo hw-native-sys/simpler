@@ -60,11 +60,6 @@
 #include "common/core_type.h"
 #include "common/platform_config.h"
 
-// Maximum number of successor tasks per L2PerfRecord (matches Task::fanout)
-#ifndef RUNTIME_MAX_FANOUT
-#define RUNTIME_MAX_FANOUT 128
-#endif
-
 // =============================================================================
 // L2 perf_level — granularity ladder for the L2 swimlane profiler.
 //
@@ -82,7 +77,7 @@
 enum class L2PerfLevel : uint32_t {
     DISABLED = 0,       // No collection at all
     AICORE_TIMING = 1,  // AICore per-task start/end timestamps + task record buffer
-    AICPU_TIMING = 2,   // + AICPU dispatch/finish timestamps + fanout dependency list
+    AICPU_TIMING = 2,   // + AICPU dispatch/finish timestamps
     SCHED_PHASES = 3,   // + scheduler main-loop phase records (SCHED_COMPLETE/DISPATCH/IDLE_WAIT)
     ORCH_PHASES = 4,    // + orchestrator phase records
 };
@@ -92,7 +87,13 @@ enum class L2PerfLevel : uint32_t {
 // =============================================================================
 
 /**
- * Single task execution record
+ * Single task execution record.
+ *
+ * Fanout edges live in the static DAG (deps.json from dep_gen) — not in
+ * this record. Keeping fanout out of the hot AICPU commit path avoids a
+ * per-task ~1 KB GM store + a linked-list walk on the scheduler's
+ * critical fanin tail. The host swimlane export emits empty fanout
+ * fields; `swimlane_converter.py` joins deps.json at post-process time.
  */
 struct L2PerfRecord {
     // Timing information (device clock timestamps)
@@ -111,10 +112,6 @@ struct L2PerfRecord {
     uint64_t task_id;
     uint32_t func_id;    // Kernel function identifier
     CoreType core_type;  // Core type (AIC/AIV)
-
-    // Dependency relationship (fanout only)
-    uint64_t fanout[RUNTIME_MAX_FANOUT];  // Successor task task_id array
-    int32_t fanout_count;                 // Number of successor tasks
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(L2PerfRecord) % 64 == 0, "L2PerfRecord must be 64-byte aligned for optimal cache performance");
@@ -309,26 +306,39 @@ struct L2PerfDataHeader {
 /**
  * AICPU phase identifier
  *
- * Scheduler phases (0-3): four phases in each scheduler loop iteration.
- * Orchestrator phases (16-24): sub-steps within each submit_task() call.
+ * Scheduler phases (0-1): the two work-emitting phases per scheduler loop
+ * iteration. Idle iterations no longer emit a record — host tooling recovers
+ * idle spans from the gap between consecutive sched records on the same
+ * thread (see swimlane_converter.py / sched_overhead_analysis.py).
+ *
+ * Orchestrator phase (25): one record per submit_task() / alloc_tensors()
+ * call captures the entire submit's [start, end] wall-clock window.
+ * Per-sub-step cycle splits (ALLOC / SYNC / LOOKUP / INSERT / PARAMS /
+ * FANIN) still live in the device cold-path log as cumulative counters
+ * (`g_orch_*_cycle`) — they are the right tool for "which sub-step
+ * dominates overall", while the per-submit record covers "which submit
+ * was slow".
+ *
+ * ORCH_SUBMIT is intentionally numbered above the legacy range so older
+ * captures' per-sub-step records do not get re-interpreted as full-submit
+ * envelopes by the new host parser (in particular: id 16 used to be
+ * ORCH_SYNC — picking 16 for ORCH_SUBMIT would silently relabel every
+ * legacy sync record as a submit envelope, breaking backward decoding).
+ *
+ * Legacy IDs:
+ *   - 2, 3: SCHED_SCAN (never emitted) / SCHED_IDLE_WAIT — host parser
+ *           silently drops them on old captures (idle reconstructed from
+ *           gaps between work records).
+ *   - 16-24: pre-fold per-sub-step orch phases (ORCH_SYNC..ORCH_SCOPE_END).
+ *           Old captures may carry them; host parser maps to "unknown"
+ *           and tools drop them.
  */
 enum class AicpuPhaseId : uint32_t {
-    // Scheduler phases (0-3)
-    SCHED_COMPLETE = 0,     // Process completed tasks (fanout traversal)
-    SCHED_DISPATCH = 1,     // Dispatch ready tasks to idle cores
-    SCHED_SCAN = 2,         // Incremental scan for root tasks
-    SCHED_IDLE_WAIT = 3,    // Idle/spinning (no progress)
-    SCHED_PHASE_COUNT = 4,  // Sentinel: number of scheduler phases
-    // Orchestrator phases (16-24)
-    ORCH_SYNC = 16,      // tensormap sync
-    ORCH_ALLOC = 17,     // task_ring_alloc
-    ORCH_PARAMS = 18,    // param copy
-    ORCH_LOOKUP = 19,    // tensormap lookup + dep
-    ORCH_HEAP = 20,      // heap alloc
-    ORCH_INSERT = 21,    // tensormap insert
-    ORCH_FANIN = 22,     // fanin + early-ready
-    ORCH_FINALIZE = 23,  // scheduler init + SM
-    ORCH_SCOPE_END = 24  // scope_end
+    // Scheduler phases (per scheduler loop iter)
+    SCHED_COMPLETE = 0,  // Process completed tasks (fanin traversal)
+    SCHED_DISPATCH = 1,  // Dispatch ready tasks to idle cores
+    // Orchestrator phase (per submit_task() call)
+    ORCH_SUBMIT = 25,  // Entire submit_task() span (placed above legacy 16-24 to avoid collision)
 };
 
 /**
@@ -340,7 +350,8 @@ enum class AicpuPhaseId : uint32_t {
  * extra1 / extra2 carry phase-specific stats; meaning is keyed by phase_id:
  *   SCHED_DISPATCH: extra1 = pop_hit delta since last emit
  *                   extra2 = pop_miss delta since last emit
- *   All other phases: extras are 0 (reserved for future per-phase metrics).
+ *   SCHED_COMPLETE: extras are 0.
+ *   Orchestrator phases: extras are 0 (reserved for future per-phase metrics).
  */
 struct AicpuPhaseRecord {
     uint64_t start_time;    // Phase start timestamp

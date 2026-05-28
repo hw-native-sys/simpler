@@ -119,7 +119,7 @@ struct AicpuExecutor {
     std::atomic<bool> init_failed_{false};
     std::atomic<bool> finished_{false};
 
-    int32_t thread_num_{0};
+    int32_t aicpu_thread_num_{0};
 
     // ===== Task queue state (managed by scheduler ready queues) =====
 
@@ -179,19 +179,21 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
 
-    // Read execution parameters from runtime
-    thread_num_ = runtime->sche_cpu_num;
-    sched_thread_num_ = thread_num_ - 1;
+    // Read execution parameters from runtime. The 0 → 1 fixup runs before the
+    // sched_thread_num_ derivation so a zero input doesn't leave the scheduler
+    // count at -1.
+    aicpu_thread_num_ = runtime->aicpu_thread_num;
+    if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
+    sched_thread_num_ = aicpu_thread_num_ - 1;
     orch_to_sched_ = runtime->orch_to_sched;
-    if (thread_num_ == 0) thread_num_ = 1;
 
-    if (thread_num_ < 1 || thread_num_ > MAX_AICPU_THREADS) {
-        LOG_ERROR("Invalid thread_num: %d", thread_num_);
+    if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
+        LOG_ERROR("Invalid aicpu_thread_num: %d", aicpu_thread_num_);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
 
-    if (sched_ctx_.init(runtime, thread_num_, sched_thread_num_, orch_to_sched_, get_platform_regs()) != 0) {
+    if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, orch_to_sched_, get_platform_regs()) != 0) {
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -264,7 +266,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     return -1;
                 }
 
-                // Try multiple paths that may allow execution on AICPU
+                // Try multiple paths that may allow execution on AICPU.
                 char so_path[256];
                 bool file_created = false;
                 const char *candidate_dirs[] = {
@@ -465,28 +467,59 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
             );
 
-            void *sm_ptr = runtime->get_gm_sm_ptr();
-            void *gm_heap = runtime->get_gm_heap_ptr();
+            // gm_heap pointer / dep_pool_capacity are encoded into the prebuilt
+            // runtime arena image at host build time, so we no longer fetch
+            // them here. They remain on the host Runtime instance and on the
+            // PTO2Runtime header for diagnostic purposes only.
+            (void)dep_pool_capacity;
 
+            void *sm_ptr = runtime->get_gm_sm_ptr();
             uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
-            rt = runtime_create_from_sm(
-                PTO2_MODE_EXECUTE, sm_ptr, sm_size, task_window_size, gm_heap, heap_size, runtime_arena_,
-                dep_pool_capacity
-            );
-            if (!rt) {
-                LOG_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
-                // Unblock scheduler threads before returning so they don't spin forever.
+
+            // Prebuilt-arena fast path. Host has pre-populated the entire
+            // runtime arena (PTO2Runtime + orchestrator/scheduler/tensor_map
+            // sub-regions + sm_handle wrapper + mailbox) and uploaded it via
+            // rtMemcpy into the pooled runtime_arena buffer. We attach to it,
+            // wire arena-internal pointers to their device addresses, reset
+            // the SM, and finalize the few device-only fields the host could
+            // not know at image-build time.
+            void *prebuilt_arena = runtime->get_prebuilt_arena_base();
+            size_t off_runtime = runtime->get_prebuilt_runtime_offset();
+            if (prebuilt_arena == nullptr) {
+                LOG_ERROR("Thread %d: prebuilt_arena_base is null", thread_idx);
+                runtime_init_ready_.store(true, std::memory_order_release);
+                return -1;
+            }
+            runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
+            rt = reinterpret_cast<PTO2Runtime *>(static_cast<char *>(prebuilt_arena) + off_runtime);
+
+            // Wire every arena-internal pointer field (host wrote host-mirror
+            // addresses; we overwrite them with device addresses).
+            runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+
+            // Reset SM state. setup_pointers + init_header_per_ring restore
+            // ring flow-control counters, layout metadata, error flags, and
+            // the per-slot ring->slot_states[] (bind_ring + reset_for_reuse +
+            // fanin_count/active_mask zero — previously done inside
+            // RingSchedState::init).
+            memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
+            if (!rt->sm_handle->init(sm_ptr, sm_size, task_window_size, heap_size)) {
+                LOG_ERROR("Thread %d: sm_handle->init failed", thread_idx);
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
 
+            // AICore completion mailbox lives in the arena; reset it each
+            // boot so stale completion notifications from a previous run do
+            // not leak.
+            memset(rt->aicore_mailbox, 0, sizeof(*rt->aicore_mailbox));
+
+            // Fill ops / core counts (host can't resolve s_runtime_ops's
+            // device address nor know the SchedulerContext's core fan-out).
+            runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
 #if PTO2_PROFILING
             rt->orchestrator.l2_perf_level = get_l2_perf_level();
 #endif
-
-            // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
-            rt->orchestrator.total_cluster_count = sched_ctx_.aic_count();
-            rt->orchestrator.total_aiv_count = sched_ctx_.aiv_count();
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
             runtime->set_slot_states_ptr(nullptr);
@@ -674,7 +707,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     // Check if this is the last thread to finish
     int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
-    if (prev_finished + 1 == thread_num_) {
+    if (prev_finished + 1 == aicpu_thread_num_) {
         finished_.store(true, std::memory_order_release);
         // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
         // always tear them down here, but we keep the per-cid orch SO entries
@@ -709,7 +742,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     finished_count_.store(0, std::memory_order_release);
     runtime_init_ready_.store(false, std::memory_order_release);
 
-    thread_num_ = 0;
+    aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
 

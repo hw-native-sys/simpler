@@ -121,6 +121,8 @@ static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
 // Caches the comm handle on the chip's ChipWorker so subsequent
 // CTRL_ALLOC_DOMAIN calls can find it.
 static constexpr uint64_t CTRL_COMM_INIT = 9;
+static constexpr uint64_t CTRL_PY_REGISTER = 10;
+static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy; cid for register)
@@ -136,6 +138,13 @@ static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
 // Fixed-width so the wire layout stays simple; well above the encoded length
 // of "simpler-cb-<pid>-<cid>-<counter>" with pid < 32-bit max.
 static constexpr size_t CTRL_SHM_NAME_BYTES = 32;
+
+struct ControlResult {
+    std::string worker_type;
+    int32_t worker_index{0};
+    bool ok{false};
+    std::string error_message;
+};
 
 // =============================================================================
 // WorkerDispatch — per-dispatch handle handed to a WorkerThread.
@@ -213,6 +222,7 @@ public:
     // for the in-flight TASK_DONE before claiming the mailbox.
     void control_register(int32_t cid, const char *shm_name);
     void control_unregister(int32_t cid);
+    void control_generic(uint64_t sub_cmd, int32_t cid, const char *shm_name, double timeout_s);
 
     // Dynamic CommDomain allocate / release.  `request_shm_name` carries the
     // request payload (header + rank_ids + buffer_nbytes); for alloc the child
@@ -244,6 +254,7 @@ private:
     // dispatch loop and the orch-thread control_* path. Per-WorkerThread,
     // so different workers can dispatch in parallel.
     std::mutex mailbox_mu_;
+    bool mailbox_control_timed_out_{false};
 
     void loop();
     void dispatch_process(TaskSlotState &s, int32_t group_index);
@@ -251,7 +262,7 @@ private:
     // Common tail for the four control_* methods. Caller writes the args
     // region and holds `mailbox_mu_`; this helper signals the child,
     // spin-polls CONTROL_DONE, and throws on a non-zero child error code.
-    void run_control_command(const char *op_name);
+    void run_control_command(const char *op_name, double timeout_s = -1.0);
 
     char *mbox() const { return static_cast<char *>(mailbox_); }
     MailboxState read_mailbox_state() const;
@@ -312,6 +323,9 @@ public:
     // worker in parallel. Returns a vector of per-worker error strings
     // (empty on full success). Caller decides whether to log / surface.
     std::vector<std::string> broadcast_unregister_all(int32_t cid);
+    std::vector<ControlResult> broadcast_control_all(
+        WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size, double timeout_s
+    );
 
     // Write SHUTDOWN to every registered mailbox.
     void shutdown_children();

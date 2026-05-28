@@ -122,5 +122,46 @@ class TestTensorDump(SceneTestCase):
         )
 
 
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestTensorDumpPartial(SceneTestCase):
+    """Vector example with one task explicitly selected for tensor dump."""
+
+    CALLABLE = {
+        "orchestration": {
+            "source": "kernels/orchestration/partial_dump_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.IN, D.IN, D.OUT],
+        },
+        "incores": TestTensorDump.CALLABLE["incores"],
+    }
+
+    CASES = TestTensorDump.CASES
+
+    def generate_args(self, params):
+        return TestTensorDump.generate_args(self, params)
+
+    def compute_golden(self, args, params):
+        return TestTensorDump.compute_golden(self, args, params)
+
+    def test_run(self, st_platform, st_worker, request):
+        super().test_run(st_platform, st_worker, request)
+        if not request.config.getoption("--dump-tensor", default=False):
+            return
+        safe_label = _sanitize_for_filename("TestTensorDumpPartial_default")
+        matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
+        assert matches, "partial tensor dump output directory missing"
+        dump_dir = matches[-1] / "tensor_dump"
+        manifest = dump_dir / "tensor_dump.json"
+        assert manifest.exists(), f"tensor_dump.json missing under {dump_dir}"
+        with manifest.open() as f:
+            data = json.load(f)
+        tensors = data.get("tensors", [])
+        assert len(tensors) == 3
+        assert data.get("before_dispatch") == 2
+        assert data.get("after_completion") == 1
+        assert {t["task_id"] for t in tensors} == {"0x0000000100000003"}
+        assert [t["role"] for t in tensors] == ["input", "input", "output"]
+
+
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)

@@ -44,7 +44,7 @@ Runtime::Runtime() {
     next_task_id = 0;
     initial_ready_count = 0;
     worker_count = 0;
-    sche_cpu_num = 1;
+    aicpu_thread_num = 1;
     tensor_info_storage_ = nullptr;
     tensor_info_storage_bytes_ = 0;
     tensor_allocation_storage_ = nullptr;
