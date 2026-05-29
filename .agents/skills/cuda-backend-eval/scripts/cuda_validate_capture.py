@@ -50,6 +50,7 @@ PAIRED_CURRENT_BASELINES = (
     "pto_persistent_dag_graph_tagged_inout",
     "pto_persistent_dag_graph_triad",
     "pto_persistent_dag_graph_quad",
+    "pto_persistent_dag_graph_unary_square",
     "pto_persistent_dag_graph_tensor",
     "pto_persistent_dag_graph_tensor_core",
     "pto_persistent_dag_unary_square",
@@ -62,8 +63,8 @@ PAIRED_CURRENT_BASELINES = (
 PAIRED_CURRENT_SIZES = (1024, 65536, 1048576)
 COMPACT_CURRENT_SIZES = (1024,)
 COMPACT_CURRENT_EXPECTED_REPEATS = 1
-COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 76
-PAIRED_CURRENT_EXPECTED_RESULT_COUNT = 990
+COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 78
+PAIRED_CURRENT_EXPECTED_RESULT_COUNT = 1008
 REQUIRED_SOURCE_PAPER_IDS = ("arXiv:2605.03190", "arXiv:2512.22219v1")
 REPORT_FILES = (
     "cuda-benchmark.md",
@@ -91,6 +92,7 @@ PAIRED_CURRENT_DISPATCH = {
     "pto_persistent_dag_graph_tagged_inout": "1,1,1",
     "pto_persistent_dag_graph_triad": "6,2,1",
     "pto_persistent_dag_graph_quad": "8,2,1",
+    "pto_persistent_dag_graph_unary_square": "7,1,1",
     "pto_persistent_dag_unary_square": "7,1,1",
     "pto_persistent_dag_tensor": "3,1,2,1",
     "pto_persistent_dag_graph_tensor": "3,1,2,1",
@@ -127,6 +129,7 @@ PAIRED_CURRENT_GRAPH_FANIN = {
     "pto_persistent_dag_graph_tagged_inout": "0,1,1",
     "pto_persistent_dag_graph_triad": "0,0,2",
     "pto_persistent_dag_graph_quad": "0,0,2",
+    "pto_persistent_dag_graph_unary_square": "0,1,1",
     "pto_persistent_dag_graph_tensor": "0,1,1,2",
     "pto_persistent_dag_graph_tensor_core": "0,1,1,2",
 }
@@ -140,6 +143,7 @@ PAIRED_CURRENT_GRAPH_DEPENDENTS = {
     "pto_persistent_dag_graph_tagged_inout": "1,2",
     "pto_persistent_dag_graph_triad": "2,2",
     "pto_persistent_dag_graph_quad": "2,2",
+    "pto_persistent_dag_graph_unary_square": "1,2",
     "pto_persistent_dag_graph_tensor": "1,2,3,3",
     "pto_persistent_dag_graph_tensor_core": "1,2,3,3",
 }

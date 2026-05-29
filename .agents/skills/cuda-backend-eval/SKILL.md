@@ -1574,9 +1574,9 @@ PYTHONPATH=$PWD:$PWD/python \
 The historical compact paired benchmark capture with this row is under
 `tmp/cuda-backend/combined-current-dbb01406/`. The current compact selected
 baseline gate is under
-`tmp/cuda-backend/tagged-scalar-compact-current-working/combined-current-8c023f59/`
-and also includes the graph tensor-core and tagged scalar graph rows. It uses
-`N=1024`, one repeat,
+`tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/`
+and also includes the graph tensor-core, tagged scalar graph, and graph
+unary-square rows. It uses `N=1024`, one repeat,
 `batch_tasks=2`, `worker_blocks_per_task=4`, validates source-paper
 provenance and zero scheduler errors, requires
 `scratch_reuse=reused_buffer=tmp0,reuse_task=4`, and includes Markdown plus
@@ -1626,6 +1626,18 @@ PYTHONPATH=$PWD:$PWD/python \
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
     --single-baseline pto_persistent_dag_graph_quad \
+    --sizes 1024 --repeats 1 --arch compute_80
+```
+
+Use `--single-baseline pto_persistent_dag_graph_unary_square` for a quick
+benchmark path check of the explicit graph-descriptor path that carries the
+same one-input square task body as `pto_persistent_dag_unary_square`. This row
+validates dispatch `7,1,1`, graph fan-in `0,1,1`, and dependents `1,2`:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_graph_unary_square \
     --sizes 1024 --repeats 1 --arch compute_80
 ```
 
@@ -1905,10 +1917,10 @@ selected tensor baselines, the graph tensor-core baseline, the host-schedule
 generic-args baseline, graph generic-args4 baseline, graph-chain baseline,
 graph-scratch-reuse baseline, graph-tagged-inout baseline, graph descriptor
 fan-in/dependent metadata, graph-triad and graph-quad baselines, the tagged
-scalar graph baseline, task-argument tags, size `1024`, one repeat, `76`
-combined samples, and the Markdown/SVG report files. The current compact gate
-artifact is under
-`tmp/cuda-backend/tagged-scalar-compact-current-working/combined-current-8c023f59/`.
+scalar graph baseline, the graph unary-square baseline, task-argument tags,
+size `1024`, one repeat, `78` combined samples, and the Markdown/SVG report
+files. The current compact gate artifact is under
+`tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/`.
 Validate older captures with explicit `--require-*` checks if the current
 preset has gained new selected rows since that capture.
 New paired-runner captures use a dynamic validator command because the

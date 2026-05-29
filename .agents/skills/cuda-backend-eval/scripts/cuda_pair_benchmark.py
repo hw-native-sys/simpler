@@ -49,6 +49,7 @@ BASELINE_ROWS: tuple[str, ...] = (
     "pto_persistent_dag_graph_tagged_inout",
     "pto_persistent_dag_graph_triad",
     "pto_persistent_dag_graph_quad",
+    "pto_persistent_dag_graph_unary_square",
     "pto_persistent_dag_unary_square",
     "pto_persistent_dag_tensor",
     "pto_persistent_dag_graph_tensor",
@@ -82,6 +83,7 @@ EXPECTED_DISPATCH_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_tagged_inout": "1,1,1",
     "pto_persistent_dag_graph_triad": "6,2,1",
     "pto_persistent_dag_graph_quad": "8,2,1",
+    "pto_persistent_dag_graph_unary_square": "7,1,1",
     "pto_persistent_dag_unary_square": "7,1,1",
     "pto_persistent_dag_tensor": "3,1,2,1",
     "pto_persistent_dag_graph_tensor": "3,1,2,1",
@@ -118,6 +120,7 @@ EXPECTED_GRAPH_FANIN_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_tagged_inout": "0,1,1",
     "pto_persistent_dag_graph_triad": "0,0,2",
     "pto_persistent_dag_graph_quad": "0,0,2",
+    "pto_persistent_dag_graph_unary_square": "0,1,1",
     "pto_persistent_dag_graph_tensor": "0,1,1,2",
     "pto_persistent_dag_graph_tensor_core": "0,1,1,2",
 }
@@ -131,6 +134,7 @@ EXPECTED_GRAPH_DEPENDENTS_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_tagged_inout": "1,2",
     "pto_persistent_dag_graph_triad": "2,2",
     "pto_persistent_dag_graph_quad": "2,2",
+    "pto_persistent_dag_graph_unary_square": "1,2",
     "pto_persistent_dag_graph_tensor": "1,2,3,3",
     "pto_persistent_dag_graph_tensor_core": "1,2,3,3",
 }

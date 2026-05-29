@@ -2,10 +2,10 @@
 
 This page summarizes the latest full paired A100/H200 CUDA backend capture
 from commit `61cf96cd`, plus compact current-head validation captures. The
-latest compact gate is artifact label `8c023f59`, which revalidates the
-tagged scalar graph-descriptor row in the selected baseline matrix. The raw JSON,
-Markdown, and SVG reports are generated locally under `tmp/cuda-backend/` and
-intentionally remain uncommitted.
+latest compact gate is artifact label `f074746a`, which promotes the explicit
+graph unary-square descriptor row into the selected baseline matrix. The raw
+JSON, Markdown, and SVG reports are generated locally under
+`tmp/cuda-backend/` and intentionally remain uncommitted.
 
 The capture uses `nvcc` for target-specific PTX on both machines:
 
@@ -211,8 +211,58 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-sweep.md`
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-sweep.svg`
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-throughput.svg`
+- `tmp/cuda-backend/graph-unary-benchmark-working/a100-current-f074746a/cuda-benchmark.json`
+- `tmp/cuda-backend/graph-unary-benchmark-working/h200-current-f074746a/cuda-benchmark.json`
+- `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark.json`
+- `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark.md`
+- `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark.svg`
+- `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark-throughput.svg`
 
-## Latest Tagged Scalar Graph Benchmark Gate
+## Latest Graph Unary-Square Benchmark Gate
+
+The compact paired gate at artifact label `f074746a` adds
+`pto_persistent_dag_graph_unary_square` to the selected benchmark matrix. It
+uses the default `16x16x16` tensor descriptor, `N=1024`, one repeat,
+`batch_tasks=2`, and `worker_blocks_per_task=4`. The paired runner synced the
+local tree to `bizhaoh200`, captured local A100 and remote H200 reports,
+merged them, and validated the combined JSON.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark.json \
+    --preset compact-current
+```
+
+The combined JSON has `78` samples. The validator checked A100/H200 machine
+names, size `1024`, one repeat, selected tensor baselines, source-paper
+provenance, sanitized command examples, generated Markdown/SVG reports,
+expected generated-dispatch sequences, tensor descriptor metadata, graph
+descriptor fan-in/dependent metadata, graph task-argument metadata, and zero
+scheduler errors for PTO persistent DAG rows.
+
+Selected unary rows:
+
+| GPU | Host ns | Fixed DAG ns | Graph DAG ns | Dispatch | Fan-in | Dependents |
+| --- | ------- | ------------ | ------------ | -------- | ------ | ---------- |
+| A100 | 44032 | 41984 | 36864 | `7,1,1` | `0,1,1` | `1,2` |
+| H200 | 38592 | 32416 | 31968 | `7,1,1` | `0,1,1` | `1,2` |
+
+The graph unary-square row uses the same one-input square task body as the
+fixed DAG row, but routes it through the explicit graph descriptor adapter.
+This keeps the kernel body stable while validating that graph metadata can
+select unary callable arguments, produce dispatch `[7,1,1]`, and record the
+descriptor as `tasks=3`, `fanin=[0,1,1]`, and `dependents=[1,2]`.
+
+The report directory contains `cuda-benchmark.json`, `cuda-benchmark.md`,
+`cuda-benchmark.svg`, `cuda-benchmark-ratios.svg`,
+`cuda-benchmark-dag-deltas.svg`, and `cuda-benchmark-throughput.svg`.
+
+## Previous Tagged Scalar Graph Benchmark Gate
 
 The compact paired gate at artifact label `8c023f59` adds
 `pto_persistent_dag_graph_tagged` to the selected benchmark matrix. It uses

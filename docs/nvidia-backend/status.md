@@ -2932,29 +2932,29 @@ PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
   .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
     --sizes 1024 --repeats 1 --batch-tasks 2 \
     --worker-blocks-per-task 4 --sync-remote-tree \
-    --output-root tmp/cuda-backend/tagged-scalar-compact-current-working
+    --output-root tmp/cuda-backend/graph-unary-benchmark-working
 ```
 
 The paired runner wrote and validated
-`tmp/cuda-backend/tagged-scalar-compact-current-working/combined-current-8c023f59/cuda-benchmark.json`
-with the `compact-current` preset. It required 76 samples, source-paper
+`tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark.json`
+with the `compact-current` preset. It required 78 samples, source-paper
 provenance, sanitized command examples, generated Markdown/SVG reports, zero
-scheduler errors, graph tensor-core metadata, and the new tagged scalar graph
-row. The tagged scalar graph row validates dispatch `[9,2,1]`, graph fan-in
-`[0,0,2]`, graph dependents `[2,2]`, scalar args
-`scalar_args[0]=1.5` and `scalar_args[1]=0.25`, and graph task args
-`input:a,input:b,output:tmp1,scalar:scalar_args[0],scalar:scalar_args[1]`,
-`input:a,input:b,output:tmp2`, and
-`input:tmp1,input:tmp2,output_existing:out`.
+scheduler errors, graph tensor-core metadata, tagged scalar graph metadata,
+and the graph unary-square row. The graph unary-square row validates dispatch
+`[7,1,1]`, graph fan-in `[0,1,1]`, graph dependents `[1,2]`, and a
+three-task explicit graph descriptor for the same one-input square task body
+used by the fixed unary DAG row.
 
-| GPU | Tagged scalar ns | Tagged inout ns | Graph tensor-core ns | cuBLAS Graph ns |
-| --- | ---------------- | --------------- | -------------------- | --------------- |
-| A100 | 46080 | 52224 | 41984 | 11264 |
-| H200 | 25632 | 28032 | 32288 | 9247 |
+| GPU | Fixed unary ns | Graph unary ns | Tagged scalar ns | Graph tensor-core ns |
+| --- | -------------- | -------------- | ---------------- | -------------------- |
+| A100 | 41984 | 36864 | 34816 | 39936 |
+| H200 | 32416 | 31968 | 31552 | 40864 |
 
-Both tagged scalar rows use target-specific PTX (`compute_80` on A100 and
+All selected PTO rows use target-specific PTX (`compute_80` on A100 and
 `compute_90` on H200), report zero scheduler errors, and are visible in the
-generated Markdown/SVG compact report beside the tagged-inout graph row.
+generated Markdown/SVG compact report beside the tagged scalar and tensor-core
+graph rows. The previous tagged-scalar compact gate remains under
+`tmp/cuda-backend/tagged-scalar-compact-current-working/`.
 
 Graph-descriptor dependency inference now builds the producer map from the
 whole descriptor before inferring omitted `dependents`, so the scene-test graph
@@ -3272,9 +3272,9 @@ Needed:
   automatic default temporary allocation, logical-output/storage-output
   separation for scratch reuse, order-independent tensor-flow dependency
   inference, tagged TaskArgs-like graph task lowering including `inout`
-  producer chaining, tagged graph-descriptor paired smoke, and five-task
-  chain, five-task fan-out/fan-in, and six-task scratch-reuse graph descriptor
-  smokes;
+  producer chaining, explicit unary square graph dispatch, tagged
+  graph-descriptor paired smoke, and five-task chain, five-task fan-out/fan-in,
+  and six-task scratch-reuse graph descriptor smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, and direct/queue/DAG
   prepared-callable repeat-run smokes. The paired lifecycle matrix runner now

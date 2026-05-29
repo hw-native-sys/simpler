@@ -1745,6 +1745,15 @@ def run_single_sample(  # noqa: PLR0912
             baseline=baseline,
             dag_shape="graph_descriptor_quad",
         )
+    if baseline == "pto_persistent_dag_graph_unary_square":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="graph_descriptor_unary_square",
+        )
     if baseline == "pto_persistent_dag_unary_square":
         return run_persistent_sample(
             device=device,
@@ -1976,6 +1985,7 @@ def run_benchmark(
                     "pto_persistent_dag_graph_tagged_inout",
                     "pto_persistent_dag_graph_triad",
                     "pto_persistent_dag_graph_quad",
+                    "pto_persistent_dag_graph_unary_square",
                     "pto_persistent_dag_unary_square",
                     "pto_persistent_dag_tensor",
                     "pto_persistent_dag_graph_tensor",
@@ -2557,6 +2567,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         "pto_persistent_dag_graph_tagged_inout": "#4e342e",
         "pto_persistent_dag_graph_triad": "#6f4e37",
         "pto_persistent_dag_graph_quad": "#3e2723",
+        "pto_persistent_dag_graph_unary_square": "#8d6e63",
         "pto_persistent_dag_unary_square": "#e3a857",
         "pto_persistent_dag_tensor": "#e76f51",
         "pto_persistent_dag_graph_tensor": "#c7522a",
@@ -2958,6 +2969,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  for the generated-dispatch three-input task.",
             "- `pto_persistent_dag_graph_quad` uses an explicit graph descriptor",
             "  for the generated-dispatch four-input task.",
+            "- `pto_persistent_dag_graph_unary_square` uses an explicit graph descriptor",
+            "  for a one-input square task body.",
             "- `pto_persistent_dag_unary_square` uses a one-input square task body",
             "  to validate unary persistent DAG arguments.",
             (
@@ -3120,6 +3133,7 @@ def main() -> None:
             "pto_persistent_dag_graph_tagged_inout",
             "pto_persistent_dag_graph_triad",
             "pto_persistent_dag_graph_quad",
+            "pto_persistent_dag_graph_unary_square",
             "pto_persistent_dag_unary_square",
             "pto_persistent_dag_tensor",
             "pto_persistent_dag_graph_tensor",
