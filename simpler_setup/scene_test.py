@@ -1816,10 +1816,50 @@ class _CudaPersistentDagSceneBuffers:
         if (task_args is not None or args_alias is not None) and has_node_io_fields:
             raise ValueError("CUDA persistent_dag_graph_f32 graph tasks cannot mix args with node IO fields")
         if task_args is not None:
-            return task_args
+            return _CudaPersistentDagSceneBuffers._normalize_graph_task_args_shape(task_args)
         if args_alias is not None:
-            return args_alias
+            return _CudaPersistentDagSceneBuffers._normalize_graph_task_args_shape(args_alias)
         return _CudaPersistentDagSceneBuffers._graph_node_io_task_args(task_spec, has_node_io_fields)
+
+    @staticmethod
+    def _normalize_graph_task_args_shape(task_args: Any) -> Any:
+        if not isinstance(task_args, dict):
+            return task_args
+        if any(field in task_args for field in _CudaPersistentDagSceneBuffers._GRAPH_NODE_IO_FIELDS):
+            return _CudaPersistentDagSceneBuffers._graph_task_arg_map_entries(task_args)
+        if any(field in task_args for field in ("tensor", "name", "role", "tag")):
+            return [task_args]
+        raise ValueError(
+            "CUDA persistent_dag_graph_f32 task_args dictionaries must use role keys or describe one task arg"
+        )
+
+    @staticmethod
+    def _graph_task_arg_map_entries(task_args: dict[str, Any]) -> list[dict[str, Any]]:
+        roles = {
+            "input": "input",
+            "inputs": "input",
+            "output": "output",
+            "outputs": "output",
+            "output_existing": "output_existing",
+            "inout": "inout",
+            "inouts": "inout",
+            "scalar": "scalar",
+            "scalars": "scalar",
+        }
+        entries: list[dict[str, Any]] = []
+        for key, value in task_args.items():
+            role = roles.get(str(key))
+            if role is None:
+                continue
+            if isinstance(value, dict):
+                values = _CudaPersistentDagSceneBuffers._graph_node_port_values(value)
+            elif isinstance(value, (list, tuple)):
+                values = list(value)
+            else:
+                values = [value]
+            for item in values:
+                entries.append({"scalar": item} if role == "scalar" else {role: item})
+        return entries
 
     @staticmethod
     def _graph_node_io_task_args(task_spec: dict[str, Any], has_node_io_fields: bool) -> list[dict[str, Any]] | None:

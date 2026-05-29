@@ -1509,6 +1509,12 @@ Task args may also use two-item role/name pairs such as `("input", "a")`,
 `("output", "tmp0")`, `("inout", "tmp0")`, or
 `("output_existing", "out")`; the adapter expands these through the same
 role-keyed lowering path as the dictionary forms.
+Task args may also use a role-map dictionary such as
+`{"inputs": ["a", "b"], "output": "tmp0"}` or
+`{"inout": "tmp0", "input": "b"}`. The adapter preserves role-key insertion
+order because CUDA task argument order decides which descriptor fields become
+`a`, `b`, `c`, and `d`; dictionary-valued role entries still flatten through
+the stable node-port order.
 Graph tasks may use a `callable` or `op` name instead of embedding `func_id`
 directly when `graph.callables` maps that name to callable metadata such as
 `{"func_id": 9}`. `graph.callables` may be either a dictionary keyed by
@@ -1587,6 +1593,16 @@ Run the `args` alias selector after changing graph task-argument lowering:
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
     -q -k args_alias --platform cuda
+```
+
+Run the role-map task-argument selector after changing graph task-argument
+normalization:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k 'task_arg_role_maps or role_map_task_args_graph_with_ctypes_data' \
+    --platform cuda
 ```
 
 Run the pair-shaped task-argument selector after changing compact graph

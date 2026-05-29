@@ -2264,6 +2264,15 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 also reported `2 passed, 121 deselected`, after the known PTO-ISA SSH refresh
 warning.
+Graph task descriptors now also accept role-map `task_args` dictionaries such
+as `{"inputs": ["a", "b"], "output": "tmp0"}`. This keeps the descriptor
+closer to a bundled `TaskArgs` object while preserving CUDA descriptor field
+ordering. The focused regression first failed because the adapter iterated
+dictionary keys as task-arg entries. After adding role-map normalization, the
+descriptor selector reported `4 passed, 139 deselected`, the local A100 ctypes
+selector reported `1 passed, 142 deselected`, and the synced H200 selector
+reported `1 passed, 142 deselected` after the known PTO-ISA SSH refresh
+warning.
 Graph task-list descriptors now also accept top-level `graph.submits` or
 `graph.submissions` as aliases for `graph.tasks`/`graph.nodes`, so a
 scene-test descriptor can look like a list of
@@ -4571,9 +4580,10 @@ Needed:
   and paired smoke including
   node-link `links` and dictionary-valued node IO port maps,
   tagged TaskArgs-like graph task lowering including `inout` producer
-  chaining, submit-shaped graph descriptors, explicit unary square graph
-  dispatch, tagged graph-descriptor paired smoke, and five-task chain,
-  five-task fan-out/fan-in, and six-task scratch-reuse graph descriptor smokes;
+  chaining, role-map task-argument dictionaries, submit-shaped graph
+  descriptors, explicit unary square graph dispatch, tagged graph-descriptor
+  paired smoke, and five-task chain, five-task fan-out/fan-in, and six-task
+  scratch-reuse graph descriptor smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, tensor-core graph, and
   direct/queue/DAG prepared-callable repeat-run smokes. The paired lifecycle

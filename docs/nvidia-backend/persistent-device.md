@@ -348,6 +348,10 @@ For compact graph specs, an entry may also be a two-item role/name pair such
 as `("input", "a")`, `("output", "tmp0")`, `("inout", "tmp0")`, or
 `("output_existing", "out")`. Pair entries lower through the same role-keyed
 path as expanded dictionaries.
+`task_args` and `args` may also use a role-map dictionary such as
+`{"inputs": ["a", "b"], "output": "tmp0"}`. Role-key order is preserved
+because the current CUDA descriptor ABI maps argument order onto fixed fields
+`a`, `b`, `c`, and `d`.
 The scene-test adapter lowers those roles into the current bounded CUDA
 descriptor fields: the first four inputs become `a`/`b`/`c`/`d`, additional
 inputs append to `tensor_args`, and the single output becomes `out`. This is
