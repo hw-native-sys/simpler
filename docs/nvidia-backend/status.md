@@ -403,7 +403,7 @@ reports now also write `cuda-benchmark-dag-deltas.svg`, which plots each
 `cuda-benchmark-throughput.svg`, which plots median GF/s for tensor-DAG and
 cuBLAS rows with recorded tensor tile descriptors. Benchmark Markdown reports
 now include a graph descriptor metadata table, and the primary benchmark SVG
-embeds graph task-argument metadata for explicit graph rows.
+embeds graph topology and task-argument metadata for explicit graph rows.
 
 The first cuBLAS library-backed tensor baseline adds `cublas_sgemm` to the
 same compact selected-baseline report shape. It uses CUDA Runtime API events
@@ -582,7 +582,8 @@ Evidence:
   metadata, sanitized command examples, dispatch IDs, tensor-tile shapes, and
   graph descriptor, graph task-argument, and scratch-reuse metadata before
   docs are refreshed. Current paired presets also require visible graph
-  task-argument metadata in `cuda-benchmark.md` and `cuda-benchmark.svg`.
+  topology and task-argument metadata in `cuda-benchmark.md` and
+  `cuda-benchmark.svg`.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py` checks
   paired smoke captures for required A100/H200 artifacts, pass status, zero
   scheduler errors, expected runtime/mode, dispatch IDs, repeat-run lifecycle

@@ -1771,6 +1771,56 @@ def test_cuda_capture_validator_requires_graph_task_args_metadata():
     )
 
 
+def test_cuda_capture_validator_checks_graph_topology_in_reports(tmp_path):
+    cuda_validate_capture = _load_capture_validator_module()
+    artifact_dir = tmp_path / "combined-current-graph-topology"
+    artifact_dir.mkdir()
+    payload = _paired_capture_payload()
+    payload["results"].append(
+        {
+            "machine": "hina",
+            "baseline": "pto_persistent_dag_graph_role_keyed_inout",
+            "n": 1024,
+            "repeat": 0,
+            "status": "pass",
+            "device_wall_ns": 1024,
+            "graph_descriptor": {"fanin": [0, 1, 1], "dependents": [1, 2]},
+        }
+    )
+    (artifact_dir / "cuda-benchmark.md").write_text("# report\n")
+    (artifact_dir / "cuda-benchmark.svg").write_text("<svg>stale chart</svg>\n")
+    (artifact_dir / "cuda-benchmark-ratios.svg").write_text("<svg></svg>\n")
+    (artifact_dir / "cuda-benchmark-dag-deltas.svg").write_text("<svg></svg>\n")
+    (artifact_dir / "cuda-benchmark-throughput.svg").write_text("<svg></svg>\n")
+
+    errors = cuda_validate_capture.validate_capture(
+        payload,
+        artifact_dir=artifact_dir,
+        require_report_files=True,
+        require_report_graph_topology=True,
+        required_graph_fanin={"pto_persistent_dag_graph_role_keyed_inout": "0,1,1"},
+        required_graph_dependents={"pto_persistent_dag_graph_role_keyed_inout": "1,2"},
+    )
+
+    assert "missing report graph topology in cuda-benchmark.md" in errors
+    assert "missing report graph topology in cuda-benchmark.svg" in errors
+
+    (artifact_dir / "cuda-benchmark.md").write_text("| Graph fan-in | Graph dependents |\n| 0,1,1 | 1,2 |\n")
+    (artifact_dir / "cuda-benchmark.svg").write_text("<svg><desc>fanin=0,1,1 dependents=1,2</desc></svg>\n")
+
+    assert (
+        cuda_validate_capture.validate_capture(
+            payload,
+            artifact_dir=artifact_dir,
+            require_report_files=True,
+            require_report_graph_topology=True,
+            required_graph_fanin={"pto_persistent_dag_graph_role_keyed_inout": "0,1,1"},
+            required_graph_dependents={"pto_persistent_dag_graph_role_keyed_inout": "1,2"},
+        )
+        == []
+    )
+
+
 def test_cuda_capture_validator_checks_graph_task_args_in_reports(tmp_path):
     cuda_validate_capture = _load_capture_validator_module()
     artifact_dir = tmp_path / "combined-current-graph-task-args"
@@ -1938,6 +1988,8 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     assert "cublas_sgemm=16x16x16" in args.require_tensor_tile
     assert "cublas_sgemm_graph=16x16x16" in args.require_tensor_tile
     assert args.expected_result_count == 1026
+    assert args.require_report_graph_topology is True
+    assert args.require_report_graph_task_args is True
 
 
 def test_cuda_capture_validator_compact_current_preset_matches_docs_gate():
@@ -1954,6 +2006,8 @@ def test_cuda_capture_validator_compact_current_preset_matches_docs_gate():
     assert args.require_command_examples is True
     assert args.require_zero_scheduler_errors is True
     assert args.require_source_papers is True
+    assert args.require_report_graph_topology is True
+    assert args.require_report_graph_task_args is True
     assert "pto_host_schedule_generic_args" in args.require_baseline
     assert "pto_persistent_dag_scalar_scale" in args.require_baseline
     assert "pto_persistent_dag_graph_generic_args4" in args.require_baseline
