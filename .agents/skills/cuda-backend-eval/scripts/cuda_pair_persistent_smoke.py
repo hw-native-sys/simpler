@@ -275,6 +275,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "graph_descriptor": "9,2,1",
         "graph_descriptor_chain": "1,2,1,2,1",
         "graph_descriptor_compact_role_inout": "1,1,1",
+        "graph_descriptor_pair_inout": "1,1,1",
         "graph_descriptor_depends_on": "1,2,1",
         "graph_descriptor_diamond": "9,2,1,2,1",
         "graph_descriptor_generic_args4": "9,2,1",
@@ -331,6 +332,7 @@ def _expected_graph_descriptor(config: PairedPersistentSmokeConfig) -> tuple[str
         "graph_descriptor_scalar_scale": ("0,0,2", "2,2"),
         "graph_descriptor_scratch_reuse": ("0,0,2,1,1,2", "2,2,3,4,5,5"),
         "graph_descriptor_compact_role_inout": ("0,1,1", "1,2"),
+        "graph_descriptor_pair_inout": ("0,1,1", "1,2"),
         "graph_descriptor_role_keyed_inout": ("0,1,1", "1,2"),
         "graph_descriptor_tagged": ("0,0,2", "2,2"),
         "graph_descriptor_tagged_inout": ("0,1,1", "1,2"),
@@ -356,6 +358,9 @@ def _expected_graph_task_args(config: PairedPersistentSmokeConfig) -> str | None
         "graph_descriptor_compact_role_inout": (
             "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
         ),
+        "graph_descriptor_pair_inout": (
+            "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+        ),
         "graph_descriptor_role_keyed_inout": (
             "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
         ),
@@ -371,6 +376,7 @@ def _expected_graph_task_arg_key(config: PairedPersistentSmokeConfig) -> str | N
     return {
         "graph_descriptor_compact_role_inout": "compact",
         "graph_descriptor_node_io": "node_io",
+        "graph_descriptor_pair_inout": "pair",
         "graph_descriptor_role_keyed_inout": "role",
     }.get(config.dag_shape)
 
@@ -422,9 +428,7 @@ def _expected_tensor_args(config: PairedPersistentSmokeConfig) -> str | None:
         "generic_args4": "tensor_args[0]=tmp0,tensor_args[1]=tmp3,tensor_args[2]=a,tensor_args[3]=b",
         "graph_descriptor": "tensor_args[0]=tmp0,tensor_args[1]=tmp3",
         "graph_descriptor_diamond": "tensor_args[0]=tmp0,tensor_args[1]=tmp3",
-        "graph_descriptor_generic_args4": (
-            "tensor_args[0]=tmp0,tensor_args[1]=tmp3,tensor_args[2]=a,tensor_args[3]=b"
-        ),
+        "graph_descriptor_generic_args4": ("tensor_args[0]=tmp0,tensor_args[1]=tmp3,tensor_args[2]=a,tensor_args[3]=b"),
         "graph_descriptor_node_attrs": "tensor_args[0]=tmp0,tensor_args[1]=tmp3",
         "graph_descriptor_reordered": "tensor_args[0]=tmp0,tensor_args[1]=tmp3",
         "graph_descriptor_tagged": "tensor_args[0]=tmp0,tensor_args[1]=tmp3",
@@ -645,6 +649,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_op",
+            "graph_descriptor_pair_inout",
             "graph_descriptor_quad",
             "graph_descriptor_reordered",
             "graph_descriptor_scalar_affine",

@@ -659,6 +659,50 @@ body: compact role entries must survive through SceneTest-style lowering,
 persistent-device benchmark dispatch, JSON capture, Markdown/SVG reporting,
 and the paired validator.
 
+## Pair Task-Arg Smoke Gate
+
+The current working-tree gate adds
+`pto_persistent_dag_graph_pair_inout` to the selected benchmark and report
+scripts, and `graph_descriptor_pair_inout` to the paired persistent-smoke
+runner. The new spelling represents each graph task argument as a two-item
+role/name pair while preserving the same topology and task flow as the
+tagged, role-keyed, and compact inout rows.
+
+Artifact path:
+
+- `tmp/cuda-backend/persistent-pair-inout-smoke-working/persistent-graph_descriptor_pair_inout-repeat2-smoke-5028d521/`
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py \
+    tmp/cuda-backend/persistent-pair-inout-smoke-working/persistent-graph_descriptor_pair_inout-repeat2-smoke-5028d521/a100.json \
+    tmp/cuda-backend/persistent-pair-inout-smoke-working/persistent-graph_descriptor_pair_inout-repeat2-smoke-5028d521/h200.json \
+    --require-artifact a100 --require-artifact h200 \
+    --expected-runtime persistent_device --expected-mode dag \
+    --expected-repeat-runs 2 --expected-completed-count 3 \
+    --expected-dag-shape graph_descriptor_pair_inout \
+    --expected-dispatch 1,1,1 --expected-graph-fanin 0,1,1 \
+    --expected-graph-dependents 1,2 \
+    --expected-graph-task-arg-key pair \
+    --require-report-files --require-report-graph-topology \
+    --require-report-graph-task-args
+```
+
+Rows:
+
+| GPU | N | Task arg key | Device ns | Dispatch | Fan-in | Dependents | Task args |
+| --- | - | ------------ | --------- | -------- | ------ | ---------- | --------- |
+| A100 | 1024 | pair | 66560 | `1,1,1` | `0,1,1` | `1,2` | `task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out` |
+| H200 | 1024 | pair | 50688 | `1,1,1` | `0,1,1` | `1,2` | `task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out` |
+
+Supplemental single-baseline samples are stored under
+`tmp/cuda-backend/pair-inout-single-benchmark/`. They reported A100
+`device_wall_ns=49152`, `host_wall_ns=68485`, and H200
+`device_wall_ns=28672`, `host_wall_ns=38506` for
+`pto_persistent_dag_graph_pair_inout`.
+
 ## Graph Unary-Square Benchmark Gate
 
 The compact paired gate at artifact label `f074746a` adds

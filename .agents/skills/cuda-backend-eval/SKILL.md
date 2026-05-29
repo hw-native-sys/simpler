@@ -1502,10 +1502,24 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-root tmp/cuda-backend/compact-role-inout-working
 ```
 
+Use `graph_descriptor_pair_inout` after changing pair-shaped graph
+task-argument lowering. It validates the same in-place graph shape, but
+requires `graph_task_arg_key=pair` and proves entries shaped as
+`("role", "name")` survive through JSON plus Markdown/SVG reporting:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_pair_inout --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-pair-inout-smoke-working
+```
+
 The selected benchmark path also includes
 `pto_persistent_dag_graph_role_keyed_inout` and
-`pto_persistent_dag_graph_compact_role_inout`. Use a compact paired capture
-when changing graph task-argument lowering or capture validation:
+`pto_persistent_dag_graph_compact_role_inout`, and
+`pto_persistent_dag_graph_pair_inout`. Use a compact paired capture when
+changing graph task-argument lowering or capture validation:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \

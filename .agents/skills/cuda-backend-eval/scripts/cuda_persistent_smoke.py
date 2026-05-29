@@ -1791,6 +1791,7 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
         )
     if dag_shape in {
         "graph_descriptor_compact_role_inout",
+        "graph_descriptor_pair_inout",
         "graph_descriptor_tagged_inout",
         "graph_descriptor_role_keyed_inout",
     }:
@@ -2573,6 +2574,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
             if config.dag_shape in {
                 "graph_descriptor_compact_role_inout",
+                "graph_descriptor_pair_inout",
                 "graph_descriptor_tagged_inout",
                 "graph_descriptor_role_keyed_inout",
             }:
@@ -2600,7 +2602,11 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 expected_tmp0 = [_f32(host_a[i] * host_a[i]) for i in range(n)]
                 expected_tmp1 = [_f32(expected_tmp0[i] + host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + host_a[i]) for i in range(n)]
-            if config.dag_shape in {"graph_descriptor_depends_on", "graph_descriptor_node_io", "graph_descriptor_node_op"}:
+            if config.dag_shape in {
+                "graph_descriptor_depends_on",
+                "graph_descriptor_node_io",
+                "graph_descriptor_node_op",
+            }:
                 expected_out = expected_tmp0
             if _is_tensor_tile_shape(config.dag_shape):
                 expected_tmp0 = _matmul_expected(host_a, host_b, n, config.tensor_tile)
@@ -2748,6 +2754,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_op",
+            "graph_descriptor_pair_inout",
             "graph_descriptor_quad",
             "graph_descriptor_reordered",
             "graph_descriptor_role_keyed_inout",
@@ -2803,11 +2810,13 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 }
             if config.dag_shape in {
                 "graph_descriptor_compact_role_inout",
+                "graph_descriptor_pair_inout",
                 "graph_descriptor_tagged_inout",
                 "graph_descriptor_role_keyed_inout",
             }:
                 result["graph_task_arg_key"] = {
                     "graph_descriptor_compact_role_inout": "compact",
+                    "graph_descriptor_pair_inout": "pair",
                     "graph_descriptor_role_keyed_inout": "role",
                     "graph_descriptor_tagged_inout": "tag",
                 }[config.dag_shape]
@@ -2907,6 +2916,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_node_attrs",
         "graph_descriptor_node_io",
         "graph_descriptor_node_op",
+        "graph_descriptor_pair_inout",
         "graph_descriptor_quad",
         "graph_descriptor_reordered",
         "graph_descriptor_scalar_affine",
@@ -2975,6 +2985,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_op",
+            "graph_descriptor_pair_inout",
             "graph_descriptor_reordered",
             "graph_descriptor_scalar_affine",
             "graph_descriptor_scalar_axpy",
@@ -3200,6 +3211,7 @@ def main() -> None:
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_op",
+            "graph_descriptor_pair_inout",
             "graph_descriptor_quad",
             "graph_descriptor_reordered",
             "graph_descriptor_scalar_affine",

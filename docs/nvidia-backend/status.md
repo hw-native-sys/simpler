@@ -2495,6 +2495,53 @@ so `cuda-benchmark.md` now has a focused `Graph Role Spelling Rows` section
 and `cuda-benchmark.svg` exposes the same tag/role/compact rows in
 `graph role spelling:` metadata.
 
+The graph adapter also accepts pair-shaped task-argument entries, where each
+entry is written as a two-item role/name pair. This spelling is useful as a
+minimal structured form when JSON-like role maps would add unnecessary keys,
+but it must still lower to the same TaskArgs role flow as tag, role-keyed,
+and compact spellings. A failing benchmark/report selector first required
+`graph_descriptor_pair_inout` and
+`pto_persistent_dag_graph_pair_inout` in the persistent smoke, paired smoke,
+benchmark, validator, and current-summary scripts. The focused selector then
+passed:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_benchmark_report.py \
+  -q -k 'pair_inout or graph_role_spelling or \
+          validate_command_matches_configured_capture or paired_current or \
+          compact_current or current_summary'
+```
+
+Result: `17 passed, 267 deselected`.
+
+The no-torch paired persistent-smoke workflow now covers the same in-place
+graph shape as `graph_descriptor_pair_inout`:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_pair_inout --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-pair-inout-smoke-working
+```
+
+Result:
+`tmp/cuda-backend/persistent-pair-inout-smoke-working/persistent-graph_descriptor_pair_inout-repeat2-smoke-5028d521/`
+contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The paired validator required dispatch `[1,1,1]`,
+graph fan-in `[0,1,1]`, dependents `[1,2]`,
+`graph_task_arg_key=pair`, task args `input:a,input:b,output:tmp1`,
+`inout:tmp1,input:b`, and `input:tmp1,input:a,output_existing:out`, repeat
+completions `[3,3]`, resource policy `scheduler_blocks=1`,
+`worker_blocks=3`, `block_dim=256`, and zero scheduler errors on both GPUs.
+A100 reported per-launch device times `[40960,25600]`; H200 reported
+`[29760,20928]`. Supplemental single-baseline samples under
+`tmp/cuda-backend/pair-inout-single-benchmark/` reported A100
+`device_wall_ns=49152`, `host_wall_ns=68485`, and H200
+`device_wall_ns=28672`, `host_wall_ns=38506` for
+`pto_persistent_dag_graph_pair_inout`.
+
 The same tagged graph shape is now also in the paired persistent-smoke report
 flow as `graph_descriptor_tagged`, with scalar inputs recorded beside tensor
 roles in `graph_task_args`. The current A100/H200 JSON plus Markdown/SVG

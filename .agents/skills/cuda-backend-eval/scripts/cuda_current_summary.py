@@ -55,6 +55,7 @@ DAG_BASELINES = (
     "pto_persistent_dag_graph_tagged_inout",
     "pto_persistent_dag_graph_role_keyed_inout",
     "pto_persistent_dag_graph_compact_role_inout",
+    "pto_persistent_dag_graph_pair_inout",
     "pto_persistent_dag_unary_square",
     "pto_persistent_dag_tensor",
 )
@@ -71,6 +72,7 @@ GRAPH_ROLE_SPELLING_BASELINES = (
     "pto_persistent_dag_graph_tagged_inout",
     "pto_persistent_dag_graph_role_keyed_inout",
     "pto_persistent_dag_graph_compact_role_inout",
+    "pto_persistent_dag_graph_pair_inout",
 )
 
 
@@ -293,6 +295,7 @@ def render_dag_shape_table(payload: Payload) -> str:
                         (machine, "pto_persistent_dag_graph_compact_role_inout", n, 3, 1),
                         dag,
                     ),
+                    _ratio_for_key(summary, (machine, "pto_persistent_dag_graph_pair_inout", n, 3, 1), dag),
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_unary_square", n, 3, 1), dag),
                     _ratio(tensor, dag),
                 ]
@@ -316,6 +319,7 @@ def render_dag_shape_table(payload: Payload) -> str:
             "Graph Tagged Inout/DAG",
             "Graph Role Inout/DAG",
             "Graph Compact Role Inout/DAG",
+            "Graph Pair Inout/DAG",
             "Unary Square/DAG",
             "Tensor/DAG",
         ],
