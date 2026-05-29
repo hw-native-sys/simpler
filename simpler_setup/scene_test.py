@@ -1368,8 +1368,32 @@ class _CudaPersistentDagSceneBuffers:
             if out_name is not None:
                 producers.setdefault(str(out_name), []).append(task_id)
 
-        inferred_dependents = [[] for _ in task_specs]
+        dependents = [[] for _ in task_specs]
+
         for task_id, task_spec in enumerate(task_specs):
+            if "dependents" in task_spec and _CudaPersistentDagSceneBuffers._graph_task_dependencies(task_spec):
+                raise ValueError(
+                    "CUDA persistent_dag_graph_f32 graph tasks cannot mix dependents with depends_on/dependencies"
+                )
+            if "dependents" in task_spec:
+                dependents[task_id].extend(int(dependent) for dependent in task_spec["dependents"])
+
+        for task_id, task_spec in enumerate(task_specs):
+            dependency_ids = _CudaPersistentDagSceneBuffers._graph_task_dependencies(task_spec)
+            if dependency_ids is None:
+                continue
+            for dependency_id in dependency_ids:
+                if dependency_id < 0 or dependency_id >= len(task_specs):
+                    raise ValueError(
+                        "CUDA persistent_dag_graph_f32 dependency task id "
+                        f"{dependency_id} for task {task_id} is outside the graph"
+                    )
+                if task_id not in dependents[dependency_id]:
+                    dependents[dependency_id].append(task_id)
+
+        for task_id, task_spec in enumerate(task_specs):
+            if "dependents" in task_spec or _CudaPersistentDagSceneBuffers._graph_task_dependencies(task_spec):
+                continue
             producer_ids = {
                 producer_id
                 for name in _CudaPersistentDagSceneBuffers._graph_task_read_names(task_spec)
@@ -1377,11 +1401,23 @@ class _CudaPersistentDagSceneBuffers:
                 is not None
             }
             for producer_id in sorted(producer_ids):
-                inferred_dependents[producer_id].append(task_id)
-        return [
-            list(task_spec["dependents"]) if "dependents" in task_spec else inferred_dependents[task_id]
-            for task_id, task_spec in enumerate(task_specs)
-        ]
+                if task_id not in dependents[producer_id]:
+                    dependents[producer_id].append(task_id)
+        return dependents
+
+    @staticmethod
+    def _graph_task_dependencies(task_spec: dict[str, Any]) -> list[int] | None:
+        dependencies = task_spec.get("depends_on")
+        dependency_alias = task_spec.get("dependencies")
+        if dependencies is not None and dependency_alias is not None:
+            raise ValueError("CUDA persistent_dag_graph_f32 graph tasks cannot use both depends_on and dependencies")
+        if dependencies is None:
+            dependencies = dependency_alias
+        if dependencies is None:
+            return None
+        if isinstance(dependencies, int):
+            return [dependencies]
+        return [int(dependency) for dependency in dependencies]
 
     @staticmethod
     def _graph_read_producer(producers: dict[str, list[int]], name: str, task_id: int) -> int | None:

@@ -2227,6 +2227,84 @@ def test_scene_test_builds_cuda_persistent_graph_from_tagged_task_args():
     assert buffers.host_tasks[2].out == buffers.tensor_buffers.ptrs["out"]
 
 
+def test_scene_test_builds_cuda_persistent_graph_from_depends_on_edges():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "graph": {
+            "tasks": [
+                {"func_id": 1, "a": "a", "b": "b", "out": "tmp0"},
+                {"func_id": 2, "a": "a", "b": "b", "out": "tmp1"},
+                {"func_id": 1, "a": "a", "b": "b", "out": "out", "depends_on": [0, 1]},
+            ]
+        },
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert list(buffers.host_fanin) == [0, 0, 2]
+    assert list(buffers.host_dependents) == [2, 2]
+    assert [(task.func_id, task.dependent_begin, task.dependent_count) for task in buffers.host_tasks] == [
+        (1, 0, 1),
+        (2, 1, 1),
+        (1, 2, 0),
+    ]
+    assert buffers.host_tasks[2].a == buffers.tensor_buffers.ptrs["a"]
+    assert buffers.host_tasks[2].b == buffers.tensor_buffers.ptrs["b"]
+    assert buffers.host_tasks[2].out == buffers.tensor_buffers.ptrs["out"]
+
+
+def test_scene_test_builds_cuda_persistent_graph_from_dependencies_alias():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "graph": {
+            "tasks": [
+                {"func_id": 1, "a": "a", "b": "b", "out": "tmp0"},
+                {"func_id": 2, "a": "a", "b": "b", "out": "tmp1"},
+                {"func_id": 1, "a": "a", "b": "b", "out": "out", "dependencies": [0, 1]},
+            ]
+        },
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert list(buffers.host_fanin) == [0, 0, 2]
+    assert list(buffers.host_dependents) == [2, 2]
+
+
+def test_scene_test_rejects_cuda_persistent_graph_depends_on_out_of_range():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "graph": {
+            "tasks": [
+                {"func_id": 1, "a": "a", "b": "b", "out": "tmp0"},
+                {"func_id": 1, "a": "tmp0", "b": "b", "out": "out", "depends_on": [7]},
+            ]
+        },
+    }
+
+    with pytest.raises(ValueError, match="dependency task id 7 for task 1 is outside the graph"):
+        _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+
 def test_scene_test_builds_cuda_persistent_graph_scalar_task_args():
     test_args = TaskArgsBuilder(
         Tensor("a", _FakeTensor(17)),

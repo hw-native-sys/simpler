@@ -1219,6 +1219,11 @@ task edges from tensor flow: reads bind to the nearest previous producer for
 that tensor name, or to a later producer when the descriptor is intentionally
 out of topological order. Use this form when testing the first step toward
 PTO-style dependency inference while still providing an explicit descriptor.
+Graph tasks may also spell incoming task edges as `depends_on` or
+`dependencies`. Those fields are lowered into the same flattened dependent
+array as explicit outgoing `dependents`, but they do not require the consumer's
+tensor arguments to read producer output buffers. Use this form when checking
+graph construction that is closer to normal task-graph dependency notation.
 Graph tasks whose `out` names are not existing input/output tensors are
 allocated as temporary buffers automatically, so tests only need an explicit
 `temporaries` map when a temporary needs a size different from the output

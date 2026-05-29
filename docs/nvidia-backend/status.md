@@ -1821,6 +1821,11 @@ producer for that tensor name, or to a later producer when the descriptor is
 intentionally out of topological order. The inference is per task, so mixed
 descriptors can keep explicit dependency lists for some tasks while inferring
 omitted edges for the remaining tasks.
+The graph adapter also accepts incoming dependency lists through `depends_on`
+or `dependencies`, lowering consumer-side task IDs into the same flattened
+dependent array. That lets scene tests express graph edges independently from
+the task's tensor pointer layout, which is closer to normal task-graph
+metadata than CUDA-specific outgoing edge lists.
 The graph adapter now accepts a role-keyed `task_args` task form as a first
 TaskArgs-like lowering slice: `input`, `output`, `output_existing`, and
 `inout` roles are lowered to the existing bounded CUDA graph descriptor fields
