@@ -434,6 +434,16 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-root tmp/cuda-backend/scheduler-error-matrix-working
 ```
 
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_validate_scheduler_error_matrix.py \
+    tmp/cuda-backend/scheduler-error-matrix-working/scheduler-error-matrix-35de3303/cuda-scheduler-error-matrix.json \
+    --preset default
+```
+
 Selected rows:
 
 | GPU | Case | DAG shape | Expected | Observed |

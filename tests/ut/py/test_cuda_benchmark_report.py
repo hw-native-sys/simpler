@@ -271,6 +271,22 @@ def _load_lifecycle_matrix_validator_module():
         sys.modules.pop(spec.name, None)
 
 
+def _load_scheduler_error_matrix_validator_module():
+    script_dir = Path(__file__).resolve().parents[3] / ".agents" / "skills" / "cuda-backend-eval" / "scripts"
+    script_path = script_dir / "cuda_validate_scheduler_error_matrix.py"
+    sys.path.insert(0, str(script_dir))
+    try:
+        spec = importlib.util.spec_from_file_location("cuda_validate_scheduler_error_matrix", script_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop("cuda_validate_scheduler_error_matrix", None)
+        sys.path.remove(str(script_dir))
+
+
 def _load_smoke_report_module():
     script_path = (
         Path(__file__).resolve().parents[3]
@@ -434,6 +450,114 @@ def test_cuda_scheduler_error_matrix_runs_with_fake_runner(tmp_path):
     assert (output_dir / "cuda-scheduler-error-matrix.json").exists()
     assert (output_dir / "cuda-scheduler-error-matrix.md").exists()
     assert (output_dir / "cuda-scheduler-error-matrix.svg").exists()
+
+
+def test_cuda_scheduler_error_matrix_validator_accepts_default_matrix(tmp_path):
+    validator = _load_scheduler_error_matrix_validator_module()
+    matrix_dir = tmp_path / "scheduler-error-matrix-abc123"
+    matrix_dir.mkdir()
+    cases = [
+        ("invalid-dispatch", "bad_func_id", 1, 0),
+        ("invalid-dependent", "bad_dependent", 2, 7),
+        ("dependent-range", "bad_dependent_range", 3, 0),
+        ("fanin-underflow", "bad_fanin_underflow", 4, 2),
+        ("duplicate-dependent", "bad_duplicate_dependent", 8, 1),
+        ("self-dependent", "bad_self_dependent", 9, 0),
+        ("initial-fanin", "bad_initial_fanin", 5, 0),
+        ("no-root", "bad_no_root", 6, 0),
+        ("unreachable", "bad_unreachable", 7, 1),
+    ]
+    payload = {
+        "metadata": {
+            "label": "scheduler-error-matrix-abc123",
+            "git_commit": "abc123",
+            "source_papers": [
+                {"id": "arXiv:2605.03190", "path": "tmp/sources/arxiv-2605.03190-vdcores.pdf"},
+                {
+                    "id": "arXiv:2512.22219v1",
+                    "path": "tmp/sources/arxiv-2512.22219v1-mirage-persistent-kernel.pdf",
+                },
+            ],
+            "command_examples": {
+                "local_sample": "python cuda_persistent_smoke.py --dag-shape bad_func_id",
+                "remote_sample": "ssh bizhaoh200 python cuda_persistent_smoke.py --dag-shape bad_func_id",
+            },
+        },
+        "results": [
+            {
+                "machine": machine,
+                "case": case,
+                "dag_shape": dag_shape,
+                "expected_code": code,
+                "expected_task_id": task_id,
+                "observed_code": code,
+                "observed_task_id": task_id,
+                "observed_count": 1,
+                "status": "pass",
+            }
+            for case, dag_shape, code, task_id in cases
+            for machine in ("a100", "h200")
+        ],
+    }
+    (matrix_dir / "cuda-scheduler-error-matrix.json").write_text(json.dumps(payload) + "\n")
+    (matrix_dir / "cuda-scheduler-error-matrix.md").write_text("# CUDA Scheduler Error Matrix\n")
+    (matrix_dir / "cuda-scheduler-error-matrix.svg").write_text("<svg>CUDA scheduler error matrix</svg>\n")
+    source_dir = tmp_path / "tmp" / "sources"
+    source_dir.mkdir(parents=True)
+    (source_dir / "arxiv-2605.03190-vdcores.pdf").write_text("source paper\n")
+    (source_dir / "arxiv-2512.22219v1-mirage-persistent-kernel.pdf").write_text("source paper\n")
+
+    errors = validator.validate_scheduler_error_matrix(
+        payload,
+        artifact_dir=matrix_dir,
+        required_cases=[case for case, _, _, _ in cases],
+        required_machines=["a100", "h200"],
+        require_report_files=True,
+        require_source_papers=True,
+        require_command_examples=True,
+        source_paper_root=tmp_path,
+    )
+
+    assert errors == []
+
+
+def test_cuda_scheduler_error_matrix_validator_reports_contract_errors(tmp_path):
+    validator = _load_scheduler_error_matrix_validator_module()
+    matrix_dir = tmp_path / "scheduler-error-matrix-bad"
+    matrix_dir.mkdir()
+    payload = {
+        "metadata": {"label": "scheduler-error-matrix-bad"},
+        "results": [
+            {
+                "machine": "a100",
+                "case": "self-dependent",
+                "dag_shape": "bad_self_dependent",
+                "expected_code": 9,
+                "expected_task_id": 0,
+                "observed_code": 7,
+                "observed_task_id": 1,
+                "observed_count": 0,
+                "status": "pass",
+            }
+        ],
+    }
+
+    errors = validator.validate_scheduler_error_matrix(
+        payload,
+        artifact_dir=matrix_dir,
+        required_cases=["self-dependent"],
+        required_machines=["a100", "h200"],
+        require_report_files=True,
+        require_source_papers=True,
+        require_command_examples=True,
+    )
+
+    assert "missing machine h200" in errors
+    assert "missing report file cuda-scheduler-error-matrix.md" in errors
+    assert "missing metadata.source_papers arXiv:2605.03190" in errors
+    assert "missing metadata.command_examples.local_sample" in errors
+    assert any("expected code=9(self_dependent) task=0" in error for error in errors)
+    assert any("observed code=7(unreachable_task) task=1 count=0" in error for error in errors)
 
 
 def test_persistent_smoke_builds_graph_descriptor_dag_shape():

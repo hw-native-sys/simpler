@@ -1053,6 +1053,10 @@ range, fan-in underflow, duplicate dependent, self dependent, initial fan-in
 mismatch, no root, and unreachable task. Every row reported `status=pass`
 with the expected scheduler code, task ID, and `count=1`.
 
+The matrix also passes the scheduler-error matrix validator with
+`--preset default`, which checks the required cases, A100/H200 coverage,
+source-paper provenance, command examples, and generated report files.
+
 The current unreachable-task slice was also checked on H200 through pytest
 after syncing the working tree:
 

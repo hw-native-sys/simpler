@@ -967,6 +967,18 @@ unsupported `func_id`, invalid dependent ID, invalid dependent range,
 fan-in underflow, duplicate dependent, self dependent, initial fan-in
 mismatch, no root, and unreachable task.
 
+Validate the captured matrix contract with the dedicated checker. The default
+preset requires A100/H200 coverage for all nine diagnostics, source-paper
+provenance under `tmp/sources/`, command examples, and Markdown/SVG reports:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_validate_scheduler_error_matrix.py \
+    tmp/cuda-backend/scheduler-error-matrix-working/scheduler-error-matrix-35de3303/cuda-scheduler-error-matrix.json \
+    --preset default
+```
+
 Run the five-task persistent DAG-chain smoke, which reuses the same generated
 dispatch PTX but passes a different runtime task graph:
 

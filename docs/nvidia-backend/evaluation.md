@@ -71,7 +71,8 @@ latest multi-size tensor baseline sweep uses `e79edba2`:
   prepared-callable validation path.
 - [Current capture](evaluation-current.md) records the `35de3303` scheduler
   error matrix that captures all synthetic malformed-DAG diagnostics on A100
-  and H200 with JSON, Markdown, and SVG artifacts.
+  and H200 with JSON, Markdown, and SVG artifacts validated by
+  `cuda_validate_scheduler_error_matrix.py --preset default`.
 - [Historical captures](evaluation-history.md) preserve the previous
   accumulated benchmark notes, including earlier graph, stream, task-count,
   worker-grid, DAG-chain, scratch-reuse, and tensor-tile captures.
