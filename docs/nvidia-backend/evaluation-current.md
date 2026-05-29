@@ -1,15 +1,15 @@
 # CUDA Current Evaluation Capture
 
 This page summarizes the latest full paired A100/H200 CUDA backend capture
-from commit `5424bcca`, plus compact current-head validation captures. The
+from commit `f99dc6b0`, plus compact current-head validation captures. The
 full current-head capture is under
-`tmp/cuda-backend/current-head-full-named-callable-working/`
-`combined-current-5424bcca/`.
+`tmp/cuda-backend/current-head-full-role-map-working/`
+`combined-current-f99dc6b0/`.
 The latest compact current-head gate remains the capture under
-`tmp/cuda-backend/persistent-named-callable-baseline-working/`
-`combined-current-95be2b5b/`, which validates the selected compact benchmark
-matrix after named-callable graph descriptors joined the selected graph-node
-rows.
+`tmp/cuda-backend/role-map-selected-benchmark-working/`
+`combined-current-a3c09113/`, which validates the selected compact benchmark
+matrix after role-map graph task-argument metadata joined the selected
+graph-node rows.
 The raw
 JSON, Markdown, and SVG reports are generated locally under
 `tmp/cuda-backend/` and intentionally remain uncommitted.
@@ -23,18 +23,16 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - repeats: `3`
 - batch tasks: `2,6,12`
 - worker blocks per task: `32,64,128,256`
-- samples in combined JSON: `1242` in the latest full capture; new full
-  captures should validate `1260` after the role-map graph row joined the
-  selected matrix
+- samples in combined JSON: `1260`
 
-The latest full capture validated `1242` samples after the named-callable
-graph row joined the selected matrix. The current paired-current validator
-expects `1260` samples after the role-map graph row joined the selected
-matrix.
+The latest full capture validated `1260` samples after the role-map graph
+row joined the selected matrix. The previous `5424bcca` full capture remains
+useful as historical evidence, but it validated `1242` samples before that
+row was included.
 The older `9ec5511e` full capture remains useful as historical evidence, but
-it validated `1224` samples before that row was included. The older
-`cb300e82` full capture validated `1206` samples before the node-link graph
-row joined the selected matrix.
+it validated `1224` samples before the named-callable graph row was included.
+The older `cb300e82` full capture validated `1206` samples before the
+node-link graph row joined the selected matrix.
 
 ## Artifact Paths
 
@@ -46,16 +44,24 @@ row joined the selected matrix.
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark.svg`
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark-ratios.svg`
-- `tmp/cuda-backend/current-head-full-named-callable-working/a100-current-5424bcca/cuda-benchmark.json`
-- `tmp/cuda-backend/current-head-full-named-callable-working/a100-current-5424bcca/cuda-benchmark.md`
-- `tmp/cuda-backend/current-head-full-named-callable-working/h200-current-5424bcca/cuda-benchmark.json`
-- `tmp/cuda-backend/current-head-full-named-callable-working/h200-current-5424bcca/cuda-benchmark.md`
-- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark.json`
-- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark.md`
-- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark.svg`
-- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark-ratios.svg`
-- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark-dag-deltas.svg`
-- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark-throughput.svg`
+- `tmp/cuda-backend/current-head-full-role-map-working/a100-current-f99dc6b0/cuda-benchmark.json`
+- `tmp/cuda-backend/current-head-full-role-map-working/a100-current-f99dc6b0/cuda-benchmark.md`
+- `tmp/cuda-backend/current-head-full-role-map-working/h200-current-f99dc6b0/cuda-benchmark.json`
+- `tmp/cuda-backend/current-head-full-role-map-working/h200-current-f99dc6b0/cuda-benchmark.md`
+- `tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark.json`
+- `tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark.md`
+- `tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark.svg`
+- `tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark-throughput.svg`
+- `tmp/cuda-backend/role-map-selected-benchmark-working/a100-current-a3c09113/cuda-benchmark.json`
+- `tmp/cuda-backend/role-map-selected-benchmark-working/h200-current-a3c09113/cuda-benchmark.json`
+- `tmp/cuda-backend/role-map-selected-benchmark-working/combined-current-a3c09113/cuda-benchmark.json`
+- `tmp/cuda-backend/role-map-selected-benchmark-working/combined-current-a3c09113/cuda-benchmark.md`
+- `tmp/cuda-backend/role-map-selected-benchmark-working/combined-current-a3c09113/cuda-benchmark.svg`
+- `tmp/cuda-backend/role-map-selected-benchmark-working/combined-current-a3c09113/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/role-map-selected-benchmark-working/combined-current-a3c09113/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/role-map-selected-benchmark-working/combined-current-a3c09113/cuda-benchmark-throughput.svg`
 - `tmp/cuda-backend/persistent-named-callable-baseline-working/a100-current-95be2b5b/cuda-benchmark.json`
 - `tmp/cuda-backend/persistent-named-callable-baseline-working/h200-current-95be2b5b/cuda-benchmark.json`
 - `tmp/cuda-backend/persistent-named-callable-baseline-working/combined-current-95be2b5b/cuda-benchmark.json`
@@ -351,12 +357,12 @@ row joined the selected matrix.
 
 ## Latest Full Current-Head Capture
 
-The full paired capture at artifact label `5424bcca` refreshes the broad
+The full paired capture at artifact label `f99dc6b0` refreshes the broad
 A100/H200 benchmark matrix on the current branch head. It uses `compute_80`
 on A100, `compute_90` on H200, the default `16x16x16` tensor descriptor,
 three vector sizes, three repeats, same-work task counts `2,6,12`, and worker
 grid values `32,64,128,256`. This is the first full three-size capture after
-`pto_persistent_dag_graph_named_callable` joined the selected benchmark
+`pto_persistent_dag_graph_role_map_inout` joined the selected benchmark
 matrix.
 
 Validation command:
@@ -364,7 +370,7 @@ Validation command:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark.json \
+    tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark.json \
     --preset paired-current
 ```
 
@@ -372,20 +378,19 @@ The paired runner generated this validator with explicit required baselines,
 generated-dispatch IDs, tensor descriptors, graph fan-in/dependent arrays,
 TaskArgs-like graph metadata, graph node attrs/ops, named-callable metadata,
 scratch-reuse metadata, and tensor/core/cuBLAS report requirements. It
-accepted the combined JSON, Markdown, and SVG artifacts with `1242` samples
-before the role-map graph row joined the selected matrix. New full captures
-should use the `paired-current` preset and validate `1260` samples.
+accepted the combined JSON, Markdown, and SVG artifacts with `1260` samples
+after the role-map graph row joined the selected matrix.
 
 Launch baseline comparison from the same raw JSON:
 
 | GPU | N | PTO host ns | Compiler ns | Driver ns | Graph ns | Compiler/PTO | Graph/PTO |
 | --- | - | ----------- | ----------- | --------- | -------- | ------------ | --------- |
-| A100 | 1024 | 43008 | 41984 | 38911 | 25599 | 0.98x | 0.60x |
-| A100 | 65536 | 33760 | 34368 | 41855 | 27456 | 1.02x | 0.81x |
-| A100 | 1048576 | 27488 | 24352 | 28031 | 23967 | 0.89x | 0.87x |
-| H200 | 1024 | 29760 | 30688 | 21759 | 16960 | 1.03x | 0.57x |
-| H200 | 65536 | 15136 | 16800 | 24895 | 19104 | 1.11x | 1.26x |
-| H200 | 1048576 | 21280 | 22112 | 29087 | 19455 | 1.04x | 0.91x |
+| A100 | 1024 | 43008 | 43008 | 40959 | 25599 | 1.00x | 0.60x |
+| A100 | 65536 | 29696 | 29824 | 43807 | 28319 | 1.00x | 0.95x |
+| A100 | 1048576 | 26848 | 24352 | 27359 | 23072 | 0.91x | 0.86x |
+| H200 | 1024 | 30080 | 29952 | 26367 | 18624 | 1.00x | 0.62x |
+| H200 | 65536 | 13472 | 18624 | 25312 | 16992 | 1.38x | 1.26x |
+| H200 | 1048576 | 20928 | 23520 | 29055 | 22719 | 1.12x | 1.09x |
 
 Selected tensor throughput from the same raw JSON:
 
@@ -1890,17 +1895,17 @@ and `block_dim=256`. The row validates graph task args
 `task2=callable:add,input:a,input:b,output:out` and graph-node ops
 `task0=op:add=1;task1=op:mul=2;task2=op:add=1`.
 
-The full `5424bcca` capture validates the same named-callable row across all
+The full `f99dc6b0` capture validates the same named-callable row across all
 three paired-current sizes. Median device times were:
 
 | GPU | N | Named-callable ns | Node-link ns | Raw DAG ns |
 | --- | - | ----------------- | ------------ | ---------- |
-| A100 | 1024 | 28672 | 32768 | 29696 |
-| A100 | 65536 | 135616 | 135968 | 152288 |
-| A100 | 1048576 | 2411424 | 2387264 | 2414784 |
-| H200 | 1024 | 26112 | 26176 | 37280 |
-| H200 | 65536 | 134496 | 132832 | 133600 |
-| H200 | 1048576 | 1907872 | 1889408 | 1908928 |
+| A100 | 1024 | 28672 | 28672 | 28672 |
+| A100 | 65536 | 134976 | 137280 | 172096 |
+| A100 | 1048576 | 2378272 | 2414592 | 2640352 |
+| H200 | 1024 | 27072 | 26784 | 28320 |
+| H200 | 65536 | 132864 | 132544 | 150304 |
+| H200 | 1048576 | 1906528 | 1891776 | 1898976 |
 
 ## Supplemental Reordered Graph-Descriptor Smoke
 
@@ -2541,13 +2546,36 @@ not GEMM throughput.
 
 ## Current Role-Map Graph Row
 
-The compact selected-matrix capture under
-`tmp/cuda-backend/role-map-selected-benchmark-working/`
-`combined-current-a3c09113/` adds
-`pto_persistent_dag_graph_role_map_inout` to the benchmark, paired runner, and
-compact/full validator presets. The row uses the same three-task in-place
+The full paired-current capture under
+`tmp/cuda-backend/current-head-full-role-map-working/`
+`combined-current-f99dc6b0/` adds
+`pto_persistent_dag_graph_role_map_inout` to the full benchmark, paired
+runner, and validator presets. The row uses the same three-task in-place
 descriptor as the tag/role/compact/pair spellings, but the graph task
 argument metadata is keyed as `role_map`.
+
+The full A100/H200 gate validates `1260` rows across the three-size matrix,
+three repeats, source-paper provenance, command examples, Markdown/SVG
+reports, graph topology/task-argument metadata, tensor-throughput rows, and
+zero scheduler errors. The role-map row specifically validates dispatch
+`1,1,1`, graph fan-in `0,1,1`, dependents `1,2`, and
+`graph_task_arg_key=role_map`.
+
+| Machine | Device ns | Host ns |
+| ------- | --------- | ------- |
+| A100 | 32768 | 47129 |
+| H200 | 28960 | 37615 |
+
+Role-spelling medians at `N=1024` from the same full capture were:
+
+| Machine | Tagged | Role-keyed | Compact | Pair | Role-map |
+| ------- | ------ | ---------- | ------- | ---- | -------- |
+| A100 | 31744 | 32768 | 31744 | 32768 | 32768 |
+| H200 | 29248 | 28512 | 28864 | 28064 | 28960 |
+
+The earlier compact selected-matrix capture under
+`tmp/cuda-backend/role-map-selected-benchmark-working/`
+`combined-current-a3c09113/` remains useful as the focused selector gate.
 
 The compact A100/H200 gate validates `98` non-batch rows at size `1024`, one
 repeat, source-paper provenance, command examples, Markdown/SVG reports, graph

@@ -1937,18 +1937,19 @@ Use `--dry-run` to print the commands without launching benchmarks. The paired
 benchmark default tensor descriptor is `16x16x16` so the scalar tensor DAG,
 explicit graph tensor DAG, WMMA tensor-core DAG, and cuBLAS rows can run
 together. The current committed summary keeps the full current-head
-`5424bcca` capture plus compact current-head gates in
+`f99dc6b0` capture plus compact current-head gates in
 `docs/nvidia-backend/evaluation-current.md`.
 The full current-head artifact under
-`tmp/cuda-backend/current-head-full-named-callable-working/`
-`combined-current-5424bcca/` validated `1242` historical A100/H200 samples
-after the named-callable graph row joined the selected matrix. New full
-captures should validate `1260` samples with sizes `1024,65536,1048576`,
-three repeats, tensor descriptor `16x16x16`, task counts `2,6,12`,
-worker-grid values `32,64,128,256`, source-paper provenance, sanitized
-command examples, graph topology and TaskArgs metadata reports,
-tensor-throughput reports, generated node-link, named-callable, and role-map
-graph metadata, and zero scheduler errors.
+`tmp/cuda-backend/current-head-full-role-map-working/`
+`combined-current-f99dc6b0/` validated `1260` A100/H200 samples after the
+role-map graph row joined the selected matrix. Full captures should validate
+`1260` samples with sizes `1024,65536,1048576`, three repeats, tensor
+descriptor `16x16x16`, task counts `2,6,12`, worker-grid values
+`32,64,128,256`, source-paper provenance, sanitized command examples, graph
+topology and TaskArgs metadata reports, tensor-throughput reports, generated
+node-link, named-callable, role-map graph metadata, and zero scheduler errors.
+The role-map row must report dispatch `1,1,1`, fan-in `0,1,1`, dependents
+`1,2`, and `graph_task_arg_key=role_map`.
 
 Run the full paired-current gate with:
 
@@ -1956,7 +1957,7 @@ Run the full paired-current gate with:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
     --sync-remote-tree \
-    --output-root tmp/cuda-backend/current-head-full-named-callable-working
+    --output-root tmp/cuda-backend/current-head-full-role-map-working
 ```
 
 Use this compact paired gate after changing selected persistent graph

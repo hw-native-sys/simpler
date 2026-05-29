@@ -340,12 +340,11 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest full paired capture at commit `5424bcca` uses the `16x16x16`
+The latest full paired capture at commit `f99dc6b0` uses the `16x16x16`
 tensor descriptor, sizes `1024,65536,1048576`, three repeats, task counts
 `2,6,12`, and worker-grid values `32,64,128,256`. It writes artifacts under
-`tmp/cuda-backend/current-head-full-named-callable-working/`
-`combined-current-5424bcca/` and validates `1242` historical combined samples.
-New full paired captures should validate `1260` combined samples after the
+`tmp/cuda-backend/current-head-full-role-map-working/`
+`combined-current-f99dc6b0/` and validates `1260` combined samples after the
 role-map graph row joined the selected matrix. The paired-runner validator
 checked
 source-paper provenance, sanitized command examples, generated Markdown/SVG
@@ -4571,11 +4570,11 @@ errors. The named-callable benchmark rows were:
   `named_callable`, `25728 ns`.
 
 The refreshed full paired-current capture under
-`tmp/cuda-backend/current-head-full-named-callable-working/`
-`combined-current-5424bcca/` validates the same selected row across
+`tmp/cuda-backend/current-head-full-role-map-working/`
+`combined-current-f99dc6b0/` validates the same selected row across
 `N=1024,65536,1048576` with zero scheduler errors. Median named-callable
-device times were `28672/135616/2411424 ns` on A100 and
-`26112/134496/1907872 ns` on H200 for those sizes.
+device times were `28672/134976/2378272 ns` on A100 and
+`27072/132864/1906528 ns` on H200 for those sizes.
 
 Needed:
 
@@ -4658,8 +4657,14 @@ matrix, not only the paired smoke path. The focused TDD first failed because
 `cuda_benchmark.py` rejected
 `pto_persistent_dag_graph_role_map_inout`, and the paired/compact validators
 did not require that row or its graph metadata. After adding the benchmark
-row, the focused selector reported `7 passed, 292 deselected`. The compact
-paired A100/H200 gate under
+row, the focused selector reported `7 passed, 292 deselected`. The full
+paired-current gate under
+`tmp/cuda-backend/current-head-full-role-map-working/`
+`combined-current-f99dc6b0/` validated `1260` samples. At `N=1024`, role
+spelling medians were tag/role/compact/pair/role-map
+`31744/32768/31744/32768/32768 ns` on A100 and
+`29248/28512/28864/28064/28960 ns` on H200. The compact paired A100/H200
+gate under
 `tmp/cuda-backend/role-map-selected-benchmark-working/`
 `combined-current-a3c09113/` validated `98` non-batch samples with source
 paper provenance, sanitized reconstruction commands, Markdown/SVG reports,
