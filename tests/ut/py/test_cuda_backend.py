@@ -988,6 +988,42 @@ else:
 
 
 @requires_cuda
+def test_cuda_persistent_device_smoke_reports_self_dependent_errors():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+try:
+    run_persistent_smoke(
+        device=0,
+        task_count=1,
+        n=1024,
+        arch="compute_80",
+        mode="dag",
+        queue_capacity=1,
+        dag_shape="bad_self_dependent",
+    )
+except RuntimeError as exc:
+    message = str(exc)
+    assert "persistent dag scheduler error" in message
+    assert "code=9" in message
+    assert "task_id=0" in message
+else:
+    raise AssertionError("expected persistent DAG self-dependent scheduler error")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+@requires_cuda
 def test_cuda_persistent_device_smoke_reports_initial_fanin_mismatch_errors():
     script = """
 import sys

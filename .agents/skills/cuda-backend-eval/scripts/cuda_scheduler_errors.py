@@ -23,6 +23,7 @@ SCHEDULER_ERROR_NAMES = {
     6: "no_root_task",
     7: "unreachable_task",
     8: "duplicate_dependent",
+    9: "self_dependent",
 }
 
 

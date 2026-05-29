@@ -350,6 +350,8 @@ def test_render_persistent_dag_source_records_device_scheduler_errors():
     assert "pto_dag_record_error(state, 3U, task_id);" in source
     assert "static_cast<unsigned long long>(dependent_id) >= state->task_count" in source
     assert "pto_dag_record_error(state, 2U, dependent_id);" in source
+    assert "dependent_id == task_id" in source
+    assert "pto_dag_record_error(state, 9U, dependent_id);" in source
     assert "if (old == 0U)" in source
     assert "pto_dag_record_error(state, 4U, dependent_id);" in source
     assert "state->fanin[idx] != state->tasks[idx].initial_fanin" in source

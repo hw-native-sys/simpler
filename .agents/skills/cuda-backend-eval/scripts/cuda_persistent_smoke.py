@@ -2032,6 +2032,27 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                 ),
             ),
         )
+    if dag_shape == "bad_self_dependent":
+        task_count = 1
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 1
+        task_t = CudaPersistentDagTask * task_count
+        return (
+            host_fanin_t(0),
+            dependents_t(0),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=1,
+                    initial_fanin=0,
+                )
+            ),
+        )
     if dag_shape == "bad_initial_fanin":
         task_count = 1
         host_fanin_t = ctypes.c_uint32 * task_count
@@ -2849,6 +2870,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "bad_func_id",
         "bad_initial_fanin",
         "bad_no_root",
+        "bad_self_dependent",
         "bad_unreachable",
         "chain",
         "fork_join",
@@ -3135,6 +3157,7 @@ def main() -> None:
             "bad_func_id",
             "bad_initial_fanin",
             "bad_no_root",
+            "bad_self_dependent",
             "bad_unreachable",
             "chain",
             "fork_join",

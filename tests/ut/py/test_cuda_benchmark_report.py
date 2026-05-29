@@ -335,6 +335,7 @@ def test_cuda_scheduler_error_label_contract_is_shared():
 
     assert cuda_scheduler_errors.scheduler_error_code_label(0) == "0"
     assert cuda_scheduler_errors.scheduler_error_code_label(7) == "7(unreachable_task)"
+    assert cuda_scheduler_errors.scheduler_error_code_label(9) == "9(self_dependent)"
     assert cuda_scheduler_errors.scheduler_error_code_label(99) == "99"
     assert cuda_scheduler_errors.scheduler_error_code_label("pending") == "pending"
 

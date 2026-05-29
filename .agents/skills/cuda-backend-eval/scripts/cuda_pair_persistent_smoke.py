@@ -525,6 +525,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "bad_func_id",
             "bad_initial_fanin",
             "bad_no_root",
+            "bad_self_dependent",
             "chain",
             "fork_join",
             "generic_args",
