@@ -583,7 +583,8 @@ Evidence:
 - `.agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py` checks
   paired smoke captures for required A100/H200 artifacts, pass status, zero
   scheduler errors, expected runtime/mode, dispatch IDs, repeat-run lifecycle
-  counts, tensor-tile descriptor shape, and generated smoke report files.
+  counts, tensor-tile descriptor shape, generated smoke report files, and
+  visible report graph topology when requested.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_artifact_index.py` indexes
   local `tmp/cuda-backend/` benchmark, tensor-shape sweep, lifecycle matrix,
   and smoke artifacts, including tensor-tile shapes, persistent smoke modes,

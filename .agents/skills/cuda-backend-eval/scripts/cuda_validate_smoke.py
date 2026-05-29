@@ -66,6 +66,7 @@ class SmokeValidationExpectation:
     scratch_reuse: str | None = None
     resource_policy: ResourcePolicyExpectation | None = None
     require_report_files: bool = False
+    require_report_graph_topology: bool = False
 
 
 def _artifact_label(path: Path) -> str:
@@ -339,6 +340,41 @@ def _validate_report_files(artifact_dir: Path | None) -> list[str]:
     return [f"missing report file {file_name}" for file_name in REPORT_FILES if not (artifact_dir / file_name).exists()]
 
 
+def _validate_report_graph_topology(
+    artifact_dir: Path | None,
+    *,
+    expected_fanin: str | None,
+    expected_dependents: str | None,
+) -> list[str]:
+    if artifact_dir is None:
+        return ["missing artifact directory for report graph topology validation"]
+
+    checks = {
+        "cuda-smoke-report.md": [
+            "Graph fan-in",
+            "Graph dependents",
+            f"`{expected_fanin}`" if expected_fanin is not None else None,
+            f"`{expected_dependents}`" if expected_dependents is not None else None,
+        ],
+        "cuda-smoke-report.svg": [
+            "graph:",
+            f"fanin={expected_fanin}" if expected_fanin is not None else None,
+            f"dependents={expected_dependents}" if expected_dependents is not None else None,
+        ],
+    }
+
+    errors: list[str] = []
+    for file_name, needles in checks.items():
+        path = artifact_dir / file_name
+        if not path.exists():
+            errors.append(f"missing report graph topology in {file_name}")
+            continue
+        content = path.read_text()
+        if any(needle is not None and needle not in content for needle in needles):
+            errors.append(f"missing report graph topology in {file_name}")
+    return errors
+
+
 def validate_smoke(
     payloads: list[dict[str, Any]],
     *,
@@ -385,6 +421,14 @@ def validate_smoke(
     )
     if expectation.require_report_files:
         errors.extend(_validate_report_files(expectation.artifact_dir))
+    if expectation.require_report_graph_topology:
+        errors.extend(
+            _validate_report_graph_topology(
+                expectation.artifact_dir,
+                expected_fanin=expectation.graph_fanin,
+                expected_dependents=expectation.graph_dependents,
+            )
+        )
     return errors
 
 
@@ -411,6 +455,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-block-dim", type=int)
     parser.add_argument("--expected-grid-dim", type=int)
     parser.add_argument("--require-report-files", action="store_true")
+    parser.add_argument("--require-report-graph-topology", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -448,6 +493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scratch_reuse=args.expected_scratch_reuse,
             resource_policy=_resource_policy_expectation(args),
             require_report_files=args.require_report_files,
+            require_report_graph_topology=args.require_report_graph_topology,
         ),
     )
     if errors:

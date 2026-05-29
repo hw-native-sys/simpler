@@ -338,7 +338,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --expected-dag-shape graph_descriptor --expected-repeat-runs 2 \
     --expected-completed-count 3 --expected-dispatch 9,2,1 \
     --expected-graph-fanin 0,0,2 --expected-graph-dependents 2,2 \
-    --require-report-files
+    --require-report-files --require-report-graph-topology
 ```
 
 For tensor-tile smokes, add `--expected-tensor-tile ROWSxCOLSxINNER` to
@@ -348,4 +348,6 @@ passes `--expected-dispatch` for the requested DAG shape so a numerically
 passing artifact must still prove the expected device task sequence.
 For explicit graph-descriptor smokes, it also passes
 `--expected-graph-fanin` and `--expected-graph-dependents` so the JSON payloads
-must prove the expected runtime graph topology.
+must prove the expected runtime graph topology. It also passes
+`--require-report-graph-topology` so the Markdown and SVG smoke reports cannot
+silently lag behind the JSON topology metadata.

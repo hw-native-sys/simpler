@@ -427,7 +427,15 @@ def build_validate_command(config: PairedPersistentSmokeConfig, suffix: str) -> 
     expected_graph_descriptor = _expected_graph_descriptor(config)
     if expected_graph_descriptor is not None:
         fanin, dependents = expected_graph_descriptor
-        command.extend(["--expected-graph-fanin", fanin, "--expected-graph-dependents", dependents])
+        command.extend(
+            [
+                "--expected-graph-fanin",
+                fanin,
+                "--expected-graph-dependents",
+                dependents,
+                "--require-report-graph-topology",
+            ]
+        )
     expected_graph_task_args = _expected_graph_task_args(config)
     if expected_graph_task_args is not None:
         command.extend(["--expected-graph-task-args", expected_graph_task_args])

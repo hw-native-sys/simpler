@@ -2360,6 +2360,66 @@ def test_cuda_smoke_validator_checks_graph_descriptor_metadata(tmp_path):
     assert "expected graph_descriptor.dependents 2,3,4 for artifact=a100, found 2,3,2,3,4,4" in errors
 
 
+def test_cuda_smoke_validator_requires_graph_topology_in_reports(tmp_path):
+    cuda_validate_smoke = _load_smoke_validator_module()
+    artifact_dir = tmp_path / "persistent-graph-descriptor-smoke"
+    artifact_dir.mkdir()
+    payload = {
+        "status": "pass",
+        "runtime": "persistent_device",
+        "mode": "dag",
+        "dag_shape": "graph_descriptor",
+        "n": 1024,
+        "repeat_runs": 2,
+        "launch_completed_counts": [3, 3],
+        "dispatch_func_ids": [9, 2, 1],
+        "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+        "graph_descriptor": {
+            "tasks": 3,
+            "fanin": [0, 0, 2],
+            "dependents": [2, 2],
+        },
+    }
+    (artifact_dir / "a100.json").write_text(json.dumps(payload) + "\n")
+    (artifact_dir / "h200.json").write_text(json.dumps(payload) + "\n")
+    (artifact_dir / "cuda-smoke-report.md").write_text("# CUDA Smoke Report\n\nstale table\n")
+    (artifact_dir / "cuda-smoke-report.svg").write_text("<svg>stale chart</svg>\n")
+
+    payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json", artifact_dir / "h200.json"])
+    errors = cuda_validate_smoke.validate_smoke(
+        payloads,
+        expectation=cuda_validate_smoke.SmokeValidationExpectation(
+            artifact_dir=artifact_dir,
+            graph_fanin="0,0,2",
+            graph_dependents="2,2",
+            require_report_files=True,
+            require_report_graph_topology=True,
+        ),
+    )
+
+    assert "missing report graph topology in cuda-smoke-report.md" in errors
+    assert "missing report graph topology in cuda-smoke-report.svg" in errors
+
+    (artifact_dir / "cuda-smoke-report.md").write_text(
+        "| Dispatch | Graph fan-in | Graph dependents |\n| `9,2,1` | `0,0,2` | `2,2` |\n"
+    )
+    (artifact_dir / "cuda-smoke-report.svg").write_text("<svg>graph: fanin=0,0,2,dependents=2,2</svg>\n")
+
+    assert (
+        cuda_validate_smoke.validate_smoke(
+            payloads,
+            expectation=cuda_validate_smoke.SmokeValidationExpectation(
+                artifact_dir=artifact_dir,
+                graph_fanin="0,0,2",
+                graph_dependents="2,2",
+                require_report_files=True,
+                require_report_graph_topology=True,
+            ),
+        )
+        == []
+    )
+
+
 def test_cuda_smoke_validator_checks_graph_task_args_metadata(tmp_path):
     cuda_validate_smoke = _load_smoke_validator_module()
     artifact_dir = tmp_path / "persistent-graph-descriptor-tagged-smoke"
@@ -3883,6 +3943,7 @@ def test_cuda_pair_persistent_smoke_builds_graph_tensor_core_tile_workflow(tmp_p
     assert "0,1,1,2" in validate
     assert "--expected-graph-dependents" in validate
     assert "1,2,3,3" in validate
+    assert "--require-report-graph-topology" in validate
     assert "persistent-graph_tensor_core_tile-16x16x16-smoke-abc123" in report
 
 
@@ -4268,6 +4329,7 @@ def test_cuda_pair_persistent_smoke_accepts_tagged_graph_descriptor_workflow(tmp
     assert "0,0,2" in validate
     assert "--expected-graph-dependents" in validate
     assert "2,2" in validate
+    assert "--require-report-graph-topology" in validate
     assert "--expected-graph-task-args" in validate
     assert "task0=input:a,input:b,output:tmp1,scalar:scalar_args[0],scalar:scalar_args[1]" in " ".join(validate)
     assert "task2=input:tmp1,input:tmp2,output_existing:out" in " ".join(validate)
@@ -4310,6 +4372,7 @@ def test_cuda_pair_persistent_smoke_accepts_tagged_inout_graph_descriptor_workfl
     assert "0,1,1" in validate
     assert "--expected-graph-dependents" in validate
     assert "1,2" in validate
+    assert "--require-report-graph-topology" in validate
     assert "--expected-graph-task-args" in validate
     assert "task1=inout:tmp1,input:b" in " ".join(validate)
 
@@ -4351,6 +4414,7 @@ def test_cuda_pair_persistent_smoke_accepts_role_keyed_inout_graph_descriptor_wo
     assert "0,1,1" in validate
     assert "--expected-graph-dependents" in validate
     assert "1,2" in validate
+    assert "--require-report-graph-topology" in validate
     assert "--expected-graph-task-arg-key" in validate
     assert "role" in validate
     assert "--expected-graph-task-args" in validate

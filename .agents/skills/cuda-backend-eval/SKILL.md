@@ -543,7 +543,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --expected-scheduler-blocks 1 --expected-worker-blocks 3 \
     --expected-worker-blocks-per-task 1 --expected-stream-id 0 \
     --expected-block-dim 256 --expected-grid-dim 4 \
-    --require-report-files
+    --require-report-files --require-report-graph-topology
 ```
 
 For generated-dispatch DAG shapes, the paired runner passes
@@ -566,7 +566,9 @@ whose recorded descriptor shape does not match the requested
 For explicit graph-descriptor smokes, it also passes
 `--expected-graph-fanin` and `--expected-graph-dependents`, so reordered,
 diamond, scratch-reuse, and graph tensor captures must prove the recorded
-runtime graph topology.
+runtime graph topology. It also passes `--require-report-graph-topology`, so
+the Markdown and SVG smoke reports must visibly carry the same fan-in and
+dependent arrays.
 For `graph_descriptor_tagged` and `graph_descriptor_tagged_inout`, it
 additionally passes `--expected-graph-task-args`, so tagged graph captures
 must prove the TaskArgs-like roles that were lowered into the runtime
@@ -2011,7 +2013,8 @@ Use `cuda_validate_smoke.py` for paired smoke artifacts. It checks required
 artifacts, pass status, zero device scheduler errors, expected runtime/mode,
 dispatch IDs, repeat-run lifecycle counts, tensor-tile descriptor shape when
 requested, graph-descriptor fan-in/dependent metadata when requested,
-`graph_task_args` metadata when requested, and generated smoke report files.
+`graph_task_args` metadata when requested, generated smoke report files, and
+visible report graph topology when requested.
 `cuda_pair_persistent_smoke.py` runs this validator automatically unless
 `--skip-validation` is set.
 
