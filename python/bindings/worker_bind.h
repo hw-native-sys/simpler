@@ -29,6 +29,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 #include "ring.h"
@@ -38,6 +39,51 @@
 #include "worker_manager.h"
 
 namespace nb = nanobind;
+
+inline CallableKind parse_callable_kind(const std::string &kind) {
+    if (kind == "CHIP_CALLABLE") return CallableKind::CHIP_CALLABLE;
+    if (kind == "PYTHON_SERIALIZED") return CallableKind::PYTHON_SERIALIZED;
+    throw std::invalid_argument("CALLABLE_KIND_UNSUPPORTED: " + kind);
+}
+
+inline TargetNamespace parse_target_namespace(const std::string &target_namespace) {
+    if (target_namespace == "LOCAL_CHIP") return TargetNamespace::LOCAL_CHIP;
+    if (target_namespace == "LOCAL_PYTHON") return TargetNamespace::LOCAL_PYTHON;
+    throw std::invalid_argument("unsupported callable target namespace: " + target_namespace);
+}
+
+inline CallableIdentity make_callable_identity(nb::bytes digest, const std::string &kind, const std::string &target_namespace) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(digest.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
+        throw nb::python_error();
+    }
+    auto release = [&]() {
+        PyBuffer_Release(&view);
+    };
+    if (static_cast<size_t>(view.len) != CALLABLE_HASH_DIGEST_SIZE) {
+        release();
+        throw std::invalid_argument("callable digest must be exactly 32 bytes");
+    }
+    CallableIdentity out;
+    std::memcpy(out.digest.data(), view.buf, CALLABLE_HASH_DIGEST_SIZE);
+    release();
+    out.kind = parse_callable_kind(kind);
+    out.target_namespace = parse_target_namespace(target_namespace);
+    return out;
+}
+
+inline std::string bytes_from_digest_arg(nb::object digest) {
+    Py_buffer view;
+    if (PyObject_GetBuffer(digest.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
+        throw nb::python_error();
+    }
+    std::string out(static_cast<const char *>(view.buf), static_cast<size_t>(view.len));
+    PyBuffer_Release(&view);
+    if (out.size() != CALLABLE_HASH_DIGEST_SIZE) {
+        throw std::invalid_argument("callable digest must be exactly 32 bytes");
+    }
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // Mailbox acquire/release helpers (exposed to Python as _mailbox_load_i32 /
@@ -104,37 +150,44 @@ inline void bind_worker(nb::module_ &m) {
     nb::class_<Orchestrator>(m, "_Orchestrator")
         .def(
             "submit_next_level",
-            [](Orchestrator &self, int32_t callable_id, const TaskArgs &args, const CallConfig &config, int8_t worker) {
-                return self.submit_next_level(callable_id, args, config, worker);
+            [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
+               const TaskArgs &args, const CallConfig &config, int8_t worker) {
+                return self.submit_next_level(make_callable_identity(digest, kind, target_namespace), args, config, worker);
             },
-            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("worker") = int8_t(-1),
-            "Submit a NEXT_LEVEL (chip) task by registered callable id. "
+            nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args"), nb::arg("config"),
+            nb::arg("worker") = int8_t(-1),
+            "Submit a NEXT_LEVEL task by registered callable digest. "
             "worker= pins to a specific next-level worker (-1 = any)."
         )
         .def(
             "submit_next_level_group",
-            [](Orchestrator &self, int32_t callable_id, const std::vector<TaskArgs> &args_list,
-               const CallConfig &config, const std::vector<int8_t> &workers) {
-                return self.submit_next_level_group(callable_id, args_list, config, workers);
+            [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
+               const std::vector<TaskArgs> &args_list, const CallConfig &config, const std::vector<int8_t> &workers) {
+                return self.submit_next_level_group(
+                    make_callable_identity(digest, kind, target_namespace), args_list, config, workers
+                );
             },
-            nb::arg("callable_id"), nb::arg("args_list"), nb::arg("config"), nb::arg("workers") = std::vector<int8_t>{},
-            "Submit a group of NEXT_LEVEL tasks by registered callable id. "
+            nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args_list"), nb::arg("config"),
+            nb::arg("workers") = std::vector<int8_t>{},
+            "Submit a group of NEXT_LEVEL tasks by registered callable digest. "
             "workers= per-args affinity (empty = any)."
         )
         .def(
             "submit_sub",
-            [](Orchestrator &self, int32_t callable_id, const TaskArgs &args) {
-                return self.submit_sub(callable_id, args);
+            [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
+               const TaskArgs &args) {
+                return self.submit_sub(make_callable_identity(digest, kind, target_namespace), args);
             },
-            nb::arg("callable_id"), nb::arg("args"),
-            "Submit a SUB task by registered callable id. Tags drive dependency inference."
+            nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args"),
+            "Submit a SUB task by registered callable digest. Tags drive dependency inference."
         )
         .def(
             "submit_sub_group",
-            [](Orchestrator &self, int32_t callable_id, const std::vector<TaskArgs> &args_list) {
-                return self.submit_sub_group(callable_id, args_list);
+            [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
+               const std::vector<TaskArgs> &args_list) {
+                return self.submit_sub_group(make_callable_identity(digest, kind, target_namespace), args_list);
             },
-            nb::arg("callable_id"), nb::arg("args_list"),
+            nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args_list"),
             "Submit a group of SUB tasks: N args -> N workers, 1 DAG node."
         )
         .def(
@@ -241,21 +294,33 @@ inline void bind_worker(nb::module_ &m) {
             "Blocks until the child publishes CONTROL_DONE."
         )
         .def(
-            "broadcast_register_all", &Worker::broadcast_register_all, nb::arg("cid"), nb::arg("blob_ptr"),
-            nb::arg("blob_size"), nb::call_guard<nb::gil_scoped_release>(),
+            "broadcast_register_all",
+            [](Worker &self, int32_t cid, uint64_t blob_ptr, uint64_t blob_size, nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                self.broadcast_register_all(
+                    cid, blob_ptr, blob_size, reinterpret_cast<const uint8_t *>(digest_bytes.data())
+                );
+            },
+            nb::arg("cid"), nb::arg("blob_ptr"), nb::arg("blob_size"), nb::arg("digest"),
             "Stage `blob_size` bytes from `blob_ptr` into a POSIX shm and broadcast "
             "CTRL_REGISTER to every NEXT_LEVEL child in parallel. Throws on any failure."
         )
         .def(
-            "broadcast_unregister_all", &Worker::broadcast_unregister_all, nb::arg("cid"),
-            nb::call_guard<nb::gil_scoped_release>(),
+            "broadcast_unregister_all",
+            [](Worker &self, int32_t cid, nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                return self.broadcast_unregister_all(cid, reinterpret_cast<const uint8_t *>(digest_bytes.data()));
+            },
+            nb::arg("cid"), nb::arg("digest"),
             "Best-effort broadcast of CTRL_UNREGISTER to every NEXT_LEVEL child in parallel. "
             "Returns a list of per-child error strings (empty on full success)."
         )
         .def(
             "broadcast_control_all",
             [](Worker &self, WorkerType worker_type, uint64_t sub_cmd, int32_t cid, nb::object payload,
-               nb::object timeout_s) {
+               nb::object digest, nb::object timeout_s) {
                 std::string payload_bytes;
                 const void *payload_ptr = nullptr;
                 size_t payload_size = 0;
@@ -269,12 +334,20 @@ inline void bind_worker(nb::module_ &m) {
                     payload_ptr = payload_bytes.data();
                     payload_size = payload_bytes.size();
                 }
+                std::string digest_bytes;
+                const uint8_t *digest_ptr = nullptr;
+                if (!digest.is_none()) {
+                    digest_bytes = bytes_from_digest_arg(digest);
+                    digest_ptr = reinterpret_cast<const uint8_t *>(digest_bytes.data());
+                }
                 double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
                 nb::gil_scoped_release release;
-                return self.broadcast_control_all(worker_type, sub_cmd, cid, payload_ptr, payload_size, timeout_val);
+                return self.broadcast_control_all(
+                    worker_type, sub_cmd, cid, payload_ptr, payload_size, digest_ptr, timeout_val
+                );
             },
             nb::arg("worker_type"), nb::arg("sub_cmd"), nb::arg("cid"), nb::arg("payload") = nb::none(),
-            nb::arg("timeout_s") = nb::none(),
+            nb::arg("digest") = nb::none(), nb::arg("timeout_s") = nb::none(),
             "Broadcast an arbitrary CONTROL_REQUEST to the selected worker pool. "
             "If payload is a Python buffer, C++ stages it in POSIX shm and writes the shm name "
             "into the mailbox. Returns per-child ControlResult entries."

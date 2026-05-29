@@ -19,16 +19,16 @@
  *                        directly — no separate dispatch carrier struct)
  *   - ReadyQueue: Orch→Scheduler notification channel
  *
- * Dispatch encodes (callable_id, CallConfig, TaskArgs) into the
+ * Dispatch encodes (callable hash digest, CallConfig, TaskArgs) into the
  * per-WorkerThread shm mailbox with inline std::memcpy of
- * [int32 T][int32 S][ContinuousTensor × T][uint64 × S]; the forked child
- * decodes the same layout to rebuild a TaskArgsView and runs the cid
- * (returned by `Worker.register()`, prepared via `prepare_callable`) on
- * its `ChipWorker` instance.
+ * [hash digest][int32 T][int32 S][ContinuousTensor × T][uint64 × S]; the
+ * forked child decodes the same layout to rebuild a TaskArgsView and resolves
+ * the digest to a target-private execution slot.
  */
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -79,6 +79,24 @@ static constexpr int32_t INVALID_SLOT = -1;
 // =============================================================================
 
 using TaskSlot = int32_t;
+
+static constexpr size_t CALLABLE_HASH_DIGEST_SIZE = 32;
+
+enum class CallableKind : int32_t {
+    CHIP_CALLABLE = 1,
+    PYTHON_SERIALIZED = 2,
+};
+
+enum class TargetNamespace : int32_t {
+    LOCAL_CHIP = 1,
+    LOCAL_PYTHON = 2,
+};
+
+struct CallableIdentity {
+    std::array<uint8_t, CALLABLE_HASH_DIGEST_SIZE> digest{};
+    CallableKind kind{CallableKind::CHIP_CALLABLE};
+    TargetNamespace target_namespace{TargetNamespace::LOCAL_CHIP};
+};
 
 // =============================================================================
 // WorkerType
@@ -145,11 +163,9 @@ struct TaskSlotState {
 
     // --- Task data (stored on parent heap, lives until slot CONSUMED) ---
     WorkerType worker_type{WorkerType::NEXT_LEVEL};
-    // Unified callable id: NEXT_LEVEL chip callables and SUB fns share the
-    // same Worker.register() id space. The mailbox wire format writes this
-    // as a uint64 with the cid in the low 32 bits; dispatch_process reads
-    // it identically for both worker types.
-    int32_t callable_id{-1};
+    // Stable callable identity submitted by the parent. Child-local integer
+    // execution slots stay private to the target process.
+    CallableIdentity callable{};
     CallConfig config{};  // NEXT_LEVEL config (block_dim, aicpu_thread_num, diagnostics sub-features)
 
     // Unified task-args storage: `task_args` is the single-task builder;

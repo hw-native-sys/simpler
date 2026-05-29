@@ -16,11 +16,12 @@
  * Provides idle-worker selection and dispatch to the Scheduler.
  * The Scheduler drives the DAG; the Manager drives the workers.
  *
- * Each WorkerThread encodes `(callable, config, args_blob)` into a
+ * Each WorkerThread encodes `(callable digest, config, args_blob)` into a
  * pre-forked child's shared-memory mailbox, signals TASK_READY, and
  * spin-polls TASK_DONE. The child process loop (Python) reads the
- * mailbox and runs the cid on its `ChipWorker` (NEXT_LEVEL) or the
- * registered Python callable (SUB) in its own address space.
+ * digest, resolves it to a child-local slot, and runs that slot on its
+ * `ChipWorker` (NEXT_LEVEL) or registered Python callable (SUB) in its
+ * own address space.
  */
 
 #pragma once
@@ -50,8 +51,8 @@ class WorkerManager;
 // =============================================================================
 //
 // One layout for both NEXT_LEVEL (chip) and SUB workers. SUB children
-// read `callable` as a uint64 encoding the callable_id and ignore
-// config + args_blob.
+// read the callable hash digest from MAILBOX_OFF_ARGS, resolve it to a
+// private slot, and decode the TaskArgs blob after the digest prefix.
 
 enum class MailboxState : int32_t {
     IDLE = 0,
@@ -91,8 +92,14 @@ static_assert(
 );
 static constexpr ptrdiff_t MAILBOX_OFF_ERROR_MSG =
     static_cast<ptrdiff_t>(MAILBOX_SIZE) - static_cast<ptrdiff_t>(MAILBOX_ERROR_MSG_SIZE);
+static constexpr ptrdiff_t MAILBOX_OFF_TASK_CALLABLE_HASH = MAILBOX_OFF_ARGS;
+static constexpr ptrdiff_t MAILBOX_OFF_TASK_ARGS_BLOB =
+    MAILBOX_OFF_TASK_CALLABLE_HASH + static_cast<ptrdiff_t>(CALLABLE_HASH_DIGEST_SIZE);
+static constexpr size_t CTRL_SHM_NAME_BYTES = 32;
+static constexpr ptrdiff_t MAILBOX_OFF_CONTROL_CALLABLE_HASH =
+    MAILBOX_OFF_ARGS + static_cast<ptrdiff_t>(CTRL_SHM_NAME_BYTES);
 static constexpr size_t MAILBOX_ARGS_CAPACITY =
-    MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_ARGS) - MAILBOX_ERROR_MSG_SIZE;
+    MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB) - MAILBOX_ERROR_MSG_SIZE;
 
 // Control sub-commands (written at MAILBOX_OFF_CALLABLE when state == CONTROL_*)
 static constexpr uint64_t CTRL_MALLOC = 0;
@@ -102,9 +109,9 @@ static constexpr uint64_t CTRL_COPY_FROM = 3;
 // Pre-warm a chip child for cid=arg0 by calling prepare_callable in the child;
 // issued at end of init() so the first run_prepared does not pay the H2D cost.
 static constexpr uint64_t CTRL_PREPARE = 4;
-// Dynamic post-init register/unregister of a ChipCallable. CTRL_REGISTER carries
-// (cid, shm_name) with bytes staged in POSIX shm by the parent;
-// CTRL_UNREGISTER carries only the cid.
+// Dynamic post-init register/unregister of a callable slot. CTRL_REGISTER carries
+// (cid, shm_name, digest) with bytes staged in POSIX shm by the parent;
+// CTRL_UNREGISTER carries (cid, digest).
 static constexpr uint64_t CTRL_REGISTER = 5;
 static constexpr uint64_t CTRL_UNREGISTER = 6;
 // Dynamic per-orch CommDomain allocation/release.  Both carry a pair of
@@ -134,10 +141,10 @@ static constexpr ptrdiff_t CTRL_OFF_ARG1 = 24;
 static constexpr ptrdiff_t CTRL_OFF_ARG2 = 32;
 static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
 
-// CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS.
+// CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS and
+// the callable digest immediately after it.
 // Fixed-width so the wire layout stays simple; well above the encoded length
 // of "simpler-cb-<pid>-<cid>-<counter>" with pid < 32-bit max.
-static constexpr size_t CTRL_SHM_NAME_BYTES = 32;
 
 struct ControlResult {
     std::string worker_type;
@@ -220,9 +227,9 @@ public:
     // name where the ChipCallable bytes are staged. Both methods hold
     // mailbox_mu_, so a CTRL_REGISTER concurrent with dispatch_process waits
     // for the in-flight TASK_DONE before claiming the mailbox.
-    void control_register(int32_t cid, const char *shm_name);
-    void control_unregister(int32_t cid);
-    void control_generic(uint64_t sub_cmd, int32_t cid, const char *shm_name, double timeout_s);
+    void control_register(int32_t cid, const char *shm_name, const uint8_t *digest);
+    void control_unregister(int32_t cid, const uint8_t *digest);
+    void control_generic(uint64_t sub_cmd, int32_t cid, const char *shm_name, double timeout_s, const uint8_t *digest);
 
     // Dynamic CommDomain allocate / release.  `request_shm_name` carries the
     // request payload (header + rank_ids + buffer_nbytes); for alloc the child
@@ -317,14 +324,15 @@ public:
     // (with no reverse rollback to ACKed children — partial state is inert
     // garbage and is overwritten on cid reuse). The shm is unlinked when
     // every leaf has ACKed (success or failure).
-    void broadcast_register_all(int32_t cid, const void *blob_ptr, size_t blob_size);
+    void broadcast_register_all(int32_t cid, const void *blob_ptr, size_t blob_size, const uint8_t *digest);
 
     // Best-effort: broadcast CTRL_UNREGISTER for `cid` to every NEXT_LEVEL
     // worker in parallel. Returns a vector of per-worker error strings
     // (empty on full success). Caller decides whether to log / surface.
-    std::vector<std::string> broadcast_unregister_all(int32_t cid);
+    std::vector<std::string> broadcast_unregister_all(int32_t cid, const uint8_t *digest);
     std::vector<ControlResult> broadcast_control_all(
-        WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size, double timeout_s
+        WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size,
+        const uint8_t *digest, double timeout_s
     );
 
     // Write SHUTDOWN to every registered mailbox.

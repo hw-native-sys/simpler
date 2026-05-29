@@ -149,7 +149,6 @@ void WorkerThread::loop() {
 }
 
 void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
-    uint64_t callable = static_cast<uint64_t>(static_cast<uint32_t>(s.callable_id));
     TaskArgsView view = s.args_view(group_index);
 
     // Hold mailbox_mu_ for the entire round trip (write payload + state +
@@ -167,8 +166,8 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
     std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
 
-    // Write callable.
-    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &callable, sizeof(uint64_t));
+    uint64_t reserved_callable = 0;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &reserved_callable, sizeof(uint64_t));
 
     // Write config as a single packed POD block (see call_config.h).
     std::memcpy(mbox() + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
@@ -179,7 +178,10 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
         throw std::runtime_error("WorkerThread::dispatch_process: args blob exceeds mailbox capacity");
     }
-    uint8_t *d = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_ARGS);
+    uint8_t *hash_dst = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_CALLABLE_HASH);
+    std::memcpy(hash_dst, s.callable.digest.data(), CALLABLE_HASH_DIGEST_SIZE);
+
+    uint8_t *d = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_ARGS_BLOB);
     std::memcpy(d + 0, &view.tensor_count, sizeof(int32_t));
     std::memcpy(d + 4, &view.scalar_count, sizeof(int32_t));
     if (view.tensor_count > 0) {
@@ -336,6 +338,14 @@ static uint64_t read_control_result(const char *mbox) {
     return r;
 }
 
+static void write_control_digest(char *mbox, const uint8_t *digest) {
+    if (digest == nullptr) {
+        std::memset(mbox + MAILBOX_OFF_CONTROL_CALLABLE_HASH, 0, CALLABLE_HASH_DIGEST_SIZE);
+        return;
+    }
+    std::memcpy(mbox + MAILBOX_OFF_CONTROL_CALLABLE_HASH, digest, CALLABLE_HASH_DIGEST_SIZE);
+}
+
 // Issue a control sub-command and block until the child publishes
 // CONTROL_DONE. Caller must hold `mailbox_mu_`. On a non-zero error code
 // from the child, throws and leaves the mailbox in IDLE before unwinding
@@ -384,7 +394,7 @@ void WorkerThread::control_prepare(int32_t cid) {
     run_control_command("control_prepare");
 }
 
-void WorkerThread::control_register(int32_t cid, const char *shm_name) {
+void WorkerThread::control_register(int32_t cid, const char *shm_name, const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     // OFF_ERROR / OFF_ERROR_MSG are cleared by run_control_command — no
     // prelude memset needed (matches the other control_* methods).
@@ -392,6 +402,7 @@ void WorkerThread::control_register(int32_t cid, const char *shm_name) {
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     uint64_t cid_v = static_cast<uint32_t>(cid);
     std::memcpy(mbox() + CTRL_OFF_ARG0, &cid_v, sizeof(uint64_t));
+    write_control_digest(mbox(), digest);
     // Stage the NUL-terminated shm name in the args region. Pad with zeros so
     // stale bytes from a prior control op cannot leak into the child's decode.
     size_t name_len = std::strlen(shm_name);
@@ -403,17 +414,21 @@ void WorkerThread::control_register(int32_t cid, const char *shm_name) {
     run_control_command("control_register");
 }
 
-void WorkerThread::control_unregister(int32_t cid) {
+void WorkerThread::control_unregister(int32_t cid, const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_UNREGISTER, static_cast<uint64_t>(static_cast<uint32_t>(cid)));
+    write_control_digest(mbox(), digest);
     run_control_command("control_unregister");
 }
 
-void WorkerThread::control_generic(uint64_t sub_cmd, int32_t cid, const char *shm_name, double timeout_s) {
+void WorkerThread::control_generic(
+    uint64_t sub_cmd, int32_t cid, const char *shm_name, double timeout_s, const uint8_t *digest
+) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     uint64_t cid_v = static_cast<uint32_t>(cid);
     std::memcpy(mbox() + CTRL_OFF_ARG0, &cid_v, sizeof(uint64_t));
+    write_control_digest(mbox(), digest);
     const char *name = shm_name ? shm_name : "";
     size_t name_len = std::strlen(name);
     if (name_len + 1 > CTRL_SHM_NAME_BYTES) {
@@ -624,7 +639,7 @@ void WorkerManager::control_comm_init(int worker_id, const char *request_shm_nam
     wt->control_comm_init(request_shm_name);
 }
 
-void WorkerManager::broadcast_register_all(int32_t cid, const void *blob_ptr, size_t blob_size) {
+void WorkerManager::broadcast_register_all(int32_t cid, const void *blob_ptr, size_t blob_size, const uint8_t *digest) {
     if (next_level_threads_.empty()) return;
 
     std::string shm_name = make_shm_name(cid);
@@ -638,9 +653,9 @@ void WorkerManager::broadcast_register_all(int32_t cid, const void *blob_ptr, si
     std::vector<std::thread> workers;
     workers.reserve(next_level_threads_.size());
     for (size_t i = 0; i < next_level_threads_.size(); ++i) {
-        workers.emplace_back([this, i, cid, name = shm.name(), &errors]() {
+        workers.emplace_back([this, i, cid, digest, name = shm.name(), &errors]() {
             try {
-                next_level_threads_[i]->control_register(cid, name.c_str());
+                next_level_threads_[i]->control_register(cid, name.c_str(), digest);
             } catch (...) {
                 errors[i] = std::current_exception();
             }
@@ -668,7 +683,7 @@ void WorkerManager::broadcast_register_all(int32_t cid, const void *blob_ptr, si
     }
 }
 
-std::vector<std::string> WorkerManager::broadcast_unregister_all(int32_t cid) {
+std::vector<std::string> WorkerManager::broadcast_unregister_all(int32_t cid, const uint8_t *digest) {
     std::vector<std::string> errors;
     if (next_level_threads_.empty()) return errors;
 
@@ -676,9 +691,9 @@ std::vector<std::string> WorkerManager::broadcast_unregister_all(int32_t cid) {
     std::vector<std::thread> workers;
     workers.reserve(next_level_threads_.size());
     for (size_t i = 0; i < next_level_threads_.size(); ++i) {
-        workers.emplace_back([this, i, cid, &per_worker]() {
+        workers.emplace_back([this, i, cid, digest, &per_worker]() {
             try {
-                next_level_threads_[i]->control_unregister(cid);
+                next_level_threads_[i]->control_unregister(cid, digest);
             } catch (const std::exception &e) {
                 std::string msg = strip_control_prefix(e.what(), "control_unregister");
                 per_worker[i] = std::string("next_level ") + std::to_string(i) + ": " + msg;
@@ -695,7 +710,8 @@ std::vector<std::string> WorkerManager::broadcast_unregister_all(int32_t cid) {
 }
 
 std::vector<ControlResult> WorkerManager::broadcast_control_all(
-    WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size, double timeout_s
+    WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size, const uint8_t *digest,
+    double timeout_s
 ) {
     auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
     const char *type_name = (type == WorkerType::NEXT_LEVEL) ? "NEXT_LEVEL" : "SUB";
@@ -723,7 +739,9 @@ std::vector<ControlResult> WorkerManager::broadcast_control_all(
     for (size_t i = 0; i < threads.size(); ++i) {
         workers.emplace_back([&, i]() {
             try {
-                threads[i]->control_generic(sub_cmd, cid, shm_name.empty() ? nullptr : shm_name.c_str(), timeout_s);
+                threads[i]->control_generic(
+                    sub_cmd, cid, shm_name.empty() ? nullptr : shm_name.c_str(), timeout_s, digest
+                );
             } catch (const std::exception &e) {
                 results[i].ok = false;
                 results[i].error_message = strip_control_prefix(e.what(), "control_generic");

@@ -111,14 +111,19 @@ public:
     // the contiguous ChipCallable bytes (see PyChipCallable::buffer_ptr /
     // buffer_size). Throws on any child error for register; unregister is
     // best-effort and returns the per-child error list.
-    void broadcast_register_all(int32_t cid, uint64_t blob_ptr, uint64_t blob_size) {
-        manager_.broadcast_register_all(cid, reinterpret_cast<const void *>(blob_ptr), static_cast<size_t>(blob_size));
+    void broadcast_register_all(int32_t cid, uint64_t blob_ptr, uint64_t blob_size, const uint8_t *digest) {
+        manager_.broadcast_register_all(
+            cid, reinterpret_cast<const void *>(blob_ptr), static_cast<size_t>(blob_size), digest
+        );
     }
-    std::vector<std::string> broadcast_unregister_all(int32_t cid) { return manager_.broadcast_unregister_all(cid); }
+    std::vector<std::string> broadcast_unregister_all(int32_t cid, const uint8_t *digest) {
+        return manager_.broadcast_unregister_all(cid, digest);
+    }
     std::vector<ControlResult> broadcast_control_all(
-        WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size, double timeout_s
+        WorkerType type, uint64_t sub_cmd, int32_t cid, const void *payload, size_t payload_size,
+        const uint8_t *digest, double timeout_s
     ) {
-        return manager_.broadcast_control_all(type, sub_cmd, cid, payload, payload_size, timeout_s);
+        return manager_.broadcast_control_all(type, sub_cmd, cid, payload, payload_size, digest, timeout_s);
     }
 
 private:

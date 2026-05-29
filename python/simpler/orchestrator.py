@@ -13,15 +13,16 @@ Orchestrator handle at init, retrieves the C++ object via ``Worker.get_orchestra
 and passes the handle to the user's orch function::
 
     def my_orch(orch, args, cfg):
+        # chip_handle/sub_handle come from Worker.register(...)
         # build the args object yourself; tags drive dependency inference
         a = TaskArgs()
         a.add_tensor(make_tensor_arg(input_tensor),  TensorArgType.INPUT)
         a.add_tensor(make_tensor_arg(output_tensor), TensorArgType.OUTPUT)
-        orch.submit_next_level(chip_cid, a, cfg)  # cid from Worker.register(chip_callable)
+        orch.submit_next_level(chip_handle, a, cfg)  # handle from Worker.register(chip_callable)
 
         sub_args = TaskArgs()
         sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
-        orch.submit_sub(sub_cid, sub_args)
+        orch.submit_sub(sub_handle, sub_args)
 
     w.run(my_orch, my_args, my_config)
 
@@ -33,6 +34,7 @@ import contextlib
 from collections.abc import Iterator, Sequence
 from typing import Any, Optional
 
+from .callable_identity import CallableHandle
 from .task_interface import (
     CallConfig,
     ChipCallable,
@@ -47,21 +49,28 @@ from .task_interface import (
 )
 
 
-def _require_cid(callable_or_cid: Any, *, kind: str) -> int:
-    """Coerce a submit argument to a registered cid.
+def _require_handle(callable_or_handle: Any, *, kind: str, expected_namespace: Optional[str] = None) -> CallableHandle:
+    """Validate a submit argument is a registered CallableHandle.
 
     Raises a clear migration error when the caller still passes a
     ``ChipCallable`` directly — every chip callable must be registered
     via ``Worker.register(callable)`` *before* ``init()`` so each chip
     child can pre-warm it on its own device.
     """
-    if isinstance(callable_or_cid, ChipCallable) or hasattr(callable_or_cid, "buffer_ptr"):
+    if isinstance(callable_or_handle, ChipCallable) or hasattr(callable_or_handle, "buffer_ptr"):
         raise TypeError(
-            f"{kind} now takes a registered cid, not a ChipCallable. "
+            f"{kind} now takes a CallableHandle, not a ChipCallable. "
             "Register the callable before init() via "
-            "`cid = worker.register(chip_callable)` and pass `cid` here."
+            "`handle = worker.register(chip_callable)` and pass `handle` here."
         )
-    return int(callable_or_cid)
+    if not isinstance(callable_or_handle, CallableHandle):
+        raise TypeError(f"{kind} expects a CallableHandle returned by Worker.register")
+    if expected_namespace is not None and callable_or_handle.target_namespace != expected_namespace:
+        raise TypeError(
+            f"{kind} cannot run {callable_or_handle.target_namespace}; expected {expected_namespace} "
+            f"for {callable_or_handle.hashid}"
+        )
+    return callable_or_handle
 
 
 class Orchestrator:
@@ -81,26 +90,36 @@ class Orchestrator:
         # in isolation for tests.
         self._worker = worker
 
+    def _expected_next_level_namespace(self) -> Optional[str]:
+        if self._worker is None:
+            return None
+        if getattr(self._worker, "_next_level_workers", []):
+            return "LOCAL_PYTHON"
+        if getattr(self._worker, "_chip_shms", []):
+            return "LOCAL_CHIP"
+        return None
+
     # ------------------------------------------------------------------
     # User-facing submit API
     # ------------------------------------------------------------------
 
     def submit_next_level(
-        self, callable_id: Any, args: TaskArgs, config: Optional[CallConfig] = None, *, worker: int = -1
+        self, callable_handle: Any, args: TaskArgs, config: Optional[CallConfig] = None, *, worker: int = -1
     ):
-        """Submit a NEXT_LEVEL (chip) task by registered callable id.
+        """Submit a NEXT_LEVEL task by registered callable handle.
 
-        ``callable_id`` must be the int returned by
-        ``Worker.register(chip_callable)``. Tags inside ``args`` drive deps.
+        ``callable_handle`` must be returned by ``Worker.register``. Tags inside ``args`` drive deps.
         ``worker``: logical worker id for affinity (-1 = unconstrained).
         """
         cfg = config if config is not None else CallConfig()
-        cid = _require_cid(callable_id, kind="orch.submit_next_level")
-        return self._o.submit_next_level(cid, args, cfg, int(worker))
+        handle = _require_handle(
+            callable_handle, kind="orch.submit_next_level", expected_namespace=self._expected_next_level_namespace()
+        )
+        return self._o.submit_next_level(handle.digest, handle.kind, handle.target_namespace, args, cfg, int(worker))
 
     def submit_next_level_group(
         self,
-        callable_id: Any,
+        callable_handle: Any,
         args_list: list,
         config: Optional[CallConfig] = None,
         *,
@@ -112,21 +131,27 @@ class Orchestrator:
         """
         cfg = config if config is not None else CallConfig()
         w = [int(x) for x in workers] if workers else []
-        cid = _require_cid(callable_id, kind="orch.submit_next_level_group")
-        return self._o.submit_next_level_group(cid, args_list, cfg, w)
+        handle = _require_handle(
+            callable_handle,
+            kind="orch.submit_next_level_group",
+            expected_namespace=self._expected_next_level_namespace(),
+        )
+        return self._o.submit_next_level_group(handle.digest, handle.kind, handle.target_namespace, args_list, cfg, w)
 
-    def submit_sub(self, callable_id: int, args: Optional[TaskArgs] = None):
-        """Submit a SUB task by registered callable id.
+    def submit_sub(self, callable_handle: Any, args: Optional[TaskArgs] = None):
+        """Submit a SUB task by registered callable handle.
 
         ``args`` may be omitted for a tag-less task (no dependencies, no outputs).
         """
         if args is None:
             args = TaskArgs()
-        return self._o.submit_sub(int(callable_id), args)
+        handle = _require_handle(callable_handle, kind="orch.submit_sub", expected_namespace="LOCAL_PYTHON")
+        return self._o.submit_sub(handle.digest, handle.kind, handle.target_namespace, args)
 
-    def submit_sub_group(self, callable_id: int, args_list: list):
+    def submit_sub_group(self, callable_handle: Any, args_list: list):
         """Submit a group of SUB tasks (N TaskArgs → N workers, 1 DAG node)."""
-        return self._o.submit_sub_group(int(callable_id), args_list)
+        handle = _require_handle(callable_handle, kind="orch.submit_sub_group", expected_namespace="LOCAL_PYTHON")
+        return self._o.submit_sub_group(handle.digest, handle.kind, handle.target_namespace, args_list)
 
     # ------------------------------------------------------------------
     # Dynamic CommDomain allocation (collective; blocks orch_fn for the

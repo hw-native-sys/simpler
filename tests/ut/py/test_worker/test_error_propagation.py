@@ -92,9 +92,9 @@ class TestSubWorkerException:
             def orch(o, args, cfg):
                 o.submit_sub(42)
 
-            with pytest.raises(RuntimeError) as info:
+            with pytest.raises(TypeError) as info:
                 hw.run(orch)
-            assert "not registered" in str(info.value)
+            assert "CallableHandle returned by Worker.register" in str(info.value)
         finally:
             hw.close()
 

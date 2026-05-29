@@ -65,7 +65,7 @@ class TestTwoWorkersParallel:
                 buf = counters[i].buf
                 assert buf is not None
                 hw = Worker(level=3, num_sub_workers=1)
-                cid = hw.register(lambda args, b=buf: _inc(b))
+                cid = hw.register(lambda args, b=buf, _i=i: _inc(b))
                 hw.init()
                 workers.append((hw, cid))
 
@@ -136,7 +136,7 @@ class TestManyTasksNoLeak:
             cids = []
             for i in range(n_tasks):
                 buf = counters[i].buf
-                cids.append(hw.register(lambda args, b=buf: _inc(b)))
+                cids.append(hw.register(lambda args, b=buf, _i=i: _inc(b)))
             hw.init()
 
             def orch(o, args, cfg):

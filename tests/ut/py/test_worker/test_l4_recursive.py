@@ -19,6 +19,7 @@ import struct
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
+from simpler.callable_identity import CallableHandle
 from simpler.task_interface import CallConfig, TaskArgs
 from simpler.worker import Worker
 
@@ -160,8 +161,8 @@ class TestL4DynamicRegister:
         try:
             callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
             cid = w4.register(callable_obj)
-            assert isinstance(cid, int)
-            assert cid >= 0
+            assert isinstance(cid, CallableHandle)
+            assert cid._slot_id >= 0
         finally:
             w4.close()
 
@@ -182,7 +183,7 @@ class TestL4DynamicRegister:
             assert cid_a not in w4._callable_registry
             # Slot is freed; the next register reuses it.
             cid_b = w4.register(callable_obj)
-            assert cid_b == cid_a
+            assert cid_b._slot_id == cid_a._slot_id
         finally:
             w4.close()
 
