@@ -912,7 +912,7 @@ void SchedulerContext::deinit() {
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
     drain_state_.drain_worker_elected.store(0, std::memory_order_release);
     drain_state_.drain_ack_mask.store(0, std::memory_order_release);
-    drain_state_.pending_task = nullptr;
+    drain_state_.pending_task.store(nullptr, std::memory_order_release);
 
     // Reset task counters and orchestrator state
     completed_tasks_.store(0, std::memory_order_release);
