@@ -2015,6 +2015,33 @@ PYTHONPATH=$PWD:$PWD/python \
     --sizes 4096 --arch compute_80
 ```
 
+Use `--single-baseline pto_persistent_dag_graph_node_link` for the selected
+benchmark row that exercises node-link style graph descriptors
+(`graph.nodes[*].id`, nested `data`, and `graph.links`) through the benchmark
+matrix. For a quick A100/H200 check, capture stdout JSON under
+`tmp/cuda-backend/graph-node-link-baseline-working/`:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_graph_node_link \
+    --sizes 1024 --device 0 --arch compute_80 \
+    > tmp/cuda-backend/graph-node-link-baseline-working/a100-single.json
+
+ssh bizhaoh200 'cd /data/shibizhao/pto-cu && \
+  CUDA_HOME=/usr/local/cuda-12.8 PATH=/usr/local/cuda-12.8/bin:$PATH \
+  PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_graph_node_link \
+    --sizes 1024 --device 0 --arch compute_90' \
+  > tmp/cuda-backend/graph-node-link-baseline-working/h200-single.json
+```
+
+The current capture reported A100/H200 device times of `41984/28352 ns`,
+dispatch `[1,2,1]`, graph fan-in `[0,0,2]`, graph dependents `[2,2]`,
+graph-node ops `task0=op:add=1;task1=op:mul=2;task2=op:add=1`, and zero
+device scheduler errors.
+
 Use `--single-baseline pto_persistent_dag_graph_depends_on` for a quick
 benchmark path check of incoming-edge graph notation. This row uses dispatch
 `1,2,1`, graph fan-in `0,0,2`, and graph dependents `2,2`:
@@ -2446,14 +2473,14 @@ The compact current-head gate checks the expected A100/H200 machines,
 selected tensor baselines, the graph tensor-core baseline, the host-schedule
 generic-args baseline, graph generic-args4 baseline, graph-chain baseline,
 graph-depends-on baseline, graph-node-attrs baseline, graph-node-IO baseline,
-graph-node-op baseline,
+graph-node-link baseline, graph-node-op baseline,
 graph-scratch-reuse baseline, graph-tagged-inout baseline, graph descriptor
 fan-in/dependent metadata, graph-triad and graph-quad baselines, the tagged
 scalar graph baseline, the graph unary-square baseline, task-argument tags,
 visible Markdown/SVG graph topology and task-argument metadata, visible
 Markdown/SVG tensor throughput rows for required tensor/cuBLAS descriptors,
-size `1024`, one repeat, `98` combined samples, and the Markdown/SVG report
-files. The current compact gate artifact is under
+size `1024`, one repeat, `102` combined samples, and the Markdown/SVG report
+files. The latest full compact gate artifact before the node-link row is under
 `tmp/cuda-backend/graph-node-io-benchmark-working/combined-current-c0d327d2/`.
 Validate older captures with explicit `--require-*` checks if the current
 preset has gained new selected rows since that capture.

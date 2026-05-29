@@ -2097,6 +2097,15 @@ command examples, Markdown/SVG reports, zero scheduler errors, dispatch
 `task1=input:a,input:b,output:tmp1`, and
 `task2=input:a,input:b,output:out`.
 Device times were `28672 ns` on A100 and `25632 ns` on H200 for `N=1024`.
+The node-link graph descriptor spelling is now promoted into the selected
+benchmark matrix as `pto_persistent_dag_graph_node_link`. It covers
+`graph.nodes[*].id`, nested node `data`, and `graph.links` through the same
+add/mul/add callable sequence used by the graph-node `op` row. Single-baseline
+real-data captures under
+`tmp/cuda-backend/graph-node-link-baseline-working/` validated dispatch
+`[1,2,1]`, graph fan-in `[0,0,2]`, graph dependents `[2,2]`, graph-node ops
+`task0=op:add=1;task1=op:mul=2;task2=op:add=1`, zero scheduler errors, and
+device times of `41984 ns` on A100 and `28352 ns` on H200 for `N=1024`.
 The same node-IO graph descriptor path is now also covered by the paired
 persistent-smoke report validator. The working-tree capture under
 `tmp/cuda-backend/persistent-node-io-smoke-working/`

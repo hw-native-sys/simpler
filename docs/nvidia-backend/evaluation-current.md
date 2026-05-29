@@ -1781,6 +1781,28 @@ Both rows reported zero device scheduler errors. The generated Markdown
 report, SVG `<desc>`, current summary table, and local artifact index carry
 the node-op metadata, so this coverage is visible outside the raw JSON.
 
+## Supplemental Graph Node Link Benchmark
+
+The node-link graph descriptor path is now a selected benchmark baseline as
+`pto_persistent_dag_graph_node_link`. It uses node-link style graph spelling
+(`graph.nodes[*].id`, nested node `data`, and `graph.links`) while lowering to
+the same add/mul/add callable sequence as the graph-node `op` row. This keeps
+node-link schema compatibility visible in the benchmark matrix, not only in
+paired persistent-smoke reports.
+
+Single-baseline A100/H200 evidence is under
+`tmp/cuda-backend/graph-node-link-baseline-working/` as `a100-single.json` and
+`h200-single.json`.
+
+| GPU | Baseline | N | Dispatch | Fan-in | Dependents | Node ops | Device ns | Status |
+| --- | -------- | - | -------- | ------ | ---------- | -------- | --------- | ------ |
+| A100 | `pto_persistent_dag_graph_node_link` | 1024 | `1,2,1` | `0,0,2` | `2,2` | `task0=op:add=1;task1=op:mul=2;task2=op:add=1` | 41984 | pass |
+| H200 | `pto_persistent_dag_graph_node_link` | 1024 | `1,2,1` | `0,0,2` | `2,2` | `task0=op:add=1;task1=op:mul=2;task2=op:add=1` | 28352 | pass |
+
+Both rows reported zero device scheduler errors with
+`graph_descriptor_node_link`, `worker_blocks=3`, `scheduler_blocks=1`, and
+`block_dim=256`.
+
 ## Supplemental Reordered Graph-Descriptor Smoke
 
 The reordered graph-descriptor persistent DAG smoke at artifact label

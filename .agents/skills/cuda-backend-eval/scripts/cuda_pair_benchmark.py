@@ -44,6 +44,7 @@ BASELINE_ROWS: tuple[str, ...] = (
     "pto_persistent_dag_graph_generic_args4",
     "pto_persistent_dag_graph_node_attrs",
     "pto_persistent_dag_graph_node_io",
+    "pto_persistent_dag_graph_node_link",
     "pto_persistent_dag_graph_node_op",
     "pto_persistent_dag_graph_depends_on",
     "pto_persistent_dag_graph_scalar_axpy",
@@ -89,6 +90,7 @@ EXPECTED_DISPATCH_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_generic_args4": "9,2,1",
     "pto_persistent_dag_graph_node_attrs": "9,2,1",
     "pto_persistent_dag_graph_node_io": "1,2,1",
+    "pto_persistent_dag_graph_node_link": "1,2,1",
     "pto_persistent_dag_graph_node_op": "1,2,1",
     "pto_persistent_dag_graph_depends_on": "1,2,1",
     "pto_persistent_dag_graph_scalar_axpy": "4,2,1",
@@ -154,6 +156,7 @@ EXPECTED_GRAPH_NODE_ATTRS_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_node_attrs": "task0=attrs:tensor_args,scalar_args",
 }
 EXPECTED_GRAPH_NODE_OPS_BY_BASELINE: dict[str, str] = {
+    "pto_persistent_dag_graph_node_link": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
     "pto_persistent_dag_graph_node_op": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
 }
 EXPECTED_SCALAR_ARGS_BY_BASELINE: dict[str, str] = {
@@ -167,6 +170,7 @@ EXPECTED_GRAPH_FANIN_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_generic_args4": "0,0,2",
     "pto_persistent_dag_graph_node_attrs": "0,0,2",
     "pto_persistent_dag_graph_node_io": "0,0,2",
+    "pto_persistent_dag_graph_node_link": "0,0,2",
     "pto_persistent_dag_graph_node_op": "0,0,2",
     "pto_persistent_dag_graph_depends_on": "0,0,2",
     "pto_persistent_dag_graph_scalar_axpy": "0,0,2",
@@ -192,6 +196,7 @@ EXPECTED_GRAPH_DEPENDENTS_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_generic_args4": "2,2",
     "pto_persistent_dag_graph_node_attrs": "2,2",
     "pto_persistent_dag_graph_node_io": "2,2",
+    "pto_persistent_dag_graph_node_link": "2,2",
     "pto_persistent_dag_graph_node_op": "2,2",
     "pto_persistent_dag_graph_depends_on": "2,2",
     "pto_persistent_dag_graph_scalar_axpy": "2,2",
