@@ -4356,6 +4356,49 @@ dependents `[1,2]`, graph task arg key `submits`, and graph task args
 `task2=input:tmp1,input:a,output_existing:out`. Device times were
 `74752 ns` on A100 and `48288 ns` on H200.
 
+The submit-group graph descriptor spelling is now available in the paired
+persistent-smoke workflow as `graph_descriptor_submit_groups`. The TDD
+selector first failed because `run_persistent_smoke` rejected the unknown DAG
+shape and the paired runner rejected the CLI choice. After wiring the
+parallel add/add/join descriptor, paired-runner expectations, graph
+fan-in/dependent metadata, and report-visible submit-group task-arg metadata,
+the focused local tests passed:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest \
+    tests/ut/py/test_cuda_benchmark_report.py \
+    tests/ut/py/test_cuda_backend.py \
+    -q -k 'graph_descriptor_submit_groups or submit_groups_graph_descriptor' \
+    --platform cuda
+```
+
+That run reported `2 passed, 341 deselected`. The paired smoke then validated
+local A100 and remote H200 artifacts:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_submit_groups --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-submit-groups-smoke-working
+```
+
+The capture is under:
+
+```text
+tmp/cuda-backend/persistent-submit-groups-smoke-working/persistent-graph_descriptor_submit_groups-repeat2-smoke-dccd3bd9/
+```
+
+It contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. It validated repeat completions `[3,3]`, zero
+scheduler errors, dispatch `[1,1,1]`, graph fan-in `[0,0,2]`, graph
+dependents `[2,2]`, graph task arg key `submit_groups`, and graph task args
+`task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2;`
+`task2=input:tmp1,input:tmp2,output_existing:out`. Device times were
+`64512 ns` on A100 and `43616 ns` on H200.
+
 Needed:
 
 - full graph construction from normal PTO task graphs;
@@ -4373,9 +4416,9 @@ Needed:
   node-link `links` and dictionary-valued node IO port maps,
   dictionary-keyed graph task descriptors,
   tagged TaskArgs-like graph task lowering including `inout` producer
-  chaining, submit-shaped graph descriptors, expanded submit-group descriptor
-  coverage, named graph-callable resolution, explicit unary square graph
-  dispatch, tagged graph-descriptor paired smoke, and five-task chain,
+  chaining, submit-shaped graph descriptors, named graph-callable resolution,
+  explicit unary square graph dispatch, tagged graph-descriptor paired smoke,
+  and five-task chain,
   five-task fan-out/fan-in, and six-task scratch-reuse graph descriptor smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, tensor-core graph, and

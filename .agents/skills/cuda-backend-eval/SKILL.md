@@ -1618,6 +1618,19 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-root tmp/cuda-backend/persistent-submits-smoke-working
 ```
 
+Use `graph_descriptor_submit_groups` after changing submit-group graph
+descriptor expansion. It validates two independent submit entries feeding one
+join task, requires `graph_task_arg_key=submit_groups`, and records the
+expanded TaskArgs-like entries in the paired JSON plus Markdown/SVG reports:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_submit_groups --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-submit-groups-smoke-working
+```
+
 The selected benchmark path also includes
 `pto_persistent_dag_graph_role_keyed_inout` and
 `pto_persistent_dag_graph_compact_role_inout`, and
