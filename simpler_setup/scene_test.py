@@ -1380,7 +1380,10 @@ class _CudaPersistentDagSceneBuffers:
                     "CUDA persistent_dag_graph_f32 graph tasks cannot mix dependents with depends_on/dependencies"
                 )
             if "dependents" in task_spec:
-                dependents[task_id].extend(int(dependent) for dependent in task_spec["dependents"])
+                dependents[task_id].extend(
+                    _CudaPersistentDagSceneBuffers._graph_dependent_task_id(dependent, task_name_to_id)
+                    for dependent in task_spec["dependents"]
+                )
 
         for task_id, task_spec in enumerate(task_specs):
             dependency_ids = _CudaPersistentDagSceneBuffers._graph_task_dependencies(task_spec, task_name_to_id)
@@ -1456,6 +1459,18 @@ class _CudaPersistentDagSceneBuffers:
             return int(key)
         except ValueError as exc:
             raise ValueError(f"CUDA persistent_dag_graph_f32 unknown dependency task name: {key}") from exc
+
+    @staticmethod
+    def _graph_dependent_task_id(dependent: Any, task_name_to_id: dict[str, int]) -> int:
+        if isinstance(dependent, int):
+            return dependent
+        key = str(dependent)
+        if key in task_name_to_id:
+            return task_name_to_id[key]
+        try:
+            return int(key)
+        except ValueError as exc:
+            raise ValueError(f"CUDA persistent_dag_graph_f32 unknown dependent task name: {key}") from exc
 
     @staticmethod
     def _graph_read_producer(producers: dict[str, list[int]], name: str, task_id: int) -> int | None:

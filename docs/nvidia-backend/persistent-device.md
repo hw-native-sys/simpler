@@ -348,11 +348,12 @@ named or indexed callables plus TaskArgs-like roles instead of repeating raw
 generated-dispatch IDs on every task. This is still not full capture of a live
 PTO orchestrator graph, but it moves descriptor construction closer to the
 normal `submit_next_level(callable, TaskArgs, ...)` shape.
-Graph tasks may also carry `name` and use those names in `depends_on` or
-`dependencies`. This preserves the incoming-edge graph style while avoiding
-fragile numeric task IDs in descriptor specs. Integer dependencies remain
-accepted, and tensor-flow inference remains the fallback when neither outgoing
-`dependents` nor incoming dependencies are provided.
+Graph tasks may also carry `name` and use those names in outgoing
+`dependents` or incoming `depends_on` / `dependencies`. This preserves both
+edge-list styles while avoiding fragile numeric task IDs in descriptor specs.
+Integer task IDs remain accepted, and tensor-flow inference remains the
+fallback when neither outgoing `dependents` nor incoming dependencies are
+provided.
 Role `output` is the only task-arg role that may allocate a new default-sized
 temporary. Roles `output_existing` and `inout` must name storage that is
 already known at that point in descriptor order, either an input/output tensor,

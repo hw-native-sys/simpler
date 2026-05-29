@@ -1254,10 +1254,11 @@ Use `persistent_dag_graph_f32` when a test should pass an explicit runtime
 graph descriptor with per-task `func_id`, `a`/`b`/`c`/`d`/`out`,
 `dependents`, optional `initial_fanin`, `tensor_args`, and `scalar_args`
 fields instead of selecting one of the fixed tracer-bullet DAG adapters.
-Graph tasks may set `name` and then use task names in `depends_on` or
-`dependencies`; integer task IDs still work. Prefer named incoming edges for
-new graph-descriptor tests because they are closer to normal named PTO task
-graphs and avoid renumbering errors when inserting tasks.
+Graph tasks may set `name` and then use task names in outgoing `dependents`
+or incoming `depends_on` / `dependencies`; integer task IDs still work.
+Prefer named edges for new graph-descriptor tests because they are closer to
+normal named PTO task graphs and avoid renumbering errors when inserting
+tasks.
 Graph tasks may alternatively pass role-keyed `task_args` entries with
 `input`, `output`, `output_existing`, or `inout` roles. The adapter prefers
 the `role` key and still accepts the older `tag` spelling for compatibility.
