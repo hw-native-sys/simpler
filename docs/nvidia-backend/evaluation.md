@@ -155,7 +155,10 @@ The compact benchmark and tensor-sweep tables in
 the selected benchmark tensor-throughput table via
 `--section tensor-throughput`, graph tensor-core rows in both tensor table
 sections, and graph scratch-reuse ratios via `--section dag-shapes` when the
-capture includes `pto_persistent_dag_graph_scratch_reuse`.
+capture includes `pto_persistent_dag_graph_scratch_reuse`. Use
+`--section graph-metadata` to render the explicit graph descriptor dispatch
+sequence, fan-in/dependent arrays, task-argument keying, tagged task
+arguments, and tensor-tile shape beside the timing tables.
 New benchmark and tensor-sweep Markdown reports embed source-paper provenance
 for the VDCores and MPK notes kept under `tmp/sources/` and sanitized
 local/remote command examples for reconstructing the run. Tensor sweeps also

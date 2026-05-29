@@ -570,8 +570,10 @@ Evidence:
   the compact benchmark tables, selected benchmark tensor-throughput table,
   and compact tensor-sweep median table used by
   [evaluation-current.md](evaluation-current.md) from raw JSON artifacts,
-  including graph scratch-reuse ratios in the DAG-shapes table and cuBLAS
-  Graph replay columns in tensor-sweep summaries.
+  including graph scratch-reuse ratios in the DAG-shapes table, explicit
+  graph descriptor dispatch/fan-in/task-argument metadata in the
+  graph-metadata table, and cuBLAS Graph replay columns in tensor-sweep
+  summaries.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py`
   checks paired benchmark captures for expected machines, selected baselines,
   sizes, repeats, sample count, generated report files, source-paper

@@ -64,6 +64,7 @@ BENCHMARK_TENSOR_BASELINES = (
     "cublas_sgemm",
     "cublas_sgemm_graph",
 )
+GRAPH_METADATA_BASELINE_PREFIX = "pto_persistent_dag_graph"
 
 
 def _machine_label(machine: str) -> str:
@@ -121,6 +122,20 @@ def _format_number(value: int | float) -> str:
 
 def _format_gflops(value: float | None) -> str:
     return "-" if value is None else f"{value:.2f}"
+
+
+def _format_int_list(value: Any) -> str:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return "-"
+    return ",".join(str(int(part)) for part in value)
+
+
+def _format_graph_task_args(value: Any) -> str:
+    if isinstance(value, Mapping):
+        return ";".join(f"{key}={value[key]}" for key in sorted(value))
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return ";".join(str(part) for part in value)
+    return str(value) if value else "-"
 
 
 def _table(headers: Sequence[str], rows: Sequence[Sequence[str | int]]) -> str:
@@ -264,6 +279,67 @@ def render_dag_shape_table(payload: Payload) -> str:
             "Graph Role Inout/DAG",
             "Unary Square/DAG",
             "Tensor/DAG",
+        ],
+        rows,
+    )
+
+
+def render_graph_metadata_table(payload: Payload) -> str:
+    rows: list[list[str | int]] = []
+    graph_rows = [
+        row
+        for row in payload.get("results", [])
+        if row.get("status", "pass") == "pass"
+        and str(row.get("baseline", "")).startswith(GRAPH_METADATA_BASELINE_PREFIX)
+    ]
+    graph_rows.sort(
+        key=lambda row: (
+            _machine_label(str(row.get("machine") or row.get("artifact", "unknown"))),
+            int(row.get("n", 0)),
+            str(row.get("baseline", "")),
+        )
+    )
+    seen: set[tuple[str, int, str, str, str, str]] = set()
+    for row in graph_rows:
+        machine = str(row.get("machine") or row.get("artifact", "unknown"))
+        baseline = str(row.get("baseline", "unknown"))
+        n = int(row.get("n", 0))
+        descriptor = row.get("graph_descriptor") if isinstance(row.get("graph_descriptor"), Mapping) else {}
+        dispatch = _format_int_list(row.get("dispatch_func_ids"))
+        fanin = _format_int_list(descriptor.get("fanin"))
+        dependents = _format_int_list(descriptor.get("dependents"))
+        key = str(row.get("graph_task_arg_key") or "-")
+        task_args = _format_graph_task_args(row.get("graph_task_args"))
+        table_key = (machine, n, baseline, dispatch, fanin, dependents)
+        if table_key in seen:
+            continue
+        seen.add(table_key)
+        rows.append(
+            [
+                _machine_label(machine),
+                n,
+                baseline,
+                dispatch,
+                int(descriptor.get("tasks") or row.get("task_count", 0)),
+                fanin,
+                dependents,
+                key,
+                task_args,
+                _tensor_tile_shape(row),
+            ]
+        )
+    return _table(
+        [
+            "GPU",
+            "N",
+            "Baseline",
+            "Dispatch",
+            "Tasks",
+            "Fan-in",
+            "Dependents",
+            "Task arg key",
+            "Task args",
+            "Tensor tile",
         ],
         rows,
     )
@@ -500,6 +576,8 @@ def render_summary(payload: Payload) -> str:
             render_worker_grid_table(payload),
             "## Persistent DAG Shapes",
             render_dag_shape_table(payload),
+            "## Graph Descriptor Metadata",
+            render_graph_metadata_table(payload),
             "## Selected Tensor Throughput",
             render_benchmark_tensor_throughput_table(payload),
         ]
@@ -517,6 +595,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "unary-square",
             "worker-grid",
             "dag-shapes",
+            "graph-metadata",
             "tensor-throughput",
             "tensor-sweep",
         ),
@@ -536,6 +615,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(render_worker_grid_table(payload))
     elif args.section == "dag-shapes":
         print(render_dag_shape_table(payload))
+    elif args.section == "graph-metadata":
+        print(render_graph_metadata_table(payload))
     elif args.section == "tensor-throughput":
         print(render_benchmark_tensor_throughput_table(payload))
     elif args.section == "tensor-sweep":

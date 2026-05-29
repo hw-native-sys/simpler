@@ -6202,6 +6202,69 @@ def test_cuda_current_summary_renders_benchmark_tensor_throughput_table():
     )
 
 
+def test_cuda_current_summary_renders_graph_metadata_table():
+    cuda_current_summary = _load_current_summary_module()
+    payload = {
+        "results": [
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_graph_role_keyed_inout",
+                "n": 1024,
+                "task_count": 3,
+                "device_wall_ns": 1024,
+                "dispatch_func_ids": [1, 1, 1],
+                "graph_descriptor": {"tasks": 3, "fanin": [0, 1, 1], "dependents": [1, 2]},
+                "graph_task_arg_key": "role",
+                "graph_task_args": {
+                    "task0": "input:a,input:b,output:tmp1",
+                    "task1": "inout:tmp1,input:b",
+                    "task2": "input:tmp1,input:a,output_existing:out",
+                },
+                "status": "pass",
+            },
+            {
+                "machine": "dasys-h200x8",
+                "baseline": "pto_persistent_dag_graph_tensor_core",
+                "n": 1024,
+                "task_count": 4,
+                "device_wall_ns": 2048,
+                "dispatch_func_ids": [10, 2, 4, 1],
+                "graph_descriptor": {"tasks": 4, "fanin": [0, 0, 1, 2], "dependents": [2, 3, 3]},
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 1},
+                "status": "pass",
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag",
+                "n": 1024,
+                "task_count": 3,
+                "device_wall_ns": 512,
+                "dispatch_func_ids": [1, 2, 1],
+                "status": "pass",
+            },
+        ]
+    }
+
+    table = cuda_current_summary.render_graph_metadata_table(payload)
+    report = cuda_current_summary.render_summary(payload)
+
+    assert (
+        "| GPU | N | Baseline | Dispatch | Tasks | Fan-in | Dependents | Task arg key | Task args | Tensor tile |"
+        in table
+    )
+    assert (
+        "| A100 | 1024 | pto_persistent_dag_graph_role_keyed_inout | 1,1,1 | 3 | 0,1,1 | 1,2 | role | "
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,"
+        "output_existing:out | - |" in table
+    )
+    assert (
+        "| H200 | 1024 | pto_persistent_dag_graph_tensor_core | 10,2,4,1 | 4 | 0,0,1,2 | 2,3,3 | - | "
+        "- | 16x16x16 |" in table
+    )
+    assert "## Graph Descriptor Metadata" in report
+    assert "pto_persistent_dag_graph_role_keyed_inout" in report
+
+
 def test_cuda_current_summary_renders_graph_tensor_core_without_scalar_reference():
     cuda_current_summary = _load_current_summary_module()
     payload = {
