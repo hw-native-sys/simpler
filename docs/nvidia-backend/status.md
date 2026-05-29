@@ -4160,6 +4160,40 @@ CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
 That run reported `2 passed, 133 deselected` after the known PTO-ISA SSH
 refresh warning.
 
+The node-link descriptor shape is now also available in the paired
+persistent-smoke workflow as `graph_descriptor_node_link`, so the `links`
+schema can produce A100/H200 JSON plus generated Markdown/SVG evidence. The
+new TDD selector first failed because the smoke builder and paired runner did
+not know the shape; after wiring the generated add/mul/add descriptor,
+metadata expectations, and CLI choices, the focused local report tests passed:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_benchmark_report.py \
+    -q -k 'node_link_graph_descriptor'
+```
+
+That run reported `2 passed, 284 deselected`. The paired smoke then validated
+local A100 and remote H200 artifacts:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_node_link --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-node-link-smoke-working
+```
+
+The capture under
+`tmp/cuda-backend/persistent-node-link-smoke-working/persistent-graph_descriptor_node_link-repeat2-smoke-3e4ddb00/`
+contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. It validated repeat completions `[3,3]`, zero
+scheduler errors, dispatch `[1,2,1]`, graph fan-in `[0,0,2]`, graph
+dependents `[2,2]`, graph-node ops
+`task0=op:add=1;task1=op:mul=2;task2=op:add=1`, A100 device time `45056 ns`,
+and H200 device time `43808 ns`.
+
 Needed:
 
 - full graph construction from normal PTO task graphs;
@@ -4172,7 +4206,8 @@ Needed:
   string `source -> target` entries, adjacency dictionaries, `graph.links`
   aliases, `graph.nodes` aliases, node `id` identity aliases, node-link
   `data` payloads, node-style IO fields, node `op` callable aliases, callable
-  metadata `callable_id` / `cid` aliases, and paired smoke,
+  metadata `callable_id` / `cid` aliases, and paired smoke including
+  node-link `links`,
   dictionary-keyed graph task descriptors,
   tagged TaskArgs-like graph task lowering including `inout` producer
   chaining, named graph-callable resolution, explicit unary square graph

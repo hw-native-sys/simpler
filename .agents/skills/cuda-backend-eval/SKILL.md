@@ -448,6 +448,29 @@ dependents `[2,2]`, and graph-node ops
 `task0=op:add=1;task1=op:mul=2;task2=op:add=1`. Device times were `65536 ns`
 on A100 and `55296 ns` on H200 for `N=1024`.
 
+Use `--dag-shape graph_descriptor_node_link` when the same node-link graph
+schema should be captured through the paired smoke workflow. This shape uses
+list-shaped graph nodes with `id`/`data` payloads and edge metadata spelled as
+`links`, then validates the same generated add/mul/add dispatch, topology, and
+report-visible graph-node ops:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_node_link --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-node-link-smoke-working
+```
+
+The working-tree capture under
+`tmp/cuda-backend/persistent-node-link-smoke-working/`
+`persistent-graph_descriptor_node_link-repeat2-smoke-3e4ddb00/` validated
+paired A100 and H200 JSON, Markdown, and SVG artifacts with repeat
+completions `[3,3]`, zero scheduler errors, dispatch `[1,2,1]`, graph fan-in
+`[0,0,2]`, graph dependents `[2,2]`, and graph-node ops
+`task0=op:add=1;task1=op:mul=2;task2=op:add=1`. Device times were `45056 ns`
+on A100 and `43808 ns` on H200 for `N=1024`.
+
 When changing node-link graph input handling, run the SceneTestCase node-data
 selector. It validates list-shaped `graph.nodes` entries whose `id` carries
 identity and whose task payload lives under `data`, with top-level node fields
@@ -713,6 +736,8 @@ under
 `tmp/cuda-backend/persistent-graph_descriptor_generic_args4-repeat2-smoke-11db2c9d/`.
 The current graph-node attrs repeat-run capture is under
 `tmp/cuda-backend/persistent-graph_descriptor_node_attrs-repeat2-smoke-b1b3e28c/`.
+The current graph-node link repeat-run capture is under
+`tmp/cuda-backend/persistent-node-link-smoke-working/persistent-graph_descriptor_node_link-repeat2-smoke-3e4ddb00/`.
 Use `--dag-shape graph_descriptor_tagged --repeat-runs 2` to validate the
 same three-task graph descriptor shape after lowering tagged TaskArgs-like
 entries (`input`, `output`, `output_existing`, and scalar inputs) into the

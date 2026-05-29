@@ -281,6 +281,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "graph_descriptor_generic_args4": "9,2,1",
         "graph_descriptor_node_attrs": "9,2,1",
         "graph_descriptor_node_io": "1,2,1",
+        "graph_descriptor_node_link": "1,2,1",
         "graph_descriptor_node_op": "1,2,1",
         "graph_descriptor_quad": "8,2,1",
         "graph_descriptor_reordered": "1,9,2",
@@ -324,6 +325,7 @@ def _expected_graph_descriptor(config: PairedPersistentSmokeConfig) -> tuple[str
         "graph_descriptor_generic_args4": ("0,0,2", "2,2"),
         "graph_descriptor_node_attrs": ("0,0,2", "2,2"),
         "graph_descriptor_node_io": ("0,0,2", "2,2"),
+        "graph_descriptor_node_link": ("0,0,2", "2,2"),
         "graph_descriptor_node_op": ("0,0,2", "2,2"),
         "graph_descriptor_quad": ("0,0,2", "2,2"),
         "graph_descriptor_reordered": ("2,0,0", "0,0"),
@@ -393,6 +395,7 @@ def _expected_graph_node_ops(config: PairedPersistentSmokeConfig) -> str | None:
     if config.mode != "dag":
         return None
     return {
+        "graph_descriptor_node_link": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
         "graph_descriptor_node_op": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
     }.get(config.dag_shape)
 
@@ -648,6 +651,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "graph_descriptor_generic_args4",
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
+            "graph_descriptor_node_link",
             "graph_descriptor_node_op",
             "graph_descriptor_pair_inout",
             "graph_descriptor_quad",

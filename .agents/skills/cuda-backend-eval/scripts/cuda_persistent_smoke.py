@@ -1681,7 +1681,12 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                 ),
             ),
         )
-    if dag_shape in {"graph_descriptor_depends_on", "graph_descriptor_node_io", "graph_descriptor_node_op"}:
+    if dag_shape in {
+        "graph_descriptor_depends_on",
+        "graph_descriptor_node_io",
+        "graph_descriptor_node_link",
+        "graph_descriptor_node_op",
+    }:
         task_count = 3
         host_fanin_t = ctypes.c_uint32 * task_count
         dependents_t = ctypes.c_uint32 * 2
@@ -2605,6 +2610,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             if config.dag_shape in {
                 "graph_descriptor_depends_on",
                 "graph_descriptor_node_io",
+                "graph_descriptor_node_link",
                 "graph_descriptor_node_op",
             }:
                 expected_out = expected_tmp0
@@ -2753,6 +2759,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_generic_args4",
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
+            "graph_descriptor_node_link",
             "graph_descriptor_node_op",
             "graph_descriptor_pair_inout",
             "graph_descriptor_quad",
@@ -2789,7 +2796,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 result["scalar_args"] = scalar_args
             if config.dag_shape == "graph_descriptor_node_attrs":
                 result["graph_node_attrs"] = {"task0": "attrs:tensor_args,scalar_args"}
-            if config.dag_shape == "graph_descriptor_node_op":
+            if config.dag_shape in {"graph_descriptor_node_link", "graph_descriptor_node_op"}:
                 result["graph_node_ops"] = {
                     "task0": "op:add=1",
                     "task1": "op:mul=2",
@@ -2915,6 +2922,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_generic_args4",
         "graph_descriptor_node_attrs",
         "graph_descriptor_node_io",
+        "graph_descriptor_node_link",
         "graph_descriptor_node_op",
         "graph_descriptor_pair_inout",
         "graph_descriptor_quad",
@@ -2984,6 +2992,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_descriptor_generic_args4",
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
+            "graph_descriptor_node_link",
             "graph_descriptor_node_op",
             "graph_descriptor_pair_inout",
             "graph_descriptor_reordered",
@@ -3210,6 +3219,7 @@ def main() -> None:
             "graph_descriptor_generic_args4",
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
+            "graph_descriptor_node_link",
             "graph_descriptor_node_op",
             "graph_descriptor_pair_inout",
             "graph_descriptor_quad",
