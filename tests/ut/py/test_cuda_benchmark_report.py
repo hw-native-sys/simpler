@@ -3026,6 +3026,28 @@ def test_cuda_lifecycle_matrix_validator_requires_source_papers_and_commands(tmp
         )
         == []
     )
+    payload["metadata"]["collection_mode"] = "existing"
+
+    errors = cuda_validate_lifecycle.validate_lifecycle_matrix(
+        payload,
+        require_source_papers=True,
+        source_paper_root=source_root,
+        require_command_examples=True,
+    )
+
+    assert "metadata.command_examples.local_sample missing --collect-existing-suffix" in errors
+
+    payload["metadata"]["command_examples"]["local_sample"] += " --collect-existing-suffix abc123"
+
+    assert (
+        cuda_validate_lifecycle.validate_lifecycle_matrix(
+            payload,
+            require_source_papers=True,
+            source_paper_root=source_root,
+            require_command_examples=True,
+        )
+        == []
+    )
 
 
 def test_cuda_lifecycle_matrix_validator_reports_contract_errors(tmp_path):
@@ -5381,7 +5403,11 @@ def test_cuda_persistent_lifecycle_matrix_collects_existing_suffix(tmp_path):
     json_path = output_root / "persistent-lifecycle-matrix-abc123" / "cuda-lifecycle-matrix.json"
     payload = json.loads(json_path.read_text())
     assert payload["metadata"]["git_commit"] == "abc123"
+    assert payload["metadata"]["collection_mode"] == "existing"
+    report = (output_root / "persistent-lifecycle-matrix-abc123" / "cuda-lifecycle-matrix.md").read_text()
+    assert "- Collection mode: `existing`" in report
     assert payload["metadata"]["command_examples"]["local_sample"].startswith("env 'PYTHONPATH=$PWD:$PWD/python'")
+    assert "--collect-existing-suffix abc123" in payload["metadata"]["command_examples"]["local_sample"]
     assert "--sync-remote-tree" in payload["metadata"]["command_examples"]["local_sample"]
     assert "--skip-remote-refresh" not in payload["metadata"]["command_examples"]["local_sample"]
 

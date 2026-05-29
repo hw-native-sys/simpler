@@ -205,6 +205,12 @@ def _validate_command_examples(payload: dict[str, Any]) -> list[str]:
             errors.append("metadata.command_examples.local_sample contains local checkout path")
         if "$PWD" not in local_sample:
             errors.append("metadata.command_examples.local_sample must use $PWD")
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("collection_mode") == "existing"
+            and "--collect-existing-suffix" not in local_sample
+        ):
+            errors.append("metadata.command_examples.local_sample missing --collect-existing-suffix")
 
     if not isinstance(remote_sample, str) or not remote_sample:
         errors.append("missing metadata.command_examples.remote_sample")

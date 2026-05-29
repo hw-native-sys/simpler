@@ -3506,10 +3506,12 @@ Needed:
   The lifecycle matrix validator checks required scenarios, A100/H200
   artifacts, repeat-run completion counts, DAG-chain dispatch,
   graph-scratch-reuse dispatch, scratch-reuse metadata, report files,
-  VDCores/MPK source-paper provenance, sanitized reconstruction commands, and
-  zero device scheduler errors. The matrix report can be regenerated from the
-  existing per-scenario smoke JSON with `--collect-existing-suffix b50a80dd`
-  without rerunning the GPUs. The paired persistent-smoke validator now
+  VDCores/MPK source-paper provenance, collection mode, sanitized
+  reconstruction commands, and zero device scheduler errors. The matrix report
+  can be regenerated from the existing per-scenario smoke JSON with
+  `--collect-existing-suffix b50a80dd` without rerunning the GPUs, and the
+  validator requires that flag in the regenerated local command example. The
+  paired persistent-smoke validator now
   requires `scratch_reuse=reused_buffer=tmp0,reuse_task=4`, and the smoke
   Markdown/SVG report renders that physical alias beside task metadata. In
   the current capture, graph-scratch-reuse validates

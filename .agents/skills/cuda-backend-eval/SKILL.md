@@ -949,11 +949,12 @@ PYTHONPATH=$PWD:$PWD/python \
 This writes per-scenario smoke artifacts plus
 `tmp/cuda-backend/persistent-lifecycle-matrix-<commit>/cuda-lifecycle-matrix.md`,
 `cuda-lifecycle-matrix.svg`, and `cuda-lifecycle-matrix.json`.
-Lifecycle matrix JSON/Markdown includes source-paper provenance, paper
-alignment text, and sanitized local/remote command examples. Use
+Lifecycle matrix JSON/Markdown includes source-paper provenance, collection
+mode, paper alignment text, and sanitized local/remote command examples. Use
 `--collect-existing-suffix <commit>` to regenerate the combined matrix report
 and index from existing per-scenario `a100.json`/`h200.json` files without
-rerunning A100/H200 hardware.
+rerunning A100/H200 hardware; the regenerated report's local sample command
+must include the same flag.
 Use `--dry-run` to print every paired smoke command plus the final matrix
 validator and artifact-index commands without writing the matrix report.
 The current paired lifecycle matrix capture is under

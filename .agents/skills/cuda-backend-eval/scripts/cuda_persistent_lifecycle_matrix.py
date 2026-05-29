@@ -205,6 +205,8 @@ def build_command_examples(config: LifecycleMatrixConfig, suffix: str) -> dict[s
     ]
     for scenario_name in config.scenario_names:
         local_command.extend(["--scenario", scenario_name])
+    if config.collect_existing_suffix is not None:
+        local_command.extend(["--collect-existing-suffix", config.collect_existing_suffix])
     if config.sync_remote_tree:
         local_command.append("--sync-remote-tree")
     if not config.refresh_remote and not config.sync_remote_tree:
@@ -227,6 +229,7 @@ def build_metadata(config: LifecycleMatrixConfig, label: str, suffix: str) -> di
     return {
         "label": label,
         "git_commit": suffix,
+        "collection_mode": "existing" if config.collect_existing_suffix is not None else "paired-smoke",
         "n": config.n,
         "repeat_runs": config.repeat_runs,
         "stream_id": config.stream_id,
@@ -347,6 +350,8 @@ def render_lifecycle_markdown(
     source_papers = _source_paper_summary(metadata)
     if source_papers:
         lines.append(f"- Source papers: {source_papers}")
+    if metadata.get("collection_mode"):
+        lines.append(f"- Collection mode: `{metadata['collection_mode']}`")
     if metadata.get("paper_setup"):
         lines.append(f"- Paper alignment: {metadata['paper_setup']}")
     lines.extend(_command_example_lines(metadata))
