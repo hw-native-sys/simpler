@@ -2972,6 +2972,10 @@ def test_cuda_lifecycle_matrix_validator_accepts_default_matrix(tmp_path):
             "launch_completed_counts": [3, 3],
             "completed_count": 3,
             "dispatch_func_ids": [1, 2, 1],
+            "graph_descriptor": {
+                "fanin": [0, 0, 2],
+                "dependents": [2, 2],
+            },
             "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
             "resource_policy": {
                 "scheduler_blocks": 1,
@@ -2994,6 +2998,14 @@ def test_cuda_lifecycle_matrix_validator_accepts_default_matrix(tmp_path):
             "launch_completed_counts": [6, 6],
             "completed_count": 6,
             "dispatch_func_ids": [1, 2, 1, 2, 1, 1],
+            "graph_descriptor": {
+                "fanin": [0, 0, 2, 1, 1, 2],
+                "dependents": [2, 2, 3, 4, 5, 5],
+            },
+            "scratch_reuse": {
+                "reused_buffer": "tmp0",
+                "reuse_task": 4,
+            },
             "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
             "resource_policy": {
                 "scheduler_blocks": 1,
@@ -3019,6 +3031,73 @@ def test_cuda_lifecycle_matrix_validator_accepts_default_matrix(tmp_path):
     )
 
     assert errors == []
+
+
+def test_cuda_lifecycle_matrix_validator_requires_graph_topology_and_scratch_reuse():
+    cuda_validate_lifecycle = _load_lifecycle_matrix_validator_module()
+    rows = [
+        {
+            "scenario": "graph-depends-on",
+            "artifact": "a100",
+            "status": "pass",
+            "runtime": "persistent_device",
+            "mode": "dag",
+            "dag_shape": "graph_descriptor_depends_on",
+            "n": 1024,
+            "repeat_runs": 2,
+            "launch_completed_counts": [3, 3],
+            "completed_count": 3,
+            "dispatch_func_ids": [1, 2, 1],
+            "graph_descriptor": {
+                "fanin": [0, 1, 1],
+                "dependents": [1, 2],
+            },
+        },
+        {
+            "scenario": "graph-scratch-reuse",
+            "artifact": "h200",
+            "status": "pass",
+            "runtime": "persistent_device",
+            "mode": "dag",
+            "dag_shape": "graph_descriptor_scratch_reuse",
+            "n": 1024,
+            "repeat_runs": 2,
+            "launch_completed_counts": [6, 6],
+            "completed_count": 6,
+            "dispatch_func_ids": [1, 2, 1, 2, 1, 1],
+            "graph_descriptor": {
+                "fanin": [0, 0, 2, 1, 1, 2],
+                "dependents": [2, 2, 3, 4, 5, 5],
+            },
+            "scratch_reuse": {
+                "reused_buffer": "tmp1",
+                "reuse_task": 5,
+            },
+        },
+    ]
+
+    errors = cuda_validate_lifecycle.validate_lifecycle_matrix(
+        {"label": "test", "rows": rows},
+        required_graph_fanin={
+            "graph-depends-on": "0,0,2",
+            "graph-scratch-reuse": "0,0,2,1,1,2",
+        },
+        required_graph_dependents={
+            "graph-depends-on": "2,2",
+            "graph-scratch-reuse": "2,2,3,4,5,5",
+        },
+        required_scratch_reuse={
+            "graph-scratch-reuse": "reused_buffer=tmp0,reuse_task=4",
+        },
+    )
+
+    assert ("expected graph fanin 0,0,2 for scenario=graph-depends-on artifact=a100, found 0,1,1") in errors
+    assert ("expected graph dependents 2,2 for scenario=graph-depends-on artifact=a100, found 1,2") in errors
+    assert (
+        "expected scratch reuse reused_buffer=tmp0,reuse_task=4 for "
+        "scenario=graph-scratch-reuse artifact=h200, "
+        "found reused_buffer=tmp1,reuse_task=5"
+    ) in errors
 
 
 def test_cuda_lifecycle_matrix_validator_requires_source_papers_and_commands(tmp_path):
@@ -5560,6 +5639,11 @@ def test_cuda_persistent_lifecycle_matrix_validates_custom_scenarios(tmp_path):
     assert "graph-depends-on" in command
     assert "--require-dispatch" in command
     assert "graph-depends-on=1,2,1" in command
+    assert "--require-graph-fanin" in command
+    assert "graph-depends-on=0,0,2" in command
+    assert "--require-graph-dependents" in command
+    assert "graph-depends-on=2,2" in command
+    assert "--require-scratch-reuse" not in command
 
 
 def test_cuda_persistent_lifecycle_matrix_renders_report(tmp_path):
@@ -5622,6 +5706,10 @@ def test_cuda_persistent_lifecycle_matrix_renders_report(tmp_path):
             "repeat_runs": 2,
             "launch_completed_counts": [3, 3],
             "dispatch_func_ids": [1, 2, 1],
+            "graph_descriptor": {
+                "fanin": [0, 0, 2],
+                "dependents": [2, 2],
+            },
             "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
             "resource_policy": {
                 "scheduler_blocks": 1,
@@ -5645,6 +5733,14 @@ def test_cuda_persistent_lifecycle_matrix_renders_report(tmp_path):
             "repeat_runs": 2,
             "launch_completed_counts": [6, 6],
             "dispatch_func_ids": [1, 2, 1, 2, 1, 1],
+            "graph_descriptor": {
+                "fanin": [0, 0, 2, 1, 1, 2],
+                "dependents": [2, 2, 3, 4, 5, 5],
+            },
+            "scratch_reuse": {
+                "reused_buffer": "tmp0",
+                "reuse_task": 4,
+            },
             "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
             "resource_policy": {
                 "scheduler_blocks": 1,
@@ -5693,8 +5789,11 @@ def test_cuda_persistent_lifecycle_matrix_renders_report(tmp_path):
     assert "`1,2,1,2,1`" in report
     assert ("| graph-depends-on | a100 | pass | persistent_device | dag/graph_descriptor_depends_on |") in report
     assert "`1,2,1`" in report
+    assert "`fanin=0,0,2;deps=2,2`" in report
     assert ("| graph-scratch-reuse | a100 | pass | persistent_device | dag/graph_descriptor_scratch_reuse |") in report
     assert "`1,2,1,2,1,1`" in report
+    assert "`fanin=0,0,2,1,1,2;deps=2,2,3,4,5,5`" in report
+    assert "`reused_buffer=tmp0,reuse_task=4`" in report
     assert "lifecycle-test" in svg_path.read_text()
 
 

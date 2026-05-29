@@ -41,6 +41,17 @@ DEFAULT_DISPATCH = {
     "graph-depends-on": "1,2,1",
     "graph-scratch-reuse": "1,2,1,2,1,1",
 }
+DEFAULT_GRAPH_FANIN = {
+    "graph-depends-on": "0,0,2",
+    "graph-scratch-reuse": "0,0,2,1,1,2",
+}
+DEFAULT_GRAPH_DEPENDENTS = {
+    "graph-depends-on": "2,2",
+    "graph-scratch-reuse": "2,2,3,4,5,5",
+}
+DEFAULT_SCRATCH_REUSE = {
+    "graph-scratch-reuse": "reused_buffer=tmp0,reuse_task=4",
+}
 
 
 def scheduler_error_code_label(code: Any) -> str:
@@ -75,6 +86,27 @@ def _dispatch(row: dict[str, Any]) -> str | None:
     if not isinstance(dispatch, list):
         return None
     return ",".join(str(func_id) for func_id in dispatch)
+
+
+def _graph_sequence(row: dict[str, Any], key: str) -> str | None:
+    descriptor = row.get("graph_descriptor")
+    if not isinstance(descriptor, dict):
+        return None
+    values = descriptor.get(key)
+    if not isinstance(values, list):
+        return None
+    return ",".join(str(value) for value in values)
+
+
+def _scratch_reuse(row: dict[str, Any]) -> str | None:
+    reuse = row.get("scratch_reuse")
+    if not isinstance(reuse, dict):
+        return None
+    reused_buffer = reuse.get("reused_buffer")
+    reuse_task = reuse.get("reuse_task")
+    if reused_buffer is None or reuse_task is None:
+        return None
+    return f"reused_buffer={reused_buffer},reuse_task={reuse_task}"
 
 
 def load_lifecycle_matrix(path: Path) -> dict[str, Any]:
@@ -173,6 +205,44 @@ def _validate_dispatch(rows: list[dict[str, Any]], required_dispatch: dict[str, 
     return errors
 
 
+def _validate_graph_sequence(
+    rows: list[dict[str, Any]],
+    *,
+    key: str,
+    label: str,
+    required_values: dict[str, str],
+) -> list[str]:
+    errors: list[str] = []
+    for row in rows:
+        scenario = str(row.get("scenario"))
+        expected = required_values.get(scenario)
+        if expected is None:
+            continue
+        found = _graph_sequence(row, key)
+        if found != expected:
+            errors.append(
+                f"expected graph {label} {expected} for scenario={scenario} "
+                f"artifact={row.get('artifact', 'unknown')}, found {found}"
+            )
+    return errors
+
+
+def _validate_scratch_reuse(rows: list[dict[str, Any]], required_scratch_reuse: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+    for row in rows:
+        scenario = str(row.get("scenario"))
+        expected = required_scratch_reuse.get(scenario)
+        if expected is None:
+            continue
+        found = _scratch_reuse(row)
+        if found != expected:
+            errors.append(
+                f"expected scratch reuse {expected} for scenario={scenario} "
+                f"artifact={row.get('artifact', 'unknown')}, found {found}"
+            )
+    return errors
+
+
 def _validate_report_files(artifact_dir: Path | None) -> list[str]:
     if artifact_dir is None:
         return ["missing artifact directory for report-file validation"]
@@ -247,7 +317,7 @@ def _validate_command_examples(payload: dict[str, Any]) -> list[str]:
     return errors
 
 
-def validate_lifecycle_matrix(
+def validate_lifecycle_matrix(  # noqa: PLR0913
     payload: dict[str, Any],
     *,
     artifact_dir: Path | None = None,
@@ -258,6 +328,9 @@ def validate_lifecycle_matrix(
     require_report_files: bool = False,
     require_source_papers: bool = False,
     require_command_examples: bool = False,
+    required_graph_fanin: dict[str, str] | None = None,
+    required_graph_dependents: dict[str, str] | None = None,
+    required_scratch_reuse: dict[str, str] | None = None,
     source_paper_root: Path | None = None,
 ) -> list[str]:
     rows = _rows(payload)
@@ -271,6 +344,23 @@ def validate_lifecycle_matrix(
     errors.extend(_validate_scheduler_errors(rows))
     errors.extend(_validate_lifecycle(rows, expected_repeat_runs))
     errors.extend(_validate_dispatch(rows, required_dispatch or DEFAULT_DISPATCH))
+    errors.extend(
+        _validate_graph_sequence(
+            rows,
+            key="fanin",
+            label="fanin",
+            required_values=required_graph_fanin or DEFAULT_GRAPH_FANIN,
+        )
+    )
+    errors.extend(
+        _validate_graph_sequence(
+            rows,
+            key="dependents",
+            label="dependents",
+            required_values=required_graph_dependents or DEFAULT_GRAPH_DEPENDENTS,
+        )
+    )
+    errors.extend(_validate_scratch_reuse(rows, required_scratch_reuse or DEFAULT_SCRATCH_REUSE))
     if require_report_files:
         errors.extend(_validate_report_files(artifact_dir))
     if require_source_papers:
@@ -290,6 +380,16 @@ def _parse_required_dispatch(values: Sequence[str] | None) -> dict[str, str]:
     return required
 
 
+def _parse_required_map(values: Sequence[str] | None, *, flag: str) -> dict[str, str]:
+    required: dict[str, str] = {}
+    for value in values or ():
+        if "=" not in value:
+            raise ValueError(f"invalid {flag} {value!r}; expected SCENARIO=VALUE")
+        scenario, expected = value.split("=", 1)
+        required[scenario.strip()] = expected.strip()
+    return required
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("json_path", type=Path)
@@ -298,6 +398,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-scenario", action="append")
     parser.add_argument("--require-artifact", action="append")
     parser.add_argument("--require-dispatch", action="append")
+    parser.add_argument("--require-graph-fanin", action="append")
+    parser.add_argument("--require-graph-dependents", action="append")
+    parser.add_argument("--require-scratch-reuse", action="append")
     parser.add_argument("--require-report-files", action="store_true")
     parser.add_argument("--require-source-papers", action="store_true")
     parser.add_argument("--require-command-examples", action="store_true")
@@ -315,6 +418,16 @@ def _apply_preset(args: argparse.Namespace) -> None:
         args.require_artifact = list(DEFAULT_ARTIFACTS)
     if not args.require_dispatch:
         args.require_dispatch = [f"{scenario}={dispatch}" for scenario, dispatch in DEFAULT_DISPATCH.items()]
+    if not args.require_graph_fanin:
+        args.require_graph_fanin = [f"{scenario}={fanin}" for scenario, fanin in DEFAULT_GRAPH_FANIN.items()]
+    if not args.require_graph_dependents:
+        args.require_graph_dependents = [
+            f"{scenario}={dependents}" for scenario, dependents in DEFAULT_GRAPH_DEPENDENTS.items()
+        ]
+    if not args.require_scratch_reuse:
+        args.require_scratch_reuse = [
+            f"{scenario}={scratch_reuse}" for scenario, scratch_reuse in DEFAULT_SCRATCH_REUSE.items()
+        ]
     args.require_report_files = True
 
 
@@ -323,6 +436,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     _apply_preset(args)
     try:
         required_dispatch = _parse_required_dispatch(args.require_dispatch)
+        required_graph_fanin = _parse_required_map(args.require_graph_fanin, flag="--require-graph-fanin")
+        required_graph_dependents = _parse_required_map(
+            args.require_graph_dependents,
+            flag="--require-graph-dependents",
+        )
+        required_scratch_reuse = _parse_required_map(args.require_scratch_reuse, flag="--require-scratch-reuse")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -333,6 +452,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         required_scenarios=_as_list(args.require_scenario),
         require_artifacts=_as_list(args.require_artifact),
         required_dispatch=required_dispatch,
+        required_graph_fanin=required_graph_fanin,
+        required_graph_dependents=required_graph_dependents,
+        required_scratch_reuse=required_scratch_reuse,
         require_report_files=args.require_report_files,
         require_source_papers=args.require_source_papers,
         require_command_examples=args.require_command_examples,

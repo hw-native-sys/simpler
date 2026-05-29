@@ -3529,11 +3529,11 @@ Needed:
   (`tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/`).
   The lifecycle matrix validator checks required scenarios, A100/H200
   artifacts, repeat-run completion counts, DAG-chain dispatch, graph
-  depends-on dispatch, graph-scratch-reuse dispatch, scratch-reuse metadata,
-  report files,
-  VDCores/MPK source-paper provenance, collection mode, sanitized
-  reconstruction commands, and zero device scheduler errors. The matrix report
-  can be regenerated from the existing per-scenario smoke JSON with
+  depends-on dispatch/topology, graph-scratch-reuse dispatch/topology,
+  scratch-reuse metadata, report files, VDCores/MPK source-paper provenance,
+  collection mode, sanitized reconstruction commands, and zero device
+  scheduler errors. The matrix report can be regenerated from the existing
+  per-scenario smoke JSON with
   `--collect-existing-suffix 9024e9bb` without rerunning the GPUs, and the
   validator requires that flag in the regenerated local command example. The
   artifact index reads the lifecycle metadata commit and collection mode so

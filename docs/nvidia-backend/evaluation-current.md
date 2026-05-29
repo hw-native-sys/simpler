@@ -294,6 +294,8 @@ graph-scratch-reuse scenarios with `repeat_runs=2`, `stream_id=1`, and
 `worker_blocks=2` for queue/DAG modes. It writes JSON, Markdown, and SVG
 artifacts under
 `tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/`.
+The default validator rejects this matrix if the incoming-edge graph topology
+or scratch-buffer reuse alias is missing or different.
 
 Validation command:
 
@@ -313,10 +315,11 @@ Selected lifecycle rows:
 | graph-scratch-reuse | A100 | 94208 | 131317 | `6,6` | `1,2,1,2,1,1` | `0,0,2,1,1,2` | `2,2,3,4,5,5` |
 | graph-scratch-reuse | H200 | 70368 | 90238 | `6,6` | `1,2,1,2,1,1` | `0,0,2,1,1,2` | `2,2,3,4,5,5` |
 
-All rows reported zero scheduler errors. This matrix keeps the incoming-edge
-graph descriptor in the same lifecycle evidence path as direct, queue,
-fixed-DAG, and scratch-reuse executors, so future prepared-callable reset
-regressions are caught by one paired validator.
+All rows reported zero scheduler errors. The matrix report now carries graph
+topology and scratch-reuse columns in addition to dispatch and resource
+policy. This keeps the incoming-edge graph descriptor in the same lifecycle
+evidence path as direct, queue, fixed-DAG, and scratch-reuse executors, so
+future prepared-callable reset regressions are caught by one paired validator.
 
 ## Previous Compact Role Benchmark Gate
 

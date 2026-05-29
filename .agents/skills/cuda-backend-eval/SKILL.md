@@ -969,11 +969,12 @@ This writes per-scenario smoke artifacts plus
 `tmp/cuda-backend/persistent-lifecycle-matrix-<commit>/cuda-lifecycle-matrix.md`,
 `cuda-lifecycle-matrix.svg`, and `cuda-lifecycle-matrix.json`.
 Lifecycle matrix JSON/Markdown includes source-paper provenance, collection
-mode, paper alignment text, and sanitized local/remote command examples. Use
-`--collect-existing-suffix <commit>` to regenerate the combined matrix report
-and index from existing per-scenario `a100.json`/`h200.json` files without
-rerunning A100/H200 hardware; the regenerated report's local sample command
-must include the same flag.
+mode, paper alignment text, sanitized local/remote command examples, graph
+topology, and scratch-reuse metadata. Use `--collect-existing-suffix
+<commit>` to regenerate the combined matrix report and index from existing
+per-scenario `a100.json`/`h200.json` files without rerunning A100/H200
+hardware; the regenerated report's local sample command must include the same
+flag.
 Use `--dry-run` to print every paired smoke command plus the final matrix
 validator and artifact-index commands without writing the matrix report.
 The current paired lifecycle matrix capture is under
@@ -987,10 +988,13 @@ PYTHONPATH=$PWD:$PWD/python \
     --preset default --require-source-papers --require-command-examples
 ```
 
-The default preset now requires the `graph-depends-on` scenario with dispatch
-`1,2,1`, so focused one-scenario lifecycle matrices should pass explicit
-`--scenario graph-depends-on` to the matrix runner rather than relying on the
-default preset.
+The default preset now requires `graph-depends-on` with dispatch `1,2,1`,
+graph fan-in `0,0,2`, and dependents `2,2`. It also requires
+`graph-scratch-reuse` with dispatch `1,2,1,2,1,1`, fan-in
+`0,0,2,1,1,2`, dependents `2,2,3,4,5,5`, and
+`scratch_reuse=reused_buffer=tmp0,reuse_task=4`. Focused one-scenario
+lifecycle matrices should pass explicit `--scenario` values to the matrix
+runner rather than relying on the default preset.
 
 Run the six-task persistent DAG scratch-reuse smoke. This graph reuses `tmp0`
 after its last dependent has completed and validates the final reused-buffer

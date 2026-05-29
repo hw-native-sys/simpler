@@ -123,6 +123,17 @@ SCENARIO_DISPATCH = {
     "graph-depends-on": "1,2,1",
     "graph-scratch-reuse": "1,2,1,2,1,1",
 }
+SCENARIO_GRAPH_FANIN = {
+    "graph-depends-on": "0,0,2",
+    "graph-scratch-reuse": "0,0,2,1,1,2",
+}
+SCENARIO_GRAPH_DEPENDENTS = {
+    "graph-depends-on": "2,2",
+    "graph-scratch-reuse": "2,2,3,4,5,5",
+}
+SCENARIO_SCRATCH_REUSE = {
+    "graph-scratch-reuse": "reused_buffer=tmp0,reuse_task=4",
+}
 
 
 @dataclass(frozen=True)
@@ -348,6 +359,30 @@ def _policy(row: dict[str, Any]) -> str:
     )
 
 
+def _graph_topology(row: dict[str, Any]) -> str:
+    descriptor = row.get("graph_descriptor")
+    if not isinstance(descriptor, dict):
+        return "-"
+    fanin = descriptor.get("fanin")
+    dependents = descriptor.get("dependents")
+    if not isinstance(fanin, list) or not isinstance(dependents, list):
+        return "-"
+    fanin_text = ",".join(str(value) for value in fanin)
+    dependents_text = ",".join(str(value) for value in dependents)
+    return f"fanin={fanin_text};deps={dependents_text}"
+
+
+def _scratch_reuse(row: dict[str, Any]) -> str:
+    reuse = row.get("scratch_reuse")
+    if not isinstance(reuse, dict):
+        return "-"
+    reused_buffer = reuse.get("reused_buffer")
+    reuse_task = reuse.get("reuse_task")
+    if reused_buffer is None or reuse_task is None:
+        return "-"
+    return f"reused_buffer={reused_buffer},reuse_task={reuse_task}"
+
+
 def _source_paper_summary(metadata: dict[str, Any]) -> str:
     papers = metadata.get("source_papers") or SOURCE_PAPERS
     parts = []
@@ -400,12 +435,12 @@ def render_lifecycle_markdown(
             (
                 "| Scenario | Artifact | Status | Runtime | Mode | N | Device ns | "
                 "Host ns | Repeat runs | Completions | Dispatch | Scheduler errors | "
-                "Resource policy |"
+                "Resource policy | Graph topology | Scratch reuse |"
             ),
             (
                 "| -------- | -------- | ------ | ------- | ---- | - | --------- | "
                 "------- | ----------- | ----------- | -------- | ---------------- | "
-                "--------------- |"
+                "--------------- | -------------- | ------------- |"
             ),
         ]
     )
@@ -416,7 +451,7 @@ def render_lifecycle_markdown(
             f"{_mode(row)} | {row.get('n', '-')} | {row.get('device_wall_ns', '-')} | "
             f"{row.get('host_wall_ns', '-')} | `{row.get('repeat_runs', '-')}` | "
             f"`{_completed(row)}` | `{_dispatch(row)}` | `{_scheduler_errors(row)}` | "
-            f"`{_policy(row)}` |"
+            f"`{_policy(row)}` | `{_graph_topology(row)}` | `{_scratch_reuse(row)}` |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -457,6 +492,10 @@ def render_lifecycle_svg(rows: list[dict[str, Any]], label: str) -> str:
                 (
                     f'<text x="{left}" y="{y + 40}" font-family="sans-serif" font-size="11" fill="#555">'
                     f"completed={html.escape(_completed(row))}; policy={html.escape(_policy(row))}</text>"
+                ),
+                (
+                    f'<text x="{left}" y="{y + 55}" font-family="sans-serif" font-size="10" fill="#555">'
+                    f"graph={html.escape(_graph_topology(row))}; scratch={html.escape(_scratch_reuse(row))}</text>"
                 ),
             ]
         )
@@ -503,6 +542,15 @@ def build_validate_command(config: LifecycleMatrixConfig, suffix: str) -> list[s
         dispatch = SCENARIO_DISPATCH.get(scenario_name)
         if dispatch is not None:
             command.extend(["--require-dispatch", f"{scenario_name}={dispatch}"])
+        graph_fanin = SCENARIO_GRAPH_FANIN.get(scenario_name)
+        if graph_fanin is not None:
+            command.extend(["--require-graph-fanin", f"{scenario_name}={graph_fanin}"])
+        graph_dependents = SCENARIO_GRAPH_DEPENDENTS.get(scenario_name)
+        if graph_dependents is not None:
+            command.extend(["--require-graph-dependents", f"{scenario_name}={graph_dependents}"])
+        scratch_reuse = SCENARIO_SCRATCH_REUSE.get(scenario_name)
+        if scratch_reuse is not None:
+            command.extend(["--require-scratch-reuse", f"{scenario_name}={scratch_reuse}"])
     command.append("--require-report-files")
     return command
 
