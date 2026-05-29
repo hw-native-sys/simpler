@@ -1881,7 +1881,9 @@ with sample counts. The JSON metadata also records sanitized local and remote
 sample command examples so the selected baseline/shape/size setup can be
 reconstructed without rerunning the sweep. Publish-time source-paper
 validation checks that the referenced VDCores and MPK notes exist under
-`tmp/sources/`.
+`tmp/sources/`. The compact validation preset also requires the Markdown
+median summary and throughput SVG to expose `Median GF/s`, each required
+baseline, and each required tensor shape.
 
 Regenerate reports from an existing tensor-sweep JSON without rerunning the
 A100/H200 measurements:
@@ -1919,6 +1921,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-size 256 --require-size 4096 --require-size 65536 \
     --require-shape 16x16x16 --expected-repeats 3 \
     --expected-result-count 108 --require-report-files \
+    --require-report-throughput \
     --require-command-examples \
     --require-source-papers \
     --require-dispatch pto_persistent_dag_tensor=3,1,2,1 \

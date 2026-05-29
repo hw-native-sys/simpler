@@ -1748,7 +1748,8 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-size 256 --require-shape 16x16x16 \
     --expected-repeats 1 --expected-result-count 2 \
     --require-dispatch pto_persistent_dag_graph_tensor_core=10,1,2,1 \
-    --require-report-files --require-command-examples \
+    --require-report-files --require-report-throughput \
+    --require-command-examples \
     --require-source-papers
 ```
 

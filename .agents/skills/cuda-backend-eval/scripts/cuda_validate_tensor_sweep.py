@@ -190,6 +190,36 @@ def _validate_report_files(artifact_dir: Path | None) -> list[str]:
     return [f"missing report file {file_name}" for file_name in REPORT_FILES if not (artifact_dir / file_name).exists()]
 
 
+def _validate_text_file_contains(path: Path, *, required_text: Sequence[str]) -> list[str]:
+    if not path.exists():
+        return [f"missing report file {path.name}"]
+    text = path.read_text()
+    return [f"missing report tensor throughput in {path.name}: {value}" for value in required_text if value not in text]
+
+
+def _validate_report_throughput(
+    artifact_dir: Path | None,
+    *,
+    required_baselines: Sequence[str],
+    required_shapes: Sequence[str],
+) -> list[str]:
+    if artifact_dir is None:
+        return ["missing artifact directory for report-throughput validation"]
+
+    markdown_required = ["Median Summary", "Median GF/s", *required_baselines, *required_shapes]
+    svg_required = ["Median GF/s", *required_baselines, *required_shapes]
+    return [
+        *_validate_text_file_contains(
+            artifact_dir / "cuda-tensor-shape-sweep.md",
+            required_text=markdown_required,
+        ),
+        *_validate_text_file_contains(
+            artifact_dir / "cuda-tensor-shape-throughput.svg",
+            required_text=svg_required,
+        ),
+    ]
+
+
 def _validate_command_examples(payload: dict[str, Any]) -> list[str]:
     metadata = payload.get("metadata")
     examples = metadata.get("command_examples") if isinstance(metadata, dict) else None
@@ -264,6 +294,7 @@ def validate_tensor_sweep(  # noqa: PLR0913
     expected_result_count: int | None = None,
     required_dispatch: dict[str, str] | None = None,
     require_report_files: bool = False,
+    require_report_throughput: bool = False,
     require_command_examples: bool = False,
     require_source_papers: bool = False,
     source_root: Path | None = None,
@@ -293,6 +324,15 @@ def validate_tensor_sweep(  # noqa: PLR0913
 
     if require_report_files:
         errors.extend(_validate_report_files(artifact_dir))
+
+    if require_report_throughput:
+        errors.extend(
+            _validate_report_throughput(
+                artifact_dir,
+                required_baselines=required_baselines,
+                required_shapes=required_shapes,
+            )
+        )
 
     if require_command_examples:
         errors.extend(_validate_command_examples(payload))
@@ -333,6 +373,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
             f"{baseline}={dispatch}" for baseline, dispatch in COMPACT_TENSOR_BASELINE_DISPATCH.items()
         ]
     args.require_report_files = True
+    args.require_report_throughput = True
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -347,6 +388,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-result-count", type=int)
     parser.add_argument("--require-dispatch", action="append")
     parser.add_argument("--require-report-files", action="store_true")
+    parser.add_argument("--require-report-throughput", action="store_true")
     parser.add_argument("--require-command-examples", action="store_true")
     parser.add_argument("--require-source-papers", action="store_true")
     return parser.parse_args(argv)
@@ -372,6 +414,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_result_count=args.expected_result_count,
         required_dispatch=required_dispatch,
         require_report_files=args.require_report_files,
+        require_report_throughput=args.require_report_throughput,
         require_command_examples=args.require_command_examples,
         require_source_papers=args.require_source_papers,
     )

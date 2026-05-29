@@ -502,12 +502,12 @@ A100 scalar/graph/tensor-core/cuBLAS `47104/47104/45056/48128 ns` at
 dispatch `3,1,2,1` as the scalar tensor row while exercising the explicit
 runtime graph descriptor path.
 `cuda_validate_tensor_sweep.py` checked the expected A100/H200 rows,
-baselines, sizes, shape, three repeats, report files, and PTO dispatch
-sequences before the numbers were copied into docs. New tensor-sweep captures
-can also require sanitized local/remote command examples and source-paper
-metadata before publishing with `--require-command-examples` and
-`--require-source-papers`; the source-paper gate verifies the referenced
-files exist under `tmp/sources/`.
+baselines, sizes, shape, three repeats, report files, throughput report
+content, and PTO dispatch sequences before the numbers were copied into docs.
+New tensor-sweep captures can also require sanitized local/remote command
+examples and source-paper metadata before publishing with
+`--require-command-examples` and `--require-source-papers`; the source-paper
+gate verifies the referenced files exist under `tmp/sources/`.
 Benchmark captures now use the same VDCores/MPK `source_papers` metadata
 contract and sanitized command-example metadata contract as tensor sweeps.
 They can be gated with `cuda_validate_capture.py` plus
@@ -2532,7 +2532,8 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-size 256 --require-shape 16x16x16 \
     --expected-repeats 1 --expected-result-count 2 \
     --require-dispatch pto_persistent_dag_graph_tensor_core=10,1,2,1 \
-    --require-report-files --require-command-examples \
+    --require-report-files --require-report-throughput \
+    --require-command-examples \
     --require-source-papers
 ```
 

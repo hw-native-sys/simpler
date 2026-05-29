@@ -2384,6 +2384,56 @@ def test_cuda_tensor_sweep_validator_accepts_complete_artifact(tmp_path):
     assert errors == []
 
 
+def test_cuda_tensor_sweep_validator_checks_throughput_reports(tmp_path):
+    cuda_validate_tensor_sweep = _load_tensor_sweep_validator_module()
+    artifact_dir = tmp_path / "tensor-shape-sweep-abc123"
+    artifact_dir.mkdir()
+    payload = _tensor_sweep_payload()
+    required_baselines = ["pto_persistent_dag_tensor", "pto_persistent_dag_tensor_core", "cublas_sgemm"]
+    required_shapes = ["16x16x16", "16x16x64"]
+    (artifact_dir / "cuda-tensor-shape-sweep.md").write_text("# stale report\n")
+    (artifact_dir / "cuda-tensor-shape-throughput.svg").write_text("<svg></svg>\n")
+
+    errors = cuda_validate_tensor_sweep.validate_tensor_sweep(
+        payload,
+        artifact_dir=artifact_dir,
+        required_baselines=required_baselines,
+        required_shapes=required_shapes,
+        require_report_throughput=True,
+    )
+
+    assert "missing report tensor throughput in cuda-tensor-shape-sweep.md: Median Summary" in errors
+    assert "missing report tensor throughput in cuda-tensor-shape-sweep.md: Median GF/s" in errors
+    assert "missing report tensor throughput in cuda-tensor-shape-throughput.svg: Median GF/s" in errors
+    expected_error = (
+        "missing report tensor throughput in cuda-tensor-shape-throughput.svg: pto_persistent_dag_tensor_core"
+    )
+    assert expected_error in errors
+
+    markdown = "\n".join(
+        [
+            "## Median Summary",
+            "| Artifact | Baseline | Shape | Median GF/s |",
+            *required_baselines,
+            *required_shapes,
+        ]
+    )
+    svg = "\n".join(["<svg>", "Median GF/s", *required_baselines, *required_shapes, "</svg>"])
+    (artifact_dir / "cuda-tensor-shape-sweep.md").write_text(markdown + "\n")
+    (artifact_dir / "cuda-tensor-shape-throughput.svg").write_text(svg + "\n")
+
+    assert (
+        cuda_validate_tensor_sweep.validate_tensor_sweep(
+            payload,
+            artifact_dir=artifact_dir,
+            required_baselines=required_baselines,
+            required_shapes=required_shapes,
+            require_report_throughput=True,
+        )
+        == []
+    )
+
+
 def test_cuda_tensor_sweep_validator_reports_missing_rows_and_metadata(tmp_path):
     cuda_validate_tensor_sweep = _load_tensor_sweep_validator_module()
     artifact_dir = tmp_path / "tensor-shape-sweep-abc123"
@@ -2563,6 +2613,7 @@ def test_cuda_tensor_sweep_validator_compact_preset_keeps_dispatch_commas():
 
     assert args.expected_repeats == 3
     assert args.expected_result_count == 72
+    assert args.require_report_throughput is True
     assert "cublas_sgemm_graph" in args.require_baseline
     assert "pto_persistent_dag_graph_tensor_core" in args.require_baseline
     assert required_dispatch == {

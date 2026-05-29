@@ -215,6 +215,9 @@ the focused tag/role/compact graph rows and
 view, so a report captured with the wrong `--tensor-rows`, `--tensor-cols`,
 `--tensor-inner`, missing GF/s rows, or stale graph metadata does not get
 copied into the current-evaluation tables.
+Tensor-shape sweep validation uses the same report-quality contract through
+`--require-report-throughput`, and the compact tensor-baseline preset enables
+that gate by default.
 
 ## Baselines
 
