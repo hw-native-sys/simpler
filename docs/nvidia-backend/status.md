@@ -1822,6 +1822,13 @@ the same bounded `scalar_args` slots as explicit graph descriptors. Scalar
 entries still resolve through normal `TaskArgsBuilder` scalar names before the
 descriptor is launched, so a tagged graph can now keep tensor roles and scalar
 inputs in one TaskArgs-like list.
+The graph adapter now also resolves named graph callables before lowering
+tagged `task_args`: a descriptor may define `graph.callables` with callable
+metadata such as `func_id`, then each graph task can use `callable: "name"`
+instead of embedding the raw generated-dispatch ID. Task-local fields override
+callable defaults, so the resulting descriptor still records the same
+generated dispatch while the scene-test graph shape is closer to normal PTO
+`submit_next_level(callable, TaskArgs, ...)` submissions.
 The role mapping now preserves the lifecycle distinction needed by CUDA
 memory planning: tagged `output` may create a default-sized temporary, but
 tagged `output_existing` and `inout` must name storage that is already known
@@ -1876,8 +1883,34 @@ PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
 
 Result: `2 passed, 77 deselected`.
 After syncing the branch tree to H200 with `rsync`, the same selector returned
-`2 passed, 77 deselected` on `bizhaoh200`, with the known PTO-ISA SSH refresh
-warning printed before pytest.
+`2 passed, 77 deselected` with the known PTO-ISA SSH refresh warning.
+
+Named-callable graph lowering was then added under TDD. The first real-data
+selector failed with `KeyError: 'func_id'` because graph tasks using
+`callable: "generic"` still reached task construction without resolving the
+callable metadata. After adding callable-name resolution, the local A100
+descriptor and real-data selectors passed:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py -q \
+  -k 'named_callable or named_callables'
+
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py -q \
+  -k 'unknown_cuda_persistent_graph_callable_name'
+
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py -q \
+  -k named_callable_graph_with_ctypes_data --platform cuda
+```
+
+Results: the first selector reported `2 passed, 80 deselected`, the unknown
+callable-name guard reported `1 passed, 81 deselected`, and the local A100
+real-data named-callable graph scene reported `1 passed, 81 deselected`. The
+same real-data selector passed on the H200 checkout after syncing the touched
+files: `1 passed, 81 deselected`, again with the known PTO-ISA SSH refresh
+warning.
 Tagged `inout` graph lowering was then covered with a failing descriptor test
 that first produced fan-in `[0,0,1]`, leaving the in-place update as an
 incorrect root. After changing tensor-flow inference to prefer the nearest
@@ -3272,9 +3305,10 @@ Needed:
   automatic default temporary allocation, logical-output/storage-output
   separation for scratch reuse, order-independent tensor-flow dependency
   inference, tagged TaskArgs-like graph task lowering including `inout`
-  producer chaining, explicit unary square graph dispatch, tagged
-  graph-descriptor paired smoke, and five-task chain, five-task fan-out/fan-in,
-  and six-task scratch-reuse graph descriptor smokes;
+  producer chaining, named graph-callable resolution, explicit unary square
+  graph dispatch, tagged graph-descriptor paired smoke, and five-task chain,
+  five-task fan-out/fan-in, and six-task scratch-reuse graph descriptor
+  smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, and direct/queue/DAG
   prepared-callable repeat-run smokes. The paired lifecycle matrix runner now

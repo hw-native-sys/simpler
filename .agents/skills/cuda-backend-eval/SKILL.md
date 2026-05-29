@@ -1159,6 +1159,12 @@ Graph tasks may alternatively pass tagged `task_args` entries with
 first four inputs to `a`/`b`/`c`/`d`, appends any additional inputs to
 `tensor_args`, and lowers the single output to `out`; this is the preferred
 test form when checking the first TaskArgs-like lowering slice.
+Graph tasks may use a `callable` name instead of embedding `func_id` directly
+when `graph.callables` maps that name to callable metadata such as
+`{"func_id": 9}`. The task-local fields override callable defaults, and the
+adapter resolves the name before tagged `task_args`, temporary allocation, and
+tensor-flow edge inference. Use this form when checking the scene-test step
+toward normal PTO task graphs with named callables and tagged arguments.
 Use `output` only when a graph task creates a new default-sized temporary.
 Use `output_existing` or `inout` only for storage already known at that point
 in descriptor order, such as scene tensors, explicit temporaries, or
@@ -1199,6 +1205,15 @@ duplicate logical tensor producers or in-place graph updates:
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
     -q -k tagged_inout_graph --platform cuda
+```
+
+Run the named-callable graph selector after changing callable-name resolution
+or the tagged task-argument graph lowering:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k named_callable_graph_with_ctypes_data --platform cuda
 ```
 
 Use the paired smoke runner for A100/H200 artifact evidence of the same

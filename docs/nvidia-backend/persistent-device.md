@@ -332,6 +332,14 @@ descriptor fields: the first four inputs become `a`/`b`/`c`/`d`, additional
 inputs append to `tensor_args`, and the single output becomes `out`. This is
 still host-side descriptor construction, but it reduces the gap between
 normal task-argument metadata and the persistent-device runtime ABI.
+Graph tasks can now name a callable through `callable` when
+`graph.callables` maps that name to callable metadata such as `func_id`. The
+task-local fields override callable defaults before tagged `task_args` are
+lowered, so a scene graph can use named callables plus TaskArgs-like roles
+instead of repeating raw generated-dispatch IDs on every task. This is still
+not full capture of a live PTO orchestrator graph, but it moves descriptor
+construction closer to the normal `submit_next_level(callable, TaskArgs, ...)`
+shape.
 Tagged `output` is the only role that may allocate a new default-sized
 temporary. Tagged `output_existing` and `inout` must name storage that is
 already known at that point in descriptor order, either an input/output tensor,

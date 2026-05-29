@@ -1218,6 +1218,7 @@ class _CudaPersistentDagSceneBuffers:
         task_specs = list(graph.get("tasks", []))
         if not task_specs:
             raise ValueError("CUDA persistent_dag_graph_f32 requires at least one graph task")
+        task_specs = [self._resolve_graph_task_callable(graph, task_spec) for task_spec in task_specs]
         task_specs = [self._normalize_graph_task_spec(task_spec) for task_spec in task_specs]
 
         ptrs = dict(self.tensor_buffers.ptrs)
@@ -1287,6 +1288,27 @@ class _CudaPersistentDagSceneBuffers:
         self.host_tasks = task_t(*task_values)
         fanin_t = ctypes_module.c_uint32 * len(fanin)
         self.host_fanin = fanin_t(*fanin)
+
+    @staticmethod
+    def _resolve_graph_task_callable(graph: dict[str, Any], task_spec: dict[str, Any]) -> dict[str, Any]:
+        callable_name = task_spec.get("callable")
+        if callable_name is None:
+            return task_spec
+
+        graph_callables = graph.get("callables", {})
+        if not isinstance(graph_callables, dict):
+            raise ValueError("CUDA persistent_dag_graph_f32 graph callables must be a dictionary")
+        key = str(callable_name)
+        if key not in graph_callables:
+            raise ValueError(f"CUDA persistent_dag_graph_f32 unknown graph callable: {key}")
+        callable_spec = graph_callables[key]
+        if not isinstance(callable_spec, dict):
+            raise ValueError(f"CUDA persistent_dag_graph_f32 graph callable {key} must be a dictionary")
+
+        resolved = dict(callable_spec)
+        resolved.update(task_spec)
+        resolved.pop("callable", None)
+        return resolved
 
     @staticmethod
     def _bind_graph_task_output_storage(
