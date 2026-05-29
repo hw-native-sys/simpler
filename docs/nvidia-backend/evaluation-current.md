@@ -2,10 +2,11 @@
 
 This page summarizes the latest full paired A100/H200 CUDA backend capture
 from commit `61cf96cd`, plus compact current-head validation captures. The
-latest compact gate is artifact label `30a8974f`, which promotes the compact
-role-entry graph descriptor row into the selected baseline matrix and compares
-tagged, role-keyed, and compact task-argument spellings. The raw JSON,
-Markdown, and SVG reports are generated locally under
+latest compact gate is artifact label `01ddf564`, which promotes the
+incoming-edge `depends_on` graph descriptor row into the selected baseline
+matrix. The previous compact-role gate at `30a8974f` remains the
+task-argument spelling comparison for tagged, role-keyed, and compact graph
+entries. The raw JSON, Markdown, and SVG reports are generated locally under
 `tmp/cuda-backend/` and intentionally remain uncommitted.
 
 The capture uses `nvcc` for target-specific PTX on both machines:
@@ -231,8 +232,57 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark-dag-deltas.svg`
 - `tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark-throughput.svg`
+- `tmp/cuda-backend/graph-depends-benchmark-working/a100-current-01ddf564/cuda-benchmark.json`
+- `tmp/cuda-backend/graph-depends-benchmark-working/a100-current-01ddf564/cuda-benchmark.md`
+- `tmp/cuda-backend/graph-depends-benchmark-working/h200-current-01ddf564/cuda-benchmark.json`
+- `tmp/cuda-backend/graph-depends-benchmark-working/h200-current-01ddf564/cuda-benchmark.md`
+- `tmp/cuda-backend/graph-depends-benchmark-working/combined-current-01ddf564/cuda-benchmark.json`
+- `tmp/cuda-backend/graph-depends-benchmark-working/combined-current-01ddf564/cuda-benchmark.md`
+- `tmp/cuda-backend/graph-depends-benchmark-working/combined-current-01ddf564/cuda-benchmark.svg`
+- `tmp/cuda-backend/graph-depends-benchmark-working/combined-current-01ddf564/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/graph-depends-benchmark-working/combined-current-01ddf564/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/graph-depends-benchmark-working/combined-current-01ddf564/cuda-benchmark-throughput.svg`
 
-## Latest Compact Role Benchmark Gate
+## Latest Graph Depends-On Benchmark Gate
+
+The compact paired gate at artifact label `01ddf564` adds
+`pto_persistent_dag_graph_depends_on` to the selected benchmark matrix. It
+uses the default `16x16x16` tensor descriptor, `N=1024`, one repeat,
+`batch_tasks=2`, and `worker_blocks_per_task=4`. The paired runner synced the
+local tree to `bizhaoh200`, captured local A100 and remote H200 reports,
+merged them, generated Markdown and SVG reports, and validated the combined
+JSON.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    tmp/cuda-backend/graph-depends-benchmark-working/combined-current-01ddf564/cuda-benchmark.json \
+    --preset compact-current
+```
+
+The combined JSON has `84` samples. The validator checked A100/H200 machine
+names, size `1024`, one repeat, selected tensor baselines, source-paper
+provenance, sanitized command examples, generated Markdown/SVG reports,
+expected generated-dispatch sequences, tensor descriptor metadata, graph
+descriptor fan-in/dependent metadata, graph task-argument metadata, and zero
+scheduler errors for PTO persistent DAG rows.
+
+Selected incoming-edge graph rows:
+
+| GPU | Device ns | Host ns | Dispatch | Fan-in | Dependents |
+| --- | --------- | ------- | -------- | ------ | ---------- |
+| A100 | 30720 | 44736 | `1,2,1` | `0,0,2` | `2,2` |
+| H200 | 26112 | 48462 | `1,2,1` | `0,0,2` | `2,2` |
+
+The generated DAG-shapes summary for this capture includes
+`Graph Depends-On/DAG`: A100 reports `0.49x` and H200 reports `0.69x`
+relative to the matched base `pto_persistent_dag` row. The row uses the same
+device task functions as the fixed DAG, but gets its fan-in from graph-node
+`depends_on` fields instead of a separately spelled outgoing-edge list.
+
+## Previous Compact Role Benchmark Gate
 
 The compact paired gate at artifact label `30a8974f` adds
 `pto_persistent_dag_graph_compact_role_inout` to the selected benchmark

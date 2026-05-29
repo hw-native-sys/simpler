@@ -6791,7 +6791,7 @@ def test_cuda_current_summary_renders_worker_and_dag_tables():
     assert "| A100 | 65536 | 6 | 128 | 3000 | 0.30x |" in worker_table
     assert (
         "| A100 | 65536 | 1.50x | 2.00x | 1.25x | 1.23x | 1.30x | 1.35x | 1.40x | "
-        "1.10x | 1.15x | - | 1.80x | - | - | 1.12x | 1.20x | 2.50x |"
+        "1.10x | 1.15x | - | - | 1.80x | - | - | 1.12x | 1.20x | 2.50x |"
     ) in dag_table
 
 
@@ -6835,13 +6835,62 @@ def test_cuda_current_summary_keeps_old_captures_without_scalar_affine():
 
     assert (
         "| GPU | N | Chain/DAG | Reuse/DAG | Scalar AXPY/DAG | Scalar Scale/DAG | Scalar Affine/DAG | "
-        "Triad/DAG | Quad/DAG | Generic Args/DAG | Graph Descriptor/DAG | Graph Diamond/DAG | "
-        "Graph Scratch Reuse/DAG | Graph Tagged Inout/DAG | Graph Role Inout/DAG | "
+        "Triad/DAG | Quad/DAG | Generic Args/DAG | Graph Descriptor/DAG | Graph Depends-On/DAG | "
+        "Graph Diamond/DAG | Graph Scratch Reuse/DAG | Graph Tagged Inout/DAG | Graph Role Inout/DAG | "
         "Graph Compact Role Inout/DAG | Unary Square/DAG | Tensor/DAG |"
     ) in dag_table
     assert (
-        "| A100 | 65536 | 1.50x | 2.00x | 1.25x | - | - | - | - | - | - | - | - | - | - | - | - | 2.50x |"
+        "| A100 | 65536 | 1.50x | 2.00x | 1.25x | - | - | - | - | - | - | - | - | - | - | - | - | - | 2.50x |"
     ) in dag_table
+
+
+def test_cuda_current_summary_renders_graph_depends_on_dag_ratio():
+    cuda_current_summary = _load_current_summary_module()
+    payload = {
+        "results": [
+            {"machine": "hina", "baseline": "pto_persistent_dag", "n": 1024, "task_count": 3, "device_wall_ns": 2000},
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_chain",
+                "n": 1024,
+                "task_count": 5,
+                "device_wall_ns": 3000,
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_reuse",
+                "n": 1024,
+                "task_count": 6,
+                "device_wall_ns": 4000,
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_scalar_axpy",
+                "n": 1024,
+                "task_count": 3,
+                "device_wall_ns": 2500,
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_graph_depends_on",
+                "n": 1024,
+                "task_count": 3,
+                "device_wall_ns": 2100,
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_tensor",
+                "n": 1024,
+                "task_count": 4,
+                "device_wall_ns": 5000,
+            },
+        ],
+    }
+
+    dag_table = cuda_current_summary.render_dag_shape_table(payload)
+
+    assert "Graph Depends-On/DAG" in dag_table
+    assert "| A100 | 1024 | 1.50x | 2.00x | 1.25x | - | - | - | - | - | - | 1.05x |" in dag_table
 
 
 def test_cuda_current_summary_renders_tensor_sweep_table():
