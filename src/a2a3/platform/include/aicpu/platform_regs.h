@@ -131,6 +131,23 @@ void platform_init_aicore_regs(uint64_t reg_addr);
 int32_t platform_deinit_aicore_regs(uint64_t reg_addr);
 
 /**
+ * Variant-specific AICore deinit wait timeout, in ticks of get_sys_cnt_aicpu.
+ *
+ * Implemented per-variant in:
+ *   sim/aicpu/inner_platform_regs.cpp    -- larger budget (OS scheduling)
+ *   onboard/aicpu/inner_platform_regs.cpp -- 1 s (hardware hang detection)
+ *
+ * Rationale: on hardware, AICore is independent silicon and 1 s of
+ * non-response means the op got STARS-killed or the core is wedged. In
+ * sim, "AICore" is a host CPU thread; "no response in 1 s" can just mean
+ * the OS scheduler hasn't given it a slice on a CPU-starved CI runner.
+ * Keeping the hardware budget at 1 s preserves fast hang detection;
+ * widening the sim budget tolerates scheduler jitter without false
+ * positives.
+ */
+uint64_t inner_get_deinit_timeout_ticks();
+
+/**
  * Get physical core count for current platform
  *
  * This function returns the maximum valid physical_core_id value (exclusive upper bound).

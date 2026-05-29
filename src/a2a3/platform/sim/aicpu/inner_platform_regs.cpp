@@ -10,29 +10,17 @@
  */
 /**
  * @file inner_platform_regs.cpp
- * @brief AICPU register read/write for simulation (a5sim)
+ * @brief Variant-specific platform_regs hooks for simulation (a2a3sim)
  *
- * Simulated registers are three compact pages per core (16KB total):
- *   0x0000-0x0FFF -> page 0 (AICore SPR low: CTRL, DATA_MAIN_BASE)
- *   0x2400-0x43FF -> page 2 (PMU MMIO)
- *   0x5000-0x5FFF -> page 1 (AICore SPR high: COND)
- * sparse_reg_ptr() performs the offset remapping.
+ * a2a3 sim and onboard share the same register layout, so read_reg /
+ * write_reg live in the shared src/aicpu/platform_regs.cpp. This file
+ * exists only for the deinit-timeout split where sim wants a much wider
+ * budget than onboard — see platform_regs.h for the rationale.
  */
 
 #include <cstdint>
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
-
-volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg) {
-    volatile uint8_t *reg_base = reinterpret_cast<volatile uint8_t *>(reg_base_addr);
-    return reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(reg_base, reg_offset(reg)));
-}
-
-uint64_t read_reg(uint64_t reg_base_addr, RegId reg) { return static_cast<uint64_t>(*get_reg_ptr(reg_base_addr, reg)); }
-
-void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
-    *get_reg_ptr(reg_base_addr, reg) = static_cast<uint32_t>(value);
-}
 
 // 10 s budget on sim — AICore is a host CPU thread and "no response" can
 // just mean the OS scheduler hasn't given it a slice on a CPU-starved CI

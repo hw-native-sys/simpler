@@ -66,12 +66,15 @@ int32_t platform_deinit_aicore_regs(uint64_t reg_addr) {
     // Send exit signal to AICore
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
 
-    // Wait for AICore to acknowledge exit, with timeout.
+    // Wait for AICore to acknowledge exit, with timeout. Timeout is
+    // variant-specific (sim wider than onboard) — see
+    // inner_get_deinit_timeout_ticks declaration in platform_regs.h.
     // On timeout, skip register cleanup (AICore is unresponsive; host will
     // aclrtResetDevice to clear all hardware state).
+    const uint64_t deinit_timeout_ticks = inner_get_deinit_timeout_ticks();
     uint64_t t0 = get_sys_cnt_aicpu();
     while (read_reg(reg_addr, RegId::COND) != AICORE_EXITED_VALUE) {
-        if (get_sys_cnt_aicpu() - t0 > PLATFORM_DEINIT_TIMEOUT_TICKS) {
+        if (get_sys_cnt_aicpu() - t0 > deinit_timeout_ticks) {
             return -1;
         }
     }
