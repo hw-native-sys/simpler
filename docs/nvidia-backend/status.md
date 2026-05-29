@@ -2017,6 +2017,17 @@ command examples, Markdown/SVG reports, zero scheduler errors, dispatch
 `[1,2,1]`, graph fan-in `[0,0,2]`, graph dependents `[2,2]`, and
 `graph_node_ops=task0=op:add=1;task1=op:mul=2;task2=op:add=1`. Device times
 were `31744 ns` on A100 and `25536 ns` on H200 for `N=1024`.
+The same node-op graph descriptor path is now also covered by the paired
+persistent-smoke report validator. The working-tree capture under
+`tmp/cuda-backend/persistent-node-op-smoke-working/`
+`persistent-graph_descriptor_node_op-repeat2-smoke-32e3b1ae/` contains A100
+and H200 JSON plus Markdown/SVG artifacts. The paired validator accepted
+dispatch `[1,2,1]`, graph fan-in `[0,0,2]`, graph dependents `[2,2]`,
+repeat completions `[3,3]`, resource policy `scheduler_blocks=1`,
+`worker_blocks=3`, `block_dim=256`, `grid_dim=4`, report-visible graph-node
+ops `task0=op:add=1;task1=op:mul=2;task2=op:add=1`, and zero scheduler errors.
+A100 reported `device_wall_ns=65536`, `host_wall_ns=97710`; H200 reported
+`device_wall_ns=55296`, `host_wall_ns=78895`.
 The incoming-edge path is now covered by both a real-data L2 ctypes scene and
 paired persistent-device smoke. The working-tree smoke capture under
 `tmp/cuda-backend/depends-on-graph-working/persistent-graph_descriptor_depends_on-repeat2-smoke-06b988b5/`

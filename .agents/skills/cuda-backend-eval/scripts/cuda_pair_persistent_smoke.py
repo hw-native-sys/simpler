@@ -369,6 +369,14 @@ def _expected_graph_task_arg_key(config: PairedPersistentSmokeConfig) -> str | N
     }.get(config.dag_shape)
 
 
+def _expected_graph_node_ops(config: PairedPersistentSmokeConfig) -> str | None:
+    if config.mode != "dag":
+        return None
+    return {
+        "graph_descriptor_node_op": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
+    }.get(config.dag_shape)
+
+
 def _expected_scratch_reuse(config: PairedPersistentSmokeConfig) -> str | None:
     if config.mode != "dag":
         return None
@@ -460,6 +468,15 @@ def build_validate_command(config: PairedPersistentSmokeConfig, suffix: str) -> 
     expected_graph_task_arg_key = _expected_graph_task_arg_key(config)
     if expected_graph_task_arg_key is not None:
         command.extend(["--expected-graph-task-arg-key", expected_graph_task_arg_key])
+    expected_graph_node_ops = _expected_graph_node_ops(config)
+    if expected_graph_node_ops is not None:
+        command.extend(
+            [
+                "--expected-graph-node-ops",
+                expected_graph_node_ops,
+                "--require-report-graph-node-ops",
+            ]
+        )
     expected_scratch_reuse = _expected_scratch_reuse(config)
     if expected_scratch_reuse is not None:
         command.extend(["--expected-scratch-reuse", expected_scratch_reuse])

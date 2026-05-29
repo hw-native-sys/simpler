@@ -388,7 +388,8 @@ PYTHONPATH=$PWD:$PWD/python \
 
 Use `--dag-shape graph_descriptor_node_op` to capture graph node `op`
 callable aliases over the add/mul/add descriptor shape. The paired validator
-expects dispatch `1,2,1`, graph fan-in `0,0,2`, dependents `2,2`, and
+expects dispatch `1,2,1`, graph fan-in `0,0,2`, dependents `2,2`,
+generated Markdown/SVG report files with `Graph node ops`, and
 `graph_node_ops=task0=op:add=1;task1=op:mul=2;task2=op:add=1`:
 
 ```bash
@@ -397,6 +398,14 @@ PYTHONPATH=$PWD:$PWD/python \
     --dag-shape graph_descriptor_node_op --task-count 3 \
     --queue-capacity 2 --repeat-runs 2 --sync-remote-tree
 ```
+
+The working-tree capture under
+`tmp/cuda-backend/persistent-node-op-smoke-working/` validated paired A100 and
+H200 JSON, Markdown, and SVG artifacts with repeat completions `[3,3]`, zero
+scheduler errors, dispatch `[1,2,1]`, graph fan-in `[0,0,2]`, graph
+dependents `[2,2]`, and graph-node ops
+`task0=op:add=1;task1=op:mul=2;task2=op:add=1`. Device times were `65536 ns`
+on A100 and `55296 ns` on H200 for `N=1024`.
 
 Use `--dag-shape graph_descriptor_triad` and
 `--dag-shape graph_descriptor_quad` when the graph descriptor path should

@@ -3427,6 +3427,79 @@ def test_cuda_smoke_validator_checks_graph_task_arg_key_metadata(tmp_path):
     assert "expected graph_task_arg_key role for artifact=a100, found tag" in errors
 
 
+def test_cuda_smoke_validator_checks_graph_node_ops_metadata(tmp_path):
+    cuda_validate_smoke = _load_smoke_validator_module()
+    artifact_dir = tmp_path / "persistent-graph-descriptor-node-op-smoke"
+    artifact_dir.mkdir()
+    payload = {
+        "status": "pass",
+        "runtime": "persistent_device",
+        "mode": "dag",
+        "dag_shape": "graph_descriptor_node_op",
+        "n": 1024,
+        "repeat_runs": 2,
+        "launch_completed_counts": [3, 3],
+        "dispatch_func_ids": [1, 2, 1],
+        "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+        "graph_node_ops": {
+            "task0": "op:add=1",
+            "task1": "op:add=1",
+            "task2": "op:add=1",
+        },
+    }
+    (artifact_dir / "a100.json").write_text(json.dumps(payload) + "\n")
+    (artifact_dir / "cuda-smoke-report.md").write_text("# CUDA Smoke Report\n\nstale table\n")
+    (artifact_dir / "cuda-smoke-report.svg").write_text("<svg>stale chart</svg>\n")
+
+    payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json"])
+    expected_node_ops = "task0=op:add=1;task1=op:mul=2;task2=op:add=1"
+    errors = cuda_validate_smoke.validate_smoke(
+        payloads,
+        expectation=cuda_validate_smoke.SmokeValidationExpectation(
+            graph_node_ops=expected_node_ops,
+        ),
+    )
+
+    assert (
+        "expected graph_node_ops task0=op:add=1;task1=op:mul=2;task2=op:add=1 "
+        "for artifact=a100, found task0=op:add=1;task1=op:add=1;task2=op:add=1"
+    ) in errors
+
+    payload["graph_node_ops"]["task1"] = "op:mul=2"
+    (artifact_dir / "a100.json").write_text(json.dumps(payload) + "\n")
+    payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json"])
+    errors = cuda_validate_smoke.validate_smoke(
+        payloads,
+        expectation=cuda_validate_smoke.SmokeValidationExpectation(
+            artifact_dir=artifact_dir,
+            graph_node_ops=expected_node_ops,
+            require_report_files=True,
+            require_report_graph_node_ops=True,
+        ),
+    )
+
+    assert "missing report graph node ops in cuda-smoke-report.md" in errors
+    assert "missing report graph node ops in cuda-smoke-report.svg" in errors
+
+    (artifact_dir / "cuda-smoke-report.md").write_text(
+        f"| Graph node ops |\n| `{expected_node_ops}` |\n"
+    )
+    (artifact_dir / "cuda-smoke-report.svg").write_text(f"<svg>node ops: {expected_node_ops}</svg>\n")
+
+    assert (
+        cuda_validate_smoke.validate_smoke(
+            payloads,
+            expectation=cuda_validate_smoke.SmokeValidationExpectation(
+                artifact_dir=artifact_dir,
+                graph_node_ops=expected_node_ops,
+                require_report_files=True,
+                require_report_graph_node_ops=True,
+            ),
+        )
+        == []
+    )
+
+
 def test_cuda_smoke_validator_checks_scratch_reuse_metadata(tmp_path):
     cuda_validate_smoke = _load_smoke_validator_module()
     artifact_dir = tmp_path / "persistent-graph-descriptor-scratch-reuse-smoke"
@@ -5676,6 +5749,48 @@ def test_cuda_pair_persistent_smoke_accepts_graph_descriptor_generic_args4_workf
     assert "persistent-graph_descriptor_generic_args4-smoke-abc123/h200.json" in remote[-1]
     assert "--expected-dispatch" in validate
     assert "9,2,1" in validate
+
+
+def test_cuda_pair_persistent_smoke_accepts_node_op_graph_descriptor_workflow(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+    args = cuda_pair_persistent_smoke.parse_args(
+        [
+            "--dag-shape",
+            "graph_descriptor_node_op",
+            "--repeat-runs",
+            "2",
+            "--sync-remote-tree",
+        ]
+    )
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape=args.dag_shape,
+        repeat_runs=args.repeat_runs,
+        sync_remote_tree=args.sync_remote_tree,
+        refresh_remote=not args.skip_remote_refresh and not args.sync_remote_tree,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
+
+    assert "persistent-graph_descriptor_node_op-repeat2-smoke-abc123" in str(local)
+    assert "graph_descriptor_node_op" in local
+    assert "--dag-shape graph_descriptor_node_op" in remote[-1]
+    assert "persistent-graph_descriptor_node_op-repeat2-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-dispatch" in validate
+    assert "1,2,1" in validate
+    assert "--expected-graph-fanin" in validate
+    assert "0,0,2" in validate
+    assert "--expected-graph-dependents" in validate
+    assert "2,2" in validate
+    assert "--expected-graph-node-ops" in validate
+    assert "task0=op:add=1;task1=op:mul=2;task2=op:add=1" in validate
+    assert "--require-report-graph-node-ops" in validate
 
 
 def test_cuda_pair_persistent_smoke_accepts_depends_on_graph_descriptor_workflow(tmp_path):
