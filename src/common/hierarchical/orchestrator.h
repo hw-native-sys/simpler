@@ -136,6 +136,12 @@ public:
     // task is allowed to finish so ring slots aren't leaked.
     void drain();
 
+    // Wire the Scheduler's loop mutex so drain() can hold it across
+    // reset_to_empty(), preventing the scheduler thread from touching slot
+    // state mid-teardown (heap-use-after-free). Set once by Worker after the
+    // Scheduler is constructed.
+    void set_scheduler_loop_mutex(std::mutex *m) { sched_loop_mu_ = m; }
+
     // Clear any stored dispatch error so the next Worker::run() starts
     // from a clean slate. Called by Worker::run before scope_begin.
     void clear_error();
@@ -170,6 +176,9 @@ private:
     std::atomic<int32_t> active_tasks_{0};
     std::mutex drain_mu_;
     std::condition_variable drain_cv_;
+    // Scheduler's loop mutex (not owned). Held across reset_to_empty() in
+    // drain() so the scheduler can't be mid-on_task_complete during teardown.
+    std::mutex *sched_loop_mu_{nullptr};
 
     // Slot state lives in the Ring; the pointer stays stable for the
     // slot's lifetime. Throws if the id is out of range — callers that

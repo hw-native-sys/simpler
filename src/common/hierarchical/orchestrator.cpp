@@ -455,7 +455,19 @@ void Orchestrator::drain() {
     // Every slot is CONSUMED (active_tasks_ == 0 ⇒ allocator last_alive_ ==
     // next_task_id_). Drop all per-slot state so the next Worker.run()
     // starts from task_id = 0 with no accumulated memory.
-    allocator_->reset_to_empty();
+    //
+    // Hold the scheduler's loop mutex across the reset: active_tasks_ can reach
+    // zero while the scheduler thread is still inside on_task_complete (it reads
+    // the slot after the consume that drives the count to 0). Freeing the slots
+    // here without this guard is a heap-use-after-free. The scheduler releases
+    // loop_mu_ only between iterations, and with active_tasks_ == 0 it has no
+    // further slots to touch, so this blocks at most one in-flight iteration.
+    if (sched_loop_mu_ != nullptr) {
+        std::lock_guard<std::mutex> sched_lk(*sched_loop_mu_);
+        allocator_->reset_to_empty();
+    } else {
+        allocator_->reset_to_empty();
+    }
 
     // Rethrow the first dispatch failure seen during this run. Deferred to
     // after allocator reset so the next Worker.run() can proceed cleanly
