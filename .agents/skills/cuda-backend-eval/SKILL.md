@@ -1830,8 +1830,10 @@ PYTHONPATH=$PWD:$PWD/python:.agents/skills/cuda-backend-eval/scripts \
 Use `--section launch`, `--section unary-square`, `--section worker-grid`,
 `--section dag-shapes`, `--section tensor-throughput`, or
 `--section tensor-sweep` to refresh only one table. The tensor-throughput and
-tensor-sweep sections summarize selected tensor-DAG, graph-tensor, tensor-core,
-cuBLAS, and cuBLAS Graph rows as median GF/s from recorded tensor descriptors.
+tensor-sweep sections summarize selected tensor-DAG, graph-tensor, fixed
+tensor-core, graph tensor-core, cuBLAS, and cuBLAS Graph rows as median GF/s
+from recorded tensor descriptors. They also keep graph tensor-core-only
+working captures visible even when a scalar tensor reference row is absent.
 The DAG-shapes section includes explicit graph scratch-reuse rows when the
 capture has `pto_persistent_dag_graph_scratch_reuse`, avoiding hand-calculated
 current-evaluation ratios from raw JSON.

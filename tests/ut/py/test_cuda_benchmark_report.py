@@ -5697,6 +5697,15 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
             {
                 "artifact": "a100",
                 "machine": "a100",
+                "baseline": "pto_persistent_dag_graph_tensor_core",
+                "n": 256,
+                "shape": "16x16x16",
+                "device_wall_ns": 1000,
+                "status": "pass",
+            },
+            {
+                "artifact": "a100",
+                "machine": "a100",
                 "baseline": "pto_persistent_dag_graph_tensor",
                 "n": 256,
                 "shape": "16x16x16",
@@ -5742,6 +5751,15 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
             {
                 "artifact": "h200",
                 "machine": "h200",
+                "baseline": "pto_persistent_dag_graph_tensor_core",
+                "n": 256,
+                "shape": "16x16x16",
+                "device_wall_ns": 1200,
+                "status": "pass",
+            },
+            {
+                "artifact": "h200",
+                "machine": "h200",
                 "baseline": "pto_persistent_dag_graph_tensor",
                 "n": 256,
                 "shape": "16x16x16",
@@ -5772,17 +5790,18 @@ def test_cuda_current_summary_renders_tensor_sweep_table():
     table = cuda_current_summary.render_tensor_sweep_table(payload)
 
     assert (
-        "| GPU | N | Shape | Scalar tensor ns | Graph tensor ns | Tensor-core ns | cuBLAS ns | "
-        "cuBLAS Graph ns | Scalar GF/s | Graph tensor GF/s | Tensor-core GF/s | cuBLAS GF/s | "
-        "cuBLAS Graph GF/s | Graph/scalar | Tensor-core/scalar | cuBLAS/scalar | cuBLAS Graph/scalar |" in table
+        "| GPU | N | Shape | Scalar tensor ns | Graph tensor ns | Tensor-core ns | Graph tensor-core ns | "
+        "cuBLAS ns | cuBLAS Graph ns | Scalar GF/s | Graph tensor GF/s | Tensor-core GF/s | "
+        "Graph tensor-core GF/s | cuBLAS GF/s | cuBLAS Graph GF/s | Graph/scalar | Tensor-core/scalar | "
+        "Graph tensor-core/scalar | cuBLAS/scalar | cuBLAS Graph/scalar |" in table
     )
     assert (
-        "| A100 | 256 | 16x16x16 | 1100 | 1300 | 900 | 1500 | 500 | 7.45 | 6.30 | 9.10 | 5.46 | "
-        "16.38 | 1.18x | 0.82x | 1.36x | 0.45x |" in table
+        "| A100 | 256 | 16x16x16 | 1100 | 1300 | 900 | 1000 | 1500 | 500 | 7.45 | 6.30 | 9.10 | 8.19 | "
+        "5.46 | 16.38 | 1.18x | 0.82x | 0.91x | 1.36x | 0.45x |" in table
     )
     assert (
-        "| H200 | 256 | 16x16x16 | 800 | 700 | 1000 | 1600 | 400 | 10.24 | 11.70 | 8.19 | 5.12 | "
-        "20.48 | 0.88x | 1.25x | 2.00x | 0.50x |" in table
+        "| H200 | 256 | 16x16x16 | 800 | 700 | 1000 | 1200 | 1600 | 400 | 10.24 | 11.70 | 8.19 | 6.83 | "
+        "5.12 | 20.48 | 0.88x | 1.25x | 1.50x | 2.00x | 0.50x |" in table
     )
 
 
@@ -5803,6 +5822,14 @@ def test_cuda_current_summary_renders_benchmark_tensor_throughput_table():
                 "baseline": "pto_persistent_dag_tensor_core",
                 "n": 512,
                 "device_wall_ns": 1024,
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 2},
+                "status": "pass",
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_graph_tensor_core",
+                "n": 512,
+                "device_wall_ns": 1536,
                 "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 2},
                 "status": "pass",
             },
@@ -5848,6 +5875,14 @@ def test_cuda_current_summary_renders_benchmark_tensor_throughput_table():
             },
             {
                 "machine": "dasys-h200x8",
+                "baseline": "pto_persistent_dag_graph_tensor_core",
+                "n": 512,
+                "device_wall_ns": 2560,
+                "tensor_tile": {"rows": 16, "cols": 16, "inner": 16, "tile_count": 2},
+                "status": "pass",
+            },
+            {
+                "machine": "dasys-h200x8",
                 "baseline": "cublas_sgemm",
                 "n": 512,
                 "device_wall_ns": 4096,
@@ -5868,23 +5903,45 @@ def test_cuda_current_summary_renders_benchmark_tensor_throughput_table():
     table = cuda_current_summary.render_benchmark_tensor_throughput_table(payload)
 
     assert (
-        "| GPU | N | Shape | Scalar ns | Graph ns | Tensor-core ns | cuBLAS ns | cuBLAS graph ns | "
-        "Scalar GF/s | Graph GF/s | Tensor-core GF/s | cuBLAS GF/s | cuBLAS graph GF/s | "
-        "Tensor-core/scalar | cuBLAS/scalar | cuBLAS graph/scalar |"
+        "| GPU | N | Shape | Scalar ns | Graph ns | Tensor-core ns | Graph tensor-core ns | cuBLAS ns | "
+        "cuBLAS graph ns | Scalar GF/s | Graph GF/s | Tensor-core GF/s | Graph tensor-core GF/s | "
+        "cuBLAS GF/s | cuBLAS graph GF/s | Tensor-core/scalar | Graph tensor-core/scalar | "
+        "cuBLAS/scalar | cuBLAS graph/scalar |"
     ) in table
     assert (
-        "| --- | - | ----- | --------- | -------- | -------------- | --------- | --------------- | ----------- | "
-        "---------- | ---------------- | ----------- | ----------------- | ------------------ | ------------- | "
-        "------------------- |"
+        "| --- | - | ----- | --------- | -------- | -------------- | -------------------- | --------- | "
+        "--------------- | ----------- | ---------- | ---------------- | ---------------------- | ----------- | "
+        "----------------- | ------------------ | ------------------------ | ------------- | ------------------- |"
     ) in table
     assert (
-        "| A100 | 512 | 16x16x16 | 2048 | 4096 | 1024 | 8192 | 6144 | 8.00 | 4.00 | 16.00 | 2.00 | "
-        "2.67 | 0.50x | 4.00x | 3.00x |" in table
+        "| A100 | 512 | 16x16x16 | 2048 | 4096 | 1024 | 1536 | 8192 | 6144 | 8.00 | 4.00 | 16.00 | 10.67 | "
+        "2.00 | 2.67 | 0.50x | 0.75x | 4.00x | 3.00x |" in table
     )
     assert (
-        "| H200 | 512 | 16x16x16 | 1024 | - | 2048 | 4096 | 3072 | 16.00 | - | 8.00 | 4.00 | "
-        "5.33 | 2.00x | 4.00x | 3.00x |" in table
+        "| H200 | 512 | 16x16x16 | 1024 | - | 2048 | 2560 | 4096 | 3072 | 16.00 | - | 8.00 | 6.40 | "
+        "4.00 | 5.33 | 2.00x | 2.50x | 4.00x | 3.00x |" in table
     )
+
+
+def test_cuda_current_summary_renders_graph_tensor_core_without_scalar_reference():
+    cuda_current_summary = _load_current_summary_module()
+    payload = {
+        "results": [
+            {
+                "artifact": "a100",
+                "machine": "a100",
+                "baseline": "pto_persistent_dag_graph_tensor_core",
+                "n": 256,
+                "shape": "16x16x16",
+                "device_wall_ns": 1000,
+                "status": "pass",
+            }
+        ]
+    }
+
+    table = cuda_current_summary.render_tensor_sweep_table(payload)
+
+    assert "| A100 | 256 | 16x16x16 | - | - | - | 1000 | - | - | - | - | - | 8.19 | - | - | - | - | - | - |" in table
 
 
 def test_summarize_results_groups_by_machine_and_baseline():

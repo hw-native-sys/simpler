@@ -30,7 +30,8 @@ latest multi-size tensor baseline sweep uses `e79edba2`:
   `pto_persistent_dag_tensor`.
 - [Current capture](evaluation-current.md) records a compact tensor-baseline
   size sweep comparing scalar tensor DAG, explicit-graph scalar tensor DAG,
-  WMMA tensor-core DAG, and cuBLAS SGEMM rows for a `16x16x16` descriptor.
+  fixed WMMA tensor-core DAG, explicit-graph WMMA tensor-core DAG, and cuBLAS
+  SGEMM rows for a `16x16x16` descriptor.
 - [Current capture](evaluation-current.md) records the compact `d361006f`
   paired gate that validates the default `16x16x16` tensor descriptor with
   scalar tensor DAG, WMMA tensor-core DAG, and cuBLAS rows in one current-head
@@ -46,6 +47,9 @@ latest multi-size tensor baseline sweep uses `e79edba2`:
   benchmark row for `pto_persistent_dag_tensor_core`, a WMMA
   `m16n16k8` TF32/F32 generated-dispatch task followed by the same residual,
   gate, and fan-in tasks as the scalar tensor DAG.
+- [Current capture](evaluation-current.md) records the first
+  `pto_persistent_dag_graph_tensor_core` benchmark row, the explicit
+  graph-descriptor variant of the WMMA tensor-core DAG, on A100 and H200.
 - [Current capture](evaluation-current.md) records the first
   `cublas_sgemm` library-backed tensor baseline row in the same compact
   selected-baseline report shape.
@@ -107,6 +111,7 @@ committed:
 - `tmp/cuda-backend/a100-tensor-core-current-0879aa9e/`
 - `tmp/cuda-backend/h200-tensor-core-current-0879aa9e/`
 - `tmp/cuda-backend/combined-tensor-core-current-0879aa9e/`
+- `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/`
 - `tmp/cuda-backend/a100-cublas-current-343924df/`
 - `tmp/cuda-backend/h200-cublas-current-343924df/`
 - `tmp/cuda-backend/combined-cublas-current-343924df/`
@@ -138,9 +143,9 @@ The compact benchmark and tensor-sweep tables in
 [Current capture](evaluation-current.md) can be regenerated from raw JSON with
 `.agents/skills/cuda-backend-eval/scripts/cuda_current_summary.py`, including
 the selected benchmark tensor-throughput table via
-`--section tensor-throughput` and graph scratch-reuse ratios via
-`--section dag-shapes` when the capture includes
-`pto_persistent_dag_graph_scratch_reuse`.
+`--section tensor-throughput`, graph tensor-core rows in both tensor table
+sections, and graph scratch-reuse ratios via `--section dag-shapes` when the
+capture includes `pto_persistent_dag_graph_scratch_reuse`.
 New benchmark and tensor-sweep Markdown reports embed source-paper provenance
 for the VDCores and MPK notes kept under `tmp/sources/` and sanitized
 local/remote command examples for reconstructing the run. Tensor sweeps also
@@ -208,6 +213,8 @@ does not get copied into the current-evaluation tables.
 - `pto_persistent_dag_tensor_core`: four-task generated-dispatch DAG with a
   block-wide WMMA `m16n16k8` TF32/F32 task followed by residual, gate, and
   fan-in elementwise tasks.
+- `pto_persistent_dag_graph_tensor_core`: explicit graph-descriptor variant
+  of the WMMA tensor-core DAG.
 - `cublas_sgemm`: CUDA Runtime API plus cuBLAS
   `cublasSgemmStridedBatched` over the configured tensor descriptor. This is
   the first library-backed CUDA tensor baseline in the selected report.

@@ -59,6 +59,7 @@ BENCHMARK_TENSOR_BASELINES = (
     "pto_persistent_dag_tensor",
     "pto_persistent_dag_graph_tensor",
     "pto_persistent_dag_tensor_core",
+    "pto_persistent_dag_graph_tensor_core",
     "cublas_sgemm",
     "cublas_sgemm_graph",
 )
@@ -342,13 +343,15 @@ def render_benchmark_tensor_throughput_table(payload: Payload) -> str:
         scalar_key = (machine, "pto_persistent_dag_tensor", n, shape)
         graph_tensor_key = (machine, "pto_persistent_dag_graph_tensor", n, shape)
         tensor_core_key = (machine, "pto_persistent_dag_tensor_core", n, shape)
+        graph_tensor_core_key = (machine, "pto_persistent_dag_graph_tensor_core", n, shape)
         cublas_key = (machine, "cublas_sgemm", n, shape)
         cublas_graph_key = (machine, "cublas_sgemm_graph", n, shape)
-        if scalar_key not in medians:
+        if not any(key in medians for key in (scalar_key, graph_tensor_key, tensor_core_key, graph_tensor_core_key)):
             continue
-        scalar = medians[scalar_key]
+        scalar = medians.get(scalar_key)
         graph_tensor = medians.get(graph_tensor_key)
         tensor_core = medians.get(tensor_core_key)
+        graph_tensor_core = medians.get(graph_tensor_core_key)
         cublas = medians.get(cublas_key)
         cublas_graph = medians.get(cublas_graph_key)
         rows.append(
@@ -356,19 +359,22 @@ def render_benchmark_tensor_throughput_table(payload: Payload) -> str:
                 _machine_label(machine),
                 n,
                 shape,
-                _format_number(scalar),
+                _format_number(scalar) if scalar is not None else "-",
                 _format_number(graph_tensor) if graph_tensor is not None else "-",
                 _format_number(tensor_core) if tensor_core is not None else "-",
+                _format_number(graph_tensor_core) if graph_tensor_core is not None else "-",
                 _format_number(cublas) if cublas is not None else "-",
                 _format_number(cublas_graph) if cublas_graph is not None else "-",
                 _format_gflops(_tensor_gflops(n, shape, scalar)),
                 _format_gflops(_tensor_gflops(n, shape, graph_tensor)),
                 _format_gflops(_tensor_gflops(n, shape, tensor_core)),
+                _format_gflops(_tensor_gflops(n, shape, graph_tensor_core)),
                 _format_gflops(_tensor_gflops(n, shape, cublas)),
                 _format_gflops(_tensor_gflops(n, shape, cublas_graph)),
-                _ratio(tensor_core, scalar) if tensor_core is not None else "-",
-                _ratio(cublas, scalar) if cublas is not None else "-",
-                _ratio(cublas_graph, scalar) if cublas_graph is not None else "-",
+                _ratio(tensor_core, scalar) if scalar is not None and tensor_core is not None else "-",
+                _ratio(graph_tensor_core, scalar) if scalar is not None and graph_tensor_core is not None else "-",
+                _ratio(cublas, scalar) if scalar is not None and cublas is not None else "-",
+                _ratio(cublas_graph, scalar) if scalar is not None and cublas_graph is not None else "-",
             ]
         )
     return _table(
@@ -379,14 +385,17 @@ def render_benchmark_tensor_throughput_table(payload: Payload) -> str:
             "Scalar ns",
             "Graph ns",
             "Tensor-core ns",
+            "Graph tensor-core ns",
             "cuBLAS ns",
             "cuBLAS graph ns",
             "Scalar GF/s",
             "Graph GF/s",
             "Tensor-core GF/s",
+            "Graph tensor-core GF/s",
             "cuBLAS GF/s",
             "cuBLAS graph GF/s",
             "Tensor-core/scalar",
+            "Graph tensor-core/scalar",
             "cuBLAS/scalar",
             "cuBLAS graph/scalar",
         ],
@@ -405,18 +414,21 @@ def render_tensor_sweep_table(payload: Payload) -> str:
         scalar_key = (machine, "pto_persistent_dag_tensor", n, shape)
         graph_tensor_key = (machine, "pto_persistent_dag_graph_tensor", n, shape)
         tensor_core_key = (machine, "pto_persistent_dag_tensor_core", n, shape)
+        graph_tensor_core_key = (machine, "pto_persistent_dag_graph_tensor_core", n, shape)
         cublas_key = (machine, "cublas_sgemm", n, shape)
         cublas_graph_key = (machine, "cublas_sgemm_graph", n, shape)
-        if scalar_key not in medians:
+        if not any(key in medians for key in (scalar_key, graph_tensor_key, tensor_core_key, graph_tensor_core_key)):
             continue
-        scalar = medians[scalar_key]
+        scalar = medians.get(scalar_key)
         graph_tensor = medians.get(graph_tensor_key)
         tensor_core = medians.get(tensor_core_key)
+        graph_tensor_core = medians.get(graph_tensor_core_key)
         cublas = medians.get(cublas_key)
         cublas_graph = medians.get(cublas_graph_key)
         scalar_gflops = _tensor_gflops(n, shape, scalar)
         graph_tensor_gflops = _tensor_gflops(n, shape, graph_tensor)
         tensor_core_gflops = _tensor_gflops(n, shape, tensor_core)
+        graph_tensor_core_gflops = _tensor_gflops(n, shape, graph_tensor_core)
         cublas_gflops = _tensor_gflops(n, shape, cublas)
         cublas_graph_gflops = _tensor_gflops(n, shape, cublas_graph)
         rows.append(
@@ -424,20 +436,23 @@ def render_tensor_sweep_table(payload: Payload) -> str:
                 _machine_label(machine),
                 n,
                 shape,
-                _format_number(scalar),
+                _format_number(scalar) if scalar is not None else "-",
                 _format_number(graph_tensor) if graph_tensor is not None else "-",
                 _format_number(tensor_core) if tensor_core is not None else "-",
+                _format_number(graph_tensor_core) if graph_tensor_core is not None else "-",
                 _format_number(cublas) if cublas is not None else "-",
                 _format_number(cublas_graph) if cublas_graph is not None else "-",
                 _format_gflops(scalar_gflops),
                 _format_gflops(graph_tensor_gflops),
                 _format_gflops(tensor_core_gflops),
+                _format_gflops(graph_tensor_core_gflops),
                 _format_gflops(cublas_gflops),
                 _format_gflops(cublas_graph_gflops),
-                _ratio(graph_tensor, scalar) if graph_tensor is not None else "-",
-                _ratio(tensor_core, scalar) if tensor_core is not None else "-",
-                _ratio(cublas, scalar) if cublas is not None else "-",
-                _ratio(cublas_graph, scalar) if cublas_graph is not None else "-",
+                _ratio(graph_tensor, scalar) if scalar is not None and graph_tensor is not None else "-",
+                _ratio(tensor_core, scalar) if scalar is not None and tensor_core is not None else "-",
+                _ratio(graph_tensor_core, scalar) if scalar is not None and graph_tensor_core is not None else "-",
+                _ratio(cublas, scalar) if scalar is not None and cublas is not None else "-",
+                _ratio(cublas_graph, scalar) if scalar is not None and cublas_graph is not None else "-",
             ]
         )
     return _table(
@@ -448,15 +463,18 @@ def render_tensor_sweep_table(payload: Payload) -> str:
             "Scalar tensor ns",
             "Graph tensor ns",
             "Tensor-core ns",
+            "Graph tensor-core ns",
             "cuBLAS ns",
             "cuBLAS Graph ns",
             "Scalar GF/s",
             "Graph tensor GF/s",
             "Tensor-core GF/s",
+            "Graph tensor-core GF/s",
             "cuBLAS GF/s",
             "cuBLAS Graph GF/s",
             "Graph/scalar",
             "Tensor-core/scalar",
+            "Graph tensor-core/scalar",
             "cuBLAS/scalar",
             "cuBLAS Graph/scalar",
         ],
