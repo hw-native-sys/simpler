@@ -1242,6 +1242,19 @@ PYTHONPATH=$PWD:$PWD/python \
     --queue-capacity 2 --repeat-runs 2 --sync-remote-tree
 ```
 
+Use `graph_descriptor_role_keyed_inout` when the paired smoke report must
+prove that the descriptor came from the preferred `role` task-arg spelling,
+not only the compatibility `tag` spelling. The validator requires
+`graph_task_arg_key=role` in both A100 and H200 JSON payloads:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_role_keyed_inout --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/role-keyed-inout-working
+```
+
 Graph tasks may also pass `out_storage` when the logical graph output should
 reuse an existing scratch buffer. Keep `out` unique for tensor-flow dependency
 inference and set `out_storage` to the physical buffer name, for example

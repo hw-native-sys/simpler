@@ -1048,6 +1048,45 @@ path on A100 and H200. The paired validator also checks
 `--expected-graph-task-args`, so the artifact fails validation if those tagged
 roles disappear from either GPU payload.
 
+The role-keyed inout graph-descriptor paired smoke extends the same
+three-task in-place shape to the preferred `role` task-argument spelling. The
+artifact is under
+`tmp/cuda-backend/role-keyed-inout-working/persistent-graph_descriptor_role_keyed_inout-repeat2-smoke-5075b400/`.
+It records `graph_task_arg_key=role` beside the same graph task metadata:
+`input:a,input:b,output:tmp1`, `inout:tmp1,input:b`, and
+`input:tmp1,input:a,output_existing:out`.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py \
+    tmp/cuda-backend/role-keyed-inout-working/persistent-graph_descriptor_role_keyed_inout-repeat2-smoke-5075b400/a100.json \
+    tmp/cuda-backend/role-keyed-inout-working/persistent-graph_descriptor_role_keyed_inout-repeat2-smoke-5075b400/h200.json \
+    --require-artifact a100 --require-artifact h200 \
+    --expected-runtime persistent_device --expected-mode dag \
+    --expected-dag-shape graph_descriptor_role_keyed_inout \
+    --expected-repeat-runs 2 --expected-completed-count 3 \
+    --expected-dispatch 1,1,1 \
+    --expected-graph-fanin 0,1,1 \
+    --expected-graph-dependents 1,2 \
+    --expected-graph-task-arg-key role \
+    --expected-graph-task-args \
+      'task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out' \
+    --require-report-files
+```
+
+| GPU | Dispatch | Fan-in | Dependents | Launch completions | Device ns | Host ns | Status |
+| --- | -------- | ------ | ---------- | ------------------ | --------- | ------- | ------ |
+| A100 | `1,1,1` | `0,1,1` | `1,2` | `3,3` | 69632 | 103494 | pass |
+| H200 | `1,1,1` | `0,1,1` | `1,2` | `3,3` | 67232 | 91251 | pass |
+
+Both rows reported zero device scheduler errors and generated Markdown/SVG
+smoke reports. The report includes a `Graph task arg key` column with `role`
+for both GPUs, so this artifact can catch regressions where role-keyed
+TaskArgs-like metadata is accidentally reported only as generic tagged
+metadata.
+
 The diamond graph-descriptor paired smoke at artifact label `072e396c`
 validates a wider explicit descriptor shape than the three-task
 graph-descriptor and reordered-graph smokes. It has two root producers, two

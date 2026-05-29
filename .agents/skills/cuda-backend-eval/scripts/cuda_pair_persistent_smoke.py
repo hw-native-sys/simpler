@@ -282,6 +282,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "graph_descriptor_scalar_axpy": "4,2,1",
         "graph_descriptor_scalar_scale": "11,2,1",
         "graph_descriptor_scratch_reuse": "1,2,1,2,1,1",
+        "graph_descriptor_role_keyed_inout": "1,1,1",
         "graph_descriptor_tagged": "9,2,1",
         "graph_descriptor_tagged_inout": "1,1,1",
         "graph_descriptor_triad": "6,2,1",
@@ -320,6 +321,7 @@ def _expected_graph_descriptor(config: PairedPersistentSmokeConfig) -> tuple[str
         "graph_descriptor_scalar_axpy": ("0,0,2", "2,2"),
         "graph_descriptor_scalar_scale": ("0,0,2", "2,2"),
         "graph_descriptor_scratch_reuse": ("0,0,2,1,1,2", "2,2,3,4,5,5"),
+        "graph_descriptor_role_keyed_inout": ("0,1,1", "1,2"),
         "graph_descriptor_tagged": ("0,0,2", "2,2"),
         "graph_descriptor_tagged_inout": ("0,1,1", "1,2"),
         "graph_descriptor_triad": ("0,0,2", "2,2"),
@@ -341,6 +343,17 @@ def _expected_graph_task_args(config: PairedPersistentSmokeConfig) -> str | None
         "graph_descriptor_tagged_inout": (
             "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
         ),
+        "graph_descriptor_role_keyed_inout": (
+            "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+        ),
+    }.get(config.dag_shape)
+
+
+def _expected_graph_task_arg_key(config: PairedPersistentSmokeConfig) -> str | None:
+    if config.mode != "dag":
+        return None
+    return {
+        "graph_descriptor_role_keyed_inout": "role",
     }.get(config.dag_shape)
 
 
@@ -418,6 +431,9 @@ def build_validate_command(config: PairedPersistentSmokeConfig, suffix: str) -> 
     expected_graph_task_args = _expected_graph_task_args(config)
     if expected_graph_task_args is not None:
         command.extend(["--expected-graph-task-args", expected_graph_task_args])
+    expected_graph_task_arg_key = _expected_graph_task_arg_key(config)
+    if expected_graph_task_arg_key is not None:
+        command.extend(["--expected-graph-task-arg-key", expected_graph_task_arg_key])
     expected_scratch_reuse = _expected_scratch_reuse(config)
     if expected_scratch_reuse is not None:
         command.extend(["--expected-scratch-reuse", expected_scratch_reuse])
@@ -501,6 +517,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "graph_descriptor_scalar_axpy",
             "graph_descriptor_scalar_scale",
             "graph_descriptor_scratch_reuse",
+            "graph_descriptor_role_keyed_inout",
             "graph_descriptor_tagged",
             "graph_descriptor_tagged_inout",
             "graph_descriptor_triad",

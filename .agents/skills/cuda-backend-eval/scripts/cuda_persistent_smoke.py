@@ -1748,7 +1748,7 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                 ),
             ),
         )
-    if dag_shape == "graph_descriptor_tagged_inout":
+    if dag_shape in {"graph_descriptor_tagged_inout", "graph_descriptor_role_keyed_inout"}:
         task_count = 3
         host_fanin_t = ctypes.c_uint32 * task_count
         dependents_t = ctypes.c_uint32 * 2
@@ -2503,7 +2503,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 ]
                 expected_tmp2 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
-            if config.dag_shape == "graph_descriptor_tagged_inout":
+            if config.dag_shape in {"graph_descriptor_tagged_inout", "graph_descriptor_role_keyed_inout"}:
                 expected_tmp0 = [0.0 for _ in range(n)]
                 expected_tmp1 = [_f32(_f32(host_a[i] + host_b[i]) + host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + host_a[i]) for i in range(n)]
@@ -2670,6 +2670,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_generic_args4",
             "graph_descriptor_quad",
             "graph_descriptor_reordered",
+            "graph_descriptor_role_keyed_inout",
             "graph_descriptor_scalar_scale",
             "graph_descriptor_scratch_reuse",
             "graph_descriptor_tagged",
@@ -2704,7 +2705,10 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                     "task1": "input:a,input:b,output:tmp2",
                     "task2": "input:tmp1,input:tmp2,output_existing:out",
                 }
-            if config.dag_shape == "graph_descriptor_tagged_inout":
+            if config.dag_shape in {"graph_descriptor_tagged_inout", "graph_descriptor_role_keyed_inout"}:
+                result["graph_task_arg_key"] = (
+                    "role" if config.dag_shape == "graph_descriptor_role_keyed_inout" else "tag"
+                )
                 result["graph_task_args"] = {
                     "task0": "input:a,input:b,output:tmp1",
                     "task1": "inout:tmp1,input:b",
@@ -2801,6 +2805,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_scalar_axpy",
         "graph_descriptor_scalar_scale",
         "graph_descriptor_scratch_reuse",
+        "graph_descriptor_role_keyed_inout",
         "graph_descriptor_tagged",
         "graph_descriptor_tagged_inout",
         "graph_descriptor_triad",
@@ -2861,6 +2866,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_descriptor_scalar_affine",
             "graph_descriptor_scalar_axpy",
             "graph_descriptor_scalar_scale",
+            "graph_descriptor_role_keyed_inout",
             "graph_descriptor_tagged",
             "graph_descriptor_tagged_inout",
         }
@@ -3081,6 +3087,7 @@ def main() -> None:
             "graph_descriptor_scalar_axpy",
             "graph_descriptor_scalar_scale",
             "graph_descriptor_scratch_reuse",
+            "graph_descriptor_role_keyed_inout",
             "graph_descriptor_tagged",
             "graph_descriptor_tagged_inout",
             "graph_descriptor_triad",

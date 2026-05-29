@@ -1987,6 +1987,29 @@ graph fan-in `[0,1,1]`, dependents `[1,2]`, tagged task args
 resource policy `scheduler_blocks=1`, `worker_blocks=3`, `block_dim=256`,
 and zero scheduler errors on both GPUs. A100 reported per-launch device times
 `[46080,25600]` and H200 reported `[28960,20512]`.
+The role-keyed variant of the same in-place graph shape is now covered by
+`graph_descriptor_role_keyed_inout` in the paired persistent-smoke workflow:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_role_keyed_inout --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/role-keyed-inout-working
+```
+
+Result:
+`tmp/cuda-backend/role-keyed-inout-working/persistent-graph_descriptor_role_keyed_inout-repeat2-smoke-5075b400/`
+contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. The paired validator required dispatch `[1,1,1]`,
+graph fan-in `[0,1,1]`, dependents `[1,2]`, `graph_task_arg_key=role`,
+task args `input:a,input:b,output:tmp1`, `inout:tmp1,input:b`, and
+`input:tmp1,input:a,output_existing:out`, repeat completions `[3,3]`,
+resource policy `scheduler_blocks=1`, `worker_blocks=3`, `block_dim=256`,
+and zero scheduler errors on both GPUs. A100 reported per-launch device times
+`[43008,26624]` and H200 reported `[41792,25440]`. The generated smoke report
+adds a visible `Graph task arg key` column, so the artifact distinguishes the
+preferred `role` spelling from the older `tag` spelling.
 The same tagged graph shape is now also in the paired persistent-smoke report
 flow as `graph_descriptor_tagged`, with scalar inputs recorded beside tensor
 roles in `graph_task_args`. The current A100/H200 JSON plus Markdown/SVG

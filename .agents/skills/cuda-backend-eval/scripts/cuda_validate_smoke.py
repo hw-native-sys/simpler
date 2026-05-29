@@ -61,6 +61,7 @@ class SmokeValidationExpectation:
     tensor_tile: str | None = None
     graph_fanin: str | None = None
     graph_dependents: str | None = None
+    graph_task_arg_key: str | None = None
     graph_task_args: str | None = None
     scratch_reuse: str | None = None
     resource_policy: ResourcePolicyExpectation | None = None
@@ -269,6 +270,22 @@ def _validate_graph_task_args(
     return errors
 
 
+def _validate_graph_task_arg_key(
+    payloads: list[dict[str, Any]],
+    *,
+    expected_key: str | None,
+) -> list[str]:
+    errors: list[str] = []
+    if expected_key is None:
+        return errors
+    for payload in payloads:
+        artifact = payload.get("_artifact", "unknown")
+        actual = payload.get("graph_task_arg_key")
+        if actual != expected_key:
+            errors.append(f"expected graph_task_arg_key {expected_key} for artifact={artifact}, found {actual}")
+    return errors
+
+
 def _validate_scratch_reuse(
     payloads: list[dict[str, Any]],
     *,
@@ -356,6 +373,7 @@ def validate_smoke(
             expected_dependents=expectation.graph_dependents,
         )
     )
+    errors.extend(_validate_graph_task_arg_key(payloads, expected_key=expectation.graph_task_arg_key))
     errors.extend(_validate_graph_task_args(payloads, expected_task_args=expectation.graph_task_args))
     errors.extend(_validate_scratch_reuse(payloads, expected_scratch_reuse=expectation.scratch_reuse))
     errors.extend(
@@ -383,6 +401,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-tensor-tile")
     parser.add_argument("--expected-graph-fanin")
     parser.add_argument("--expected-graph-dependents")
+    parser.add_argument("--expected-graph-task-arg-key")
     parser.add_argument("--expected-graph-task-args")
     parser.add_argument("--expected-scratch-reuse")
     parser.add_argument("--expected-scheduler-blocks", type=int)
@@ -424,6 +443,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             tensor_tile=args.expected_tensor_tile,
             graph_fanin=args.expected_graph_fanin,
             graph_dependents=args.expected_graph_dependents,
+            graph_task_arg_key=args.expected_graph_task_arg_key,
             graph_task_args=args.expected_graph_task_args,
             scratch_reuse=args.expected_scratch_reuse,
             resource_policy=_resource_policy_expectation(args),

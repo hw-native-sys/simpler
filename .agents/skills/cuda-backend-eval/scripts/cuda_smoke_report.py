@@ -134,6 +134,11 @@ def _graph_task_args(row: dict[str, Any]) -> str:
     return ";".join(f"{key}={task_args[key]}" for key in sorted(task_args))
 
 
+def _graph_task_arg_key(row: dict[str, Any]) -> str:
+    key = row.get("graph_task_arg_key")
+    return str(key) if key else "-"
+
+
 def _scratch_reuse(row: dict[str, Any]) -> str:
     scratch_reuse = row.get("scratch_reuse")
     if not isinstance(scratch_reuse, dict) or not scratch_reuse:
@@ -166,13 +171,15 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
             "| Artifact | Status | Runtime | Mode | N | PTX arch | Device ns | "
             "Host ns | Tensor shape | Tiles | Tensor core | Dispatch | "
             "Scheduler errors | Repeat runs | Launch completions | Resource policy | "
-            "Scalar args | Tensor args | Scratch reuse | Graph task args |"
+            "Scalar args | Tensor args | Scratch reuse | Graph task arg key | "
+            "Graph task args |"
         ),
         (
             "| -------- | ------ | ------- | ---- | - | -------- | --------- | "
             "------- | ------------ | ----- | ----------- | -------- | "
             "---------------- | ----------- | ------------------ | --------------- | "
-            "----------- | ----------- | ------------- | --------------- |"
+            "----------- | ----------- | ------------- | ------------------ | "
+            "--------------- |"
         ),
     ]
     for row in payloads:
@@ -185,7 +192,8 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
             f"`{_repeat_runs(row)}` | `{_launch_completed_counts(row)}` | "
             f"`{_resource_policy(row)}` | "
             f"`{_scalar_args(row)}` | `{_tensor_args(row)}` | "
-            f"`{_scratch_reuse(row)}` | `{_graph_task_args(row)}` |"
+            f"`{_scratch_reuse(row)}` | `{_graph_task_arg_key(row)}` | "
+            f"`{_graph_task_args(row)}` |"
         )
 
     lines.extend(["", "## PTX Sources", ""])
@@ -198,7 +206,7 @@ def render_markdown_report(payloads: list[dict[str, Any]], label: str) -> str:
 def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
     width = 760
     bar_height = 28
-    row_gap = 104
+    row_gap = 118
     left = 170
     right = 40
     top = 70
@@ -225,6 +233,7 @@ def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
         scalar_args = _scalar_args(row)
         tensor_args = _tensor_args(row)
         scratch_reuse = _scratch_reuse(row)
+        graph_task_arg_key = _graph_task_arg_key(row)
         graph_task_args = _graph_task_args(row)
         lines.extend(
             [
@@ -266,6 +275,11 @@ def render_svg_report(payloads: list[dict[str, Any]], label: str) -> str:
                 ),
                 (
                     f'<text x="{left}" y="{y + bar_height + 98}" '
+                    'font-family="sans-serif" font-size="11" fill="#555">'
+                    f"task arg key: {html.escape(graph_task_arg_key)}</text>"
+                ),
+                (
+                    f'<text x="{left}" y="{y + bar_height + 112}" '
                     'font-family="sans-serif" font-size="11" fill="#555">'
                     f"task args: {html.escape(graph_task_args)}</text>"
                 ),
