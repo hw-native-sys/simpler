@@ -1127,8 +1127,8 @@ PYTHONPATH=$PWD:$PWD/python \
 
 Use `persistent_dag_tensor_core_tile_f32` for the normal L2 scene-test path
 when the first DAG task should be a block-wide WMMA
-`m16n16k8:tf32->f32` task. It requires rows and columns in multiples of `16`
-and `K` divisible by `8`.
+`m16n16k8:tf32->f32` task. The current L2 adapter requires `rows=16`,
+`cols=16`, and `K` divisible by `8`.
 CUDA `persistent_device` scene-test specs can pass `stream_id` in the
 `CALLABLE["cuda"]` spec; this is forwarded to the prepared callable manifest
 and selects the CUDA runtime stream used by `Worker.run`.
@@ -1158,6 +1158,9 @@ Graph tasks may also pass tensor-tile descriptor fields: `rows`, `cols`,
 `inner`, `lda`, `ldb`, `ldc`, `a_batch_stride`, `b_batch_stride`, and
 `out_batch_stride`. Use this when the explicit graph descriptor should run a
 scalar tiled-GEMM task before downstream residual, gate, and fan-in tasks.
+Graph tasks with `func_id=10` run the WMMA tensor-core generated-dispatch
+body and must pass a compatible descriptor: `rows=16`, `cols=16`, and
+`inner` divisible by `8`.
 If every graph task omits `dependents`, the SceneTestCase CUDA adapter infers
 task edges from tensor flow: reads bind to the nearest previous producer for
 that tensor name, or to a later producer when the descriptor is intentionally
@@ -1206,6 +1209,15 @@ Run the no-torch graph tensor-tile ctypes scene on A100 or H200 with:
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
     -q -k graph_tensor_tile_with_ctypes_data --platform cuda
+```
+
+Run the no-torch graph tensor-core ctypes scene after changing graph
+descriptor tensor-core lowering or validation:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k graph_tensor_core_tile_with_ctypes_data --platform cuda
 ```
 
 Run the graph scalar-name ctypes scene after changing graph descriptor scalar

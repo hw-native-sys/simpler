@@ -1450,6 +1450,14 @@ class _CudaPersistentDagSceneBuffers:
             raise ValueError("CUDA persistent_dag_graph_f32 supports at most four tensor_args per task")
         if len(scalar_args) > 4:
             raise ValueError("CUDA persistent_dag_graph_f32 supports at most four scalar_args per task")
+        if int(task_spec["func_id"]) == 10 and (
+            int(task_spec.get("rows", 0)) != 16
+            or int(task_spec.get("cols", 0)) != 16
+            or int(task_spec.get("inner", 0)) % 8 != 0
+        ):
+            raise ValueError(
+                "CUDA persistent_dag_graph_f32 tensor core task requires rows=16, cols=16, and inner divisible by 8"
+            )
 
         tensor_args_t = ctypes_module.c_void_p * 4
         scalar_args_t = ctypes_module.c_float * 4

@@ -2158,6 +2158,42 @@ Both GPUs validated `runtime=persistent_device`, `mode=dag`, dispatch
 | A100 | 76800 | 106982 | `49152,27648` | pass |
 | H200 | 57472 | 75314 | `31712,25760` | pass |
 
+The same explicit graph tensor-core descriptor is now covered by the normal
+L2 `SceneTestCase` path. The descriptor-only red test first failed because
+`persistent_dag_graph_f32` accepted a graph task with `func_id=10` and an
+incompatible `rows=8` WMMA tile. The graph adapter now applies the same
+tensor-core compatibility guard as the fixed tensor-core adapter:
+`rows=16`, `cols=16`, and `inner` divisible by `8`.
+
+Focused local A100 coverage:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py -q \
+  -k 'graph_tensor_core_tile_args or graph_tensor_core_tile_with_ctypes_data' \
+  --platform cuda
+```
+
+Result: `3 passed, 75 deselected`, covering graph descriptor construction,
+the incompatible tensor-core descriptor rejection, and a no-torch real-data
+ctypes scene through `Worker` / `ChipWorker`.
+
+The same no-torch real-data scene passed on remote H200 after syncing the
+working tree:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && \
+   CUDA_HOME=/usr/local/cuda-12.8 \
+   PATH=/usr/local/cuda-12.8/bin:/usr/local/cuda/bin:$PATH \
+   PYTHONPATH=$PWD:$PWD/python \
+   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+     -q -rs -k graph_tensor_core_tile_with_ctypes_data --platform cuda'
+```
+
+Result: `1 passed, 77 deselected`. The command printed the known PTO-ISA SSH
+refresh warning before passing.
+
 The explicit graph tensor-tile path is also exposed as the
 `pto_persistent_dag_graph_tensor` benchmark baseline. It uses
 `dag_shape=graph_tensor_tile`, receives the same `--tensor-rows`,
