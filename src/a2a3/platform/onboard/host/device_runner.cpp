@@ -352,7 +352,7 @@ int DeviceRunner::ensure_binaries_loaded() {
 
     // One-shot bootstrap: libaicpu_extend_kernels invokes our dispatcher,
     // which writes the runtime AICPU SO bytes to
-    // /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>.so
+    // /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so
     // using sched-thread (HwHiAiUser) write permission. The dispatcher SO
     // itself is never persisted to disk — only the transient
     // libaicpu_extend_kernels dlopen. Subsequent per-task AICPU launches
@@ -360,7 +360,7 @@ int DeviceRunner::ensure_binaries_loaded() {
     // rtsLaunchCpuKernel directly against the preinstall file.
     int rc = load_aicpu_op_.BootstrapDispatcher(
         dispatcher_so_binary_.data(), dispatcher_so_binary_.size(), aicpu_so_binary_.data(), aicpu_so_binary_.size(),
-        stream_aicpu_
+        stream_aicpu_, device_id_
     );
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::BootstrapDispatcher failed: %d", rc);
@@ -667,6 +667,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // dlopen'd). Read it directly when populating KernelArgs.
     kernel_args_.args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
     kernel_args_.args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
+    // Device ordinal for the AICPU executor's per-device orchestration-SO name.
+    kernel_args_.args.device_id = static_cast<uint32_t>(device_id_);
 
     rc = kernel_args_init_ffts_base_addr(kernel_args_);
     if (rc != 0) {

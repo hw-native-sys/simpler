@@ -240,14 +240,14 @@ int DeviceRunner::ensure_binaries_loaded() {
     }
 
     // One-shot bootstrap: libaicpu_extend_kernels invokes our dispatcher,
-    // which writes the runtime AICPU SO bytes to simpler_inner_<fp>.so in
+    // which writes the runtime AICPU SO bytes to simpler_inner_<fp>_<device_id>.so in
     // the device-side preinstall path. The dispatcher SO itself is never
     // persisted. Subsequent per-task AICPU launches resolve symbols via
     // rtsBinaryLoadFromFile + rtsFuncGetByName + rtsLaunchCpuKernel
     // directly against that preinstall file.
     int rc = load_aicpu_op_.BootstrapDispatcher(
         dispatcher_so_binary_.data(), dispatcher_so_binary_.size(), aicpu_so_binary_.data(), aicpu_so_binary_.size(),
-        stream_aicpu_
+        stream_aicpu_, device_id_
     );
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::BootstrapDispatcher failed: %d", rc);
@@ -512,6 +512,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // dlopen'd). Read it directly when populating KernelArgs.
     kernel_args_.args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
     kernel_args_.args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
+    // Device ordinal for the AICPU executor's per-device orchestration-SO name.
+    kernel_args_.args.device_id = static_cast<uint32_t>(device_id_);
 
     // Start collector mgmt + poll threads now, just before kernels launch.
     // Starting earlier wastes CPU on empty queues and risks tripping

@@ -35,6 +35,7 @@
 
 static uint64_t g_platform_regs = 0;
 static uint64_t g_platform_pmu_reg_addrs = 0;
+static int g_orch_device_id = 0;
 
 void set_platform_regs(uint64_t regs) { g_platform_regs = regs; }
 
@@ -43,6 +44,10 @@ uint64_t get_platform_regs() { return g_platform_regs; }
 void set_platform_pmu_reg_addrs(uint64_t pmu_regs) { g_platform_pmu_reg_addrs = pmu_regs; }
 
 uint64_t get_platform_pmu_reg_addrs() { return g_platform_pmu_reg_addrs; }
+
+void set_orch_device_id(int device_id) { g_orch_device_id = device_id; }
+
+int get_orch_device_id() { return g_orch_device_id; }
 
 volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg) {
     return reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg));

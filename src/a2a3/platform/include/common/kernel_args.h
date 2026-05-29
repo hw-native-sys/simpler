@@ -108,6 +108,13 @@ struct KernelArgs {
     // (no special-casing — write-through works because sim AICPU and host
     // share memory). Zero when the buffer was not allocated.
     uint64_t device_wall_data_base{0};
+    // ACL device ordinal. Pushed to the AICPU so the executor can suffix the
+    // staged orchestration SO name (libdevice_orch_<pid>_<cid>_<device_id>.so):
+    // paired a2a3 dies share the preinstall filesystem, and a content/pid-only
+    // name risks a cross-die write/execute collision (see simpler_inner fix).
+    // Trailing field — keeps the CANN-fixed front offsets and AICore-read
+    // fields in place.
+    uint32_t device_id{0};
 };
 
 #ifdef __cplusplus

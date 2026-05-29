@@ -66,6 +66,17 @@ void set_platform_pmu_reg_addrs(uint64_t pmu_regs);
  */
 uint64_t get_platform_pmu_reg_addrs();
 
+/**
+ * Set the ACL device ordinal for the current run. Pushed by the platform layer
+ * (kernel.cpp) before aicpu_execute() from KernelArgs.device_id; the executor
+ * reads it to make the staged orchestration SO filename unique per device so
+ * paired dies sharing the preinstall filesystem never collide.
+ */
+void set_orch_device_id(int device_id);
+
+/** Get the ACL device ordinal set for the current run (0 if unset). */
+int get_orch_device_id();
+
 #ifdef __cplusplus
 }
 #endif

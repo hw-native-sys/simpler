@@ -29,12 +29,15 @@
  *      path (some /tmp on device, often unlinked after open), dlopens us,
  *      dlsym's the three CANN-contract symbols (Static + DynInit + Dyn),
  *      invokes our `DynTileFwkBackendKernelServerInit`.
- *   3. Our Init reads inner_so_bin/inner_so_len from DeviceArgs, fingerprints
- *      the bytes (FNV-1a over first 64 bytes XOR len), and writes them to
- *      `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>.so`.
- *      The sched thread (HwHiAiUser) owns this dir, so the write succeeds.
- *   4. host computes the same fingerprint locally to derive the same
- *      preinstall filename.
+ *   3. Our Init reads inner_so_bin/inner_so_len/device_id from DeviceArgs,
+ *      fingerprints the bytes (ELF Build-ID), and writes them to
+ *      `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so`.
+ *      The sched thread (HwHiAiUser) owns this dir, so the write succeeds. The
+ *      device_id suffix keeps paired dies sharing this filesystem from writing
+ *      and executing one shared file (which corrupted the image under
+ *      concurrent bootstrap and faulted simpler_aicpu_exec).
+ *   4. host computes the same fingerprint + uses the same device_id to derive
+ *      the same preinstall filename.
  *   5. Per-task launches: host calls `rtsBinaryLoadFromFile` to
  *      JSON-register the preinstall file (cpuKernelMode=0), resolves
  *      `simpler_aicpu_init` / `simpler_aicpu_exec` via `rtsFuncGetByName`,

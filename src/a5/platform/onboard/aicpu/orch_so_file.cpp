@@ -15,19 +15,24 @@
 
 #include <cstdio>
 
-int32_t create_orch_so_file(const char *dir, int32_t callable_id, char *out_path, size_t out_path_size) {
-    // Pid + callable_id naming: AICPU device libc may lack mkstemps. With
-    // per-callable_id dispatch, multiple orch SOs can be resident in the
-    // same device process at once (one per cid in `orch_so_table_`), so
-    // the on-disk file name must be unique per cid — otherwise the
-    // second cid's `O_TRUNC` would silently shred the first cid's already
-    // dlopen'd file image and the next launch on cid=0 would SIGBUS.
-    // callable_id < 0 is the legacy single-slot path: pid alone is fine.
+int32_t
+create_orch_so_file(const char *dir, int32_t callable_id, int32_t device_id, char *out_path, size_t out_path_size) {
+    // Pid + callable_id + device_id naming: AICPU device libc may lack mkstemps.
+    // With per-callable_id dispatch, multiple orch SOs can be resident in the
+    // same device process at once (one per cid in `orch_so_table_`), so the
+    // on-disk file name must be unique per cid — otherwise the second cid's
+    // `O_TRUNC` would silently shred the first cid's already dlopen'd file
+    // image and the next launch on cid=0 would SIGBUS. The device_id suffix
+    // additionally isolates the paired dies of one chip, which share this
+    // preinstall filesystem and would otherwise race on one shared file if
+    // their device-side pids collided (mirrors the simpler_inner fix).
+    // callable_id < 0 is the legacy single-slot path.
     int32_t written;
     if (callable_id >= 0) {
-        written = snprintf(out_path, out_path_size, "%s/libdevice_orch_%d_%d.so", dir, getpid(), callable_id);
+        written =
+            snprintf(out_path, out_path_size, "%s/libdevice_orch_%d_%d_%d.so", dir, getpid(), callable_id, device_id);
     } else {
-        written = snprintf(out_path, out_path_size, "%s/libdevice_orch_%d.so", dir, getpid());
+        written = snprintf(out_path, out_path_size, "%s/libdevice_orch_%d_dev%d.so", dir, getpid(), device_id);
     }
     if (written < 0 || static_cast<size_t>(written) >= out_path_size) {
         return -1;

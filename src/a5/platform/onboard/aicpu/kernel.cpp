@@ -100,6 +100,8 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // mirrored into Handshake), so decode the umbrella bitmask once and
     // hand it to the existing platform-state setters.
     set_platform_regs(k_args->regs);
+    // Device ordinal for per-device orchestration-SO naming in the executor.
+    set_orch_device_id(static_cast<int>(k_args->device_id));
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_tensor_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
     set_platform_l2_perf_base(k_args->l2_perf_data_base);

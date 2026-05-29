@@ -276,7 +276,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
 
                 for (int32_t i = 0; i < num_candidates && !file_created; i++) {
-                    int32_t fd = create_orch_so_file(candidate_dirs[i], callable_id, so_path, sizeof(so_path));
+                    int32_t fd = create_orch_so_file(
+                        candidate_dirs[i], callable_id, get_orch_device_id(), so_path, sizeof(so_path)
+                    );
                     if (fd < 0) {
                         LOG_INFO_V0(
                             "Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx, so_path, errno

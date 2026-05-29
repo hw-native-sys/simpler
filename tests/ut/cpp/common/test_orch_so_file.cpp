@@ -18,10 +18,12 @@
 // on cid=0 SIGBUS'd inside the AICPU executor (manifesting as
 // `rtStreamSynchronize (AICPU) failed: 507018` on the host).
 //
-// The fix is to embed `callable_id` in the file name when cid >= 0. This
-// test exercises the contract directly: distinct cids must produce distinct
-// paths, and the legacy cid=-1 path must remain pid-only (no behavioural
-// change for variants that never adopt per-cid dispatch).
+// The fix embeds `callable_id` in the file name when cid >= 0, plus a
+// `device_id` suffix so the paired dies of one chip (which share the
+// preinstall filesystem) never stage/execute the same on-disk SO. This test
+// exercises the contract directly: distinct cids must produce distinct paths,
+// distinct device_ids must produce distinct paths, and the legacy cid=-1 path
+// stays pid + device_id named.
 
 #include <unistd.h>
 
@@ -61,11 +63,11 @@ TEST(OrchSoFile, DistinctCallableIdsProduceDistinctPaths) {
     char path0[256] = {};
     char path1[256] = {};
 
-    int32_t fd0 = create_orch_so_file(dir.c_str(), /*callable_id=*/0, path0, sizeof(path0));
+    int32_t fd0 = create_orch_so_file(dir.c_str(), /*callable_id=*/0, /*device_id=*/0, path0, sizeof(path0));
     ASSERT_GE(fd0, 0) << "create_orch_so_file(cid=0) failed";
     close(fd0);
 
-    int32_t fd1 = create_orch_so_file(dir.c_str(), /*callable_id=*/1, path1, sizeof(path1));
+    int32_t fd1 = create_orch_so_file(dir.c_str(), /*callable_id=*/1, /*device_id=*/0, path1, sizeof(path1));
     ASSERT_GE(fd1, 0) << "create_orch_so_file(cid=1) failed";
     close(fd1);
 
@@ -75,19 +77,41 @@ TEST(OrchSoFile, DistinctCallableIdsProduceDistinctPaths) {
     rmtree(dir);
 }
 
-TEST(OrchSoFile, LegacySentinelKeepsPidOnlyNaming) {
-    // Variants that never adopt per-cid dispatch pass cid=-1; the file
-    // name must remain pid-only so existing callers see no change.
+TEST(OrchSoFile, DistinctDeviceIdsProduceDistinctPaths) {
+    // Repro for the cross-die 507018 fault: paired dies share the preinstall
+    // filesystem, so the same cid on two device ids must not collide on one
+    // on-disk SO (concurrent bootstrap there corrupts the mmap'd image).
+    const std::string dir = mkscratch_dir();
+    char path_dev0[256] = {};
+    char path_dev1[256] = {};
+
+    int32_t fd0 = create_orch_so_file(dir.c_str(), /*callable_id=*/0, /*device_id=*/0, path_dev0, sizeof(path_dev0));
+    ASSERT_GE(fd0, 0) << "create_orch_so_file(dev=0) failed";
+    close(fd0);
+
+    int32_t fd1 = create_orch_so_file(dir.c_str(), /*callable_id=*/0, /*device_id=*/1, path_dev1, sizeof(path_dev1));
+    ASSERT_GE(fd1, 0) << "create_orch_so_file(dev=1) failed";
+    close(fd1);
+
+    EXPECT_STRNE(path_dev0, path_dev1) << "Distinct device ids must yield distinct file paths "
+                                          "(paired dies share the preinstall filesystem).";
+
+    rmtree(dir);
+}
+
+TEST(OrchSoFile, LegacySentinelKeepsPidDeviceNaming) {
+    // Variants that never adopt per-cid dispatch pass cid=-1; the file name is
+    // pid + device_id (no callable_id segment).
     const std::string dir = mkscratch_dir();
     char path[256] = {};
 
-    int32_t fd = create_orch_so_file(dir.c_str(), /*callable_id=*/-1, path, sizeof(path));
+    int32_t fd = create_orch_so_file(dir.c_str(), /*callable_id=*/-1, /*device_id=*/3, path, sizeof(path));
     ASSERT_GE(fd, 0);
     close(fd);
 
     char expected[256];
-    std::snprintf(expected, sizeof(expected), "%s/libdevice_orch_%d.so", dir.c_str(), getpid());
-    EXPECT_STREQ(path, expected) << "Legacy (cid=-1) path must remain pid-only";
+    std::snprintf(expected, sizeof(expected), "%s/libdevice_orch_%d_dev3.so", dir.c_str(), getpid());
+    EXPECT_STREQ(path, expected) << "Legacy (cid=-1) path must be pid + device_id named";
 
     rmtree(dir);
 }

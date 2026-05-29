@@ -44,10 +44,14 @@
  *                       resident orch SOs (one per cid) do not collide on
  *                       the same on-disk file. Pass -1 for the legacy
  *                       single-slot dispatch path.
+ * @param device_id      ACL device ordinal, suffixed onto the onboard name so
+ *                       the paired dies of one chip (which share this preinstall
+ *                       filesystem) never stage/execute the same on-disk file.
  * @param out_path       Buffer that receives the full file path on success
  * @param out_path_size  Size of `out_path` in bytes
  * @return Open writable fd on success, -1 on failure
  */
-int32_t create_orch_so_file(const char *dir, int32_t callable_id, char *out_path, size_t out_path_size);
+int32_t
+create_orch_so_file(const char *dir, int32_t callable_id, int32_t device_id, char *out_path, size_t out_path_size);
 
 #endif  // PLATFORM_AICPU_ORCH_SO_FILE_H_

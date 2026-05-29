@@ -20,7 +20,7 @@
  *      `rtAicpuKernelLaunchExWithArgs` (kernel_type =
  *      `KERNEL_TYPE_AICPU_KFC`) targeting libaicpu_extend_kernels. Our
  *      dispatcher then writes the runtime SO to
- *      `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>.so`
+ *      `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so`
  *      using sched-thread (HwHiAiUser) write permission. The dispatcher SO
  *      itself is never persisted to disk.
  *
@@ -93,11 +93,15 @@ public:
      * @param inner_so_data       Runtime SO bytes (caller-owned, must outlive call)
      * @param inner_so_len        Runtime SO size
      * @param stream              Stream on which to enqueue the bootstrap
+     * @param device_id           ACL device ordinal; suffixed onto the preinstall
+     *                            basename (simpler_inner_<fp>_<device_id>.so) so
+     *                            paired dies sharing the filesystem do not write
+     *                            and execute the same on-disk SO.
      * @return 0 on success, error code on failure
      */
     int BootstrapDispatcher(
         const void *dispatcher_so_data, size_t dispatcher_so_len, const void *inner_so_data, size_t inner_so_len,
-        rtStream_t stream
+        rtStream_t stream, int device_id
     );
 
     /**
@@ -124,6 +128,7 @@ private:
     std::unordered_map<std::string, rtFuncHandle> func_handles_;
     std::string json_file_path_;
     uint64_t inner_fp_ = 0;
+    int device_id_ = 0;
     std::string inner_so_basename_;
 
     bool GenerateAicpuOpJson(const std::string &json_path, const std::string &kernel_so);
