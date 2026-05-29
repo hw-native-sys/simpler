@@ -1982,7 +1982,16 @@ scratch-reuse rows when the capture has
 `pto_persistent_dag_graph_scratch_reuse`, avoiding hand-calculated
 current-evaluation ratios from raw JSON. The graph-metadata section lists
 explicit graph descriptor dispatch IDs, fan-in/dependent arrays, task-argument
-keying, tagged task arguments, and tensor-tile shape per GPU.
+keying, tagged task arguments, and tensor-tile shape per GPU. The
+graph-role-spelling section focuses on tagged, role-keyed, and compact
+role-entry graph rows when checking TaskArgs spelling compatibility:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python:.agents/skills/cuda-backend-eval/scripts \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_current_summary.py \
+    tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark.json \
+    --section graph-role-spelling
+```
 
 Render the compact tensor-baseline sweep table directly from its raw sweep
 JSON:

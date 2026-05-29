@@ -2,9 +2,10 @@
 
 This page summarizes the latest full paired A100/H200 CUDA backend capture
 from commit `61cf96cd`, plus compact current-head validation captures. The
-latest compact gate is artifact label `f074746a`, which promotes the explicit
-graph unary-square descriptor row into the selected baseline matrix. The raw
-JSON, Markdown, and SVG reports are generated locally under
+latest compact gate is artifact label `30a8974f`, which promotes the compact
+role-entry graph descriptor row into the selected baseline matrix and compares
+tagged, role-keyed, and compact task-argument spellings. The raw JSON,
+Markdown, and SVG reports are generated locally under
 `tmp/cuda-backend/` and intentionally remain uncommitted.
 
 The capture uses `nvcc` for target-specific PTX on both machines:
@@ -219,8 +220,69 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark-dag-deltas.svg`
 - `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark-throughput.svg`
+- `tmp/cuda-backend/compact-role-benchmark-working/a100-current-30a8974f/cuda-benchmark.json`
+- `tmp/cuda-backend/compact-role-benchmark-working/h200-current-30a8974f/cuda-benchmark.json`
+- `tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark.json`
+- `tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark.md`
+- `tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark.svg`
+- `tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark-throughput.svg`
 
-## Latest Graph Unary-Square Benchmark Gate
+## Latest Compact Role Benchmark Gate
+
+The compact paired gate at artifact label `30a8974f` adds
+`pto_persistent_dag_graph_compact_role_inout` to the selected benchmark
+matrix. It uses the default `16x16x16` tensor descriptor, `N=1024`, one
+repeat, no batch rows, and a synced H200 source tree. The paired runner
+captured local A100 and remote H200 reports, merged them, generated Markdown
+and SVG reports, and validated the combined JSON.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark.json \
+    --require-size 1024 --expected-repeats 1 --expected-result-count 74 \
+    --require-report-files --require-report-graph-topology \
+    --require-report-graph-task-args --require-command-examples \
+    --require-zero-scheduler-errors --require-source-papers
+```
+
+The paired benchmark command additionally required the selected baselines,
+dispatch IDs, tensor-tile metadata, graph fan-in/dependent arrays, and graph
+task-argument metadata. The compact role row is checked with dispatch
+`1,1,1`, fan-in `0,1,1`, dependents `1,2`, and
+`graph_task_arg_key=compact`.
+
+Graph role-spelling rows:
+
+| GPU | N | Task arg key | Baseline | Device ns | Dispatch | Fan-in | Dependents | Task args |
+| --- | - | ------------ | -------- | --------- | -------- | ------ | ---------- | --------- |
+| A100 | 1024 | compact | `pto_persistent_dag_graph_compact_role_inout` | 50176 | `1,1,1` | `0,1,1` | `1,2` | `task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out` |
+| A100 | 1024 | role | `pto_persistent_dag_graph_role_keyed_inout` | 50176 | `1,1,1` | `0,1,1` | `1,2` | `task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out` |
+| A100 | 1024 | tag | `pto_persistent_dag_graph_tagged_inout` | 50176 | `1,1,1` | `0,1,1` | `1,2` | `task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out` |
+| H200 | 1024 | compact | `pto_persistent_dag_graph_compact_role_inout` | 27360 | `1,1,1` | `0,1,1` | `1,2` | `task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out` |
+| H200 | 1024 | role | `pto_persistent_dag_graph_role_keyed_inout` | 32352 | `1,1,1` | `0,1,1` | `1,2` | `task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out` |
+| H200 | 1024 | tag | `pto_persistent_dag_graph_tagged_inout` | 27648 | `1,1,1` | `0,1,1` | `1,2` | `task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out` |
+
+This table is rendered from the combined JSON with:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python:.agents/skills/cuda-backend-eval/scripts \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_current_summary.py \
+    tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark.json \
+    --section graph-role-spelling
+```
+
+All three spellings lower to the same three-task graph topology and task-arg
+flow. The row therefore checks the adapter contract rather than a new kernel
+body: compact role entries must survive through SceneTest-style lowering,
+persistent-device benchmark dispatch, JSON capture, Markdown/SVG reporting,
+and the paired validator.
+
+## Graph Unary-Square Benchmark Gate
 
 The compact paired gate at artifact label `f074746a` adds
 `pto_persistent_dag_graph_unary_square` to the selected benchmark matrix. It

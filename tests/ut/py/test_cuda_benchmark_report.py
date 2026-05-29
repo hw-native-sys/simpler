@@ -6822,6 +6822,77 @@ def test_cuda_current_summary_renders_graph_metadata_table():
     assert "pto_persistent_dag_graph_compact_role_inout" in report
 
 
+def test_cuda_current_summary_renders_graph_role_spelling_table():
+    cuda_current_summary = _load_current_summary_module()
+    task_args = {
+        "task0": "input:a,input:b,output:tmp1",
+        "task1": "inout:tmp1,input:b",
+        "task2": "input:tmp1,input:a,output_existing:out",
+    }
+    payload = {
+        "results": [
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_graph_tagged_inout",
+                "n": 1024,
+                "device_wall_ns": 512,
+                "dispatch_func_ids": [1, 1, 1],
+                "graph_descriptor": {"tasks": 3, "fanin": [0, 1, 1], "dependents": [1, 2]},
+                "graph_task_arg_key": "tag",
+                "graph_task_args": task_args,
+                "status": "pass",
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_graph_role_keyed_inout",
+                "n": 1024,
+                "device_wall_ns": 768,
+                "dispatch_func_ids": [1, 1, 1],
+                "graph_descriptor": {"tasks": 3, "fanin": [0, 1, 1], "dependents": [1, 2]},
+                "graph_task_arg_key": "role",
+                "graph_task_args": task_args,
+                "status": "pass",
+            },
+            {
+                "machine": "dasys-h200x8",
+                "baseline": "pto_persistent_dag_graph_compact_role_inout",
+                "n": 1024,
+                "device_wall_ns": 384,
+                "dispatch_func_ids": [1, 1, 1],
+                "graph_descriptor": {"tasks": 3, "fanin": [0, 1, 1], "dependents": [1, 2]},
+                "graph_task_arg_key": "compact",
+                "graph_task_args": task_args,
+                "status": "pass",
+            },
+            {
+                "machine": "hina",
+                "baseline": "pto_persistent_dag_graph",
+                "n": 1024,
+                "device_wall_ns": 1024,
+                "dispatch_func_ids": [9, 2, 1],
+                "graph_descriptor": {"tasks": 3, "fanin": [0, 0, 2], "dependents": [2, 2]},
+                "status": "pass",
+            },
+        ]
+    }
+
+    table = cuda_current_summary.render_graph_role_spelling_table(payload)
+    report = cuda_current_summary.render_summary(payload)
+
+    assert "| GPU | N | Task arg key | Baseline | Device ns | Dispatch | Fan-in | Dependents | Task args |" in table
+    assert (
+        "| A100 | 1024 | tag | pto_persistent_dag_graph_tagged_inout | 512 | 1,1,1 | 0,1,1 | 1,2 | "
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,"
+        "output_existing:out |" in table
+    )
+    assert "| A100 | 1024 | role | pto_persistent_dag_graph_role_keyed_inout | 768 | 1,1,1 | 0,1,1 | 1,2 |" in table
+    assert (
+        "| H200 | 1024 | compact | pto_persistent_dag_graph_compact_role_inout | 384 | 1,1,1 | 0,1,1 | 1,2 |" in table
+    )
+    assert "pto_persistent_dag_graph |" not in table
+    assert "## Graph Role Spelling Rows" in report
+
+
 def test_cuda_current_summary_renders_graph_tensor_core_without_scalar_reference():
     cuda_current_summary = _load_current_summary_module()
     payload = {

@@ -66,6 +66,11 @@ BENCHMARK_TENSOR_BASELINES = (
     "cublas_sgemm_graph",
 )
 GRAPH_METADATA_BASELINE_PREFIX = "pto_persistent_dag_graph"
+GRAPH_ROLE_SPELLING_BASELINES = (
+    "pto_persistent_dag_graph_tagged_inout",
+    "pto_persistent_dag_graph_role_keyed_inout",
+    "pto_persistent_dag_graph_compact_role_inout",
+)
 
 
 def _machine_label(machine: str) -> str:
@@ -352,6 +357,52 @@ def render_graph_metadata_table(payload: Payload) -> str:
     )
 
 
+def render_graph_role_spelling_table(payload: Payload) -> str:
+    rows: list[list[str | int]] = []
+    graph_rows = [
+        row
+        for row in payload.get("results", [])
+        if row.get("status", "pass") == "pass" and row.get("baseline") in GRAPH_ROLE_SPELLING_BASELINES
+    ]
+    graph_rows.sort(
+        key=lambda row: (
+            _machine_label(str(row.get("machine") or row.get("artifact", "unknown"))),
+            int(row.get("n", 0)),
+            str(row.get("graph_task_arg_key") or "-"),
+        )
+    )
+    for row in graph_rows:
+        machine = str(row.get("machine") or row.get("artifact", "unknown"))
+        descriptor = row.get("graph_descriptor") if isinstance(row.get("graph_descriptor"), Mapping) else {}
+        rows.append(
+            [
+                _machine_label(machine),
+                int(row.get("n", 0)),
+                str(row.get("graph_task_arg_key") or "-"),
+                str(row.get("baseline", "unknown")),
+                int(row.get("device_wall_ns", 0)),
+                _format_int_list(row.get("dispatch_func_ids")),
+                _format_int_list(descriptor.get("fanin")),
+                _format_int_list(descriptor.get("dependents")),
+                _format_graph_task_args(row.get("graph_task_args")),
+            ]
+        )
+    return _table(
+        [
+            "GPU",
+            "N",
+            "Task arg key",
+            "Baseline",
+            "Device ns",
+            "Dispatch",
+            "Fan-in",
+            "Dependents",
+            "Task args",
+        ],
+        rows,
+    )
+
+
 def _tensor_row_n(row: Mapping[str, Any], payload: Payload) -> str:
     n = row.get("n", payload.get("metadata", {}).get("n", "-"))
     return str(n)
@@ -585,6 +636,8 @@ def render_summary(payload: Payload) -> str:
             render_dag_shape_table(payload),
             "## Graph Descriptor Metadata",
             render_graph_metadata_table(payload),
+            "## Graph Role Spelling Rows",
+            render_graph_role_spelling_table(payload),
             "## Selected Tensor Throughput",
             render_benchmark_tensor_throughput_table(payload),
         ]
@@ -603,6 +656,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "worker-grid",
             "dag-shapes",
             "graph-metadata",
+            "graph-role-spelling",
             "tensor-throughput",
             "tensor-sweep",
         ),
@@ -624,6 +678,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(render_dag_shape_table(payload))
     elif args.section == "graph-metadata":
         print(render_graph_metadata_table(payload))
+    elif args.section == "graph-role-spelling":
+        print(render_graph_role_spelling_table(payload))
     elif args.section == "tensor-throughput":
         print(render_benchmark_tensor_throughput_table(payload))
     elif args.section == "tensor-sweep":
