@@ -344,8 +344,10 @@ The latest full paired capture at commit `5424bcca` uses the `16x16x16`
 tensor descriptor, sizes `1024,65536,1048576`, three repeats, task counts
 `2,6,12`, and worker-grid values `32,64,128,256`. It writes artifacts under
 `tmp/cuda-backend/current-head-full-named-callable-working/`
-`combined-current-5424bcca/` and validates `1242` combined samples. The
-paired-runner validator checked
+`combined-current-5424bcca/` and validates `1242` historical combined samples.
+New full paired captures should validate `1260` combined samples after the
+role-map graph row joined the selected matrix. The paired-runner validator
+checked
 source-paper provenance, sanitized command examples, generated Markdown/SVG
 reports, zero scheduler errors, selected tensor throughput reports, graph
 topology reports, graph TaskArgs-like metadata reports, expected generated
@@ -4650,6 +4652,20 @@ Needed:
   nonzero scheduler codes with stable labels such as `7(unreachable_task)`,
   so negative A100/H200 captures are easier to triage without cross-reading
   raw runtime constants.
+
+The role-map graph descriptor row is now part of the selected benchmark
+matrix, not only the paired smoke path. The focused TDD first failed because
+`cuda_benchmark.py` rejected
+`pto_persistent_dag_graph_role_map_inout`, and the paired/compact validators
+did not require that row or its graph metadata. After adding the benchmark
+row, the focused selector reported `7 passed, 292 deselected`. The compact
+paired A100/H200 gate under
+`tmp/cuda-backend/role-map-selected-benchmark-working/`
+`combined-current-a3c09113/` validated `98` non-batch samples with source
+paper provenance, sanitized reconstruction commands, Markdown/SVG reports,
+and zero scheduler errors. The role-map row validated dispatch `1,1,1`, graph
+fan-in `0,1,1`, dependents `1,2`, and `graph_task_arg_key=role_map`; A100
+reported `device_wall_ns=29696`, and H200 reported `device_wall_ns=25440`.
 
 ### Tuned Tensor Workloads
 

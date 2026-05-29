@@ -1941,14 +1941,14 @@ together. The current committed summary keeps the full current-head
 `docs/nvidia-backend/evaluation-current.md`.
 The full current-head artifact under
 `tmp/cuda-backend/current-head-full-named-callable-working/`
-`combined-current-5424bcca/` validated `1242` A100/H200 samples after the
-named-callable graph row joined the selected matrix. New full captures should
-validate `1242` samples with sizes `1024,65536,1048576`, three repeats,
-tensor descriptor `16x16x16`, task counts `2,6,12`, worker-grid values
-`32,64,128,256`, source-paper provenance, sanitized command examples, graph
-topology and TaskArgs metadata reports, tensor-throughput reports,
-generated node-link and named-callable graph metadata, and zero scheduler
-errors.
+`combined-current-5424bcca/` validated `1242` historical A100/H200 samples
+after the named-callable graph row joined the selected matrix. New full
+captures should validate `1260` samples with sizes `1024,65536,1048576`,
+three repeats, tensor descriptor `16x16x16`, task counts `2,6,12`,
+worker-grid values `32,64,128,256`, source-paper provenance, sanitized
+command examples, graph topology and TaskArgs metadata reports,
+tensor-throughput reports, generated node-link, named-callable, and role-map
+graph metadata, and zero scheduler errors.
 
 Run the full paired-current gate with:
 
@@ -1960,7 +1960,7 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 Use this compact paired gate after changing selected persistent graph
-benchmark rows. With `--batch-tasks 0`, it validates 96 non-batch samples
+benchmark rows. With `--batch-tasks 0`, it validates 98 non-batch samples
 across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
 `pto_persistent_dag_graph_node_io`, `pto_persistent_dag_graph_node_link`,
 `pto_persistent_dag_graph_named_callable`, `pto_persistent_dag_graph_node_op`,
@@ -1970,9 +1970,10 @@ across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
 `pto_persistent_dag_graph_scalar_affine`,
 `pto_persistent_dag_graph_reordered`,
 `pto_persistent_dag_graph_triad`, `pto_persistent_dag_graph_quad`, and
-`pto_persistent_dag_graph_compact_role_inout` with dispatch `9,2,1`,
-`1,2,1`, `1,2,1`, `1,2,1`, `1,2,1`, `4,2,1`, `11,2,1`, `5,2,1`,
-`1,9,2`, `6,2,1`, `8,2,1`, and `1,1,1`.
+`pto_persistent_dag_graph_compact_role_inout` and
+`pto_persistent_dag_graph_role_map_inout` with dispatch `9,2,1`, `1,2,1`,
+`1,2,1`, `1,2,1`, `1,2,1`, `4,2,1`, `11,2,1`, `5,2,1`, `1,9,2`,
+`6,2,1`, `8,2,1`, `1,1,1`, and `1,1,1`.
 The node-attrs row requires
 `graph_node_attrs=task0=attrs:tensor_args,scalar_args`,
 `scalar_args[0]=1.5,scalar_args[1]=0.25`, and
@@ -2658,7 +2659,7 @@ fan-in/dependent metadata, graph-triad and graph-quad baselines, the tagged
 scalar graph baseline, the graph unary-square baseline, task-argument tags,
 visible Markdown/SVG graph topology and task-argument metadata, visible
 Markdown/SVG tensor throughput rows for required tensor/cuBLAS descriptors,
-size `1024`, one repeat, `96` non-batch combined samples, and the
+size `1024`, one repeat, `98` non-batch combined samples, and the
 Markdown/SVG report files. The current compact gate artifact with
 named-callable coverage is under
 `tmp/cuda-backend/persistent-named-callable-baseline-working/`

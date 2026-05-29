@@ -66,6 +66,7 @@ PAIRED_CURRENT_BASELINES = (
     "pto_persistent_dag_graph_role_keyed_inout",
     "pto_persistent_dag_graph_compact_role_inout",
     "pto_persistent_dag_graph_pair_inout",
+    "pto_persistent_dag_graph_role_map_inout",
     "pto_persistent_dag_graph_triad",
     "pto_persistent_dag_graph_quad",
     "pto_persistent_dag_graph_unary_square",
@@ -92,8 +93,8 @@ COMPACT_CURRENT_BASELINES = tuple(
 PAIRED_CURRENT_SIZES = (1024, 65536, 1048576)
 COMPACT_CURRENT_SIZES = (1024,)
 COMPACT_CURRENT_EXPECTED_REPEATS = 1
-COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 96
-PAIRED_CURRENT_EXPECTED_RESULT_COUNT = 1242
+COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 98
+PAIRED_CURRENT_EXPECTED_RESULT_COUNT = 1260
 REQUIRED_SOURCE_PAPER_IDS = ("arXiv:2605.03190", "arXiv:2512.22219v1")
 REPORT_FILES = (
     "cuda-benchmark.md",
@@ -132,6 +133,7 @@ PAIRED_CURRENT_DISPATCH = {
     "pto_persistent_dag_graph_role_keyed_inout": "1,1,1",
     "pto_persistent_dag_graph_compact_role_inout": "1,1,1",
     "pto_persistent_dag_graph_pair_inout": "1,1,1",
+    "pto_persistent_dag_graph_role_map_inout": "1,1,1",
     "pto_persistent_dag_graph_triad": "6,2,1",
     "pto_persistent_dag_graph_quad": "8,2,1",
     "pto_persistent_dag_graph_unary_square": "7,1,1",
@@ -169,6 +171,9 @@ PAIRED_CURRENT_GRAPH_TASK_ARGS = {
     "pto_persistent_dag_graph_pair_inout": (
         "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
     ),
+    "pto_persistent_dag_graph_role_map_inout": (
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    ),
     "pto_persistent_dag_graph_node_io": (
         "task0=input:a,input:b,output:tmp0;task1=input:a,input:b,output:tmp1;task2=input:a,input:b,output:out"
     ),
@@ -183,6 +188,7 @@ PAIRED_CURRENT_GRAPH_TASK_ARG_KEYS = {
     "pto_persistent_dag_graph_role_keyed_inout": "role",
     "pto_persistent_dag_graph_compact_role_inout": "compact",
     "pto_persistent_dag_graph_pair_inout": "pair",
+    "pto_persistent_dag_graph_role_map_inout": "role_map",
     "pto_persistent_dag_graph_named_callable": "named_callable",
     "pto_persistent_dag_graph_node_io": "node_io",
 }
@@ -205,6 +211,7 @@ PAIRED_CURRENT_GRAPH_ROLE_SPELLING_BASELINES = (
     "pto_persistent_dag_graph_role_keyed_inout",
     "pto_persistent_dag_graph_compact_role_inout",
     "pto_persistent_dag_graph_pair_inout",
+    "pto_persistent_dag_graph_role_map_inout",
 )
 PAIRED_CURRENT_GRAPH_FANIN = {
     "pto_persistent_dag_graph": "0,0,2",
@@ -227,6 +234,7 @@ PAIRED_CURRENT_GRAPH_FANIN = {
     "pto_persistent_dag_graph_role_keyed_inout": "0,1,1",
     "pto_persistent_dag_graph_compact_role_inout": "0,1,1",
     "pto_persistent_dag_graph_pair_inout": "0,1,1",
+    "pto_persistent_dag_graph_role_map_inout": "0,1,1",
     "pto_persistent_dag_graph_triad": "0,0,2",
     "pto_persistent_dag_graph_quad": "0,0,2",
     "pto_persistent_dag_graph_unary_square": "0,1,1",
@@ -254,6 +262,7 @@ PAIRED_CURRENT_GRAPH_DEPENDENTS = {
     "pto_persistent_dag_graph_role_keyed_inout": "1,2",
     "pto_persistent_dag_graph_compact_role_inout": "1,2",
     "pto_persistent_dag_graph_pair_inout": "1,2",
+    "pto_persistent_dag_graph_role_map_inout": "1,2",
     "pto_persistent_dag_graph_triad": "2,2",
     "pto_persistent_dag_graph_quad": "2,2",
     "pto_persistent_dag_graph_unary_square": "1,2",

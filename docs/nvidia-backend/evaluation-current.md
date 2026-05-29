@@ -23,10 +23,14 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - repeats: `3`
 - batch tasks: `2,6,12`
 - worker blocks per task: `32,64,128,256`
-- samples in combined JSON: `1242`
+- samples in combined JSON: `1242` in the latest full capture; new full
+  captures should validate `1260` after the role-map graph row joined the
+  selected matrix
 
-The current paired-current validator now accepts the full capture with
-`1242` samples after the named-callable graph row joined the selected matrix.
+The latest full capture validated `1242` samples after the named-callable
+graph row joined the selected matrix. The current paired-current validator
+expects `1260` samples after the role-map graph row joined the selected
+matrix.
 The older `9ec5511e` full capture remains useful as historical evidence, but
 it validated `1224` samples before that row was included. The older
 `cb300e82` full capture validated `1206` samples before the node-link graph
@@ -368,9 +372,9 @@ The paired runner generated this validator with explicit required baselines,
 generated-dispatch IDs, tensor descriptors, graph fan-in/dependent arrays,
 TaskArgs-like graph metadata, graph node attrs/ops, named-callable metadata,
 scratch-reuse metadata, and tensor/core/cuBLAS report requirements. It
-accepted the combined JSON, Markdown, and SVG artifacts with `1242` samples.
-New full captures should use the `paired-current` preset with the same sample
-count until the selected benchmark matrix changes again.
+accepted the combined JSON, Markdown, and SVG artifacts with `1242` samples
+before the role-map graph row joined the selected matrix. New full captures
+should use the `paired-current` preset and validate `1260` samples.
 
 Launch baseline comparison from the same raw JSON:
 
@@ -1857,7 +1861,8 @@ node-op rows.
 
 The compact A100/H200 artifact is under
 `tmp/cuda-backend/persistent-named-callable-baseline-working/`
-`combined-current-95be2b5b/`. It contains 96 non-batch rows, source-paper
+`combined-current-95be2b5b/`. It contains 96 historical non-batch rows,
+source-paper
 provenance, Markdown plus SVG reports, graph topology/task-argument report
 metadata, tensor-throughput SVG output, and sanitized command examples. It
 passes:
@@ -2533,6 +2538,27 @@ at `33792 ns` on A100 and `32960 ns` on H200. The cuBLAS row is intentionally
 a library-backed launch/compute baseline rather than PTO runtime work; at this
 small descriptor size it is dominated by cuBLAS launch and dispatch overhead,
 not GEMM throughput.
+
+## Current Role-Map Graph Row
+
+The compact selected-matrix capture under
+`tmp/cuda-backend/role-map-selected-benchmark-working/`
+`combined-current-a3c09113/` adds
+`pto_persistent_dag_graph_role_map_inout` to the benchmark, paired runner, and
+compact/full validator presets. The row uses the same three-task in-place
+descriptor as the tag/role/compact/pair spellings, but the graph task
+argument metadata is keyed as `role_map`.
+
+The compact A100/H200 gate validates `98` non-batch rows at size `1024`, one
+repeat, source-paper provenance, command examples, Markdown/SVG reports, graph
+topology/task-argument metadata, tensor-throughput rows, and zero scheduler
+errors. The role-map row specifically validates dispatch `1,1,1`, graph
+fan-in `0,1,1`, dependents `1,2`, and `graph_task_arg_key=role_map`.
+
+| Machine | Device ns | Host ns |
+| ------- | --------- | ------- |
+| A100 | 29696 | 41249 |
+| H200 | 25440 | 34115 |
 
 ## Reproduction Commands
 
