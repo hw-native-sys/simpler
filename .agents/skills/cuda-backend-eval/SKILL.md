@@ -1161,10 +1161,21 @@ first four inputs to `a`/`b`/`c`/`d`, appends any additional inputs to
 test form when checking the first TaskArgs-like lowering slice.
 Graph tasks may use a `callable` name instead of embedding `func_id` directly
 when `graph.callables` maps that name to callable metadata such as
-`{"func_id": 9}`. The task-local fields override callable defaults, and the
-adapter resolves the name before tagged `task_args`, temporary allocation, and
-tensor-flow edge inference. Use this form when checking the scene-test step
-toward normal PTO task graphs with named callables and tagged arguments.
+`{"func_id": 9}`. `graph.callables` may be either a dictionary keyed by
+callable name or a list of callable specs with `name` fields, matching the
+list-shaped callable registries used elsewhere in scene tests. The task-local
+fields override callable defaults, and the adapter resolves the name before
+tagged `task_args`, temporary allocation, and tensor-flow edge inference. Use
+this form when checking the scene-test step toward normal PTO task graphs with
+named callables and tagged arguments.
+Validate the list-shaped callable registry path with:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_scene_test.py -q \
+  -k 'named_callable_list_graph_with_ctypes_data' --platform cuda
+```
+
 Use `output` only when a graph task creates a new default-sized temporary.
 Use `output_existing` or `inout` only for storage already known at that point
 in descriptor order, such as scene tensors, explicit temporaries, or

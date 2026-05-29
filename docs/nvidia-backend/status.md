@@ -1823,12 +1823,18 @@ entries still resolve through normal `TaskArgsBuilder` scalar names before the
 descriptor is launched, so a tagged graph can now keep tensor roles and scalar
 inputs in one TaskArgs-like list.
 The graph adapter now also resolves named graph callables before lowering
-tagged `task_args`: a descriptor may define `graph.callables` with callable
-metadata such as `func_id`, then each graph task can use `callable: "name"`
-instead of embedding the raw generated-dispatch ID. Task-local fields override
-callable defaults, so the resulting descriptor still records the same
-generated dispatch while the scene-test graph shape is closer to normal PTO
+tagged `task_args`: a descriptor may define `graph.callables` as either a
+dictionary keyed by callable name or a list of callable specs with `name`
+fields, then each graph task can use `callable: "name"` instead of embedding
+the raw generated-dispatch ID. Task-local fields override callable defaults,
+so the resulting descriptor still records the same generated dispatch while
+the scene-test graph shape is closer to normal PTO
 `submit_next_level(callable, TaskArgs, ...)` submissions.
+The list-shaped callable registry slice is covered by descriptor tests and by
+the real-data scene selector
+`named_callable_list_graph_with_ctypes_data`. That selector passed on the
+local A100 and remote H200; the H200 run also printed the known PTO-ISA SSH
+refresh warning before pytest reported `1 passed, 84 deselected`.
 The role mapping now preserves the lifecycle distinction needed by CUDA
 memory planning: tagged `output` may create a default-sized temporary, but
 tagged `output_existing` and `inout` must name storage that is already known

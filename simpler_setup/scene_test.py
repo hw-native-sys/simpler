@@ -1295,9 +1295,7 @@ class _CudaPersistentDagSceneBuffers:
         if callable_name is None:
             return task_spec
 
-        graph_callables = graph.get("callables", {})
-        if not isinstance(graph_callables, dict):
-            raise ValueError("CUDA persistent_dag_graph_f32 graph callables must be a dictionary")
+        graph_callables = _CudaPersistentDagSceneBuffers._graph_callables_by_name(graph)
         key = str(callable_name)
         if key not in graph_callables:
             raise ValueError(f"CUDA persistent_dag_graph_f32 unknown graph callable: {key}")
@@ -1308,6 +1306,25 @@ class _CudaPersistentDagSceneBuffers:
         resolved = dict(callable_spec)
         resolved.update(task_spec)
         resolved.pop("callable", None)
+        return resolved
+
+    @staticmethod
+    def _graph_callables_by_name(graph: dict[str, Any]) -> dict[str, Any]:
+        graph_callables = graph.get("callables", {})
+        if isinstance(graph_callables, dict):
+            return graph_callables
+        if not isinstance(graph_callables, list):
+            raise ValueError("CUDA persistent_dag_graph_f32 graph callables must be a dictionary or list")
+
+        resolved: dict[str, Any] = {}
+        for entry in graph_callables:
+            if not isinstance(entry, dict):
+                raise ValueError("CUDA persistent_dag_graph_f32 graph callable list entries must be dictionaries")
+            if "name" not in entry:
+                raise ValueError("CUDA persistent_dag_graph_f32 graph callable list entries must include name")
+            callable_spec = dict(entry)
+            name = str(callable_spec.pop("name"))
+            resolved[name] = callable_spec
         return resolved
 
     @staticmethod
