@@ -212,6 +212,9 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/lifecycle-graph-working/persistent-lifecycle-matrix-b50a80dd/cuda-lifecycle-matrix.json`
 - `tmp/cuda-backend/lifecycle-graph-working/persistent-lifecycle-matrix-b50a80dd/cuda-lifecycle-matrix.md`
 - `tmp/cuda-backend/lifecycle-graph-working/persistent-lifecycle-matrix-b50a80dd/cuda-lifecycle-matrix.svg`
+- `tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/cuda-lifecycle-matrix.json`
+- `tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/cuda-lifecycle-matrix.md`
+- `tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/cuda-lifecycle-matrix.svg`
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-sweep.json`
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-sweep.md`
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-sweep.svg`
@@ -281,6 +284,39 @@ The generated DAG-shapes summary for this capture includes
 relative to the matched base `pto_persistent_dag` row. The row uses the same
 device task functions as the fixed DAG, but gets its fan-in from graph-node
 `depends_on` fields instead of a separately spelled outgoing-edge list.
+
+## Latest Persistent Lifecycle Matrix
+
+The default lifecycle matrix at artifact label `9024e9bb` extends the paired
+A100/H200 prepared-callable repeat-run matrix with `graph-depends-on`. The
+matrix covers direct, queue, fixed DAG-chain, incoming-edge graph, and
+graph-scratch-reuse scenarios with `repeat_runs=2`, `stream_id=1`, and
+`worker_blocks=2` for queue/DAG modes. It writes JSON, Markdown, and SVG
+artifacts under
+`tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/`.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_lifecycle_matrix.py \
+    tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/cuda-lifecycle-matrix.json \
+    --preset default --require-source-papers --require-command-examples
+```
+
+Selected lifecycle rows:
+
+| Scenario | GPU | Device ns | Host ns | Completions | Dispatch | Fan-in | Dependents |
+| -------- | --- | --------- | ------- | ----------- | -------- | ------ | ---------- |
+| graph-depends-on | A100 | 62464 | 99754 | `3,3` | `1,2,1` | `0,0,2` | `2,2` |
+| graph-depends-on | H200 | 49120 | 69085 | `3,3` | `1,2,1` | `0,0,2` | `2,2` |
+| graph-scratch-reuse | A100 | 94208 | 131317 | `6,6` | `1,2,1,2,1,1` | `0,0,2,1,1,2` | `2,2,3,4,5,5` |
+| graph-scratch-reuse | H200 | 70368 | 90238 | `6,6` | `1,2,1,2,1,1` | `0,0,2,1,1,2` | `2,2,3,4,5,5` |
+
+All rows reported zero scheduler errors. This matrix keeps the incoming-edge
+graph descriptor in the same lifecycle evidence path as direct, queue,
+fixed-DAG, and scratch-reuse executors, so future prepared-callable reset
+regressions are caught by one paired validator.
 
 ## Previous Compact Role Benchmark Gate
 

@@ -99,6 +99,14 @@ SCENARIOS: dict[str, LifecycleScenario] = {
         queue_capacity=3,
         worker_blocks=2,
     ),
+    "graph-depends-on": LifecycleScenario(
+        name="graph-depends-on",
+        mode="dag",
+        dag_shape="graph_descriptor_depends_on",
+        task_count=3,
+        queue_capacity=3,
+        worker_blocks=2,
+    ),
     "graph-scratch-reuse": LifecycleScenario(
         name="graph-scratch-reuse",
         mode="dag",
@@ -109,7 +117,12 @@ SCENARIOS: dict[str, LifecycleScenario] = {
     ),
 }
 
-DEFAULT_SCENARIO_NAMES = ("direct", "queue", "dag-chain", "graph-scratch-reuse")
+DEFAULT_SCENARIO_NAMES = ("direct", "queue", "dag-chain", "graph-depends-on", "graph-scratch-reuse")
+SCENARIO_DISPATCH = {
+    "dag-chain": "1,2,1,2,1",
+    "graph-depends-on": "1,2,1",
+    "graph-scratch-reuse": "1,2,1,2,1,1",
+}
 
 
 @dataclass(frozen=True)
@@ -472,15 +485,26 @@ def write_lifecycle_report(
 
 def build_validate_command(config: LifecycleMatrixConfig, suffix: str) -> list[str]:
     output_dir = config.output_root / f"persistent-lifecycle-matrix-{suffix}"
-    return [
+    command = [
         config.local_python,
         ".agents/skills/cuda-backend-eval/scripts/cuda_validate_lifecycle_matrix.py",
         str(output_dir / "cuda-lifecycle-matrix.json"),
-        "--preset",
-        "default",
-        "--require-source-papers",
-        "--require-command-examples",
     ]
+    if config.scenario_names == DEFAULT_SCENARIO_NAMES:
+        command.extend(["--preset", "default"])
+        command.extend(["--require-source-papers", "--require-command-examples"])
+        return command
+    command.extend(["--require-source-papers", "--require-command-examples"])
+    command.extend(["--expected-repeat-runs", str(config.repeat_runs)])
+    for artifact in ("a100", "h200"):
+        command.extend(["--require-artifact", artifact])
+    for scenario_name in config.scenario_names:
+        command.extend(["--require-scenario", scenario_name])
+        dispatch = SCENARIO_DISPATCH.get(scenario_name)
+        if dispatch is not None:
+            command.extend(["--require-dispatch", f"{scenario_name}={dispatch}"])
+    command.append("--require-report-files")
+    return command
 
 
 def run_lifecycle_matrix(

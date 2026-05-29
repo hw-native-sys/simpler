@@ -3524,26 +3524,30 @@ Needed:
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, and direct/queue/DAG
   prepared-callable repeat-run smokes. The paired lifecycle matrix runner now
-  captures direct, queue, DAG-chain, and graph-descriptor scratch-reuse
-  repeat-run evidence across A100 and H200 in one artifact set
-  (`tmp/cuda-backend/lifecycle-graph-working/persistent-lifecycle-matrix-b50a80dd/`).
+  captures direct, queue, DAG-chain, incoming-edge graph, and graph-descriptor
+  scratch-reuse repeat-run evidence across A100 and H200 in one artifact set
+  (`tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/`).
   The lifecycle matrix validator checks required scenarios, A100/H200
-  artifacts, repeat-run completion counts, DAG-chain dispatch,
-  graph-scratch-reuse dispatch, scratch-reuse metadata, report files,
+  artifacts, repeat-run completion counts, DAG-chain dispatch, graph
+  depends-on dispatch, graph-scratch-reuse dispatch, scratch-reuse metadata,
+  report files,
   VDCores/MPK source-paper provenance, collection mode, sanitized
   reconstruction commands, and zero device scheduler errors. The matrix report
   can be regenerated from the existing per-scenario smoke JSON with
-  `--collect-existing-suffix b50a80dd` without rerunning the GPUs, and the
+  `--collect-existing-suffix 9024e9bb` without rerunning the GPUs, and the
   validator requires that flag in the regenerated local command example. The
   artifact index reads the lifecycle metadata commit and collection mode so
   regenerated reports remain distinguishable in `tmp/cuda-backend/*/index.md`.
   The paired persistent-smoke validator now
   requires `scratch_reuse=reused_buffer=tmp0,reuse_task=4`, and the smoke
   Markdown/SVG report renders that physical alias beside task metadata. In
-  the current capture, graph-scratch-reuse validates
+  the current capture, graph-depends-on validates
+  `launch_completed_counts=[3,3]`, dispatch `1,2,1`, graph fan-in `0,0,2`,
+  dependents `2,2`, and device times of `62464 ns` on A100 and `49120 ns` on
+  H200. The same capture's graph-scratch-reuse scenario validates
   `launch_completed_counts=[6,6]`, dispatch `1,2,1,2,1,1`, graph fan-in
   `0,0,2,1,1,2`, dependents `2,2,3,4,5,5`, scratch reuse of `tmp0` at task
-  `4`, and device times of `76800 ns` on A100 and `63552 ns` on H200, so the
+  `4`, and device times of `94208 ns` on A100 and `70368 ns` on H200, so the
   remaining lifecycle gap is normal PTO graph breadth rather than
   prepared-callable reset coverage;
 - broader resource policy beyond the current single scheduler block,

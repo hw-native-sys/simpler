@@ -34,10 +34,11 @@ SCHEDULER_ERROR_NAMES = {
     8: "duplicate_dependent",
 }
 REQUIRED_SOURCE_PAPER_IDS = ("arXiv:2605.03190", "arXiv:2512.22219v1")
-DEFAULT_SCENARIOS = ("direct", "queue", "dag-chain", "graph-scratch-reuse")
+DEFAULT_SCENARIOS = ("direct", "queue", "dag-chain", "graph-depends-on", "graph-scratch-reuse")
 DEFAULT_ARTIFACTS = ("a100", "h200")
 DEFAULT_DISPATCH = {
     "dag-chain": "1,2,1,2,1",
+    "graph-depends-on": "1,2,1",
     "graph-scratch-reuse": "1,2,1,2,1,1",
 }
 

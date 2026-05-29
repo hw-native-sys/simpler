@@ -951,12 +951,13 @@ PYTHONPATH=$PWD:$PWD/python \
     --mode queue --queue-capacity 2 --repeat-runs 2
 ```
 
-Use `cuda_persistent_lifecycle_matrix.py` when direct, queue, DAG-chain, and
-graph-descriptor scratch-reuse prepared-callable lifecycle evidence should be
-captured together on local A100 and remote H200. The default matrix uses
-`repeat_runs=2`, `stream_id=1`, direct `worker_blocks_per_task=2`, and
-queue/DAG `worker_blocks=2`, then validates each paired smoke and the combined
-matrix report before refreshing the artifact index:
+Use `cuda_persistent_lifecycle_matrix.py` when direct, queue, DAG-chain,
+incoming-edge graph, and graph-descriptor scratch-reuse prepared-callable
+lifecycle evidence should be captured together on local A100 and remote H200.
+The default matrix uses `repeat_runs=2`, `stream_id=1`, direct
+`worker_blocks_per_task=2`, and queue/DAG `worker_blocks=2`, then validates
+each paired smoke and the combined matrix report before refreshing the
+artifact index:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -976,15 +977,20 @@ must include the same flag.
 Use `--dry-run` to print every paired smoke command plus the final matrix
 validator and artifact-index commands without writing the matrix report.
 The current paired lifecycle matrix capture is under
-`tmp/cuda-backend/lifecycle-graph-working/persistent-lifecycle-matrix-b50a80dd/`.
+`tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/`.
 Validate a lifecycle matrix before copying its fields into docs:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_lifecycle_matrix.py \
-    tmp/cuda-backend/lifecycle-graph-working/persistent-lifecycle-matrix-b50a80dd/cuda-lifecycle-matrix.json \
+    tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/cuda-lifecycle-matrix.json \
     --preset default --require-source-papers --require-command-examples
 ```
+
+The default preset now requires the `graph-depends-on` scenario with dispatch
+`1,2,1`, so focused one-scenario lifecycle matrices should pass explicit
+`--scenario graph-depends-on` to the matrix runner rather than relying on the
+default preset.
 
 Run the six-task persistent DAG scratch-reuse smoke. This graph reuses `tmp0`
 after its last dependent has completed and validates the final reused-buffer
