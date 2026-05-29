@@ -1064,6 +1064,40 @@ Both rows reported zero device scheduler errors and the report includes
 in this one-repeat compact gate; the device event time is the useful
 scheduler-path signal.
 
+## Supplemental Graph Scalar-Scale Benchmark
+
+The explicit graph-descriptor scalar-scale row is now in the selected paired
+benchmark path as `pto_persistent_dag_graph_scalar_scale`. It validates the
+same generated scalar-scale task body as runtime graph metadata rather than a
+fixed smoke shape. The compact paired artifact is under
+`tmp/cuda-backend/graph-scalar-scale-benchmark-working/combined-current-993254e8/`.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    tmp/cuda-backend/graph-scalar-scale-benchmark-working/combined-current-993254e8/cuda-benchmark.json \
+    --require-size 1024 --expected-repeats 1 --expected-result-count 80 \
+    --require-baseline pto_persistent_dag_graph_scalar_scale \
+    --require-dispatch pto_persistent_dag_graph_scalar_scale=11,2,1 \
+    --require-graph-fanin pto_persistent_dag_graph_scalar_scale=0,0,2 \
+    --require-graph-dependents pto_persistent_dag_graph_scalar_scale=2,2 \
+    --require-report-files --require-zero-scheduler-errors \
+    --require-command-examples --require-source-papers
+```
+
+| GPU | N | Dispatch | Fan-in | Dependents | Scalar args | Device ns | Status |
+| --- | - | -------- | ------ | ---------- | ----------- | --------- | ------ |
+| A100 | 1024 | `11,2,1` | `0,0,2` | `2,2` | `scalar0=2.0` | 28672 | pass |
+| H200 | 1024 | `11,2,1` | `0,0,2` | `2,2` | `scalar0=2.0` | 27712 | pass |
+
+Both rows reported zero device scheduler errors. The generated benchmark
+Markdown, SVG `<desc>`, and local artifact index include the graph topology
+and scalar metadata, so this scalar graph path is visible in the same reports
+as the selected task-argument, node-attrs, tensor, tensor-core, and cuBLAS
+rows.
+
 ## Supplemental Scalar-Scale Smoke
 
 The scalar-scale persistent DAG smoke at artifact label `e9c9f5f2` validates a

@@ -1514,6 +1514,7 @@ def run_persistent_sample(
             "generic_args",
             "graph_descriptor",
             "graph_descriptor_generic_args4",
+            "graph_descriptor_scalar_scale",
             "graph_descriptor_triad",
             "graph_descriptor_quad",
             "unary_square",
@@ -1704,6 +1705,15 @@ def run_single_sample(  # noqa: PLR0912
             mode="dag",
             baseline=baseline,
             dag_shape="graph_descriptor_depends_on",
+        )
+    if baseline == "pto_persistent_dag_graph_scalar_scale":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="graph_descriptor_scalar_scale",
         )
     if baseline == "pto_persistent_dag_graph_chain":
         return run_persistent_sample(
@@ -2021,6 +2031,7 @@ def run_benchmark(
                     "pto_persistent_dag_graph_generic_args4",
                     "pto_persistent_dag_graph_node_attrs",
                     "pto_persistent_dag_graph_depends_on",
+                    "pto_persistent_dag_graph_scalar_scale",
                     "pto_persistent_dag_graph_chain",
                     "pto_persistent_dag_graph_scratch_reuse",
                     "pto_persistent_dag_graph_diamond",
@@ -2329,6 +2340,7 @@ def summarize_results(payload: dict[str, Any]) -> dict[tuple[str, str, int, int,
             "graph_task_arg_key",
             "graph_task_args",
             "graph_node_attrs",
+            "scalar_args",
         ):
             if field_name in first:
                 summary_row[field_name] = first[field_name]
@@ -2445,12 +2457,19 @@ def _graph_node_attrs_text(value: Any) -> str:
     return ";".join(f"{key}={value[key]}" for key in sorted(value))
 
 
+def _scalar_args_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    return ",".join(f"{key}={value[key]}" for key in sorted(value))
+
+
 def _graph_metadata_rows(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for row in _sorted_summary_rows(summary):
         graph_descriptor = row.get("graph_descriptor")
         task_args = row.get("graph_task_args")
         node_attrs = row.get("graph_node_attrs")
+        scalar_args = row.get("scalar_args")
         if (
             not isinstance(graph_descriptor, dict)
             and not isinstance(task_args, dict)
@@ -2473,6 +2492,7 @@ def _graph_metadata_rows(summary: dict[tuple[str, str, int, int, int], dict[str,
                 "task_arg_key": str(row.get("graph_task_arg_key") or "-"),
                 "task_args": _graph_task_args_text(task_args),
                 "node_attrs": _graph_node_attrs_text(node_attrs),
+                "scalar_args": _scalar_args_text(scalar_args),
             }
         )
     return rows
@@ -2710,7 +2730,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
             f"{row['machine']} {row['baseline']} n={row['n']} "
             f"dispatch={row['dispatch']} fanin={row['fanin']} dependents={row['dependents']} "
             f"task arg key: {row['task_arg_key']} task args: {row['task_args']} "
-            f"node attrs: {row['node_attrs']}"
+            f"node attrs: {row['node_attrs']} scalar args: {row['scalar_args']}"
             for row in graph_metadata
         ]
         desc_parts.extend(
@@ -3000,9 +3020,9 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
                 "## Graph Descriptor Metadata",
                 "",
                 "| Machine | N | Baseline | Dispatch | Graph fan-in | Graph dependents | "
-                "Graph task arg key | Graph task args | Graph node attrs |",
+                "Graph task arg key | Graph task args | Graph node attrs | Scalar args |",
                 "| ------- | - | -------- | -------- | ------------ | ---------------- | "
-                "------------------ | --------------- | ---------------- |",
+                "------------------ | --------------- | ---------------- | ----------- |",
             ]
         )
         for row in graph_metadata:
@@ -3010,7 +3030,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             lines.append(
                 f"| {row['machine']} | {row['n']} | {row['baseline']} | "
                 f"{row['dispatch']} | {row['fanin']} | {row['dependents']} | "
-                f"{task_arg_key} | `{row['task_args']}` | `{row['node_attrs']}` |"
+                f"{task_arg_key} | `{row['task_args']}` | `{row['node_attrs']}` | "
+                f"`{row['scalar_args']}` |"
             )
     graph_role_spelling = _graph_role_spelling_rows(summary)
     if graph_role_spelling:
@@ -3308,6 +3329,7 @@ def main() -> None:
             "pto_persistent_dag_graph_generic_args4",
             "pto_persistent_dag_graph_node_attrs",
             "pto_persistent_dag_graph_depends_on",
+            "pto_persistent_dag_graph_scalar_scale",
             "pto_persistent_dag_graph_chain",
             "pto_persistent_dag_graph_scratch_reuse",
             "pto_persistent_dag_graph_diamond",

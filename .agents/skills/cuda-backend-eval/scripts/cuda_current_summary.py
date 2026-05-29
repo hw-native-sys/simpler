@@ -151,6 +151,12 @@ def _format_graph_node_attrs(value: Any) -> str:
     return ";".join(f"{key}={value[key]}" for key in sorted(value))
 
 
+def _format_scalar_args(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return "-"
+    return ",".join(f"{key}={value[key]}" for key in sorted(value))
+
+
 def _table(headers: Sequence[str], rows: Sequence[Sequence[str | int]]) -> str:
     lines = [
         "| " + " | ".join(headers) + " |",
@@ -332,6 +338,7 @@ def render_graph_metadata_table(payload: Payload) -> str:
         key = str(row.get("graph_task_arg_key") or "-")
         task_args = _format_graph_task_args(row.get("graph_task_args"))
         node_attrs = _format_graph_node_attrs(row.get("graph_node_attrs"))
+        scalar_args = _format_scalar_args(row.get("scalar_args"))
         table_key = (machine, n, baseline, dispatch, fanin, dependents)
         if table_key in seen:
             continue
@@ -348,6 +355,7 @@ def render_graph_metadata_table(payload: Payload) -> str:
                 key,
                 task_args,
                 node_attrs,
+                scalar_args,
                 _tensor_tile_shape(row),
             ]
         )
@@ -363,6 +371,7 @@ def render_graph_metadata_table(payload: Payload) -> str:
             "Task arg key",
             "Task args",
             "Node attrs",
+            "Scalar args",
             "Tensor tile",
         ],
         rows,

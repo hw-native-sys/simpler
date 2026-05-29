@@ -1628,16 +1628,17 @@ together. The current committed summary keeps the full `61cf96cd` capture plus
 compact current-head gates in `docs/nvidia-backend/evaluation-current.md`.
 
 Use this compact paired gate after changing selected persistent graph
-benchmark rows. With no batch rows, it validates 78 samples across A100 and
+benchmark rows. With no batch rows, it validates 80 samples across A100 and
 H200, including `pto_persistent_dag_graph_node_attrs`,
-`pto_persistent_dag_graph_depends_on`, `pto_persistent_dag_graph_triad`,
-`pto_persistent_dag_graph_quad`, and
+`pto_persistent_dag_graph_depends_on`,
+`pto_persistent_dag_graph_scalar_scale`,
+`pto_persistent_dag_graph_triad`, `pto_persistent_dag_graph_quad`, and
 `pto_persistent_dag_graph_compact_role_inout` with dispatch `9,2,1`,
-`1,2,1`, `6,2,1`, `8,2,1`, and `1,1,1`. The node-attrs row requires
-`graph_node_attrs=task0=attrs:tensor_args,scalar_args`; the depends-on row
-requires graph fan-in `0,0,2` and dependents `2,2`; the compact role row
-requires graph fan-in `0,1,1`, dependents `1,2`, and
-`graph_task_arg_key=compact`:
+`1,2,1`, `11,2,1`, `6,2,1`, `8,2,1`, and `1,1,1`. The node-attrs row
+requires `graph_node_attrs=task0=attrs:tensor_args,scalar_args`; the
+depends-on and scalar-scale graph rows require graph fan-in `0,0,2` and
+dependents `2,2`; the compact role row requires graph fan-in `0,1,1`,
+dependents `1,2`, and `graph_task_arg_key=compact`:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -1645,6 +1646,19 @@ PYTHONPATH=$PWD:$PWD/python \
     --sizes 1024 --repeats 1 --batch-tasks '' \
     --worker-blocks-per-task '' --sync-remote-tree \
     --output-root tmp/cuda-backend/graph-node-attrs-benchmark-working
+```
+
+Use `--single-baseline pto_persistent_dag_graph_scalar_scale` for a quick
+benchmark path check of the explicit graph-descriptor scalar-scale DAG. This
+row validates dispatch `11,2,1`, graph fan-in `0,0,2`, dependents `2,2`, and
+scalar metadata `scalar0=2.0`. Benchmark Markdown and SVG graph-metadata
+reports include the scalar args column for this row:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_graph_scalar_scale \
+    --sizes 4096 --repeats 1 --arch compute_80
 ```
 
 For a lighter no-torch real-data check, run the paired Worker smoke instead of
