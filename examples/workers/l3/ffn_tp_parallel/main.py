@@ -190,8 +190,8 @@ def run(
         num_sub_workers=0,
         build=build,
     )
-    ffn_cid = worker.register(ffn_local_cc)
-    allreduce_cid = worker.register(allreduce_cc)
+    ffn_cid = worker.prepare_callable(ffn_local_cc)
+    allreduce_cid = worker.prepare_callable(allreduce_cc)
 
     try:
         print("[ffn_tp_parallel] init worker (forks chip children; base comm is lazy)...")

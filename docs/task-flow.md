@@ -1,7 +1,7 @@
 # Task Flow — Callable / TaskArgs / CallConfig Pass-Through
 
 Callable identity update: public Python submit APIs now accept
-`CallableHandle` objects returned by `Worker.register`, and hierarchical task
+`CallableHandle` objects returned by `Worker.prepare_callable`, and hierarchical task
 mailboxes carry the handle's 32-byte hash digest. Target-local integer slots
 remain private to the receiving worker. Older `cid` references in this document
 describe historical or target-local internals; the authoritative contract is
@@ -52,7 +52,7 @@ struct CallableIdentity {
 };
 ```
 
-Python users submit `CallableHandle` objects returned by `Worker.register`.
+Python users submit `CallableHandle` objects returned by `Worker.prepare_callable`.
 The Python facade validates ownership/liveness and passes `CallableIdentity`
 to C++:
 
@@ -383,14 +383,14 @@ delegates to
 ```python
 # L3 child: sub-only (no chips for this example)
 l3 = Worker(level=3, num_sub_workers=1)
-l3_sub_handle = l3.register(lambda: verify_result())
+l3_sub_handle = l3.prepare_callable(lambda: verify_result())
 
 def my_l3_orch(orch, args, config):
     orch.submit_sub(l3_sub_handle)
 
 # L4 parent
 w4 = Worker(level=4, num_sub_workers=0)
-l3_handle = w4.register(my_l3_orch) # register L3 orch fn in Python dict
+l3_handle = w4.prepare_callable(my_l3_orch) # register L3 orch fn in Python dict
 w4.add_worker(l3)                   # add un-init'd L3 Worker as child
 w4.init()
 

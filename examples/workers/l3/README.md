@@ -27,7 +27,7 @@ worker = Worker(
 
 # 1. Register sub-worker callables BEFORE init (level >= 3 only).
 #    Returns an integer id you pass to orchestrator.submit_sub(...) later.
-postprocess_id = worker.register(
+postprocess_id = worker.prepare_callable(
     lambda args: print("post-process received", args)
 )
 
@@ -48,7 +48,7 @@ finally:
 
 Two things to know before reading the example:
 
-1. **`register()` and `add_worker()` MUST run before `init()`**. The Python
+1. **`prepare_callable()` and `add_worker()` MUST run before `init()`**. The Python
    callables get captured via copy-on-write when `init()` forks child
    processes, so anything registered after the fork is invisible to the
    children.

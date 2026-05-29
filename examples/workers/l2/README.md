@@ -24,13 +24,13 @@ worker = Worker(
 worker.init()             # load host.so + aicpu.so + aicore.o, set device
 try:
     # ... allocate device buffers, build ChipCallable ...
-    cid = worker.register(chip_callable)   # one-shot: cid is reused across runs
+    cid = worker.prepare_callable(chip_callable)   # one-shot: cid is reused across runs
     worker.run(cid, task_args, call_config)
 finally:
     worker.close()        # release ACL resources and device
 ```
 
-`register()` is the only way to obtain a `cid`; `worker.run` always takes
+`prepare_callable()` is the only way to obtain a `cid`; `worker.run` always takes
 that int, never the raw `ChipCallable`. A cid stays valid for the
 lifetime of the worker, so you register once and reuse it across runs —
 this is also why ST cases cache the cid on the test class (see

@@ -7,19 +7,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end test for ChipWorker.prepare_callable / run / unregister_callable.
+"""End-to-end test for Worker.prepare_callable / run / unregister_callable.
 
 Reuses the vector_example orchestration + AIV kernels. Exercises:
   - prepare_callable once, then run twice (second run proves the
     AICPU-side dlopen cache / host-side orch SO dedup is working — no re-upload).
-  - Two distinct callable_ids sharing the same orch SO binary: verifies both
+  - Two distinct handles sharing the same callable identity: verifies both
     produce correct output independently.
   - unregister_callable after runs complete: should not raise.
-  - aicpu_dlopen_count assertions covering: same-cid repeat, multi-cid
-    interleaving, double-prepare rejection, and unregister + re-prepare.
+  - aicpu_dlopen_count assertions covering: same-handle repeat, duplicate
+    handle interleaving, deduped duplicate prepare, and unregister + re-prepare.
 """
 
-import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -27,14 +26,6 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 from simpler_setup.scene_test import _build_chip_task_args, _compare_outputs
 
 _VECTOR_KERNELS = "../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
-
-# White-box cids: this class owns the entire cid table of its isolated
-# Worker (see ./conftest.py), so picking 0 and 1 directly is intentional —
-# they signify "the first two slots in a fresh table" rather than "any
-# free cid". Naming them makes that intent explicit.
-_CID_PRIMARY = 0
-_CID_SECONDARY = 1
-
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestPreparedCallable(SceneTestCase):
@@ -116,32 +107,32 @@ class TestPreparedCallable(SceneTestCase):
 
         config = self._build_config(config_dict)
 
-        # 1) prepare two callable_ids with the SAME callable (shared orch SO)
-        worker.prepare_callable(_CID_PRIMARY, callable_obj)
-        worker.prepare_callable(_CID_SECONDARY, callable_obj)
+        # 1) prepare two handles with the SAME callable identity.
+        primary = worker.prepare_callable(callable_obj)
+        secondary = worker.prepare_callable(callable_obj)
 
-        # 2) run primary cid twice (second run proves dedup/cache hit)
+        # 2) run primary handle twice (second run proves dedup/cache hit)
         for _ in range(2):
             test_args = self.generate_args(params)
             chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-            worker.run(_CID_PRIMARY, chip_args, config=config)
+            worker.run(primary, chip_args, config=config)
             _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-        # 3) run secondary cid — different slot, same SO, must also work
+        # 3) run secondary handle, which shares the same callable identity.
         test_args = self.generate_args(params)
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
 
-        worker.run(_CID_SECONDARY, chip_args, config=config)
+        worker.run(secondary, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         # 4) unregister both — should not raise
-        worker.unregister_callable(_CID_PRIMARY)
-        worker.unregister_callable(_CID_SECONDARY)
+        worker.unregister_callable(primary)
+        worker.unregister_callable(secondary)
 
     # ------------------------------------------------------------------
     # aicpu_dlopen_count assertions.
@@ -161,122 +152,130 @@ class TestPreparedCallable(SceneTestCase):
         config = self._build_config(case["config"])
         return callable_obj, config, case
 
-    def _run_one(self, worker, cid, callable_obj, config, case):
+    def _run_one(self, worker, handle, callable_obj, config, case):
         params = case["params"]
         orch_sig = self.CALLABLE["orchestration"]["signature"]
         test_args = self.generate_args(params)
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
-        worker.run(cid, chip_args, config=config)
+        worker.run(handle, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     def test_dlopen_count_same_cid_repeated_runs(self, st_platform, st_worker):
-        """Case A: prepare(primary) + run × 5 → dlopen_count delta == 1."""
+        """Case A: prepare(primary) + run x5 -> dlopen_count delta == 1."""
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.aicpu_dlopen_count
+        primary = None
         try:
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
+            primary = st_worker.prepare_callable(callable_obj)
             for _ in range(5):
-                self._run_one(st_worker, _CID_PRIMARY, callable_obj, config, case)
+                self._run_one(st_worker, primary, callable_obj, config, case)
             assert st_worker.aicpu_dlopen_count - baseline == 1, (
-                f"expected exactly 1 new dlopen for 5 runs of primary cid, "
+                f"expected exactly 1 new dlopen for 5 runs of primary handle, "
                 f"got delta {st_worker.aicpu_dlopen_count - baseline}"
             )
         finally:
-            st_worker.unregister_callable(_CID_PRIMARY)
+            if primary is not None:
+                st_worker.unregister_callable(primary)
 
     def test_dlopen_count_two_cids_alternating(self, st_platform, st_worker):
-        """Case B: prepare(primary)+prepare(secondary) + alternating runs × 5 → delta == 2."""
+        """Case B: duplicate handles share one prepared callable identity."""
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.aicpu_dlopen_count
+        primary = None
+        secondary = None
         try:
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
-            st_worker.prepare_callable(_CID_SECONDARY, callable_obj)
+            primary = st_worker.prepare_callable(callable_obj)
+            secondary = st_worker.prepare_callable(callable_obj)
             for _ in range(5):
-                self._run_one(st_worker, _CID_PRIMARY, callable_obj, config, case)
-                self._run_one(st_worker, _CID_SECONDARY, callable_obj, config, case)
-            assert st_worker.aicpu_dlopen_count - baseline == 2, (
-                f"expected exactly 2 new dlopens for two cids interleaved, "
+                self._run_one(st_worker, primary, callable_obj, config, case)
+                self._run_one(st_worker, secondary, callable_obj, config, case)
+            assert st_worker.aicpu_dlopen_count - baseline == 1, (
+                f"expected exactly 1 new dlopen for duplicate handle interleaving, "
                 f"got delta {st_worker.aicpu_dlopen_count - baseline}"
             )
         finally:
-            st_worker.unregister_callable(_CID_PRIMARY)
-            st_worker.unregister_callable(_CID_SECONDARY)
+            if secondary is not None:
+                st_worker.unregister_callable(secondary)
+            if primary is not None:
+                st_worker.unregister_callable(primary)
 
-    def test_dlopen_count_double_prepare_raises(self, st_platform, st_worker):
-        """Case C: prepare(primary) + prepare(primary) → second call raises RuntimeError."""
+    def test_dlopen_count_duplicate_prepare_dedups(self, st_platform, st_worker):
+        """Case C: duplicate prepare returns another handle for the same identity."""
         callable_obj, _config, _case = self._setup_dlopen_count_test(st_worker, st_platform)
+        first = None
+        second = None
         try:
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
-            with pytest.raises(RuntimeError):
-                st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
+            first = st_worker.prepare_callable(callable_obj)
+            second = st_worker.prepare_callable(callable_obj)
+            assert first is not second
+            assert first.hashid == second.hashid
         finally:
-            st_worker.unregister_callable(_CID_PRIMARY)
+            if second is not None:
+                st_worker.unregister_callable(second)
+            if first is not None:
+                st_worker.unregister_callable(first)
 
     def test_dedup_shared_so_independent_unregister(self, st_platform, st_worker):
-        """Case E: two cids on the same ChipCallable share one device orch SO buffer.
+        """Case E: two handles on the same ChipCallable share one device orch SO buffer.
 
         Build-ID-keyed dedup in DeviceRunner refcounts the buffer; unregistering
-        one cid must not invalidate the other. Run-after-unregister proves the
+        one handle must not invalidate the other. Run-after-unregister proves the
         shared buffer is still alive (a missing refcount would either crash or
-        produce incorrect results when cid_secondary dispatches into a freed
+        produce incorrect results when the second handle dispatches into a freed
         device region).
         """
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
-        registered_primary = False
-        registered_secondary = False
+        primary = None
+        secondary = None
         try:
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
-            registered_primary = True
-            st_worker.prepare_callable(_CID_SECONDARY, callable_obj)
-            registered_secondary = True
-            # Sanity: both cids work before any unregister.
-            self._run_one(st_worker, _CID_PRIMARY, callable_obj, config, case)
-            self._run_one(st_worker, _CID_SECONDARY, callable_obj, config, case)
-            # Drop cid_primary; cid_secondary's run must still succeed because
+            primary = st_worker.prepare_callable(callable_obj)
+            secondary = st_worker.prepare_callable(callable_obj)
+            # Sanity: both handles work before any unregister.
+            self._run_one(st_worker, primary, callable_obj, config, case)
+            self._run_one(st_worker, secondary, callable_obj, config, case)
+            # Drop primary; secondary's run must still succeed because
             # the dedup refcount is still > 0.
-            st_worker.unregister_callable(_CID_PRIMARY)
-            registered_primary = False
-            self._run_one(st_worker, _CID_SECONDARY, callable_obj, config, case)
+            st_worker.unregister_callable(primary)
+            primary = None
+            self._run_one(st_worker, secondary, callable_obj, config, case)
         finally:
-            if registered_secondary:
-                st_worker.unregister_callable(_CID_SECONDARY)
-            if registered_primary:
-                st_worker.unregister_callable(_CID_PRIMARY)
+            if secondary is not None:
+                st_worker.unregister_callable(secondary)
+            if primary is not None:
+                st_worker.unregister_callable(primary)
 
     def test_dlopen_count_unregister_re_prepare(self, st_platform, st_worker):
-        """Case D: prepare+run+unregister+prepare+run on the same cid → delta == 2.
+        """Case D: prepare+run+unregister+prepare+run -> delta == 2.
 
-        unregister erases the cid from aicpu_seen_callable_ids_, so the second
+        unregister erases the slot from aicpu_seen_callable_ids_, so the second
         prepare/run pair sets register_new_callable_id_ again and the AICPU
         does a fresh dlopen. The counter is monotonic (does NOT decrement on
         unregister), so the delta after the second cycle is 2.
         """
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.aicpu_dlopen_count
-        registered = False
+        handle = None
         try:
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
-            registered = True
-            self._run_one(st_worker, _CID_PRIMARY, callable_obj, config, case)
+            handle = st_worker.prepare_callable(callable_obj)
+            self._run_one(st_worker, handle, callable_obj, config, case)
             assert st_worker.aicpu_dlopen_count - baseline == 1
-            st_worker.unregister_callable(_CID_PRIMARY)
-            registered = False
+            st_worker.unregister_callable(handle)
+            handle = None
             after_unreg = st_worker.aicpu_dlopen_count
             assert after_unreg - baseline == 1, (
                 f"unregister must NOT decrement the dlopen counter; baseline={baseline}, after_unreg={after_unreg}"
             )
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
-            registered = True
-            self._run_one(st_worker, _CID_PRIMARY, callable_obj, config, case)
+            handle = st_worker.prepare_callable(callable_obj)
+            self._run_one(st_worker, handle, callable_obj, config, case)
             assert st_worker.aicpu_dlopen_count - baseline == 2, (
                 f"after re-prepare expected counter +2 (two distinct AICPU dlopens), "
                 f"got delta {st_worker.aicpu_dlopen_count - baseline}"
             )
         finally:
-            if registered:
-                st_worker.unregister_callable(_CID_PRIMARY)
+            if handle is not None:
+                st_worker.unregister_callable(handle)
 
 
 if __name__ == "__main__":

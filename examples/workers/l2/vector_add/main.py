@@ -19,7 +19,7 @@ Pipeline (what the @scene_test framework normally does for you):
     host arrays ──[worker.malloc + copy_to]──►  device buffers
                                           │
                                           ▼
-                       chip_cid = worker.register(chip_callable)  # before init()
+                       chip_cid = worker.prepare_callable(chip_callable)  # before init()
                               worker.run(chip_cid, task_args, cfg)
                                           │
     device result ──[worker.copy_from]──► host array ──[torch compare]
@@ -186,7 +186,7 @@ def run(platform: str, device_id: int) -> int:
     chip_callable = build_chip_callable(platform)
     print(f"[vector_add] compiled. binary_size={chip_callable.binary_size} bytes")
 
-    chip_cid = worker.register(chip_callable)
+    chip_cid = worker.prepare_callable(chip_callable)
 
     print(f"[vector_add] init worker (device={device_id})...")
     worker.init()

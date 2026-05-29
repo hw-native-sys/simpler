@@ -65,7 +65,7 @@ def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids)
 
     chip_callable = _build_chip_callable(st_platform)
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
-    cid = worker.register(chip_callable)
+    cid = worker.prepare_callable(chip_callable)
     worker.init()
     try:
         config = CallConfig()

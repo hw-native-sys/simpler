@@ -175,14 +175,14 @@ inner Worker and enters a mailbox-polling loop (`_child_worker_loop`).
 ```python
 # L3 child: sub-only (or with chips via device_ids)
 l3 = Worker(level=3, num_sub_workers=1)
-l3_sub_handle = l3.register(lambda: verify_result())
+l3_sub_handle = l3.prepare_callable(lambda: verify_result())
 
 def my_l3_orch(orch, args, config):
     orch.submit_sub(l3_sub_handle)
 
 # L4 parent
 w4 = Worker(level=4, num_sub_workers=0)
-l3_handle = w4.register(my_l3_orch)
+l3_handle = w4.prepare_callable(my_l3_orch)
 w4.add_worker(l3)
 w4.init()
 

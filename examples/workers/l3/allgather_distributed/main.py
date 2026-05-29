@@ -141,7 +141,7 @@ def run(
         num_sub_workers=0,
         build=build,
     )
-    chip_cid = worker.register(chip_callable)
+    chip_cid = worker.prepare_callable(chip_callable)
 
     try:
         print("[allgather] init worker (forks chip children; base comm is lazy)...")

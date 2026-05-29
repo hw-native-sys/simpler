@@ -67,7 +67,7 @@ class TestSubWorkerException:
             raise SentinelError("boom-from-sub")
 
         hw = Worker(level=3, num_sub_workers=1)
-        cid = hw.register(boom)
+        cid = hw.prepare_callable(boom)
         hw.init()
         try:
 
@@ -94,7 +94,7 @@ class TestSubWorkerException:
 
             with pytest.raises(TypeError) as info:
                 hw.run(orch)
-            assert "CallableHandle returned by Worker.register" in str(info.value)
+            assert "CallableHandle returned by Worker.prepare_callable" in str(info.value)
         finally:
             hw.close()
 
@@ -126,8 +126,8 @@ class TestScopeMidFailure:
                 raise SentinelError("first run failure")
 
             hw = Worker(level=3, num_sub_workers=1)
-            fail_cid = hw.register(boom)
-            ok_cid = hw.register(lambda args: _increment_counter(counter_buf))
+            fail_cid = hw.prepare_callable(boom)
+            ok_cid = hw.prepare_callable(lambda args: _increment_counter(counter_buf))
             hw.init()
             try:
 
@@ -165,7 +165,7 @@ class TestScopeMidFailure:
             raise SentinelError("fail-fast")
 
         hw = Worker(level=3, num_sub_workers=1)
-        cid = hw.register(boom)
+        cid = hw.prepare_callable(boom)
         hw.init()
         try:
 
@@ -208,13 +208,13 @@ class TestL4ChainedFailure:
             raise SentinelError("l3-sub-boom")
 
         l3 = Worker(level=3, num_sub_workers=1)
-        l3_sub_cid = l3.register(boom_sub)
+        l3_sub_cid = l3.prepare_callable(boom_sub)
 
         def l3_orch(orch, args, config):
             orch.submit_sub(l3_sub_cid)
 
         w4 = Worker(level=4, num_sub_workers=0)
-        l3_cid = w4.register(l3_orch)
+        l3_cid = w4.prepare_callable(l3_orch)
         w4.add_worker(l3)
         w4.init()
         try:

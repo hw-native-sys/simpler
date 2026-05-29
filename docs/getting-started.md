@@ -159,7 +159,7 @@ worker = Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and
 worker.init()
 
 # Register the ChipCallable to obtain an opaque callable handle.
-handle = worker.register(chip_callable)
+handle = worker.prepare_callable(chip_callable)
 
 # Execute the registered callable on device. Omitting block_dim uses the
 # default 0 = auto, which DeviceRunner resolves to the max the AICore

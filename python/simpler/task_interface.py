@@ -286,7 +286,8 @@ class ChipWorker:
     cannot be changed.
     This is the low-level direct chip execution API; its integer
     ``callable_id`` slots are private to the local ``ChipWorker`` instance and
-    are separate from hierarchical ``Worker.register`` / ``CallableHandle``.
+    are separate from hierarchical ``Worker.prepare_callable`` /
+    ``CallableHandle``.
 
     Usage::
 
@@ -294,7 +295,7 @@ class ChipWorker:
         worker.init(device_id=0, bins=bins)
         worker.prepare_callable(callable_id=0, callable=chip_callable)
         worker.run(callable_id=0, args=orch_args, config=CallConfig())  # block_dim defaults to 0 = auto
-        worker.unregister_callable(callable_id=0)
+        worker.unregister_callable_callable(callable_id=0)
         worker.finalize()
     """
 

@@ -7,15 +7,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end ST for post-init Worker.register(ChipCallable) at L3.
+"""End-to-end ST for post-init Worker.prepare_callable(ChipCallable) at L3.
 
 Exercises the _CTRL_REGISTER IPC path end-to-end: parent stages a
 ChipCallable in shared memory after init(), broadcasts CTRL_REGISTER to
-every chip child, the child mmaps + prepares, and the resulting cid is
-indistinguishable from a pre-init registration when used in run().
+every chip child, the child mmaps + prepares, and the resulting handle is
+indistinguishable from a pre-init preparation when used in run().
 
 The UT suite (tests/ut/py/test_worker/test_host_worker.py) already covers
-the facade-level paths (lock guard, cid overflow, lambda rejection, run
+the facade-level paths (lock guard, slot overflow, lambda rejection, run
 race detection, shm name generator). This file's job is to prove the
 bytes actually traverse shm to the chip child and prepare succeeds —
 which only a real (sim or device) chip child can confirm.
@@ -61,7 +61,7 @@ def _build_vector_callable(platform: str) -> ChipCallable:
     """Compile the vector_example orchestration + 3 AIV kernels.
 
     Mirrors how SceneTestCase._compile_chip_callable_from_spec assembles
-    a ChipCallable, but inline so the test can call register() on it both
+    a ChipCallable, but inline so the test can call prepare_callable() on it both
     before and after init().
     """
     from simpler.task_interface import CoreCallable  # noqa: PLC0415
@@ -126,7 +126,7 @@ def test_register_after_init_then_run(st_platform, st_device_ids):
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    cid_pre = worker.register(chip_callable)
+    cid_pre = worker.prepare_callable(chip_callable)
 
     # Pre-allocate both runs' tensors BEFORE Worker.init() so the
     # share_memory_() mappings are inherited by the forked chip child.
@@ -164,7 +164,7 @@ def test_register_after_init_then_run(st_platform, st_device_ids):
         #    prepare_callable_from_blob. cid_post is unknown to the
         #    CoW-inherited registry on the child side — only the IPC path
         #    can deliver it.
-        cid_post = worker.register(chip_callable)
+        cid_post = worker.prepare_callable(chip_callable)
         assert cid_post != cid_pre
 
         # 3. Run with cid_post. If CTRL_REGISTER delivered correctly, the
@@ -201,7 +201,7 @@ def test_register_after_init_parallel_broadcast(st_platform, st_device_ids):
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    cid_pre = worker.register(chip_callable)
+    cid_pre = worker.prepare_callable(chip_callable)
     a, b = 2.0, 3.0
     expected = _golden(a, b)
     # Pre-allocate args for each chip (chip_id = block group). The
@@ -226,7 +226,7 @@ def test_register_after_init_parallel_broadcast(st_platform, st_device_ids):
         assert torch.allclose(args_pre.f, torch.full_like(args_pre.f, expected), rtol=1e-5, atol=1e-5)
 
         # Now broadcast CTRL_REGISTER to BOTH chip mailboxes in parallel.
-        cid_post = worker.register(chip_callable)
+        cid_post = worker.prepare_callable(chip_callable)
 
         def orch_post(o, _a, _c):
             o.submit_next_level(cid_post, chip_args_post, config)
@@ -258,8 +258,8 @@ def test_register_cid_overflow_post_init(st_platform, st_device_ids):
     )
     # Fill the registry pre-init with sub fn lambdas (cheap, no device cost).
     for _ in range(MAX_REGISTERED_CALLABLE_IDS - 1):
-        worker.register(lambda args: None)
-    cid_chip = worker.register(chip_callable)  # last slot
+        worker.prepare_callable(lambda args: None)
+    cid_chip = worker.prepare_callable(chip_callable)  # last slot
     assert len(worker._callable_registry) == MAX_REGISTERED_CALLABLE_IDS
 
     a, b = 2.0, 3.0
@@ -279,7 +279,7 @@ def test_register_cid_overflow_post_init(st_platform, st_device_ids):
 
         # The very next dynamic register hits the table ceiling.
         with pytest.raises(RuntimeError, match="MAX_REGISTERED_CALLABLE_IDS"):
-            worker.register(chip_callable)
+            worker.prepare_callable(chip_callable)
     finally:
         worker.close()
 
@@ -302,7 +302,7 @@ def test_register_unregister_register_runs_each_time(st_platform, st_device_ids)
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    cid_pre = worker.register(chip_callable)
+    cid_pre = worker.prepare_callable(chip_callable)
 
     a, b = 2.0, 3.0
     expected = _golden(a, b)
@@ -329,7 +329,7 @@ def test_register_unregister_register_runs_each_time(st_platform, st_device_ids)
         assert torch.allclose(args_one.f, torch.full_like(args_one.f, expected), rtol=1e-5, atol=1e-5)
 
         # 2. Dynamic register a second cid, run it.
-        cid_dyn = worker.register(chip_callable)
+        cid_dyn = worker.prepare_callable(chip_callable)
 
         def orch_two(o, _args, _cfg):
             o.submit_next_level(cid_dyn, chip_args_two, config)
@@ -339,14 +339,14 @@ def test_register_unregister_register_runs_each_time(st_platform, st_device_ids)
 
         # 3. Unregister cid_dyn — CTRL_UNREGISTER hits the chip child,
         #    which calls cw.unregister_callable(cid_dyn).
-        worker.unregister(cid_dyn)
+        worker.unregister_callable(cid_dyn)
         assert cid_dyn not in worker._callable_registry
 
         # 4. Re-register and run again. `_allocate_cid` returns the
         #    smallest unused integer, so the freed slot is reused
         #    immediately. This is the slot-recycling property that
         #    unregister exists for.
-        cid_again = worker.register(chip_callable)
+        cid_again = worker.prepare_callable(chip_callable)
         assert cid_again == cid_dyn, "unregister should free the cid slot for reuse"
 
         def orch_three(o, _args, _cfg):

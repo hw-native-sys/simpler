@@ -13,12 +13,12 @@ Orchestrator handle at init, retrieves the C++ object via ``Worker.get_orchestra
 and passes the handle to the user's orch function::
 
     def my_orch(orch, args, cfg):
-        # chip_handle/sub_handle come from Worker.register(...)
+        # chip_handle/sub_handle come from Worker.prepare_callable(...)
         # build the args object yourself; tags drive dependency inference
         a = TaskArgs()
         a.add_tensor(make_tensor_arg(input_tensor),  TensorArgType.INPUT)
         a.add_tensor(make_tensor_arg(output_tensor), TensorArgType.OUTPUT)
-        orch.submit_next_level(chip_handle, a, cfg)  # handle from Worker.register(chip_callable)
+        orch.submit_next_level(chip_handle, a, cfg)  # handle from Worker.prepare_callable(chip_callable)
 
         sub_args = TaskArgs()
         sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
@@ -59,17 +59,17 @@ def _require_handle(
 
     Raises a clear migration error when the caller still passes a
     ``ChipCallable`` directly — every chip callable must be registered
-    via ``Worker.register(callable)`` *before* ``init()`` so each chip
+    via ``Worker.prepare_callable(callable)`` *before* ``init()`` so each chip
     child can pre-warm it on its own device.
     """
     if isinstance(callable_or_handle, ChipCallable) or hasattr(callable_or_handle, "buffer_ptr"):
         raise TypeError(
             f"{kind} now takes a CallableHandle, not a ChipCallable. "
-            "Register the callable before init() via "
-            "`handle = worker.register(chip_callable)` and pass `handle` here."
+            "Prepare the callable before init() via "
+            "`handle = worker.prepare_callable(chip_callable)` and pass `handle` here."
         )
     if not isinstance(callable_or_handle, CallableHandle):
-        raise TypeError(f"{kind} expects a CallableHandle returned by Worker.register")
+        raise TypeError(f"{kind} expects a CallableHandle returned by Worker.prepare_callable")
     if worker is not None:
         state = worker._resolve_handle(callable_or_handle, expected_namespace=expected_namespace)
         return state.digest, state.kind, state.target_namespace
@@ -116,7 +116,7 @@ class Orchestrator:
     ):
         """Submit a NEXT_LEVEL task by registered callable handle.
 
-        ``callable_handle`` must be returned by ``Worker.register``. Tags inside ``args`` drive deps.
+        ``callable_handle`` must be returned by ``Worker.prepare_callable``. Tags inside ``args`` drive deps.
         ``worker``: logical worker id for affinity (-1 = unconstrained).
         """
         cfg = config if config is not None else CallConfig()

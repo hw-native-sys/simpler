@@ -199,7 +199,7 @@ class TestWorkerSmoke:
                 struct.pack_into("i", b, 0, v + 1)
 
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.register(sub)
+            cid = hw.prepare_callable(sub)
             hw.init()
             try:
 

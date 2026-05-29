@@ -10,8 +10,8 @@ chip outputs. The smallest correct L3 program.
 | ------- | ------------------------------ |
 | Shared-memory tensors | `torch.randn(...).share_memory_()` — chip children see the same storage |
 | `TensorArgType` tags | `INPUT` / `OUTPUT_EXISTING` drive DAG dependency tracking |
-| ChipCallable id | `chip_cid = worker.register(chip_callable)` **before** `init()` |
-| Python SubWorker | `sub_cid = worker.register(fn)` **before** `init()` |
+| ChipCallable id | `chip_cid = worker.prepare_callable(chip_callable)` **before** `init()` |
+| Python SubWorker | `sub_cid = worker.prepare_callable(fn)` **before** `init()` |
 | `Worker(level=3)` config | `device_ids=[0, 1]`, `num_sub_workers=1` |
 | Orchestration | `orch.submit_next_level(chip_cid, ...)` per chip + `orch.submit_sub(sub_cid, args)` |
 
@@ -67,8 +67,8 @@ host_b   = [torch.randn(...).share_memory_() for _ in device_ids]
 host_out = [torch.zeros(...).share_memory_() for _ in device_ids]
 
 def subworker(sub_args): ...
-chip_cid = worker.register(chip_callable)   # ChipCallable: BEFORE init()
-sub_cid  = worker.register(subworker)        # Python SubWorker: BEFORE init()
+chip_cid = worker.prepare_callable(chip_callable)   # ChipCallable: BEFORE init()
+sub_cid  = worker.prepare_callable(subworker)        # Python SubWorker: BEFORE init()
 ```
 
 `share_memory_()` moves the tensor's storage to a `mmap` region. After
@@ -76,11 +76,11 @@ sub_cid  = worker.register(subworker)        # Python SubWorker: BEFORE init()
 address, so when the kernel writes to `host_out[i]`, the parent's tensor sees
 it immediately. No explicit copy back.
 
-**`register()` MUST come before `init()`** for *every* callable — both
+**`prepare_callable()` MUST come before `init()`** for *every* callable — both
 the `ChipCallable` dispatched to chips and the Python sub functions.
 `init()` forks child processes; the registry is captured by copy-on-write.
 Anything registered after `init()` is invisible to the forked children,
-and `Worker.register()` at L≥3 raises if called post-init.
+and `Worker.prepare_callable()` at L≥3 raises if called post-init.
 
 ### 2. `init()` — fork + C++ scheduler
 

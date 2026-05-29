@@ -83,6 +83,7 @@ class TestGroupBasic:
 
             shm = SharedMemory(name=counter_name)
             try:
+                assert shm.buf is not None
                 with open(lock_path, "r+") as lock_file:
                     fcntl.flock(lock_file, fcntl.LOCK_EX)
                     value = struct.unpack_from("i", shm.buf, 0)[0]
@@ -91,7 +92,7 @@ class TestGroupBasic:
                 shm.close()
 
         try:
-            cid = hw.register(inc)
+            cid = hw.prepare_callable(inc)
             hw.init()
 
             def orch(o, args, cfg):
@@ -117,13 +118,14 @@ class TestGroupBasic:
         def inc(args):
             shm = SharedMemory(name=counter_name)
             try:
+                assert shm.buf is not None
                 value = struct.unpack_from("i", shm.buf, 0)[0]
                 struct.pack_into("i", shm.buf, 0, value + 1)
             finally:
                 shm.close()
 
         try:
-            cid = hw.register(inc)
+            cid = hw.prepare_callable(inc)
             hw.init()
 
             def orch(o, args, cfg):
@@ -163,8 +165,8 @@ class TestGroupDependency:
             assert gb is not None and db is not None
 
             hw = Worker(level=3, num_sub_workers=3)
-            group_cid = hw.register(lambda args: struct.pack_into("i", gb, 0, 1))
-            dep_cid = hw.register(lambda args: struct.pack_into("i", db, 0, 1))
+            group_cid = hw.prepare_callable(lambda args: struct.pack_into("i", gb, 0, 1))
+            dep_cid = hw.prepare_callable(lambda args: struct.pack_into("i", db, 0, 1))
             hw.init()
 
             def orch(o, args, cfg):

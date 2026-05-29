@@ -152,7 +152,7 @@ def run(platform: str, device_ids: list[int]) -> int:
         num_sub_workers=0,
     )
     print("[domain_rank_map] compiling communication kernel...")
-    allreduce_cid = worker.register(build_allreduce_callable(platform))
+    allreduce_cid = worker.prepare_callable(build_allreduce_callable(platform))
 
     # `ok` is mutated by the orch closures; wrap in a list for nonlocal write.
     state = {"ok": True}

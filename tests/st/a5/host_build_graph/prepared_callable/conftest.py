@@ -10,11 +10,10 @@
 
 The default ``st_worker`` (root conftest) is shared across L2 ST classes
 in a session-scoped pool — correct for ordinary business tests but not
-for prepared_callable, which asserts on the worker's internal cid table
-(``aicpu_dlopen_count`` / ``host_dlopen_count`` deltas, double-prepare
-``RuntimeError``, SO cache hits). Sharing the worker breaks those
-assertions: other tests' ``register()`` calls leave residue on the
-hard-coded cids 0/1.
+for prepared_callable, which asserts on the worker's internal handle table
+(``aicpu_dlopen_count`` / ``host_dlopen_count`` deltas, SO cache hits). Sharing the worker breaks those
+assertions: other tests' prepared handles leave residue in the
+worker identity table.
 
 Override ``st_worker`` here as class-scope, building a fresh L2 worker
 that does **not** enter ``_l2_worker_pool``. Cost: one extra init/close

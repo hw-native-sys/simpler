@@ -819,7 +819,7 @@ class SceneTestCase:
 
         Mirrors the ``st_worker`` pytest fixture, which yields a ``Worker``
         (not a raw ``ChipWorker``) — ``_run_and_validate_l2`` is shared by both
-        paths and calls ``worker.register(...)`` / ``worker.run(cid, ...)``,
+        paths and calls ``worker.prepare_callable(...)`` / ``worker.run(cid, ...)``,
         which only the ``Worker`` wrapper exposes.
         """
         from simpler.worker import Worker  # noqa: PLC0415
@@ -950,14 +950,12 @@ class SceneTestCase:
         config_dict = case.get("config", {})
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
-        # The L2 entry point is `Worker.run(cid, args, cfg)`.  Reuse the
-        # cid registered by the st_worker fixture / standalone path.  For
-        # first-time callers (worker reused across rounds), `_st_l2_cid`
-        # caches the cid so subsequent runs skip re-registration.
-        cid = getattr(type(self), "_st_l2_cid", None)
-        if cid is None:
-            cid = worker.register(callable_obj)
-            type(self)._st_l2_cid = cid
+        # The L2 entry point is `Worker.run(handle, args, cfg)`. Reuse the
+        # handle prepared by the st_worker fixture / standalone path.
+        handle = getattr(type(self), "_st_l2_handle", None)
+        if handle is None:
+            handle = worker.prepare_callable(callable_obj)
+            type(self)._st_l2_handle = handle
 
         # Build args
         test_args = self.generate_args(params)
@@ -997,7 +995,7 @@ class SceneTestCase:
             )
 
             with _temporary_env(self._resolve_env()):
-                timing = worker.run(cid, chip_args, config=config)
+            timing = worker.run(handle, chip_args, config=config)
             if rounds > 1 and timing is not None:
                 timings.append((timing.host_wall_us, timing.device_wall_us))
 
@@ -1140,7 +1138,7 @@ class SceneTestCase:
         cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
         sub_ids = getattr(type(self), "_st_sub_ids", {})
-        # For L3, use pre-registered chip cids instead of raw ChipCallable
+        # For L3, use prepared chip handles instead of raw ChipCallable
         # objects.
         chip_cids = getattr(type(self), "_st_chip_cids", {})
         if self._st_level == 3 and chip_cids:
@@ -1413,8 +1411,8 @@ class SceneTestCase:
                     callable_obj = inst.build_callable(args.platform)
                     sub_ids = per_class_sub_ids.get(cls, {})
                     chip_cids = per_class_chip_cids.get(cls, {})
-                    # For L3: merge chip cids into callable_obj (replacing
-                    # ChipCallable objects with their registered cid).
+                    # For L3: merge chip handles into callable_obj (replacing
+                    # ChipCallable objects with their prepared handle).
                     if level == 3 and chip_cids:
                         callable_obj = {**chip_cids}
                     for case in selected_by_cls[cls]:
@@ -1682,9 +1680,9 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         runtime=first_cls._st_runtime,
         build=build,
     )
-    # Register sub callables per-class to avoid name collisions
+    # Prepare sub callables per-class to avoid name collisions.
     per_class_sub_ids: dict[type, dict] = {}
-    # Also register ChipCallables here (before init) so the chip children
+    # Also prepare ChipCallables here (before init) so the chip children
     # pre-warm them via _CTRL_PREPARE.
     per_class_chip_cids: dict[type, dict] = {}
     for cls in group:
@@ -1692,13 +1690,13 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         cls_chip_cids = {}
         for entry in cls.CALLABLE.get("callables", []):
             if "callable" in entry:
-                cid = worker.register(entry["callable"])
+                cid = worker.prepare_callable(entry["callable"])
                 cls_sub_ids[entry["name"]] = cid
             elif "orchestration" in entry:
                 name = entry["name"]
                 cache_key = (cls.__qualname__, name, args.platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
-                cid = worker.register(chip)
+                cid = worker.prepare_callable(chip)
                 cls_chip_cids[name] = cid
                 cls_chip_cids[f"{name}_sig"] = entry["orchestration"].get("signature", [])
         per_class_sub_ids[cls] = cls_sub_ids

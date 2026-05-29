@@ -16,7 +16,7 @@ Primitives introduced over L2 (see ../../l2/vector_add/main.py for the L2 versio
 
   * torch.share_memory_() tensors       — visible to forked chip children, IS the data plane
   * TaskArgs + TensorArgType tags        — INPUT / OUTPUT_EXISTING drive DAG deps
-  * Worker.register(python_fn)           — register Python callable runnable as a sub task
+  * Worker.prepare_callable(python_fn)           — register Python callable runnable as a sub task
   * Worker(level=3, device_ids=[...], num_sub_workers=N) — multi-chip + sub fork-and-serve
   * orch.submit_next_level(cb, args, cfg, worker=i)  — submit a chip task
   * orch.submit_sub(cid, args)           — submit a Python sub task
@@ -140,14 +140,14 @@ def run(platform: str, device_ids: list[int]) -> int:
         # results to disk or trigger the next pipeline stage.
         print(f"[multi_chip_dispatch] subworker fired (received {sub_args.tensor_count()} tensor refs) ✅")
 
-    sub_cid = worker.register(subworker)
+    sub_cid = worker.prepare_callable(subworker)
 
     # --- 4. Compile the ChipCallable once, reused on both chips.
     print(f"[multi_chip_dispatch] compiling kernels for {platform}...")
     chip_callable = build_chip_callable(platform)
 
     # Register the ChipCallable so submit_next_level takes a cid.
-    chip_cid = worker.register(chip_callable)
+    chip_cid = worker.prepare_callable(chip_callable)
 
     # --- 5. init() forks chip + sub child processes, starts C++ scheduler.
     print("[multi_chip_dispatch] init worker...")

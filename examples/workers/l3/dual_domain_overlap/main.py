@@ -192,8 +192,8 @@ def run(platform: str, device_ids: list[int]) -> int:
         device_ids=device_ids,
         num_sub_workers=0,
     )
-    allreduce_cid = worker.register(allreduce_cc)
-    affine_cid = worker.register(affine_cc)
+    allreduce_cid = worker.prepare_callable(allreduce_cc)
+    affine_cid = worker.prepare_callable(affine_cc)
 
     try:
         print("[dual_domain_overlap] init worker...")

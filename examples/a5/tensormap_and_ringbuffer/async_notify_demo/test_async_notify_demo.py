@@ -112,7 +112,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None, pto_isa_commi
         device_ids=device_ids,
         num_sub_workers=0,
     )
-    chip_cid = worker.register(chip_callable)
+    chip_cid = worker.prepare_callable(chip_callable)
     try:
         worker.init()
 

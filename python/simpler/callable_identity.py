@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Callable identity helpers for hierarchical Worker registration."""
+"""Callable identity helpers for hierarchical Worker callable preparation."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import ctypes
 import hashlib
 import struct
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from .task_interface import ArgDirection, ChipCallable
 
@@ -156,7 +156,7 @@ def validate_hashid(hashid: str) -> None:
 
 
 class CallableHandle:
-    """Opaque public token returned by ``Worker.register``."""
+    """Opaque public token returned by ``Worker.prepare_callable``."""
 
     __slots__ = ("hashid", "kind", "target_namespace", "_digest", "_handle_id", "_owner_id")
 
@@ -172,7 +172,7 @@ class CallableHandle:
         self.target_namespace = target_namespace
         self._digest = hashid_to_digest(hashid)
         self._handle_id = -1
-        self._owner_id: Optional[str] = None
+        self._owner_id: str | None = None
         self._validate_public_fields()
 
     @classmethod

@@ -147,7 +147,7 @@ def run(platform: str, device_id: int) -> int:
 
     print(f"[child_memory] compiling kernels for {platform}...")
     chip_callable = build_chip_callable(platform)
-    chip_cid = worker.register(chip_callable)
+    chip_cid = worker.prepare_callable(chip_callable)
 
     print("[child_memory] init worker...")
     worker.init()
