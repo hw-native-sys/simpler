@@ -1844,6 +1844,11 @@ The index-only registry slice is covered by
 `name` when graph tasks reference callables by name. That selector passed on
 the local A100 and remote H200, again with the known H200 PTO-ISA SSH refresh
 warning.
+The compact callable-registry slice is covered by
+`compact_callable_index_graph_with_ctypes_data`; integer list entries now
+lower directly to generated-dispatch `func_id` values for index-referenced
+graphs. That selector passed on the local A100 and remote H200, again with the
+known H200 PTO-ISA SSH refresh warning.
 The role mapping now preserves the lifecycle distinction needed by CUDA
 memory planning: tagged `output` may create a default-sized temporary, but
 tagged `output_existing` and `inout` must name storage that is already known

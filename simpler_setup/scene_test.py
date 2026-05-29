@@ -1318,8 +1318,13 @@ class _CudaPersistentDagSceneBuffers:
 
         resolved: dict[str, Any] = {}
         for index, entry in enumerate(graph_callables):
+            if isinstance(entry, int):
+                resolved[str(index)] = {"func_id": entry}
+                continue
             if not isinstance(entry, dict):
-                raise ValueError("CUDA persistent_dag_graph_f32 graph callable list entries must be dictionaries")
+                raise ValueError(
+                    "CUDA persistent_dag_graph_f32 graph callable list entries must be dictionaries or integers"
+                )
             callable_spec = dict(entry)
             name = callable_spec.pop("name", None)
             if name is not None:
