@@ -274,6 +274,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "generic_args4": "9,2,1",
         "graph_descriptor": "9,2,1",
         "graph_descriptor_chain": "1,2,1,2,1",
+        "graph_descriptor_compact_role_inout": "1,1,1",
         "graph_descriptor_diamond": "9,2,1,2,1",
         "graph_descriptor_generic_args4": "9,2,1",
         "graph_descriptor_quad": "8,2,1",
@@ -321,6 +322,7 @@ def _expected_graph_descriptor(config: PairedPersistentSmokeConfig) -> tuple[str
         "graph_descriptor_scalar_axpy": ("0,0,2", "2,2"),
         "graph_descriptor_scalar_scale": ("0,0,2", "2,2"),
         "graph_descriptor_scratch_reuse": ("0,0,2,1,1,2", "2,2,3,4,5,5"),
+        "graph_descriptor_compact_role_inout": ("0,1,1", "1,2"),
         "graph_descriptor_role_keyed_inout": ("0,1,1", "1,2"),
         "graph_descriptor_tagged": ("0,0,2", "2,2"),
         "graph_descriptor_tagged_inout": ("0,1,1", "1,2"),
@@ -343,6 +345,9 @@ def _expected_graph_task_args(config: PairedPersistentSmokeConfig) -> str | None
         "graph_descriptor_tagged_inout": (
             "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
         ),
+        "graph_descriptor_compact_role_inout": (
+            "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+        ),
         "graph_descriptor_role_keyed_inout": (
             "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
         ),
@@ -353,6 +358,7 @@ def _expected_graph_task_arg_key(config: PairedPersistentSmokeConfig) -> str | N
     if config.mode != "dag":
         return None
     return {
+        "graph_descriptor_compact_role_inout": "compact",
         "graph_descriptor_role_keyed_inout": "role",
     }.get(config.dag_shape)
 
@@ -523,6 +529,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "generic_args4",
             "graph_descriptor",
             "graph_descriptor_chain",
+            "graph_descriptor_compact_role_inout",
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
             "graph_descriptor_quad",

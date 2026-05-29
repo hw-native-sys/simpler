@@ -1264,6 +1264,19 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-root tmp/cuda-backend/role-keyed-inout-working
 ```
 
+Use `graph_descriptor_compact_role_inout` after changing compact role-entry
+lowering or report metadata. It validates the same in-place graph shape, but
+requires `graph_task_arg_key=compact` in the paired JSON plus Markdown/SVG
+reports:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_compact_role_inout --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/compact-role-inout-working
+```
+
 The selected benchmark path also includes
 `pto_persistent_dag_graph_role_keyed_inout`. Use a compact paired capture when
 changing graph task-argument lowering or capture validation:
