@@ -340,14 +340,13 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest full paired capture at commit `f99dc6b0` uses the `16x16x16`
+The latest full paired capture at commit `c183d1ad` uses the `16x16x16`
 tensor descriptor, sizes `1024,65536,1048576`, three repeats, task counts
 `2,6,12`, and worker-grid values `32,64,128,256`. It writes artifacts under
-`tmp/cuda-backend/current-head-full-role-map-working/`
-`combined-current-f99dc6b0/` and validates `1260` combined samples after the
-role-map graph row joined the selected matrix. New full paired captures should
-validate `1278` samples after the submit-groups row joined the selected
-matrix. The paired-runner validator checked
+`tmp/cuda-backend/current-head-full-submit-groups-working/`
+`combined-current-c183d1ad/` and validates `1278` combined samples after the
+submit-groups graph row joined the selected matrix. The paired-runner
+validator checked
 source-paper provenance, sanitized command examples, generated Markdown/SVG
 reports, zero scheduler errors, selected tensor throughput reports, graph
 topology reports, graph TaskArgs-like metadata reports, expected generated
@@ -358,14 +357,14 @@ and scratch-reuse metadata. This supersedes the older `9ec5511e`,
 three-size/three-repeat comparison role.
 
 Selected current-head full-capture medians show that the compiler-backed
-host-schedule row remains within `0.89x-1.11x` of the handwritten
+host-schedule row remains within `0.50x-1.14x` of the handwritten
 host-schedule row across A100/H200 and vector sizes. The graph task-argument
-spelling rows also validate tag, role-keyed, compact, and pair-shaped
-spellings through the same in-place graph topology: dispatch `1,1,1`,
-fan-in `0,1,1`, dependents `1,2`, and the same report-visible task args.
-At `N=1024`, A100 reported tag/role/compact/pair medians of
-`29696/30720/30720/30720 ns`; H200 reported
-`28608/28992/27776/28704 ns`.
+spelling rows also validate tag, role-keyed, compact, pair-shaped, and
+role-map spellings through the same in-place graph topology: dispatch
+`1,1,1`, fan-in `0,1,1`, dependents `1,2`, and the same report-visible task
+args. At `N=1024`, A100 reported tag/role/compact/pair/role-map medians of
+`30720/30720/30720/29696/30720 ns`; H200 reported
+`29056/28576/27712/27936/29056 ns`.
 The selected named-callable row now appears in the full matrix at all three
 sizes with graph fan-in `0,0,2`, dependents `2,2`, graph-node ops
 `task0=op:add=1;task1=op:mul=2;task2=op:add=1`, graph task arg key
@@ -373,7 +372,7 @@ sizes with graph fan-in `0,0,2`, dependents `2,2`, graph-node ops
 `task0=callable:add,input:a,input:b,output:tmp0;`
 `task1=callable:mul,input:a,input:b,output:tmp1;`
 `task2=callable:add,input:a,input:b,output:out`. Median device times were
-`28672/135616/2411424 ns` on A100 and `26112/134496/1907872 ns` on H200 for
+`26624/135168/2361344 ns` on A100 and `25344/132320/1907936 ns` on H200 for
 sizes `1024/65536/1048576`.
 
 A compact paired benchmark at commit `945016c3` adds
@@ -4571,11 +4570,11 @@ errors. The named-callable benchmark rows were:
   `named_callable`, `25728 ns`.
 
 The refreshed full paired-current capture under
-`tmp/cuda-backend/current-head-full-role-map-working/`
-`combined-current-f99dc6b0/` validates the same selected row across
+`tmp/cuda-backend/current-head-full-submit-groups-working/`
+`combined-current-c183d1ad/` validates the same selected row across
 `N=1024,65536,1048576` with zero scheduler errors. Median named-callable
-device times were `28672/134976/2378272 ns` on A100 and
-`27072/132864/1906528 ns` on H200 for those sizes.
+device times were `26624/135168/2361344 ns` on A100 and
+`25344/132320/1907936 ns` on H200 for those sizes.
 
 Needed:
 
@@ -4661,11 +4660,11 @@ matrix, not only the paired smoke path. The focused TDD first failed because
 did not require that row or its graph metadata. After adding the benchmark
 row, the focused selector reported `7 passed, 292 deselected`. The full
 paired-current gate under
-`tmp/cuda-backend/current-head-full-role-map-working/`
-`combined-current-f99dc6b0/` validated `1260` samples. At `N=1024`, role
+`tmp/cuda-backend/current-head-full-submit-groups-working/`
+`combined-current-c183d1ad/` validated `1278` samples. At `N=1024`, role
 spelling medians were tag/role/compact/pair/role-map
-`31744/32768/31744/32768/32768 ns` on A100 and
-`29248/28512/28864/28064/28960 ns` on H200. The compact paired A100/H200
+`30720/30720/30720/29696/30720 ns` on A100 and
+`29056/28576/27712/27936/29056 ns` on H200. The compact paired A100/H200
 gate under
 `tmp/cuda-backend/role-map-selected-benchmark-working/`
 `combined-current-a3c09113/` validated `98` non-batch samples with source
@@ -4680,15 +4679,18 @@ selector first failed because `cuda_benchmark.py` rejected that baseline and
 the paired/compact validators still expected `1260` full samples and `98`
 compact non-batch samples. After adding the selected row and validator
 metadata, the full benchmark-report test file passed with `300` tests. The
-compact paired A100/H200 gate under
-`tmp/cuda-backend/submit-groups-selected-benchmark-working/`
-`combined-current-193ccc4d/` validated `100` non-batch samples with source
-paper provenance, sanitized reconstruction commands, Markdown/SVG reports,
-and zero scheduler errors. The submit-groups row validated dispatch `1,1,1`,
+full paired A100/H200 gate under
+`tmp/cuda-backend/current-head-full-submit-groups-working/`
+`combined-current-c183d1ad/` validated `1278` samples with source-paper
+provenance, sanitized reconstruction commands, Markdown/SVG reports, and zero
+scheduler errors. The submit-groups row validated dispatch `1,1,1`,
 graph fan-in `0,0,2`, dependents `2,2`, and
 `graph_task_arg_key=submit_groups`; A100 reported
-`device_wall_ns=27648`, and H200 reported `device_wall_ns=24160`. New full
-paired-current captures should validate `1278` samples.
+`device_wall_ns=25600`, and H200 reported `device_wall_ns=24160`. The compact
+paired A100/H200 gate under
+`tmp/cuda-backend/submit-groups-selected-benchmark-working/`
+`combined-current-193ccc4d/` remains useful as the focused selector gate and
+validated `100` non-batch samples before this full refresh.
 
 ### Tuned Tensor Workloads
 

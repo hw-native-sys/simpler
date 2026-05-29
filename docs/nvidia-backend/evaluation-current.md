@@ -1,11 +1,11 @@
 # CUDA Current Evaluation Capture
 
 This page summarizes the latest full paired A100/H200 CUDA backend capture
-from commit `f99dc6b0`, plus compact current-head validation captures. The
+from commit `c183d1ad`, plus compact current-head validation captures. The
 full current-head capture is under
-`tmp/cuda-backend/current-head-full-role-map-working/`
-`combined-current-f99dc6b0/`.
-The latest compact current-head gate remains the capture under
+`tmp/cuda-backend/current-head-full-submit-groups-working/`
+`combined-current-c183d1ad/`.
+The compact current-head gate before the full refresh remains the capture under
 `tmp/cuda-backend/submit-groups-selected-benchmark-working/`
 `combined-current-193ccc4d/`, which validates the selected compact benchmark
 matrix after submit-group graph task-argument metadata joined the selected
@@ -23,17 +23,16 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - repeats: `3`
 - batch tasks: `2,6,12`
 - worker blocks per task: `32,64,128,256`
-- samples in combined JSON: `1260` in the latest full capture; new full
-  captures should validate `1278` after the submit-groups graph row joined
-  the selected matrix
+- samples in combined JSON: `1278` in the latest full capture
 
-The latest full capture validated `1260` samples after the role-map graph
-row joined the selected matrix. The previous `5424bcca` full capture remains
-useful as historical evidence, but it validated `1242` samples before that
+The latest full capture validated `1278` samples after the submit-groups graph
+row joined the selected matrix. The previous `f99dc6b0` full capture remains
+useful as historical evidence, but it validated `1260` samples before that
 row was included.
+The earlier `5424bcca` full capture remains useful as historical evidence,
+but it validated `1242` samples before the role-map row was included.
 The compact `193ccc4d` gate validates `100` samples after the submit-groups
-graph row joined the selected matrix. New full paired-current captures should
-validate `1278` samples.
+graph row joined the selected matrix.
 The older `9ec5511e` full capture remains useful as historical evidence, but
 it validated `1224` samples before the named-callable graph row was included.
 The older `cb300e82` full capture validated `1206` samples before the
@@ -49,6 +48,16 @@ node-link graph row joined the selected matrix.
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark.svg`
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/current-head-full-submit-groups-working/a100-current-c183d1ad/cuda-benchmark.json`
+- `tmp/cuda-backend/current-head-full-submit-groups-working/a100-current-c183d1ad/cuda-benchmark.md`
+- `tmp/cuda-backend/current-head-full-submit-groups-working/h200-current-c183d1ad/cuda-benchmark.json`
+- `tmp/cuda-backend/current-head-full-submit-groups-working/h200-current-c183d1ad/cuda-benchmark.md`
+- `tmp/cuda-backend/current-head-full-submit-groups-working/combined-current-c183d1ad/cuda-benchmark.json`
+- `tmp/cuda-backend/current-head-full-submit-groups-working/combined-current-c183d1ad/cuda-benchmark.md`
+- `tmp/cuda-backend/current-head-full-submit-groups-working/combined-current-c183d1ad/cuda-benchmark.svg`
+- `tmp/cuda-backend/current-head-full-submit-groups-working/combined-current-c183d1ad/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/current-head-full-submit-groups-working/combined-current-c183d1ad/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/current-head-full-submit-groups-working/combined-current-c183d1ad/cuda-benchmark-throughput.svg`
 - `tmp/cuda-backend/current-head-full-role-map-working/a100-current-f99dc6b0/cuda-benchmark.json`
 - `tmp/cuda-backend/current-head-full-role-map-working/a100-current-f99dc6b0/cuda-benchmark.md`
 - `tmp/cuda-backend/current-head-full-role-map-working/h200-current-f99dc6b0/cuda-benchmark.json`
@@ -370,12 +379,12 @@ node-link graph row joined the selected matrix.
 
 ## Latest Full Current-Head Capture
 
-The full paired capture at artifact label `f99dc6b0` refreshes the broad
+The full paired capture at artifact label `c183d1ad` refreshes the broad
 A100/H200 benchmark matrix on the current branch head. It uses `compute_80`
 on A100, `compute_90` on H200, the default `16x16x16` tensor descriptor,
 three vector sizes, three repeats, same-work task counts `2,6,12`, and worker
 grid values `32,64,128,256`. This is the first full three-size capture after
-`pto_persistent_dag_graph_role_map_inout` joined the selected benchmark
+`pto_persistent_dag_graph_submit_groups` joined the selected benchmark
 matrix.
 
 Validation command:
@@ -383,7 +392,7 @@ Validation command:
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark.json \
+    tmp/cuda-backend/current-head-full-submit-groups-working/combined-current-c183d1ad/cuda-benchmark.json \
     --preset paired-current
 ```
 
@@ -391,41 +400,41 @@ The paired runner generated this validator with explicit required baselines,
 generated-dispatch IDs, tensor descriptors, graph fan-in/dependent arrays,
 TaskArgs-like graph metadata, graph node attrs/ops, named-callable metadata,
 scratch-reuse metadata, and tensor/core/cuBLAS report requirements. It
-accepted the combined JSON, Markdown, and SVG artifacts with `1260` samples
-after the role-map graph row joined the selected matrix.
+accepted the combined JSON, Markdown, and SVG artifacts with `1278` samples
+after the submit-groups graph row joined the selected matrix.
 
 Launch baseline comparison from the same raw JSON:
 
 | GPU | N | PTO host ns | Compiler ns | Driver ns | Graph ns | Compiler/PTO | Graph/PTO |
 | --- | - | ----------- | ----------- | --------- | -------- | ------------ | --------- |
-| A100 | 1024 | 43008 | 43008 | 40959 | 25599 | 1.00x | 0.60x |
-| A100 | 65536 | 29696 | 29824 | 43807 | 28319 | 1.00x | 0.95x |
-| A100 | 1048576 | 26848 | 24352 | 27359 | 23072 | 0.91x | 0.86x |
-| H200 | 1024 | 30080 | 29952 | 26367 | 18624 | 1.00x | 0.62x |
-| H200 | 65536 | 13472 | 18624 | 25312 | 16992 | 1.38x | 1.26x |
-| H200 | 1048576 | 20928 | 23520 | 29055 | 22719 | 1.12x | 1.09x |
+| A100 | 1024 | 36864 | 37888 | 35840 | 24576 | 1.03x | 0.67x |
+| A100 | 65536 | 25440 | 25216 | 37856 | 25599 | 0.99x | 1.01x |
+| A100 | 1048576 | 22688 | 22528 | 22816 | 20511 | 0.99x | 0.90x |
+| H200 | 1024 | 29536 | 14752 | 21088 | 17696 | 0.50x | 0.60x |
+| H200 | 65536 | 14880 | 17024 | 23488 | 17535 | 1.14x | 1.18x |
+| H200 | 1048576 | 19680 | 19840 | 26591 | 19360 | 1.01x | 0.98x |
 
 Selected tensor throughput from the same raw JSON:
 
 | GPU | N | Shape | Scalar ns | Graph ns | Tensor-core ns | Graph tensor-core ns | cuBLAS ns | cuBLAS graph ns |
 | --- | - | ----- | --------- | -------- | -------------- | -------------------- | --------- | --------------- |
-| A100 | 1024 | 16x16x16 | 36864 | 35840 | 38912 | 38912 | 20479 | 9216 |
-| A100 | 65536 | 16x16x16 | 458560 | 457792 | 566336 | 567520 | 16383 | 9216 |
-| A100 | 1048576 | 16x16x16 | 7249408 | 7251808 | 8955584 | 8911200 | 54271 | 46080 |
-| H200 | 1024 | 16x16x16 | 34496 | 34368 | 35008 | 35392 | 22592 | 9088 |
-| H200 | 65536 | 16x16x16 | 463872 | 458880 | 451776 | 445056 | 25631 | 10080 |
-| H200 | 1048576 | 16x16x16 | 7081312 | 6993504 | 6892480 | 6790816 | 29343 | 19551 |
+| A100 | 1024 | 16x16x16 | 36864 | 36864 | 37888 | 38912 | 23552 | 10239 |
+| A100 | 65536 | 16x16x16 | 456032 | 456416 | 563648 | 564832 | 17408 | 9216 |
+| A100 | 1048576 | 16x16x16 | 7257312 | 7259744 | 8935968 | 8955744 | 54271 | 45056 |
+| H200 | 1024 | 16x16x16 | 34592 | 34720 | 34720 | 34784 | 23231 | 8895 |
+| H200 | 65536 | 16x16x16 | 456640 | 463328 | 445760 | 449984 | 23840 | 9312 |
+| H200 | 1048576 | 16x16x16 | 6989952 | 7071904 | 6788768 | 6896192 | 31360 | 18495 |
 
 Graph task-argument spelling medians:
 
-| GPU | N | Tag ns | Role ns | Compact ns | Pair ns |
-| --- | - | ------ | ------- | ---------- | ------- |
-| A100 | 1024 | 29696 | 30720 | 30720 | 30720 |
-| A100 | 65536 | 218080 | 220384 | 217472 | 214752 |
-| A100 | 1048576 | 3216832 | 3212224 | 3213312 | 3238816 |
-| H200 | 1024 | 28608 | 28992 | 27776 | 28704 |
-| H200 | 65536 | 184480 | 183680 | 184992 | 183200 |
-| H200 | 1048576 | 2686784 | 2669280 | 2687456 | 2667200 |
+| GPU | N | Tag ns | Role ns | Compact ns | Pair ns | Role-map ns |
+| --- | - | ------ | ------- | ---------- | ------- | ----------- |
+| A100 | 1024 | 30720 | 30720 | 30720 | 29696 | 30720 |
+| A100 | 65536 | 218912 | 217120 | 214304 | 217568 | 216064 |
+| A100 | 1048576 | 3215072 | 3211552 | 3223936 | 3223104 | 3231808 |
+| H200 | 1024 | 29056 | 28576 | 27712 | 27936 | 29056 |
+| H200 | 65536 | 182912 | 184640 | 182560 | 184672 | 183296 |
+| H200 | 1048576 | 2668672 | 2686624 | 2663488 | 2687776 | 2668384 |
 
 Interpretation:
 
@@ -434,9 +443,10 @@ Interpretation:
 - CUDA Graph replay is best for the tiny launch-dominated row, but is not a
   replacement for the persistent-device scheduler path because the host still
   launches the captured graph.
-- The tag, role-keyed, compact, and pair-shaped graph task-argument spellings
-  produce the same dispatch `1,1,1`, fan-in `0,1,1`, dependents `1,2`, and
-  TaskArgs-like metadata in the report, with comparable median device times.
+- The tag, role-keyed, compact, pair-shaped, and role-map graph task-argument
+  spellings produce the same dispatch `1,1,1`, fan-in `0,1,1`, dependents
+  `1,2`, and TaskArgs-like metadata in the report, with comparable median
+  device times.
 - Tensor/core rows remain validation and reporting evidence for the current
   generated-dispatch path. cuBLAS and cuBLAS Graph are expectedly much faster
   as library baselines for this descriptor.
@@ -1908,17 +1918,17 @@ and `block_dim=256`. The row validates graph task args
 `task2=callable:add,input:a,input:b,output:out` and graph-node ops
 `task0=op:add=1;task1=op:mul=2;task2=op:add=1`.
 
-The full `f99dc6b0` capture validates the same named-callable row across all
+The full `c183d1ad` capture validates the same named-callable row across all
 three paired-current sizes. Median device times were:
 
 | GPU | N | Named-callable ns | Node-link ns | Raw DAG ns |
 | --- | - | ----------------- | ------------ | ---------- |
-| A100 | 1024 | 28672 | 28672 | 28672 |
-| A100 | 65536 | 134976 | 137280 | 172096 |
-| A100 | 1048576 | 2378272 | 2414592 | 2640352 |
-| H200 | 1024 | 27072 | 26784 | 28320 |
-| H200 | 65536 | 132864 | 132544 | 150304 |
-| H200 | 1048576 | 1906528 | 1891776 | 1898976 |
+| A100 | 1024 | 26624 | 26624 | 30720 |
+| A100 | 65536 | 135168 | 135744 | 155040 |
+| A100 | 1048576 | 2361344 | 2376864 | 2390496 |
+| H200 | 1024 | 25344 | 25696 | 27648 |
+| H200 | 65536 | 132320 | 131648 | 133856 |
+| H200 | 1048576 | 1907936 | 1890656 | 1909984 |
 
 ## Supplemental Reordered Graph-Descriptor Smoke
 
@@ -2560,14 +2570,14 @@ not GEMM throughput.
 ## Current Role-Map Graph Row
 
 The full paired-current capture under
-`tmp/cuda-backend/current-head-full-role-map-working/`
-`combined-current-f99dc6b0/` adds
-`pto_persistent_dag_graph_role_map_inout` to the full benchmark, paired
+`tmp/cuda-backend/current-head-full-submit-groups-working/`
+`combined-current-c183d1ad/` includes
+`pto_persistent_dag_graph_role_map_inout` in the full benchmark, paired
 runner, and validator presets. The row uses the same three-task in-place
 descriptor as the tag/role/compact/pair spellings, but the graph task
 argument metadata is keyed as `role_map`.
 
-The full A100/H200 gate validates `1260` rows across the three-size matrix,
+The full A100/H200 gate validates `1278` rows across the three-size matrix,
 three repeats, source-paper provenance, command examples, Markdown/SVG
 reports, graph topology/task-argument metadata, tensor-throughput rows, and
 zero scheduler errors. The role-map row specifically validates dispatch
@@ -2576,15 +2586,15 @@ zero scheduler errors. The role-map row specifically validates dispatch
 
 | Machine | Device ns | Host ns |
 | ------- | --------- | ------- |
-| A100 | 32768 | 47129 |
-| H200 | 28960 | 37615 |
+| A100 | 30720 | 43406 |
+| H200 | 29056 | 37893 |
 
 Role-spelling medians at `N=1024` from the same full capture were:
 
 | Machine | Tagged | Role-keyed | Compact | Pair | Role-map |
 | ------- | ------ | ---------- | ------- | ---- | -------- |
-| A100 | 31744 | 32768 | 31744 | 32768 | 32768 |
-| H200 | 29248 | 28512 | 28864 | 28064 | 28960 |
+| A100 | 30720 | 30720 | 30720 | 29696 | 30720 |
+| H200 | 29056 | 28576 | 27712 | 27936 | 29056 |
 
 The earlier compact selected-matrix capture under
 `tmp/cuda-backend/role-map-selected-benchmark-working/`
@@ -2603,9 +2613,9 @@ fan-in `0,1,1`, dependents `1,2`, and `graph_task_arg_key=role_map`.
 
 ## Current Submit-Groups Graph Row
 
-The compact selected-matrix capture under
-`tmp/cuda-backend/submit-groups-selected-benchmark-working/`
-`combined-current-193ccc4d/` adds
+The full paired-current capture under
+`tmp/cuda-backend/current-head-full-submit-groups-working/`
+`combined-current-c183d1ad/` adds
 `pto_persistent_dag_graph_submit_groups` to the selected benchmark,
 paired-runner validator, and compact/full presets. The row expands the
 current submit-group descriptor bridge into two independent producer tasks
@@ -2613,17 +2623,23 @@ and one join task. This preserves the callable and TaskArgs-like lowering
 for group members while remaining a tracer-bullet expansion, not the final
 single-slot PTO group semantics.
 
-The compact A100/H200 gate validates `100` non-batch rows at size `1024`, one
-repeat, source-paper provenance, command examples, Markdown/SVG reports, graph
-topology/task-argument metadata, tensor-throughput rows, and zero scheduler
-errors. The submit-groups row specifically validates dispatch `1,1,1`, graph
-fan-in `0,0,2`, dependents `2,2`, and
+The full A100/H200 gate validates `1278` rows across the three-size matrix,
+three repeats, source-paper provenance, command examples, Markdown/SVG
+reports, graph topology/task-argument metadata, tensor-throughput rows, and
+zero scheduler errors. The submit-groups row specifically validates dispatch
+`1,1,1`, graph fan-in `0,0,2`, dependents `2,2`, and
 `graph_task_arg_key=submit_groups`.
 
 | Machine | Device ns | Host ns |
 | ------- | --------- | ------- |
-| A100 | 27648 | 38500 |
-| H200 | 24160 | 33134 |
+| A100 | 25600 | 38077 |
+| H200 | 24160 | 32631 |
+
+The compact selected-matrix capture under
+`tmp/cuda-backend/submit-groups-selected-benchmark-working/`
+`combined-current-193ccc4d/` remains useful as the focused selector gate. It
+validated `100` non-batch rows at size `1024`, one repeat, and the same
+submit-groups metadata before the full `c183d1ad` refresh.
 
 ## Reproduction Commands
 

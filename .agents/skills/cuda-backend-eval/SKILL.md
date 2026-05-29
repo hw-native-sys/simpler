@@ -1938,13 +1938,13 @@ Use `--dry-run` to print the commands without launching benchmarks. The paired
 benchmark default tensor descriptor is `16x16x16` so the scalar tensor DAG,
 explicit graph tensor DAG, WMMA tensor-core DAG, and cuBLAS rows can run
 together. The current committed summary keeps the full current-head
-`f99dc6b0` capture plus compact current-head gates in
+`c183d1ad` capture plus compact current-head gates in
 `docs/nvidia-backend/evaluation-current.md`.
 The full current-head artifact under
-`tmp/cuda-backend/current-head-full-role-map-working/`
-`combined-current-f99dc6b0/` validated `1260` A100/H200 samples after the
-role-map graph row joined the selected matrix. Full captures should validate
-`1278` samples with sizes `1024,65536,1048576`, three repeats, tensor
+`tmp/cuda-backend/current-head-full-submit-groups-working/`
+`combined-current-c183d1ad/` validated `1278` A100/H200 samples after the
+submit-groups graph row joined the selected matrix. Full captures should
+validate `1278` samples with sizes `1024,65536,1048576`, three repeats, tensor
 descriptor `16x16x16`, task counts `2,6,12`, worker-grid values
 `32,64,128,256`, source-paper provenance, sanitized command examples, graph
 topology and TaskArgs metadata reports, tensor-throughput reports, generated
@@ -1960,7 +1960,7 @@ Run the full paired-current gate with:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
     --sync-remote-tree \
-    --output-root tmp/cuda-backend/current-head-full-role-map-working
+    --output-root tmp/cuda-backend/current-head-full-submit-groups-working
 ```
 
 Use this compact paired gate after changing selected persistent graph
