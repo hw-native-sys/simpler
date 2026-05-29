@@ -2013,6 +2013,10 @@ requirements automatically from `--tensor-rows`, `--tensor-cols`, and
 runtime graph descriptor rows recorded the expected dependency shape. The
 paired benchmark runner adds these requirements automatically for known graph
 descriptor benchmark baselines.
+It also passes `--require-report-graph-topology` and
+`--require-report-graph-task-args`, so paired benchmark Markdown and SVG
+reports must show the same graph topology and TaskArgs-like metadata that the
+JSON payload carries.
 
 Use `cuda_validate_smoke.py` for paired smoke artifacts. It checks required
 artifacts, pass status, zero device scheduler errors, expected runtime/mode,

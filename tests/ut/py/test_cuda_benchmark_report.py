@@ -2992,6 +2992,8 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     assert "cublas_sgemm_graph=16x16x16" in validate
     assert "--require-command-examples" in validate
     assert "--require-source-papers" in validate
+    assert "--require-report-graph-topology" in validate
+    assert "--require-report-graph-task-args" in validate
     assert "--require-zero-scheduler-errors" in validate
     assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
 
@@ -3069,6 +3071,8 @@ def test_cuda_pair_benchmark_validate_command_matches_configured_capture(tmp_pat
         validate[index + 1] for index, part in enumerate(validate) if part == "--require-graph-task-arg-key"
     ]
     assert "pto_persistent_dag_graph_role_keyed_inout=role" in graph_task_arg_keys
+    assert "--require-report-graph-topology" in validate
+    assert "--require-report-graph-task-args" in validate
 
 
 def test_cuda_pair_benchmark_omits_empty_batch_sweeps(tmp_path):

@@ -475,6 +475,8 @@ def build_validate_command(
         *graph_fanin_args,
         *graph_dependents_args,
         "--require-report-files",
+        "--require-report-graph-topology",
+        "--require-report-graph-task-args",
         "--require-command-examples",
         "--require-zero-scheduler-errors",
         "--require-source-papers",
