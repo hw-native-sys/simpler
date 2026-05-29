@@ -3383,6 +3383,45 @@ def test_cuda_pair_persistent_smoke_builds_tensor_core_tile_workflow(tmp_path):
     assert "persistent-tensor_core_tile-16x16x16-smoke-abc123" in report
 
 
+def test_cuda_pair_persistent_smoke_builds_graph_tensor_core_tile_workflow(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape="graph_tensor_core_tile",
+        task_count=4,
+        n=256,
+        tensor_rows=16,
+        tensor_cols=16,
+        tensor_inner=16,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
+    report = cuda_pair_persistent_smoke.build_report_command(config, "abc123")
+
+    assert "persistent-graph_tensor_core_tile-16x16x16-smoke-abc123" in str(local)
+    assert "--dag-shape graph_tensor_core_tile" in remote[-1]
+    assert "--tensor-rows 16" in remote[-1]
+    assert "--expected-dag-shape" in validate
+    assert "graph_tensor_core_tile" in validate
+    assert "--expected-completed-count" in validate
+    assert "4" in validate
+    assert "--expected-dispatch" in validate
+    assert "10,1,2,1" in validate
+    assert "--expected-tensor-tile" in validate
+    assert "16x16x16" in validate
+    assert "--expected-graph-fanin" in validate
+    assert "0,1,1,2" in validate
+    assert "--expected-graph-dependents" in validate
+    assert "1,2,3,3" in validate
+    assert "persistent-graph_tensor_core_tile-16x16x16-smoke-abc123" in report
+
+
 def test_cuda_pair_persistent_smoke_builds_scalar_axpy_workflow(tmp_path):
     cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
     config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
@@ -5044,6 +5083,33 @@ def test_tensor_core_tile_dag_shape_uses_block_wide_wmma_task():
     assert tasks[0].rows == 16
     assert tasks[0].cols == 16
     assert tasks[0].inner == 16
+
+
+def test_graph_tensor_core_tile_dag_shape_uses_block_wide_wmma_task():
+    cuda_persistent_smoke = _load_persistent_smoke_module()
+
+    descriptor = cuda_persistent_smoke._make_tensor_tile_descriptor(rows=16, cols=16, inner=16)
+    fanin, dependents, tasks = cuda_persistent_smoke._make_dag_shape(
+        "graph_tensor_core_tile",
+        256,
+        101,
+        102,
+        201,
+        202,
+        203,
+        204,
+        301,
+        tensor_tile=descriptor,
+    )
+
+    assert list(fanin) == [0, 1, 1, 2]
+    assert list(dependents) == [1, 2, 3, 3]
+    assert [task.func_id for task in tasks] == [10, 1, 2, 1]
+    assert [task.initial_fanin for task in tasks] == [0, 1, 1, 2]
+    assert tasks[0].rows == 16
+    assert tasks[0].cols == 16
+    assert tasks[0].inner == 16
+    assert tasks[3].out == 301
 
 
 def test_scalar_affine_dag_shape_uses_two_scalar_descriptor_fields():

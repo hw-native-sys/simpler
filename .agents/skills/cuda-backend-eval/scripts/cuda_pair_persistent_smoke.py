@@ -23,7 +23,7 @@ Runner = Callable[..., subprocess.CompletedProcess]
 
 
 def _is_tensor_tile_shape(dag_shape: str) -> bool:
-    return dag_shape in {"graph_tensor_tile", "tensor_core_tile", "tensor_tile"}
+    return dag_shape in {"graph_tensor_core_tile", "graph_tensor_tile", "tensor_core_tile", "tensor_tile"}
 
 
 @dataclass(frozen=True)
@@ -256,6 +256,7 @@ def _expected_completed_count(config: PairedPersistentSmokeConfig) -> int:
         "graph_descriptor_chain": 5,
         "graph_descriptor_diamond": 5,
         "graph_descriptor_scratch_reuse": 6,
+        "graph_tensor_core_tile": 4,
         "graph_tensor_tile": 4,
         "scratch_reuse": 6,
         "tensor_core_tile": 4,
@@ -285,6 +286,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "graph_descriptor_tagged_inout": "1,1,1",
         "graph_descriptor_triad": "6,2,1",
         "graph_descriptor_unary_square": "7,1,1",
+        "graph_tensor_core_tile": "10,1,2,1",
         "graph_tensor_tile": "3,1,2,1",
         "quad": "8,2,1",
         "scalar_affine": "5,2,1",
@@ -322,6 +324,7 @@ def _expected_graph_descriptor(config: PairedPersistentSmokeConfig) -> tuple[str
         "graph_descriptor_tagged_inout": ("0,1,1", "1,2"),
         "graph_descriptor_triad": ("0,0,2", "2,2"),
         "graph_descriptor_unary_square": ("0,1,1", "1,2"),
+        "graph_tensor_core_tile": ("0,1,1,2", "1,2,3,3"),
         "graph_tensor_tile": ("0,1,1,2", "1,2,3,3"),
     }.get(config.dag_shape)
 
@@ -502,6 +505,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "graph_descriptor_tagged_inout",
             "graph_descriptor_triad",
             "graph_descriptor_unary_square",
+            "graph_tensor_core_tile",
             "graph_tensor_tile",
             "quad",
             "scalar_affine",

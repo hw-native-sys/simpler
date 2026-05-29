@@ -1001,7 +1001,7 @@ _TENSOR_TILE_DESCRIPTOR = _make_tensor_tile_descriptor()
 
 
 def _is_tensor_tile_shape(dag_shape: str) -> bool:
-    return dag_shape in {"graph_tensor_tile", "tensor_core_tile", "tensor_tile"}
+    return dag_shape in {"graph_tensor_core_tile", "graph_tensor_tile", "tensor_core_tile", "tensor_tile"}
 
 
 def _tensor_tile_buffer_lengths(n: int, descriptor: dict[str, int]) -> dict[str, int]:
@@ -1328,13 +1328,13 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                 ),
             ),
         )
-    if dag_shape in {"graph_tensor_tile", "tensor_core_tile", "tensor_tile"}:
+    if dag_shape in {"graph_tensor_core_tile", "graph_tensor_tile", "tensor_core_tile", "tensor_tile"}:
         descriptor = tensor_tile or _TENSOR_TILE_DESCRIPTOR
         task_count = 4
         host_fanin_t = ctypes.c_uint32 * task_count
         dependents_t = ctypes.c_uint32 * 4
         task_t = CudaPersistentDagTask * task_count
-        func_id = 10 if dag_shape == "tensor_core_tile" else 3
+        func_id = 10 if dag_shape in {"graph_tensor_core_tile", "tensor_core_tile"} else 3
         return (
             host_fanin_t(0, 1, 1, 2),
             dependents_t(1, 2, 3, 3),
@@ -2637,7 +2637,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 **config.tensor_tile,
                 "tile_count": (tensor_lengths or _tensor_tile_buffer_lengths(n, config.tensor_tile))["tile_count"],
             }
-        if config.dag_shape == "tensor_core_tile":
+        if config.dag_shape in {"graph_tensor_core_tile", "tensor_core_tile"}:
             result["tensor_core"] = {"api": "wmma", "mma_shape": "m16n16k8", "input": "tf32", "accumulator": "f32"}
         if config.dag_shape in {"scalar_axpy", "graph_descriptor_scalar_axpy"}:
             result["scalar_args"] = {"scalar0": 1.5}
@@ -2676,6 +2676,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_tagged_inout",
             "graph_descriptor_triad",
             "graph_descriptor_unary_square",
+            "graph_tensor_core_tile",
             "graph_tensor_tile",
         }:
             result["graph_descriptor"] = {
@@ -2804,6 +2805,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_tagged_inout",
         "graph_descriptor_triad",
         "graph_descriptor_unary_square",
+        "graph_tensor_core_tile",
         "graph_tensor_tile",
         "quad",
         "scalar_affine",
@@ -3083,6 +3085,7 @@ def main() -> None:
             "graph_descriptor_tagged_inout",
             "graph_descriptor_triad",
             "graph_descriptor_unary_square",
+            "graph_tensor_core_tile",
             "graph_tensor_tile",
             "quad",
             "scalar_affine",

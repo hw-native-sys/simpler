@@ -179,6 +179,10 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/graph-unary-square-working/persistent-graph_descriptor_unary_square-repeat2-smoke-02c99b5c/h200.json`
 - `tmp/cuda-backend/graph-unary-square-working/persistent-graph_descriptor_unary_square-repeat2-smoke-02c99b5c/cuda-smoke-report.md`
 - `tmp/cuda-backend/graph-unary-square-working/persistent-graph_descriptor_unary_square-repeat2-smoke-02c99b5c/cuda-smoke-report.svg`
+- `tmp/cuda-backend/graph-tensor-core-working/persistent-graph_tensor_core_tile-16x16x16-repeat2-smoke-40aa2f43/a100.json`
+- `tmp/cuda-backend/graph-tensor-core-working/persistent-graph_tensor_core_tile-16x16x16-repeat2-smoke-40aa2f43/h200.json`
+- `tmp/cuda-backend/graph-tensor-core-working/persistent-graph_tensor_core_tile-16x16x16-repeat2-smoke-40aa2f43/cuda-smoke-report.md`
+- `tmp/cuda-backend/graph-tensor-core-working/persistent-graph_tensor_core_tile-16x16x16-repeat2-smoke-40aa2f43/cuda-smoke-report.svg`
 
 ## Latest Tensor-Arity Graph Benchmark Gate
 
@@ -1205,6 +1209,42 @@ Artifact:
 Both rows report zero device scheduler errors, `completed_count=4`, and
 target-specific `nvcc` PTX (`compute_80` on A100, `compute_90` on H200). The
 generated Markdown/SVG report is in the artifact directory.
+
+## Graph Tensor-Core Descriptor Smoke
+
+The latest graph tensor-core persistent DAG smoke adds explicit runtime graph
+descriptor coverage around the same WMMA first task as `tensor_core_tile`. It
+uses a `16x16x16` descriptor, `N=256`, two repeat launches, queue capacity
+`2`, and one scheduler block plus four worker blocks on both A100 and H200.
+
+Validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_smoke.py \
+    tmp/cuda-backend/graph-tensor-core-working/persistent-graph_tensor_core_tile-16x16x16-repeat2-smoke-40aa2f43/a100.json \
+    tmp/cuda-backend/graph-tensor-core-working/persistent-graph_tensor_core_tile-16x16x16-repeat2-smoke-40aa2f43/h200.json \
+    --require-artifact a100 --require-artifact h200 \
+    --expected-runtime persistent_device --expected-mode dag \
+    --expected-repeat-runs 2 --expected-completed-count 4 \
+    --expected-scheduler-blocks 1 --expected-worker-blocks 4 \
+    --expected-worker-blocks-per-task 1 --expected-stream-id 0 \
+    --expected-block-dim 256 --expected-grid-dim 5 \
+    --require-report-files --expected-dag-shape graph_tensor_core_tile \
+    --expected-dispatch 10,1,2,1 --expected-tensor-tile 16x16x16 \
+    --expected-graph-fanin 0,1,1,2 \
+    --expected-graph-dependents 1,2,3,3
+```
+
+| GPU | Dispatch | Graph fan-in | Dependents | Tensor core | Device ns | Host ns |
+| --- | -------- | ------------ | ---------- | ----------- | --------- | ------- |
+| A100 | `10,1,2,1` | `0,1,1,2` | `1,2,3,3` | `wmma:m16n16k8:tf32->f32` | 76800 | 106982 |
+| H200 | `10,1,2,1` | `0,1,1,2` | `1,2,3,3` | `wmma:m16n16k8:tf32->f32` | 57472 | 75314 |
+
+Both artifacts report `launch_completed_counts=[4,4]`, zero scheduler errors,
+tensor tile `16x16x16`, and target-specific PTX (`compute_80` on A100,
+`compute_90` on H200). This is graph-lowering and callable metadata evidence;
+throughput comparisons remain in the selected tensor baseline sweeps.
 
 ## Tensor-Core Benchmark Row
 

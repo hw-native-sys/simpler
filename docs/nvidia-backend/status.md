@@ -2115,6 +2115,49 @@ Result summary: A100 reported `device_wall_ns=98304`, H200 reported
 `launch_completed_counts=[4,4]`, dispatch `[3,1,2,1]`, and
 `graph_descriptor.dependents=[1,2,3,3]`.
 
+The graph tensor-core smoke then added the same explicit graph descriptor
+coverage for the WMMA first task. The focused red test first failed because
+`graph_tensor_core_tile` was not accepted as a DAG shape and the paired
+runner did not classify it as a tensor-tile shape. After adding the shape, the
+focused unit selector passed:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_benchmark_report.py -q \
+  -k graph_tensor_core_tile
+```
+
+Result: `2 passed, 218 deselected`.
+
+Paired A100/H200 evidence used the graph tensor-core shape with two launches:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_tensor_core_tile --task-count 4 --queue-capacity 2 \
+    --repeat-runs 2 --n 256 \
+    --tensor-rows 16 --tensor-cols 16 --tensor-inner 16 \
+    --sync-remote-tree \
+    --output-root tmp/cuda-backend/graph-tensor-core-working
+```
+
+The artifact directory is:
+
+```text
+tmp/cuda-backend/graph-tensor-core-working/persistent-graph_tensor_core_tile-16x16x16-repeat2-smoke-40aa2f43/
+```
+
+Both GPUs validated `runtime=persistent_device`, `mode=dag`, dispatch
+`[10,1,2,1]`, graph fan-in `[0,1,1,2]`, dependents `[1,2,3,3]`, tensor tile
+`16x16x16`, tensor-core metadata `wmma:m16n16k8:tf32->f32`,
+`launch_completed_counts=[4,4]`, zero scheduler errors, and resource policy
+`scheduler_blocks=1`, `worker_blocks=4`, `block_dim=256`, `grid_dim=5`.
+
+| GPU | Device ns | Host ns | Per-launch device ns | Status |
+| --- | --------- | ------- | -------------------- | ------ |
+| A100 | 76800 | 106982 | `49152,27648` | pass |
+| H200 | 57472 | 75314 | `31712,25760` | pass |
+
 The explicit graph tensor-tile path is also exposed as the
 `pto_persistent_dag_graph_tensor` benchmark baseline. It uses
 `dag_shape=graph_tensor_tile`, receives the same `--tensor-rows`,
