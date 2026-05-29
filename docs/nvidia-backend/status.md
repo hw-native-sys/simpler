@@ -348,6 +348,8 @@ reports, zero scheduler errors, selected tensor throughput reports, graph
 topology reports, graph TaskArgs-like metadata reports, expected generated
 dispatch sequences, tensor tile descriptors, graph fan-in/dependent arrays,
 node attrs/ops metadata, task-argument spellings, and scratch-reuse metadata.
+After the node-link graph row joined the selected matrix, a refreshed full
+paired-current capture should validate `1224` combined samples.
 This supersedes the older `61cf96cd` full capture while keeping the same
 three-size/three-repeat comparison role.
 

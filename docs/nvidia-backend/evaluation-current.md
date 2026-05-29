@@ -23,6 +23,10 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - worker blocks per task: `32,64,128,256`
 - samples in combined JSON: `1206`
 
+The current paired-current validator expects `1224` samples for a refreshed
+full capture after the node-link graph row joined the selected matrix. The
+`1206` sample count above describes the historical `cb300e82` full capture.
+
 ## Artifact Paths
 
 - `tmp/cuda-backend/a100-current-61cf96cd/cuda-benchmark.json`
@@ -344,7 +348,8 @@ The paired runner generated this validator with explicit required baselines,
 generated-dispatch IDs, tensor descriptors, graph fan-in/dependent arrays,
 TaskArgs-like graph metadata, graph node attrs/ops, scratch-reuse metadata,
 and tensor/core/cuBLAS report requirements. It accepted the combined JSON,
-Markdown, and SVG artifacts with `1206` samples.
+Markdown, and SVG artifacts with `1206` samples. New full captures should use
+the `paired-current` preset, which now expects `1224` samples.
 
 Launch baseline comparison from the same raw JSON:
 

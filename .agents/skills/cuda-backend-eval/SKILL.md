@@ -1792,12 +1792,14 @@ validated `1206` A100/H200 samples with sizes `1024,65536,1048576`, three
 repeats, tensor descriptor `16x16x16`, task counts `2,6,12`, worker-grid
 values `32,64,128,256`, source-paper provenance, sanitized command examples,
 graph topology and TaskArgs metadata reports, tensor-throughput reports, and
-zero scheduler errors.
+zero scheduler errors. A refreshed full paired-current capture after the
+node-link graph row should validate `1224` samples.
 
 Use this compact paired gate after changing selected persistent graph
-benchmark rows. With one same-work batch point, it validates 98 samples
+benchmark rows. With one same-work batch point, it validates 102 samples
 across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
-`pto_persistent_dag_graph_node_io`, `pto_persistent_dag_graph_node_op`,
+`pto_persistent_dag_graph_node_io`, `pto_persistent_dag_graph_node_link`,
+`pto_persistent_dag_graph_node_op`,
 `pto_persistent_dag_graph_depends_on`,
 `pto_persistent_dag_graph_scalar_axpy`,
 `pto_persistent_dag_graph_scalar_scale`,
@@ -1830,12 +1832,13 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-root tmp/cuda-backend/graph-node-io-benchmark-working
 ```
 
-The current `c0d327d2` capture under
-`tmp/cuda-backend/graph-node-io-benchmark-working/combined-current-c0d327d2/`
-is the latest checked compact form of this gate. It validates 98 A100/H200
-samples and requires report-visible graph topology, node-IO task args,
-scalar/tensor node-attrs descriptor args, selected tensor-throughput rows,
-sanitized command examples, source-paper metadata, and zero scheduler errors.
+The current compact capture under
+`tmp/cuda-backend/graph-node-link-compact-current-preset-working/`
+`combined-current-8a74e5ab/` is the latest checked compact form of this gate.
+It validates 102 A100/H200 samples and requires report-visible graph topology,
+node-IO task args, node-link graph-node ops, scalar/tensor node-attrs
+descriptor args, selected tensor-throughput rows, sanitized command examples,
+source-paper metadata, and zero scheduler errors.
 The generated
 `cuda_current_summary.py --section graph-metadata` output includes a
 `Task args` column for copying graph node IO metadata into evaluation docs.

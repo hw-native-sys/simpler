@@ -2863,7 +2863,7 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     assert (
         "pto_persistent_dag_graph_node_link=task0=op:add=1;task1=op:mul=2;task2=op:add=1" in args.require_graph_node_ops
     )
-    assert args.expected_result_count == 1236
+    assert args.expected_result_count == 1224
     assert args.require_report_graph_topology is True
     assert args.require_report_graph_task_args is True
     assert args.require_report_graph_role_spelling is True
@@ -4530,6 +4530,17 @@ def test_cuda_pair_benchmark_defaults_remote_cuda_home_to_h200_toolkit():
     remote_shell = cuda_pair_benchmark.build_remote_benchmark_command(config, "abc123")[-1]
 
     assert "CUDA_HOME=/usr/local/cuda-12.8 PATH=/usr/local/cuda-12.8/bin:$PATH" in remote_shell
+
+
+def test_cuda_capture_paired_current_count_matches_paired_runner_default():
+    cuda_pair_benchmark = _load_pair_benchmark_module()
+    cuda_validate_capture = _load_capture_validator_module()
+    config = cuda_pair_benchmark.PairedBenchmarkConfig()
+    args = cuda_validate_capture.parse_args(["capture.json", "--preset", "paired-current"])
+
+    cuda_validate_capture._apply_preset(args)
+
+    assert args.expected_result_count == cuda_pair_benchmark._expected_result_count(config)
 
 
 def test_cuda_pair_benchmark_validate_command_matches_configured_capture(tmp_path):  # noqa: PLR0915
