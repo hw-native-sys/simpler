@@ -1462,6 +1462,20 @@ def _cuda_persistent_node_op_graph_spec(add_source, mul_source, *, arch="compute
     return spec
 
 
+def _cuda_persistent_callable_id_graph_spec(add_source, mul_source, *, arch="compute_80", block_dim=256):
+    spec = _cuda_persistent_node_io_graph_spec(add_source, mul_source, arch=arch, block_dim=block_dim)
+    spec["cuda"]["graph"]["callables"] = {
+        "add": {"callable_id": 1},
+        "mul": {"cid": 2},
+    }
+    spec["cuda"]["graph"]["nodes"] = {
+        "left": {"op": "add", "inputs": ["a", "b"], "outputs": ["tmp0"]},
+        "right": {"op": "mul", "inputs": ["a", "b"], "outputs": ["tmp1"]},
+        "join": {"op": "add", "inputs": ["a", "b"], "outputs": ["out"]},
+    }
+    return spec
+
+
 def _cuda_persistent_node_attrs_graph_spec(
     generic_source,
     add_source,
@@ -2629,6 +2643,43 @@ def test_scene_test_builds_cuda_persistent_graph_from_node_ops():
         "queue_capacity": 2,
         "graph": {
             "callables": {"add": 1, "mul": 2},
+            "nodes": {
+                "left": {"op": "add", "inputs": ["a", "b"], "outputs": ["tmp0"]},
+                "right": {"op": "mul", "inputs": ["a", "b"], "outputs": ["tmp1"]},
+                "join": {"op": "add", "inputs": ["a", "b"], "outputs": ["out"]},
+            },
+            "edges": {
+                "left": "join",
+                "right": ["join"],
+            },
+        },
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert list(buffers.host_fanin) == [0, 0, 2]
+    assert list(buffers.host_dependents) == [2, 2]
+    assert [(task.func_id, task.a, task.b, task.out) for task in buffers.host_tasks] == [
+        (1, buffers.tensor_buffers.ptrs["a"], buffers.tensor_buffers.ptrs["b"], buffers.dev_tmp0),
+        (2, buffers.tensor_buffers.ptrs["a"], buffers.tensor_buffers.ptrs["b"], buffers.dev_tmp1),
+        (1, buffers.tensor_buffers.ptrs["a"], buffers.tensor_buffers.ptrs["b"], buffers.tensor_buffers.ptrs["out"]),
+    ]
+
+
+def test_scene_test_builds_cuda_persistent_graph_from_callable_id_aliases():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "graph": {
+            "callables": {
+                "add": {"callable_id": 1},
+                "mul": {"cid": 2},
+            },
             "nodes": {
                 "left": {"op": "add", "inputs": ["a", "b"], "outputs": ["tmp0"]},
                 "right": {"op": "mul", "inputs": ["a", "b"], "outputs": ["tmp1"]},
@@ -6652,6 +6703,58 @@ def test_scene_test_runs_cuda_persistent_device_node_op_graph_with_ctypes_data(t
             worker,
             callable_obj,
             CudaPersistentNodeOpGraphCtypesScene.CASES[0],
+            skip_golden=True,
+        )
+        args = scene.last_args
+        a_values = args.a.to_list()
+        b_values = args.b.to_list()
+        actual = args.out.to_list()
+        expected = [a_values[idx] + b_values[idx] for idx in range(len(actual))]
+        assert actual == pytest.approx(expected)
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_callable_id_graph_with_ctypes_data(tmp_path):
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentCallableIdGraphCtypesScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_callable_id_graph_spec(add_source, mul_source)
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            args = TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.5 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+            )
+            self.last_args = args
+            return args
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit post-run validation")
+
+    scene = CudaPersistentCallableIdGraphCtypesScene()
+    worker = CudaPersistentCallableIdGraphCtypesScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(
+            worker,
+            callable_obj,
+            CudaPersistentCallableIdGraphCtypesScene.CASES[0],
             skip_golden=True,
         )
         args = scene.last_args

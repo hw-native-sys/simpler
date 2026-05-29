@@ -341,7 +341,9 @@ inputs append to `tensor_args`, and the single output becomes `out`. This is
 still host-side descriptor construction, but it reduces the gap between normal
 task-argument metadata and the persistent-device runtime ABI.
 Graph tasks can now name a callable through `callable` or `op` when
-`graph.callables` maps that name to callable metadata such as `func_id`.
+`graph.callables` maps that name to callable metadata such as `func_id`,
+`callable_id`, or `cid`. The aliases normalize to the existing generated
+dispatch `func_id` field before CUDA task descriptors are built.
 `graph.callables` may be a dictionary keyed by callable name or a list of
 callable specs with `name` fields, which matches the list-shaped callable
 registries used by normal scene tests. For list-shaped registries, graph tasks

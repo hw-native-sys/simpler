@@ -1231,6 +1231,7 @@ class _CudaPersistentDagSceneBuffers:
         if not task_specs:
             raise ValueError("CUDA persistent_dag_graph_f32 requires at least one graph task")
         task_specs = [self._resolve_graph_task_callable(graph, task_spec) for task_spec in task_specs]
+        task_specs = [self._normalize_graph_task_func_id(task_spec) for task_spec in task_specs]
         task_specs = [self._normalize_graph_task_spec(task_spec) for task_spec in task_specs]
 
         ptrs = dict(self.tensor_buffers.ptrs)
@@ -1339,6 +1340,21 @@ class _CudaPersistentDagSceneBuffers:
         resolved.pop("callable", None)
         resolved.pop("op", None)
         return resolved
+
+    @staticmethod
+    def _normalize_graph_task_func_id(task_spec: dict[str, Any]) -> dict[str, Any]:
+        func_id = task_spec.get("func_id")
+        aliases = [task_spec.get(alias) for alias in ("callable_id", "cid") if alias in task_spec]
+        alias_values = {str(alias) for alias in aliases}
+        if len(alias_values) > 1 or (func_id is not None and alias_values and str(func_id) not in alias_values):
+            raise ValueError("CUDA persistent_dag_graph_f32 graph task has conflicting func_id/callable_id/cid values")
+        if func_id is not None or not aliases:
+            return task_spec
+        normalized = dict(task_spec)
+        normalized["func_id"] = aliases[0]
+        normalized.pop("callable_id", None)
+        normalized.pop("cid", None)
+        return normalized
 
     @staticmethod
     def _graph_callables_by_name(graph: dict[str, Any]) -> dict[str, Any]:

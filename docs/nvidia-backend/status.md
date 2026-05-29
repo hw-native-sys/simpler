@@ -2181,6 +2181,15 @@ graphs. The same compact form now works for dictionary registries such as
 locally with `2 passed, 111 deselected`, the full local A100 CUDA scene-test
 file passed with `113 passed`, and the H200 selector passed with `1 passed,
 112 deselected` while still emitting the known PTO-ISA SSH refresh warning.
+Callable metadata in graph descriptors may now spell the generated-dispatch
+ID as `func_id`, `callable_id`, or `cid`. The aliases normalize before
+role-keyed `task_args` and node IO lowering, so descriptor tests can use the
+same `callable_id` / `cid` terminology as the normal Worker dispatch path
+while preserving the current CUDA task ABI. The focused TDD selector first
+failed with `KeyError: 'func_id'`, then passed on local A100 with `2 passed,
+127 deselected`; the same selector passed on remote H200 with `2 passed, 127
+deselected` after syncing the working tree, with the known PTO-ISA SSH
+refresh warning printed first.
 The role-keyed task-argument slice is covered by descriptor and real-data
 selectors
 `role_keyed_task_args` and `role_keyed_inout_graph_with_ctypes_data`. These
@@ -4102,8 +4111,8 @@ Needed:
   inference, explicit outgoing and incoming graph edges with scalar or
   list-valued named task dependencies, top-level graph edge lists including
   string `source -> target` entries, adjacency dictionaries, `graph.nodes`
-  aliases, node-style IO fields,
-  node `op` callable aliases, and paired smoke,
+  aliases, node-style IO fields, node `op` callable aliases, callable
+  metadata `callable_id` / `cid` aliases, and paired smoke,
   dictionary-keyed graph task descriptors,
   tagged TaskArgs-like graph task lowering including `inout` producer
   chaining, named graph-callable resolution, explicit unary square graph
