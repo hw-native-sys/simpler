@@ -2458,7 +2458,7 @@ def test_cuda_pair_benchmark_omits_empty_batch_sweeps(tmp_path):
     assert "pto_host_schedule_batch" not in validate
     assert "pto_persistent_device_grid_batch" not in validate
     assert "--expected-result-count" in validate
-    assert "64" in validate
+    assert "66" in validate
 
 
 def test_cuda_pair_benchmark_merge_command_records_sanitized_examples(tmp_path):
@@ -7411,10 +7411,11 @@ def test_run_benchmark_can_include_persistent_device_modes(monkeypatch):
         "pto_persistent_dag_tensor",
         "pto_persistent_dag_graph_tensor",
         "pto_persistent_dag_tensor_core",
+        "pto_persistent_dag_graph_tensor_core",
         "cublas_sgemm",
         "cublas_sgemm_graph",
     ]
-    assert len(payload["results"]) == 32
+    assert len(payload["results"]) == 33
 
 
 def test_run_single_sample_dispatches_cublas_sgemm(monkeypatch):
@@ -8852,6 +8853,7 @@ def test_run_benchmark_passes_tensor_descriptor_to_tensor_dag(monkeypatch):
         "pto_persistent_dag_tensor",
         "pto_persistent_dag_graph_tensor",
         "pto_persistent_dag_tensor_core",
+        "pto_persistent_dag_graph_tensor_core",
         "cublas_sgemm",
         "cublas_sgemm_graph",
     }
@@ -8862,6 +8864,7 @@ def test_run_benchmark_passes_tensor_descriptor_to_tensor_dag(monkeypatch):
         ("pto_persistent_dag_tensor", tensor_tile),
         ("pto_persistent_dag_graph_tensor", tensor_tile),
         ("pto_persistent_dag_tensor_core", tensor_tile),
+        ("pto_persistent_dag_graph_tensor_core", tensor_tile),
         ("cublas_sgemm", tensor_tile),
         ("cublas_sgemm_graph", tensor_tile),
     ]
@@ -8932,6 +8935,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_dag_tensor", 1),
         ("pto_persistent_dag_graph_tensor", 1),
         ("pto_persistent_dag_tensor_core", 1),
+        ("pto_persistent_dag_graph_tensor_core", 1),
         ("cublas_sgemm", 1),
         ("cublas_sgemm_graph", 1),
         ("pto_host_schedule_batch", 6),
@@ -8939,7 +8943,7 @@ def test_run_benchmark_can_include_same_work_batch_modes(monkeypatch):
         ("pto_persistent_queue_batch", 6),
     ]
     assert payload["metadata"]["batch_tasks"] == 6
-    assert len(payload["results"]) == 35
+    assert len(payload["results"]) == 36
 
 
 def test_run_benchmark_can_include_worker_grid_batch_mode(monkeypatch):
