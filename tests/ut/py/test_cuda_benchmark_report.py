@@ -304,6 +304,22 @@ def _load_scheduler_errors_module():
     return module
 
 
+def _load_scheduler_error_matrix_module():
+    script_dir = Path(__file__).resolve().parents[3] / ".agents" / "skills" / "cuda-backend-eval" / "scripts"
+    script_path = script_dir / "cuda_scheduler_error_matrix.py"
+    sys.path.insert(0, str(script_dir))
+    try:
+        spec = importlib.util.spec_from_file_location("cuda_scheduler_error_matrix", script_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop("cuda_scheduler_error_matrix", None)
+        sys.path.remove(str(script_dir))
+
+
 def _write_artifact_payload(path: Path, label: str, machine: str, baseline: str) -> None:
     path.mkdir(parents=True)
     payload = {
@@ -342,6 +358,82 @@ def test_cuda_scheduler_error_label_contract_is_shared():
     for consumer in consumers:
         assert consumer.SCHEDULER_ERROR_NAMES is cuda_scheduler_errors.SCHEDULER_ERROR_NAMES
         assert consumer.scheduler_error_code_label(8) == "8(duplicate_dependent)"
+
+
+def test_cuda_scheduler_error_matrix_parses_and_renders_report():
+    cuda_scheduler_error_matrix = _load_scheduler_error_matrix_module()
+
+    parsed = cuda_scheduler_error_matrix.parse_scheduler_error(
+        "persistent dag scheduler error code=9 task_id=0 count=1"
+    )
+    assert parsed == {"code": 9, "task_id": 0, "count": 1}
+
+    payload = {
+        "metadata": {"label": "scheduler-error-matrix-abc123", "git_commit": "abc123"},
+        "results": [
+            {
+                "machine": "a100",
+                "case": "self-dependent",
+                "dag_shape": "bad_self_dependent",
+                "expected_code": 9,
+                "expected_task_id": 0,
+                "observed_code": 9,
+                "observed_task_id": 0,
+                "observed_count": 1,
+                "status": "pass",
+                "stderr": "persistent dag scheduler error code=9 task_id=0 count=1",
+            }
+        ],
+    }
+
+    markdown = cuda_scheduler_error_matrix.render_markdown(payload)
+    svg = cuda_scheduler_error_matrix.render_svg(payload)
+
+    assert "CUDA Scheduler Error Matrix" in markdown
+    assert "scheduler-error-matrix-abc123" in markdown
+    assert "9(self_dependent)" in markdown
+    assert "| a100 | self-dependent | bad_self_dependent | pass |" in markdown
+    assert "CUDA scheduler error matrix" in svg
+    assert "self-dependent" in svg
+    assert "9(self_dependent)" in svg
+
+
+def test_cuda_scheduler_error_matrix_runs_with_fake_runner(tmp_path):
+    cuda_scheduler_error_matrix = _load_scheduler_error_matrix_module()
+    calls = []
+
+    def fake_runner(command, **kwargs):
+        calls.append((command, kwargs))
+        if command == ["git", "rev-parse", "--short", "HEAD"]:
+            return subprocess.CompletedProcess(command, 0, stdout="abc123\n", stderr="")
+        if command[:3] == ["rsync", "-a", "--delete"]:
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        text = "persistent dag scheduler error code=9 task_id=0 count=1\n"
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr=text)
+
+    config = cuda_scheduler_error_matrix.SchedulerErrorMatrixConfig(
+        output_root=tmp_path / "cuda-backend",
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        sync_remote_tree=True,
+        cases=(cuda_scheduler_error_matrix.SCHEDULER_ERROR_CASES_BY_NAME["self-dependent"],),
+    )
+
+    payload = cuda_scheduler_error_matrix.run_scheduler_error_matrix(config, runner=fake_runner)
+
+    command_text = "\n".join(" ".join(command) for command, _ in calls)
+    output_dir = tmp_path / "cuda-backend" / "scheduler-error-matrix-abc123"
+    assert payload["metadata"]["label"] == "scheduler-error-matrix-abc123"
+    assert len(payload["results"]) == 2
+    assert {row["machine"] for row in payload["results"]} == {"a100", "h200"}
+    assert all(row["status"] == "pass" for row in payload["results"])
+    assert "bad_self_dependent" in command_text
+    assert "compute_80" in command_text
+    assert "compute_90" in command_text
+    assert "ssh" in calls[-1][0]
+    assert (output_dir / "cuda-scheduler-error-matrix.json").exists()
+    assert (output_dir / "cuda-scheduler-error-matrix.md").exists()
+    assert (output_dir / "cuda-scheduler-error-matrix.svg").exists()
 
 
 def test_persistent_smoke_builds_graph_descriptor_dag_shape():
@@ -1332,6 +1424,72 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
     assert (
         "scalar0=1.5 | c=tmp0 | role | task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2 |"
     ) in report
+
+
+def test_cuda_artifact_index_scans_scheduler_error_matrix_outputs(tmp_path):
+    cuda_artifact_index = _load_artifact_index_module()
+    artifact_dir = tmp_path / "scheduler-error-matrix-abc123"
+    artifact_dir.mkdir()
+    payload = {
+        "metadata": {
+            "label": "scheduler-error-matrix-abc123",
+            "git_commit": "abc123",
+            "source_papers": [{"id": "arXiv:2605.03190"}],
+            "command_examples": {
+                "local_sample": "python cuda_scheduler_error_matrix.py",
+                "remote_sample": "ssh h200-box python cuda_scheduler_error_matrix.py",
+            },
+        },
+        "results": [
+            {
+                "machine": "a100",
+                "case": "self-dependent",
+                "dag_shape": "bad_self_dependent",
+                "expected_code": 9,
+                "expected_task_id": 0,
+                "observed_code": 9,
+                "observed_task_id": 0,
+                "observed_count": 1,
+                "status": "pass",
+            },
+            {
+                "machine": "h200",
+                "case": "unreachable",
+                "dag_shape": "bad_unreachable",
+                "expected_code": 7,
+                "expected_task_id": 1,
+                "observed_code": 7,
+                "observed_task_id": 1,
+                "observed_count": 1,
+                "status": "pass",
+            },
+        ],
+    }
+    (artifact_dir / "cuda-scheduler-error-matrix.json").write_text(json.dumps(payload) + "\n")
+    (artifact_dir / "cuda-scheduler-error-matrix.md").write_text("# CUDA Scheduler Error Matrix\n")
+    (artifact_dir / "cuda-scheduler-error-matrix.svg").write_text("<svg></svg>\n")
+
+    [entry] = cuda_artifact_index.scan_artifacts(tmp_path)
+    report = cuda_artifact_index.render_markdown([entry])
+
+    assert entry["kind"] == "scheduler_error_matrix"
+    assert entry["label"] == "scheduler-error-matrix-abc123"
+    assert entry["machine"] == "combined"
+    assert entry["git_commit"] == "abc123"
+    assert entry["result_count"] == 2
+    assert entry["baselines"] == ["self-dependent", "unreachable"]
+    assert entry["smoke_modes"] == ["bad_self_dependent", "bad_unreachable"]
+    assert entry["scheduler_errors"] == [
+        "count=1,code=7(unreachable_task),task=1",
+        "count=1,code=9(self_dependent),task=0",
+    ]
+    assert entry["source_papers"] == ["arXiv:2605.03190"]
+    assert entry["has_command_examples"] is True
+    assert entry["has_markdown"] is True
+    assert entry["has_svg"] is True
+    assert "| scheduler-error-matrix-abc123 | scheduler_error_matrix |" in report
+    assert "count=1,code=7(unreachable_task),task=1" in report
+    assert "count=1,code=9(self_dependent),task=0" in report
 
 
 def test_cuda_artifact_index_records_persistent_smoke_lifecycle_reuse(tmp_path):

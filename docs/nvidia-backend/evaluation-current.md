@@ -215,6 +215,9 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/lifecycle-tensor-core-working/persistent-lifecycle-matrix-1c683c1c/cuda-lifecycle-matrix.json`
 - `tmp/cuda-backend/lifecycle-tensor-core-working/persistent-lifecycle-matrix-1c683c1c/cuda-lifecycle-matrix.md`
 - `tmp/cuda-backend/lifecycle-tensor-core-working/persistent-lifecycle-matrix-1c683c1c/cuda-lifecycle-matrix.svg`
+- `tmp/cuda-backend/scheduler-error-matrix-working/scheduler-error-matrix-35de3303/cuda-scheduler-error-matrix.json`
+- `tmp/cuda-backend/scheduler-error-matrix-working/scheduler-error-matrix-35de3303/cuda-scheduler-error-matrix.md`
+- `tmp/cuda-backend/scheduler-error-matrix-working/scheduler-error-matrix-35de3303/cuda-scheduler-error-matrix.svg`
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-sweep.json`
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-sweep.md`
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-sweep.svg`
@@ -408,6 +411,43 @@ resource policy. This keeps the incoming-edge graph descriptor and the
 graph tensor-core descriptor in the same lifecycle evidence path as direct,
 queue, fixed-DAG, and scratch-reuse executors, so future prepared-callable
 reset regressions are caught by one paired validator.
+
+## Latest Scheduler Error Matrix
+
+The scheduler error matrix at artifact label `35de3303` captures the
+persistent-device negative-DAG diagnostics as paired A100/H200 JSON,
+Markdown, and SVG evidence. It runs each synthetic malformed graph through
+`cuda_persistent_smoke.py` and treats the expected nonzero scheduler error as
+the pass condition. The matrix covers unsupported `func_id`, invalid
+dependent ID, invalid dependent range, fan-in underflow, duplicate dependent,
+self dependent, initial fan-in mismatch, no root, and unreachable task.
+
+Artifact directory:
+`tmp/cuda-backend/scheduler-error-matrix-working/scheduler-error-matrix-35de3303/`.
+
+Capture command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_scheduler_error_matrix.py \
+    --sync-remote-tree \
+    --output-root tmp/cuda-backend/scheduler-error-matrix-working
+```
+
+Selected rows:
+
+| GPU | Case | DAG shape | Expected | Observed |
+| --- | ---- | --------- | -------- | -------- |
+| A100 | duplicate-dependent | `bad_duplicate_dependent` | `8(duplicate_dependent)` task `1` | `8(duplicate_dependent)` count `1` |
+| H200 | duplicate-dependent | `bad_duplicate_dependent` | `8(duplicate_dependent)` task `1` | `8(duplicate_dependent)` count `1` |
+| A100 | self-dependent | `bad_self_dependent` | `9(self_dependent)` task `0` | `9(self_dependent)` count `1` |
+| H200 | self-dependent | `bad_self_dependent` | `9(self_dependent)` task `0` | `9(self_dependent)` count `1` |
+| A100 | unreachable | `bad_unreachable` | `7(unreachable_task)` task `1` | `7(unreachable_task)` count `1` |
+| H200 | unreachable | `bad_unreachable` | `7(unreachable_task)` task `1` | `7(unreachable_task)` count `1` |
+
+All `18` matrix rows reported `status=pass`, so the report proves that the
+runtime surfaces each known malformed-graph condition on both GPU families
+instead of deadlocking or falling through to output-mismatch checks.
 
 ## Previous Compact Role Benchmark Gate
 

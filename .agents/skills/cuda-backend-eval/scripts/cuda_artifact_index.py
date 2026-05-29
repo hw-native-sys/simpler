@@ -324,6 +324,63 @@ def _read_lifecycle_matrix_artifact(path: Path, root: Path) -> dict[str, Any]:
     }
 
 
+def _matrix_scheduler_errors(row: dict[str, Any]) -> str | None:
+    code = row.get("observed_code")
+    task_id = row.get("observed_task_id")
+    count = row.get("observed_count")
+    if code is None or task_id is None or count is None:
+        return None
+    return f"count={count},code={scheduler_error_code_label(code)},task={task_id}"
+
+
+def _read_scheduler_error_matrix_artifact(path: Path, root: Path) -> dict[str, Any]:
+    payload = json.loads((path / "cuda-scheduler-error-matrix.json").read_text())
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    rows = payload.get("results", [])
+    machines = _sorted_unique({row.get("machine", "unknown") for row in rows})
+    if len(machines) > 1:
+        machine = "combined"
+    elif machines:
+        machine = str(machines[0])
+    else:
+        machine = "unknown"
+    return {
+        "path": str(path.relative_to(root)),
+        "kind": "scheduler_error_matrix",
+        "label": str(metadata.get("label", path.name)),
+        "machine": machine,
+        "git_commit": str(metadata.get("git_commit", "unknown")),
+        "result_count": len(rows),
+        "baselines": _sorted_unique({row.get("case", "unknown") for row in rows}),
+        "sizes": [],
+        "tensor_tiles": [],
+        "smoke_modes": _sorted_unique({str(row.get("dag_shape")) for row in rows if row.get("dag_shape")}),
+        "dispatches": [],
+        "graph_fanins": [],
+        "graph_dependents": [],
+        "scheduler_errors": _sorted_unique(
+            {errors for row in rows for errors in (_matrix_scheduler_errors(row),) if errors is not None}
+        ),
+        "repeat_runs": [],
+        "launch_completed_counts": [],
+        "resource_policies": [],
+        "scalar_args": [],
+        "tensor_args": [],
+        "graph_task_arg_keys": [],
+        "graph_task_args": [],
+        "collection_modes": [],
+        "source_papers": _source_paper_ids(metadata),
+        "has_command_examples": _has_command_examples(metadata),
+        "has_markdown": (path / "cuda-scheduler-error-matrix.md").exists(),
+        "has_svg": (path / "cuda-scheduler-error-matrix.svg").exists(),
+        "has_throughput_svg": False,
+        "has_ratio_svg": False,
+        "has_dag_delta_svg": False,
+    }
+
+
 def _smoke_label(report: str, fallback: str) -> str:
     match = _SMOKE_LABEL_RE.search(report)
     if match:
@@ -412,6 +469,9 @@ def scan_artifacts(root: Path) -> list[dict[str, Any]]:
     benchmark_dirs = {path.parent for path in root.rglob("cuda-benchmark.json") if path.is_file()}
     tensor_sweep_dirs = {path.parent for path in root.rglob("cuda-tensor-shape-sweep.json") if path.is_file()}
     lifecycle_matrix_dirs = {path.parent for path in root.rglob("cuda-lifecycle-matrix.json") if path.is_file()}
+    scheduler_error_matrix_dirs = {
+        path.parent for path in root.rglob("cuda-scheduler-error-matrix.json") if path.is_file()
+    }
     smoke_dirs = {
         path.parent
         for path in root.rglob("cuda-smoke-report.md")
@@ -419,10 +479,12 @@ def scan_artifacts(root: Path) -> list[dict[str, Any]]:
         and path.parent not in benchmark_dirs
         and path.parent not in tensor_sweep_dirs
         and path.parent not in lifecycle_matrix_dirs
+        and path.parent not in scheduler_error_matrix_dirs
     }
     entries = [_read_artifact(path, root) for path in benchmark_dirs]
     entries.extend(_read_tensor_sweep_artifact(path, root) for path in tensor_sweep_dirs)
     entries.extend(_read_lifecycle_matrix_artifact(path, root) for path in lifecycle_matrix_dirs)
+    entries.extend(_read_scheduler_error_matrix_artifact(path, root) for path in scheduler_error_matrix_dirs)
     entries.extend(_read_smoke_artifact(path, root) for path in smoke_dirs)
     return sorted(entries, key=lambda entry: entry["path"])
 

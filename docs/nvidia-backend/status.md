@@ -1033,6 +1033,26 @@ The H200 no-root check returned the expected diagnostic:
 The H200 unreachable-task check returned the expected diagnostic:
 `persistent dag scheduler error code=7 task_id=1 count=1`.
 
+The current scheduler-diagnostic matrix was then captured as paired A100/H200
+JSON, Markdown, and SVG evidence:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_scheduler_error_matrix.py \
+    --sync-remote-tree \
+    --output-root tmp/cuda-backend/scheduler-error-matrix-working
+```
+
+Result:
+`tmp/cuda-backend/scheduler-error-matrix-working/scheduler-error-matrix-35de3303/`
+contains `cuda-scheduler-error-matrix.json`,
+`cuda-scheduler-error-matrix.md`, and
+`cuda-scheduler-error-matrix.svg`. The matrix has `18` rows covering A100 and
+H200 for unsupported `func_id`, invalid dependent ID, invalid dependent
+range, fan-in underflow, duplicate dependent, self dependent, initial fan-in
+mismatch, no root, and unreachable task. Every row reported `status=pass`
+with the expected scheduler code, task ID, and `count=1`.
+
 The current unreachable-task slice was also checked on H200 through pytest
 after syncing the working tree:
 

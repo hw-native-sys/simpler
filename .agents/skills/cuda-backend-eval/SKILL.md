@@ -950,6 +950,23 @@ except RuntimeError as exc:
 PY
 ```
 
+Use `cuda_scheduler_error_matrix.py` when all synthetic scheduler diagnostics
+should be captured as paired A100/H200 JSON, Markdown, and SVG evidence:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_scheduler_error_matrix.py \
+    --sync-remote-tree \
+    --output-root tmp/cuda-backend/scheduler-error-matrix-working
+```
+
+The current capture under
+`tmp/cuda-backend/scheduler-error-matrix-working/scheduler-error-matrix-35de3303/`
+validates all nine scheduler diagnostics on A100 and H200:
+unsupported `func_id`, invalid dependent ID, invalid dependent range,
+fan-in underflow, duplicate dependent, self dependent, initial fan-in
+mismatch, no root, and unreachable task.
+
 Run the five-task persistent DAG-chain smoke, which reuses the same generated
 dispatch PTX but passes a different runtime task graph:
 
