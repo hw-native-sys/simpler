@@ -1696,6 +1696,56 @@ assert result["graph_task_args"] == {
 
 
 @requires_cuda
+def test_cuda_persistent_device_smoke_runs_graph_descriptor_submits():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+result = run_persistent_smoke(
+    device=0,
+    task_count=3,
+    n=4096,
+    arch="compute_80",
+    mode="dag",
+    queue_capacity=2,
+    dag_shape="graph_descriptor_submits",
+)
+assert result["status"] == "pass"
+assert result["runtime"] == "persistent_device"
+assert result["mode"] == "dag"
+assert result["dag_shape"] == "graph_descriptor_submits"
+assert result["task_count"] == 3
+assert result["queue_capacity"] == 2
+assert result["completed_count"] == 3
+assert result["dispatch_func_ids"] == [1, 1, 1]
+assert result["fanin_remaining"] == [0, 0, 0]
+assert result["device_scheduler_errors"] == {"count": 0, "code": 0, "task_id": 0}
+assert result["graph_descriptor"] == {
+    "tasks": 3,
+    "dependents": [1, 2],
+    "fanin": [0, 1, 1],
+}
+assert result["source_kind"] == "generated-dispatch"
+assert result["graph_task_arg_key"] == "submits"
+assert result["graph_task_args"] == {
+    "task0": "input:a,input:b,output:tmp1",
+    "task1": "inout:tmp1,input:b",
+    "task2": "input:tmp1,input:a,output_existing:out",
+}
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+@requires_cuda
 def test_cuda_persistent_device_smoke_runs_graph_descriptor_scratch_reuse():
     script = """
 import sys

@@ -6285,6 +6285,52 @@ def test_cuda_pair_persistent_smoke_accepts_node_port_dict_graph_descriptor_work
     assert "--require-report-graph-task-args" in validate
 
 
+def test_cuda_pair_persistent_smoke_accepts_submits_graph_descriptor_workflow(tmp_path):
+    cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
+    args = cuda_pair_persistent_smoke.parse_args(
+        [
+            "--dag-shape",
+            "graph_descriptor_submits",
+            "--repeat-runs",
+            "2",
+            "--sync-remote-tree",
+        ]
+    )
+    config = cuda_pair_persistent_smoke.PairedPersistentSmokeConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        dag_shape=args.dag_shape,
+        repeat_runs=args.repeat_runs,
+        sync_remote_tree=args.sync_remote_tree,
+        refresh_remote=not args.skip_remote_refresh and not args.sync_remote_tree,
+    )
+
+    local = cuda_pair_persistent_smoke.build_local_smoke_command(config, "abc123")
+    remote = cuda_pair_persistent_smoke.build_remote_smoke_command(config, "abc123")
+    validate = cuda_pair_persistent_smoke.build_validate_command(config, "abc123")
+
+    assert "persistent-graph_descriptor_submits-repeat2-smoke-abc123" in str(local)
+    assert "graph_descriptor_submits" in local
+    assert "--dag-shape graph_descriptor_submits" in remote[-1]
+    assert "persistent-graph_descriptor_submits-repeat2-smoke-abc123/h200.json" in remote[-1]
+    assert "--expected-dispatch" in validate
+    assert "1,1,1" in validate
+    assert "--expected-graph-fanin" in validate
+    assert "0,1,1" in validate
+    assert "--expected-graph-dependents" in validate
+    assert "1,2" in validate
+    assert "--expected-graph-task-arg-key" in validate
+    assert "submits" in validate
+    assert "--expected-graph-task-args" in validate
+    assert (
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    ) in validate
+    assert "--require-report-graph-task-args" in validate
+
+
 def test_cuda_pair_persistent_smoke_accepts_node_attrs_graph_descriptor_workflow(tmp_path):
     cuda_pair_persistent_smoke = _load_pair_persistent_smoke_module()
     args = cuda_pair_persistent_smoke.parse_args(

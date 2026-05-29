@@ -4286,6 +4286,44 @@ dependents `[2,2]`, graph-node ops
 `task2=input.lhs:tmp0,input.rhs:tmp1,output.value:out`. Device times were
 `61440 ns` on A100 and `41408 ns` on H200.
 
+The submit-shaped graph descriptor spelling is now also available in the
+paired persistent-smoke workflow as `graph_descriptor_submits`. The TDD
+selector first failed because the direct smoke rejected the unknown DAG shape;
+after wiring the generated add/add/add inout descriptor, paired-runner
+expectations, graph fan-in/dependent metadata, and report-visible submit
+task-arg metadata, the focused local tests passed:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest \
+    tests/ut/py/test_cuda_benchmark_report.py \
+    tests/ut/py/test_cuda_backend.py \
+    -q -k 'graph_descriptor_submits or submits_graph_descriptor' \
+    --platform cuda
+```
+
+That run reported `2 passed, 339 deselected`. The paired smoke then validated
+local A100 and remote H200 artifacts:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_submits --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-submits-smoke-working
+```
+
+The capture under
+`tmp/cuda-backend/persistent-submits-smoke-working/persistent-graph_descriptor_submits-repeat2-smoke-c6130969/`
+contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. It validated repeat completions `[3,3]`, zero
+scheduler errors, dispatch `[1,1,1]`, graph fan-in `[0,1,1]`, graph
+dependents `[1,2]`, graph task arg key `submits`, and graph task args
+`task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;`
+`task2=input:tmp1,input:a,output_existing:out`. Device times were
+`74752 ns` on A100 and `48288 ns` on H200.
+
 Needed:
 
 - full graph construction from normal PTO task graphs;
@@ -4303,8 +4341,9 @@ Needed:
   node-link `links` and dictionary-valued node IO port maps,
   dictionary-keyed graph task descriptors,
   tagged TaskArgs-like graph task lowering including `inout` producer
-  chaining, named graph-callable resolution, explicit unary square graph
-  dispatch, tagged graph-descriptor paired smoke, and five-task chain,
+  chaining, submit-shaped graph descriptors, named graph-callable resolution,
+  explicit unary square graph dispatch, tagged graph-descriptor paired smoke,
+  and five-task chain,
   five-task fan-out/fan-in, and six-task scratch-reuse graph descriptor smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, tensor-core graph, and

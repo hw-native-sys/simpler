@@ -1598,6 +1598,19 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-root tmp/cuda-backend/persistent-pair-inout-smoke-working
 ```
 
+Use `graph_descriptor_submits` after changing the submit-shaped graph
+descriptor bridge. It validates the same in-place graph shape, but requires
+`graph_task_arg_key=submits` and records the TaskArgs-like submit entries in
+the paired JSON plus Markdown/SVG reports:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_submits --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-submits-smoke-working
+```
+
 The selected benchmark path also includes
 `pto_persistent_dag_graph_role_keyed_inout` and
 `pto_persistent_dag_graph_compact_role_inout`, and
