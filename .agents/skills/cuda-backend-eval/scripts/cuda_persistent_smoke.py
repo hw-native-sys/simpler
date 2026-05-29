@@ -1685,6 +1685,7 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
         "graph_descriptor_depends_on",
         "graph_descriptor_node_io",
         "graph_descriptor_node_link",
+        "graph_descriptor_named_callable",
         "graph_descriptor_node_op",
         "graph_descriptor_node_port_dict",
         "graph_descriptor_task_dict",
@@ -2661,6 +2662,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 "graph_descriptor_depends_on",
                 "graph_descriptor_node_io",
                 "graph_descriptor_node_link",
+                "graph_descriptor_named_callable",
                 "graph_descriptor_node_op",
                 "graph_descriptor_node_port_dict",
                 "graph_descriptor_task_dict",
@@ -2813,6 +2815,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_link",
+            "graph_descriptor_named_callable",
             "graph_descriptor_node_op",
             "graph_descriptor_node_port_dict",
             "graph_descriptor_pair_inout",
@@ -2855,6 +2858,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 result["graph_node_attrs"] = {"task0": "attrs:tensor_args,scalar_args"}
             if config.dag_shape in {
                 "graph_descriptor_node_link",
+                "graph_descriptor_named_callable",
                 "graph_descriptor_node_op",
                 "graph_descriptor_node_port_dict",
             }:
@@ -2869,6 +2873,13 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                     "task0": "input.lhs:a,input.rhs:b,output.value:tmp0",
                     "task1": "input.lhs:a,input.rhs:b,output.value:tmp1",
                     "task2": "input.lhs:tmp0,input.rhs:tmp1,output.value:out",
+                }
+            if config.dag_shape == "graph_descriptor_named_callable":
+                result["graph_task_arg_key"] = "named_callable"
+                result["graph_task_args"] = {
+                    "task0": "callable:add,input:a,input:b,output:tmp0",
+                    "task1": "callable:mul,input:a,input:b,output:tmp1",
+                    "task2": "callable:add,input:a,input:b,output:out",
                 }
             if config.dag_shape == "graph_descriptor_node_io":
                 result["graph_task_arg_key"] = "node_io"
@@ -3007,6 +3018,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_node_attrs",
         "graph_descriptor_node_io",
         "graph_descriptor_node_link",
+        "graph_descriptor_named_callable",
         "graph_descriptor_node_op",
         "graph_descriptor_node_port_dict",
         "graph_descriptor_pair_inout",
@@ -3081,6 +3093,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_link",
+            "graph_descriptor_named_callable",
             "graph_descriptor_node_op",
             "graph_descriptor_node_port_dict",
             "graph_descriptor_pair_inout",
@@ -3312,6 +3325,7 @@ def main() -> None:
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_link",
+            "graph_descriptor_named_callable",
             "graph_descriptor_node_op",
             "graph_descriptor_node_port_dict",
             "graph_descriptor_pair_inout",

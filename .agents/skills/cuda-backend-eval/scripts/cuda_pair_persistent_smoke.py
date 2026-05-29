@@ -282,6 +282,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "graph_descriptor_node_attrs": "9,2,1",
         "graph_descriptor_node_io": "1,2,1",
         "graph_descriptor_node_link": "1,2,1",
+        "graph_descriptor_named_callable": "1,2,1",
         "graph_descriptor_node_op": "1,2,1",
         "graph_descriptor_node_port_dict": "1,2,1",
         "graph_descriptor_quad": "8,2,1",
@@ -330,6 +331,7 @@ def _expected_graph_descriptor(config: PairedPersistentSmokeConfig) -> tuple[str
         "graph_descriptor_node_attrs": ("0,0,2", "2,2"),
         "graph_descriptor_node_io": ("0,0,2", "2,2"),
         "graph_descriptor_node_link": ("0,0,2", "2,2"),
+        "graph_descriptor_named_callable": ("0,0,2", "2,2"),
         "graph_descriptor_node_op": ("0,0,2", "2,2"),
         "graph_descriptor_node_port_dict": ("0,0,2", "2,2"),
         "graph_descriptor_quad": ("0,0,2", "2,2"),
@@ -390,6 +392,11 @@ def _expected_graph_task_args(config: PairedPersistentSmokeConfig) -> str | None
             "task1=input.lhs:a,input.rhs:b,output.value:tmp1;"
             "task2=input.lhs:tmp0,input.rhs:tmp1,output.value:out"
         ),
+        "graph_descriptor_named_callable": (
+            "task0=callable:add,input:a,input:b,output:tmp0;"
+            "task1=callable:mul,input:a,input:b,output:tmp1;"
+            "task2=callable:add,input:a,input:b,output:out"
+        ),
         "graph_descriptor_task_dict": (
             "join=input:a,input:b,output:out;left=input:a,input:b,output:tmp0;right=input:a,input:b,output:tmp1"
         ),
@@ -401,6 +408,7 @@ def _expected_graph_task_arg_key(config: PairedPersistentSmokeConfig) -> str | N
         return None
     return {
         "graph_descriptor_compact_role_inout": "compact",
+        "graph_descriptor_named_callable": "named_callable",
         "graph_descriptor_node_io": "node_io",
         "graph_descriptor_node_port_dict": "node_port_dict",
         "graph_descriptor_pair_inout": "pair",
@@ -424,6 +432,7 @@ def _expected_graph_node_ops(config: PairedPersistentSmokeConfig) -> str | None:
         return None
     return {
         "graph_descriptor_node_link": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
+        "graph_descriptor_named_callable": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
         "graph_descriptor_node_op": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
         "graph_descriptor_node_port_dict": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
     }.get(config.dag_shape)
@@ -681,6 +690,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_link",
+            "graph_descriptor_named_callable",
             "graph_descriptor_node_op",
             "graph_descriptor_node_port_dict",
             "graph_descriptor_pair_inout",

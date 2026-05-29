@@ -523,6 +523,33 @@ graph dependents `[2,2]`, `graph_task_arg_key=task_dict`, and graph task args
 `right=input:a,input:b,output:tmp1`. Device times were `67584 ns` on A100 and
 `43456 ns` on H200 for `N=1024`.
 
+Use `--dag-shape graph_descriptor_named_callable` when the paired smoke
+should prove that graph callable names lower to generated-dispatch task IDs.
+This shape records callable names beside the graph task args while validating
+the same add/mul/add topology:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_named_callable --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-named-callable-smoke-working
+```
+
+The working-tree capture under
+`tmp/cuda-backend/persistent-named-callable-smoke-working/`
+`persistent-graph_descriptor_named_callable-repeat2-smoke-4b785a91/`
+validated paired A100 and H200 JSON, Markdown, and SVG artifacts with repeat
+completions `[3,3]`, zero scheduler errors, dispatch `[1,2,1]`, graph fan-in
+`[0,0,2]`, graph dependents `[2,2]`, graph-node ops
+`task0=op:add=1;task1=op:mul=2;task2=op:add=1`,
+`graph_task_arg_key=named_callable`, and graph task args
+`task0=callable:add,input:a,input:b,output:tmp0;`
+`task1=callable:mul,input:a,input:b,output:tmp1;`
+`task2=callable:add,input:a,input:b,output:out`. Device times were
+`66560 ns` on A100 and `42784 ns` on H200 for `N=1024`.
+
 When changing node-link graph input handling, run the SceneTestCase node-data
 selector. It validates list-shaped `graph.nodes` entries whose `id` carries
 identity and whose task payload lives under `data`, with top-level node fields
