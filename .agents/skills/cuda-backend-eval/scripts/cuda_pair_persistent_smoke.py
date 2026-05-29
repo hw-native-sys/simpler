@@ -287,6 +287,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "graph_descriptor_node_port_dict": "1,2,1",
         "graph_descriptor_quad": "8,2,1",
         "graph_descriptor_reordered": "1,9,2",
+        "graph_descriptor_role_map_inout": "1,1,1",
         "graph_descriptor_scalar_affine": "5,2,1",
         "graph_descriptor_scalar_axpy": "4,2,1",
         "graph_descriptor_scalar_scale": "11,2,1",
@@ -342,6 +343,7 @@ def _expected_graph_descriptor(config: PairedPersistentSmokeConfig) -> tuple[str
         "graph_descriptor_scratch_reuse": ("0,0,2,1,1,2", "2,2,3,4,5,5"),
         "graph_descriptor_compact_role_inout": ("0,1,1", "1,2"),
         "graph_descriptor_pair_inout": ("0,1,1", "1,2"),
+        "graph_descriptor_role_map_inout": ("0,1,1", "1,2"),
         "graph_descriptor_role_keyed_inout": ("0,1,1", "1,2"),
         "graph_descriptor_submit_groups": ("0,0,2", "2,2"),
         "graph_descriptor_submits": ("0,1,1", "1,2"),
@@ -371,6 +373,9 @@ def _expected_graph_task_args(config: PairedPersistentSmokeConfig) -> str | None
             "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
         ),
         "graph_descriptor_pair_inout": (
+            "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+        ),
+        "graph_descriptor_role_map_inout": (
             "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
         ),
         "graph_descriptor_role_keyed_inout": (
@@ -412,6 +417,7 @@ def _expected_graph_task_arg_key(config: PairedPersistentSmokeConfig) -> str | N
         "graph_descriptor_node_io": "node_io",
         "graph_descriptor_node_port_dict": "node_port_dict",
         "graph_descriptor_pair_inout": "pair",
+        "graph_descriptor_role_map_inout": "role_map",
         "graph_descriptor_role_keyed_inout": "role",
         "graph_descriptor_submit_groups": "submit_groups",
         "graph_descriptor_submits": "submits",
@@ -696,6 +702,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "graph_descriptor_pair_inout",
             "graph_descriptor_quad",
             "graph_descriptor_reordered",
+            "graph_descriptor_role_map_inout",
             "graph_descriptor_scalar_affine",
             "graph_descriptor_scalar_axpy",
             "graph_descriptor_scalar_scale",

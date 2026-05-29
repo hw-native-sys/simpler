@@ -1605,6 +1605,20 @@ PYTHONPATH=$PWD:$PWD/python \
     --platform cuda
 ```
 
+Use `graph_descriptor_role_map_inout` after changing role-map graph
+task-argument lowering or report metadata. It validates the same in-place
+graph shape, but requires `graph_task_arg_key=role_map` and proves map-shaped
+entries such as `{"inputs": ["a", "b"], "output": "tmp1"}` survive through
+JSON plus Markdown/SVG reporting:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_role_map_inout --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/role-map-inout-working
+```
+
 Run the pair-shaped task-argument selector after changing compact graph
 argument lowering:
 

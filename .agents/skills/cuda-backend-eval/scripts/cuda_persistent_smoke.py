@@ -1800,6 +1800,7 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
     if dag_shape in {
         "graph_descriptor_compact_role_inout",
         "graph_descriptor_pair_inout",
+        "graph_descriptor_role_map_inout",
         "graph_descriptor_tagged_inout",
         "graph_descriptor_role_keyed_inout",
         "graph_descriptor_submits",
@@ -2625,6 +2626,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             if config.dag_shape in {
                 "graph_descriptor_compact_role_inout",
                 "graph_descriptor_pair_inout",
+                "graph_descriptor_role_map_inout",
                 "graph_descriptor_tagged_inout",
                 "graph_descriptor_role_keyed_inout",
                 "graph_descriptor_submits",
@@ -2821,6 +2823,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_pair_inout",
             "graph_descriptor_quad",
             "graph_descriptor_reordered",
+            "graph_descriptor_role_map_inout",
             "graph_descriptor_role_keyed_inout",
             "graph_descriptor_scalar_scale",
             "graph_descriptor_scratch_reuse",
@@ -2904,6 +2907,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             if config.dag_shape in {
                 "graph_descriptor_compact_role_inout",
                 "graph_descriptor_pair_inout",
+                "graph_descriptor_role_map_inout",
                 "graph_descriptor_tagged_inout",
                 "graph_descriptor_role_keyed_inout",
                 "graph_descriptor_submits",
@@ -2911,6 +2915,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 result["graph_task_arg_key"] = {
                     "graph_descriptor_compact_role_inout": "compact",
                     "graph_descriptor_pair_inout": "pair",
+                    "graph_descriptor_role_map_inout": "role_map",
                     "graph_descriptor_role_keyed_inout": "role",
                     "graph_descriptor_submits": "submits",
                     "graph_descriptor_tagged_inout": "tag",
@@ -3024,6 +3029,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_pair_inout",
         "graph_descriptor_quad",
         "graph_descriptor_reordered",
+        "graph_descriptor_role_map_inout",
         "graph_descriptor_scalar_affine",
         "graph_descriptor_scalar_axpy",
         "graph_descriptor_scalar_scale",
@@ -3098,6 +3104,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_descriptor_node_port_dict",
             "graph_descriptor_pair_inout",
             "graph_descriptor_reordered",
+            "graph_descriptor_role_map_inout",
             "graph_descriptor_scalar_affine",
             "graph_descriptor_scalar_axpy",
             "graph_descriptor_scalar_scale",
@@ -3331,6 +3338,7 @@ def main() -> None:
             "graph_descriptor_pair_inout",
             "graph_descriptor_quad",
             "graph_descriptor_reordered",
+            "graph_descriptor_role_map_inout",
             "graph_descriptor_scalar_affine",
             "graph_descriptor_scalar_axpy",
             "graph_descriptor_scalar_scale",

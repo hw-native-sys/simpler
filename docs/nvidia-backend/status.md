@@ -2273,6 +2273,17 @@ descriptor selector reported `4 passed, 139 deselected`, the local A100 ctypes
 selector reported `1 passed, 142 deselected`, and the synced H200 selector
 reported `1 passed, 142 deselected` after the known PTO-ISA SSH refresh
 warning.
+The paired persistent-smoke/report path now also has a dedicated
+`graph_descriptor_role_map_inout` shape. The focused report-helper TDD first
+failed because both the persistent smoke builder and paired-smoke CLI rejected
+that shape. After registering it, the focused selector reported
+`2 passed, 296 deselected`. The paired A100/H200 smoke under
+`tmp/cuda-backend/role-map-inout-working/`
+`persistent-graph_descriptor_role_map_inout-repeat2-smoke-63e71c8a/`
+validated `repeat_runs=2`, dispatch `1,1,1`, graph fan-in `0,1,1`,
+dependents `1,2`, `graph_task_arg_key=role_map`, generated Markdown/SVG
+reports, and zero scheduler errors. A100 reported `device_wall_ns=69632`;
+H200 reported `device_wall_ns=49888`.
 Graph task-list descriptors now also accept top-level `graph.submits` or
 `graph.submissions` as aliases for `graph.tasks`/`graph.nodes`, so a
 scene-test descriptor can look like a list of
@@ -4580,10 +4591,10 @@ Needed:
   and paired smoke including
   node-link `links` and dictionary-valued node IO port maps,
   tagged TaskArgs-like graph task lowering including `inout` producer
-  chaining, role-map task-argument dictionaries, submit-shaped graph
-  descriptors, explicit unary square graph dispatch, tagged graph-descriptor
-  paired smoke, and five-task chain, five-task fan-out/fan-in, and six-task
-  scratch-reuse graph descriptor smokes;
+  chaining, role-map task-argument dictionaries with paired smoke,
+  submit-shaped graph descriptors, explicit unary square graph dispatch,
+  tagged graph-descriptor paired smoke, and five-task chain, five-task
+  fan-out/fan-in, and six-task scratch-reuse graph descriptor smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, tensor-core graph, and
   direct/queue/DAG prepared-callable repeat-run smokes. The paired lifecycle
