@@ -4318,6 +4318,49 @@ dependents `[2,2]`, graph-node ops
 `task2=input.lhs:tmp0,input.rhs:tmp1,output.value:out`. Device times were
 `61440 ns` on A100 and `41408 ns` on H200.
 
+The dictionary-keyed graph task descriptor spelling is now promoted into the
+paired persistent-smoke workflow as `graph_descriptor_task_dict`. The TDD
+selector first failed because `run_persistent_smoke` rejected the unknown DAG
+shape and the paired runner rejected the CLI choice. After wiring the
+add/mul/add descriptor, paired-runner expectations, graph fan-in/dependent
+metadata, and report-visible task-dictionary metadata, the focused local tests
+passed:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest \
+    tests/ut/py/test_cuda_benchmark_report.py \
+    tests/ut/py/test_cuda_backend.py \
+    -q -k 'graph_descriptor_task_dict or task_dict_graph_descriptor' \
+    --platform cuda
+```
+
+That run reported `2 passed, 343 deselected`. The paired smoke then validated
+local A100 and remote H200 artifacts:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_task_dict --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-task-dict-smoke-working
+```
+
+The capture is under:
+
+```text
+tmp/cuda-backend/persistent-task-dict-smoke-working/persistent-graph_descriptor_task_dict-repeat2-smoke-6566536a/
+```
+
+It contains `a100.json`, `h200.json`, `cuda-smoke-report.md`, and
+`cuda-smoke-report.svg`. It validated repeat completions `[3,3]`, zero
+scheduler errors, dispatch `[1,2,1]`, graph fan-in `[0,0,2]`, graph dependents
+`[2,2]`, graph task arg key `task_dict`, and graph task args
+`join=input:a,input:b,output:out;left=input:a,input:b,output:tmp0;`
+`right=input:a,input:b,output:tmp1`. Device times were `67584 ns` on A100 and
+`43456 ns` on H200.
+
 The submit-shaped graph descriptor spelling is now also available in the
 paired persistent-smoke workflow as `graph_descriptor_submits`. The TDD
 selector first failed because the direct smoke rejected the unknown DAG shape;
@@ -4414,7 +4457,6 @@ Needed:
   node `op` callable aliases, callable metadata `callable_id` / `cid` aliases,
   and paired smoke including
   node-link `links` and dictionary-valued node IO port maps,
-  dictionary-keyed graph task descriptors,
   tagged TaskArgs-like graph task lowering including `inout` producer
   chaining, submit-shaped graph descriptors, named graph-callable resolution,
   explicit unary square graph dispatch, tagged graph-descriptor paired smoke,

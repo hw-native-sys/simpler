@@ -1687,6 +1687,7 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
         "graph_descriptor_node_link",
         "graph_descriptor_node_op",
         "graph_descriptor_node_port_dict",
+        "graph_descriptor_task_dict",
     }:
         task_count = 3
         host_fanin_t = ctypes.c_uint32 * task_count
@@ -2662,6 +2663,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 "graph_descriptor_node_link",
                 "graph_descriptor_node_op",
                 "graph_descriptor_node_port_dict",
+                "graph_descriptor_task_dict",
             }:
                 expected_out = expected_tmp0
             if _is_tensor_tile_shape(config.dag_shape):
@@ -2821,6 +2823,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_scratch_reuse",
             "graph_descriptor_submit_groups",
             "graph_descriptor_submits",
+            "graph_descriptor_task_dict",
             "graph_descriptor_tagged",
             "graph_descriptor_tagged_inout",
             "graph_descriptor_triad",
@@ -2873,6 +2876,13 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                     "task0": "input:a,input:b,output:tmp0",
                     "task1": "input:a,input:b,output:tmp1",
                     "task2": "input:a,input:b,output:out",
+                }
+            if config.dag_shape == "graph_descriptor_task_dict":
+                result["graph_task_arg_key"] = "task_dict"
+                result["graph_task_args"] = {
+                    "left": "input:a,input:b,output:tmp0",
+                    "right": "input:a,input:b,output:tmp1",
+                    "join": "input:a,input:b,output:out",
                 }
             if config.dag_shape == "graph_descriptor_tagged":
                 result["graph_task_args"] = {
@@ -3009,6 +3019,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_role_keyed_inout",
         "graph_descriptor_submit_groups",
         "graph_descriptor_submits",
+        "graph_descriptor_task_dict",
         "graph_descriptor_tagged",
         "graph_descriptor_tagged_inout",
         "graph_descriptor_triad",
@@ -3080,6 +3091,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_descriptor_submit_groups",
             "graph_descriptor_submits",
             "graph_descriptor_role_keyed_inout",
+            "graph_descriptor_task_dict",
             "graph_descriptor_tagged",
             "graph_descriptor_tagged_inout",
         }
@@ -3312,6 +3324,7 @@ def main() -> None:
             "graph_descriptor_role_keyed_inout",
             "graph_descriptor_submit_groups",
             "graph_descriptor_submits",
+            "graph_descriptor_task_dict",
             "graph_descriptor_tagged",
             "graph_descriptor_tagged_inout",
             "graph_descriptor_triad",

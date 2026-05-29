@@ -499,6 +499,30 @@ completions `[3,3]`, zero scheduler errors, dispatch `[1,2,1]`, graph fan-in
 `task2=input.lhs:tmp0,input.rhs:tmp1,output.value:out`.
 Device times were `61440 ns` on A100 and `41408 ns` on H200 for `N=1024`.
 
+Use `--dag-shape graph_descriptor_task_dict` when the paired smoke should
+prove dictionary-keyed graph task descriptors. This shape records named graph
+task args for `left`, `right`, and `join`, then validates the same add/mul/add
+dispatch and topology as the SceneTest dictionary-task graph:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_task_dict --task-count 3 \
+    --queue-capacity 2 --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-task-dict-smoke-working
+```
+
+The working-tree capture under
+`tmp/cuda-backend/persistent-task-dict-smoke-working/`
+`persistent-graph_descriptor_task_dict-repeat2-smoke-6566536a/` validated
+paired A100 and H200 JSON, Markdown, and SVG artifacts with repeat completions
+`[3,3]`, zero scheduler errors, dispatch `[1,2,1]`, graph fan-in `[0,0,2]`,
+graph dependents `[2,2]`, `graph_task_arg_key=task_dict`, and graph task args
+`join=input:a,input:b,output:out;left=input:a,input:b,output:tmp0;`
+`right=input:a,input:b,output:tmp1`. Device times were `67584 ns` on A100 and
+`43456 ns` on H200 for `N=1024`.
+
 When changing node-link graph input handling, run the SceneTestCase node-data
 selector. It validates list-shaped `graph.nodes` entries whose `id` carries
 identity and whose task payload lives under `data`, with top-level node fields

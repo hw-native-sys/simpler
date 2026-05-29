@@ -293,6 +293,7 @@ def _expected_dispatch(config: PairedPersistentSmokeConfig) -> str | None:
         "graph_descriptor_role_keyed_inout": "1,1,1",
         "graph_descriptor_submit_groups": "1,1,1",
         "graph_descriptor_submits": "1,1,1",
+        "graph_descriptor_task_dict": "1,2,1",
         "graph_descriptor_tagged": "9,2,1",
         "graph_descriptor_tagged_inout": "1,1,1",
         "graph_descriptor_triad": "6,2,1",
@@ -342,6 +343,7 @@ def _expected_graph_descriptor(config: PairedPersistentSmokeConfig) -> tuple[str
         "graph_descriptor_role_keyed_inout": ("0,1,1", "1,2"),
         "graph_descriptor_submit_groups": ("0,0,2", "2,2"),
         "graph_descriptor_submits": ("0,1,1", "1,2"),
+        "graph_descriptor_task_dict": ("0,0,2", "2,2"),
         "graph_descriptor_tagged": ("0,0,2", "2,2"),
         "graph_descriptor_tagged_inout": ("0,1,1", "1,2"),
         "graph_descriptor_triad": ("0,0,2", "2,2"),
@@ -388,6 +390,9 @@ def _expected_graph_task_args(config: PairedPersistentSmokeConfig) -> str | None
             "task1=input.lhs:a,input.rhs:b,output.value:tmp1;"
             "task2=input.lhs:tmp0,input.rhs:tmp1,output.value:out"
         ),
+        "graph_descriptor_task_dict": (
+            "join=input:a,input:b,output:out;left=input:a,input:b,output:tmp0;right=input:a,input:b,output:tmp1"
+        ),
     }.get(config.dag_shape)
 
 
@@ -402,6 +407,7 @@ def _expected_graph_task_arg_key(config: PairedPersistentSmokeConfig) -> str | N
         "graph_descriptor_role_keyed_inout": "role",
         "graph_descriptor_submit_groups": "submit_groups",
         "graph_descriptor_submits": "submits",
+        "graph_descriptor_task_dict": "task_dict",
     }.get(config.dag_shape)
 
 
@@ -687,6 +693,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "graph_descriptor_role_keyed_inout",
             "graph_descriptor_submit_groups",
             "graph_descriptor_submits",
+            "graph_descriptor_task_dict",
             "graph_descriptor_tagged",
             "graph_descriptor_tagged_inout",
             "graph_descriptor_triad",
