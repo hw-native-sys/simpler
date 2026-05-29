@@ -24,6 +24,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -573,6 +574,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_dep_gen_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
     }
+    if (enable_scope_stats_) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+    }
     kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
     for (int i = 0; i < num_aicore; i++) {
@@ -633,6 +637,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         rc = init_dep_gen(launch_aicpu_num, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_dep_gen failed: %d", rc);
+            return rc;
+        }
+    }
+
+    if (enable_scope_stats_) {
+        rc = init_scope_stats(launch_aicpu_num, device_id_);
+        if (rc != 0) {
+            LOG_ERROR("init_scope_stats failed: %d", rc);
             return rc;
         }
     }
@@ -700,6 +712,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
     if (enable_dep_gen_) {
         dep_gen_collector_.start(thread_factory);
+    }
+    if (enable_scope_stats_) {
+        scope_stats_collector_.start(thread_factory);
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
@@ -803,6 +818,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
                 LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
             }
         }
+    }
+
+    if (enable_scope_stats_) {
+        scope_stats_collector_.stop();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(output_prefix_);
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -1415,6 +1436,38 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id) {
     return 0;
 }
 
+int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+
+    auto register_cb = +[](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
+        if (load_hal_if_needed() != 0) {
+            LOG_ERROR("Failed to load ascend_hal for scope_stats: %s", dlerror());
+            return -1;
+        }
+        HalHostRegisterFn fn = get_halHostRegister();
+        if (fn == nullptr) {
+            LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
+            return -1;
+        }
+        return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
+    };
+
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
+
+    int rc = scope_stats_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id);
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.args.scope_stats_data_base =
+        reinterpret_cast<uint64_t>(scope_stats_collector_.get_scope_stats_shm_device_ptr());
+    return 0;
+}
+
 void DeviceRunner::finalize_collectors() {
     auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
         HalHostUnregisterFn fn = get_halHostUnregister();
@@ -1438,5 +1491,9 @@ void DeviceRunner::finalize_collectors() {
     }
     if (dep_gen_collector_.is_initialized()) {
         dep_gen_collector_.finalize(unregister_cb, free_cb);
+    }
+    if (scope_stats_collector_.is_initialized()) {
+        scope_stats_collector_.finalize(unregister_cb, free_cb);
+        kernel_args_.args.scope_stats_data_base = 0;
     }
 }

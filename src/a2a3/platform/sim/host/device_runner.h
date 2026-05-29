@@ -58,6 +58,7 @@
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/dep_gen_collector.h"
+#include "host/scope_stats_collector.h"
 #include "runtime.h"
 
 /**
@@ -195,6 +196,7 @@ public:
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
     void set_dep_gen_enabled(bool enable) { enable_dep_gen_ = enable; }
+    void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
     // Directory under which all diagnostic artifacts (l2_perf_records.json /
     // tensor_dump/ / pmu.csv) land. Required (non-empty) when any diagnostic
     // is enabled; CallConfig::validate() enforces this contract upstream.
@@ -386,6 +388,8 @@ private:
     void (*set_pmu_enabled_func_)(bool){nullptr};
     void (*set_platform_dep_gen_base_func_)(uint64_t){nullptr};
     void (*set_dep_gen_enabled_func_)(bool){nullptr};
+    void (*set_scope_stats_enabled_func_)(bool){nullptr};
+    void (*set_platform_scope_stats_base_func_)(uint64_t){nullptr};
     std::string aicpu_so_path_;
     std::string aicore_so_path_;
 
@@ -398,6 +402,7 @@ private:
     PmuCollector pmu_collector_;
     // dep_gen collector — captures orchestrator submit_task inputs for offline replay
     DepGenCollector dep_gen_collector_;
+    ScopeStatsCollector scope_stats_collector_;
 
     // Private helper methods — read aicpu_so_binary_ / aicore_kernel_binary_
     // off the runner (populated by set_executors during simpler_init).
@@ -430,6 +435,7 @@ private:
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
 
     int init_dep_gen(int num_threads, int device_id);
+    int init_scope_stats(int num_threads);
 
     /**
      * Finalize whichever diagnostics collectors are currently initialized,
@@ -448,6 +454,7 @@ private:
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
     bool enable_dep_gen_{false};
+    bool enable_scope_stats_{false};
     L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};             // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory

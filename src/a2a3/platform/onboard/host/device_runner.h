@@ -52,6 +52,7 @@
 #include "host/pmu_collector.h"
 #include "host/dep_gen_collector.h"
 #include "load_aicpu_op.h"
+#include "host/scope_stats_collector.h"
 #include "runtime.h"
 
 /**
@@ -219,6 +220,7 @@ public:
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
     void set_dep_gen_enabled(bool enable) { enable_dep_gen_ = enable; }
+    void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
     // Directory under which all diagnostic artifacts (l2_perf_records.json /
     // tensor_dump/ / pmu.csv) land. Required (non-empty) when any diagnostic
     // is enabled; CallConfig::validate() enforces this contract upstream.
@@ -734,6 +736,7 @@ private:
      * @return 0 on success, error code on failure
      */
     int init_dep_gen(int num_threads, int device_id);
+    int init_scope_stats(int num_threads, int device_id);
 
     /**
      * Finalize whichever diagnostics collectors are currently initialized,
@@ -754,6 +757,8 @@ private:
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
     bool enable_dep_gen_{false};
+    bool enable_scope_stats_{false};
+    ScopeStatsCollector scope_stats_collector_;
     L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};             // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory

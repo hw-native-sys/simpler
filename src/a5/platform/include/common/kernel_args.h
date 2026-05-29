@@ -77,10 +77,13 @@ struct KernelArgs {
     // indexes by block_idx and forwards into per-core platform state.
     uint64_t aicore_l2_perf_ring_addrs{0};  // L2PerfAicoreRing* per core; 0 when L2 swimlane is off
     uint64_t aicore_pmu_ring_addrs{0};      // PmuAicoreRing* per core; 0 when PMU is off
+    uint64_t scope_stats_data_base{0};      // ScopeStatsBuffer device pointer; 0 when scope_stats is off.
+                                            // a5 has no halHostRegister — host keeps a separate shadow and
+                                            // refreshes it via rtMemcpy DEVICE_TO_HOST at dump time.
     uint32_t log_level{1};                  // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
     uint32_t log_info_v{5};                 // INFO verbosity threshold (0..9); default V5
-    uint32_t enable_profiling_flag{0};      // Profiling umbrella bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
-    uint32_t _pad{0};                       // Alignment padding
+    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
+    uint32_t _pad{0};                   // Alignment padding
 
     // Device pointer to an 8-byte buffer that the platform AICPU entry writes
     // the run-wall (ns) into. Allocated once at simpler_init, kept resident.

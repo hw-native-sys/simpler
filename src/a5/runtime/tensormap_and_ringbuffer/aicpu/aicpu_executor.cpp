@@ -36,6 +36,7 @@
 
 // Performance profiling headers
 #include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "common/l2_perf_profiling.h"
 #include "common/unified_log.h"
@@ -523,6 +524,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             rt->orchestrator.l2_perf_level = get_l2_perf_level();
+            {
+                auto &orch = rt->orchestrator;
+                for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+                    auto &alloc = orch.rings[r].task_allocator;
+                    scope_stats_set_ring_capacity(r, alloc.window_size(), alloc.heap_capacity());
+                }
+                scope_stats_set_tensormap_capacity(orch.tensor_map.pool_capacity());
+            }
 #endif
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
@@ -543,6 +552,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
                 l2_perf_aicpu_set_orch_thread_idx(thread_idx);
             }
+            // scope_stats streams scope_end records off the orchestrator thread:
+            // record the per-thread ready_queue index. No-op (writer shared
+            // state null) when scope_stats is disabled; the current buffer is
+            // popped lazily on the first scope_end append.
+            scope_stats_aicpu_set_orch_thread_idx(thread_idx);
 #endif
 
 #if PTO2_PROFILING
@@ -555,6 +569,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt_scope_begin(rt);
             (*p_func)(*orch_args_cached_);
             rt_scope_end(rt);
+#if PTO2_PROFILING
+            // Push the partially-filled scope_stats buffer so the host gets the
+            // final scope_end records. Idempotent / no-op when disabled.
+            scope_stats_aicpu_flush_buffers();
+#endif
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             (void)orch_cycle_end;

@@ -61,6 +61,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/dep_gen_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/scope_stats_collector.cpp"
 )
 # Add common/host sources (LoadAicpuOp)
 list(APPEND HOST_RUNTIME_SOURCES

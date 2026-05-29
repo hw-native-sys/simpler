@@ -423,6 +423,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_pmu_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
+    if (enable_scope_stats_) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+    }
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -487,6 +490,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
+    if (enable_scope_stats_) {
+        rc = init_scope_stats(launch_aicpu_num, device_id_);
+        if (rc != 0) {
+            LOG_ERROR("init_scope_stats failed: %d", rc);
+            return rc;
+        }
+    }
+
     // Cleanup guard for early returns: stops all started collectors so
     // their mgmt + poll threads exit cleanly. stop() is idempotent and a
     // no-op on collectors that never started.
@@ -529,6 +540,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
     if (enable_pmu_) {
         pmu_collector_.start(thread_factory);
+    }
+    if (enable_scope_stats_) {
+        scope_stats_collector_.start(thread_factory);
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
@@ -622,6 +636,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_pmu_) {
         pmu_collector_.stop();
         pmu_collector_.reconcile_counters();
+    }
+
+    if (enable_scope_stats_) {
+        scope_stats_collector_.stop();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(output_prefix_);
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -930,6 +950,10 @@ int DeviceRunner::finalize() {
     if (pmu_collector_.is_initialized()) {
         pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
+    if (scope_stats_collector_.is_initialized()) {
+        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        kernel_args_.args.scope_stats_data_base = 0;
+    }
 
     // Release the three per-Worker pooled arenas (GM heap, PTO2 SM, optional
     // trb prebuilt runtime arena — each its own device_malloc). Must precede
@@ -1141,4 +1165,17 @@ int DeviceRunner::init_pmu(
             reinterpret_cast<uint64_t>(pmu_collector_.get_aicore_ring_addrs_device_ptr());
     }
     return rc;
+}
+
+int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
+    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
+    // device buffer + rtMemcpy's the zeroed shadow to device (see
+    // ScopeStatsCollector::alloc_single_buffer). No halHostRegister on a5.
+    int rc = scope_stats_collector_.init(num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, device_id);
+    if (rc != 0) {
+        return rc;
+    }
+    kernel_args_.args.scope_stats_data_base =
+        reinterpret_cast<uint64_t>(scope_stats_collector_.get_scope_stats_shm_device_ptr());
+    return 0;
 }
