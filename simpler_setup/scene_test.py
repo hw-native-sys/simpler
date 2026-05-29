@@ -1598,8 +1598,7 @@ class _CudaPersistentDagSceneBuffers:
         inout_names: list[str] = []
         output_requires_existing = False
         for index, task_arg in enumerate(task_args):
-            if not isinstance(task_arg, dict):
-                raise ValueError("CUDA persistent_dag_graph_f32 task_args entries must be dictionaries")
+            task_arg = _CudaPersistentDagSceneBuffers._normalize_graph_task_arg_entry(task_arg, index)
             compact_role, compact_name = _CudaPersistentDagSceneBuffers._compact_graph_tensor_task_arg(
                 task_arg,
                 index,
@@ -1643,6 +1642,19 @@ class _CudaPersistentDagSceneBuffers:
         if inout_names:
             normalized["_inout_names"] = inout_names
         return normalized
+
+    @staticmethod
+    def _normalize_graph_task_arg_entry(task_arg: Any, index: int) -> dict[str, Any]:
+        if isinstance(task_arg, dict):
+            return task_arg
+        if isinstance(task_arg, (list, tuple)) and len(task_arg) == 2:
+            role, name = task_arg
+            if str(role).lower() == "scalar":
+                return {"scalar": name}
+            return {"tensor": name, "role": role}
+        raise ValueError(
+            f"CUDA persistent_dag_graph_f32 task_args entry {index} must be a dictionary or role/name pair"
+        )
 
     @staticmethod
     def _expand_graph_task_attrs(task_spec: dict[str, Any]) -> dict[str, Any]:

@@ -2195,6 +2195,28 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 also reported `2 passed, 121 deselected`, after the known PTO-ISA SSH refresh
 warning.
+Graph task descriptors now also accept two-item role/name pairs in the
+`task_args` list, such as `("input", "a")`, `("output", "tmp0")`,
+`("inout", "tmp0")`, and `("output_existing", "out")`. These pair entries
+normalize into the same role-keyed lowering path as expanded dictionaries,
+so they preserve temporary allocation, existing-output aliasing, and
+tensor-flow dependency inference. The focused TDD selector first failed at
+descriptor construction because non-dictionary entries were rejected. After
+adding pair normalization, the local A100 selector:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k pair_task_args --platform cuda
+```
+
+reported `2 passed, 123 deselected`, covering both descriptor construction
+and a ctypes-backed real-data persistent-device graph scene. The same synced
+working tree on H200 reported `2 passed, 123 deselected` with the known
+PTO-ISA SSH refresh warning. A neighboring local selector for
+`pair_task_args`, `role_keyed_task_args`, `args_alias`, and
+`compact_role_task_args` reported `6 passed, 119 deselected`, checking that
+the new shorthand did not regress the existing graph task-argument spellings.
 The role mapping now preserves the lifecycle distinction needed by CUDA
 memory planning: role `output` may create a default-sized temporary, but
 roles `output_existing` and `inout` must name storage that is already known at

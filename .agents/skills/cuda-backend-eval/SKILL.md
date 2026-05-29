@@ -1366,6 +1366,10 @@ For compact graph specs, a task arg may also be written as a single role-keyed
 dictionary such as `{"input": "a"}`, `{"output": "tmp0"}`,
 `{"inout": "tmp0"}`, or `{"output_existing": "out"}`. Do not mix this compact
 form with `tensor`/`name` plus `role`/`tag` in the same task-arg entry.
+Task args may also use two-item role/name pairs such as `("input", "a")`,
+`("output", "tmp0")`, `("inout", "tmp0")`, or
+`("output_existing", "out")`; the adapter expands these through the same
+role-keyed lowering path as the dictionary forms.
 Graph tasks may use a `callable` or `op` name instead of embedding `func_id`
 directly when `graph.callables` maps that name to callable metadata such as
 `{"func_id": 9}`. `graph.callables` may be either a dictionary keyed by
@@ -1442,6 +1446,15 @@ Run the `args` alias selector after changing graph task-argument lowering:
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
     -q -k args_alias --platform cuda
+```
+
+Run the pair-shaped task-argument selector after changing compact graph
+argument lowering:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k pair_task_args --platform cuda
 ```
 
 Run the named-callable graph selector after changing callable-name resolution
