@@ -4346,6 +4346,7 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
         output_root=tmp_path / "cuda-backend",
         local_python=".venv/bin/python",
         remote_python=".venv/bin/python",
+        remote_cuda_home="/opt/cuda-test",
     )
 
     local = cuda_pair_benchmark.build_local_benchmark_command(config, "abc123")
@@ -4374,7 +4375,7 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
         "fetch origin design/nvidia-backend" in remote_shell
     )
     assert "git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null" in remote_shell
-    assert "CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH PYTHONPATH=$PWD:$PWD/python" in remote_shell
+    assert "CUDA_HOME=/opt/cuda-test PATH=/opt/cuda-test/bin:$PATH PYTHONPATH=$PWD:$PWD/python" in remote_shell
     assert "--arch compute_90" in remote_shell
     assert "--tensor-rows 16" in remote_shell
     assert "--tensor-cols 16" in remote_shell
@@ -4520,6 +4521,15 @@ def test_cuda_pair_benchmark_builds_current_a100_h200_workflow(tmp_path):
     assert "--require-report-tensor-throughput" in validate
     assert "--require-zero-scheduler-errors" in validate
     assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
+
+
+def test_cuda_pair_benchmark_defaults_remote_cuda_home_to_h200_toolkit():
+    cuda_pair_benchmark = _load_pair_benchmark_module()
+
+    config = cuda_pair_benchmark.PairedBenchmarkConfig()
+    remote_shell = cuda_pair_benchmark.build_remote_benchmark_command(config, "abc123")[-1]
+
+    assert "CUDA_HOME=/usr/local/cuda-12.8 PATH=/usr/local/cuda-12.8/bin:$PATH" in remote_shell
 
 
 def test_cuda_pair_benchmark_validate_command_matches_configured_capture(tmp_path):  # noqa: PLR0915

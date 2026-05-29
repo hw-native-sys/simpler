@@ -1776,6 +1776,10 @@ pass `--sync-remote-tree` to copy the current local tree to `bizhaoh200` with
 local commit. It syncs `.git` so the remote benchmark metadata reports the
 same commit as the synced source tree.
 
+The paired benchmark runner defaults `--remote-cuda-home` to
+`/usr/local/cuda-12.8`, matching the non-interactive H200 shell. Override the
+flag only when the remote toolkit path changes.
+
 Use `--dry-run` to print the commands without launching benchmarks. The paired
 benchmark default tensor descriptor is `16x16x16` so the scalar tensor DAG,
 explicit graph tensor DAG, WMMA tensor-core DAG, and cuBLAS rows can run
@@ -2015,10 +2019,19 @@ PYTHONPATH=$PWD:$PWD/python \
     --sizes 4096 --arch compute_80
 ```
 
-Use `--single-baseline pto_persistent_dag_graph_node_link` for the selected
-benchmark row that exercises node-link style graph descriptors
+Use `--single-baseline pto_persistent_dag_graph_node_link` for a quick check
+of the selected benchmark row that exercises node-link style graph descriptors
 (`graph.nodes[*].id`, nested `data`, and `graph.links`) through the benchmark
-matrix. For a quick A100/H200 check, capture stdout JSON under
+matrix. The full compact A100/H200 gate with this row is under
+`tmp/cuda-backend/graph-node-link-compact-current-preset-working/`
+`combined-current-8a74e5ab/`; it validated `102` rows with source-paper
+provenance, Markdown/SVG reports, graph topology/task metadata, tensor
+throughput SVG output, and zero device scheduler errors. The node-link row
+reported A100/H200 device times of `35840/31808 ns` with dispatch `[1,2,1]`,
+graph fan-in `[0,0,2]`, graph dependents `[2,2]`, and graph-node ops
+`task0=op:add=1;task1=op:mul=2;task2=op:add=1`.
+
+For a smaller A100/H200 check, capture stdout JSON under
 `tmp/cuda-backend/graph-node-link-baseline-working/`:
 
 ```bash
@@ -2036,11 +2049,6 @@ ssh bizhaoh200 'cd /data/shibizhao/pto-cu && \
     --sizes 1024 --device 0 --arch compute_90' \
   > tmp/cuda-backend/graph-node-link-baseline-working/h200-single.json
 ```
-
-The current capture reported A100/H200 device times of `41984/28352 ns`,
-dispatch `[1,2,1]`, graph fan-in `[0,0,2]`, graph dependents `[2,2]`,
-graph-node ops `task0=op:add=1;task1=op:mul=2;task2=op:add=1`, and zero
-device scheduler errors.
 
 Use `--single-baseline pto_persistent_dag_graph_depends_on` for a quick
 benchmark path check of incoming-edge graph notation. This row uses dispatch
@@ -2480,8 +2488,9 @@ scalar graph baseline, the graph unary-square baseline, task-argument tags,
 visible Markdown/SVG graph topology and task-argument metadata, visible
 Markdown/SVG tensor throughput rows for required tensor/cuBLAS descriptors,
 size `1024`, one repeat, `102` combined samples, and the Markdown/SVG report
-files. The latest full compact gate artifact before the node-link row is under
-`tmp/cuda-backend/graph-node-io-benchmark-working/combined-current-c0d327d2/`.
+files. The current compact gate artifact with node-link coverage is under
+`tmp/cuda-backend/graph-node-link-compact-current-preset-working/`
+`combined-current-8a74e5ab/`.
 Validate older captures with explicit `--require-*` checks if the current
 preset has gained new selected rows since that capture.
 New paired-runner captures use a dynamic validator command because the

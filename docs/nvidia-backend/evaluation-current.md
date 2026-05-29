@@ -5,9 +5,10 @@ from commit `cb300e82`, plus compact current-head validation captures. The
 full current-head capture is under
 `tmp/cuda-backend/current-head-full-pair-working/combined-current-cb300e82/`.
 The latest compact current-head gate is the capture under
-`tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/`,
-which validates the selected compact benchmark matrix after pair-shaped graph
-task arguments joined the tag, role-keyed, and compact spellings. The raw
+`tmp/cuda-backend/graph-node-link-compact-current-preset-working/`
+`combined-current-8a74e5ab/`, which validates the selected compact benchmark
+matrix after node-link graph descriptors joined the selected graph-node rows.
+The raw
 JSON, Markdown, and SVG reports are generated locally under
 `tmp/cuda-backend/` and intentionally remain uncommitted.
 
@@ -197,6 +198,14 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/cuda-benchmark-dag-deltas.svg`
 - `tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/cuda-benchmark-throughput.svg`
+- `tmp/cuda-backend/graph-node-link-compact-current-preset-working/a100-current-8a74e5ab/cuda-benchmark.json`
+- `tmp/cuda-backend/graph-node-link-compact-current-preset-working/h200-current-8a74e5ab/cuda-benchmark.json`
+- `tmp/cuda-backend/graph-node-link-compact-current-preset-working/combined-current-8a74e5ab/cuda-benchmark.json`
+- `tmp/cuda-backend/graph-node-link-compact-current-preset-working/combined-current-8a74e5ab/cuda-benchmark.md`
+- `tmp/cuda-backend/graph-node-link-compact-current-preset-working/combined-current-8a74e5ab/cuda-benchmark.svg`
+- `tmp/cuda-backend/graph-node-link-compact-current-preset-working/combined-current-8a74e5ab/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/graph-node-link-compact-current-preset-working/combined-current-8a74e5ab/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/graph-node-link-compact-current-preset-working/combined-current-8a74e5ab/cuda-benchmark-throughput.svg`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/a100.json`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/h200.json`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/cuda-smoke-report.md`
@@ -1790,14 +1799,23 @@ the same add/mul/add callable sequence as the graph-node `op` row. This keeps
 node-link schema compatibility visible in the benchmark matrix, not only in
 paired persistent-smoke reports.
 
-Single-baseline A100/H200 evidence is under
-`tmp/cuda-backend/graph-node-link-baseline-working/` as `a100-single.json` and
-`h200-single.json`.
+The compact A100/H200 artifact is under
+`tmp/cuda-backend/graph-node-link-compact-current-preset-working/`
+`combined-current-8a74e5ab/`. It contains 102 rows, source-paper provenance,
+Markdown plus SVG reports, graph topology/task-argument report metadata,
+tensor-throughput SVG output, and sanitized command examples. It passes:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    tmp/cuda-backend/graph-node-link-compact-current-preset-working/combined-current-8a74e5ab/cuda-benchmark.json \
+    --preset compact-current
+```
 
 | GPU | Baseline | N | Dispatch | Fan-in | Dependents | Node ops | Device ns | Status |
 | --- | -------- | - | -------- | ------ | ---------- | -------- | --------- | ------ |
-| A100 | `pto_persistent_dag_graph_node_link` | 1024 | `1,2,1` | `0,0,2` | `2,2` | `task0=op:add=1;task1=op:mul=2;task2=op:add=1` | 41984 | pass |
-| H200 | `pto_persistent_dag_graph_node_link` | 1024 | `1,2,1` | `0,0,2` | `2,2` | `task0=op:add=1;task1=op:mul=2;task2=op:add=1` | 28352 | pass |
+| A100 | `pto_persistent_dag_graph_node_link` | 1024 | `1,2,1` | `0,0,2` | `2,2` | `task0=op:add=1;task1=op:mul=2;task2=op:add=1` | 35840 | pass |
+| H200 | `pto_persistent_dag_graph_node_link` | 1024 | `1,2,1` | `0,0,2` | `2,2` | `task0=op:add=1;task1=op:mul=2;task2=op:add=1` | 31808 | pass |
 
 Both rows reported zero device scheduler errors with
 `graph_descriptor_node_link`, `worker_blocks=3`, `scheduler_blocks=1`, and

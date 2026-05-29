@@ -238,6 +238,7 @@ class PairedBenchmarkConfig:
     tensor_inner: int = 16
     local_python: str = sys.executable
     remote_python: str = ".venv/bin/python"
+    remote_cuda_home: str = "/usr/local/cuda-12.8"
     ssh_connect_timeout: int = 8
     remote_git_low_speed_limit: int = 1
     remote_git_low_speed_time: int = 30
@@ -355,7 +356,8 @@ def _remote_shell_command(config: PairedBenchmarkConfig, commit: str) -> str:
             config=config,
         ),
     ]
-    remote_env = "CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH PYTHONPATH=$PWD:$PWD/python"
+    remote_cuda_home = shlex.quote(config.remote_cuda_home)
+    remote_env = f"CUDA_HOME={remote_cuda_home} PATH={remote_cuda_home}/bin:$PATH PYTHONPATH=$PWD:$PWD/python"
     fetch_command = (
         f"timeout {config.remote_git_fetch_timeout} "
         "git "
@@ -646,6 +648,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tensor-inner", type=int, default=16)
     parser.add_argument("--local-python", default=sys.executable)
     parser.add_argument("--remote-python", default=".venv/bin/python")
+    parser.add_argument("--remote-cuda-home", default="/usr/local/cuda-12.8")
     parser.add_argument("--ssh-connect-timeout", type=int, default=8)
     parser.add_argument("--remote-git-low-speed-limit", type=int, default=1)
     parser.add_argument("--remote-git-low-speed-time", type=int, default=30)
@@ -676,6 +679,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         tensor_inner=args.tensor_inner,
         local_python=args.local_python,
         remote_python=args.remote_python,
+        remote_cuda_home=args.remote_cuda_home,
         ssh_connect_timeout=args.ssh_connect_timeout,
         remote_git_low_speed_limit=args.remote_git_low_speed_limit,
         remote_git_low_speed_time=args.remote_git_low_speed_time,
