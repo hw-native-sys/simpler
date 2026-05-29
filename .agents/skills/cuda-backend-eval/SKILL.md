@@ -1911,18 +1911,20 @@ together. The current committed summary keeps the full current-head
 `docs/nvidia-backend/evaluation-current.md`.
 The full current-head artifact under
 `tmp/cuda-backend/current-head-full-node-link-working/`
-`combined-current-9ec5511e/` validated `1224` A100/H200 samples with sizes
-`1024,65536,1048576`, three repeats, tensor descriptor `16x16x16`, task
-counts `2,6,12`, worker-grid values `32,64,128,256`, source-paper
-provenance, sanitized command examples, graph topology and TaskArgs metadata
-reports, tensor-throughput reports, generated node-link graph metadata, and
-zero scheduler errors.
+`combined-current-9ec5511e/` validated `1224` A100/H200 samples before the
+named-callable graph row joined the selected matrix. New full captures should
+validate `1242` samples with sizes `1024,65536,1048576`, three repeats,
+tensor descriptor `16x16x16`, task counts `2,6,12`, worker-grid values
+`32,64,128,256`, source-paper provenance, sanitized command examples, graph
+topology and TaskArgs metadata reports, tensor-throughput reports,
+generated node-link and named-callable graph metadata, and zero scheduler
+errors.
 
 Use this compact paired gate after changing selected persistent graph
-benchmark rows. With one same-work batch point, it validates 102 samples
+benchmark rows. With `--batch-tasks 0`, it validates 96 non-batch samples
 across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
 `pto_persistent_dag_graph_node_io`, `pto_persistent_dag_graph_node_link`,
-`pto_persistent_dag_graph_node_op`,
+`pto_persistent_dag_graph_named_callable`, `pto_persistent_dag_graph_node_op`,
 `pto_persistent_dag_graph_depends_on`,
 `pto_persistent_dag_graph_scalar_axpy`,
 `pto_persistent_dag_graph_scalar_scale`,
@@ -1930,8 +1932,8 @@ across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
 `pto_persistent_dag_graph_reordered`,
 `pto_persistent_dag_graph_triad`, `pto_persistent_dag_graph_quad`, and
 `pto_persistent_dag_graph_compact_role_inout` with dispatch `9,2,1`,
-`1,2,1`, `1,2,1`, `1,2,1`, `4,2,1`, `11,2,1`, `5,2,1`, `1,9,2`,
-`6,2,1`, `8,2,1`, and `1,1,1`.
+`1,2,1`, `1,2,1`, `1,2,1`, `1,2,1`, `4,2,1`, `11,2,1`, `5,2,1`,
+`1,9,2`, `6,2,1`, `8,2,1`, and `1,1,1`.
 The node-attrs row requires
 `graph_node_attrs=task0=attrs:tensor_args,scalar_args`,
 `scalar_args[0]=1.5,scalar_args[1]=0.25`, and
@@ -1941,7 +1943,11 @@ The node-attrs row requires
 `task1=input:a,input:b,output:tmp1`;
 `task2=input:a,input:b,output:out`. The node-op row
 requires `graph_node_ops=task0=op:add=1;task1=op:mul=2;task2=op:add=1`;
-the depends-on and
+the named-callable row additionally requires
+`graph_task_arg_key=named_callable` and callable-tagged task args
+`task0=callable:add,input:a,input:b,output:tmp0`;
+`task1=callable:mul,input:a,input:b,output:tmp1`;
+`task2=callable:add,input:a,input:b,output:out`. The depends-on and
 graph scalar rows require graph fan-in `0,0,2` and dependents `2,2`; the
 reordered row requires graph fan-in `2,0,0` and dependents `0,0`; the compact
 role row requires graph fan-in `0,1,1`, dependents `1,2`, and
@@ -1950,18 +1956,18 @@ role row requires graph fan-in `0,1,1`, dependents `1,2`, and
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
-    --sizes 1024 --repeats 1 --batch-tasks 2 \
-    --worker-blocks-per-task 32 --sync-remote-tree \
-    --output-root tmp/cuda-backend/graph-node-io-benchmark-working
+    --sizes 1024 --repeats 1 --batch-tasks 0 \
+    --worker-blocks-per-task 1 --sync-remote-tree \
+    --output-root tmp/cuda-backend/persistent-named-callable-baseline-working
 ```
 
 The current compact capture under
-`tmp/cuda-backend/graph-node-link-compact-current-preset-working/`
-`combined-current-8a74e5ab/` is the latest checked compact form of this gate.
-It validates 102 A100/H200 samples and requires report-visible graph topology,
-node-IO task args, node-link graph-node ops, scalar/tensor node-attrs
-descriptor args, selected tensor-throughput rows, sanitized command examples,
-source-paper metadata, and zero scheduler errors.
+`tmp/cuda-backend/persistent-named-callable-baseline-working/`
+`combined-current-95be2b5b/` is the latest checked compact form of this gate.
+It validates 96 A100/H200 samples and requires report-visible graph topology,
+node-IO task args, node-link/named-callable graph-node ops, scalar/tensor
+node-attrs descriptor args, selected tensor-throughput rows, sanitized
+command examples, source-paper metadata, and zero scheduler errors.
 The generated
 `cuda_current_summary.py --section graph-metadata` output includes a
 `Task args` column for copying graph node IO metadata into evaluation docs.
@@ -2607,16 +2613,17 @@ The compact current-head gate checks the expected A100/H200 machines,
 selected tensor baselines, the graph tensor-core baseline, the host-schedule
 generic-args baseline, graph generic-args4 baseline, graph-chain baseline,
 graph-depends-on baseline, graph-node-attrs baseline, graph-node-IO baseline,
-graph-node-link baseline, graph-node-op baseline,
+graph-node-link baseline, graph-named-callable baseline, graph-node-op baseline,
 graph-scratch-reuse baseline, graph-tagged-inout baseline, graph descriptor
 fan-in/dependent metadata, graph-triad and graph-quad baselines, the tagged
 scalar graph baseline, the graph unary-square baseline, task-argument tags,
 visible Markdown/SVG graph topology and task-argument metadata, visible
 Markdown/SVG tensor throughput rows for required tensor/cuBLAS descriptors,
-size `1024`, one repeat, `102` combined samples, and the Markdown/SVG report
-files. The current compact gate artifact with node-link coverage is under
-`tmp/cuda-backend/graph-node-link-compact-current-preset-working/`
-`combined-current-8a74e5ab/`.
+size `1024`, one repeat, `96` non-batch combined samples, and the
+Markdown/SVG report files. The current compact gate artifact with
+named-callable coverage is under
+`tmp/cuda-backend/persistent-named-callable-baseline-working/`
+`combined-current-95be2b5b/`.
 Validate older captures with explicit `--require-*` checks if the current
 preset has gained new selected rows since that capture.
 New paired-runner captures use a dynamic validator command because the

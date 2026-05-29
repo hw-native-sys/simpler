@@ -6,9 +6,10 @@ full current-head capture is under
 `tmp/cuda-backend/current-head-full-node-link-working/`
 `combined-current-9ec5511e/`.
 The latest compact current-head gate is the capture under
-`tmp/cuda-backend/graph-node-link-compact-current-preset-working/`
-`combined-current-8a74e5ab/`, which validates the selected compact benchmark
-matrix after node-link graph descriptors joined the selected graph-node rows.
+`tmp/cuda-backend/persistent-named-callable-baseline-working/`
+`combined-current-95be2b5b/`, which validates the selected compact benchmark
+matrix after named-callable graph descriptors joined the selected graph-node
+rows.
 The raw
 JSON, Markdown, and SVG reports are generated locally under
 `tmp/cuda-backend/` and intentionally remain uncommitted.
@@ -26,8 +27,10 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 
 The current paired-current validator now accepts the full capture with
 `1224` samples after the node-link graph row joined the selected matrix. The
-older `cb300e82` full capture remains useful as historical evidence, but it
-validated `1206` samples before that row was included.
+named-callable graph row raises the next full paired-current target to `1242`
+samples when that full three-size capture is refreshed. The older `cb300e82`
+full capture remains useful as historical evidence, but it validated `1206`
+samples before that row was included.
 
 ## Artifact Paths
 
@@ -49,6 +52,14 @@ validated `1206` samples before that row was included.
 - `tmp/cuda-backend/current-head-full-node-link-working/combined-current-9ec5511e/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/current-head-full-node-link-working/combined-current-9ec5511e/cuda-benchmark-dag-deltas.svg`
 - `tmp/cuda-backend/current-head-full-node-link-working/combined-current-9ec5511e/cuda-benchmark-throughput.svg`
+- `tmp/cuda-backend/persistent-named-callable-baseline-working/a100-current-95be2b5b/cuda-benchmark.json`
+- `tmp/cuda-backend/persistent-named-callable-baseline-working/h200-current-95be2b5b/cuda-benchmark.json`
+- `tmp/cuda-backend/persistent-named-callable-baseline-working/combined-current-95be2b5b/cuda-benchmark.json`
+- `tmp/cuda-backend/persistent-named-callable-baseline-working/combined-current-95be2b5b/cuda-benchmark.md`
+- `tmp/cuda-backend/persistent-named-callable-baseline-working/combined-current-95be2b5b/cuda-benchmark.svg`
+- `tmp/cuda-backend/persistent-named-callable-baseline-working/combined-current-95be2b5b/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/persistent-named-callable-baseline-working/combined-current-95be2b5b/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/persistent-named-callable-baseline-working/combined-current-95be2b5b/cuda-benchmark-throughput.svg`
 - `tmp/cuda-backend/current-head-full-pair-working/a100-current-cb300e82/cuda-benchmark.json`
 - `tmp/cuda-backend/current-head-full-pair-working/a100-current-cb300e82/cuda-benchmark.md`
 - `tmp/cuda-backend/current-head-full-pair-working/h200-current-cb300e82/cuda-benchmark.json`
@@ -1838,6 +1849,44 @@ PYTHONPATH=$PWD:$PWD/python \
 Both rows reported zero device scheduler errors with
 `graph_descriptor_node_link`, `worker_blocks=3`, `scheduler_blocks=1`, and
 `block_dim=256`.
+
+## Supplemental Named-Callable Graph Benchmark
+
+The named-callable graph descriptor path is now a selected benchmark baseline
+as `pto_persistent_dag_graph_named_callable`. It carries callable names in
+the graph task-argument metadata while the executable path remains the same
+device-compiled add/mul/add task-function dispatch used by the node-link and
+node-op rows.
+
+The compact A100/H200 artifact is under
+`tmp/cuda-backend/persistent-named-callable-baseline-working/`
+`combined-current-95be2b5b/`. It contains 96 non-batch rows, source-paper
+provenance, Markdown plus SVG reports, graph topology/task-argument report
+metadata, tensor-throughput SVG output, and sanitized command examples. It
+passes:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  ROOT=tmp/cuda-backend/persistent-named-callable-baseline-working \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    "$ROOT"/combined-current-95be2b5b/cuda-benchmark.json \
+    --preset compact-current
+```
+
+- A100: `pto_persistent_dag_graph_named_callable`, `n=1024`,
+  dispatch `1,2,1`, fan-in `0,0,2`, dependents `2,2`,
+  key `named_callable`, `33792 ns`.
+- H200: `pto_persistent_dag_graph_named_callable`, `n=1024`,
+  dispatch `1,2,1`, fan-in `0,0,2`, dependents `2,2`,
+  key `named_callable`, `25728 ns`.
+
+Both rows reported zero device scheduler errors with
+`graph_descriptor_named_callable`, `worker_blocks=3`, `scheduler_blocks=1`,
+and `block_dim=256`. The row validates graph task args
+`task0=callable:add,input:a,input:b,output:tmp0;`
+`task1=callable:mul,input:a,input:b,output:tmp1;`
+`task2=callable:add,input:a,input:b,output:out` and graph-node ops
+`task0=op:add=1;task1=op:mul=2;task2=op:add=1`.
 
 ## Supplemental Reordered Graph-Descriptor Smoke
 

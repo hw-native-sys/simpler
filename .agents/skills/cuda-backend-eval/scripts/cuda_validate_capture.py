@@ -51,6 +51,7 @@ PAIRED_CURRENT_BASELINES = (
     "pto_persistent_dag_graph_node_attrs",
     "pto_persistent_dag_graph_node_io",
     "pto_persistent_dag_graph_node_link",
+    "pto_persistent_dag_graph_named_callable",
     "pto_persistent_dag_graph_node_op",
     "pto_persistent_dag_graph_depends_on",
     "pto_persistent_dag_graph_scalar_axpy",
@@ -77,11 +78,22 @@ PAIRED_CURRENT_BASELINES = (
     "pto_persistent_queue",
     "pto_persistent_queue_batch",
 )
+COMPACT_CURRENT_BASELINES = tuple(
+    baseline
+    for baseline in PAIRED_CURRENT_BASELINES
+    if baseline
+    not in {
+        "pto_host_schedule_batch",
+        "pto_persistent_device_batch",
+        "pto_persistent_device_grid_batch",
+        "pto_persistent_queue_batch",
+    }
+)
 PAIRED_CURRENT_SIZES = (1024, 65536, 1048576)
 COMPACT_CURRENT_SIZES = (1024,)
 COMPACT_CURRENT_EXPECTED_REPEATS = 1
-COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 102
-PAIRED_CURRENT_EXPECTED_RESULT_COUNT = 1224
+COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 96
+PAIRED_CURRENT_EXPECTED_RESULT_COUNT = 1242
 REQUIRED_SOURCE_PAPER_IDS = ("arXiv:2605.03190", "arXiv:2512.22219v1")
 REPORT_FILES = (
     "cuda-benchmark.md",
@@ -105,6 +117,7 @@ PAIRED_CURRENT_DISPATCH = {
     "pto_persistent_dag_graph_node_attrs": "9,2,1",
     "pto_persistent_dag_graph_node_io": "1,2,1",
     "pto_persistent_dag_graph_node_link": "1,2,1",
+    "pto_persistent_dag_graph_named_callable": "1,2,1",
     "pto_persistent_dag_graph_node_op": "1,2,1",
     "pto_persistent_dag_graph_depends_on": "1,2,1",
     "pto_persistent_dag_graph_scalar_axpy": "4,2,1",
@@ -159,12 +172,18 @@ PAIRED_CURRENT_GRAPH_TASK_ARGS = {
     "pto_persistent_dag_graph_node_io": (
         "task0=input:a,input:b,output:tmp0;task1=input:a,input:b,output:tmp1;task2=input:a,input:b,output:out"
     ),
+    "pto_persistent_dag_graph_named_callable": (
+        "task0=callable:add,input:a,input:b,output:tmp0;"
+        "task1=callable:mul,input:a,input:b,output:tmp1;"
+        "task2=callable:add,input:a,input:b,output:out"
+    ),
 }
 PAIRED_CURRENT_GRAPH_TASK_ARG_KEYS = {
     "pto_persistent_dag_graph_tagged_inout": "tag",
     "pto_persistent_dag_graph_role_keyed_inout": "role",
     "pto_persistent_dag_graph_compact_role_inout": "compact",
     "pto_persistent_dag_graph_pair_inout": "pair",
+    "pto_persistent_dag_graph_named_callable": "named_callable",
     "pto_persistent_dag_graph_node_io": "node_io",
 }
 PAIRED_CURRENT_GRAPH_NODE_ATTRS = {
@@ -172,6 +191,7 @@ PAIRED_CURRENT_GRAPH_NODE_ATTRS = {
 }
 PAIRED_CURRENT_GRAPH_NODE_OPS = {
     "pto_persistent_dag_graph_node_link": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
+    "pto_persistent_dag_graph_named_callable": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
     "pto_persistent_dag_graph_node_op": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
 }
 PAIRED_CURRENT_SCALAR_ARGS = {
@@ -192,6 +212,7 @@ PAIRED_CURRENT_GRAPH_FANIN = {
     "pto_persistent_dag_graph_node_attrs": "0,0,2",
     "pto_persistent_dag_graph_node_io": "0,0,2",
     "pto_persistent_dag_graph_node_link": "0,0,2",
+    "pto_persistent_dag_graph_named_callable": "0,0,2",
     "pto_persistent_dag_graph_node_op": "0,0,2",
     "pto_persistent_dag_graph_depends_on": "0,0,2",
     "pto_persistent_dag_graph_scalar_axpy": "0,0,2",
@@ -218,6 +239,7 @@ PAIRED_CURRENT_GRAPH_DEPENDENTS = {
     "pto_persistent_dag_graph_node_attrs": "2,2",
     "pto_persistent_dag_graph_node_io": "2,2",
     "pto_persistent_dag_graph_node_link": "2,2",
+    "pto_persistent_dag_graph_named_callable": "2,2",
     "pto_persistent_dag_graph_node_op": "2,2",
     "pto_persistent_dag_graph_depends_on": "2,2",
     "pto_persistent_dag_graph_scalar_axpy": "2,2",
@@ -1091,7 +1113,8 @@ def _apply_preset(args: argparse.Namespace) -> None:  # noqa: PLR0912
     if not args.require_machine:
         args.require_machine = list(PAIRED_CURRENT_MACHINES)
     if not args.require_baseline:
-        args.require_baseline = list(PAIRED_CURRENT_BASELINES)
+        baselines = COMPACT_CURRENT_BASELINES if args.preset == "compact-current" else PAIRED_CURRENT_BASELINES
+        args.require_baseline = list(baselines)
     if not args.require_size:
         sizes = COMPACT_CURRENT_SIZES if args.preset == "compact-current" else PAIRED_CURRENT_SIZES
         args.require_size = [str(size) for size in sizes]

@@ -73,6 +73,9 @@ latest multi-size tensor baseline sweep uses `e79edba2`:
 - [Current capture](evaluation-current.md) records the compact `c0d327d2`
   paired gate that promotes graph node `inputs`/`outputs` metadata into the
   selected A100/H200 benchmark matrix with 98 validated samples.
+- [Current capture](evaluation-current.md) records the compact `95be2b5b`
+  paired gate that promotes graph named-callable task metadata into the
+  selected A100/H200 benchmark matrix with 96 non-batch validated samples.
 - [Current capture](evaluation-current.md) records the `1c683c1c` lifecycle
   matrix that adds graph tensor-core descriptors to the paired repeat-run
   prepared-callable validation path.
@@ -280,6 +283,19 @@ that gate by default.
 - `pto_persistent_dag_graph`: generated-dispatch DAG that reads an explicit
   runtime graph descriptor before downstream fan-in. This row validates the
   same graph-lowering shape used by `persistent_dag_graph_f32`.
+- `pto_persistent_dag_graph_node_attrs`: explicit graph-descriptor row that
+  records scalar/tensor node attributes in report-visible metadata.
+- `pto_persistent_dag_graph_node_io`: explicit graph-descriptor row that
+  records node `inputs` / `outputs` task-argument metadata.
+- `pto_persistent_dag_graph_node_link`: explicit graph-descriptor row that
+  accepts node-link style graph spelling and records graph-node ops.
+- `pto_persistent_dag_graph_named_callable`: explicit graph-descriptor row
+  that records callable names in task-argument metadata while dispatching the
+  same add/mul/add device task functions.
+- `pto_persistent_dag_graph_node_op`: explicit graph-descriptor row that
+  records node `op` callable aliases in graph-node ops metadata.
+- `pto_persistent_dag_graph_depends_on`: explicit graph-descriptor row that
+  accepts incoming `depends_on` edge spelling.
 - `pto_persistent_dag_graph_chain`: explicit graph-descriptor variant of the
   five-task chain DAG, validating that the benchmark path can time the chain
   shape from graph metadata rather than a fixed DAG adapter.

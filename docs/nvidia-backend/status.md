@@ -311,6 +311,8 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_graph_generic_args4`;
 - `pto_persistent_dag_graph_node_attrs`;
 - `pto_persistent_dag_graph_node_io`;
+- `pto_persistent_dag_graph_node_link`;
+- `pto_persistent_dag_graph_named_callable`;
 - `pto_persistent_dag_graph_node_op`;
 - `pto_persistent_dag_graph_depends_on`;
 - `pto_persistent_dag_graph_scalar_axpy`;
@@ -4487,6 +4489,54 @@ scheduler errors, dispatch `[1,2,1]`, graph fan-in `[0,0,2]`, graph dependents
 `task1=callable:mul,input:a,input:b,output:tmp1;`
 `task2=callable:add,input:a,input:b,output:out`. Device times were
 `66560 ns` on A100 and `42784 ns` on H200.
+
+The same named-callable graph descriptor is now part of the selected paired
+benchmark matrix as `pto_persistent_dag_graph_named_callable`. The compact
+paired benchmark gate uses `--batch-tasks 0` as the no-batch sentinel, so the
+paired runner and `compact-current` validator now normalize that value away
+and require `96` A100/H200 samples: `48` selected non-batch rows on each
+machine. The focused TDD selector first failed because the compact validator
+still expected batch rows and `104` samples for this no-batch command. After
+normalizing zero batch sweeps in `cuda_pair_benchmark.py` and splitting the
+compact baseline list from the full paired-current list in
+`cuda_validate_capture.py`, the selector passed:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_benchmark_report.py \
+  -q -k 'compact_current_preset_matches_docs_gate or \
+omits_empty_batch_sweeps or treats_zero_batch_sweeps_as_empty or \
+validate_command_matches_configured_capture' --platform cuda
+```
+
+That run reported `4 passed, 292 deselected`. The compact A100/H200 capture
+under:
+
+```text
+tmp/cuda-backend/persistent-named-callable-baseline-working/combined-current-95be2b5b/
+```
+
+passes:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  ROOT=tmp/cuda-backend/persistent-named-callable-baseline-working \
+  .venv/bin/python \
+    .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
+    "$ROOT"/combined-current-95be2b5b/cuda-benchmark.json \
+    --preset compact-current
+```
+
+It validates source-paper provenance, sanitized command examples, graph
+topology/task-argument reports, tensor-throughput reports, and zero scheduler
+errors. The named-callable benchmark rows were:
+
+- A100: `pto_persistent_dag_graph_named_callable`, `n=1024`,
+  dispatch `1,2,1`, fan-in `0,0,2`, dependents `2,2`, task arg key
+  `named_callable`, `33792 ns`.
+- H200: `pto_persistent_dag_graph_named_callable`, `n=1024`,
+  dispatch `1,2,1`, fan-in `0,0,2`, dependents `2,2`, task arg key
+  `named_callable`, `25728 ns`.
 
 Needed:
 

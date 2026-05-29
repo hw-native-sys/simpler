@@ -1720,6 +1720,15 @@ def run_single_sample(  # noqa: PLR0912
             baseline=baseline,
             dag_shape="graph_descriptor_node_link",
         )
+    if baseline == "pto_persistent_dag_graph_named_callable":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="graph_descriptor_named_callable",
+        )
     if baseline == "pto_persistent_dag_graph_node_op":
         return run_persistent_sample(
             device=device,
@@ -2100,6 +2109,7 @@ def run_benchmark(
                     "pto_persistent_dag_graph_node_attrs",
                     "pto_persistent_dag_graph_node_io",
                     "pto_persistent_dag_graph_node_link",
+                    "pto_persistent_dag_graph_named_callable",
                     "pto_persistent_dag_graph_node_op",
                     "pto_persistent_dag_graph_depends_on",
                     "pto_persistent_dag_graph_scalar_axpy",
@@ -3257,6 +3267,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  fields over the add/mul/add descriptor shape accepted by SceneTestCase.",
             "- `pto_persistent_dag_graph_node_link` uses node-link graph",
             "  descriptors with node id/data payloads and link edge metadata.",
+            "- `pto_persistent_dag_graph_named_callable` records graph callable",
+            "  names while validating the same add/mul/add descriptor dispatch.",
             "- `pto_persistent_dag_graph_node_op` uses graph node `op` callable aliases",
             "  over the add/mul/add descriptor shape accepted by SceneTestCase.",
             "- `pto_persistent_dag_graph_chain` uses a five-task explicit graph",
@@ -3439,6 +3451,7 @@ def main() -> None:
             "pto_persistent_dag_graph_node_attrs",
             "pto_persistent_dag_graph_node_io",
             "pto_persistent_dag_graph_node_link",
+            "pto_persistent_dag_graph_named_callable",
             "pto_persistent_dag_graph_node_op",
             "pto_persistent_dag_graph_depends_on",
             "pto_persistent_dag_graph_scalar_axpy",

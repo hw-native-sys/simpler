@@ -45,6 +45,7 @@ BASELINE_ROWS: tuple[str, ...] = (
     "pto_persistent_dag_graph_node_attrs",
     "pto_persistent_dag_graph_node_io",
     "pto_persistent_dag_graph_node_link",
+    "pto_persistent_dag_graph_named_callable",
     "pto_persistent_dag_graph_node_op",
     "pto_persistent_dag_graph_depends_on",
     "pto_persistent_dag_graph_scalar_axpy",
@@ -91,6 +92,7 @@ EXPECTED_DISPATCH_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_node_attrs": "9,2,1",
     "pto_persistent_dag_graph_node_io": "1,2,1",
     "pto_persistent_dag_graph_node_link": "1,2,1",
+    "pto_persistent_dag_graph_named_callable": "1,2,1",
     "pto_persistent_dag_graph_node_op": "1,2,1",
     "pto_persistent_dag_graph_depends_on": "1,2,1",
     "pto_persistent_dag_graph_scalar_axpy": "4,2,1",
@@ -145,11 +147,17 @@ EXPECTED_GRAPH_TASK_ARGS_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_node_io": (
         "task0=input:a,input:b,output:tmp0;task1=input:a,input:b,output:tmp1;task2=input:a,input:b,output:out"
     ),
+    "pto_persistent_dag_graph_named_callable": (
+        "task0=callable:add,input:a,input:b,output:tmp0;"
+        "task1=callable:mul,input:a,input:b,output:tmp1;"
+        "task2=callable:add,input:a,input:b,output:out"
+    ),
 }
 EXPECTED_GRAPH_TASK_ARG_KEY_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_role_keyed_inout": "role",
     "pto_persistent_dag_graph_compact_role_inout": "compact",
     "pto_persistent_dag_graph_pair_inout": "pair",
+    "pto_persistent_dag_graph_named_callable": "named_callable",
     "pto_persistent_dag_graph_node_io": "node_io",
 }
 EXPECTED_GRAPH_NODE_ATTRS_BY_BASELINE: dict[str, str] = {
@@ -157,6 +165,7 @@ EXPECTED_GRAPH_NODE_ATTRS_BY_BASELINE: dict[str, str] = {
 }
 EXPECTED_GRAPH_NODE_OPS_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_node_link": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
+    "pto_persistent_dag_graph_named_callable": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
     "pto_persistent_dag_graph_node_op": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
 }
 EXPECTED_SCALAR_ARGS_BY_BASELINE: dict[str, str] = {
@@ -171,6 +180,7 @@ EXPECTED_GRAPH_FANIN_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_node_attrs": "0,0,2",
     "pto_persistent_dag_graph_node_io": "0,0,2",
     "pto_persistent_dag_graph_node_link": "0,0,2",
+    "pto_persistent_dag_graph_named_callable": "0,0,2",
     "pto_persistent_dag_graph_node_op": "0,0,2",
     "pto_persistent_dag_graph_depends_on": "0,0,2",
     "pto_persistent_dag_graph_scalar_axpy": "0,0,2",
@@ -197,6 +207,7 @@ EXPECTED_GRAPH_DEPENDENTS_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_node_attrs": "2,2",
     "pto_persistent_dag_graph_node_io": "2,2",
     "pto_persistent_dag_graph_node_link": "2,2",
+    "pto_persistent_dag_graph_named_callable": "2,2",
     "pto_persistent_dag_graph_node_op": "2,2",
     "pto_persistent_dag_graph_depends_on": "2,2",
     "pto_persistent_dag_graph_scalar_axpy": "2,2",
@@ -249,6 +260,14 @@ class PairedBenchmarkConfig:
 
 def _csv(values: Sequence[int]) -> str:
     return ",".join(str(value) for value in values)
+
+
+def _batch_task_values(config: PairedBenchmarkConfig) -> tuple[int, ...]:
+    return tuple(value for value in config.batch_tasks if value > 0)
+
+
+def _grid_worker_blocks_per_task(config: PairedBenchmarkConfig) -> tuple[int, ...]:
+    return tuple(value for value in config.worker_blocks_per_task if value > 1)
 
 
 def _git_commit(runner: Runner = subprocess.run) -> str:
@@ -317,8 +336,9 @@ def _benchmark_args(
         "--output-dir",
         str(output_dir),
     ]
-    if config.batch_tasks:
-        args.extend(["--batch-tasks", _csv(config.batch_tasks)])
+    batch_task_values = _batch_task_values(config)
+    if batch_task_values:
+        args.extend(["--batch-tasks", _csv(batch_task_values)])
         if config.worker_blocks_per_task:
             args.extend(["--worker-blocks-per-task", _csv(config.worker_blocks_per_task)])
     return args
@@ -458,17 +478,17 @@ def _combined_label(local_commit: str, remote_commit: str | None = None) -> str:
 
 def _selected_baselines(config: PairedBenchmarkConfig) -> list[str]:
     baselines = list(BASELINE_ROWS)
-    if config.batch_tasks:
+    if _batch_task_values(config):
         baselines.extend(BATCH_ROWS)
-        if config.worker_blocks_per_task:
+        if _grid_worker_blocks_per_task(config):
             baselines.append(GRID_BATCH_ROW)
     return baselines
 
 
 def _expected_result_count(config: PairedBenchmarkConfig) -> int:
     rows_per_size_repeat = len(BASELINE_ROWS)
-    rows_per_size_repeat += len(config.batch_tasks) * len(BATCH_ROWS)
-    rows_per_size_repeat += len(config.batch_tasks) * len(config.worker_blocks_per_task)
+    rows_per_size_repeat += len(_batch_task_values(config)) * len(BATCH_ROWS)
+    rows_per_size_repeat += len(_batch_task_values(config)) * len(_grid_worker_blocks_per_task(config))
     return 2 * len(config.sizes) * config.repeats * rows_per_size_repeat
 
 
