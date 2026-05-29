@@ -151,48 +151,57 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-    for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
-        uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
-        uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
-        uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
-        for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
-            CYCLE_COUNT_LAP(prof_scope_and_loop);
-            PTO2_SCOPE() {
-                uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
+    // Two-pass emission: pre-emit ALL QKs in an outer scope so AICore can
+    // start its first wave immediately, then run the original per-(b,q)
+    // depth-first loop for SF/PV/UP referencing the already-emitted QK
+    // outputs. Compared to the original depth-first emission, orch hands
+    // 256 independent QKs to wiring back-to-back at the start instead of
+    // 1 QK every 4-task quartet.
+    //
+    // Outer scope holds 256 QKs; each inner scope holds 3 tasks
+    // (SF/PV/UP). SF reads sij_buf produced in the outer scope —
+    // cross-scope dependency is wired by add_input via the Tensor's
+    // owning-task metadata.
+    //
+    // Tensor's default ctor is private, so sij_buf storage uses a
+    // placement-new wrapper.
+    static constexpr size_t MAX_BQ = 256;
+    struct TensorSlot {
+        alignas(alignof(Tensor)) unsigned char buf[sizeof(Tensor)];
+        Tensor &get() { return *reinterpret_cast<Tensor *>(buf); }
+        void set(const Tensor &src) { new (buf) Tensor(src); }
+    };
 
+    PTO2_SCOPE() {  // outer scope: pre-emit QKs
+        // Per-(b,q) carry: QK output + n_blocks + valid_len_last needed
+        // by SF in pass 2.
+        TensorSlot sij_buf_arr[MAX_BQ];
+        uint64_t n_blocks_arr[MAX_BQ];
+        uint64_t valid_len_arr[MAX_BQ];
+        size_t n_bq = 0;
+
+        Arg params_qk;
+
+        // === Pass 1: emit ALL QKs back-to-back ===
+        for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
+            uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
+            uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
+            uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
+            for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
+                uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
                 uint32_t qi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
                 uint32_t qi_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
                 Tensor qi = query.view(qi_shapes, qi_offsets);
-                uint32_t out_view_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
-                uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                Tensor out_view = out.view(out_view_shapes, out_view_offsets, true);
 #ifdef ENABLE_PROFILING
-                prof_view_count += 2;
+                prof_view_count += 1;
                 CYCLE_COUNT_LAP(prof_tensor_view);
 #endif
-                CYCLE_COUNT_LAP(prof_param_setup);
-                TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_ci, scalar_ci);
-                const Tensor &oi = alloc_outs.get_ref(0);
-                const Tensor &li_update = alloc_outs.get_ref(1);
-                const Tensor &mi_update = alloc_outs.get_ref(2);
-#ifdef ENABLE_PROFILING
-                prof_submit_count++;
-                CYCLE_COUNT_LAP(prof_submit_task);
-#endif
-
-                // Reusable Arg objects — reset() before each use avoids
-                // repeated stack-frame construction in the inner loop.
-                Arg params_qk, params_sf, params_pv, params_up;
-
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
                     uint64_t n_blocks = std::min(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
-
-                    // Valid length for last block in this group
                     uint64_t last_block_seq_start = (bn + n_blocks - 1) * block_size;
                     uint64_t valid_len_last = std::min(block_size, cur_seq - last_block_seq_start);
                     CYCLE_COUNT_LAP(prof_param_extract);
 
-                    // === Task 1: Batched QK matmul ===
                     uint32_t sij_buf_shapes[2] = {
                         static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
                     };
@@ -208,66 +217,100 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_qk.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
-                    const Tensor &sij_buf = qk_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 #endif
-
-                    // === Task 2: Two-pass softmax over all blocks in group ===
-                    uint32_t pij_buf_shapes[2] = {
-                        static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
-                    };
-                    TensorCreateInfo pij_buf_ci(pij_buf_shapes, 2, data_type);
-#ifdef ENABLE_PROFILING
-                    prof_make_count += 1;
-                    CYCLE_COUNT_LAP(prof_make_tensor);
-#endif
-
-                    params_sf.reset();
-                    params_sf.add_input(sij_buf);
-                    params_sf.add_output(pij_buf_ci, scalar_ci, scalar_ci);
-                    params_sf.add_scalar(scale_value, n_blocks, valid_len_last);
-                    CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
-                    const Tensor &pij_buf = sf_outs.get_ref(0);
-                    const Tensor &mi = sf_outs.get_ref(1);
-                    const Tensor &li = sf_outs.get_ref(2);
-#ifdef ENABLE_PROFILING
-                    prof_submit_count++;
-                    CYCLE_COUNT_LAP(prof_submit_task);
-#endif
-
-                    // === Task 3: SplitK PV matmul (accumulated P @ V) ===
-                    params_pv.reset();
-                    params_pv.add_input(pij_buf, value_cache, block_table);
-                    params_pv.add_output(tile2d_ci);
-                    params_pv.add_scalar(n_blocks, b_idx * block_num + bn);
-                    CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
-                    const Tensor &oi_new = pv_outs.get_ref(0);
-#ifdef ENABLE_PROFILING
-                    prof_submit_count++;
-                    CYCLE_COUNT_LAP(prof_submit_task);
-#endif
-
-                    // === Task 4: Online update (per-group) ===
-                    uint64_t is_first = (bn == 0) ? 1 : 0;
-                    uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
-
-                    params_up.reset();
-                    params_up.add_input(mi, li, oi_new);
-                    params_up.add_inout(mi_update, li_update, oi, out_view);
-                    params_up.add_scalar(is_first, is_last);
-                    CYCLE_COUNT_LAP(prof_param_setup);
-                    rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
-#ifdef ENABLE_PROFILING
-                    prof_submit_count++;
-                    CYCLE_COUNT_LAP(prof_submit_task);
-#endif
+                    sij_buf_arr[n_bq].set(qk_outs.get_ref(0));
+                    n_blocks_arr[n_bq] = n_blocks;
+                    valid_len_arr[n_bq] = valid_len_last;
+                    n_bq++;
                 }
             }
-            CYCLE_COUNT_LAP(prof_scope_and_loop);
+        }
+
+        // === Pass 2: per (b,q) — inner scope, emit SF/PV/UP referencing
+        //             the QK outputs pre-emitted in the outer scope. ===
+        size_t bq_idx = 0;
+        Arg params_sf, params_pv, params_up;
+        for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
+            uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
+            uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
+            uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
+            for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
+                CYCLE_COUNT_LAP(prof_scope_and_loop);
+                PTO2_SCOPE() {  // inner scope: SF/PV/UP for this (b,q)
+                    uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
+                    uint32_t out_view_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
+                    uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
+                    Tensor out_view = out.view(out_view_shapes, out_view_offsets, true);
+#ifdef ENABLE_PROFILING
+                    prof_view_count += 1;
+                    CYCLE_COUNT_LAP(prof_tensor_view);
+#endif
+                    TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_ci, scalar_ci);
+                    const Tensor &oi = alloc_outs.get_ref(0);
+                    const Tensor &li_update = alloc_outs.get_ref(1);
+                    const Tensor &mi_update = alloc_outs.get_ref(2);
+
+                    for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
+                        uint64_t n_blocks = n_blocks_arr[bq_idx];
+                        uint64_t valid_len_last = valid_len_arr[bq_idx];
+
+                        // SF (depends on QK from outer scope)
+                        uint32_t pij_buf_shapes[2] = {
+                            static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
+                        };
+                        TensorCreateInfo pij_buf_ci(pij_buf_shapes, 2, data_type);
+#ifdef ENABLE_PROFILING
+                        prof_make_count += 1;
+                        CYCLE_COUNT_LAP(prof_make_tensor);
+#endif
+                        params_sf.reset();
+                        params_sf.add_input(sij_buf_arr[bq_idx].get());
+                        params_sf.add_output(pij_buf_ci, scalar_ci, scalar_ci);
+                        params_sf.add_scalar(scale_value, n_blocks, valid_len_last);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                        TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
+                        const Tensor &pij_buf = sf_outs.get_ref(0);
+                        const Tensor &mi = sf_outs.get_ref(1);
+                        const Tensor &li = sf_outs.get_ref(2);
+#ifdef ENABLE_PROFILING
+                        prof_submit_count++;
+                        CYCLE_COUNT_LAP(prof_submit_task);
+#endif
+
+                        // PV (depends on SF)
+                        params_pv.reset();
+                        params_pv.add_input(pij_buf, value_cache, block_table);
+                        params_pv.add_output(tile2d_ci);
+                        params_pv.add_scalar(n_blocks, b_idx * block_num + bn);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                        TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
+                        const Tensor &oi_new = pv_outs.get_ref(0);
+#ifdef ENABLE_PROFILING
+                        prof_submit_count++;
+                        CYCLE_COUNT_LAP(prof_submit_task);
+#endif
+
+                        // UP (depends on SF + PV)
+                        uint64_t is_first = (bn == 0) ? 1 : 0;
+                        uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
+                        params_up.reset();
+                        params_up.add_input(mi, li, oi_new);
+                        params_up.add_inout(mi_update, li_update, oi, out_view);
+                        params_up.add_scalar(is_first, is_last);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                        rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+#ifdef ENABLE_PROFILING
+                        prof_submit_count++;
+                        CYCLE_COUNT_LAP(prof_submit_task);
+#endif
+                        bq_idx++;
+                    }
+                }
+                CYCLE_COUNT_LAP(prof_scope_and_loop);
+            }
         }
     }
     CYCLE_COUNT_LAP(prof_scope_and_loop);
