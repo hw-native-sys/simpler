@@ -333,7 +333,7 @@ descriptor fields: the first four inputs become `a`/`b`/`c`/`d`, additional
 inputs append to `tensor_args`, and the single output becomes `out`. This is
 still host-side descriptor construction, but it reduces the gap between normal
 task-argument metadata and the persistent-device runtime ABI.
-Graph tasks can now name a callable through `callable` when
+Graph tasks can now name a callable through `callable` or `op` when
 `graph.callables` maps that name to callable metadata such as `func_id`.
 `graph.callables` may be a dictionary keyed by callable name or a list of
 callable specs with `name` fields, which matches the list-shaped callable
@@ -344,11 +344,12 @@ callable-id shape used elsewhere in scene tests. A list entry only needs
 unnamed callable specs, or the compact integer form where each list element is
 the generated-dispatch `func_id`. Dictionary registries may also use compact
 integer values such as `{"add": 1}`. The task-local fields override callable
-defaults before role-keyed `task_args` are lowered, so a scene graph can use
-named or indexed callables plus TaskArgs-like roles instead of repeating raw
-generated-dispatch IDs on every task. This is still not full capture of a live
-PTO orchestrator graph, but it moves descriptor construction closer to the
-normal `submit_next_level(callable, TaskArgs, ...)` shape.
+defaults before role-keyed `task_args` and node IO fields are lowered, so a
+scene graph can use named or indexed callables plus TaskArgs-like roles
+instead of repeating raw generated-dispatch IDs on every task. This is still
+not full capture of a live PTO orchestrator graph, but it moves descriptor
+construction closer to the normal `submit_next_level(callable, TaskArgs, ...)`
+shape.
 Graph tasks may also carry `name` and use those names in outgoing
 `dependents` or incoming `depends_on` / `dependencies`. This preserves both
 edge-list styles while avoiding fragile numeric task IDs in descriptor specs.

@@ -1282,8 +1282,8 @@ For compact graph specs, a task arg may also be written as a single role-keyed
 dictionary such as `{"input": "a"}`, `{"output": "tmp0"}`,
 `{"inout": "tmp0"}`, or `{"output_existing": "out"}`. Do not mix this compact
 form with `tensor`/`name` plus `role`/`tag` in the same task-arg entry.
-Graph tasks may use a `callable` name instead of embedding `func_id` directly
-when `graph.callables` maps that name to callable metadata such as
+Graph tasks may use a `callable` or `op` name instead of embedding `func_id`
+directly when `graph.callables` maps that name to callable metadata such as
 `{"func_id": 9}`. `graph.callables` may be either a dictionary keyed by
 callable name or a list of callable specs with `name` fields, matching the
 list-shaped callable registries used elsewhere in scene tests. For list-shaped
@@ -1293,9 +1293,10 @@ index-based graphs may use unnamed callable specs, or the compact integer
 form where each list element is the generated-dispatch `func_id`. Dictionary
 registries may also use compact integer values such as `{"add": 1}`. The
 task-local fields override callable defaults, and the adapter resolves the
-callable before role-keyed `task_args`, temporary allocation, and tensor-flow
-edge inference. Use this form when checking the scene-test step toward normal
-PTO task graphs with indexed or named callables and task-argument roles.
+callable before role-keyed `task_args`, node IO fields, temporary allocation,
+and tensor-flow edge inference. Use this form when checking the scene-test
+step toward normal PTO task graphs with indexed or named callables and
+task-argument roles.
 Validate the list-shaped callable registry path with:
 
 ```bash

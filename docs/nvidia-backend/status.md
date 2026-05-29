@@ -1929,6 +1929,14 @@ avoid embedding `a`/`b`/`out` ABI field names directly. The ctypes-backed
 deselected`; the full local A100 CUDA scene-test file passed with
 `117 passed`; and the H200 selector passed with `1 passed, 116 deselected`
 while still emitting the known PTO-ISA SSH refresh warning.
+Graph nodes may now use `op` as an alias for `callable`, resolved through
+`graph.callables` before node IO fields are lowered. This lets node
+descriptors keep an operation-name spelling while still producing the same
+generated-dispatch `func_id` task array. The ctypes-backed
+`node_op_graph_with_ctypes_data` scene passed locally with `2 passed, 117
+deselected`; the full local A100 CUDA scene-test file passed with
+`119 passed`; and the H200 selector passed with `1 passed, 118 deselected`
+while still emitting the known PTO-ISA SSH refresh warning.
 The incoming-edge path is now covered by both a real-data L2 ctypes scene and
 paired persistent-device smoke. The working-tree smoke capture under
 `tmp/cuda-backend/depends-on-graph-working/persistent-graph_descriptor_depends_on-repeat2-smoke-06b988b5/`
@@ -3656,7 +3664,7 @@ Needed:
   inference, explicit outgoing and incoming graph edges with scalar or
   list-valued named task dependencies, top-level graph edge lists and
   adjacency dictionaries, `graph.nodes` aliases, node-style IO fields,
-  and paired smoke,
+  node `op` callable aliases, and paired smoke,
   dictionary-keyed graph task descriptors,
   tagged TaskArgs-like graph task lowering including `inout` producer
   chaining, named graph-callable resolution, explicit unary square graph

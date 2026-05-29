@@ -1318,6 +1318,11 @@ class _CudaPersistentDagSceneBuffers:
     @staticmethod
     def _resolve_graph_task_callable(graph: dict[str, Any], task_spec: dict[str, Any]) -> dict[str, Any]:
         callable_name = task_spec.get("callable")
+        op_name = task_spec.get("op")
+        if callable_name is not None and op_name is not None and str(callable_name) != str(op_name):
+            raise ValueError("CUDA persistent_dag_graph_f32 graph task cannot use conflicting callable and op values")
+        if callable_name is None:
+            callable_name = op_name
         if callable_name is None:
             return task_spec
 
@@ -1332,6 +1337,7 @@ class _CudaPersistentDagSceneBuffers:
         resolved = dict(callable_spec)
         resolved.update(task_spec)
         resolved.pop("callable", None)
+        resolved.pop("op", None)
         return resolved
 
     @staticmethod
