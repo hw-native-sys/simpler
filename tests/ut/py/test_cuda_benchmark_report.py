@@ -839,6 +839,9 @@ def test_cuda_artifact_index_scans_benchmark_outputs(tmp_path):
             "baselines": ["direct_driver_graph"],
             "sizes": [1024],
             "tensor_tiles": [],
+            "dispatches": [],
+            "graph_task_arg_keys": [],
+            "graph_task_args": [],
             "source_papers": [],
             "has_command_examples": False,
             "has_markdown": True,
@@ -867,7 +870,7 @@ def test_cuda_artifact_index_renders_markdown_and_writes_default_index(tmp_path)
     assert "# CUDA Backend Artifact Index" in report
     assert (
         "| a100-graph | benchmark | a100-graph | hina | abc123 | 1 | 1024 |  |  |  |  |  |  |  |  |  |  | "
-        " | no | direct_driver_graph |"
+        " |  | no | direct_driver_graph |"
     ) in report
     assert "ratio SVG" in report
     assert "DAG delta SVG" in report
@@ -905,6 +908,46 @@ def test_cuda_artifact_index_records_benchmark_tensor_tiles(tmp_path):
 
     assert entries[0]["tensor_tiles"] == ["8x4x12"]
     assert "| combined-tensorflags | benchmark | tensorflags | combined | abc123 | 1 | 64 | 8x4x12 |" in report
+
+
+def test_cuda_artifact_index_records_benchmark_graph_task_arg_keys(tmp_path):
+    cuda_artifact_index = _load_artifact_index_module()
+    artifact_dir = tmp_path / "combined-role-keyed"
+    artifact_dir.mkdir()
+    payload = {
+        "metadata": {
+            "label": "role-keyed",
+            "git_commit": "abc123",
+            "machine": "combined",
+        },
+        "results": [
+            {
+                "baseline": "pto_persistent_dag_graph_role_keyed_inout",
+                "n": 1024,
+                "device_wall_ns": 10,
+                "dispatch_func_ids": [1, 1, 1],
+                "graph_task_arg_key": "role",
+                "graph_task_args": {
+                    "task0": "input:a,input:b,output:tmp1",
+                    "task1": "inout:tmp1,input:b",
+                    "task2": "input:tmp1,input:a,output_existing:out",
+                },
+            }
+        ],
+    }
+    (artifact_dir / "cuda-benchmark.json").write_text(json.dumps(payload) + "\n")
+
+    entries = cuda_artifact_index.scan_artifacts(tmp_path)
+    report = cuda_artifact_index.render_markdown(entries)
+
+    assert entries[0]["dispatches"] == ["1,1,1"]
+    assert entries[0]["graph_task_arg_keys"] == ["role"]
+    assert entries[0]["graph_task_args"] == [
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    ]
+    assert "1,1,1 |" in report
+    assert "role |" in report
+    assert "task1=inout:tmp1,input:b" in report
 
 
 def test_cuda_artifact_index_records_benchmark_source_papers(tmp_path):
@@ -1026,6 +1069,7 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
         },
         "scalar_args": {"scalar0": 1.5},
         "tensor_args": {"c": "tmp0"},
+        "graph_task_arg_key": "role",
         "graph_task_args": {
             "task0": "input:a,input:b,output:tmp1",
             "task1": "input:a,input:b,output:tmp2",
@@ -1070,6 +1114,7 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
             "resource_policies": ["sched=1,workers=2,wp=1,stream=1,block=256,grid=3"],
             "scalar_args": ["scalar0=1.5"],
             "tensor_args": ["c=tmp0"],
+            "graph_task_arg_keys": ["role"],
             "graph_task_args": ["task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2"],
             "tensor_tiles": ["16x16x16"],
             "has_markdown": True,
@@ -1081,13 +1126,15 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
     ]
     assert (
         "Smoke mode | Dispatch | Scheduler errors | Repeat runs | Launch completions | "
-        "Resource policy | Scalar args | Tensor args |"
+        "Resource policy | Scalar args | Tensor args | Graph task arg keys |"
     ) in report
     assert "| tensor-descriptor-smoke | smoke | tensor-smoke | combined | unknown | 2 |" in report
     assert "| 4096 | 16x16x16 | dag/tensor_tile | 3,1,2,1 |" in report
     assert "count=0,code=0,task=0, count=1,code=7,task=3 |" in report
     assert "sched=1,workers=2,wp=1,stream=1,block=256,grid=3 |" in report
-    assert "scalar0=1.5 | c=tmp0 | task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2 |" in report
+    assert (
+        "scalar0=1.5 | c=tmp0 | role | task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2 |"
+    ) in report
 
 
 def test_cuda_artifact_index_records_persistent_smoke_lifecycle_reuse(tmp_path):

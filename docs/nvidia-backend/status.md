@@ -586,7 +586,8 @@ Evidence:
   local `tmp/cuda-backend/` benchmark, tensor-shape sweep, and smoke
   artifacts, including tensor-tile shapes, persistent smoke modes, dispatch
   sequences, scheduler error counters, repeat-run counts, and per-launch
-  completion counts.
+  completion counts, graph task-argument keys, and graph task-argument
+  metadata.
 - `.agents/skills/cuda-backend-eval/SKILL.md` documents the current paired
   A100/H200 recipe.
 

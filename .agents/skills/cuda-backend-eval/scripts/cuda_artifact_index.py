@@ -150,6 +150,11 @@ def _graph_task_args(payload: dict[str, Any]) -> str | None:
     return ";".join(f"{key}={task_args[key]}" for key in sorted(task_args))
 
 
+def _graph_task_arg_key(payload: dict[str, Any]) -> str | None:
+    key = payload.get("graph_task_arg_key")
+    return str(key) if key else None
+
+
 def _read_artifact(path: Path, root: Path) -> dict[str, Any]:
     payload = json.loads((path / "cuda-benchmark.json").read_text())
     metadata = payload.get("metadata", {})
@@ -164,6 +169,15 @@ def _read_artifact(path: Path, root: Path) -> dict[str, Any]:
         "baselines": _sorted_unique({row.get("baseline", "unknown") for row in results}),
         "sizes": _sorted_unique({row.get("n", "unknown") for row in results}),
         "tensor_tiles": _tensor_tile_shapes([payload]),
+        "dispatches": _sorted_unique(
+            {dispatch for row in results for dispatch in (_dispatch_func_ids(row),) if dispatch is not None}
+        ),
+        "graph_task_arg_keys": _sorted_unique(
+            {key for row in results for key in (_graph_task_arg_key(row),) if key is not None}
+        ),
+        "graph_task_args": _sorted_unique(
+            {task_args for row in results for task_args in (_graph_task_args(row),) if task_args is not None}
+        ),
         "source_papers": _source_paper_ids(metadata),
         "has_command_examples": _has_command_examples(metadata),
         "has_markdown": (path / "cuda-benchmark.md").exists(),
@@ -261,6 +275,9 @@ def _read_smoke_artifact(path: Path, root: Path) -> dict[str, Any]:
         "tensor_args": _sorted_unique(
             {tensors for payload in payloads for tensors in (_tensor_args(payload),) if tensors is not None}
         ),
+        "graph_task_arg_keys": _sorted_unique(
+            {key for payload in payloads for key in (_graph_task_arg_key(payload),) if key is not None}
+        ),
         "graph_task_args": _sorted_unique(
             {task_args for payload in payloads for task_args in (_graph_task_args(payload),) if task_args is not None}
         ),
@@ -309,15 +326,17 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
             "| Path | Kind | Label | Machine | Commit | Results | Sizes | "
             "Tensor tile | Smoke mode | Dispatch | Scheduler errors | "
             "Repeat runs | Launch completions | Resource policy | Scalar args | "
-            "Tensor args | Graph task args | Source papers | Commands | Baselines | Markdown | "
-            "SVG | throughput SVG | ratio SVG | DAG delta SVG |"
+            "Tensor args | Graph task arg keys | Graph task args | Source papers | "
+            "Commands | Baselines | Markdown | SVG | throughput SVG | ratio SVG | "
+            "DAG delta SVG |"
         ),
         (
             "| ---- | ---- | ----- | ------- | ------ | ------- | ----- | "
             "----------- | ---------- | -------- | ---------------- | "
             "----------- | ------------------ | --------------- | ----------- | "
-            "----------- | --------------- | ------------- | -------- | --------- | -------- | "
-            "--- | -------------- | --------- | ------------- |"
+            "----------- | ------------------- | --------------- | ------------- | "
+            "-------- | --------- | -------- | --- | -------------- | --------- | "
+            "------------- |"
         ),
     ]
     for entry in entries:
@@ -333,6 +352,7 @@ def render_markdown(entries: list[dict[str, Any]]) -> str:
             f"{_format_list(entry.get('resource_policies', []))} | "
             f"{_format_list(entry.get('scalar_args', []))} | "
             f"{_format_list(entry.get('tensor_args', []))} | "
+            f"{_format_list(entry.get('graph_task_arg_keys', []))} | "
             f"{_format_list(entry.get('graph_task_args', []))} | "
             f"{_format_list(entry.get('source_papers', []))} | "
             f"{_checkmark(entry.get('has_command_examples', False))} | "
