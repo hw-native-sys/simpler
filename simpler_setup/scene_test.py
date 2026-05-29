@@ -1659,11 +1659,16 @@ class _CudaPersistentDagSceneBuffers:
     @staticmethod
     def _graph_task_args_for_normalization(task_spec: dict[str, Any]) -> Any:
         task_args = task_spec.get("task_args")
+        args_alias = task_spec.get("args")
+        if task_args is not None and args_alias is not None:
+            raise ValueError("CUDA persistent_dag_graph_f32 graph tasks cannot use both task_args and args")
         has_node_io_fields = any(field in task_spec for field in _CudaPersistentDagSceneBuffers._GRAPH_NODE_IO_FIELDS)
-        if task_args is not None and has_node_io_fields:
-            raise ValueError("CUDA persistent_dag_graph_f32 graph tasks cannot mix task_args with node IO fields")
+        if (task_args is not None or args_alias is not None) and has_node_io_fields:
+            raise ValueError("CUDA persistent_dag_graph_f32 graph tasks cannot mix args with node IO fields")
         if task_args is not None:
             return task_args
+        if args_alias is not None:
+            return args_alias
         return _CudaPersistentDagSceneBuffers._graph_node_io_task_args(task_spec, has_node_io_fields)
 
     @staticmethod

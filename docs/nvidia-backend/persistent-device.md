@@ -328,6 +328,9 @@ The same graph adapter also accepts a small role-keyed `task_args` form that
 is closer to the normal PTO task argument model. Each entry names a tensor or
 temporary and marks it as `input`, `output`, `output_existing`, or `inout`
 with `role`; the older `tag` spelling remains accepted for compatibility.
+Graph tasks may use `args` as a shorter alias for `task_args`, matching the
+argument slot in `submit_next_level(callable, TaskArgs, ...)` while keeping
+the same role semantics. A graph task must not provide both spellings.
 The scene-test adapter lowers those roles into the current bounded CUDA
 descriptor fields: the first four inputs become `a`/`b`/`c`/`d`, additional
 inputs append to `tensor_args`, and the single output becomes `out`. This is

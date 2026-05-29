@@ -1356,6 +1356,9 @@ with task-local fields taking precedence over conflicting attribute values.
 Graph tasks may alternatively pass role-keyed `task_args` entries with
 `input`, `output`, `output_existing`, or `inout` roles. The adapter prefers
 the `role` key and still accepts the older `tag` spelling for compatibility.
+`args` is accepted as a shorter alias for `task_args`, matching
+`submit_next_level(callable, TaskArgs, ...)` terminology. Do not provide both
+spellings on the same graph task.
 It lowers the first four inputs to `a`/`b`/`c`/`d`, appends any additional
 inputs to `tensor_args`, and lowers the single output to `out`; this is the
 preferred test form when checking the first TaskArgs-like lowering slice.
@@ -1431,6 +1434,14 @@ duplicate logical tensor producers or in-place graph updates:
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
     -q -k 'tagged_inout_graph or role_keyed_inout_graph' --platform cuda
+```
+
+Run the `args` alias selector after changing graph task-argument lowering:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k args_alias --platform cuda
 ```
 
 Run the named-callable graph selector after changing callable-name resolution

@@ -2168,6 +2168,33 @@ before it existed. After adding shared `role`/`tag` normalization, the focused
 local A100 selector reported `2 passed, 91 deselected`; the remote H200
 real-data selector reported `1 passed, 92 deselected` with the known PTO-ISA
 SSH refresh warning.
+Graph task descriptors now also accept `args` as a short alias for
+`task_args`, matching the argument slot in
+`submit_next_level(callable, TaskArgs, ...)` more closely while preserving
+the same role-keyed lowering. The descriptor-only regression first failed
+with fan-in `[0,0,0]` because `args` was ignored. After wiring the alias into
+the same normalization path, the local A100 selector:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k 'args_alias' --platform cuda
+```
+
+reported `2 passed, 121 deselected`, covering both the descriptor and a
+ctypes-backed real-data persistent-device graph scene. The same synced
+working tree on H200:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && CUDA_HOME=/usr/local/cuda \
+   PATH=/usr/local/cuda/bin:$PATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+   PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+   tests/ut/py/test_cuda_scene_test.py -q -k args_alias --platform cuda'
+```
+
+also reported `2 passed, 121 deselected`, after the known PTO-ISA SSH refresh
+warning.
 The role mapping now preserves the lifecycle distinction needed by CUDA
 memory planning: role `output` may create a default-sized temporary, but
 roles `output_existing` and `inout` must name storage that is already known at
