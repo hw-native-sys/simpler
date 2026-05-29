@@ -1957,12 +1957,15 @@ task name/id or a list of task names/ids. The real-data
 `graph_with_ctypes_data` scene now uses scalar named outgoing dependents and
 passed on local A100 and remote H200; the H200 run printed the known PTO-ISA
 SSH refresh warning before pytest reported `1 passed, 104 deselected`.
-The graph adapter also accepts a top-level `edges` list with either
-`{"from": <task>, "to": <task>}` dictionaries or two-item endpoint pairs. The
-ctypes-backed `edge_list_graph_with_ctypes_data` scene passed locally on A100
-with pytest reporting `5 passed, 102 deselected` for the focused selector and
-remotely on H200 with pytest reporting `1 passed, 106 deselected`; the H200
-run printed the known PTO-ISA SSH refresh warning first.
+The graph adapter also accepts a top-level `edges` list with
+`{"from": <task>, "to": <task>}` dictionaries, two-item endpoint pairs, or
+`"<source> -> <target>"` strings. The ctypes-backed
+`edge_list_graph_with_ctypes_data` scene passed locally on A100 with pytest
+reporting `5 passed, 102 deselected` for the focused selector and remotely on
+H200 with pytest reporting `1 passed, 106 deselected`; the H200 run printed
+the known PTO-ISA SSH refresh warning first. The new string-edge selector
+first failed at `_graph_edge_endpoints`, then passed on local A100 and remote
+H200 with pytest reporting `2 passed, 125 deselected` on both systems.
 The same graph-shaped path now accepts `graph.tasks` as a dictionary keyed by
 task name, so descriptor specs can keep node names in one place and reference
 those names from top-level edges. The ctypes-backed
@@ -4097,8 +4100,9 @@ Needed:
   automatic default temporary allocation, logical-output/storage-output
   separation for scratch reuse, order-independent tensor-flow dependency
   inference, explicit outgoing and incoming graph edges with scalar or
-  list-valued named task dependencies, top-level graph edge lists and
-  adjacency dictionaries, `graph.nodes` aliases, node-style IO fields,
+  list-valued named task dependencies, top-level graph edge lists including
+  string `source -> target` entries, adjacency dictionaries, `graph.nodes`
+  aliases, node-style IO fields,
   node `op` callable aliases, and paired smoke,
   dictionary-keyed graph task descriptors,
   tagged TaskArgs-like graph task lowering including `inout` producer

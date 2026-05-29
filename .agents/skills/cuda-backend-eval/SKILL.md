@@ -1338,7 +1338,8 @@ normal named PTO task graphs and avoid renumbering errors when inserting
 tasks.
 Each edge field may be a single task name/id or a list of task names/ids.
 For a more graph-shaped descriptor, use top-level `graph.edges` entries such
-as `{"from": "producer", "to": "consumer"}` or two-item endpoint pairs.
+as `{"from": "producer", "to": "consumer"}`, two-item endpoint pairs, or
+`"producer -> consumer"` strings.
 `graph.edges` may also be an adjacency dictionary such as
 `{"producer": ["consumer"]}`.
 `graph.tasks` may be a list of task dictionaries or a dictionary keyed by task

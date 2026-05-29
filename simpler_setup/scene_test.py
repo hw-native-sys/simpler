@@ -1503,9 +1503,14 @@ class _CudaPersistentDagSceneBuffers:
             if source is None or target is None:
                 raise ValueError("CUDA persistent_dag_graph_f32 graph edges must provide from/to endpoints")
             return source, target
+        if isinstance(edge, str):
+            endpoints = edge.split("->")
+            if len(endpoints) != 2 or not endpoints[0].strip() or not endpoints[1].strip():
+                raise ValueError("CUDA persistent_dag_graph_f32 string graph edges must use '<source> -> <target>'")
+            return endpoints[0].strip(), endpoints[1].strip()
         if isinstance(edge, (list, tuple)) and len(edge) == 2:
             return edge[0], edge[1]
-        raise ValueError("CUDA persistent_dag_graph_f32 graph edges must be endpoint pairs or dictionaries")
+        raise ValueError("CUDA persistent_dag_graph_f32 graph edges must be endpoint pairs, dictionaries, or strings")
 
     @staticmethod
     def _graph_task_name_to_id(task_specs: list[dict[str, Any]]) -> dict[str, int]:
