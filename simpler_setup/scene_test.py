@@ -1245,7 +1245,7 @@ class _CudaPersistentDagSceneBuffers:
         for task_spec in task_specs:
             self._bind_graph_task_output_storage(task_spec, ptrs, add_temporary, output_nbytes)
 
-        graph_dependents = self._graph_dependents_from_task_specs(task_specs)
+        graph_dependents = self._graph_dependents_from_task_specs(task_specs, graph.get("edges", []))
         dependents: list[int] = []
         fanin = [0 for _ in task_specs]
         for task_id, task_spec in enumerate(task_specs):
@@ -1361,7 +1361,10 @@ class _CudaPersistentDagSceneBuffers:
             ptrs[str(out_name)] = ptrs[str(storage_name)]
 
     @staticmethod
-    def _graph_dependents_from_task_specs(task_specs: list[dict[str, Any]]) -> list[list[int]]:
+    def _graph_dependents_from_task_specs(
+        task_specs: list[dict[str, Any]],
+        graph_edges: list[Any] | None = None,
+    ) -> list[list[int]]:
         task_name_to_id = _CudaPersistentDagSceneBuffers._graph_task_name_to_id(task_specs)
         producers: dict[str, list[int]] = {}
         for task_id, task_spec in enumerate(task_specs):
@@ -1387,6 +1390,13 @@ class _CudaPersistentDagSceneBuffers:
                     _CudaPersistentDagSceneBuffers._graph_dependent_task_id(dependent, task_name_to_id)
                     for dependent in task_dependents
                 )
+
+        _CudaPersistentDagSceneBuffers._add_graph_edges_to_dependents(
+            dependents,
+            graph_edges or [],
+            task_name_to_id,
+            len(task_specs),
+        )
 
         for task_id, task_spec in enumerate(task_specs):
             dependency_ids = _CudaPersistentDagSceneBuffers._graph_task_dependencies(task_spec, task_name_to_id)
@@ -1417,6 +1427,36 @@ class _CudaPersistentDagSceneBuffers:
                 if task_id not in dependents[producer_id]:
                     dependents[producer_id].append(task_id)
         return dependents
+
+    @staticmethod
+    def _add_graph_edges_to_dependents(
+        dependents: list[list[int]],
+        graph_edges: list[Any],
+        task_name_to_id: dict[str, int],
+        task_count: int,
+    ) -> None:
+        for edge in graph_edges:
+            source, target = _CudaPersistentDagSceneBuffers._graph_edge_endpoints(edge)
+            source_id = _CudaPersistentDagSceneBuffers._graph_dependency_task_id(source, task_name_to_id)
+            target_id = _CudaPersistentDagSceneBuffers._graph_dependent_task_id(target, task_name_to_id)
+            if source_id < 0 or source_id >= task_count:
+                raise ValueError(f"CUDA persistent_dag_graph_f32 edge source task id {source_id} is outside the graph")
+            if target_id < 0 or target_id >= task_count:
+                raise ValueError(f"CUDA persistent_dag_graph_f32 edge target task id {target_id} is outside the graph")
+            if target_id not in dependents[source_id]:
+                dependents[source_id].append(target_id)
+
+    @staticmethod
+    def _graph_edge_endpoints(edge: Any) -> tuple[Any, Any]:
+        if isinstance(edge, dict):
+            source = edge.get("from", edge.get("source", edge.get("src")))
+            target = edge.get("to", edge.get("target", edge.get("dst")))
+            if source is None or target is None:
+                raise ValueError("CUDA persistent_dag_graph_f32 graph edges must provide from/to endpoints")
+            return source, target
+        if isinstance(edge, (list, tuple)) and len(edge) == 2:
+            return edge[0], edge[1]
+        raise ValueError("CUDA persistent_dag_graph_f32 graph edges must be endpoint pairs or dictionaries")
 
     @staticmethod
     def _graph_task_name_to_id(task_specs: list[dict[str, Any]]) -> dict[str, int]:

@@ -1260,6 +1260,8 @@ Prefer named edges for new graph-descriptor tests because they are closer to
 normal named PTO task graphs and avoid renumbering errors when inserting
 tasks.
 Each edge field may be a single task name/id or a list of task names/ids.
+For a more graph-shaped descriptor, use top-level `graph.edges` entries such
+as `{"from": "producer", "to": "consumer"}` or two-item endpoint pairs.
 Graph tasks may alternatively pass role-keyed `task_args` entries with
 `input`, `output`, `output_existing`, or `inout` roles. The adapter prefers
 the `role` key and still accepts the older `tag` spelling for compatibility.

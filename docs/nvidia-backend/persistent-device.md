@@ -352,6 +352,10 @@ Graph tasks may also carry `name` and use those names in outgoing
 `dependents` or incoming `depends_on` / `dependencies`. This preserves both
 edge-list styles while avoiding fragile numeric task IDs in descriptor specs.
 Each edge field may be a single task name/id or a list of task names/ids.
+The graph descriptor may also carry a top-level `edges` list, where each edge
+is either `{"from": <task>, "to": <task>}` or a two-item endpoint pair. This
+keeps node/task metadata separate from dependency metadata when a scene test
+needs a more graph-shaped descriptor.
 Integer task IDs remain accepted, and tensor-flow inference remains the
 fallback when neither outgoing `dependents` nor incoming dependencies are
 provided.
