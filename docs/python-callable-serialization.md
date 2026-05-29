@@ -66,11 +66,14 @@ After children have started, the parent:
 
 1. serializes the callable into the `SPYC` payload;
 2. computes the `PYTHON_SERIALIZED` descriptor and hash digest;
-3. installs a parent-side live `CallableHandle` entry only after target install
-   succeeds;
+3. creates an unpublished parent-side registration entry and handle id;
 4. stages the `SPYC` payload in POSIX shared memory;
 5. broadcasts a Python register control with the staged shm name and digest to
    Python-capable children.
+
+The parent returns the handle only after every target reports success. If any
+target fails, the unpublished entry is removed and confirmed installs are
+cleaned up by digest-owned unregister control.
 
 The child:
 

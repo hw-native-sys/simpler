@@ -9,11 +9,13 @@
 """Worker — unified factory for all hierarchy levels.
 
 Callable identity is exposed as an opaque ``CallableHandle`` returned by
-``Worker.register(callable)``. ``Worker.run`` and the orchestrator's
-``submit_next_level`` / ``submit_sub`` all take this handle — never the raw
-``ChipCallable`` / Python function. L≥3 targets resolve the handle's stable
-SHA-256 digest to a private child-local slot; later Python registrations are
-serialized and sent through the mailbox control plane.
+``Worker.register(callable)``. L2 ``Worker.run`` and hierarchical
+``Orchestrator.submit_next_level`` / ``submit_sub`` consume handles, never raw
+``ChipCallable`` objects. L3+ ``Worker.run`` keeps the existing raw Python
+orchestration-function entry point; that function captures handles and submits
+them through the Orchestrator. L≥3 targets resolve the handle's stable SHA-256
+digest to a private child-local slot; later Python registrations are serialized
+and sent through the mailbox control plane.
 
 Usage::
 
@@ -43,7 +45,7 @@ Usage::
                 platform="a2a3", runtime="tensormap_and_ringbuffer")
     w4 = Worker(level=4, num_sub_workers=1)
     l3_handle = w4.register(my_l3_orch)
-    verify_handle = w4.register(lambda: verify())
+    verify_handle = w4.register(lambda args: verify())
     w4.add_worker(l3)
     w4.init()
 
@@ -51,7 +53,7 @@ Usage::
         orch.submit_next_level(l3_handle, chip_args, config)
         orch.submit_sub(verify_handle)
 
-    w4.run(Task(orch=my_l4_orch))
+    w4.run(my_l4_orch)
     w4.close()
 """
 
@@ -779,7 +781,8 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
     TASK_READY carries a callable digest. The child resolves it to a
     target-local slot, prepares that slot once, then runs it. ``_CTRL_PREPARE``
     is the explicit pre-warm path (parent pushes after init() to amortise the
-    first H2D upload); TASK_READY also lazy-prepares as a safety net.
+    first H2D upload); TASK_READY preserves the historical lazy-prepare safety
+    net when the digest mapping exists but prewarm was missed.
     """
     prepared: set[int] = set()
     while True:

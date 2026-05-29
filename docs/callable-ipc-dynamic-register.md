@@ -97,9 +97,10 @@ No level assumes that a parent slot id matches a child slot id.
 the registration scope reports success. If a register broadcast fails after a
 partial install, the parent sends digest-owned unregister cleanup. If cleanup
 cannot be confirmed, the parent marks that digest uncertain and rejects later
-registration attempts for the same hashid on that Worker. The current local
-broadcast API does not report the exact successful-child set, so the parent
-uses this conservative uncertain state after any register broadcast failure.
+registration attempts for the same hashid on that Worker. The local broadcast
+API returns per-target status, so parent-side cleanup is sent only to targets
+that confirmed install or refcount increment; cleanup failure on any of those
+targets marks the digest uncertain.
 
 `Worker.unregister` is best effort after a handle has been published. The parent
 removes the local handle lifetime and sends digest-owned unregister to active

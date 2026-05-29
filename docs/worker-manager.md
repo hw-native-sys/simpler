@@ -118,13 +118,14 @@ the mailbox for the lifetime of the worker.
 ```cpp
 void WorkerThread::dispatch_process(WorkerDispatch d) {
     TaskSlotState &s = *ring_->slot_state(d.task_slot);
-    uint8_t *m = (uint8_t*)mailbox_ + HEADER_SIZE;
+    char *m = static_cast<char *>(mailbox_);
 
     // Write task data: reserved callable field, config, digest prefix, then
     // length-prefixed TaskArgs blob. Tags are stripped; only
     // [digest][T][S][tensors][scalars] crosses the fork boundary.
-    *reinterpret_cast<uint64_t*>(m)            = 0;
-    *reinterpret_cast<CallConfig*>(m + 8)      = s.config;
+    uint64_t reserved = 0;
+    memcpy(m + MAILBOX_OFF_CALLABLE, &reserved, sizeof(reserved));
+    memcpy(m + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
     memcpy(m + MAILBOX_OFF_TASK_CALLABLE_HASH, s.callable.digest.data(), 32);
     const TaskArgs &args = s.is_group() ? s.task_args_list[d.group_index] : s.task_args;
     write_blob(m + MAILBOX_OFF_TASK_ARGS_BLOB, args);
@@ -144,8 +145,8 @@ void WorkerThread::dispatch_process(WorkerDispatch d) {
 
 Parent-side cost per dispatch:
 
-- One memcpy of `Callable` (8 B) + `CallConfig` (~16 B) + blob (≤~1.7 KB for
-  L3)
+- One reserved `uint64`, one `CallConfig`, one 32-byte digest, and one
+  TaskArgs blob
 - One signal (`write_state`)
 - Poll loop with `sleep_for(50us)` (not busy-wait)
 
@@ -167,23 +168,20 @@ The child inherits the parent's full address space at fork time, so:
 ### 3.3 Mailbox layout
 
 ```text
-offset 0:                              int32  state    (IDLE / TASK_READY / TASK_DONE / SHUTDOWN)
-offset 4:                              int32  error
-offset 8:                              uint64 callable
-offset 16:                             CallConfig config
-offset 16 + sizeof(CallConfig):        bytes  blob:  [int32 T][int32 S][ContinuousTensor × T][uint64_t × S]
+offset 0:                         int32   state
+offset 4:                         int32   error
+offset 8:                         uint64  reserved task callable field
+                                          or control sub-command
+offset 16:                        CallConfig config
+MAILBOX_OFF_TASK_CALLABLE_HASH:   uint8[32] callable digest
+MAILBOX_OFF_TASK_ARGS_BLOB:       bytes [int32 T][int32 S]
+                                        [ContinuousTensor x T][uint64_t x S]
+tail:                             fixed-size NUL-terminated error message
 ```
 
-Sized at WorkerThread construction:
-
-```cpp
-mailbox_size_ = HEADER_SIZE                    // 8 B (state + error)
-              + sizeof(Callable)                // 8 B
-              + sizeof(CallConfig)              // ~16 B
-              + MAX_BLOB_SIZE;                  // per-level, e.g. 1672 B for L3
-```
-
-Per-worker total: ~2 KB. Typical pool: 4-8 workers → ~8-16 KB shm total.
+The current mailbox size is the C++ `MAILBOX_SIZE` constant exported through
+the nanobind module; Python derives its offsets from the same binding where
+possible so the two sides cannot drift silently.
 
 ### 3.4 Shutdown
 

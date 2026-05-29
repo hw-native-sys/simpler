@@ -27,19 +27,29 @@ integer callable id cannot model safely:
    orchestration function must not depend on those slot values being inherited
    or consistent.
 
-The local worker design is materialize-before-dispatch:
+The local worker design is register-before-dispatch:
 
 ```text
 bootstrap workers
 register callable identities
-install target-local executable slots
+install target-local digest -> slot mappings
+prewarm chip executable state when applicable
 dispatch tasks by callable handle
 target worker resolves handle hashid to its local slot
 ```
 
 Runtime demand-fetch is not part of the local worker contract. A child never
 pauses task execution to ask its parent for a missing callable binary;
-registration must materialize executable state before dispatch.
+registration must materialize the target-local identity mapping before
+dispatch. For chip targets, the local implementation also prewarms executable
+state before first use when startup or dynamic register control reaches the
+child before dispatch.
+
+The current chip child loop preserves the historical TASK_READY lazy-prepare
+safety net: if a digest is already registered in the child identity table but
+the explicit prewarm step was missed, the child prepares its private slot in
+the dispatch path and logs a warning. This is not a public cid compatibility
+path and it does not fetch missing callable bytes from the parent.
 
 Introduce `hashid` as the stable callable identity:
 
@@ -334,18 +344,15 @@ new top-level registration requirement for `Worker.run`.
 
 ### Registry Contract
 
-Each target namespace records identity state:
+Each target namespace records local identity state. In the current local
+mailbox implementation this state is intentionally compact:
 
 ```text
 identity_table:
-  hashid -> {
-    local_slot,
-    callable_kind,
-    descriptor_version,
-    payload_digest,
-    ref_count,
-    state,
-  }
+  hashid -> local_slot
+
+identity_refs:
+  hashid -> ref_count
 
 slot_table:
   local_slot -> {
@@ -355,38 +362,32 @@ slot_table:
   }
 ```
 
-States:
-
-- `INSTALLED`: visible to local hashid resolution and subsequent tasks.
-- `TOMBSTONED`: target-local unregister or failed-register cleanup is in
-  progress.
-  The hashid has been removed from local resolution, and the private slot is
-  not reusable until in-flight users have drained.
-- `FAILED`: target state is uncertain or cleanup failed.
-
 `local_slot` is private to the target process. It may appear in local debug
 logs, but it must not appear in public handles, parent-side task slots, or
 control replies.
 
 `hashid` itself is content-derived and is not reused for a different callable.
 Registering the same hashid with a different descriptor or payload is always a
-mismatch error. Tombstone state protects only target-local cleanup and private
-slot reuse; it is not a public hashid reuse guard.
+mismatch error.
 
 Repeated public registrations of the same descriptor increment the target-local
 `ref_count` for that `hashid`. Unregistering one handle decrements the
 refcount; the target removes local resolution and frees executable state only
 when the refcount reaches zero.
 
-Target-local slot reuse rule:
+Current local slot reuse rule:
 
 - A child resolves `hashid -> local_slot` immediately before execution.
-- Unregister and failed-register cleanup remove the hashid from resolution
-  before cleanup.
-- If a task already resolved the hashid, cleanup waits for that task to finish.
-- The private slot may be freed or reused only after those users have drained.
+- Each endpoint has one local mailbox operation in flight at a time.
+- Parent-side dispatch and control operations to the same endpoint are
+  serialized by the per-WorkerThread mailbox lock.
+- Final unregister removes the hashid from resolution and releases the private
+  slot only after the current mailbox operation has completed.
 
 This rule prevents stale slot reuse without exposing any extra public field.
+A future remote or multi-flight control channel must add explicit
+`INSTALLED` / `TOMBSTONED` / `FAILED` target states, sequence numbers, and
+in-flight user draining before it can reuse private slots safely.
 
 ### Registration Failure Contract
 
@@ -395,8 +396,8 @@ Registration remains synchronous and whole-scope. For a given
 `Worker`'s corresponding resolver domain at register start.
 
 1. Parent builds the canonical descriptor and computes the `hashid`.
-2. Parent allocates a parent-side `CallableHandle` entry, but does not expose
-   it to user code yet.
+2. Parent allocates an unpublished parent-side registration entry and handle
+   id, but does not expose it to user code yet.
 3. Parent sends `REGISTER_CALLABLE` to every target in the scope.
 4. Target validates descriptor bytes, payload digest, feature gates, and
    namespace.
@@ -525,15 +526,13 @@ Target unregister sequence:
 2. If the refcount remains nonzero, keep the mapping installed.
 3. If the refcount reaches zero, stop new local resolutions from `hashid` to
    private slot.
-4. Mark the entry `TOMBSTONED`.
-5. Wait until no in-flight task that already resolved this hashid is using the
-   private slot.
-6. Clear executable state.
-7. Release the private slot for reuse.
-8. Remove or archive the `hashid` entry.
+4. Clear executable state.
+5. Release the private slot for reuse.
+6. Remove or archive the `hashid` entry.
 
 This sequence is the concrete unregister form of the target-local slot reuse
-rule.
+rule for the current single-flight local mailbox. A future multi-flight target
+must insert a tombstone/drain phase before clearing executable state.
 
 If failed-register cleanup cannot be confirmed, the parent must not dispatch
 that hashid to the uncertain target again until cleanup is confirmed or the
@@ -605,7 +604,7 @@ Required tests:
 | Pre-start register | Startup hashid mappings are visible after ready. |
 | Partial register failure | No public handle is returned. |
 | Cleanup uncertainty | Unconfirmed cleanup blocks that target/hashid pair. |
-| Unregister tombstone | Hashid resolution stops before slot cleanup. |
+| Unregister cleanup | Hashid resolution stops before final slot cleanup. |
 | Unsupported kind | Target rejects unsupported kind before install. |
 | Hashid format fuzz | Bad prefix, length, or hex encoding is rejected. |
 | No slot consistency | Workers do not need matching private slots. |

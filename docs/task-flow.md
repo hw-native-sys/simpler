@@ -394,10 +394,10 @@ l3_handle = w4.register(my_l3_orch) # register L3 orch fn in Python dict
 w4.add_worker(l3)                   # add un-init'd L3 Worker as child
 w4.init()
 
-def my_l4_orch(orch, args):
+def my_l4_orch(orch, args, config):
     orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
 
-w4.run(Task(orch=my_l4_orch))
+w4.run(my_l4_orch)
 w4.close()
 ```
 
