@@ -44,6 +44,7 @@ public:
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path, int device_id
     );
+    void init_roles(const std::unordered_map<std::string, std::string> &role_paths, int device_id);
 
     /// Tear down everything: device resources and runtime library.
     /// Terminal — the object cannot be reused after this.

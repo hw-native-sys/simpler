@@ -293,6 +293,13 @@ def _runtime_binary_path(bins, role: str, legacy_attr: str):
     return getattr(bins, legacy_attr, None)
 
 
+def _runtime_role_paths(bins):
+    role_paths = getattr(bins, "role_paths", None)
+    if not role_paths:
+        return None
+    return {role: str(path) for role, path in role_paths.items()}
+
+
 def _chip_worker_init_paths(bins):
     host_path = _runtime_binary_path(bins, "host", "host_path")
     device_path = _runtime_binary_path(bins, "device", "device_path")
@@ -343,8 +350,9 @@ class ChipWorker:
             device_id: NPU device ID to attach the calling thread to.
             bins: A `simpler_setup.runtime_builder.RuntimeBinaries` (or any
                 object exposing role_paths / path_for_role plus
-                simpler_log_path / sim_context_path). Legacy host_path /
-                aicpu_path / aicore_path fields are still accepted.
+                simpler_log_path / sim_context_path). `_ChipWorker` receives
+                role-keyed paths when supported. Legacy host_path / aicpu_path
+                / aicore_path fields are still accepted.
             log_level: Severity floor (0=DEBUG..4=NUL). Defaults to a snapshot
                 of the simpler logger via `_log.get_current_config()`.
             log_info_v: INFO verbosity threshold (0..9). Same default.
@@ -379,6 +387,11 @@ class ChipWorker:
             _preload_global(str(bins.sim_context_path))
 
         # 3. host_runtime.so is dlopen'd RTLD_LOCAL inside _impl.init.
+        role_paths = _runtime_role_paths(bins)
+        if role_paths is not None and hasattr(self._impl, "init_roles"):
+            self._impl.init_roles(role_paths, int(device_id))
+            return
+
         host_path, aicpu_path, aicore_path = _chip_worker_init_paths(bins)
         self._impl.init(
             str(host_path),

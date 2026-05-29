@@ -17,6 +17,10 @@ design work so evaluation results are not mistaken for a complete backend.
   and `device` targets, and `persistent_device` also declares a native
   `scheduler` target. The legacy `aicpu_path` and `aicore_path` fields are
   compatibility aliases to the CUDA `device` artifact.
+- The Python `ChipWorker` wrapper and underlying `_ChipWorker` nanobind
+  boundary now accept role-keyed runtime binary maps directly through
+  `_ChipWorker.init_roles(...)`. The legacy positional init remains as a
+  compatibility fallback.
 
 Evidence:
 
@@ -2898,9 +2902,10 @@ compatibility mapping is:
 
 The Python `ChipWorker.init(...)` wrapper now resolves runtime binary paths
 through `path_for_role(...)` / `role_paths` first. CUDA role-only binary maps
-with `host` / `device` or `host` / `scheduler` / `device` can initialize
-through the Python API while the underlying C++ nanobind call still receives
-its compatibility host, scheduler, and device path arguments.
+with `host` / `device` or `host` / `scheduler` / `device` initialize through
+the Python API and are passed through the C++ nanobind boundary as role maps.
+The underlying `ChipWorker` maps `device` to the current two-binary
+`simpler_init` ABI internally until the C host-runtime ABI is generalized.
 
 The scheduler-role build slice was verified with:
 
@@ -2908,7 +2913,7 @@ The scheduler-role build slice was verified with:
 PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
   tests/ut/py/test_runtime_builder.py tests/ut/py/test_chip_worker.py -q \
   -k 'cuda_runtime_binaries or role_only_runtime_binaries or \
-      role_keyed_paths or scheduler_role'
+      role_keyed_init or role_keyed_paths or scheduler_role'
 
 PYTHONPATH=$PWD:$PWD/python .venv/bin/python - <<'PY'
 from simpler_setup.runtime_builder import RuntimeBuilder
@@ -2918,9 +2923,23 @@ print(bins.path_for_role("scheduler"))
 PY
 ```
 
-Result: the focused selector reported `4 passed, 38 deselected`; the runtime
+Result: the focused selector reported `5 passed, 38 deselected`; the runtime
 builder printed `['device', 'host', 'scheduler']` and the scheduler artifact
 path under `build/lib/cuda/onboard/persistent_device/`.
+
+After adding `_ChipWorker.init_roles(...)`, the same focused selector was run
+on the synced H200 checkout and reported `5 passed, 38 deselected` with the
+known PTO-ISA SSH refresh warning. A real persistent graph SceneTest path was
+then checked on both GPUs through the Python `Worker` / `ChipWorker` surface:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k persistent_device_graph_with_ctypes_data --platform cuda
+```
+
+Result: local A100 reported `1 passed, 72 deselected`; synced H200 reported
+`1 passed, 72 deselected` with the known PTO-ISA SSH refresh warning.
 
 The same source tree was synced to `bizhaoh200` and checked with a paired
 real-data persistent graph smoke:
@@ -2947,8 +2966,10 @@ H200 reported `device_wall_ns=56864`. Both hosts also built
 
 Needed:
 
-- removal of legacy `aicpu_path` and `aicore_path` attributes after all
-  external and C++ binding boundaries accept role-keyed binaries directly.
+- removal of legacy `aicpu_path` and `aicore_path` attributes after the C
+  host-runtime ABI accepts a role-keyed binary map directly. The Python and
+  nanobind boundaries now accept role maps; the remaining compatibility
+  lowering is inside C++ `ChipWorker` before calling `simpler_init`.
 
 ### Persistent Scheduler Generalization
 

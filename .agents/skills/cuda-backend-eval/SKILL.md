@@ -1059,7 +1059,8 @@ PYTHONPATH=$PWD:$PWD/python \
 
 After changing CUDA runtime role discovery or `persistent_device` build
 targets, rebuild the runtime and check that the role-keyed binary map includes
-the optional scheduler image:
+the optional scheduler image and that the Python/C++ `ChipWorker` boundary
+accepts role-keyed maps:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python .venv/bin/python - <<'PY'
@@ -1068,6 +1069,16 @@ bins = RuntimeBuilder(platform="cuda").get_binaries("persistent_device", build=T
 print(sorted(bins.role_paths))
 print(bins.path_for_role("scheduler"))
 PY
+
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest \
+    tests/ut/py/test_chip_worker.py tests/ut/py/test_runtime_builder.py \
+    -q -k 'role_keyed_init or role_only_runtime_binaries or \
+           role_keyed_paths or scheduler_role or cuda_runtime_binaries'
+
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k persistent_device_graph_with_ctypes_data --platform cuda
 ```
 
 Use `persistent_dag_tensor_core_tile_f32` for the normal L2 scene-test path

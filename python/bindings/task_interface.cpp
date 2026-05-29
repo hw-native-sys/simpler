@@ -20,6 +20,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
+#include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/vector.h>
 
 #include <cstring>
@@ -710,6 +711,7 @@ NB_MODULE(_task_interface, m) {
             "init", &ChipWorker::init, nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"),
             nb::arg("device_id")
         )
+        .def("init_roles", &ChipWorker::init_roles, nb::arg("role_paths"), nb::arg("device_id"))
         .def("finalize", &ChipWorker::finalize)
         .def(
             "prepare_callable",

@@ -69,7 +69,7 @@ def _invalidate_cache_if_stale(target_cache_dir: Path, current_commit: str) -> N
 
 @dataclass
 class RuntimeBinaries:
-    """Paths to the compiled runtime binaries."""
+    """Paths to compiled runtime binaries, keyed by target role."""
 
     host_path: Path
     aicpu_path: Path
@@ -259,7 +259,8 @@ class RuntimeBuilder:
                 If False (default), return pre-built binary paths.
 
         Returns:
-            RuntimeBinaries with paths to host, aicpu, and aicore binaries.
+            RuntimeBinaries with role-keyed paths plus legacy compatibility
+            fields for existing host/aicpu/aicore call sites.
 
         Raises:
             FileNotFoundError: If build=False and pre-built binaries are missing.

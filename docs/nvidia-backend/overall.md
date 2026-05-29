@@ -220,9 +220,11 @@ For a low-risk transition, `RuntimeBinaries` can keep `aicpu_path` and
 started with `RuntimeBinaries.role_paths` and
 `RuntimeBinaries.path_for_role(...)`: Ascend exposes `host`, `aicpu`, and
 `aicore`, while CUDA build configs now declare `host`, optional `scheduler`,
-and `device`. The cleaner end state is a target-binary map keyed only by
-runtime roles, with Ascend build configs declaring `host`, `aicpu`, `aicore`
-and CUDA declaring `host`, optional `scheduler`, and `device`.
+and `device`. The Python `ChipWorker` wrapper and `_ChipWorker` nanobind
+boundary now pass role-keyed maps directly when available. The cleaner end
+state is a target-binary map keyed only by runtime roles, with Ascend build
+configs declaring `host`, `aicpu`, `aicore` and CUDA declaring `host`,
+optional `scheduler`, and `device`.
 
 Add a `CudaNvccToolchain`:
 

@@ -57,6 +57,28 @@ std::vector<uint8_t> read_binary_file(const std::string &path) {
 
 ChipWorker::~ChipWorker() { finalize(); }
 
+void ChipWorker::init_roles(const std::unordered_map<std::string, std::string> &role_paths, int device_id) {
+    auto host_it = role_paths.find("host");
+    if (host_it == role_paths.end()) {
+        throw std::runtime_error("ChipWorker::init_roles requires a 'host' runtime binary role");
+    }
+
+    auto device_it = role_paths.find("device");
+    if (device_it != role_paths.end()) {
+        init(host_it->second, device_it->second, device_it->second, device_id);
+        return;
+    }
+
+    auto aicpu_it = role_paths.find("aicpu");
+    auto aicore_it = role_paths.find("aicore");
+    if (aicpu_it == role_paths.end() || aicore_it == role_paths.end()) {
+        throw std::runtime_error(
+            "ChipWorker::init_roles requires either a 'device' role or both 'aicpu' and 'aicore' roles"
+        );
+    }
+    init(host_it->second, aicpu_it->second, aicore_it->second, device_id);
+}
+
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path, int device_id
 ) {
