@@ -1,5 +1,12 @@
 # Task Flow — Callable / TaskArgs / CallConfig Pass-Through
 
+Callable identity update: public Python submit APIs now accept
+`CallableHandle` objects returned by `Worker.register`, and hierarchical task
+mailboxes carry the handle's 32-byte hash digest. Target-local integer slots
+remain private to the receiving worker. Older `cid` references in this document
+describe historical or target-local internals; the authoritative contract is
+[callable-identity-registration.md](callable-identity-registration.md).
+
 This document specifies **what data flows through the hierarchical runtime and
 what shapes it takes at each stage**. It covers:
 
@@ -26,39 +33,45 @@ Every task flowing through any level carries exactly three pieces of data:
 
 | Handle | Type | What it is |
 | ------ | ---- | ---------- |
-| `Callable` | `uint64_t` (opaque) | What the target worker should execute — interpretation depends on the receiving worker type |
+| `CallableHandle` / `CallableIdentity` | hash digest + kind + namespace | What the target worker should execute; targets resolve the digest to a local slot |
 | `TaskArgs` | user builder class | Tensors + scalars + per-tensor tags (IN/OUT/INOUT/etc.) |
 | `CallConfig` | small POD | Execution knobs (block_dim, aicpu_thread_num, profiling/dump/PMU flags, …) |
 
 Everything else in the engine is either plumbing (slots, ring, tensormap,
-scheduler) or per-kernel state (stored in `Callable`).
+scheduler) or target-local executable state resolved from the callable digest.
 
 ---
 
-## 2. `Callable` — one type, three meanings
+## 2. Callable Identity
 
 ```cpp
-using Callable = uint64_t;
+struct CallableIdentity {
+    std::array<uint8_t, 32> digest;
+    CallableKind kind;
+    TargetNamespace target_namespace;
+};
 ```
 
-Opaque 64-bit handle. What it actually is depends on the destination worker:
+Python users submit `CallableHandle` objects returned by `Worker.register`.
+The Python facade validates ownership/liveness and passes `CallableIdentity`
+to C++:
 
-| Context | `Callable` encodes | How it's consumed |
+| Context | Namespace | How it's consumed |
 | ------- | ------------------ | ----------------- |
-| `w3.submit_next_level(cid, …)` dispatched to a chip child (L2) | `int32_t` cid returned by `Worker.register(ChipCallable)` | `ChipWorker::run(cid, …)` in the forked child looks up the prepared callable |
-| `w4.submit_next_level(cid, …)` dispatched to an L3 `Worker` child | `int32_t` cid returned by `Worker.register(orch_fn)` (Python orch fn) | `_child_worker_loop` looks up the orch fn in the child's COW registry and calls `inner_worker.run(orch_fn, …)` |
-| `w3.submit_sub(cid, …)` dispatched to a SUB child | `int32_t` cid indexing the Python callable registry | `_sub_worker_loop` calls `fn(args)` with the decoded `TaskArgs` |
+| `w3.submit_next_level(handle, …)` dispatched to a chip child | `LOCAL_CHIP` | child resolves digest to its private chip slot, then calls `ChipWorker::run(local_slot, …)` |
+| `w4.submit_next_level(handle, …)` dispatched to an L3 `Worker` child | `LOCAL_PYTHON` | child resolves digest to an orchestration function and calls `inner_worker.run(orch_fn, …)` |
+| `w3.submit_sub(handle, …)` dispatched to a SUB child | `LOCAL_PYTHON` | child resolves digest to a Python callable and calls `fn(args)` |
 
-All three paths share one mailbox wire format — the cid is written into
-`MAILBOX_OFF_CALLABLE` and the child does the dispatch in its own
-address space.
+All three paths share one mailbox wire format: `MAILBOX_OFF_CALLABLE` is
+reserved, and the 32-byte digest prefixes the args blob. The receiving child
+does the digest-to-slot resolve in its own address space.
 
-### Lifetime — pre-fork registration
+### Lifetime — materialize before dispatch
 
-Every concrete `Callable` object (ChipCallable, Python orch fn, sub callable)
-**must be registered before any child process is forked**. After fork, the
-child inherits these through COW and the uint64 handle dereferences validly
-in the child.
+Pre-start registration is captured in the startup snapshot inherited by child
+processes. Post-start registration uses the local control plane and completes
+only after every active target in scope has installed the digest or reported
+failure. A task is dispatched only after registration succeeds.
 
 ---
 
@@ -153,14 +166,15 @@ View does **not** own memory. Valid for the duration of a single
      │
      │ child decodes header → builds TaskArgsView over the blob bytes
      ▼
-    ChipWorker::run(cid, view, config)         (in the forked child)
+    child resolves digest -> local slot
+    ChipWorker::run(local_slot, view, config)  (in the forked child)
 
      │ (L2 ABI edge)
      ▼
 ④ ChipStorageTaskArgs POD — child stack
      │ memcpy view.tensors, view.scalars into struct
      ▼
-    pto2_run_runtime(cid, &chip_storage, &config)
+    pto2_run_runtime(local_slot, &chip_storage, &config)
 ```
 
 ---
@@ -207,13 +221,13 @@ Wraps a dlsym'd `runtime.so`. `_chip_process_loop` instantiates one
 calls `pto2_run_runtime`:
 
 ```cpp
-void ChipWorker::run(int32_t cid, TaskArgsView view, const CallConfig &config) {
+void ChipWorker::run(int32_t local_slot, TaskArgsView view, const CallConfig &config) {
     ChipStorageTaskArgs chip_storage;
     chip_storage.tensor_count_ = view.tensor_count;
     chip_storage.scalar_count_ = view.scalar_count;
     memcpy(chip_storage.tensors_, view.tensors, view.tensor_count * sizeof(ContinuousTensor));
     memcpy(chip_storage.scalars_, view.scalars, view.scalar_count * sizeof(uint64_t));
-    pto2_run_runtime(cid, &chip_storage, &config);
+    pto2_run_runtime(local_slot, &chip_storage, &config);
 }
 ```
 
@@ -231,7 +245,7 @@ fn(args)    # args: TaskArgs decoded from the mailbox blob
 ```
 
 The callable receives the same `TaskArgs` that was submitted via
-`orch.submit_sub(cid, args)`, with tags stripped (tags are consumed by
+`orch.submit_sub(handle, args)`, with tags stripped (tags are consumed by
 the Orchestrator at submit time). There is no C++ class for SUB workers
 — the Python child loop and callable registry are the entire
 implementation; the child inherits the Python registry through fork COW.
@@ -240,7 +254,7 @@ implementation; the child inherits the Python registry through fork COW.
 
 A higher-level `Worker` is **not** itself an execution leaf. When L4
 dispatches to an L3 child, the child process runs `_child_worker_loop`,
-which looks up the registered orch fn for that cid and calls
+which resolves the digest to the registered orch fn and calls
 `inner_worker.run(orch_fn, args, config)` — i.e. the L3 `Worker.run`
 Python method, not a C++ leaf. The kernel-running leaves stay at L2
 (`ChipWorker`); higher levels just compose more scheduling engines.
@@ -255,9 +269,12 @@ The user's orch fn receives an `Orchestrator*` (not a `Worker*`) and calls
 ```cpp
 class Orchestrator {
 public:
-    SubmitResult submit_next_level(Callable cb, TaskArgs args, const CallConfig &config);
-    SubmitResult submit_next_level_group(Callable cb, std::vector<TaskArgs> args_list, const CallConfig &config);
-    SubmitResult submit_sub(Callable cb, TaskArgs args, const CallConfig &config);
+    SubmitResult submit_next_level(const CallableIdentity &callable, TaskArgs args, const CallConfig &config);
+    SubmitResult submit_next_level_group(
+        const CallableIdentity &callable,
+        std::vector<TaskArgs> args_list,
+        const CallConfig &config);
+    SubmitResult submit_sub(const CallableIdentity &callable, TaskArgs args, const CallConfig &config);
 };
 
 struct SubmitResult { TaskSlot slot_id; };
@@ -268,7 +285,7 @@ own pointers (already registered in TensorMap by the OUTPUT/INOUT tag).
 
 Where the data goes after submit:
 
-1. `Callable` — copied into `slot.callable` (parent heap, one `uint64_t`)
+1. `CallableIdentity` — copied into `slot.callable` (parent heap)
 2. `TaskArgs` — moved into `slot.task_args` (parent heap, vector-backed).
    Tags are consumed during the same submit call for dep inference and
    **never carried further**.
@@ -280,13 +297,13 @@ fanout wiring), see [orchestrator.md](orchestrator.md).
 ## 7. Data flow through dispatch
 
 After the scheduler picks an idle `WorkerThread` and calls `wt->dispatch(sid)`,
-the parent-side WorkerThread encodes `(cid, CallConfig, TaskArgs)` into
-the per-WT shm mailbox and the forked child decodes it:
+the parent-side WorkerThread encodes `(callable digest, CallConfig, TaskArgs)`
+into the per-WT shm mailbox and the forked child decodes it:
 
 ```text
-slot.callable_id ─┐
-slot.config      ─┼─► memcpy into shm mailbox ─► child decodes ─► ChipWorker::run(cid, view, cfg)
-slot.task_args   ─┘    (dispatch_process)         (_chip_process_loop)
+slot.callable.digest ─┐
+slot.config          ─┼─► memcpy into shm mailbox ─► child resolves digest
+slot.task_args       ─┘    (dispatch_process)         and runs local slot
 ```
 
 For SUB children the same mailbox layout is reused; the Python child
@@ -357,7 +374,8 @@ A higher-level `Worker` registers a lower-level `Worker` as a
 NEXT_LEVEL child via a mailbox just like L3 does for `ChipWorker`. The
 parent side is uniform — `WorkerThread::dispatch_process` doesn't care
 what kind of child is on the other end of the mailbox. The forked
-child runs `_child_worker_loop`, which delegates each dispatched cid to
+child runs `_child_worker_loop`, which resolves each dispatched digest and
+delegates to
 `inner_worker.run(...)` — i.e. another full scheduling engine inside.
 
 ### Setup
@@ -365,26 +383,26 @@ child runs `_child_worker_loop`, which delegates each dispatched cid to
 ```python
 # L3 child: sub-only (no chips for this example)
 l3 = Worker(level=3, num_sub_workers=1)
-l3_sub_cid = l3.register(lambda: verify_result())
+l3_sub_handle = l3.register(lambda: verify_result())
 
 def my_l3_orch(orch, args, config):
-    orch.submit_sub(l3_sub_cid)
+    orch.submit_sub(l3_sub_handle)
 
 # L4 parent
 w4 = Worker(level=4, num_sub_workers=0)
-l3_cid = w4.register(my_l3_orch)   # register L3 orch fn in Python dict
+l3_handle = w4.register(my_l3_orch) # register L3 orch fn in Python dict
 w4.add_worker(l3)                   # add un-init'd L3 Worker as child
 w4.init()
 
 def my_l4_orch(orch, args):
-    orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
+    orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
 
 w4.run(Task(orch=my_l4_orch))
 w4.close()
 ```
 
-At L4 the `Callable` passed to `submit_next_level` is a **registry id**
-(cid) that maps to a Python orch function — not a `ChipCallable`.
+At L4 the handle passed to `submit_next_level` is a `LOCAL_PYTHON` handle
+that maps to a Python orchestration function, not a `ChipCallable`.
 
 ### Fork sequence
 
@@ -416,13 +434,13 @@ L4 parent process
 | Step | Where | What happens |
 | ---- | ----- | ------------ |
 | 1 | L4 parent Python | `w4.run(my_l4_orch)` → `scope_begin` → `my_l4_orch(orch4, ...)` |
-| 2 | L4 `Orchestrator.submit_next_level` | `l3_cid` stored as slot's `callable`; slot pushed to L4's ready queue |
+| 2 | L4 `Orchestrator.submit_next_level` | the L3 callable handle digest is stored in the slot's callable identity; slot pushed to L4's ready queue |
 | 3 | L4 Scheduler | pop slot; pick idle WorkerThread → the L3 child's mailbox |
-| 4 | L4 WorkerThread (PROCESS) | encode `(l3_cid, config, args_blob)` into mailbox; write `TASK_READY`; spin-poll |
-| 5 | L3 child `_child_worker_loop` | wake on `TASK_READY`; read cid → `registry[cid]` → `my_l3_orch` |
+| 4 | L4 WorkerThread (PROCESS) | encode `(callable digest, config, args_blob)` into mailbox; write `TASK_READY`; spin-poll |
+| 5 | L3 child `_child_worker_loop` | wake on `TASK_READY`; read digest → child-local slot → `my_l3_orch` |
 | 6 | L3 child | `inner_worker.run(my_l3_orch, args, cfg)` → `scope_begin` → `my_l3_orch(orch3, ...)` |
-| 7 | L3 `Orchestrator.submit_sub` | `l3_sub_cid` dispatched to L3's own sub worker child |
-| 8 | L3 sub child | `registry[l3_sub_cid]()` → `verify_result()` executes |
+| 7 | L3 `Orchestrator.submit_sub` | `l3_sub_handle` digest dispatched to L3's own sub worker child |
+| 8 | L3 sub child | child resolves digest to its local Python callable and executes `verify_result()` |
 | 9 | L3 drain | all L3 tasks complete; `scope_end` + `drain` return |
 | 10 | L3 child | `inner_worker.run()` returns; `_child_worker_loop` writes `TASK_DONE` |
 | 11 | L4 WorkerThread | sees `TASK_DONE`; calls `on_complete_(slot)` |
@@ -469,9 +487,9 @@ Step-by-step (one chip worker):
 | 2 | `Worker::run` | `scope_begin` → call `my_orch(&orch_, args.view(), cfg)` |
 | 3 | `Orchestrator::submit_next_level` | `slot = ring.alloc()`; move `chip_args` into `slot.task_args`; walk tags → `tensormap.lookup(a.data)`, `tensormap.lookup(b.data)`, `tensormap.insert(c.data, slot)`; push ready |
 | 4 | Scheduler thread | pop `slot`; `wt = manager.pick_idle(NEXT_LEVEL)` (WT_chip_0); `wt->dispatch(slot)` |
-| 5 | WT_chip_0 parent side | encode mailbox: write `callable` = chip_kernel handle, `config`, `write_blob` of task_args; set `TASK_READY`; spin-poll |
-| 6 | chip_0 child process | wake on `TASK_READY`; `read_blob` → `view`; call `ChipWorker::run(cb, view, cfg)` |
-| 7 | `ChipWorker::run` | assemble `ChipStorageTaskArgs` POD (memcpy view); call `pto2_run_runtime(cb, &chip_storage, &cfg)` |
+| 5 | WT_chip_0 parent side | encode mailbox: write reserved callable field, `config`, digest prefix, `write_blob` of task_args; set `TASK_READY`; spin-poll |
+| 6 | chip_0 child process | wake on `TASK_READY`; resolve digest to local slot; `read_blob` → `view`; call `ChipWorker::run(local_slot, view, cfg)` |
+| 7 | `ChipWorker::run` | assemble `ChipStorageTaskArgs` POD (memcpy view); call `pto2_run_runtime(local_slot, &chip_storage, &cfg)` |
 | 8 | runtime.so | translate host ptrs → device ptrs; dispatch AICPU / AICore; write output into `c`'s shm |
 | 9 | chip_0 child | `run` returns; write `TASK_DONE` |
 | 10 | WT_chip_0 parent | see `TASK_DONE`; call `on_complete_(slot)` |
@@ -482,13 +500,13 @@ Step-by-step (one chip worker):
 
 ## 11. Design notes
 
-### Why `Callable = uint64_t`, not `void*`
+### Why `CallableIdentity`, not a raw integer
 
-All three callable meanings (ChipCallable pointer, OrchFn pointer, sub
-callable_id) fit in 64 bits. Using `void*` forced `int32_t callable_id` to go
-through `reinterpret_cast<intptr_t>` then `static_cast<int32_t>` — three layers
-of cast. `uint64_t` lets each receiver do a single cast appropriate to its
-semantics.
+Parent-side task slots need a stable identity that is valid across child
+processes even when each target uses a different private execution slot. The
+submitted `CallableIdentity` carries the 32-byte digest plus scheduling
+metadata; each child resolves that digest to its own local slot immediately
+before execution.
 
 ### Why tags live only on user-side `TaskArgs`
 
@@ -501,8 +519,8 @@ runtime: `ChipStorageTaskArgs` (`task_args.h:157`) is already declared with
 
 ### Why no `WorkerPayload` wrapper
 
-`ChipWorker::run` takes `(cid, TaskArgsView, const CallConfig&)` directly.
-Wrapping them in a struct added no value and made mailbox serialization
+`ChipWorker::run` takes `(local_slot, TaskArgsView, const CallConfig&)`
+directly. Wrapping them in a struct added no value and made mailbox serialization
 indirect. Task identity (slot_id) is held by the parent's WorkerThread
 for the completion callback, not passed into the child.
 

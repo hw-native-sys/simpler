@@ -12,14 +12,23 @@ Tests use SubWorker (fork/shm) as the only worker type — no NPU device require
 Each test verifies a distinct aspect of the L3 scheduling pipeline.
 """
 
+import ctypes
 import struct
 import threading
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
-from simpler.callable_identity import CallableHandle
+from simpler.callable_identity import (
+    CallableHandle,
+    build_chip_callable_descriptor,
+    build_python_serialized_descriptor,
+    compute_callable_hashid,
+    hashid_to_digest,
+)
 from simpler.task_interface import (
+    MAILBOX_ERROR_MSG_SIZE,
+    MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     ChipCallable,
     DataType,
@@ -32,6 +41,7 @@ from simpler.worker import (
     _CONTROL_REQUEST,
     _CTRL_PY_REGISTER,
     _CTRL_PY_UNREGISTER,
+    _CTRL_UNREGISTER,
     _IDLE,
     _OFF_STATE,
     Worker,
@@ -92,19 +102,33 @@ def _roundtrip_py_callable_payload(target):
         shm.unlink()
 
 
-def _test_handle(cid: int, digest: bytes, *, kind: str = "PYTHON_SERIALIZED", namespace: str = "LOCAL_PYTHON"):
-    return CallableHandle(
-        hashid="sha256:" + digest.hex(),
-        kind=kind,
-        target_namespace=namespace,
-        _slot_id=cid,
-        _digest=digest,
-        _handle_id=10_000 + cid,
-    )
-
-
 def _slot_for(worker: Worker, handle: CallableHandle) -> int:
     return worker._identity_registry[handle.digest].slot_id
+
+
+class _FakeControlResult:
+    def __init__(self, worker_type: str, worker_index: int = 0, ok: bool = True, error_message: str = ""):
+        self.worker_type = worker_type
+        self.worker_index = worker_index
+        self.ok = ok
+        self.error_message = error_message
+
+
+def _chip_payload_shm(callable_obj: ChipCallable) -> SharedMemory:
+    payload = ctypes.string_at(int(callable_obj.buffer_ptr()), int(callable_obj.buffer_size()))
+    shm = SharedMemory(create=True, size=len(payload))
+    assert shm.buf is not None
+    shm.buf[: len(payload)] = payload
+    return shm
+
+
+def _chip_digest(callable_obj: ChipCallable, *, platform: str = "", runtime: str = "") -> bytes:
+    descriptor = build_chip_callable_descriptor(target=callable_obj, platform=platform, runtime=runtime)
+    return hashid_to_digest(compute_callable_hashid(descriptor))
+
+
+def _py_payload_digest(payload: bytes) -> bytes:
+    return hashid_to_digest(compute_callable_hashid(build_python_serialized_descriptor(payload)))
 
 
 def _unique_py_callable(index: int):
@@ -372,43 +396,83 @@ class TestLifecycle:
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
         observed = {}
 
-        def fake_post_init_register(cid, target, digest):
-            observed["cid"] = cid
+        def fake_post_init_register(target, digest, *, is_new):
             observed["target"] = target
             observed["digest"] = digest
+            observed["is_new"] = is_new
             observed["locked"] = hw._registry_lock.locked()
 
         hw._post_init_register = fake_post_init_register
 
-        cid = hw.register(callable_obj)
+        handle = hw.register(callable_obj)
 
-        slot = _slot_for(hw, cid)
-        assert observed == {"cid": slot, "target": callable_obj, "digest": cid.digest, "locked": False}
+        slot = _slot_for(hw, handle)
+        assert observed == {"target": callable_obj, "digest": handle.digest, "is_new": True, "locked": False}
         assert hw._callable_registry[slot] is callable_obj
 
-    def test_register_at_broadcast_runs_without_registry_lock(self):
+    def test_register_child_chip_broadcast_runs_without_registry_lock(self):
+        from simpler.worker import _build_callable_registration  # noqa: PLC0415
+
         hw = Worker(level=3, num_sub_workers=0)
         hw._initialized = True
+        hw._hierarchical_started = True
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+        digest = _build_callable_registration(hw, callable_obj).digest
         observed = {}
 
-        def fake_post_init_register(cid, target, digest):
-            observed["cid"] = cid
+        def fake_post_init_register(target, digest, *, is_new):
             observed["target"] = target
             observed["digest"] = digest
+            observed["is_new"] = is_new
             observed["locked"] = hw._registry_lock.locked()
 
         hw._post_init_register = fake_post_init_register
 
-        hw._register_at(7, callable_obj)
+        slot = hw._register_child_chip(callable_obj, digest=digest)
 
         assert observed == {
-            "cid": 7,
             "target": callable_obj,
-            "digest": next(iter(hw._identity_registry)),
+            "digest": digest,
+            "is_new": True,
             "locked": False,
         }
-        assert hw._callable_registry[7] is callable_obj
+        assert hw._callable_registry[slot] is callable_obj
+
+    def test_startup_identity_snapshot_filters_by_target_namespace(self):
+        from simpler.worker import _make_local_identity_tables  # noqa: PLC0415
+
+        hw = Worker(level=3, num_sub_workers=0)
+        py_target = _unique_py_callable(1)
+        chip_target = _unique_chip_callable(2)
+        py_handle = hw.register(py_target)
+        chip_handle = hw.register(chip_target)
+        snapshot = [
+            (digest, state.target, state.ref_count, state.kind, state.target_namespace)
+            for digest, state in hw._identity_registry.items()
+        ]
+
+        py_registry, py_identity_table, py_refs = _make_local_identity_tables(
+            snapshot,
+            callable_kind="PYTHON_SERIALIZED",
+            target_namespace="LOCAL_PYTHON",
+        )
+        chip_registry, chip_identity_table, chip_refs = _make_local_identity_tables(
+            snapshot,
+            callable_kind="CHIP_CALLABLE",
+            target_namespace="LOCAL_CHIP",
+        )
+
+        assert set(py_identity_table) == {py_handle.digest}
+        assert py_refs == {py_handle.digest: 1}
+        assert len(py_registry) == 1
+        assert next(iter(py_registry.values())) is py_target
+        assert chip_handle.digest not in py_identity_table
+
+        assert set(chip_identity_table) == {chip_handle.digest}
+        assert chip_refs == {chip_handle.digest: 1}
+        assert len(chip_registry) == 1
+        assert next(iter(chip_registry.values())) is chip_target
+        assert py_handle.digest not in chip_identity_table
 
     def test_python_control_broadcast_passes_default_timeout(self):
         from simpler.worker import _CTRL_PY_UNREGISTER, _PY_CONTROL_TIMEOUT_S  # noqa: PLC0415
@@ -417,18 +481,19 @@ class TestLifecycle:
             def __init__(self):
                 self.calls = []
 
-            def broadcast_control_all(self, worker_type, sub_cmd, cid, payload, digest=None, timeout_s=None):
-                self.calls.append((worker_type, sub_cmd, cid, payload, digest, timeout_s))
+            def broadcast_control_all(self, worker_type, sub_cmd, payload=None, digest=None, timeout_s=None):
+                self.calls.append((worker_type, sub_cmd, payload, digest, timeout_s))
                 return []
 
         fake = FakeControlWorker()
         hw = Worker(level=3, num_sub_workers=1)
         hw._worker = fake
+        digest = bytes([3]) * 32
 
-        errors = hw._broadcast_py_control([WorkerType.SUB], _CTRL_PY_UNREGISTER, 3, strict=False)
+        errors = hw._broadcast_py_control([WorkerType.SUB], _CTRL_PY_UNREGISTER, digest=digest, strict=False)
 
         assert errors == []
-        assert fake.calls == [(WorkerType.SUB, _CTRL_PY_UNREGISTER, 3, None, None, _PY_CONTROL_TIMEOUT_S)]
+        assert fake.calls == [(WorkerType.SUB, _CTRL_PY_UNREGISTER, None, digest, _PY_CONTROL_TIMEOUT_S)]
 
     def test_cloudpickle_payload_roundtrip_supported_callable_shapes(self):
         class AddValue:
@@ -462,15 +527,16 @@ class TestLifecycle:
         hw._hierarchical_started = True
         calls = []
 
-        def fake_broadcast(worker_types, sub_cmd, broadcast_cid, *, digest=None, payload=None, strict):
-            calls.append((list(worker_types), sub_cmd, broadcast_cid, digest, strict))
-            if sub_cmd == _CTRL_PY_UNREGISTER:
-                return ["SUB[0]: injected unregister failure"]
-            if sub_cmd == _CTRL_PY_REGISTER:
-                return []
-            raise AssertionError(f"unexpected sub_cmd={sub_cmd}")
+        class FakeWorker:
+            def broadcast_control_all(self, worker_type, sub_cmd, payload=None, digest=None, timeout_s=None):
+                calls.append((worker_type, sub_cmd, digest, payload is not None, timeout_s))
+                if sub_cmd == _CTRL_PY_UNREGISTER:
+                    return [_FakeControlResult("SUB", 0, False, "injected unregister failure")]
+                if sub_cmd == _CTRL_PY_REGISTER:
+                    return [_FakeControlResult("SUB", 0, True)]
+                raise AssertionError(f"unexpected sub_cmd={sub_cmd}")
 
-        hw._broadcast_py_control = fake_broadcast
+        hw._worker = FakeWorker()
 
         slot = _slot_for(hw, cid)
         hw.unregister(cid)
@@ -483,9 +549,8 @@ class TestLifecycle:
 
         reused = hw.register(lambda args: None)
         assert _slot_for(hw, reused) == slot
-        assert calls[0] == ([WorkerType.SUB], _CTRL_PY_UNREGISTER, slot, cid.digest, False)
-        assert calls[1][0:3] == ([WorkerType.SUB], _CTRL_PY_REGISTER, slot)
-        assert calls[1][4] is True
+        assert calls[0][:4] == (WorkerType.SUB, _CTRL_PY_UNREGISTER, cid.digest, False)
+        assert calls[1][:4] == (WorkerType.SUB, _CTRL_PY_REGISTER, reused.digest, True)
 
     def test_pending_unregister_cid_is_not_reused_until_broadcast_returns(self):
         from simpler.worker import _CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER  # noqa: PLC0415
@@ -499,17 +564,16 @@ class TestLifecycle:
         release_broadcast = threading.Event()
         errors: list[BaseException] = []
 
-        def fake_broadcast(worker_types, sub_cmd, broadcast_cid, *, digest=None, payload=None, strict):
-            if sub_cmd == _CTRL_PY_UNREGISTER:
-                broadcast_started.set()
-                assert release_broadcast.wait(timeout=2.0)
-            elif sub_cmd == _CTRL_PY_REGISTER:
-                return []
-            else:
-                raise AssertionError(f"unexpected sub_cmd={sub_cmd}")
-            return []
+        class FakeWorker:
+            def broadcast_control_all(self, worker_type, sub_cmd, payload=None, digest=None, timeout_s=None):
+                if sub_cmd == _CTRL_PY_UNREGISTER:
+                    broadcast_started.set()
+                    assert release_broadcast.wait(timeout=2.0)
+                elif sub_cmd != _CTRL_PY_REGISTER:
+                    raise AssertionError(f"unexpected sub_cmd={sub_cmd}")
+                return [_FakeControlResult("SUB", 0, True)]
 
-        hw._broadcast_py_control = fake_broadcast
+        hw._worker = FakeWorker()
         slot = _slot_for(hw, cid)
 
         def do_unregister():
@@ -669,7 +733,7 @@ class TestLifecycle:
             slot = _slot_for(hw, cid)
             hw.unregister(cid)
             assert slot not in hw._callable_registry
-            with pytest.raises(RuntimeError, match="not registered"):
+            with pytest.raises(KeyError, match="not live"):
                 hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
 
             counter_name = counter_shm.name
@@ -715,7 +779,7 @@ class TestLifecycle:
             slot = _slot_for(hw, cid)
             hw.unregister(cid)
             assert slot not in hw._callable_registry
-            with pytest.raises(RuntimeError, match="not registered"):
+            with pytest.raises(KeyError, match="not live"):
                 hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
 
             reused = hw.register(dynamic)
@@ -764,28 +828,22 @@ class TestLifecycle:
                 finally:
                     shm.close()
 
-            cid = 5
             worker_impl = hw._worker
             assert worker_impl is not None
-            digest = bytes([5]) * 32
+            payload = _pack_py_callable_payload(dynamic_sub)
+            digest = _py_payload_digest(payload)
             results = worker_impl.broadcast_control_all(
                 WorkerType.SUB,
                 _CTRL_PY_REGISTER,
-                cid,
-                memoryview(_pack_py_callable_payload(dynamic_sub)),
+                memoryview(payload),
                 digest,
             )
             assert len(results) == 1
             assert results[0].ok
-            handle = _test_handle(cid, digest)
-
-            def run_dynamic(orch, args, cfg):
-                orch.submit_sub(handle)
-
-            hw.run(run_dynamic)
+            unregister_results = worker_impl.broadcast_control_all(WorkerType.SUB, _CTRL_PY_UNREGISTER, None, digest)
+            assert len(unregister_results) == 1
+            assert unregister_results[0].ok
             hw.close()
-
-            assert _read_counter(counter_buf) == 1
         finally:
             counter_shm.close()
             counter_shm.unlink()
@@ -798,7 +856,7 @@ class TestLifecycle:
             hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
             worker_impl = hw._worker
             assert worker_impl is not None
-            results = worker_impl.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, 5, b"bad")
+            results = worker_impl.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, b"bad", bytes([6]) * 32)
             assert len(results) == 1
             assert not results[0].ok
             assert "payload" in results[0].error_message
@@ -814,7 +872,7 @@ class TestLifecycle:
             worker_impl = hw._worker
             assert worker_impl is not None
             with pytest.raises(RuntimeError, match="payload pointer and size"):
-                worker_impl.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, 5, b"")
+                worker_impl.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, b"", bytes([7]) * 32)
         finally:
             hw.close()
 
@@ -829,8 +887,8 @@ class TestLifecycle:
             results = dw.broadcast_control_all(
                 WorkerType.SUB,
                 _CTRL_PY_UNREGISTER,
-                0,
                 None,
+                bytes([8]) * 32,
                 timeout_s=0.001,
             )
             assert len(results) == 1
@@ -862,8 +920,8 @@ class TestLifecycle:
                 results = dw.broadcast_control_all(
                     selected_type,
                     _CTRL_PY_UNREGISTER,
-                    0,
                     None,
+                    bytes([9]) * 32,
                     timeout_s=0.001,
                 )
                 assert len(results) == 1
@@ -894,13 +952,12 @@ class TestLifecycle:
             register_results = worker_impl.broadcast_control_all(
                 WorkerType.SUB,
                 _CTRL_PY_REGISTER,
-                5,
                 b"bad",
+                bytes([10]) * 32,
             )
             unregister_results = worker_impl.broadcast_control_all(
                 WorkerType.SUB,
                 _CTRL_PY_UNREGISTER,
-                _slot_for(hw, bootstrap_cid),
                 None,
                 bootstrap_cid.digest,
             )
@@ -933,72 +990,96 @@ class TestLifecycle:
         finally:
             hw.close()
 
-    def test_chip_register_reuse_clears_seen_python_cid_before_binary_register(self):
-        from simpler.worker import _CTRL_PY_UNREGISTER  # noqa: PLC0415
-
+    def test_duplicate_chip_register_broadcasts_ref_increment_without_new_slot(self):
         calls = []
 
         class FakeWorker:
-            def broadcast_register_all(self, cid, blob_ptr, blob_size, digest):
-                calls.append(("binary_register", cid, blob_size, digest))
+            def broadcast_register_all(self, blob_ptr, blob_size, digest):
+                calls.append(("binary_register", blob_size, digest))
+                return [_FakeControlResult("NEXT_LEVEL", 0, True)]
 
         hw = Worker(level=3, num_sub_workers=1)
         hw._initialized = True
         hw._hierarchical_started = True
         hw._worker = FakeWorker()
-        hw._py_callable_cids_seen.add(0)
-
-        def fake_py_control(worker_types, sub_cmd, cid, *, digest=None, payload=None, strict):
-            calls.append(("py_clear", list(worker_types), sub_cmd, cid, digest, strict))
-            return []
-
-        hw._broadcast_py_control = fake_py_control
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
 
-        cid = hw.register(callable_obj)
-        slot = _slot_for(hw, cid)
+        first = hw.register(callable_obj)
+        second = hw.register(callable_obj)
 
+        slot = _slot_for(hw, first)
         assert slot == 0
-        assert calls[0][0:4] == ("py_clear", [WorkerType.SUB], _CTRL_PY_UNREGISTER, 0)
-        assert calls[0][5] is True
-        assert calls[1][0] == "binary_register"
-        assert 0 not in hw._py_callable_cids_seen
+        assert _slot_for(hw, second) == slot
+        assert hw._identity_registry[first.digest].ref_count == 2
+        assert calls == [
+            ("binary_register", int(callable_obj.buffer_size()), first.digest),
+            ("binary_register", int(callable_obj.buffer_size()), second.digest),
+        ]
 
-        hw._callable_registry.pop(slot)
-        hw._identity_registry.pop(cid.digest, None)
-        calls.clear()
-
-        cid = hw.register(ChipCallable.build(signature=[], func_name="y", binary=b"\x00", children=[]))
-
-        assert _slot_for(hw, cid) == 0
-        assert len(calls) == 1
-        assert calls[0][0:2] == ("binary_register", 0)
-
-    def test_chip_register_reuse_fails_before_binary_register_when_python_clear_fails(self):
+    def test_duplicate_chip_register_partial_failure_preserves_existing_handle(self):
         calls = []
 
         class FakeWorker:
-            def broadcast_register_all(self, cid, blob_ptr, blob_size, digest):
-                calls.append(("binary_register", cid))
+            def __init__(self):
+                self.register_count = 0
+
+            def broadcast_register_all(self, blob_ptr, blob_size, digest):
+                self.register_count += 1
+                calls.append(("binary_register", self.register_count, digest))
+                if self.register_count == 1:
+                    return [_FakeControlResult("NEXT_LEVEL", 0, True), _FakeControlResult("NEXT_LEVEL", 1, True)]
+                return [_FakeControlResult("NEXT_LEVEL", 0, True), _FakeControlResult("NEXT_LEVEL", 1, False, "boom")]
+
+            def control_digest_only(self, worker_type, worker_index, sub_cmd, digest, timeout_s=None):
+                calls.append(("cleanup_one", worker_type, worker_index, sub_cmd, digest))
+                return _FakeControlResult("NEXT_LEVEL", worker_index, True)
 
         hw = Worker(level=3, num_sub_workers=1)
         hw._initialized = True
         hw._hierarchical_started = True
         hw._worker = FakeWorker()
-        hw._py_callable_cids_seen.add(0)
-
-        def fake_py_control(worker_types, sub_cmd, cid, *, digest=None, payload=None, strict):
-            calls.append(("py_clear", cid, strict))
-            raise RuntimeError("clear failed")
-
-        hw._broadcast_py_control = fake_py_control
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
 
-        with pytest.raises(RuntimeError, match="clear failed"):
+        first = hw.register(callable_obj)
+        with pytest.raises(RuntimeError, match="REGISTER_PARTIAL_FAILURE"):
             hw.register(callable_obj)
 
-        assert calls == [("py_clear", 0, True)]
+        state = hw._resolve_handle(first)
+        assert state.ref_count == 1
+        assert hw._callable_registry[state.slot_id] is callable_obj
+        assert first.digest not in hw._uncertain_hashids
+        assert calls == [
+            ("binary_register", 1, first.digest),
+            ("binary_register", 2, first.digest),
+            ("cleanup_one", WorkerType.NEXT_LEVEL, 0, _CTRL_UNREGISTER, first.digest),
+        ]
+
+    def test_chip_register_failure_rolls_back_handle_and_marks_uncertain_when_cleanup_fails(self):
+        calls = []
+
+        class FakeWorker:
+            def broadcast_register_all(self, blob_ptr, blob_size, digest):
+                calls.append(("binary_register", digest))
+                raise RuntimeError("register failed")
+
+            def broadcast_unregister_all(self, digest):
+                calls.append(("cleanup", digest))
+                return ["cleanup failed"]
+
+        hw = Worker(level=3, num_sub_workers=1)
+        hw._initialized = True
+        hw._hierarchical_started = True
+        hw._worker = FakeWorker()
+        callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+
+        with pytest.raises(RuntimeError, match="register failed"):
+            hw.register(callable_obj)
+
+        digest = next(iter(hw._uncertain_hashids))
+        assert calls == [("binary_register", digest), ("cleanup", digest)]
         assert hw._callable_registry == {}
+        with pytest.raises(RuntimeError, match="REGISTER_CLEANUP_UNCERTAIN"):
+            hw.register(callable_obj)
 
     def test_unregister_middle_cid_reuses_hole(self):
         # `_allocate_cid` must fill the smallest hole, not append at
@@ -1193,11 +1274,10 @@ class TestScope:
 
     def test_user_nested_scope_binding_is_exposed(self):
         """The scope context manager and raw scope_begin / scope_end are bound."""
-        from simpler.task_interface import _Orchestrator  # noqa: PLC0415
+        from simpler.orchestrator import Orchestrator  # noqa: PLC0415
 
-        # Binding carries the new accessors.
-        assert hasattr(_Orchestrator, "scope_begin")
-        assert hasattr(_Orchestrator, "scope_end")
+        assert hasattr(Orchestrator, "scope_begin")
+        assert hasattr(Orchestrator, "scope_end")
 
         hw = Worker(level=3, num_sub_workers=1)
         hw.register(lambda args: None)
@@ -1451,21 +1531,12 @@ class TestSubCallableArgs:
 
 
 # ---------------------------------------------------------------------------
-# Test: _CTRL_REGISTER self-heal on cid reuse
+# Test: _CTRL_REGISTER digest-owned child slots
 # ---------------------------------------------------------------------------
 
 
-class TestChipMainLoopRegisterSelfHeal:
-    """Direct white-box tests on the _run_chip_main_loop self-heal branch.
-
-    Drives the loop in a background thread with a MagicMock ChipWorker and
-    a real shm mailbox. Each test simulates the parent by writing a control
-    command, waiting for the child to publish _CONTROL_DONE, resetting the
-    state to _IDLE, and finally writing _SHUTDOWN. This exercises the
-    actual state-machine code path including the self-heal block; injecting
-    `prepared = {cid}` directly is not possible because the set is a local
-    in the loop function — the seed comes from a real prior CTRL_REGISTER.
-    """
+class TestChipMainLoopDigestRegister:
+    """Direct white-box tests on _run_chip_main_loop dynamic registration."""
 
     @staticmethod
     def _build_mailbox():
@@ -1484,7 +1555,7 @@ class TestChipMainLoopRegisterSelfHeal:
         return shm, buf, state_addr
 
     @staticmethod
-    def _send_ctrl_register(buf, state_addr, cid: int, shm_name: str, digest: bytes = b"\x07" * 32):
+    def _send_ctrl_register(buf, state_addr, shm_name: str, digest: bytes = b"\x07" * 32, arg0: int = 7):
         """Stage a CTRL_REGISTER request and flip the state to CONTROL_REQUEST."""
         from simpler.worker import (  # noqa: PLC0415
             _CONTROL_REQUEST,
@@ -1498,7 +1569,7 @@ class TestChipMainLoopRegisterSelfHeal:
         )
 
         struct.pack_into("Q", buf, _OFF_CALLABLE, _CTRL_REGISTER)
-        struct.pack_into("Q", buf, _CTRL_OFF_ARG0, cid)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG0, arg0)
         assert len(digest) == 32
         buf[_OFF_CONTROL_CALLABLE_HASH : _OFF_CONTROL_CALLABLE_HASH + len(digest)] = digest
         encoded = shm_name.encode("utf-8")
@@ -1507,6 +1578,21 @@ class TestChipMainLoopRegisterSelfHeal:
         buf[_OFF_ARGS + len(encoded) : _OFF_ARGS + _CTRL_SHM_NAME_BYTES] = b"\x00" * (
             _CTRL_SHM_NAME_BYTES - len(encoded)
         )
+        _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
+
+    @staticmethod
+    def _send_ctrl_unregister(buf, state_addr, digest: bytes = b"\x07" * 32):
+        from simpler.worker import (  # noqa: PLC0415
+            _CONTROL_REQUEST,
+            _CTRL_UNREGISTER,
+            _OFF_CALLABLE,
+            _OFF_CONTROL_CALLABLE_HASH,
+            _mailbox_store_i32,
+        )
+
+        struct.pack_into("Q", buf, _OFF_CALLABLE, _CTRL_UNREGISTER)
+        assert len(digest) == 32
+        buf[_OFF_CONTROL_CALLABLE_HASH : _OFF_CONTROL_CALLABLE_HASH + len(digest)] = digest
         _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
 
     @staticmethod
@@ -1533,42 +1619,119 @@ class TestChipMainLoopRegisterSelfHeal:
         return err_code
 
     @staticmethod
+    def _read_error_message(buf) -> str:
+        raw = bytes(buf[MAILBOX_OFF_ERROR_MSG : MAILBOX_OFF_ERROR_MSG + MAILBOX_ERROR_MSG_SIZE])
+        return raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+    @staticmethod
     def _shutdown(state_addr):
         from simpler.worker import _SHUTDOWN, _mailbox_store_i32  # noqa: PLC0415
 
         _mailbox_store_i32(state_addr, _SHUTDOWN)
 
     @staticmethod
-    def _spawn_loop(cw, buf, state_addr):
+    def _spawn_loop(cw, buf, state_addr, registry=None, identity_table=None, identity_refs=None):
         from simpler.worker import _run_chip_main_loop  # noqa: PLC0415
 
+        if registry is None:
+            registry = {}
+        if identity_table is None:
+            identity_table = {}
+        if identity_refs is None:
+            identity_refs = {}
         t = threading.Thread(
             target=_run_chip_main_loop,
-            args=(cw, buf, 0, state_addr, 0, {}, {}),
+            args=(cw, buf, 0, state_addr, 0, registry, identity_table, identity_refs),
             daemon=True,
         )
         t.start()
         return t
 
-    def test_no_self_heal_when_prepared_clean(self):
-        # First CTRL_REGISTER on a fresh loop: `prepared` starts empty, so the
-        # self-heal branch must be skipped — no extra unregister_callable call.
-        # Locks in the zero-cost happy path.
+    def test_register_ignores_parent_arg0_and_allocates_local_slot(self):
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         cw = MagicMock()
+        cw._impl = MagicMock()
         cw.unregister_callable = MagicMock()
         cw._impl.prepare_callable_from_blob = MagicMock()
 
-        payload_shm = SharedMemory(create=True, size=64)
+        callable_obj = _unique_chip_callable(7)
+        digest = _chip_digest(callable_obj)
+        payload_shm = _chip_payload_shm(callable_obj)
         shm, buf, state_addr = self._build_mailbox()
         try:
             t = self._spawn_loop(cw, buf, state_addr)
             try:
-                self._send_ctrl_register(buf, state_addr, cid=7, shm_name=payload_shm.name)
+                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest, arg0=123)
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 0
-                # Critical assertion: no self-heal cleanup on a fresh slot.
+                assert cw.unregister_callable.call_count == 0
+                cw._impl.prepare_callable_from_blob.assert_called_once()
+                assert cw._impl.prepare_callable_from_blob.call_args.args[0] == 0
+            finally:
+                self._shutdown(state_addr)
+                t.join(timeout=2.0)
+        finally:
+            shm.close()
+            shm.unlink()
+            payload_shm.close()
+            payload_shm.unlink()
+
+    def test_register_rejects_digest_descriptor_mismatch(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        cw = MagicMock()
+        cw._impl = MagicMock()
+        cw.unregister_callable = MagicMock()
+        cw._impl.prepare_callable_from_blob = MagicMock()
+
+        callable_obj = _unique_chip_callable(7)
+        wrong_digest = _chip_digest(_unique_chip_callable(8))
+        payload_shm = _chip_payload_shm(callable_obj)
+        shm, buf, state_addr = self._build_mailbox()
+        registry = {}
+        identity_table = {}
+        identity_refs = {}
+        try:
+            t = self._spawn_loop(cw, buf, state_addr, registry, identity_table, identity_refs)
+            try:
+                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=wrong_digest)
+                err = self._wait_for_done_and_reset(buf, state_addr)
+                assert err == 1
+                assert "HASHID_DESCRIPTOR_MISMATCH" in self._read_error_message(buf)
+                cw._impl.prepare_callable_from_blob.assert_not_called()
+                cw.unregister_callable.assert_not_called()
+                assert registry == {}
+                assert identity_table == {}
+                assert identity_refs == {}
+            finally:
+                self._shutdown(state_addr)
+                t.join(timeout=2.0)
+        finally:
+            shm.close()
+            shm.unlink()
+            payload_shm.close()
+            payload_shm.unlink()
+
+    def test_duplicate_register_increments_ref_without_reprepare(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        cw = MagicMock()
+        cw._impl = MagicMock()
+        cw.unregister_callable = MagicMock()
+        cw._impl.prepare_callable_from_blob = MagicMock()
+
+        callable_obj = _unique_chip_callable(7)
+        digest = _chip_digest(callable_obj)
+        payload_shm = _chip_payload_shm(callable_obj)
+        shm, buf, state_addr = self._build_mailbox()
+        try:
+            t = self._spawn_loop(cw, buf, state_addr)
+            try:
+                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest)
+                assert self._wait_for_done_and_reset(buf, state_addr) == 0
+                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest)
+                assert self._wait_for_done_and_reset(buf, state_addr) == 0
                 assert cw.unregister_callable.call_count == 0
                 assert cw._impl.prepare_callable_from_blob.call_count == 1
             finally:
@@ -1580,71 +1743,33 @@ class TestChipMainLoopRegisterSelfHeal:
             payload_shm.close()
             payload_shm.unlink()
 
-    def test_self_heal_triggers_on_repeat_register(self):
-        # Second CTRL_REGISTER on the same cid: after the first round
-        # `prepared` holds 7, so the loop must self-heal — call
-        # unregister_callable to clear host-side residue before re-preparing.
-        # This is the scenario a best-effort unregister failure leaves behind.
+    def test_unregister_removes_only_after_last_digest_ref(self):
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         cw = MagicMock()
+        cw._impl = MagicMock()
         cw.unregister_callable = MagicMock()
         cw._impl.prepare_callable_from_blob = MagicMock()
 
-        payload_shm = SharedMemory(create=True, size=64)
+        callable_obj = _unique_chip_callable(7)
+        digest = _chip_digest(callable_obj)
+        payload_shm = _chip_payload_shm(callable_obj)
         shm, buf, state_addr = self._build_mailbox()
         try:
             t = self._spawn_loop(cw, buf, state_addr)
             try:
-                # Round 1: seed `prepared = {7}`.
-                self._send_ctrl_register(buf, state_addr, cid=7, shm_name=payload_shm.name)
+                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest)
+                assert self._wait_for_done_and_reset(buf, state_addr) == 0
+                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest)
+                assert self._wait_for_done_and_reset(buf, state_addr) == 0
+
+                self._send_ctrl_unregister(buf, state_addr, digest=digest)
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
                 assert cw.unregister_callable.call_count == 0
-                # Round 2: cid=7 already in `prepared` -> self-heal fires.
-                self._send_ctrl_register(buf, state_addr, cid=7, shm_name=payload_shm.name)
+
+                self._send_ctrl_unregister(buf, state_addr, digest=digest)
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                # Self-heal called unregister_callable exactly once, then
-                # prepare_callable_from_blob ran on the cleaned slot.
-                assert cw.unregister_callable.call_count == 1
-                cw.unregister_callable.assert_called_with(7)
-                assert cw._impl.prepare_callable_from_blob.call_count == 2
-            finally:
-                self._shutdown(state_addr)
-                t.join(timeout=2.0)
-        finally:
-            shm.close()
-            shm.unlink()
-            payload_shm.close()
-            payload_shm.unlink()
-
-    def test_self_heal_tolerates_unregister_exception(self):
-        # The self-heal try/except must swallow exceptions from
-        # unregister_callable so a flaky cleanup does not block the new
-        # registration. The follow-on prepare_callable_from_blob still runs
-        # and the mailbox publishes a clean (code=0) CONTROL_DONE.
-        from unittest.mock import MagicMock  # noqa: PLC0415
-
-        cw = MagicMock()
-        # First call: succeeds (seed phase has no self-heal invocation).
-        # Second call (self-heal): raises — must be swallowed.
-        cw.unregister_callable = MagicMock(side_effect=[RuntimeError("simulated")])
-        cw._impl.prepare_callable_from_blob = MagicMock()
-
-        payload_shm = SharedMemory(create=True, size=64)
-        shm, buf, state_addr = self._build_mailbox()
-        try:
-            t = self._spawn_loop(cw, buf, state_addr)
-            try:
-                # Round 1: no self-heal, prepared seeded with {7}.
-                self._send_ctrl_register(buf, state_addr, cid=7, shm_name=payload_shm.name)
-                assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                # Round 2: self-heal fires; unregister_callable raises but is
-                # caught; prepare_callable_from_blob still runs.
-                self._send_ctrl_register(buf, state_addr, cid=7, shm_name=payload_shm.name)
-                err = self._wait_for_done_and_reset(buf, state_addr)
-                assert err == 0, "self-heal exception leaked into mailbox error code"
-                assert cw.unregister_callable.call_count == 1
-                assert cw._impl.prepare_callable_from_blob.call_count == 2
+                cw.unregister_callable.assert_called_once_with(0)
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)

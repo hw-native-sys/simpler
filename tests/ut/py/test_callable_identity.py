@@ -66,3 +66,45 @@ def test_worker_register_returns_opaque_handle_and_deduplicates_same_identity():
         assert worker._identity_registry[first.digest].ref_count == 2
     finally:
         worker.close()
+
+
+def test_callable_handle_public_constructor_does_not_expose_slot_identity():
+    handle = CallableHandle("sha256:" + "0" * 64, "PYTHON_SERIALIZED", "LOCAL_PYTHON")
+
+    assert handle.digest == bytes(32)
+    assert not hasattr(handle, "_slot_id")
+
+
+def test_forged_public_handle_is_rejected_by_worker_apis():
+    worker = Worker(level=3, num_sub_workers=0)
+    real = worker.register(_py_target)
+    forged = CallableHandle(real.hashid, real.kind, real.target_namespace)
+    try:
+        with pytest.raises(KeyError, match="does not belong|not live"):
+            worker.unregister(forged)
+        with pytest.raises(KeyError, match="does not belong|not live"):
+            worker._resolve_handle(forged)
+    finally:
+        worker.close()
+
+
+def test_mutated_handle_fields_are_rejected():
+    worker = Worker(level=3, num_sub_workers=0)
+    handle = worker.register(_py_target)
+    try:
+        handle.kind = "CHIP_CALLABLE"
+        with pytest.raises(RuntimeError, match="CALLABLE_HANDLE_MUTATED"):
+            worker._resolve_handle(handle)
+    finally:
+        worker.close()
+
+
+def test_uncertain_cleanup_hashid_blocks_live_handle_resolution():
+    worker = Worker(level=3, num_sub_workers=0)
+    handle = worker.register(_py_target)
+    try:
+        worker._uncertain_hashids.add(handle.digest)
+        with pytest.raises(RuntimeError, match="REGISTER_CLEANUP_UNCERTAIN"):
+            worker._resolve_handle(handle)
+    finally:
+        worker.close()

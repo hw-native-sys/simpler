@@ -10,10 +10,10 @@ Related background:
 - [python-callable-serialization.md](python-callable-serialization.md)
 - [callable-ipc-dynamic-register.md](callable-ipc-dynamic-register.md)
 
-These documents describe existing cid-based materialization paths. This
-document defines the hashid identity contract and does not depend on
-`remote-l3-worker-design.md`. Remote workers are outside the scope of this
-document.
+`callable-ipc-dynamic-register.md` is a historical note for the earlier
+cid-based IPC design; the hashid identity contract in this document is the
+source of truth. This document does not depend on `remote-l3-worker-design.md`.
+Remote workers are outside the scope of this document.
 
 ## Overview
 
@@ -297,6 +297,11 @@ the same callable may return distinct handle objects with the same `hashid`.
 Unregistering one handle must not invalidate another live handle that shares
 the same `hashid`.
 
+Constructing a `CallableHandle` directly from its public fields does not create
+a live registration. Submit and unregister paths must validate that the handle
+belongs to the `Worker` that returned it and that its public fields still match
+the parent-side live registration record.
+
 Submit APIs accept only `CallableHandle`:
 
 ```python
@@ -310,6 +315,13 @@ def parent_orch(orch, args, config):
 
 They do not accept bare strings or raw callables. Direct string hashids are
 registration internals, not submit arguments.
+
+This contract covers the hierarchical `Worker` and `Orchestrator` APIs. The
+lower-level `ChipWorker` direct execution wrapper still exposes explicit
+`callable_id` slots for local prepared-callable tests and single-chip runtime
+debugging. Those slots are local to that `ChipWorker` instance and are not
+valid `CallableHandle` values, orchestration submit arguments, task slots, or
+mailbox task callable references.
 
 Top-level `Worker.run` keeps the current behavior:
 
@@ -400,6 +412,10 @@ If any target fails or times out:
 - The parent sends cleanup to targets that may have installed the hashid.
 - If cleanup cannot be confirmed, that target/hashid pair is marked uncertain
   and must not be used again until cleanup is confirmed or the worker restarts.
+  The local broadcast path returns per-target status; parent-side cleanup sends
+  the reverse unregister only to targets that confirmed install or refcount
+  increment. A cleanup failure on one of those targets marks the hashid
+  uncertain conservatively.
 
 This is failure cleanup with conservative uncertainty handling. It stays on
 the same synchronous install path and does not introduce a separate recovery
@@ -444,31 +460,35 @@ REGISTER_CLEANUP_UNCERTAIN
 UNREGISTER_TOMBSTONE_ACTIVE
 ```
 
-Error messages should include endpoint id, namespace, `hashid`, operation, and
-sequence number. They must not include user-specific local absolute paths.
+Error messages should include endpoint id, namespace, `hashid`, and operation.
+The current local mailbox has one outstanding operation per endpoint and does
+not carry a separate sequence field; a future multi-flight control channel must
+add one. Messages must not include user-specific local absolute paths.
 
 ### Local Control Contract
 
-Register-family controls carry identity and materialization data, not slots:
+Register-family controls carry identity and materialization data, not slots.
+The current local IPC encoding is compact because targets can reconstruct the
+canonical descriptor from the staged materialization payload and their local
+execution context:
 
 ```text
-target_namespace
-callable_kind
 callable_hash_digest: uint8[32]
-descriptor_version
-descriptor_len
-descriptor bytes
-payload_kind:
-  INLINE_BYTES
-  STAGED_REF
-payload_len_or_ref
-payload bytes or staged reference
+payload:
+  staged POSIX shm reference for register
+  absent for unregister
 ```
 
 Rules:
 
 - Register requests never carry a requested slot.
 - Register replies never expose target-local slots.
+- `target_namespace` and `callable_kind` are determined by the selected worker
+  pool and control sub-command, not by a user-provided slot.
+- Targets reconstruct or parse the staged payload and recompute the canonical
+  descriptor digest locally before install. If a future callable kind cannot
+  reconstruct its canonical descriptor from the staged payload and local
+  context, its control request must carry descriptor bytes explicitly.
 - `REGISTER_CALLABLE` for an already-installed matching hashid increments the
   target-local `ref_count`.
 - `REGISTER_CALLABLE` for an already-installed hashid with different

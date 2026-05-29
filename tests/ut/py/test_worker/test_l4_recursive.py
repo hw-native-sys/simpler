@@ -149,7 +149,7 @@ class TestL4DynamicRegister:
     The L3 child is sub-only (no chip device) so the cascade hits zero
     chip mailboxes inside the L3 child — but exercises the full path
     from L4 parent → next_level mailbox → ``_child_worker_loop`` CONTROL
-    handler → ``inner_worker._register_at`` recursively. NPU not required.
+    handler → ``inner_worker._register_child_chip`` recursively. NPU not required.
     """
 
     def test_l4_register_chip_callable_after_init_succeeds(self):

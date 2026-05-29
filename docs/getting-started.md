@@ -152,33 +152,26 @@ TEST PASSED
 ### Python API Example
 
 ```python
-from simpler.task_interface import ChipWorker
-from simpler_setup.runtime_builder import RuntimeBuilder
+from simpler.worker import Worker
 
-# Build or locate pre-built runtime binaries
-builder = RuntimeBuilder(platform="a2a3sim")
-binaries = builder.get_binaries("tensormap_and_ringbuffer")
+# Create a level-2 Worker for device 0.
+worker = Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
+worker.init()
 
-# Create worker and initialize with platform binaries (attaches the calling
-# thread to device 0 internally — no separate set_device step required)
-worker = ChipWorker()
-worker.init(device_id=0, bins=binaries)
-
-# Register the ChipCallable to obtain a callable_id
-cid = worker.register(chip_callable)
+# Register the ChipCallable to obtain an opaque callable handle.
+handle = worker.register(chip_callable)
 
 # Execute the registered callable on device. Omitting block_dim uses the
 # default 0 = auto, which DeviceRunner resolves to the max the AICore
 # stream allows. Pass block_dim=<n> to pin a smaller value.
-worker.run(cid, orch_args)
+worker.run(handle, orch_args)
 
 # Cleanup
-worker.finalize()
+worker.close()
 ```
 
-`ChipWorker` follows the same `register → run(cid)` contract as
-`Worker(level=2)`; reach for the high-level `Worker` first and use
-`ChipWorker` only when a low-level handle is required.
+Reach for the high-level `Worker` first. Public registration returns a
+`CallableHandle`; integer callable slots are backend internals.
 
 ## Configuration
 

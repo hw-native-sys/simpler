@@ -52,7 +52,8 @@ inline TargetNamespace parse_target_namespace(const std::string &target_namespac
     throw std::invalid_argument("unsupported callable target namespace: " + target_namespace);
 }
 
-inline CallableIdentity make_callable_identity(nb::bytes digest, const std::string &kind, const std::string &target_namespace) {
+inline CallableIdentity
+make_callable_identity(nb::bytes digest, const std::string &kind, const std::string &target_namespace) {
     Py_buffer view;
     if (PyObject_GetBuffer(digest.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
         throw nb::python_error();
@@ -152,7 +153,9 @@ inline void bind_worker(nb::module_ &m) {
             "submit_next_level",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const TaskArgs &args, const CallConfig &config, int8_t worker) {
-                return self.submit_next_level(make_callable_identity(digest, kind, target_namespace), args, config, worker);
+                return self.submit_next_level(
+                    make_callable_identity(digest, kind, target_namespace), args, config, worker
+                );
             },
             nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args"), nb::arg("config"),
             nb::arg("worker") = int8_t(-1),
@@ -288,39 +291,58 @@ inline void bind_worker(nb::module_ &m) {
         // Release the GIL during the spin-poll wait so other Python threads
         // (e.g. a concurrent Worker.run) can keep running.
         .def(
-            "control_prepare", &Worker::control_prepare, nb::arg("worker_id"), nb::arg("cid"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Prewarm a NEXT_LEVEL child for `cid` by sending CTRL_PREPARE. "
-            "Blocks until the child publishes CONTROL_DONE."
+            "control_prepare",
+            [](Worker &self, int worker_id, nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                self.control_prepare(worker_id, reinterpret_cast<const uint8_t *>(digest_bytes.data()));
+            },
+            nb::arg("worker_id"), nb::arg("digest"), "Prewarm a NEXT_LEVEL child by callable digest."
         )
         .def(
             "broadcast_register_all",
-            [](Worker &self, int32_t cid, uint64_t blob_ptr, uint64_t blob_size, nb::object digest) {
+            [](Worker &self, uint64_t blob_ptr, uint64_t blob_size, nb::object digest) {
                 std::string digest_bytes = bytes_from_digest_arg(digest);
                 nb::gil_scoped_release release;
-                self.broadcast_register_all(
-                    cid, blob_ptr, blob_size, reinterpret_cast<const uint8_t *>(digest_bytes.data())
+                return self.broadcast_register_all(
+                    blob_ptr, blob_size, reinterpret_cast<const uint8_t *>(digest_bytes.data())
                 );
             },
-            nb::arg("cid"), nb::arg("blob_ptr"), nb::arg("blob_size"), nb::arg("digest"),
+            nb::arg("blob_ptr"), nb::arg("blob_size"), nb::arg("digest"),
             "Stage `blob_size` bytes from `blob_ptr` into a POSIX shm and broadcast "
-            "CTRL_REGISTER to every NEXT_LEVEL child in parallel. Throws on any failure."
+            "CTRL_REGISTER to every NEXT_LEVEL child in parallel. Returns per-child status."
+        )
+        .def(
+            "control_digest_only",
+            [](Worker &self, WorkerType worker_type, int worker_id, uint64_t sub_cmd, nb::object digest,
+               nb::object timeout_s) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
+                nb::gil_scoped_release release;
+                return self.control_digest_only(
+                    worker_type, worker_id, sub_cmd, reinterpret_cast<const uint8_t *>(digest_bytes.data()), timeout_val
+                );
+            },
+            nb::arg("worker_type"), nb::arg("worker_id"), nb::arg("sub_cmd"), nb::arg("digest"),
+            nb::arg("timeout_s") = nb::none(),
+            "Drive one selected worker through a digest-only CONTROL_REQUEST. "
+            "Used by registration cleanup after partial broadcast failures."
         )
         .def(
             "broadcast_unregister_all",
-            [](Worker &self, int32_t cid, nb::object digest) {
+            [](Worker &self, nb::object digest) {
                 std::string digest_bytes = bytes_from_digest_arg(digest);
                 nb::gil_scoped_release release;
-                return self.broadcast_unregister_all(cid, reinterpret_cast<const uint8_t *>(digest_bytes.data()));
+                return self.broadcast_unregister_all(reinterpret_cast<const uint8_t *>(digest_bytes.data()));
             },
-            nb::arg("cid"), nb::arg("digest"),
+            nb::arg("digest"),
             "Best-effort broadcast of CTRL_UNREGISTER to every NEXT_LEVEL child in parallel. "
             "Returns a list of per-child error strings (empty on full success)."
         )
         .def(
             "broadcast_control_all",
-            [](Worker &self, WorkerType worker_type, uint64_t sub_cmd, int32_t cid, nb::object payload,
-               nb::object digest, nb::object timeout_s) {
+            [](Worker &self, WorkerType worker_type, uint64_t sub_cmd, nb::object payload, nb::object digest,
+               nb::object timeout_s) {
                 std::string payload_bytes;
                 const void *payload_ptr = nullptr;
                 size_t payload_size = 0;
@@ -343,11 +365,11 @@ inline void bind_worker(nb::module_ &m) {
                 double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
                 nb::gil_scoped_release release;
                 return self.broadcast_control_all(
-                    worker_type, sub_cmd, cid, payload_ptr, payload_size, digest_ptr, timeout_val
+                    worker_type, sub_cmd, payload_ptr, payload_size, digest_ptr, timeout_val
                 );
             },
-            nb::arg("worker_type"), nb::arg("sub_cmd"), nb::arg("cid"), nb::arg("payload") = nb::none(),
-            nb::arg("digest") = nb::none(), nb::arg("timeout_s") = nb::none(),
+            nb::arg("worker_type"), nb::arg("sub_cmd"), nb::arg("payload") = nb::none(), nb::arg("digest") = nb::none(),
+            nb::arg("timeout_s") = nb::none(),
             "Broadcast an arbitrary CONTROL_REQUEST to the selected worker pool. "
             "If payload is a Python buffer, C++ stages it in POSIX shm and writes the shm name "
             "into the mailbox. Returns per-child ControlResult entries."

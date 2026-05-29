@@ -1,5 +1,11 @@
 # Worker Manager — Pool, Threading, and Dispatch
 
+Callable identity update: WorkerThread task frames now carry the submitted
+callable's 32-byte digest; the child resolves that digest to its private local
+slot. Older callable-id snippets below are historical shorthand for
+target-local internals. See
+[callable-identity-registration.md](callable-identity-registration.md).
+
 `WorkerManager` and `WorkerThread` together implement the **execution layer**
 of a `Worker` engine. `WorkerManager` owns two pools of `WorkerThread`s (one
 for next-level workers, one for sub workers); each `WorkerThread` drives a
@@ -114,17 +120,14 @@ void WorkerThread::dispatch_process(WorkerDispatch d) {
     TaskSlotState &s = *ring_->slot_state(d.task_slot);
     uint8_t *m = (uint8_t*)mailbox_ + HEADER_SIZE;
 
-    // Write task data: callable (8 B) + config (~16 B) + length-prefixed
-    // TaskArgs blob. The blob is derived from the slot's stored TaskArgs
-    // via write_blob() — tags are stripped, only [T][S][tensors][scalars]
-    // crosses the fork boundary.
-    uint64_t callable = (s.worker_type == WorkerType::SUB)
-        ? static_cast<uint64_t>(s.callable_id)
-        : s.callable;
-    *reinterpret_cast<uint64_t*>(m)            = callable;
+    // Write task data: reserved callable field, config, digest prefix, then
+    // length-prefixed TaskArgs blob. Tags are stripped; only
+    // [digest][T][S][tensors][scalars] crosses the fork boundary.
+    *reinterpret_cast<uint64_t*>(m)            = 0;
     *reinterpret_cast<CallConfig*>(m + 8)      = s.config;
+    memcpy(m + MAILBOX_OFF_TASK_CALLABLE_HASH, s.callable.digest.data(), 32);
     const TaskArgs &args = s.is_group() ? s.task_args_list[d.group_index] : s.task_args;
-    write_blob(m + 8 + sizeof(CallConfig), args);
+    write_blob(m + MAILBOX_OFF_TASK_ARGS_BLOB, args);
 
     // Signal child
     write_state(mailbox_, MailboxState::TASK_READY);
@@ -152,9 +155,8 @@ Total ~nanoseconds overhead; the wait is dominated by actual kernel execution.
 
 The child loop lives in Python — see `_chip_process_loop` and
 `_sub_worker_loop` in `python/simpler/worker.py`. Each child polls
-`MAILBOX_OFF_STATE`, decodes the args blob on `TASK_READY`, runs the
-real worker (a `ChipWorker.run(cid, …)` call for chip children, the
-registered Python callable for sub workers), writes back any error,
+`MAILBOX_OFF_STATE`, decodes the digest-prefixed args blob on `TASK_READY`,
+resolves the digest to its private local slot/callable, writes back any error,
 and publishes `TASK_DONE`.
 The child inherits the parent's full address space at fork time, so:
 

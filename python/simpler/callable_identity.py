@@ -13,8 +13,8 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import struct
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Any, Literal, Optional
 
 from .task_interface import ArgDirection, ChipCallable
 
@@ -155,27 +155,46 @@ def validate_hashid(hashid: str) -> None:
         raise ValueError("HASHID_FORMAT_INVALID: sha256 digest contains non-hex characters") from exc
 
 
-@dataclass(frozen=True, eq=False)
 class CallableHandle:
     """Opaque public token returned by ``Worker.register``."""
 
-    hashid: str
-    kind: CallableKindName
-    target_namespace: TargetNamespaceName
-    _slot_id: int = field(repr=False)
-    _digest: bytes = field(repr=False)
-    _handle_id: int = field(repr=False)
+    __slots__ = ("hashid", "kind", "target_namespace", "_digest", "_handle_id", "_owner_id")
 
-    def __post_init__(self) -> None:
-        validate_hashid(self.hashid)
+    def __init__(
+        self,
+        hashid: str,
+        kind: CallableKindName,
+        target_namespace: TargetNamespaceName,
+    ) -> None:
+        validate_hashid(hashid)
+        self.hashid = hashid
+        self.kind = kind
+        self.target_namespace = target_namespace
+        self._digest = hashid_to_digest(hashid)
+        self._handle_id = -1
+        self._owner_id: Optional[str] = None
+        self._validate_public_fields()
+
+    @classmethod
+    def _from_registration(
+        cls,
+        *,
+        hashid: str,
+        kind: CallableKindName,
+        target_namespace: TargetNamespaceName,
+        handle_id: int,
+        owner_id: str,
+    ) -> "CallableHandle":
+        handle = cls(hashid, kind, target_namespace)
+        handle._handle_id = int(handle_id)
+        handle._owner_id = owner_id
+        return handle
+
+    def _validate_public_fields(self) -> None:
         if self.kind not in ("CHIP_CALLABLE", "PYTHON_SERIALIZED"):
             raise ValueError(f"CALLABLE_KIND_UNSUPPORTED: {self.kind}")
         if self.target_namespace not in (TARGET_NAMESPACE_LOCAL_CHIP, TARGET_NAMESPACE_LOCAL_PYTHON):
             raise ValueError(f"unsupported callable target namespace: {self.target_namespace}")
-        if len(self._digest) != CALLABLE_HASH_DIGEST_BYTES:
-            raise ValueError(f"callable digest must be {CALLABLE_HASH_DIGEST_BYTES} bytes")
-        if self._digest != hashid_to_digest(self.hashid):
-            raise ValueError("CallableHandle digest does not match hashid")
 
     @property
     def digest(self) -> bytes:

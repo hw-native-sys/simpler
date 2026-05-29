@@ -447,10 +447,9 @@ NB_MODULE(_task_interface, m) {
                 // serialised representation produced by `buffer_ptr()` /
                 // `buffer_size()`. Used by the L4 cascade in
                 // _child_worker_loop, which receives CTRL_REGISTER bytes
-                // through shared memory and needs a typed ChipCallable to
-                // hand to inner_worker._register_at (the cid is dictated
-                // by the outer cascade, not freshly allocated); see
-                // docs/callable-ipc-dynamic-register.md.
+                // through shared memory and needs a typed ChipCallable for
+                // digest-owned registration on the child Worker; see
+                // docs/callable-identity-registration.md.
                 std::vector<uint8_t> buf(
                     reinterpret_cast<const uint8_t *>(raw.c_str()),
                     reinterpret_cast<const uint8_t *>(raw.c_str()) + raw.size()
@@ -728,8 +727,8 @@ NB_MODULE(_task_interface, m) {
             nb::arg("callable_id"), nb::arg("blob_ptr"),
             "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
             "post-fork dynamic register handlers that receive the ChipCallable "
-            "bytes via shared memory; see docs/callable-ipc-dynamic-register.md). "
-            "Equivalent to prepare_callable(cid, ChipCallable) but accepts the "
+            "bytes via shared memory; see docs/callable-identity-registration.md). "
+            "Equivalent to prepare_callable(callable_id, ChipCallable) but accepts the "
             "ChipCallable layout pointer directly so chip-child loops can prepare "
             "from shm without rebuilding a PyChipCallable wrapper."
         )

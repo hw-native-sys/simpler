@@ -41,7 +41,6 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     TensorArgType,
     WorkerType,
     _ChipWorker,
-    _Orchestrator,
     _Worker,
     arg_direction_name,
     get_dtype_name,
@@ -68,7 +67,6 @@ __all__ = [
     # Distributed runtime
     "WorkerType",
     "TaskState",
-    "_Orchestrator",
     "SubmitResult",
     "_Worker",
     "MAILBOX_SIZE",
@@ -286,6 +284,9 @@ class ChipWorker:
 
     The runtime library and target device are bound once via init() and
     cannot be changed.
+    This is the low-level direct chip execution API; its integer
+    ``callable_id`` slots are private to the local ``ChipWorker`` instance and
+    are separate from hierarchical ``Worker.register`` / ``CallableHandle``.
 
     Usage::
 

@@ -34,6 +34,8 @@ import contextlib
 from collections.abc import Iterator, Sequence
 from typing import Any, Optional
 
+from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
+
 from .callable_identity import CallableHandle
 from .task_interface import (
     CallConfig,
@@ -44,12 +46,15 @@ from .task_interface import (
     DataType,
     TaskArgs,
 )
-from .task_interface import (
-    _Orchestrator as _COrchestrator,
-)
 
 
-def _require_handle(callable_or_handle: Any, *, kind: str, expected_namespace: Optional[str] = None) -> CallableHandle:
+def _require_handle(
+    callable_or_handle: Any,
+    *,
+    kind: str,
+    worker: Any = None,
+    expected_namespace: Optional[str] = None,
+) -> tuple[bytes, str, str]:
     """Validate a submit argument is a registered CallableHandle.
 
     Raises a clear migration error when the caller still passes a
@@ -65,12 +70,15 @@ def _require_handle(callable_or_handle: Any, *, kind: str, expected_namespace: O
         )
     if not isinstance(callable_or_handle, CallableHandle):
         raise TypeError(f"{kind} expects a CallableHandle returned by Worker.register")
+    if worker is not None:
+        state = worker._resolve_handle(callable_or_handle, expected_namespace=expected_namespace)
+        return state.digest, state.kind, state.target_namespace
     if expected_namespace is not None and callable_or_handle.target_namespace != expected_namespace:
         raise TypeError(
             f"{kind} cannot run {callable_or_handle.target_namespace}; expected {expected_namespace} "
             f"for {callable_or_handle.hashid}"
         )
-    return callable_or_handle
+    return callable_or_handle.digest, callable_or_handle.kind, callable_or_handle.target_namespace
 
 
 class Orchestrator:
@@ -112,10 +120,13 @@ class Orchestrator:
         ``worker``: logical worker id for affinity (-1 = unconstrained).
         """
         cfg = config if config is not None else CallConfig()
-        handle = _require_handle(
-            callable_handle, kind="orch.submit_next_level", expected_namespace=self._expected_next_level_namespace()
+        digest, kind, target_namespace = _require_handle(
+            callable_handle,
+            kind="orch.submit_next_level",
+            worker=self._worker,
+            expected_namespace=self._expected_next_level_namespace(),
         )
-        return self._o.submit_next_level(handle.digest, handle.kind, handle.target_namespace, args, cfg, int(worker))
+        return self._o.submit_next_level(digest, kind, target_namespace, args, cfg, int(worker))
 
     def submit_next_level_group(
         self,
@@ -131,12 +142,13 @@ class Orchestrator:
         """
         cfg = config if config is not None else CallConfig()
         w = [int(x) for x in workers] if workers else []
-        handle = _require_handle(
+        digest, kind, target_namespace = _require_handle(
             callable_handle,
             kind="orch.submit_next_level_group",
+            worker=self._worker,
             expected_namespace=self._expected_next_level_namespace(),
         )
-        return self._o.submit_next_level_group(handle.digest, handle.kind, handle.target_namespace, args_list, cfg, w)
+        return self._o.submit_next_level_group(digest, kind, target_namespace, args_list, cfg, w)
 
     def submit_sub(self, callable_handle: Any, args: Optional[TaskArgs] = None):
         """Submit a SUB task by registered callable handle.
@@ -145,13 +157,23 @@ class Orchestrator:
         """
         if args is None:
             args = TaskArgs()
-        handle = _require_handle(callable_handle, kind="orch.submit_sub", expected_namespace="LOCAL_PYTHON")
-        return self._o.submit_sub(handle.digest, handle.kind, handle.target_namespace, args)
+        digest, kind, target_namespace = _require_handle(
+            callable_handle,
+            kind="orch.submit_sub",
+            worker=self._worker,
+            expected_namespace="LOCAL_PYTHON",
+        )
+        return self._o.submit_sub(digest, kind, target_namespace, args)
 
     def submit_sub_group(self, callable_handle: Any, args_list: list):
         """Submit a group of SUB tasks (N TaskArgs → N workers, 1 DAG node)."""
-        handle = _require_handle(callable_handle, kind="orch.submit_sub_group", expected_namespace="LOCAL_PYTHON")
-        return self._o.submit_sub_group(handle.digest, handle.kind, handle.target_namespace, args_list)
+        digest, kind, target_namespace = _require_handle(
+            callable_handle,
+            kind="orch.submit_sub_group",
+            worker=self._worker,
+            expected_namespace="LOCAL_PYTHON",
+        )
+        return self._o.submit_sub_group(digest, kind, target_namespace, args_list)
 
     # ------------------------------------------------------------------
     # Dynamic CommDomain allocation (collective; blocks orch_fn for the
@@ -188,7 +210,7 @@ class Orchestrator:
 
             with orch.allocate_domain(name="tp", workers=[0, 1], window_size=4096) as tp:
                 for chip_idx in tp.workers:
-                    orch.submit_next_level(cid, ..., worker=chip_idx)
+                    orch.submit_next_level(chip_handle, ..., worker=chip_idx)
         """
         if self._worker is None:
             raise RuntimeError("allocate_domain requires an Orchestrator bound to a Worker")
