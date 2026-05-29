@@ -1713,9 +1713,10 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 The selected benchmark path also includes
-`pto_persistent_dag_graph_role_keyed_inout` and
-`pto_persistent_dag_graph_compact_role_inout`, and
-`pto_persistent_dag_graph_pair_inout`. Use a compact paired capture when
+`pto_persistent_dag_graph_role_keyed_inout`,
+`pto_persistent_dag_graph_compact_role_inout`,
+`pto_persistent_dag_graph_pair_inout`, and
+`pto_persistent_dag_graph_submit_groups`. Use a compact paired capture when
 changing graph task-argument lowering or capture validation:
 
 ```bash
@@ -1943,13 +1944,15 @@ The full current-head artifact under
 `tmp/cuda-backend/current-head-full-role-map-working/`
 `combined-current-f99dc6b0/` validated `1260` A100/H200 samples after the
 role-map graph row joined the selected matrix. Full captures should validate
-`1260` samples with sizes `1024,65536,1048576`, three repeats, tensor
+`1278` samples with sizes `1024,65536,1048576`, three repeats, tensor
 descriptor `16x16x16`, task counts `2,6,12`, worker-grid values
 `32,64,128,256`, source-paper provenance, sanitized command examples, graph
 topology and TaskArgs metadata reports, tensor-throughput reports, generated
-node-link, named-callable, role-map graph metadata, and zero scheduler errors.
-The role-map row must report dispatch `1,1,1`, fan-in `0,1,1`, dependents
-`1,2`, and `graph_task_arg_key=role_map`.
+node-link, named-callable, role-map, submit-groups graph metadata, and zero
+scheduler errors. The role-map row must report dispatch `1,1,1`, fan-in
+`0,1,1`, dependents `1,2`, and `graph_task_arg_key=role_map`; the
+submit-groups row must report dispatch `1,1,1`, fan-in `0,0,2`, dependents
+`2,2`, and `graph_task_arg_key=submit_groups`.
 
 Run the full paired-current gate with:
 
@@ -1961,7 +1964,7 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 Use this compact paired gate after changing selected persistent graph
-benchmark rows. With `--batch-tasks 0`, it validates 98 non-batch samples
+benchmark rows. With `--batch-tasks 0`, it validates 100 non-batch samples
 across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
 `pto_persistent_dag_graph_node_io`, `pto_persistent_dag_graph_node_link`,
 `pto_persistent_dag_graph_named_callable`, `pto_persistent_dag_graph_node_op`,
@@ -1972,9 +1975,10 @@ across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
 `pto_persistent_dag_graph_reordered`,
 `pto_persistent_dag_graph_triad`, `pto_persistent_dag_graph_quad`, and
 `pto_persistent_dag_graph_compact_role_inout` and
-`pto_persistent_dag_graph_role_map_inout` with dispatch `9,2,1`, `1,2,1`,
+`pto_persistent_dag_graph_role_map_inout` and
+`pto_persistent_dag_graph_submit_groups` with dispatch `9,2,1`, `1,2,1`,
 `1,2,1`, `1,2,1`, `1,2,1`, `4,2,1`, `11,2,1`, `5,2,1`, `1,9,2`,
-`6,2,1`, `8,2,1`, `1,1,1`, and `1,1,1`.
+`6,2,1`, `8,2,1`, `1,1,1`, `1,1,1`, and `1,1,1`.
 The node-attrs row requires
 `graph_node_attrs=task0=attrs:tensor_args,scalar_args`,
 `scalar_args[0]=1.5,scalar_args[1]=0.25`, and
@@ -2660,11 +2664,11 @@ fan-in/dependent metadata, graph-triad and graph-quad baselines, the tagged
 scalar graph baseline, the graph unary-square baseline, task-argument tags,
 visible Markdown/SVG graph topology and task-argument metadata, visible
 Markdown/SVG tensor throughput rows for required tensor/cuBLAS descriptors,
-size `1024`, one repeat, `98` non-batch combined samples, and the
+size `1024`, one repeat, `100` non-batch combined samples, and the
 Markdown/SVG report files. The current compact gate artifact with
-named-callable coverage is under
-`tmp/cuda-backend/persistent-named-callable-baseline-working/`
-`combined-current-95be2b5b/`.
+submit-groups coverage is under
+`tmp/cuda-backend/submit-groups-selected-benchmark-working/`
+`combined-current-193ccc4d/`.
 Validate older captures with explicit `--require-*` checks if the current
 preset has gained new selected rows since that capture.
 New paired-runner captures use a dynamic validator command because the

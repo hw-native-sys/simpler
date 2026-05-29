@@ -10,7 +10,7 @@ local A100 runs, and remote H200 runs.
 
 The latest full paired A100/H200 benchmark capture was taken at commit
 `f99dc6b0`, and the latest compact current-head paired gate uses artifact
-label `a3c09113`. Supplemental tensor-shape and tensor-core captures were
+label `193ccc4d`. Supplemental tensor-shape and tensor-core captures were
 taken at commits `c0ada3ad` and `0879aa9e`. The first cuBLAS library baseline
 capture uses the `343924df` artifact label, and the first cuBLAS CUDA Graph
 baseline capture is under `cublas-graph-compact-working`. The first
@@ -79,9 +79,12 @@ latest multi-size tensor baseline sweep uses `e79edba2`:
 - [Current capture](evaluation-current.md) records the compact `a3c09113`
   paired gate that promotes role-map graph task-argument metadata into the
   selected A100/H200 benchmark matrix with 98 non-batch validated samples.
+- [Current capture](evaluation-current.md) records the compact `193ccc4d`
+  paired gate that promotes submit-group graph task-argument metadata into the
+  selected A100/H200 benchmark matrix with 100 non-batch validated samples.
 - [Current capture](evaluation-current.md) records the full `f99dc6b0`
   paired-current gate that promotes role-map graph task-argument metadata
-  into the three-size A100/H200 benchmark matrix with 1260 validated samples.
+  into the three-size A100/H200 benchmark matrix with 1260 historical samples.
 - [Current capture](evaluation-current.md) records the `1c683c1c` lifecycle
   matrix that adds graph tensor-core descriptors to the paired repeat-run
   prepared-callable validation path.

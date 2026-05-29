@@ -345,8 +345,9 @@ tensor descriptor, sizes `1024,65536,1048576`, three repeats, task counts
 `2,6,12`, and worker-grid values `32,64,128,256`. It writes artifacts under
 `tmp/cuda-backend/current-head-full-role-map-working/`
 `combined-current-f99dc6b0/` and validates `1260` combined samples after the
-role-map graph row joined the selected matrix. The paired-runner validator
-checked
+role-map graph row joined the selected matrix. New full paired captures should
+validate `1278` samples after the submit-groups row joined the selected
+matrix. The paired-runner validator checked
 source-paper provenance, sanitized command examples, generated Markdown/SVG
 reports, zero scheduler errors, selected tensor throughput reports, graph
 topology reports, graph TaskArgs-like metadata reports, expected generated
@@ -4593,9 +4594,10 @@ Needed:
   node-link `links` and dictionary-valued node IO port maps,
   tagged TaskArgs-like graph task lowering including `inout` producer
   chaining, role-map task-argument dictionaries with paired smoke,
-  submit-shaped graph descriptors, explicit unary square graph dispatch,
-  tagged graph-descriptor paired smoke, and five-task chain, five-task
-  fan-out/fan-in, and six-task scratch-reuse graph descriptor smokes;
+  submit-shaped graph descriptors, submit-group descriptor expansion in the
+  selected benchmark matrix, explicit unary square graph dispatch, tagged
+  graph-descriptor paired smoke, and five-task chain, five-task fan-out/fan-in,
+  and six-task scratch-reuse graph descriptor smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
   graph-descriptor and generic-argument repeat-run, tensor-core graph, and
   direct/queue/DAG prepared-callable repeat-run smokes. The paired lifecycle
@@ -4671,6 +4673,22 @@ paper provenance, sanitized reconstruction commands, Markdown/SVG reports,
 and zero scheduler errors. The role-map row validated dispatch `1,1,1`, graph
 fan-in `0,1,1`, dependents `1,2`, and `graph_task_arg_key=role_map`; A100
 reported `device_wall_ns=29696`, and H200 reported `device_wall_ns=25440`.
+
+The submit-groups graph descriptor row is now also part of the selected
+benchmark matrix as `pto_persistent_dag_graph_submit_groups`. The TDD red
+selector first failed because `cuda_benchmark.py` rejected that baseline and
+the paired/compact validators still expected `1260` full samples and `98`
+compact non-batch samples. After adding the selected row and validator
+metadata, the full benchmark-report test file passed with `300` tests. The
+compact paired A100/H200 gate under
+`tmp/cuda-backend/submit-groups-selected-benchmark-working/`
+`combined-current-193ccc4d/` validated `100` non-batch samples with source
+paper provenance, sanitized reconstruction commands, Markdown/SVG reports,
+and zero scheduler errors. The submit-groups row validated dispatch `1,1,1`,
+graph fan-in `0,0,2`, dependents `2,2`, and
+`graph_task_arg_key=submit_groups`; A100 reported
+`device_wall_ns=27648`, and H200 reported `device_wall_ns=24160`. New full
+paired-current captures should validate `1278` samples.
 
 ### Tuned Tensor Workloads
 

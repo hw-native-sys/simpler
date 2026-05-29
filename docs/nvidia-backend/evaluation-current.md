@@ -6,9 +6,9 @@ full current-head capture is under
 `tmp/cuda-backend/current-head-full-role-map-working/`
 `combined-current-f99dc6b0/`.
 The latest compact current-head gate remains the capture under
-`tmp/cuda-backend/role-map-selected-benchmark-working/`
-`combined-current-a3c09113/`, which validates the selected compact benchmark
-matrix after role-map graph task-argument metadata joined the selected
+`tmp/cuda-backend/submit-groups-selected-benchmark-working/`
+`combined-current-193ccc4d/`, which validates the selected compact benchmark
+matrix after submit-group graph task-argument metadata joined the selected
 graph-node rows.
 The raw
 JSON, Markdown, and SVG reports are generated locally under
@@ -23,12 +23,17 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - repeats: `3`
 - batch tasks: `2,6,12`
 - worker blocks per task: `32,64,128,256`
-- samples in combined JSON: `1260`
+- samples in combined JSON: `1260` in the latest full capture; new full
+  captures should validate `1278` after the submit-groups graph row joined
+  the selected matrix
 
 The latest full capture validated `1260` samples after the role-map graph
 row joined the selected matrix. The previous `5424bcca` full capture remains
 useful as historical evidence, but it validated `1242` samples before that
 row was included.
+The compact `193ccc4d` gate validates `100` samples after the submit-groups
+graph row joined the selected matrix. New full paired-current captures should
+validate `1278` samples.
 The older `9ec5511e` full capture remains useful as historical evidence, but
 it validated `1224` samples before the named-callable graph row was included.
 The older `cb300e82` full capture validated `1206` samples before the
@@ -54,6 +59,14 @@ node-link graph row joined the selected matrix.
 - `tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark-dag-deltas.svg`
 - `tmp/cuda-backend/current-head-full-role-map-working/combined-current-f99dc6b0/cuda-benchmark-throughput.svg`
+- `tmp/cuda-backend/submit-groups-selected-benchmark-working/a100-current-193ccc4d/cuda-benchmark.json`
+- `tmp/cuda-backend/submit-groups-selected-benchmark-working/h200-current-193ccc4d/cuda-benchmark.json`
+- `tmp/cuda-backend/submit-groups-selected-benchmark-working/combined-current-193ccc4d/cuda-benchmark.json`
+- `tmp/cuda-backend/submit-groups-selected-benchmark-working/combined-current-193ccc4d/cuda-benchmark.md`
+- `tmp/cuda-backend/submit-groups-selected-benchmark-working/combined-current-193ccc4d/cuda-benchmark.svg`
+- `tmp/cuda-backend/submit-groups-selected-benchmark-working/combined-current-193ccc4d/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/submit-groups-selected-benchmark-working/combined-current-193ccc4d/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/submit-groups-selected-benchmark-working/combined-current-193ccc4d/cuda-benchmark-throughput.svg`
 - `tmp/cuda-backend/role-map-selected-benchmark-working/a100-current-a3c09113/cuda-benchmark.json`
 - `tmp/cuda-backend/role-map-selected-benchmark-working/h200-current-a3c09113/cuda-benchmark.json`
 - `tmp/cuda-backend/role-map-selected-benchmark-working/combined-current-a3c09113/cuda-benchmark.json`
@@ -2587,6 +2600,30 @@ fan-in `0,1,1`, dependents `1,2`, and `graph_task_arg_key=role_map`.
 | ------- | --------- | ------- |
 | A100 | 29696 | 41249 |
 | H200 | 25440 | 34115 |
+
+## Current Submit-Groups Graph Row
+
+The compact selected-matrix capture under
+`tmp/cuda-backend/submit-groups-selected-benchmark-working/`
+`combined-current-193ccc4d/` adds
+`pto_persistent_dag_graph_submit_groups` to the selected benchmark,
+paired-runner validator, and compact/full presets. The row expands the
+current submit-group descriptor bridge into two independent producer tasks
+and one join task. This preserves the callable and TaskArgs-like lowering
+for group members while remaining a tracer-bullet expansion, not the final
+single-slot PTO group semantics.
+
+The compact A100/H200 gate validates `100` non-batch rows at size `1024`, one
+repeat, source-paper provenance, command examples, Markdown/SVG reports, graph
+topology/task-argument metadata, tensor-throughput rows, and zero scheduler
+errors. The submit-groups row specifically validates dispatch `1,1,1`, graph
+fan-in `0,0,2`, dependents `2,2`, and
+`graph_task_arg_key=submit_groups`.
+
+| Machine | Device ns | Host ns |
+| ------- | --------- | ------- |
+| A100 | 27648 | 38500 |
+| H200 | 24160 | 33134 |
 
 ## Reproduction Commands
 
