@@ -34,23 +34,36 @@ SCHEDULER_ERROR_NAMES = {
     8: "duplicate_dependent",
 }
 REQUIRED_SOURCE_PAPER_IDS = ("arXiv:2605.03190", "arXiv:2512.22219v1")
-DEFAULT_SCENARIOS = ("direct", "queue", "dag-chain", "graph-depends-on", "graph-scratch-reuse")
+DEFAULT_SCENARIOS = (
+    "direct",
+    "queue",
+    "dag-chain",
+    "graph-depends-on",
+    "graph-scratch-reuse",
+    "graph-tensor-core",
+)
 DEFAULT_ARTIFACTS = ("a100", "h200")
 DEFAULT_DISPATCH = {
     "dag-chain": "1,2,1,2,1",
     "graph-depends-on": "1,2,1",
     "graph-scratch-reuse": "1,2,1,2,1,1",
+    "graph-tensor-core": "10,1,2,1",
 }
 DEFAULT_GRAPH_FANIN = {
     "graph-depends-on": "0,0,2",
     "graph-scratch-reuse": "0,0,2,1,1,2",
+    "graph-tensor-core": "0,1,1,2",
 }
 DEFAULT_GRAPH_DEPENDENTS = {
     "graph-depends-on": "2,2",
     "graph-scratch-reuse": "2,2,3,4,5,5",
+    "graph-tensor-core": "1,2,3,3",
 }
 DEFAULT_SCRATCH_REUSE = {
     "graph-scratch-reuse": "reused_buffer=tmp0,reuse_task=4",
+}
+DEFAULT_TENSOR_TILE = {
+    "graph-tensor-core": "16x16x16",
 }
 
 
@@ -107,6 +120,18 @@ def _scratch_reuse(row: dict[str, Any]) -> str | None:
     if reused_buffer is None or reuse_task is None:
         return None
     return f"reused_buffer={reused_buffer},reuse_task={reuse_task}"
+
+
+def _tensor_tile(row: dict[str, Any]) -> str | None:
+    tile = row.get("tensor_tile")
+    if not isinstance(tile, dict):
+        return None
+    rows = tile.get("rows")
+    cols = tile.get("cols")
+    inner = tile.get("inner")
+    if rows is None or cols is None or inner is None:
+        return None
+    return f"{rows}x{cols}x{inner}"
 
 
 def load_lifecycle_matrix(path: Path) -> dict[str, Any]:
@@ -243,6 +268,22 @@ def _validate_scratch_reuse(rows: list[dict[str, Any]], required_scratch_reuse: 
     return errors
 
 
+def _validate_tensor_tile(rows: list[dict[str, Any]], required_tensor_tile: dict[str, str]) -> list[str]:
+    errors: list[str] = []
+    for row in rows:
+        scenario = str(row.get("scenario"))
+        expected = required_tensor_tile.get(scenario)
+        if expected is None:
+            continue
+        found = _tensor_tile(row)
+        if found != expected:
+            errors.append(
+                f"expected tensor tile {expected} for scenario={scenario} "
+                f"artifact={row.get('artifact', 'unknown')}, found {found}"
+            )
+    return errors
+
+
 def _validate_report_files(artifact_dir: Path | None) -> list[str]:
     if artifact_dir is None:
         return ["missing artifact directory for report-file validation"]
@@ -331,6 +372,7 @@ def validate_lifecycle_matrix(  # noqa: PLR0913
     required_graph_fanin: dict[str, str] | None = None,
     required_graph_dependents: dict[str, str] | None = None,
     required_scratch_reuse: dict[str, str] | None = None,
+    required_tensor_tile: dict[str, str] | None = None,
     source_paper_root: Path | None = None,
 ) -> list[str]:
     rows = _rows(payload)
@@ -361,6 +403,7 @@ def validate_lifecycle_matrix(  # noqa: PLR0913
         )
     )
     errors.extend(_validate_scratch_reuse(rows, required_scratch_reuse or DEFAULT_SCRATCH_REUSE))
+    errors.extend(_validate_tensor_tile(rows, required_tensor_tile or DEFAULT_TENSOR_TILE))
     if require_report_files:
         errors.extend(_validate_report_files(artifact_dir))
     if require_source_papers:
@@ -401,6 +444,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-graph-fanin", action="append")
     parser.add_argument("--require-graph-dependents", action="append")
     parser.add_argument("--require-scratch-reuse", action="append")
+    parser.add_argument("--require-tensor-tile", action="append")
     parser.add_argument("--require-report-files", action="store_true")
     parser.add_argument("--require-source-papers", action="store_true")
     parser.add_argument("--require-command-examples", action="store_true")
@@ -428,6 +472,10 @@ def _apply_preset(args: argparse.Namespace) -> None:
         args.require_scratch_reuse = [
             f"{scenario}={scratch_reuse}" for scenario, scratch_reuse in DEFAULT_SCRATCH_REUSE.items()
         ]
+    if not args.require_tensor_tile:
+        args.require_tensor_tile = [
+            f"{scenario}={tensor_tile}" for scenario, tensor_tile in DEFAULT_TENSOR_TILE.items()
+        ]
     args.require_report_files = True
 
 
@@ -442,6 +490,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             flag="--require-graph-dependents",
         )
         required_scratch_reuse = _parse_required_map(args.require_scratch_reuse, flag="--require-scratch-reuse")
+        required_tensor_tile = _parse_required_map(args.require_tensor_tile, flag="--require-tensor-tile")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -455,6 +504,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         required_graph_fanin=required_graph_fanin,
         required_graph_dependents=required_graph_dependents,
         required_scratch_reuse=required_scratch_reuse,
+        required_tensor_tile=required_tensor_tile,
         require_report_files=args.require_report_files,
         require_source_papers=args.require_source_papers,
         require_command_examples=args.require_command_examples,

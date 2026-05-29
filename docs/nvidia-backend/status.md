@@ -3522,34 +3522,39 @@ Needed:
   dispatch, tagged graph-descriptor paired smoke, and five-task chain,
   five-task fan-out/fan-in, and six-task scratch-reuse graph descriptor smokes;
 - broader lifecycle validation beyond the current scratch-reuse,
-  graph-descriptor and generic-argument repeat-run, and direct/queue/DAG
-  prepared-callable repeat-run smokes. The paired lifecycle matrix runner now
-  captures direct, queue, DAG-chain, incoming-edge graph, and graph-descriptor
-  scratch-reuse repeat-run evidence across A100 and H200 in one artifact set
-  (`tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/`).
+  graph-descriptor and generic-argument repeat-run, tensor-core graph, and
+  direct/queue/DAG prepared-callable repeat-run smokes. The paired lifecycle
+  matrix runner now captures direct, queue, DAG-chain, incoming-edge graph,
+  graph-descriptor scratch-reuse, and graph tensor-core repeat-run evidence
+  across A100 and H200 in one artifact set
+  (`tmp/cuda-backend/lifecycle-tensor-core-working/persistent-lifecycle-matrix-1c683c1c/`).
   The lifecycle matrix validator checks required scenarios, A100/H200
   artifacts, repeat-run completion counts, DAG-chain dispatch, graph
   depends-on dispatch/topology, graph-scratch-reuse dispatch/topology,
-  scratch-reuse metadata, report files, VDCores/MPK source-paper provenance,
-  collection mode, sanitized reconstruction commands, and zero device
-  scheduler errors. The matrix report can be regenerated from the existing
-  per-scenario smoke JSON with
-  `--collect-existing-suffix 9024e9bb` without rerunning the GPUs, and the
-  validator requires that flag in the regenerated local command example. The
-  artifact index reads the lifecycle metadata commit and collection mode so
-  regenerated reports remain distinguishable in `tmp/cuda-backend/*/index.md`.
+  graph tensor-core dispatch/topology, scratch-reuse metadata, tensor-tile
+  metadata, report files, VDCores/MPK source-paper provenance, collection
+  mode, sanitized reconstruction commands, and zero device scheduler errors.
+  The matrix report can be regenerated from the existing per-scenario smoke
+  JSON with `--collect-existing-suffix 1c683c1c` without rerunning the GPUs,
+  and the validator requires that flag in the regenerated local command
+  example. The artifact index reads the lifecycle metadata commit and
+  collection mode so regenerated reports remain distinguishable in
+  `tmp/cuda-backend/*/index.md`.
   The paired persistent-smoke validator now
   requires `scratch_reuse=reused_buffer=tmp0,reuse_task=4`, and the smoke
   Markdown/SVG report renders that physical alias beside task metadata. In
   the current capture, graph-depends-on validates
   `launch_completed_counts=[3,3]`, dispatch `1,2,1`, graph fan-in `0,0,2`,
-  dependents `2,2`, and device times of `62464 ns` on A100 and `49120 ns` on
+  dependents `2,2`, and device times of `63488 ns` on A100 and `41600 ns` on
   H200. The same capture's graph-scratch-reuse scenario validates
   `launch_completed_counts=[6,6]`, dispatch `1,2,1,2,1,1`, graph fan-in
   `0,0,2,1,1,2`, dependents `2,2,3,4,5,5`, scratch reuse of `tmp0` at task
-  `4`, and device times of `94208 ns` on A100 and `70368 ns` on H200, so the
-  remaining lifecycle gap is normal PTO graph breadth rather than
-  prepared-callable reset coverage;
+  `4`, and device times of `92160 ns` on A100 and `89056 ns` on H200. The
+  graph-tensor-core scenario validates `launch_completed_counts=[4,4]`,
+  dispatch `10,1,2,1`, graph fan-in `0,1,1,2`, dependents `1,2,3,3`,
+  tensor tile `16x16x16`, `worker_blocks=4`, and device times of `77824 ns`
+  on A100 and `56672 ns` on H200, so the remaining lifecycle gap is normal
+  PTO graph breadth rather than prepared-callable reset coverage;
 - broader resource policy beyond the current single scheduler block,
   configurable queue/DAG worker blocks, direct worker-blocks-per-task,
   callable stream id tracer bullet, and configurable block dimension. The

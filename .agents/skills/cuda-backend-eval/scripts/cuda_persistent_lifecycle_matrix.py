@@ -72,9 +72,13 @@ class LifecycleScenario:
     mode: str
     dag_shape: str = "fork_join"
     task_count: int = 3
+    n: int | None = None
     queue_capacity: int = 2
     worker_blocks_per_task: int = 1
     worker_blocks: int | None = None
+    tensor_rows: int = 16
+    tensor_cols: int = 16
+    tensor_inner: int = 16
 
 
 SCENARIOS: dict[str, LifecycleScenario] = {
@@ -115,24 +119,49 @@ SCENARIOS: dict[str, LifecycleScenario] = {
         queue_capacity=3,
         worker_blocks=2,
     ),
+    "graph-tensor-core": LifecycleScenario(
+        name="graph-tensor-core",
+        mode="dag",
+        dag_shape="graph_tensor_core_tile",
+        task_count=4,
+        n=256,
+        queue_capacity=2,
+        worker_blocks=4,
+        tensor_rows=16,
+        tensor_cols=16,
+        tensor_inner=16,
+    ),
 }
 
-DEFAULT_SCENARIO_NAMES = ("direct", "queue", "dag-chain", "graph-depends-on", "graph-scratch-reuse")
+DEFAULT_SCENARIO_NAMES = (
+    "direct",
+    "queue",
+    "dag-chain",
+    "graph-depends-on",
+    "graph-scratch-reuse",
+    "graph-tensor-core",
+)
 SCENARIO_DISPATCH = {
     "dag-chain": "1,2,1,2,1",
     "graph-depends-on": "1,2,1",
     "graph-scratch-reuse": "1,2,1,2,1,1",
+    "graph-tensor-core": "10,1,2,1",
 }
 SCENARIO_GRAPH_FANIN = {
     "graph-depends-on": "0,0,2",
     "graph-scratch-reuse": "0,0,2,1,1,2",
+    "graph-tensor-core": "0,1,1,2",
 }
 SCENARIO_GRAPH_DEPENDENTS = {
     "graph-depends-on": "2,2",
     "graph-scratch-reuse": "2,2,3,4,5,5",
+    "graph-tensor-core": "1,2,3,3",
 }
 SCENARIO_SCRATCH_REUSE = {
     "graph-scratch-reuse": "reused_buffer=tmp0,reuse_task=4",
+}
+SCENARIO_TENSOR_TILE = {
+    "graph-tensor-core": "16x16x16",
 }
 
 
@@ -187,7 +216,7 @@ def _scenario_config(
         output_root=config.output_root,
         local_device=config.local_device,
         remote_device=config.remote_device,
-        n=config.n,
+        n=scenario.n if scenario.n is not None else config.n,
         mode=scenario.mode,
         dag_shape=scenario.dag_shape,
         task_count=scenario.task_count,
@@ -196,6 +225,9 @@ def _scenario_config(
         worker_blocks=scenario.worker_blocks,
         stream_id=config.stream_id,
         repeat_runs=config.repeat_runs,
+        tensor_rows=scenario.tensor_rows,
+        tensor_cols=scenario.tensor_cols,
+        tensor_inner=scenario.tensor_inner,
         local_arch=config.local_arch,
         remote_arch=config.remote_arch,
         local_python=config.local_python,
@@ -383,6 +415,18 @@ def _scratch_reuse(row: dict[str, Any]) -> str:
     return f"reused_buffer={reused_buffer},reuse_task={reuse_task}"
 
 
+def _tensor_tile(row: dict[str, Any]) -> str:
+    tile = row.get("tensor_tile")
+    if not isinstance(tile, dict):
+        return "-"
+    rows = tile.get("rows")
+    cols = tile.get("cols")
+    inner = tile.get("inner")
+    if rows is None or cols is None or inner is None:
+        return "-"
+    return f"{rows}x{cols}x{inner}"
+
+
 def _source_paper_summary(metadata: dict[str, Any]) -> str:
     papers = metadata.get("source_papers") or SOURCE_PAPERS
     parts = []
@@ -435,12 +479,12 @@ def render_lifecycle_markdown(
             (
                 "| Scenario | Artifact | Status | Runtime | Mode | N | Device ns | "
                 "Host ns | Repeat runs | Completions | Dispatch | Scheduler errors | "
-                "Resource policy | Graph topology | Scratch reuse |"
+                "Resource policy | Graph topology | Scratch reuse | Tensor tile |"
             ),
             (
                 "| -------- | -------- | ------ | ------- | ---- | - | --------- | "
                 "------- | ----------- | ----------- | -------- | ---------------- | "
-                "--------------- | -------------- | ------------- |"
+                "--------------- | -------------- | ------------- | ----------- |"
             ),
         ]
     )
@@ -451,7 +495,8 @@ def render_lifecycle_markdown(
             f"{_mode(row)} | {row.get('n', '-')} | {row.get('device_wall_ns', '-')} | "
             f"{row.get('host_wall_ns', '-')} | `{row.get('repeat_runs', '-')}` | "
             f"`{_completed(row)}` | `{_dispatch(row)}` | `{_scheduler_errors(row)}` | "
-            f"`{_policy(row)}` | `{_graph_topology(row)}` | `{_scratch_reuse(row)}` |"
+            f"`{_policy(row)}` | `{_graph_topology(row)}` | `{_scratch_reuse(row)}` | "
+            f"`{_tensor_tile(row)}` |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -495,7 +540,9 @@ def render_lifecycle_svg(rows: list[dict[str, Any]], label: str) -> str:
                 ),
                 (
                     f'<text x="{left}" y="{y + 55}" font-family="sans-serif" font-size="10" fill="#555">'
-                    f"graph={html.escape(_graph_topology(row))}; scratch={html.escape(_scratch_reuse(row))}</text>"
+                    f"graph={html.escape(_graph_topology(row))}; "
+                    f"scratch={html.escape(_scratch_reuse(row))}; "
+                    f"tile={html.escape(_tensor_tile(row))}</text>"
                 ),
             ]
         )
@@ -551,6 +598,9 @@ def build_validate_command(config: LifecycleMatrixConfig, suffix: str) -> list[s
         scratch_reuse = SCENARIO_SCRATCH_REUSE.get(scenario_name)
         if scratch_reuse is not None:
             command.extend(["--require-scratch-reuse", f"{scenario_name}={scratch_reuse}"])
+        tensor_tile = SCENARIO_TENSOR_TILE.get(scenario_name)
+        if tensor_tile is not None:
+            command.extend(["--require-tensor-tile", f"{scenario_name}={tensor_tile}"])
     command.append("--require-report-files")
     return command
 

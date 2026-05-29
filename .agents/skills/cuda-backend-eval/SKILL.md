@@ -970,7 +970,8 @@ This writes per-scenario smoke artifacts plus
 `cuda-lifecycle-matrix.svg`, and `cuda-lifecycle-matrix.json`.
 Lifecycle matrix JSON/Markdown includes source-paper provenance, collection
 mode, paper alignment text, sanitized local/remote command examples, graph
-topology, and scratch-reuse metadata. Use `--collect-existing-suffix
+topology, scratch-reuse metadata, and tensor-tile metadata. Use
+`--collect-existing-suffix
 <commit>` to regenerate the combined matrix report and index from existing
 per-scenario `a100.json`/`h200.json` files without rerunning A100/H200
 hardware; the regenerated report's local sample command must include the same
@@ -978,13 +979,13 @@ flag.
 Use `--dry-run` to print every paired smoke command plus the final matrix
 validator and artifact-index commands without writing the matrix report.
 The current paired lifecycle matrix capture is under
-`tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/`.
+`tmp/cuda-backend/lifecycle-tensor-core-working/persistent-lifecycle-matrix-1c683c1c/`.
 Validate a lifecycle matrix before copying its fields into docs:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_validate_lifecycle_matrix.py \
-    tmp/cuda-backend/lifecycle-depends-working/persistent-lifecycle-matrix-9024e9bb/cuda-lifecycle-matrix.json \
+    tmp/cuda-backend/lifecycle-tensor-core-working/persistent-lifecycle-matrix-1c683c1c/cuda-lifecycle-matrix.json \
     --preset default --require-source-papers --require-command-examples
 ```
 
@@ -992,7 +993,9 @@ The default preset now requires `graph-depends-on` with dispatch `1,2,1`,
 graph fan-in `0,0,2`, and dependents `2,2`. It also requires
 `graph-scratch-reuse` with dispatch `1,2,1,2,1,1`, fan-in
 `0,0,2,1,1,2`, dependents `2,2,3,4,5,5`, and
-`scratch_reuse=reused_buffer=tmp0,reuse_task=4`. Focused one-scenario
+`scratch_reuse=reused_buffer=tmp0,reuse_task=4`. It also requires
+`graph-tensor-core` with dispatch `10,1,2,1`, fan-in `0,1,1,2`,
+dependents `1,2,3,3`, and tensor tile `16x16x16`. Focused one-scenario
 lifecycle matrices should pass explicit `--scenario` values to the matrix
 runner rather than relying on the default preset.
 

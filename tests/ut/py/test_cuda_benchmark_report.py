@@ -3016,6 +3016,37 @@ def test_cuda_lifecycle_matrix_validator_accepts_default_matrix(tmp_path):
                 "grid_dim": 3,
             },
         },
+        {
+            "scenario": "graph-tensor-core",
+            "artifact": "a100",
+            "status": "pass",
+            "runtime": "persistent_device",
+            "mode": "dag",
+            "dag_shape": "graph_tensor_core_tile",
+            "n": 256,
+            "repeat_runs": 2,
+            "launch_completed_counts": [4, 4],
+            "completed_count": 4,
+            "dispatch_func_ids": [10, 1, 2, 1],
+            "graph_descriptor": {
+                "fanin": [0, 1, 1, 2],
+                "dependents": [1, 2, 3, 3],
+            },
+            "tensor_tile": {
+                "rows": 16,
+                "cols": 16,
+                "inner": 16,
+            },
+            "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+            "resource_policy": {
+                "scheduler_blocks": 1,
+                "worker_blocks": 4,
+                "worker_blocks_per_task": 1,
+                "stream_id": 1,
+                "block_dim": 256,
+                "grid_dim": 5,
+            },
+        },
     ]
     (artifact_dir / "cuda-lifecycle-matrix.json").write_text(json.dumps({"label": "test", "rows": rows}) + "\n")
     (artifact_dir / "cuda-lifecycle-matrix.md").write_text("# matrix\n")
@@ -3025,7 +3056,14 @@ def test_cuda_lifecycle_matrix_validator_accepts_default_matrix(tmp_path):
         cuda_validate_lifecycle.load_lifecycle_matrix(artifact_dir / "cuda-lifecycle-matrix.json"),
         artifact_dir=artifact_dir,
         expected_repeat_runs=2,
-        required_scenarios=["direct", "queue", "dag-chain", "graph-depends-on", "graph-scratch-reuse"],
+        required_scenarios=[
+            "direct",
+            "queue",
+            "dag-chain",
+            "graph-depends-on",
+            "graph-scratch-reuse",
+            "graph-tensor-core",
+        ],
         require_artifacts=["a100", "h200"],
         require_report_files=True,
     )
@@ -3098,6 +3136,43 @@ def test_cuda_lifecycle_matrix_validator_requires_graph_topology_and_scratch_reu
         "scenario=graph-scratch-reuse artifact=h200, "
         "found reused_buffer=tmp1,reuse_task=5"
     ) in errors
+
+
+def test_cuda_lifecycle_matrix_validator_requires_tensor_tile_metadata():
+    cuda_validate_lifecycle = _load_lifecycle_matrix_validator_module()
+    rows = [
+        {
+            "scenario": "graph-tensor-core",
+            "artifact": "a100",
+            "status": "pass",
+            "runtime": "persistent_device",
+            "mode": "dag",
+            "dag_shape": "graph_tensor_core_tile",
+            "n": 256,
+            "repeat_runs": 2,
+            "launch_completed_counts": [4, 4],
+            "completed_count": 4,
+            "dispatch_func_ids": [10, 1, 2, 1],
+            "graph_descriptor": {
+                "fanin": [0, 1, 1, 2],
+                "dependents": [1, 2, 3, 3],
+            },
+            "tensor_tile": {
+                "rows": 16,
+                "cols": 32,
+                "inner": 16,
+            },
+        }
+    ]
+
+    errors = cuda_validate_lifecycle.validate_lifecycle_matrix(
+        {"label": "test", "rows": rows},
+        required_tensor_tile={
+            "graph-tensor-core": "16x16x16",
+        },
+    )
+
+    assert ("expected tensor tile 16x16x16 for scenario=graph-tensor-core artifact=a100, found 16x32x16") in errors
 
 
 def test_cuda_lifecycle_matrix_validator_requires_source_papers_and_commands(tmp_path):
@@ -5421,13 +5496,19 @@ def test_cuda_persistent_lifecycle_matrix_builds_default_workflow(tmp_path):
     assert "persistent-chain-repeat2-smoke-abc123/a100.json" in command_text
     assert "persistent-graph_descriptor_depends_on-repeat2-smoke-abc123/a100.json" in command_text
     assert "persistent-graph_descriptor_scratch_reuse-repeat2-smoke-abc123/a100.json" in command_text
+    assert "persistent-graph_tensor_core_tile-16x16x16-repeat2-smoke-abc123/a100.json" in command_text
     assert "--mode direct" in command_text
     assert "--mode queue" in command_text
     assert "--mode dag" in command_text
     assert "--dag-shape graph_descriptor_depends_on" in command_text
     assert "--dag-shape graph_descriptor_scratch_reuse" in command_text
+    assert "--dag-shape graph_tensor_core_tile" in command_text
+    assert "--tensor-rows 16" in command_text
+    assert "--tensor-cols 16" in command_text
+    assert "--tensor-inner 16" in command_text
     assert "--worker-blocks-per-task 2" in command_text
     assert "--worker-blocks 2" in command_text
+    assert "--worker-blocks 4" in command_text
     assert "--stream-id 1" in command_text
     validate_script = ".agents/skills/cuda-backend-eval/scripts/cuda_validate_lifecycle_matrix.py"
     validate_commands = [command for command in commands if validate_script in command]
@@ -5454,13 +5535,24 @@ def test_cuda_persistent_lifecycle_matrix_validates_written_report(tmp_path):
         calls.append((command, kwargs))
         return subprocess.CompletedProcess(command, 0, stdout="abc123\n", stderr="")
 
-    def write_payload(directory, completed_count, *, mode, dag_shape=None, dispatch=None):
+    def write_payload(
+        directory,
+        completed_count,
+        *,
+        mode,
+        dag_shape=None,
+        dispatch=None,
+        graph_descriptor=None,
+        tensor_tile=None,
+        worker_blocks=2,
+        n=1024,
+    ):
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
             "status": "pass",
             "runtime": "persistent_device",
             "mode": mode,
-            "n": 1024,
+            "n": n,
             "device_wall_ns": 4096,
             "host_wall_ns": 8192,
             "repeat_runs": 2,
@@ -5468,11 +5560,11 @@ def test_cuda_persistent_lifecycle_matrix_validates_written_report(tmp_path):
             "launch_completed_counts": [completed_count, completed_count],
             "resource_policy": {
                 "scheduler_blocks": 1 if mode != "direct" else 0,
-                "worker_blocks": 2,
+                "worker_blocks": worker_blocks,
                 "worker_blocks_per_task": 1 if mode != "direct" else 2,
                 "stream_id": 1,
                 "block_dim": 256,
-                "grid_dim": 3,
+                "grid_dim": (1 if mode != "direct" else 0) + worker_blocks,
             },
         }
         if dag_shape is not None:
@@ -5480,6 +5572,10 @@ def test_cuda_persistent_lifecycle_matrix_validates_written_report(tmp_path):
             payload["device_scheduler_errors"] = {"count": 0, "code": 0, "task_id": 0}
         if dispatch is not None:
             payload["dispatch_func_ids"] = dispatch
+        if graph_descriptor is not None:
+            payload["graph_descriptor"] = graph_descriptor
+        if tensor_tile is not None:
+            payload["tensor_tile"] = tensor_tile
         for artifact in ("a100", "h200"):
             (directory / f"{artifact}.json").write_text(json.dumps(payload) + "\n")
 
@@ -5498,6 +5594,7 @@ def test_cuda_persistent_lifecycle_matrix_validates_written_report(tmp_path):
         mode="dag",
         dag_shape="graph_descriptor_depends_on",
         dispatch=[1, 2, 1],
+        graph_descriptor={"fanin": [0, 0, 2], "dependents": [2, 2], "tasks": 3},
     )
     write_payload(
         output_root / "persistent-graph_descriptor_scratch_reuse-repeat2-smoke-abc123",
@@ -5505,6 +5602,18 @@ def test_cuda_persistent_lifecycle_matrix_validates_written_report(tmp_path):
         mode="dag",
         dag_shape="graph_descriptor_scratch_reuse",
         dispatch=[1, 2, 1, 2, 1, 1],
+        graph_descriptor={"fanin": [0, 0, 2, 1, 1, 2], "dependents": [2, 2, 3, 4, 5, 5], "tasks": 6},
+    )
+    write_payload(
+        output_root / "persistent-graph_tensor_core_tile-16x16x16-repeat2-smoke-abc123",
+        4,
+        mode="dag",
+        dag_shape="graph_tensor_core_tile",
+        dispatch=[10, 1, 2, 1],
+        graph_descriptor={"fanin": [0, 1, 1, 2], "dependents": [1, 2, 3, 3], "tasks": 4},
+        tensor_tile={"rows": 16, "cols": 16, "inner": 16},
+        worker_blocks=4,
+        n=256,
     )
     config = cuda_lifecycle_matrix.LifecycleMatrixConfig(
         remote="h200-box",
@@ -5563,6 +5672,13 @@ def test_cuda_persistent_lifecycle_matrix_collects_existing_suffix(tmp_path):
             "graph_descriptor_scratch_reuse",
             [1, 2, 1, 2, 1, 1],
         ),
+        (
+            "persistent-graph_tensor_core_tile-16x16x16-repeat2-smoke-abc123",
+            4,
+            "dag",
+            "graph_tensor_core_tile",
+            [10, 1, 2, 1],
+        ),
     ):
         directory = output_root / scenario_dir
         directory.mkdir(parents=True)
@@ -5590,6 +5706,21 @@ def test_cuda_persistent_lifecycle_matrix_collects_existing_suffix(tmp_path):
             payload["device_scheduler_errors"] = {"count": 0, "code": 0, "task_id": 0}
         if dispatch is not None:
             payload["dispatch_func_ids"] = dispatch
+        if dag_shape == "graph_descriptor_depends_on":
+            payload["graph_descriptor"] = {"fanin": [0, 0, 2], "dependents": [2, 2], "tasks": 3}
+        if dag_shape == "graph_descriptor_scratch_reuse":
+            payload["graph_descriptor"] = {
+                "fanin": [0, 0, 2, 1, 1, 2],
+                "dependents": [2, 2, 3, 4, 5, 5],
+                "tasks": 6,
+            }
+            payload["scratch_reuse"] = {"reused_buffer": "tmp0", "reuse_task": 4}
+        if dag_shape == "graph_tensor_core_tile":
+            payload["n"] = 256
+            payload["resource_policy"]["worker_blocks"] = 4
+            payload["resource_policy"]["grid_dim"] = 5
+            payload["graph_descriptor"] = {"fanin": [0, 1, 1, 2], "dependents": [1, 2, 3, 3], "tasks": 4}
+            payload["tensor_tile"] = {"rows": 16, "cols": 16, "inner": 16}
         for artifact in ("a100", "h200"):
             (directory / f"{artifact}.json").write_text(json.dumps(payload) + "\n")
 
@@ -5644,6 +5775,23 @@ def test_cuda_persistent_lifecycle_matrix_validates_custom_scenarios(tmp_path):
     assert "--require-graph-dependents" in command
     assert "graph-depends-on=2,2" in command
     assert "--require-scratch-reuse" not in command
+
+    tensor_config = cuda_lifecycle_matrix.LifecycleMatrixConfig(
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        scenario_names=("graph-tensor-core",),
+    )
+
+    tensor_command = cuda_lifecycle_matrix.build_validate_command(tensor_config, "abc123")
+
+    assert "--require-dispatch" in tensor_command
+    assert "graph-tensor-core=10,1,2,1" in tensor_command
+    assert "--require-graph-fanin" in tensor_command
+    assert "graph-tensor-core=0,1,1,2" in tensor_command
+    assert "--require-graph-dependents" in tensor_command
+    assert "graph-tensor-core=1,2,3,3" in tensor_command
+    assert "--require-tensor-tile" in tensor_command
+    assert "graph-tensor-core=16x16x16" in tensor_command
 
 
 def test_cuda_persistent_lifecycle_matrix_renders_report(tmp_path):
@@ -5751,6 +5899,38 @@ def test_cuda_persistent_lifecycle_matrix_renders_report(tmp_path):
                 "grid_dim": 3,
             },
         },
+        {
+            "scenario": "graph-tensor-core",
+            "artifact": "h200",
+            "mode": "dag",
+            "dag_shape": "graph_tensor_core_tile",
+            "status": "pass",
+            "runtime": "persistent_device",
+            "n": 256,
+            "device_wall_ns": 2048,
+            "host_wall_ns": 4096,
+            "repeat_runs": 2,
+            "launch_completed_counts": [4, 4],
+            "dispatch_func_ids": [10, 1, 2, 1],
+            "graph_descriptor": {
+                "fanin": [0, 1, 1, 2],
+                "dependents": [1, 2, 3, 3],
+            },
+            "tensor_tile": {
+                "rows": 16,
+                "cols": 16,
+                "inner": 16,
+            },
+            "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+            "resource_policy": {
+                "scheduler_blocks": 1,
+                "worker_blocks": 4,
+                "worker_blocks_per_task": 1,
+                "stream_id": 1,
+                "block_dim": 256,
+                "grid_dim": 5,
+            },
+        },
     ]
 
     markdown_path, svg_path = cuda_lifecycle_matrix.write_lifecycle_report(
@@ -5794,6 +5974,10 @@ def test_cuda_persistent_lifecycle_matrix_renders_report(tmp_path):
     assert "`1,2,1,2,1,1`" in report
     assert "`fanin=0,0,2,1,1,2;deps=2,2,3,4,5,5`" in report
     assert "`reused_buffer=tmp0,reuse_task=4`" in report
+    assert ("| graph-tensor-core | h200 | pass | persistent_device | dag/graph_tensor_core_tile |") in report
+    assert "`10,1,2,1`" in report
+    assert "`fanin=0,1,1,2;deps=1,2,3,3`" in report
+    assert "`16x16x16`" in report
     assert "lifecycle-test" in svg_path.read_text()
 
 
