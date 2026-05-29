@@ -168,7 +168,9 @@ Markdown and SVG evidence. Persistent-device reports include dispatch
 `func_id` sequences, device-side scheduler error counters, resource policy,
 tensor/scalar task argument metadata, graph descriptor fan-in/dependent
 arrays, tagged graph `graph_task_args` metadata, and repeat-run lifecycle
-counters when present:
+counters when present. Nonzero scheduler error codes are rendered with stable
+taxonomy names such as `7(unreachable_task)` in validators, smoke reports, and
+artifact indexes:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
@@ -1938,9 +1940,9 @@ descriptor fan-in/dependent arrays, graph task-argument keys, graph
 task-argument metadata, tensor-sweep source-paper IDs, tensor-sweep
 command-example presence, lifecycle-matrix source-paper IDs,
 lifecycle-matrix collection mode, lifecycle-matrix command-example presence,
-and generated report/chart presence. It is a local audit aid under `tmp/`; do
-not commit it with raw benchmark, tensor sweep, lifecycle matrix, or smoke
-data.
+named scheduler error codes, and generated report/chart presence. It is a
+local audit aid under `tmp/`; do not commit it with raw benchmark, tensor
+sweep, lifecycle matrix, or smoke data.
 
 Render compact smoke JSON reports when a result is a smoke validation rather
 than a full benchmark:

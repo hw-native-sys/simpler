@@ -3537,7 +3537,11 @@ Needed:
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
   invalid-dependent-ID, dependent-range, fan-in-underflow,
   duplicate-dependent, initial-fan-in, and no-root/unreachable-task
-  diagnostics.
+  diagnostics. The current validators, smoke reports, lifecycle matrix
+  reports, benchmark validators, and local artifact index render known
+  nonzero scheduler codes with stable labels such as `7(unreachable_task)`,
+  so negative A100/H200 captures are easier to triage without cross-reading
+  raw runtime constants.
 
 ### Tuned Tensor Workloads
 

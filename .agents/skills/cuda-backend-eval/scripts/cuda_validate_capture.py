@@ -75,6 +75,17 @@ REPORT_FILES = (
     "cuda-benchmark-dag-deltas.svg",
     "cuda-benchmark-throughput.svg",
 )
+SCHEDULER_ERROR_NAMES = {
+    0: "none",
+    1: "unsupported_func_id",
+    2: "invalid_dependent_id",
+    3: "invalid_dependent_range",
+    4: "fanin_underflow",
+    5: "initial_fanin_mismatch",
+    6: "no_root_task",
+    7: "unreachable_task",
+    8: "duplicate_dependent",
+}
 PAIRED_CURRENT_DISPATCH = {
     "pto_persistent_dag": "1,2,1",
     "pto_persistent_dag_chain": "1,2,1,2,1",
@@ -171,6 +182,17 @@ PAIRED_CURRENT_GRAPH_DEPENDENTS = {
     "pto_persistent_dag_graph_tensor": "1,2,3,3",
     "pto_persistent_dag_graph_tensor_core": "1,2,3,3",
 }
+
+
+def scheduler_error_code_label(code: Any) -> str:
+    if not isinstance(code, int):
+        return str(code)
+    name = SCHEDULER_ERROR_NAMES.get(code)
+    if name is None:
+        return str(code)
+    if code == 0:
+        return "0"
+    return f"{code}({name})"
 
 
 def _as_list(values: Sequence[str] | None) -> list[str]:
@@ -553,7 +575,7 @@ def _validate_zero_scheduler_errors(rows: list[dict[str, Any]]) -> list[str]:
             errors.append(
                 "scheduler error "
                 f"machine={machine} baseline={baseline} n={size} "
-                f"count={count} code={code} task_id={task_id}"
+                f"count={count} code={scheduler_error_code_label(code)} task_id={task_id}"
             )
     return errors
 

@@ -151,7 +151,10 @@ commands, and can be refreshed from existing per-scenario smoke JSON with
 The lifecycle validator requires regenerated existing-JSON reports to retain
 that flag in their local sample command. The artifact index reads the lifecycle
 matrix metadata commit and collection mode so regenerated reports stay
-distinguishable from paired smoke captures.
+distinguishable from paired smoke captures. Validators, smoke reports,
+lifecycle matrix reports, benchmark diagnostics, and the artifact index render
+known nonzero device scheduler codes with stable labels such as
+`7(unreachable_task)`, while zero-error rows remain compact as `code=0`.
 Benchmark report directories now include `cuda-benchmark-dag-deltas.svg`,
 which visualizes the signed device-time increment of each
 `pto_persistent_dag_*` row over the matched `pto_persistent_dag` scheduler

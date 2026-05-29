@@ -821,7 +821,8 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
         "`task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2` |" in markdown
     )
     assert (
-        "| `3,1,2,1` | `0,1,1,2` | `1,2,3,3` | `count=1,code=7,task=3` | `2` | `4,4` | "
+        "| `3,1,2,1` | `0,1,1,2` | `1,2,3,3` | "
+        "`count=1,code=7(unreachable_task),task=3` | `2` | `4,4` | "
         "`sched=1,workers=2,wp=1,stream=1,block=256,grid=3` | "
         "`scalar0=1.5` | `c=tmp0` | `reused_buffer=tmp0,reuse_task=4` |" in markdown
     )
@@ -829,7 +830,7 @@ def test_cuda_smoke_report_renders_markdown_and_svg(tmp_path):
     assert "<svg" in svg
     assert "tensor-smoke" in svg
     assert "h200" in svg
-    assert "errors: count=1,code=7,task=3" in svg
+    assert "errors: count=1,code=7(unreachable_task),task=3" in svg
     assert "policy: sched=1,workers=2,wp=1,stream=1,block=256,grid=3" in svg
     assert "lifecycle: repeat=2,completed=4,4" in svg
     assert "scalars: scalar0=1.5" in svg
@@ -1236,7 +1237,7 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
             "graph_dependents": [],
             "scheduler_errors": [
                 "count=0,code=0,task=0",
-                "count=1,code=7,task=3",
+                "count=1,code=7(unreachable_task),task=3",
             ],
             "repeat_runs": [],
             "launch_completed_counts": [],
@@ -1260,7 +1261,7 @@ def test_cuda_artifact_index_scans_smoke_report_outputs(tmp_path):
     ) in report
     assert "| tensor-descriptor-smoke | smoke | tensor-smoke | combined | unknown | 2 |" in report
     assert "| 4096 | 16x16x16 | dag/tensor_tile | 3,1,2,1 |  |  |" in report
-    assert "count=0,code=0,task=0, count=1,code=7,task=3 |" in report
+    assert "count=0,code=0,task=0, count=1,code=7(unreachable_task),task=3 |" in report
     assert "sched=1,workers=2,wp=1,stream=1,block=256,grid=3 |" in report
     assert (
         "scalar0=1.5 | c=tmp0 | role | task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2 |"
@@ -1609,7 +1610,9 @@ def test_cuda_capture_validator_requires_zero_scheduler_errors():
         require_zero_scheduler_errors=True,
     )
 
-    assert "scheduler error machine=hina baseline=pto_persistent_dag n=1024 count=1 code=7 task_id=2" in errors
+    assert (
+        "scheduler error machine=hina baseline=pto_persistent_dag n=1024 count=1 code=7(unreachable_task) task_id=2"
+    ) in errors
 
     payload["results"][-1]["device_scheduler_errors"] = {"count": 0, "code": 0, "task_id": 0}
 
@@ -2851,7 +2854,7 @@ def test_cuda_smoke_validator_reports_lifecycle_and_report_errors(tmp_path):
 
     assert "missing artifact h200" in errors
     assert "non-pass artifact=a100 status=fail" in errors
-    assert "scheduler error artifact=a100 count=1 code=7 task=0" in errors
+    assert "scheduler error artifact=a100 count=1 code=7(unreachable_task) task=0" in errors
     assert "expected completed count 3 for artifact=a100 launch=1, found 2" in errors
     assert "missing report file cuda-smoke-report.md" in errors
     assert "missing report file cuda-smoke-report.svg" in errors
@@ -3087,7 +3090,7 @@ def test_cuda_lifecycle_matrix_validator_reports_contract_errors(tmp_path):
     assert "missing artifact h200" in errors
     assert "missing report file cuda-lifecycle-matrix.md" in errors
     assert "non-pass scenario=dag-chain artifact=a100 status=fail" in errors
-    assert "scheduler error scenario=dag-chain artifact=a100 count=1 code=7 task=1" in errors
+    assert "scheduler error scenario=dag-chain artifact=a100 count=1 code=7(unreachable_task) task=1" in errors
     assert "expected dispatch 1,2,1,2,1 for scenario=dag-chain artifact=a100, found 1,2,1" in errors
     assert "expected completed count 5 for scenario=dag-chain artifact=a100 launch=1, found 4" in errors
 
