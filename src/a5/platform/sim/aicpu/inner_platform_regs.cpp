@@ -34,7 +34,14 @@ void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
     *get_reg_ptr(reg_base_addr, reg) = static_cast<uint32_t>(value);
 }
 
-// 10 s budget on sim — AICore is a host CPU thread and "no response" can
-// just mean the OS scheduler hasn't given it a slice on a CPU-starved CI
-// runner. See declaration in platform_regs.h for the design rationale.
+/**
+ * @brief Deinit ACK-wait budget on sim: 10 s.
+ *
+ * On sim "AICore" is a host CPU thread, so a missing exit ACK usually just
+ * means the OS scheduler hasn't given that thread a slice on a CPU-starved CI
+ * runner — not a wedged op. The wide budget tolerates that jitter. See the
+ * declaration in platform_regs.h for the full rationale.
+ *
+ * @return Timeout in profiling system-counter ticks.
+ */
 uint64_t inner_get_deinit_timeout_ticks() { return 10 * PLATFORM_PROF_SYS_CNT_FREQ; }

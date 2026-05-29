@@ -37,7 +37,14 @@ void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
     *get_reg_ptr(reg_base_addr, reg) = static_cast<uint32_t>(value);
 }
 
-// 1 s budget on real hardware — non-response that long means the op was
-// STARS-killed or the core is wedged; aclrtResetDevice will clean up.
-// See declaration in platform_regs.h for the design rationale.
+/**
+ * @brief Deinit ACK-wait budget on real hardware: 1 s.
+ *
+ * On silicon a non-response this long means the op was STARS-killed or the
+ * core is wedged; aclrtResetDevice will clean up. The tight budget preserves
+ * hardware hang detection. See the declaration in platform_regs.h for the
+ * full rationale.
+ *
+ * @return Timeout in profiling system-counter ticks.
+ */
 uint64_t inner_get_deinit_timeout_ticks() { return PLATFORM_PROF_SYS_CNT_FREQ; }

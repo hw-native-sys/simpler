@@ -75,17 +75,23 @@ profiling-vs-parallelism trade-off.
 
 ### Sim jobs on CPU-constrained runners
 
-Sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-latest`, which typically
-has 2 vCPUs. `--device 0-15` is still the right choice for the **pool size**
-(some L3 cases need several virtual ids), but the default `--max-parallel auto`
-caps the in-flight subprocess count to `min(nproc, len(--device))` — on a
-2-core runner that becomes `2`, avoiding CPU thrashing:
+Sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-latest`, whose standard
+GitHub-hosted runner currently has **4 vCPUs**. `--device 0-15` is still the
+right choice for the **pool size** (some L3 cases need several virtual ids), but
+the default `--max-parallel auto` caps the in-flight subprocess count to
+`min(nproc, len(--device))` — on a 4-core runner that becomes `4`. Note
+`os.cpu_count()` reports the host's logical CPUs and ignores any cgroup CPU
+quota, so this is the true core count, not a container limit.
 
 ```bash
-# Sim: --max-parallel auto resolves to 2 on ubuntu-latest
+# Sim: --max-parallel auto resolves to 4 on a standard ubuntu-latest runner
 pytest examples tests/st --platform a2a3sim --device 0-15
 
-# Or pin explicitly if your runner has a different CPU count
+# Throttle further on a CPU-starved runner: 4 concurrent cases (each forking
+# several chip subprocesses with many threads) can oversubscribe 4 cores and
+# trigger the sim handshake/deinit failures in
+# troubleshooting/sim-oversubscription-hang.md. --max-parallel 2 trades
+# throughput for stability.
 pytest examples tests/st --platform a2a3sim --device 0-15 --max-parallel 2
 ```
 
