@@ -475,12 +475,13 @@ When changing node-link graph input handling, run the SceneTestCase node-data
 selector. It validates list-shaped `graph.nodes` entries whose `id` carries
 identity and whose task payload lives under `data`, with top-level node fields
 overriding conflicting `data` fields. It also covers `graph.links` as the
-node-link spelling for edge-list metadata:
+node-link spelling for edge-list metadata and dictionary-valued node IO port
+maps:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
-    -q -k 'node_data or node_link' --platform cuda
+    -q -k 'node_data or node_link or node_port_dict' --platform cuda
 ```
 
 Use `--dag-shape graph_descriptor_triad` and
@@ -1391,6 +1392,10 @@ Graph nodes may use top-level `inputs`, `outputs`, `output_existing`,
 `inouts`, and `scalars` fields when the descriptor should look like node IO
 metadata instead of a task-arg list. The adapter expands those fields into the
 same role-keyed `task_args` lowering path.
+Dictionary-valued `inputs` and `outputs` are accepted as node-port maps. The
+adapter flattens their values in stable port order, so schemas such as
+`inputs={"lhs": "a", "rhs": "b"}` and `outputs={"value": "tmp0"}` lower like
+the list-shaped `inputs=["a", "b"]` and `outputs=["tmp0"]` form.
 Graph nodes may keep non-IO metadata under an `attrs` dictionary. Use this for
 node metadata such as `tensor_args` and `scalar_args` that should not be
 treated as graph IO edges. The adapter merges `attrs` before node IO lowering,

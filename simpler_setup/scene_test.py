@@ -1762,11 +1762,42 @@ class _CudaPersistentDagSceneBuffers:
             if key not in task_spec:
                 continue
             value = task_spec[key]
-            if isinstance(value, (list, tuple)):
+            if isinstance(value, dict):
+                values.extend(_CudaPersistentDagSceneBuffers._graph_node_port_values(value))
+            elif isinstance(value, (list, tuple)):
                 values.extend(value)
             else:
                 values.append(value)
         return values
+
+    @staticmethod
+    def _graph_node_port_values(value: dict[Any, Any]) -> list[Any]:
+        priority = {
+            "a": 0,
+            "lhs": 0,
+            "left": 0,
+            "x": 0,
+            "input0": 0,
+            "b": 1,
+            "rhs": 1,
+            "right": 1,
+            "y": 1,
+            "input1": 1,
+            "c": 2,
+            "input2": 2,
+            "d": 3,
+            "input3": 3,
+            "out": 4,
+            "output": 4,
+            "value": 4,
+        }
+        return [
+            item[1]
+            for item in sorted(
+                value.items(),
+                key=lambda item: (priority.get(str(item[0]).lower(), 100), str(item[0])),
+            )
+        ]
 
     @staticmethod
     def _compact_graph_tensor_task_arg(task_arg: dict[str, Any], index: int) -> tuple[str | None, Any]:

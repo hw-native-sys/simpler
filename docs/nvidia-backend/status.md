@@ -2001,6 +2001,13 @@ avoid embedding `a`/`b`/`out` ABI field names directly. The ctypes-backed
 deselected`; the full local A100 CUDA scene-test file passed with
 `117 passed`; and the H200 selector passed with `1 passed, 116 deselected`
 while still emitting the known PTO-ISA SSH refresh warning.
+Dictionary-valued `inputs` and `outputs` node-port maps now lower through the
+same node-IO path. This covers graph schemas that carry edge ports as
+`{"lhs": "a", "rhs": "b"}` or `{"value": "tmp0"}` rather than plain lists.
+The focused TDD selector first failed because the adapter stringified the
+port dictionaries into unknown tensor names; after flattening port values
+deterministically, local A100 and synced H200 both reported
+`2 passed, 135 deselected` for `-k node_port_dict --platform cuda`.
 Graph nodes may now use `op` as an alias for `callable`, resolved through
 `graph.callables` before node IO fields are lowered. This lets node
 descriptors keep an operation-name spelling while still producing the same
@@ -4219,8 +4226,9 @@ Needed:
   list-valued named task dependencies, top-level graph edge lists including
   string `source -> target` entries, adjacency dictionaries, `graph.links`
   aliases, `graph.nodes` aliases, node `id` identity aliases, node-link
-  `data` payloads, node-style IO fields, node `op` callable aliases, callable
-  metadata `callable_id` / `cid` aliases, and paired smoke including
+  `data` payloads, node-style IO fields, dictionary-valued node IO port maps,
+  node `op` callable aliases, callable metadata `callable_id` / `cid` aliases,
+  and paired smoke including
   node-link `links`,
   dictionary-keyed graph task descriptors,
   tagged TaskArgs-like graph task lowering including `inout` producer
