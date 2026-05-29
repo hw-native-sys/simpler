@@ -99,6 +99,26 @@ def _load_pair_benchmark_module():
         sys.modules.pop(spec.name, None)
 
 
+def _load_pair_stream_benchmark_module():
+    script_path = (
+        Path(__file__).resolve().parents[3]
+        / ".agents"
+        / "skills"
+        / "cuda-backend-eval"
+        / "scripts"
+        / "cuda_pair_stream_benchmark.py"
+    )
+    spec = importlib.util.spec_from_file_location("cuda_pair_stream_benchmark", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
 def _load_tensor_shape_sweep_module():
     script_path = (
         Path(__file__).resolve().parents[3]
@@ -4104,6 +4124,101 @@ def test_cuda_pair_benchmark_merge_command_records_sanitized_examples(tmp_path):
     assert all(str(Path.cwd()) not in example for example in examples)
     assert any(example.startswith("local_sample=env PYTHONPATH=$PWD:$PWD/python") for example in examples)
     assert any(example.startswith("remote_sample=ssh") and "--arch compute_90" in example for example in examples)
+    assert any(example.startswith("sync_remote_tree=rsync") for example in examples)
+
+
+def test_cuda_pair_stream_benchmark_builds_a100_h200_workflow(tmp_path):
+    cuda_pair_stream_benchmark = _load_pair_stream_benchmark_module()
+    config = cuda_pair_stream_benchmark.PairedStreamBenchmarkConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        branch="design/nvidia-backend",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        stream_pool_size=6,
+        repeats=2,
+    )
+
+    local = cuda_pair_stream_benchmark.build_local_benchmark_command(config, "abc123")
+    remote = cuda_pair_stream_benchmark.build_remote_benchmark_command(config, "abc123")
+    scp = cuda_pair_stream_benchmark.build_scp_command(config, "abc123")
+    merge = cuda_pair_stream_benchmark.build_merge_command(config, "abc123")
+    validate = cuda_pair_stream_benchmark.build_validate_command(config, "abc123")
+    index = cuda_pair_stream_benchmark.build_index_command(config)
+
+    assert local[:2] == ["env", f"PYTHONPATH={Path.cwd()}:{Path.cwd() / 'python'}"]
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py" in local
+    assert "--stream-concurrency" in local
+    assert "--stream-pool-size" in local
+    assert "6" in local
+    assert "--repeats" in local
+    assert "2" in local
+    assert "--arch" in local
+    assert "compute_80" in local
+    assert "a100-stream-pool6-abc123" in local
+
+    assert remote[:6] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "h200-box"]
+    remote_shell = remote[-1]
+    assert "cd /remote/pto-cu" in remote_shell
+    assert "fetch origin design/nvidia-backend" in remote_shell
+    assert "git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null" in remote_shell
+    assert "CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH PYTHONPATH=$PWD:$PWD/python" in remote_shell
+    assert "--stream-concurrency" in remote_shell
+    assert "--stream-pool-size 6" in remote_shell
+    assert "--repeats 2" in remote_shell
+    assert "--arch compute_90" in remote_shell
+    assert "h200-stream-pool6-abc123" in remote_shell
+
+    assert scp == [
+        "scp",
+        "-r",
+        f"h200-box:/remote/pto-cu/{tmp_path / 'cuda-backend' / 'h200-stream-pool6-abc123'}",
+        str(tmp_path / "cuda-backend"),
+    ]
+    assert "--merge-json" in merge
+    assert str(tmp_path / "cuda-backend" / "a100-stream-pool6-abc123" / "cuda-benchmark.json") in merge
+    assert str(tmp_path / "cuda-backend" / "h200-stream-pool6-abc123" / "cuda-benchmark.json") in merge
+    assert "combined-stream-pool6-abc123" in merge
+
+    assert ".agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py" in validate
+    assert str(tmp_path / "cuda-backend" / "combined-stream-pool6-abc123" / "cuda-benchmark.json") in validate
+    assert "--require-machine" in validate
+    assert "hina" in validate
+    assert "dasys-h200x8" in validate
+    assert "--require-size" in validate
+    assert "2" in validate
+    assert "--expected-repeats" in validate
+    assert "2" in validate
+    assert "--expected-result-count" in validate
+    assert "8" in validate
+    baselines = [validate[index + 1] for index, part in enumerate(validate) if part == "--require-baseline"]
+    assert baselines == ["pto_stream_serial", "pto_stream_parallel"]
+    assert "--require-report-files" in validate
+    assert "--require-command-examples" in validate
+    assert "--require-source-papers" in validate
+    assert index[-2:] == ["--root", str(tmp_path / "cuda-backend")]
+
+
+def test_cuda_pair_stream_benchmark_merge_command_records_sanitized_examples(tmp_path):
+    cuda_pair_stream_benchmark = _load_pair_stream_benchmark_module()
+    config = cuda_pair_stream_benchmark.PairedStreamBenchmarkConfig(
+        remote="h200-box",
+        remote_workdir="/remote/pto-cu",
+        branch="design/nvidia-backend",
+        output_root=tmp_path / "cuda-backend",
+        local_python=".venv/bin/python",
+        remote_python=".venv/bin/python",
+        sync_remote_tree=True,
+    )
+
+    merge = cuda_pair_stream_benchmark.build_merge_command(config, "abc123")
+    examples = [merge[index + 1] for index, part in enumerate(merge) if part == "--command-example"]
+
+    assert len(examples) == 3
+    assert all(str(Path.cwd()) not in example for example in examples)
+    assert any(example.startswith("local_sample=env PYTHONPATH=$PWD:$PWD/python") for example in examples)
+    assert any(example.startswith("remote_sample=ssh") and "--stream-concurrency" in example for example in examples)
     assert any(example.startswith("sync_remote_tree=rsync") for example in examples)
 
 

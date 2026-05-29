@@ -298,6 +298,14 @@ and task count. For same-work batch rows, the reference is
 `pto_host_schedule_batch`, not the one-task `pto_host_schedule` row. Stream
 rows use `pto_stream_serial` as their reference.
 
+The host-schedule stream-concurrency workflow has its own paired runner
+because it is a focused launch-overlap benchmark rather than part of the
+selected persistent-device baseline matrix. The latest paired stream capture
+is under
+`tmp/cuda-backend/stream-pair-working/combined-stream-pool6-a36d137b/` and
+validates two repeats of `pto_stream_serial` and `pto_stream_parallel` on
+A100 and H200 with `--stream-pool-size 6`.
+
 ## Reproduction
 
 The committed workflow lives under
@@ -331,6 +339,16 @@ truth, add `--sync-remote-tree` to copy the current local tree to
 excludes `.venv`, `build`, and `tmp`, and labels both GPU artifacts with the
 local commit. It syncs `.git` so the remote benchmark metadata reports the
 same commit as the synced source tree.
+
+Use the paired stream runner to refresh the host-schedule stream-concurrency
+capture:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_stream_benchmark.py \
+    --repeats 2 --stream-pool-size 6 --sync-remote-tree \
+    --output-root tmp/cuda-backend/stream-pair-working
+```
 
 Use the paired smoke runner when the goal is a fast real-data A100/H200 check
 without requiring `torch` on the H200 environment:

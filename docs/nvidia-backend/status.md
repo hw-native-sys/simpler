@@ -129,6 +129,48 @@ contains JSON, Markdown, and SVG report files. A100 reported median
 The merged Markdown report includes `Host stream pool size: 6`, making the
 concurrency configuration explicit in the visual artifact set.
 
+The stream-concurrency workflow now has a paired runner,
+`cuda_pair_stream_benchmark.py`, so the A100/H200 capture is repeatable with
+the same validation discipline as the selected persistent benchmark gates. The
+TDD check first failed because the paired stream runner did not exist, then
+passed after adding command construction, sanitized merge examples, and a
+capture validation command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+  tests/ut/py/test_cuda_benchmark_report.py -q \
+  -k 'pair_stream_benchmark'
+```
+
+Result: `2 passed, 266 deselected`.
+
+The paired A100/H200 run used `--stream-pool-size 6`, two repeats, local
+`compute_80`, remote `compute_90`, and tree sync to the H200 host:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_pair_stream_benchmark.py \
+    --repeats 2 --stream-pool-size 6 --sync-remote-tree \
+    --output-root tmp/cuda-backend/stream-pair-working
+```
+
+Artifacts:
+
+- `tmp/cuda-backend/stream-pair-working/a100-stream-pool6-a36d137b/`
+- `tmp/cuda-backend/stream-pair-working/h200-stream-pool6-a36d137b/`
+- `tmp/cuda-backend/stream-pair-working/combined-stream-pool6-a36d137b/`
+- `tmp/cuda-backend/stream-pair-working/index.md`
+
+The validator required machines `hina` and `dasys-h200x8`, baselines
+`pto_stream_serial` and `pto_stream_parallel`, size `2`, two repeats, eight
+total rows, source-paper provenance, command examples, and generated report
+files.
+
+| GPU | Serial ns | Parallel ns | Parallel/serial |
+| --- | --------- | ----------- | --------------- |
+| A100 | 113791963 | 58041653 | 0.51x |
+| H200 | 89717007 | 46203624 | 0.51x |
+
 ### Persistent-Device Runtime
 
 The CUDA `persistent_device` runtime is implemented as a set of tracer-bullet

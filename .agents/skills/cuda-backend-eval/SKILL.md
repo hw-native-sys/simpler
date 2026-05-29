@@ -2376,6 +2376,25 @@ The stream-pool-size capture under
 `tmp/cuda-backend/stream-pool6-working/` uses `--stream-pool-size 6`; it
 reported parallel/serial ratios of `0.51x` on A100 and `0.48x` on H200.
 
+Use the paired stream runner to capture local A100 and remote H200 stream
+concurrency in one command. It runs `cuda_benchmark.py --stream-concurrency`
+on both machines, merges the JSON reports, validates both machines and stream
+baselines, and refreshes the local artifact index:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_stream_benchmark.py \
+    --repeats 2 --stream-pool-size 6 --sync-remote-tree \
+    --output-root tmp/cuda-backend/stream-pair-working
+```
+
+The current paired capture under
+`tmp/cuda-backend/stream-pair-working/combined-stream-pool6-a36d137b/`
+validated eight rows: two repeats of `pto_stream_serial` and
+`pto_stream_parallel` on A100 and H200, source-paper provenance, sanitized
+command examples, and generated Markdown/SVG reports. The median parallel vs.
+serial ratios were `0.51x` on A100 and `0.51x` on H200.
+
 The DAG-chain capture at `323f4587` adds `pto_persistent_dag_chain` to the
 normal `--include-persistent` benchmark. It shows the same generated-dispatch
 PTX can run both the three-task fork/join DAG and a five-task post-fan-in
