@@ -219,6 +219,10 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-sweep.md`
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-sweep.svg`
 - `tmp/cuda-backend/graph-tensor-core-benchmark-working/tensor-shape-sweep-debe979d/cuda-tensor-shape-throughput.svg`
+- `tmp/cuda-backend/tensor-sweep-current-working/tensor-shape-sweep-219042f5/cuda-tensor-shape-sweep.json`
+- `tmp/cuda-backend/tensor-sweep-current-working/tensor-shape-sweep-219042f5/cuda-tensor-shape-sweep.md`
+- `tmp/cuda-backend/tensor-sweep-current-working/tensor-shape-sweep-219042f5/cuda-tensor-shape-sweep.svg`
+- `tmp/cuda-backend/tensor-sweep-current-working/tensor-shape-sweep-219042f5/cuda-tensor-shape-throughput.svg`
 - `tmp/cuda-backend/graph-unary-benchmark-working/a100-current-f074746a/cuda-benchmark.json`
 - `tmp/cuda-backend/graph-unary-benchmark-working/h200-current-f074746a/cuda-benchmark.json`
 - `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/cuda-benchmark.json`
@@ -1670,6 +1674,43 @@ The CUDA Graph replay row is much faster than plain cuBLAS for this tiny
 launch-dominated descriptor because the capture has already paid the library
 setup cost. It is a launch/replay baseline, not a tuned large-GEMM throughput
 claim.
+
+A current-head three-repeat compact tensor sweep at commit `219042f5`
+refreshes the full compact preset after adding the report-throughput gate.
+It uses the six selected tensor baselines, `N=256`, shapes `16x16x16` and
+`16x16x64`, and A100/H200 target PTX (`compute_80` and `compute_90`). The
+artifact is under
+`tmp/cuda-backend/tensor-sweep-current-working/tensor-shape-sweep-219042f5/`
+and validated with:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_tensor_sweep.py \
+    tmp/cuda-backend/tensor-sweep-current-working/tensor-shape-sweep-219042f5/cuda-tensor-shape-sweep.json \
+    --preset compact-tensor-baselines \
+    --require-command-examples \
+    --require-source-papers
+```
+
+The preset checked 72 rows, A100/H200 artifacts, the six required baselines,
+both required tensor shapes, three repeats, dispatch IDs for PTO tensor rows,
+report files, visible Markdown/SVG throughput content, command examples, and
+VDCores/MPK source-paper provenance.
+
+| GPU | Shape | Scalar ns | Graph scalar ns | Tensor-core ns | Graph tensor-core ns | cuBLAS ns | cuBLAS Graph ns |
+| --- | ----- | --------- | --------------- | -------------- | -------------------- | --------- | --------------- |
+| A100 | 16x16x16 | 49152 | 49152 | 46080 | 45056 | 79871 | 12288 |
+| A100 | 16x16x64 | 52224 | 38912 | 50176 | 50176 | 74752 | 9216 |
+| H200 | 16x16x16 | 38144 | 32448 | 32672 | 33024 | 51104 | 9664 |
+| H200 | 16x16x64 | 32288 | 32512 | 32480 | 32127 | 51135 | 10176 |
+
+The corresponding median GFLOP/s for `16x16x64` are A100 scalar/graph
+scalar/tensor-core/graph tensor-core/cuBLAS/cuBLAS Graph
+`0.63/0.84/0.65/0.65/0.44/3.56`, and H200
+`1.01/1.01/1.01/1.02/0.64/3.22`. These remain small launch-dominated tiles:
+the cuBLAS Graph row is the best launch-replay baseline, while the PTO graph
+tensor rows validate scheduler and descriptor plumbing rather than tuned
+large-GEMM throughput.
 
 ## Tensor-Core Callable Smoke
 

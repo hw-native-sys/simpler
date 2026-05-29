@@ -138,6 +138,7 @@ committed:
 - `tmp/cuda-backend/tensor-shape-sweep-c4ee08eb/`
 - `tmp/cuda-backend/tensor-shape-sweep-47d857e1/`
 - `tmp/cuda-backend/tensor-shape-sweep-e79edba2/`
+- `tmp/cuda-backend/tensor-sweep-current-working/tensor-shape-sweep-219042f5/`
 - `tmp/cuda-backend/compact-role-benchmark-working/a100-current-30a8974f/`
 - `tmp/cuda-backend/compact-role-benchmark-working/h200-current-30a8974f/`
 - `tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/`

@@ -1905,6 +1905,12 @@ PYTHONPATH=$PWD:$PWD/python \
     --require-source-papers
 ```
 
+The current validated compact tensor-baseline artifact is:
+
+```text
+tmp/cuda-backend/tensor-sweep-current-working/tensor-shape-sweep-219042f5/
+```
+
 Validate a size sweep by spelling out the required sizes and result count:
 
 ```bash
@@ -2066,7 +2072,7 @@ JSON:
 ```bash
 PYTHONPATH=$PWD:$PWD/python:.agents/skills/cuda-backend-eval/scripts \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_current_summary.py \
-    tmp/cuda-backend/tensor-graph-library-baselines-working/tensor-shape-sweep-848c4ee5/cuda-tensor-shape-sweep.json \
+    tmp/cuda-backend/tensor-sweep-current-working/tensor-shape-sweep-219042f5/cuda-tensor-shape-sweep.json \
     --section tensor-sweep
 ```
 
