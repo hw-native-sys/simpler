@@ -1306,7 +1306,15 @@ class _CudaPersistentDagSceneBuffers:
     def _graph_task_specs(graph: dict[str, Any]) -> list[dict[str, Any]]:
         if "tasks" in graph and "nodes" in graph:
             raise ValueError("CUDA persistent_dag_graph_f32 graph cannot use both tasks and nodes")
-        tasks = graph.get("tasks", graph.get("nodes", []))
+        has_task_list = "tasks" in graph or "nodes" in graph
+        has_submit_list = "submits" in graph or "submissions" in graph
+        if has_task_list and has_submit_list:
+            raise ValueError(
+                "CUDA persistent_dag_graph_f32 graph cannot mix task/node descriptors with submit descriptors"
+            )
+        if "submits" in graph and "submissions" in graph:
+            raise ValueError("CUDA persistent_dag_graph_f32 graph cannot use both submits and submissions")
+        tasks = graph.get("tasks", graph.get("nodes", graph.get("submits", graph.get("submissions", []))))
         if isinstance(tasks, dict):
             task_specs = []
             for task_name, task_spec in tasks.items():

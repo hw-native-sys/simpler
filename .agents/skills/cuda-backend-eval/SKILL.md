@@ -1414,6 +1414,12 @@ edge-list field as `graph.edges`.
 name; in the dictionary form, the key becomes the task name used by edge
 metadata. `graph.nodes` is accepted as an alias for `graph.tasks` when the
 descriptor should use graph-node terminology; do not provide both fields.
+Use `graph.submits` or `graph.submissions` instead of `graph.tasks`/`nodes`
+when a scene descriptor should mirror
+`submit_next_level(callable, TaskArgs, ...)` calls. Submit-shaped entries use
+the same `callable` resolution, `args`/`task_args` role lowering, temporary
+allocation, and tensor-flow edge inference as task entries. Do not mix submit
+and task/node list spellings in the same graph descriptor.
 List-shaped graph nodes may use `id` as a `name` alias when the source graph
 schema calls node identity `id`.
 Graph nodes may use top-level `inputs`, `outputs`, `output_existing`,

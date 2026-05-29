@@ -2252,6 +2252,37 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
 
 also reported `2 passed, 121 deselected`, after the known PTO-ISA SSH refresh
 warning.
+Graph task-list descriptors now also accept top-level `graph.submits` or
+`graph.submissions` as aliases for `graph.tasks`/`graph.nodes`, so a
+scene-test descriptor can look like a list of
+`submit_next_level(callable, TaskArgs, ...)` calls. Submit entries still use
+the same named/indexed callable resolution, `args`/`task_args` role lowering,
+temporary allocation, and tensor-flow edge inference as task entries. The
+focused regression first failed with
+`CUDA persistent_dag_graph_f32 requires at least one graph task` because the
+adapter ignored `submits`. After adding the alias, the local A100 selector:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k 'submits_alias or args_alias' --platform cuda
+```
+
+reported `4 passed, 135 deselected`, covering descriptor construction and
+ctypes-backed real-data persistent-device graph scenes. The same synced
+working tree on H200:
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
+  'cd /data/shibizhao/pto-cu && CUDA_HOME=/usr/local/cuda \
+   PATH=/usr/local/cuda/bin:$PATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+   PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
+   tests/ut/py/test_cuda_scene_test.py -q \
+   -k "submits_alias or args_alias" --platform cuda'
+```
+
+also reported `4 passed, 135 deselected`, after the known PTO-ISA SSH refresh
+warning.
 Graph task descriptors now also accept two-item role/name pairs in the
 `task_args` list, such as `("input", "a")`, `("output", "tmp0")`,
 `("inout", "tmp0")`, and `("output_existing", "out")`. These pair entries

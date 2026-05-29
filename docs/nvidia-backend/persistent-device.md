@@ -331,6 +331,12 @@ with `role`; the older `tag` spelling remains accepted for compatibility.
 Graph tasks may use `args` as a shorter alias for `task_args`, matching the
 argument slot in `submit_next_level(callable, TaskArgs, ...)` while keeping
 the same role semantics. A graph task must not provide both spellings.
+At the graph level, `submits` and `submissions` are accepted as aliases for
+`tasks`/`nodes` when a descriptor should read like a list of
+`submit_next_level` calls. Submit-shaped entries still lower through the same
+callable resolution, role-keyed argument normalization, temporary allocation,
+and tensor-flow dependency inference path. A graph descriptor must not mix the
+task/node spelling with the submit/submission spelling.
 For compact graph specs, an entry may also be a two-item role/name pair such
 as `("input", "a")`, `("output", "tmp0")`, `("inout", "tmp0")`, or
 `("output_existing", "out")`. Pair entries lower through the same role-keyed
