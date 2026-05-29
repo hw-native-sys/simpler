@@ -7,12 +7,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end ST for post-init Worker.prepare_callable(ChipCallable) at L3.
+"""End-to-end ST for post-start Worker.prepare_callable(ChipCallable) at L3.
 
 Exercises the _CTRL_REGISTER IPC path end-to-end: parent stages a
-ChipCallable in shared memory after init(), broadcasts CTRL_REGISTER to
-every chip child, the child mmaps + prepares, and the resulting handle is
-indistinguishable from a pre-init preparation when used in run().
+ChipCallable in shared memory after child startup, broadcasts CTRL_REGISTER to
+every chip child, the child mmaps + prepares, and the resulting
+CallableHandle is indistinguishable from a pre-start preparation when used
+in run().
 
 The UT suite (tests/ut/py/test_worker/test_host_worker.py) already covers
 the facade-level paths (lock guard, slot overflow, lambda rejection, run
@@ -57,7 +58,7 @@ _AIV_MUL = os.path.join(_KERNELS, "aiv", "kernel_mul.cpp")
 _ORCH_SIG = [D.IN, D.IN, D.OUT]
 
 
-def _build_vector_callable(platform: str) -> ChipCallable:
+def _build_vector_callable(platform: str, *, extra_unused_child: bool = False) -> ChipCallable:
     """Compile the vector_example orchestration + 3 AIV kernels.
 
     Mirrors how SceneTestCase._compile_chip_callable_from_spec assembles
@@ -83,12 +84,27 @@ def _build_vector_callable(platform: str) -> ChipCallable:
     add_scalar = CoreCallable.build(signature=[D.IN, D.OUT], binary=_aiv(_AIV_ADD_SCALAR))
     mul = CoreCallable.build(signature=[D.IN, D.IN, D.OUT], binary=_aiv(_AIV_MUL))
 
+    children = [(0, add), (1, add_scalar), (2, mul)]
+    if extra_unused_child:
+        children.append((99, add))
+
     return ChipCallable.build(
         signature=_ORCH_SIG,
         func_name="aicpu_orchestration_entry",
         binary=orch_bytes,
-        children=[(0, add), (1, add_scalar), (2, mul)],
+        children=children,
     )
+
+
+def _unique_py_callable(index: int):
+    def fn(args, _index=index):
+        return _index
+
+    return fn
+
+
+def _slot_for(worker: Worker, handle) -> int:
+    return worker._resolve_handle(handle).slot_id
 
 
 def _make_args(a: float, b: float) -> TaskArgsBuilder:
@@ -109,15 +125,15 @@ def _golden(a: float, b: float) -> float:
 @pytest.mark.platforms(["a2a3sim"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)
-def test_register_after_init_then_run(st_platform, st_device_ids):
-    """Happy path: register one cid pre-init and one cid post-init, run both.
+def test_prepare_new_identity_after_start_then_run(st_platform, st_device_ids):
+    """Happy path: prepare one identity pre-start and another post-start.
 
-    Proves the post-init register path delivers a usable cid — the chip
-    child mmapped the shm, prepared the ChipCallable, and dispatch finds
-    it on the next submit. Both cids execute against the same kernel
-    binaries and must produce numerically identical outputs.
+    Proves the post-start control path delivers a usable handle for a
+    previously unseen hashid. Both identities execute equivalent kernels and
+    must produce numerically identical outputs.
     """
     chip_callable = _build_vector_callable(st_platform)
+    post_callable = _build_vector_callable(st_platform, extra_unused_child=True)
 
     worker = Worker(
         level=3,
@@ -126,7 +142,7 @@ def test_register_after_init_then_run(st_platform, st_device_ids):
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    cid_pre = worker.prepare_callable(chip_callable)
+    pre_handle = worker.prepare_callable(chip_callable)
 
     # Pre-allocate both runs' tensors BEFORE Worker.init() so the
     # share_memory_() mappings are inherited by the forked chip child.
@@ -146,36 +162,36 @@ def test_register_after_init_then_run(st_platform, st_device_ids):
         config.block_dim = 3
         config.aicpu_thread_num = 4
 
-        # 1. Run cid_pre once to force _start_hierarchical (forks chip
+        # 1. Run pre_handle once to force _start_hierarchical (forks chip
         #    children, runs the CTRL_PREPARE prewarm loop). This puts the
         #    chip child into _run_chip_main_loop, the only state in which
         #    a CTRL_REGISTER broadcast can be ACKed.
         def orch_pre(o, _args, _cfg):
-            o.submit_next_level(cid_pre, chip_args_pre, config)
+            o.submit_next_level(pre_handle, chip_args_pre, config)
 
         worker.run(orch_pre)
         got_pre = args_pre.f
         assert torch.allclose(got_pre, torch.full_like(got_pre, expected), rtol=1e-5, atol=1e-5), (
-            f"cid_pre={cid_pre}: expected {expected}, got {got_pre[:4].tolist()}..."
+            f"pre_handle={pre_handle.hashid}: expected {expected}, got {got_pre[:4].tolist()}..."
         )
 
-        # 2. Now do the post-fork dynamic register. The parent stages bytes
+        # 2. Now do the post-start dynamic prepare. The parent stages bytes
         #    in shm and broadcasts CTRL_REGISTER; the child mmaps and calls
-        #    prepare_callable_from_blob. cid_post is unknown to the
+        #    prepare_callable_from_blob. post_handle is unknown to the
         #    CoW-inherited registry on the child side — only the IPC path
         #    can deliver it.
-        cid_post = worker.prepare_callable(chip_callable)
-        assert cid_post != cid_pre
+        post_handle = worker.prepare_callable(post_callable)
+        assert post_handle.hashid != pre_handle.hashid
 
-        # 3. Run with cid_post. If CTRL_REGISTER delivered correctly, the
-        #    child has the cid prepared; otherwise dispatch will fail.
+        # 3. Run with post_handle. If CTRL_REGISTER delivered correctly, the
+        #    child has the identity prepared; otherwise dispatch will fail.
         def orch_post(o, _args, _cfg):
-            o.submit_next_level(cid_post, chip_args_post, config)
+            o.submit_next_level(post_handle, chip_args_post, config)
 
         worker.run(orch_post)
         got_post = args_post.f
         assert torch.allclose(got_post, torch.full_like(got_post, expected), rtol=1e-5, atol=1e-5), (
-            f"cid_post={cid_post}: expected {expected}, got {got_post[:4].tolist()}..."
+            f"post_handle={post_handle.hashid}: expected {expected}, got {got_post[:4].tolist()}..."
         )
     finally:
         worker.close()
@@ -184,15 +200,16 @@ def test_register_after_init_then_run(st_platform, st_device_ids):
 @pytest.mark.platforms(["a2a3sim"])
 @pytest.mark.device_count(2)
 @pytest.mark.runtime(_RUNTIME)
-def test_register_after_init_parallel_broadcast(st_platform, st_device_ids):
-    """Two chip children, post-init register broadcasts to both in parallel.
+def test_prepare_new_identity_after_start_parallel_broadcast(st_platform, st_device_ids):
+    """Two chip children, post-start prepare broadcasts to both in parallel.
 
-    Asserts that the registered cid runs successfully on each chip — proving
+    Asserts that the prepared handle runs successfully on each chip — proving
     the C++ broadcast (one std::thread per WorkerThread) delivers the bytes
     to every chip's mailbox and each prepare_callable_from_blob runs without
     racing against the others.
     """
     chip_callable = _build_vector_callable(st_platform)
+    post_callable = _build_vector_callable(st_platform, extra_unused_child=True)
     device_ids = [int(d) for d in st_device_ids[:2]]
     worker = Worker(
         level=3,
@@ -201,13 +218,13 @@ def test_register_after_init_parallel_broadcast(st_platform, st_device_ids):
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    cid_pre = worker.prepare_callable(chip_callable)
+    pre_handle = worker.prepare_callable(chip_callable)
     a, b = 2.0, 3.0
     expected = _golden(a, b)
     # Pre-allocate args for each chip (chip_id = block group). The
     # vector_example orchestration partitions the input across cores, so a
     # single args bundle works for both chips' first-run trigger; the
-    # second-run uses the post-registered cid.
+    # second-run uses the post-start prepared handle.
     args_pre = _make_args(a, b)
     args_post = _make_args(a, b)
     chip_args_pre, _ = _build_l3_task_args(args_pre, _ORCH_SIG)
@@ -220,16 +237,16 @@ def test_register_after_init_parallel_broadcast(st_platform, st_device_ids):
         config.aicpu_thread_num = 4
 
         def orch_pre(o, _a, _c):
-            o.submit_next_level(cid_pre, chip_args_pre, config)
+            o.submit_next_level(pre_handle, chip_args_pre, config)
 
         worker.run(orch_pre)
         assert torch.allclose(args_pre.f, torch.full_like(args_pre.f, expected), rtol=1e-5, atol=1e-5)
 
         # Now broadcast CTRL_REGISTER to BOTH chip mailboxes in parallel.
-        cid_post = worker.prepare_callable(chip_callable)
+        post_handle = worker.prepare_callable(post_callable)
 
         def orch_post(o, _a, _c):
-            o.submit_next_level(cid_post, chip_args_post, config)
+            o.submit_next_level(post_handle, chip_args_post, config)
 
         worker.run(orch_post)
         assert torch.allclose(args_post.f, torch.full_like(args_post.f, expected), rtol=1e-5, atol=1e-5)
@@ -240,12 +257,12 @@ def test_register_after_init_parallel_broadcast(st_platform, st_device_ids):
 @pytest.mark.platforms(["a2a3sim"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)
-def test_register_cid_overflow_post_init(st_platform, st_device_ids):
-    """Saturate the cid table pre-init, then verify post-init register hits
-    the same ``MAX_REGISTERED_CALLABLE_IDS`` ceiling.
+def test_prepare_slot_overflow_post_start(st_platform, st_device_ids):
+    """Saturate the slot table pre-start, then verify post-start prepare hits
+    the same ``MAX_REGISTERED_CALLABLE_IDS`` ceiling for a new hashid.
 
-    Confirms the cid bookkeeping is shared between the pre-init and the new
-    dynamic-register entry points (and that the error message is
+    Confirms slot bookkeeping is shared between pre-start preparation and the
+    post-start control path (and that the error message is
     protocol-aware so the operator sees the same diagnostic in both paths).
     """
     chip_callable = _build_vector_callable(st_platform)
@@ -256,10 +273,11 @@ def test_register_cid_overflow_post_init(st_platform, st_device_ids):
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    # Fill the registry pre-init with sub fn lambdas (cheap, no device cost).
-    for _ in range(MAX_REGISTERED_CALLABLE_IDS - 1):
-        worker.prepare_callable(lambda args: None)
-    cid_chip = worker.prepare_callable(chip_callable)  # last slot
+    # Fill the registry pre-start with distinct sub fn identities (cheap, no
+    # device cost).
+    for i in range(MAX_REGISTERED_CALLABLE_IDS - 1):
+        worker.prepare_callable(_unique_py_callable(i))
+    chip_handle = worker.prepare_callable(chip_callable)  # last slot
     assert len(worker._callable_registry) == MAX_REGISTERED_CALLABLE_IDS
 
     a, b = 2.0, 3.0
@@ -273,13 +291,15 @@ def test_register_cid_overflow_post_init(st_platform, st_device_ids):
         config.aicpu_thread_num = 4
 
         def orch_pre(o, _a, _c):
-            o.submit_next_level(cid_chip, chip_args_pre, config)
+            o.submit_next_level(chip_handle, chip_args_pre, config)
 
         worker.run(orch_pre)
 
-        # The very next dynamic register hits the table ceiling.
+        # The very next dynamic prepare of a new identity hits the table
+        # ceiling. Re-preparing ``chip_callable`` itself would only create
+        # another handle to the existing identity.
         with pytest.raises(RuntimeError, match="MAX_REGISTERED_CALLABLE_IDS"):
-            worker.prepare_callable(chip_callable)
+            worker.prepare_callable(_build_vector_callable(st_platform, extra_unused_child=True))
     finally:
         worker.close()
 
@@ -287,12 +307,14 @@ def test_register_cid_overflow_post_init(st_platform, st_device_ids):
 @pytest.mark.platforms(["a2a3sim"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)
-def test_register_unregister_register_runs_each_time(st_platform, st_device_ids):
-    """register → run → unregister → register again → run.
+def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_device_ids):
+    """prepare same hashid twice, unregister one handle, run the other.
 
-    Proves the IPC unregister path works end-to-end: after CTRL_UNREGISTER
-    propagates to the chip child, the cid slot is freed and a subsequent
-    dynamic register on a fresh cid prepares + dispatches correctly.
+    This is the hashid-specific post-start path: the second
+    ``prepare_callable(same_chip_callable)`` must return a distinct handle for
+    the same hashid without allocating a new slot. Unregistering one handle
+    must only decrement the child refcount; the remaining handle must still
+    dispatch successfully.
     """
     chip_callable = _build_vector_callable(st_platform)
     worker = Worker(
@@ -302,12 +324,81 @@ def test_register_unregister_register_runs_each_time(st_platform, st_device_ids)
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    cid_pre = worker.prepare_callable(chip_callable)
+    pre_handle = worker.prepare_callable(chip_callable)
 
     a, b = 2.0, 3.0
     expected = _golden(a, b)
-    # Three runs total — preallocate three args bundles BEFORE init() so
+    # Two runs total — preallocate both args bundles BEFORE init() so
     # the share_memory_ mappings are inherited by the forked chip child.
+    args_one = _make_args(a, b)
+    args_two = _make_args(a, b)
+    chip_args_one, _ = _build_l3_task_args(args_one, _ORCH_SIG)
+    chip_args_two, _ = _build_l3_task_args(args_two, _ORCH_SIG)
+
+    worker.init()
+    try:
+        config = CallConfig()
+        config.block_dim = 3
+        config.aicpu_thread_num = 4
+
+        # 1. Trigger fork via pre_handle to put the chip child into the main loop.
+        def orch_one(o, _args, _cfg):
+            o.submit_next_level(pre_handle, chip_args_one, config)
+
+        worker.run(orch_one)
+        assert torch.allclose(args_one.f, torch.full_like(args_one.f, expected), rtol=1e-5, atol=1e-5)
+
+        # 2. Prepare the same callable after start. This is a refcount
+        # increment for the same hashid/slot, not a new identity.
+        duplicate_handle = worker.prepare_callable(chip_callable)
+        slot = _slot_for(worker, pre_handle)
+        assert duplicate_handle.hashid == pre_handle.hashid
+        assert duplicate_handle.digest == pre_handle.digest
+        assert _slot_for(worker, duplicate_handle) == slot
+        assert worker._identity_registry[pre_handle.digest].ref_count == 2
+
+        # 3. Drop the first handle. The child must keep the prepared identity
+        # alive for duplicate_handle.
+        worker.unregister_callable(pre_handle)
+        assert slot in worker._callable_registry
+        assert worker._identity_registry[duplicate_handle.digest].ref_count == 1
+
+        def orch_two(o, _args, _cfg):
+            o.submit_next_level(duplicate_handle, chip_args_two, config)
+
+        worker.run(orch_two)
+        assert torch.allclose(args_two.f, torch.full_like(args_two.f, expected), rtol=1e-5, atol=1e-5)
+
+        # 4. Dropping the final handle releases the slot.
+        worker.unregister_callable(duplicate_handle)
+        assert slot not in worker._callable_registry
+    finally:
+        worker.close()
+
+
+@pytest.mark.platforms(["a2a3sim"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime(_RUNTIME)
+def test_unregister_last_handle_releases_slot_for_reprepare(st_platform, st_device_ids):
+    """prepare → run → unregister final handle → prepare same identity again.
+
+    Proves the IPC unregister path works end-to-end: after CTRL_UNREGISTER
+    propagates to the chip child, the slot is freed and a subsequent
+    post-start prepare of that identity materializes it again.
+    """
+    chip_callable = _build_vector_callable(st_platform)
+    post_callable = _build_vector_callable(st_platform, extra_unused_child=True)
+    worker = Worker(
+        level=3,
+        device_ids=[int(st_device_ids[0])],
+        num_sub_workers=0,
+        platform=st_platform,
+        runtime=_RUNTIME,
+    )
+    pre_handle = worker.prepare_callable(chip_callable)
+
+    a, b = 2.0, 3.0
+    expected = _golden(a, b)
     args_one = _make_args(a, b)
     args_two = _make_args(a, b)
     args_three = _make_args(a, b)
@@ -321,36 +412,31 @@ def test_register_unregister_register_runs_each_time(st_platform, st_device_ids)
         config.block_dim = 3
         config.aicpu_thread_num = 4
 
-        # 1. Trigger fork via cid_pre to put the chip child into the main loop.
         def orch_one(o, _args, _cfg):
-            o.submit_next_level(cid_pre, chip_args_one, config)
+            o.submit_next_level(pre_handle, chip_args_one, config)
 
         worker.run(orch_one)
         assert torch.allclose(args_one.f, torch.full_like(args_one.f, expected), rtol=1e-5, atol=1e-5)
 
-        # 2. Dynamic register a second cid, run it.
-        cid_dyn = worker.prepare_callable(chip_callable)
+        dyn_handle = worker.prepare_callable(post_callable)
+        dyn_slot = _slot_for(worker, dyn_handle)
 
         def orch_two(o, _args, _cfg):
-            o.submit_next_level(cid_dyn, chip_args_two, config)
+            o.submit_next_level(dyn_handle, chip_args_two, config)
 
         worker.run(orch_two)
         assert torch.allclose(args_two.f, torch.full_like(args_two.f, expected), rtol=1e-5, atol=1e-5)
 
-        # 3. Unregister cid_dyn — CTRL_UNREGISTER hits the chip child,
-        #    which calls cw.unregister_callable(cid_dyn).
-        worker.unregister_callable(cid_dyn)
-        assert cid_dyn not in worker._callable_registry
+        worker.unregister_callable(dyn_handle)
+        assert dyn_slot not in worker._callable_registry
 
-        # 4. Re-register and run again. `_allocate_cid` returns the
-        #    smallest unused integer, so the freed slot is reused
-        #    immediately. This is the slot-recycling property that
-        #    unregister exists for.
-        cid_again = worker.prepare_callable(chip_callable)
-        assert cid_again == cid_dyn, "unregister should free the cid slot for reuse"
+        # Re-prepare the same hashid after its final handle was dropped.
+        again_handle = worker.prepare_callable(post_callable)
+        assert again_handle.hashid == dyn_handle.hashid
+        assert _slot_for(worker, again_handle) == dyn_slot, "unregister should free the slot for reuse"
 
         def orch_three(o, _args, _cfg):
-            o.submit_next_level(cid_again, chip_args_three, config)
+            o.submit_next_level(again_handle, chip_args_three, config)
 
         worker.run(orch_three)
         assert torch.allclose(args_three.f, torch.full_like(args_three.f, expected), rtol=1e-5, atol=1e-5)

@@ -995,7 +995,7 @@ class SceneTestCase:
             )
 
             with _temporary_env(self._resolve_env()):
-            timing = worker.run(handle, chip_args, config=config)
+                timing = worker.run(handle, chip_args, config=config)
             if rounds > 1 and timing is not None:
                 timings.append((timing.host_wall_us, timing.device_wall_us))
 
