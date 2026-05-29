@@ -14,7 +14,6 @@ import ctypes
 import hashlib
 import struct
 from dataclasses import dataclass, field
-from functools import total_ordering
 from typing import Any, Literal
 
 from .task_interface import ArgDirection, ChipCallable
@@ -156,17 +155,16 @@ def validate_hashid(hashid: str) -> None:
         raise ValueError("HASHID_FORMAT_INVALID: sha256 digest contains non-hex characters") from exc
 
 
-@total_ordering
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class CallableHandle:
     """Opaque public token returned by ``Worker.register``."""
 
     hashid: str
     kind: CallableKindName
     target_namespace: TargetNamespaceName
-    _slot_id: int = field(repr=False, compare=False)
-    _digest: bytes = field(repr=False, compare=False)
-    _handle_id: int = field(repr=False, compare=False)
+    _slot_id: int = field(repr=False)
+    _digest: bytes = field(repr=False)
+    _handle_id: int = field(repr=False)
 
     def __post_init__(self) -> None:
         validate_hashid(self.hashid)
@@ -178,23 +176,6 @@ class CallableHandle:
             raise ValueError(f"callable digest must be {CALLABLE_HASH_DIGEST_BYTES} bytes")
         if self._digest != hashid_to_digest(self.hashid):
             raise ValueError("CallableHandle digest does not match hashid")
-
-    def __hash__(self) -> int:
-        return hash(self._slot_id)
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, CallableHandle):
-            return self._handle_id == other._handle_id
-        if isinstance(other, int):
-            return self._slot_id == other
-        return False
-
-    def __lt__(self, other: object) -> bool:
-        if isinstance(other, CallableHandle):
-            return self._handle_id < other._handle_id
-        if isinstance(other, int):
-            return self._slot_id < other
-        return NotImplemented
 
     @property
     def digest(self) -> bytes:
@@ -213,4 +194,3 @@ class CallableIdentityState:
     target: Any
     ref_count: int = 0
     state: str = "INSTALLED"
-

@@ -1271,17 +1271,12 @@ class Worker:
             self._py_callable_cids_seen.discard(cid)
         self._worker.broadcast_register_all(int(cid), int(target.buffer_ptr()), int(target.buffer_size()), digest)
 
-    def _coerce_handle_digest_slot(self, handle_or_slot) -> tuple[Optional[int], bytes, int]:
+    def _coerce_handle_digest_slot(self, handle_or_slot) -> tuple[int, bytes, int]:
         if isinstance(handle_or_slot, CallableHandle):
             digest = self._live_handles.get(handle_or_slot._handle_id)
             if digest is None:
                 raise KeyError(f"Worker.unregister: handle {handle_or_slot.hashid} not registered")
             return handle_or_slot._handle_id, digest, handle_or_slot._slot_id
-        if isinstance(handle_or_slot, int):
-            for digest, state in self._identity_registry.items():
-                if state.slot_id == int(handle_or_slot):
-                    return None, digest, state.slot_id
-            raise KeyError(f"Worker.unregister: cid={int(handle_or_slot)} not registered")
         raise TypeError("Worker.unregister expects a CallableHandle returned by Worker.register")
 
     def _pre_start_unregister_if_needed(self, handle_or_slot) -> bool:
@@ -1299,8 +1294,7 @@ class Worker:
                 state = self._identity_registry[digest]
                 if cid in self._pending_unregister_cids:
                     raise KeyError(f"Worker.unregister: cid={cid} already pending unregister")
-                if handle_id is not None:
-                    self._live_handles.pop(handle_id, None)
+                self._live_handles.pop(handle_id, None)
                 state.ref_count -= 1
                 if state.ref_count > 0:
                     return True
@@ -1326,22 +1320,21 @@ class Worker:
         cid would just exhaust the slot space faster.
 
         Raises:
-          KeyError: cid was never registered.
+          KeyError: handle was never registered.
         """
         if self._pre_start_unregister_if_needed(handle_or_slot):
             return
         target = None
         digest = b""
         cid = -1
-        handle_id: Optional[int] = None
+        handle_id = -1
         remove_target = False
         with self._registry_lock:
             handle_id, digest, cid = self._coerce_handle_digest_slot(handle_or_slot)
             if cid in self._pending_unregister_cids:
                 raise KeyError(f"Worker.unregister: cid={cid} already pending unregister")
             state = self._identity_registry[digest]
-            if handle_id is not None:
-                self._live_handles.pop(handle_id, None)
+            self._live_handles.pop(handle_id, None)
             state.ref_count -= 1
             if state.ref_count > 0:
                 return
@@ -1387,17 +1380,54 @@ class Worker:
 
     def _unregister_slot(self, cid: int, *, digest: bytes) -> None:
         with self._registry_lock:
-            actual_digest = None
-            for candidate_digest, state in self._identity_registry.items():
-                if state.slot_id == int(cid):
-                    actual_digest = candidate_digest
-                    break
-        if actual_digest is not None and actual_digest != digest:
-            raise RuntimeError(
-                f"HASHID_DESCRIPTOR_MISMATCH: unregister requested {_format_digest(digest)} "
-                f"but slot {cid} holds {_format_digest(actual_digest)}"
-            )
-        self.unregister(cid)
+            state = self._identity_registry.get(digest)
+            if state is None:
+                raise KeyError(f"Worker.unregister: hash {_format_digest(digest)} not registered")
+            if state.slot_id != int(cid):
+                raise RuntimeError(
+                    f"HASHID_DESCRIPTOR_MISMATCH: unregister requested slot {cid} "
+                    f"but {_format_digest(digest)} is installed at slot {state.slot_id}"
+                )
+            if cid in self._pending_unregister_cids:
+                raise KeyError(f"Worker.unregister: cid={cid} already pending unregister")
+            target = self._callable_registry[cid]
+            if self.level >= 3 and self._initialized and getattr(self, "_hierarchical_started", False):
+                self._pending_unregister_cids.add(cid)
+            elif self.level == 2 and self._initialized:
+                assert self._chip_worker is not None
+                self._chip_worker.unregister_callable(cid)
+                self._callable_registry.pop(cid, None)
+                self._identity_registry.pop(digest, None)
+                return
+            else:
+                self._callable_registry.pop(cid, None)
+                self._identity_registry.pop(digest, None)
+                self._py_callable_cids_seen.discard(cid)
+                return
+
+        try:
+            if isinstance(target, ChipCallable):
+                self._broadcast_unregister(cid, digest)
+            else:
+                errors = self._broadcast_py_control(
+                    self._python_worker_types(),
+                    _CTRL_PY_UNREGISTER,
+                    cid,
+                    digest=digest,
+                    strict=False,
+                )
+                if errors:
+                    sys.stderr.write(
+                        f"Worker.unregister(cid={cid}): {len(errors)} Python children reported errors "
+                        f"(continuing best-effort). First error: {errors[0]}\n"
+                    )
+                    sys.stderr.flush()
+        finally:
+            with self._registry_lock:
+                self._callable_registry.pop(cid, None)
+                self._identity_registry.pop(digest, None)
+                self._py_callable_cids_seen.discard(cid)
+                self._pending_unregister_cids.discard(cid)
 
     def _broadcast_unregister(self, cid: int, digest: bytes) -> None:
         """Broadcast _CTRL_UNREGISTER via C++ to every NEXT_LEVEL child.

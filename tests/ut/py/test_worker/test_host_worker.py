@@ -103,6 +103,10 @@ def _test_handle(cid: int, digest: bytes, *, kind: str = "PYTHON_SERIALIZED", na
     )
 
 
+def _slot_for(worker: Worker, handle: CallableHandle) -> int:
+    return worker._identity_registry[handle.digest].slot_id
+
+
 def _unique_py_callable(index: int):
     def fn(args, _index=index):
         return _index
@@ -147,8 +151,8 @@ class TestLifecycle:
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
-            cid = hw.register(lambda args: None)
-            assert cid in hw._callable_registry
+            handle = hw.register(lambda args: None)
+            assert _slot_for(hw, handle) in hw._callable_registry
         finally:
             hw.close()
 
@@ -162,8 +166,8 @@ class TestLifecycle:
         real_worker = hw._worker
         try:
             hw._worker = BroadcastTrap()
-            cid = hw.register(lambda args: None)
-            assert cid in hw._callable_registry
+            handle = hw.register(lambda args: None)
+            assert _slot_for(hw, handle) in hw._callable_registry
         finally:
             hw._worker = real_worker
             hw.close()
@@ -288,7 +292,8 @@ class TestLifecycle:
             assert not register_thread.is_alive()
             assert not startup_thread.is_alive()
             assert errors == []
-            assert result == [0]
+            assert len(result) == 1
+            assert _slot_for(hw, result[0]) == 0
             assert startup_snapshot_attempted.is_set()
             assert hw._hierarchical_start_state == "started"
         finally:
@@ -302,14 +307,14 @@ class TestLifecycle:
         # With no chip children (device_ids unset), the C++ broadcast is a
         # no-op (next_level_threads_ is empty) — exercises the facade path
         # (registry lock, cid allocation, broadcast call, return) end-to-end
-            # without needing an NPU.
+        # without needing an NPU.
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
             callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
             handle = hw.register(callable_obj)
             assert isinstance(handle, CallableHandle)
-            assert handle._slot_id >= 0
+            assert _slot_for(hw, handle) >= 0
         finally:
             hw.close()
 
@@ -329,13 +334,13 @@ class TestLifecycle:
         finally:
             hw.close()
 
-    def test_unregister_unknown_cid_raises(self):
-        # Symmetric to register: unregister must fail loud if the caller
-        # confuses cid for an unrelated integer or unregisters twice.
+    def test_unregister_rejects_raw_slot_id(self):
+        # Public unregister is handle-based. Raw slot ids are internal and
+        # should not be accepted as a compatibility alias.
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
-            with pytest.raises(KeyError, match="cid=999 not registered"):
+            with pytest.raises(TypeError, match="CallableHandle returned by Worker.register"):
                 hw.unregister(999)
         finally:
             hw.close()
@@ -351,11 +356,12 @@ class TestLifecycle:
         try:
             callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
             cid_a = hw.register(callable_obj)
-            assert cid_a in hw._callable_registry
+            slot_a = _slot_for(hw, cid_a)
+            assert slot_a in hw._callable_registry
             hw.unregister(cid_a)
-            assert cid_a not in hw._callable_registry
+            assert slot_a not in hw._callable_registry
             cid_b = hw.register(callable_obj)
-            assert cid_b._slot_id == cid_a._slot_id, "smallest-unused-cid policy should reuse the freed slot"
+            assert _slot_for(hw, cid_b) == slot_a, "smallest-unused-cid policy should reuse the freed slot"
         finally:
             hw.close()
 
@@ -376,8 +382,9 @@ class TestLifecycle:
 
         cid = hw.register(callable_obj)
 
-        assert observed == {"cid": cid._slot_id, "target": callable_obj, "digest": cid.digest, "locked": False}
-        assert hw._callable_registry[cid] is callable_obj
+        slot = _slot_for(hw, cid)
+        assert observed == {"cid": slot, "target": callable_obj, "digest": cid.digest, "locked": False}
+        assert hw._callable_registry[slot] is callable_obj
 
     def test_register_at_broadcast_runs_without_registry_lock(self):
         hw = Worker(level=3, num_sub_workers=0)
@@ -465,18 +472,19 @@ class TestLifecycle:
 
         hw._broadcast_py_control = fake_broadcast
 
+        slot = _slot_for(hw, cid)
         hw.unregister(cid)
 
         captured = capsys.readouterr()
         assert "Python children reported errors" in captured.err
         assert "injected unregister failure" in captured.err
-        assert cid not in hw._callable_registry
-        assert cid not in hw._pending_unregister_cids
+        assert slot not in hw._callable_registry
+        assert slot not in hw._pending_unregister_cids
 
         reused = hw.register(lambda args: None)
-        assert reused._slot_id == cid._slot_id
-        assert calls[0] == ([WorkerType.SUB], _CTRL_PY_UNREGISTER, cid._slot_id, cid.digest, False)
-        assert calls[1][0:3] == ([WorkerType.SUB], _CTRL_PY_REGISTER, cid._slot_id)
+        assert _slot_for(hw, reused) == slot
+        assert calls[0] == ([WorkerType.SUB], _CTRL_PY_UNREGISTER, slot, cid.digest, False)
+        assert calls[1][0:3] == ([WorkerType.SUB], _CTRL_PY_REGISTER, slot)
         assert calls[1][4] is True
 
     def test_pending_unregister_cid_is_not_reused_until_broadcast_returns(self):
@@ -502,6 +510,7 @@ class TestLifecycle:
             return []
 
         hw._broadcast_py_control = fake_broadcast
+        slot = _slot_for(hw, cid)
 
         def do_unregister():
             try:
@@ -514,8 +523,8 @@ class TestLifecycle:
         assert broadcast_started.wait(timeout=2.0)
 
         cid_during_unregister = hw.register(lambda args: None)
-        assert cid_during_unregister != cid
-        assert cid in hw._pending_unregister_cids
+        assert _slot_for(hw, cid_during_unregister) != slot
+        assert slot in hw._pending_unregister_cids
 
         release_broadcast.set()
         t.join(timeout=2.0)
@@ -523,7 +532,7 @@ class TestLifecycle:
         assert errors == []
 
         cid_after_unregister = hw.register(lambda args: None)
-        assert cid_after_unregister._slot_id == cid._slot_id
+        assert _slot_for(hw, cid_after_unregister) == slot
 
     def test_register_python_sub_callable_after_start_succeeds(self):
         counter_shm, counter_buf = _make_shared_counter()
@@ -657,8 +666,9 @@ class TestLifecycle:
             hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
             assert _read_counter(counter_buf) == 1
 
+            slot = _slot_for(hw, cid)
             hw.unregister(cid)
-            assert cid not in hw._callable_registry
+            assert slot not in hw._callable_registry
             with pytest.raises(RuntimeError, match="not registered"):
                 hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
 
@@ -672,7 +682,7 @@ class TestLifecycle:
                     shm.close()
 
             reused = hw.register(replacement)
-            assert reused._slot_id == cid._slot_id
+            assert _slot_for(hw, reused) == slot
             hw.run(lambda orch, args, cfg: orch.submit_sub(reused))
             hw.close()
 
@@ -702,13 +712,14 @@ class TestLifecycle:
             hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
             assert _read_counter(counter_buf) == 1
 
+            slot = _slot_for(hw, cid)
             hw.unregister(cid)
-            assert cid not in hw._callable_registry
+            assert slot not in hw._callable_registry
             with pytest.raises(RuntimeError, match="not registered"):
                 hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
 
             reused = hw.register(dynamic)
-            assert reused._slot_id == cid._slot_id
+            assert _slot_for(hw, reused) == slot
             hw.run(lambda orch, args, cfg: orch.submit_sub(reused))
             hw.close()
 
@@ -889,7 +900,7 @@ class TestLifecycle:
             unregister_results = worker_impl.broadcast_control_all(
                 WorkerType.SUB,
                 _CTRL_PY_UNREGISTER,
-                bootstrap_cid._slot_id,
+                _slot_for(hw, bootstrap_cid),
                 None,
                 bootstrap_cid.digest,
             )
@@ -945,20 +956,21 @@ class TestLifecycle:
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
 
         cid = hw.register(callable_obj)
+        slot = _slot_for(hw, cid)
 
-        assert cid == 0
+        assert slot == 0
         assert calls[0][0:4] == ("py_clear", [WorkerType.SUB], _CTRL_PY_UNREGISTER, 0)
         assert calls[0][5] is True
         assert calls[1][0] == "binary_register"
         assert 0 not in hw._py_callable_cids_seen
 
-        hw._callable_registry.pop(0)
+        hw._callable_registry.pop(slot)
         hw._identity_registry.pop(cid.digest, None)
         calls.clear()
 
         cid = hw.register(ChipCallable.build(signature=[], func_name="y", binary=b"\x00", children=[]))
 
-        assert cid == 0
+        assert _slot_for(hw, cid) == 0
         assert len(calls) == 1
         assert calls[0][0:2] == ("binary_register", 0)
 
@@ -1003,15 +1015,18 @@ class TestLifecycle:
             cid0 = hw.register(cb0)
             cid1 = hw.register(cb1)
             cid2 = hw.register(cb2)
-            assert (cid0, cid1, cid2) == (0, 1, 2)
+            slot0 = _slot_for(hw, cid0)
+            slot1 = _slot_for(hw, cid1)
+            slot2 = _slot_for(hw, cid2)
+            assert (slot0, slot1, slot2) == (0, 1, 2)
             hw.unregister(cid1)
             cid_reused = hw.register(cb3)
-            assert cid_reused == 1, "hole at cid=1 should be reused before appending"
+            assert _slot_for(hw, cid_reused) == 1, "hole at cid=1 should be reused before appending"
             # cid=2 entry must still be the original callable, not silently overwritten.
-            assert hw._callable_registry[cid2] is cb2
+            assert hw._callable_registry[slot2] is cb2
             # Next register fills cid=3 since 0..2 are all occupied.
             cid_next = hw.register(_unique_chip_callable(4))
-            assert cid_next == 3
+            assert _slot_for(hw, cid_next) == 3
         finally:
             hw.close()
 

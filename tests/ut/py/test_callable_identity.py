@@ -61,6 +61,7 @@ def test_worker_register_returns_opaque_handle_and_deduplicates_same_identity():
         assert first.hashid == second.hashid
         assert first.digest == second.digest
         assert first != second
+        assert first != worker._identity_registry[first.digest].slot_id
         assert len(worker._callable_registry) == 1
         assert worker._identity_registry[first.digest].ref_count == 2
     finally:

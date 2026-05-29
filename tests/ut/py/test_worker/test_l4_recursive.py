@@ -46,6 +46,10 @@ def _increment_counter(buf) -> None:
     struct.pack_into("i", buf, 0, v + 1)
 
 
+def _slot_for(worker: Worker, handle: CallableHandle) -> int:
+    return worker._identity_registry[handle.digest].slot_id
+
+
 # ---------------------------------------------------------------------------
 # Test: L4 lifecycle (init / close without submitting any tasks)
 # ---------------------------------------------------------------------------
@@ -162,7 +166,7 @@ class TestL4DynamicRegister:
             callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
             cid = w4.register(callable_obj)
             assert isinstance(cid, CallableHandle)
-            assert cid._slot_id >= 0
+            assert _slot_for(w4, cid) >= 0
         finally:
             w4.close()
 
@@ -179,11 +183,12 @@ class TestL4DynamicRegister:
         try:
             callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
             cid_a = w4.register(callable_obj)
+            slot_a = _slot_for(w4, cid_a)
             w4.unregister(cid_a)
-            assert cid_a not in w4._callable_registry
+            assert slot_a not in w4._callable_registry
             # Slot is freed; the next register reuses it.
             cid_b = w4.register(callable_obj)
-            assert cid_b._slot_id == cid_a._slot_id
+            assert _slot_for(w4, cid_b) == slot_a
         finally:
             w4.close()
 
