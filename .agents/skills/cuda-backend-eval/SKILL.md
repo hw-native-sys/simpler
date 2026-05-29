@@ -1503,7 +1503,8 @@ The script writes:
 
 - `cuda-benchmark.json`: raw samples, metadata, hardware, git commit.
 - `cuda-benchmark.md`: short report with interpretation notes.
-- `cuda-benchmark.svg`: bar chart of median device time by baseline.
+- `cuda-benchmark.svg`: bar chart of median device time by baseline, with
+  graph task-argument metadata embedded for explicit graph rows.
 - `cuda-benchmark-ratios.svg`: bar chart of each row's device-time ratio
   against its matched reference.
 - `cuda-benchmark-dag-deltas.svg`: bar chart of each `pto_persistent_dag_*`
@@ -1985,8 +1986,9 @@ generic-args baseline, graph generic-args4 baseline, graph-chain baseline,
 graph-scratch-reuse baseline, graph-tagged-inout baseline, graph descriptor
 fan-in/dependent metadata, graph-triad and graph-quad baselines, the tagged
 scalar graph baseline, the graph unary-square baseline, task-argument tags,
-size `1024`, one repeat, `78` combined samples, and the Markdown/SVG report
-files. The current compact gate artifact is under
+visible Markdown/SVG graph task-argument metadata, size `1024`, one repeat,
+`78` combined samples, and the Markdown/SVG report files. The current compact
+gate artifact is under
 `tmp/cuda-backend/graph-unary-benchmark-working/combined-current-f074746a/`.
 Validate older captures with explicit `--require-*` checks if the current
 preset has gained new selected rows since that capture.

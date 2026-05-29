@@ -1771,6 +1771,66 @@ def test_cuda_capture_validator_requires_graph_task_args_metadata():
     )
 
 
+def test_cuda_capture_validator_checks_graph_task_args_in_reports(tmp_path):
+    cuda_validate_capture = _load_capture_validator_module()
+    artifact_dir = tmp_path / "combined-current-graph-task-args"
+    artifact_dir.mkdir()
+    payload = _paired_capture_payload()
+    expected = "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    payload["results"].append(
+        {
+            "machine": "hina",
+            "baseline": "pto_persistent_dag_graph_role_keyed_inout",
+            "n": 1024,
+            "repeat": 0,
+            "status": "pass",
+            "device_wall_ns": 1024,
+            "graph_task_arg_key": "role",
+            "graph_task_args": {
+                "task0": "input:a,input:b,output:tmp1",
+                "task1": "inout:tmp1,input:b",
+                "task2": "input:tmp1,input:a,output_existing:out",
+            },
+        }
+    )
+    (artifact_dir / "cuda-benchmark.md").write_text("# report\n")
+    (artifact_dir / "cuda-benchmark.svg").write_text("<svg>stale chart</svg>\n")
+    (artifact_dir / "cuda-benchmark-ratios.svg").write_text("<svg></svg>\n")
+    (artifact_dir / "cuda-benchmark-dag-deltas.svg").write_text("<svg></svg>\n")
+    (artifact_dir / "cuda-benchmark-throughput.svg").write_text("<svg></svg>\n")
+
+    errors = cuda_validate_capture.validate_capture(
+        payload,
+        artifact_dir=artifact_dir,
+        require_report_files=True,
+        require_report_graph_task_args=True,
+        required_graph_task_args={"pto_persistent_dag_graph_role_keyed_inout": expected},
+        required_graph_task_arg_keys={"pto_persistent_dag_graph_role_keyed_inout": "role"},
+    )
+
+    assert "missing report graph task args in cuda-benchmark.md" in errors
+    assert "missing report graph task args in cuda-benchmark.svg" in errors
+
+    (artifact_dir / "cuda-benchmark.md").write_text(
+        f"| Graph task arg key | Graph task args |\n| `role` | `{expected}` |\n"
+    )
+    (artifact_dir / "cuda-benchmark.svg").write_text(
+        f"<svg><desc>task arg key: role task args: {expected}</desc></svg>\n"
+    )
+
+    assert (
+        cuda_validate_capture.validate_capture(
+            payload,
+            artifact_dir=artifact_dir,
+            require_report_files=True,
+            require_report_graph_task_args=True,
+            required_graph_task_args={"pto_persistent_dag_graph_role_keyed_inout": expected},
+            required_graph_task_arg_keys={"pto_persistent_dag_graph_role_keyed_inout": "role"},
+        )
+        == []
+    )
+
+
 def test_cuda_capture_validator_requires_graph_task_arg_key_metadata():
     cuda_validate_capture = _load_capture_validator_module()
     payload = _paired_capture_payload()
@@ -6711,6 +6771,48 @@ def test_render_report_contains_table_and_svg():
     assert "a100-local" in report
     assert "<svg" in svg
     assert "direct_driver" in svg
+
+
+def test_render_report_exposes_graph_task_args_metadata():
+    cuda_benchmark = _load_benchmark_module()
+    expected_task_args = (
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    )
+    payload = {
+        "metadata": {
+            "label": "graph-task-args-unit",
+            "git_commit": "abc123",
+            "paper_setup": "microbenchmarks only",
+        },
+        "results": [
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_dag_graph_role_keyed_inout",
+                "n": 1024,
+                "task_count": 3,
+                "device_wall_ns": 1000,
+                "dispatch_func_ids": [1, 1, 1],
+                "graph_descriptor": {"fanin": [0, 1, 1], "dependents": [1, 2]},
+                "graph_task_arg_key": "role",
+                "graph_task_args": {
+                    "task0": "input:a,input:b,output:tmp1",
+                    "task1": "inout:tmp1,input:b",
+                    "task2": "input:tmp1,input:a,output_existing:out",
+                },
+            }
+        ],
+    }
+
+    report = cuda_benchmark.render_markdown_report(payload)
+    svg = cuda_benchmark.render_svg(cuda_benchmark.summarize_results(payload))
+
+    assert "## Graph Descriptor Metadata" in report
+    assert (
+        "| a100-local | 1024 | pto_persistent_dag_graph_role_keyed_inout | 1,1,1 | 0,1,1 | 1,2 | `role` |"
+    ) in report
+    assert expected_task_args in report
+    assert "task arg key: role" in svg
+    assert f"task args: {expected_task_args}" in svg
 
 
 def test_render_report_includes_host_schedule_relative_ratios():

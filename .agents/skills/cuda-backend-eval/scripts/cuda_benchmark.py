@@ -2277,7 +2277,8 @@ def summarize_results(payload: dict[str, Any]) -> dict[tuple[str, str, int, int,
     for key, rows in grouped.items():
         host_values = [int(row.get("host_wall_ns", row["device_wall_ns"])) for row in rows]
         device_values = [int(row["device_wall_ns"]) for row in rows]
-        summary[key] = {
+        first = rows[0]
+        summary_row = {
             "machine": key[0],
             "baseline": key[1],
             "n": key[2],
@@ -2287,6 +2288,10 @@ def summarize_results(payload: dict[str, Any]) -> dict[tuple[str, str, int, int,
             "median_host_wall_ns": int(statistics.median(host_values)),
             "median_device_wall_ns": int(statistics.median(device_values)),
         }
+        for field_name in ("dispatch_func_ids", "graph_descriptor", "graph_task_arg_key", "graph_task_args"):
+            if field_name in first:
+                summary_row[field_name] = first[field_name]
+        summary[key] = summary_row
     return summary
 
 
@@ -2379,6 +2384,44 @@ def _tensor_tile_shape(tile: Any) -> str | None:
     if rows is None or cols is None or inner is None:
         return None
     return f"{rows}x{cols}x{inner}"
+
+
+def _join_int_values(values: Any) -> str:
+    if not isinstance(values, list):
+        return "-"
+    return ",".join(str(value) for value in values)
+
+
+def _graph_task_args_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    return ";".join(f"{key}={value[key]}" for key in sorted(value))
+
+
+def _graph_metadata_rows(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for row in _sorted_summary_rows(summary):
+        graph_descriptor = row.get("graph_descriptor")
+        task_args = row.get("graph_task_args")
+        if not isinstance(graph_descriptor, dict) and not isinstance(task_args, dict):
+            continue
+        rows.append(
+            {
+                "machine": str(row["machine"]),
+                "n": str(row["n"]),
+                "baseline": str(row["baseline"]),
+                "dispatch": _join_int_values(row.get("dispatch_func_ids")),
+                "fanin": _join_int_values(
+                    graph_descriptor.get("fanin") if isinstance(graph_descriptor, dict) else None
+                ),
+                "dependents": _join_int_values(
+                    graph_descriptor.get("dependents") if isinstance(graph_descriptor, dict) else None
+                ),
+                "task_arg_key": str(row.get("graph_task_arg_key") or "-"),
+                "task_args": _graph_task_args_text(task_args),
+            }
+        )
+    return rows
 
 
 def _tensor_flops(row: dict[str, Any]) -> int | None:
@@ -2598,6 +2641,15 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         '<text x="20" y="28" font-family="sans-serif" font-size="18" font-weight="700">'
         "Median device time by baseline</text>",
     ]
+    graph_metadata = _graph_metadata_rows(summary)
+    if graph_metadata:
+        desc = "; ".join(
+            f"{row['machine']} {row['baseline']} n={row['n']} "
+            f"dispatch={row['dispatch']} fanin={row['fanin']} dependents={row['dependents']} "
+            f"task arg key: {row['task_arg_key']} task args: {row['task_args']}"
+            for row in graph_metadata
+        )
+        lines.append(f"<desc>{html.escape(desc)}</desc>")
     for idx, row in enumerate(rows):
         y = 50 + idx * (bar_height + row_gap)
         label = (
@@ -2868,6 +2920,26 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
                 f"{row['task_count']} | {row['base_device_wall_ns']} | "
                 f"{row['median_device_wall_ns']} | {increment} | "
                 f"{_signed_ratio_text(increment, row['base_device_wall_ns'])} |"
+            )
+    graph_metadata = _graph_metadata_rows(summary)
+    if graph_metadata:
+        lines.extend(
+            [
+                "",
+                "## Graph Descriptor Metadata",
+                "",
+                "| Machine | N | Baseline | Dispatch | Graph fan-in | Graph dependents | "
+                "Graph task arg key | Graph task args |",
+                "| ------- | - | -------- | -------- | ------------ | ---------------- | "
+                "------------------ | --------------- |",
+            ]
+        )
+        for row in graph_metadata:
+            task_arg_key = "-" if row["task_arg_key"] == "-" else f"`{row['task_arg_key']}`"
+            lines.append(
+                f"| {row['machine']} | {row['n']} | {row['baseline']} | "
+                f"{row['dispatch']} | {row['fanin']} | {row['dependents']} | "
+                f"{task_arg_key} | `{row['task_args']}` |"
             )
     tensor_rows = _tensor_throughput_rows(payload)
     if tensor_rows:

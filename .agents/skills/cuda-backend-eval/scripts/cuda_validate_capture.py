@@ -308,6 +308,40 @@ def _validate_report_files(artifact_dir: Path | None) -> list[str]:
     return [f"missing report file {file_name}" for file_name in REPORT_FILES if not (artifact_dir / file_name).exists()]
 
 
+def _validate_report_graph_task_args(
+    artifact_dir: Path | None,
+    *,
+    required_graph_task_args: dict[str, str],
+    required_graph_task_arg_keys: dict[str, str],
+) -> list[str]:
+    if artifact_dir is None:
+        return ["missing artifact directory for report graph task args validation"]
+
+    checks = {
+        "cuda-benchmark.md": [
+            "Graph task arg key" if required_graph_task_arg_keys else None,
+            "Graph task args",
+            *[f"`{value}`" for value in required_graph_task_arg_keys.values()],
+            *[f"`{value}`" for value in required_graph_task_args.values()],
+        ],
+        "cuda-benchmark.svg": [
+            *[f"task arg key: {value}" for value in required_graph_task_arg_keys.values()],
+            *[f"task args: {value}" for value in required_graph_task_args.values()],
+        ],
+    }
+
+    errors: list[str] = []
+    for file_name, needles in checks.items():
+        path = artifact_dir / file_name
+        if not path.exists():
+            errors.append(f"missing report graph task args in {file_name}")
+            continue
+        content = path.read_text()
+        if any(needle is not None and needle not in content for needle in needles):
+            errors.append(f"missing report graph task args in {file_name}")
+    return errors
+
+
 def _validate_source_papers(payload: dict[str, Any], *, source_root: Path) -> list[str]:
     metadata = payload.get("metadata")
     paper_setup = metadata.get("paper_setup") if isinstance(metadata, dict) else None
@@ -517,6 +551,7 @@ def validate_capture(  # noqa: PLR0913
     expected_repeats: int | None = None,
     expected_result_count: int | None = None,
     require_report_files: bool = False,
+    require_report_graph_task_args: bool = False,
     require_command_examples: bool = False,
     require_zero_scheduler_errors: bool = False,
     required_dispatch: dict[str, str] | None = None,
@@ -550,6 +585,14 @@ def validate_capture(  # noqa: PLR0913
 
     if require_report_files:
         errors.extend(_validate_report_files(artifact_dir))
+    if require_report_graph_task_args:
+        errors.extend(
+            _validate_report_graph_task_args(
+                artifact_dir,
+                required_graph_task_args=required_graph_task_args or {},
+                required_graph_task_arg_keys=required_graph_task_arg_keys or {},
+            )
+        )
 
     if require_command_examples:
         errors.extend(_validate_command_examples(payload))
@@ -616,6 +659,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
             f"{baseline}={metadata}" for baseline, metadata in PAIRED_CURRENT_GRAPH_DEPENDENTS.items()
         ]
     args.require_report_files = True
+    args.require_report_graph_task_args = True
     args.require_zero_scheduler_errors = True
     if args.preset == "compact-current":
         args.require_command_examples = True
@@ -651,6 +695,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-graph-task-arg-key", action="append")
     parser.add_argument("--require-graph-fanin", action="append")
     parser.add_argument("--require-graph-dependents", action="append")
+    parser.add_argument("--require-report-graph-task-args", action="store_true")
     parser.add_argument("--require-source-papers", action="store_true")
     return parser.parse_args(argv)
 
@@ -691,6 +736,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_repeats=args.expected_repeats,
         expected_result_count=args.expected_result_count,
         require_report_files=args.require_report_files,
+        require_report_graph_task_args=args.require_report_graph_task_args,
         require_command_examples=args.require_command_examples,
         require_zero_scheduler_errors=args.require_zero_scheduler_errors,
         required_dispatch=required_dispatch,
