@@ -1907,11 +1907,11 @@ Use `--dry-run` to print the commands without launching benchmarks. The paired
 benchmark default tensor descriptor is `16x16x16` so the scalar tensor DAG,
 explicit graph tensor DAG, WMMA tensor-core DAG, and cuBLAS rows can run
 together. The current committed summary keeps the full current-head
-`9ec5511e` capture plus compact current-head gates in
+`5424bcca` capture plus compact current-head gates in
 `docs/nvidia-backend/evaluation-current.md`.
 The full current-head artifact under
-`tmp/cuda-backend/current-head-full-node-link-working/`
-`combined-current-9ec5511e/` validated `1224` A100/H200 samples before the
+`tmp/cuda-backend/current-head-full-named-callable-working/`
+`combined-current-5424bcca/` validated `1242` A100/H200 samples after the
 named-callable graph row joined the selected matrix. New full captures should
 validate `1242` samples with sizes `1024,65536,1048576`, three repeats,
 tensor descriptor `16x16x16`, task counts `2,6,12`, worker-grid values
@@ -1919,6 +1919,15 @@ tensor descriptor `16x16x16`, task counts `2,6,12`, worker-grid values
 topology and TaskArgs metadata reports, tensor-throughput reports,
 generated node-link and named-callable graph metadata, and zero scheduler
 errors.
+
+Run the full paired-current gate with:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
+    --sync-remote-tree \
+    --output-root tmp/cuda-backend/current-head-full-named-callable-working
+```
 
 Use this compact paired gate after changing selected persistent graph
 benchmark rows. With `--batch-tasks 0`, it validates 96 non-batch samples

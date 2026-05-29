@@ -340,19 +340,20 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest full paired capture at commit `9ec5511e` uses the `16x16x16`
+The latest full paired capture at commit `5424bcca` uses the `16x16x16`
 tensor descriptor, sizes `1024,65536,1048576`, three repeats, task counts
 `2,6,12`, and worker-grid values `32,64,128,256`. It writes artifacts under
-`tmp/cuda-backend/current-head-full-node-link-working/`
-`combined-current-9ec5511e/` and validates `1224` combined samples. The
+`tmp/cuda-backend/current-head-full-named-callable-working/`
+`combined-current-5424bcca/` and validates `1242` combined samples. The
 paired-runner validator checked
 source-paper provenance, sanitized command examples, generated Markdown/SVG
 reports, zero scheduler errors, selected tensor throughput reports, graph
 topology reports, graph TaskArgs-like metadata reports, expected generated
 dispatch sequences, tensor tile descriptors, graph fan-in/dependent arrays,
-node attrs/ops metadata, task-argument spellings, and scratch-reuse metadata.
-This supersedes the older `cb300e82` and `61cf96cd` full captures while
-keeping the same three-size/three-repeat comparison role.
+node attrs/ops metadata, named-callable metadata, task-argument spellings,
+and scratch-reuse metadata. This supersedes the older `9ec5511e`,
+`cb300e82`, and `61cf96cd` full captures while keeping the same
+three-size/three-repeat comparison role.
 
 Selected current-head full-capture medians show that the compiler-backed
 host-schedule row remains within `0.89x-1.11x` of the handwritten
@@ -363,6 +364,15 @@ fan-in `0,1,1`, dependents `1,2`, and the same report-visible task args.
 At `N=1024`, A100 reported tag/role/compact/pair medians of
 `29696/30720/30720/30720 ns`; H200 reported
 `28608/28992/27776/28704 ns`.
+The selected named-callable row now appears in the full matrix at all three
+sizes with graph fan-in `0,0,2`, dependents `2,2`, graph-node ops
+`task0=op:add=1;task1=op:mul=2;task2=op:add=1`, graph task arg key
+`named_callable`, and graph task args
+`task0=callable:add,input:a,input:b,output:tmp0;`
+`task1=callable:mul,input:a,input:b,output:tmp1;`
+`task2=callable:add,input:a,input:b,output:out`. Median device times were
+`28672/135616/2411424 ns` on A100 and `26112/134496/1907872 ns` on H200 for
+sizes `1024/65536/1048576`.
 
 A compact paired benchmark at commit `945016c3` adds
 `pto_persistent_dag_graph_diamond` to the benchmark matrix and validates the
@@ -4537,6 +4547,13 @@ errors. The named-callable benchmark rows were:
 - H200: `pto_persistent_dag_graph_named_callable`, `n=1024`,
   dispatch `1,2,1`, fan-in `0,0,2`, dependents `2,2`, task arg key
   `named_callable`, `25728 ns`.
+
+The refreshed full paired-current capture under
+`tmp/cuda-backend/current-head-full-named-callable-working/`
+`combined-current-5424bcca/` validates the same selected row across
+`N=1024,65536,1048576` with zero scheduler errors. Median named-callable
+device times were `28672/135616/2411424 ns` on A100 and
+`26112/134496/1907872 ns` on H200 for those sizes.
 
 Needed:
 

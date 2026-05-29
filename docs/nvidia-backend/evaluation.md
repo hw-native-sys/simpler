@@ -76,6 +76,9 @@ latest multi-size tensor baseline sweep uses `e79edba2`:
 - [Current capture](evaluation-current.md) records the compact `95be2b5b`
   paired gate that promotes graph named-callable task metadata into the
   selected A100/H200 benchmark matrix with 96 non-batch validated samples.
+- [Current capture](evaluation-current.md) records the full `5424bcca`
+  paired-current gate that promotes graph named-callable task metadata into
+  the three-size A100/H200 benchmark matrix with 1242 validated samples.
 - [Current capture](evaluation-current.md) records the `1c683c1c` lifecycle
   matrix that adds graph tensor-core descriptors to the paired repeat-run
   prepared-callable validation path.

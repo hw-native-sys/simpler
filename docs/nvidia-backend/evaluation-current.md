@@ -1,11 +1,11 @@
 # CUDA Current Evaluation Capture
 
 This page summarizes the latest full paired A100/H200 CUDA backend capture
-from commit `9ec5511e`, plus compact current-head validation captures. The
+from commit `5424bcca`, plus compact current-head validation captures. The
 full current-head capture is under
-`tmp/cuda-backend/current-head-full-node-link-working/`
-`combined-current-9ec5511e/`.
-The latest compact current-head gate is the capture under
+`tmp/cuda-backend/current-head-full-named-callable-working/`
+`combined-current-5424bcca/`.
+The latest compact current-head gate remains the capture under
 `tmp/cuda-backend/persistent-named-callable-baseline-working/`
 `combined-current-95be2b5b/`, which validates the selected compact benchmark
 matrix after named-callable graph descriptors joined the selected graph-node
@@ -23,14 +23,14 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - repeats: `3`
 - batch tasks: `2,6,12`
 - worker blocks per task: `32,64,128,256`
-- samples in combined JSON: `1224`
+- samples in combined JSON: `1242`
 
 The current paired-current validator now accepts the full capture with
-`1224` samples after the node-link graph row joined the selected matrix. The
-named-callable graph row raises the next full paired-current target to `1242`
-samples when that full three-size capture is refreshed. The older `cb300e82`
-full capture remains useful as historical evidence, but it validated `1206`
-samples before that row was included.
+`1242` samples after the named-callable graph row joined the selected matrix.
+The older `9ec5511e` full capture remains useful as historical evidence, but
+it validated `1224` samples before that row was included. The older
+`cb300e82` full capture validated `1206` samples before the node-link graph
+row joined the selected matrix.
 
 ## Artifact Paths
 
@@ -42,16 +42,16 @@ samples before that row was included.
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark.md`
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark.svg`
 - `tmp/cuda-backend/combined-current-61cf96cd/cuda-benchmark-ratios.svg`
-- `tmp/cuda-backend/current-head-full-node-link-working/a100-current-9ec5511e/cuda-benchmark.json`
-- `tmp/cuda-backend/current-head-full-node-link-working/a100-current-9ec5511e/cuda-benchmark.md`
-- `tmp/cuda-backend/current-head-full-node-link-working/h200-current-9ec5511e/cuda-benchmark.json`
-- `tmp/cuda-backend/current-head-full-node-link-working/h200-current-9ec5511e/cuda-benchmark.md`
-- `tmp/cuda-backend/current-head-full-node-link-working/combined-current-9ec5511e/cuda-benchmark.json`
-- `tmp/cuda-backend/current-head-full-node-link-working/combined-current-9ec5511e/cuda-benchmark.md`
-- `tmp/cuda-backend/current-head-full-node-link-working/combined-current-9ec5511e/cuda-benchmark.svg`
-- `tmp/cuda-backend/current-head-full-node-link-working/combined-current-9ec5511e/cuda-benchmark-ratios.svg`
-- `tmp/cuda-backend/current-head-full-node-link-working/combined-current-9ec5511e/cuda-benchmark-dag-deltas.svg`
-- `tmp/cuda-backend/current-head-full-node-link-working/combined-current-9ec5511e/cuda-benchmark-throughput.svg`
+- `tmp/cuda-backend/current-head-full-named-callable-working/a100-current-5424bcca/cuda-benchmark.json`
+- `tmp/cuda-backend/current-head-full-named-callable-working/a100-current-5424bcca/cuda-benchmark.md`
+- `tmp/cuda-backend/current-head-full-named-callable-working/h200-current-5424bcca/cuda-benchmark.json`
+- `tmp/cuda-backend/current-head-full-named-callable-working/h200-current-5424bcca/cuda-benchmark.md`
+- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark.json`
+- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark.md`
+- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark.svg`
+- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark-throughput.svg`
 - `tmp/cuda-backend/persistent-named-callable-baseline-working/a100-current-95be2b5b/cuda-benchmark.json`
 - `tmp/cuda-backend/persistent-named-callable-baseline-working/h200-current-95be2b5b/cuda-benchmark.json`
 - `tmp/cuda-backend/persistent-named-callable-baseline-working/combined-current-95be2b5b/cuda-benchmark.json`
@@ -347,33 +347,30 @@ samples before that row was included.
 
 ## Latest Full Current-Head Capture
 
-The full paired capture at artifact label `9ec5511e` refreshes the broad
+The full paired capture at artifact label `5424bcca` refreshes the broad
 A100/H200 benchmark matrix on the current branch head. It uses `compute_80`
 on A100, `compute_90` on H200, the default `16x16x16` tensor descriptor,
 three vector sizes, three repeats, same-work task counts `2,6,12`, and worker
-grid values `32,64,128,256`.
+grid values `32,64,128,256`. This is the first full three-size capture after
+`pto_persistent_dag_graph_named_callable` joined the selected benchmark
+matrix.
 
 Validation command:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/current-head-full-node-link-working/combined-current-9ec5511e/cuda-benchmark.json \
-    --require-size 1024,65536,1048576 --expected-repeats 3 \
-    --expected-result-count 1224 \
-    --require-report-files --require-report-graph-topology \
-    --require-report-graph-task-args --require-report-tensor-throughput \
-    --require-command-examples --require-zero-scheduler-errors \
-    --require-source-papers
+    tmp/cuda-backend/current-head-full-named-callable-working/combined-current-5424bcca/cuda-benchmark.json \
+    --preset paired-current
 ```
 
 The paired runner generated this validator with explicit required baselines,
 generated-dispatch IDs, tensor descriptors, graph fan-in/dependent arrays,
-TaskArgs-like graph metadata, graph node attrs/ops, scratch-reuse metadata,
-and tensor/core/cuBLAS report requirements. It accepted the combined JSON,
-Markdown, and SVG artifacts with `1224` samples. New full captures should use
-the `paired-current` preset with the same sample count until the selected
-benchmark matrix changes again.
+TaskArgs-like graph metadata, graph node attrs/ops, named-callable metadata,
+scratch-reuse metadata, and tensor/core/cuBLAS report requirements. It
+accepted the combined JSON, Markdown, and SVG artifacts with `1242` samples.
+New full captures should use the `paired-current` preset with the same sample
+count until the selected benchmark matrix changes again.
 
 Launch baseline comparison from the same raw JSON:
 
@@ -1887,6 +1884,18 @@ and `block_dim=256`. The row validates graph task args
 `task1=callable:mul,input:a,input:b,output:tmp1;`
 `task2=callable:add,input:a,input:b,output:out` and graph-node ops
 `task0=op:add=1;task1=op:mul=2;task2=op:add=1`.
+
+The full `5424bcca` capture validates the same named-callable row across all
+three paired-current sizes. Median device times were:
+
+| GPU | N | Named-callable ns | Node-link ns | Raw DAG ns |
+| --- | - | ----------------- | ------------ | ---------- |
+| A100 | 1024 | 28672 | 32768 | 29696 |
+| A100 | 65536 | 135616 | 135968 | 152288 |
+| A100 | 1048576 | 2411424 | 2387264 | 2414784 |
+| H200 | 1024 | 26112 | 26176 | 37280 |
+| H200 | 65536 | 134496 | 132832 | 133600 |
+| H200 | 1048576 | 1907872 | 1889408 | 1908928 |
 
 ## Supplemental Reordered Graph-Descriptor Smoke
 
