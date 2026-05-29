@@ -185,10 +185,11 @@ capture is still rejected if it ran the wrong CUDA device task sequence. It
 also checks tensor descriptor metadata for tensor and cuBLAS rows, plus
 explicit `--require-report-graph-topology` and
 `--require-report-graph-task-args` gates for visible graph topology and
-task-argument metadata in `cuda-benchmark.md` and `cuda-benchmark.svg`, so a
-report captured with the wrong `--tensor-rows`, `--tensor-cols`,
-`--tensor-inner`, or stale graph metadata does not get copied into the
-current-evaluation tables.
+task-argument metadata in `cuda-benchmark.md` and `cuda-benchmark.svg`.
+Current paired presets also use `--require-report-graph-role-spelling` for
+the focused tag/role/compact graph rows, so a report captured with the wrong
+`--tensor-rows`, `--tensor-cols`, `--tensor-inner`, or stale graph metadata
+does not get copied into the current-evaluation tables.
 
 ## Baselines
 

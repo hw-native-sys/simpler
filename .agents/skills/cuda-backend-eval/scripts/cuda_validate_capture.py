@@ -130,9 +130,15 @@ PAIRED_CURRENT_GRAPH_TASK_ARGS = {
     ),
 }
 PAIRED_CURRENT_GRAPH_TASK_ARG_KEYS = {
+    "pto_persistent_dag_graph_tagged_inout": "tag",
     "pto_persistent_dag_graph_role_keyed_inout": "role",
     "pto_persistent_dag_graph_compact_role_inout": "compact",
 }
+PAIRED_CURRENT_GRAPH_ROLE_SPELLING_BASELINES = (
+    "pto_persistent_dag_graph_tagged_inout",
+    "pto_persistent_dag_graph_role_keyed_inout",
+    "pto_persistent_dag_graph_compact_role_inout",
+)
 PAIRED_CURRENT_GRAPH_FANIN = {
     "pto_persistent_dag_graph": "0,0,2",
     "pto_persistent_dag_graph_generic_args4": "0,0,2",
@@ -384,6 +390,86 @@ def _validate_report_graph_task_args(
     return errors
 
 
+def _validate_report_graph_role_spelling(
+    artifact_dir: Path | None,
+    *,
+    required_graph_task_args: dict[str, str],
+    required_graph_task_arg_keys: dict[str, str],
+    required_graph_fanin: dict[str, str],
+    required_graph_dependents: dict[str, str],
+) -> list[str]:
+    if artifact_dir is None:
+        return ["missing artifact directory for report graph role spelling validation"]
+
+    role_baselines = [
+        baseline
+        for baseline in PAIRED_CURRENT_GRAPH_ROLE_SPELLING_BASELINES
+        if baseline in required_graph_task_args
+        or baseline in required_graph_task_arg_keys
+        or baseline in required_graph_fanin
+        or baseline in required_graph_dependents
+    ]
+    checks = {
+        "cuda-benchmark.md": [
+            "Graph Role Spelling Rows",
+            "Graph task arg key",
+            "Median device ns",
+            *role_baselines,
+            *[
+                f"`{required_graph_task_arg_keys[baseline]}`"
+                for baseline in role_baselines
+                if baseline in required_graph_task_arg_keys
+            ],
+            *[
+                f"`{required_graph_task_args[baseline]}`"
+                for baseline in role_baselines
+                if baseline in required_graph_task_args
+            ],
+            *[required_graph_fanin[baseline] for baseline in role_baselines if baseline in required_graph_fanin],
+            *[
+                required_graph_dependents[baseline]
+                for baseline in role_baselines
+                if baseline in required_graph_dependents
+            ],
+        ],
+        "cuda-benchmark.svg": [
+            "graph role spelling:",
+            *role_baselines,
+            *[
+                f"key={required_graph_task_arg_keys[baseline]}"
+                for baseline in role_baselines
+                if baseline in required_graph_task_arg_keys
+            ],
+            *[
+                f"task args={required_graph_task_args[baseline]}"
+                for baseline in role_baselines
+                if baseline in required_graph_task_args
+            ],
+            *[
+                f"fanin={required_graph_fanin[baseline]}"
+                for baseline in role_baselines
+                if baseline in required_graph_fanin
+            ],
+            *[
+                f"dependents={required_graph_dependents[baseline]}"
+                for baseline in role_baselines
+                if baseline in required_graph_dependents
+            ],
+        ],
+    }
+
+    errors: list[str] = []
+    for file_name, needles in checks.items():
+        path = artifact_dir / file_name
+        if not path.exists():
+            errors.append(f"missing report graph role spelling in {file_name}")
+            continue
+        content = path.read_text()
+        if any(needle not in content for needle in needles):
+            errors.append(f"missing report graph role spelling in {file_name}")
+    return errors
+
+
 def _validate_source_papers(payload: dict[str, Any], *, source_root: Path) -> list[str]:
     metadata = payload.get("metadata")
     paper_setup = metadata.get("paper_setup") if isinstance(metadata, dict) else None
@@ -595,6 +681,7 @@ def validate_capture(  # noqa: PLR0913
     require_report_files: bool = False,
     require_report_graph_topology: bool = False,
     require_report_graph_task_args: bool = False,
+    require_report_graph_role_spelling: bool = False,
     require_command_examples: bool = False,
     require_zero_scheduler_errors: bool = False,
     required_dispatch: dict[str, str] | None = None,
@@ -642,6 +729,16 @@ def validate_capture(  # noqa: PLR0913
                 artifact_dir,
                 required_graph_task_args=required_graph_task_args or {},
                 required_graph_task_arg_keys=required_graph_task_arg_keys or {},
+            )
+        )
+    if require_report_graph_role_spelling:
+        errors.extend(
+            _validate_report_graph_role_spelling(
+                artifact_dir,
+                required_graph_task_args=required_graph_task_args or {},
+                required_graph_task_arg_keys=required_graph_task_arg_keys or {},
+                required_graph_fanin=required_graph_fanin or {},
+                required_graph_dependents=required_graph_dependents or {},
             )
         )
 
@@ -712,6 +809,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
     args.require_report_files = True
     args.require_report_graph_topology = True
     args.require_report_graph_task_args = True
+    args.require_report_graph_role_spelling = True
     args.require_zero_scheduler_errors = True
     if args.preset == "compact-current":
         args.require_command_examples = True
@@ -749,6 +847,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--require-graph-dependents", action="append")
     parser.add_argument("--require-report-graph-topology", action="store_true")
     parser.add_argument("--require-report-graph-task-args", action="store_true")
+    parser.add_argument("--require-report-graph-role-spelling", action="store_true")
     parser.add_argument("--require-source-papers", action="store_true")
     return parser.parse_args(argv)
 
@@ -791,6 +890,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_report_files=args.require_report_files,
         require_report_graph_topology=args.require_report_graph_topology,
         require_report_graph_task_args=args.require_report_graph_task_args,
+        require_report_graph_role_spelling=args.require_report_graph_role_spelling,
         require_command_examples=args.require_command_examples,
         require_zero_scheduler_errors=args.require_zero_scheduler_errors,
         required_dispatch=required_dispatch,

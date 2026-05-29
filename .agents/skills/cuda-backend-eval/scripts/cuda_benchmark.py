@@ -68,6 +68,11 @@ TENSOR_THROUGHPUT_BASELINES = {
     "cublas_sgemm",
     "cublas_sgemm_graph",
 }
+GRAPH_ROLE_SPELLING_BASELINES = {
+    "pto_persistent_dag_graph_tagged_inout",
+    "pto_persistent_dag_graph_role_keyed_inout",
+    "pto_persistent_dag_graph_compact_role_inout",
+}
 
 _FALLBACK_SLOW_VECTOR_ADD_PTX = rb"""
 //
@@ -2420,6 +2425,7 @@ def _graph_metadata_rows(summary: dict[tuple[str, str, int, int, int], dict[str,
                 "machine": str(row["machine"]),
                 "n": str(row["n"]),
                 "baseline": str(row["baseline"]),
+                "median_device_wall_ns": str(row["median_device_wall_ns"]),
                 "dispatch": _join_int_values(row.get("dispatch_func_ids")),
                 "fanin": _join_int_values(
                     graph_descriptor.get("fanin") if isinstance(graph_descriptor, dict) else None
@@ -2432,6 +2438,13 @@ def _graph_metadata_rows(summary: dict[tuple[str, str, int, int, int], dict[str,
             }
         )
     return rows
+
+
+def _graph_role_spelling_rows(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) -> list[dict[str, str]]:
+    return sorted(
+        (row for row in _graph_metadata_rows(summary) if row["baseline"] in GRAPH_ROLE_SPELLING_BASELINES),
+        key=lambda row: (row["machine"], int(row["n"]), row["task_arg_key"], row["baseline"]),
+    )
 
 
 def _tensor_flops(row: dict[str, Any]) -> int | None:
@@ -2654,12 +2667,19 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
     ]
     graph_metadata = _graph_metadata_rows(summary)
     if graph_metadata:
-        desc = "; ".join(
+        desc_parts = [
             f"{row['machine']} {row['baseline']} n={row['n']} "
             f"dispatch={row['dispatch']} fanin={row['fanin']} dependents={row['dependents']} "
             f"task arg key: {row['task_arg_key']} task args: {row['task_args']}"
             for row in graph_metadata
+        ]
+        desc_parts.extend(
+            f"graph role spelling: {row['machine']} {row['baseline']} n={row['n']} "
+            f"key={row['task_arg_key']} dispatch={row['dispatch']} fanin={row['fanin']} "
+            f"dependents={row['dependents']} task args={row['task_args']}"
+            for row in _graph_role_spelling_rows(summary)
         )
+        desc = "; ".join(desc_parts)
         lines.append(f"<desc>{html.escape(desc)}</desc>")
     for idx, row in enumerate(rows):
         y = 50 + idx * (bar_height + row_gap)
@@ -2951,6 +2971,26 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
                 f"| {row['machine']} | {row['n']} | {row['baseline']} | "
                 f"{row['dispatch']} | {row['fanin']} | {row['dependents']} | "
                 f"{task_arg_key} | `{row['task_args']}` |"
+            )
+    graph_role_spelling = _graph_role_spelling_rows(summary)
+    if graph_role_spelling:
+        lines.extend(
+            [
+                "",
+                "## Graph Role Spelling Rows",
+                "",
+                "| Machine | N | Graph task arg key | Baseline | Median device ns | Dispatch | Graph fan-in | "
+                "Graph dependents | Graph task args |",
+                "| ------- | - | ------------------ | -------- | ---------------- | -------- | ------------ | "
+                "---------------- | --------------- |",
+            ]
+        )
+        for row in graph_role_spelling:
+            task_arg_key = "-" if row["task_arg_key"] == "-" else f"`{row['task_arg_key']}`"
+            lines.append(
+                f"| {row['machine']} | {row['n']} | {task_arg_key} | {row['baseline']} | "
+                f"{row['median_device_wall_ns']} | {row['dispatch']} | {row['fanin']} | "
+                f"{row['dependents']} | `{row['task_args']}` |"
             )
     tensor_rows = _tensor_throughput_rows(payload)
     if tensor_rows:

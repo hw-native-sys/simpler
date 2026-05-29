@@ -237,16 +237,21 @@ matrix. It uses the default `16x16x16` tensor descriptor, `N=1024`, one
 repeat, no batch rows, and a synced H200 source tree. The paired runner
 captured local A100 and remote H200 reports, merged them, generated Markdown
 and SVG reports, and validated the combined JSON.
+The report-rendering gate was refreshed in
+`tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f-report-role-spelling/`
+so `cuda-benchmark.md` now includes a focused `Graph Role Spelling Rows`
+section and `cuda-benchmark.svg` includes matching `<desc>` metadata.
 
 Validation command:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_validate_capture.py \
-    tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f/cuda-benchmark.json \
+    tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f-report-role-spelling/cuda-benchmark.json \
     --require-size 1024 --expected-repeats 1 --expected-result-count 74 \
     --require-report-files --require-report-graph-topology \
-    --require-report-graph-task-args --require-command-examples \
+    --require-report-graph-task-args \
+    --require-report-graph-role-spelling --require-command-examples \
     --require-zero-scheduler-errors --require-source-papers
 ```
 
@@ -254,7 +259,9 @@ The paired benchmark command additionally required the selected baselines,
 dispatch IDs, tensor-tile metadata, graph fan-in/dependent arrays, and graph
 task-argument metadata. The compact role row is checked with dispatch
 `1,1,1`, fan-in `0,1,1`, dependents `1,2`, and
-`graph_task_arg_key=compact`.
+`graph_task_arg_key=compact`. The focused role-spelling report gate also
+checks the tagged `tag`, role-keyed `role`, and compact `compact` task-arg
+keys in Markdown and SVG artifacts.
 
 Graph role-spelling rows:
 

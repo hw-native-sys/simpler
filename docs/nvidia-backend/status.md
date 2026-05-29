@@ -2141,6 +2141,11 @@ dependents `[1,2]`, task args `input:a,input:b,output:tmp1`,
 `device_wall_ns=27360`, `host_wall_ns=36621`. Both rows passed with zero
 device scheduler errors, and the current-summary DAG table now includes a
 `Graph Compact Role Inout/DAG` column.
+The combined benchmark report was regenerated under
+`tmp/cuda-backend/compact-role-benchmark-working/combined-current-30a8974f-report-role-spelling/`
+so `cuda-benchmark.md` now has a focused `Graph Role Spelling Rows` section
+and `cuda-benchmark.svg` exposes the same tag/role/compact rows in
+`graph role spelling:` metadata.
 
 The same tagged graph shape is now also in the paired persistent-smoke report
 flow as `graph_descriptor_tagged`, with scalar inputs recorded beside tensor

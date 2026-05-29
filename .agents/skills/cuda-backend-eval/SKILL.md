@@ -1984,7 +1984,10 @@ current-evaluation ratios from raw JSON. The graph-metadata section lists
 explicit graph descriptor dispatch IDs, fan-in/dependent arrays, task-argument
 keying, tagged task arguments, and tensor-tile shape per GPU. The
 graph-role-spelling section focuses on tagged, role-keyed, and compact
-role-entry graph rows when checking TaskArgs spelling compatibility:
+role-entry graph rows when checking TaskArgs spelling compatibility. The
+full benchmark Markdown report also includes the same `Graph Role Spelling
+Rows` section, and `cuda-benchmark.svg` carries matching `graph role
+spelling:` metadata in its `<desc>` element:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python:.agents/skills/cuda-backend-eval/scripts \
@@ -2051,9 +2054,11 @@ runtime graph descriptor rows recorded the expected dependency shape. The
 paired benchmark runner adds these requirements automatically for known graph
 descriptor benchmark baselines.
 It also passes `--require-report-graph-topology` and
-`--require-report-graph-task-args`, so paired benchmark Markdown and SVG
-reports must show the same graph topology and TaskArgs-like metadata that the
-JSON payload carries.
+`--require-report-graph-task-args`. Current paired presets also pass
+`--require-report-graph-role-spelling`, so paired benchmark Markdown and SVG
+reports must show the same graph topology, TaskArgs-like metadata, and
+focused tag/role/compact graph task-argument spelling rows that the JSON
+payload carries.
 
 Use `cuda_validate_smoke.py` for paired smoke artifacts. It checks required
 artifacts, pass status, zero device scheduler errors, expected runtime/mode,

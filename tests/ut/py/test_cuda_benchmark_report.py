@@ -1911,6 +1911,76 @@ def test_cuda_capture_validator_checks_graph_task_args_in_reports(tmp_path):
     )
 
 
+def test_cuda_capture_validator_checks_graph_role_spelling_in_reports(tmp_path):
+    cuda_validate_capture = _load_capture_validator_module()
+    artifact_dir = tmp_path / "combined-current-graph-role-spelling"
+    artifact_dir.mkdir()
+    payload = _paired_capture_payload()
+    expected = "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    payload["results"].append(
+        {
+            "machine": "hina",
+            "baseline": "pto_persistent_dag_graph_compact_role_inout",
+            "n": 1024,
+            "repeat": 0,
+            "status": "pass",
+            "device_wall_ns": 384,
+            "dispatch_func_ids": [1, 1, 1],
+            "graph_descriptor": {"fanin": [0, 1, 1], "dependents": [1, 2]},
+            "graph_task_arg_key": "compact",
+            "graph_task_args": {
+                "task0": "input:a,input:b,output:tmp1",
+                "task1": "inout:tmp1,input:b",
+                "task2": "input:tmp1,input:a,output_existing:out",
+            },
+        }
+    )
+    (artifact_dir / "cuda-benchmark.md").write_text("# report\n")
+    (artifact_dir / "cuda-benchmark.svg").write_text("<svg>stale chart</svg>\n")
+    (artifact_dir / "cuda-benchmark-ratios.svg").write_text("<svg></svg>\n")
+    (artifact_dir / "cuda-benchmark-dag-deltas.svg").write_text("<svg></svg>\n")
+    (artifact_dir / "cuda-benchmark-throughput.svg").write_text("<svg></svg>\n")
+
+    errors = cuda_validate_capture.validate_capture(
+        payload,
+        artifact_dir=artifact_dir,
+        require_report_files=True,
+        require_report_graph_role_spelling=True,
+        required_graph_task_args={"pto_persistent_dag_graph_compact_role_inout": expected},
+        required_graph_task_arg_keys={"pto_persistent_dag_graph_compact_role_inout": "compact"},
+        required_graph_fanin={"pto_persistent_dag_graph_compact_role_inout": "0,1,1"},
+        required_graph_dependents={"pto_persistent_dag_graph_compact_role_inout": "1,2"},
+    )
+
+    assert "missing report graph role spelling in cuda-benchmark.md" in errors
+    assert "missing report graph role spelling in cuda-benchmark.svg" in errors
+
+    (artifact_dir / "cuda-benchmark.md").write_text(
+        "## Graph Role Spelling Rows\n"
+        "| Graph task arg key | Baseline | Median device ns | Dispatch | Graph fan-in | Graph dependents | "
+        "Graph task args |\n"
+        f"| `compact` | pto_persistent_dag_graph_compact_role_inout | 384 | 1,1,1 | 0,1,1 | 1,2 | `{expected}` |\n"
+    )
+    (artifact_dir / "cuda-benchmark.svg").write_text(
+        "<svg><desc>graph role spelling: hina pto_persistent_dag_graph_compact_role_inout n=1024 "
+        f"key=compact dispatch=1,1,1 fanin=0,1,1 dependents=1,2 task args={expected}</desc></svg>\n"
+    )
+
+    assert (
+        cuda_validate_capture.validate_capture(
+            payload,
+            artifact_dir=artifact_dir,
+            require_report_files=True,
+            require_report_graph_role_spelling=True,
+            required_graph_task_args={"pto_persistent_dag_graph_compact_role_inout": expected},
+            required_graph_task_arg_keys={"pto_persistent_dag_graph_compact_role_inout": "compact"},
+            required_graph_fanin={"pto_persistent_dag_graph_compact_role_inout": "0,1,1"},
+            required_graph_dependents={"pto_persistent_dag_graph_compact_role_inout": "1,2"},
+        )
+        == []
+    )
+
+
 def test_cuda_capture_validator_requires_graph_task_arg_key_metadata():
     cuda_validate_capture = _load_capture_validator_module()
     payload = _paired_capture_payload()
@@ -2016,6 +2086,7 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
         "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;"
         "task2=input:tmp1,input:a,output_existing:out"
     ) in args.require_graph_task_args
+    assert "pto_persistent_dag_graph_tagged_inout=tag" in args.require_graph_task_arg_key
     assert "pto_persistent_dag_graph_role_keyed_inout=role" in args.require_graph_task_arg_key
     assert "pto_persistent_dag_graph_compact_role_inout=compact" in args.require_graph_task_arg_key
     assert "pto_persistent_dag_graph_diamond=9,2,1,2,1" in args.require_dispatch
@@ -2030,6 +2101,7 @@ def test_cuda_capture_validator_paired_current_requires_generic_args_baseline():
     assert args.expected_result_count == 1044
     assert args.require_report_graph_topology is True
     assert args.require_report_graph_task_args is True
+    assert args.require_report_graph_role_spelling is True
 
 
 def test_cuda_capture_validator_compact_current_preset_matches_docs_gate():
@@ -2048,6 +2120,7 @@ def test_cuda_capture_validator_compact_current_preset_matches_docs_gate():
     assert args.require_source_papers is True
     assert args.require_report_graph_topology is True
     assert args.require_report_graph_task_args is True
+    assert args.require_report_graph_role_spelling is True
     assert "pto_host_schedule_generic_args" in args.require_baseline
     assert "pto_persistent_dag_scalar_scale" in args.require_baseline
     assert "pto_persistent_dag_graph_generic_args4" in args.require_baseline
@@ -2101,6 +2174,7 @@ def test_cuda_capture_validator_compact_current_preset_matches_docs_gate():
         "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;"
         "task2=input:tmp1,input:a,output_existing:out"
     ) in args.require_graph_task_args
+    assert "pto_persistent_dag_graph_tagged_inout=tag" in args.require_graph_task_arg_key
     assert "pto_persistent_dag_graph_role_keyed_inout=role" in args.require_graph_task_arg_key
     assert "pto_persistent_dag_graph_compact_role_inout=compact" in args.require_graph_task_arg_key
     assert "pto_persistent_dag_graph_tensor=3,1,2,1" in args.require_dispatch
@@ -7083,6 +7157,94 @@ def test_render_report_exposes_graph_task_args_metadata():
     assert expected_task_args in report
     assert "task arg key: role" in svg
     assert f"task args: {expected_task_args}" in svg
+
+
+def test_render_report_exposes_graph_role_spelling_rows():
+    cuda_benchmark = _load_benchmark_module()
+    task_args = {
+        "task0": "input:a,input:b,output:tmp1",
+        "task1": "inout:tmp1,input:b",
+        "task2": "input:tmp1,input:a,output_existing:out",
+    }
+    expected_task_args = (
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    )
+    payload = {
+        "metadata": {
+            "label": "graph-role-spelling-unit",
+            "git_commit": "abc123",
+            "paper_setup": "microbenchmarks only",
+        },
+        "results": [
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_dag_graph_tagged_inout",
+                "n": 1024,
+                "task_count": 3,
+                "device_wall_ns": 512,
+                "dispatch_func_ids": [1, 1, 1],
+                "graph_descriptor": {"tasks": 3, "fanin": [0, 1, 1], "dependents": [1, 2]},
+                "graph_task_arg_key": "tag",
+                "graph_task_args": task_args,
+            },
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_dag_graph_role_keyed_inout",
+                "n": 1024,
+                "task_count": 3,
+                "device_wall_ns": 768,
+                "dispatch_func_ids": [1, 1, 1],
+                "graph_descriptor": {"tasks": 3, "fanin": [0, 1, 1], "dependents": [1, 2]},
+                "graph_task_arg_key": "role",
+                "graph_task_args": task_args,
+            },
+            {
+                "machine": "h200-remote",
+                "baseline": "pto_persistent_dag_graph_compact_role_inout",
+                "n": 1024,
+                "task_count": 3,
+                "device_wall_ns": 384,
+                "dispatch_func_ids": [1, 1, 1],
+                "graph_descriptor": {"tasks": 3, "fanin": [0, 1, 1], "dependents": [1, 2]},
+                "graph_task_arg_key": "compact",
+                "graph_task_args": task_args,
+            },
+            {
+                "machine": "a100-local",
+                "baseline": "pto_persistent_dag_graph",
+                "n": 1024,
+                "task_count": 3,
+                "device_wall_ns": 1024,
+                "dispatch_func_ids": [9, 2, 1],
+                "graph_descriptor": {"tasks": 3, "fanin": [0, 0, 2], "dependents": [2, 2]},
+            },
+        ],
+    }
+
+    report = cuda_benchmark.render_markdown_report(payload)
+    svg = cuda_benchmark.render_svg(cuda_benchmark.summarize_results(payload))
+
+    assert "## Graph Role Spelling Rows" in report
+    role_section = report.split("## Graph Role Spelling Rows", 1)[1].split("##", 1)[0]
+    assert (
+        "| Machine | N | Graph task arg key | Baseline | Median device ns | Dispatch | Graph fan-in | "
+        "Graph dependents | Graph task args |"
+    ) in role_section
+    assert (
+        "| a100-local | 1024 | `tag` | pto_persistent_dag_graph_tagged_inout | 512 | 1,1,1 | 0,1,1 | "
+        f"1,2 | `{expected_task_args}` |"
+    ) in role_section
+    assert (
+        "| a100-local | 1024 | `role` | pto_persistent_dag_graph_role_keyed_inout | 768 | 1,1,1 | 0,1,1 | 1,2 |"
+    ) in role_section
+    assert (
+        "| h200-remote | 1024 | `compact` | pto_persistent_dag_graph_compact_role_inout | 384 | 1,1,1 | 0,1,1 | 1,2 |"
+    ) in role_section
+    assert "pto_persistent_dag_graph |" not in role_section
+    assert "graph role spelling:" in svg
+    assert "key=tag" in svg
+    assert "key=role" in svg
+    assert "key=compact" in svg
 
 
 def test_render_report_includes_host_schedule_relative_ratios():
