@@ -15,8 +15,8 @@ design work so evaluation results are not mistaken for a complete backend.
   `path_for_role(...)`. Ascend platforms map the existing `host`, `aicpu`,
   and `aicore` roles directly. CUDA build configs now declare native `host`
   and `device` targets, and `persistent_device` also declares a native
-  `scheduler` target. The legacy `aicpu_path` and `aicore_path` fields are
-  compatibility aliases to the CUDA `device` artifact.
+  `scheduler` target. CUDA `RuntimeBinaries` no longer populates legacy
+  `aicpu_path` / `aicore_path` aliases; consumers use the role map instead.
 - The Python `ChipWorker` wrapper and underlying `_ChipWorker` nanobind
   boundary now accept role-keyed runtime binary maps directly through
   `_ChipWorker.init_roles(...)`. The C++ `ChipWorker` probes the optional
@@ -1223,8 +1223,9 @@ and preflight checks passed.
 After adding native CUDA `device` build roles, both CUDA runtimes were rebuilt
 locally and on H200. `RuntimeBuilder(platform="cuda")` reported
 `libcuda_device_runtime.so` for the `device` role in `host_schedule` and
-`persistent_device`; the legacy `aicpu_path` and `aicore_path` attributes
-aliased the same device artifact.
+`persistent_device`. The later role-cleanup slice removed the CUDA
+`aicpu_path` and `aicore_path` aliases, so CUDA consumers now read the device
+artifact through `path_for_role("device")` or `role_paths["device"]`.
 
 The local A100 no-build host-schedule Worker smoke passed after the rebuild:
 
@@ -2900,8 +2901,8 @@ compatibility mapping is:
 - Ascend: `host`, `aicpu`, and `aicore` map to their existing artifacts.
 - CUDA: `host` maps to `libhost_runtime.so`, `device` maps to
   `libcuda_device_runtime.so`, `scheduler` maps to
-  `libcuda_scheduler_runtime.so` when present, and legacy `aicpu_path` /
-  `aicore_path` attributes alias the CUDA device artifact.
+  `libcuda_scheduler_runtime.so` when present. CUDA no longer exposes
+  `aicpu_path` / `aicore_path` aliases for these role-native artifacts.
 
 The Python `ChipWorker.init(...)` wrapper now resolves runtime binary paths
 through `path_for_role(...)` / `role_paths` first. CUDA role-only binary maps
@@ -2930,9 +2931,11 @@ print(bins.path_for_role("scheduler"))
 PY
 ```
 
-Result: the focused selector reported `5 passed, 38 deselected`; the runtime
-builder printed `['device', 'host', 'scheduler']` and the scheduler artifact
-path under `build/lib/cuda/onboard/persistent_device/`.
+Result: the focused selector reported `7 passed, 75 deselected` with
+`--platform cuda`; the runtime builder printed
+`['device', 'host', 'scheduler']`, `aicpu_path=None`, `aicore_path=None`, and
+the scheduler artifact path under
+`build/lib/cuda/onboard/persistent_device/`.
 
 After adding `_ChipWorker.init_roles(...)`, the same focused selector was run
 on the synced H200 checkout and reported `5 passed, 38 deselected` with the
@@ -2990,9 +2993,10 @@ H200 reported `device_wall_ns=56864`. Both hosts also built
 
 Needed:
 
-- removal of legacy `aicpu_path` and `aicore_path` attributes once all Python,
-  tests, docs, and Ascend compatibility paths consume `RuntimeBinaries` through
-  role keys.
+- remove or hide the legacy positional `_ChipWorker.init(...)` path once all
+  host runtimes export `simpler_init_roles(...)`; until then it remains the
+  compatibility path for Ascend and old runtime-binary objects without
+  `role_paths`.
 
 ### Persistent Scheduler Generalization
 

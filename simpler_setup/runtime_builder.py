@@ -72,14 +72,16 @@ class RuntimeBinaries:
     """Paths to compiled runtime binaries, keyed by target role."""
 
     host_path: Path
-    aicpu_path: Path
-    aicore_path: Path
     simpler_log_path: Path
+    aicpu_path: Optional[Path] = None
+    aicore_path: Optional[Path] = None
     sim_context_path: Optional[Path] = None
     role_paths: dict[str, Path] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.role_paths:
+            if self.aicpu_path is None or self.aicore_path is None:
+                raise ValueError("RuntimeBinaries requires role_paths when legacy AICPU/AICore paths are absent")
             self.role_paths = {
                 "host": self.host_path,
                 "aicpu": self.aicpu_path,
@@ -182,20 +184,25 @@ class RuntimeBuilder:
         sim_context_path: Optional[Path],
     ) -> RuntimeBinaries:
         device_path = paths.get("device")
-        aicpu_path = paths.get("aicpu", device_path)
-        aicore_path = paths.get("aicore", device_path)
+        if self._arch == "cuda" and device_path is not None:
+            aicpu_path = paths.get("aicpu")
+            aicore_path = paths.get("aicore")
+        else:
+            aicpu_path = paths.get("aicpu", device_path)
+            aicore_path = paths.get("aicore", device_path)
         if aicpu_path is None or aicore_path is None:
-            missing = []
-            if aicpu_path is None:
-                missing.append("aicpu")
-            if aicore_path is None:
-                missing.append("aicore")
-            raise KeyError(f"Missing runtime binary path(s): {', '.join(missing)}")
+            if self._arch != "cuda" or device_path is None:
+                missing = []
+                if aicpu_path is None:
+                    missing.append("aicpu")
+                if aicore_path is None:
+                    missing.append("aicore")
+                raise KeyError(f"Missing runtime binary path(s): {', '.join(missing)}")
         return RuntimeBinaries(
             host_path=paths["host"],
+            simpler_log_path=simpler_log_path,
             aicpu_path=aicpu_path,
             aicore_path=aicore_path,
-            simpler_log_path=simpler_log_path,
             sim_context_path=sim_context_path,
             role_paths=self._target_role_paths(paths),
         )
@@ -259,8 +266,8 @@ class RuntimeBuilder:
                 If False (default), return pre-built binary paths.
 
         Returns:
-            RuntimeBinaries with role-keyed paths plus legacy compatibility
-            fields for existing host/aicpu/aicore call sites.
+            RuntimeBinaries with role-keyed paths. Ascend runtimes also fill
+            legacy AICPU/AICore fields for positional init compatibility.
 
         Raises:
             FileNotFoundError: If build=False and pre-built binaries are missing.

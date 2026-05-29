@@ -215,13 +215,14 @@ hardware names:
 - `device`: CUDA cubin/fatbin/PTX for the executor or persistent runtime.
 - `scheduler`: optional alias for the `persistent_device` scheduler module.
 
-For a low-risk transition, `RuntimeBinaries` can keep `aicpu_path` and
-`aicore_path` temporarily as compatibility aliases. That transition has
-started with `RuntimeBinaries.role_paths` and
+For a low-risk transition, `RuntimeBinaries` kept `aicpu_path` and
+`aicore_path` temporarily as compatibility aliases. That transition has now
+reached the role-map boundary with `RuntimeBinaries.role_paths` and
 `RuntimeBinaries.path_for_role(...)`: Ascend exposes `host`, `aicpu`, and
 `aicore`, while CUDA build configs now declare `host`, optional `scheduler`,
-and `device`. The Python `ChipWorker` wrapper and `_ChipWorker` nanobind
-boundary now pass role-keyed maps directly when available. The C++ worker also
+and `device`. CUDA `RuntimeBinaries` no longer fills `aicpu_path` or
+`aicore_path`. The Python `ChipWorker` wrapper and `_ChipWorker` nanobind
+boundary pass role-keyed maps directly when available. The C++ worker also
 probes an optional `simpler_init_roles` host-runtime entry so CUDA runtimes can
 receive `device` and `scheduler` binaries without pretending they are
 AICPU/AICore images. The cleaner end state is a target-binary map keyed only

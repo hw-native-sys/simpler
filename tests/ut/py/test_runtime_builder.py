@@ -205,6 +205,8 @@ class TestRuntimeBuilderGetBinaries:
 
         assert isinstance(result, RuntimeBinaries)
         assert result.host_path.name == "libhost.so"
+        assert result.aicpu_path is not None
+        assert result.aicore_path is not None
         assert result.aicpu_path.name == "libaicpu.so"
         assert result.aicore_path.name == "libaicore.so"
 
@@ -221,18 +223,28 @@ class TestRuntimeBuilderGetBinaries:
         builder = RuntimeBuilder(platform=default_test_platform)
         result = builder.get_binaries("test_rt", build=True)
 
-        assert result.role_paths == {
-            "host": result.host_path,
-            "aicpu": result.aicpu_path,
-            "aicore": result.aicore_path,
-        }
+        if test_arch == "cuda":
+            assert result.role_paths == {
+                "host": result.host_path,
+                "device": result.path_for_role("device"),
+            }
+        else:
+            assert result.role_paths == {
+                "host": result.host_path,
+                "aicpu": result.aicpu_path,
+                "aicore": result.aicore_path,
+            }
         assert result.path_for_role("host") == result.host_path
-        with pytest.raises(KeyError, match="device"):
-            result.path_for_role("device")
+        if test_arch == "cuda":
+            with pytest.raises(KeyError, match="aicpu"):
+                result.path_for_role("aicpu")
+        else:
+            with pytest.raises(KeyError, match="device"):
+                result.path_for_role("device")
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_cuda_runtime_binaries_uses_native_device_role(self, MockCompiler, tmp_path, monkeypatch):
-        """CUDA builds host/device targets while preserving legacy aliases."""
+        """CUDA builds host/device targets without AICPU/AICore aliases."""
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
@@ -267,8 +279,8 @@ class TestRuntimeBuilderGetBinaries:
             "device": result.path_for_role("device"),
         }
         assert result.path_for_role("device").name == "libdevice.so"
-        assert result.aicpu_path == result.path_for_role("device")
-        assert result.aicore_path == result.path_for_role("device")
+        assert result.aicpu_path is None
+        assert result.aicore_path is None
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_cuda_runtime_binaries_exposes_optional_scheduler_role(self, MockCompiler, tmp_path, monkeypatch):
@@ -317,8 +329,8 @@ class TestRuntimeBuilderGetBinaries:
         }
         assert result.path_for_role("scheduler").name == "libscheduler.so"
         assert result.path_for_role("device").name == "libdevice.so"
-        assert result.aicpu_path == result.path_for_role("device")
-        assert result.aicore_path == result.path_for_role("device")
+        assert result.aicpu_path is None
+        assert result.aicore_path is None
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_calls_compiler_three_times(self, MockCompiler, tmp_path, default_test_platform, test_arch):
@@ -401,10 +413,9 @@ class TestRuntimeBuilderIntegration:
         result = builder.get_binaries(runtime_name, build=True)
 
         assert isinstance(result, RuntimeBinaries)
-        for label, path in [
-            ("host", result.host_path),
-            ("aicpu", result.aicpu_path),
-            ("aicore", result.aicore_path),
-        ]:
+        for label, path in result.role_paths.items():
             assert path.is_file(), f"{label} binary not found: {path}"
             assert path.stat().st_size > 0, f"{label} binary is empty: {path}"
+        if not platform.startswith("cuda"):
+            assert result.aicpu_path is not None
+            assert result.aicore_path is not None

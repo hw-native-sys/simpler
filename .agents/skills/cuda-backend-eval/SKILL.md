@@ -1060,13 +1060,16 @@ PYTHONPATH=$PWD:$PWD/python \
 After changing CUDA runtime role discovery or `persistent_device` build
 targets, rebuild the runtime and check that the role-keyed binary map includes
 the optional scheduler image and that the Python/C++ `ChipWorker` boundary
-accepts role-keyed maps:
+accepts role-keyed maps. CUDA `RuntimeBinaries` should print `None None` for
+the legacy AICPU/AICore path fields; use `role_paths` / `path_for_role`
+instead:
 
 ```bash
 PYTHONPATH=$PWD:$PWD/python .venv/bin/python - <<'PY'
 from simpler_setup.runtime_builder import RuntimeBuilder
 bins = RuntimeBuilder(platform="cuda").get_binaries("persistent_device", build=True)
 print(sorted(bins.role_paths))
+print(bins.aicpu_path, bins.aicore_path)
 print(bins.path_for_role("scheduler"))
 PY
 
