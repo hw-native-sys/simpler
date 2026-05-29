@@ -67,6 +67,7 @@ class SmokeValidationExpectation:
     resource_policy: ResourcePolicyExpectation | None = None
     require_report_files: bool = False
     require_report_graph_topology: bool = False
+    require_report_graph_task_args: bool = False
 
 
 def _artifact_label(path: Path) -> str:
@@ -375,6 +376,40 @@ def _validate_report_graph_topology(
     return errors
 
 
+def _validate_report_graph_task_args(
+    artifact_dir: Path | None,
+    *,
+    expected_key: str | None,
+    expected_task_args: str | None,
+) -> list[str]:
+    if artifact_dir is None:
+        return ["missing artifact directory for report graph task args validation"]
+
+    checks = {
+        "cuda-smoke-report.md": [
+            "Graph task arg key" if expected_key is not None else None,
+            "Graph task args",
+            f"`{expected_key}`" if expected_key is not None else None,
+            f"`{expected_task_args}`" if expected_task_args is not None else None,
+        ],
+        "cuda-smoke-report.svg": [
+            f"task arg key: {expected_key}" if expected_key is not None else None,
+            f"task args: {expected_task_args}" if expected_task_args is not None else None,
+        ],
+    }
+
+    errors: list[str] = []
+    for file_name, needles in checks.items():
+        path = artifact_dir / file_name
+        if not path.exists():
+            errors.append(f"missing report graph task args in {file_name}")
+            continue
+        content = path.read_text()
+        if any(needle is not None and needle not in content for needle in needles):
+            errors.append(f"missing report graph task args in {file_name}")
+    return errors
+
+
 def validate_smoke(
     payloads: list[dict[str, Any]],
     *,
@@ -429,6 +464,14 @@ def validate_smoke(
                 expected_dependents=expectation.graph_dependents,
             )
         )
+    if expectation.require_report_graph_task_args:
+        errors.extend(
+            _validate_report_graph_task_args(
+                expectation.artifact_dir,
+                expected_key=expectation.graph_task_arg_key,
+                expected_task_args=expectation.graph_task_args,
+            )
+        )
     return errors
 
 
@@ -456,6 +499,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expected-grid-dim", type=int)
     parser.add_argument("--require-report-files", action="store_true")
     parser.add_argument("--require-report-graph-topology", action="store_true")
+    parser.add_argument("--require-report-graph-task-args", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -494,6 +538,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             resource_policy=_resource_policy_expectation(args),
             require_report_files=args.require_report_files,
             require_report_graph_topology=args.require_report_graph_topology,
+            require_report_graph_task_args=args.require_report_graph_task_args,
         ),
     )
     if errors:

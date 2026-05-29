@@ -572,7 +572,9 @@ dependent arrays.
 For `graph_descriptor_tagged` and `graph_descriptor_tagged_inout`, it
 additionally passes `--expected-graph-task-args`, so tagged graph captures
 must prove the TaskArgs-like roles that were lowered into the runtime
-descriptor.
+descriptor. It also passes `--require-report-graph-task-args`, so the
+Markdown and SVG smoke reports must show those roles instead of only carrying
+them in JSON.
 
 The JSON payload and compact report include `resource_policy` fields for
 `scheduler_blocks`, `worker_blocks`, `worker_blocks_per_task`, `stream_id`,
@@ -2013,8 +2015,9 @@ Use `cuda_validate_smoke.py` for paired smoke artifacts. It checks required
 artifacts, pass status, zero device scheduler errors, expected runtime/mode,
 dispatch IDs, repeat-run lifecycle counts, tensor-tile descriptor shape when
 requested, graph-descriptor fan-in/dependent metadata when requested,
-`graph_task_args` metadata when requested, generated smoke report files, and
-visible report graph topology when requested.
+`graph_task_args` metadata when requested, generated smoke report files,
+visible report graph topology when requested, and visible report graph
+task-argument metadata when requested.
 `cuda_pair_persistent_smoke.py` runs this validator automatically unless
 `--skip-validation` is set.
 

@@ -2443,8 +2443,11 @@ def test_cuda_smoke_validator_checks_graph_task_args_metadata(tmp_path):
             "task0": "input:a,input:b,output:tmp1",
             "task1": "input:a,input:b,output:tmp2",
         },
+        "graph_task_arg_key": "role",
     }
     (artifact_dir / "a100.json").write_text(json.dumps(payload) + "\n")
+    (artifact_dir / "cuda-smoke-report.md").write_text("# CUDA Smoke Report\n\nstale table\n")
+    (artifact_dir / "cuda-smoke-report.svg").write_text("<svg>stale chart</svg>\n")
 
     payloads = cuda_validate_smoke.load_smoke_payloads([artifact_dir / "a100.json"])
     errors = cuda_validate_smoke.validate_smoke(
@@ -2459,6 +2462,42 @@ def test_cuda_smoke_validator_checks_graph_task_args_metadata(tmp_path):
         "task0=input:a,input:b,output:tmp1;task2=input:tmp1,input:tmp2,output_existing:out "
         "for artifact=a100, found task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2"
     ) in errors
+
+    expected_task_args = "task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2"
+    errors = cuda_validate_smoke.validate_smoke(
+        payloads,
+        expectation=cuda_validate_smoke.SmokeValidationExpectation(
+            artifact_dir=artifact_dir,
+            graph_task_arg_key="role",
+            graph_task_args=expected_task_args,
+            require_report_files=True,
+            require_report_graph_task_args=True,
+        ),
+    )
+
+    assert "missing report graph task args in cuda-smoke-report.md" in errors
+    assert "missing report graph task args in cuda-smoke-report.svg" in errors
+
+    (artifact_dir / "cuda-smoke-report.md").write_text(
+        f"| Graph task arg key | Graph task args |\n| `role` | `{expected_task_args}` |\n"
+    )
+    (artifact_dir / "cuda-smoke-report.svg").write_text(
+        "<svg>task arg key: role task args: task0=input:a,input:b,output:tmp1;task1=input:a,input:b,output:tmp2</svg>\n"
+    )
+
+    assert (
+        cuda_validate_smoke.validate_smoke(
+            payloads,
+            expectation=cuda_validate_smoke.SmokeValidationExpectation(
+                artifact_dir=artifact_dir,
+                graph_task_arg_key="role",
+                graph_task_args=expected_task_args,
+                require_report_files=True,
+                require_report_graph_task_args=True,
+            ),
+        )
+        == []
+    )
 
 
 def test_cuda_smoke_validator_checks_graph_task_arg_key_metadata(tmp_path):
@@ -4331,6 +4370,7 @@ def test_cuda_pair_persistent_smoke_accepts_tagged_graph_descriptor_workflow(tmp
     assert "2,2" in validate
     assert "--require-report-graph-topology" in validate
     assert "--expected-graph-task-args" in validate
+    assert "--require-report-graph-task-args" in validate
     assert "task0=input:a,input:b,output:tmp1,scalar:scalar_args[0],scalar:scalar_args[1]" in " ".join(validate)
     assert "task2=input:tmp1,input:tmp2,output_existing:out" in " ".join(validate)
 
@@ -4374,6 +4414,7 @@ def test_cuda_pair_persistent_smoke_accepts_tagged_inout_graph_descriptor_workfl
     assert "1,2" in validate
     assert "--require-report-graph-topology" in validate
     assert "--expected-graph-task-args" in validate
+    assert "--require-report-graph-task-args" in validate
     assert "task1=inout:tmp1,input:b" in " ".join(validate)
 
 
@@ -4418,6 +4459,7 @@ def test_cuda_pair_persistent_smoke_accepts_role_keyed_inout_graph_descriptor_wo
     assert "--expected-graph-task-arg-key" in validate
     assert "role" in validate
     assert "--expected-graph-task-args" in validate
+    assert "--require-report-graph-task-args" in validate
     assert "task1=inout:tmp1,input:b" in " ".join(validate)
 
 

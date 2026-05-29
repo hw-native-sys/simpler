@@ -351,3 +351,6 @@ For explicit graph-descriptor smokes, it also passes
 must prove the expected runtime graph topology. It also passes
 `--require-report-graph-topology` so the Markdown and SVG smoke reports cannot
 silently lag behind the JSON topology metadata.
+For tagged graph smokes, it also passes `--expected-graph-task-args` and
+`--require-report-graph-task-args`, so the visible reports must expose the
+same lowered TaskArgs-like roles as the JSON payload.

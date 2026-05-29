@@ -438,7 +438,13 @@ def build_validate_command(config: PairedPersistentSmokeConfig, suffix: str) -> 
         )
     expected_graph_task_args = _expected_graph_task_args(config)
     if expected_graph_task_args is not None:
-        command.extend(["--expected-graph-task-args", expected_graph_task_args])
+        command.extend(
+            [
+                "--expected-graph-task-args",
+                expected_graph_task_args,
+                "--require-report-graph-task-args",
+            ]
+        )
     expected_graph_task_arg_key = _expected_graph_task_arg_key(config)
     if expected_graph_task_arg_key is not None:
         command.extend(["--expected-graph-task-arg-key", expected_graph_task_arg_key])
