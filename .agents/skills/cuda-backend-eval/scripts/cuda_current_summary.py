@@ -52,6 +52,7 @@ DAG_BASELINES = (
     "pto_persistent_dag_graph_diamond",
     "pto_persistent_dag_graph_scratch_reuse",
     "pto_persistent_dag_graph_tagged_inout",
+    "pto_persistent_dag_graph_role_keyed_inout",
     "pto_persistent_dag_unary_square",
     "pto_persistent_dag_tensor",
 )
@@ -235,6 +236,11 @@ def render_dag_shape_table(payload: Payload) -> str:
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_graph_diamond", n, 5, 1), dag),
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_graph_scratch_reuse", n, 6, 1), dag),
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_graph_tagged_inout", n, 3, 1), dag),
+                    _ratio_for_key(
+                        summary,
+                        (machine, "pto_persistent_dag_graph_role_keyed_inout", n, 3, 1),
+                        dag,
+                    ),
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_unary_square", n, 3, 1), dag),
                     _ratio(tensor, dag),
                 ]
@@ -255,6 +261,7 @@ def render_dag_shape_table(payload: Payload) -> str:
             "Graph Diamond/DAG",
             "Graph Scratch Reuse/DAG",
             "Graph Tagged Inout/DAG",
+            "Graph Role Inout/DAG",
             "Unary Square/DAG",
             "Tensor/DAG",
         ],

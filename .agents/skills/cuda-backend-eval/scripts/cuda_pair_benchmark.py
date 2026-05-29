@@ -47,6 +47,7 @@ BASELINE_ROWS: tuple[str, ...] = (
     "pto_persistent_dag_graph_diamond",
     "pto_persistent_dag_graph_tagged",
     "pto_persistent_dag_graph_tagged_inout",
+    "pto_persistent_dag_graph_role_keyed_inout",
     "pto_persistent_dag_graph_triad",
     "pto_persistent_dag_graph_quad",
     "pto_persistent_dag_graph_unary_square",
@@ -81,6 +82,7 @@ EXPECTED_DISPATCH_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_diamond": "9,2,1,2,1",
     "pto_persistent_dag_graph_tagged": "9,2,1",
     "pto_persistent_dag_graph_tagged_inout": "1,1,1",
+    "pto_persistent_dag_graph_role_keyed_inout": "1,1,1",
     "pto_persistent_dag_graph_triad": "6,2,1",
     "pto_persistent_dag_graph_quad": "8,2,1",
     "pto_persistent_dag_graph_unary_square": "7,1,1",
@@ -109,6 +111,12 @@ EXPECTED_GRAPH_TASK_ARGS_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_tagged_inout": (
         "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
     ),
+    "pto_persistent_dag_graph_role_keyed_inout": (
+        "task0=input:a,input:b,output:tmp1;task1=inout:tmp1,input:b;task2=input:tmp1,input:a,output_existing:out"
+    ),
+}
+EXPECTED_GRAPH_TASK_ARG_KEY_BY_BASELINE: dict[str, str] = {
+    "pto_persistent_dag_graph_role_keyed_inout": "role",
 }
 EXPECTED_GRAPH_FANIN_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph": "0,0,2",
@@ -118,6 +126,7 @@ EXPECTED_GRAPH_FANIN_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_diamond": "0,0,2,2,2",
     "pto_persistent_dag_graph_tagged": "0,0,2",
     "pto_persistent_dag_graph_tagged_inout": "0,1,1",
+    "pto_persistent_dag_graph_role_keyed_inout": "0,1,1",
     "pto_persistent_dag_graph_triad": "0,0,2",
     "pto_persistent_dag_graph_quad": "0,0,2",
     "pto_persistent_dag_graph_unary_square": "0,1,1",
@@ -132,6 +141,7 @@ EXPECTED_GRAPH_DEPENDENTS_BY_BASELINE: dict[str, str] = {
     "pto_persistent_dag_graph_diamond": "2,3,2,3,4,4",
     "pto_persistent_dag_graph_tagged": "2,2",
     "pto_persistent_dag_graph_tagged_inout": "1,2",
+    "pto_persistent_dag_graph_role_keyed_inout": "1,2",
     "pto_persistent_dag_graph_triad": "2,2",
     "pto_persistent_dag_graph_quad": "2,2",
     "pto_persistent_dag_graph_unary_square": "1,2",
@@ -423,6 +433,15 @@ def build_validate_command(
         if baseline in EXPECTED_GRAPH_TASK_ARGS_BY_BASELINE
         for part in ("--require-graph-task-args", f"{baseline}={EXPECTED_GRAPH_TASK_ARGS_BY_BASELINE[baseline]}")
     ]
+    graph_task_arg_key_args = [
+        part
+        for baseline in _selected_baselines(config)
+        if baseline in EXPECTED_GRAPH_TASK_ARG_KEY_BY_BASELINE
+        for part in (
+            "--require-graph-task-arg-key",
+            f"{baseline}={EXPECTED_GRAPH_TASK_ARG_KEY_BY_BASELINE[baseline]}",
+        )
+    ]
     graph_fanin_args = [
         part
         for baseline in _selected_baselines(config)
@@ -452,6 +471,7 @@ def build_validate_command(
         *tensor_tile_args,
         *scratch_reuse_args,
         *graph_task_args,
+        *graph_task_arg_key_args,
         *graph_fanin_args,
         *graph_dependents_args,
         "--require-report-files",

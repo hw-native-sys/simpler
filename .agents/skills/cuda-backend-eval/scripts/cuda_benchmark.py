@@ -1727,6 +1727,15 @@ def run_single_sample(  # noqa: PLR0912
             baseline=baseline,
             dag_shape="graph_descriptor_tagged_inout",
         )
+    if baseline == "pto_persistent_dag_graph_role_keyed_inout":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="graph_descriptor_role_keyed_inout",
+        )
     if baseline == "pto_persistent_dag_graph_triad":
         return run_persistent_sample(
             device=device,
@@ -1983,6 +1992,7 @@ def run_benchmark(
                     "pto_persistent_dag_graph_diamond",
                     "pto_persistent_dag_graph_tagged",
                     "pto_persistent_dag_graph_tagged_inout",
+                    "pto_persistent_dag_graph_role_keyed_inout",
                     "pto_persistent_dag_graph_triad",
                     "pto_persistent_dag_graph_quad",
                     "pto_persistent_dag_graph_unary_square",
@@ -2565,6 +2575,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         "pto_persistent_dag_graph_diamond": "#5d4037",
         "pto_persistent_dag_graph_tagged": "#704214",
         "pto_persistent_dag_graph_tagged_inout": "#4e342e",
+        "pto_persistent_dag_graph_role_keyed_inout": "#6a4c93",
         "pto_persistent_dag_graph_triad": "#6f4e37",
         "pto_persistent_dag_graph_quad": "#3e2723",
         "pto_persistent_dag_graph_unary_square": "#8d6e63",
@@ -2965,6 +2976,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  output-existing, and scalar task-argument tags over a three-task graph descriptor.",
             "- `pto_persistent_dag_graph_tagged_inout` uses explicit input, output,",
             "  and inout task-argument tags over a three-task graph descriptor.",
+            "- `pto_persistent_dag_graph_role_keyed_inout` uses the same",
+            "  inout descriptor with the preferred role-keyed task-argument spelling.",
             "- `pto_persistent_dag_graph_triad` uses an explicit graph descriptor",
             "  for the generated-dispatch three-input task.",
             "- `pto_persistent_dag_graph_quad` uses an explicit graph descriptor",
@@ -3131,6 +3144,7 @@ def main() -> None:
             "pto_persistent_dag_graph_diamond",
             "pto_persistent_dag_graph_tagged",
             "pto_persistent_dag_graph_tagged_inout",
+            "pto_persistent_dag_graph_role_keyed_inout",
             "pto_persistent_dag_graph_triad",
             "pto_persistent_dag_graph_quad",
             "pto_persistent_dag_graph_unary_square",

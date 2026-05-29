@@ -1255,6 +1255,18 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-root tmp/cuda-backend/role-keyed-inout-working
 ```
 
+The selected benchmark path also includes
+`pto_persistent_dag_graph_role_keyed_inout`. Use a compact paired capture when
+changing graph task-argument lowering or capture validation:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
+    --sizes 1024 --repeats 1 --batch-tasks '' \
+    --worker-blocks-per-task '' --sync-remote-tree \
+    --output-root tmp/cuda-backend/role-keyed-benchmark-working
+```
+
 Graph tasks may also pass `out_storage` when the logical graph output should
 reuse an existing scratch buffer. Keep `out` unique for tensor-flow dependency
 inference and set `out_storage` to the physical buffer name, for example

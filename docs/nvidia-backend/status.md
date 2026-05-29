@@ -271,6 +271,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_graph_diamond`;
 - `pto_persistent_dag_graph_tagged`;
 - `pto_persistent_dag_graph_tagged_inout`;
+- `pto_persistent_dag_graph_role_keyed_inout`;
 - `pto_persistent_dag_graph_triad`;
 - `pto_persistent_dag_graph_quad`;
 - `pto_persistent_dag_unary_square`;
@@ -2010,6 +2011,27 @@ and zero scheduler errors on both GPUs. A100 reported per-launch device times
 `[43008,26624]` and H200 reported `[41792,25440]`. The generated smoke report
 adds a visible `Graph task arg key` column, so the artifact distinguishes the
 preferred `role` spelling from the older `tag` spelling.
+The same role-keyed graph shape is also part of the selected paired benchmark
+matrix as `pto_persistent_dag_graph_role_keyed_inout`. A compact A100/H200
+capture:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
+    --sizes 1024 --repeats 1 --batch-tasks '' \
+    --worker-blocks-per-task '' --sync-remote-tree \
+    --output-root tmp/cuda-backend/role-keyed-benchmark-working
+```
+
+validated `72` rows under
+`tmp/cuda-backend/role-keyed-benchmark-working/combined-current-a7787008/`.
+The capture required dispatch `[1,1,1]`, graph fan-in `[0,1,1]`,
+dependents `[1,2]`, task args `input:a,input:b,output:tmp1`,
+`inout:tmp1,input:b`, `input:tmp1,input:a,output_existing:out`, and
+`graph_task_arg_key=role`. The role-keyed row reported A100
+`device_wall_ns=38912`, `host_wall_ns=52853`; H200
+`device_wall_ns=20864`, `host_wall_ns=2446166`. Both rows passed with zero
+device scheduler errors.
 The same tagged graph shape is now also in the paired persistent-smoke report
 flow as `graph_descriptor_tagged`, with scalar inputs recorded beside tensor
 roles in `graph_task_args`. The current A100/H200 JSON plus Markdown/SVG

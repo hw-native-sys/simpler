@@ -1087,6 +1087,29 @@ for both GPUs, so this artifact can catch regressions where role-keyed
 TaskArgs-like metadata is accidentally reported only as generic tagged
 metadata.
 
+The role-keyed graph descriptor is also in the compact selected-benchmark
+path as `pto_persistent_dag_graph_role_keyed_inout`. The artifact under
+`tmp/cuda-backend/role-keyed-benchmark-working/combined-current-a7787008/`
+was produced with:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
+    --sizes 1024 --repeats 1 --batch-tasks '' \
+    --worker-blocks-per-task '' --sync-remote-tree \
+    --output-root tmp/cuda-backend/role-keyed-benchmark-working
+```
+
+The paired capture validator checked `72` rows, source-paper provenance,
+sanitized command examples, report files, zero scheduler errors, dispatch
+`1,1,1`, graph fan-in `0,1,1`, dependents `1,2`, the role-keyed graph task
+args, and `graph_task_arg_key=role`.
+
+| GPU | Baseline | Device ns | Host ns | Graph task arg key | Status |
+| --- | -------- | --------- | ------- | ------------------ | ------ |
+| A100 | `pto_persistent_dag_graph_role_keyed_inout` | 38912 | 52853 | `role` | pass |
+| H200 | `pto_persistent_dag_graph_role_keyed_inout` | 20864 | 2446166 | `role` | pass |
+
 The diamond graph-descriptor paired smoke at artifact label `072e396c`
 validates a wider explicit descriptor shape than the three-task
 graph-descriptor and reordered-graph smokes. It has two root producers, two
