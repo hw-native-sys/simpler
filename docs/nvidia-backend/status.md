@@ -310,16 +310,24 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_graph`;
 - `pto_persistent_dag_graph_generic_args4`;
 - `pto_persistent_dag_graph_node_attrs`;
+- `pto_persistent_dag_graph_node_io`;
 - `pto_persistent_dag_graph_node_op`;
 - `pto_persistent_dag_graph_depends_on`;
+- `pto_persistent_dag_graph_scalar_axpy`;
+- `pto_persistent_dag_graph_scalar_scale`;
+- `pto_persistent_dag_graph_scalar_affine`;
+- `pto_persistent_dag_graph_reordered`;
 - `pto_persistent_dag_graph_chain`;
 - `pto_persistent_dag_graph_scratch_reuse`;
 - `pto_persistent_dag_graph_diamond`;
 - `pto_persistent_dag_graph_tagged`;
 - `pto_persistent_dag_graph_tagged_inout`;
 - `pto_persistent_dag_graph_role_keyed_inout`;
+- `pto_persistent_dag_graph_compact_role_inout`;
+- `pto_persistent_dag_graph_pair_inout`;
 - `pto_persistent_dag_graph_triad`;
 - `pto_persistent_dag_graph_quad`;
+- `pto_persistent_dag_graph_unary_square`;
 - `pto_persistent_dag_unary_square`;
 - `pto_persistent_dag_tensor`;
 - `pto_persistent_dag_graph_tensor`;
@@ -2541,6 +2549,33 @@ A100 reported per-launch device times `[40960,25600]`; H200 reported
 `device_wall_ns=49152`, `host_wall_ns=68485`, and H200
 `device_wall_ns=28672`, `host_wall_ns=38506` for
 `pto_persistent_dag_graph_pair_inout`.
+
+The pair-shaped graph spelling is now also covered by the selected compact
+A100/H200 benchmark matrix:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python .venv/bin/python \
+  .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
+    --sizes 1024 --repeats 1 --batch-tasks '' \
+    --worker-blocks-per-task '' --sync-remote-tree \
+    --output-root tmp/cuda-backend/pair-current-compact-working
+```
+
+Result:
+`tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/`
+contains `cuda-benchmark.json`, `cuda-benchmark.md`, `cuda-benchmark.svg`,
+`cuda-benchmark-ratios.svg`, `cuda-benchmark-dag-deltas.svg`, and
+`cuda-benchmark-throughput.svg`. The paired validator required `92` rows,
+source-paper provenance, generated report files, zero scheduler errors, and
+the pair row's dispatch `[1,1,1]`, graph fan-in `[0,1,1]`, dependents
+`[1,2]`, task args `input:a,input:b,output:tmp1`,
+`inout:tmp1,input:b`, `input:tmp1,input:a,output_existing:out`, and
+`graph_task_arg_key=pair`. The pair row reported A100
+`device_wall_ns=39936`, `host_wall_ns=54972`; H200 reported
+`device_wall_ns=25120`, `host_wall_ns=33814`. The current-summary DAG table
+now includes `Graph Pair Inout/DAG`; the compact selected capture reported
+A100 `0.87x` and H200 `0.68x` versus the base
+`pto_persistent_dag` row.
 
 The same tagged graph shape is now also in the paired persistent-smoke report
 flow as `graph_descriptor_tagged`, with scalar inputs recorded beside tensor

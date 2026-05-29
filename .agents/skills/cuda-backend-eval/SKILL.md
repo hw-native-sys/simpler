@@ -1526,8 +1526,14 @@ PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
     --sizes 1024 --repeats 1 --batch-tasks '' \
     --worker-blocks-per-task '' --sync-remote-tree \
-    --output-root tmp/cuda-backend/compact-role-benchmark-working
+    --output-root tmp/cuda-backend/pair-current-compact-working
 ```
+
+The compact selected capture under
+`tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/`
+validated `92` A100/H200 rows, generated JSON/Markdown/SVG reports, and
+checked the pair graph row with `graph_task_arg_key=pair`, dispatch `1,1,1`,
+fan-in `0,1,1`, and dependents `1,2`.
 
 Graph tasks may also pass `out_storage` when the logical graph output should
 reuse an existing scratch buffer. Keep `out` unique for tensor-flow dependency

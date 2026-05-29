@@ -3,13 +3,11 @@
 This page summarizes the latest full paired A100/H200 CUDA backend capture
 from commit `61cf96cd`, plus compact current-head validation captures. The
 latest compact current-head gate is the capture under
-`tmp/cuda-backend/graph-node-io-benchmark-working/combined-current-c0d327d2/`,
-which validates the selected compact benchmark matrix after graph node
-`inputs`/`outputs` metadata became visible in graph-metadata summaries. The
-compact-role gate at `30a8974f` remains the task-argument spelling comparison
-for tagged, role-keyed, and compact graph entries. The raw JSON, Markdown,
-and SVG reports are generated locally under `tmp/cuda-backend/` and
-intentionally remain uncommitted.
+`tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/`,
+which validates the selected compact benchmark matrix after pair-shaped graph
+task arguments joined the tag, role-keyed, and compact spellings. The raw
+JSON, Markdown, and SVG reports are generated locally under
+`tmp/cuda-backend/` and intentionally remain uncommitted.
 
 The capture uses `nvcc` for target-specific PTX on both machines:
 
@@ -179,6 +177,14 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 - `tmp/cuda-backend/combined-current-a46db551/cuda-benchmark.svg`
 - `tmp/cuda-backend/combined-current-a46db551/cuda-benchmark-ratios.svg`
 - `tmp/cuda-backend/combined-current-a46db551/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/pair-current-compact-working/a100-current-c5094aa5/cuda-benchmark.json`
+- `tmp/cuda-backend/pair-current-compact-working/h200-current-c5094aa5/cuda-benchmark.json`
+- `tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/cuda-benchmark.json`
+- `tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/cuda-benchmark.md`
+- `tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/cuda-benchmark.svg`
+- `tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/cuda-benchmark-throughput.svg`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/a100.json`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/h200.json`
 - `tmp/cuda-backend/persistent-scalar_scale-smoke-e9c9f5f2/cuda-smoke-report.md`
@@ -598,6 +604,56 @@ Selected rows:
 All `18` matrix rows reported `status=pass`, so the report proves that the
 runtime surfaces each known malformed-graph condition on both GPU families
 instead of deadlocking or falling through to output-mismatch checks.
+
+## Latest Pair Compact Benchmark Gate
+
+The compact paired gate at artifact label `c5094aa5` validates the selected
+benchmark matrix after adding `pto_persistent_dag_graph_pair_inout`. It uses
+the default `16x16x16` tensor descriptor, `N=1024`, one repeat, no batch rows,
+and a synced H200 source tree. The paired runner captured local A100 and
+remote H200 reports, merged them, generated Markdown and SVG reports, and
+validated the combined JSON.
+
+Artifact path:
+
+- `tmp/cuda-backend/pair-current-compact-working/combined-current-c5094aa5/`
+
+Generated report files:
+
+- `cuda-benchmark.json`
+- `cuda-benchmark.md`
+- `cuda-benchmark.svg`
+- `cuda-benchmark-ratios.svg`
+- `cuda-benchmark-dag-deltas.svg`
+- `cuda-benchmark-throughput.svg`
+
+Validation summary:
+
+- expected rows: `92`
+- required machines: A100 `hina`, H200 `dasys-h200x8`
+- required graph pair dispatch: `1,1,1`
+- required graph pair fan-in/dependents: `0,1,1` / `1,2`
+- required graph task arg key: `pair`
+- required source-paper provenance: VDCores and MPK
+- required generated report files and zero scheduler errors
+
+Graph role-spelling rows:
+
+| GPU | N | Task arg key | Baseline | Device ns | Dispatch | Fan-in | Dependents |
+| --- | - | ------------ | -------- | --------- | -------- | ------ | ---------- |
+| A100 | 1024 | compact | `pto_persistent_dag_graph_compact_role_inout` | 29696 | `1,1,1` | `0,1,1` | `1,2` |
+| A100 | 1024 | pair | `pto_persistent_dag_graph_pair_inout` | 39936 | `1,1,1` | `0,1,1` | `1,2` |
+| A100 | 1024 | role | `pto_persistent_dag_graph_role_keyed_inout` | 30720 | `1,1,1` | `0,1,1` | `1,2` |
+| A100 | 1024 | tag | `pto_persistent_dag_graph_tagged_inout` | 29696 | `1,1,1` | `0,1,1` | `1,2` |
+| H200 | 1024 | compact | `pto_persistent_dag_graph_compact_role_inout` | 25600 | `1,1,1` | `0,1,1` | `1,2` |
+| H200 | 1024 | pair | `pto_persistent_dag_graph_pair_inout` | 25120 | `1,1,1` | `0,1,1` | `1,2` |
+| H200 | 1024 | role | `pto_persistent_dag_graph_role_keyed_inout` | 25408 | `1,1,1` | `0,1,1` | `1,2` |
+| H200 | 1024 | tag | `pto_persistent_dag_graph_tagged_inout` | 25792 | `1,1,1` | `0,1,1` | `1,2` |
+
+All four spellings lower to the same three-task in-place graph topology and
+the same task-argument flow. The pair row therefore checks that the compact
+structured pair spelling survives through benchmark dispatch, JSON capture,
+Markdown/SVG reporting, current-summary rendering, and the paired validator.
 
 ## Previous Compact Role Benchmark Gate
 
