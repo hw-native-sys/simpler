@@ -1089,11 +1089,10 @@ class _CudaPersistentDagSceneBuffers:
             self._setup_graph_descriptor(ctypes, CudaPersistentDagTask, n, output_nbytes)
         else:
             descriptor = self._tensor_tile_descriptor(n)
-            if arg_builder == "persistent_dag_tensor_core_tile_f32" and (
-                descriptor["rows"] != 16 or descriptor["cols"] != 16 or descriptor["inner"] % 8 != 0
-            ):
+            if arg_builder == "persistent_dag_tensor_core_tile_f32" and not self._is_tensor_core_tile(descriptor):
                 raise ValueError(
-                    "CUDA persistent_dag_tensor_core_tile_f32 requires rows=16, cols=16, and inner divisible by 8"
+                    "CUDA persistent_dag_tensor_core_tile_f32 requires rows/cols multiples of 16 "
+                    "and inner divisible by 8"
                 )
             tensor_func_id = 10 if arg_builder == "persistent_dag_tensor_core_tile_f32" else 3
             self.dev_tmp2 = self._malloc(output_nbytes)
@@ -1229,6 +1228,17 @@ class _CudaPersistentDagSceneBuffers:
             "b_batch_stride": b_batch_stride,
             "out_batch_stride": out_batch_stride,
         }
+
+    @staticmethod
+    def _is_tensor_core_tile(descriptor: dict[str, int]) -> bool:
+        return (
+            descriptor["rows"] > 0
+            and descriptor["cols"] > 0
+            and descriptor["inner"] > 0
+            and descriptor["rows"] % 16 == 0
+            and descriptor["cols"] % 16 == 0
+            and descriptor["inner"] % 8 == 0
+        )
 
     @staticmethod
     def _make_tensor_tile_task(task_type, descriptor: dict[str, int], **kwargs):
@@ -2042,12 +2052,17 @@ class _CudaPersistentDagSceneBuffers:
         if len(scalar_args) > 4:
             raise ValueError("CUDA persistent_dag_graph_f32 supports at most four scalar_args per task")
         if int(task_spec["func_id"]) == 10 and (
-            int(task_spec.get("rows", 0)) != 16
-            or int(task_spec.get("cols", 0)) != 16
-            or int(task_spec.get("inner", 0)) % 8 != 0
+            not _CudaPersistentDagSceneBuffers._is_tensor_core_tile(
+                {
+                    "rows": int(task_spec.get("rows", 0)),
+                    "cols": int(task_spec.get("cols", 0)),
+                    "inner": int(task_spec.get("inner", 0)),
+                }
+            )
         ):
             raise ValueError(
-                "CUDA persistent_dag_graph_f32 tensor core task requires rows=16, cols=16, and inner divisible by 8"
+                "CUDA persistent_dag_graph_f32 tensor core task requires rows/cols multiples of 16 "
+                "and inner divisible by 8"
             )
 
         tensor_args_t = ctypes_module.c_void_p * 4

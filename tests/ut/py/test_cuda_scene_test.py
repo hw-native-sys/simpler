@@ -394,25 +394,29 @@ task->out[out_base + row * task->ldc + col] = acc;
 """.strip()
 
 _PERSISTENT_WMMA_TILE_BODY = """
-if (task->rows != 16U || task->cols != 16U || task->inner == 0U || (task->inner % 8U) != 0U) {
+if ((task->rows % 16U) != 0U || (task->cols % 16U) != 0U || task->inner == 0U || (task->inner % 8U) != 0U) {
   return;
 }
 using namespace nvcuda;
 unsigned long long tile_count = task->n / task->out_batch_stride;
 for (unsigned long long tile_id = 0; tile_id < tile_count; ++tile_id) {
-  wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a_frag;
-  wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> b_frag;
-  wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc_frag;
-  wmma::fill_fragment(acc_frag, 0.0f);
   unsigned long long a_base = tile_id * task->a_batch_stride;
   unsigned long long b_base = tile_id * task->b_batch_stride;
   unsigned long long out_base = tile_id * task->out_batch_stride;
-  for (unsigned int k = 0; k < task->inner; k += 8U) {
-    wmma::load_matrix_sync(a_frag, task->a + a_base + k, task->lda);
-    wmma::load_matrix_sync(b_frag, task->b + b_base + k * task->ldb, task->ldb);
-    wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+  for (unsigned int row = 0; row < task->rows; row += 16U) {
+    for (unsigned int col = 0; col < task->cols; col += 16U) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> a_frag;
+      wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> b_frag;
+      wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc_frag;
+      wmma::fill_fragment(acc_frag, 0.0f);
+      for (unsigned int k = 0; k < task->inner; k += 8U) {
+        wmma::load_matrix_sync(a_frag, task->a + a_base + row * task->lda + k, task->lda);
+        wmma::load_matrix_sync(b_frag, task->b + b_base + k * task->ldb + col, task->ldb);
+        wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+      }
+      wmma::store_matrix_sync(task->out + out_base + row * task->ldc + col, acc_frag, task->ldc, wmma::mem_row_major);
+    }
   }
-  wmma::store_matrix_sync(task->out + out_base, acc_frag, task->ldc, wmma::mem_row_major);
 }
 """.strip()
 
@@ -839,7 +843,9 @@ def _cuda_persistent_tensor_core_tile_spec(
     arch="compute_80",
     block_dim=256,
     stream_id=0,
+    tensor_tile=None,
 ):
+    tensor_tile = tensor_tile or {"rows": 16, "cols": 16, "inner": 16}
     return {
         "cuda": {
             "runtime": "persistent_device",
@@ -874,7 +880,7 @@ def _cuda_persistent_tensor_core_tile_spec(
             "arg_builder": "persistent_dag_tensor_core_tile_f32",
             "args": ["a", "b", "out"],
             "queue_capacity": 2,
-            "tensor_tile": {"rows": 16, "cols": 16, "inner": 16},
+            "tensor_tile": tensor_tile,
         }
     }
 
@@ -4612,6 +4618,31 @@ def test_scene_test_builds_cuda_persistent_tensor_core_tile_args():
     assert buffers.host_tasks[3].out == buffers.tensor_buffers.ptrs["out"]
 
 
+def test_scene_test_builds_cuda_persistent_multi_fragment_tensor_core_tile_args():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(512)),
+        Tensor("b", _FakeTensor(512)),
+        Tensor("out", _FakeTensor(512)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_tensor_core_tile_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "tensor_tile": {"rows": 32, "cols": 16, "inner": 16},
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert len(buffers.host_tasks) == 4
+    assert buffers.host_tasks[0].func_id == 10
+    assert buffers.host_tasks[0].rows == 32
+    assert buffers.host_tasks[0].cols == 16
+    assert buffers.host_tasks[0].inner == 16
+    assert buffers.host_tasks[0].a_batch_stride == 512
+    assert buffers.host_tasks[0].b_batch_stride == 256
+    assert buffers.host_tasks[0].out_batch_stride == 512
+    assert buffers.host_tasks[3].out == buffers.tensor_buffers.ptrs["out"]
+
+
 def test_scene_test_builds_cuda_persistent_graph_tensor_core_tile_args():
     test_args = TaskArgsBuilder(
         Tensor("a", _FakeTensor(256)),
@@ -4663,6 +4694,47 @@ def test_scene_test_builds_cuda_persistent_graph_tensor_core_tile_args():
     assert buffers.host_tasks[3].out == buffers.tensor_buffers.ptrs["out"]
 
 
+def test_scene_test_builds_cuda_persistent_graph_multi_fragment_tensor_core_tile_args():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(512)),
+        Tensor("b", _FakeTensor(512)),
+        Tensor("out", _FakeTensor(512)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "temporaries": {"tmp0": "out"},
+        "graph": {
+            "tasks": [
+                {
+                    "func_id": 10,
+                    "a": "a",
+                    "b": "b",
+                    "out": "tmp0",
+                    "rows": 32,
+                    "cols": 16,
+                    "inner": 16,
+                    "lda": 16,
+                    "ldb": 16,
+                    "ldc": 16,
+                    "a_batch_stride": 512,
+                    "b_batch_stride": 256,
+                    "out_batch_stride": 512,
+                }
+            ]
+        },
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert len(buffers.host_tasks) == 1
+    assert buffers.host_tasks[0].func_id == 10
+    assert buffers.host_tasks[0].rows == 32
+    assert buffers.host_tasks[0].cols == 16
+    assert buffers.host_tasks[0].inner == 16
+    assert buffers.host_tasks[0].out == buffers.dev_tmp0
+
+
 def test_scene_test_rejects_incompatible_cuda_persistent_graph_tensor_core_tile_args():
     test_args = TaskArgsBuilder(
         Tensor("a", _FakeTensor(128)),
@@ -4695,7 +4767,7 @@ def test_scene_test_rejects_incompatible_cuda_persistent_graph_tensor_core_tile_
         },
     }
 
-    with pytest.raises(ValueError, match="graph.*tensor.*core.*rows=16"):
+    with pytest.raises(ValueError, match="graph.*tensor.*core.*rows/cols multiples of 16"):
         _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
 
 
@@ -8046,9 +8118,10 @@ def test_scene_test_runs_cuda_persistent_device_graph_tensor_tile_with_ctypes_da
             rows = params["rows"]
             cols = params["cols"]
             inner = params["inner"]
+            b_elems = max(rows * cols, inner * cols)
             args = TaskArgsBuilder(
                 Tensor("a", _CtypesFloatTensor(float((i % 5) + 1) for i in range(rows * inner))),
-                Tensor("b", _CtypesFloatTensor(float((i % 3) + 1) for i in range(inner * cols))),
+                Tensor("b", _CtypesFloatTensor(float((i % 3) + 1) for i in range(b_elems))),
                 Tensor("out", _CtypesFloatTensor(0.0 for _ in range(rows * cols))),
             )
             self.last_args = args
@@ -8117,9 +8190,10 @@ def test_scene_test_runs_cuda_persistent_device_graph_tensor_core_tile_with_ctyp
             rows = params["rows"]
             cols = params["cols"]
             inner = params["inner"]
+            b_elems = max(rows * cols, inner * cols)
             args = TaskArgsBuilder(
                 Tensor("a", _CtypesFloatTensor(float((i % 5) + 1) for i in range(rows * inner))),
-                Tensor("b", _CtypesFloatTensor(float((i % 3) + 1) for i in range(inner * cols))),
+                Tensor("b", _CtypesFloatTensor(float((i % 3) + 1) for i in range(b_elems))),
                 Tensor("out", _CtypesFloatTensor(0.0 for _ in range(rows * cols))),
             )
             self.last_args = args
@@ -8221,12 +8295,18 @@ def test_scene_test_runs_cuda_persistent_device_tensor_core_tile_with_ctypes_dat
 
     @scene_test(level=2, runtime="persistent_device")
     class CudaPersistentTensorCoreTileCtypesScene(SceneTestCase):
-        CALLABLE = _cuda_persistent_tensor_core_tile_spec(wmma_source, add_source, mul_source, stream_id=1)
+        CALLABLE = _cuda_persistent_tensor_core_tile_spec(
+            wmma_source,
+            add_source,
+            mul_source,
+            stream_id=1,
+            tensor_tile={"rows": 32, "cols": 16, "inner": 16},
+        )
         CASES = [
             {
-                "name": "tile16",
+                "name": "tile32x16",
                 "platforms": ["cuda"],
-                "params": {"rows": 16, "cols": 16, "inner": 16},
+                "params": {"rows": 32, "cols": 16, "inner": 16},
                 "config": {"block_dim": 256},
             }
         ]
@@ -8235,9 +8315,10 @@ def test_scene_test_runs_cuda_persistent_device_tensor_core_tile_with_ctypes_dat
             rows = params["rows"]
             cols = params["cols"]
             inner = params["inner"]
+            b_elems = max(rows * cols, inner * cols)
             args = TaskArgsBuilder(
                 Tensor("a", _CtypesFloatTensor(float((i % 5) + 1) for i in range(rows * inner))),
-                Tensor("b", _CtypesFloatTensor(float((i % 3) + 1) for i in range(inner * cols))),
+                Tensor("b", _CtypesFloatTensor(float((i % 3) + 1) for i in range(b_elems))),
                 Tensor("out", _CtypesFloatTensor(0.0 for _ in range(rows * cols))),
             )
             self.last_args = args

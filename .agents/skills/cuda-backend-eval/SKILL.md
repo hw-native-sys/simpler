@@ -1510,8 +1510,10 @@ PYTHONPATH=$PWD:$PWD/python \
 
 Use `persistent_dag_tensor_core_tile_f32` for the normal L2 scene-test path
 when the first DAG task should be a block-wide WMMA
-`m16n16k8:tf32->f32` task. The current L2 adapter requires `rows=16`,
-`cols=16`, and `K` divisible by `8`.
+`m16n16k8:tf32->f32` task. The current L2 adapter accepts descriptor
+families with `rows` and `cols` in multiples of `16` and `K` divisible by
+`8`; the no-torch ctypes selector below includes a `32x16x16` real-data
+case on A100/H200.
 CUDA `persistent_device` scene-test specs can pass `stream_id` in the
 `CALLABLE["cuda"]` spec; this is forwarded to the prepared callable manifest
 and selects the CUDA runtime stream used by `Worker.run`.
@@ -1629,8 +1631,8 @@ Graph tasks may also pass tensor-tile descriptor fields: `rows`, `cols`,
 `out_batch_stride`. Use this when the explicit graph descriptor should run a
 scalar tiled-GEMM task before downstream residual, gate, and fan-in tasks.
 Graph tasks with `func_id=10` run the WMMA tensor-core generated-dispatch
-body and must pass a compatible descriptor: `rows=16`, `cols=16`, and
-`inner` divisible by `8`.
+body and must pass a compatible descriptor: `rows` and `cols` in multiples of
+`16`, and `inner` divisible by `8`.
 If every graph task omits `dependents`, the SceneTestCase CUDA adapter infers
 task edges from tensor flow: reads bind to the nearest previous producer for
 that tensor name, or to a later producer when the descriptor is intentionally
@@ -1829,6 +1831,16 @@ descriptor tensor-core lowering or validation:
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
     -q -k graph_tensor_core_tile_with_ctypes_data --platform cuda
+```
+
+Run both no-torch tensor-core ctypes scenes after changing the normal or graph
+SceneTestCase tensor-core descriptor guards. The normal path includes the
+`32x16x16` multi-fragment descriptor:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -rs -k tensor_core_tile_with_ctypes_data --platform cuda
 ```
 
 Run the graph scalar-name ctypes scene after changing graph descriptor scalar

@@ -527,6 +527,27 @@ Both GPUs reported dispatch `10,1,2,1`, tensor tile `32x16x16`,
 `tile_count=2`, repeat completions `[4,4]`, and zero scheduler errors. The
 A100 device total was `77824 ns`; H200 was `61152 ns`.
 
+The normal L2 `SceneTestCase` adapter now uses the same descriptor rule as
+the benchmark/smoke path for tensor-core tasks: `rows` and `cols` must be
+multiples of `16`, and `inner` must be divisible by `8`. Focused TDD first
+failed on both the fixed `persistent_dag_tensor_core_tile_f32` builder and
+the explicit graph `func_id=10` path because each still required
+`rows=16, cols=16`. After the guard was generalized, the no-torch ctypes
+SceneTestCase selector ran the normal tensor-core path with a `32x16x16`
+descriptor and the graph tensor-core path with the existing `16x16x16`
+descriptor on A100 and H200:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -rs -k 'tensor_core_tile_with_ctypes_data' --platform cuda
+```
+
+Local A100 reported `2 passed, 143 deselected`; the synced H200 run reported
+the same result after the known PTO-ISA SSH refresh warning. This closes the
+normal scene-test gap for multi-fragment WMMA descriptors; broader
+model-kernel families are still an evaluation and tuning task.
+
 The compact paired benchmark then used the same `32x16x16` descriptor with
 `N=1024`, one repeat, no batch rows, and the normal selected baseline set:
 
@@ -3014,7 +3035,7 @@ L2 `SceneTestCase` path. The descriptor-only red test first failed because
 `persistent_dag_graph_f32` accepted a graph task with `func_id=10` and an
 incompatible `rows=8` WMMA tile. The graph adapter now applies the same
 tensor-core compatibility guard as the fixed tensor-core adapter:
-`rows=16`, `cols=16`, and `inner` divisible by `8`.
+`rows` and `cols` in multiples of `16`, and `inner` divisible by `8`.
 
 Focused local A100 coverage:
 
