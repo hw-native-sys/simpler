@@ -2471,8 +2471,9 @@ def _resolve_chip_entry_paths(entry, cls_dir):
                 resolved_sources = []
                 for task_source in entry["cuda"]["task_sources"]:
                     task_source = dict(task_source)
-                    if "source_path" in task_source:
-                        task_source["source_path"] = _resolve_path_value(task_source["source_path"], cls_dir)
+                    source_path = task_source.get("source_path", task_source.get("source"))
+                    if source_path is not None:
+                        task_source["source_path"] = _resolve_path_value(source_path, cls_dir)
                     resolved_sources.append(task_source)
                 entry["cuda"]["task_sources"] = resolved_sources
     if "orchestration" in entry:
@@ -2878,7 +2879,7 @@ def _compile_cuda_callable_from_spec(spec, runtime):
 
 def _cuda_persistent_task_sources(cuda: dict[str, Any]) -> list[dict[str, Any]]:
     if "task_sources" in cuda:
-        return [dict(task_source) for task_source in cuda["task_sources"]]
+        return [_normalize_cuda_task_source_entry(task_source) for task_source in cuda["task_sources"]]
 
     task_sources_path = cuda.get("task_sources_path", cuda.get("task_sources_file"))
     if task_sources_path is None:
@@ -2902,9 +2903,17 @@ def _resolve_cuda_task_source_sidecar_entry(task_source: Any, base_dir: Path) ->
     if not isinstance(task_source, dict):
         raise ValueError("CUDA persistent_device task source sidecar entries must be dictionaries")
 
+    return _normalize_cuda_task_source_entry(task_source, base_dir=base_dir)
+
+
+def _normalize_cuda_task_source_entry(task_source: Any, base_dir: Path | None = None) -> dict[str, Any]:
+    if not isinstance(task_source, dict):
+        raise ValueError("CUDA persistent_device task source entries must be dictionaries")
+
     resolved = dict(task_source)
-    if "source_path" in resolved:
-        resolved["source_path"] = _resolve_path_value(resolved["source_path"], base_dir)
+    source_path = resolved.get("source_path", resolved.get("source"))
+    if source_path is not None:
+        resolved["source_path"] = _resolve_path_value(source_path, base_dir) if base_dir is not None else source_path
     return resolved
 
 

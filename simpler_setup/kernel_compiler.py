@@ -560,7 +560,10 @@ class KernelCompiler:
         for item in task_sources:
             func_id = item["func_id"]
             task_name = item["task_name"]
-            source = Path(item["source_path"])
+            source_value = item.get("source_path", item.get("source"))
+            if source_value is None:
+                raise ValueError("CUDA persistent_device task sources require source_path or source")
+            source = Path(source_value)
             if not source.is_file():
                 raise FileNotFoundError(f"Source file not found: {source}")
             if item.get("body_style") == "task_body":

@@ -405,9 +405,10 @@ metadata is then treated as an overlay on top of the file contents, so a raw
 runtime-specific fields such as `task_defaults`. The generated-dispatch task
 source list may also be loaded from `task_sources_path` or
 `task_sources_file`. The task-source sidecar can be a JSON list, or a JSON
-object with `task_sources` or `sources`, and each `source_path` inside the
-sidecar is resolved relative to the sidecar file. In a `SceneTestCase`
-CALLABLE, relative CUDA `task_sources[*].source_path`, `task_sources_path`,
+object with `task_sources` or `sources`. Each task source entry may use
+`source_path` or the shorter `source` alias; sidecar-relative paths are
+resolved beside the sidecar file. In a `SceneTestCase` CALLABLE, relative CUDA
+`task_sources[*].source_path`, `task_sources[*].source`, `task_sources_path`,
 `task_sources_file`, `graph_path`, `graph_file`, and string-valued `graph`
 entries are resolved relative to the test class file, matching the existing
 relative CUDA source behavior.

@@ -1690,6 +1690,18 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k task_sources_file --platform cuda
 ```
 
+After changing the `source`/`source_path` task source spelling accepted by
+`KernelCompiler` or persistent-device sidecar loading, use:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_kernel_compiler.py \
+    -q -k persistent_device_source_alias
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k task_sources_source_alias --platform cuda
+```
+
 After changing task metadata sidecar-file loading for inline graph
 descriptors, use:
 

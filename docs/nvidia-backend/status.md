@@ -2135,6 +2135,10 @@ entries are resolved relative to the sidecar file before
 `KernelCompiler.compile_cuda_persistent_device(...)` receives them. The
 focused selector first failed with `KeyError: 'task_sources'`, then passed
 locally on A100 with `2 passed, 173 deselected`.
+The same task source entries now also accept `source` as an alias for
+`source_path`, matching other scene-test source specs. The TDD selector first
+failed with `KeyError: 'source_path'`, then passed locally on A100 with
+`2 passed, 175 deselected`.
 The same graph-shaped path now accepts `graph.tasks` as a dictionary keyed by
 task name, so descriptor specs can keep node names in one place and reference
 those names from top-level edges. The ctypes-backed
