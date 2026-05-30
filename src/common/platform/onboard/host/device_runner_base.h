@@ -50,10 +50,15 @@
 
 #include "arg_direction.h"
 #include "callable.h"
+#include "common/l2_perf_profiling.h"
 #include "device_arena.h"
 #include "device_runner_helpers.h"
 #include "host/load_aicpu_op.h"
+#include "host/l2_perf_collector.h"
 #include "host/memory_allocator.h"
+#include "host/pmu_collector.h"
+#include "host/scope_stats_collector.h"
+#include "host/tensor_dump_collector.h"
 #include "prepare_callable_common.h"
 
 /**
@@ -276,6 +281,48 @@ public:
      */
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
+    /**
+     * Launch an AICPU kernel. Internal helper used by the subclass's
+     * `run()`; thin wrapper that dispatches through `load_aicpu_op_`'s
+     * cached `rtFuncHandle` (resolved by `LoadAicpuOp::Init` at first
+     * bootstrap).
+     *
+     * @param stream       AICPU stream
+     * @param k_args       Kernel arguments
+     * @param kernel_name  Name of the kernel to launch (e.g.
+     *                     `host::KernelNames::InitName` / `RunName`)
+     * @param aicpu_num    Number of AICPU instances to launch
+     * @return 0 on success, error code on failure
+     */
+    int launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num);
+
+    /**
+     * Enablement setters for the four shared diagnostics sub-features.
+     * Called by the c_api entry point before `run()`; downstream `run()`
+     * paths read the corresponding `enable_*_` members directly.
+     *
+     * `set_dep_gen_enabled` is a2a3-only and lives on the subclass.
+     */
+    void set_l2_swimlane_enabled(int level) {
+        l2_perf_level_ = static_cast<L2PerfLevel>(level);
+        enable_l2_swimlane_ = (l2_perf_level_ != L2PerfLevel::DISABLED);
+    }
+    void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
+    void set_pmu_enabled(int enable_pmu) {
+        enable_pmu_ = (enable_pmu > 0);
+        pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
+    }
+    void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
+
+    /**
+     * Directory under which all diagnostic artifacts
+     * (l2_perf_records.json / tensor_dump/ / pmu.csv) land. Required
+     * (non-empty) when any diagnostic is enabled; `CallConfig::validate()`
+     * enforces this contract upstream.
+     */
+    void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
+    const std::string &output_prefix() const { return output_prefix_; }
+
 protected:
     // Ctor / dtor are protected: this class is for inheritance only —
     // direct instantiation (`new DeviceRunnerBase()`) and polymorphic delete
@@ -474,6 +521,27 @@ protected:
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};
+
+    // Shared diagnostics collectors. Each subclass initializes its own
+    // (a2a3 wraps `halHostRegister`/`Unregister` callbacks, a5 uses
+    // direct `rtMalloc`/`rtFree`), but the storage and lifetime live
+    // on the base. `DepGenCollector` is a2a3-only and stays on the
+    // a2a3 subclass.
+    L2PerfCollector l2_perf_collector_;
+    TensorDumpCollector dump_collector_;
+    PmuCollector pmu_collector_;
+    ScopeStatsCollector scope_stats_collector_;
+
+    // Enablement for the four shared diagnostics sub-features.
+    // Written by the c_api entry point via `set_*_enabled()` before
+    // `run()`, read inside `run()` and its helpers.
+    bool enable_l2_swimlane_{false};
+    bool enable_dump_tensor_{false};
+    bool enable_pmu_{false};
+    bool enable_scope_stats_{false};
+    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};             // resolved from set_l2_swimlane_enabled()
+    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
+    std::string output_prefix_{};                                  // diagnostic artifact root directory
 };
 
 #endif  // SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_BASE_H

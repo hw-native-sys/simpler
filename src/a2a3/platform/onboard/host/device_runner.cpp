@@ -741,13 +741,7 @@ int DeviceRunner::finalize() {
     return rc;
 }
 
-int DeviceRunner::launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num) {
-    // kernel_name is host::KernelNames::InitName / RunName — the runtime SO's
-    // actual exported symbol (simpler_aicpu_init / simpler_aicpu_exec).
-    // LaunchBuiltInOp dispatches via rtsLaunchCpuKernel on the cached
-    // rtFuncHandle resolved by LoadAicpuOp::Init at first-time bootstrap.
-    return load_aicpu_op_.LaunchBuiltInOp(stream, k_args, aicpu_num, kernel_name);
-}
+// `launch_aicpu_kernel` lives on `DeviceRunnerBase`.
 
 int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
     // Lazy-register the AICore binary on first call; reuse cached handle

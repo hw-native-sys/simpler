@@ -117,27 +117,10 @@ public:
      */
     int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1);
 
-    /**
-     * Enablement setters for the three diagnostics sub-features. Called by
-     * the c_api entry point before run(); downstream run() paths read the
-     * corresponding `enable_*_` members directly. Moved off the generic
-     * Runtime struct / run() arg list so all three travel the same way.
-     */
-    void set_l2_swimlane_enabled(int level) {
-        l2_perf_level_ = static_cast<L2PerfLevel>(level);
-        enable_l2_swimlane_ = (l2_perf_level_ != L2PerfLevel::DISABLED);
-    }
-    void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
-    void set_pmu_enabled(int enable_pmu) {
-        enable_pmu_ = (enable_pmu > 0);
-        pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
-    }
-    void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
-    // Directory under which all diagnostic artifacts (l2_perf_records.json /
-    // tensor_dump/ / pmu.csv) land. Required (non-empty) when any diagnostic
-    // is enabled; CallConfig::validate() enforces this contract upstream.
-    void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
-    const std::string &output_prefix() const { return output_prefix_; }
+    // `set_l2_swimlane_enabled`, `set_dump_tensor_enabled`,
+    // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
+    // `output_prefix()`, and `launch_aicpu_kernel` live on
+    // `DeviceRunnerBase`.
 
     /**
      * Cleanup all resources
@@ -149,19 +132,7 @@ public:
      */
     int finalize();
 
-    /**
-     * Launch an AICPU kernel
-     *
-     * Internal method used by run(). Can be called directly for custom
-     * workflows.
-     *
-     * @param stream      AICPU stream
-     * @param k_args       Kernel arguments
-     * @param kernel_name  Name of the kernel to launch
-     * @param aicpu_num    Number of AICPU instances to launch
-     * @return 0 on success, error code on failure
-     */
-    int launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num);
+    // `launch_aicpu_kernel` lives on `DeviceRunnerBase`.
 
     /**
      * Launch an AICore kernel
@@ -202,14 +173,8 @@ private:
     // (`ChipCallableBuffer`, `CallableState`, `OrchSoBuffer`) are
     // inherited from `DeviceRunnerBase`.
 
-    // Performance profiling
-    L2PerfCollector l2_perf_collector_;
-
-    // Tensor dump (independent from profiling)
-    TensorDumpCollector dump_collector_;
-
-    // PMU profiling (per-task AICore hardware counters)
-    PmuCollector pmu_collector_;
+    // Shared collectors (`l2_perf_collector_`, `dump_collector_`,
+    // `pmu_collector_`, `scope_stats_collector_`) live on `DeviceRunnerBase`.
 
     // `query_max_block_dim`, `validate_block_dim`, `ensure_binaries_loaded`,
     // `configure_aicore_op_timeout`, and `prepare_orch_so` are inherited
@@ -246,18 +211,9 @@ private:
      * publishes the data-header pointer into kernel_args.pmu_data_base.
      * Signature matches a2a3 for cross-platform consistency.
      */
-    // Enablement for the three diagnostics sub-features. Written by the c_api
-    // entry point via set_enable_*() before run(), read inside run() and its
-    // helpers. Moved off Runtime / run() args so all three sub-features use
-    // the same plumbing shape.
-    bool enable_l2_swimlane_{false};
-    bool enable_dump_tensor_{false};
-    bool enable_pmu_{false};
-    bool enable_scope_stats_{false};
-    ScopeStatsCollector scope_stats_collector_;
-    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};             // resolved from set_l2_swimlane_enabled()
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
-    std::string output_prefix_{};                                  // diagnostic artifact root directory
+    // Shared enable flags (`enable_l2_swimlane_`, `enable_dump_tensor_`,
+    // `enable_pmu_`, `enable_scope_stats_`, `l2_perf_level_`,
+    // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.
 
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
     int init_scope_stats(int num_threads, int device_id);
