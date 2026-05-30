@@ -85,30 +85,19 @@ static int get_aicore_reg_info(std::vector<int64_t> &regs, int64_t device_id) {
     return 0;
 }
 
-static void get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id) {
+/**
+ * Propagates HAL failure: the AICPU init/deinit handshake dereferences these
+ * addresses via write_reg/read_reg, so any placeholder fill would deadlock
+ * the next task on a stream-sync timeout instead of failing prepare cleanly.
+ */
+static int get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id) {
     int rt = get_aicore_reg_info(regs, device_id);
-
     if (rt != 0) {
-        LOG_ERROR("get_aicore_reg_info failed, using placeholder addresses");
-        // Fallback: generate placeholder addresses
-        constexpr size_t MAX_INDEX = DAV_3510::PLATFORM_MAX_PHYSICAL_CORES * PLATFORM_CORES_PER_BLOCKDIM;
-        regs.clear();
-        regs.resize(MAX_INDEX);
-
-        for (uint32_t core_idx = 0; core_idx < DAV_3510::PLATFORM_MAX_PHYSICAL_CORES; core_idx++) {
-            uint32_t die_idx = core_idx / PLATFORM_AICORE_PER_DIE;
-            uint32_t local_idx = core_idx % PLATFORM_AICORE_PER_DIE;
-            uint32_t die_base = die_idx * (PLATFORM_AICORE_PER_DIE * PLATFORM_CORES_PER_BLOCKDIM);
-
-            uint64_t base_addr = 0xDEADBEEF00000000ULL + (core_idx * 0x800000);
-
-            regs[die_base + local_idx] = base_addr;
-            regs[die_base + PLATFORM_AICORE_PER_DIE + local_idx * 2] = base_addr + REG_AIV_FIRST_OFFSET;
-            regs[die_base + PLATFORM_AICORE_PER_DIE + local_idx * 2 + 1] = base_addr + REG_AIV_SECOND_OFFSET;
-        }
+        LOG_ERROR("get_aicore_reg_info failed: %d", rt);
+        return rt;
     }
-
     LOG_INFO_V0("get_aicore_regs: Retrieved %zu register addresses", regs.size());
+    return 0;
 }
 
 int init_aicore_register_addresses(uint64_t *runtime_regs_ptr, uint64_t device_id, MemoryAllocator &allocator) {
@@ -121,11 +110,10 @@ int init_aicore_register_addresses(uint64_t *runtime_regs_ptr, uint64_t device_i
 
     // Step 1: Get register addresses from HAL
     std::vector<int64_t> host_regs;
-    get_aicore_regs(host_regs, device_id);
-
-    if (host_regs.empty()) {
-        LOG_ERROR("Failed to get AICore register addresses");
-        return -1;
+    int rc = get_aicore_regs(host_regs, device_id);
+    if (rc != 0) {
+        LOG_ERROR("Failed to get AICore register addresses: %d", rc);
+        return rc;
     }
 
     // Step 2: Allocate device memory for register address array
