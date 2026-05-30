@@ -1253,7 +1253,7 @@ class Worker:
         device_id = self._config.get("device_id", 0)
 
         builder = RuntimeBuilder(platform)
-        binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
+        binaries = builder.get_binaries(runtime)
 
         self._chip_worker = ChipWorker()
         self._chip_worker.init(device_id, binaries)
@@ -1286,7 +1286,7 @@ class Worker:
             platform = self._config["platform"]
             runtime = self._config["runtime"]
             builder = RuntimeBuilder(platform)
-            binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
+            binaries = builder.get_binaries(runtime)
 
             # Stash the full RuntimeBinaries so forked chip children can
             # construct a ChipWorker with one call (`cw.init(device_id, bins)`)

@@ -47,4 +47,4 @@ my_example/
 
 Run via pytest: `pytest examples tests/st --platform <platform>`, or standalone: `python <example_or_test>/test_*.py -p <platform>`.
 
-Add `--build` to recompile runtime from source (incremental). Without it, pre-built binaries from `build/lib/` are used. See [docs/developer-guide.md](../../docs/developer-guide.md#build-workflow) for the full rebuild decision table.
+Tests load pre-built runtime binaries from `build/lib/`. After changing runtime/platform C++, re-run `pip install --no-build-isolation -e .` to rebuild them (incremental via the cmake cache; there is no rebuild-on-import — `editable.rebuild = false`) before re-running. See [docs/developer-guide.md](../../docs/developer-guide.md#when-to-rebuild) for the full rebuild decision table.

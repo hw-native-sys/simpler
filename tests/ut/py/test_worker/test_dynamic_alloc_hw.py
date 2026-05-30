@@ -31,8 +31,6 @@ the C ABI.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 
@@ -50,8 +48,7 @@ def test_two_rank_allocate_release_round_trip(st_device_ids):
 
     from simpler_setup.runtime_builder import RuntimeBuilder
 
-    build = bool(os.environ.get("PTO_UT_BUILD"))
-    _ = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer", build=build)
+    _ = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer")
     assert len(st_device_ids) >= 2, "device_count(2) fixture must yield >= 2 ids"
     device_ids = [int(d) for d in st_device_ids[:2]]
     nranks = len(device_ids)

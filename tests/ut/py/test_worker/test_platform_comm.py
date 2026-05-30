@@ -172,8 +172,7 @@ def test_two_rank_comm_lifecycle(st_device_ids):
     """End-to-end 2-rank hardware smoke test for ChipWorker.comm_* wrappers."""
     from simpler_setup.runtime_builder import RuntimeBuilder
 
-    build = bool(os.environ.get("PTO_UT_BUILD"))
-    bins = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer", build=build)
+    bins = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer")
     assert len(st_device_ids) >= 2, "device_count(2) fixture must yield >= 2 ids"
     nranks = 2
     rootinfo_path = f"/tmp/pto_comm_py_ut_rootinfo_{os.getpid()}.bin"
