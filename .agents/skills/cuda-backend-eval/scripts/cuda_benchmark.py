@@ -1534,7 +1534,12 @@ def run_persistent_sample(
             task_count = 6
         else:
             task_count = 2
-    queue_capacity = 2 if mode in {"dag", "queue"} else None
+    if mode == "dag":
+        queue_capacity = task_count
+    elif mode == "queue":
+        queue_capacity = 2
+    else:
+        queue_capacity = None
     result = run_persistent_smoke(
         device=device,
         task_count=task_count,

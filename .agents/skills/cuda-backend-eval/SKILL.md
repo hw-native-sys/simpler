@@ -1900,6 +1900,10 @@ same vector-add PTX kernel through two launch paths:
   bounded device ring queue consumed by worker blocks inside the same launch.
 - `pto_persistent_dag`: generated-dispatch-like task selection and fan-in
   counters that release dependent tasks onto the bounded ring.
+  Benchmark DAG rows use a ready/completion queue capacity equal to the task
+  count so wider selected graphs do not measure an artificially constrained
+  ring. Use paired persistent smoke sweeps when the experiment is specifically
+  about smaller bounded-ring capacity.
 - `pto_persistent_dag_chain`: five-task generated-dispatch DAG with a
   post-fan-in dependency chain, using the same compiled device binary as the
   smaller DAG and only changing runtime graph descriptors.

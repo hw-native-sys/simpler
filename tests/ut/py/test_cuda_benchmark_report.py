@@ -11735,6 +11735,61 @@ def test_run_single_sample_dispatches_cublas_sgemm_graph(monkeypatch):
     assert result["baseline"] == "cublas_sgemm_graph"
 
 
+def test_run_persistent_sample_sizes_dag_queue_to_task_count(monkeypatch):
+    cuda_benchmark = _load_benchmark_module()
+    seen = {}
+
+    def fake_run_persistent_smoke(**kwargs):
+        seen.update(
+            {
+                "device": kwargs["device"],
+                "task_count": kwargs["task_count"],
+                "n": kwargs["n"],
+                "arch": kwargs["arch"],
+                "mode": kwargs["mode"],
+                "queue_capacity": kwargs["queue_capacity"],
+                "worker_blocks_per_task": kwargs["worker_blocks_per_task"],
+                "dag_shape": kwargs["dag_shape"],
+                "tensor_rows": kwargs["tensor_rows"],
+                "tensor_cols": kwargs["tensor_cols"],
+                "tensor_inner": kwargs["tensor_inner"],
+            }
+        )
+        return {
+            "baseline": "pto_persistent_dag_graph_parallel_chains",
+            "n": kwargs["n"],
+            "task_count": kwargs["task_count"],
+            "device_wall_ns": 10,
+            "status": "pass",
+        }
+
+    monkeypatch.setattr(cuda_benchmark, "run_persistent_smoke", fake_run_persistent_smoke)
+
+    result = cuda_benchmark.run_persistent_sample(
+        device=3,
+        n=1048576,
+        arch="compute_80",
+        mode="dag",
+        baseline="pto_persistent_dag_graph_parallel_chains",
+        dag_shape="graph_descriptor_parallel_chains",
+    )
+
+    assert seen == {
+        "device": 3,
+        "task_count": 9,
+        "n": 1048576,
+        "arch": "compute_80",
+        "mode": "dag",
+        "queue_capacity": 9,
+        "worker_blocks_per_task": 1,
+        "dag_shape": "graph_descriptor_parallel_chains",
+        "tensor_rows": 16,
+        "tensor_cols": 16,
+        "tensor_inner": 16,
+    }
+    assert result["baseline"] == "pto_persistent_dag_graph_parallel_chains"
+
+
 def test_run_single_sample_dispatches_scalar_axpy_dag(monkeypatch):
     cuda_benchmark = _load_benchmark_module()
     seen = {}
