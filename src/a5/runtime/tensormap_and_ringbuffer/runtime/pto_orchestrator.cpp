@@ -37,6 +37,16 @@
 extern "C" void set_dump_tensor_selective_mode(bool enable);
 extern "C" void set_dump_tensor_task_mask(uint64_t task_id, uint64_t mask);
 
+#if PTO2_PROFILING
+#include "aicpu/scope_stats_collector_aicpu.h"
+
+// Scope_stats enable gate, queried via the same predicate idiom as
+// is_dep_gen_enabled. The AICPU collector links the strong definition; host
+// builds fall back to this weak `false`. Gating here still skips the
+// cross-agent occupancy reads that feed the sample when scope_stats is disabled.
+extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabled() { return false; }
+#endif
+
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
@@ -146,6 +156,12 @@ static int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) 
 static void
 orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code, const char *func, const char *fmt, va_list args) {
     int32_t latched_code = orch_mark_fatal(orch, error_code);
+#if PTO2_PROFILING
+    // Flush the active scope's peaks before the FATAL line so the diagnostic
+    // context lands adjacent in the log. Latched internally — safe to call
+    // from every cascaded report_fatal.
+    scope_stats_on_fatal();
+#endif
 
     if (fmt == nullptr || fmt[0] == '\0') {
         if (latched_code != PTO2_ERROR_NONE && latched_code != error_code) {
@@ -396,6 +412,18 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
     if (mode == PTO2ScopeMode::MANUAL && !already_in_manual_scope) {
         orch->manual_begin_depth = orch->scope_stack_top;
     }
+#if PTO2_PROFILING
+    // Gate via is_scope_stats_enabled() (weak-false in host builds) BEFORE the
+    // collector call: when disabled we pay nothing. Sample the current ring's
+    // task/heap start-end and tensormap usage at the scope boundary.
+    if (is_scope_stats_enabled()) {
+        auto &alloc = orch->rings[orch->current_ring_id()].task_allocator;
+        scope_stats_begin(
+            orch->current_ring_id(), alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(),
+            orch->tensor_map.current_used()
+        );
+    }
+#endif
 }
 
 void PTO2OrchestratorState::end_scope() {
@@ -404,6 +432,21 @@ void PTO2OrchestratorState::end_scope() {
         return;
     }
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
+
+    // Snapshot the ring start/end BEFORE the orchestrator drains pending tasks
+    // via scheduler->on_scope_end, so the end record reflects the scope's
+    // occupancy at close, not the residual after teardown.
+#if PTO2_PROFILING
+    // Gate via is_scope_stats_enabled() (see begin_scope). One collector call
+    // emits the end-boundary record and tears down bookkeeping.
+    if (is_scope_stats_enabled()) {
+        auto &alloc = orch->rings[orch->current_ring_id()].task_allocator;
+        scope_stats_end(
+            orch->current_ring_id(), alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(),
+            orch->tensor_map.current_used()
+        );
+    }
+#endif
 
 #if PTO2_ORCH_PROFILING
     uint64_t _se0 = get_sys_cnt_aicpu();

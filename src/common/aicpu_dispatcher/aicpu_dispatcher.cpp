@@ -97,9 +97,11 @@ uint64_t Fingerprint(const char *data, uint64_t len) {
 
 // Preinstall path — HwHiAiUser owns this dir, the sched thread can write here.
 // device-side /tmp is mounted read-only / restricted in CANN 9.0.
-std::string MakeInnerSoPath(uint64_t fp) {
+std::string MakeInnerSoPath(uint64_t fp, uint64_t device_id) {
     char buf[256];
-    snprintf(buf, sizeof(buf), "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_%016lx.so", fp);
+    snprintf(
+        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_%016lx_%lu.so", fp, device_id
+    );
     return buf;
 }
 
@@ -190,7 +192,7 @@ __attribute__((visibility("default"))) uint32_t DynTileFwkBackendKernelServerIni
     }
     const char *inner_bytes = reinterpret_cast<const char *>(d->inner_so_bin);
     uint64_t fp = simpler_dispatcher::Fingerprint(inner_bytes, d->inner_so_len);
-    std::string path = simpler_dispatcher::MakeInnerSoPath(fp);
+    std::string path = simpler_dispatcher::MakeInnerSoPath(fp, d->device_id);
     if (!simpler_dispatcher::WriteBytes(path, inner_bytes, d->inner_so_len)) {
         return 1;
     }

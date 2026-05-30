@@ -24,6 +24,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -158,23 +159,6 @@ int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, siz
     if (commit_region(gm_sm_arena_, cached_gm_sm_size_, gm_sm_size) != 0) return -1;
     if (commit_region(runtime_arena_pool_, cached_runtime_arena_size_, runtime_arena_size) != 0) return -1;
     return 0;
-}
-
-void *DeviceRunner::acquire_pooled_gm_heap() {
-    if (!gm_heap_arena_.is_committed()) return nullptr;
-    return gm_heap_arena_.base();
-}
-
-void *DeviceRunner::acquire_pooled_gm_sm() {
-    if (!gm_sm_arena_.is_committed()) return nullptr;
-    return gm_sm_arena_.base();
-}
-
-void *DeviceRunner::acquire_pooled_runtime_arena() {
-    // hbg calls setup_static_arena(...,0) and leaves runtime_arena_pool_
-    // uncommitted — fail loudly if a caller asks for it anyway.
-    if (!runtime_arena_pool_.is_committed()) return nullptr;
-    return runtime_arena_pool_.base();
 }
 
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
@@ -352,7 +336,7 @@ int DeviceRunner::ensure_binaries_loaded() {
 
     // One-shot bootstrap: libaicpu_extend_kernels invokes our dispatcher,
     // which writes the runtime AICPU SO bytes to
-    // /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>.so
+    // /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so
     // using sched-thread (HwHiAiUser) write permission. The dispatcher SO
     // itself is never persisted to disk — only the transient
     // libaicpu_extend_kernels dlopen. Subsequent per-task AICPU launches
@@ -360,7 +344,7 @@ int DeviceRunner::ensure_binaries_loaded() {
     // rtsLaunchCpuKernel directly against the preinstall file.
     int rc = load_aicpu_op_.BootstrapDispatcher(
         dispatcher_so_binary_.data(), dispatcher_so_binary_.size(), aicpu_so_binary_.data(), aicpu_so_binary_.size(),
-        stream_aicpu_
+        stream_aicpu_, device_id_
     );
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::BootstrapDispatcher failed: %d", rc);
@@ -403,22 +387,6 @@ int DeviceRunner::ensure_binaries_loaded() {
     binaries_loaded_ = true;
     LOG_INFO_V0("DeviceRunner: binaries loaded");
     return 0;
-}
-
-void *DeviceRunner::allocate_tensor(size_t bytes) { return mem_alloc_.alloc(bytes); }
-
-void DeviceRunner::free_tensor(void *dev_ptr) {
-    if (dev_ptr != nullptr) {
-        mem_alloc_.free(dev_ptr);
-    }
-}
-
-int DeviceRunner::copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes) {
-    return rtMemcpy(dev_ptr, bytes, host_ptr, bytes, RT_MEMCPY_HOST_TO_DEVICE);
-}
-
-int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes) {
-    return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
 int DeviceRunner::query_max_block_dim(rtStream_t stream, uint32_t *out_cube, uint32_t *out_vector) {
@@ -573,6 +541,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_dep_gen_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
     }
+    if (enable_scope_stats_) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+    }
     kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
     for (int i = 0; i < num_aicore; i++) {
@@ -637,6 +608,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
+    if (enable_scope_stats_) {
+        rc = init_scope_stats(launch_aicpu_num, device_id_);
+        if (rc != 0) {
+            LOG_ERROR("init_scope_stats failed: %d", rc);
+            return rc;
+        }
+    }
+
     // On any exit from run() — success or early error — release the diagnostics
     // collectors' shared memory. They are only re-initialized per run(), so a
     // Worker reused across runs (e.g. a pytest session-scoped worker pool) would
@@ -667,6 +646,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // dlopen'd). Read it directly when populating KernelArgs.
     kernel_args_.args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
     kernel_args_.args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
+    // Device ordinal for the AICPU executor's per-device orchestration-SO name.
+    kernel_args_.args.device_id = static_cast<uint32_t>(device_id_);
 
     rc = kernel_args_init_ffts_base_addr(kernel_args_);
     if (rc != 0) {
@@ -698,6 +679,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
     if (enable_dep_gen_) {
         dep_gen_collector_.start(thread_factory);
+    }
+    if (enable_scope_stats_) {
+        scope_stats_collector_.start(thread_factory);
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
@@ -801,6 +785,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
                 LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
             }
         }
+    }
+
+    if (enable_scope_stats_) {
+        scope_stats_collector_.stop();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(output_prefix_);
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -1119,21 +1109,41 @@ int DeviceRunner::finalize() {
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
 
-    // Reset device and finalize ACL AFTER all device memory is freed.
-    // Gated on acl_ready_ so rt-only runtimes that never called
-    // ensure_acl_ready() do not try to aclFinalize an un-init'd ACL state.
-    if (acl_ready_ && device_id_ >= 0) {
-        int reset_rc = aclrtResetDevice(device_id_);
-        if (reset_rc != 0) {
-            LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
-            rc = reset_rc;
+    // Reset device AFTER all device memory is freed. Two paths:
+    //
+    // - acl_ready_=true (HCCL / comm path):  aclrtResetDevice + aclFinalize
+    //   tear down both the device runtime and the ACL bring-up that
+    //   ensure_acl_ready() did.
+    //
+    // - acl_ready_=false (pure rt path, the common case for non-HCCL tests):
+    //   rtDeviceReset is still needed to clear any per-device runtime state
+    //   the test left behind — without this, an AICPU exception / stuck
+    //   kernel on this DeviceRunner wedges the device for the next
+    //   ChipWorker that initializes on the same id (rtStreamCreate then
+    //   returns 507899). a5 has been doing this unconditionally; a2a3 was
+    //   missing the rt-path reset, which is the root cause of the chronic
+    //   "test_dedup_shared_so_independent_unregister → 507899 cascade"
+    //   pattern seen across PR CI all session.
+    if (device_id_ >= 0) {
+        if (acl_ready_) {
+            int reset_rc = aclrtResetDevice(device_id_);
+            if (reset_rc != 0) {
+                LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
+                rc = reset_rc;
+            }
+            int finalize_rc = aclFinalize();
+            if (finalize_rc != 0) {
+                LOG_ERROR("aclFinalize failed during finalize: %d", finalize_rc);
+                if (rc == 0) rc = finalize_rc;
+            }
+            acl_ready_ = false;
+        } else {
+            int reset_rc = rtDeviceReset(device_id_);
+            if (reset_rc != 0) {
+                LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, reset_rc);
+                if (rc == 0) rc = reset_rc;
+            }
         }
-        int finalize_rc = aclFinalize();
-        if (finalize_rc != 0) {
-            LOG_ERROR("aclFinalize failed during finalize: %d", finalize_rc);
-            if (rc == 0) rc = finalize_rc;
-        }
-        acl_ready_ = false;
     }
 
     // Free the 8-byte device_wall buffer (allocated lazily in run()).
@@ -1393,6 +1403,38 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id) {
     return 0;
 }
 
+int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+
+    auto register_cb = +[](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
+        if (load_hal_if_needed() != 0) {
+            LOG_ERROR("Failed to load ascend_hal for scope_stats: %s", dlerror());
+            return -1;
+        }
+        HalHostRegisterFn fn = get_halHostRegister();
+        if (fn == nullptr) {
+            LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
+            return -1;
+        }
+        return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
+    };
+
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
+
+    int rc = scope_stats_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id);
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.args.scope_stats_data_base =
+        reinterpret_cast<uint64_t>(scope_stats_collector_.get_scope_stats_shm_device_ptr());
+    return 0;
+}
+
 void DeviceRunner::finalize_collectors() {
     auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
         HalHostUnregisterFn fn = get_halHostUnregister();
@@ -1416,5 +1458,9 @@ void DeviceRunner::finalize_collectors() {
     }
     if (dep_gen_collector_.is_initialized()) {
         dep_gen_collector_.finalize(unregister_cb, free_cb);
+    }
+    if (scope_stats_collector_.is_initialized()) {
+        scope_stats_collector_.finalize(unregister_cb, free_cb);
+        kernel_args_.args.scope_stats_data_base = 0;
     }
 }

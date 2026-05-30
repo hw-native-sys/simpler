@@ -371,6 +371,13 @@ struct PTO2TensorMap {
         return task_local_id & (task_window_sizes[ring_id] - 1);
     }
 
+    // Accessors read by scope_stats_collector. Declared unconditionally so the
+    // collector .cpp compiles at PTO2_PROFILING=0 (collector is unconditional —
+    // setter symbols must export for host dlsym; the probe call sites that use
+    // these accessors stay gated by PTO2_PROFILING).
+    int32_t current_used() const { return next_entry_idx - free_num; }
+    int32_t pool_capacity() const { return pool_size; }
+
     // new_entry only allocates memory, does not assign attributes
     PTO2TensorMapEntry *new_entry() {
         if (free_num > 0) {

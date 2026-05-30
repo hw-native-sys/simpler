@@ -280,6 +280,20 @@ int DeviceRunner::ensure_binaries_loaded() {
             return -1;
         }
 
+        set_scope_stats_enabled_func_ =
+            reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_scope_stats_enabled"));
+        if (set_scope_stats_enabled_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_scope_stats_enabled: %s", dlerror());
+            return -1;
+        }
+
+        set_platform_scope_stats_base_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_scope_stats_base"));
+        if (set_platform_scope_stats_base_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_scope_stats_base: %s", dlerror());
+            return -1;
+        }
+
         // Log config travels via the RTLD_GLOBAL HostLogger singleton in
         // libsimpler_log.so — already seeded by simpler_log_init() before the
         // AICPU sim SO was dlopen'd, so no per-SO setter forwarding is needed.
@@ -425,6 +439,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_pmu_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
+    if (enable_scope_stats_) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+    }
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -486,6 +503,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
+    if (enable_scope_stats_) {
+        rc = init_scope_stats(launch_aicpu_num);
+        if (rc != 0) {
+            LOG_ERROR("init_scope_stats failed: %d", rc);
+            return rc;
+        }
+    }
+
     // Cleanup guard for early returns: stops all started collectors so
     // their mgmt + poll threads exit cleanly. stop() is idempotent and a
     // no-op on collectors that never started.
@@ -533,7 +558,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Check if executors are loaded
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
         set_platform_dump_base_func_ == nullptr || set_dump_tensor_enabled_func_ == nullptr ||
-        set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr) {
+        set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
+        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
@@ -545,6 +571,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
     set_pmu_enabled_func_(enable_pmu_);
+    set_scope_stats_enabled_func_(enable_scope_stats_);
+    set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
     // No per-SO log-config push: HostLogger lives in libsimpler_log.so
     // (RTLD_GLOBAL singleton) and the AICPU sim SO reads it directly via the
@@ -565,6 +593,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
     if (enable_pmu_) {
         pmu_collector_.start(thread_factory);
+    }
+    if (enable_scope_stats_) {
+        scope_stats_collector_.start(thread_factory);
     }
 
     // Launch AICPU threads (over-launch for affinity gate)
@@ -660,6 +691,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         pmu_collector_.reconcile_counters();
     }
 
+    if (enable_scope_stats_) {
+        scope_stats_collector_.stop();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(output_prefix_);
+    }
+
     // Print handshake results at end of run
     print_handshake_results();
 
@@ -706,6 +743,8 @@ void DeviceRunner::unload_executor_binaries() {
         set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
         set_pmu_enabled_func_ = nullptr;
+        set_scope_stats_enabled_func_ = nullptr;
+        set_platform_scope_stats_base_func_ = nullptr;
         aicpu_so_loaded_ = false;
     }
     if (!aicpu_so_path_.empty()) {
@@ -915,6 +954,10 @@ int DeviceRunner::finalize() {
     }
     if (pmu_collector_.is_initialized()) {
         pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+    }
+    if (scope_stats_collector_.is_initialized()) {
+        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        kernel_args_.scope_stats_data_base = 0;
     }
 
     // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
@@ -1133,4 +1176,19 @@ int DeviceRunner::init_pmu(
             reinterpret_cast<uint64_t>(pmu_collector_.get_aicore_ring_addrs_device_ptr());
     }
     return rc;
+}
+
+int DeviceRunner::init_scope_stats(int num_threads) {
+    // a5 sim: register_cb=nullptr, so the collector mallocs a host shadow per
+    // device buffer; sim's profiling_copy_* are plain memcpys, so the dev/host
+    // shadow path collapses to one allocation pair without address-space tricks.
+    int rc = scope_stats_collector_.init(
+        num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1
+    );
+    if (rc != 0) {
+        return rc;
+    }
+    kernel_args_.scope_stats_data_base =
+        reinterpret_cast<uint64_t>(scope_stats_collector_.get_scope_stats_shm_device_ptr());
+    return 0;
 }

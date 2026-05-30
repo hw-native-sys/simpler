@@ -313,6 +313,20 @@ int DeviceRunner::ensure_binaries_loaded() {
             return -1;
         }
 
+        set_scope_stats_enabled_func_ =
+            reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_scope_stats_enabled"));
+        if (set_scope_stats_enabled_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_scope_stats_enabled: %s", dlerror());
+            return -1;
+        }
+
+        set_platform_scope_stats_base_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_scope_stats_base"));
+        if (set_platform_scope_stats_base_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_scope_stats_base: %s", dlerror());
+            return -1;
+        }
+
         // Log config travels via the RTLD_GLOBAL HostLogger singleton in
         // libsimpler_log.so — already seeded by simpler_log_init() before the
         // AICPU sim SO was dlopen'd, so no per-SO setter forwarding is needed.
@@ -464,6 +478,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_dep_gen_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
     }
+    if (enable_scope_stats_) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+    }
     kernel_args_.enable_profiling_flag = enable_profiling_flag;
 
     for (int i = 0; i < num_aicore; i++) {
@@ -527,6 +544,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         rc = init_dep_gen(launch_aicpu_num, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_dep_gen failed: %d", rc);
+            return rc;
+        }
+    }
+
+    if (enable_scope_stats_) {
+        rc = init_scope_stats(launch_aicpu_num);
+        if (rc != 0) {
+            LOG_ERROR("init_scope_stats failed: %d", rc);
             return rc;
         }
     }
@@ -617,7 +642,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         set_platform_dump_base_func_ == nullptr || set_dump_tensor_enabled_func_ == nullptr ||
         set_platform_pmu_base_func_ == nullptr || set_platform_pmu_reg_addrs_func_ == nullptr ||
         set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
-        set_dep_gen_enabled_func_ == nullptr) {
+        set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
+        set_platform_scope_stats_base_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
@@ -632,6 +658,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     set_pmu_enabled_func_(enable_pmu_);
     set_platform_dep_gen_base_func_(kernel_args_.dep_gen_data_base);
     set_dep_gen_enabled_func_(enable_dep_gen_);
+    set_scope_stats_enabled_func_(enable_scope_stats_);
+    set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
     // No per-SO log-config push: HostLogger lives in libsimpler_log.so
     // (RTLD_GLOBAL singleton) and the AICPU sim SO reads it directly via the
@@ -654,6 +682,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
     if (enable_dep_gen_) {
         dep_gen_collector_.start(thread_factory);
+    }
+    if (enable_scope_stats_) {
+        scope_stats_collector_.start(thread_factory);
     }
 
     // Launch AICPU threads (over-launch for affinity gate)
@@ -764,6 +795,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
+    if (enable_scope_stats_) {
+        scope_stats_collector_.stop();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(output_prefix_);
+    }
+
     // Print handshake results at end of run
     print_handshake_results();
 
@@ -813,6 +850,8 @@ void DeviceRunner::unload_executor_binaries() {
         set_pmu_enabled_func_ = nullptr;
         set_platform_dep_gen_base_func_ = nullptr;
         set_dep_gen_enabled_func_ = nullptr;
+        set_scope_stats_enabled_func_ = nullptr;
+        set_platform_scope_stats_base_func_ = nullptr;
         aicpu_so_loaded_ = false;
     }
     if (!aicpu_so_path_.empty()) {
@@ -1263,6 +1302,26 @@ int DeviceRunner::init_dep_gen(int num_threads, int /*device_id*/) {
     return 0;
 }
 
+int DeviceRunner::init_scope_stats(int num_threads) {
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
+
+    // Sim shares an address space with the AICPU thread, so register_cb is
+    // not needed (mirrors PMU / dep_gen's nullptr in sim).
+    int rc = scope_stats_collector_.init(num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, /*device_id=*/-1);
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.scope_stats_data_base =
+        reinterpret_cast<uint64_t>(scope_stats_collector_.get_scope_stats_shm_device_ptr());
+    return 0;
+}
+
 void DeviceRunner::finalize_collectors() {
     // Free through MemoryAllocator so finalize() can audit. Sim shares an
     // address space with the AICPU thread, so no host unregister is needed.
@@ -1281,5 +1340,9 @@ void DeviceRunner::finalize_collectors() {
     }
     if (dep_gen_collector_.is_initialized()) {
         dep_gen_collector_.finalize(nullptr, free_cb);
+    }
+    if (scope_stats_collector_.is_initialized()) {
+        scope_stats_collector_.finalize(nullptr, free_cb);
+        kernel_args_.scope_stats_data_base = 0;
     }
 }

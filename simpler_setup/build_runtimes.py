@@ -24,6 +24,7 @@ import logging
 import os
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -130,6 +131,8 @@ def build_all(
                 logger.error(f"Failed to build cpu_sim_context: {e}")
                 raise
 
+    # Collect all (platform, runtime_name) tasks to run in parallel
+    tasks: list[tuple[str, str]] = []
     for platform in platforms:
         arch, _ = parse_platform(platform)
         runtimes = discover_runtimes(arch)
@@ -138,18 +141,28 @@ def build_all(
             logger.warning(f"  {platform}: no runtimes found, skipping")
             continue
 
+        for runtime_name in runtimes:
+            tasks.append((platform, runtime_name))
+
+    def _build_runtime(platform: str, runtime_name: str) -> None:
         try:
             builder = RuntimeBuilder(platform=platform)
         except (ValueError, FileNotFoundError) as e:
             logger.warning(f"  {platform}: cannot initialize builder: {e}")
-            continue
+            return
 
-        for runtime_name in runtimes:
-            logger.info(f"  Building {platform}/{runtime_name}...")
+        logger.info(f"  Building {platform}/{runtime_name}...")
+        builder.get_binaries(runtime_name, build=True)
+
+    with ThreadPoolExecutor(max_workers=len(tasks) or 1) as executor:
+        futures = {executor.submit(_build_runtime, p, r): (p, r) for p, r in tasks}
+        for future in as_completed(futures):
+            platform, runtime_name = futures[future]
             try:
-                builder.get_binaries(runtime_name, build=True)
+                future.result()
             except Exception as e:
                 logger.error(f"  Failed to build {platform}/{runtime_name}: {e}")
+                executor.shutdown(wait=True, cancel_futures=True)
                 raise
 
         # No device-side deployment step here. The dispatcher SO is uploaded

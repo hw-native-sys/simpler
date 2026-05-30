@@ -22,7 +22,8 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
-#include <unordered_set>
+#include <set>
+#include <utility>
 #include <vector>
 
 #include "acl/acl.h"
@@ -34,9 +35,9 @@ namespace host {
 
 namespace {
 
-std::string MakeInnerSoBasename(uint64_t fp) {
+std::string MakeInnerSoBasename(uint64_t fp, int device_id) {
     char buf[64];
-    snprintf(buf, sizeof(buf), "simpler_inner_%016lx.so", fp);
+    snprintf(buf, sizeof(buf), "simpler_inner_%016lx_%d.so", fp, device_id);
     return buf;
 }
 
@@ -65,16 +66,19 @@ struct DeviceBuf {
     aclError alloc(size_t bytes) { return aclrtMalloc(&ptr, bytes, ACL_MEM_MALLOC_HUGE_FIRST); }
 };
 
-// Process-level cache of inner-SO fingerprints we've already bootstrapped.
-// Multiple DeviceRunner instances in the same process share one entry per
-// runtime here; same-content uploads short-circuit. Guarded by a mutex so
-// that callers releasing the Python GIL (e.g. nanobind methods marked
+// Process-level cache of (inner-SO fingerprint, device_id) pairs we've already
+// bootstrapped. Keyed by both because the preinstall file is now per-device
+// (simpler_inner_<fp>_<device_id>.so) — a single process driving multiple
+// devices must bootstrap each device's file even when the fp matches.
+// Multiple DeviceRunner instances in the same process share this; same-content
+// same-device uploads short-circuit. Guarded by a mutex so that callers
+// releasing the Python GIL (e.g. nanobind methods marked
 // `nb::call_guard<nb::gil_scoped_release>`) cannot race on the set's
 // internals. The lock is uncontended on the steady-state path and only
 // touched at DeviceRunner init time, so the overhead is negligible
 // compared to keeping the invariant alive in a comment.
-std::unordered_set<uint64_t> &BootstrappedFps() {
-    static std::unordered_set<uint64_t> kSet;
+std::set<std::pair<uint64_t, int>> &BootstrappedFps() {
+    static std::set<std::pair<uint64_t, int>> kSet;
     return kSet;
 }
 std::mutex &BootstrappedFpsMutex() {
@@ -86,7 +90,7 @@ std::mutex &BootstrappedFpsMutex() {
 
 int LoadAicpuOp::BootstrapDispatcher(
     const void *dispatcher_so_data, size_t dispatcher_so_len, const void *inner_so_data, size_t inner_so_len,
-    rtStream_t stream
+    rtStream_t stream, int device_id
 ) {
     if (dispatcher_so_data == nullptr || dispatcher_so_len == 0) {
         LOG_ERROR("BootstrapDispatcher: empty dispatcher SO bytes");
@@ -96,13 +100,22 @@ int LoadAicpuOp::BootstrapDispatcher(
         LOG_ERROR("BootstrapDispatcher: empty inner SO bytes");
         return -1;
     }
+    device_id_ = device_id;
     inner_fp_ = FingerprintBytes(inner_so_data, inner_so_len);
-    inner_so_basename_ = MakeInnerSoBasename(inner_fp_);
+    // Per-device basename: the paired dies of one a2a3 chip (e.g. devices 8/9 =
+    // chipId N die0/die1) share the preinstall filesystem. A content-only name
+    // would have both dies write/rename/execute one shared
+    // simpler_inner_<fp>.so; concurrent bootstrap there corrupts the mmap'd
+    // image and faults simpler_aicpu_exec (507018 aicpu exception → chip fault
+    // → 507899 cascade). Suffixing device_id isolates each die's file.
+    inner_so_basename_ = MakeInnerSoBasename(inner_fp_, device_id_);
 
     {
         std::lock_guard<std::mutex> lk(BootstrappedFpsMutex());
-        if (BootstrappedFps().count(inner_fp_) > 0) {
-            LOG_INFO_V2("BootstrapDispatcher: inner SO fp=%016lx already bootstrapped, skipping", inner_fp_);
+        if (BootstrappedFps().count({inner_fp_, device_id_}) > 0) {
+            LOG_INFO_V2(
+                "BootstrapDispatcher: inner SO fp=%016lx dev=%d already bootstrapped, skipping", inner_fp_, device_id_
+            );
             return 0;
         }
     }
@@ -148,7 +161,7 @@ int LoadAicpuOp::BootstrapDispatcher(
     };
     write_qword(96, reinterpret_cast<uint64_t>(dev_dispatcher.ptr));
     write_qword(104, static_cast<uint64_t>(dispatcher_len));
-    write_qword(112, 0);
+    write_qword(112, static_cast<uint64_t>(device_id_));
     write_qword(120, reinterpret_cast<uint64_t>(dev_inner.ptr));
     write_qword(128, static_cast<uint64_t>(inner_len));
 
@@ -203,7 +216,7 @@ int LoadAicpuOp::BootstrapDispatcher(
     );
     {
         std::lock_guard<std::mutex> lk(BootstrappedFpsMutex());
-        BootstrappedFps().insert(inner_fp_);
+        BootstrappedFps().insert({inner_fp_, device_id_});
     }
     return 0;
 }

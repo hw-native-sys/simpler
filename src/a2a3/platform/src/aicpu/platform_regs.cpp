@@ -35,6 +35,7 @@
 
 static uint64_t g_platform_regs = 0;
 static uint64_t g_platform_pmu_reg_addrs = 0;
+static int g_orch_device_id = 0;
 
 void set_platform_regs(uint64_t regs) { g_platform_regs = regs; }
 
@@ -43,6 +44,10 @@ uint64_t get_platform_regs() { return g_platform_regs; }
 void set_platform_pmu_reg_addrs(uint64_t pmu_regs) { g_platform_pmu_reg_addrs = pmu_regs; }
 
 uint64_t get_platform_pmu_reg_addrs() { return g_platform_pmu_reg_addrs; }
+
+void set_orch_device_id(int device_id) { g_orch_device_id = device_id; }
+
+int get_orch_device_id() { return g_orch_device_id; }
 
 volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg) {
     return reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg));
@@ -66,12 +71,15 @@ int32_t platform_deinit_aicore_regs(uint64_t reg_addr) {
     // Send exit signal to AICore
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
 
-    // Wait for AICore to acknowledge exit, with timeout.
+    // Wait for AICore to acknowledge exit, with timeout. Timeout is
+    // variant-specific (sim wider than onboard) — see
+    // inner_get_deinit_timeout_ticks declaration in platform_regs.h.
     // On timeout, skip register cleanup (AICore is unresponsive; host will
     // aclrtResetDevice to clear all hardware state).
+    const uint64_t deinit_timeout_ticks = inner_get_deinit_timeout_ticks();
     uint64_t t0 = get_sys_cnt_aicpu();
     while (read_reg(reg_addr, RegId::COND) != AICORE_EXITED_VALUE) {
-        if (get_sys_cnt_aicpu() - t0 > PLATFORM_DEINIT_TIMEOUT_TICKS) {
+        if (get_sys_cnt_aicpu() - t0 > deinit_timeout_ticks) {
             return -1;
         }
     }

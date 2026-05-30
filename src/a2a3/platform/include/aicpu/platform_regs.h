@@ -66,6 +66,17 @@ void set_platform_pmu_reg_addrs(uint64_t pmu_regs);
  */
 uint64_t get_platform_pmu_reg_addrs();
 
+/**
+ * Set the ACL device ordinal for the current run. Pushed by the platform layer
+ * (kernel.cpp) before aicpu_execute() from KernelArgs.device_id; the executor
+ * reads it to make the staged orchestration SO filename unique per device so
+ * paired dies sharing the preinstall filesystem never collide.
+ */
+void set_orch_device_id(int device_id);
+
+/** Get the ACL device ordinal set for the current run (0 if unset). */
+int get_orch_device_id();
+
 #ifdef __cplusplus
 }
 #endif
@@ -129,6 +140,23 @@ void platform_init_aicore_regs(uint64_t reg_addr);
  * @return 0 if the core acknowledged exit, non-zero on timeout
  */
 int32_t platform_deinit_aicore_regs(uint64_t reg_addr);
+
+/**
+ * Variant-specific AICore deinit wait timeout, in ticks of get_sys_cnt_aicpu.
+ *
+ * Implemented per-variant in:
+ *   sim/aicpu/inner_platform_regs.cpp    -- larger budget (OS scheduling)
+ *   onboard/aicpu/inner_platform_regs.cpp -- 1 s (hardware hang detection)
+ *
+ * Rationale: on hardware, AICore is independent silicon and 1 s of
+ * non-response means the op got STARS-killed or the core is wedged. In
+ * sim, "AICore" is a host CPU thread; "no response in 1 s" can just mean
+ * the OS scheduler hasn't given it a slice on a CPU-starved CI runner.
+ * Keeping the hardware budget at 1 s preserves fast hang detection;
+ * widening the sim budget tolerates scheduler jitter without false
+ * positives.
+ */
+uint64_t inner_get_deinit_timeout_ticks();
 
 /**
  * Get physical core count for current platform

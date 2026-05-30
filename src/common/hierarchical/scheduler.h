@@ -71,8 +71,15 @@ public:
     // Called by WorkerManager (from WorkerThread) after run() completes.
     void worker_done(TaskSlot slot);
 
+    // Mutex held by run() across each loop iteration's slot-touching body
+    // (completion processing + dispatch). Orchestrator::drain() acquires it
+    // before Ring::reset_to_empty() so the ring can't be torn down while the
+    // scheduler thread is mid-on_task_complete (heap-use-after-free).
+    std::mutex &loop_mutex() { return loop_mu_; }
+
 private:
     Config cfg_;
+    std::mutex loop_mu_;
 
     // Shared completion queue (WorkerThread → Scheduler)
     std::queue<TaskSlot> completion_queue_;

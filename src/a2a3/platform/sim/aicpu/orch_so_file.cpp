@@ -24,16 +24,19 @@
 
 #include <cstdio>
 
-int32_t create_orch_so_file(const char *dir, int32_t callable_id, char *out_path, size_t out_path_size) {
+int32_t
+create_orch_so_file(const char *dir, int32_t callable_id, int32_t device_id, char *out_path, size_t out_path_size) {
     // mkstemps: multiple sim workers can share a process, so names must be
     // unique per call.  The "XXXXXX" template is replaced in-place.
-    // callable_id is embedded purely for log readability (mkstemps already
-    // guarantees uniqueness regardless).
+    // callable_id / device_id are embedded purely for log readability
+    // (mkstemps already guarantees uniqueness; sim has no shared preinstall
+    // filesystem, so the onboard cross-die concern does not apply here).
     int32_t written;
     if (callable_id >= 0) {
-        written = snprintf(out_path, out_path_size, "%s/libdevice_orch_cid%d_XXXXXX.so", dir, callable_id);
+        written =
+            snprintf(out_path, out_path_size, "%s/libdevice_orch_cid%d_dev%d_XXXXXX.so", dir, callable_id, device_id);
     } else {
-        written = snprintf(out_path, out_path_size, "%s/libdevice_orch_XXXXXX.so", dir);
+        written = snprintf(out_path, out_path_size, "%s/libdevice_orch_dev%d_XXXXXX.so", dir, device_id);
     }
     if (written < 0 || static_cast<size_t>(written) >= out_path_size) {
         return -1;

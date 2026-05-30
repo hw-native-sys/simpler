@@ -163,6 +163,12 @@ def pytest_addoption(parser):
         help="Enable PMU collection. Bare flag = PIPE_UTILIZATION(2). "
         "Pass event type to override (e.g. --enable-pmu 4)",
     )
+    parser.addoption(
+        "--enable-scope-stats",
+        action="store_true",
+        default=False,
+        help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
+    )
     parser.addoption("--build", action="store_true", default=False, help="Compile runtime from source")
     parser.addoption(
         "--pto-isa-commit",

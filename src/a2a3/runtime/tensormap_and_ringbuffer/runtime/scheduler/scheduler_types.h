@@ -383,7 +383,7 @@ struct alignas(64) SyncStartDrainState {
     std::atomic<int32_t> sync_start_pending{0};    // 0=normal; -1=initializing; >0=active (value=block_num)
     std::atomic<int32_t> drain_worker_elected{0};  // 0=none; >0: elected thread's (thread_idx+1)
     std::atomic<uint32_t> drain_ack_mask{0};       // bit per thread; all-set = all threads reached ack barrier
-    PTO2TaskSlotState *pending_task{nullptr};      // held task (not re-queued)
+    std::atomic<PTO2TaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
     int32_t _pad[10];
 };
 static_assert(sizeof(SyncStartDrainState) == 64);

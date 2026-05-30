@@ -72,6 +72,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Phase 1: Wait for AICPU initialization signal
     while (my_hank->aicpu_ready == 0) {
         dcci(my_hank, SINGLE_CACHE_LINE);
+        SPIN_WAIT_HINT();
     }
 
     // Phase 2: Report physical core ID, signal ready
@@ -81,6 +82,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     dcci(&my_hank->aicore_regs_ready, SINGLE_CACHE_LINE, CACHELINE_OUT);
     while (my_hank->aicpu_regs_ready == 0) {
         dcci(&my_hank->aicpu_regs_ready, SINGLE_CACHE_LINE);
+        SPIN_WAIT_HINT();
     }
     // Report initial idle status via register
     write_reg(RegId::COND, AICORE_IDLE_VALUE);

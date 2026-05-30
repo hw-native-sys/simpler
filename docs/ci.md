@@ -75,17 +75,23 @@ profiling-vs-parallelism trade-off.
 
 ### Sim jobs on CPU-constrained runners
 
-Sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-latest`, which typically
-has 2 vCPUs. `--device 0-15` is still the right choice for the **pool size**
-(some L3 cases need several virtual ids), but the default `--max-parallel auto`
-caps the in-flight subprocess count to `min(nproc, len(--device))` — on a
-2-core runner that becomes `2`, avoiding CPU thrashing:
+Sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-latest`, whose standard
+GitHub-hosted runner currently has **4 vCPUs**. `--device 0-15` is still the
+right choice for the **pool size** (some L3 cases need several virtual ids), but
+the default `--max-parallel auto` caps the in-flight subprocess count to
+`min(nproc, len(--device))` — on a 4-core runner that becomes `4`. Note
+`os.cpu_count()` reports the host's logical CPUs and ignores any cgroup CPU
+quota, so this is the true core count, not a container limit.
 
 ```bash
-# Sim: --max-parallel auto resolves to 2 on ubuntu-latest
+# Sim: --max-parallel auto resolves to 4 on a standard ubuntu-latest runner
 pytest examples tests/st --platform a2a3sim --device 0-15
 
-# Or pin explicitly if your runner has a different CPU count
+# Throttle further on a CPU-starved runner: 4 concurrent cases (each forking
+# several chip subprocesses with many threads) can oversubscribe 4 cores and
+# trigger the sim handshake/deinit failures in
+# troubleshooting/sim-oversubscription-hang.md. --max-parallel 2 trades
+# throughput for stability.
 pytest examples tests/st --platform a2a3sim --device 0-15 --max-parallel 2
 ```
 
@@ -217,3 +223,5 @@ No `--platform` means "run all sims" — tests with no sim in their `platforms` 
 ## Platform notes
 
 - **macOS libomp collision**: on macOS, the root `conftest.py` sets `KMP_DUPLICATE_LIB_OK=TRUE` before `import pytest` to work around a duplicate-libomp abort triggered by homebrew numpy and pip torch coexisting in one Python process (see [troubleshooting/macos-libomp-collision.md](troubleshooting/macos-libomp-collision.md)). Standalone `python test_*.py` bypasses conftest — rely on the env var being exported by the shell or `tools/verify_packaging.sh`.
+- **sim hangs / `rc=-1` under CPU oversubscription**: on a few-vCPU runner, high `--max-parallel` (or many concurrent sim cases) oversubscribes the host CPUs, where sim's busy-spin handshake can livelock (hang → `rc=124`) or the deinit timeout can false-trip (`run_prepared failed with code -1`). Mitigate with `--max-parallel 2`; onboard is unaffected (see [troubleshooting/sim-oversubscription-hang.md](troubleshooting/sim-oversubscription-hang.md)).
+- **`st-onboard-a2a3` mass 507899 is not OOM**: a whole-suite collapse of `507899`/`507018`/`prepare_callable -1` is an AICPU device-fault cascade (`simpler_aicpu_exec` exception), not memory exhaustion. Diagnosis recipe and the per-device preinstall-name fix are in [troubleshooting/a2a3-507899-aicpu-shared-so-fault.md](troubleshooting/a2a3-507899-aicpu-shared-so-fault.md).

@@ -599,7 +599,9 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
     for (int32_t i = 0; i < cores_total_num_; i++) {
         Handshake *hank = &all_handshakes[i];
 
-        while (hank->aicore_regs_ready == 0) {}
+        while (hank->aicore_regs_ready == 0) {
+            SPIN_WAIT_HINT();
+        }
 
         uint32_t physical_core_id = hank->physical_core_id;
 
@@ -622,7 +624,9 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
 
         OUT_OF_ORDER_STORE_BARRIER();
 
-        while (hank->aicore_done == 0) {}
+        while (hank->aicore_done == 0) {
+            SPIN_WAIT_HINT();
+        }
 
         CoreType type = hank->core_type;
 
@@ -916,7 +920,7 @@ void SchedulerContext::deinit() {
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
     drain_state_.drain_worker_elected.store(0, std::memory_order_release);
     drain_state_.drain_ack_mask.store(0, std::memory_order_release);
-    drain_state_.pending_task = nullptr;
+    drain_state_.pending_task.store(nullptr, std::memory_order_release);
 
     // Reset task counters and orchestrator state
     completed_tasks_.store(0, std::memory_order_release);

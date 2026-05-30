@@ -26,10 +26,15 @@
 #include "spin_hint.h"
 
 static uint64_t g_platform_regs = 0;
+static int g_orch_device_id = 0;
 
 void set_platform_regs(uint64_t regs) { g_platform_regs = regs; }
 
 uint64_t get_platform_regs() { return g_platform_regs; }
+
+void set_orch_device_id(int device_id) { g_orch_device_id = device_id; }
+
+int get_orch_device_id() { return g_orch_device_id; }
 
 void platform_init_aicore_regs(uint64_t reg_addr) {
     // Initialize task dispatch register to idle state
@@ -41,9 +46,12 @@ int32_t platform_deinit_aicore_regs(uint64_t reg_addr) {
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
 
     // Wait for AICore to acknowledge exit by writing AICORE_EXITED_VALUE to COND.
+    // Timeout is variant-specific (sim wider than onboard) — see
+    // inner_get_deinit_timeout_ticks declaration in platform_regs.h.
+    const uint64_t deinit_timeout_ticks = inner_get_deinit_timeout_ticks();
     uint64_t t0 = get_sys_cnt_aicpu();
     while (read_reg(reg_addr, RegId::COND) != AICORE_EXITED_VALUE) {
-        if (get_sys_cnt_aicpu() - t0 > PLATFORM_DEINIT_TIMEOUT_TICKS) {
+        if (get_sys_cnt_aicpu() - t0 > deinit_timeout_ticks) {
             LOG_ERROR("Timed out waiting for AICore exit ack at reg_addr=0x%lx", static_cast<unsigned long>(reg_addr));
             return -1;
         }

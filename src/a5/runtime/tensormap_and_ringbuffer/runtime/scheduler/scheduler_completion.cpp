@@ -341,7 +341,7 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
         return false;  // Another thread already holds the drain slot.
     }
     // We own the drain slot.  Store the task and reset election flag before making it visible.
-    drain_state_.pending_task = slot_state;
+    drain_state_.pending_task.store(slot_state, std::memory_order_release);
     drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
     // Release store: all stores above are now visible to any thread that
@@ -363,7 +363,7 @@ int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape) {
 // Called only when global resources >= block_num, so one pass always suffices.
 // All other threads are spinning -- the drain worker has exclusive tracker access.
 void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num) {
-    PTO2TaskSlotState *slot_state = drain_state_.pending_task;
+    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
     if (!slot_state) {
         drain_state_.sync_start_pending.store(0, std::memory_order_release);
         return;
@@ -382,7 +382,7 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
     // Release fence ensures tracker mutations are visible to threads that
     // acquire-load sync_start_pending == 0 and resume normal operation.
     std::atomic_thread_fence(std::memory_order_release);
-    drain_state_.pending_task = nullptr;
+    drain_state_.pending_task.store(nullptr, std::memory_order_release);
     drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
@@ -438,7 +438,17 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
     }
 
     // Elected: check if global resources are sufficient.
-    PTO2TaskSlotState *slot_state = drain_state_.pending_task;
+    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+    if (slot_state == nullptr) {
+        // pending_task is observed null only when a concurrent drain completion
+        // already cleared it (drain_worker_dispatch nulls it before reopening the
+        // gate). That drain is done and this is a stale-elected thread, so just
+        // release the election lock and return. Do NOT clear drain_ack_mask or
+        // sync_start_pending: a *new* drain run may already be active and
+        // accumulating acks, and zeroing them would corrupt it into a hang.
+        drain_state_.drain_worker_elected.store(0, std::memory_order_release);
+        return;
+    }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
     int32_t available = count_global_available(shape);
 

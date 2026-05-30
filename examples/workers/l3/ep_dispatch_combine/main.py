@@ -43,7 +43,7 @@ Type/shape contract:
     [weight, 0, 0, …, 0]; receiver writes recv_w[loc_e][slot, :W_PAD]
     and the kernel TROWSUM-compacts to a [L, R] FP32 host output.
   - Idx uses the same minimum-tile rationale: 1xIDX_PAD=8 INT32 per
-    route, actual r=t*TOPK+k at slot [0]; compacted via scalar copy to
+    route, actual r=t*TOPK+k at slot [0]; TROWSUM-compacted to
     [L, R] INT32 host output. Combine reads it to address
     routed_y_buf[t, k, :] without a host-built origin_map.
   - ``recv_count_out`` is [L, 1] INT32 emitted by dispatch's prefix_sum

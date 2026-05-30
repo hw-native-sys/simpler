@@ -92,6 +92,9 @@ void Worker::init() {
     };
 
     scheduler_.start(cfg);
+    // Let drain() hold the scheduler's loop mutex across ring teardown so slots
+    // aren't freed while the scheduler thread is mid-on_task_complete.
+    orchestrator_.set_scheduler_loop_mutex(&scheduler_.loop_mutex());
     initialized_ = true;
 }
 

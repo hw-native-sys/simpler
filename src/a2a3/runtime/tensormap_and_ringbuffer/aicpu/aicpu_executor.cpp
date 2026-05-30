@@ -36,6 +36,7 @@
 
 // Performance profiling headers
 #include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "common/l2_perf_profiling.h"
@@ -275,7 +276,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
 
                 for (int32_t i = 0; i < num_candidates && !file_created; i++) {
-                    int32_t fd = create_orch_so_file(candidate_dirs[i], callable_id, so_path, sizeof(so_path));
+                    int32_t fd = create_orch_so_file(
+                        candidate_dirs[i], callable_id, get_orch_device_id(), so_path, sizeof(so_path)
+                    );
                     if (fd < 0) {
                         LOG_INFO_V0(
                             "Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx, so_path, errno
@@ -519,6 +522,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
 #if PTO2_PROFILING
             rt->orchestrator.l2_perf_level = get_l2_perf_level();
+            {
+                auto &orch = rt->orchestrator;
+                for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+                    auto &alloc = orch.rings[r].task_allocator;
+                    scope_stats_set_ring_capacity(r, alloc.window_size(), alloc.heap_capacity());
+                }
+                scope_stats_set_tensormap_capacity(orch.tensor_map.pool_capacity());
+            }
 #endif
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
@@ -550,6 +561,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
 #if PTO2_PROFILING
+            // scope_stats streams scope_end records off the orchestrator thread:
+            // record the per-thread ready_queue index. No-op (writer shared
+            // state null) when scope_stats is disabled; the current buffer is
+            // popped lazily on the first scope_end append.
+            scope_stats_aicpu_set_orch_thread_idx(thread_idx);
+#endif
+
+#if PTO2_PROFILING
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
             framework_bind_runtime(rt);
@@ -565,6 +584,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             if (is_dep_gen_enabled()) {
                 dep_gen_aicpu_flush();
             }
+#if PTO2_PROFILING
+            // Push the partially-filled scope_stats buffer so the host gets the
+            // final scope_end records. Idempotent / no-op when disabled.
+            scope_stats_aicpu_flush_buffers();
+#endif
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             (void)orch_cycle_end;

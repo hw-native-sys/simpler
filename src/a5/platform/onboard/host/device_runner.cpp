@@ -110,23 +110,6 @@ int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, siz
     return 0;
 }
 
-void *DeviceRunner::acquire_pooled_gm_heap() {
-    if (!gm_heap_arena_.is_committed()) return nullptr;
-    return gm_heap_arena_.base();
-}
-
-void *DeviceRunner::acquire_pooled_gm_sm() {
-    if (!gm_sm_arena_.is_committed()) return nullptr;
-    return gm_sm_arena_.base();
-}
-
-void *DeviceRunner::acquire_pooled_runtime_arena() {
-    // hbg calls setup_static_arena(...,0) and leaves runtime_arena_pool_
-    // uncommitted — fail loudly if a caller asks for it anyway.
-    if (!runtime_arena_pool_.is_committed()) return nullptr;
-    return runtime_arena_pool_.base();
-}
-
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     int dev_id = device_id_;
     return std::thread([dev_id, fn = std::move(fn)]() {
@@ -240,14 +223,14 @@ int DeviceRunner::ensure_binaries_loaded() {
     }
 
     // One-shot bootstrap: libaicpu_extend_kernels invokes our dispatcher,
-    // which writes the runtime AICPU SO bytes to simpler_inner_<fp>.so in
+    // which writes the runtime AICPU SO bytes to simpler_inner_<fp>_<device_id>.so in
     // the device-side preinstall path. The dispatcher SO itself is never
     // persisted. Subsequent per-task AICPU launches resolve symbols via
     // rtsBinaryLoadFromFile + rtsFuncGetByName + rtsLaunchCpuKernel
     // directly against that preinstall file.
     int rc = load_aicpu_op_.BootstrapDispatcher(
         dispatcher_so_binary_.data(), dispatcher_so_binary_.size(), aicpu_so_binary_.data(), aicpu_so_binary_.size(),
-        stream_aicpu_
+        stream_aicpu_, device_id_
     );
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::BootstrapDispatcher failed: %d", rc);
@@ -289,22 +272,6 @@ int DeviceRunner::ensure_binaries_loaded() {
     binaries_loaded_ = true;
     LOG_INFO_V0("DeviceRunner: binaries loaded");
     return 0;
-}
-
-void *DeviceRunner::allocate_tensor(size_t bytes) { return mem_alloc_.alloc(bytes); }
-
-void DeviceRunner::free_tensor(void *dev_ptr) {
-    if (dev_ptr != nullptr) {
-        mem_alloc_.free(dev_ptr);
-    }
-}
-
-int DeviceRunner::copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes) {
-    return rtMemcpy(dev_ptr, bytes, host_ptr, bytes, RT_MEMCPY_HOST_TO_DEVICE);
-}
-
-int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes) {
-    return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
 int DeviceRunner::query_max_block_dim(rtStream_t stream, uint32_t *out_cube, uint32_t *out_vector) {
@@ -423,6 +390,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_pmu_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
+    if (enable_scope_stats_) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+    }
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -487,6 +457,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
+    if (enable_scope_stats_) {
+        rc = init_scope_stats(launch_aicpu_num, device_id_);
+        if (rc != 0) {
+            LOG_ERROR("init_scope_stats failed: %d", rc);
+            return rc;
+        }
+    }
+
     // Cleanup guard for early returns: stops all started collectors so
     // their mgmt + poll threads exit cleanly. stop() is idempotent and a
     // no-op on collectors that never started.
@@ -512,6 +490,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // dlopen'd). Read it directly when populating KernelArgs.
     kernel_args_.args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
     kernel_args_.args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
+    // Device ordinal for the AICPU executor's per-device orchestration-SO name.
+    kernel_args_.args.device_id = static_cast<uint32_t>(device_id_);
 
     // Start collector mgmt + poll threads now, just before kernels launch.
     // Starting earlier wastes CPU on empty queues and risks tripping
@@ -527,6 +507,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
     if (enable_pmu_) {
         pmu_collector_.start(thread_factory);
+    }
+    if (enable_scope_stats_) {
+        scope_stats_collector_.start(thread_factory);
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
@@ -620,6 +603,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_pmu_) {
         pmu_collector_.stop();
         pmu_collector_.reconcile_counters();
+    }
+
+    if (enable_scope_stats_) {
+        scope_stats_collector_.stop();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(output_prefix_);
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -928,6 +917,10 @@ int DeviceRunner::finalize() {
     if (pmu_collector_.is_initialized()) {
         pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
+    if (scope_stats_collector_.is_initialized()) {
+        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        kernel_args_.args.scope_stats_data_base = 0;
+    }
 
     // Release the three per-Worker pooled arenas (GM heap, PTO2 SM, optional
     // trb prebuilt runtime arena — each its own device_malloc). Must precede
@@ -1139,4 +1132,17 @@ int DeviceRunner::init_pmu(
             reinterpret_cast<uint64_t>(pmu_collector_.get_aicore_ring_addrs_device_ptr());
     }
     return rc;
+}
+
+int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
+    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
+    // device buffer + rtMemcpy's the zeroed shadow to device (see
+    // ScopeStatsCollector::alloc_single_buffer). No halHostRegister on a5.
+    int rc = scope_stats_collector_.init(num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, device_id);
+    if (rc != 0) {
+        return rc;
+    }
+    kernel_args_.args.scope_stats_data_base =
+        reinterpret_cast<uint64_t>(scope_stats_collector_.get_scope_stats_shm_device_ptr());
+    return 0;
 }

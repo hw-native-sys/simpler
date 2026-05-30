@@ -87,7 +87,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         a, b = args.a, args.b
         args.f[:] = (a + b + 1) * (a + b + 2)
 
-    def _run_and_validate_l2(
+    def _run_and_validate_l2(  # noqa: PLR0913
         self,
         worker,
         callable_obj,
@@ -98,6 +98,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
+        enable_scope_stats=False,
         output_prefix="",
     ):
         params = case.get("params", {})

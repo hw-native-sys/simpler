@@ -154,14 +154,6 @@ constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 50000000;  // 50 MHz
 
 /**
- * AICore deinit wait timeout (ticks at PLATFORM_PROF_SYS_CNT_FREQ).
- * platform_deinit_aicore_regs waits for AICore to acknowledge the exit
- * signal. If AICore is stuck (STARS-killed op, hardware fault), waiting
- * forever blocks the AICPU scheduling thread. This timeout bounds the wait.
- */
-constexpr uint64_t PLATFORM_DEINIT_TIMEOUT_TICKS = PLATFORM_PROF_SYS_CNT_FREQ;  // 1s
-
-/**
  * Timeout duration for performance data collection (seconds)
  */
 constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 30;
@@ -177,6 +169,7 @@ inline double cycles_to_us(uint64_t cycles) {
 #define PROFILING_FLAG_L2_SWIMLANE (1u << 1)
 #define PROFILING_FLAG_PMU (1u << 2)
 #define PROFILING_FLAG_DEP_GEN (1u << 3)
+#define PROFILING_FLAG_SCOPE_STATS (1u << 4)
 #define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
 #define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
 #define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
@@ -289,6 +282,39 @@ constexpr int PLATFORM_DEP_GEN_READYQUEUE_SIZE = PLATFORM_DEP_GEN_BUFFERS_PER_IN
  * Idle timeout duration for dep_gen collection (seconds).
  */
 constexpr int PLATFORM_DEP_GEN_TIMEOUT_SECONDS = 30;
+
+// =============================================================================
+// scope_stats Configuration
+// =============================================================================
+
+/**
+ * Number of ScopeStatsRecord entries per ScopeStatsBuffer.
+ * Each record is 52 B. Larger buffers = fewer device-side switch_buffer
+ * hand-offs (barriers, helps Orch) and fewer/larger device→host drain memcpys.
+ * 512 records ≈ 27 KB/buffer (×8 buffers ≈ 213 KB).
+ */
+constexpr int PLATFORM_SCOPE_STATS_RECORDS_PER_BUFFER = 512;
+
+/**
+ * SPSC free_queue slot count for scope_stats buffers (Host→Device hand-off depth).
+ */
+constexpr int PLATFORM_SCOPE_STATS_SLOT_COUNT = 8;
+
+/**
+ * Pre-allocated ScopeStatsBuffer count per orchestrator instance.
+ */
+constexpr int PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE = 8;
+
+/**
+ * Ready queue capacity for scope_stats (per AICPU thread). scope_stats is
+ * single-instance so headroom over BUFFERS_PER_INSTANCE is small.
+ */
+constexpr int PLATFORM_SCOPE_STATS_READYQUEUE_SIZE = PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE * 2;
+
+/**
+ * Idle timeout duration for scope_stats collection (seconds).
+ */
+constexpr int PLATFORM_SCOPE_STATS_TIMEOUT_SECONDS = 30;
 
 // =============================================================================
 // Register Communication Configuration
