@@ -130,6 +130,12 @@ latest current-head multi-size tensor baseline sweep uses `76422250`:
   five-task diamond and nine-task parallel-chain sweeps in one JSON,
   Markdown, and SVG report with task count, device ns/task, and
   tasks/scheduler columns.
+- [Current capture](evaluation-current.md) records the current-head
+  `3d32a7e4` selected-benchmark smoke row that promotes the nine-task
+  `pto_persistent_dag_graph_parallel_chains` descriptor into the selected
+  benchmark matrix. The quick A100/H200 artifacts validate dispatch, graph
+  topology, generated-dispatch PTX, and zero scheduler errors before the next
+  full paired refresh.
 - [Current capture](evaluation-current.md) records the `35de3303` scheduler
   error matrix that captures all synthetic malformed-DAG diagnostics on A100
   and H200 with JSON, Markdown, and SVG artifacts validated by

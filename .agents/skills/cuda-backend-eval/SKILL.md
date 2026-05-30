@@ -1937,6 +1937,9 @@ same vector-add PTX kernel through two launch paths:
 - `pto_persistent_dag_graph_diamond`: five-task generated-dispatch DAG using
   an explicit graph descriptor with two roots, two fan-out consumers, and a
   final join.
+- `pto_persistent_dag_graph_parallel_chains`: nine-task generated-dispatch
+  DAG using an explicit graph descriptor with four roots, paired joins, two
+  parallel consumers, and a final join.
 - `pto_persistent_dag_graph_tagged`: three-task generated-dispatch DAG using
   explicit graph task-argument tags for `input`, `output`,
   `output_existing`, and scalar inputs.
@@ -2357,6 +2360,23 @@ PYTHONPATH=$PWD:$PWD/python \
     --single-baseline pto_persistent_dag_graph_diamond \
     --sizes 1024 --arch compute_80
 ```
+
+Use `--single-baseline pto_persistent_dag_graph_parallel_chains` for a quick
+benchmark path check of the selected nine-task parallel-chain graph
+descriptor with dispatch `1,2,1,2,1,1,2,1,1`:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
+    --single-baseline pto_persistent_dag_graph_parallel_chains \
+    --sizes 1024 --arch compute_80
+```
+
+The quick selected-row capture under
+`tmp/cuda-backend/graph-parallel-chains-selected-working/` includes A100 and
+H200 JSON plus a smoke Markdown/SVG report. Both rows validate nine
+completed tasks, fan-in `0,0,0,0,2,2,2,2,2`, dependents
+`4,4,5,5,6,7,6,7,8,8`, generated-dispatch PTX, and zero scheduler errors.
 
 Use `--single-baseline pto_persistent_dag_graph_chain` for a quick benchmark
 path check of the explicit five-task chain graph descriptor with dispatch

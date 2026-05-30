@@ -33,6 +33,11 @@ The earlier `5424bcca` full capture remains useful as historical evidence,
 but it validated `1242` samples before the role-map row was included.
 The compact `193ccc4d` gate validates `100` samples after the submit-groups
 graph row joined the selected matrix.
+After adding `pto_persistent_dag_graph_parallel_chains`, the next compact
+current-head selected gate is expected to validate `102` samples, and the
+next full paired-current gate is expected to validate `1296` samples. The
+latest full capture above remains the latest full paired run until that
+refresh is captured.
 The older `9ec5511e` full capture remains useful as historical evidence, but
 it validated `1224` samples before the named-callable graph row was included.
 The older `cb300e82` full capture validated `1206` samples before the
@@ -1095,6 +1100,36 @@ At four scheduler blocks, the nine-task graph lowers per-task event time from
 `19660 ns` to `12856 ns` on A100 and from `14150 ns` to `10030 ns` on H200
 relative to the five-task graph. This is still a microbenchmark over
 generated vector task bodies, not a tuned model-kernel benchmark.
+
+## Parallel-Chains Selected Benchmark Row
+
+The current-head selected benchmark path now includes
+`pto_persistent_dag_graph_parallel_chains`, the explicit nine-task graph
+descriptor used by the scheduler-scaling smoke. A quick A100/H200 single-row
+capture at commit `3d32a7e4` validates that the selected-benchmark dispatcher
+uses `graph_descriptor_parallel_chains` with generated-dispatch PTX on both
+machines.
+
+Artifacts:
+
+- `tmp/cuda-backend/graph-parallel-chains-selected-working/a100-current-3d32a7e4.json`
+- `tmp/cuda-backend/graph-parallel-chains-selected-working/h200-current-3d32a7e4.json`
+- `tmp/cuda-backend/graph-parallel-chains-selected-working/cuda-smoke-report.md`
+- `tmp/cuda-backend/graph-parallel-chains-selected-working/cuda-smoke-report.svg`
+
+Selected rows:
+
+| GPU | PTX arch | Device ns | Host ns | Completed | Dispatch |
+| --- | -------- | --------- | ------- | --------- | -------- |
+| A100 | `compute_80` | 87040 | 107290 | 9 | `1,2,1,2,1,1,2,1,1` |
+| H200 | `compute_90` | 69376 | 79147 | 9 | `1,2,1,2,1,1,2,1,1` |
+
+Both artifacts report zero device scheduler errors, fan-in
+`0,0,0,0,2,2,2,2,2`, dependents `4,4,5,5,6,7,6,7,8,8`,
+`scheduler_processed_by_block=[9]`, and one scheduler block plus nine worker
+blocks. This row is a selected-benchmark integration check for the wider DAG;
+the paired scheduler-scaling captures above remain the better evidence for
+multi-scheduler behavior.
 
 ## Latest Scheduler Error Matrix
 
