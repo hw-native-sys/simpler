@@ -1599,7 +1599,14 @@ class TestChipMainLoopDigestRegister:
         return shm, buf, state_addr
 
     @staticmethod
-    def _send_ctrl_register(buf, state_addr, shm_name: str, digest: bytes = b"\x07" * 32, payload_size=None):
+    def _send_ctrl_register(
+        buf,
+        state_addr,
+        shm_name: str,
+        *,
+        payload_size: int,
+        digest: bytes = b"\x07" * 32,
+    ):
         """Stage a CTRL_REGISTER request and flip the state to CONTROL_REQUEST."""
         from simpler.worker import (  # noqa: PLC0415
             _CONTROL_REQUEST,
@@ -1611,13 +1618,6 @@ class TestChipMainLoopDigestRegister:
             _OFF_CONTROL_CALLABLE_HASH,
             _mailbox_store_i32,
         )
-
-        if payload_size is None:
-            payload_shm = SharedMemory(name=shm_name)
-            try:
-                payload_size = payload_shm.size
-            finally:
-                payload_shm.close()
 
         struct.pack_into("Q", buf, _OFF_CALLABLE, _CTRL_REGISTER)
         struct.pack_into("Q", buf, _CTRL_OFF_ARG0, int(payload_size))
@@ -1746,8 +1746,13 @@ class TestChipMainLoopDigestRegister:
         payload = ctypes.string_at(int(callable_obj.buffer_ptr()), int(callable_obj.buffer_size()))
         digest = _chip_digest(callable_obj)
         payload_shm = SharedMemory(create=True, size=len(payload) + 4096)
-        payload_shm.buf[: len(payload)] = payload
-        payload_shm.buf[len(payload) :] = b"\xff" * 4096
+        payload_buf = payload_shm.buf
+        assert payload_buf is not None
+        try:
+            payload_buf[: len(payload)] = payload
+            payload_buf[len(payload) : len(payload) + 4096] = b"\xff" * 4096
+        finally:
+            payload_buf.release()
         shm, buf, state_addr = self._build_mailbox()
         try:
             t = self._spawn_loop(cw, buf, state_addr)
@@ -1788,7 +1793,13 @@ class TestChipMainLoopDigestRegister:
         try:
             t = self._spawn_loop(cw, buf, state_addr, registry, identity_table, identity_refs)
             try:
-                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=wrong_digest)
+                self._send_ctrl_register(
+                    buf,
+                    state_addr,
+                    shm_name=payload_shm.name,
+                    payload_size=int(callable_obj.buffer_size()),
+                    digest=wrong_digest,
+                )
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 1
                 assert "HASHID_DESCRIPTOR_MISMATCH" in self._read_error_message(buf)
@@ -1817,13 +1828,26 @@ class TestChipMainLoopDigestRegister:
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)
         payload_shm = _chip_payload_shm(callable_obj)
+        payload_size = int(callable_obj.buffer_size())
         shm, buf, state_addr = self._build_mailbox()
         try:
             t = self._spawn_loop(cw, buf, state_addr)
             try:
-                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest)
+                self._send_ctrl_register(
+                    buf,
+                    state_addr,
+                    shm_name=payload_shm.name,
+                    payload_size=payload_size,
+                    digest=digest,
+                )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest)
+                self._send_ctrl_register(
+                    buf,
+                    state_addr,
+                    shm_name=payload_shm.name,
+                    payload_size=payload_size,
+                    digest=digest,
+                )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
                 assert cw._unregister_slot.call_count == 0
                 assert cw._impl.prepare_callable_from_blob.call_count == 1
@@ -1847,13 +1871,26 @@ class TestChipMainLoopDigestRegister:
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)
         payload_shm = _chip_payload_shm(callable_obj)
+        payload_size = int(callable_obj.buffer_size())
         shm, buf, state_addr = self._build_mailbox()
         try:
             t = self._spawn_loop(cw, buf, state_addr)
             try:
-                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest)
+                self._send_ctrl_register(
+                    buf,
+                    state_addr,
+                    shm_name=payload_shm.name,
+                    payload_size=payload_size,
+                    digest=digest,
+                )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest)
+                self._send_ctrl_register(
+                    buf,
+                    state_addr,
+                    shm_name=payload_shm.name,
+                    payload_size=payload_size,
+                    digest=digest,
+                )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
 
                 self._send_ctrl_unregister(buf, state_addr, digest=digest)

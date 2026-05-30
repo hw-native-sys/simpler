@@ -412,8 +412,8 @@ def _validate_chip_payload_digest(
 def _read_py_callable_payload_from_shm(shm_name: str) -> bytes:
     shm = SharedMemory(name=shm_name)
     shm_buf = shm.buf
+    assert shm_buf is not None
     try:
-        assert shm_buf is not None
         if shm.size < _PY_CALLABLE_HEADER.size:
             raise RuntimeError(f"python callable payload too small: {shm.size} bytes")
         magic, version, serializer, flags, payload_size = _PY_CALLABLE_HEADER.unpack_from(shm_buf, 0)
@@ -438,8 +438,8 @@ def _read_py_callable_payload_from_shm(shm_name: str) -> bytes:
 def _read_chip_callable_from_shm(shm_name: str, payload_size: int) -> ChipCallable:
     shm = SharedMemory(name=shm_name)
     shm_buf = shm.buf
+    assert shm_buf is not None
     try:
-        assert shm_buf is not None
         if payload_size <= 0 or payload_size > shm.size:
             raise RuntimeError(f"CTRL_REGISTER payload size mismatch: payload={payload_size}, shm={shm.size}")
         return ChipCallable.from_bytes(bytes(shm_buf[:payload_size]))
@@ -653,8 +653,8 @@ def _handle_ctrl_alloc_domain(cw: "ChipWorker", buf: memoryview) -> None:
 
     req_shm = SharedMemory(name=request_shm_name)
     req_buf = req_shm.buf
+    assert req_buf is not None
     try:
-        assert req_buf is not None
         (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
         nbytes_offset = _DOMAIN_REQ_HEADER.size
@@ -690,8 +690,8 @@ def _handle_ctrl_alloc_domain(cw: "ChipWorker", buf: memoryview) -> None:
 
     reply_shm = SharedMemory(name=reply_shm_name)
     reply_buf = reply_shm.buf
+    assert reply_buf is not None
     try:
-        assert reply_buf is not None
         _DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, int(device_ctx), int(local_window_base), int(buffer_count))
         if buffer_ptrs:
             struct.pack_into(f"<{len(buffer_ptrs)}Q", reply_buf, _DOMAIN_REPLY_HEADER.size, *buffer_ptrs)
@@ -710,8 +710,8 @@ def _handle_ctrl_comm_init(cw: "ChipWorker", buf: memoryview) -> None:
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
     req_buf = req_shm.buf
+    assert req_buf is not None
     try:
-        assert req_buf is not None
         (rank, nranks) = _COMM_INIT_HEADER.unpack_from(req_buf, 0)
         # rootinfo_path is the rest of the shm, NUL-terminated.
         raw = bytes(req_buf[_COMM_INIT_HEADER.size :])
@@ -732,8 +732,8 @@ def _handle_ctrl_release_domain(cw: "ChipWorker", buf: memoryview) -> None:
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
     req_buf = req_shm.buf
+    assert req_buf is not None
     try:
-        assert req_buf is not None
         (allocation_id, rank_count, domain_rank, _ws, _bc) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
     finally:
         req_buf.release()
@@ -875,8 +875,8 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                     shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
                     shm = SharedMemory(name=shm_name)
                     shm_buf = shm.buf
+                    assert shm_buf is not None
                     try:
-                        assert shm_buf is not None
                         if payload_size <= 0 or payload_size > shm.size:
                             raise RuntimeError(
                                 f"CTRL_REGISTER payload size mismatch: payload={payload_size}, shm={shm.size}"
