@@ -568,6 +568,29 @@ int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Du
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
     stop();
 
+    // ProfilerBase::stop() only joins the mgmt + poll threads. The writer
+    // thread is otherwise torn down solely by export_dump_files(), so any path
+    // that skips export — e.g. run() bailing on a device error before its
+    // collector-teardown block — would leak it: left blocked on write_cv_ with
+    // writer_done_ == false while writer_thread_ stays joinable, which trips
+    // std::terminate when the collector is destroyed or re-run. finalize() is
+    // reached via run()'s perf_cleanup guard on every exit path, so join the
+    // writer here too. Idempotent: export_dump_files() clears writer_started_
+    // on the success path, making this a no-op.
+    if (writer_started_ && writer_thread_.joinable()) {
+        writer_done_.store(true);
+        write_cv_.notify_one();
+        writer_thread_.join();
+    }
+
+    // The writer thread opens bin_file_ in start_writer_thread_once() and it is
+    // otherwise closed only by export_dump_files(). Close it here too so an
+    // export-skipping path does not leave it open — a stale-open stream makes
+    // the next run's bin_file_.open() set failbit. Guarded for idempotency.
+    if (bin_file_.is_open()) {
+        bin_file_.close();
+    }
+
     // DumpMetaBuffers appear in multiple lists (per-thread free_queues,
     // recycled pool); dedup so each dev_ptr funnels through the shared
     // ProfilerBase RAII helper exactly once.
