@@ -94,7 +94,6 @@ def run(
     platform: str = "a2a3",
     device_ids: list[int] | None = None,
     pto_isa_commit: str | None = None,
-    build: bool = False,
 ) -> int:
     if device_ids is None:
         device_ids = [0, 1]
@@ -116,7 +115,6 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        build=build,
     )
     chip_handle = worker.register(chip_callable)
     try:
@@ -170,10 +168,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", default="a2a3")
     parser.add_argument("-d", "--device", default="0-1")
-    parser.add_argument("--build", action="store_true")
     parser.add_argument("--pto-isa-commit", default=None)
     args = parser.parse_args()
-    return run(args.platform, parse_device_range(args.device), args.pto_isa_commit, build=args.build)
+    return run(args.platform, parse_device_range(args.device), args.pto_isa_commit)
 
 
 if __name__ == "__main__":

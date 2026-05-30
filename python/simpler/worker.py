@@ -869,6 +869,15 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                             identity_refs[digest] = identity_refs.get(digest, 1) + 1
                         else:
                             cid = _install_local_identity(registry, identity_table, identity_refs, digest, callable_obj)
+                            # Self-heal when a prior unregister popped the local
+                            # identity table but failed before clearing device
+                            # prepared state for the reusable private slot.
+                            if int(cid) in prepared:
+                                try:
+                                    cw._unregister_slot(int(cid))
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                prepared.discard(int(cid))
                             exported = ctypes.c_char.from_buffer(shm_buf)
                             try:
                                 addr = ctypes.addressof(exported)
@@ -1419,7 +1428,7 @@ class Worker:
         # The AICPU side keeps a fixed-size orch_so_table_ keyed by cid;
         # raise here so the failure surfaces at register-time with a
         # protocol-aware message, not later from
-        # DeviceRunner::register_prepared_callable with a generic
+        # DeviceRunner::register_callable with a generic
         # "out of range" log.
         raise RuntimeError(
             "Worker.register: callable capacity exhausted "
@@ -1784,7 +1793,7 @@ class Worker:
         device_id = self._config.get("device_id", 0)
 
         builder = RuntimeBuilder(platform)
-        binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
+        binaries = builder.get_binaries(runtime)
 
         self._chip_worker = ChipWorker()
         self._chip_worker.init(device_id, binaries)
@@ -1817,7 +1826,7 @@ class Worker:
             platform = self._config["platform"]
             runtime = self._config["runtime"]
             builder = RuntimeBuilder(platform)
-            binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
+            binaries = builder.get_binaries(runtime)
 
             # Stash the full RuntimeBinaries so forked chip children can
             # construct a ChipWorker with one call (`cw.init(device_id, bins)`)

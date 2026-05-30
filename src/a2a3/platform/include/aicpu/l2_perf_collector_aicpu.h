@@ -54,43 +54,58 @@ L2PerfLevel get_l2_perf_level();
 /**
  * Initialize performance profiling
  *
- * Sets up double buffers for each core and initializes tracking state.
+ * Sets up the AICPU buffer pool for each core and initializes tracking state.
  * Reads the perf device-base pointer published via `set_platform_l2_perf_base()`.
- * AICPU caches each core's stable AICore staging-ring address from
- * `L2PerfBufferState[i].aicore_ring_ptr` (host populated it before AICPU
- * started). AICore receives the same per-core ring through
- * `KernelArgs::aicore_ring_addr` + `set_aicore_l2_perf_ring()`, so this
- * routine no longer touches runtime's Handshake.
+ *
+ * Also primes the per-core AICore rotation channel: pops the initial
+ * L2PerfAicoreBuffer from L2PerfAicoreBufferState::free_queue and writes its
+ * address into the AicoreRotation channel that AICore polls per task.
  *
  * @param worker_count  Number of AICore workers (cores) to initialize
  */
 void l2_perf_aicpu_init(int worker_count);
 
 /**
+ * Rotate the AICore buffer for a given core, if needed.
+ *
+ * Called from the dispatch path (scheduler_dispatch in tensormap_and_ringbuffer,
+ * aicpu_executor in host_build_graph) immediately before write_reg(DATA_MAIN_BASE)
+ * for each task. Increments the per-core dispatch counter and, when it crosses
+ * a PLATFORM_AICORE_BUFFER_SIZE boundary, enqueues the current AICore buffer
+ * to the ready queue (kind=2) and pops the next one from free_queue.
+ *
+ * Race safety: rotation happens BEFORE the dispatch register write, so by the
+ * runtime's completion-before-dispatch invariant all prior tasks have FIN'd
+ * (and AICore has finished writing their records into the old buffer) before
+ * the old buffer enters the ready queue.
+ *
+ * Called regardless of l2_perf_level — internally gates on AICORE_TIMING.
+ *
+ * @param core_id     Core index
+ * @param thread_idx  Owning AICPU thread (target ready-queue)
+ */
+void l2_perf_aicpu_maybe_rotate_aicore(int core_id, int thread_idx);
+
+/**
  * Complete a L2PerfRecord with AICPU-side metadata after AICore task completion
  *
- * Reads the AICore-published timing from the per-core staging ring at
- * `dual_issue_slots[expected_reg_task_id % PLATFORM_L2_AICORE_RING_SIZE]`,
- * validates the task_id match, fills all AICPU-side fields, commits into
- * the current records buffer, and rotates the records buffer internally
- * once it fills up. Fanout edges live in the static DAG (deps.json from
- * dep_gen) and are joined by the host's swimlane converter post-run, so
- * this commit path does not touch fanout.
+ * AICore-as-producer: AICore writes start/end/task_id directly into the
+ * per-core L2PerfAicoreBuffer at `records[reg_task_id % SIZE]`. AICPU does
+ * NOT read that buffer on the hot path — it only writes AICPU-owned fields
+ * (task_id, reg_task_id, func_id, core_type, dispatch_time, finish_time)
+ * here, leaving start/end as zero. The host post-processor joins the AICore
+ * stream into the L2PerfRecord stream by `reg_task_id` at flush time.
  *
  * Per-core counter accounting:
  *   total_record_count++       — every commit attempt (success or failure)
  *   dropped_record_count++     — capacity-driven drop (no free buffer / queue
  *                                full); actionable via
  *                                PLATFORM_PROF_BUFFERS_PER_CORE
- *   mismatch_record_count++    — ring slot/task_id mismatch. The runtime's
- *                                completion-before-dispatch invariant says
- *                                this must never happen; if it does, it is a
- *                                hard error (DEV_ERROR) — surface separately
- *                                from capacity drops.
  *
  * @param core_id               Core index — used to resolve buffer state and update counters
  * @param thread_idx            Owning AICPU thread (used when rotating records buffer)
- * @param expected_reg_task_id  Register dispatch token (low 32 bits) to validate
+ * @param expected_reg_task_id  Register dispatch token (low 32 bits) — written
+ *                              into L2PerfRecord.reg_task_id as the join key
  * @param task_id               Task identifier to write (PTO2 encoding or plain id)
  * @param func_id               Kernel function identifier
  * @param core_type             Core type (AIC/AIV)

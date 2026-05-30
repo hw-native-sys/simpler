@@ -87,6 +87,26 @@ If unlocked results contradict CI or prior runs, **first** check whether
 another process is on the same chip (`npu-smi info` + the process table at
 the bottom) before treating the discrepancy as a real signal.
 
+## Pre-flight: arch precheck
+
+Before `task-submit … --run "… pytest … --platform a2a3|a5 …"`, gate the
+invocation through
+[`onboard-arch-precheck`](../skills/onboard-arch-precheck/SKILL.md). The
+precheck takes ~600 ms cold (cached afterwards at ~5 ms) and refuses a
+wrong-arch invocation BEFORE any device lock is acquired. Running the
+wrong arch produces 507018 / 507899 cascades that look like genuine bugs
+and routinely waste hours of debugging — see the skill for the failure
+signatures.
+
+```bash
+.claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1
+task-submit --device auto --device-num 1 \
+    --run "python -m pytest ... --platform a2a3 --device \$TASK_DEVICE"
+```
+
+Sim variants (`a2a3sim`, `a5sim`) pass the precheck unconditionally — they
+are silicon-agnostic. The precheck is purely about onboard invocations.
+
 ## Anti-patterns
 
 - ❌ Bash `for i in $(seq 1 50); do pytest ... --device 8 & pytest ... --device 9 & wait; done`
@@ -97,6 +117,9 @@ the bottom) before treating the discrepancy as a real signal.
   the outlier, not CI.
 - ❌ Claiming "X% reproduction rate" from unlocked runs without listing
   `task-submit --list` at the time of the run.
+- ❌ Bypassing `onboard-arch-precheck` — the `--platform` mismatch failure
+  modes are silent (look like real bugs) and burn hours of investigation
+  time. Always run the gate.
 
 ## Quick reference
 

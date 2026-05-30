@@ -35,12 +35,23 @@ static L2PerfDataHeader *s_l2_perf_header = nullptr;
 // Per-core L2PerfBufferState cache
 static L2PerfBufferState *s_perf_buffer_states[PLATFORM_MAX_CORES] = {};
 
-// Per-core L2PerfAicoreRing cache (stable for the run; AICPU reads, AICore writes)
-static L2PerfAicoreRing *s_perf_aicore_rings[PLATFORM_MAX_CORES] = {};
+// Per-core L2PerfAicoreBufferState cache (lives in the same shared region;
+// host writes initial pool + the rotation channel that AICore polls).
+//
+// All AICore-side bookkeeping (rotation channel, free queue,
+// total_record_count, current_buf_seq) is owned by this shared struct — see
+// l2_perf_profiling.h. We deliberately do not keep AICPU-process-local
+// mirror counters because the struct's volatile fields are the single
+// source of truth across init/complete/rotate/flush. The high-water-mark
+// formula `total_record_count - current_buf_seq * BUFFER_SIZE` correctly
+// handles the failed-rotation case (free_queue empty or ready_queue full)
+// since current_buf_seq only bumps on a successful rotation.
+static L2PerfAicoreBufferState *s_aicore_buffer_states[PLATFORM_MAX_CORES] = {};
 
 // Per-core cached current-records-buffer pointer. Written by AICPU when
-// rotating buffers from inside `complete_record`; AICPU never publishes this
-// to AICore (AICore only sees the stable ring).
+// rotating buffers from inside `complete_record`. AICore writes to its own
+// per-core L2PerfAicoreBuffer (host-allocated, AICPU rotates) and AICPU
+// never reads from it on the hot path.
 static L2PerfBuffer *s_perf_records_buffers[PLATFORM_MAX_CORES] = {};
 
 // Per-thread PhaseBufferState cache
@@ -124,15 +135,10 @@ void l2_perf_aicpu_init(int worker_count) {
     // Pop first buffer from free_queue for each core
     for (int i = 0; i < worker_count; i++) {
         L2PerfBufferState *state = get_perf_buffer_state(l2_perf_base, i);
+        L2PerfAicoreBufferState *ac_state = get_aicore_buffer_state(l2_perf_base, worker_count, i);
 
         s_perf_buffer_states[i] = state;
-
-        // Cache the per-core staging ring (host populated state->aicore_ring_ptr
-        // before the AICPU started). AICore receives the same per-core ring via
-        // KernelArgs::aicore_ring_addr + set_aicore_l2_perf_ring() — no
-        // handshake hop, so this routine doesn't republish anything.
-        L2PerfAicoreRing *ring = reinterpret_cast<L2PerfAicoreRing *>(state->aicore_ring_ptr);
-        s_perf_aicore_rings[i] = ring;
+        s_aicore_buffer_states[i] = ac_state;
 
         // Pop first buffer from free_queue
         rmb();
@@ -157,11 +163,35 @@ void l2_perf_aicpu_init(int worker_count) {
             state->current_buf_ptr = 0;
             s_perf_records_buffers[i] = nullptr;
         }
+
+        // Prime the AICore rotation channel with the initial buffer.
+        // Generation starts at 1 so AICore's cached_generation==0 triggers
+        // a refresh on its first task.
+        rmb();
+        uint32_t ac_head = ac_state->free_queue.head;
+        uint32_t ac_tail = ac_state->free_queue.tail;
+        if (ac_head != ac_tail) {
+            uint64_t ac_buf_ptr = ac_state->free_queue.buffer_ptrs[ac_head % PLATFORM_PROF_SLOT_COUNT];
+            rmb();
+            ac_state->free_queue.head = ac_head + 1;
+            ac_state->current_buf_seq = 0;
+            ac_state->rotation.current_buf_ptr = ac_buf_ptr;
+            ac_state->rotation.generation = 1;
+            wmb();
+            L2PerfAicoreBuffer *ac_buf = reinterpret_cast<L2PerfAicoreBuffer *>(ac_buf_ptr);
+            ac_buf->count = 0;
+            LOG_DEBUG("Core %d: primed AICore rotation with buf=0x%lx, gen=1", i, ac_buf_ptr);
+        } else {
+            LOG_ERROR("Core %d: AICore free_queue is empty during init!", i);
+            ac_state->rotation.current_buf_ptr = 0;
+            ac_state->rotation.generation = 1;
+            wmb();
+        }
     }
 
     wmb();
 
-    LOG_INFO_V0("Performance profiling initialized for %d cores", worker_count);
+    LOG_INFO_V0("Performance profiling initialized for %d cores (with AICore rotation)", worker_count);
 }
 
 /**
@@ -224,6 +254,75 @@ static void switch_records_buffer(int core_id, int thread_idx) {
     LOG_INFO_V0("Thread %d: Core %d switched to new buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
 }
 
+// Try to rotate the AICore buffer for `core_id`. Called from the completion
+// path after a successful L2PerfRecord commit so the just-FIN'd task's
+// AICore record is guaranteed to be in the old buffer before we enqueue it.
+// On success bumps `ac_state->current_buf_seq`; on failure (empty free queue
+// or full ready queue) the old buffer is abandoned in place, AICore overflows
+// it from now on, and the drop count grows.
+static void aicore_rotate(int core_id, int thread_idx) {
+    L2PerfAicoreBufferState *ac_state = s_aicore_buffer_states[core_id];
+    if (ac_state == nullptr) {
+        return;
+    }
+
+    uint64_t old_buf_ptr = ac_state->rotation.current_buf_ptr;
+    uint32_t seq = ac_state->current_buf_seq;
+
+    rmb();
+    uint32_t head = ac_state->free_queue.head;
+    uint32_t tail = ac_state->free_queue.tail;
+    if (head == tail) {
+        // No replacement available — AICore continues to write into the
+        // old buffer; its slot counter will hit BUFFER_SIZE and drop the
+        // overflow. Account the drop on AICPU side too. Note that we do
+        // NOT bump current_buf_seq here — flush will still see the buffer
+        // as the "current full" one and stamp it correctly.
+        ac_state->dropped_record_count =
+            ac_state->dropped_record_count + static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+        LOG_WARN(
+            "Thread %d: Core %d AICore free_queue empty at rotation; up to %d subsequent records will drop", thread_idx,
+            core_id, PLATFORM_AICORE_BUFFER_SIZE
+        );
+        return;
+    }
+
+    // Enqueue the just-filled AICore buffer with count = BUFFER_SIZE.
+    if (old_buf_ptr != 0) {
+        L2PerfAicoreBuffer *old_buf = reinterpret_cast<L2PerfAicoreBuffer *>(old_buf_ptr);
+        old_buf->count = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+        wmb();
+        int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, old_buf_ptr, seq, /*is_phase=*/2);
+        if (rc != 0) {
+            LOG_ERROR(
+                "Thread %d: Core %d failed to enqueue AICore buffer (queue full), %d records lost", thread_idx, core_id,
+                PLATFORM_AICORE_BUFFER_SIZE
+            );
+            ac_state->dropped_record_count =
+                ac_state->dropped_record_count + static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+            return;
+        }
+    }
+
+    // Pop next buffer from free_queue and publish via the rotation channel.
+    uint64_t new_buf_ptr = ac_state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
+    rmb();
+    ac_state->free_queue.head = head + 1;
+    ac_state->current_buf_seq = seq + 1;
+    L2PerfAicoreBuffer *new_buf = reinterpret_cast<L2PerfAicoreBuffer *>(new_buf_ptr);
+    new_buf->count = 0;
+
+    wmb();  // ensure new_buf->count=0 visible before AICore sees new ptr
+    ac_state->rotation.current_buf_ptr = new_buf_ptr;
+    ac_state->rotation.generation = ac_state->rotation.generation + 1;
+    wmb();
+}
+
+// Public no-op shim kept so callers compile during the cross-runtime
+// transition; the rotation has been moved into l2_perf_aicpu_complete_record
+// where it is race-free vs in-flight AICore record writes.
+void l2_perf_aicpu_maybe_rotate_aicore(int /*core_id*/, int /*thread_idx*/) {}
+
 int l2_perf_aicpu_complete_record(
     int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
     uint64_t dispatch_time, uint64_t finish_time
@@ -235,13 +334,9 @@ int l2_perf_aicpu_complete_record(
     if (state == nullptr) {
         return -1;
     }
-    L2PerfAicoreRing *ring = s_perf_aicore_rings[core_id];
-    if (ring == nullptr) {
-        return -1;
-    }
 
     // Account every commit attempt up front so host can detect silent loss as
-    // `device_total - (collected + dropped + mismatch)`.
+    // `device_total - (collected + dropped)`.
     state->total_record_count += 1;
 
     L2PerfBuffer *l2_perf_buf = s_perf_records_buffers[core_id];
@@ -258,43 +353,24 @@ int l2_perf_aicpu_complete_record(
         return -1;
     }
 
-    // Read AICore-published timing from the per-core staging ring.
-    // AICore↔AICPU is hardware-coherent on GM; AICore's dcci pushes the slot
-    // to GM before signaling FIN, so AICPU sees it without invalidate. The
-    // caller's COND read (MMIO Device-nGnRnE) and these slot reads (Normal
-    // cacheable) have no data/address dependency on ARM64 — the `rmb()`
-    // prevents speculative slot loads from being satisfied before COND
-    // indicates FIN. (See src/a2a3/docs/cache-coherency.md.)
-    L2PerfRecord *slot = &ring->dual_issue_slots[expected_reg_task_id % PLATFORM_L2_AICORE_RING_SIZE];
-    rmb();
-    if (static_cast<uint32_t>(slot->task_id) != expected_reg_task_id) {
-        // Hard error: the runtime's completion-before-dispatch invariant
-        // guarantees AICore must have published this slot before AICPU sees
-        // FIN. A mismatch means the invariant is broken (e.g. in-flight
-        // depth exceeded PLATFORM_L2_AICORE_RING_SIZE, or AICore failed to
-        // dcci before signaling). Surface separately from capacity drops.
-        state->mismatch_record_count += 1;
-        LOG_ERROR(
-            "L2Perf invariant violated: core %d slot task_id=0x%x expected=0x%x "
-            "(completion-before-dispatch broken or ring undersized)",
-            core_id, static_cast<uint32_t>(slot->task_id), expected_reg_task_id
-        );
-        return -1;
-    }
-
-    // Copy AICore timing to committed record slot
+    // AICore-as-producer: AICore writes start/end/task_id directly into its
+    // own per-core L2PerfAicoreBuffer (indexed by reg_task_id % SIZE). AICPU
+    // writes only AICPU-owned fields here; start/end stay zero on-device and
+    // are patched by the host when the buffer is consumed. Join key is
+    // `reg_task_id` (monotonic per core), stored alongside the PTO2-encoded
+    // `task_id` so the host can match without a hashmap lookup. This
+    // eliminates the per-task rmb() + staging cache-line read the previous
+    // design required.
     L2PerfRecord *record = &l2_perf_buf->records[count];
-    record->start_time = slot->start_time;
-    record->end_time = slot->end_time;
-
-    // Fill AICPU-owned fields
+    record->start_time = 0;
+    record->end_time = 0;
+    record->duration = 0;
     record->task_id = task_id;
+    record->reg_task_id = expected_reg_task_id;
     record->func_id = func_id;
     record->core_type = core_type;
 
-    // AICPU_TIMING and above: dispatch/finish timing. Fanout edges live in
-    // the static DAG (deps.json) and are joined by the host post-run, so they
-    // are not written here.
+    // AICPU_TIMING and above: dispatch/finish timing.
     if (g_l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
         record->dispatch_time = dispatch_time;
         record->finish_time = finish_time;
@@ -307,10 +383,42 @@ int l2_perf_aicpu_complete_record(
     l2_perf_buf->count = new_count;
     wmb();
 
-    // Rotate after the write so the just-committed record is preserved.
-    // The ring is stable, so AICore is unaffected by this swap.
+    // Rotate AICpu's L2PerfBuffer after the write so the just-committed
+    // record is preserved.
     if (new_count >= PLATFORM_PROF_BUFFER_SIZE) {
         switch_records_buffer(core_id, thread_idx);
+    }
+
+    // AICore-side rotation: piggy-back on this completion. The current task's
+    // AICore record has already been written (AICore writes it before the FIN
+    // signal that brought us here), so at every PLATFORM_AICORE_BUFFER_SIZE-th
+    // completion we hand the just-filled AICore buffer to the ready queue and
+    // pop a fresh one. Doing this in the completion path (not the dispatch
+    // path) closes the dispatch-boundary race: at a dispatch boundary AICore
+    // may still be running task K-1 with its record write yet to happen, so a
+    // dispatch-time rotation could leak K-1's record into the wrong buffer.
+    //
+    // Residual race at the next dispatch: under dual-issue, AICPU may have
+    // already dispatched task K+1 when it processes the FIN of K=BUFFER_SIZE-1.
+    // AICPU's rotation (~1 us — a few wmbs + an enqueue + a pop) needs to
+    // complete before AICore's `record_task` for K+1 reads the published
+    // rotation channel; otherwise AICore's local `slot_within_buf` hits the
+    // `slot >= BUFFER_SIZE` guard and silently drops K+1's record. For typical
+    // kernels (>10 us) the rotation completes long before AICore's record
+    // write, so this never fires; for adversarial sub-microsecond kernels it
+    // can. The host parser surfaces the loss via the `unmatched > 0` warning
+    // in join_aicore_records().
+    //
+    // total_record_count is uint32_t — wraps after ~4 G completions per core.
+    // At realistic dispatch rates this is multi-week continuous-run territory;
+    // we accept the limitation rather than widening the on-device counter.
+    L2PerfAicoreBufferState *ac_state = s_aicore_buffer_states[core_id];
+    if (ac_state != nullptr) {
+        uint32_t completed = ac_state->total_record_count + 1;
+        ac_state->total_record_count = completed;
+        if ((completed & (PLATFORM_AICORE_BUFFER_SIZE - 1)) == 0) {
+            aicore_rotate(core_id, thread_idx);
+        }
     }
 
     return 0;
@@ -341,34 +449,77 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
         uint64_t buf_ptr = state->current_buf_ptr;
         if (buf_ptr == 0) {
             // No active buffer
-            continue;
+        } else {
+            L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(buf_ptr);
+            if (buf->count > 0) {
+                uint32_t seq = state->current_buf_seq;
+                int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, buf_ptr, seq, 0);
+                if (rc == 0) {
+                    LOG_INFO_V0("Thread %d: Core %d flushed buffer with %u records", thread_idx, core_id, buf->count);
+                    flushed_count++;
+                    state->current_buf_ptr = 0;
+                    s_perf_records_buffers[core_id] = nullptr;
+                    wmb();
+                } else {
+                    // ready_queue full at end-of-run: account the loss and clear the
+                    // buffer so host reconcile sees a clean state (current_buf_ptr=0)
+                    // and dropped == flush failures rather than ring/task_id mismatch.
+                    LOG_ERROR(
+                        "Thread %d: Core %d failed to enqueue buffer (queue full), %u records lost!", thread_idx,
+                        core_id, buf->count
+                    );
+                    state->dropped_record_count = state->dropped_record_count + buf->count;
+                    buf->count = 0;
+                    state->current_buf_ptr = 0;
+                    s_perf_records_buffers[core_id] = nullptr;
+                    wmb();
+                }
+            }
         }
 
-        L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(buf_ptr);
-        if (buf->count == 0) {
+        // Also flush the current AICore buffer to the ready queue so the host
+        // sees this session's final batch of AICore timestamps.
+        //
+        // High-water mark uses the rotation accounting (total_record_count -
+        // current_buf_seq * BUFFER_SIZE) so the failed-rotation case is
+        // correctly handled: when an earlier rotation couldn't find a free
+        // buffer the current buffer holds BUFFER_SIZE valid records plus an
+        // unknown number of dropped overflow attempts; the formula clamps
+        // to BUFFER_SIZE in that case rather than stamping a stale partial
+        // count.
+        L2PerfAicoreBufferState *ac_state = s_aicore_buffer_states[core_id];
+        if (ac_state == nullptr) continue;
+
+        rmb();
+        uint64_t ac_buf_ptr = ac_state->rotation.current_buf_ptr;
+        if (ac_buf_ptr == 0) continue;
+
+        uint32_t live = ac_state->total_record_count -
+                        ac_state->current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+        if (live == 0) {
+            // Last rotation matched the last completion exactly — buffer is
+            // freshly popped and empty. Skip.
             continue;
         }
+        uint32_t ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
+                               static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
+                               live;
+        L2PerfAicoreBuffer *ac_buf = reinterpret_cast<L2PerfAicoreBuffer *>(ac_buf_ptr);
+        ac_buf->count = ac_mark;
+        wmb();
 
-        uint32_t seq = state->current_buf_seq;
-        int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, buf_ptr, seq, 0);
+        uint32_t ac_seq = ac_state->current_buf_seq;
+        int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, ac_buf_ptr, ac_seq, /*is_phase=*/2);
         if (rc == 0) {
-            LOG_INFO_V0("Thread %d: Core %d flushed buffer with %u records", thread_idx, core_id, buf->count);
-            flushed_count++;
-            state->current_buf_ptr = 0;
-            s_perf_records_buffers[core_id] = nullptr;
+            LOG_INFO_V0(
+                "Thread %d: Core %d flushed AICore buffer (seq=%u, count=%u)", thread_idx, core_id, ac_seq, ac_mark
+            );
+            ac_state->rotation.current_buf_ptr = 0;
             wmb();
         } else {
-            // ready_queue full at end-of-run: account the loss and clear the
-            // buffer so host reconcile sees a clean state (current_buf_ptr=0)
-            // and dropped == flush failures rather than ring/task_id mismatch.
-            LOG_ERROR(
-                "Thread %d: Core %d failed to enqueue buffer (queue full), %u records lost!", thread_idx, core_id,
-                buf->count
-            );
-            state->dropped_record_count = state->dropped_record_count + buf->count;
-            buf->count = 0;
-            state->current_buf_ptr = 0;
-            s_perf_records_buffers[core_id] = nullptr;
+            LOG_ERROR("Thread %d: Core %d failed to enqueue AICore buffer at flush (queue full)", thread_idx, core_id);
+            ac_state->dropped_record_count = ac_state->dropped_record_count + ac_mark;
+            ac_state->rotation.current_buf_ptr = 0;
             wmb();
         }
     }

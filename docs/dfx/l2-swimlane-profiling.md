@@ -255,56 +255,80 @@ L2PerfDataHeader                                (host init, device R/W)
 ├── queue_heads / queue_tails (per-thread)
 └── num_cores
 
-L2PerfBufferState[num_cores]                    (per-core perf state)
+L2PerfBufferState[num_cores]                    (per-core AICPU pool state)
 ├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
 ├── current_buf_ptr           (AICPU active L2PerfBuffer*)
-├── aicore_ring_ptr           (stable L2PerfAicoreRing*, host writes once)
+├── aicore_ring_ptr           (legacy; kept for ABI continuity)
 ├── total_record_count
 ├── dropped_record_count
-└── mismatch_record_count     (ring slot / task_id invariant violations)
+└── mismatch_record_count     (legacy; no longer written)
 
-[L2PerfAicoreRing[num_cores]]                   (stable AICore staging)
-└── L2PerfRecord dual_issue_slots[PLATFORM_L2_AICORE_RING_SIZE]
+L2PerfAicoreBufferState[num_cores]              (per-core AICore pool state)
+├── rotation {current_buf_ptr, generation}      (AICPU writes, AICore reads
+│                                                — cache-line independent)
+├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
+├── total_record_count / dropped_record_count
+└── current_buf_seq
+
+[L2PerfAicoreBuffer × PLATFORM_AICORE_BUFFERS_PER_CORE per core]
+└── L2PerfAicoreRecord records[PLATFORM_AICORE_BUFFER_SIZE]  (1024 records, 32B each)
 
 [AicpuPhaseHeader + PhaseBufferState[num_threads]]  (optional)
 ├── magic / num_sched_threads
 ├── core_to_thread[]  (core_id → scheduler thread index)
-└── per-thread phase buffers (PhaseBufferState aliases L2PerfBufferState;
-                              `aicore_ring_ptr` / `mismatch_record_count`
-                              unused for PHASE)
+└── per-thread phase buffers (PhaseBufferState aliases L2PerfBufferState)
 ```
 
 The records themselves are identical across architectures:
 
-- `L2PerfRecord` — per-task timing + fanout, 64-byte aligned.
+- `L2PerfRecord` — per-task AICPU-owned fields (task_id, dispatch_time,
+  finish_time, func_id, core_type, reg_task_id), 64-byte aligned.
+  `reg_task_id` is the join key against the matching AICore record.
+- `L2PerfAicoreRecord` — slim AICore-only record (start, end, task_id),
+  32 bytes; AICore writes one per task into its currently-active
+  per-core buffer.
 - `AicpuPhaseRecord` — per-iteration scheduler / orchestrator
-  phase, 32 bytes.
+  phase, 40 bytes.
 
 This is the key reason a single `swimlane_converter` consumes
 both architectures' output unchanged. Orchestrator timing is carried
-entirely by per-task `AicpuPhaseRecord` entries (ORCH_SYNC, ORCH_ALLOC,
-…); there is no separate shared-memory aggregate. The run-window
-envelope is emitted to device log via `LOG_INFO_V9
-"orch_start=… orch_end=… orch_cost=…"`.
+by per-submit `AicpuPhaseRecord` entries (ORCH_SUBMIT, folded from
+the historical per-sub-step records); there is no separate
+shared-memory aggregate. The run-window envelope is emitted to device
+log via `LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…"`.
 
-**Producer/consumer protocol on AICore.** AICore writes per-task
-timing into a stable per-core `L2PerfAicoreRing` at
-`dual_issue_slots[reg_task_id % PLATFORM_L2_AICORE_RING_SIZE]`.
-The ring address is published once via a per-core table on
-`KernelArgs` (a2a3: `aicore_ring_addr`; a5:
-`aicore_l2_perf_ring_addrs`), forwarded by `KERNEL_ENTRY` into
-platform-owned AICore state, and never reassigned — so AICore is
-fully decoupled from any AICPU-side records-buffer rotation. AICPU,
-on observing FIN, validates the slot's register token, copies the slot
-record into the current `L2PerfBuffer::records[count]`, fills
-`func_id` / `core_type` / `dispatch_time_us` / `finish_time_us` / `fanout`,
-advances `count`, and rotates the records buffer in place when it
-fills up. The ring is sized to the runtime's in-flight issue depth
-(2 for dual-issue today; raise to the next power of two when issue
-depth grows). The "completion-before-dispatch" runtime invariant
-guarantees AICore never overwrites a slot before AICPU has read it;
-violations are surfaced via the dedicated `mismatch_record_count`
-counter.
+**Producer/consumer protocol on AICore (AICore-as-producer with rotation).**
+AICore writes a slim `L2PerfAicoreRecord` into its currently-active per-core
+`L2PerfAicoreBuffer` at `records[slot_within_buf++]`. The active buffer is
+published via a per-core `AicoreRotation` cache line (`current_buf_ptr` +
+`generation`); AICore `dcci`'s it per task — cheap relative to the
+baseline `dcci(payload, ENTIRE_DATA_CACHE)` it already pays per task.
+AICPU drives rotation: immediately before each `write_reg(DATA_MAIN_BASE)`
+for task `K`, if `K % PLATFORM_AICORE_BUFFER_SIZE == 0`, AICPU enqueues
+the current buffer to the per-thread ready queue (kind `is_phase=2`),
+pops the next from `L2PerfAicoreBufferState::free_queue`, and bumps
+`AicoreRotation::generation`. AICore detects the bumped generation on
+its next task's `dcci`, refreshes its local cache, and resets its slot
+counter to 0.
+
+**Race safety.** The runtime's completion-before-dispatch invariant
+guarantees all tasks `< K` have FIN'd before AICPU dispatches `K`, so
+by the time AICPU enqueues the old buffer, AICore has finished writing
+(and `dcci+dsb`'d) records for all those tasks. No spin-wait, no
+cross-direction read on the hot path.
+
+**Sizing.** `PLATFORM_AICORE_BUFFER_SIZE = 1024` (power of two, modulo
+lowers to AND) and `PLATFORM_AICORE_BUFFERS_PER_CORE = 4` (1 active +
+3 recycled). Host-side `BufferPoolManager` refills the recycled pool
+from the ready queue while the session runs, so session length is
+bounded only by how fast the host drains — not by the per-core buffer
+sum.
+
+**Measured impact.** Hardware bench on a2a3 paged_attention_unroll
+Case1 with swimlane=4: rotation design delivers sched −4 µs / orch −19 µs
+vs the upstream/main baseline, comparable to the no-rotation predecessor
+(which had this PR's earlier commit; the rotation adds about 3 µs
+sched overhead per session as price for unbounded session length).
 
 ### 5.2 a2a3 — shared-memory streaming
 

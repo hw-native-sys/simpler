@@ -96,7 +96,7 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
 
 /**
  * Stage the per-callable resources (kernel binaries + orchestration SO) into
- * the supplied runtime so a subsequent bind_prepared_to_runtime_impl can use
+ * the supplied runtime so a subsequent bind_callable_to_runtime_impl can use
  * them. This is the cacheable half of init_runtime_impl: nothing here depends
  * on per-run argument values, so the prepare_callable / run_prepared split
  * lets us run this once per callable_id and amortize across runs.
@@ -105,9 +105,8 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
  * @param callable  ChipCallable carrying the orch SO + child kernel binaries
  * @return 0 on success, -1 on failure
  */
-extern "C" int prepare_callable_impl(
-    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), PreparedCallableArtifacts *out
-) {
+extern "C" int
+prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out) {
     if (callable == nullptr) {
         LOG_ERROR("Callable pointer is null");
         return -1;
@@ -116,7 +115,7 @@ extern "C" int prepare_callable_impl(
         LOG_ERROR("upload_fn or out is null");
         return -1;
     }
-    *out = PreparedCallableArtifacts{};
+    *out = CallableArtifacts{};
     out->signature.assign(callable->signature_, callable->signature_ + callable->sig_count());
 
     LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
@@ -161,7 +160,7 @@ extern "C" int prepare_callable_impl(
  * @param orch_args  Separated tensor/scalar arguments for this run
  * @return 0 on success, -1 on failure
  */
-extern "C" int bind_prepared_to_runtime_impl(
+extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
     const ArgDirection * /*signature*/, int /*sig_count*/
 ) {
@@ -177,7 +176,7 @@ extern "C" int bind_prepared_to_runtime_impl(
     // function pointer to invoke. The c_api signature accepts one for
     // symmetry with hbg; assert the trb-side invariant here.
     if (host_orch_func_ptr != nullptr) {
-        LOG_ERROR("bind_prepared_to_runtime_impl: trb does not accept a host_orch_func_ptr");
+        LOG_ERROR("bind_callable_to_runtime_impl: trb does not accept a host_orch_func_ptr");
         return -1;
     }
 

@@ -423,7 +423,7 @@ public:
     /**
      * Replay a previously-uploaded kernel address onto a fresh Runtime
      * without recording it in registered_kernel_func_ids_. Used by
-     * DeviceRunner::bind_prepared_callable_to_runtime when restoring kernels
+     * DeviceRunner::bind_callable_to_runtime when restoring kernels
      * across run_prepared invocations: the prepared callable owns the
      * kernel binaries' device memory until unregister, so
      * validate_runtime_impl must NOT free them.

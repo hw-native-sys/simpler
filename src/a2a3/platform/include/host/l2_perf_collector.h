@@ -54,8 +54,12 @@
 /**
  * Buffer kind discriminator carried in ReadyBufferInfo and used to index the
  * per-kind recycled pool inside BufferPoolManager.
+ *   PERF_RECORD: per-core AICPU-written L2PerfBuffer
+ *   PHASE:       per-thread AICPU-written PhaseBuffer
+ *   AICORE:      per-core AICore-written L2PerfAicoreBuffer (rotation driven
+ *                by AICPU at dispatch boundaries)
  */
-enum class ProfBufferType { PERF_RECORD = 0, PHASE = 1 };
+enum class ProfBufferType { PERF_RECORD = 0, PHASE = 1, AICORE = 2 };
 
 /**
  * Information about a ready (full) buffer, passed from mgmt thread to main thread.
@@ -75,7 +79,7 @@ struct L2PerfModule {
     using ReadyBufferInfo = ::ReadyBufferInfo;
     using FreeQueue = L2PerfFreeQueue;  // PhaseBufferState aliases L2PerfBufferState
 
-    static constexpr int kBufferKinds = 2;  // 0=PERF_RECORD, 1=PHASE
+    static constexpr int kBufferKinds = 3;  // 0=PERF_RECORD, 1=PHASE, 2=AICORE
     static constexpr uint32_t kReadyQueueSize = PLATFORM_PROF_READYQUEUE_SIZE;
     static constexpr uint32_t kSlotCount = PLATFORM_PROF_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "L2PerfModule";
@@ -88,7 +92,8 @@ struct L2PerfModule {
     static constexpr int batch_size(int kind) {
         constexpr int kPerfBatch = PLATFORM_PROF_BUFFERS_PER_CORE - PLATFORM_PROF_SLOT_COUNT;
         constexpr int kPhaseBatch = PLATFORM_PROF_BUFFERS_PER_THREAD - PLATFORM_PROF_SLOT_COUNT;
-        const int b = (kind == 0) ? kPerfBatch : kPhaseBatch;
+        constexpr int kAicoreBatch = PLATFORM_AICORE_BUFFERS_PER_CORE - PLATFORM_PROF_SLOT_COUNT;
+        const int b = (kind == 0) ? kPerfBatch : (kind == 1 ? kPhaseBatch : kAicoreBatch);
         return b < 1 ? 1 : b;
     }
 
@@ -97,41 +102,52 @@ struct L2PerfModule {
     static DataHeader *header_from_shm(void *shm) { return get_l2_perf_header(shm); }
 
     /**
-     * Branch on `is_phase` to pick the per-core perf state vs. the per-thread
-     * phase state. Returns nullopt for out-of-range indices (which would
-     * otherwise corrupt unrelated BufferStates downstream).
+     * Branch on entry.is_phase (kind discriminator 0/1/2) to pick the
+     * per-core perf state vs. the per-thread phase state vs. the per-core
+     * AICore state. Returns nullopt for out-of-range indices.
      */
     static std::optional<profiling_common::EntrySite<L2PerfModule>>
     resolve_entry(void *shm, DataHeader *header, int /*q*/, const ReadyEntry &entry) {
-        const bool is_phase = (entry.is_phase != 0);
         const int num_cores = static_cast<int>(header->num_cores);
+        const uint32_t kind = entry.is_phase;
 
-        if (is_phase) {
+        if (kind == 1) {
             if (entry.core_index >= static_cast<uint32_t>(PLATFORM_MAX_AICPU_THREADS)) {
                 LOG_ERROR("L2PerfModule: invalid phase entry: thread=%u", entry.core_index);
                 return std::nullopt;
             }
         } else {
             if (entry.core_index >= static_cast<uint32_t>(num_cores)) {
-                LOG_ERROR("L2PerfModule: invalid perf entry: core=%u", entry.core_index);
+                LOG_ERROR("L2PerfModule: invalid perf entry: core=%u kind=%u", entry.core_index, kind);
                 return std::nullopt;
             }
         }
 
-        L2PerfBufferState *state = is_phase ?
-                                       get_phase_buffer_state(shm, num_cores, static_cast<int>(entry.core_index)) :
-                                       get_perf_buffer_state(shm, static_cast<int>(entry.core_index));
-
         profiling_common::EntrySite<L2PerfModule> site;
-        site.kind = is_phase ? 1 : 0;
-        site.free_queue = &state->free_queue;
-        site.buffer_size = is_phase ? sizeof(PhaseBuffer) : sizeof(L2PerfBuffer);
-        site.info.type = is_phase ? ProfBufferType::PHASE : ProfBufferType::PERF_RECORD;
+        site.kind = static_cast<int>(kind);
         site.info.index = entry.core_index;
         site.info.slot_idx = 0;
         site.info.dev_buffer_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
         site.info.host_buffer_ptr = nullptr;  // filled by ProfilerAlgorithms
         site.info.buffer_seq = entry.buffer_seq;
+
+        if (kind == 0) {
+            L2PerfBufferState *state = get_perf_buffer_state(shm, static_cast<int>(entry.core_index));
+            site.free_queue = &state->free_queue;
+            site.buffer_size = sizeof(L2PerfBuffer);
+            site.info.type = ProfBufferType::PERF_RECORD;
+        } else if (kind == 1) {
+            PhaseBufferState *state = get_phase_buffer_state(shm, num_cores, static_cast<int>(entry.core_index));
+            site.free_queue = &state->free_queue;
+            site.buffer_size = sizeof(PhaseBuffer);
+            site.info.type = ProfBufferType::PHASE;
+        } else {  // kind == 2 (AICORE)
+            L2PerfAicoreBufferState *ac_state =
+                get_aicore_buffer_state(shm, num_cores, static_cast<int>(entry.core_index));
+            site.free_queue = &ac_state->free_queue;
+            site.buffer_size = sizeof(L2PerfAicoreBuffer);
+            site.info.type = ProfBufferType::AICORE;
+        }
         return site;
     }
 
@@ -143,6 +159,12 @@ struct L2PerfModule {
         for (int i = 0; i < num_cores; i++) {
             L2PerfBufferState *state = get_perf_buffer_state(shm, i);
             cb(/*kind=*/0, &state->free_queue, sizeof(L2PerfBuffer));
+        }
+
+        // Per-core AICore states (kind 2)
+        for (int i = 0; i < num_cores; i++) {
+            L2PerfAicoreBufferState *ac_state = get_aicore_buffer_state(shm, num_cores, i);
+            cb(/*kind=*/2, &ac_state->free_queue, sizeof(L2PerfAicoreBuffer));
         }
 
         // Per-thread phase states (kind 1) — gated on AicpuPhaseHeader being
@@ -320,7 +342,7 @@ private:
     // (set via set_memory_context in initialize()).
     void *perf_shared_mem_dev_{nullptr};
 
-    // Standalone uint64_t[num_aicore] table holding per-core L2PerfAicoreRing
+    // Standalone uint64_t[num_aicore] table holding per-core L2PerfAicoreBuffer
     // addresses. Allocated in initialize(), freed in finalize(). AICore reads
     // ring_table[block_idx] via KernelArgs::aicore_ring_addr.
     void *aicore_ring_addr_table_dev_{nullptr};
@@ -334,6 +356,12 @@ private:
 
     // Collected data (per-core vectors, indexed by core_index)
     std::vector<std::vector<L2PerfRecord>> collected_perf_records_;
+
+    // Collected AICore records (per-core vectors). Each entry is a full
+    // L2PerfAicoreRecord captured from a rotated L2PerfAicoreBuffer. The
+    // order across rotations is preserved by `copy_aicore_buffer` (we sort
+    // incoming buffers by buffer_seq before flattening).
+    std::vector<std::vector<L2PerfAicoreRecord>> collected_aicore_records_;
 
     // AICPU phase profiling data (per-thread, mixed sched + orch records)
     std::vector<std::vector<AicpuPhaseRecord>> collected_phase_records_;
@@ -354,6 +382,16 @@ private:
     // Per-buffer-kind handlers used by on_buffer_collected.
     void copy_perf_buffer(const ReadyBufferInfo &info);
     void copy_phase_buffer(const ReadyBufferInfo &info);
+    void copy_aicore_buffer(const ReadyBufferInfo &info);
+
+    // AICore-as-producer: AICore writes start/end/task_id directly into a
+    // per-core L2PerfAicoreBuffer (allocated by initialize(), addressed via
+    // state->aicore_ring_ptr). AICPU never reads it on the hot path.
+    // join_aicore_records() runs after stop(): it walks each core's buffer,
+    // builds a `task_id_low32 → (start, end)` map, then patches the matching
+    // L2PerfRecord entries in collected_perf_records_. Called from
+    // export_swimlane_json() so external callers see a transparent stream.
+    void join_aicore_records();
 };
 
 #endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_L2_PERF_COLLECTOR_H_

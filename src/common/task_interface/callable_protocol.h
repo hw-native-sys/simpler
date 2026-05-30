@@ -16,7 +16,7 @@
  * pulling in <vector>/<stdexcept>.
  *
  * Both sides must agree on these bounds:
- *   - Host: DeviceRunner::register_prepared_callable rejects out-of-range ids.
+ *   - Host: DeviceRunner::register_callable rejects out-of-range ids.
  *   - AICPU: AicpuExecutor::run guards `orch_so_table_[callable_id]` access.
  */
 
@@ -25,7 +25,7 @@
 #include <cstdint>
 
 // Hard cap on the number of distinct callable_ids that can be registered
-// via Worker.register / DeviceRunner::register_prepared_callable. The AICPU
+// via Worker.register / DeviceRunner::register_callable. The AICPU
 // executor reserves a fixed-size `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
 // keyed by callable_id, so this bound is part of the host↔AICPU protocol.
 constexpr int32_t MAX_REGISTERED_CALLABLE_IDS = 64;

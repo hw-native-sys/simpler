@@ -96,7 +96,7 @@ static PTO2Runtime *rt{nullptr};
 // that callable_id, kept warm across runs).
 // MAX_REGISTERED_CALLABLE_IDS is the protocol hard cap on callable_id values
 // (mailbox uint32 callable_id, register() returns small ints) and is shared
-// with the host bounds check in DeviceRunner::register_prepared_callable —
+// with the host bounds check in DeviceRunner::register_callable —
 // see src/common/task_interface/callable_protocol.h.
 
 struct OrchSoEntry {

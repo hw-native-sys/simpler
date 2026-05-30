@@ -25,10 +25,11 @@
  *
  * Lifecycle:
  *   1. Host fills `KernelArgs::enable_profiling_flag` and
- *      `KernelArgs::aicore_ring_addr`.
+ *      `KernelArgs::aicore_ring_addr` (now points to a per-core
+ *      `AicoreRotation` table).
  *   2. AICore kernel entry indexes `aicore_ring_addr[block_idx]` for this
- *      core's `L2PerfAicoreRing*` and calls `set_aicore_profiling_flag()` +
- *      `set_aicore_l2_perf_ring()` before invoking `aicore_execute`.
+ *      core's `AicoreRotation*` and calls `set_aicore_profiling_flag()` +
+ *      `set_aicore_rotation()` before invoking `aicore_execute`.
  *   3. `aicore_execute` and downstream profiling helpers read via getters.
  */
 
@@ -49,11 +50,12 @@ __aicore__ void set_aicore_profiling_flag(uint32_t flag);
 __aicore__ uint32_t get_aicore_profiling_flag();
 
 /**
- * Per-core L2Perf staging ring. Set once at kernel entry from
+ * Per-core AICore rotation channel. Set once at kernel entry from
  * `((uint64_t*)k_args->aicore_ring_addr)[block_idx]`; nullptr when the L2
- * swimlane bit is off or the address table itself is null.
+ * swimlane bit is off or the address table itself is null. AICore reads
+ * this cache line per task to pick up the current L2PerfAicoreBuffer.
  */
-__aicore__ void set_aicore_l2_perf_ring(__gm__ L2PerfAicoreRing *ring);
-__aicore__ __gm__ L2PerfAicoreRing *get_aicore_l2_perf_ring();
+__aicore__ void set_aicore_rotation(__gm__ AicoreRotation *rotation);
+__aicore__ __gm__ AicoreRotation *get_aicore_rotation();
 
 #endif  // PLATFORM_AICORE_AICORE_PROFILING_STATE_H_

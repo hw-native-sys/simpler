@@ -846,7 +846,7 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     @classmethod
-    def _create_worker(cls, platform, device_id=0, build=False):
+    def _create_worker(cls, platform, device_id=0):
         """Create the L2 Worker for the standalone path.
 
         Mirrors the ``st_worker`` pytest fixture, which yields a ``Worker``
@@ -856,7 +856,7 @@ class SceneTestCase:
         """
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime, build=build)
+        w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime)
         w.init()
         return w
 
@@ -1294,7 +1294,6 @@ class SceneTestCase:
             help="Enable per-scope peak collection and emit <output_prefix>/scope_stats/scope_stats.jsonl "
             "(per-scope ring-fill peaks).",
         )
-        parser.add_argument("--build", action="store_true", help="Compile runtime from source")
         parser.add_argument(
             "--runtime",
             default=None,
@@ -1529,8 +1528,6 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common.append("--enable-dep-gen")
     if args.enable_scope_stats:
         common.append("--enable-scope-stats")
-    if args.build:
-        common.append("--build")
 
     # ----- L3 phase: one subprocess per class (not per case).
     # The child's _create_standalone_worker allocates max(cls.CASES.device_count)
@@ -1710,9 +1707,8 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
     callables nor pre-registered chip callables, so both dicts are empty.
     """
     first_cls = group[0]
-    build = getattr(args, "build", False)
     if level == 2:
-        return first_cls._create_worker(args.platform, args.device, build=build), {}, {}
+        return first_cls._create_worker(args.platform, args.device), {}, {}
 
     from simpler.worker import Worker  # noqa: PLC0415
 
@@ -1737,7 +1733,6 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         num_sub_workers=max_subs,
         platform=args.platform,
         runtime=first_cls._st_runtime,
-        build=build,
     )
     # Prepare sub callables per-class to avoid name collisions.
     per_class_sub_handles: dict[type, dict] = {}

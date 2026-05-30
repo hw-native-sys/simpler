@@ -44,10 +44,8 @@ extern "C" {
 /* ===========================================================================
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
-int prepare_callable_impl(
-    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), PreparedCallableArtifacts *out
-);
-int bind_prepared_to_runtime_impl(
+int prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
+int bind_callable_to_runtime_impl(
     Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
     int sig_count
 );
@@ -313,7 +311,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
         int rc = runner->attach_current_thread(runner->device_id());
         if (rc != 0) return rc;
 
-        PreparedCallableArtifacts artifacts;
+        CallableArtifacts artifacts;
         rc = prepare_callable_impl(
             reinterpret_cast<const ChipCallable *>(callable), upload_chip_callable_buffer_wrapper, &artifacts
         );
@@ -322,8 +320,8 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
         }
 
         // Re-pack ChildKernelAddr -> std::pair to match the existing
-        // register_prepared_callable* signature. The named struct only crosses
-        // the runtime-maker / device-runner interface; PreparedCallableState
+        // register_callable* signature. The named struct only crosses
+        // the runtime-maker / device-runner interface; CallableState
         // stores the historical pair shape.
         std::vector<std::pair<int, uint64_t>> kernel_addrs;
         kernel_addrs.reserve(artifacts.kernel_addrs.size());
@@ -334,12 +332,12 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
         // hbg's prepare_callable_impl populates host_dlopen_handle; trb's
         // leaves it null and fills orch_so_data + func_name/config_name.
         if (artifacts.host_dlopen_handle != nullptr) {
-            return runner->register_prepared_callable_host_orch(
+            return runner->register_callable_host_orch(
                 callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
                 std::move(artifacts.signature)
             );
         }
-        return runner->register_prepared_callable(
+        return runner->register_callable(
             callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
             artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
         );
@@ -360,7 +358,7 @@ int run_prepared(
     if (ctx == NULL || runtime == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
 
-    if (!runner->has_prepared_callable(callable_id)) {
+    if (!runner->has_callable(callable_id)) {
         LOG_ERROR("run_prepared: callable_id=%d not prepared", callable_id);
         return -1;
     }
@@ -390,18 +388,18 @@ int run_prepared(
 
         // Restore kernel addrs + orch symbol names + active_callable_id; the
         // returned host_orch_func_ptr is non-null only on the hbg path and is
-        // handed straight into bind_prepared_to_runtime_impl below. signature
+        // handed straight into bind_callable_to_runtime_impl below. signature
         // is the cached ChipCallable signature_[]; it's plumbed end-to-end for
         // per-tensor direction decisions in runtime_maker but is currently
-        // unconsumed on both runtimes — see bind_prepared_to_runtime_impl.
-        auto bind_result = runner->bind_prepared_callable_to_runtime(*r, callable_id);
+        // unconsumed on both runtimes — see bind_callable_to_runtime_impl.
+        auto bind_result = runner->bind_callable_to_runtime(*r, callable_id);
         if (bind_result.rc != 0) {
             r->~Runtime();
             return bind_result.rc;
         }
 
         // Per-run binding (tensor args, GM heap, SM alloc)
-        rc = bind_prepared_to_runtime_impl(
+        rc = bind_callable_to_runtime_impl(
             r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
             bind_result.signature, bind_result.sig_count
         );
@@ -443,7 +441,7 @@ int run_prepared(
 int unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     if (ctx == NULL) return -1;
     try {
-        return static_cast<DeviceRunner *>(ctx)->unregister_prepared_callable(callable_id);
+        return static_cast<DeviceRunner *>(ctx)->unregister_callable(callable_id);
     } catch (...) {
         return -1;
     }

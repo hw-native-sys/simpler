@@ -1115,8 +1115,8 @@ class TestLifecycle:
 
     def test_prepare_overflow_raises(self):
         # The AICPU side reserves a fixed-size orch_so_table_[MAX_REGISTERED_CALLABLE_IDS];
-        # Worker.register must surface the bound at prepare-time, not later when
-        # DeviceRunner::register_prepared_callable rejects the cid.
+        # Worker.register must surface the bound at register-time, not later when
+        # DeviceRunner::register_callable rejects the private slot.
         hw = Worker(level=3, num_sub_workers=0)
         try:
             for i in range(MAX_REGISTERED_CALLABLE_IDS):

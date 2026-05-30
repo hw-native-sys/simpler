@@ -169,7 +169,6 @@ def pytest_addoption(parser):
         default=False,
         help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
     )
-    parser.addoption("--build", action="store_true", default=False, help="Compile runtime from source")
     parser.addoption(
         "--pto-isa-commit",
         action="store",
@@ -966,7 +965,6 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
 
     level = cls._st_level
     runtime = cls._st_runtime
-    build = request.config.getoption("--build", default=False)
 
     if level == 2:
         # L2 share: reuse any Worker already created for this runtime in the
@@ -990,7 +988,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
         key = (runtime, dev_id)
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime, build=build)
+        w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime)
         w._st_device_id = dev_id
         w.init()
         _l2_worker_pool[key] = w
@@ -1014,7 +1012,6 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
             num_sub_workers=max_subs,
             platform=st_platform,
             runtime=runtime,
-            build=build,
         )
         w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
 

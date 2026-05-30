@@ -92,7 +92,7 @@ struct KernelArgs {
                                         // Allocated by host's ScopeStatsCollector, read+written by AICPU's
                                         // scope_stats_collector via set_platform_scope_stats_base.
     uint64_t aicore_ring_addr{0};       // Device ptr to a uint64_t[num_aicore] table holding each core's
-                                        // L2PerfAicoreRing address. AICore kernel entry indexes by block_idx
+                                        // L2PerfAicoreBuffer address. AICore kernel entry indexes by block_idx
                                         // and forwards into platform set/get state. 0 when L2 swimlane is off.
     uint32_t log_level{1};              // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
     uint32_t log_info_v{5};             // INFO verbosity threshold (0..9); default V5

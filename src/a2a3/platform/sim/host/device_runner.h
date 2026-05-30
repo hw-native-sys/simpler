@@ -257,20 +257,20 @@ public:
      */
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
 
-    int register_prepared_callable(
+    int register_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
         const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
-    // Host-orchestration sibling of register_prepared_callable; see
+    // Host-orchestration sibling of register_callable; see
     // src/a2a3/platform/onboard/host/device_runner.h for the contract. Sim
     // shares the host-only dlopen path verbatim (no AICPU side effects).
-    int register_prepared_callable_host_orch(
+    int register_callable_host_orch(
         int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
-    int unregister_prepared_callable(int32_t callable_id);
-    bool has_prepared_callable(int32_t callable_id) const;
-    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    int unregister_callable(int32_t callable_id);
+    bool has_callable(int32_t callable_id) const;
+    BindCallableResult bind_callable_to_runtime(Runtime &runtime, int32_t callable_id);
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
@@ -341,7 +341,7 @@ private:
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
     // Per-callable_id prepared state. Mirrors onboard.
-    struct PreparedCallableState {
+    struct CallableState {
         // trb path
         uint64_t hash{0};
         uint64_t dev_orch_so_addr{0};
@@ -360,7 +360,7 @@ private:
         size_t capacity{0};
         int refcount{0};
     };
-    std::unordered_map<int32_t, PreparedCallableState> prepared_callables_;
+    std::unordered_map<int32_t, CallableState> callables_;
     std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     size_t aicpu_dlopen_total_{0};
@@ -412,9 +412,9 @@ private:
 
     /**
      * Stamp `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` from the
-     * PreparedCallableState for `runtime.get_active_callable_id()`. Identical
+     * CallableState for `runtime.get_active_callable_id()`. Identical
      * contract to the onboard version: bytes were staged at
-     * `register_prepared_callable` time, so this is metadata-only — no copy.
+     * `register_callable` time, so this is metadata-only — no copy.
      */
     int prepare_orch_so(Runtime &runtime);
 

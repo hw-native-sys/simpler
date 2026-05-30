@@ -143,7 +143,7 @@ class TestPreparedCallableHbg(SceneTestCase):
     # ------------------------------------------------------------------
     # host_dlopen_count assertions (hbg path).
     #
-    # hbg increments host_dlopen_count on every register_prepared_callable_host_orch
+    # hbg increments host_dlopen_count on every register_callable_host_orch
     # invocation (i.e. each private slot prepare), independent of how many
     # times run is invoked afterwards. AICPU never dlopens the orch
     # SO on this variant, so aicpu_dlopen_count stays at 0.

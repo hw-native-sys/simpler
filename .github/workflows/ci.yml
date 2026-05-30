@@ -474,6 +474,23 @@ jobs:
               --resource-spec-file $PWD/tests/ut/cpp/build/resources.json \
               -j$(nproc) --output-on-failure
 
+      - name: Build cann-examples/query (CANN host-API smoke)
+        run: |
+          cd tools/cann-examples/query
+          cmake -B build .
+          cmake --build build
+          ./build/query version
+
+      - name: Build cann-examples/aicpu-device-query (device-side HAL probe smoke)
+        run: |
+          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
+          cd tools/cann-examples/aicpu-device-query/device
+          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
+          cmake --build build
+          cd ../host
+          cmake -B build .
+          cmake --build build
+
   # ---------- Scene tests (a2a3 hardware) ----------
   st-onboard-a2a3:
     needs: detect-changes
@@ -618,6 +635,23 @@ jobs:
           "
           DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a5)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure"
+
+      - name: Build cann-examples/query (CANN host-API smoke)
+        run: |
+          cd tools/cann-examples/query
+          cmake -B build .
+          cmake --build build
+          ./build/query version
+
+      - name: Build cann-examples/aicpu-device-query (device-side HAL probe smoke)
+        run: |
+          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
+          cd tools/cann-examples/aicpu-device-query/device
+          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
+          cmake --build build
+          cd ../host
+          cmake -B build .
+          cmake --build build
 
   st-onboard-a5:
     needs: detect-changes

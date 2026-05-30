@@ -1,6 +1,6 @@
 # Platform Backends (a5)
 
-Two platform backends under `src/a5/platform/`, providing different execution environments for the same runtime code.
+Two platform backends under `src/a5/platform/`, providing different execution environments for the same runtime code. For the underlying chip hardware layout (die / device-id mapping, AICPU and AICore counts, host bus), see [hardware.md](hardware.md).
 
 ## Comparison
 

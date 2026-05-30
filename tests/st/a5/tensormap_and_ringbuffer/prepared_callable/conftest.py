@@ -35,7 +35,6 @@ def st_worker(request, st_platform, device_pool):
         pytest.skip("isolated st_worker requires a SceneTestCase subclass")
 
     runtime = cls._st_runtime
-    build = request.config.getoption("--build", default=False)
 
     ids = device_pool.allocate(1)
     if not ids:
@@ -49,7 +48,6 @@ def st_worker(request, st_platform, device_pool):
             device_id=dev_id,
             platform=st_platform,
             runtime=runtime,
-            build=build,
         )
         w.init()
         try:
