@@ -56,63 +56,10 @@ static int prof_free_cb(void *dev_ptr) { return rtFree(dev_ptr); }
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
-int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
-    // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
-    // runtime arena. Split out from a single large allocation because the
-    // combined size can exceed the device allocator's largest contiguous
-    // block. Each arena commits exactly one region, so its base() is the
-    // pooled pointer the caller wants.
-    //
-    // Idempotent for the production case (sizes do not change across a
-    // worker's lifetime). If a caller asks for a larger layout on any
-    // region, redo just that region — already-committed peers stay alive
-    // so their callers don't have to re-acquire.
-    auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
-        if (requested_size == 0) {
-            // hbg's runtime_arena path: caller passed 0 and never reserved
-            // a region. Leave the arena uncommitted; acquire_pooled_* will
-            // return nullptr.
-            if (arena.is_committed() && cached_size != 0) {
-                arena.release();
-                cached_size = 0;
-            }
-            return 0;
-        }
-        if (arena.is_committed() && requested_size <= cached_size) {
-            return 0;
-        }
-        arena.release();
-        cached_size = 0;
-        arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
-        if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-            // commit() failure leaves committed_=false, so the next entry's
-            // is_committed() guard skips the release branch. release() is
-            // idempotent on a never-committed arena (zeroes cursor_).
-            arena.release();
-            return -1;
-        }
-        cached_size = requested_size;
-        return 0;
-    };
-    if (commit_region(gm_heap_arena_, cached_gm_heap_size_, gm_heap_size) != 0) return -1;
-    if (commit_region(gm_sm_arena_, cached_gm_sm_size_, gm_sm_size) != 0) {
-        gm_heap_arena_.release();
-        cached_gm_heap_size_ = 0;
-        return -1;
-    }
-    if (commit_region(runtime_arena_pool_, cached_runtime_arena_size_, runtime_arena_size) != 0) {
-        gm_heap_arena_.release();
-        gm_sm_arena_.release();
-        cached_gm_heap_size_ = 0;
-        cached_gm_sm_size_ = 0;
-        return -1;
-    }
-    return 0;
-}
-
-// `create_thread`, `attach_current_thread`, `configure_aicore_op_timeout`,
-// `ensure_device_initialized`, `ensure_binaries_loaded`, `query_max_block_dim`,
-// and `validate_block_dim` live on `DeviceRunnerBase` — see
+// `setup_static_arena`, `create_thread`, `attach_current_thread`,
+// `configure_aicore_op_timeout`, `ensure_device_initialized`,
+// `ensure_binaries_loaded`, `query_max_block_dim`, and `validate_block_dim`
+// live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
 int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
@@ -468,54 +415,7 @@ int DeviceRunner::finalize() {
     return rc;
 }
 
-// `launch_aicpu_kernel` lives on `DeviceRunnerBase`.
-
-int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
-    // Lazy-register the AICore binary on first call; reuse cached handle
-    // thereafter. CANN has no public rtUnregisterAllKernel, so re-registering
-    // every run would pin another device-side copy of the ELF (~365KB on a5)
-    // and quickly exhaust HBM — surfaced in CI as 207001 at
-    // rtKernelLaunchWithHandleV2 with a 507899 cascade at rtStreamCreate.
-    if (aicore_bin_handle_ == nullptr) {
-        if (aicore_kernel_binary_.empty()) {
-            LOG_ERROR("AICore kernel binary is empty");
-            return -1;
-        }
-        rtDevBinary_t binary;
-        std::memset(&binary, 0, sizeof(binary));
-        binary.magic = RT_DEV_BINARY_MAGIC_ELF;
-        binary.version = 0;
-        binary.data = aicore_kernel_binary_.data();
-        binary.length = aicore_kernel_binary_.size();
-        int rc = rtRegisterAllKernel(&binary, &aicore_bin_handle_);
-        if (rc != RT_ERROR_NONE) {
-            LOG_ERROR("rtRegisterAllKernel failed: %d", rc);
-            aicore_bin_handle_ = nullptr;
-            return rc;
-        }
-    }
-
-    struct Args {
-        KernelArgs *k_args;
-    };
-    // Pass device address of KernelArgs to AICore (KERNEL_ENTRY signature).
-    Args args = {k_args};
-    rtArgsEx_t rt_args;
-    std::memset(&rt_args, 0, sizeof(rt_args));
-    rt_args.args = &args;
-    rt_args.argsSize = sizeof(args);
-
-    rtTaskCfgInfo_t cfg = {};
-    cfg.schemMode = RT_SCHEM_MODE_BATCH;
-
-    int rc = rtKernelLaunchWithHandleV2(aicore_bin_handle_, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
-    if (rc != RT_ERROR_NONE) {
-        LOG_ERROR("rtKernelLaunchWithHandleV2 failed: %d", rc);
-        return rc;
-    }
-
-    return rc;
-}
+// `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
 void DeviceRunner::finalize_collectors() {
     if (l2_perf_collector_.is_initialized()) {

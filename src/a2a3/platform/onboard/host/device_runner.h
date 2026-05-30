@@ -83,22 +83,13 @@ public:
     DeviceRunner() = default;
     ~DeviceRunner();
 
-    /**
-     * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
-     * memory, trb prebuilt runtime arena) as three independent device
-     * allocations. Must be called before any acquire_pooled_*. Idempotent
-     * on identical sizes. `runtime_arena_size` is 0 for the hbg path (no
-     * prebuilt runtime arena) — the corresponding arena stays uncommitted.
-     * Returns 0 on success, -1 on failure.
-     *
-     * `allocate_tensor`, `free_tensor`, `copy_to_device`, `copy_from_device`,
-     * `acquire_pooled_{gm_heap,gm_sm,runtime_arena}`, `create_thread`,
-     * `attach_current_thread`, `ensure_device_initialized`,
-     * `print_handshake_results`, `set_executors`, `set_dispatcher_binary`,
-     * `device_id`, and `last_device_wall_ns` are inherited from
-     * `DeviceRunnerBase`.
-     */
-    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    // `setup_static_arena`, `allocate_tensor`, `free_tensor`,
+    // `copy_to_device`, `copy_from_device`,
+    // `acquire_pooled_{gm_heap,gm_sm,runtime_arena}`, `create_thread`,
+    // `attach_current_thread`, `ensure_device_initialized`,
+    // `print_handshake_results`, `set_executors`, `set_dispatcher_binary`,
+    // `device_id`, `last_device_wall_ns`, `launch_aicpu_kernel`, and
+    // `launch_aicore_kernel` are inherited from `DeviceRunnerBase`.
 
     /**
      * Execute a runtime
@@ -142,20 +133,6 @@ public:
      * @return 0 on success, error code on failure
      */
     int finalize();
-
-    // `launch_aicpu_kernel` lives on `DeviceRunnerBase`.
-
-    /**
-     * Launch an AICore kernel
-     *
-     * Internal method used by run(). Can be called directly for custom
-     * workflows.
-     *
-     * @param stream  AICore stream
-     * @param k_args  Pointer to kernel arguments (includes runtime, ffts_base_addr, etc.)
-     * @return 0 on success, error code on failure
-     */
-    int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
 
     // `upload_chip_callable_buffer` is inherited from `DeviceRunnerBase`.
 
@@ -203,16 +180,9 @@ public:
 private:
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // worker_count_, executor + dispatcher bytes, aicore_bin_handle_,
-    // load_aicpu_op_, mem_alloc_, the three DeviceArenas, persistent
-    // AICPU/AICore streams, kernel_args_, device_wall_*, device_args_,
-    // binaries_loaded_) is inherited from `DeviceRunnerBase`.
-    //
-    // Arena cached sizes for setup_static_arena's "fits" check — avoids
-    // re-allocating the same buffer when a later worker init asks for an
-    // equal-or-smaller layout on an already-committed arena.
-    size_t cached_gm_heap_size_{0};
-    size_t cached_gm_sm_size_{0};
-    size_t cached_runtime_arena_size_{0};
+    // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
+    // sizes, persistent AICPU/AICore streams, kernel_args_, device_wall_*,
+    // device_args_, binaries_loaded_) is inherited from `DeviceRunnerBase`.
 
     // Group D state (`chip_callable_buffers_`, `callables_`,
     // `orch_so_dedup_`, `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,

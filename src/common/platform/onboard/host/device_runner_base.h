@@ -84,6 +84,27 @@ public:
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
 
     /**
+     * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2
+     * shared memory, trb prebuilt runtime arena) as three independent
+     * device allocations. Must be called before any `acquire_pooled_*`.
+     * Idempotent on identical (or smaller) sizes; an equal-or-smaller
+     * follow-up request leaves the arena untouched. `runtime_arena_size`
+     * is 0 for the hbg path (no prebuilt runtime arena) — the
+     * corresponding arena stays uncommitted.
+     *
+     * On failure to commit a later region, earlier committed regions are
+     * rolled back (a5's prior semantics). This is the safer default: a
+     * partial commit otherwise leaves the caller with pooled pointers
+     * that survive a "failure" return, masking the real error and risking
+     * later mismatched-arena bugs. (The a2a3 implementation that
+     * previously kept earlier committed peers alive on failure is
+     * normalized away.)
+     *
+     * @return 0 on success, -1 on failure.
+     */
+    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+
+    /**
      * Return the pooled GM heap / PTO2 SM / runtime arena base pointer.
      * `setup_static_arena` (arch subclass) must have already committed
      * the relevant region; otherwise returns nullptr. The runtime arena
@@ -295,6 +316,23 @@ public:
      * @return 0 on success, error code on failure
      */
     int launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num);
+
+    /**
+     * Launch an AICore kernel. Lazy-registers the kernel binary
+     * (`aicore_kernel_binary_`) on first call via `rtRegisterAllKernel`
+     * and caches the resulting `aicore_bin_handle_`; subsequent calls
+     * reuse the cached handle. CANN has no public
+     * `rtUnregisterAllKernel`, so re-registering on every run would pin
+     * another device-side copy of the ELF and quickly exhaust HBM —
+     * manifested in CI as 207001 at `rtKernelLaunchWithHandleV2` with a
+     * 507899 cascade at `rtStreamCreate`.
+     *
+     * `k_args` reaches the AICore kernel through `rtArgsEx_t`; whether
+     * it is a host-resident or device-resident `KernelArgs` pointer is
+     * decided by the subclass's `run()` (a2a3 passes host; a5 passes
+     * device).
+     */
+    int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
 
     /**
      * Enablement setters for the four shared diagnostics sub-features.
@@ -529,6 +567,14 @@ protected:
     DeviceArena gm_heap_arena_;
     DeviceArena gm_sm_arena_;
     DeviceArena runtime_arena_pool_;
+
+    // Cached arena sizes for `setup_static_arena`'s "fits" check — avoids
+    // re-allocating the same buffer when a later worker init asks for an
+    // equal-or-smaller layout on an already-committed arena. Reset by
+    // the subclass's `finalize()` alongside the other identity state.
+    size_t cached_gm_heap_size_{0};
+    size_t cached_gm_sm_size_{0};
+    size_t cached_runtime_arena_size_{0};
 
     // Persistent AICPU / AICore streams created in
     // `ensure_device_initialized()` and torn down in the subclass's
