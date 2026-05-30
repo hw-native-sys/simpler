@@ -14,7 +14,7 @@
 
 #include <stdint.h>
 
-#include "aicore_completion_mailbox.h"
+#include "aicore_completion_mailbox_types.h"
 
 // CompletionToken is the runtime-internal POD that backend submit handlers
 // produce and the generic register_completion_condition() consumes. It is the

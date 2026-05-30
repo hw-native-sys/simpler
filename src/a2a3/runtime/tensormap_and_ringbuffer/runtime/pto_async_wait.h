@@ -28,14 +28,11 @@ struct PTO2LocalReadyBuffer;
 struct CompletionStats;
 
 inline constexpr int32_t MAX_ASYNC_WAITS = 64;
-inline constexpr int32_t MAX_PENDING_COMPLETIONS = 128;
 
-inline bool aicore_completion_mailbox_has_pending(volatile AICoreCompletionMailbox *aicore_mailbox) {
-    if (aicore_mailbox == nullptr) return false;
-    uint64_t head = __atomic_load_n(&aicore_mailbox->head, __ATOMIC_ACQUIRE);
-    uint64_t tail = __atomic_load_n(&aicore_mailbox->tail, __ATOMIC_ACQUIRE);
-    return tail < head;
-}
+// The mailbox transport (has_pending / try_push_condition /
+// try_push_normal_done / try_pop) lives as AICoreCompletionMailbox member
+// functions in aicore_completion_mailbox.h. This file only holds the
+// application layer: translating drained messages into wait-list state.
 
 inline uintptr_t mailbox_cache_line(const volatile void *addr) {
     return reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
@@ -124,13 +121,6 @@ struct AsyncWaitEntry {
     bool normal_done{false};
 };
 
-struct PendingCompletion {
-    PTO2TaskId task_token{PTO2TaskId::invalid()};
-    uint64_t addr{0};
-    uint32_t expected_value{0};
-    AsyncEngine engine{ASYNC_ENGINE_SDMA};
-};
-
 struct AsyncPollResult {
     int32_t completed{0};
     int32_t error_code{PTO2_ERROR_NONE};
@@ -156,8 +146,11 @@ struct AsyncWaitList {
     std::atomic<int32_t> busy{0};
     AsyncWaitEntry entries[MAX_ASYNC_WAITS];
     int32_t count{0};
-    PendingCompletion pending_completions[MAX_PENDING_COMPLETIONS];
-    int32_t pending_completion_count{0};
+    // Diagnostic: counts every FIN-side try_push that hit a full mailbox.
+    // Expected to stay zero on real workloads (ring is 4096 entries); a
+    // non-zero value means consumers are too slow or the ring is undersized.
+    // Read by scheduler shutdown / l2 perf summary; not on the hot path.
+    std::atomic<uint64_t> mpsc_skipped_count{0};
 
     bool try_lock() {
         int32_t expected = 0;
@@ -173,91 +166,105 @@ struct AsyncWaitList {
         return nullptr;
     }
 
-    int32_t
-    drain_aicore_completion_mailbox_locked(volatile AICoreCompletionMailbox *aicore_mailbox, int32_t &error_code) {
+    // Captures the side-channel a scheduler-aware drain needs to complete
+    // NotDeferred tasks inline (without storing a transient entry in
+    // entries[]).
+    struct DrainCompletionSink {
+        PTO2SchedulerState *sched{nullptr};
+        PTO2LocalReadyBuffer *local_bufs{nullptr};
+        PTO2TaskSlotState **deferred_release_slot_states{nullptr};
+        int32_t *deferred_release_count{nullptr};
+        int32_t deferred_release_capacity{0};
+        int32_t inline_completed{0};
+#if PTO2_SCHED_PROFILING
+        int32_t thread_idx{0};
+#endif
+
+        bool can_inline_complete() const { return sched != nullptr; }
+    };
+
+    // Inline-complete a NotDeferred task during drain. Returns false on
+    // deferred_release_slot_states overflow.
+    bool try_inline_complete_locked(DrainCompletionSink &sink, PTO2TaskSlotState &slot_state);
+
+    // Single-consumer drain: pop each published message in tail order and
+    // translate it into wait-list state. An empty sink (sched == nullptr) just
+    // materializes entries; a sched-aware sink additionally inline-completes
+    // lonely NotDeferred NORMAL_DONEs without ever growing entries[].
+    int32_t drain_aicore_completion_mailbox_locked(
+        AICoreCompletionMailbox *aicore_mailbox, DrainCompletionSink &sink, int32_t &error_code
+    ) {
         error_code = PTO2_ERROR_NONE;
         if (aicore_mailbox == nullptr) return 0;
 
         int32_t drained = 0;
-        while (true) {
-            uint64_t tail = __atomic_load_n(&aicore_mailbox->tail, __ATOMIC_ACQUIRE);
-            uint64_t head_snapshot = __atomic_load_n(&aicore_mailbox->head, __ATOMIC_ACQUIRE);
-            if (tail >= head_snapshot) break;
-
-            while (tail < head_snapshot) {
-                volatile AICoreCompletionMailboxMessage *slot =
-                    &aicore_mailbox->entries[tail & AICORE_COMPLETION_MAILBOX_MASK];
-                uint64_t expected_seq = tail + 1;
-                uint64_t seq = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
-                if (seq != expected_seq) return drained;
-
-                PTO2TaskId token{slot->task_token.raw};
-                uint64_t addr = slot->addr;
-                uint32_t expected_value = slot->expected_value;
-                AsyncEngine engine = static_cast<AsyncEngine>(slot->engine);
-
-                __atomic_store_n(&slot->seq, 0, __ATOMIC_RELEASE);
-                __atomic_store_n(&aicore_mailbox->tail, tail + 1, __ATOMIC_RELEASE);
-                drained++;
-                tail++;
-
-                AsyncWaitEntry *entry = find_entry_by_token(token);
-                if (entry != nullptr) {
-                    if (entry->condition_count >= MAX_COMPLETIONS_PER_TASK) {
-                        error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
+        AICoreCompletionMsgView msg;
+        // try_pop is the transport layer (seq-gated, in-order dequeue); this
+        // loop is the application layer (translate each message into wait-list
+        // state). try_pop returns false at the first gap or when empty.
+        while (aicore_mailbox->try_pop(msg)) {
+            drained++;
+            if (msg.kind == MSG_KIND_CONDITION) {
+                AsyncWaitEntry *entry = find_entry_by_token(msg.task_token);
+                if (entry == nullptr) {
+                    // First message for this task — materialize the entry here.
+                    // slot_state stays null until the matching TASK_NORMAL_DONE
+                    // sentinel arrives.
+                    if (count >= MAX_ASYNC_WAITS) {
+                        error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
                         return drained;
                     }
-                    CompletionCondition &cond = entry->conditions[entry->condition_count++];
-                    cond.engine = engine;
-                    cond.completion_type = COMPLETION_TYPE_COUNTER;
-                    cond.satisfied = false;
-                    cond.retired = false;
-                    cond.addr = addr;
-                    cond.counter_addr = reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(addr));
-                    cond.expected_value = expected_value;
-                    entry->waiting_completion_count++;
-                    continue;
+                    entry = &entries[count++];
+                    entry->task_token = msg.task_token;
+                    entry->slot_state = nullptr;
+                    entry->condition_count = 0;
+                    entry->waiting_completion_count = 0;
+                    entry->normal_done = false;
                 }
-
-                if (pending_completion_count >= MAX_PENDING_COMPLETIONS) {
-                    error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
+                if (!append_condition_locked(
+                        *entry, msg.addr, msg.expected_value, static_cast<AsyncEngine>(msg.engine), msg.completion_type,
+                        error_code
+                    )) {
                     return drained;
                 }
-                PendingCompletion &pending = pending_completions[pending_completion_count++];
-                pending.task_token = token;
-                pending.addr = addr;
-                pending.expected_value = expected_value;
-                pending.engine = engine;
+            } else if (msg.kind == MSG_KIND_TASK_NORMAL_DONE) {
+                PTO2TaskSlotState *slot_state_ptr =
+                    reinterpret_cast<PTO2TaskSlotState *>(static_cast<uintptr_t>(msg.addr));
+                AsyncWaitEntry *entry = find_entry_by_token(msg.task_token);
+                if (entry == nullptr) {
+                    // Producers strictly order: all CONDITIONs for token T are
+                    // pushed before the matching NORMAL_DONE (the acq_rel on
+                    // on_subtask_complete enforces this across producers). So
+                    // observing NORMAL_DONE first => the task registered no
+                    // conditions => NotDeferred. Complete it inline when the
+                    // sink allows; otherwise fall back to the entry-store path.
+                    if (sink.can_inline_complete()) {
+                        (void)try_inline_complete_locked(sink, *slot_state_ptr);
+                        continue;
+                    }
+                    if (count >= MAX_ASYNC_WAITS) {
+                        error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
+                        return drained;
+                    }
+                    entry = &entries[count++];
+                    entry->task_token = msg.task_token;
+                    entry->slot_state = slot_state_ptr;
+                    entry->condition_count = 0;
+                    entry->waiting_completion_count = 0;
+                    entry->normal_done = true;
+                } else {
+                    if (entry->slot_state == nullptr) {
+                        entry->slot_state = slot_state_ptr;
+                    }
+                    entry->normal_done = true;
+                }
+            } else {
+                error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
+                return drained;
             }
         }
         return drained;
     }
-
-    void absorb_pending_completions_locked(AsyncWaitEntry &entry) {
-        int32_t write = 0;
-        for (int32_t i = 0; i < pending_completion_count; i++) {
-            if (pending_completions[i].task_token == entry.task_token) {
-                if (entry.condition_count < MAX_COMPLETIONS_PER_TASK) {
-                    CompletionCondition &cond = entry.conditions[entry.condition_count++];
-                    cond.engine = pending_completions[i].engine;
-                    cond.completion_type = COMPLETION_TYPE_COUNTER;
-                    cond.satisfied = false;
-                    cond.retired = false;
-                    cond.addr = pending_completions[i].addr;
-                    cond.counter_addr =
-                        reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(pending_completions[i].addr));
-                    cond.expected_value = pending_completions[i].expected_value;
-                    entry.waiting_completion_count++;
-                }
-            } else {
-                if (write != i) pending_completions[write] = pending_completions[i];
-                write++;
-            }
-        }
-        pending_completion_count = write;
-    }
-
-    enum class RegisterResult { Registered, NotDeferred, Skipped, Error };
 
     bool append_condition_locked(
         AsyncWaitEntry &entry, uint64_t addr, uint32_t expected_value, AsyncEngine engine, int32_t completion_type,
@@ -281,84 +288,9 @@ struct AsyncWaitList {
         return true;
     }
 
-    RegisterResult
-    register_deferred(PTO2TaskSlotState &slot_state, const AsyncCtx &async_ctx, bool normal_done, int32_t &error_code) {
-        error_code = PTO2_ERROR_NONE;
-        if (slot_state.payload == nullptr) {
-            return RegisterResult::NotDeferred;
-        }
-
-        if (!try_lock()) return RegisterResult::Skipped;
-
-        uint32_t deferred_count = 0;
-        if (async_ctx.completion_count != nullptr) {
-            if (async_ctx.completion_error_code != nullptr) {
-                if (*async_ctx.completion_error_code != PTO2_ERROR_NONE) {
-                    error_code = *async_ctx.completion_error_code;
-                    unlock();
-                    return RegisterResult::Error;
-                }
-            }
-            deferred_count = *async_ctx.completion_count;
-        }
-        if (deferred_count > async_ctx.completion_capacity) {
-            error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
-            unlock();
-            return RegisterResult::Error;
-        }
-        if (deferred_count > 0) {
-            if (async_ctx.completion_entries == nullptr) {
-                error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
-                unlock();
-                return RegisterResult::Error;
-            }
-        }
-        AsyncWaitEntry *entry = find_entry_by_token(slot_state.task->task_id);
-        if (entry == nullptr && deferred_count == 0) {
-            unlock();
-            return RegisterResult::NotDeferred;
-        }
-        if (entry == nullptr) {
-            if (count >= MAX_ASYNC_WAITS) {
-                error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
-                unlock();
-                return RegisterResult::Error;
-            }
-            entry = &entries[count++];
-            entry->slot_state = &slot_state;
-            entry->task_token = slot_state.task->task_id;
-            entry->condition_count = 0;
-            entry->waiting_completion_count = 0;
-            entry->normal_done = false;
-        }
-        if (normal_done) {
-            entry->normal_done = true;
-        }
-
-        for (uint32_t i = 0; i < deferred_count; ++i) {
-            volatile DeferredCompletionEntry *deferred = &async_ctx.completion_entries[i];
-            if (deferred->completion_type == COMPLETION_TYPE_COUNTER) {
-                volatile uint32_t *counter =
-                    reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(deferred->addr));
-                cache_invalidate_range(reinterpret_cast<const void *>(mailbox_cache_line(counter)), sizeof(uint32_t));
-            }
-            if (!append_condition_locked(
-                    *entry, deferred->addr, deferred->expected_value, static_cast<AsyncEngine>(deferred->engine),
-                    deferred->completion_type, error_code
-                )) {
-                unlock();
-                return RegisterResult::Error;
-            }
-        }
-
-        absorb_pending_completions_locked(*entry);
-        unlock();
-        return RegisterResult::Registered;
-    }
-
     template <bool Profiling>
     AsyncPollResult poll_and_complete(
-        volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
+        AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
         PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
         int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING

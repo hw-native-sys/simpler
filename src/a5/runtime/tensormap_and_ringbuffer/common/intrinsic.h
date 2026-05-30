@@ -52,7 +52,7 @@
 
 #include <stdint.h>
 
-#include "aicore_completion_mailbox.h"
+#include "aicore_completion_mailbox_types.h"
 #include "pto_task_id.h"
 
 #ifndef __gm__

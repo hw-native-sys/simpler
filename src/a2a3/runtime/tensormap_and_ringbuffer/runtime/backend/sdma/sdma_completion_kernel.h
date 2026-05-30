@@ -18,7 +18,7 @@
 #include <pto/npu/comm/async/sdma/sdma_async_intrin.hpp>
 
 #include "pto_async_kernel_api.h"
-#include "aicore_completion_mailbox.h"
+#include "aicore_completion_mailbox_types.h"
 #include "pto_runtime_status.h"
 
 #ifndef __aicore__

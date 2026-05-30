@@ -14,7 +14,7 @@
 
 #include <stdint.h>
 
-#include "aicore_completion_mailbox.h"
+#include "aicore_completion_mailbox_types.h"
 #include "pto_runtime_status.h"
 
 // CompletionToken is the runtime-internal POD that backend submit handlers

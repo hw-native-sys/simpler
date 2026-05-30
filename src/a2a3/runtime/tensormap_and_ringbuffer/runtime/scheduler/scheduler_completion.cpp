@@ -80,33 +80,71 @@ void SchedulerContext::complete_slot_task(
 #else
     (void)hank;
 #endif
-    bool mixed_complete = sched_->on_subtask_complete(slot_state);
-    if (slot_state.payload != nullptr) {
-        int32_t reg_err = PTO2_ERROR_NONE;
-        AsyncWaitList::RegisterResult reg_result;
-        volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
-        AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
-        do {
-            reg_result = sched_->async_wait_list.register_deferred(slot_state, async_ctx, mixed_complete, reg_err);
-            if (reg_result == AsyncWaitList::RegisterResult::Skipped) {
-                SPIN_WAIT_HINT();
-            }
-        } while (reg_result == AsyncWaitList::RegisterResult::Skipped);
+    // MPSC fast-path is opt-in per task: only tasks with at least one subtask
+    // that registered a deferred condition route through the mailbox. Pure
+    // non-deferred tasks complete inline on this thread (matching pre-MPSC
+    // behavior — keeps the common case parallelized across scheduler threads
+    // instead of serializing through the single consumer). The
+    // any_subtask_deferred flag on slot_state is the discriminator; it's set
+    // (release) before on_subtask_complete and read (acquire) after, so the
+    // last subtask sees flag writes from any earlier subtask of the same task.
+    AICoreCompletionMailbox *mailbox = rt_ != nullptr ? rt_->aicore_mailbox : nullptr;
+    bool defer_completion_to_consumer = false;
 
-        if (reg_result == AsyncWaitList::RegisterResult::Error) {
+    if (slot_state.payload != nullptr) {
+        volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
+        int32_t slab_err = deferred_slab->error_code;
+        if (slab_err != PTO2_ERROR_NONE) {
             int32_t expected = PTO2_ERROR_NONE;
             sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
+                expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
             );
             completed_.store(true, std::memory_order_release);
             return;
         }
 
-        if (mixed_complete && reg_result == AsyncWaitList::RegisterResult::Registered) {
+        uint32_t cond_count = deferred_slab->count;
+        if (cond_count > MAX_COMPLETIONS_PER_TASK) {
+            int32_t expected = PTO2_ERROR_NONE;
+            sched_->sm_header->sched_error_code.compare_exchange_strong(
+                expected, PTO2_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire
+            );
+            completed_.store(true, std::memory_order_release);
             return;
         }
+
+        if (cond_count > 0) {
+            // Publish "this task is deferred" before on_subtask_complete so the
+            // acq_rel fetch_add inside on_subtask_complete makes the flag
+            // visible to whichever subtask sees mixed_complete=true (which may
+            // be this thread or a later one).
+            slot_state.any_subtask_deferred.store(true, std::memory_order_release);
+
+            const PTO2TaskId token = slot_state.task->task_id;
+            for (uint32_t i = 0; i < cond_count; ++i) {
+                volatile DeferredCompletionEntry *e = &deferred_slab->entries[i];
+                while (!mailbox->try_push_condition(token, e->addr, e->expected_value, e->engine, e->completion_type)) {
+                    sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
+                    SPIN_WAIT_HINT();
+                }
+            }
+        }
     }
-    if (mixed_complete) {
+
+    bool mixed_complete = sched_->on_subtask_complete(slot_state);
+
+    if (mixed_complete && slot_state.payload != nullptr &&
+        slot_state.any_subtask_deferred.load(std::memory_order_acquire)) {
+        // Some subtask of this task registered conditions; finish the
+        // registration by handing the slot_state off to the consumer.
+        while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
+            sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
+            SPIN_WAIT_HINT();
+        }
+        defer_completion_to_consumer = true;
+    }
+
+    if (mixed_complete && !defer_completion_to_consumer) {
 #if PTO2_PROFILING
         if (is_dump_tensor_enabled()) {
             dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(

@@ -18,7 +18,7 @@
 #include <pto/comm/pto_comm_inst.hpp>
 
 #include "intrinsic.h"
-#include "aicore_completion_mailbox.h"
+#include "aicore_completion_mailbox_types.h"
 #include "pto_completion_token.h"
 #include "pto_runtime_status.h"
 
