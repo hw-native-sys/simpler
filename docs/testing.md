@@ -651,6 +651,48 @@ Key fields:
 
 If similar coverage exists in both `examples/` and `tests/st/`, collapse it into a single `test_*.py`: small cases get `platforms: ["a2a3sim", "a2a3"]`; large benchmark cases get `platforms: ["a2a3"], "manual": True`.
 
+## Sanitizer builds (ASAN / TSAN)
+
+Sanitizers instrument **host-compiled** code only — on sim that is the runtime
+(`host`/`aicpu`/`aicore`), the per-test kernels, and orchestration; on onboard
+only the host runtime. Device code (ccec AICore `.o`, aarch64 AICPU) cannot
+carry a host sanitizer, and device custom arenas (`DeviceArena`/`HeapRing`)
+bypass ASAN redzones, so device-side heap bugs are not caught.
+
+It is a two-part flag — **install-time** (which sanitizer the binaries are
+built with) and **run-time** (preload + match):
+
+```bash
+# 1. Build the runtime with the sanitizer (ASAN bundles UBSan).
+pip install --no-build-isolation --config-settings=cmake.define.SIMPLER_SANITIZER=asan .
+
+# 2. Run, preloading the matching runtime (the instrumented .so are dlopen'd
+#    into a vanilla Python, so the sanitizer runtime must come first). Sim
+#    unifies on g++-15, so preload g++-15's runtime — using plain g++'s would
+#    mismatch the kernels' ABI and fail at load.
+LD_PRELOAD=$(g++-15 -print-file-name=libasan.so) \
+ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+pytest examples tests/st --platform a2a3sim --sanitizer asan -v
+```
+
+`--sanitizer` must match the `SIMPLER_SANITIZER` the runtime was installed with;
+it compiles the per-test kernels/orchestration to match and fails fast (with the
+exact `LD_PRELOAD` command) if the runtime isn't preloaded. Presets: `asan`
+(`address,undefined`), `ubsan`, `tsan`; a raw `-fsanitize` token list also works.
+
+**TSAN is a separate, mutually-exclusive build** (cannot coexist with ASAN) and
+is **Linux-only** (no macOS `libtsan`):
+
+```bash
+pip install --no-build-isolation --config-settings=cmake.define.SIMPLER_SANITIZER=tsan .
+LD_PRELOAD=$(g++-15 -print-file-name=libtsan.so) TSAN_OPTIONS=halt_on_error=1 \
+pytest examples tests/st --platform a2a3sim --sanitizer tsan -v
+```
+
+`detect_leaks=0` is recommended initially — LSan false-positives on the device
+custom arenas until suppressions are added.
+
 ## CI Pipeline
 
 See [ci.md](ci.md) for the full CI pipeline documentation, including the job matrix, runner constraints, and marker scheme.

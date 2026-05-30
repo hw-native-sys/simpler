@@ -38,6 +38,7 @@ sys.path.insert(0, str(_project_root / "python"))
 
 from simpler_setup.platform_info import PROJECT_ROOT, discover_runtimes, parse_platform  # noqa: E402
 from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: E402
+from simpler_setup.sanitizers import SANITIZER_PRESETS, resolve, validate  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ def build_all(
     cache_dir: Path,
     platforms: Optional[list] = None,
     clone_protocol: str = "ssh",
+    sanitizer: str = "none",
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -85,10 +87,23 @@ def build_all(
         clone_protocol: Protocol used by ensure_pto_isa_root() when an
             onboard platform needs the pto-isa headers and PTO_ISA_ROOT is
             not pre-set. Mirrors conftest's --clone-protocol flag.
+        sanitizer: Sanitizer preset (asan/ubsan/tsan/none) or raw `-fsanitize`
+            token list. Only host-compiled targets honor it; see
+            BuildTarget.gen_cmake_args.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
     RuntimeBuilder._CACHE_DIR = cache_dir
+
+    # Resolve the preset to `-fsanitize` tokens and stash on RuntimeCompiler so
+    # every host cmake configure below picks it up (default "" = no sanitizer).
+    from simpler_setup.runtime_compiler import RuntimeCompiler  # noqa: PLC0415
+
+    tokens = resolve(sanitizer)
+    validate(tokens)
+    RuntimeCompiler._sanitizers = tokens
+    if tokens:
+        logger.info(f"Building with sanitizers: {tokens} (host targets only)")
 
     if platforms is None:
         platforms = detect_buildable_platforms()
@@ -205,6 +220,15 @@ def main():
             "and PTO_ISA_ROOT is not pre-set (default: ssh, matching conftest)"
         ),
     )
+    parser.add_argument(
+        "--sanitizer",
+        default="none",
+        help=(
+            f"Compiler sanitizer for host-compiled targets. Preset "
+            f"({'/'.join(SANITIZER_PRESETS)}) or a raw -fsanitize token list. "
+            "Default: none. asan/tsan are mutually exclusive (separate builds)."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -229,6 +253,7 @@ def main():
         cache_dir=args.cache_dir,
         platforms=args.platforms,
         clone_protocol=args.clone_protocol,
+        sanitizer=args.sanitizer,
     )
 
 

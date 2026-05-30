@@ -40,3 +40,11 @@ set_target_properties(cpu_sim_context PROPERTIES
     SUFFIX ".so"
     POSITION_INDEPENDENT_CODE ON
 )
+
+# Apply compiler sanitizers to this host-compiled target. No-op unless
+# SIMPLER_SANITIZERS is set at configure time, which runtime_compiler only
+# passes for host toolchains (sim + onboard host). See cmake/sanitizers.cmake.
+if(SIMPLER_SANITIZERS)
+    include("${SIMPLER_CMAKE_DIR}/sanitizers.cmake")
+    simpler_apply_sanitizers(cpu_sim_context)
+endif()

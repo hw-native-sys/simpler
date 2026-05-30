@@ -174,3 +174,11 @@ target_link_directories(host_runtime
 )
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")
+
+# Apply compiler sanitizers to this host-compiled target. No-op unless
+# SIMPLER_SANITIZERS is set at configure time, which runtime_compiler only
+# passes for host toolchains (sim + onboard host). See cmake/sanitizers.cmake.
+if(SIMPLER_SANITIZERS)
+    include("${SIMPLER_CMAKE_DIR}/sanitizers.cmake")
+    simpler_apply_sanitizers(host_runtime)
+endif()

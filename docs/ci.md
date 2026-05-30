@@ -47,6 +47,16 @@ PullRequest
 | `ut-a5` | a5 self-hosted | `pytest tests/ut --platform a5` + `ctest -L "^requires_hardware(_a5)?$"` |
 | `st-onboard-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --device ...` |
 
+### Nightly sanitizer sweep
+
+A **separate** workflow, [`sanitizers.yml`](../.github/workflows/sanitizers.yml),
+runs on a nightly `schedule` — kept out of `ci.yml` so the cron fires only the
+sanitizer jobs, never the PR/self-hosted pipeline. Its
+`sanitizer-sim` job builds the sim runtime + kernels with ASAN or TSAN
+(`pip install --config-settings=cmake.define.SIMPLER_SANITIZER=...`) and runs
+`pytest examples tests/st` under the matching `LD_PRELOAD` (a2a3sim/a5sim,
+ubuntu-only). Not a PR gate; see [testing.md](testing.md#sanitizer-builds-asan--tsan).
+
 ### Parallel ST runs on hardware
 
 For self-hosted jobs with multiple NPUs, pass a `--device` range (and

@@ -1250,6 +1250,15 @@ class SceneTestCase:
             help="Device id or range ('0', '4-7', '0,2,5')",
         )
         parser.add_argument(
+            "--sanitizer",
+            default="none",
+            help=(
+                "Run against sanitizer-built binaries (asan/ubsan/tsan or raw -fsanitize "
+                "tokens). Must match the installed runtime's SIMPLER_SANITIZER and needs "
+                "the runtime preloaded, e.g. LD_PRELOAD=$(g++ -print-file-name=libasan.so)."
+            ),
+        )
+        parser.add_argument(
             "--case",
             action="append",
             default=None,
@@ -1342,6 +1351,27 @@ class SceneTestCase:
         )
         args = parser.parse_args()
         configure_logging(args.log_level)
+
+        # Match the per-test kernel/orchestration compile to the runtime's
+        # sanitizer, and require the runtime preloaded — same as conftest, since
+        # the standalone path skips it.
+        from . import sanitizers as _san  # noqa: PLC0415
+
+        _san_tokens = _san.resolve(args.sanitizer)
+        if _san_tokens:
+            try:
+                _san.validate(_san_tokens)
+            except ValueError as e:
+                parser.error(f"--sanitizer={args.sanitizer}: {e}")
+            from .kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+            KernelCompiler._sanitizers = _san_tokens
+            _lib = _san.preload_lib(_san_tokens)
+            if _lib and not _san.is_runtime_loaded(_lib):
+                parser.error(
+                    f"--sanitizer={args.sanitizer} needs the {_lib} runtime preloaded. Re-run with:\n"
+                    f"  {_san.preload_command(_san_tokens, args.platform)} python {module_name} ..."
+                )
 
         os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(
             commit=args.pto_isa_commit,
@@ -1518,6 +1548,8 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
     script = os.path.abspath(getattr(module, "__file__", sys.argv[0]))
 
     common = ["-p", args.platform, "--manual", args.manual, "--log-level", args.log_level]
+    if args.sanitizer != "none":
+        common += ["--sanitizer", args.sanitizer]
     if args.rounds != 1:
         common += ["--rounds", str(args.rounds)]
     if args.skip_golden:

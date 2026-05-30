@@ -90,6 +90,11 @@ class Toolchain:
     - BuildTarget (in runtime_compiler.py): calls get_cmake_args() for CMake builds
     """
 
+    # Host toolchains can carry a host sanitizer runtime; device toolchains
+    # (ccec / aarch64 cross) run on the NPU and cannot. Overridden to True by
+    # the host compilers (Gxx, Gxx15) below.
+    is_host: bool = False
+
     cxx_path: str
 
     def __init__(self):
@@ -164,6 +169,8 @@ class CCECToolchain(Toolchain):
 class Gxx15Toolchain(Toolchain):
     """g++-15 compiler for simulation kernels."""
 
+    is_host = True
+
     def __init__(self):
         super().__init__()
         self.cxx_path = "g++-15"
@@ -195,11 +202,20 @@ class Gxx15Toolchain(Toolchain):
 
 
 class GxxToolchain(Toolchain):
-    """g++ compiler for host compilation."""
+    """g++ compiler for host compilation.
 
-    def __init__(self):
+    ``prefer_g15`` switches the binary to g++-15/gcc-15. Used under a sanitizer
+    on sim: the runtime, helpers, and orchestration must share the SAME host
+    compiler as the sim kernels (which are always g++-15), because mixing g++
+    and g++-15 sanitizer runtimes is an ABI mismatch that fails at `.so` load.
+    """
+
+    is_host = True
+
+    def __init__(self, prefer_g15: bool = False):
         super().__init__()
-        self.cxx_path = "g++"
+        self.cxx_path = "g++-15" if prefer_g15 else "g++"
+        self._prefer_g15 = prefer_g15
         self._gcc = _is_gcc(self.cxx_path)
 
     def get_compile_flags(self, **kwargs) -> list[str]:
@@ -211,7 +227,7 @@ class GxxToolchain(Toolchain):
         return flags
 
     def get_cmake_args(self) -> list[str]:
-        args = _host_compiler_cmake_args("gcc", self.cxx_path)
+        args = _host_compiler_cmake_args("gcc-15" if self._prefer_g15 else "gcc", self.cxx_path)
         if self.ascend_home_path:
             args.append(f"-DASCEND_HOME_PATH={self.ascend_home_path}")
         return args

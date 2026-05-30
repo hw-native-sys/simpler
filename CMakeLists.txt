@@ -36,6 +36,13 @@ add_subdirectory(python/bindings)
 set(SIMPLER_PTO_CLONE_PROTOCOL "ssh" CACHE STRING
     "Protocol for cloning pto-isa during install (ssh or https)")
 
+# Compiler sanitizer for host-compiled targets (sim runtime/kernels and the
+# onboard host runtime). Default `none`. Preset (asan/ubsan/tsan) or a raw
+# -fsanitize token list. Enable at `pip install` time via
+#   pip install --no-build-isolation --config-settings=cmake.define.SIMPLER_SANITIZER=asan .
+set(SIMPLER_SANITIZER "none" CACHE STRING
+    "Sanitizer for host targets during install (none/asan/ubsan/tsan)")
+
 # Pre-build runtime binaries (persistent build dirs for incremental compilation)
 add_custom_target(build_runtimes ALL
     COMMAND ${Python_EXECUTABLE}
@@ -43,6 +50,7 @@ add_custom_target(build_runtimes ALL
         --lib-dir ${CMAKE_SOURCE_DIR}/build/lib
         --cache-dir ${CMAKE_SOURCE_DIR}/build/cache
         --clone-protocol ${SIMPLER_PTO_CLONE_PROTOCOL}
+        --sanitizer ${SIMPLER_SANITIZER}
     COMMENT "Building runtime binaries (incremental)..."
 )
 
