@@ -491,6 +491,16 @@ jobs:
           cmake -B build .
           cmake --build build
 
+      - name: Build cann-examples/aicpu-kernel-launch (dispatcher bootstrap smoke)
+        run: |
+          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
+          cd tools/cann-examples/aicpu-kernel-launch/device
+          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
+          cmake --build build
+          cd ../host
+          cmake -B build .
+          cmake --build build
+
   # ---------- Scene tests (a2a3 hardware) ----------
   st-onboard-a2a3:
     needs: detect-changes
@@ -647,6 +657,16 @@ jobs:
         run: |
           export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
           cd tools/cann-examples/aicpu-device-query/device
+          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
+          cmake --build build
+          cd ../host
+          cmake -B build .
+          cmake --build build
+
+      - name: Build cann-examples/aicpu-kernel-launch (dispatcher bootstrap smoke)
+        run: |
+          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
+          cd tools/cann-examples/aicpu-kernel-launch/device
           cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
           cmake --build build
           cd ../host

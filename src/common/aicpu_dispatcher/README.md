@@ -39,3 +39,15 @@ dlsym's all three at load time, but only DynInit does real work:
 
 See `aicpu_dispatcher.h` for the bootstrap protocol details (extended DeviceArgs
 with `inner_so_bin`/`inner_so_len`, FNV-1a content fingerprint).
+
+## See also
+
+- [`docs/aicpu-kernel-launch-mechanisms.md`](../../../docs/aicpu-kernel-launch-mechanisms.md) —
+  this dispatcher is the heart of "Method 2 (Path A)". That doc compares
+  it against the older tar.gz method and the broken Path B
+  (`KERNEL_TYPE_AICPU_CUSTOM`), and records the four failed user-space
+  workarounds from issue #822 so future readers don't re-derive them.
+- [`tools/cann-examples/aicpu-kernel-launch/`](../../../tools/cann-examples/aicpu-kernel-launch/) —
+  standalone reference tool implementing the dispatcher bootstrap with
+  the minimum possible inner kernel; copy that as a template for new
+  AICPU work.

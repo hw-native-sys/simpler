@@ -72,3 +72,16 @@ uses; results come back through GM. Documents the resolution of the
 a3 AICPU 8 → 6 split and the a5 AICPU 9 → 6 split — see the tool's own
 [README](./cann-examples/aicpu-device-query/README.md) for build/run
 instructions and what it confirmed.
+
+### cann-examples/aicpu-kernel-launch
+
+The minimum end-to-end demonstration of launching a custom AICPU kernel
+from a host process using the production dispatcher bootstrap path —
+no sudo, no tar.gz pre-deployment. Strips out everything specific to
+this repo's runtime (ringbuffer setup, tensormap encoding, ChipWorker
+fork, etc.); the inner kernel writes a magic value, an echoed token, and
+one `halGetDeviceInfo` result so the readback proves end-to-end
+correctness. Read this first if you want to add new AICPU work to this
+repo. See the tool's own
+[README](./cann-examples/aicpu-kernel-launch/README.md) for the
+pipeline diagram, I/O contract, and Path A vs Path B (#822) notes.

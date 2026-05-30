@@ -60,7 +60,10 @@ Full writeup: [`src/a5/docs/hardware.md`](../../../src/a5/docs/hardware.md#devic
 
 Three pieces, exact same wiring as the production runtime's AICPU upload
 chain — see [`src/common/aicpu_dispatcher/README.md`](../../../src/common/aicpu_dispatcher/README.md)
-for the dispatcher's role.
+for the dispatcher's role and
+[`docs/aicpu-kernel-launch-mechanisms.md`](../../../docs/aicpu-kernel-launch-mechanisms.md)
+for why this method (Path A) and not tar.gz pre-deployment or the
+broken Path B (`KERNEL_TYPE_AICPU_CUSTOM`, issue #822).
 
 ```text
 +---------------------+        rtAicpuKernelLaunchExWithArgs (KFC, libaicpu_extend_kernels)
