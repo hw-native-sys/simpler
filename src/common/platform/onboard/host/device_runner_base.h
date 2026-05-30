@@ -384,6 +384,34 @@ protected:
     int validate_block_dim(rtStream_t stream, int block_dim);
 
     /**
+     * Shared body of `finalize()`. Each arch subclass's `finalize()`
+     * handles: (a) the early-return + thread attach prologue, (b) any
+     * arch-specific collector teardown (e.g. a2a3's `dep_gen_collector_`),
+     * and (c) the arch-specific device reset (a2a3's ACL/rt branch vs
+     * a5's `rtDeviceReset`). Everything else lives here:
+     *
+     *   - rtStreamDestroy for both persistent streams
+     *   - kernel_args_.finalize_device_args
+     *   - aicore_bin_handle_ + binaries_loaded_ reset
+     *   - chip_callable_buffers_ free + clear
+     *   - orch_so_dedup_ free + clear
+     *   - callables_ dlclose-on-hbg + clear + aicpu counter reset
+     *   - 3 arenas release + cached size reset
+     *   - device_wall_dev_ptr_ free (before mem_alloc_.finalize)
+     *   - mem_alloc_.finalize
+     *   - block_dim_, worker_count_, aicore_kernel_binary_ reset
+     *
+     * Device-wall free order is normalized to "before mem_alloc_.finalize"
+     * (matching the prior a5 ordering). The prior a2a3 ordering freed it
+     * AFTER `mem_alloc_.finalize` + `rtDeviceReset`, which routed through
+     * an already-finalized allocator on a torn-down device context — a
+     * latent UAF / no-op. This refactor fixes that.
+     *
+     * @return 0 on success, first nonzero rc encountered otherwise.
+     */
+    int finalize_common();
+
+    /**
      * Stamp `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` from the
      * registered CallableState for `runtime.get_active_callable_id()`.
      * The orch SO bytes were already H2D'd at `register_callable` time

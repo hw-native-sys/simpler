@@ -611,84 +611,20 @@ int DeviceRunner::finalize() {
         return rc;
     }
 
-    // Streams are persistent for the DeviceRunner's lifetime; destroy them here.
-    // Intentionally no pre-destroy sync: when a run hits the AICore op-timeout
-    // chain (PR #718), the AICPU stream surfaces ACL_ERROR_RT_AICPU_EXCEPTION
-    // (507018) at run-path sync; calling aclrtSynchronizeStream* again on the
-    // error-state stream at finalize wedges subsequent tests (observed: 507018
-    // / 507899 / 507901 cascade across the whole st-onboard-a2a3 suite).
-    // rtStreamDestroy on an error-state stream is the supported teardown path.
-    if (stream_aicpu_ != nullptr) {
-        rtStreamDestroy(stream_aicpu_);
-        stream_aicpu_ = nullptr;
-    }
-    if (stream_aicore_ != nullptr) {
-        rtStreamDestroy(stream_aicore_);
-        stream_aicore_ = nullptr;
-    }
-
-    // Cleanup kernel args (deviceArgs)
-    kernel_args_.finalize_device_args();
-
-    // load_aicpu_op_ has no per-task host-side state to release —
-    // rtsLaunchCpuKernel does not hand back any per-launch handle, and the
-    // dispatcher itself was a transient libaicpu_extend_kernels dlopen.
-    // aicore_bin_handle_ was registered once via rtRegisterAllKernel; CANN
-    // releases its device-side state when the device context tears down.
-    aicore_bin_handle_ = nullptr;
-    binaries_loaded_ = false;
-
-    // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
-    // Pool semantics mirror per-fid binaries: never freed until finalize.
-    for (auto &kv : chip_callable_buffers_) {
-        mem_alloc_.free(reinterpret_cast<void *>(kv.second.chip_dev));
-        LOG_DEBUG(
-            "Freed chip callable buffer: chip_dev=0x%lx, size=%zu, hash=0x%lx", kv.second.chip_dev,
-            kv.second.total_size, kv.first
-        );
-    }
-    chip_callable_buffers_.clear();
-
-    // Release any prepared-callable orch SO buffers that callers forgot to
-    // unregister. Refcounts no longer matter at this point — the device is
-    // about to be reset.
-    for (auto &kv : orch_so_dedup_) {
-        if (kv.second.dev_addr != nullptr) {
-            mem_alloc_.free(kv.second.dev_addr);
-        }
-    }
-    orch_so_dedup_.clear();
-    // hbg path: dlclose any host orch handles callers forgot to unregister.
-    // finalize() is the last chance; Worker.close() does not auto-unregister
-    // each callable_id, so without this loop the host process leaks one
-    // dlopen handle per (re)created Worker — observable in long-running
-    // pytest sessions.
-    for (auto &kv : callables_) {
-        if (kv.second.host_dlopen_handle != nullptr) {
-            dlclose(kv.second.host_dlopen_handle);
-        }
-    }
-    callables_.clear();
-    aicpu_seen_callable_ids_.clear();
-    aicpu_dlopen_total_ = 0;
-
-    // Cleanup performance profiling. Normally already done by run()'s
-    // perf_cleanup guard; this is the backstop for the no-run-since-init case.
+    // Cleanup performance profiling (including a2a3's dep_gen). Normally
+    // already done by run()'s perf_cleanup guard; this is the backstop
+    // for the no-run-since-init case.
     finalize_collectors();
 
-    // Release the three per-Worker pooled arenas (GM heap, PTO2 SM, optional
-    // trb prebuilt runtime arena — each its own device_malloc). Must precede
-    // mem_alloc_.finalize() so the arenas free through the still-live
-    // allocator, not after it.
-    gm_heap_arena_.release();
-    gm_sm_arena_.release();
-    runtime_arena_pool_.release();
+    // Shared cleanup body — streams, kernel_args, callable/orch maps,
+    // chip-callable buffer pool, the three arenas, device_wall, and
+    // mem_alloc_.finalize(). Device-wall free order is normalized to
+    // "before mem_alloc_.finalize" inside finalize_common(); the a2a3-
+    // specific cached arena sizes still need clearing here.
+    rc = finalize_common();
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
     cached_runtime_arena_size_ = 0;
-
-    // Free all remaining allocations (including handshake buffer and binGmAddr)
-    mem_alloc_.finalize();
 
     // Reset device AFTER all device memory is freed. Two paths:
     //
@@ -710,7 +646,7 @@ int DeviceRunner::finalize() {
             int reset_rc = aclrtResetDevice(device_id_);
             if (reset_rc != 0) {
                 LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
-                rc = reset_rc;
+                if (rc == 0) rc = reset_rc;
             }
             int finalize_rc = aclFinalize();
             if (finalize_rc != 0) {
@@ -727,16 +663,7 @@ int DeviceRunner::finalize() {
         }
     }
 
-    // Free the 8-byte device_wall buffer (allocated lazily in run()).
-    if (device_wall_dev_ptr_ != nullptr) {
-        free_tensor(device_wall_dev_ptr_);
-        device_wall_dev_ptr_ = nullptr;
-    }
     device_id_ = -1;
-    block_dim_ = 0;
-    worker_count_ = 0;
-    aicore_kernel_binary_.clear();
-
     LOG_INFO_V0("DeviceRunner finalized");
     return rc;
 }
