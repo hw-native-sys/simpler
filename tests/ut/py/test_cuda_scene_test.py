@@ -1570,6 +1570,29 @@ def _write_graph_callables_file(path):
     path.write_text(json.dumps({"generic": 9, "mul": 2, "add": 1}))
 
 
+def _write_cuda_persistent_task_sources_file(path, add_source, mul_source):
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "func_id": 1,
+                    "task_name": "add_f32",
+                    "source_path": str(add_source),
+                    "body_style": "task_body",
+                    "context_definition": _PERSISTENT_CONTEXT,
+                },
+                {
+                    "func_id": 2,
+                    "task_name": "mul_f32",
+                    "source_path": str(mul_source),
+                    "body_style": "task_body",
+                    "context_definition": _PERSISTENT_CONTEXT,
+                },
+            ]
+        )
+    )
+
+
 def _cuda_persistent_dep_gen_json_file_graph_spec(
     add_source,
     mul_source,
@@ -1582,6 +1605,26 @@ def _cuda_persistent_dep_gen_json_file_graph_spec(
     spec["cuda"]["arg_builder"] = "persistent_dag_graph_f32"
     spec["cuda"]["graph_path"] = str(dep_graph_path)
     spec["cuda"]["graph"] = {"task_defaults": {"func_id": 1, "a": "a", "b": "b", "out": "out"}}
+    return spec
+
+
+def _cuda_persistent_dag_task_sources_file_spec(
+    task_sources_path,
+    *,
+    arch="compute_80",
+    block_dim=256,
+    stream_id=0,
+):
+    spec = _cuda_persistent_dag_spec(
+        "unused-add.pto.cu",
+        "unused-mul.pto.cu",
+        arch=arch,
+        block_dim=block_dim,
+        stream_id=stream_id,
+    )
+    cuda_spec = spec["cuda"]
+    cuda_spec["task_sources_path"] = str(task_sources_path)
+    cuda_spec.pop("task_sources")
     return spec
 
 
@@ -2131,6 +2174,52 @@ def test_scene_test_compiles_cuda_persistent_device_callable(tmp_path, monkeypat
     assert seen["platform"] == "cuda"
     assert [item["func_id"] for item in seen["task_sources"]] == [1, 2]
     assert [item["task_name"] for item in seen["task_sources"]] == ["add_f32", "mul_f32"]
+    assert seen["kwargs"]["arch"] == "compute_80"
+
+
+def test_scene_test_compiles_cuda_persistent_device_callable_from_task_sources_file(tmp_path, monkeypatch):
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    task_sources_path = tmp_path / "task_sources.json"
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+    _write_cuda_persistent_task_sources_file(task_sources_path, add_source, mul_source)
+    seen = {}
+
+    def fake_compile_cuda_persistent_device(self, task_sources, **kwargs):
+        seen["platform"] = self.platform
+        seen["task_sources"] = task_sources
+        seen["kwargs"] = kwargs
+        return CudaPersistentCallableArtifact(
+            cache_key="persistent-scene-test-key",
+            cache_hit=False,
+            source_path=tmp_path / "generated_dispatch.cu",
+            ptx_path=tmp_path / "pto_callable.ptx",
+            manifest_path=tmp_path / "pto_callable.json",
+            ptx=b"fake-persistent-scene-ptx",
+            entry_name="pto_persistent_dag_f32_executor",
+            arch=kwargs["arch"],
+            source_kind="generated-dispatch",
+        )
+
+    monkeypatch.setattr(
+        "simpler_setup.kernel_compiler.KernelCompiler.compile_cuda_persistent_device",
+        fake_compile_cuda_persistent_device,
+    )
+
+    prepared = _compile_chip_callable_from_spec(
+        _cuda_persistent_dag_task_sources_file_spec(task_sources_path, stream_id=1),
+        "cuda",
+        "persistent_device",
+        ("cuda-persistent-scene-task-source-file-compile", "cuda", "persistent_device"),
+    )
+
+    assert isinstance(prepared, PreparedCudaCallable)
+    assert prepared.runtime == "persistent_device"
+    assert prepared.manifest.stream_id == 1
+    assert seen["platform"] == "cuda"
+    assert [item["func_id"] for item in seen["task_sources"]] == [1, 2]
+    assert [item["source_path"] for item in seen["task_sources"]] == [str(add_source), str(mul_source)]
     assert seen["kwargs"]["arch"] == "compute_80"
 
 
@@ -5953,6 +6042,60 @@ def test_scene_test_runs_cuda_persistent_device_dag_with_real_data(tmp_path):
     try:
         callable_obj = scene.build_callable("cuda")
         scene._run_and_validate_l2(worker, callable_obj, CudaPersistentDagScene.CASES[0])
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_task_sources_file_with_ctypes_data(tmp_path):
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    task_sources_path = tmp_path / "task_sources.json"
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+    _write_cuda_persistent_task_sources_file(task_sources_path, add_source, mul_source)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentTaskSourcesFileCtypesScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_dag_task_sources_file_spec(task_sources_path)
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            args = TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.5 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+            )
+            self.last_args = args
+            return args
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit post-run validation")
+
+    scene = CudaPersistentTaskSourcesFileCtypesScene()
+    worker = CudaPersistentTaskSourcesFileCtypesScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(
+            worker,
+            callable_obj,
+            CudaPersistentTaskSourcesFileCtypesScene.CASES[0],
+            skip_golden=True,
+        )
+        args = scene.last_args
+        a_values = args.a.to_list()
+        b_values = args.b.to_list()
+        actual = args.out.to_list()
+        expected = [a_values[idx] + b_values[idx] + a_values[idx] * b_values[idx] for idx in range(len(actual))]
+        assert actual == pytest.approx(expected)
     finally:
         worker.close()
 

@@ -2462,7 +2462,7 @@ def _resolve_chip_entry_paths(entry, cls_dir):
         cuda = entry["cuda"]
         if isinstance(cuda, dict):
             entry["cuda"] = dict(cuda)
-            for key in ("source", "graph_path", "graph_file"):
+            for key in ("source", "graph_path", "graph_file", "task_sources_path", "task_sources_file"):
                 if key in entry["cuda"]:
                     entry["cuda"][key] = _resolve_path_value(entry["cuda"][key], cls_dir)
             if isinstance(entry["cuda"].get("graph"), (str, os.PathLike)):
@@ -2839,7 +2839,7 @@ def _compile_cuda_callable_from_spec(spec, runtime):
     kc = KernelCompiler(platform="cuda")
     if runtime == "persistent_device":
         artifact = kc.compile_cuda_persistent_device(
-            cuda["task_sources"],
+            _cuda_persistent_task_sources(cuda),
             arch=cuda.get("arch", os.environ.get("PTO_CUDA_ARCH", "compute_80")),
             cache_root=cuda.get("cache_root"),
             nvcc=cuda.get("nvcc", "nvcc"),
@@ -2874,6 +2874,38 @@ def _compile_cuda_callable_from_spec(spec, runtime):
         stream_id=int(cuda.get("stream_id", 0)),
         op=int(cuda.get("op", 1)),
     )
+
+
+def _cuda_persistent_task_sources(cuda: dict[str, Any]) -> list[dict[str, Any]]:
+    if "task_sources" in cuda:
+        return [dict(task_source) for task_source in cuda["task_sources"]]
+
+    task_sources_path = cuda.get("task_sources_path", cuda.get("task_sources_file"))
+    if task_sources_path is None:
+        raise ValueError("CUDA persistent_device CALLABLE requires task_sources or task_sources_path")
+
+    task_sources_file_path = Path(task_sources_path)
+    with task_sources_file_path.open(encoding="utf-8") as task_sources_file:
+        loaded = json.load(task_sources_file)
+
+    if isinstance(loaded, dict):
+        loaded = loaded.get("task_sources", loaded.get("sources"))
+    if not isinstance(loaded, list):
+        raise ValueError("CUDA persistent_device task source sidecar must contain a list")
+
+    return [
+        _resolve_cuda_task_source_sidecar_entry(task_source, task_sources_file_path.parent) for task_source in loaded
+    ]
+
+
+def _resolve_cuda_task_source_sidecar_entry(task_source: Any, base_dir: Path) -> dict[str, Any]:
+    if not isinstance(task_source, dict):
+        raise ValueError("CUDA persistent_device task source sidecar entries must be dictionaries")
+
+    resolved = dict(task_source)
+    if "source_path" in resolved:
+        resolved["source_path"] = _resolve_path_value(resolved["source_path"], base_dir)
+    return resolved
 
 
 # ---------------------------------------------------------------------------

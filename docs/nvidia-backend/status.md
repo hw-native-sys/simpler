@@ -2128,6 +2128,13 @@ selector first failed with `unknown graph callable: generic`, then passed
 locally on A100 with `2 passed, 169 deselected` and remotely on H200 with
 `2 passed, 169 deselected`; the H200 run printed the known PTO-ISA SSH refresh
 warning first.
+Generated-dispatch task source metadata can now be loaded from
+`task_sources_path` or `task_sources_file` sidecars. The sidecar accepts either
+a JSON list or an object with `task_sources`/`sources`, and `source_path`
+entries are resolved relative to the sidecar file before
+`KernelCompiler.compile_cuda_persistent_device(...)` receives them. The
+focused selector first failed with `KeyError: 'task_sources'`, then passed
+locally on A100 with `2 passed, 173 deselected`.
 The same graph-shaped path now accepts `graph.tasks` as a dictionary keyed by
 task name, so descriptor specs can keep node names in one place and reference
 those names from top-level edges. The ctypes-backed

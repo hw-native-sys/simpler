@@ -1682,6 +1682,14 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k callable_sidecar --platform cuda
 ```
 
+After changing persistent-device task source sidecar loading, use:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k task_sources_file --platform cuda
+```
+
 After changing task metadata sidecar-file loading for inline graph
 descriptors, use:
 
