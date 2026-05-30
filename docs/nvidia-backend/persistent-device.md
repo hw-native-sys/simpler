@@ -410,7 +410,9 @@ spec maps selected task IDs onto different generated-dispatch `func_id` values
 or different temporary/output bindings. `task_metadata` is accepted as the
 same override field when the descriptor should read as metadata enrichment
 rather than replacement, and it may be either the same keyed dictionary or a
-list of metadata entries carrying `name`, `id`, or `task_id`.
+list of metadata entries carrying `name`, `id`, or `task_id`. Inline graph
+overlays may also use `task_metadata_path` or `task_metadata_file` to load the
+same metadata list/dictionary from a sidecar JSON file.
 `graph.edges` may also be an adjacency dictionary from source task name/id to
 a single target or a list of targets.
 `graph.links` is accepted as the same edge-list field when importing

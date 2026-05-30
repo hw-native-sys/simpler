@@ -1349,7 +1349,16 @@ class _CudaPersistentDagSceneBuffers:
             return loaded_graph
         if not isinstance(graph, dict):
             raise ValueError("CUDA persistent_dag_graph_f32 graph overlay must be a dictionary")
-        return {**loaded_graph, **graph}
+        merged_graph = {**loaded_graph, **graph}
+        default_metadata_path = cuda_spec.get("task_metadata_path", cuda_spec.get("task_metadata_file"))
+        metadata_path = merged_graph.pop(
+            "task_metadata_path",
+            merged_graph.pop("task_metadata_file", default_metadata_path),
+        )
+        if metadata_path is not None:
+            with Path(metadata_path).open(encoding="utf-8") as metadata_file:
+                merged_graph["task_metadata"] = json.load(metadata_file)
+        return merged_graph
 
     @staticmethod
     def _graph_task_specs(graph: dict[str, Any]) -> list[dict[str, Any]]:
