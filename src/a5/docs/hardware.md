@@ -50,7 +50,7 @@ this repo.
   the spec table is the variant this repo's runtime targets. Check
   the actual `Ascend950*.ini` for your SoC to confirm.
 
-## Three views of "how many cores": observation + calibrated inference
+## Three views of "how many cores": observation + device-side ground truth
 
 a5's HAL exposes more layers than a3 does. The same `halGetDeviceInfo`
 call surface has **different semantics** on a5 vs a3 — do not assume
@@ -63,47 +63,67 @@ HAL counts mean the same thing across generations.
 | `rtGetAiCpuCount` | **6** | — | — |
 | `aclrtGetDeviceInfo(ACL_DEV_ATTR_AICPU_CORE_NUM)` | **6** | — | — |
 | CANN ini `ai_cpu_cnt` / `ai_core_cnt` / `vector_core_cnt` | (per-SKU, see ini) | (per-SKU) | (per-SKU) |
-| `halGetDeviceInfo(AICPU, CORE_NUM)` | **8** | — | — |
-| `halGetDeviceInfo(AICPU, OCCUPY)` | `0x1fe` (**9-bit** mask, 8 set) | — | — |
+| `halGetDeviceInfo(AICPU, CORE_NUM)` host-side | **8** | — | — |
+| `halGetDeviceInfo(AICPU, OCCUPY)` host-side | `0x1fe` (**9-bit** mask, 8 set: bits 1..8) | — | — |
 | `halGetDeviceInfo(AICPU, IN_USED)` | **8** | — | — |
 | `halGetDeviceInfo(AICORE, CORE_NUM)` | — | **36** (per device, = 2 dies × 18) | — |
 | `halGetDeviceInfo(AICORE, DIE_NUM)` | — | **2** | — |
 | `halGetDeviceInfo(VECTOR_CORE, CORE_NUM)` | — | — | **72** (per device) |
 | DSMI `SOC_INFO+CPU_TOPO` | **9 logical CPUs** (8 physical + 1 hyperthread on phy_cpu_id 1) | — | — |
 
-### Two-layer AICPU reservation on a5
+### Device-side probe resolves the AICPU question
 
-`9 → 8 → 6` shows two distinct reservations stacked:
+CANN's `halGetDeviceInfo` exposes some queries (notably
+`MODULE_TYPE_AICPU + INFO_TYPE_OS_SCHED`) that are flagged "used in
+device" in the header — they only succeed when called from device-side
+AICPU code, not from the host. The `tools/cann-examples/aicpu-device-query/`
+companion tool uploads a small inner SO via the dispatcher bootstrap path,
+runs HAL queries from inside an AICPU OS process, and reads results
+back through GM. On this a5 host (`Ascend950PR_9599`) with local device
+id 0 it returns:
 
-1. **9 logical CPUs** (DSMI CPU_TOPO total): 8 physical Taishan cores
-   on this die, one of which is hyperthreaded into 2 logical CPUs.
-2. **8 in HAL OCCUPY mask** (`0x1fe = 0b111111110`): bit 0 is cleared,
-   bits 1–8 set. Whatever owns cpu_id 0 — likely the lowest-level
-   firmware / hypervisor — is below the HAL's view entirely.
-3. **6 in `rtGetAiCpuCount`**: the additional 2 cores between HAL's
-   "occupied 8" and runtime's "user-visible 6" are most plausibly
-   AICPU-OS-reserved or PG-disabled, by analogy with a3 where a
-   device-side probe confirmed `OS_SCHED = 0x1` (1 OS core) + the
-   remaining gap cpu_id is PG fab-disabled.
-   (See [`src/a2a3/docs/hardware.md`](../../a2a3/docs/hardware.md#device-side-probe-resolves-the-aicpu-question)
-   for the technique that resolved the a3 question.)
+| Query | Result | Interpretation |
+| ----- | ------ | -------------- |
+| `AICPU + OS_SCHED` | `0x1` | **AICPU OS owns exactly cpu_id 0** (single bit) |
+| `AICPU + OCCUPY` (device-side) | `0x1f8 = 0b111111000` | **6 cores in the AICPU user pool at cpu_id 3..8** — not the `0x1fe` seen host-side. The 2-bit divergence (bits 1, 2) is the key new finding. |
+| `AICPU + PF_OCCUPY` | `0x1f8` | identical to device-side OCCUPY → no SR-IOV / vNPU slicing |
+| `AICPU + PF_CORE_NUM` | `6` | PF-view count matches user view → no virtualization |
+| `AICPU + CORE_NUM` (device-side) | rc=3 | unlike a3, a5 restricts this query device-side — use `PF_CORE_NUM` instead |
+| `CCPU + OCCUPY` | `0x1` | CCPU owns 1 core in its own namespace |
+| `DCPU/TSCPU + OCCUPY`, `+ CORE_NUM` | rc=3 | module-level access restricted device-side (same as a3) |
 
-**The a3-equivalent question on a5 is not yet resolved**:
-`tools/cann-examples/aicpu-device-query/` should be run on a5 hardware
-to read `AICPU + OS_SCHED` from inside an AICPU OS process — that one
-bit pattern will tell us how many of the 2 "missing" cores between
-HAL's 8 and runtime's 6 are OS-reserved (the rest being PG-disabled).
-Until that probe runs on a5, the two-layer breakdown above is
-**inference by analogy**, not direct measurement. Likewise the role of
-cpu_id 0 (cleared in OCCUPY) — firmware-only / RAS / boot — remains
-inferred until a device-side query covers it.
+The host-side / device-side OCCUPY divergence is **a5-specific**: on a3
+both views return the same `0xfc`. On a5 host-side reports 8 enabled
+cores (`0x1fe`) but the device-side AICPU OS exposes only 6 to its user
+kernel pool (`0x1f8`). The 2-bit gap (bits 1, 2) exactly matches DSMI
+CPU_TOPO's lone hyperthread pair on phy_cpu_id 1 — the AICPU OS keeps
+the SMT-paired logical CPUs for itself rather than dispatching user
+kernels onto them.
+
+Combined with the absence of any vNPU mode (`is_virtual: no` via ACL),
+the AICPU side splits as:
+
+| Slot | Owner | Evidence |
+| ---- | ----- | -------- |
+| cpu_id 0 | AICPU OS scheduler | OS_SCHED bit 0 = 1 (device-side probe); cleared in host-side OCCUPY by design (OS scheduler is exposed via OS_SCHED, not OCCUPY) |
+| cpu_id 1, 2 | Hyperthread pair on phy_cpu_id 1, withheld from the user pool by the AICPU OS | present in host-side OCCUPY (`0x1fe`) so they are **not** PG fab-disabled — that would clear them everywhere as cpu_id 1 was on a3. Absent from device-side AICPU OCCUPY (`0x1f8`), absent from CCPU OCCUPY (`0x1`). DSMI CPU_TOPO labels exactly this pair as the chip's only SMT pair. AICPU OS withholds SMT pairs from user dispatch to avoid intra-pair contention. |
+| cpu_id 3..8 | user-schedulable (6) | device-side OCCUPY bits 3..8 set; matches `rtGetAiCpuCount=6` and `PF_CORE_NUM=6` |
+
+The 9 → 6 gap on a5 is therefore **1 AICPU OS-reserved (cpu_id 0) + 2
+SMT-pair withheld from user (cpu_id 1, 2)**, not "AICPU-OS-reserved
+or PG fab-disabled" as the earlier inference from HAL host-side data
+alone suggested. PG fab-disable can be ruled out on a5 by the host-side
+OCCUPY containing both gap slots.
 
 ### Key semantic differences from a3
 
 | Observation | a3 (Ascend910_93xx) | a5 (Ascend950) |
 | ----------- | ------------------- | -------------- |
-| `halGetDeviceInfo(AICPU, CORE_NUM)` | 6 (matches user-visible) | **8** (does NOT match user-visible) |
-| `halGetDeviceInfo(AICPU, OCCUPY)` | 8-bit `0xfc` | **9-bit `0x1fe`** |
+| `halGetDeviceInfo(AICPU, CORE_NUM)` host-side | 6 (matches user-visible) | **8** (does NOT match user-visible) |
+| `halGetDeviceInfo(AICPU, CORE_NUM)` device-side | 6 (succeeds) | **rc=3** (restricted) |
+| `halGetDeviceInfo(AICPU, OCCUPY)` host-side | 8-bit `0xfc` | **9-bit `0x1fe`** |
+| `halGetDeviceInfo(AICPU, OCCUPY)` device-side | `0xfc` (matches host) | **`0x1f8` (differs from host)** — AICPU OS withholds the SMT pair |
+| `AICPU` gap composition (HAL → user) | 1 OS-reserved + 1 PG fab-disabled | **1 OS-reserved + 2 SMT-pair withheld** (no PG-disable) |
 | Logical vs physical AICPU | no hyperthread evidence | **1 phy core hyperthreaded → 9 logical** |
 | `halGetDeviceInfo(AICORE, DIE_NUM)` | fails (rc=3) | works, returns **2** |
 | `halGetDeviceInfo(AICORE, CORE_NUM)` | 25 per die | **36 per device** (aggregates both dies) |
@@ -124,7 +144,7 @@ report what user code can address.
 | Counting cores in a multi-die a5 device | **per-device** HAL CORE_NUM (= 2 × per-die) |
 | Reasoning about hyperthreading on AICPU | **DSMI CPU_TOPO** (only it shows the hyperthread pair on cpu_id 1+2) |
 | Writing code expected to also work on a3 | **ACL or CANN ini only** — HAL semantics differ |
-| Debugging "I requested N AICPU, only 6 ran" | gap is the **AICPU OS + lowest-level reservation**, totalling 3 cores between physical 9 and user 6 |
+| Debugging "I requested N AICPU, only 6 ran" | gap is **1 AICPU OS scheduler (cpu_id 0) + 2 SMT-pair (cpu_id 1, 2) withheld by AICPU OS**; cap is 6 |
 
 For cross-generation portable code: **always go through ACL or CANN
 ini, never HAL**. HAL's CORE_NUM semantics shift between a3 and a5 in

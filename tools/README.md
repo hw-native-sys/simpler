@@ -69,6 +69,6 @@ resolves the "used in device" HAL queries (`AICPU + OS_SCHED`,
 `AICPU + PF_*`, etc.) that always fail from host code. Uploads a small
 inner SO via the same dispatcher bootstrap path the production runtime
 uses; results come back through GM. Documents the resolution of the
-a3 AICPU 8 → 6 split — see the tool's own
+a3 AICPU 8 → 6 split and the a5 AICPU 9 → 6 split — see the tool's own
 [README](./cann-examples/aicpu-device-query/README.md) for build/run
 instructions and what it confirmed.
