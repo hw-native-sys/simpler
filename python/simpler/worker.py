@@ -1688,7 +1688,12 @@ class Worker:
         finally:
             with self._registry_lock:
                 current = self._identity_registry.get(digest)
-                if remove_target and current is state and current.ref_count <= 0:
+                if (
+                    remove_target
+                    and current is not None
+                    and current is state
+                    and current.ref_count <= 0
+                ):
                     self._callable_registry.pop(cid, None)
                     self._identity_registry.pop(digest, None)
                 self._pending_unregister_cids.discard(cid)
@@ -1747,7 +1752,12 @@ class Worker:
         finally:
             with self._registry_lock:
                 current = self._identity_registry.get(digest)
-                if remove_target and current is state and current.ref_count <= 0:
+                if (
+                    remove_target
+                    and current is not None
+                    and current is state
+                    and current.ref_count <= 0
+                ):
                     self._callable_registry.pop(cid, None)
                     self._identity_registry.pop(digest, None)
                 self._pending_unregister_cids.discard(cid)
