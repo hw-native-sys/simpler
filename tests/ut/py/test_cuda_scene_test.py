@@ -1562,6 +1562,10 @@ def _write_dep_gen_task_overrides_file(path):
     )
 
 
+def _write_graph_callables_file(path):
+    path.write_text(json.dumps({"generic": 9, "mul": 2, "add": 1}))
+
+
 def _cuda_persistent_dep_gen_json_file_graph_spec(
     add_source,
     mul_source,
@@ -1686,6 +1690,27 @@ def _cuda_persistent_inline_task_metadata_file_graph_spec(
             {"pred": "4294967296", "succ": "4294967298", "arg": 1, "source": "tensormap"},
         ],
     }
+    return spec
+
+
+def _cuda_persistent_callable_sidecar_graph_spec(
+    generic_source,
+    add_source,
+    mul_source,
+    callables_path,
+    *,
+    arch="compute_80",
+    block_dim=256,
+):
+    spec = _cuda_persistent_named_callable_graph_spec(
+        generic_source,
+        add_source,
+        mul_source,
+        arch=arch,
+        block_dim=block_dim,
+    )
+    spec["cuda"]["graph"].pop("callables")
+    spec["cuda"]["graph"]["callables_path"] = str(callables_path)
     return spec
 
 
@@ -3860,6 +3885,67 @@ def test_scene_test_builds_cuda_persistent_graph_from_compact_callable_dict():
         "queue_capacity": 2,
         "graph": {
             "callables": {"generic": 9, "mul": 2, "add": 1},
+            "tasks": [
+                {
+                    "callable": "generic",
+                    "task_args": [
+                        {"tensor": "a", "tag": "input"},
+                        {"tensor": "b", "tag": "input"},
+                        {"tensor": "tmp0", "tag": "output"},
+                        {"scalar": "alpha"},
+                        {"scalar": "beta"},
+                    ],
+                    "tensor_args": ["c", "d"],
+                },
+                {
+                    "callable": "mul",
+                    "task_args": [
+                        {"tensor": "a", "tag": "input"},
+                        {"tensor": "b", "tag": "input"},
+                        {"tensor": "tmp1", "tag": "output"},
+                    ],
+                },
+                {
+                    "callable": "add",
+                    "task_args": [
+                        {"tensor": "tmp0", "tag": "input"},
+                        {"tensor": "tmp1", "tag": "input"},
+                        {"tensor": "out", "tag": "output_existing"},
+                    ],
+                },
+            ],
+        },
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert [(task.func_id, task.dependent_begin, task.dependent_count) for task in buffers.host_tasks] == [
+        (9, 0, 1),
+        (2, 1, 1),
+        (1, 2, 0),
+    ]
+    assert list(buffers.host_fanin) == [0, 0, 2]
+    assert list(buffers.host_dependents) == [2, 2]
+    assert list(buffers.host_tasks[0].scalar_args)[:2] == pytest.approx([1.5, 0.25])
+
+
+def test_scene_test_builds_cuda_persistent_graph_from_callable_sidecar_file(tmp_path):
+    callables_path = tmp_path / "callables.json"
+    _write_graph_callables_file(callables_path)
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("c", _FakeTensor(17)),
+        Tensor("d", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+        Scalar("alpha", ctypes.c_float(1.5)),
+        Scalar("beta", ctypes.c_float(0.25)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "c", "d", "out"],
+        "queue_capacity": 2,
+        "graph": {
+            "callables_path": str(callables_path),
             "tasks": [
                 {
                     "callable": "generic",
@@ -6586,6 +6672,76 @@ def test_scene_test_runs_cuda_persistent_device_compact_callable_dict_graph_with
             worker,
             callable_obj,
             CudaPersistentCompactCallableDictGraphCtypesScene.CASES[0],
+            skip_golden=True,
+        )
+        args = scene.last_args
+        a_values = args.a.to_list()
+        b_values = args.b.to_list()
+        c_values = args.c.to_list()
+        d_values = args.d.to_list()
+        actual = args.out.to_list()
+        expected = [
+            1.5 * a_values[idx] + c_values[idx] + 0.25 * d_values[idx] + a_values[idx] * b_values[idx]
+            for idx in range(len(actual))
+        ]
+        assert actual == pytest.approx(expected)
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_callable_sidecar_graph_with_ctypes_data(tmp_path):
+    generic_source = tmp_path / "generic_args.pto.cu"
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    callables_path = tmp_path / "callables.json"
+    generic_source.write_text(_PERSISTENT_GENERIC_ARGS_BODY)
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+    _write_graph_callables_file(callables_path)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentCallableSidecarGraphCtypesScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_callable_sidecar_graph_spec(
+            generic_source,
+            add_source,
+            mul_source,
+            callables_path,
+        )
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            args = TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.5 for i in range(n))),
+                Tensor("c", _CtypesFloatTensor(float(i) * 0.25 for i in range(n))),
+                Tensor("d", _CtypesFloatTensor(float(i) * 0.125 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+                Scalar("alpha", ctypes.c_float(1.5)),
+                Scalar("beta", ctypes.c_float(0.25)),
+            )
+            self.last_args = args
+            return args
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit post-run validation")
+
+    scene = CudaPersistentCallableSidecarGraphCtypesScene()
+    worker = CudaPersistentCallableSidecarGraphCtypesScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(
+            worker,
+            callable_obj,
+            CudaPersistentCallableSidecarGraphCtypesScene.CASES[0],
             skip_golden=True,
         )
         args = scene.last_args

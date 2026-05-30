@@ -1664,6 +1664,15 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k relative_task_metadata_file --platform cuda
 ```
 
+After changing callable registry sidecar-file loading for persistent graph
+descriptors, use:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k callable_sidecar --platform cuda
+```
+
 After changing task metadata sidecar-file loading for inline graph
 descriptors, use:
 

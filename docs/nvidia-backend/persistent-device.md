@@ -422,6 +422,11 @@ loaded through `graph_path`, `graph_file`, or a string-valued `graph`,
 relative sidecar paths are resolved beside that graph JSON file. Inline-only
 graph descriptors keep normal process-working-directory relative path
 semantics.
+Callable registries can also be kept in a sidecar JSON file with
+`callables_path` or `callables_file`. The loaded JSON has the same shape as
+inline `graph.callables`, so graph tasks can reference generated-dispatch
+functions by `callable` or `op` while captured graph files keep structural
+task rows separate from runtime-specific callable IDs.
 `graph.edges` may also be an adjacency dictionary from source task name/id to
 a single target or a list of targets.
 `graph.links` is accepted as the same edge-list field when importing

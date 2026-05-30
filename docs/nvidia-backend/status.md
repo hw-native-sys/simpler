@@ -2109,6 +2109,15 @@ with `FileNotFoundError: add.pto.cu`; after extending callable path
 resolution, it passed locally on A100 with `2 passed, 167 deselected` and
 remotely on H200 with `2 passed, 167 deselected`; the H200 run printed the
 known PTO-ISA SSH refresh warning first.
+Callable registries can now be loaded from `callables_path` or
+`callables_file` sidecars before graph task extraction. The sidecar has the
+same dictionary or list shape as inline `graph.callables`, letting captured
+graph descriptors keep `callable`/`op` references in structural task rows
+while storing generated-dispatch `func_id` metadata separately. The focused
+selector first failed with `unknown graph callable: generic`, then passed
+locally on A100 with `2 passed, 169 deselected` and remotely on H200 with
+`2 passed, 169 deselected`; the H200 run printed the known PTO-ISA SSH refresh
+warning first.
 The same graph-shaped path now accepts `graph.tasks` as a dictionary keyed by
 task name, so descriptor specs can keep node names in one place and reference
 those names from top-level edges. The ctypes-backed

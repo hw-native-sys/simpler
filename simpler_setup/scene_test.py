@@ -1388,6 +1388,16 @@ class _CudaPersistentDagSceneBuffers:
                 encoding="utf-8"
             ) as overrides_file:
                 merged_graph["task_overrides"] = json.load(overrides_file)
+        default_callables_path = cuda_spec.get("callables_path", cuda_spec.get("callables_file"))
+        callables_path = merged_graph.pop(
+            "callables_path",
+            merged_graph.pop("callables_file", default_callables_path),
+        )
+        if callables_path is not None:
+            with _CudaPersistentDagSceneBuffers._graph_sidecar_path(callables_path, graph_dir).open(
+                encoding="utf-8"
+            ) as callables_file:
+                merged_graph["callables"] = json.load(callables_file)
         return merged_graph
 
     @staticmethod
