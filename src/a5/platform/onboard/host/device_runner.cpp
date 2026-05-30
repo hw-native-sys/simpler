@@ -425,8 +425,8 @@ int DeviceRunner::prepare_orch_so(Runtime &runtime) {
         LOG_ERROR("prepare_orch_so: no active callable_id; prepared-callable flow required");
         return -1;
     }
-    auto it = prepared_callables_.find(cid);
-    if (it == prepared_callables_.end()) {
+    auto it = callables_.find(cid);
+    if (it == callables_.end()) {
         LOG_ERROR("prepare_orch_so: callable_id=%d not registered", cid);
         return -1;
     }
@@ -453,7 +453,7 @@ int DeviceRunner::prepare_orch_so(Runtime &runtime) {
     return 0;
 }
 
-int DeviceRunner::register_prepared_callable(
+int DeviceRunner::register_callable(
     int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
@@ -462,36 +462,34 @@ int DeviceRunner::register_prepared_callable(
     // it by callable_id; rejecting an out-of-range id here keeps host and AICPU
     // in sync and avoids an OOB access at run time.
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
-        LOG_ERROR(
-            "register_prepared_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
-        );
+        LOG_ERROR("register_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS);
         return -1;
     }
     if (orch_so_data == nullptr || orch_so_size == 0) {
-        LOG_ERROR("register_prepared_callable: empty orch SO for callable_id=%d", callable_id);
+        LOG_ERROR("register_callable: empty orch SO for callable_id=%d", callable_id);
         return -1;
     }
-    if (prepared_callables_.count(callable_id) != 0) {
-        LOG_ERROR("register_prepared_callable: callable_id=%d already registered", callable_id);
+    if (callables_.count(callable_id) != 0) {
+        LOG_ERROR("register_callable: callable_id=%d already registered", callable_id);
         return -1;
     }
 
     const uint64_t hash = simpler::common::utils::elf_build_id_64(orch_so_data, orch_so_size);
 
     // Hash dedup: share device buffer across callable_ids that carry the same
-    // SO bytes. Refcount drops in unregister_prepared_callable; we only free
+    // SO bytes. Refcount drops in unregister_callable; we only free
     // when the count hits zero.
     auto buf_it = orch_so_dedup_.find(hash);
     uint64_t dev_addr = 0;
     if (buf_it == orch_so_dedup_.end()) {
         void *buf = mem_alloc_.alloc(orch_so_size);
         if (buf == nullptr) {
-            LOG_ERROR("register_prepared_callable: alloc %zu bytes failed", orch_so_size);
+            LOG_ERROR("register_callable: alloc %zu bytes failed", orch_so_size);
             return -1;
         }
         int rc = rtMemcpy(buf, orch_so_size, orch_so_data, orch_so_size, RT_MEMCPY_HOST_TO_DEVICE);
         if (rc != 0) {
-            LOG_ERROR("register_prepared_callable: rtMemcpy failed: %d", rc);
+            LOG_ERROR("register_callable: rtMemcpy failed: %d", rc);
             mem_alloc_.free(buf);
             return rc;
         }
@@ -501,16 +499,14 @@ int DeviceRunner::register_prepared_callable(
         entry.refcount = 1;
         orch_so_dedup_.emplace(hash, entry);
         dev_addr = reinterpret_cast<uint64_t>(buf);
-        LOG_INFO_V0("register_prepared_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
+        LOG_INFO_V0("register_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
     } else {
         buf_it->second.refcount++;
         dev_addr = reinterpret_cast<uint64_t>(buf_it->second.dev_addr);
-        LOG_INFO_V0(
-            "register_prepared_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount
-        );
+        LOG_INFO_V0("register_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount);
     }
 
-    PreparedCallableState state;
+    CallableState state;
     state.hash = hash;
     state.dev_orch_so_addr = dev_addr;
     state.dev_orch_so_size = orch_so_size;
@@ -518,48 +514,47 @@ int DeviceRunner::register_prepared_callable(
     state.config_name = (config_name != nullptr) ? config_name : "";
     state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
-    prepared_callables_.emplace(callable_id, std::move(state));
+    callables_.emplace(callable_id, std::move(state));
     return 0;
 }
 
-int DeviceRunner::register_prepared_callable_host_orch(
+int DeviceRunner::register_callable_host_orch(
     int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
         LOG_ERROR(
-            "register_prepared_callable_host_orch: callable_id=%d out of range [0, %d)", callable_id,
-            MAX_REGISTERED_CALLABLE_IDS
+            "register_callable_host_orch: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
         );
         return -1;
     }
     if (host_dlopen_handle == nullptr || host_orch_func_ptr == nullptr) {
-        LOG_ERROR("register_prepared_callable_host_orch: null handle/fn for callable_id=%d", callable_id);
+        LOG_ERROR("register_callable_host_orch: null handle/fn for callable_id=%d", callable_id);
         return -1;
     }
-    if (prepared_callables_.count(callable_id) != 0) {
-        LOG_ERROR("register_prepared_callable_host_orch: callable_id=%d already registered", callable_id);
+    if (callables_.count(callable_id) != 0) {
+        LOG_ERROR("register_callable_host_orch: callable_id=%d already registered", callable_id);
         return -1;
     }
 
-    PreparedCallableState state;
+    CallableState state;
     state.host_dlopen_handle = host_dlopen_handle;
     state.host_orch_func_ptr = host_orch_func_ptr;
     state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
-    prepared_callables_.emplace(callable_id, std::move(state));
+    callables_.emplace(callable_id, std::move(state));
     ++host_dlopen_total_;
-    LOG_INFO_V0("register_prepared_callable_host_orch: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
+    LOG_INFO_V0("register_callable_host_orch: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
     return 0;
 }
 
-int DeviceRunner::unregister_prepared_callable(int32_t callable_id) {
-    auto it = prepared_callables_.find(callable_id);
-    if (it == prepared_callables_.end()) {
+int DeviceRunner::unregister_callable(int32_t callable_id) {
+    auto it = callables_.find(callable_id);
+    if (it == callables_.end()) {
         return 0;
     }
-    PreparedCallableState state = std::move(it->second);
-    prepared_callables_.erase(it);
+    CallableState state = std::move(it->second);
+    callables_.erase(it);
     aicpu_seen_callable_ids_.erase(callable_id);
 
     if (state.host_dlopen_handle != nullptr) {
@@ -578,14 +573,12 @@ int DeviceRunner::unregister_prepared_callable(int32_t callable_id) {
     return 0;
 }
 
-bool DeviceRunner::has_prepared_callable(int32_t callable_id) const {
-    return prepared_callables_.count(callable_id) != 0;
-}
+bool DeviceRunner::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
-BindPreparedCallableResult DeviceRunner::bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id) {
-    auto it = prepared_callables_.find(callable_id);
-    if (it == prepared_callables_.end()) {
-        LOG_ERROR("bind_prepared_callable_to_runtime: callable_id=%d not registered", callable_id);
+BindCallableResult DeviceRunner::bind_callable_to_runtime(Runtime &runtime, int32_t callable_id) {
+    auto it = callables_.find(callable_id);
+    if (it == callables_.end()) {
+        LOG_ERROR("bind_callable_to_runtime: callable_id=%d not registered", callable_id);
         return {-1, nullptr, nullptr, 0};
     }
     const auto &state = it->second;
@@ -597,7 +590,7 @@ BindPreparedCallableResult DeviceRunner::bind_prepared_callable_to_runtime(Runti
     // be freed by finalize().
     for (const auto &kv : state.kernel_addrs) {
         if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
-            LOG_ERROR("bind_prepared_callable_to_runtime: func_id=%d out of range", kv.first);
+            LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
             return {-1, nullptr, nullptr, 0};
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
@@ -677,12 +670,12 @@ int DeviceRunner::finalize() {
     // each callable_id, so without this loop the host process leaks one
     // dlopen handle per (re)created Worker — observable in long-running
     // pytest sessions.
-    for (auto &kv : prepared_callables_) {
+    for (auto &kv : callables_) {
         if (kv.second.host_dlopen_handle != nullptr) {
             dlclose(kv.second.host_dlopen_handle);
         }
     }
-    prepared_callables_.clear();
+    callables_.clear();
     aicpu_seen_callable_ids_.clear();
     aicpu_dlopen_total_ = 0;
 

@@ -248,25 +248,25 @@ public:
      * Stage a per-callable_id orchestration SO and its supporting metadata.
      * See a5 onboard or a2a3 device_runner.h for full contract.
      */
-    int register_prepared_callable(
+    int register_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
         const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
     /** Host-orchestration sibling for hbg variants. See a2a3 onboard. */
-    int register_prepared_callable_host_orch(
+    int register_callable_host_orch(
         int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
     /** Drop prepared state for `callable_id`; trb refcounts SO, hbg dlcloses handle. */
-    int unregister_prepared_callable(int32_t callable_id);
+    int unregister_callable(int32_t callable_id);
 
     /** True iff `callable_id` has prepared state staged. */
-    bool has_prepared_callable(int32_t callable_id) const;
+    bool has_callable(int32_t callable_id) const;
 
     /** Replay prepared state onto a freshly-constructed Runtime. */
-    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    BindCallableResult bind_callable_to_runtime(Runtime &runtime, int32_t callable_id);
 
     /** Monotonic AICPU dlopen counter (first-sighting only; never decremented). */
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
@@ -340,7 +340,7 @@ private:
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
     // Per-callable_id prepared state. Mirrors onboard.
-    struct PreparedCallableState {
+    struct CallableState {
         // trb path
         uint64_t hash{0};
         uint64_t dev_orch_so_addr{0};
@@ -359,7 +359,7 @@ private:
         size_t capacity{0};
         int refcount{0};
     };
-    std::unordered_map<int32_t, PreparedCallableState> prepared_callables_;
+    std::unordered_map<int32_t, CallableState> callables_;
     std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     size_t aicpu_dlopen_total_{0};

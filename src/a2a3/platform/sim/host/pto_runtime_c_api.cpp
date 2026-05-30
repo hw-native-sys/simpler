@@ -39,10 +39,8 @@ extern "C" {
 /* ===========================================================================
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
-int prepare_callable_impl(
-    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), PreparedCallableArtifacts *out
-);
-int bind_prepared_to_runtime_impl(
+int prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
+int bind_callable_to_runtime_impl(
     Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
     int sig_count
 );
@@ -274,7 +272,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
     pthread_setspecific(g_runner_key, ctx);
 
     try {
-        PreparedCallableArtifacts artifacts;
+        CallableArtifacts artifacts;
         int rc = prepare_callable_impl(
             reinterpret_cast<const ChipCallable *>(callable), upload_chip_callable_buffer_wrapper, &artifacts
         );
@@ -284,7 +282,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
         }
 
         // Re-pack ChildKernelAddr -> std::pair to match the existing
-        // register_prepared_callable* signature.
+        // register_callable* signature.
         std::vector<std::pair<int, uint64_t>> kernel_addrs;
         kernel_addrs.reserve(artifacts.kernel_addrs.size());
         for (const ChildKernelAddr &c : artifacts.kernel_addrs) {
@@ -292,12 +290,12 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
         }
 
         if (artifacts.host_dlopen_handle != nullptr) {
-            rc = runner->register_prepared_callable_host_orch(
+            rc = runner->register_callable_host_orch(
                 callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
                 std::move(artifacts.signature)
             );
         } else {
-            rc = runner->register_prepared_callable(
+            rc = runner->register_callable(
                 callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
                 artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
             );
@@ -322,7 +320,7 @@ int run_prepared(
     if (ctx == NULL || runtime == NULL) return -1;
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
 
-    if (!runner->has_prepared_callable(callable_id)) {
+    if (!runner->has_callable(callable_id)) {
         LOG_ERROR("run_prepared: callable_id=%d not prepared", callable_id);
         return -1;
     }
@@ -344,7 +342,7 @@ int run_prepared(
         r->host_api.acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
-        auto bind_result = runner->bind_prepared_callable_to_runtime(*r, callable_id);
+        auto bind_result = runner->bind_callable_to_runtime(*r, callable_id);
         int rc = bind_result.rc;
         if (rc != 0) {
             r->~Runtime();
@@ -352,7 +350,7 @@ int run_prepared(
             return rc;
         }
 
-        rc = bind_prepared_to_runtime_impl(
+        rc = bind_callable_to_runtime_impl(
             r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
             bind_result.signature, bind_result.sig_count
         );
@@ -398,7 +396,7 @@ int run_prepared(
 int unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     if (ctx == NULL) return -1;
     try {
-        return static_cast<DeviceRunner *>(ctx)->unregister_prepared_callable(callable_id);
+        return static_cast<DeviceRunner *>(ctx)->unregister_callable(callable_id);
     } catch (...) {
         return -1;
     }

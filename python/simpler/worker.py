@@ -619,7 +619,7 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     # when a prior _CTRL_UNREGISTER failed before reaching
                     # prepared.discard, while the parent still popped its
                     # registry under best-effort semantics. Without this,
-                    # register_prepared_callable would fail-fast on a slot the
+                    # register_callable would fail-fast on a slot the
                     # user was told is reusable. The `cid in prepared` gate
                     # keeps the happy path at zero added cost.
                     if int(cid) in prepared:
@@ -1062,7 +1062,7 @@ class Worker:
         # The AICPU side keeps a fixed-size orch_so_table_ keyed by cid;
         # raise here so the failure surfaces at register-time with a
         # protocol-aware message, not later from
-        # DeviceRunner::register_prepared_callable with a generic
+        # DeviceRunner::register_callable with a generic
         # "out of range" log.
         raise RuntimeError(
             "Worker.register: cid space exhausted "

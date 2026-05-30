@@ -260,22 +260,22 @@ public:
      *                      them onto a fresh Runtime without re-uploading.
      * @return 0 on success, negative on failure.
      */
-    int register_prepared_callable(
+    int register_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
         const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
     /**
-     * Host-orchestration variant of register_prepared_callable: stores a
+     * Host-orchestration variant of register_callable: stores a
      * dlopen handle + entry-symbol pointer that runtime_maker resolved on the
      * host (host_build_graph variant). Mutually exclusive with the trb-shaped
-     * `register_prepared_callable` overload — exactly one is invoked for a
+     * `register_callable` overload — exactly one is invoked for a
      * given callable_id, picked by the C ABI based on which staging fields the
      * runtime carries after prepare_callable_impl. dlopen handle is owned by
      * DeviceRunner from this call onward and dlclose'd by
-     * unregister_prepared_callable. Increments `host_dlopen_count_`.
+     * unregister_callable. Increments `host_dlopen_count_`.
      */
-    int register_prepared_callable_host_orch(
+    int register_callable_host_orch(
         int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
@@ -287,17 +287,17 @@ public:
      * callables and only released by finalize().
      *
      * @param callable_id  Id previously passed to one of the
-     *                     register_prepared_callable* overloads.
+     *                     register_callable* overloads.
      * @return 0 on success or if the id was not registered.
      */
-    int unregister_prepared_callable(int32_t callable_id);
+    int unregister_callable(int32_t callable_id);
 
     /**
      * True iff `callable_id` has prepared state staged via
-     * register_prepared_callable. Lets the c_api layer reject `run_prepared`
+     * register_callable. Lets the c_api layer reject `run_prepared`
      * calls without a matching `prepare_callable`.
      */
-    bool has_prepared_callable(int32_t callable_id) const;
+    bool has_callable(int32_t callable_id) const;
 
     /**
      * Replay the prepared state for `callable_id` onto a freshly-constructed
@@ -306,7 +306,7 @@ public:
      * subsequent `run` dispatches via the AICPU per-cid table. The kernel
      * addresses are written directly into func_id_to_addr_ (bypassing
      * registered_kernel_func_ids_) so validate_runtime_impl will not free them
-     * — they survive until unregister_prepared_callable / finalize().
+     * — they survive until unregister_callable / finalize().
      *
      * Marks the cid as seen so the upcoming prepare_orch_so resolves
      * `register_new_callable_id_` correctly (true exactly on first sighting
@@ -318,10 +318,10 @@ public:
      * Replay a previously-registered callable's state onto a fresh Runtime
      * for a per-run binding. Writes back kernel addrs, orch entry-symbol
      * names, and active_callable_id; returns the hbg `host_orch_func_ptr`
-     * (or nullptr on trb / on error) inside a `BindPreparedCallableResult`
+     * (or nullptr on trb / on error) inside a `BindCallableResult`
      * so the caller can destructure with structured bindings.
      */
-    BindPreparedCallableResult bind_prepared_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    BindCallableResult bind_callable_to_runtime(Runtime &runtime, int32_t callable_id);
 
     /**
      * Number of distinct callable_ids the AICPU has been asked to dlopen for.
@@ -335,7 +335,7 @@ public:
 
     /**
      * Number of host-side dlopen() invocations triggered by
-     * `register_prepared_callable_host_orch`. Mirrors `aicpu_dlopen_count` but
+     * `register_callable_host_orch`. Mirrors `aicpu_dlopen_count` but
      * counts the host_build_graph variant's host-side dlopens; it never
      * decrements (re-prepare after unregister still counts). Tests assert
      * `host_dlopen_count == distinct_registered_cids` to verify the prepared
@@ -372,14 +372,14 @@ private:
 
     // Per-callable_id prepared state.
     //
-    // `prepared_callables_` maps the caller-stable callable_id to the orch
+    // `callables_` maps the caller-stable callable_id to the orch
     // SO slice + symbol names needed to launch it. `orch_so_dedup_` shares
     // device buffers across callable_ids whose orch SO bytes have the same
     // ELF Build-ID hash (refcounted; freed when the count hits zero).
     // `aicpu_seen_callable_ids_` tracks which ids have already been delivered
     // to the AICPU at least once so prepare_orch_so can set
     // register_new_callable_id_ correctly on first sighting.
-    struct PreparedCallableState {
+    struct CallableState {
         // trb path (AICPU dlopens orch SO from device buffer)
         uint64_t hash{0};
         uint64_t dev_orch_so_addr{0};
@@ -398,7 +398,7 @@ private:
         size_t capacity{0};
         int refcount{0};
     };
-    std::unordered_map<int32_t, PreparedCallableState> prepared_callables_;
+    std::unordered_map<int32_t, CallableState> callables_;
     std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     // Monotonic count of AICPU dlopens triggered (incremented on each
@@ -407,7 +407,7 @@ private:
     // re-prepared. Exposed via aicpu_dlopen_count() for tests.
     size_t aicpu_dlopen_total_{0};
     // Monotonic count of host-side dlopens triggered (incremented on every
-    // register_prepared_callable_host_orch call; never decremented). Same
+    // register_callable_host_orch call; never decremented). Same
     // re-prepare semantics as aicpu_dlopen_total_, but for hbg variants.
     size_t host_dlopen_total_{0};
     // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
@@ -431,8 +431,8 @@ private:
 
     /**
      * Stamp `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` from the
-     * PreparedCallableState for `runtime.get_active_callable_id()`. The orch
-     * SO bytes were already H2D'd at `register_prepared_callable` time and
+     * CallableState for `runtime.get_active_callable_id()`. The orch
+     * SO bytes were already H2D'd at `register_callable` time and
      * are shared via `orch_so_dedup_` across cids; this method only refreshes
      * the device-SO metadata onto the per-run Runtime and bumps the AICPU
      * first-sighting counter when the cid is new since registration.

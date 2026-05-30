@@ -280,14 +280,12 @@ extern "C" {
  * Stage the per-callable resources for the host_build_graph variant: upload
  * kernel binaries and dlopen the orchestration SO on the host. The dlopen
  * handle and resolved entry-symbol pointer are returned via
- * PreparedCallableArtifacts so the platform layer can hoist them into its
- * PreparedCallableState. Splitting this out of init_runtime_impl is what
+ * CallableArtifacts so the platform layer can hoist them into its
+ * CallableState. Splitting this out of init_runtime_impl is what
  * the hbg prepare_callable / run_prepared path rests on — the dlopen runs
  * once per cid instead of every run.
  */
-int prepare_callable_impl(
-    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), PreparedCallableArtifacts *out
-) {
+int prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out) {
     if (callable == nullptr) {
         LOG_ERROR("Callable pointer is null");
         return -1;
@@ -296,7 +294,7 @@ int prepare_callable_impl(
         LOG_ERROR("upload_fn or out is null");
         return -1;
     }
-    *out = PreparedCallableArtifacts{};
+    *out = CallableArtifacts{};
     out->signature.assign(callable->signature_, callable->signature_ + callable->sig_count());
 
     LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
@@ -322,7 +320,7 @@ int prepare_callable_impl(
 
     // Load orchestration SO from binary data via temp file. Held open across
     // the lifetime of the prepared callable; closed by
-    // DeviceRunner::unregister_prepared_callable.
+    // DeviceRunner::unregister_callable.
     std::string fd_path;
     if (!create_temp_so_file(orch_so_binary, orch_so_size, &fd_path)) {
         LOG_ERROR("Failed to create temp SO file");
@@ -356,10 +354,10 @@ int prepare_callable_impl(
  * Per-run binding for hbg: invoke the previously-resolved orchestration entry
  * point against the supplied args, then upload tensor info / allocation
  * storage. The c_api caller passes `host_orch_func_ptr` straight through from
- * DeviceRunner::bind_prepared_callable_to_runtime (which read it from
- * PreparedCallableState for this run's callable_id).
+ * DeviceRunner::bind_callable_to_runtime (which read it from
+ * CallableState for this run's callable_id).
  */
-int bind_prepared_to_runtime_impl(
+int bind_callable_to_runtime_impl(
     Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
     int sig_count
 ) {
@@ -373,7 +371,7 @@ int bind_prepared_to_runtime_impl(
     }
     OrchestrationFunc orch_func = reinterpret_cast<OrchestrationFunc>(host_orch_func_ptr);
     if (orch_func == nullptr) {
-        LOG_ERROR("bind_prepared_to_runtime_impl: host orch_func pointer is null");
+        LOG_ERROR("bind_callable_to_runtime_impl: host orch_func pointer is null");
         return -1;
     }
 
