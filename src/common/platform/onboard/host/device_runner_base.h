@@ -421,6 +421,75 @@ protected:
      */
     int validate_block_dim(rtStream_t stream, int block_dim);
 
+    // ---- run() sub-sequence helpers --------------------------------------
+    //
+    // Each arch's `run()` keeps the heavily-divergent middle (register
+    // address setup, profiling flag building, init_*, collector start /
+    // teardown, dep_gen, ffts setup, kernel launches). These helpers
+    // cover the byte-identical sub-sequences at the head and tail.
+
+    /**
+     * Validate the caller's `launch_aicpu_num` against
+     * `PLATFORM_MAX_AICPU_THREADS`. Returns 0 on success, -1 on
+     * out-of-range with a logged error.
+     */
+    int validate_launch_aicpu_num(int launch_aicpu_num);
+
+    /**
+     * Lazy-allocate the 8-byte device-resident buffer that AICPU writes
+     * the run wall (ns) into and that `read_device_wall_ns()` pulls
+     * back after stream sync. Idempotent: a no-op once
+     * `device_wall_dev_ptr_` is non-null. Routes the alloc through
+     * `mem_alloc_`; the pointer is freed by `finalize_common()`.
+     * Failure to alloc is non-fatal (`device_wall_data_base` stays 0,
+     * subsequent `last_device_wall_ns()` reads 0).
+     */
+    void ensure_device_wall_buffer();
+
+    /**
+     * Resolve the caller's `requested_block_dim` into a concrete
+     * block_dim:
+     *  - `requested_block_dim == 0`: auto-resolve from
+     *    `query_max_block_dim(stream_aicore_)`.
+     *  - otherwise: pass through `validate_block_dim`.
+     *
+     * Returns the resolved block_dim on success, -1 on failure.
+     * Updates `block_dim_` on success.
+     */
+    int resolve_block_dim(int requested_block_dim);
+
+    /**
+     * Per-run Runtime setup: derives `num_aicore = block_dim *
+     * cores_per_blockdim_`, range-checks against `RUNTIME_MAX_WORKER`,
+     * publishes `runtime.worker_count`, `worker_count_`,
+     * `runtime.aicpu_thread_num`, zero-initializes the handshake
+     * worker array with AIC/AIV core typing (first `block_dim` cores
+     * are AIC, remaining are AIV), and rewrites each task's
+     * `function_bin_addr` from `runtime.get_function_bin_addr(func_id)
+     * + CoreCallable::binary_data_offset()`.
+     *
+     * Returns 0 on success, -1 on `block_dim`-too-large error.
+     */
+    int prepare_runtime_for_launch(Runtime &runtime, int block_dim, int launch_aicpu_num);
+
+    /**
+     * Wait for both per-Worker streams (AICPU first, then AICore) with
+     * `PLATFORM_STREAM_SYNC_TIMEOUT_MS`. Distinguishes the timeout
+     * sentinel `ACL_ERROR_RT_STREAM_SYNC_TIMEOUT` with a stream-id and
+     * (device, block_dim) context in the log. Returns the first
+     * non-zero rc encountered.
+     */
+    int sync_run_streams();
+
+    /**
+     * Pull the device wall (ns) back from `device_wall_dev_ptr_` and
+     * cache it on `device_wall_ns_`. D2H copy failure is a soft warn —
+     * `device_wall_ns_` stays at 0 so `last_device_wall_ns()` returns 0
+     * to callers. No-op if `device_wall_dev_ptr_` is null (lazy alloc
+     * may have failed silently).
+     */
+    void read_device_wall_ns();
+
     /**
      * Shared body of `finalize()`. Each arch subclass's `finalize()`
      * handles: (a) the early-return + thread attach prologue, (b) any

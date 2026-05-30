@@ -36,6 +36,7 @@
 #include "callable.h"
 #include "callable_protocol.h"
 #include "chip_callable_layout.h"
+#include "common/core_type.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host_log.h"
@@ -776,4 +777,136 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
     }
 
     return rc;
+}
+
+// =============================================================================
+// run() sub-sequence helpers — head + tail chunks shared by both arches
+// =============================================================================
+
+int DeviceRunnerBase::validate_launch_aicpu_num(int launch_aicpu_num) {
+    if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
+        LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
+        return -1;
+    }
+    return 0;
+}
+
+void DeviceRunnerBase::ensure_device_wall_buffer() {
+    if (device_wall_dev_ptr_ != nullptr) return;
+    device_wall_dev_ptr_ = allocate_tensor(sizeof(uint64_t));
+    if (device_wall_dev_ptr_ != nullptr) {
+        kernel_args_.args.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
+        uint64_t zero = 0;
+        (void)copy_to_device(device_wall_dev_ptr_, &zero, sizeof(uint64_t));
+    }
+}
+
+int DeviceRunnerBase::resolve_block_dim(int requested_block_dim) {
+    // Auto sentinel (block_dim == 0) is resolved directly from
+    // query_max_block_dim; explicit values still go through validate. The
+    // auto branch skips validate so we don't pay the ACL syscalls twice.
+    int resolved = requested_block_dim;
+    if (resolved == 0) {
+        resolved = query_max_block_dim(stream_aicore_);
+        LOG_INFO_V0("block_dim auto-resolved to %d", resolved);
+        if (resolved < 1) {
+            LOG_ERROR("block_dim auto-resolved to invalid value %d", resolved);
+            return -1;
+        }
+    } else {
+        int rc = validate_block_dim(stream_aicore_, resolved);
+        if (rc != 0) {
+            return -1;
+        }
+    }
+    block_dim_ = resolved;
+    return resolved;
+}
+
+int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim, int launch_aicpu_num) {
+    int num_aicore = block_dim * cores_per_blockdim_;
+    if (num_aicore > RUNTIME_MAX_WORKER) {
+        LOG_ERROR("block_dim (%d) exceeds RUNTIME_MAX_WORKER (%d)", block_dim, RUNTIME_MAX_WORKER);
+        return -1;
+    }
+
+    runtime.worker_count = num_aicore;
+    worker_count_ = num_aicore;  // Stored for print_handshake_results in destructor
+    runtime.aicpu_thread_num = launch_aicpu_num;
+
+    // First `block_dim` cores are AIC; remaining ~2/3 are AIV.
+    int num_aic = block_dim;
+    for (int i = 0; i < num_aicore; i++) {
+        runtime.workers[i].aicpu_ready = 0;
+        runtime.workers[i].aicore_done = 0;
+        runtime.workers[i].task = 0;
+        runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
+    }
+
+    // Set function_bin_addr for all tasks: Runtime::func_id_to_addr_[] stores
+    // a CoreCallable device address; the binary code address is one
+    // compile-time offset further in. The dispatch path then reads
+    // resolved_addr_ from the on-device CoreCallable header.
+    LOG_DEBUG("Setting function_bin_addr for Tasks");
+    for (int i = 0; i < runtime.get_task_count(); i++) {
+        Task *task = runtime.get_task(i);
+        if (task != nullptr) {
+            uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
+            task->function_bin_addr = callable_addr + CoreCallable::binary_data_offset();
+            LOG_DEBUG("Task %d (func_id=%d) -> function_bin_addr=0x%lx", i, task->func_id, task->function_bin_addr);
+        }
+    }
+    LOG_DEBUG("");
+    return 0;
+}
+
+int DeviceRunnerBase::sync_run_streams() {
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
+    int rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+        );
+        return rc;
+    }
+    if (rc != 0) {
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICPU) failed: %d", rc);
+        return rc;
+    }
+
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+        );
+        return rc;
+    }
+    if (rc != 0) {
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
+        return rc;
+    }
+    return 0;
+}
+
+void DeviceRunnerBase::read_device_wall_ns() {
+    // Pull the platform-level device wall (ns) back from the 8-byte
+    // device buffer that AICPU writes through via
+    // KernelArgs::device_wall_data_base. (We can't use the
+    // device_k_args_ shadow here — CANN's rtAicpuKernelLaunchExWithArgs
+    // copies KernelArgs into AICPU-private memory at launch, so AICPU's
+    // writes to its local copy don't propagate to device_k_args_.)
+    // Failure path is a soft warn — wall stays zero.
+    device_wall_ns_ = 0;
+    if (device_wall_dev_ptr_ != nullptr) {
+        int wall_rc = rtMemcpy(
+            &device_wall_ns_, sizeof(uint64_t), device_wall_dev_ptr_, sizeof(uint64_t), RT_MEMCPY_DEVICE_TO_HOST
+        );
+        if (wall_rc != 0) {
+            LOG_WARN("rtMemcpy(device_wall_ns) D2H failed: %d", wall_rc);
+            device_wall_ns_ = 0;
+        }
+    }
 }
