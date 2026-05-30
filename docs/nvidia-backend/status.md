@@ -2096,6 +2096,12 @@ Override sidecars are supported with `task_overrides_path` or
 selector first failed because the file was ignored and task `4294967296`
 still dispatched `func_id=1`, then passed locally on A100 with
 `2 passed, 163 deselected`.
+Relative task metadata sidecar paths embedded in graph JSON files are now
+resolved beside the graph JSON file. The focused selector first failed with
+`FileNotFoundError: task_metadata.json`, then passed locally on A100 with
+`2 passed, 165 deselected` and remotely on H200 with
+`2 passed, 165 deselected`; the H200 run printed the known PTO-ISA SSH refresh
+warning first.
 The same graph-shaped path now accepts `graph.tasks` as a dictionary keyed by
 task name, so descriptor specs can keep node names in one place and reference
 those names from top-level edges. The ctypes-backed

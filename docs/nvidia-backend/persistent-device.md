@@ -414,7 +414,11 @@ list of metadata entries carrying `name`, `id`, or `task_id`. Inline graph
 overlays may also use `task_metadata_path` / `task_metadata_file`, or
 `task_overrides_path` / `task_overrides_file`, to load the same metadata or
 override list/dictionary from a sidecar JSON file. The same sidecar fields are
-accepted on inline graph descriptors and graph JSON files.
+accepted on inline graph descriptors and graph JSON files. When a graph is
+loaded through `graph_path`, `graph_file`, or a string-valued `graph`,
+relative sidecar paths are resolved beside that graph JSON file. Inline-only
+graph descriptors keep normal process-working-directory relative path
+semantics.
 `graph.edges` may also be an adjacency dictionary from source task name/id to
 a single target or a list of targets.
 `graph.links` is accepted as the same edge-list field when importing

@@ -1646,6 +1646,15 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k dep_gen_task_metadata_file --platform cuda
 ```
 
+After changing relative task metadata sidecar-file resolution for graph JSON
+files, use:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k relative_task_metadata_file --platform cuda
+```
+
 After changing task metadata sidecar-file loading for inline graph
 descriptors, use:
 

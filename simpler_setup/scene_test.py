@@ -1341,19 +1341,32 @@ class _CudaPersistentDagSceneBuffers:
                 raise ValueError("CUDA persistent_dag_graph_f32 requires a graph descriptor")
             return _CudaPersistentDagSceneBuffers._graph_with_task_sidecar_files(cuda_spec, graph)
 
-        with Path(graph_path).open(encoding="utf-8") as graph_file:
+        graph_file_path = Path(graph_path)
+        with graph_file_path.open(encoding="utf-8") as graph_file:
             loaded_graph = json.load(graph_file)
         if not isinstance(loaded_graph, dict):
             raise ValueError("CUDA persistent_dag_graph_f32 graph file must contain a JSON object")
         if graph is None:
-            return _CudaPersistentDagSceneBuffers._graph_with_task_sidecar_files(cuda_spec, loaded_graph)
+            return _CudaPersistentDagSceneBuffers._graph_with_task_sidecar_files(
+                cuda_spec,
+                loaded_graph,
+                graph_file_path.parent,
+            )
         if not isinstance(graph, dict):
             raise ValueError("CUDA persistent_dag_graph_f32 graph overlay must be a dictionary")
         merged_graph = {**loaded_graph, **graph}
-        return _CudaPersistentDagSceneBuffers._graph_with_task_sidecar_files(cuda_spec, merged_graph)
+        return _CudaPersistentDagSceneBuffers._graph_with_task_sidecar_files(
+            cuda_spec,
+            merged_graph,
+            graph_file_path.parent,
+        )
 
     @staticmethod
-    def _graph_with_task_sidecar_files(cuda_spec: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
+    def _graph_with_task_sidecar_files(
+        cuda_spec: dict[str, Any],
+        graph: dict[str, Any],
+        graph_dir: Path | None = None,
+    ) -> dict[str, Any]:
         merged_graph = dict(graph)
         default_metadata_path = cuda_spec.get("task_metadata_path", cuda_spec.get("task_metadata_file"))
         metadata_path = merged_graph.pop(
@@ -1361,7 +1374,9 @@ class _CudaPersistentDagSceneBuffers:
             merged_graph.pop("task_metadata_file", default_metadata_path),
         )
         if metadata_path is not None:
-            with Path(metadata_path).open(encoding="utf-8") as metadata_file:
+            with _CudaPersistentDagSceneBuffers._graph_sidecar_path(metadata_path, graph_dir).open(
+                encoding="utf-8"
+            ) as metadata_file:
                 merged_graph["task_metadata"] = json.load(metadata_file)
         default_overrides_path = cuda_spec.get("task_overrides_path", cuda_spec.get("task_overrides_file"))
         overrides_path = merged_graph.pop(
@@ -1369,9 +1384,18 @@ class _CudaPersistentDagSceneBuffers:
             merged_graph.pop("task_overrides_file", default_overrides_path),
         )
         if overrides_path is not None:
-            with Path(overrides_path).open(encoding="utf-8") as overrides_file:
+            with _CudaPersistentDagSceneBuffers._graph_sidecar_path(overrides_path, graph_dir).open(
+                encoding="utf-8"
+            ) as overrides_file:
                 merged_graph["task_overrides"] = json.load(overrides_file)
         return merged_graph
+
+    @staticmethod
+    def _graph_sidecar_path(path_value: Any, graph_dir: Path | None) -> Path:
+        sidecar_path = Path(path_value)
+        if graph_dir is not None and not sidecar_path.is_absolute():
+            return graph_dir / sidecar_path
+        return sidecar_path
 
     @staticmethod
     def _graph_task_specs(graph: dict[str, Any]) -> list[dict[str, Any]]:
