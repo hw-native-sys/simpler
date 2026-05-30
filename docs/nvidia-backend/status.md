@@ -182,6 +182,8 @@ execution modes:
 - generated-dispatch DAG with fan-in counters;
 - five-task DAG-chain runtime graph descriptor;
 - six-task scratch-reuse DAG descriptor;
+- four-task multi-fan-in graph descriptor with three independent producers,
+  scalar scale metadata, a third-tensor final join, and two scheduler blocks;
 - tensor-tile DAG descriptor with rows/cols/inner/stride metadata;
 - tensor-core tile DAG descriptor with a block-wide CUDA WMMA
   `m16n16k8`/TF32/F32 generated-dispatch task body;
@@ -324,6 +326,7 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_graph_diamond`;
 - `pto_persistent_dag_graph_parallel_chains`;
 - `pto_persistent_dag_graph_wide_fanout`;
+- `pto_persistent_dag_graph_multi_fanin`;
 - `pto_persistent_dag_graph_tagged`;
 - `pto_persistent_dag_graph_tagged_inout`;
 - `pto_persistent_dag_graph_role_keyed_inout`;
@@ -359,18 +362,25 @@ node attrs/ops metadata, named-callable metadata, task-argument spellings,
 scratch-reuse metadata, the nine-task parallel-chains queue capacity, and the
 seven-task wide-fanout queue capacity. This supersedes the older `4e81fbff`,
 `c183d1ad`, `f99dc6b0`, `9ec5511e`, `cb300e82`, and `61cf96cd` full captures
-while keeping the same three-size/three-repeat comparison role.
+while keeping the same three-size/three-repeat comparison role. After adding
+`pto_persistent_dag_graph_multi_fanin`, the full paired-current preset should
+validate `1332` samples; that full three-size gate has not replaced the
+`5d84690d` artifact yet.
 
 The selected benchmark preset now also includes
-`pto_persistent_dag_graph_wide_fanout`. The compact paired A100/H200 gate
+`pto_persistent_dag_graph_multi_fanin`. The compact paired A100/H200 gate
 under
-`tmp/cuda-backend/wide-fanout-selected-current-working/`
-`combined-current-a540a014/` validates the no-batch `N=1024` selected matrix
-with `104` samples. Its wide-fanout row records dispatch `1,1,2,1,1,2,1`,
+`tmp/cuda-backend/multi-fanin-selected-current-working/`
+`combined-current-c1c5f765/` validates the no-batch `N=1024` selected matrix
+with `106` samples. Its wide-fanout row records dispatch `1,1,2,1,1,2,1`,
 fan-in `0,1,1,1,2,2,2`, dependents `1,2,3,4,4,5,5,6,6`, queue capacity `7`,
-generated-dispatch PTX, report-visible graph topology, source-paper
-provenance, sanitized local/remote command examples, and zero scheduler
-errors. The full `5d84690d` capture reports wide-fanout medians of
+and its multi-fan-in row records dispatch `1,2,11,6`, fan-in `0,0,0,3`,
+dependents `3,3,3`, scalar metadata `scalar0=2.0`, tensor metadata
+`c=tmp2`, generated-dispatch PTX, report-visible graph topology,
+source-paper provenance, sanitized local/remote command examples, and zero
+scheduler errors. The compact gate measured multi-fan-in device times of
+`51200 ns` on A100 and `46656 ns` on H200. The full `5d84690d` capture
+reports wide-fanout medians of
 `59392/275040/4225504 ns` on A100 and `55232/259168/3492544 ns` on H200 for
 `N=1024,65536,1048576`.
 
@@ -4906,8 +4916,17 @@ Needed:
   The paired smoke under
   `tmp/cuda-backend/wide-fanout-smoke-a540a014/` separately validates two
   repeat launches with scheduler completions split `[3,4]` on A100 and
-  `[4,3]` on H200. The remaining policy gap is broader graph families beyond
-  diamond, parallel-chain, and wide-fanout shapes, rather than launch
+  `[4,3]` on H200. The compact multi-fan-in gate under
+  `tmp/cuda-backend/multi-fanin-selected-current-working/`
+  `combined-current-c1c5f765/` validates 106 rows and records dispatch
+  `1,2,11,6`, fan-in `0,0,0,3`, dependents `3,3,3`, and zero scheduler
+  errors. Its paired smoke under
+  `tmp/cuda-backend/multi-fanin-working/`
+  `persistent-graph_descriptor_multi_fanin-sched2-repeat2-smoke-c1c5f765/`
+  separately validates two repeat launches with scheduler completions split
+  `[3,1]` on A100 and `[1,3]` on H200. The remaining policy gap is broader
+  graph families beyond diamond, parallel-chain, wide-fanout, and
+  multi-fan-in shapes, rather than launch
   resource partitioning, root seeding, completion-ring ownership,
   graph-size reporting, or artifact
   validation;

@@ -1523,6 +1523,59 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                 ),
             ),
         )
+    if dag_shape == "graph_descriptor_multi_fanin":
+        task_count = 4
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 3
+        task_t = CudaPersistentDagTask * task_count
+        return (
+            host_fanin_t(0, 0, 0, 3),
+            dependents_t(3, 3, 3),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp0,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp1,
+                    n=n,
+                    dependent_begin=1,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=11,
+                    a=dev_a,
+                    b=0,
+                    out=dev_tmp2,
+                    n=n,
+                    dependent_begin=2,
+                    dependent_count=1,
+                    initial_fanin=0,
+                    scalar0=2.0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=6,
+                    a=dev_tmp0,
+                    b=dev_tmp1,
+                    c=dev_tmp2,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=3,
+                    dependent_count=0,
+                    initial_fanin=3,
+                ),
+            ),
+        )
     if dag_shape in {"graph_tensor_core_tile", "graph_tensor_tile", "tensor_core_tile", "tensor_tile"}:
         descriptor = tensor_tile or _TENSOR_TILE_DESCRIPTOR
         task_count = 4
@@ -2865,6 +2918,11 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 expected_tmp2 = child_mul_b
                 expected_tmp0 = [_f32(child_mul_b[i] * expected_tmp3[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + expected_tmp0[i]) for i in range(n)]
+            if config.dag_shape == "graph_descriptor_multi_fanin":
+                expected_tmp0 = [_f32(host_a[i] + host_b[i]) for i in range(n)]
+                expected_tmp1 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
+                expected_tmp2 = [_f32(2.0 * host_a[i]) for i in range(n)]
+                expected_out = [_f32(expected_tmp0[i] * expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
             if config.dag_shape in {"scalar_axpy", "graph_descriptor_scalar_axpy"}:
                 expected_tmp0 = [_f32(_f32(1.5 * host_a[i]) + host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
@@ -2963,6 +3021,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                     "graph_descriptor",
                     "graph_descriptor_diamond",
                     "graph_descriptor_generic_args4",
+                    "graph_descriptor_multi_fanin",
                     "graph_descriptor_node_attrs",
                     "graph_descriptor_parallel_chains",
                     "graph_descriptor_reordered",
@@ -3061,6 +3120,9 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             result["scalar_args"] = {"scalar0": 2.0}
         if config.dag_shape in {"scalar_affine", "graph_descriptor_scalar_affine"}:
             result["scalar_args"] = {"scalar0": 1.5, "scalar1": 0.5}
+        if config.dag_shape == "graph_descriptor_multi_fanin":
+            result["scalar_args"] = {"scalar0": 2.0}
+            result["tensor_args"] = {"c": "tmp2"}
         if config.dag_shape in triad_shapes:
             result["tensor_args"] = {"c": "tmp0"}
         if config.dag_shape in quad_shapes:
@@ -3086,6 +3148,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_depends_on",
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
+            "graph_descriptor_multi_fanin",
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_link",
@@ -3295,6 +3358,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_depends_on",
         "graph_descriptor_diamond",
         "graph_descriptor_generic_args4",
+        "graph_descriptor_multi_fanin",
         "graph_descriptor_node_attrs",
         "graph_descriptor_node_io",
         "graph_descriptor_node_link",
@@ -3379,6 +3443,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_descriptor_depends_on",
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
+            "graph_descriptor_multi_fanin",
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_link",
@@ -3617,6 +3682,7 @@ def main() -> None:
             "graph_descriptor_depends_on",
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
+            "graph_descriptor_multi_fanin",
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
             "graph_descriptor_node_link",

@@ -495,12 +495,14 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 The compact-current preset expects the current selected persistent graph
-matrix. For no-batch graph-row gates, the paired runner should validate `98`
+matrix. For no-batch graph-row gates, the paired runner should validate `106`
 samples across A100 and H200, including
 `pto_persistent_dag_graph_reordered` with dispatch `1,9,2`, graph fan-in
 `2,0,0`, and dependents `0,0`, plus
 `pto_persistent_dag_graph_role_map_inout` with dispatch `1,1,1`, graph fan-in
-`0,1,1`, dependents `1,2`, and `graph_task_arg_key=role_map`.
+`0,1,1`, dependents `1,2`, and `graph_task_arg_key=role_map`. It also
+requires `pto_persistent_dag_graph_multi_fanin` with dispatch `1,2,11,6`,
+graph fan-in `0,0,0,3`, and dependents `3,3,3`.
 
 The default full paired benchmark shape uses:
 

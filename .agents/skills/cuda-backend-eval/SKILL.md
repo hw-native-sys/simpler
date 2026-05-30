@@ -969,6 +969,17 @@ The full paired gate under
 values `32,64,128,256`. The wide-fanout median device times are
 `59392/275040/4225504 ns` on A100 and `55232/259168/3492544 ns` on H200 for
 the three sizes.
+Use `--dag-shape graph_descriptor_multi_fanin --scheduler-blocks 2
+--worker-blocks 3 --queue-capacity 3 --repeat-runs 2` to validate a
+four-task explicit graph with three independent producers and one final
+join. This records fan-in `[0,0,0,3]`, dependents `[3,3,3]`, dispatch
+`1,2,11,6`, scalar metadata `scalar0=2.0`, and tensor metadata `c=tmp2`.
+The paired A100/H200 smoke under
+`tmp/cuda-backend/multi-fanin-working/`
+`persistent-graph_descriptor_multi_fanin-sched2-repeat2-smoke-c1c5f765/`
+validated repeat completions `[4,4]`, two active scheduler blocks, and zero
+device scheduler errors. A100 reported `90112 ns`; H200 reported
+`60544 ns` for the two-launch capture.
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such
 as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.
@@ -2234,11 +2245,12 @@ explicit graph tensor DAG, WMMA tensor-core DAG, and cuBLAS rows can run
 together. The current committed summary keeps the full current-head
 `5d84690d` capture plus compact current-head gates in
 `docs/nvidia-backend/evaluation-current.md`.
-The full current-head artifact under
+The latest checked full current-head artifact under
 `tmp/cuda-backend/current-head-full-wide-fanout-5d84690d-working/`
 `combined-current-5d84690d/` validated `1314` A100/H200 samples after the
 wide-fanout graph row joined the selected matrix.
-Full captures should validate `1314` samples with sizes
+After adding `pto_persistent_dag_graph_multi_fanin`, full captures should
+validate `1332` samples with sizes
 `1024,65536,1048576`, three repeats, tensor descriptor `16x16x16`, task
 counts `2,6,12`, worker-grid values `32,64,128,256`, source-paper
 provenance, sanitized command examples, graph topology and TaskArgs metadata
@@ -2252,6 +2264,8 @@ report dispatch `1,2,1,2,1,1,2,1,1`, queue capacity `9`, fan-in
 `0,0,0,0,2,2,2,2,2`, and dependents `4,4,5,5,6,7,6,7,8,8`; the
 wide-fanout row must report dispatch `1,1,2,1,1,2,1`, queue capacity `7`,
 fan-in `0,1,1,1,2,2,2`, and dependents `1,2,3,4,4,5,5,6,6`.
+The multi-fan-in row must report dispatch `1,2,11,6`, queue capacity `3`,
+fan-in `0,0,0,3`, and dependents `3,3,3`.
 
 Run the full paired-current gate with:
 
@@ -2263,7 +2277,7 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 Use this compact paired gate after changing selected persistent graph
-benchmark rows. With `--batch-tasks 0`, it validates 104 non-batch samples
+benchmark rows. With `--batch-tasks 0`, it validates 106 non-batch samples
 across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
 `pto_persistent_dag_graph_node_io`, `pto_persistent_dag_graph_node_link`,
 `pto_persistent_dag_graph_named_callable`, `pto_persistent_dag_graph_node_op`,
@@ -2275,12 +2289,13 @@ across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
 `pto_persistent_dag_graph_triad`, `pto_persistent_dag_graph_quad`,
 `pto_persistent_dag_graph_parallel_chains`,
 `pto_persistent_dag_graph_wide_fanout`,
+`pto_persistent_dag_graph_multi_fanin`,
 `pto_persistent_dag_graph_compact_role_inout`,
 `pto_persistent_dag_graph_role_map_inout` and
 `pto_persistent_dag_graph_submit_groups` with dispatch `9,2,1`, `1,2,1`,
 `1,2,1`, `1,2,1`, `1,2,1`, `4,2,1`, `11,2,1`, `5,2,1`, `1,9,2`,
-`6,2,1`, `8,2,1`, `1,2,1,2,1,1,2,1,1`, `1,1,2,1,1,2,1`, `1,1,1`,
-`1,1,1`, and `1,1,1`.
+`6,2,1`, `8,2,1`, `1,2,1,2,1,1,2,1,1`, `1,1,2,1,1,2,1`,
+`1,2,11,6`, `1,1,1`, `1,1,1`, and `1,1,1`.
 The node-attrs row requires
 `graph_node_attrs=task0=attrs:tensor_args,scalar_args`,
 `scalar_args[0]=1.5,scalar_args[1]=0.25`, and
@@ -2309,13 +2324,15 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 The current compact capture under
-`tmp/cuda-backend/wide-fanout-selected-current-working/`
-`combined-current-a540a014/` is the latest checked compact form of this gate.
-It validates 104 A100/H200 samples and requires report-visible graph
+`tmp/cuda-backend/multi-fanin-selected-current-working/`
+`combined-current-c1c5f765/` is the latest checked compact form of this gate.
+It validates 106 A100/H200 samples and requires report-visible graph
 topology, node-IO task args, node-link/named-callable graph-node ops,
 scalar/tensor node-attrs descriptor args, selected tensor-throughput rows,
-parallel-chain and wide-fanout graph fan-in/dependent metadata, sanitized
-command examples, source-paper metadata, and zero scheduler errors.
+parallel-chain, wide-fanout, and multi-fan-in graph fan-in/dependent
+metadata, sanitized command examples, source-paper metadata, and zero
+scheduler errors. The multi-fan-in row reports `51200 ns` on A100 and
+`46656 ns` on H200 for `N=1024`.
 The generated
 `cuda_current_summary.py --section graph-metadata` output includes a
 `Task args` column for copying graph node IO metadata into evaluation docs.

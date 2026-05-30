@@ -52,6 +52,7 @@ DAG_BASELINES = (
     "pto_persistent_dag_graph_depends_on",
     "pto_persistent_dag_graph_diamond",
     "pto_persistent_dag_graph_wide_fanout",
+    "pto_persistent_dag_graph_multi_fanin",
     "pto_persistent_dag_graph_scratch_reuse",
     "pto_persistent_dag_graph_tagged_inout",
     "pto_persistent_dag_graph_role_keyed_inout",
@@ -285,6 +286,7 @@ def render_dag_shape_table(payload: Payload) -> str:
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_graph_depends_on", n, 3, 1), dag),
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_graph_diamond", n, 5, 1), dag),
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_graph_wide_fanout", n, 7, 1), dag),
+                    _ratio_for_key(summary, (machine, "pto_persistent_dag_graph_multi_fanin", n, 4, 1), dag),
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_graph_scratch_reuse", n, 6, 1), dag),
                     _ratio_for_key(summary, (machine, "pto_persistent_dag_graph_tagged_inout", n, 3, 1), dag),
                     _ratio_for_key(
@@ -318,6 +320,7 @@ def render_dag_shape_table(payload: Payload) -> str:
             "Graph Depends-On/DAG",
             "Graph Diamond/DAG",
             "Graph Wide Fanout/DAG",
+            "Graph Multi Fan-In/DAG",
             "Graph Scratch Reuse/DAG",
             "Graph Tagged Inout/DAG",
             "Graph Role Inout/DAG",

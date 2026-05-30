@@ -3226,6 +3226,65 @@ The compact selected-matrix capture under
 validated `100` non-batch rows at size `1024`, one repeat, and the same
 submit-groups metadata before the full `c183d1ad` refresh.
 
+## Current Multi-Fan-In Graph Row
+
+The compact paired gate at artifact label `c1c5f765` adds
+`pto_persistent_dag_graph_multi_fanin` to the selected benchmark and compact
+validator presets. The row is a four-task explicit graph descriptor with
+three independent producer tasks and one final join. It exercises fan-in
+greater than two in the persistent-device scheduler without introducing a new
+task-body ABI: the producers dispatch add, multiply, and scalar-scale task
+bodies, and the final task dispatches the existing triad body over
+`tmp0`, `tmp1`, and `tmp2`.
+
+The compact A100/H200 gate validates `106` non-batch rows at size `1024`, one
+repeat, source-paper provenance, command examples, Markdown/SVG reports,
+graph topology/task-argument metadata, tensor-throughput rows, and zero
+scheduler errors. The multi-fan-in row specifically validates dispatch
+`1,2,11,6`, graph fan-in `0,0,0,3`, dependents `3,3,3`, scalar metadata
+`scalar0=2.0`, and tensor metadata `c=tmp2`.
+
+Artifacts:
+
+- Smoke:
+  root `tmp/cuda-backend/multi-fanin-working/`, label
+  `persistent-graph_descriptor_multi_fanin-sched2-repeat2-smoke-c1c5f765`.
+- Compact benchmark:
+  root `tmp/cuda-backend/multi-fanin-selected-current-working/`, label
+  `combined-current-c1c5f765`.
+
+Validation commands:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_persistent_smoke.py \
+    --dag-shape graph_descriptor_multi_fanin --task-count 4 \
+    --queue-capacity 3 --scheduler-blocks 2 --worker-blocks 3 \
+    --repeat-runs 2 --sync-remote-tree \
+    --output-root tmp/cuda-backend/multi-fanin-working
+
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
+    --sizes 1024 --repeats 1 --batch-tasks 0 \
+    --worker-blocks-per-task 1 --sync-remote-tree \
+    --output-root tmp/cuda-backend/multi-fanin-selected-current-working
+```
+
+Measured rows:
+
+| Machine | Device ns | Host ns | Dispatch | Fan-in | Dependents |
+| ------- | --------- | ------- | -------- | ------ | ---------- |
+| A100 | 51200 | 63645 | `1,2,11,6` | `0,0,0,3` | `3,3,3` |
+| H200 | 46656 | 59014 | `1,2,11,6` | `0,0,0,3` | `3,3,3` |
+
+The paired smoke for the same graph used two scheduler blocks and three
+worker blocks, with repeat completions `[4,4]` on both GPUs. The smoke
+reported `90112 ns` on A100 and `60544 ns` on H200 for the combined
+two-launch capture, with scheduler completions split `[3,1]` and `[1,3]`.
+This is a current compact gate, not a replacement for the older full
+three-size `5d84690d` capture. A full paired-current refresh after adding
+this row should validate `1332` samples.
+
 ## Reproduction Commands
 
 Local A100:

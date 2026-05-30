@@ -1499,7 +1499,13 @@ def run_persistent_sample(
     if dag_shape in {"graph_tensor_core_tile", "tensor_core_tile"}:
         _validate_tensor_core_tile(tensor_tile or {"rows": 16, "cols": 16, "inner": 16})
     if task_count is None:
-        if dag_shape in {"graph_tensor_core_tile", "graph_tensor_tile", "tensor_core_tile", "tensor_tile"}:
+        if dag_shape in {
+            "graph_descriptor_multi_fanin",
+            "graph_tensor_core_tile",
+            "graph_tensor_tile",
+            "tensor_core_tile",
+            "tensor_tile",
+        }:
             task_count = 4
         elif dag_shape == "scratch_reuse":
             task_count = 6
@@ -1838,6 +1844,15 @@ def run_single_sample(  # noqa: PLR0912
             baseline=baseline,
             dag_shape="graph_descriptor_wide_fanout",
         )
+    if baseline == "pto_persistent_dag_graph_multi_fanin":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="graph_descriptor_multi_fanin",
+        )
     if baseline == "pto_persistent_dag_graph_tagged":
         return run_persistent_sample(
             device=device,
@@ -2167,6 +2182,7 @@ def run_benchmark(
                     "pto_persistent_dag_graph_diamond",
                     "pto_persistent_dag_graph_parallel_chains",
                     "pto_persistent_dag_graph_wide_fanout",
+                    "pto_persistent_dag_graph_multi_fanin",
                     "pto_persistent_dag_graph_tagged",
                     "pto_persistent_dag_graph_tagged_inout",
                     "pto_persistent_dag_graph_role_keyed_inout",
