@@ -283,8 +283,10 @@ in addition to `scheduler_loop_count=2`, `scheduler_processed_count=5`,
 errors. Device times were `97280 ns` on A100 and `71136 ns` on H200 for
 `N=1024`.
 Use `cuda_scheduler_scaling.py` to summarize a scheduler-block sweep after
-capturing the individual paired smokes. The paired scheduler scaling capture
-under `tmp/cuda-backend/scheduler-scaling-working/` sweeps
+capturing the individual paired smokes. Its ratio column is shape-aware:
+each row is compared with the one-scheduler row for the same artifact, DAG
+shape, vector length, and worker-block policy. The paired scheduler scaling
+capture under `tmp/cuda-backend/scheduler-scaling-working/` sweeps
 `scheduler_blocks=1,2,4` with `worker_blocks=3`, writes a compact JSON,
 Markdown, and SVG summary under `scheduler-scaling-a5ca4fac/`, and shows
 A100 device times `110592/97280/98304 ns` and H200 device times
@@ -294,6 +296,14 @@ completion share. For the four-scheduler row, A100 has active schedulers
 `2/4` with `[0,2,3,0]` and H200 has active schedulers `4/4` with
 `[2,1,1,1]`; the busiest scheduler owns `60.0%` and `40.0%` of completions,
 respectively.
+The paired parallel-chain scheduler scaling capture under
+`tmp/cuda-backend/parallel-chains-scheduler-scaling-working/` sweeps the
+nine-task graph over `scheduler_blocks=1,2,4` with `worker_blocks=4`.
+Its compact report under `scheduler-scaling-674ebe2e/` shows A100 device
+times `155648/123904/115712 ns` and H200 device times
+`131104/102496/90272 ns` for `1/2/4` scheduler blocks. The four-scheduler
+rows keep all scheduler blocks active on both GPUs, with per-block counters
+`[3,2,2,2]` on A100 and `[2,2,2,3]` on H200.
 
 Run the bounded-ring persistent smoke with wraparound:
 
@@ -909,6 +919,10 @@ dependents `[4,4,5,5,6,7,6,7,8,8]`, and dispatch
 reported zero scheduler errors, repeat completions `[9,9]`, and
 per-scheduler completion counters `[2,1,3,3]` on A100 and `[3,3,2,1]` on
 H200.
+Use the same DAG shape with `scheduler_blocks=1,2,4` to produce a
+shape-aware scheduler scaling report. The current paired sweep is under
+`tmp/cuda-backend/parallel-chains-scheduler-scaling-working/`, with the
+summary report under `scheduler-scaling-674ebe2e/`.
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such
 as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.

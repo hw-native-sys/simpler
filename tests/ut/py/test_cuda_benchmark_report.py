@@ -6035,12 +6035,81 @@ def test_cuda_scheduler_scaling_report_summarizes_by_block_smokes(tmp_path):
     assert payload["rows"][1]["active_scheduler_count"] == 2
     assert payload["rows"][1]["scheduler_utilization"] == 1.0
     assert payload["rows"][5]["busiest_scheduler_share"] == 0.4
-    assert "| a100 | 2 | 90000 | 120000 | `2,3` | `2/2` | `60.0%` | `0.90x` |" in markdown
-    assert "| h200 | 4 | 110007 | 140000 | `2,1,1,1` | `4/4` | `40.0%` | `1.10x` |" in markdown
+    assert ("| a100 | graph_descriptor_diamond | 2 | 90000 | 120000 | `2,3` | `2/2` | `60.0%` | `0.90x` |") in markdown
+    assert (
+        "| h200 | graph_descriptor_diamond | 4 | 110007 | 140000 | `2,1,1,1` | `4/4` | `40.0%` | `1.10x` |"
+    ) in markdown
     assert "scheduler-scaling-test" in svg
     assert "sched=4; active=4/4; busiest=40.0%; by_block=2,1,1,1" in svg
     assert (output_dir / "cuda-scheduler-scaling.md").exists()
     assert (output_dir / "cuda-scheduler-scaling.svg").exists()
+
+
+def test_cuda_scheduler_scaling_report_uses_shape_local_baselines(tmp_path):
+    cuda_scheduler_scaling = _load_scheduler_scaling_module()
+    payloads = [
+        ("diamond-sched1", "a100.json", "graph_descriptor_diamond", 1, 100000, [5], 5),
+        ("diamond-sched4", "a100.json", "graph_descriptor_diamond", 4, 80000, [2, 1, 1, 1], 5),
+        (
+            "parallel-sched1",
+            "a100.json",
+            "graph_descriptor_parallel_chains",
+            1,
+            200000,
+            [9],
+            9,
+        ),
+        (
+            "parallel-sched4",
+            "a100.json",
+            "graph_descriptor_parallel_chains",
+            4,
+            120000,
+            [2, 2, 3, 2],
+            9,
+        ),
+    ]
+    paths = []
+    for directory, filename, dag_shape, scheduler_blocks, device_wall_ns, by_block, processed_count in payloads:
+        path = tmp_path / directory / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "status": "pass",
+                    "runtime": "persistent_device",
+                    "mode": "dag",
+                    "dag_shape": dag_shape,
+                    "n": 1024,
+                    "device_wall_ns": device_wall_ns,
+                    "host_wall_ns": device_wall_ns + 1000,
+                    "scheduler_blocks": scheduler_blocks,
+                    "worker_blocks": 4,
+                    "scheduler_loop_count": scheduler_blocks,
+                    "scheduler_processed_count": processed_count,
+                    "scheduler_processed_by_block": by_block,
+                    "launch_completed_counts": [processed_count, processed_count],
+                    "resource_policy": {"scheduler_blocks": scheduler_blocks, "worker_blocks": 4},
+                    "device_scheduler_errors": {"count": 0, "code": 0, "task_id": 0},
+                }
+            )
+            + "\n"
+        )
+        paths.append(path)
+
+    rows = cuda_scheduler_scaling.load_scaling_rows(paths)
+    markdown = cuda_scheduler_scaling.render_markdown_report(rows, label="multi-shape-scaling-test")
+
+    assert [row["dag_shape"] for row in rows] == [
+        "graph_descriptor_diamond",
+        "graph_descriptor_diamond",
+        "graph_descriptor_parallel_chains",
+        "graph_descriptor_parallel_chains",
+    ]
+    assert "| a100 | graph_descriptor_diamond | 4 | 80000 | 81000 | `2,1,1,1` |" in markdown
+    assert "`0.80x` |" in markdown
+    assert "| a100 | graph_descriptor_parallel_chains | 4 | 120000 | 121000 | `2,2,3,2` |" in markdown
+    assert "`0.60x` |" in markdown
 
 
 def test_cuda_pair_persistent_smoke_passes_repeat_runs(tmp_path):

@@ -73,20 +73,28 @@ def _comma(values: list[int]) -> str:
     return ",".join(str(value) for value in values)
 
 
-def _baseline_times(rows: list[dict[str, Any]]) -> dict[str, int]:
+def _baseline_key(row: dict[str, Any]) -> tuple[str, str, int, int]:
+    return (
+        str(row["artifact"]),
+        str(row["dag_shape"]),
+        int(row["n"]),
+        int(row["worker_blocks"]),
+    )
+
+
+def _baseline_times(rows: list[dict[str, Any]]) -> dict[tuple[str, str, int, int], int]:
     baselines = {}
     for row in rows:
-        artifact = str(row["artifact"])
         if int(row["scheduler_blocks"]) != 1:
             continue
         device_ns = int(row["device_wall_ns"])
         if device_ns > 0:
-            baselines[artifact] = device_ns
+            baselines[_baseline_key(row)] = device_ns
     return baselines
 
 
-def _ratio(row: dict[str, Any], baselines: dict[str, int]) -> str:
-    baseline = baselines.get(str(row["artifact"]))
+def _ratio(row: dict[str, Any], baselines: dict[tuple[str, str, int, int], int]) -> str:
+    baseline = baselines.get(_baseline_key(row))
     device_ns = int(row["device_wall_ns"])
     if baseline is None or baseline == 0 or device_ns <= 0:
         return "-"
@@ -134,7 +142,7 @@ def load_scaling_rows(paths: list[Path]) -> list[dict[str, Any]]:
                 "launch_completed_counts": _int_list(payload.get("launch_completed_counts")),
             }
         )
-    return sorted(rows, key=lambda row: (str(row["artifact"]), int(row["scheduler_blocks"])))
+    return sorted(rows, key=lambda row: (str(row["artifact"]), str(row["dag_shape"]), int(row["scheduler_blocks"])))
 
 
 def render_markdown_report(rows: list[dict[str, Any]], label: str) -> str:
@@ -143,15 +151,18 @@ def render_markdown_report(rows: list[dict[str, Any]], label: str) -> str:
         "# CUDA Scheduler Scaling Report",
         "",
         f"- Label: `{label}`",
-        "- Ratio column compares device time with the same artifact's one-scheduler row.",
+        (
+            "- Ratio column compares device time with the same artifact, DAG shape, vector length, "
+            "and worker-block policy at one scheduler block."
+        ),
         "- Busiest column is the largest per-scheduler completion share.",
         "",
         (
-            "| Artifact | Scheduler blocks | Device ns | Host ns | Processed by block | "
+            "| Artifact | DAG shape | Scheduler blocks | Device ns | Host ns | Processed by block | "
             "Active schedulers | Busiest | Vs sched=1 |"
         ),
         (
-            "| -------- | ---------------- | --------- | ------- | ------------------ | "
+            "| -------- | --------- | ---------------- | --------- | ------- | ------------------ | "
             "----------------- | ------- | ---------- |"
         ),
     ]
@@ -160,7 +171,7 @@ def render_markdown_report(rows: list[dict[str, Any]], label: str) -> str:
         active = f"{row['active_scheduler_count']}/{row['scheduler_blocks']}"
         busiest = _percent(float(row["busiest_scheduler_share"]))
         lines.append(
-            f"| {row['artifact']} | {row['scheduler_blocks']} | {row['device_wall_ns']} | "
+            f"| {row['artifact']} | {row['dag_shape']} | {row['scheduler_blocks']} | {row['device_wall_ns']} | "
             f"{row['host_wall_ns']} | `{processed_by_block}` | `{active}` | `{busiest}` | "
             f"`{_ratio(row, baselines)}` |"
         )
@@ -190,7 +201,7 @@ def render_svg_report(rows: list[dict[str, Any]], label: str) -> str:
         y = top + index * row_height
         value = int(row["device_wall_ns"])
         bar_width = int(chart_width * value / max_value) if max_value else 0
-        name = f"{row['artifact']} sched={row['scheduler_blocks']}"
+        name = f"{row['artifact']} {row['dag_shape']} sched={row['scheduler_blocks']}"
         by_block = _comma(row["scheduler_processed_by_block"])
         active = f"{row['active_scheduler_count']}/{row['scheduler_blocks']}"
         busiest = _percent(float(row["busiest_scheduler_share"]))

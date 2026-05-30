@@ -4687,10 +4687,17 @@ Needed:
   dispatch `1,2,1,2,1,1,2,1,1`, graph fan-in `0,0,0,0,2,2,2,2,2`, graph
   dependents `4,4,5,5,6,7,6,7,8,8`, repeat completions `[9,9]`, and zero
   scheduler errors on A100 and H200. A100 processed completions as
-  `[2,1,3,3]`; H200 processed `[3,3,2,1]`. The remaining policy gap is now
-  larger graph-size sweeps and baseline integration rather than launch
-  resource partitioning, root seeding, completion-ring ownership, or artifact
-  validation;
+  `[2,1,3,3]`; H200 processed `[3,3,2,1]`. The parallel-chains scheduler
+  scaling sweep under
+  `tmp/cuda-backend/parallel-chains-scheduler-scaling-working/` validates the
+  same graph over `scheduler_blocks=1,2,4` and writes a shape-aware summary
+  under `scheduler-scaling-674ebe2e/`. A100 reported
+  `155648/123904/115712 ns`; H200 reported `131104/102496/90272 ns`.
+  The four-scheduler rows compare at `0.74x` and `0.69x` versus each GPU's
+  matching one-scheduler row and keep all four scheduler blocks active on
+  both GPUs. The remaining policy gap is now larger graph-size sweeps and
+  baseline integration rather than launch resource partitioning, root seeding,
+  completion-ring ownership, or artifact validation;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
   invalid-dependent-ID, dependent-range, fan-in-underflow,
   duplicate-dependent, self-dependent, initial-fan-in, and

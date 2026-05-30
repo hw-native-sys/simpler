@@ -114,6 +114,10 @@ latest multi-size tensor baseline sweep uses `e79edba2`:
   parallel-chains scheduler-load smoke, a nine-task explicit graph descriptor
   with four roots, two joins, two parallel consumers, one final join, and
   paired A100/H200 Markdown/SVG artifacts.
+- [Current capture](evaluation-current.md) records the `674ebe2e`
+  parallel-chains scheduler scaling sweep over `scheduler_blocks=1,2,4`,
+  with a shape-aware compact report that compares each row against the
+  matching one-scheduler row for the same DAG shape and worker-block policy.
 - [Current capture](evaluation-current.md) records the `35de3303` scheduler
   error matrix that captures all synthetic malformed-DAG diagnostics on A100
   and H200 with JSON, Markdown, and SVG artifacts validated by
@@ -213,6 +217,8 @@ committed:
 - `tmp/cuda-backend/scheduler-by-block-policy-working/`
   `persistent-graph_descriptor_diamond-repeat2-smoke-01b85c21/`
 - `tmp/cuda-backend/scheduler-scaling-working/scheduler-scaling-a5ca4fac/`
+- `tmp/cuda-backend/parallel-chains-scheduler-scaling-working/`
+  `scheduler-scaling-674ebe2e/`
 - `tmp/cuda-backend/scheduler-error-matrix-working/scheduler-error-matrix-35de3303/`
 - `tmp/cuda-backend/index.md`
 
