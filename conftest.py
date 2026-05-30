@@ -1019,23 +1019,23 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
         w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
 
         # Register SubCallable entries from cls.CALLABLE
-        sub_ids = {}
-        chip_cids = {}
+        sub_handles = {}
+        chip_handles = {}
         for entry in cls.CALLABLE.get("callables", []):
             if "callable" in entry:
-                cid = w.register(entry["callable"])
-                sub_ids[entry["name"]] = cid
+                handle = w.register(entry["callable"])
+                sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
                 from simpler_setup.scene_test import _compile_chip_callable_from_spec  # noqa: PLC0415
 
                 name = entry["name"]
                 cache_key = (cls.__qualname__, name, st_platform, runtime)
                 chip = _compile_chip_callable_from_spec(entry, st_platform, runtime, cache_key)
-                cid = w.register(chip)
-                chip_cids[name] = cid
-                chip_cids[f"{name}_sig"] = entry["orchestration"].get("signature", [])
-        cls._st_sub_ids = sub_ids
-        cls._st_chip_cids = chip_cids
+                handle = w.register(chip)
+                chip_handles[name] = handle
+                chip_handles[f"{name}_sig"] = entry["orchestration"].get("signature", [])
+        cls._st_sub_handles = sub_handles
+        cls._st_chip_handles = chip_handles
 
         w.init()
         yield w

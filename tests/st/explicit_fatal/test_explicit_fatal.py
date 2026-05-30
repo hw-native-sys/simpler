@@ -42,13 +42,13 @@ def test_explicit_fatal_reports(st_platform, st_device_ids):
 
     chip_callable = _build_chip_callable(st_platform)
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
-    cid = worker.prepare_callable(chip_callable)
+    handle = worker.register(chip_callable)
     worker.init()
     try:
         config = CallConfig()
         config.block_dim = 24
         config.aicpu_thread_num = 4
         with pytest.raises(RuntimeError, match=r"(run_runtime|run_prepared) failed with code -9"):
-            worker.run(cid, ChipStorageTaskArgs(), config)
+            worker.run(handle, ChipStorageTaskArgs(), config)
     finally:
         worker.close()

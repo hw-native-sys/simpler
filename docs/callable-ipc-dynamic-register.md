@@ -93,7 +93,7 @@ No level assumes that a parent slot id matches a child slot id.
 
 ## Failure Handling
 
-`Worker.prepare_callable` publishes a `CallableHandle` only after every active target in
+`Worker.register` publishes a `CallableHandle` only after every active target in
 the registration scope reports success. If a register broadcast fails after a
 partial install, the parent sends digest-owned unregister cleanup. If cleanup
 cannot be confirmed, the parent marks that digest uncertain and rejects later
@@ -102,7 +102,7 @@ API returns per-target status, so parent-side cleanup is sent only to targets
 that confirmed install or refcount increment; cleanup failure on any of those
 targets marks the digest uncertain.
 
-`Worker.unregister_callable` is best effort after a handle has been published. The parent
+`Worker.unregister` is best effort after a handle has been published. The parent
 removes the local handle lifetime and sends digest-owned unregister to active
 targets; child errors are reported as warnings while local slots become
 available for future registrations according to target-local refcount rules.

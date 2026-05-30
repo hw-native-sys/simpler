@@ -139,11 +139,6 @@ inline void bind_worker(nb::module_ &m) {
         .value("COMPLETED", TaskState::COMPLETED)
         .value("CONSUMED", TaskState::CONSUMED);
 
-    // --- SubmitResult ---
-    nb::class_<SubmitResult>(m, "SubmitResult").def_prop_ro("task_slot", [](const SubmitResult &r) {
-        return r.task_slot;
-    });
-
     // --- Orchestrator (DAG builder, exposed via Worker.get_orchestrator()) ---
     // Bound as `_Orchestrator` because the Python user-facing `Orchestrator`
     // wrapper (simpler.orchestrator.Orchestrator) holds a borrowed reference
@@ -153,7 +148,7 @@ inline void bind_worker(nb::module_ &m) {
             "submit_next_level",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const TaskArgs &args, const CallConfig &config, int8_t worker) {
-                return self.submit_next_level(
+                self.submit_next_level(
                     make_callable_identity(digest, kind, target_namespace), args, config, worker
                 );
             },
@@ -166,7 +161,7 @@ inline void bind_worker(nb::module_ &m) {
             "submit_next_level_group",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const std::vector<TaskArgs> &args_list, const CallConfig &config, const std::vector<int8_t> &workers) {
-                return self.submit_next_level_group(
+                self.submit_next_level_group(
                     make_callable_identity(digest, kind, target_namespace), args_list, config, workers
                 );
             },
@@ -179,7 +174,7 @@ inline void bind_worker(nb::module_ &m) {
             "submit_sub",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const TaskArgs &args) {
-                return self.submit_sub(make_callable_identity(digest, kind, target_namespace), args);
+                self.submit_sub(make_callable_identity(digest, kind, target_namespace), args);
             },
             nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args"),
             "Submit a SUB task by registered callable digest. Tags drive dependency inference."
@@ -188,7 +183,7 @@ inline void bind_worker(nb::module_ &m) {
             "submit_sub_group",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const std::vector<TaskArgs> &args_list) {
-                return self.submit_sub_group(make_callable_identity(digest, kind, target_namespace), args_list);
+                self.submit_sub_group(make_callable_identity(digest, kind, target_namespace), args_list);
             },
             nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args_list"),
             "Submit a group of SUB tasks: N args -> N workers, 1 DAG node."

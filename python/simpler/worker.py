@@ -9,7 +9,7 @@
 """Worker — unified factory for all hierarchy levels.
 
 Callable identity is exposed as an opaque ``CallableHandle`` returned by
-``Worker.prepare_callable(callable)``. L2 ``Worker.run`` and hierarchical
+``Worker.register(callable)``. L2 ``Worker.run`` and hierarchical
 ``Orchestrator.submit_next_level`` / ``submit_sub`` consume handles, never raw
 ``ChipCallable`` objects. L3+ ``Worker.run`` keeps the existing raw Python
 orchestration-function entry point; that function captures handles and submits
@@ -22,15 +22,15 @@ Usage::
     # L2: one NPU chip
     w = Worker(level=2, device_id=8, platform="a2a3", runtime="tensormap_and_ringbuffer")
     w.init()
-    chip_handle = w.prepare_callable(chip_callable)         # L2 may register pre or post init()
+    chip_handle = w.register(chip_callable)                 # L2 may register pre or post init()
     w.run(chip_handle, chip_args, config)
     w.close()
 
     # L3: multiple chips + SubWorkers, auto-discovery in init()
     w = Worker(level=3, device_ids=[8, 9], num_sub_workers=2,
                platform="a2a3", runtime="tensormap_and_ringbuffer")
-    chip_handle = w.prepare_callable(chip_callable)         # ChipCallable, before init()
-    sub_handle  = w.prepare_callable(lambda args: postprocess())  # Python sub, before init()
+    chip_handle = w.register(chip_callable)                 # ChipCallable, before init()
+    sub_handle  = w.register(lambda args: postprocess())    # Python sub, before init()
     w.init()
 
     def my_orch(orch, args, cfg):
@@ -44,8 +44,8 @@ Usage::
     l3 = Worker(level=3, device_ids=[8, 9], num_sub_workers=1,
                 platform="a2a3", runtime="tensormap_and_ringbuffer")
     w4 = Worker(level=4, num_sub_workers=1)
-    l3_handle = w4.prepare_callable(my_l3_orch)
-    verify_handle = w4.prepare_callable(lambda args: verify())
+    l3_handle = w4.register(my_l3_orch)
+    verify_handle = w4.register(lambda args: verify())
     w4.add_worker(l3)
     w4.init()
 
@@ -83,7 +83,7 @@ from . import _log as _simpler_log
 from .callable_identity import (
     CALLABLE_HASH_DIGEST_BYTES,
     CallableHandle,
-    CallableIdentityState,
+    _CallableIdentityState,
     build_chip_callable_descriptor,
     build_python_serialized_descriptor,
     compute_callable_hashid,
@@ -344,7 +344,7 @@ def _chip_descriptor_context(worker: "Worker") -> tuple[str, str]:
         return "", ""
     first = contexts[0]
     if any(ctx != first for ctx in contexts[1:]):
-        raise RuntimeError("Worker.prepare_callable: heterogeneous chip child contexts require separate callable namespaces")
+        raise RuntimeError("Worker.register: heterogeneous chip child contexts require separate callable namespaces")
     return first
 
 
@@ -368,7 +368,7 @@ def _build_callable_registration(worker: "Worker", target) -> _CallableRegistrat
             payload=None,
         )
     if not callable(target):
-        raise TypeError("Worker.prepare_callable: non-ChipCallable target must be callable")
+        raise TypeError("Worker.register: non-ChipCallable target must be callable")
     payload = _pack_py_callable_payload(target)
     descriptor = build_python_serialized_descriptor(payload)
     hashid = compute_callable_hashid(descriptor)
@@ -752,11 +752,11 @@ def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id:
             f"[chip_process pid={os.getpid()} dev={device_id}] WARN: lazy-prepare cid={cid}; prewarm path missed it\n"
         )
         sys.stderr.flush()
-    cw.prepare_callable(cid, callable_obj)
+    cw._prepare_callable_at_slot(cid, callable_obj)
     prepared.add(cid)
 
 
-def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands + SHUTDOWN form the unified state machine; cannot collapse without obscuring dispatch
+def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READY / CONTROL_REQUEST state machine
     cw: ChipWorker,
     buf: memoryview,
     mailbox_addr: int,
@@ -844,7 +844,9 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     digest = _read_control_digest(buf)
                     cid = identity_table.get(digest)
                     if cid is None:
-                        raise RuntimeError(f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered")
+                        raise RuntimeError(
+                            f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
+                        )
                     _ensure_prepared(cw, registry, prepared, int(cid), lazy=False, device_id=device_id)
                 elif sub_cmd == _CTRL_REGISTER:
                     digest = _read_control_digest(buf)
@@ -883,7 +885,7 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     digest = _read_control_digest(buf)
                     cid, removed = _remove_local_identity(registry, identity_table, identity_refs, digest)
                     if removed and cid is not None:
-                        cw.unregister_callable(int(cid))
+                        cw._unregister_slot(int(cid))
                         prepared.discard(int(cid))
                 elif sub_cmd == _CTRL_ALLOC_DOMAIN:
                     _handle_ctrl_alloc_domain(cw, buf)
@@ -1051,7 +1053,7 @@ def _child_worker_loop(
                         raise
                 elif sub_cmd == _CTRL_UNREGISTER:
                     digest = _read_control_digest(buf)
-                    _inner_slot = inner_worker._unregister_child_digest(digest=digest)
+                    inner_worker._unregister_child_digest(digest=digest)
                     _remove_local_identity(registry, identity_table, identity_refs, digest)
                 elif sub_cmd in (_CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER):
                     _handle_py_callable_control(
@@ -1111,7 +1113,7 @@ class Worker:
         self.level = level
         self._config = config
         self._callable_registry: dict[int, Any] = {}
-        self._identity_registry: dict[bytes, CallableIdentityState] = {}
+        self._identity_registry: dict[bytes, _CallableIdentityState] = {}
         self._live_handles: dict[int, bytes] = {}
         self._next_handle_id: int = 0
         self._owner_id = uuid.uuid4().hex
@@ -1179,7 +1181,7 @@ class Worker:
     # Callable registration (before init)
     # ------------------------------------------------------------------
 
-    def _make_handle_locked(self, state: CallableIdentityState) -> CallableHandle:
+    def _make_handle_locked(self, state: _CallableIdentityState) -> CallableHandle:
         handle_id = self._next_handle_id
         self._next_handle_id += 1
         self._live_handles[handle_id] = state.digest
@@ -1202,7 +1204,7 @@ class Worker:
             return self._make_handle_locked(state), False
 
         slot_id = self._allocate_cid()
-        state = CallableIdentityState(
+        state = _CallableIdentityState(
             hashid=reg.hashid,
             digest=reg.digest,
             kind=reg.kind,  # type: ignore[arg-type]
@@ -1235,9 +1237,9 @@ class Worker:
         handle: CallableHandle,
         *,
         expected_namespace: Optional[str] = None,
-    ) -> CallableIdentityState:
+    ) -> _CallableIdentityState:
         if not isinstance(handle, CallableHandle):
-            raise TypeError("expected a CallableHandle returned by Worker.prepare_callable")
+            raise TypeError("expected a CallableHandle returned by Worker.register")
         if handle._owner_id != self._owner_id:
             raise KeyError(f"CallableHandle {handle.hashid} does not belong to this Worker")
         digest = self._live_handles.get(handle._handle_id)
@@ -1255,9 +1257,7 @@ class Worker:
         ):
             raise RuntimeError(f"CALLABLE_HANDLE_MUTATED: {handle.hashid}")
         if expected_namespace is not None and state.target_namespace != expected_namespace:
-            raise TypeError(
-                f"cannot run {state.target_namespace}; expected {expected_namespace} for {state.hashid}"
-            )
+            raise TypeError(f"cannot run {state.target_namespace}; expected {expected_namespace} for {state.hashid}")
         return state
 
     def _resolve_handle(
@@ -1265,19 +1265,19 @@ class Worker:
         handle: CallableHandle,
         *,
         expected_namespace: Optional[str] = None,
-    ) -> CallableIdentityState:
+    ) -> _CallableIdentityState:
         with self._registry_lock:
             return self._resolve_handle_locked(handle, expected_namespace=expected_namespace)
 
-    def prepare_callable(self, target) -> CallableHandle:
-        """Prepare a callable for dispatch and return an opaque handle.
+    def register(self, target) -> CallableHandle:
+        """Register a callable for dispatch and return an opaque handle.
 
         Integer execution slots remain private to the local target process.
         Submit APIs consume the returned handle and dispatch by its stable
         SHA-256 callable identity.
         """
         if self.level == 2 and not isinstance(target, ChipCallable):
-            raise TypeError("Worker.prepare_callable: level 2 only supports ChipCallable targets")
+            raise TypeError("Worker.register: level 2 only supports ChipCallable targets")
         reg = _build_callable_registration(self, target)
         if self.level >= 3:
             with self._hierarchical_start_cv:
@@ -1315,7 +1315,7 @@ class Worker:
             assert self._chip_worker is not None
             with self._registry_lock:
                 slot_id = self._identity_registry[handle.digest].slot_id
-            self._chip_worker.prepare_callable(slot_id, target)
+            self._chip_worker._prepare_callable_at_slot(slot_id, target)
         return handle
 
     def _python_worker_types(self) -> list[WorkerType]:
@@ -1330,7 +1330,7 @@ class Worker:
         worker_types = self._python_worker_types()
         if not worker_types:
             raise RuntimeError(
-                "Worker.prepare_callable: no Python-capable child workers are configured "
+                "Worker.register: no Python-capable child workers are configured "
                 "for dynamic Python callable registration"
             )
         with self._registry_lock:
@@ -1380,7 +1380,11 @@ class Worker:
 
     @staticmethod
     def _control_errors(results: list[Any]) -> list[str]:
-        return [f"{result.worker_type}[{result.worker_index}]: {result.error_message}" for result in results if not result.ok]
+        return [
+            f"{result.worker_type}[{result.worker_index}]: {result.error_message}"
+            for result in results
+            if not result.ok
+        ]
 
     def _broadcast_py_control(
         self,
@@ -1405,8 +1409,7 @@ class Worker:
         """Return the smallest unused cid in [0, MAX_REGISTERED_CALLABLE_IDS).
 
         Caller must hold ``_registry_lock``. Walks the integers in order so
-        an ``unregister_callable(handle)`` followed by a fresh
-        ``prepare_callable`` reuses K
+        an ``unregister(handle)`` followed by a fresh ``register`` reuses K
         instead of colliding with an existing entry — ``len(registry)``
         would silently overwrite the next gap-after-the-hole.
         """
@@ -1419,12 +1422,12 @@ class Worker:
         # DeviceRunner::register_prepared_callable with a generic
         # "out of range" log.
         raise RuntimeError(
-            "Worker.prepare_callable: cid space exhausted "
+            "Worker.register: callable capacity exhausted "
             f"(MAX_REGISTERED_CALLABLE_IDS={MAX_REGISTERED_CALLABLE_IDS}); "
-            "unregister unused callables before preparing more"
+            "unregister unused callables before registering more"
         )
 
-    def _register_child_chip(self, target: ChipCallable, *, digest: bytes) -> int:
+    def _register_child_chip(self, target: ChipCallable, *, digest: bytes) -> None:
         """Install a cascaded ChipCallable on this child Worker by digest."""
         if not isinstance(target, ChipCallable):
             raise TypeError("_register_child_chip: target must be a ChipCallable")
@@ -1442,7 +1445,7 @@ class Worker:
                 slot_id = state.slot_id
             else:
                 slot_id = self._allocate_cid()
-                state = CallableIdentityState(
+                state = _CallableIdentityState(
                     hashid=reg.hashid,
                     digest=reg.digest,
                     kind="CHIP_CALLABLE",
@@ -1466,7 +1469,7 @@ class Worker:
                         if state is not None:
                             state.ref_count -= 1
                     raise
-            return existing_slot
+            return
 
         if self.level >= 3 and self._initialized:
             try:
@@ -1477,7 +1480,6 @@ class Worker:
                         self._callable_registry.pop(slot_id, None)
                     self._identity_registry.pop(reg.digest, None)
                 raise
-        return slot_id
 
     def _post_init_register(self, target: ChipCallable, digest: bytes, *, is_new: bool) -> None:
         """Broadcast a new ChipCallable to every NEXT_LEVEL child via C++.
@@ -1513,11 +1515,13 @@ class Worker:
     @staticmethod
     def _format_register_partial_failure(digest: bytes, errors: list[str], cleanup_errors: list[str]) -> str:
         msg = (
-            f"REGISTER_PARTIAL_FAILURE: Worker.prepare_callable(hash={_format_digest(digest)}) failed on "
+            f"REGISTER_PARTIAL_FAILURE: Worker.register(hash={_format_digest(digest)}) failed on "
             f"{len(errors)} child workers; first error: {errors[0]}"
         )
         if cleanup_errors:
-            msg += f"; cleanup uncertain on {len(cleanup_errors)} child workers; first cleanup error: {cleanup_errors[0]}"
+            msg += (
+                f"; cleanup uncertain on {len(cleanup_errors)} child workers; first cleanup error: {cleanup_errors[0]}"
+            )
         return msg
 
     def _cleanup_control_successes(self, results: list[Any], sub_cmd: int, digest: bytes) -> list[str]:
@@ -1549,11 +1553,11 @@ class Worker:
             return WorkerType.SUB
         raise RuntimeError(f"unknown worker type in control result: {worker_type}")
 
-    def _coerce_handle_state(self, handle_or_slot) -> tuple[int, bytes, CallableIdentityState]:
+    def _coerce_handle_state(self, handle_or_slot) -> tuple[int, bytes, _CallableIdentityState]:
         if isinstance(handle_or_slot, CallableHandle):
             state = self._resolve_handle_locked(handle_or_slot)
             return handle_or_slot._handle_id, state.digest, state
-        raise TypeError("Worker.unregister_callable expects a CallableHandle returned by Worker.prepare_callable")
+        raise TypeError("Worker.unregister expects a CallableHandle returned by Worker.register")
 
     def _pre_start_unregister_if_needed(self, handle_or_slot) -> bool:
         if self.level < 3:
@@ -1569,30 +1573,30 @@ class Worker:
                 handle_id, digest, state = self._coerce_handle_state(handle_or_slot)
                 cid = state.slot_id
                 if cid in self._pending_unregister_cids:
-                    raise KeyError(f"UNREGISTER_TOMBSTONE_ACTIVE: slot={cid} already pending unregister")
+                    raise KeyError("UNREGISTER_TOMBSTONE_ACTIVE: callable handle already pending unregister")
                 self._live_handles.pop(handle_id, None)
                 state.ref_count -= 1
                 if state.ref_count > 0:
                     return True
-                target = self._callable_registry.pop(cid)
+                self._callable_registry.pop(cid)
                 self._identity_registry.pop(digest, None)
             return True
 
-    def unregister_callable(self, handle_or_slot) -> None:
+    def unregister(self, handle_or_slot) -> None:
         """Drop a ``CallableHandle`` from the registry and propagate cleanup.
 
-        Symmetric to ``Worker.prepare_callable`` for the dynamic post-init path.
-        The target-local slot becomes reusable for the next
-        ``prepare_callable`` call — the only practical way to keep a
-        long-running worker under the
+        Symmetric to ``Worker.register`` for the dynamic post-init path.
+        The target-local resources become reusable for the next
+        ``register`` call — the only practical way to keep a long-running worker under the
         ``MAX_REGISTERED_CALLABLE_IDS`` ceiling when JIT or plugin code
         churns through callables.
 
         Failure semantics (docs section 8): unregister is best-effort.
         If any chip child reports an error, the parent **warns and still
         pops the registry entry** — orch_so_table_ on the AICPU side will
-        be overwritten on slot reuse, and refusing to release a known-bad
-        slot would just exhaust the slot space faster.
+        be overwritten on target-local resource reuse, and refusing to
+        release a known-bad entry would just exhaust the resource space
+        faster.
 
         Raises:
           KeyError: handle was never registered.
@@ -1608,11 +1612,11 @@ class Worker:
             handle_id, digest, state = self._coerce_handle_state(handle_or_slot)
             cid = state.slot_id
             if cid in self._pending_unregister_cids:
-                raise KeyError(f"UNREGISTER_TOMBSTONE_ACTIVE: slot={cid} already pending unregister")
+                raise KeyError("UNREGISTER_TOMBSTONE_ACTIVE: callable handle already pending unregister")
             self._live_handles.pop(handle_id, None)
             state.ref_count -= 1
-            should_broadcast_decrement = self.level >= 3 and self._initialized and getattr(
-                self, "_hierarchical_started", False
+            should_broadcast_decrement = (
+                self.level >= 3 and self._initialized and getattr(self, "_hierarchical_started", False)
             )
             if state.ref_count > 0 and not should_broadcast_decrement:
                 return
@@ -1624,7 +1628,7 @@ class Worker:
                     remove_target = False
             elif self.level == 2 and self._initialized:
                 assert self._chip_worker is not None
-                self._chip_worker.unregister_callable(cid)
+                self._chip_worker._unregister_slot(cid)
                 self._callable_registry.pop(cid, None)
                 self._identity_registry.pop(digest, None)
                 return
@@ -1645,7 +1649,8 @@ class Worker:
                 )
                 if errors:
                     sys.stderr.write(
-                        f"Worker.unregister_callable(hash={_format_digest(digest)}): {len(errors)} Python children reported errors "
+                        f"Worker.unregister(hash={_format_digest(digest)}): "
+                        f"{len(errors)} Python children reported errors "
                         f"(continuing best-effort). First error: {errors[0]}\n"
                     )
                     sys.stderr.flush()
@@ -1656,24 +1661,24 @@ class Worker:
                     self._identity_registry.pop(digest, None)
                 self._pending_unregister_cids.discard(cid)
 
-    def _unregister_child_digest(self, *, digest: bytes) -> Optional[int]:
+    def _unregister_child_digest(self, *, digest: bytes) -> None:
         target = None
         cid = -1
         remove_target = False
         with self._registry_lock:
             state = self._identity_registry.get(digest)
             if state is None:
-                return None
+                return
             state.ref_count -= 1
             cid = state.slot_id
             if cid in self._pending_unregister_cids:
-                raise KeyError(f"UNREGISTER_TOMBSTONE_ACTIVE: slot={cid} already pending unregister")
+                raise KeyError("UNREGISTER_TOMBSTONE_ACTIVE: callable identity already pending unregister")
             target = self._callable_registry[cid]
-            should_broadcast_decrement = self.level >= 3 and self._initialized and getattr(
-                self, "_hierarchical_started", False
+            should_broadcast_decrement = (
+                self.level >= 3 and self._initialized and getattr(self, "_hierarchical_started", False)
             )
             if state.ref_count > 0 and not should_broadcast_decrement:
-                return cid
+                return
             remove_target = state.ref_count <= 0
             if should_broadcast_decrement:
                 self._pending_unregister_cids.add(cid)
@@ -1681,14 +1686,14 @@ class Worker:
                     remove_target = False
             elif self.level == 2 and self._initialized:
                 assert self._chip_worker is not None
-                self._chip_worker.unregister_callable(cid)
+                self._chip_worker._unregister_slot(cid)
                 self._callable_registry.pop(cid, None)
                 self._identity_registry.pop(digest, None)
-                return cid
+                return
             else:
                 self._callable_registry.pop(cid, None)
                 self._identity_registry.pop(digest, None)
-                return cid
+                return
 
         try:
             if isinstance(target, ChipCallable):
@@ -1702,7 +1707,8 @@ class Worker:
                 )
                 if errors:
                     sys.stderr.write(
-                        f"Worker.unregister_callable(hash={_format_digest(digest)}): {len(errors)} Python children reported errors "
+                        f"Worker.unregister(hash={_format_digest(digest)}): "
+                        f"{len(errors)} Python children reported errors "
                         f"(continuing best-effort). First error: {errors[0]}\n"
                     )
                     sys.stderr.flush()
@@ -1712,7 +1718,6 @@ class Worker:
                     self._callable_registry.pop(cid, None)
                     self._identity_registry.pop(digest, None)
                 self._pending_unregister_cids.discard(cid)
-        return cid
 
     def _cleanup_chip_registration(self, digest: bytes) -> list[str]:
         if self._worker is None:
@@ -1732,7 +1737,7 @@ class Worker:
         errors = self._worker.broadcast_unregister_all(digest)
         if errors:
             sys.stderr.write(
-                f"Worker.unregister_callable(hash={_format_digest(digest)}): {len(errors)} chips reported errors "
+                f"Worker.unregister(hash={_format_digest(digest)}): {len(errors)} chips reported errors "
                 f"(continuing best-effort). First error: {errors[0]}\n"
             )
             sys.stderr.flush()
@@ -1789,7 +1794,7 @@ class Worker:
         assert self._chip_worker is not None
         for cid, target in self._callable_registry.items():
             if isinstance(target, ChipCallable):
-                self._chip_worker.prepare_callable(cid, target)
+                self._chip_worker._prepare_callable_at_slot(cid, target)
 
     def _init_hierarchical(self) -> None:
         device_ids = self._config.get("device_ids", [])
@@ -2469,7 +2474,7 @@ class Worker:
 
         Dispatch:
           - L2: ``callable`` is a ``CallableHandle`` returned by
-            ``Worker.prepare_callable(chip_callable)``. Routes to the private slot
+            ``Worker.register(chip_callable)``. Routes to the private slot
             carried by the handle.
           - L3+: ``callable`` is a Python orch fn invoked with the
             ``Orchestrator`` handle.
@@ -2490,7 +2495,7 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
-            return self._chip_worker.run(state.slot_id, args, cfg)
+            return self._chip_worker._run_slot(state.slot_id, args, cfg)
 
         self._start_hierarchical()
         assert self._orch is not None
@@ -2536,10 +2541,10 @@ class Worker:
 
     @property
     def aicpu_dlopen_count(self) -> int:
-        """L2 only: number of distinct callable_ids the AICPU has dlopened for.
+        """L2 only: number of distinct callable identities the AICPU has dlopened for.
 
         Used by tests to assert that ``register`` + repeated ``run(handle)``
-        calls do not retrigger the AICPU dlopen for an already-seen target slot.
+        calls do not retrigger the AICPU dlopen for an already-seen identity.
         Returns 0 on non-L2 workers.
         """
         if self.level != 2 or self._chip_worker is None:

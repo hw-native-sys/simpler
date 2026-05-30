@@ -30,7 +30,7 @@ class TestEnsurePrepared:
 
         _ensure_prepared(cw, registry, prepared, 7, lazy=True, device_id=3)
 
-        cw.prepare_callable.assert_called_once_with(7, callable_obj)
+        cw._prepare_callable_at_slot.assert_called_once_with(7, callable_obj)
         assert prepared == {7}
         err = capsys.readouterr().err
         assert "WARN: lazy-prepare cid=7" in err
@@ -44,18 +44,18 @@ class TestEnsurePrepared:
 
         _ensure_prepared(cw, registry, prepared, 2, lazy=False, device_id=0)
 
-        cw.prepare_callable.assert_called_once_with(2, callable_obj)
+        cw._prepare_callable_at_slot.assert_called_once_with(2, callable_obj)
         assert prepared == {2}
         assert capsys.readouterr().err == ""
 
     def test_already_prepared_short_circuits(self):
         cw = MagicMock()
         # cid is already in `prepared`; helper must skip lookup and
-        # prepare_callable entirely.  Pass an empty registry to prove the
+        # slot preparation entirely.  Pass an empty registry to prove the
         # lookup never happens (otherwise registry.get would return None
         # and the helper would raise).
         _ensure_prepared(cw, {}, {5}, 5, lazy=True, device_id=0)
-        cw.prepare_callable.assert_not_called()
+        cw._prepare_callable_at_slot.assert_not_called()
 
     def test_missing_cid_raises(self):
         with pytest.raises(RuntimeError, match="cid 9 not in registry"):

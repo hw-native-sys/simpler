@@ -794,9 +794,9 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro("initialized", &ChipWorker::initialized)
         .def_prop_ro(
             "aicpu_dlopen_count", &ChipWorker::aicpu_dlopen_count,
-            "Number of distinct callable_ids the AICPU has dlopened for on the "
+            "Number of distinct callable entries the AICPU has dlopened for on the "
             "bound device. Equals 0 when not initialized or the runtime "
-            "variant lacks per-cid registration. Tests assert this to verify "
+            "variant lacks prepared-callable registration. Tests assert this to verify "
             "prepare_callable + repeated run do not redundantly dlopen."
         )
         .def_prop_ro(

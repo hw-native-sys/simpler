@@ -16,10 +16,10 @@ Primitives introduced over L2 (see ../../l2/vector_add/main.py for the L2 versio
 
   * torch.share_memory_() tensors       — visible to forked chip children, IS the data plane
   * TaskArgs + TensorArgType tags        — INPUT / OUTPUT_EXISTING drive DAG deps
-  * Worker.prepare_callable(python_fn)           — register Python callable runnable as a sub task
+  * Worker.register(python_fn)           — register Python callable runnable as a sub task
   * Worker(level=3, device_ids=[...], num_sub_workers=N) — multi-chip + sub fork-and-serve
   * orch.submit_next_level(cb, args, cfg, worker=i)  — submit a chip task
-  * orch.submit_sub(cid, args)           — submit a Python sub task
+  * orch.submit_sub(handle, args)        — submit a Python sub task
 
 Run:
     python examples/workers/l3/multi_chip_dispatch/main.py -p a2a3sim -d 0-1
@@ -131,23 +131,22 @@ def run(platform: str, device_ids: list[int]) -> int:
     )
 
     # --- 3. Register the Python SubWorker callable BEFORE init().
-    # Note: init() forks chip children; the callable registry is captured by
-    # copy-on-write. Anything registered after init() is invisible to the
-    # forked children.
+    # Register before init() so startup can seed child registries and pre-warm
+    # chip callables before the first DAG dispatch.
     def subworker(sub_args: TaskArgs) -> None:
         # sub_args carries the tensors we tagged INPUT on submit_sub below.
         # In this demo we just print confirmation; a real app might write
         # results to disk or trigger the next pipeline stage.
         print(f"[multi_chip_dispatch] subworker fired (received {sub_args.tensor_count()} tensor refs) ✅")
 
-    sub_cid = worker.prepare_callable(subworker)
+    sub_handle = worker.register(subworker)
 
     # --- 4. Compile the ChipCallable once, reused on both chips.
     print(f"[multi_chip_dispatch] compiling kernels for {platform}...")
     chip_callable = build_chip_callable(platform)
 
-    # Register the ChipCallable so submit_next_level takes a cid.
-    chip_cid = worker.prepare_callable(chip_callable)
+    # Register the ChipCallable so submit_next_level takes a handle.
+    chip_handle = worker.register(chip_callable)
 
     # --- 5. init() forks chip + sub child processes, starts C++ scheduler.
     print("[multi_chip_dispatch] init worker...")
@@ -168,7 +167,7 @@ def run(platform: str, device_ids: list[int]) -> int:
                 chip_args.add_tensor(make_tensor_arg(host_a[i]), TensorArgType.INPUT)
                 chip_args.add_tensor(make_tensor_arg(host_b[i]), TensorArgType.INPUT)
                 chip_args.add_tensor(make_tensor_arg(host_out[i]), TensorArgType.OUTPUT_EXISTING)
-                orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
+                orch.submit_next_level(chip_handle, chip_args, cfg, worker=i)
 
             # Sub task that depends on both chip outputs. Tagging the two
             # host_out[i] tensors INPUT tells the scheduler to wait for
@@ -176,7 +175,7 @@ def run(platform: str, device_ids: list[int]) -> int:
             sub_args = TaskArgs()
             for i in range(len(device_ids)):
                 sub_args.add_tensor(make_tensor_arg(host_out[i]), TensorArgType.INPUT)
-            orch.submit_sub(sub_cid, sub_args)
+            orch.submit_sub(sub_handle, sub_args)
 
         # --- 7. Run the DAG. Worker.run() opens a scope, invokes orch_fn,
         # drains the DAG to completion, then closes the scope.

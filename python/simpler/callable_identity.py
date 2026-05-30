@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Callable identity helpers for hierarchical Worker callable preparation."""
+"""Callable identity helpers for Worker callable registration."""
 
 from __future__ import annotations
 
@@ -27,6 +27,20 @@ TARGET_NAMESPACE_LOCAL_PYTHON = "LOCAL_PYTHON"
 
 CallableKindName = Literal["CHIP_CALLABLE", "PYTHON_SERIALIZED"]
 TargetNamespaceName = Literal["LOCAL_CHIP", "LOCAL_PYTHON"]
+
+__all__ = [
+    "CALLABLE_HASH_DIGEST_BYTES",
+    "CallableHandle",
+    "CallableKindName",
+    "TargetNamespaceName",
+    "build_chip_callable_descriptor",
+    "build_chip_signature_schema",
+    "build_python_serialized_descriptor",
+    "compute_callable_hashid",
+    "hashid_to_digest",
+    "parse_python_callable_payload",
+    "validate_hashid",
+]
 
 _PY_CALLABLE_MAGIC = b"SPYC"
 _PY_CALLABLE_VERSION = 1
@@ -156,7 +170,7 @@ def validate_hashid(hashid: str) -> None:
 
 
 class CallableHandle:
-    """Opaque public token returned by ``Worker.prepare_callable``."""
+    """Opaque public token returned by ``Worker.register``."""
 
     __slots__ = ("hashid", "kind", "target_namespace", "_digest", "_handle_id", "_owner_id")
 
@@ -184,7 +198,7 @@ class CallableHandle:
         target_namespace: TargetNamespaceName,
         handle_id: int,
         owner_id: str,
-    ) -> "CallableHandle":
+    ) -> CallableHandle:
         handle = cls(hashid, kind, target_namespace)
         handle._handle_id = int(handle_id)
         handle._owner_id = owner_id
@@ -202,7 +216,7 @@ class CallableHandle:
 
 
 @dataclass
-class CallableIdentityState:
+class _CallableIdentityState:
     hashid: str
     digest: bytes
     kind: CallableKindName

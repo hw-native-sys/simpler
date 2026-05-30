@@ -135,7 +135,7 @@ def run(
         num_sub_workers=0,
         build=build,
     )
-    chip_cid = worker.prepare_callable(chip_callable)
+    chip_handle = worker.register(chip_callable)
     try:
         worker.init()
 
@@ -173,7 +173,7 @@ def run(
                     args.add_tensor(make_tensor_arg(out[rank]), TensorArgType.OUTPUT_EXISTING)
                     args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
                     args.add_scalar(domain.device_ctx)
-                    orch.submit_next_level(chip_cid, args, cfg, worker=rank)
+                    orch.submit_next_level(chip_handle, args, cfg, worker=rank)
 
         worker.run(orch_fn, args=None, config=CallConfig())
 

@@ -26,8 +26,8 @@ worker = Worker(
 )
 
 # 1. Register sub-worker callables BEFORE init (level >= 3 only).
-#    Returns an integer id you pass to orchestrator.submit_sub(...) later.
-postprocess_id = worker.prepare_callable(
+#    Returns an opaque handle you pass to orchestrator.submit_sub(...) later.
+postprocess_handle = worker.register(
     lambda args: print("post-process received", args)
 )
 
@@ -37,7 +37,7 @@ worker.init()                 # forks chip child processes + sub children,
 def my_orch(orch, args, cfg):
     # orch is the Orchestrator. Submit one task per chip + any sub work.
     # orch.submit_next_level(...) schedules a ChipCallable onto a free chip.
-    # orch.submit_sub(cid, sub_args) schedules a Python callable.
+    # orch.submit_sub(postprocess_handle, sub_args) schedules a Python callable.
     ...
 
 try:
@@ -48,10 +48,9 @@ finally:
 
 Two things to know before reading the example:
 
-1. **`prepare_callable()` and `add_worker()` MUST run before `init()`**. The Python
-   callables get captured via copy-on-write when `init()` forks child
-   processes, so anything registered after the fork is invisible to the
-   children.
+1. **This example registers callables before `init()`**. That keeps startup
+   simple and lets chip children pre-warm their callable state before the
+   first DAG dispatch.
 2. **The orchestration function is a *plain Python function*, not a C++
    kernel.** It runs in the host process and calls `orch.submit_*(...)` to
    hand work to chip children. The children get the submitted `ChipCallable`

@@ -65,7 +65,7 @@ def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids)
 
     chip_callable = _build_chip_callable(st_platform)
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
-    cid = worker.prepare_callable(chip_callable)
+    handle = worker.register(chip_callable)
     worker.init()
     try:
         config = CallConfig()
@@ -91,7 +91,7 @@ def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids)
         # in single-digit seconds and surfaces *some* 507xxx code rather than
         # deadlocking.
         with pytest.raises(RuntimeError, match=r"run_prepared failed with code 507(046|018|000)"):
-            worker.run(cid, ChipStorageTaskArgs(), config)
+            worker.run(handle, ChipStorageTaskArgs(), config)
         elapsed = time.monotonic() - t0
 
         # STARS 1 s + AICPU deinit 1 s + host 2 s/stream — observed ~6 s.

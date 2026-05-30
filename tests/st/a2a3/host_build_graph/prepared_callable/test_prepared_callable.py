@@ -7,15 +7,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end test for Worker.prepare_callable / run on host_build_graph.
+"""End-to-end white-box test for the private L2 prepared-callable ABI on host_build_graph.
 
 Mirrors tests/st/a2a3/tensormap_and_ringbuffer/prepared_callable for the hbg
 variant: instead of the AICPU dlopening the orch SO, hbg dlopens on the host
-inside prepare_callable and replays the cached handle/fn pointer
+inside private slot preparation and replays the cached handle/fn pointer
 on every run. The dlopen counter to assert is `host_dlopen_count`,
 not `aicpu_dlopen_count` (which stays 0 — AICPU never sees the orch SO).
 """
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -23,12 +24,15 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 from simpler_setup.scene_test import _build_chip_task_args, _compare_outputs
 
 _VECTOR_KERNELS = "../vector_example/kernels"
+_SLOT_PRIMARY = 0
+_SLOT_SECONDARY = 1
+
 
 @scene_test(level=2, runtime="host_build_graph")
 class TestPreparedCallableHbg(SceneTestCase):
-    """Exercise prepare_callable / run / unregister_callable on hbg.
+    """Exercise private prepare / run / unregister slot ABI on hbg.
 
-    Requires an isolated L2 ``Worker`` (cid table starts empty); this is
+    Requires an isolated L2 ``Worker`` (private slot table starts empty); this is
     provided by the directory-local ``conftest.py`` overriding ``st_worker``
     with a class-scope fixture.
     """
@@ -87,6 +91,11 @@ class TestPreparedCallableHbg(SceneTestCase):
         a, b = args.a, args.b
         args.f[:] = (a + b + 1) * (a + b + 2)
 
+    def _chip_worker(self, worker):
+        chip_worker = worker._chip_worker
+        assert chip_worker is not None
+        return chip_worker
+
     def _run_and_validate_l2(  # noqa: PLR0913
         self,
         worker,
@@ -106,9 +115,10 @@ class TestPreparedCallableHbg(SceneTestCase):
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
         config = self._build_config(config_dict)
+        chip_worker = self._chip_worker(worker)
 
-        primary = worker.prepare_callable(callable_obj)
-        secondary = worker.prepare_callable(callable_obj)
+        chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+        chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
 
         for _ in range(2):
             test_args = self.generate_args(params)
@@ -116,7 +126,7 @@ class TestPreparedCallableHbg(SceneTestCase):
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-            worker.run(primary, chip_args, config=config)
+            chip_worker._run_slot(_SLOT_PRIMARY, chip_args, config=config)
             _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         test_args = self.generate_args(params)
@@ -124,17 +134,17 @@ class TestPreparedCallableHbg(SceneTestCase):
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
 
-        worker.run(secondary, chip_args, config=config)
+        chip_worker._run_slot(_SLOT_SECONDARY, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-        worker.unregister_callable(primary)
-        worker.unregister_callable(secondary)
+        chip_worker._unregister_slot(_SLOT_PRIMARY)
+        chip_worker._unregister_slot(_SLOT_SECONDARY)
 
     # ------------------------------------------------------------------
     # host_dlopen_count assertions (hbg path).
     #
     # hbg increments host_dlopen_count on every register_prepared_callable_host_orch
-    # invocation (i.e. each `prepare_callable` call), independent of how many
+    # invocation (i.e. each private slot prepare), independent of how many
     # times run is invoked afterwards. AICPU never dlopens the orch
     # SO on this variant, so aicpu_dlopen_count stays at 0.
     # ------------------------------------------------------------------
@@ -145,74 +155,77 @@ class TestPreparedCallableHbg(SceneTestCase):
         config = self._build_config(case["config"])
         return callable_obj, config, case
 
-    def _run_one(self, worker, handle, callable_obj, config, case):
+    def _run_one(self, worker, slot, config, case):
         params = case["params"]
         orch_sig = self.CALLABLE["orchestration"]["signature"]
         test_args = self.generate_args(params)
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
-        worker.run(handle, chip_args, config=config)
+        self._chip_worker(worker)._run_slot(slot, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-    def test_dlopen_count_same_cid_repeated_runs(self, st_platform, st_worker):
+    def test_dlopen_count_same_slot_repeated_runs(self, st_platform, st_worker):
         """prepare(primary) + run x5 -> host_dlopen delta == 1, aicpu == 0."""
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.host_dlopen_count
         baseline_aicpu = st_worker.aicpu_dlopen_count
-        primary = None
+        prepared = False
+        chip_worker = self._chip_worker(st_worker)
         try:
-            primary = st_worker.prepare_callable(callable_obj)
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            prepared = True
             for _ in range(5):
-                self._run_one(st_worker, primary, callable_obj, config, case)
+                self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 1, (
-                f"expected exactly 1 new host dlopen for 5 runs of primary handle, "
+                f"expected exactly 1 new host dlopen for 5 runs of primary slot, "
                 f"got delta {st_worker.host_dlopen_count - baseline}"
             )
             assert st_worker.aicpu_dlopen_count == baseline_aicpu, "hbg must not trigger any AICPU orch SO dlopens"
         finally:
-            if primary is not None:
-                st_worker.unregister_callable(primary)
+            if prepared:
+                chip_worker._unregister_slot(_SLOT_PRIMARY)
 
-    def test_dlopen_count_two_cids_alternating(self, st_platform, st_worker):
-        """Duplicate handles share one host dlopen and one callable identity."""
+    def test_dlopen_count_two_slots_alternating(self, st_platform, st_worker):
+        """prepare(primary)+prepare(secondary) + alternating runs x5 -> host_dlopen delta == 2."""
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.host_dlopen_count
         baseline_aicpu = st_worker.aicpu_dlopen_count
-        primary = None
-        secondary = None
+        primary_prepared = False
+        secondary_prepared = False
+        chip_worker = self._chip_worker(st_worker)
         try:
-            primary = st_worker.prepare_callable(callable_obj)
-            secondary = st_worker.prepare_callable(callable_obj)
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            primary_prepared = True
+            chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+            secondary_prepared = True
             for _ in range(5):
-                self._run_one(st_worker, primary, callable_obj, config, case)
-                self._run_one(st_worker, secondary, callable_obj, config, case)
-            assert st_worker.host_dlopen_count - baseline == 1, (
-                f"expected exactly 1 new host dlopen for duplicate handle interleaving, "
+                self._run_one(st_worker, _SLOT_PRIMARY, config, case)
+                self._run_one(st_worker, _SLOT_SECONDARY, config, case)
+            assert st_worker.host_dlopen_count - baseline == 2, (
+                f"expected exactly 2 new host dlopens for two slots interleaved, "
                 f"got delta {st_worker.host_dlopen_count - baseline}"
             )
             assert st_worker.aicpu_dlopen_count == baseline_aicpu
         finally:
-            if secondary is not None:
-                st_worker.unregister_callable(secondary)
-            if primary is not None:
-                st_worker.unregister_callable(primary)
+            if secondary_prepared:
+                chip_worker._unregister_slot(_SLOT_SECONDARY)
+            if primary_prepared:
+                chip_worker._unregister_slot(_SLOT_PRIMARY)
 
-    def test_dlopen_count_duplicate_prepare_dedups(self, st_platform, st_worker):
-        """Duplicate prepare returns another handle for the same identity."""
+    def test_dlopen_count_double_prepare_raises(self, st_platform, st_worker):
+        """prepare(primary) twice -> second call raises RuntimeError."""
         callable_obj, _config, _case = self._setup_dlopen_count_test(st_worker, st_platform)
-        first = None
-        second = None
+        prepared = False
+        chip_worker = self._chip_worker(st_worker)
         try:
-            first = st_worker.prepare_callable(callable_obj)
-            second = st_worker.prepare_callable(callable_obj)
-            assert first is not second
-            assert first.hashid == second.hashid
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            prepared = True
+            with pytest.raises(RuntimeError):
+                chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
         finally:
-            if second is not None:
-                st_worker.unregister_callable(second)
-            if first is not None:
-                st_worker.unregister_callable(first)
+            if prepared:
+                chip_worker._unregister_slot(_SLOT_PRIMARY)
 
     def test_dlopen_count_unregister_re_prepare(self, st_platform, st_worker):
         """prepare+run+unregister+prepare+run -> host_dlopen delta == 2.
@@ -221,26 +234,29 @@ class TestPreparedCallableHbg(SceneTestCase):
         """
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.host_dlopen_count
-        handle = None
+        prepared = False
+        chip_worker = self._chip_worker(st_worker)
         try:
-            handle = st_worker.prepare_callable(callable_obj)
-            self._run_one(st_worker, handle, callable_obj, config, case)
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            prepared = True
+            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 1
-            st_worker.unregister_callable(handle)
-            handle = None
+            chip_worker._unregister_slot(_SLOT_PRIMARY)
+            prepared = False
             after_unreg = st_worker.host_dlopen_count
             assert after_unreg - baseline == 1, (
                 f"unregister must NOT decrement the host dlopen counter; baseline={baseline}, after_unreg={after_unreg}"
             )
-            handle = st_worker.prepare_callable(callable_obj)
-            self._run_one(st_worker, handle, callable_obj, config, case)
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            prepared = True
+            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 2, (
                 f"after re-prepare expected counter +2 (two distinct host dlopens), "
                 f"got delta {st_worker.host_dlopen_count - baseline}"
             )
         finally:
-            if handle is not None:
-                st_worker.unregister_callable(handle)
+            if prepared:
+                chip_worker._unregister_slot(_SLOT_PRIMARY)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # Task Flow — Callable / TaskArgs / CallConfig Pass-Through
 
 Callable identity update: public Python submit APIs now accept
-`CallableHandle` objects returned by `Worker.prepare_callable`, and hierarchical task
+`CallableHandle` objects returned by `Worker.register`, and hierarchical task
 mailboxes carry the handle's 32-byte hash digest. Target-local integer slots
 remain private to the receiving worker. Older `cid` references in this document
 describe historical or target-local internals; the authoritative contract is
@@ -52,7 +52,7 @@ struct CallableIdentity {
 };
 ```
 
-Python users submit `CallableHandle` objects returned by `Worker.prepare_callable`.
+Python users submit `CallableHandle` objects returned by `Worker.register`.
 The Python facade validates ownership/liveness and passes `CallableIdentity`
 to C++:
 
@@ -263,25 +263,22 @@ Python method, not a C++ leaf. The kernel-running leaves stay at L2
 
 ## 6. Data flow through a submit
 
-The user's orch fn receives an `Orchestrator*` (not a `Worker*`) and calls
-`submit_next_level` / `submit_sub`:
+The user's Python orch fn receives an `Orchestrator` facade (not a `Worker`)
+and calls `submit_next_level` / `submit_sub`. These Python methods return
+`None`; the task slot remains internal to the scheduling engine.
 
-```cpp
-class Orchestrator {
-public:
-    SubmitResult submit_next_level(const CallableIdentity &callable, TaskArgs args, const CallConfig &config);
-    SubmitResult submit_next_level_group(
-        const CallableIdentity &callable,
-        std::vector<TaskArgs> args_list,
-        const CallConfig &config);
-    SubmitResult submit_sub(const CallableIdentity &callable, TaskArgs args, const CallConfig &config);
-};
-
-struct SubmitResult { TaskSlot slot_id; };
+```python
+class Orchestrator:
+    def submit_next_level(self, handle, args, config=None, *, worker=-1) -> None: ...
+    def submit_next_level_group(self, handle, args_list, config=None, *, workers=None) -> None: ...
+    def submit_sub(self, handle, args=None) -> None: ...
+    def submit_sub_group(self, handle, args_list) -> None: ...
 ```
 
-Only `slot_id` is returned — downstream consumers reference tensors by their
-own pointers (already registered in TensorMap by the OUTPUT/INOUT tag).
+The C++ implementation still allocates an internal task slot to drive
+scheduling, but nanobind does not expose that slot. Downstream consumers
+reference tensors by their own pointers (already registered in TensorMap by
+the OUTPUT/INOUT tag).
 
 Where the data goes after submit:
 
@@ -383,14 +380,14 @@ delegates to
 ```python
 # L3 child: sub-only (no chips for this example)
 l3 = Worker(level=3, num_sub_workers=1)
-l3_sub_handle = l3.prepare_callable(lambda: verify_result())
+l3_sub_handle = l3.register(lambda: verify_result())
 
 def my_l3_orch(orch, args, config):
     orch.submit_sub(l3_sub_handle)
 
 # L4 parent
 w4 = Worker(level=4, num_sub_workers=0)
-l3_handle = w4.prepare_callable(my_l3_orch) # register L3 orch fn in Python dict
+l3_handle = w4.register(my_l3_orch) # register L3 orch fn in Python dict
 w4.add_worker(l3)                   # add un-init'd L3 Worker as child
 w4.init()
 

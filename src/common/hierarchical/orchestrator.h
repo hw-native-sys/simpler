@@ -49,12 +49,13 @@
 class WorkerManager;
 
 // ---------------------------------------------------------------------------
-// SubmitResult — just the slot id
+// SubmitResult — C++ internal slot id
 // ---------------------------------------------------------------------------
 //
 // Downstream consumers reference outputs by their own tensor pointers (the
 // tensors live in the HeapRing allocated by the Worker), and tensormap.lookup
 // finds the producer slot from the data pointer. No outputs[] field needed.
+// This is intentionally not exposed through the Python facade.
 
 struct SubmitResult {
     TaskSlot task_slot{INVALID_SLOT};

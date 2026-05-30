@@ -13,12 +13,12 @@ Orchestrator handle at init, retrieves the C++ object via ``Worker.get_orchestra
 and passes the handle to the user's orch function::
 
     def my_orch(orch, args, cfg):
-        # chip_handle/sub_handle come from Worker.prepare_callable(...)
+        # chip_handle/sub_handle come from Worker.register(...)
         # build the args object yourself; tags drive dependency inference
         a = TaskArgs()
         a.add_tensor(make_tensor_arg(input_tensor),  TensorArgType.INPUT)
         a.add_tensor(make_tensor_arg(output_tensor), TensorArgType.OUTPUT)
-        orch.submit_next_level(chip_handle, a, cfg)  # handle from Worker.prepare_callable(chip_callable)
+        orch.submit_next_level(chip_handle, a, cfg)  # handle from Worker.register(chip_callable)
 
         sub_args = TaskArgs()
         sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
@@ -59,17 +59,17 @@ def _require_handle(
 
     Raises a clear migration error when the caller still passes a
     ``ChipCallable`` directly — every chip callable must be registered
-    via ``Worker.prepare_callable(callable)`` *before* ``init()`` so each chip
+    via ``Worker.register(callable)`` *before* ``init()`` so each chip
     child can pre-warm it on its own device.
     """
     if isinstance(callable_or_handle, ChipCallable) or hasattr(callable_or_handle, "buffer_ptr"):
         raise TypeError(
             f"{kind} now takes a CallableHandle, not a ChipCallable. "
-            "Prepare the callable before init() via "
-            "`handle = worker.prepare_callable(chip_callable)` and pass `handle` here."
+            "Register the callable before init() via "
+            "`handle = worker.register(chip_callable)` and pass `handle` here."
         )
     if not isinstance(callable_or_handle, CallableHandle):
-        raise TypeError(f"{kind} expects a CallableHandle returned by Worker.prepare_callable")
+        raise TypeError(f"{kind} expects a CallableHandle returned by Worker.register")
     if worker is not None:
         state = worker._resolve_handle(callable_or_handle, expected_namespace=expected_namespace)
         return state.digest, state.kind, state.target_namespace
@@ -116,7 +116,7 @@ class Orchestrator:
     ):
         """Submit a NEXT_LEVEL task by registered callable handle.
 
-        ``callable_handle`` must be returned by ``Worker.prepare_callable``. Tags inside ``args`` drive deps.
+        ``callable_handle`` must be returned by ``Worker.register``. Tags inside ``args`` drive deps.
         ``worker``: logical worker id for affinity (-1 = unconstrained).
         """
         cfg = config if config is not None else CallConfig()
@@ -126,7 +126,7 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace=self._expected_next_level_namespace(),
         )
-        return self._o.submit_next_level(digest, kind, target_namespace, args, cfg, int(worker))
+        self._o.submit_next_level(digest, kind, target_namespace, args, cfg, int(worker))
 
     def submit_next_level_group(
         self,
@@ -148,7 +148,7 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace=self._expected_next_level_namespace(),
         )
-        return self._o.submit_next_level_group(digest, kind, target_namespace, args_list, cfg, w)
+        self._o.submit_next_level_group(digest, kind, target_namespace, args_list, cfg, w)
 
     def submit_sub(self, callable_handle: Any, args: Optional[TaskArgs] = None):
         """Submit a SUB task by registered callable handle.
@@ -163,7 +163,7 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace="LOCAL_PYTHON",
         )
-        return self._o.submit_sub(digest, kind, target_namespace, args)
+        self._o.submit_sub(digest, kind, target_namespace, args)
 
     def submit_sub_group(self, callable_handle: Any, args_list: list):
         """Submit a group of SUB tasks (N TaskArgs → N workers, 1 DAG node)."""
@@ -173,7 +173,7 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace="LOCAL_PYTHON",
         )
-        return self._o.submit_sub_group(digest, kind, target_namespace, args_list)
+        self._o.submit_sub_group(digest, kind, target_namespace, args_list)
 
     # ------------------------------------------------------------------
     # Dynamic CommDomain allocation (collective; blocks orch_fn for the

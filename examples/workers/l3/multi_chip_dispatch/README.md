@@ -10,10 +10,10 @@ chip outputs. The smallest correct L3 program.
 | ------- | ------------------------------ |
 | Shared-memory tensors | `torch.randn(...).share_memory_()` — chip children see the same storage |
 | `TensorArgType` tags | `INPUT` / `OUTPUT_EXISTING` drive DAG dependency tracking |
-| ChipCallable id | `chip_cid = worker.prepare_callable(chip_callable)` **before** `init()` |
-| Python SubWorker | `sub_cid = worker.prepare_callable(fn)` **before** `init()` |
+| ChipCallable handle | `chip_handle = worker.register(chip_callable)` **before** `init()` |
+| Python SubWorker | `sub_handle = worker.register(fn)` **before** `init()` |
 | `Worker(level=3)` config | `device_ids=[0, 1]`, `num_sub_workers=1` |
-| Orchestration | `orch.submit_next_level(chip_cid, ...)` per chip + `orch.submit_sub(sub_cid, args)` |
+| Orchestration | `orch.submit_next_level(chip_handle, ...)` per chip + `orch.submit_sub(sub_handle, args)` |
 
 ## Layout
 
@@ -67,8 +67,8 @@ host_b   = [torch.randn(...).share_memory_() for _ in device_ids]
 host_out = [torch.zeros(...).share_memory_() for _ in device_ids]
 
 def subworker(sub_args): ...
-chip_cid = worker.prepare_callable(chip_callable)   # ChipCallable: BEFORE init()
-sub_cid  = worker.prepare_callable(subworker)        # Python SubWorker: BEFORE init()
+chip_handle = worker.register(chip_callable)   # ChipCallable: BEFORE init()
+sub_handle  = worker.register(subworker)        # Python SubWorker: BEFORE init()
 ```
 
 `share_memory_()` moves the tensor's storage to a `mmap` region. After
@@ -76,11 +76,10 @@ sub_cid  = worker.prepare_callable(subworker)        # Python SubWorker: BEFORE 
 address, so when the kernel writes to `host_out[i]`, the parent's tensor sees
 it immediately. No explicit copy back.
 
-**`prepare_callable()` MUST come before `init()`** for *every* callable — both
-the `ChipCallable` dispatched to chips and the Python sub functions.
-`init()` forks child processes; the registry is captured by copy-on-write.
-Anything registered after `init()` is invisible to the forked children,
-and `Worker.prepare_callable()` at L≥3 raises if called post-init.
+This example calls **`register()` before `init()`** for every callable — both
+the `ChipCallable` dispatched to chips and the Python sub functions — so
+startup can seed child registries and pre-warm chip callables before the first
+DAG dispatch.
 
 ### 2. `init()` — fork + C++ scheduler
 
@@ -97,12 +96,12 @@ def orch_fn(orch, _args, cfg):
         chip_args.add_tensor(make_tensor_arg(host_a[i]),   TensorArgType.INPUT)
         chip_args.add_tensor(make_tensor_arg(host_b[i]),   TensorArgType.INPUT)
         chip_args.add_tensor(make_tensor_arg(host_out[i]), TensorArgType.OUTPUT_EXISTING)
-        orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
+        orch.submit_next_level(chip_handle, chip_args, cfg, worker=i)
 
     sub_args = TaskArgs()
     for i in range(len(device_ids)):
         sub_args.add_tensor(make_tensor_arg(host_out[i]), TensorArgType.INPUT)
-    orch.submit_sub(sub_cid, sub_args)
+    orch.submit_sub(sub_handle, sub_args)
 ```
 
 The orch function runs **in the parent process**. Each `orch.submit_*` adds a
@@ -159,7 +158,7 @@ from host memory, but the runtime handles DMA transparently based on the
 ## Common pitfalls
 
 - **Registering after `init()`** → sub task fires but hits `KeyError` for the
-  callable id. Always register first.
+  callable handle. Always register first.
 - **Not using `share_memory_()`** → chip child sees zeros where it expects
   inputs. `torch` tensors without `share_memory_()` live in each process's
   private heap.

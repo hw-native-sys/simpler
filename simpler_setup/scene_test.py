@@ -13,7 +13,7 @@ pytest: ``pytest --platform a2a3sim``
 standalone: ``python test_xxx.py -p a2a3sim``
 
 A scene test class declares three things:
-  CALLABLE: what to compile/register
+  CALLABLE: what to compile/prepare
     L2: orchestration (C++ source) + incores (C++ kernels)
     L3: orchestration (Python DAG fn) + callables (ChipCallable + SubCallable)
   CASES: how to run (per-case platform, config, params)
@@ -173,13 +173,13 @@ class TaskArgsBuilder:
 
 
 class CallableNamespace:
-    """Dot-access container for compiled/registered callables.
+    """Dot-access container for compiled/prepared callables.
 
     Used by L3 orch functions to access callables by name::
 
         callables.vector_kernel       # → ChipCallable object
         callables.vector_kernel_sig   # → signature list
-        callables.verify              # → callable_id (int)
+        callables.verify              # → CallableHandle
 
     Also provides ``keep()`` for lifetime management: L3 orch functions
     that build transient Python objects (e.g. ChipStorageTaskArgs) whose
@@ -670,7 +670,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     cases,
     *,
     callable_obj,
-    sub_ids,
+    sub_handles,
     rounds,
     skip_golden,
     enable_l2_swimlane,
@@ -701,7 +701,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 worker,
                 callable_obj,
                 case,
-                sub_ids=sub_ids,
+                sub_handles=sub_handles,
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_l2_swimlane=enable_l2_swimlane,
@@ -851,7 +851,7 @@ class SceneTestCase:
 
         Mirrors the ``st_worker`` pytest fixture, which yields a ``Worker``
         (not a raw ``ChipWorker``) — ``_run_and_validate_l2`` is shared by both
-        paths and calls ``worker.prepare_callable(...)`` / ``worker.run(cid, ...)``,
+        paths and calls ``worker.register(...)`` / ``worker.run(handle, ...)``,
         which only the ``Worker`` wrapper exposes.
         """
         from simpler.worker import Worker  # noqa: PLC0415
@@ -930,7 +930,7 @@ class SceneTestCase:
         worker,
         callable_obj,
         case,
-        sub_ids=None,
+        sub_handles=None,
         rounds=1,
         skip_golden=False,
         enable_l2_swimlane=0,
@@ -958,7 +958,7 @@ class SceneTestCase:
             self._run_and_validate_l3(
                 worker,
                 callable_obj,
-                sub_ids or {},
+                sub_handles or {},
                 case,
                 rounds=rounds,
                 skip_golden=skip_golden,
@@ -989,10 +989,10 @@ class SceneTestCase:
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
         # The L2 entry point is `Worker.run(handle, args, cfg)`. Reuse the
-        # handle prepared by the st_worker fixture / standalone path.
+        # handle registered by the st_worker fixture / standalone path.
         handle = getattr(type(self), "_st_l2_handle", None)
         if handle is None:
-            handle = worker.prepare_callable(callable_obj)
+            handle = worker.register(callable_obj)
             type(self)._st_l2_handle = handle
 
         # Build args
@@ -1048,7 +1048,7 @@ class SceneTestCase:
         self,
         worker,
         compiled_callables,
-        sub_ids,
+        sub_handles,
         case,
         rounds=1,
         skip_golden=False,
@@ -1091,7 +1091,7 @@ class SceneTestCase:
                 initial_tensors[name] = getattr(test_args, name).clone()
 
         # Build CallableNamespace: compiled ChipCallables + sub callable IDs
-        ns = CallableNamespace({**compiled_callables, **sub_ids})
+        ns = CallableNamespace({**compiled_callables, **sub_handles})
 
         # Get orch function (plain function from CALLABLE)
         orch_fn = self.CALLABLE["orchestration"]
@@ -1182,12 +1182,12 @@ class SceneTestCase:
 
         cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
-        sub_ids = getattr(type(self), "_st_sub_ids", {})
-        # For L3, use prepared chip handles instead of raw ChipCallable
+        sub_handles = getattr(type(self), "_st_sub_handles", {})
+        # For L3, use registered chip handles instead of raw ChipCallable
         # objects.
-        chip_cids = getattr(type(self), "_st_chip_cids", {})
-        if self._st_level == 3 and chip_cids:
-            callable_obj = {**chip_cids}
+        chip_handles = getattr(type(self), "_st_chip_handles", {})
+        if self._st_level == 3 and chip_handles:
+            callable_obj = {**chip_handles}
 
         matched = []
         for case in self.CASES:
@@ -1212,7 +1212,7 @@ class SceneTestCase:
             self,
             matched,
             callable_obj=callable_obj,
-            sub_ids=sub_ids,
+            sub_handles=sub_handles,
             rounds=rounds,
             skip_golden=skip_golden,
             enable_l2_swimlane=enable_l2_swimlane,
@@ -1458,19 +1458,19 @@ class SceneTestCase:
         ok = True
         for (runtime, level), group in by_rt_level.items():
             print(f"\n=== Runtime: {runtime}  Level: {level} ===")
-            worker, per_class_sub_ids, per_class_chip_cids = _create_standalone_worker(
+            worker, per_class_sub_handles, per_class_chip_handles = _create_standalone_worker(
                 group, level, args, selected_by_cls
             )
             try:
                 for cls in group:
                     inst = cls()
                     callable_obj = inst.build_callable(args.platform)
-                    sub_ids = per_class_sub_ids.get(cls, {})
-                    chip_cids = per_class_chip_cids.get(cls, {})
+                    sub_handles = per_class_sub_handles.get(cls, {})
+                    chip_handles = per_class_chip_handles.get(cls, {})
                     # For L3: merge chip handles into callable_obj (replacing
-                    # ChipCallable objects with their prepared handle).
-                    if level == 3 and chip_cids:
-                        callable_obj = {**chip_cids}
+                    # ChipCallable objects with their registered handle).
+                    if level == 3 and chip_handles:
+                        callable_obj = {**chip_handles}
                     for case in selected_by_cls[cls]:
                         label = f"{cls.__name__}::{case['name']}"
                         print(f"  {label} ... ", end="", flush=True)
@@ -1480,7 +1480,7 @@ class SceneTestCase:
                                 inst,
                                 [case],
                                 callable_obj=callable_obj,
-                                sub_ids=sub_ids,
+                                sub_handles=sub_handles,
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
                                 enable_l2_swimlane=args.enable_l2_swimlane,
@@ -1705,7 +1705,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
     otherwise a manual case with a larger ``device_count`` inflates the
     allocation even when it isn't scheduled.
 
-    Returns ``(worker, per_class_sub_ids, per_class_chip_cids)`` for both
+    Returns ``(worker, per_class_sub_handles, per_class_chip_handles)`` for both
     L2 and L3 so the caller can unpack uniformly. L2 has neither sub
     callables nor pre-registered chip callables, so both dicts are empty.
     """
@@ -1740,25 +1740,25 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         build=build,
     )
     # Prepare sub callables per-class to avoid name collisions.
-    per_class_sub_ids: dict[type, dict] = {}
+    per_class_sub_handles: dict[type, dict] = {}
     # Also prepare ChipCallables here (before init) so the chip children
     # pre-warm them via _CTRL_PREPARE.
-    per_class_chip_cids: dict[type, dict] = {}
+    per_class_chip_handles: dict[type, dict] = {}
     for cls in group:
-        cls_sub_ids = {}
-        cls_chip_cids = {}
+        cls_sub_handles = {}
+        cls_chip_handles = {}
         for entry in cls.CALLABLE.get("callables", []):
             if "callable" in entry:
-                cid = worker.prepare_callable(entry["callable"])
-                cls_sub_ids[entry["name"]] = cid
+                handle = worker.register(entry["callable"])
+                cls_sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
                 name = entry["name"]
                 cache_key = (cls.__qualname__, name, args.platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
-                cid = worker.prepare_callable(chip)
-                cls_chip_cids[name] = cid
-                cls_chip_cids[f"{name}_sig"] = entry["orchestration"].get("signature", [])
-        per_class_sub_ids[cls] = cls_sub_ids
-        per_class_chip_cids[cls] = cls_chip_cids
+                handle = worker.register(chip)
+                cls_chip_handles[name] = handle
+                cls_chip_handles[f"{name}_sig"] = entry["orchestration"].get("signature", [])
+        per_class_sub_handles[cls] = cls_sub_handles
+        per_class_chip_handles[cls] = cls_chip_handles
     worker.init()
-    return worker, per_class_sub_ids, per_class_chip_cids
+    return worker, per_class_sub_handles, per_class_chip_handles

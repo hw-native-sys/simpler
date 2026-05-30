@@ -1,7 +1,7 @@
 # Python Callable Serialization for L3+ Register
 
 This document describes the current serialized-Python callable payload used by
-hierarchical `Worker.prepare_callable` for Python callables. The public registration
+hierarchical `Worker.register` for Python callables. The public registration
 contract is defined in
 [callable-identity-registration.md](callable-identity-registration.md):
 registration returns a `CallableHandle`, task frames carry the handle hash

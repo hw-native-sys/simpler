@@ -152,7 +152,7 @@ def run(platform: str, device_ids: list[int]) -> int:
         num_sub_workers=0,
     )
     print("[domain_rank_map] compiling communication kernel...")
-    allreduce_cid = worker.prepare_callable(build_allreduce_callable(platform))
+    allreduce_handle = worker.register(build_allreduce_callable(platform))
 
     # `ok` is mutated by the orch closures; wrap in a list for nonlocal write.
     state = {"ok": True}
@@ -216,7 +216,7 @@ def run(platform: str, device_ids: list[int]) -> int:
                     args.add_tensor(make_tensor_arg(host_inputs[worker_idx]), TensorArgType.INPUT)
                     args.add_tensor(make_tensor_arg(outputs[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING)
                     _add_domain_scratch(args, domain)
-                    orch.submit_next_level(allreduce_cid, args, cfg, worker=worker_idx)
+                    orch.submit_next_level(allreduce_handle, args, cfg, worker=worker_idx)
 
         return _orch_fn
 

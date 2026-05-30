@@ -146,7 +146,7 @@ def run(
         num_sub_workers=0,
         build=build,
     )
-    chip_cid = worker.register(chip_callable)
+    chip_handle = worker.register(chip_callable)
 
     try:
         print("[all_to_all] init worker (forks chip children; base comm is lazy)...")
@@ -187,7 +187,7 @@ def run(
                     )
                     chip_args.add_scalar(domain.domain_size)
                     chip_args.add_scalar(domain.device_ctx)
-                    orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
+                    orch.submit_next_level(chip_handle, chip_args, cfg, worker=i)
 
         print(f"[all_to_all] running {nranks}-chip all-to-all DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())

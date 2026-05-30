@@ -114,9 +114,10 @@ class TestWorkerRunSignature:
         # rather than swallowing it.
         from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
 
-        src = inspect.getsource(ChipWorker.run)
-        # Surgical drift guard: the wrapper must `return self._impl.run(...)`
-        # rather than calling it for side effects only. If someone reverts to
-        # the side-effect-only form, RunTiming would silently become None for
-        # every caller without anything else breaking.
-        assert "return self._impl.run" in src
+        run_src = inspect.getsource(ChipWorker.run)
+        slot_src = inspect.getsource(ChipWorker._run_slot)
+        # Surgical drift guard: the public handle API routes through the
+        # private slot runner, and that runner must return _impl.run(...)
+        # rather than calling it for side effects only.
+        assert "return self._run_slot" in run_src
+        assert "return self._impl.run" in slot_src

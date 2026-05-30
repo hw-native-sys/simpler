@@ -96,7 +96,7 @@ args.add_tensor(ContinuousTensor.make(dev_a,   shape, DataType.FLOAT32))
 args.add_tensor(ContinuousTensor.make(dev_b,   shape, DataType.FLOAT32))
 args.add_tensor(ContinuousTensor.make(dev_out, shape, DataType.FLOAT32))
 
-worker.run(chip_cid, args, CallConfig())  # chip_cid = worker.prepare_callable(chip_callable) before init()
+worker.run(chip_handle, args, CallConfig())  # chip_handle = worker.register(chip_callable) before init()
 ```
 
 The tensor order must match `signature` order on the `ChipCallable`. `run()`

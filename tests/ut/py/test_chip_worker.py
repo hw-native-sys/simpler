@@ -152,3 +152,59 @@ class TestChipWorkerPython:
         worker = ChipWorker()
         assert worker.initialized is False
         assert isinstance(PyCallConfig(), CallConfig)
+
+    def test_public_wrapper_uses_handle_and_private_slot(self):
+        from _task_interface import ChipCallable, ChipStorageTaskArgs  # noqa: PLC0415
+        from simpler.callable_identity import CallableHandle  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeImpl:
+            initialized = True
+            device_id = 0
+
+            def __init__(self):
+                self.prepared = []
+                self.runs = []
+                self.unregistered = []
+                self.aicpu_dlopen_count = 0
+                self.host_dlopen_count = 0
+
+            def prepare_callable(self, slot, callable_obj):
+                self.prepared.append((slot, callable_obj))
+
+            def run(self, slot, args, config):
+                self.runs.append((slot, args, config))
+                return "timing"
+
+            def unregister_callable(self, slot):
+                self.unregistered.append(slot)
+
+        worker = ChipWorker()
+        fake = FakeImpl()
+        worker._impl = fake
+        callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
+
+        first = worker.prepare_callable(callable_obj)
+        second = worker.prepare_callable(callable_obj)
+
+        assert isinstance(first, CallableHandle)
+        assert not isinstance(first, int)
+        assert first.hashid == second.hashid
+        assert fake.prepared == [(0, callable_obj)]
+
+        args = ChipStorageTaskArgs()
+        assert worker.run(first, args, CallConfig()) == "timing"
+        assert fake.runs[0][0] == 0
+
+        worker.unregister_callable(first)
+        assert fake.unregistered == []
+        worker.unregister_callable(second)
+        assert fake.unregistered == [0]
+
+    def test_public_wrapper_rejects_raw_slot_run(self):
+        from _task_interface import ChipStorageTaskArgs  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        worker = ChipWorker()
+        with pytest.raises(TypeError, match="CallableHandle returned by ChipWorker.prepare_callable"):
+            worker.run(0, ChipStorageTaskArgs(), CallConfig())

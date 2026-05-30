@@ -194,17 +194,18 @@ class TestWorkerSmoke:
             buf = counter_shm.buf
             assert buf is not None
             struct.pack_into("i", buf, 0, 0)
+
             def sub(args, b=buf):
                 v = struct.unpack_from("i", b, 0)[0]
                 struct.pack_into("i", b, 0, v + 1)
 
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.prepare_callable(sub)
+            handle = hw.register(sub)
             hw.init()
             try:
 
                 def orch(o, args, cfg):
-                    o.submit_sub(cid)
+                    o.submit_sub(handle)
 
                 hw.run(orch)
                 hw.run(orch)

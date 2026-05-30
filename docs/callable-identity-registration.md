@@ -89,7 +89,7 @@ parent-owned Python dispatch registry for those children. It does not populate
 an inner Worker's own `_callable_registry`; callables owned by an inner Worker
 are registered on that inner Worker separately.
 
-`Worker.prepare_callable` derives `target_namespace` from the target object and the
+`Worker.register` derives `target_namespace` from the target object and the
 Worker topology:
 
 - `ChipCallable` targets produce `LOCAL_CHIP`.
@@ -121,7 +121,7 @@ Rules:
   know a child worker's `hashid -> local_slot` mapping.
 - Registering the same `hashid` with a different descriptor or payload digest
   is an error.
-- Public `Worker.prepare_callable` calls are not deduplicated. Repeated calls may
+- Public `Worker.register` calls are not deduplicated. Repeated calls may
   return distinct `CallableHandle` objects with the same `hashid`.
 - A target may deduplicate executable state by `hashid` internally, but it must
   preserve independent public handle lifetimes with a target-local refcount.
@@ -161,7 +161,7 @@ descriptor = build_callable_descriptor(callable)
 hashid = compute_callable_hashid(descriptor)
 ```
 
-`Worker.prepare_callable` computes the descriptor and `hashid`. User code does not
+`Worker.register` computes the descriptor and `hashid`. User code does not
 provide a hashid override.
 
 Canonical descriptor schemas:
@@ -280,10 +280,10 @@ identifies the concrete serialized callable payload that was registered.
 Registration returns a callable handle, not an integer child slot:
 
 ```python
-handle = Worker.prepare_callable(callable)
+handle = Worker.register(callable)
 ```
 
-Registration uses whole-scope install. A successful `Worker.prepare_callable` means
+Registration uses whole-scope install. A successful `Worker.register` means
 every active child endpoint in the handle's `target_namespace` for this
 `Worker` has installed the callable identity. Registering to a user-selected
 worker subset is not part of this contract.
@@ -315,8 +315,8 @@ the parent-side live registration record.
 Submit APIs accept only `CallableHandle`:
 
 ```python
-matmul = worker.prepare_callable(chip_callable)
-postprocess = worker.prepare_callable(py_callable)
+matmul = worker.register(chip_callable)
+postprocess = worker.register(py_callable)
 
 def parent_orch(orch, args, config):
     orch.submit_next_level(matmul, args, config)
@@ -326,10 +326,9 @@ def parent_orch(orch, args, config):
 They do not accept bare strings or raw callables. Direct string hashids are
 registration internals, not submit arguments.
 
-This contract covers the hierarchical `Worker` and `Orchestrator` APIs. The
-lower-level `ChipWorker` direct execution wrapper still exposes explicit
-`callable_id` slots for local prepared-callable tests and single-chip runtime
-debugging. Those slots are local to that `ChipWorker` instance and are not
+This contract covers the `Worker`, `Orchestrator`, and public `ChipWorker`
+wrapper APIs. Manual `callable_id` slots are private implementation details
+inside the worker and the underscore `_ChipWorker` binding ABI. They are not
 valid `CallableHandle` values, orchestration submit arguments, task slots, or
 mailbox task callable references.
 
@@ -551,7 +550,7 @@ Milestone 1: descriptor and hash helpers.
 Milestone 2: public handle API.
 
 - Add `CallableHandle` and handle validation.
-- Change `Worker.prepare_callable` to return `CallableHandle`.
+- Change `Worker.register` to return `CallableHandle`.
 - Keep L3+ `Worker.run(raw_orch_fn, ...)` behavior unchanged.
 - Keep integer execution slots private to the target child process.
 

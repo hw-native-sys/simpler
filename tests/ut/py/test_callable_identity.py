@@ -7,10 +7,14 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-import pytest
+from typing import cast
 
+import pytest
+import simpler.callable_identity as callable_identity
 from simpler.callable_identity import (
     CallableHandle,
+    CallableKindName,
+    TargetNamespaceName,
     build_chip_callable_descriptor,
     build_python_serialized_descriptor,
     compute_callable_hashid,
@@ -50,11 +54,16 @@ def test_hashid_validation_rejects_noncanonical_values(hashid):
         validate_hashid(hashid)
 
 
+def test_callable_identity_public_exports_do_not_include_worker_state():
+    assert "CallableHandle" in callable_identity.__all__
+    assert "_CallableIdentityState" not in callable_identity.__all__
+
+
 def test_worker_register_returns_opaque_handle_and_deduplicates_same_identity():
     worker = Worker(level=3, num_sub_workers=0)
     try:
-        first = worker.prepare_callable(_py_target)
-        second = worker.prepare_callable(_py_target)
+        first = worker.register(_py_target)
+        second = worker.register(_py_target)
 
         assert isinstance(first, CallableHandle)
         assert not isinstance(first, int)
@@ -69,7 +78,11 @@ def test_worker_register_returns_opaque_handle_and_deduplicates_same_identity():
 
 
 def test_callable_handle_public_constructor_does_not_expose_slot_identity():
-    handle = CallableHandle("sha256:" + "0" * 64, "PYTHON_SERIALIZED", "LOCAL_PYTHON")
+    handle = CallableHandle(
+        "sha256:" + "0" * 64,
+        cast(CallableKindName, "PYTHON_SERIALIZED"),
+        cast(TargetNamespaceName, "LOCAL_PYTHON"),
+    )
 
     assert handle.digest == bytes(32)
     assert not hasattr(handle, "_slot_id")
@@ -77,11 +90,15 @@ def test_callable_handle_public_constructor_does_not_expose_slot_identity():
 
 def test_forged_public_handle_is_rejected_by_worker_apis():
     worker = Worker(level=3, num_sub_workers=0)
-    real = worker.prepare_callable(_py_target)
-    forged = CallableHandle(real.hashid, real.kind, real.target_namespace)
+    real = worker.register(_py_target)
+    forged = CallableHandle(
+        real.hashid,
+        cast(CallableKindName, real.kind),
+        cast(TargetNamespaceName, real.target_namespace),
+    )
     try:
         with pytest.raises(KeyError, match="does not belong|not live"):
-            worker.unregister_callable(forged)
+            worker.unregister(forged)
         with pytest.raises(KeyError, match="does not belong|not live"):
             worker._resolve_handle(forged)
     finally:
@@ -90,7 +107,7 @@ def test_forged_public_handle_is_rejected_by_worker_apis():
 
 def test_mutated_handle_fields_are_rejected():
     worker = Worker(level=3, num_sub_workers=0)
-    handle = worker.prepare_callable(_py_target)
+    handle = worker.register(_py_target)
     try:
         handle.kind = "CHIP_CALLABLE"
         with pytest.raises(RuntimeError, match="CALLABLE_HANDLE_MUTATED"):
@@ -101,7 +118,7 @@ def test_mutated_handle_fields_are_rejected():
 
 def test_uncertain_cleanup_hashid_blocks_live_handle_resolution():
     worker = Worker(level=3, num_sub_workers=0)
-    handle = worker.prepare_callable(_py_target)
+    handle = worker.register(_py_target)
     try:
         worker._uncertain_hashids.add(handle.digest)
         with pytest.raises(RuntimeError, match="REGISTER_CLEANUP_UNCERTAIN"):

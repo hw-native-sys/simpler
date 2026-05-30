@@ -92,11 +92,11 @@ class TestGroupBasic:
                 shm.close()
 
         try:
-            cid = hw.prepare_callable(inc)
+            handle = hw.register(inc)
             hw.init()
 
             def orch(o, args, cfg):
-                o.submit_sub_group(cid, [TaskArgs(), TaskArgs()])
+                o.submit_sub_group(handle, [TaskArgs(), TaskArgs()])
 
             hw.run(orch)
             hw.close()
@@ -125,11 +125,11 @@ class TestGroupBasic:
                 shm.close()
 
         try:
-            cid = hw.prepare_callable(inc)
+            handle = hw.register(inc)
             hw.init()
 
             def orch(o, args, cfg):
-                o.submit_sub_group(cid, [TaskArgs()])
+                o.submit_sub_group(handle, [TaskArgs()])
 
             hw.run(orch)
             hw.close()
@@ -165,15 +165,15 @@ class TestGroupDependency:
             assert gb is not None and db is not None
 
             hw = Worker(level=3, num_sub_workers=3)
-            group_cid = hw.prepare_callable(lambda args: struct.pack_into("i", gb, 0, 1))
-            dep_cid = hw.prepare_callable(lambda args: struct.pack_into("i", db, 0, 1))
+            group_handle = hw.register(lambda args: struct.pack_into("i", gb, 0, 1))
+            dep_handle = hw.register(lambda args: struct.pack_into("i", db, 0, 1))
             hw.init()
 
             def orch(o, args, cfg):
                 # Group: both members tag the synthetic ptr as OUTPUT — the
                 # second insert overwrites the first with the same slot id.
                 o.submit_sub_group(
-                    group_cid,
+                    group_handle,
                     [
                         _sync_args(_SYNC_PTR, TensorArgType.OUTPUT),
                         _sync_args(_SYNC_PTR, TensorArgType.OUTPUT),
@@ -181,7 +181,7 @@ class TestGroupDependency:
                 )
                 # Downstream: INPUT on the same ptr → tensormap lookup wires
                 # a fanin on the group slot.
-                o.submit_sub(dep_cid, _sync_args(_SYNC_PTR, TensorArgType.INPUT))
+                o.submit_sub(dep_handle, _sync_args(_SYNC_PTR, TensorArgType.INPUT))
 
             hw.run(orch)
             hw.close()

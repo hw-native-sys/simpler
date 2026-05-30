@@ -160,53 +160,53 @@ class TestLifecycle:
 
     def test_context_manager(self):
         with Worker(level=3, num_sub_workers=1) as hw:
-            hw.prepare_callable(lambda args: None)
+            hw.register(lambda args: None)
         # close() called by __exit__, no exception
 
     def test_l2_rejects_python_callable(self):
         hw = Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
         with pytest.raises(TypeError, match="level 2 only supports ChipCallable"):
-            hw.prepare_callable(lambda args: None)
+            hw.register(lambda args: None)
 
-    def test_register_python_fn_after_init_before_start_succeeds(self):
+    def test_prepare_python_fn_after_init_before_start_succeeds(self):
         # init() allocates mailboxes but does not fork children. Python
-        # callables registered in this window still land in the startup
+        # callables prepared in this window still land in the startup
         # snapshot consumed by the first run().
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
-            handle = hw.prepare_callable(lambda args: None)
+            handle = hw.register(lambda args: None)
             assert _slot_for(hw, handle) in hw._callable_registry
         finally:
             hw.close()
 
-    def test_register_python_fn_after_init_before_start_does_not_broadcast(self):
+    def test_prepare_python_fn_after_init_before_start_does_not_broadcast(self):
         class BroadcastTrap:
             def broadcast_control_all(self, *args, **kwargs):
-                raise AssertionError("pre-start Python register must not broadcast")
+                raise AssertionError("pre-start Python prepare must not broadcast")
 
         hw = Worker(level=3, num_sub_workers=1)
         hw.init()
         real_worker = hw._worker
         try:
             hw._worker = BroadcastTrap()
-            handle = hw.prepare_callable(lambda args: None)
+            handle = hw.register(lambda args: None)
             assert _slot_for(hw, handle) in hw._callable_registry
         finally:
             hw._worker = real_worker
             hw.close()
 
-    def test_register_python_fn_after_start_no_python_children_raises(self):
+    def test_prepare_python_fn_after_start_no_python_children_raises(self):
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
             hw.run(lambda orch, args, cfg: None)
             with pytest.raises(RuntimeError, match="no Python-capable child"):
-                hw.prepare_callable(lambda args: None)
+                hw.register(lambda args: None)
         finally:
             hw.close()
 
-    def test_register_waits_for_first_startup_then_uses_post_start_path(self):
+    def test_prepare_waits_for_first_startup_then_uses_post_start_path(self):
         hw = Worker(level=3, num_sub_workers=1)
         hw.init()
         try:
@@ -235,7 +235,7 @@ class TestLifecycle:
 
             def do_register():
                 try:
-                    result.append(hw.prepare_callable(lambda args: None))
+                    result.append(hw.register(lambda args: None))
                 except BaseException as exc:  # noqa: BLE001
                     errors.append(exc)
 
@@ -258,7 +258,7 @@ class TestLifecycle:
                 hw._hierarchical_start_cv.wait = original_wait
             hw.close()
 
-    def test_register_blocks_startup_snapshot_from_not_started_window(self):
+    def test_prepare_blocks_startup_snapshot_from_not_started_window(self):
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
 
@@ -290,7 +290,7 @@ class TestLifecycle:
 
         def do_register():
             try:
-                result.append(hw.prepare_callable(lambda args: None))
+                result.append(hw.register(lambda args: None))
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
 
@@ -327,7 +327,7 @@ class TestLifecycle:
             hw._registry_lock = real_registry_lock
             hw.close()
 
-    def test_register_chip_callable_after_init_no_chips_succeeds(self):
+    def test_prepare_chip_callable_after_init_no_chips_succeeds(self):
         # With no chip children (device_ids unset), the C++ broadcast is a
         # no-op (next_level_threads_ is empty) — exercises the facade path
         # (registry lock, cid allocation, broadcast call, return) end-to-end
@@ -336,25 +336,25 @@ class TestLifecycle:
         hw.init()
         try:
             callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
-            handle = hw.prepare_callable(callable_obj)
+            handle = hw.register(callable_obj)
             assert isinstance(handle, CallableHandle)
             assert _slot_for(hw, handle) >= 0
         finally:
             hw.close()
 
-    def test_register_chip_callable_at_cid_overflow_raises(self):
-        # cid budget is enforced under the new dynamic-register path too:
+    def test_prepare_chip_callable_at_cid_overflow_raises(self):
+        # cid budget is enforced under the new dynamic-prepare path too:
         # pre-fill registry with lambdas pre-init, init, then attempt one
-        # post-init ChipCallable register and observe the existing
+        # post-init ChipCallable prepare and observe the existing
         # MAX_REGISTERED_CALLABLE_IDS RuntimeError.
         hw = Worker(level=3, num_sub_workers=0)
         try:
             for i in range(MAX_REGISTERED_CALLABLE_IDS):
-                hw.prepare_callable(_unique_py_callable(i))
+                hw.register(_unique_py_callable(i))
             hw.init()
             callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
             with pytest.raises(RuntimeError, match="MAX_REGISTERED_CALLABLE_IDS"):
-                hw.prepare_callable(callable_obj)
+                hw.register(callable_obj)
         finally:
             hw.close()
 
@@ -364,32 +364,32 @@ class TestLifecycle:
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
-            with pytest.raises(TypeError, match="CallableHandle returned by Worker.prepare_callable"):
-                hw.unregister_callable(999)
+            with pytest.raises(TypeError, match="CallableHandle returned by Worker.register"):
+                hw.unregister(999)
         finally:
             hw.close()
 
     def test_unregister_chip_callable_after_init_no_chips_succeeds(self):
         # With zero chip mailboxes the C++ broadcast is a no-op, so the
         # facade path (registry lock, broadcast, registry pop) is exercised
-        # end-to-end without an NPU. Also verifies cid reuse — unregistering
-        # frees the slot and the next register reuses the same cid via
+        # end-to-end without an NPU. Also verifies slot reuse — unregistering
+        # frees the slot and the next register reuses the same slot via
         # `_allocate_cid` (smallest-unused-integer).
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         try:
             callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
-            cid_a = hw.prepare_callable(callable_obj)
-            slot_a = _slot_for(hw, cid_a)
+            handle_a = hw.register(callable_obj)
+            slot_a = _slot_for(hw, handle_a)
             assert slot_a in hw._callable_registry
-            hw.unregister_callable(cid_a)
+            hw.unregister(handle_a)
             assert slot_a not in hw._callable_registry
-            cid_b = hw.prepare_callable(callable_obj)
-            assert _slot_for(hw, cid_b) == slot_a, "smallest-unused-cid policy should reuse the freed slot"
+            handle_b = hw.register(callable_obj)
+            assert _slot_for(hw, handle_b) == slot_a, "smallest-unused-cid policy should reuse the freed slot"
         finally:
             hw.close()
 
-    def test_register_chip_callable_broadcast_runs_without_registry_lock(self):
+    def test_prepare_chip_callable_broadcast_runs_without_registry_lock(self):
         hw = Worker(level=3, num_sub_workers=0)
         hw._initialized = True
         hw._hierarchical_started = True
@@ -404,7 +404,7 @@ class TestLifecycle:
 
         hw._post_init_register = fake_post_init_register
 
-        handle = hw.prepare_callable(callable_obj)
+        handle = hw.register(callable_obj)
 
         slot = _slot_for(hw, handle)
         assert observed == {"target": callable_obj, "digest": handle.digest, "is_new": True, "locked": False}
@@ -428,14 +428,16 @@ class TestLifecycle:
 
         hw._post_init_register = fake_post_init_register
 
-        slot = hw._register_child_chip(callable_obj, digest=digest)
+        result = hw._register_child_chip(callable_obj, digest=digest)
 
+        assert result is None
         assert observed == {
             "target": callable_obj,
             "digest": digest,
             "is_new": True,
             "locked": False,
         }
+        slot = hw._identity_registry[digest].slot_id
         assert hw._callable_registry[slot] is callable_obj
 
     def test_startup_identity_snapshot_filters_by_target_namespace(self):
@@ -444,8 +446,8 @@ class TestLifecycle:
         hw = Worker(level=3, num_sub_workers=0)
         py_target = _unique_py_callable(1)
         chip_target = _unique_chip_callable(2)
-        py_handle = hw.prepare_callable(py_target)
-        chip_handle = hw.prepare_callable(chip_target)
+        py_handle = hw.register(py_target)
+        chip_handle = hw.register(chip_target)
         snapshot = [
             (digest, state.target, state.ref_count, state.kind, state.target_namespace)
             for digest, state in hw._identity_registry.items()
@@ -522,7 +524,7 @@ class TestLifecycle:
         from simpler.worker import _CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER  # noqa: PLC0415
 
         hw = Worker(level=3, num_sub_workers=1)
-        cid = hw.prepare_callable(lambda args: None)
+        handle = hw.register(lambda args: None)
         hw._initialized = True
         hw._hierarchical_started = True
         calls = []
@@ -538,8 +540,8 @@ class TestLifecycle:
 
         hw._worker = FakeWorker()
 
-        slot = _slot_for(hw, cid)
-        hw.unregister_callable(cid)
+        slot = _slot_for(hw, handle)
+        hw.unregister(handle)
 
         captured = capsys.readouterr()
         assert "Python children reported errors" in captured.err
@@ -547,16 +549,16 @@ class TestLifecycle:
         assert slot not in hw._callable_registry
         assert slot not in hw._pending_unregister_cids
 
-        reused = hw.prepare_callable(lambda args: None)
+        reused = hw.register(lambda args: None)
         assert _slot_for(hw, reused) == slot
-        assert calls[0][:4] == (WorkerType.SUB, _CTRL_PY_UNREGISTER, cid.digest, False)
+        assert calls[0][:4] == (WorkerType.SUB, _CTRL_PY_UNREGISTER, handle.digest, False)
         assert calls[1][:4] == (WorkerType.SUB, _CTRL_PY_REGISTER, reused.digest, True)
 
     def test_pending_unregister_cid_is_not_reused_until_broadcast_returns(self):
         from simpler.worker import _CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER  # noqa: PLC0415
 
         hw = Worker(level=3, num_sub_workers=1)
-        cid = hw.prepare_callable(lambda args: None)
+        handle = hw.register(lambda args: None)
         hw._initialized = True
         hw._hierarchical_started = True
 
@@ -574,11 +576,11 @@ class TestLifecycle:
                 return [_FakeControlResult("SUB", 0, True)]
 
         hw._worker = FakeWorker()
-        slot = _slot_for(hw, cid)
+        slot = _slot_for(hw, handle)
 
         def do_unregister():
             try:
-                hw.unregister_callable(cid)
+                hw.unregister(handle)
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
 
@@ -586,8 +588,8 @@ class TestLifecycle:
         t.start()
         assert broadcast_started.wait(timeout=2.0)
 
-        cid_during_unregister = hw.prepare_callable(lambda args: None)
-        assert _slot_for(hw, cid_during_unregister) != slot
+        handle_during_unregister = hw.register(lambda args: None)
+        assert _slot_for(hw, handle_during_unregister) != slot
         assert slot in hw._pending_unregister_cids
 
         release_broadcast.set()
@@ -595,18 +597,18 @@ class TestLifecycle:
         assert not t.is_alive()
         assert errors == []
 
-        cid_after_unregister = hw.prepare_callable(lambda args: None)
-        assert _slot_for(hw, cid_after_unregister) == slot
+        handle_after_unregister = hw.register(lambda args: None)
+        assert _slot_for(hw, handle_after_unregister) == slot
 
     def test_register_python_sub_callable_after_start_succeeds(self):
         counter_shm, counter_buf = _make_shared_counter()
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            bootstrap_cid = hw.prepare_callable(lambda args: None)
+            bootstrap_handle = hw.register(lambda args: None)
             hw.init()
 
             def bootstrap(orch, args, cfg):
-                orch.submit_sub(bootstrap_cid)
+                orch.submit_sub(bootstrap_handle)
 
             hw.run(bootstrap)
             counter_name = counter_shm.name
@@ -618,10 +620,10 @@ class TestLifecycle:
                 finally:
                     shm.close()
 
-            dynamic_cid = hw.prepare_callable(dynamic_sub)
+            dynamic_handle = hw.register(dynamic_sub)
 
             def run_dynamic(orch, args, cfg):
-                orch.submit_sub(dynamic_cid)
+                orch.submit_sub(dynamic_handle)
 
             hw.run(run_dynamic)
             hw.close()
@@ -639,7 +641,7 @@ class TestLifecycle:
         hw = Worker(level=3, num_sub_workers=1)
         run_errors: list[BaseException] = []
         register_errors: list[BaseException] = []
-        dynamic_cids: list[CallableHandle] = []
+        dynamic_handles: list[CallableHandle] = []
         run_thread = None
         register_thread = None
         try:
@@ -660,12 +662,12 @@ class TestLifecycle:
                 finally:
                     shm.close()
 
-            blocking_cid = hw.prepare_callable(blocking_sub)
+            blocking_handle = hw.register(blocking_sub)
             hw.init()
 
             def run_blocking():
                 try:
-                    hw.run(lambda orch, args, cfg: orch.submit_sub(blocking_cid))
+                    hw.run(lambda orch, args, cfg: orch.submit_sub(blocking_handle))
                 except BaseException as exc:  # noqa: BLE001
                     run_errors.append(exc)
 
@@ -686,7 +688,7 @@ class TestLifecycle:
 
             def do_register():
                 try:
-                    dynamic_cids.append(hw.prepare_callable(dynamic_sub))
+                    dynamic_handles.append(hw.register(dynamic_sub))
                 except BaseException as exc:  # noqa: BLE001
                     register_errors.append(exc)
 
@@ -703,9 +705,9 @@ class TestLifecycle:
             assert not register_thread.is_alive()
             assert run_errors == []
             assert register_errors == []
-            assert len(dynamic_cids) == 1
+            assert len(dynamic_handles) == 1
 
-            hw.run(lambda orch, args, cfg: orch.submit_sub(dynamic_cids[0]))
+            hw.run(lambda orch, args, cfg: orch.submit_sub(dynamic_handles[0]))
             assert _read_counter(counter_buf) == 1
         finally:
             if control_shm.buf is not None:
@@ -724,17 +726,17 @@ class TestLifecycle:
         counter_shm, counter_buf = _make_shared_counter()
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.prepare_callable(lambda args: _increment_counter(counter_buf))
+            handle = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
-            hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
+            hw.run(lambda orch, args, cfg: orch.submit_sub(handle))
             assert _read_counter(counter_buf) == 1
 
-            slot = _slot_for(hw, cid)
-            hw.unregister_callable(cid)
+            slot = _slot_for(hw, handle)
+            hw.unregister(handle)
             assert slot not in hw._callable_registry
             with pytest.raises(KeyError, match="not live"):
-                hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
+                hw.run(lambda orch, args, cfg: orch.submit_sub(handle))
 
             counter_name = counter_shm.name
 
@@ -745,7 +747,7 @@ class TestLifecycle:
                 finally:
                     shm.close()
 
-            reused = hw.prepare_callable(replacement)
+            reused = hw.register(replacement)
             assert _slot_for(hw, reused) == slot
             hw.run(lambda orch, args, cfg: orch.submit_sub(reused))
             hw.close()
@@ -759,9 +761,9 @@ class TestLifecycle:
         counter_shm, counter_buf = _make_shared_counter()
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            bootstrap_cid = hw.prepare_callable(lambda args: None)
+            bootstrap_handle = hw.register(lambda args: None)
             hw.init()
-            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_handle))
 
             counter_name = counter_shm.name
 
@@ -772,17 +774,17 @@ class TestLifecycle:
                 finally:
                     shm.close()
 
-            cid = hw.prepare_callable(dynamic)
-            hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
+            handle = hw.register(dynamic)
+            hw.run(lambda orch, args, cfg: orch.submit_sub(handle))
             assert _read_counter(counter_buf) == 1
 
-            slot = _slot_for(hw, cid)
-            hw.unregister_callable(cid)
+            slot = _slot_for(hw, handle)
+            hw.unregister(handle)
             assert slot not in hw._callable_registry
             with pytest.raises(KeyError, match="not live"):
-                hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
+                hw.run(lambda orch, args, cfg: orch.submit_sub(handle))
 
-            reused = hw.prepare_callable(dynamic)
+            reused = hw.register(dynamic)
             assert _slot_for(hw, reused) == slot
             hw.run(lambda orch, args, cfg: orch.submit_sub(reused))
             hw.close()
@@ -794,17 +796,17 @@ class TestLifecycle:
 
     def test_post_start_dynamic_python_callable_execute_failure_propagates(self):
         hw = Worker(level=3, num_sub_workers=1)
-        bootstrap_cid = hw.prepare_callable(lambda args: None)
+        bootstrap_handle = hw.register(lambda args: None)
         hw.init()
         try:
-            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_handle))
 
             def boom(args):
                 raise RuntimeError("dynamic callable boom")
 
-            cid = hw.prepare_callable(boom)
+            handle = hw.register(boom)
             with pytest.raises(RuntimeError, match="dynamic callable boom"):
-                hw.run(lambda orch, args, cfg: orch.submit_sub(cid))
+                hw.run(lambda orch, args, cfg: orch.submit_sub(handle))
         finally:
             hw.close()
 
@@ -812,11 +814,11 @@ class TestLifecycle:
         counter_shm, counter_buf = _make_shared_counter()
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            bootstrap_cid = hw.prepare_callable(lambda args: None)
+            bootstrap_handle = hw.register(lambda args: None)
             hw.init()
 
             def bootstrap(orch, args, cfg):
-                orch.submit_sub(bootstrap_cid)
+                orch.submit_sub(bootstrap_handle)
 
             hw.run(bootstrap)
             counter_name = counter_shm.name
@@ -850,10 +852,10 @@ class TestLifecycle:
 
     def test_broadcast_control_all_reports_malformed_payload(self):
         hw = Worker(level=3, num_sub_workers=1)
-        bootstrap_cid = hw.prepare_callable(lambda args: None)
+        bootstrap_handle = hw.register(lambda args: None)
         hw.init()
         try:
-            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_handle))
             worker_impl = hw._worker
             assert worker_impl is not None
             results = worker_impl.broadcast_control_all(WorkerType.SUB, _CTRL_PY_REGISTER, b"bad", bytes([6]) * 32)
@@ -865,10 +867,10 @@ class TestLifecycle:
 
     def test_broadcast_control_all_empty_payload_raises_before_fanout(self):
         hw = Worker(level=3, num_sub_workers=1)
-        bootstrap_cid = hw.prepare_callable(lambda args: None)
+        bootstrap_handle = hw.register(lambda args: None)
         hw.init()
         try:
-            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_handle))
             worker_impl = hw._worker
             assert worker_impl is not None
             with pytest.raises(RuntimeError, match="payload pointer and size"):
@@ -943,10 +945,10 @@ class TestLifecycle:
 
     def test_broadcast_control_all_result_shape_for_register_and_unregister(self):
         hw = Worker(level=3, num_sub_workers=1)
-        bootstrap_cid = hw.prepare_callable(lambda args: None)
+        bootstrap_handle = hw.register(lambda args: None)
         hw.init()
         try:
-            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_handle))
             worker_impl = hw._worker
             assert worker_impl is not None
             register_results = worker_impl.broadcast_control_all(
@@ -959,7 +961,7 @@ class TestLifecycle:
                 WorkerType.SUB,
                 _CTRL_PY_UNREGISTER,
                 None,
-                bootstrap_cid.digest,
+                bootstrap_handle.digest,
             )
 
             for result in (register_results[0], unregister_results[0]):
@@ -975,22 +977,22 @@ class TestLifecycle:
     def test_nonserializable_dynamic_python_callable_does_not_consume_cid(self):
         lock = threading.Lock()
         hw = Worker(level=3, num_sub_workers=1)
-        bootstrap_cid = hw.prepare_callable(lambda args: None)
+        bootstrap_handle = hw.register(lambda args: None)
         hw.init()
         try:
-            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_cid))
+            hw.run(lambda orch, args, cfg: orch.submit_sub(bootstrap_handle))
             before = dict(hw._callable_registry)
 
             def captures_lock(args):
                 lock.acquire(False)
 
             with pytest.raises(TypeError, match="lock"):
-                hw.prepare_callable(captures_lock)
+                hw.register(captures_lock)
             assert hw._callable_registry == before
         finally:
             hw.close()
 
-    def test_duplicate_chip_register_broadcasts_ref_increment_without_new_slot(self):
+    def test_duplicate_chip_prepare_broadcasts_ref_increment_without_new_slot(self):
         calls = []
 
         class FakeWorker:
@@ -1004,8 +1006,8 @@ class TestLifecycle:
         hw._worker = FakeWorker()
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
 
-        first = hw.prepare_callable(callable_obj)
-        second = hw.prepare_callable(callable_obj)
+        first = hw.register(callable_obj)
+        second = hw.register(callable_obj)
 
         slot = _slot_for(hw, first)
         assert slot == 0
@@ -1016,7 +1018,7 @@ class TestLifecycle:
             ("binary_register", int(callable_obj.buffer_size()), second.digest),
         ]
 
-    def test_duplicate_chip_register_partial_failure_preserves_existing_handle(self):
+    def test_duplicate_chip_prepare_partial_failure_preserves_existing_handle(self):
         calls = []
 
         class FakeWorker:
@@ -1040,9 +1042,9 @@ class TestLifecycle:
         hw._worker = FakeWorker()
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
 
-        first = hw.prepare_callable(callable_obj)
+        first = hw.register(callable_obj)
         with pytest.raises(RuntimeError, match="REGISTER_PARTIAL_FAILURE"):
-            hw.prepare_callable(callable_obj)
+            hw.register(callable_obj)
 
         state = hw._resolve_handle(first)
         assert state.ref_count == 1
@@ -1054,7 +1056,7 @@ class TestLifecycle:
             ("cleanup_one", WorkerType.NEXT_LEVEL, 0, _CTRL_UNREGISTER, first.digest),
         ]
 
-    def test_chip_register_failure_rolls_back_handle_and_marks_uncertain_when_cleanup_fails(self):
+    def test_chip_prepare_failure_rolls_back_handle_and_marks_uncertain_when_cleanup_fails(self):
         calls = []
 
         class FakeWorker:
@@ -1073,18 +1075,18 @@ class TestLifecycle:
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
 
         with pytest.raises(RuntimeError, match="register failed"):
-            hw.prepare_callable(callable_obj)
+            hw.register(callable_obj)
 
         digest = next(iter(hw._uncertain_hashids))
         assert calls == [("binary_register", digest), ("cleanup", digest)]
         assert hw._callable_registry == {}
         with pytest.raises(RuntimeError, match="REGISTER_CLEANUP_UNCERTAIN"):
-            hw.prepare_callable(callable_obj)
+            hw.register(callable_obj)
 
     def test_unregister_middle_cid_reuses_hole(self):
         # `_allocate_cid` must fill the smallest hole, not append at
-        # len(registry). The bug it guards against: register 0/1/2,
-        # unregister 1, next register would silently overwrite the
+        # len(registry). The bug it guards against: fill slots 0/1/2,
+        # unregister slot 1, next register would silently overwrite the
         # existing cid=2 under a `len(registry)` policy.
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
@@ -1093,34 +1095,34 @@ class TestLifecycle:
             cb1 = _unique_chip_callable(1)
             cb2 = _unique_chip_callable(2)
             cb3 = _unique_chip_callable(3)
-            cid0 = hw.prepare_callable(cb0)
-            cid1 = hw.prepare_callable(cb1)
-            cid2 = hw.prepare_callable(cb2)
-            slot0 = _slot_for(hw, cid0)
-            slot1 = _slot_for(hw, cid1)
-            slot2 = _slot_for(hw, cid2)
+            handle0 = hw.register(cb0)
+            handle1 = hw.register(cb1)
+            handle2 = hw.register(cb2)
+            slot0 = _slot_for(hw, handle0)
+            slot1 = _slot_for(hw, handle1)
+            slot2 = _slot_for(hw, handle2)
             assert (slot0, slot1, slot2) == (0, 1, 2)
-            hw.unregister_callable(cid1)
-            cid_reused = hw.prepare_callable(cb3)
-            assert _slot_for(hw, cid_reused) == 1, "hole at cid=1 should be reused before appending"
+            hw.unregister(handle1)
+            reused_handle = hw.register(cb3)
+            assert _slot_for(hw, reused_handle) == 1, "hole at cid=1 should be reused before appending"
             # cid=2 entry must still be the original callable, not silently overwritten.
             assert hw._callable_registry[slot2] is cb2
             # Next register fills cid=3 since 0..2 are all occupied.
-            cid_next = hw.prepare_callable(_unique_chip_callable(4))
-            assert _slot_for(hw, cid_next) == 3
+            next_handle = hw.register(_unique_chip_callable(4))
+            assert _slot_for(hw, next_handle) == 3
         finally:
             hw.close()
 
-    def test_register_overflow_raises(self):
+    def test_prepare_overflow_raises(self):
         # The AICPU side reserves a fixed-size orch_so_table_[MAX_REGISTERED_CALLABLE_IDS];
-        # Worker.prepare_callable must surface the bound at register-time, not later when
+        # Worker.register must surface the bound at prepare-time, not later when
         # DeviceRunner::register_prepared_callable rejects the cid.
         hw = Worker(level=3, num_sub_workers=0)
         try:
             for i in range(MAX_REGISTERED_CALLABLE_IDS):
-                hw.prepare_callable(_unique_py_callable(i))
+                hw.register(_unique_py_callable(i))
             with pytest.raises(RuntimeError, match="MAX_REGISTERED_CALLABLE_IDS"):
-                hw.prepare_callable(_unique_py_callable(MAX_REGISTERED_CALLABLE_IDS))
+                hw.register(_unique_py_callable(MAX_REGISTERED_CALLABLE_IDS))
         finally:
             # init() was never called; close() is still safe (idempotent
             # against an uninitialised Worker).
@@ -1138,11 +1140,11 @@ class TestSingleSubTask:
 
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.prepare_callable(lambda args: _increment_counter(counter_buf))
+            handle = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
             def orch(o, args, cfg):
-                o.submit_sub(cid)
+                o.submit_sub(handle)
 
             hw.run(orch)
             hw.close()
@@ -1157,12 +1159,12 @@ class TestSingleSubTask:
 
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.prepare_callable(lambda args: _increment_counter(counter_buf))
+            handle = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
             def orch(o, args, cfg):
                 for _ in range(3):
-                    o.submit_sub(cid)
+                    o.submit_sub(handle)
 
             hw.run(orch)
             hw.close()
@@ -1189,34 +1191,28 @@ class TestParallelSubWorkers:
 
 
 # ---------------------------------------------------------------------------
-# Test: SubmitResult shape — just {slot_id}; no outputs[] anymore.
-# Output buffers are user-provided tensors tagged OUTPUT in the TaskArgs.
+# Test: submit_* returns None at the Python facade; task slots stay internal.
 # ---------------------------------------------------------------------------
 
 
-class TestSubmitResult:
-    def test_submit_returns_slot_id_only(self):
+class TestSubmitReturnValue:
+    def test_submit_returns_none(self):
         counter_shm, counter_buf = _make_shared_counter()
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.prepare_callable(lambda args: _increment_counter(counter_buf))
+            handle = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
             captured = []
 
             def orch(o, args, cfg):
-                result = o.submit_sub(cid)
+                result = o.submit_sub(handle)
                 captured.append(result)
 
             hw.run(orch)
             hw.close()
 
-            assert len(captured) == 1
-            r = captured[0]
-            assert r.task_slot >= 0
-            # Note: SubmitResult no longer carries outputs[]; downstream consumers
-            # reference output tensors by their own data pointers (which the
-            # Orchestrator finds in the TensorMap).
+            assert captured == [None]
             assert _read_counter(counter_buf) == 1
         finally:
             counter_shm.close()
@@ -1234,11 +1230,11 @@ class TestScope:
 
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.prepare_callable(lambda args: _increment_counter(counter_buf))
+            handle = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
             def orch(o, args, cfg):
-                o.submit_sub(cid)
+                o.submit_sub(handle)
 
             hw.run(orch)
             hw.close()
@@ -1255,14 +1251,14 @@ class TestScope:
             # Use one sub worker so the increments serialize — _increment_counter
             # is a non-atomic RMW and races across parallel SubWorker processes.
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.prepare_callable(lambda args: _increment_counter(counter_buf))
+            handle = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
             def orch(o, args, cfg):
                 with o.scope():
-                    o.submit_sub(cid)
-                    o.submit_sub(cid)
-                o.submit_sub(cid)  # back on outer-scope ring
+                    o.submit_sub(handle)
+                    o.submit_sub(handle)
+                o.submit_sub(handle)  # back on outer-scope ring
 
             hw.run(orch)
             hw.close()
@@ -1280,7 +1276,7 @@ class TestScope:
         assert hasattr(Orchestrator, "scope_end")
 
         hw = Worker(level=3, num_sub_workers=1)
-        hw.prepare_callable(lambda args: None)
+        hw.register(lambda args: None)
         hw.init()
 
         def orch(o, args, cfg):
@@ -1303,19 +1299,19 @@ class TestScope:
         counter_shm, counter_buf = _make_shared_counter()
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.prepare_callable(lambda args: _increment_counter(counter_buf))
+            handle = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
             def orch(o, args, cfg):
-                o.submit_sub(cid)  # outer scope (ring 0)
+                o.submit_sub(handle)  # outer scope (ring 0)
                 with o.scope():
-                    o.submit_sub(cid)  # ring 1
+                    o.submit_sub(handle)  # ring 1
                     with o.scope():
-                        o.submit_sub(cid)  # ring 2
+                        o.submit_sub(handle)  # ring 2
                         with o.scope():
-                            o.submit_sub(cid)  # ring 3
+                            o.submit_sub(handle)  # ring 3
                             with o.scope():
-                                o.submit_sub(cid)  # clamps to ring 3
+                                o.submit_sub(handle)  # clamps to ring 3
 
             hw.run(orch)
             hw.close()
@@ -1336,7 +1332,7 @@ class TestOrchAlloc:
         captured = []
 
         hw = Worker(level=3, num_sub_workers=1)
-        cid = hw.prepare_callable(lambda args: None)  # sub callable doesn't actually read
+        handle = hw.register(lambda args: None)  # sub callable doesn't actually read
         hw.init()
 
         def orch(o, args, cfg):
@@ -1347,7 +1343,7 @@ class TestOrchAlloc:
             # downstream consumer (otherwise scope_end consumes alone — still fine).
             sub_args = TaskArgs()
             sub_args.add_tensor(inter, TensorArgType.INPUT)
-            o.submit_sub(cid, sub_args)
+            o.submit_sub(handle, sub_args)
 
         hw.run(orch)
         hw.close()
@@ -1364,8 +1360,8 @@ class TestOrchAlloc:
 
         try:
             hw = Worker(level=3, num_sub_workers=2)
-            producer_cid = hw.prepare_callable(lambda args: _increment_counter(marker_buf))
-            consumer_cid = hw.prepare_callable(lambda args: _increment_counter(marker_buf))
+            producer_handle = hw.register(lambda args: _increment_counter(marker_buf))
+            consumer_handle = hw.register(lambda args: _increment_counter(marker_buf))
             hw.init()
 
             def orch(o, args, cfg):
@@ -1379,13 +1375,13 @@ class TestOrchAlloc:
                 # pure inserts and would leave no dep on the alloc slot.
                 p_args = TaskArgs()
                 p_args.add_tensor(inter, TensorArgType.INOUT)
-                o.submit_sub(producer_cid, p_args)
+                o.submit_sub(producer_handle, p_args)
 
                 # Consumer tags inter as INPUT — tensormap.lookup finds the
                 # producer slot, dep wired automatically.
                 c_args = TaskArgs()
                 c_args.add_tensor(inter, TensorArgType.INPUT)
-                o.submit_sub(consumer_cid, c_args)
+                o.submit_sub(consumer_handle, c_args)
 
             hw.run(orch)
             hw.close()
@@ -1419,14 +1415,14 @@ class TestOrchAlloc:
 
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.prepare_callable(lambda args: _increment_counter(marker_buf))
+            handle = hw.register(lambda args: _increment_counter(marker_buf))
             hw.init()
 
             def orch(o, args, cfg):
                 inter = o.alloc((64,), DataType.FLOAT32)
                 args = TaskArgs()
                 args.add_tensor(inter, TensorArgType.INPUT)
-                o.submit_sub(cid, args)
+                o.submit_sub(handle, args)
 
             for _ in range(8):
                 hw.run(orch)
@@ -1459,7 +1455,7 @@ class TestSubCallableArgs:
                     if t.ndims == 1 and t.shapes[0] == 4:
                         _increment_counter(result_buf)
 
-            cid = hw.prepare_callable(check_args)
+            handle = hw.register(check_args)
             hw.init()
 
             # Use a synthetic non-zero pointer — sub callable only checks metadata,
@@ -1469,7 +1465,7 @@ class TestSubCallableArgs:
             def orch(o, args, cfg):
                 sub_args = TaskArgs()
                 sub_args.add_tensor(ct, TensorArgType.INPUT)
-                o.submit_sub(cid, sub_args)
+                o.submit_sub(handle, sub_args)
 
             hw.run(orch)
             hw.close()
@@ -1489,13 +1485,13 @@ class TestSubCallableArgs:
                 if args.scalar_count() == 1 and args.scalar(0) == 42:
                     _increment_counter(result_buf)
 
-            cid = hw.prepare_callable(check_scalar)
+            handle = hw.register(check_scalar)
             hw.init()
 
             def orch(o, args, cfg):
                 sub_args = TaskArgs()
                 sub_args.add_scalar(42)
-                o.submit_sub(cid, sub_args)
+                o.submit_sub(handle, sub_args)
 
             hw.run(orch)
             hw.close()
@@ -1515,11 +1511,11 @@ class TestSubCallableArgs:
                 if args.tensor_count() == 0 and args.scalar_count() == 0:
                     _increment_counter(result_buf)
 
-            cid = hw.prepare_callable(check_empty)
+            handle = hw.register(check_empty)
             hw.init()
 
             def orch(o, args, cfg):
-                o.submit_sub(cid)
+                o.submit_sub(handle)
 
             hw.run(orch)
             hw.close()
@@ -1652,7 +1648,7 @@ class TestChipMainLoopDigestRegister:
 
         cw = MagicMock()
         cw._impl = MagicMock()
-        cw.unregister_callable = MagicMock()
+        cw._unregister_slot = MagicMock()
         cw._impl.prepare_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
@@ -1665,7 +1661,7 @@ class TestChipMainLoopDigestRegister:
                 self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest, arg0=123)
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 0
-                assert cw.unregister_callable.call_count == 0
+                assert cw._unregister_slot.call_count == 0
                 cw._impl.prepare_callable_from_blob.assert_called_once()
                 assert cw._impl.prepare_callable_from_blob.call_args.args[0] == 0
             finally:
@@ -1682,7 +1678,7 @@ class TestChipMainLoopDigestRegister:
 
         cw = MagicMock()
         cw._impl = MagicMock()
-        cw.unregister_callable = MagicMock()
+        cw._unregister_slot = MagicMock()
         cw._impl.prepare_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
@@ -1700,7 +1696,7 @@ class TestChipMainLoopDigestRegister:
                 assert err == 1
                 assert "HASHID_DESCRIPTOR_MISMATCH" in self._read_error_message(buf)
                 cw._impl.prepare_callable_from_blob.assert_not_called()
-                cw.unregister_callable.assert_not_called()
+                cw._unregister_slot.assert_not_called()
                 assert registry == {}
                 assert identity_table == {}
                 assert identity_refs == {}
@@ -1718,7 +1714,7 @@ class TestChipMainLoopDigestRegister:
 
         cw = MagicMock()
         cw._impl = MagicMock()
-        cw.unregister_callable = MagicMock()
+        cw._unregister_slot = MagicMock()
         cw._impl.prepare_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
@@ -1732,7 +1728,7 @@ class TestChipMainLoopDigestRegister:
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
                 self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest)
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                assert cw.unregister_callable.call_count == 0
+                assert cw._unregister_slot.call_count == 0
                 assert cw._impl.prepare_callable_from_blob.call_count == 1
             finally:
                 self._shutdown(state_addr)
@@ -1748,7 +1744,7 @@ class TestChipMainLoopDigestRegister:
 
         cw = MagicMock()
         cw._impl = MagicMock()
-        cw.unregister_callable = MagicMock()
+        cw._unregister_slot = MagicMock()
         cw._impl.prepare_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
@@ -1765,11 +1761,11 @@ class TestChipMainLoopDigestRegister:
 
                 self._send_ctrl_unregister(buf, state_addr, digest=digest)
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                assert cw.unregister_callable.call_count == 0
+                assert cw._unregister_slot.call_count == 0
 
                 self._send_ctrl_unregister(buf, state_addr, digest=digest)
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                cw.unregister_callable.assert_called_once_with(0)
+                cw._unregister_slot.assert_called_once_with(0)
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)

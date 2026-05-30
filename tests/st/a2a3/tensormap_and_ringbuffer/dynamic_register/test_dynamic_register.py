@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end ST for post-start Worker.prepare_callable(ChipCallable) at L3.
+"""End-to-end ST for post-start Worker.register(ChipCallable) at L3.
 
 Exercises the _CTRL_REGISTER IPC path end-to-end: parent stages a
 ChipCallable in shared memory after child startup, broadcasts CTRL_REGISTER to
@@ -16,7 +16,7 @@ CallableHandle is indistinguishable from a pre-start preparation when used
 in run().
 
 The UT suite (tests/ut/py/test_worker/test_host_worker.py) already covers
-the facade-level paths (lock guard, slot overflow, lambda rejection, run
+the facade-level paths (lock guard, capacity overflow, lambda rejection, run
 race detection, shm name generator). This file's job is to prove the
 bytes actually traverse shm to the chip child and prepare succeeds —
 which only a real (sim or device) chip child can confirm.
@@ -103,10 +103,6 @@ def _unique_py_callable(index: int):
     return fn
 
 
-def _slot_for(worker: Worker, handle) -> int:
-    return worker._resolve_handle(handle).slot_id
-
-
 def _make_args(a: float, b: float) -> TaskArgsBuilder:
     size = 128 * 128
     return TaskArgsBuilder(
@@ -142,7 +138,7 @@ def test_prepare_new_identity_after_start_then_run(st_platform, st_device_ids):
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    pre_handle = worker.prepare_callable(chip_callable)
+    pre_handle = worker.register(chip_callable)
 
     # Pre-allocate both runs' tensors BEFORE Worker.init() so the
     # share_memory_() mappings are inherited by the forked chip child.
@@ -180,7 +176,7 @@ def test_prepare_new_identity_after_start_then_run(st_platform, st_device_ids):
         #    prepare_callable_from_blob. post_handle is unknown to the
         #    CoW-inherited registry on the child side — only the IPC path
         #    can deliver it.
-        post_handle = worker.prepare_callable(post_callable)
+        post_handle = worker.register(post_callable)
         assert post_handle.hashid != pre_handle.hashid
 
         # 3. Run with post_handle. If CTRL_REGISTER delivered correctly, the
@@ -218,7 +214,7 @@ def test_prepare_new_identity_after_start_parallel_broadcast(st_platform, st_dev
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    pre_handle = worker.prepare_callable(chip_callable)
+    pre_handle = worker.register(chip_callable)
     a, b = 2.0, 3.0
     expected = _golden(a, b)
     # Pre-allocate args for each chip (chip_id = block group). The
@@ -243,7 +239,7 @@ def test_prepare_new_identity_after_start_parallel_broadcast(st_platform, st_dev
         assert torch.allclose(args_pre.f, torch.full_like(args_pre.f, expected), rtol=1e-5, atol=1e-5)
 
         # Now broadcast CTRL_REGISTER to BOTH chip mailboxes in parallel.
-        post_handle = worker.prepare_callable(post_callable)
+        post_handle = worker.register(post_callable)
 
         def orch_post(o, _a, _c):
             o.submit_next_level(post_handle, chip_args_post, config)
@@ -257,12 +253,12 @@ def test_prepare_new_identity_after_start_parallel_broadcast(st_platform, st_dev
 @pytest.mark.platforms(["a2a3sim"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)
-def test_prepare_slot_overflow_post_start(st_platform, st_device_ids):
-    """Saturate the slot table pre-start, then verify post-start prepare hits
+def test_prepare_capacity_overflow_post_start(st_platform, st_device_ids):
+    """Saturate callable capacity pre-start, then verify post-start prepare hits
     the same ``MAX_REGISTERED_CALLABLE_IDS`` ceiling for a new hashid.
 
-    Confirms slot bookkeeping is shared between pre-start preparation and the
-    post-start control path (and that the error message is
+    Confirms the public capacity guard is shared between pre-start preparation
+    and the post-start control path (and that the error message is
     protocol-aware so the operator sees the same diagnostic in both paths).
     """
     chip_callable = _build_vector_callable(st_platform)
@@ -276,9 +272,8 @@ def test_prepare_slot_overflow_post_start(st_platform, st_device_ids):
     # Fill the registry pre-start with distinct sub fn identities (cheap, no
     # device cost).
     for i in range(MAX_REGISTERED_CALLABLE_IDS - 1):
-        worker.prepare_callable(_unique_py_callable(i))
-    chip_handle = worker.prepare_callable(chip_callable)  # last slot
-    assert len(worker._callable_registry) == MAX_REGISTERED_CALLABLE_IDS
+        worker.register(_unique_py_callable(i))
+    chip_handle = worker.register(chip_callable)  # final capacity entry
 
     a, b = 2.0, 3.0
     args_pre = _make_args(a, b)
@@ -295,11 +290,11 @@ def test_prepare_slot_overflow_post_start(st_platform, st_device_ids):
 
         worker.run(orch_pre)
 
-        # The very next dynamic prepare of a new identity hits the table
+        # The very next dynamic prepare of a new identity hits the capacity
         # ceiling. Re-preparing ``chip_callable`` itself would only create
         # another handle to the existing identity.
         with pytest.raises(RuntimeError, match="MAX_REGISTERED_CALLABLE_IDS"):
-            worker.prepare_callable(_build_vector_callable(st_platform, extra_unused_child=True))
+            worker.register(_build_vector_callable(st_platform, extra_unused_child=True))
     finally:
         worker.close()
 
@@ -312,9 +307,8 @@ def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_d
 
     This is the hashid-specific post-start path: the second
     ``prepare_callable(same_chip_callable)`` must return a distinct handle for
-    the same hashid without allocating a new slot. Unregistering one handle
-    must only decrement the child refcount; the remaining handle must still
-    dispatch successfully.
+    the same hashid. Unregistering one handle must only drop that public
+    handle; the remaining handle must still dispatch successfully.
     """
     chip_callable = _build_vector_callable(st_platform)
     worker = Worker(
@@ -324,7 +318,7 @@ def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_d
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    pre_handle = worker.prepare_callable(chip_callable)
+    pre_handle = worker.register(chip_callable)
 
     a, b = 2.0, 3.0
     expected = _golden(a, b)
@@ -348,20 +342,19 @@ def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_d
         worker.run(orch_one)
         assert torch.allclose(args_one.f, torch.full_like(args_one.f, expected), rtol=1e-5, atol=1e-5)
 
-        # 2. Prepare the same callable after start. This is a refcount
-        # increment for the same hashid/slot, not a new identity.
-        duplicate_handle = worker.prepare_callable(chip_callable)
-        slot = _slot_for(worker, pre_handle)
+        # 2. Prepare the same callable after start. This returns another
+        # public handle for the same hashid, not a new identity.
+        duplicate_handle = worker.register(chip_callable)
         assert duplicate_handle.hashid == pre_handle.hashid
         assert duplicate_handle.digest == pre_handle.digest
-        assert _slot_for(worker, duplicate_handle) == slot
-        assert worker._identity_registry[pre_handle.digest].ref_count == 2
+        assert duplicate_handle != pre_handle
 
         # 3. Drop the first handle. The child must keep the prepared identity
         # alive for duplicate_handle.
-        worker.unregister_callable(pre_handle)
-        assert slot in worker._callable_registry
-        assert worker._identity_registry[duplicate_handle.digest].ref_count == 1
+        worker.unregister(pre_handle)
+
+        with pytest.raises(KeyError, match="not live"):
+            worker.run(lambda o, _args, _cfg: o.submit_next_level(pre_handle, chip_args_one, config))
 
         def orch_two(o, _args, _cfg):
             o.submit_next_level(duplicate_handle, chip_args_two, config)
@@ -369,9 +362,10 @@ def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_d
         worker.run(orch_two)
         assert torch.allclose(args_two.f, torch.full_like(args_two.f, expected), rtol=1e-5, atol=1e-5)
 
-        # 4. Dropping the final handle releases the slot.
-        worker.unregister_callable(duplicate_handle)
-        assert slot not in worker._callable_registry
+        # 4. Dropping the final handle invalidates it through the public API.
+        worker.unregister(duplicate_handle)
+        with pytest.raises(KeyError, match="not live"):
+            worker.run(lambda o, _args, _cfg: o.submit_next_level(duplicate_handle, chip_args_two, config))
     finally:
         worker.close()
 
@@ -379,12 +373,12 @@ def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_d
 @pytest.mark.platforms(["a2a3sim"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)
-def test_unregister_last_handle_releases_slot_for_reprepare(st_platform, st_device_ids):
+def test_unregister_last_handle_allows_reprepare_same_hashid(st_platform, st_device_ids):
     """prepare → run → unregister final handle → prepare same identity again.
 
     Proves the IPC unregister path works end-to-end: after CTRL_UNREGISTER
-    propagates to the chip child, the slot is freed and a subsequent
-    post-start prepare of that identity materializes it again.
+    propagates to the chip child, the old handle is invalid and a subsequent
+    post-start prepare of that identity materializes a usable handle again.
     """
     chip_callable = _build_vector_callable(st_platform)
     post_callable = _build_vector_callable(st_platform, extra_unused_child=True)
@@ -395,7 +389,7 @@ def test_unregister_last_handle_releases_slot_for_reprepare(st_platform, st_devi
         platform=st_platform,
         runtime=_RUNTIME,
     )
-    pre_handle = worker.prepare_callable(chip_callable)
+    pre_handle = worker.register(chip_callable)
 
     a, b = 2.0, 3.0
     expected = _golden(a, b)
@@ -418,8 +412,7 @@ def test_unregister_last_handle_releases_slot_for_reprepare(st_platform, st_devi
         worker.run(orch_one)
         assert torch.allclose(args_one.f, torch.full_like(args_one.f, expected), rtol=1e-5, atol=1e-5)
 
-        dyn_handle = worker.prepare_callable(post_callable)
-        dyn_slot = _slot_for(worker, dyn_handle)
+        dyn_handle = worker.register(post_callable)
 
         def orch_two(o, _args, _cfg):
             o.submit_next_level(dyn_handle, chip_args_two, config)
@@ -427,13 +420,14 @@ def test_unregister_last_handle_releases_slot_for_reprepare(st_platform, st_devi
         worker.run(orch_two)
         assert torch.allclose(args_two.f, torch.full_like(args_two.f, expected), rtol=1e-5, atol=1e-5)
 
-        worker.unregister_callable(dyn_handle)
-        assert dyn_slot not in worker._callable_registry
+        worker.unregister(dyn_handle)
+        with pytest.raises(KeyError, match="not live"):
+            worker.run(lambda o, _args, _cfg: o.submit_next_level(dyn_handle, chip_args_two, config))
 
         # Re-prepare the same hashid after its final handle was dropped.
-        again_handle = worker.prepare_callable(post_callable)
+        again_handle = worker.register(post_callable)
         assert again_handle.hashid == dyn_handle.hashid
-        assert _slot_for(worker, again_handle) == dyn_slot, "unregister should free the slot for reuse"
+        assert again_handle != dyn_handle
 
         def orch_three(o, _args, _cfg):
             o.submit_next_level(again_handle, chip_args_three, config)

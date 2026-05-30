@@ -17,14 +17,20 @@ flows through `submit`, see [task-flow.md](task-flow.md).
 
 ---
 
-## 1. Public API
+## 1. Python Facade and C++ Internal API
 
-The user's orch fn receives an `Orchestrator*` as its first argument:
+The Python user's orch fn receives a `simpler.orchestrator.Orchestrator`
+facade. Its `submit_*` methods enqueue DAG nodes and return `None`; task slots
+remain internal to the worker.
+
+The C++ Orchestrator still returns `SubmitResult` for internal scheduling and
+C++ tests, but nanobind intentionally drops that return value instead of
+exposing it to Python:
 
 ```cpp
 class Orchestrator {
 public:
-    // --- User-facing submit API (tags inside TaskArgs drive deps) ---
+    // --- Internal submit API (tags inside TaskArgs drive deps) ---
     SubmitResult submit_next_level(const CallableIdentity &callable,
                                     const TaskArgs &args,
                                     const CallConfig &config);
@@ -49,7 +55,7 @@ private:
     // ... components: Ring, TensorMap, Scope, slot pool, active_tasks_ counter
 };
 
-struct SubmitResult { TaskSlot task_slot; };  // field is `task_slot` in current code
+struct SubmitResult { TaskSlot task_slot; };  // internal only; not bound to Python
 ```
 
 **Status**: `submit_sub` takes only `(CallableIdentity, args)` — no
