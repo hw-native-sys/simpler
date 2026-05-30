@@ -1637,6 +1637,15 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k dep_gen_task_overrides_file --platform cuda
 ```
 
+After changing task default/template sidecar-file loading for imported
+dep-gen JSON graphs, use:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k task_defaults_file --platform cuda
+```
+
 After changing list-shaped task metadata sidecars for imported dep-gen JSON
 graphs, use:
 

@@ -1562,6 +1562,10 @@ def _write_dep_gen_task_overrides_file(path):
     )
 
 
+def _write_dep_gen_task_defaults_file(path):
+    path.write_text(json.dumps({"func_id": 1, "a": "a", "b": "b", "out": "out"}))
+
+
 def _write_graph_callables_file(path):
     path.write_text(json.dumps({"generic": 9, "mul": 2, "add": 1}))
 
@@ -1621,6 +1625,22 @@ def _cuda_persistent_dep_gen_task_overrides_file_graph_spec(
         block_dim=block_dim,
     )
     spec["cuda"]["graph"]["task_overrides_path"] = str(overrides_path)
+    return spec
+
+
+def _cuda_persistent_dep_gen_task_defaults_file_graph_spec(
+    add_source,
+    mul_source,
+    dep_graph_path,
+    defaults_path,
+    *,
+    arch="compute_80",
+    block_dim=256,
+):
+    spec = _cuda_persistent_dag_spec(add_source, mul_source, arch=arch, block_dim=block_dim)
+    spec["cuda"]["arg_builder"] = "persistent_dag_graph_f32"
+    spec["cuda"]["graph_path"] = str(dep_graph_path)
+    spec["cuda"]["graph"] = {"task_defaults_path": str(defaults_path)}
     return spec
 
 
@@ -3024,6 +3044,34 @@ def test_scene_test_builds_cuda_persistent_graph_from_dep_gen_json_file(tmp_path
         "graph_path": str(dep_graph_path),
         "graph": {"task_defaults": {"func_id": 1, "a": "a", "b": "b", "out": "out"}},
     }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert list(buffers.host_fanin) == [0, 0, 2]
+    assert list(buffers.host_dependents) == [2, 2]
+    assert [(task.func_id, task.dependent_begin, task.dependent_count) for task in buffers.host_tasks] == [
+        (1, 0, 1),
+        (1, 1, 1),
+        (1, 2, 0),
+    ]
+
+
+def test_scene_test_builds_cuda_persistent_graph_from_dep_gen_task_defaults_file(tmp_path):
+    dep_graph_path = tmp_path / "deps.json"
+    defaults_path = tmp_path / "task_defaults.json"
+    _write_dep_gen_json_file(dep_graph_path)
+    _write_dep_gen_task_defaults_file(defaults_path)
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = _cuda_persistent_dep_gen_task_defaults_file_graph_spec(
+        "add.pto.cu",
+        "mul.pto.cu",
+        dep_graph_path,
+        defaults_path,
+    )["cuda"]
+
     buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
 
     assert list(buffers.host_fanin) == [0, 0, 2]
@@ -8684,6 +8732,67 @@ def test_scene_test_runs_cuda_persistent_device_dep_gen_json_file_graph_with_cty
             worker,
             callable_obj,
             CudaPersistentDepGenJsonFileGraphCtypesScene.CASES[0],
+            skip_golden=True,
+        )
+        args = scene.last_args
+        a_values = args.a.to_list()
+        b_values = args.b.to_list()
+        actual = args.out.to_list()
+        expected = [a_values[idx] + b_values[idx] for idx in range(len(actual))]
+        assert actual == pytest.approx(expected)
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_dep_gen_task_defaults_file_graph_with_ctypes_data(tmp_path):
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    dep_graph_path = tmp_path / "deps.json"
+    defaults_path = tmp_path / "task_defaults.json"
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+    _write_dep_gen_json_file(dep_graph_path)
+    _write_dep_gen_task_defaults_file(defaults_path)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentDepGenTaskDefaultsFileGraphCtypesScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_dep_gen_task_defaults_file_graph_spec(
+            add_source,
+            mul_source,
+            dep_graph_path,
+            defaults_path,
+        )
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            args = TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.5 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+            )
+            self.last_args = args
+            return args
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit post-run validation")
+
+    scene = CudaPersistentDepGenTaskDefaultsFileGraphCtypesScene()
+    worker = CudaPersistentDepGenTaskDefaultsFileGraphCtypesScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(
+            worker,
+            callable_obj,
+            CudaPersistentDepGenTaskDefaultsFileGraphCtypesScene.CASES[0],
             skip_golden=True,
         )
         args = scene.last_args

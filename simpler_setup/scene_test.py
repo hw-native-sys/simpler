@@ -1368,6 +1368,25 @@ class _CudaPersistentDagSceneBuffers:
         graph_dir: Path | None = None,
     ) -> dict[str, Any]:
         merged_graph = dict(graph)
+        defaults_path_keys = (
+            "task_defaults_path",
+            "task_defaults_file",
+            "task_template_path",
+            "task_template_file",
+            "default_task_path",
+            "default_task_file",
+        )
+        default_defaults_path = next((cuda_spec[key] for key in defaults_path_keys if key in cuda_spec), None)
+        defaults_path = default_defaults_path
+        for key in defaults_path_keys:
+            if key in merged_graph:
+                defaults_path = merged_graph.pop(key)
+                break
+        if defaults_path is not None:
+            with _CudaPersistentDagSceneBuffers._graph_sidecar_path(defaults_path, graph_dir).open(
+                encoding="utf-8"
+            ) as defaults_file:
+                merged_graph["task_defaults"] = json.load(defaults_file)
         default_metadata_path = cuda_spec.get("task_metadata_path", cuda_spec.get("task_metadata_file"))
         metadata_path = merged_graph.pop(
             "task_metadata_path",

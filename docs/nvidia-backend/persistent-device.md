@@ -414,9 +414,12 @@ or different temporary/output bindings. `task_metadata` is accepted as the
 same override field when the descriptor should read as metadata enrichment
 rather than replacement, and it may be either the same keyed dictionary or a
 list of metadata entries carrying `name`, `id`, or `task_id`. Inline graph
-overlays may also use `task_metadata_path` / `task_metadata_file`, or
-`task_overrides_path` / `task_overrides_file`, to load the same metadata or
-override list/dictionary from a sidecar JSON file. The same sidecar fields are
+overlays may also use `task_defaults_path` / `task_defaults_file`,
+`task_template_path` / `task_template_file`, or `default_task_path` /
+`default_task_file` to load shared runnable defaults from a sidecar JSON
+file. `task_metadata_path` / `task_metadata_file`, and
+`task_overrides_path` / `task_overrides_file`, load the same metadata or
+override list/dictionary from a sidecar JSON file. These sidecar fields are
 accepted on inline graph descriptors and graph JSON files. When a graph is
 loaded through `graph_path`, `graph_file`, or a string-valued `graph`,
 relative sidecar paths are resolved beside that graph JSON file. Inline-only

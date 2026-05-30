@@ -2096,6 +2096,16 @@ Override sidecars are supported with `task_overrides_path` or
 selector first failed because the file was ignored and task `4294967296`
 still dispatched `func_id=1`, then passed locally on A100 with
 `2 passed, 163 deselected`.
+Shared runnable defaults can now also live in sidecar JSON files named with
+`task_defaults_path` / `task_defaults_file`, `task_template_path` /
+`task_template_file`, or `default_task_path` / `default_task_file`. This lets
+dep-gen-style graph files keep structural task rows while a separate CUDA
+sidecar supplies the common generated-dispatch `func_id`, input tensor, and
+output binding defaults. The focused selector first failed with
+`KeyError: 'func_id'`, then passed locally on A100 with
+`2 passed, 171 deselected` and remotely on H200 with
+`2 passed, 171 deselected`; the H200 run printed the known PTO-ISA SSH refresh
+warning first.
 Relative task metadata sidecar paths embedded in graph JSON files are now
 resolved beside the graph JSON file. The focused selector first failed with
 `FileNotFoundError: task_metadata.json`, then passed locally on A100 with
