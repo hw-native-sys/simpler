@@ -1619,6 +1619,15 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k dep_gen_task_overrides --platform cuda
 ```
 
+After changing list-shaped task metadata sidecars for imported dep-gen JSON
+graphs, use:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k dep_gen_task_metadata --platform cuda
+```
+
 For H200, sync the changed files or use the paired sync workflow first, then
 export `CUDA_HOME=/usr/local/cuda-12.8` and prepend that `bin` directory to
 `PATH` in the non-interactive shell.

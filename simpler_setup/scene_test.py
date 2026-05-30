@@ -1404,14 +1404,35 @@ class _CudaPersistentDagSceneBuffers:
         overrides = graph.get("task_overrides", graph.get("task_metadata", {}))
         if overrides is None:
             return {}
-        if not isinstance(overrides, dict):
-            raise ValueError("CUDA persistent_dag_graph_f32 graph task overrides must be a dictionary")
         normalized: dict[str, dict[str, Any]] = {}
-        for task_name, override in overrides.items():
+        if isinstance(overrides, dict):
+            override_items = overrides.items()
+        elif isinstance(overrides, list):
+            override_items = []
+            for override in overrides:
+                if not isinstance(override, dict):
+                    raise ValueError("CUDA persistent_dag_graph_f32 graph task override values must be dictionaries")
+                override_key = _CudaPersistentDagSceneBuffers._graph_task_override_key(override)
+                if override_key is None:
+                    raise ValueError(
+                        "CUDA persistent_dag_graph_f32 graph task override lists require name, id, or task_id"
+                    )
+                override_items.append((override_key, override))
+        else:
+            raise ValueError("CUDA persistent_dag_graph_f32 graph task overrides must be a dictionary or list")
+        for task_name, override in override_items:
             if not isinstance(override, dict):
                 raise ValueError("CUDA persistent_dag_graph_f32 graph task override values must be dictionaries")
             normalized[str(task_name)] = _CudaPersistentDagSceneBuffers._normalize_graph_task_shape(override)
         return normalized
+
+    @staticmethod
+    def _graph_task_override_key(override: dict[str, Any]) -> str | None:
+        for key in ("name", "id", "task_id"):
+            value = override.get(key)
+            if value is not None:
+                return str(value)
+        return None
 
     @staticmethod
     def _merge_graph_task_overrides(
