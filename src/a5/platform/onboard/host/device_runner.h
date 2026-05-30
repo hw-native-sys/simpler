@@ -177,84 +177,10 @@ public:
      */
     int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
 
-    /**
-     * Upload an entire ChipCallable buffer to device memory in one shot.
-     *
-     * Walks child_offsets_ to compute total byte size, allocates device GM
-     * once, fixes up each child's resolved_addr_ in an internal host scratch
-     * (= device-side address of that child's binary code), H2D's once, and
-     * returns the device-side address of the ChipCallable header.
-     *
-     * Pool-managed: identical buffer bytes (FNV-1a 64-bit content hash) hit
-     * the dedup cache and return the cached chip_dev without reallocating.
-     * All chip buffers are bulk-freed in finalize() — there is no explicit
-     * free API, mirroring the per-fid binary pool semantics.
-     *
-     * @return Device GM address of the ChipCallable header, or 0 on failure
-     *         (also returns 0 when callable->child_count() == 0).
-     */
-    uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
-
-    /**
-     * Stage a per-callable_id orchestration SO into device memory and remember
-     * the supporting metadata (entry/config symbol names, kernel func_id ↔
-     * dev_addr table). Identical SO bytes across two callable_ids share one
-     * device buffer (refcounted by hash) so the worst case for an N-cid pool
-     * is N distinct device buffers, not N copies of the same SO.
-     *
-     * @param callable_id   Caller-stable id, must be in [0, MAX_REGISTERED_CALLABLE_IDS).
-     * @param orch_so_data  Host pointer to orchestration SO bytes (owned by caller).
-     * @param orch_so_size  Size of orchestration SO in bytes.
-     * @param func_name     Entry symbol name (copied).
-     * @param config_name   Config symbol name (copied).
-     * @param kernel_addrs  func_id ↔ dev_addr pairs already uploaded by the
-     *                      caller. Stored verbatim so run_prepared can replay
-     *                      them onto a fresh Runtime without re-uploading.
-     * @return 0 on success, negative on failure.
-     */
-    int register_callable(
-        int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
-        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
-    );
-
-    /**
-     * Host-orchestration sibling for hbg variants. See a2a3 onboard
-     * device_runner.h for full contract. Mutually exclusive with the
-     * trb-shaped overload.
-     */
-    int register_callable_host_orch(
-        int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
-        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
-    );
-
-    /**
-     * Drop the prepared state for `callable_id`. trb path: decrement orch SO
-     * refcount, free when zero. hbg path: dlclose the host handle. Kernel
-     * binaries are shared and only released by finalize().
-     */
-    int unregister_callable(int32_t callable_id);
-
-    /** True iff `callable_id` has prepared state staged. */
-    bool has_callable(int32_t callable_id) const;
-
-    /**
-     * Replay the prepared state for `callable_id` onto a freshly-constructed
-     * Runtime. See a2a3 onboard documentation for full contract.
-     */
-    BindCallableResult bind_callable_to_runtime(Runtime &runtime, int32_t callable_id);
-
-    /**
-     * Number of distinct callable_ids the AICPU has been asked to dlopen for.
-     * Monotonically increases on first-sighting bind; never decremented.
-     */
-    size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
-
-    /**
-     * Number of host-side dlopens triggered by
-     * `register_callable_host_orch` (hbg variant). Mirrors
-     * `aicpu_dlopen_count` for the host-orchestration path.
-     */
-    size_t host_dlopen_count() const { return host_dlopen_total_; }
+    // `upload_chip_callable_buffer`, `register_callable`,
+    // `register_callable_host_orch`, `unregister_callable`, `has_callable`,
+    // `bind_callable_to_runtime`, `aicpu_dlopen_count`, and
+    // `host_dlopen_count` are inherited from `DeviceRunnerBase`.
 
 private:
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
@@ -270,48 +196,12 @@ private:
     size_t cached_gm_sm_size_{0};
     size_t cached_runtime_arena_size_{0};
 
-    // Chip-callable buffer pool. Keyed by FNV-1a 64-bit content hash of the
-    // ChipCallable bytes. Each entry owns one device GM allocation holding
-    // the entire ChipCallable buffer (header + storage_, with each child's
-    // resolved_addr_ fixed up to its post-H2D device address). Pool-managed:
-    // identical buffer bytes share one entry across cids; the map is bulk-
-    // freed in finalize(). No explicit free API (mirrors per-fid binary pool
-    // semantics today).
-    struct ChipCallableBuffer {
-        uint64_t chip_dev{0};
-        size_t total_size{0};
-    };
-    std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
+    // Group D state (`chip_callable_buffers_`, `callables_`,
+    // `orch_so_dedup_`, `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
+    // `host_dlopen_total_`) and inner struct types
+    // (`ChipCallableBuffer`, `CallableState`, `OrchSoBuffer`) are
+    // inherited from `DeviceRunnerBase`.
 
-    // Per-callable_id prepared state. See a2a3 onboard device_runner.h for
-    // the full design narrative; mirrored here so a5 shares the same
-    // dispatch surface.
-    struct CallableState {
-        // trb path
-        uint64_t hash{0};
-        uint64_t dev_orch_so_addr{0};
-        size_t dev_orch_so_size{0};
-        std::string func_name;
-        std::string config_name;
-        // common
-        std::vector<std::pair<int, uint64_t>> kernel_addrs;
-        std::vector<ArgDirection> signature;
-        // hbg path
-        void *host_dlopen_handle{nullptr};
-        void *host_orch_func_ptr{nullptr};
-    };
-    struct OrchSoBuffer {
-        void *dev_addr{nullptr};
-        size_t capacity{0};
-        int refcount{0};
-    };
-    std::unordered_map<int32_t, CallableState> callables_;
-    std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
-    std::unordered_set<int32_t> aicpu_seen_callable_ids_;
-    // Monotonic AICPU dlopen counter (first-sighting bind only; never decremented).
-    size_t aicpu_dlopen_total_{0};
-    // Monotonic host-side dlopen counter for hbg variants.
-    size_t host_dlopen_total_{0};
     // Performance profiling
     L2PerfCollector l2_perf_collector_;
 
@@ -322,14 +212,8 @@ private:
     PmuCollector pmu_collector_;
 
     // `query_max_block_dim`, `validate_block_dim`, `ensure_binaries_loaded`,
-    // and `configure_aicore_op_timeout` are inherited (protected) from
-    // `DeviceRunnerBase`.
-
-    /**
-     * Stage the orchestration SO into a device-resident buffer (with hash
-     * cache). See a2a3 onboard documentation for details.
-     */
-    int prepare_orch_so(Runtime &runtime);
+    // `configure_aicore_op_timeout`, and `prepare_orch_so` are inherited
+    // (protected) from `DeviceRunnerBase`.
 
     /**
      * Initialize performance profiling device buffers
