@@ -391,6 +391,13 @@ When an edge dictionary contains both dep-gen endpoint keys and annotation
 fields such as `source="creator"` / `source="tensormap"`, the adapter treats
 `pred` and `succ` as the task endpoints and leaves the annotation fields out
 of the runtime dependency graph.
+Dep-gen task rows may also be combined with graph-level runnable metadata via
+`task_defaults`, `task_template`, or `default_task`. The adapter applies those
+defaults before callable and `func_id` normalization, while task-local fields
+remain authoritative. This allows raw `tasks` entries such as
+`{"task_id": "0", "scope": "auto"}` to be tested with a common CUDA callable
+and TaskArgs descriptor without duplicating that metadata onto every imported
+dep-gen row.
 `graph.edges` may also be an adjacency dictionary from source task name/id to
 a single target or a list of targets.
 `graph.links` is accepted as the same edge-list field when importing

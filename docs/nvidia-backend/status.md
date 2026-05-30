@@ -2051,6 +2051,15 @@ node-link `source`/`target` spellings. The ctypes-backed
 `annotated_dep_gen_graph_with_ctypes` scene passed on local A100 and remote
 H200 with `1 passed, 150 deselected`; the H200 run printed the known PTO-ISA
 SSH refresh warning first.
+Dep-gen task rows that only carry identity and metadata, such as `task_id` and
+`scope`, can now inherit runnable CUDA descriptor fields from graph-level
+`task_defaults`, `task_template`, or `default_task`. The focused selector first
+failed with `KeyError: 'func_id'`, then passed locally on A100 with
+`2 passed, 151 deselected` and remotely on H200 with
+`2 passed, 151 deselected`; the H200 run printed the known PTO-ISA SSH refresh
+warning first. This keeps real `deps.json` task lists closer to their captured
+shape while still letting scene tests provide the common callable and TaskArgs
+metadata needed to execute the graph.
 The same graph-shaped path now accepts `graph.tasks` as a dictionary keyed by
 task name, so descriptor specs can keep node names in one place and reference
 those names from top-level edges. The ctypes-backed
@@ -4658,12 +4667,13 @@ Needed:
   list-valued named task dependencies, top-level graph edge lists including
   string `source -> target` entries and dep-gen-style `pred`/`succ` endpoint
   dictionaries including annotated real `deps.json` rows with `source`
-  metadata, dep-gen-style `task_id` graph task identities, adjacency
-  dictionaries, `graph.links` aliases, `graph.nodes` aliases, node `id`
-  identity aliases, node-link `data` payloads, node-style IO fields,
-  dictionary-valued node IO port maps, node `op` callable aliases,
-  callable metadata `callable_id` / `cid` aliases, and paired smoke including
-  node-link `links` and dictionary-valued node IO port maps,
+  metadata, dep-gen-style `task_id` graph task identities, graph task defaults
+  for runnable metadata shared by dep-gen task rows, adjacency dictionaries,
+  `graph.links` aliases, `graph.nodes` aliases, node `id` identity aliases,
+  node-link `data` payloads, node-style IO fields, dictionary-valued node IO
+  port maps, node `op` callable aliases, callable metadata `callable_id` /
+  `cid` aliases, and paired smoke including node-link `links` and
+  dictionary-valued node IO port maps,
   tagged TaskArgs-like graph task lowering including `inout` producer
   chaining, role-map task-argument dictionaries with paired smoke,
   submit-shaped graph descriptors, submit-group descriptor expansion in the

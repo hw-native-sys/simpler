@@ -1593,6 +1593,15 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k annotated_dep_gen_graph_with_ctypes --platform cuda
 ```
 
+After changing graph-level defaults that make imported dep-gen task rows
+runnable, use:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k dep_gen_task_defaults --platform cuda
+```
+
 For H200, sync the changed files or use the paired sync workflow first, then
 export `CUDA_HOME=/usr/local/cuda-12.8` and prepend that `bin` directory to
 `PATH` in the non-interactive shell.

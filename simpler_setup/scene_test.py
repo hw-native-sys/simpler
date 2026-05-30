@@ -1254,6 +1254,8 @@ class _CudaPersistentDagSceneBuffers:
         task_specs = self._graph_task_specs(graph)
         if not task_specs:
             raise ValueError("CUDA persistent_dag_graph_f32 requires at least one graph task")
+        task_defaults = self._graph_task_defaults(graph)
+        task_specs = [self._merge_graph_task_defaults(task_defaults, task_spec) for task_spec in task_specs]
         task_specs = [self._resolve_graph_task_callable(graph, task_spec) for task_spec in task_specs]
         task_specs = [self._normalize_graph_task_func_id(task_spec) for task_spec in task_specs]
         task_specs = [self._normalize_graph_task_spec(task_spec) for task_spec in task_specs]
@@ -1356,6 +1358,23 @@ class _CudaPersistentDagSceneBuffers:
                 )
             return task_specs
         return [_CudaPersistentDagSceneBuffers._normalize_graph_task_shape(task_spec) for task_spec in tasks]
+
+    @staticmethod
+    def _graph_task_defaults(graph: dict[str, Any]) -> dict[str, Any]:
+        defaults = graph.get("task_defaults", graph.get("task_template", graph.get("default_task", {})))
+        if defaults is None:
+            return {}
+        if not isinstance(defaults, dict):
+            raise ValueError("CUDA persistent_dag_graph_f32 graph task defaults must be a dictionary")
+        return _CudaPersistentDagSceneBuffers._normalize_graph_task_shape(defaults)
+
+    @staticmethod
+    def _merge_graph_task_defaults(defaults: dict[str, Any], task_spec: dict[str, Any]) -> dict[str, Any]:
+        if not defaults:
+            return task_spec
+        merged = dict(defaults)
+        merged.update(task_spec)
+        return _CudaPersistentDagSceneBuffers._normalize_graph_task_shape(merged)
 
     @staticmethod
     def _graph_submit_group_task_specs(submit_groups: Any) -> list[dict[str, Any]]:
