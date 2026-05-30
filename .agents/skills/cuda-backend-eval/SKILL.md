@@ -1559,6 +1559,10 @@ For a more graph-shaped descriptor, use top-level `graph.edges` entries such
 as `{"from": "producer", "to": "consumer"}`, dep-gen-style
 `{"pred": "producer", "succ": "consumer"}`, two-item endpoint pairs, or
 `"producer -> consumer"` strings.
+Real `deps.json` edge rows may include annotation keys such as
+`source="creator"` / `source="tensormap"` and `arg=<slot>` beside
+`pred`/`succ`; the CUDA graph adapter treats `pred`/`succ` as the task
+endpoints in that form.
 `graph.edges` may also be an adjacency dictionary such as
 `{"producer": ["consumer"]}`.
 For node-link style graph schemas, `graph.links` is accepted as the same
@@ -1579,6 +1583,14 @@ After changing dep-gen-style task identity lowering, use the matching
 PYTHONPATH=$PWD:$PWD/python \
   .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
     -q -k dep_gen_task_id_graph_with_ctypes --platform cuda
+```
+
+After changing handling for annotated dep-gen edge rows, use:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k annotated_dep_gen_graph_with_ctypes --platform cuda
 ```
 
 For H200, sync the changed files or use the paired sync workflow first, then

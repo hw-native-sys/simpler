@@ -387,6 +387,10 @@ is either `{"from": <task>, "to": <task>}`, a dep-gen-style
 the form `"<source> -> <target>"`. This keeps node/task metadata separate
 from dependency metadata when a scene test needs a more graph-shaped
 descriptor.
+When an edge dictionary contains both dep-gen endpoint keys and annotation
+fields such as `source="creator"` / `source="tensormap"`, the adapter treats
+`pred` and `succ` as the task endpoints and leaves the annotation fields out
+of the runtime dependency graph.
 `graph.edges` may also be an adjacency dictionary from source task name/id to
 a single target or a list of targets.
 `graph.links` is accepted as the same edge-list field when importing

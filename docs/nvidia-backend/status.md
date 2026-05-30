@@ -2040,6 +2040,17 @@ with `unknown dependency task name: left`, then passed with
 `1 passed, 148 deselected` and on remote H200 with
 `1 passed, 148 deselected`; the H200 run printed the known PTO-ISA SSH
 refresh warning first.
+Real `deps.json` edge rows also include annotation fields such as
+`source="creator"` or `source="tensormap"`. The adapter now prefers
+`pred`/`succ` over `source`/`target` when both forms appear, so the
+annotation is not misread as a task endpoint. The focused builder selector
+first failed with `unknown dependency task name: creator`, then passed with
+`1 passed, 150 deselected`. The adjacent edge compatibility selector passed
+with `5 passed, 146 deselected`, covering dep-gen, `from`/`to`, and
+node-link `source`/`target` spellings. The ctypes-backed
+`annotated_dep_gen_graph_with_ctypes` scene passed on local A100 and remote
+H200 with `1 passed, 150 deselected`; the H200 run printed the known PTO-ISA
+SSH refresh warning first.
 The same graph-shaped path now accepts `graph.tasks` as a dictionary keyed by
 task name, so descriptor specs can keep node names in one place and reference
 those names from top-level edges. The ctypes-backed
@@ -4646,7 +4657,8 @@ Needed:
   inference, explicit outgoing and incoming graph edges with scalar or
   list-valued named task dependencies, top-level graph edge lists including
   string `source -> target` entries and dep-gen-style `pred`/`succ` endpoint
-  dictionaries, dep-gen-style `task_id` graph task identities, adjacency
+  dictionaries including annotated real `deps.json` rows with `source`
+  metadata, dep-gen-style `task_id` graph task identities, adjacency
   dictionaries, `graph.links` aliases, `graph.nodes` aliases, node `id`
   identity aliases, node-link `data` payloads, node-style IO fields,
   dictionary-valued node IO port maps, node `op` callable aliases,

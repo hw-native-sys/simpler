@@ -1483,6 +1483,15 @@ def _cuda_persistent_dep_gen_task_id_graph_spec(add_source, mul_source, *, arch=
     return spec
 
 
+def _cuda_persistent_dep_gen_annotated_edge_graph_spec(add_source, mul_source, *, arch="compute_80", block_dim=256):
+    spec = _cuda_persistent_dep_gen_task_id_graph_spec(add_source, mul_source, arch=arch, block_dim=block_dim)
+    spec["cuda"]["graph"]["edges"] = [
+        {"pred": "left", "succ": "join", "source": "creator", "arg": 0},
+        {"pred": "right", "succ": "join", "source": "tensormap", "arg": 1},
+    ]
+    return spec
+
+
 def _cuda_persistent_task_dict_edge_graph_spec(add_source, mul_source, *, arch="compute_80", block_dim=256):
     spec = _cuda_persistent_edge_list_graph_spec(add_source, mul_source, arch=arch, block_dim=block_dim)
     spec["cuda"]["graph"]["tasks"] = {
@@ -2697,6 +2706,39 @@ def test_scene_test_builds_cuda_persistent_graph_from_dep_gen_task_id_edges():
             "edges": [
                 {"pred": "left", "succ": "join"},
                 {"pred": "right", "succ": "join"},
+            ],
+        },
+    }
+    buffers = _CudaPersistentDagSceneBuffers(_FakeWorker(), test_args, cuda_spec)
+
+    assert list(buffers.host_fanin) == [0, 0, 2]
+    assert list(buffers.host_dependents) == [2, 2]
+    assert [(task.func_id, task.dependent_begin, task.dependent_count) for task in buffers.host_tasks] == [
+        (1, 0, 1),
+        (2, 1, 1),
+        (1, 2, 0),
+    ]
+
+
+def test_scene_test_builds_cuda_persistent_graph_from_annotated_dep_gen_edges():
+    test_args = TaskArgsBuilder(
+        Tensor("a", _FakeTensor(17)),
+        Tensor("b", _FakeTensor(17)),
+        Tensor("out", _FakeTensor(17)),
+    )
+    cuda_spec = {
+        "arg_builder": "persistent_dag_graph_f32",
+        "args": ["a", "b", "out"],
+        "queue_capacity": 2,
+        "graph": {
+            "tasks": [
+                {"task_id": "left", "func_id": 1, "a": "a", "b": "b", "out": "tmp0"},
+                {"task_id": "right", "func_id": 2, "a": "a", "b": "b", "out": "tmp1"},
+                {"task_id": "join", "func_id": 1, "a": "a", "b": "b", "out": "out"},
+            ],
+            "edges": [
+                {"pred": "left", "succ": "join", "source": "creator", "arg": 0},
+                {"pred": "right", "succ": "join", "source": "tensormap", "arg": 1},
             ],
         },
     }
@@ -7889,6 +7931,58 @@ def test_scene_test_runs_cuda_persistent_device_dep_gen_task_id_graph_with_ctype
             worker,
             callable_obj,
             CudaPersistentDepGenTaskIdGraphCtypesScene.CASES[0],
+            skip_golden=True,
+        )
+        args = scene.last_args
+        a_values = args.a.to_list()
+        b_values = args.b.to_list()
+        actual = args.out.to_list()
+        expected = [a_values[idx] + b_values[idx] for idx in range(len(actual))]
+        assert actual == pytest.approx(expected)
+    finally:
+        worker.close()
+
+
+@requires_cuda
+def test_scene_test_runs_cuda_persistent_device_annotated_dep_gen_graph_with_ctypes_data(tmp_path):
+    add_source = tmp_path / "add.pto.cu"
+    mul_source = tmp_path / "mul.pto.cu"
+    add_source.write_text(_PERSISTENT_ADD_BODY)
+    mul_source.write_text(_PERSISTENT_MUL_BODY)
+
+    @scene_test(level=2, runtime="persistent_device")
+    class CudaPersistentAnnotatedDepGenGraphCtypesScene(SceneTestCase):
+        CALLABLE = _cuda_persistent_dep_gen_annotated_edge_graph_spec(add_source, mul_source)
+        CASES = [
+            {
+                "name": "n1024",
+                "platforms": ["cuda"],
+                "params": {"n": 1024},
+                "config": {"block_dim": 256},
+            }
+        ]
+
+        def generate_args(self, params):
+            n = params["n"]
+            args = TaskArgsBuilder(
+                Tensor("a", _CtypesFloatTensor(float(i + 1) for i in range(n))),
+                Tensor("b", _CtypesFloatTensor(float(i) * 0.5 for i in range(n))),
+                Tensor("out", _CtypesFloatTensor(0.0 for _ in range(n))),
+            )
+            self.last_args = args
+            return args
+
+        def compute_golden(self, args, params):
+            raise AssertionError("ctypes scene uses explicit post-run validation")
+
+    scene = CudaPersistentAnnotatedDepGenGraphCtypesScene()
+    worker = CudaPersistentAnnotatedDepGenGraphCtypesScene._create_worker("cuda", device_id=0, build=False)
+    try:
+        callable_obj = scene.build_callable("cuda")
+        scene._run_and_validate_l2(
+            worker,
+            callable_obj,
+            CudaPersistentAnnotatedDepGenGraphCtypesScene.CASES[0],
             skip_golden=True,
         )
         args = scene.last_args
