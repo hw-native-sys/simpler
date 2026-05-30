@@ -459,12 +459,25 @@ void PTO2OrchestratorState::end_scope() {
         orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
     }
 
+    // Defer release_producer to the wiring thread via a ScopeEnd event. This
+    // keeps it FIFO-ordered behind every TaskSubmit pushed earlier in this
+    // scope, so by the time wiring runs the on_scope_end body, every
+    // consumer's producer.fanout_count++ has landed. Without this ordering,
+    // a producer whose scope ends here could be CONSUMED before a later
+    // consumer's wiring registers as a fanout, racing slot reuse.
+    //
+    // scope_tasks is NOT rewound — orch keeps it as a monotonic log so the
+    // pointer embedded in the event stays valid until the wiring thread exits.
+    // PTO2_SCOPE_TASKS_CAP (= PTO2_TASK_WINDOW_SIZE * PTO2_MAX_RING_DEPTH) is
+    // the hard limit on total submits per run; the existing saturation check
+    // in prepare_task surfaces overflow.
     if (orch->scheduler && count > 0) {
-        orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
+        while (!orch->scheduler->wiring.queue.push(
+            PTO2WiringEvent::for_scope_end(&orch->scope_tasks[begin], count)
+        )) {
+            SPIN_WAIT_HINT();
+        }
     }
-
-    // Rewind the task buffer — these entries are no longer needed
-    orch->scope_tasks_size = begin;
 
 #if PTO2_ORCH_PROFILING
     uint64_t _se1 = get_sys_cnt_aicpu();
@@ -613,7 +626,7 @@ static TaskOutputTensors submit_task_common(
     // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
     // is handled asynchronously by scheduler thread 0 via the wiring queue.
     // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    while (!sched->wiring.queue.push(&cur_slot_state)) {
+    while (!sched->wiring.queue.push(PTO2WiringEvent::for_task_submit(&cur_slot_state))) {
         SPIN_WAIT_HINT();
     }
 

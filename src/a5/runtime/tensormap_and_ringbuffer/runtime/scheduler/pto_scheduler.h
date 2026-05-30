@@ -423,6 +423,62 @@ void ready_queue_wire_arena_pointers(PTO2ReadyQueue *queue, DeviceArena &arena, 
 void ready_queue_destroy(PTO2ReadyQueue *queue);
 
 // =============================================================================
+// Wiring queue event (tagged union)
+// =============================================================================
+//
+// The wiring SPSC queue is a tagged-event channel from the orchestrator to
+// scheduler thread 0. Two event kinds today:
+//
+//   TaskSubmit: payload is a PTO2TaskSlotState* (the slot to wire).
+//   ScopeEnd:   payload is {scope_begin, scope_count} indexing into
+//               orch->scope_tasks[]; the wiring thread iterates this range
+//               and calls release_producer on each entry.
+//
+// Keeping scope_end on the same FIFO as task submits is essential: by the
+// time wiring sees ScopeEnd, every TaskSubmit pushed before it has already
+// finalized its producer fanout_count++, so release_producer cannot
+// prematurely transition a producer to CONSUMED. See
+// `.claude/plans/wiring-wiring-tensormap-submit-task-sub-zazzy-moore.md`.
+
+enum class PTO2WiringEventKind : uint32_t {
+    TaskSubmit = 0,
+    ScopeEnd = 1,
+};
+
+// 16-byte tagged event. Payload semantics by kind:
+//   TaskSubmit: slot points to a single PTO2TaskSlotState (slot_count unused).
+//   ScopeEnd:   slot_array points at orch->scope_tasks[begin]; slot_count is
+//               the number of slot pointers in this scope range. Since orch
+//               never rewinds scope_tasks (it is sized to hold a whole run),
+//               the pointer stays valid until completed_ is observed.
+struct PTO2WiringEvent {
+    PTO2WiringEventKind kind;  // 4B
+    int32_t slot_count;        // 4B — ScopeEnd only
+    union {
+        PTO2TaskSlotState *slot;          // TaskSubmit
+        PTO2TaskSlotState **slot_array;   // ScopeEnd: &scope_tasks[begin]
+    };  // 8B
+
+    static PTO2WiringEvent for_task_submit(PTO2TaskSlotState *slot) {
+        PTO2WiringEvent ev{};
+        ev.kind = PTO2WiringEventKind::TaskSubmit;
+        ev.slot_count = 0;
+        ev.slot = slot;
+        return ev;
+    }
+
+    static PTO2WiringEvent for_scope_end(PTO2TaskSlotState **slot_array, int32_t slot_count) {
+        PTO2WiringEvent ev{};
+        ev.kind = PTO2WiringEventKind::ScopeEnd;
+        ev.slot_count = slot_count;
+        ev.slot_array = slot_array;
+        return ev;
+    }
+};
+
+static_assert(sizeof(PTO2WiringEvent) == 16, "PTO2WiringEvent must be exactly 16B");
+
+// =============================================================================
 // SPSC Queue (Single-Producer Single-Consumer, wait-free)
 // =============================================================================
 //
@@ -447,7 +503,7 @@ struct alignas(64) PTO2SpscQueue {
     alignas(64) uint64_t head_cached_{0};
 
     // --- Shared (immutable after init) ---
-    PTO2TaskSlotState **buffer_{nullptr};
+    PTO2WiringEvent *buffer_{nullptr};
     uint64_t mask_{0};
 
     // Reserve the backing buffer region on the supplied arena. Returns the
@@ -456,20 +512,21 @@ struct alignas(64) PTO2SpscQueue {
     // orchestrator (push) and scheduler thread 0 (pop_batch), so its base
     // must not false-share with neighboring regions.
     static size_t reserve_layout(DeviceArena &arena, uint64_t capacity) {
-        return arena.reserve(capacity * sizeof(PTO2TaskSlotState *), PTO2_ALIGN_SIZE);
+        return arena.reserve(capacity * sizeof(PTO2WiringEvent), PTO2_ALIGN_SIZE);
     }
 
     // Writes everything except the arena-internal `buffer_` pointer field
-    // (zeros the slot pointer array, mask/head/tail). The host pre-builds the
-    // image without storing a host address in buffer_; the AICPU wires
-    // buffer_ at boot via wire_arena_pointers().
+    // (zeros the event array, mask/head/tail). The host pre-builds the image
+    // without storing a host address in buffer_; the AICPU wires buffer_ at
+    // boot via wire_arena_pointers().
     bool init_data_from_layout(DeviceArena &arena, size_t buffer_off, uint64_t capacity) {
         if (capacity == 0 || (capacity & (capacity - 1)) != 0) return false;
-        auto *buf = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
-        // calloc'd-equivalent: zero the slot pointers so spurious early pops
-        // observe nullptr.
-        for (uint64_t i = 0; i < capacity; i++)
-            buf[i] = nullptr;
+        auto *buf = static_cast<PTO2WiringEvent *>(arena.region_ptr(buffer_off));
+        // calloc'd-equivalent: zero so spurious early pops observe a benign
+        // (TaskSubmit, nullptr) event.
+        for (uint64_t i = 0; i < capacity; i++) {
+            buf[i] = PTO2WiringEvent{};
+        }
         mask_ = capacity - 1;
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
@@ -481,19 +538,19 @@ struct alignas(64) PTO2SpscQueue {
     // Wire the arena-internal pointer. Called by both host (with host arena)
     // and AICPU (with device arena attached to the prebuilt image).
     void wire_arena_pointers(DeviceArena &arena, size_t buffer_off) {
-        buffer_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
+        buffer_ = static_cast<PTO2WiringEvent *>(arena.region_ptr(buffer_off));
     }
 
     // Arena owns the buffer; here we only forget our pointer.
     void destroy() { buffer_ = nullptr; }
 
-    // Push one item (producer only). Returns false if queue is full.
+    // Push one event (producer only). Returns false if queue is full.
     // Full condition: next_h - tail > mask_ (i.e. > capacity-1), so the
     // effective usable capacity is capacity-1 (one slot is wasted as a
     // sentinel to distinguish full from empty). uint64_t wrapping is safe
     // since head and tail are monotonically increasing and subtraction
     // wraps correctly.
-    bool push(PTO2TaskSlotState *item) {
+    bool push(const PTO2WiringEvent &ev) {
         uint64_t h = head_.load(std::memory_order_relaxed);
         uint64_t next_h = h + 1;
         if (next_h - tail_cached_ > mask_) {
@@ -502,13 +559,13 @@ struct alignas(64) PTO2SpscQueue {
                 return false;
             }
         }
-        buffer_[h & mask_] = item;
+        buffer_[h & mask_] = ev;
         head_.store(next_h, std::memory_order_release);
         return true;
     }
 
-    // Pop up to max_count items (consumer only). Returns actual count.
-    int pop_batch(PTO2TaskSlotState **out, int max_count) {
+    // Pop up to max_count events (consumer only). Returns actual count.
+    int pop_batch(PTO2WiringEvent *out, int max_count) {
         uint64_t t = tail_.load(std::memory_order_relaxed);
         uint64_t avail = head_cached_ - t;
         if (avail == 0) {
@@ -655,14 +712,18 @@ struct PTO2SchedulerState {
     //   2. queue    — SPSC: orchestrator push, thread 0 pop
     //   3. orch_needs_drain — orchestrator write, thread 0 read
     struct alignas(64) WiringState {
-        static constexpr uint64_t BATCH_SIZE = 30;
+        // Batch buffer holds at most this many wiring events between pops.
+        // 16 keeps the batch region at 8 cache lines (counts + 16 * 16B events
+        // = 12 + 4 pad + 256 = 272, padded up to 320 via alignas on the next
+        // field). See size asserts below.
+        static constexpr uint64_t BATCH_SIZE = 16;
         static constexpr int BACKOFF_LIMIT = 32;
 
         // --- Thread 0 exclusive: local batch buffer + backoff ---
         int batch_count = 0;
         int batch_index = 0;
         int backoff_counter = 0;
-        PTO2TaskSlotState *batch[BATCH_SIZE];
+        PTO2WiringEvent batch[BATCH_SIZE];
 
         // --- SPSC queue: orchestrator (push) ↔ thread 0 (pop) ---
         alignas(64) PTO2SpscQueue queue;
@@ -672,9 +733,10 @@ struct PTO2SchedulerState {
     } wiring;
 
     static_assert(
-        offsetof(WiringState, queue) == 256, "WiringState: batch region must be exactly 4 cache lines before queue"
+        offsetof(WiringState, queue) == 320,
+        "WiringState: batch region must be exactly 5 cache lines before queue"
     );
-    static_assert(sizeof(WiringState) == 576, "WiringState must be exactly 9 cache lines (576B)");
+    static_assert(sizeof(WiringState) == 640, "WiringState must be exactly 10 cache lines (640B)");
 
     alignas(64) AsyncWaitList async_wait_list;
 
@@ -716,23 +778,38 @@ struct PTO2SchedulerState {
             if (wiring.batch_count == 0) return 0;
         }
 
-        // Process tasks from local buffer in strict FIFO order.
+        // Process events from local buffer in strict FIFO order. FIFO matters
+        // for ScopeEnd correctness: every TaskSubmit pushed before a ScopeEnd
+        // has already finalized its producer fanout_count++ by the time we
+        // call on_scope_end, so release_producer cannot prematurely transition
+        // a producer to CONSUMED. See plan
+        // `.claude/plans/wiring-wiring-tensormap-submit-task-sub-zazzy-moore.md`.
         while (wiring.batch_index < wiring.batch_count) {
-            PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
-            int ring_id = ws->ring_id;
-            auto &rss = ring_sched_states[ring_id];
-            int32_t wfanin = ws->payload->fanin_actual_count;
+            PTO2WiringEvent &ev = wiring.batch[wiring.batch_index];
 
-            if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
+            if (ev.kind == PTO2WiringEventKind::TaskSubmit) {
+                PTO2TaskSlotState *ws = ev.slot;
+                int ring_id = ws->ring_id;
+                auto &rss = ring_sched_states[ring_id];
+                int32_t wfanin = ws->payload->fanin_actual_count;
+
                 if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                    break;  // not enough dep_pool space — keep remainder for next call
+                    rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
+                    if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
+                        break;  // not enough dep_pool space — keep remainder for next call
+                    }
                 }
-            }
 
-            wiring.batch_index++;
-            wire_task(rss, ws, wfanin);
-            wired++;
+                wiring.batch_index++;
+                wire_task(rss, ws, wfanin);
+                wired++;
+            } else {
+                // PTO2WiringEventKind::ScopeEnd: release_producer on each slot
+                // in the scope range. orch never rewinds scope_tasks, so the
+                // slot_array pointer is stable.
+                on_scope_end(ev.slot_array, ev.slot_count);
+                wiring.batch_index++;
+            }
         }
 
         return wired;
