@@ -240,10 +240,13 @@ int L2PerfCollector::initialize(
         PLATFORM_PROF_BUFFERS_PER_CORE, PLATFORM_AICORE_BUFFERS_PER_CORE
     );
 
-    // Step 5c: Standalone uint64_t[num_aicore] table holding per-core
-    // AicoreRotation device addresses (= &ac_state->rotation). AICore reads
-    // rotation_table[block_idx] via KernelArgs::aicore_ring_addr and feeds it
-    // into the platform's set_aicore_rotation().
+    // Step 5c: Standalone uint64_t[num_aicore] table that will hold per-core
+    // AicoreRotation device addresses. Host only allocates the bytes and
+    // hands the device pointer to AICPU via KernelArgs::aicore_ring_addr;
+    // AICPU itself fills the entries inside `l2_perf_aicpu_init` (it has
+    // direct access to `&ac_state->rotation` device addresses, no
+    // host-to-device translation needed). AICore reads
+    // rotation_table[block_idx] at kernel entry.
     {
         size_t table_bytes = static_cast<size_t>(num_aicore) * sizeof(uint64_t);
         void *rotation_table_host = nullptr;
@@ -251,20 +254,6 @@ int L2PerfCollector::initialize(
         if (rotation_table_dev == nullptr) {
             LOG_ERROR("Failed to allocate aicore_ring_addr (rotation) table (%zu bytes)", table_bytes);
             return -1;
-        }
-        uint64_t *rotation_table = reinterpret_cast<uint64_t *>(rotation_table_host);
-
-        // Compute the per-core device address of &state->rotation. We have
-        // the host-mapped shm region; the device equivalent is at the same
-        // offset from perf_dev_ptr.
-        auto host_to_dev = [&](void *host_addr) -> uint64_t {
-            uintptr_t offset = reinterpret_cast<uintptr_t>(host_addr) - reinterpret_cast<uintptr_t>(perf_host_ptr);
-            return reinterpret_cast<uint64_t>(perf_dev_ptr) + offset;
-        };
-
-        for (int i = 0; i < num_aicore; i++) {
-            L2PerfAicoreBufferState *ac_state = get_aicore_buffer_state(perf_host_ptr, num_aicore, i);
-            rotation_table[i] = host_to_dev(&ac_state->rotation);
         }
         aicore_ring_addr_table_dev_ = rotation_table_dev;
     }

@@ -73,10 +73,19 @@ static uint64_t g_platform_l2_perf_base = 0;
 static bool g_enable_l2_swimlane = false;
 static L2PerfLevel g_l2_perf_level = L2PerfLevel::DISABLED;
 
+// AICore rotation-table device pointer (= KernelArgs::aicore_ring_addr).
+// Published by the host (sim: dlsym'd setter; onboard: from k_args via the
+// kernel entry); AICPU init walks it to fill per-core &rotation addresses.
+static uint64_t g_platform_aicore_rotation_table = 0;
+
 extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base) { g_platform_l2_perf_base = l2_perf_data_base; }
 extern "C" uint64_t get_platform_l2_perf_base() { return g_platform_l2_perf_base; }
 extern "C" void set_l2_swimlane_enabled(bool enable) { g_enable_l2_swimlane = enable; }
 extern "C" bool is_l2_swimlane_enabled() { return g_enable_l2_swimlane; }
+extern "C" void set_platform_aicore_rotation_table(uint64_t table_addr) {
+    g_platform_aicore_rotation_table = table_addr;
+}
+extern "C" uint64_t get_platform_aicore_rotation_table() { return g_platform_aicore_rotation_table; }
 L2PerfLevel get_l2_perf_level() { return g_l2_perf_level; }
 
 /**
@@ -132,6 +141,16 @@ void l2_perf_aicpu_init(int worker_count) {
         static_cast<uint32_t>(g_l2_perf_level)
     );
 
+    // Populate the per-core AicoreRotation device-address table. AICore reads
+    // `aicore_ring_addr[block_idx]` from KernelArgs to find its rotation
+    // channel; the table itself is host-allocated, but the entries are
+    // device-internal addresses (`&ac_state->rotation`) that the host would
+    // otherwise have to translate from host-mapped to device-mapped. AICPU
+    // already runs on the device, so it can write the addresses directly
+    // without any translation — that keeps the host side decoupled from the
+    // AICore shared-memory layout.
+    uint64_t *rotation_table = reinterpret_cast<uint64_t *>(g_platform_aicore_rotation_table);
+
     // Pop first buffer from free_queue for each core
     for (int i = 0; i < worker_count; i++) {
         L2PerfBufferState *state = get_perf_buffer_state(l2_perf_base, i);
@@ -139,6 +158,10 @@ void l2_perf_aicpu_init(int worker_count) {
 
         s_perf_buffer_states[i] = state;
         s_aicore_buffer_states[i] = ac_state;
+
+        if (rotation_table != nullptr) {
+            rotation_table[i] = reinterpret_cast<uint64_t>(&ac_state->rotation);
+        }
 
         // Pop first buffer from free_queue
         rmb();

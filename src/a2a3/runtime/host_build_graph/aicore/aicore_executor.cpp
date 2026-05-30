@@ -60,7 +60,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
 
     // Per-core AicoreRotation channel; see tensormap_and_ringbuffer/.../aicore_executor.cpp.
-    __gm__ AicoreRotation *l2_perf_rotation = l2_perf_enabled ? get_aicore_rotation() : nullptr;
+    // Deferred until first task so AICPU's init has populated the rotation
+    // table (the dispatch itself proves init is done).
+    __gm__ AicoreRotation *l2_perf_rotation = nullptr;
     AicoreLocalState l2_perf_local = {nullptr, 0, 0};
 
     volatile uint32_t task_id = AICPU_IDLE_TASK_ID;
@@ -82,6 +84,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         {
             uint32_t actual_task_id = task_id;
             write_reg(RegId::COND, MAKE_ACK_VALUE(actual_task_id));
+
+            // First-task lazy resolve of the rotation channel.
+            if (l2_perf_enabled && l2_perf_rotation == nullptr) {
+                l2_perf_rotation = get_aicore_rotation();
+            }
 
             __gm__ Task *task_ptr = &(runtime->tasks[actual_task_id]);
             uint64_t start_time = get_sys_cnt_aicore();

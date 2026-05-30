@@ -273,6 +273,13 @@ int DeviceRunner::ensure_binaries_loaded() {
             return -1;
         }
 
+        set_platform_aicore_rotation_table_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_aicore_rotation_table"));
+        if (set_platform_aicore_rotation_table_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_aicore_rotation_table: %s", dlerror());
+            return -1;
+        }
+
         set_l2_swimlane_enabled_func_ =
             reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_l2_swimlane_enabled"));
         if (set_l2_swimlane_enabled_func_ == nullptr) {
@@ -652,6 +659,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
     set_dump_tensor_enabled_func_(enable_dump_tensor_);
     set_platform_l2_perf_base_func_(kernel_args_.l2_perf_data_base);
+    set_platform_aicore_rotation_table_func_(kernel_args_.aicore_ring_addr);
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
     set_platform_pmu_reg_addrs_func_(kernel_args_.pmu_reg_addrs);
@@ -844,6 +852,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_dump_base_func_ = nullptr;
         set_dump_tensor_enabled_func_ = nullptr;
         set_platform_l2_perf_base_func_ = nullptr;
+        set_platform_aicore_rotation_table_func_ = nullptr;
         set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
         set_platform_pmu_reg_addrs_func_ = nullptr;

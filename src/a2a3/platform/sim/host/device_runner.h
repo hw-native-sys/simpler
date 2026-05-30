@@ -382,6 +382,7 @@ private:
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_dump_tensor_enabled_func_)(bool){nullptr};
     void (*set_platform_l2_perf_base_func_)(uint64_t){nullptr};
+    void (*set_platform_aicore_rotation_table_func_)(uint64_t){nullptr};
     void (*set_l2_swimlane_enabled_func_)(bool){nullptr};
     void (*set_platform_pmu_base_func_)(uint64_t){nullptr};
     void (*set_platform_pmu_reg_addrs_func_)(uint64_t){nullptr};

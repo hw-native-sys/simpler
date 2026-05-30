@@ -33,6 +33,9 @@
 static pthread_key_t g_reg_base_key;
 static pthread_key_t g_core_id_key;
 static pthread_key_t g_aicore_profiling_flag_key;
+// Slot pointer (NOT the dereferenced rotation address) — see
+// aicore_profiling_state.h for the lazy-deref contract.
+static pthread_key_t g_aicore_rotation_slot_key;
 static pthread_key_t g_aicore_rotation_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
@@ -40,6 +43,7 @@ static void create_tls_keys() {
     pthread_key_create(&g_reg_base_key, nullptr);
     pthread_key_create(&g_core_id_key, nullptr);
     pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
+    pthread_key_create(&g_aicore_rotation_slot_key, nullptr);
     pthread_key_create(&g_aicore_rotation_key, nullptr);
 }
 
@@ -61,11 +65,19 @@ __aicore__ uint32_t get_aicore_profiling_flag() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
 }
 
-__aicore__ void set_aicore_rotation(__gm__ AicoreRotation *rotation) {
-    pthread_setspecific(g_aicore_rotation_key, reinterpret_cast<void *>(rotation));
+__aicore__ void set_aicore_rotation_slot(__gm__ uint64_t *slot_ptr) {
+    pthread_setspecific(g_aicore_rotation_slot_key, reinterpret_cast<void *>(slot_ptr));
+    pthread_setspecific(g_aicore_rotation_key, nullptr);  // force lazy resolve on next get
 }
 __aicore__ __gm__ AicoreRotation *get_aicore_rotation() {
-    return reinterpret_cast<__gm__ AicoreRotation *>(pthread_getspecific(g_aicore_rotation_key));
+    auto *cached = reinterpret_cast<__gm__ AicoreRotation *>(pthread_getspecific(g_aicore_rotation_key));
+    if (cached != nullptr) return cached;
+    auto *slot = reinterpret_cast<__gm__ uint64_t *>(pthread_getspecific(g_aicore_rotation_slot_key));
+    if (slot == nullptr) return nullptr;
+    // Lazy first-call resolve — see aicore_profiling_state.h.
+    cached = reinterpret_cast<__gm__ AicoreRotation *>(*slot);
+    pthread_setspecific(g_aicore_rotation_key, reinterpret_cast<void *>(cached));
+    return cached;
 }
 
 // Core identity setter function pointers — set by DeviceRunner after dlopen.
@@ -107,10 +119,13 @@ extern "C" void aicore_execute_wrapper(
     // Publish per-core profiling state before the executor runs.
     set_aicore_profiling_flag(enable_profiling_flag);
     if (aicore_ring_addr != 0) {
+        // Stash only the slot pointer; deref happens lazily inside
+        // get_aicore_rotation() once AICPU has populated the table. See
+        // aicore_profiling_state.h.
         uint64_t *rotation_table = reinterpret_cast<uint64_t *>(aicore_ring_addr);
-        set_aicore_rotation(reinterpret_cast<__gm__ AicoreRotation *>(rotation_table[block_idx]));
+        set_aicore_rotation_slot(reinterpret_cast<__gm__ uint64_t *>(&rotation_table[block_idx]));
     } else {
-        set_aicore_rotation(nullptr);
+        set_aicore_rotation_slot(nullptr);
     }
 
     // Set core identity for pto-isa TPUSH/TPOP simulation.

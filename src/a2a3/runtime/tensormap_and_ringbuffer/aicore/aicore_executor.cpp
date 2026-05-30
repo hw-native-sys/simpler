@@ -102,11 +102,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
 
-    // Per-core AicoreRotation channel is published once at kernel entry from
-    // KernelArgs::aicore_ring_addr. AICore reads it per task (cheap relative
-    // to the per-task dcci(payload, ENTIRE_DATA_CACHE)) to pick up the
-    // current L2PerfAicoreBuffer — see l2_perf_collector_aicore.h.
-    __gm__ AicoreRotation *l2_perf_rotation = l2_perf_enabled ? get_aicore_rotation() : nullptr;
+    // Per-core AicoreRotation channel. The pointer to THIS core's rotation
+    // is stored in `KernelArgs::aicore_ring_addr[block_idx]`, but AICPU
+    // populates that table inside `l2_perf_aicpu_init` which runs
+    // concurrently with this kernel's entry — so we cannot deref at startup.
+    // Defer the deref via `get_aicore_rotation()` until the first task is
+    // dispatched; by then AICPU's init has completed (the very dispatch is
+    // proof of that).
+    __gm__ AicoreRotation *l2_perf_rotation = nullptr;
     AicoreLocalState l2_perf_local = {nullptr, 0, 0};
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
@@ -130,6 +133,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
         {
             uint32_t task_id = reg_val;  // Decode: register holds task_id directly
+
+            // First-task lazy resolve of the rotation channel — see comment
+            // above. `get_aicore_rotation()` caches after first call so this
+            // costs nothing on subsequent tasks.
+            if (l2_perf_enabled && l2_perf_rotation == nullptr) {
+                l2_perf_rotation = get_aicore_rotation();
+            }
 
             // Select dual-buffer slot: same bit as AICPU used when writing payload
             __gm__ PTO2DispatchPayload *exec_payload = payload + (task_id & 1u);

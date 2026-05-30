@@ -110,6 +110,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_tensor_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
     set_platform_l2_perf_base(k_args->l2_perf_data_base);
+    set_platform_aicore_rotation_table(k_args->aicore_ring_addr);
     set_l2_swimlane_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
     set_platform_pmu_reg_addrs(k_args->pmu_reg_addrs);

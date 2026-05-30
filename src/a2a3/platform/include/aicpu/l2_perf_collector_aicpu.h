@@ -46,6 +46,16 @@ extern "C" uint64_t get_platform_l2_perf_base();
 extern "C" void set_l2_swimlane_enabled(bool enable);
 extern "C" bool is_l2_swimlane_enabled();
 
+// AICore rotation-table device pointer (= KernelArgs::aicore_ring_addr).
+// Published by the host before AICPU init runs; AICPU init fills the table
+// with the per-core `&L2PerfAicoreBufferState::rotation` device addresses so
+// AICore can index `aicore_ring_addr[block_idx]` to find its rotation channel.
+// Moved from host into AICPU so the host stays decoupled from the AICore-side
+// shared-memory layout (host previously did host-to-device address translation
+// + reached into get_aicore_buffer_state to fill this).
+extern "C" void set_platform_aicore_rotation_table(uint64_t table_addr);
+extern "C" uint64_t get_platform_aicore_rotation_table();
+
 // Typed getter for the granular perf_level (promoted from the shared-memory
 // header inside l2_perf_aicpu_init). Gate sites should use this so the
 // comparison RHS is a named L2PerfLevel constant.
