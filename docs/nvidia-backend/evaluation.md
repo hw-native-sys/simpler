@@ -94,6 +94,10 @@ latest current-head multi-size tensor baseline sweep uses `76422250`:
   paired gate that promotes the nine-task parallel-chains graph descriptor
   into the selected A100/H200 benchmark matrix with 102 non-batch validated
   samples.
+- [Current capture](evaluation-current.md) records the compact `a540a014`
+  paired gate that promotes the seven-task wide-fanout graph descriptor into
+  the selected A100/H200 benchmark matrix with 104 non-batch validated
+  samples.
 - [Current capture](evaluation-current.md) records the full `4e81fbff`
   paired-current gate that promotes the nine-task parallel-chains graph
   descriptor into the three-size A100/H200 benchmark matrix with 1296

@@ -1509,6 +1509,8 @@ def run_persistent_sample(
             task_count = 5
         elif dag_shape == "graph_descriptor_parallel_chains":
             task_count = 9
+        elif dag_shape == "graph_descriptor_wide_fanout":
+            task_count = 7
         elif dag_shape in {
             "scalar_axpy",
             "scalar_scale",
@@ -1826,6 +1828,15 @@ def run_single_sample(  # noqa: PLR0912
             mode="dag",
             baseline=baseline,
             dag_shape="graph_descriptor_parallel_chains",
+        )
+    if baseline == "pto_persistent_dag_graph_wide_fanout":
+        return run_persistent_sample(
+            device=device,
+            n=n,
+            arch=arch,
+            mode="dag",
+            baseline=baseline,
+            dag_shape="graph_descriptor_wide_fanout",
         )
     if baseline == "pto_persistent_dag_graph_tagged":
         return run_persistent_sample(
@@ -2155,6 +2166,7 @@ def run_benchmark(
                     "pto_persistent_dag_graph_scratch_reuse",
                     "pto_persistent_dag_graph_diamond",
                     "pto_persistent_dag_graph_parallel_chains",
+                    "pto_persistent_dag_graph_wide_fanout",
                     "pto_persistent_dag_graph_tagged",
                     "pto_persistent_dag_graph_tagged_inout",
                     "pto_persistent_dag_graph_role_keyed_inout",
@@ -2843,6 +2855,7 @@ def render_svg(summary: dict[tuple[str, str, int, int, int], dict[str, Any]]) ->
         "pto_persistent_dag_graph_scratch_reuse": "#795548",
         "pto_persistent_dag_graph_diamond": "#5d4037",
         "pto_persistent_dag_graph_parallel_chains": "#8a5a44",
+        "pto_persistent_dag_graph_wide_fanout": "#a47148",
         "pto_persistent_dag_graph_tagged": "#704214",
         "pto_persistent_dag_graph_tagged_inout": "#4e342e",
         "pto_persistent_dag_graph_role_keyed_inout": "#6a4c93",
@@ -3319,6 +3332,8 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "  descriptor with two roots, two fan-out consumers, and a final join.",
             "- `pto_persistent_dag_graph_parallel_chains` uses a nine-task explicit",
             "  graph descriptor with four roots, paired joins, and a final join.",
+            "- `pto_persistent_dag_graph_wide_fanout` uses a seven-task explicit",
+            "  graph descriptor where one root releases three ready children before joins.",
             "- `pto_persistent_dag_graph_tagged` uses explicit input, output,",
             "  output-existing, and scalar task-argument tags over a three-task graph descriptor.",
             "- `pto_persistent_dag_graph_tagged_inout` uses explicit input, output,",
@@ -3506,6 +3521,7 @@ def main() -> None:
             "pto_persistent_dag_graph_scratch_reuse",
             "pto_persistent_dag_graph_diamond",
             "pto_persistent_dag_graph_parallel_chains",
+            "pto_persistent_dag_graph_wide_fanout",
             "pto_persistent_dag_graph_tagged",
             "pto_persistent_dag_graph_tagged_inout",
             "pto_persistent_dag_graph_role_keyed_inout",

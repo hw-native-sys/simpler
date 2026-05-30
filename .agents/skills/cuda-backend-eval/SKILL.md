@@ -945,6 +945,23 @@ Use the same DAG shape with `scheduler_blocks=1,2,4` to produce a
 shape-aware scheduler scaling report. The current paired sweep is under
 `tmp/cuda-backend/parallel-chains-scheduler-scaling-working/`, with the
 summary report under `scheduler-scaling-674ebe2e/`.
+Use `--dag-shape graph_descriptor_wide_fanout --scheduler-blocks 2
+--worker-blocks 4 --queue-capacity 7 --repeat-runs 2` to validate a
+seven-task graph where one root completion releases three ready children
+before two joins and a final join. This records fan-in `[0,1,1,1,2,2,2]`,
+dependents `[1,2,3,4,4,5,5,6,6]`, and dispatch `1,1,2,1,1,2,1`.
+The current A100/H200 smoke under
+`tmp/cuda-backend/wide-fanout-smoke-a540a014/` validates repeat completions
+`[7,7]`, scheduler processed counts `7`, two active scheduler blocks, and
+zero device scheduler errors. A100 reported `63488/48128 ns` for the two
+launches; H200 reported `48448/41152 ns`.
+The same graph shape is a selected benchmark baseline as
+`pto_persistent_dag_graph_wide_fanout`. The compact paired gate under
+`tmp/cuda-backend/wide-fanout-selected-current-working/`
+`combined-current-a540a014/` validates 104 no-batch A100/H200 rows at
+`N=1024`, including dispatch `1,1,2,1,1,2,1`, fan-in `0,1,1,1,2,2,2`,
+dependents `1,2,3,4,4,5,5,6,6`, source-paper provenance, report files,
+command examples, and zero device scheduler errors.
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such
 as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.

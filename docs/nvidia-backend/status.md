@@ -322,11 +322,15 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - `pto_persistent_dag_graph_chain`;
 - `pto_persistent_dag_graph_scratch_reuse`;
 - `pto_persistent_dag_graph_diamond`;
+- `pto_persistent_dag_graph_parallel_chains`;
+- `pto_persistent_dag_graph_wide_fanout`;
 - `pto_persistent_dag_graph_tagged`;
 - `pto_persistent_dag_graph_tagged_inout`;
 - `pto_persistent_dag_graph_role_keyed_inout`;
 - `pto_persistent_dag_graph_compact_role_inout`;
 - `pto_persistent_dag_graph_pair_inout`;
+- `pto_persistent_dag_graph_role_map_inout`;
+- `pto_persistent_dag_graph_submit_groups`;
 - `pto_persistent_dag_graph_triad`;
 - `pto_persistent_dag_graph_quad`;
 - `pto_persistent_dag_graph_unary_square`;
@@ -356,6 +360,19 @@ scratch-reuse metadata, and the nine-task parallel-chains queue capacity.
 This supersedes the older `c183d1ad`, `f99dc6b0`, `9ec5511e`, `cb300e82`,
 and `61cf96cd` full captures while keeping the same three-size/three-repeat
 comparison role.
+
+The selected benchmark preset now also includes
+`pto_persistent_dag_graph_wide_fanout`, so the next full three-size paired
+gate is expected to validate `1314` combined samples. The compact paired
+A100/H200 gate under
+`tmp/cuda-backend/wide-fanout-selected-current-working/`
+`combined-current-a540a014/` validates the no-batch `N=1024` selected matrix
+with `104` samples. Its wide-fanout row records dispatch `1,1,2,1,1,2,1`,
+fan-in `0,1,1,1,2,2,2`, dependents `1,2,3,4,4,5,5,6,6`, queue capacity `7`,
+generated-dispatch PTX, report-visible graph topology, source-paper
+provenance, sanitized local/remote command examples, and zero scheduler
+errors. A100 reported `device_wall_ns=59392`; H200 reported
+`device_wall_ns=56960`.
 
 Selected current-head full-capture medians show that the compiler-backed
 host-schedule row remains within `0.84x-1.06x` of the handwritten
@@ -4878,9 +4895,21 @@ Needed:
   errors. The compact paired gate under
   `tmp/cuda-backend/parallel-chains-compact-current-working/`
   `combined-current-c3274430/` remains the 102-row quick path. The remaining
-  policy gap is broader graph families rather than launch resource
-  partitioning, root seeding, completion-ring ownership, graph-size
-  reporting, or artifact validation;
+  wide-fanout compact gate under
+  `tmp/cuda-backend/wide-fanout-selected-current-working/`
+  `combined-current-a540a014/` validates 104 rows after adding
+  `pto_persistent_dag_graph_wide_fanout` to the selected benchmark path. The
+  wide-fanout row records dispatch `1,1,2,1,1,2,1`, fan-in `0,1,1,1,2,2,2`,
+  dependents `1,2,3,4,4,5,5,6,6`, queue capacity `7`, and zero scheduler
+  errors; A100 reported `device_wall_ns=59392`, and H200 reported
+  `device_wall_ns=56960`. The paired smoke under
+  `tmp/cuda-backend/wide-fanout-smoke-a540a014/` separately validates two
+  repeat launches with scheduler completions split `[3,4]` on A100 and
+  `[4,3]` on H200. The remaining policy gap is broader graph families beyond
+  diamond, parallel-chain, and wide-fanout shapes plus a full three-size
+  wide-fanout current-head rerun, rather than launch resource partitioning,
+  root seeding, completion-ring ownership, graph-size reporting, or artifact
+  validation;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
   invalid-dependent-ID, dependent-range, fan-in-underflow,
   duplicate-dependent, self-dependent, initial-fan-in, and

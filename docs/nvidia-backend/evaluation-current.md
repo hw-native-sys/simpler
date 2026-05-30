@@ -15,6 +15,11 @@ The latest compact current-head gate is under
 `combined-current-c3274430/`, which validates the selected compact benchmark
 matrix after the nine-task parallel-chains graph descriptor joined the
 selected graph rows.
+The newest compact gate for the selected graph-shape matrix is under
+`tmp/cuda-backend/wide-fanout-selected-current-working/`
+`combined-current-a540a014/`, which validates the selected compact benchmark
+matrix after the seven-task wide-fanout graph descriptor joined the selected
+graph rows.
 The raw
 JSON, Markdown, and SVG reports are generated locally under
 `tmp/cuda-backend/` and intentionally remain uncommitted.
@@ -33,7 +38,15 @@ The capture uses `nvcc` for target-specific PTX on both machines:
 The latest full capture validated `1296` samples after the parallel-chains
 graph row joined the selected matrix and after benchmark DAG rows were changed
 to use a ready/completion queue capacity equal to their task count. The
-previous `c183d1ad` full capture remains useful as historical evidence, but it
+current full preset is now `1314` samples after adding the wide-fanout row,
+but that three-size full gate has not yet been rerun.
+The compact `a540a014` gate validates `104` samples after
+`pto_persistent_dag_graph_wide_fanout` joined the selected compact matrix.
+The compact `c3274430` gate remains useful historical evidence with `102`
+samples after `pto_persistent_dag_graph_parallel_chains` joined the selected
+compact matrix.
+The previous `c183d1ad` full capture remains useful as historical evidence,
+but it
 validated `1278` samples before that row was included.
 The previous `f99dc6b0` full capture remains useful as historical evidence,
 but it validated `1260` samples before the submit-groups row was included.
@@ -41,8 +54,6 @@ The earlier `5424bcca` full capture remains useful as historical evidence,
 but it validated `1242` samples before the role-map row was included.
 The compact `193ccc4d` gate validates `100` samples after the submit-groups
 graph row joined the selected matrix.
-The compact `c3274430` gate validates `102` samples after
-`pto_persistent_dag_graph_parallel_chains` joined the selected compact matrix.
 The older `9ec5511e` full capture remains useful as historical evidence, but
 it validated `1224` samples before the named-callable graph row was included.
 The older `cb300e82` full capture validated `1206` samples before the
@@ -1165,6 +1176,45 @@ and generated-dispatch PTX for `compute_80` and `compute_90`. The compact
 `tmp/cuda-backend/graph-parallel-chains-selected-working/` remain useful as
 a narrow dispatcher check; the paired scheduler-scaling captures above remain
 the better evidence for multi-scheduler behavior.
+
+## Wide-Fanout Selected Benchmark Row
+
+The selected benchmark path now includes
+`pto_persistent_dag_graph_wide_fanout`, a seven-task explicit graph where one
+root completion releases three ready children before two joins and a final
+join. The compact paired A100/H200 gate at artifact label `a540a014`
+validates the row at `N=1024` in the 104-row no-batch selected matrix.
+
+Artifacts:
+
+- `tmp/cuda-backend/wide-fanout-selected-current-working/a100-current-a540a014/cuda-benchmark.json`
+- `tmp/cuda-backend/wide-fanout-selected-current-working/h200-current-a540a014/cuda-benchmark.json`
+- `tmp/cuda-backend/wide-fanout-selected-current-working/combined-current-a540a014/cuda-benchmark.json`
+- `tmp/cuda-backend/wide-fanout-selected-current-working/combined-current-a540a014/cuda-benchmark.md`
+- `tmp/cuda-backend/wide-fanout-selected-current-working/combined-current-a540a014/cuda-benchmark.svg`
+- `tmp/cuda-backend/wide-fanout-selected-current-working/combined-current-a540a014/cuda-benchmark-ratios.svg`
+- `tmp/cuda-backend/wide-fanout-selected-current-working/combined-current-a540a014/cuda-benchmark-dag-deltas.svg`
+- `tmp/cuda-backend/wide-fanout-selected-current-working/combined-current-a540a014/cuda-benchmark-throughput.svg`
+- `tmp/cuda-backend/wide-fanout-smoke-a540a014/a100.json`
+- `tmp/cuda-backend/wide-fanout-smoke-a540a014/h200.json`
+- `tmp/cuda-backend/wide-fanout-smoke-a540a014/cuda-smoke-report.md`
+- `tmp/cuda-backend/wide-fanout-smoke-a540a014/cuda-smoke-report.svg`
+
+Selected row:
+
+| GPU | N | PTX arch | Device ns | Host ns | Queue | Tasks | Dispatch |
+| --- | - | -------- | --------- | ------- | ----- | ----- | -------- |
+| A100 | 1024 | `compute_80` | 59392 | 72767 | 7 | 7 | `1,1,2,1,1,2,1` |
+| H200 | 1024 | `compute_90` | 56960 | 65468 | 7 | 7 | `1,1,2,1,1,2,1` |
+
+The compact report validated source-paper provenance, sanitized local/remote
+command examples, Markdown/SVG report files, report-visible graph topology,
+tensor throughput rows, expected generated-dispatch sequences, graph
+fan-in/dependent arrays, and zero scheduler errors. The wide-fanout row
+reports fan-in `0,1,1,1,2,2,2` and dependents
+`1,2,3,4,4,5,5,6,6`. The paired smoke separately validated two repeat runs
+with launch device times `63488/48128 ns` on A100 and `48448/41152 ns` on
+H200; scheduler completions were split `[3,4]` on A100 and `[4,3]` on H200.
 
 ## Latest Scheduler Error Matrix
 
