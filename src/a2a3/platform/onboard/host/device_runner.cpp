@@ -310,21 +310,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return rc;
     }
 
-    // Initialize runtime args
-    rc = kernel_args_.init_runtime_args(runtime, mem_alloc_);
-    if (rc != 0) {
-        LOG_ERROR("init_runtime_args failed: %d", rc);
-        return rc;
-    }
-
-    // Publish log config to AICPU via KernelArgs (severity floor + INFO verbosity).
-    // HostLogger is the single source of truth for log config (seeded by
-    // libsimpler_log.so via simpler_log_init before host_runtime.so was even
-    // dlopen'd). Read it directly when populating KernelArgs.
-    kernel_args_.args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
-    kernel_args_.args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
-    // Device ordinal for the AICPU executor's per-device orchestration-SO name.
-    kernel_args_.args.device_id = static_cast<uint32_t>(device_id_);
+    rc = init_runtime_args_with_metadata(runtime);
+    if (rc != 0) return rc;
 
     rc = kernel_args_init_ffts_base_addr(kernel_args_);
     if (rc != 0) {
@@ -339,26 +326,13 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return rc;
     }
 
-    // Start collector mgmt + poll threads now, just before kernels launch.
-    // Starting earlier wastes CPU on empty queues and risks tripping
-    // ProfilerBase's poll-loop idle-timeout if device-side init is slow.
-    auto thread_factory = [this](std::function<void()> fn) {
-        return create_thread(std::move(fn));
-    };
-    if (enable_l2_swimlane_) {
-        l2_perf_collector_.start(thread_factory);
-    }
-    if (enable_dump_tensor_) {
-        dump_collector_.start(thread_factory);
-    }
-    if (enable_pmu_) {
-        pmu_collector_.start(thread_factory);
-    }
+    start_shared_collectors_for_run();
+    // a2a3-only dep_gen collector — share the same thread_factory shape as base.
     if (enable_dep_gen_) {
+        auto thread_factory = [this](std::function<void()> fn) {
+            return create_thread(std::move(fn));
+        };
         dep_gen_collector_.start(thread_factory);
-    }
-    if (enable_scope_stats_) {
-        scope_stats_collector_.start(thread_factory);
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
@@ -392,26 +366,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
-    // Diagnostic exports use the per-task `output_prefix_` directory the user
-    // set on CallConfig (CallConfig::validate() enforces non-empty upstream).
-    if (enable_l2_swimlane_) {
-        l2_perf_collector_.stop();
-        l2_perf_collector_.read_phase_header_metadata();
-        l2_perf_collector_.reconcile_counters();
-        l2_perf_collector_.export_swimlane_json();
-    }
+    teardown_shared_collectors_after_run();
 
-    if (enable_dump_tensor_) {
-        dump_collector_.stop();
-        dump_collector_.reconcile_counters();
-        dump_collector_.export_dump_files();
-    }
-
-    if (enable_pmu_) {
-        pmu_collector_.stop();
-        pmu_collector_.reconcile_counters();
-    }
-
+    // a2a3-only dep_gen teardown: stop + reconcile + replay emit.
     if (enable_dep_gen_) {
         dep_gen_collector_.stop();
         if (dep_gen_collector_.reconcile_counters()) {
@@ -422,12 +379,6 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
                 LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", rc);
             }
         }
-    }
-
-    if (enable_scope_stats_) {
-        scope_stats_collector_.stop();
-        scope_stats_collector_.reconcile_counters();
-        scope_stats_collector_.write_jsonl(output_prefix_);
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -458,14 +409,9 @@ int DeviceRunner::finalize() {
     finalize_collectors();
 
     // Shared cleanup body — streams, kernel_args, callable/orch maps,
-    // chip-callable buffer pool, the three arenas, device_wall, and
-    // mem_alloc_.finalize(). Device-wall free order is normalized to
-    // "before mem_alloc_.finalize" inside finalize_common(); the a2a3-
-    // specific cached arena sizes still need clearing here.
+    // chip-callable buffer pool, the three arenas, device_wall,
+    // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
-    cached_gm_heap_size_ = 0;
-    cached_gm_sm_size_ = 0;
-    cached_runtime_arena_size_ = 0;
 
     // Reset device AFTER all device memory is freed. Two paths:
     //

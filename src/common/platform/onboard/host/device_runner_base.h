@@ -491,6 +491,48 @@ protected:
     void read_device_wall_ns();
 
     /**
+     * H2D the Runtime struct via `kernel_args_.init_runtime_args` and
+     * publish log config + device ordinal into KernelArgs. AICPU reads
+     * these at launch — log_level / log_info_v are sourced from
+     * `HostLogger::get_instance()` (the single source of truth seeded
+     * by `simpler_log_init` before host_runtime.so loaded); device_id
+     * is the per-device suffix the AICPU executor uses for the
+     * per-device orchestration-SO name.
+     *
+     * @return 0 on success, the underlying init_runtime_args rc on failure.
+     */
+    int init_runtime_args_with_metadata(Runtime &runtime);
+
+    /**
+     * Start collector mgmt + poll threads for the four shared
+     * diagnostics collectors (`l2_perf_collector_`, `dump_collector_`,
+     * `pmu_collector_`, `scope_stats_collector_`) that are enabled.
+     * Each `start()` is gated on the corresponding `enable_*_` flag;
+     * disabled collectors are not started.
+     *
+     * Each spawned thread is bound to `device_id_` via `create_thread`.
+     *
+     * Subclasses with arch-specific collectors (a2a3's
+     * `dep_gen_collector_`) call this helper and then start their own.
+     */
+    void start_shared_collectors_for_run();
+
+    /**
+     * Tear down the four shared diagnostics collectors after the launched
+     * kernels have synced. Each block is gated on the corresponding
+     * `enable_*_` flag and does: stop() → reconcile_counters() →
+     * export step (`l2_perf` writes swimlane JSON via
+     * `read_phase_header_metadata` + `export_swimlane_json`; `dump`
+     * writes dump files; `pmu` has no export step beyond reconcile;
+     * `scope_stats` writes JSONL).
+     *
+     * Subclasses with arch-specific collectors (a2a3's
+     * `dep_gen_collector_` + its `dep_gen_replay_emit_deps_json` export)
+     * inline their own teardown after calling this helper.
+     */
+    void teardown_shared_collectors_after_run();
+
+    /**
      * Shared body of `finalize()`. Each arch subclass's `finalize()`
      * handles: (a) the early-return + thread attach prologue, (b) any
      * arch-specific collector teardown (e.g. a2a3's `dep_gen_collector_`),

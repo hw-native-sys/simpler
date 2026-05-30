@@ -730,6 +730,9 @@ int DeviceRunnerBase::finalize_common() {
     block_dim_ = 0;
     worker_count_ = 0;
     aicore_kernel_binary_.clear();
+    cached_gm_heap_size_ = 0;
+    cached_gm_sm_size_ = 0;
+    cached_runtime_arena_size_ = 0;
     return rc;
 }
 
@@ -908,5 +911,73 @@ void DeviceRunnerBase::read_device_wall_ns() {
             LOG_WARN("rtMemcpy(device_wall_ns) D2H failed: %d", wall_rc);
             device_wall_ns_ = 0;
         }
+    }
+}
+
+int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime) {
+    int rc = kernel_args_.init_runtime_args(runtime, mem_alloc_);
+    if (rc != 0) {
+        LOG_ERROR("init_runtime_args failed: %d", rc);
+        return rc;
+    }
+    // Publish log config to AICPU via KernelArgs (severity floor + INFO verbosity).
+    // HostLogger is the single source of truth for log config (seeded by
+    // libsimpler_log.so via simpler_log_init before host_runtime.so was even
+    // dlopen'd). Read it directly when populating KernelArgs.
+    kernel_args_.args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
+    kernel_args_.args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
+    // Device ordinal for the AICPU executor's per-device orchestration-SO name.
+    kernel_args_.args.device_id = static_cast<uint32_t>(device_id_);
+    return 0;
+}
+
+void DeviceRunnerBase::start_shared_collectors_for_run() {
+    // Start collector mgmt + poll threads now, just before kernels launch.
+    // Starting earlier wastes CPU on empty queues and risks tripping
+    // ProfilerBase's poll-loop idle-timeout if device-side init is slow.
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+    if (enable_l2_swimlane_) {
+        l2_perf_collector_.start(thread_factory);
+    }
+    if (enable_dump_tensor_) {
+        dump_collector_.start(thread_factory);
+    }
+    if (enable_pmu_) {
+        pmu_collector_.start(thread_factory);
+    }
+    if (enable_scope_stats_) {
+        scope_stats_collector_.start(thread_factory);
+    }
+}
+
+void DeviceRunnerBase::teardown_shared_collectors_after_run() {
+    // Tear down collectors. stop() joins mgmt then collector in the only safe
+    // order (mgmt's final-drain pass into L2 has poll as its consumer).
+    // Diagnostic exports use the per-task `output_prefix_` directory the user
+    // set on CallConfig (CallConfig::validate() enforces non-empty upstream).
+    if (enable_l2_swimlane_) {
+        l2_perf_collector_.stop();
+        l2_perf_collector_.read_phase_header_metadata();
+        l2_perf_collector_.reconcile_counters();
+        l2_perf_collector_.export_swimlane_json();
+    }
+
+    if (enable_dump_tensor_) {
+        dump_collector_.stop();
+        dump_collector_.reconcile_counters();
+        dump_collector_.export_dump_files();
+    }
+
+    if (enable_pmu_) {
+        pmu_collector_.stop();
+        pmu_collector_.reconcile_counters();
+    }
+
+    if (enable_scope_stats_) {
+        scope_stats_collector_.stop();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(output_prefix_);
     }
 }
