@@ -163,9 +163,9 @@ _CTRL_COPY_FROM = 3
 # pay the H2D upload cost. Sent from the parent right after startup.
 _CTRL_PREPARE = 4
 # Dynamic post-init register of a ChipCallable. Parent stages the bytes
-# in a per-register POSIX shm and writes (digest, shm_name) into the mailbox;
-# the child mmaps the shm, allocates its own local slot, and prepares that slot.
-# See docs/callable-identity-registration.md for the design.
+# in a per-register POSIX shm and writes (digest, shm_name, blob_size) into
+# the mailbox; the child mmaps the shm, allocates its own local slot, and
+# prepares that slot. See docs/callable-identity-registration.md for the design.
 _CTRL_REGISTER = 5
 # Symmetric unregister by callable digest. The child drops one local reference
 # and frees the target-local slot when the final digest reference is removed.
@@ -221,7 +221,7 @@ assert _DOMAIN_REPLY_HEADER.size == 24
 
 # Control args layout (reuses task mailbox fields when state == _CONTROL_*):
 #   offset  8 (_OFF_CALLABLE):  uint64  sub-command
-#   offset 16:                  uint64  arg0 (size for malloc; dev_ptr for free/copy)
+#   offset 16:                  uint64  arg0 (size for malloc/register; dev_ptr for free/copy)
 #   offset 24:                  uint64  arg1 (host_ptr for copy)
 #   offset 32:                  uint64  arg2 (nbytes for copy)
 #   offset 40:                  uint64  result (returned ptr from malloc)
@@ -411,8 +411,8 @@ def _validate_chip_payload_digest(
 
 def _read_py_callable_payload_from_shm(shm_name: str) -> bytes:
     shm = SharedMemory(name=shm_name)
+    shm_buf = shm.buf
     try:
-        shm_buf = shm.buf
         assert shm_buf is not None
         if shm.size < _PY_CALLABLE_HEADER.size:
             raise RuntimeError(f"python callable payload too small: {shm.size} bytes")
@@ -428,8 +428,23 @@ def _read_py_callable_payload_from_shm(shm_name: str) -> bytes:
         expected_size = _PY_CALLABLE_HEADER.size + int(payload_size)
         if expected_size > shm.size:
             raise RuntimeError(f"python callable payload size mismatch: header={payload_size}, shm={shm.size}")
-        return bytes(shm_buf[:expected_size])
+        payload = bytes(shm_buf[:expected_size])
+        return payload
     finally:
+        shm_buf.release()
+        shm.close()
+
+
+def _read_chip_callable_from_shm(shm_name: str, payload_size: int) -> ChipCallable:
+    shm = SharedMemory(name=shm_name)
+    shm_buf = shm.buf
+    try:
+        assert shm_buf is not None
+        if payload_size <= 0 or payload_size > shm.size:
+            raise RuntimeError(f"CTRL_REGISTER payload size mismatch: payload={payload_size}, shm={shm.size}")
+        return ChipCallable.from_bytes(bytes(shm_buf[:payload_size]))
+    finally:
+        shm_buf.release()
         shm.close()
 
 
@@ -637,8 +652,8 @@ def _handle_ctrl_alloc_domain(cw: "ChipWorker", buf: memoryview) -> None:
     reply_shm_name = _read_shm_name(buf, _OFF_ARGS + _CTRL_SHM_NAME_BYTES)
 
     req_shm = SharedMemory(name=request_shm_name)
+    req_buf = req_shm.buf
     try:
-        req_buf = req_shm.buf
         assert req_buf is not None
         (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
@@ -649,6 +664,7 @@ def _handle_ctrl_alloc_domain(cw: "ChipWorker", buf: memoryview) -> None:
         rank_ids_struct = struct.Struct(f"<{rank_count}I")
         rank_ids = list(rank_ids_struct.unpack_from(req_buf, rank_ids_offset))
     finally:
+        req_buf.release()
         req_shm.close()
 
     handle = _comm_base_handle(cw)  # base communicator handle (cached on the ChipWorker)
@@ -673,13 +689,14 @@ def _handle_ctrl_alloc_domain(cw: "ChipWorker", buf: memoryview) -> None:
         offset += int(nbytes)
 
     reply_shm = SharedMemory(name=reply_shm_name)
+    reply_buf = reply_shm.buf
     try:
-        reply_buf = reply_shm.buf
         assert reply_buf is not None
         _DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, int(device_ctx), int(local_window_base), int(buffer_count))
         if buffer_ptrs:
             struct.pack_into(f"<{len(buffer_ptrs)}Q", reply_buf, _DOMAIN_REPLY_HEADER.size, *buffer_ptrs)
     finally:
+        reply_buf.release()
         reply_shm.close()
 
 
@@ -692,8 +709,8 @@ def _handle_ctrl_comm_init(cw: "ChipWorker", buf: memoryview) -> None:
     """
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
+    req_buf = req_shm.buf
     try:
-        req_buf = req_shm.buf
         assert req_buf is not None
         (rank, nranks) = _COMM_INIT_HEADER.unpack_from(req_buf, 0)
         # rootinfo_path is the rest of the shm, NUL-terminated.
@@ -701,6 +718,7 @@ def _handle_ctrl_comm_init(cw: "ChipWorker", buf: memoryview) -> None:
         nul = raw.find(b"\x00")
         rootinfo_path = raw[: nul if nul >= 0 else len(raw)].decode("utf-8", "replace")
     finally:
+        req_buf.release()
         req_shm.close()
 
     handle = cw.comm_init(int(rank), int(nranks), rootinfo_path)
@@ -713,11 +731,12 @@ def _handle_ctrl_release_domain(cw: "ChipWorker", buf: memoryview) -> None:
     """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
+    req_buf = req_shm.buf
     try:
-        req_buf = req_shm.buf
         assert req_buf is not None
         (allocation_id, rank_count, domain_rank, _ws, _bc) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
     finally:
+        req_buf.release()
         req_shm.close()
 
     handle = _comm_base_handle(cw)
@@ -850,14 +869,19 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                     _ensure_prepared(cw, registry, prepared, int(cid), lazy=False, device_id=device_id)
                 elif sub_cmd == _CTRL_REGISTER:
                     digest = _read_control_digest(buf)
+                    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                     raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
                     nul = raw.find(b"\x00")
                     shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
                     shm = SharedMemory(name=shm_name)
+                    shm_buf = shm.buf
                     try:
-                        shm_buf = shm.buf
                         assert shm_buf is not None
-                        callable_obj = ChipCallable.from_bytes(bytes(shm_buf[: shm.size]))
+                        if payload_size <= 0 or payload_size > shm.size:
+                            raise RuntimeError(
+                                f"CTRL_REGISTER payload size mismatch: payload={payload_size}, shm={shm.size}"
+                            )
+                        callable_obj = ChipCallable.from_bytes(bytes(shm_buf[:payload_size]))
                         _validate_chip_payload_digest(
                             callable_obj,
                             digest,
@@ -886,6 +910,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                                 del exported
                             prepared.add(int(cid))
                     finally:
+                        shm_buf.release()
                         # Release the local mmap as soon as prepare returns;
                         # prepare_callable has already H2D-copied the bytes to
                         # device GM, so the child no longer needs the shm.
@@ -1035,16 +1060,11 @@ def _child_worker_loop(
             try:
                 if sub_cmd == _CTRL_REGISTER:
                     digest = _read_control_digest(buf)
+                    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                     raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
                     nul = raw.find(b"\x00")
                     shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
-                    shm = SharedMemory(name=shm_name)
-                    try:
-                        shm_buf = shm.buf
-                        assert shm_buf is not None
-                        callable_obj = ChipCallable.from_bytes(bytes(shm_buf[: shm.size]))
-                    finally:
-                        shm.close()
+                    callable_obj = _read_chip_callable_from_shm(shm_name, int(payload_size))
                     inner_registered = False
                     try:
                         inner_worker._register_child_chip(callable_obj, digest=digest)

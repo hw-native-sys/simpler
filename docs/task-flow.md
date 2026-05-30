@@ -57,7 +57,7 @@ The Python facade validates ownership/liveness and passes `CallableIdentity`
 to C++:
 
 | Context | Namespace | How it's consumed |
-| ------- | ------------------ | ----------------- |
+| ------- | --------- | ----------------- |
 | `w3.submit_next_level(handle, …)` dispatched to a chip child | `LOCAL_CHIP` | child resolves digest to its private chip slot, then calls `ChipWorker::run(local_slot, …)` |
 | `w4.submit_next_level(handle, …)` dispatched to an L3 `Worker` child | `LOCAL_PYTHON` | child resolves digest to an orchestration function and calls `inner_worker.run(orch_fn, …)` |
 | `w3.submit_sub(handle, …)` dispatched to a SUB child | `LOCAL_PYTHON` | child resolves digest to a Python callable and calls `fn(args)` |

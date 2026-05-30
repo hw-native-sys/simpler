@@ -1551,7 +1551,7 @@ class TestChipMainLoopDigestRegister:
         return shm, buf, state_addr
 
     @staticmethod
-    def _send_ctrl_register(buf, state_addr, shm_name: str, digest: bytes = b"\x07" * 32, arg0: int = 7):
+    def _send_ctrl_register(buf, state_addr, shm_name: str, digest: bytes = b"\x07" * 32, payload_size=None):
         """Stage a CTRL_REGISTER request and flip the state to CONTROL_REQUEST."""
         from simpler.worker import (  # noqa: PLC0415
             _CONTROL_REQUEST,
@@ -1564,8 +1564,15 @@ class TestChipMainLoopDigestRegister:
             _mailbox_store_i32,
         )
 
+        if payload_size is None:
+            payload_shm = SharedMemory(name=shm_name)
+            try:
+                payload_size = payload_shm.size
+            finally:
+                payload_shm.close()
+
         struct.pack_into("Q", buf, _OFF_CALLABLE, _CTRL_REGISTER)
-        struct.pack_into("Q", buf, _CTRL_OFF_ARG0, arg0)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG0, int(payload_size))
         assert len(digest) == 32
         buf[_OFF_CONTROL_CALLABLE_HASH : _OFF_CONTROL_CALLABLE_HASH + len(digest)] = digest
         encoded = shm_name.encode("utf-8")
@@ -1643,7 +1650,7 @@ class TestChipMainLoopDigestRegister:
         t.start()
         return t
 
-    def test_register_ignores_parent_arg0_and_allocates_local_slot(self):
+    def test_register_uses_payload_size_and_allocates_local_slot(self):
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         cw = MagicMock()
@@ -1658,12 +1665,54 @@ class TestChipMainLoopDigestRegister:
         try:
             t = self._spawn_loop(cw, buf, state_addr)
             try:
-                self._send_ctrl_register(buf, state_addr, shm_name=payload_shm.name, digest=digest, arg0=123)
+                self._send_ctrl_register(
+                    buf,
+                    state_addr,
+                    shm_name=payload_shm.name,
+                    digest=digest,
+                    payload_size=int(callable_obj.buffer_size()),
+                )
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 0
                 assert cw._unregister_slot.call_count == 0
                 cw._impl.prepare_callable_from_blob.assert_called_once()
                 assert cw._impl.prepare_callable_from_blob.call_args.args[0] == 0
+            finally:
+                self._shutdown(state_addr)
+                t.join(timeout=2.0)
+        finally:
+            shm.close()
+            shm.unlink()
+            payload_shm.close()
+            payload_shm.unlink()
+
+    def test_register_reads_only_declared_payload_size(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        cw = MagicMock()
+        cw._impl = MagicMock()
+        cw._unregister_slot = MagicMock()
+        cw._impl.prepare_callable_from_blob = MagicMock()
+
+        callable_obj = _unique_chip_callable(7)
+        payload = ctypes.string_at(int(callable_obj.buffer_ptr()), int(callable_obj.buffer_size()))
+        digest = _chip_digest(callable_obj)
+        payload_shm = SharedMemory(create=True, size=len(payload) + 4096)
+        payload_shm.buf[: len(payload)] = payload
+        payload_shm.buf[len(payload) :] = b"\xff" * 4096
+        shm, buf, state_addr = self._build_mailbox()
+        try:
+            t = self._spawn_loop(cw, buf, state_addr)
+            try:
+                self._send_ctrl_register(
+                    buf,
+                    state_addr,
+                    shm_name=payload_shm.name,
+                    digest=digest,
+                    payload_size=len(payload),
+                )
+                assert self._wait_for_done_and_reset(buf, state_addr) == 0
+                cw._impl.prepare_callable_from_blob.assert_called_once()
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)

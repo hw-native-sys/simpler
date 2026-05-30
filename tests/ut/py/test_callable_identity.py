@@ -10,7 +10,7 @@
 from typing import cast
 
 import pytest
-import simpler.callable_identity as callable_identity
+from simpler import callable_identity
 from simpler.callable_identity import (
     CallableHandle,
     CallableKindName,

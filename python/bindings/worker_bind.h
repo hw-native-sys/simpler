@@ -148,9 +148,7 @@ inline void bind_worker(nb::module_ &m) {
             "submit_next_level",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const TaskArgs &args, const CallConfig &config, int8_t worker) {
-                self.submit_next_level(
-                    make_callable_identity(digest, kind, target_namespace), args, config, worker
-                );
+                self.submit_next_level(make_callable_identity(digest, kind, target_namespace), args, config, worker);
             },
             nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args"), nb::arg("config"),
             nb::arg("worker") = int8_t(-1),

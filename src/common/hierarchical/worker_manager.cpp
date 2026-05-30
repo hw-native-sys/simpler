@@ -408,14 +408,14 @@ void WorkerThread::control_prepare(const uint8_t *digest) {
     run_control_command("control_prepare");
 }
 
-void WorkerThread::control_register(const char *shm_name, const uint8_t *digest) {
+void WorkerThread::control_register(const char *shm_name, size_t blob_size, const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     // OFF_ERROR / OFF_ERROR_MSG are cleared by run_control_command — no
     // prelude memset needed (matches the other control_* methods).
     uint64_t sub_cmd = CTRL_REGISTER;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
-    uint64_t reserved = 0;
-    std::memcpy(mbox() + CTRL_OFF_ARG0, &reserved, sizeof(uint64_t));
+    uint64_t payload_size = static_cast<uint64_t>(blob_size);
+    std::memcpy(mbox() + CTRL_OFF_ARG0, &payload_size, sizeof(uint64_t));
     write_control_digest(mbox(), digest);
     // Stage the NUL-terminated shm name in the args region. Pad with zeros so
     // stale bytes from a prior control op cannot leak into the child's decode.
@@ -686,9 +686,9 @@ WorkerManager::broadcast_register_all(const void *blob_ptr, size_t blob_size, co
     std::vector<std::thread> workers;
     workers.reserve(next_level_threads_.size());
     for (size_t i = 0; i < next_level_threads_.size(); ++i) {
-        workers.emplace_back([this, i, digest, name = shm.name(), &results]() {
+        workers.emplace_back([this, i, digest, blob_size, name = shm.name(), &results]() {
             try {
-                next_level_threads_[i]->control_register(name.c_str(), digest);
+                next_level_threads_[i]->control_register(name.c_str(), blob_size, digest);
             } catch (const std::exception &e) {
                 results[i].ok = false;
                 results[i].error_message = strip_control_prefix(e.what(), "control_register");

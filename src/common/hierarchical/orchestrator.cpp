@@ -136,8 +136,7 @@ ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataTyp
 // User-facing submit_* — thin wrappers around submit_impl
 // =============================================================================
 
-SubmitResult
-Orchestrator::submit_next_level(
+SubmitResult Orchestrator::submit_next_level(
     const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker
 ) {
     std::vector<int8_t> affinities;

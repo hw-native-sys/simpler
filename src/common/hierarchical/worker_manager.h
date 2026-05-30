@@ -110,8 +110,8 @@ static constexpr uint64_t CTRL_COPY_FROM = 3;
 // first run_prepared does not pay the H2D cost.
 static constexpr uint64_t CTRL_PREPARE = 4;
 // Dynamic post-init register/unregister of a callable identity. CTRL_REGISTER
-// carries (shm_name, digest) with bytes staged in POSIX shm by the parent;
-// CTRL_UNREGISTER carries digest only.
+// carries (shm_name, blob_size, digest) with bytes staged in POSIX shm by
+// the parent; CTRL_UNREGISTER carries digest only.
 static constexpr uint64_t CTRL_REGISTER = 5;
 static constexpr uint64_t CTRL_UNREGISTER = 6;
 // Dynamic per-orch CommDomain allocation/release.  Both carry a pair of
@@ -132,7 +132,7 @@ static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
-//   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy; reserved for register)
+//   offset 16: uint64 arg0 (size for malloc/register; ptr for free; dst for copy)
 //   offset 24: uint64 arg1 (src for copy)
 //   offset 32: uint64 arg2 (nbytes for copy)
 //   offset 40: uint64 result (returned ptr from malloc)
@@ -141,8 +141,9 @@ static constexpr ptrdiff_t CTRL_OFF_ARG1 = 24;
 static constexpr ptrdiff_t CTRL_OFF_ARG2 = 32;
 static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
 
-// CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS and
-// the callable digest immediately after it.
+// CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS,
+// the exact staged blob size at CTRL_OFF_ARG0, and the callable digest
+// immediately after the shm-name slot.
 // Fixed-width so the wire layout stays simple; well above the encoded length
 // of "simpler-cb-<pid>-<counter>" with pid < 32-bit max.
 
@@ -223,10 +224,11 @@ public:
 
     // Dynamic post-init register/unregister of a ChipCallable identity.
     // `shm_name` is the (NUL-terminated, ≤ CTRL_SHM_NAME_BYTES-1) POSIX shm
-    // name where the ChipCallable bytes are staged. Both methods hold
-    // mailbox_mu_, so a CTRL_REGISTER concurrent with dispatch_process waits
-    // for the in-flight TASK_DONE before claiming the mailbox.
-    void control_register(const char *shm_name, const uint8_t *digest);
+    // name where the ChipCallable bytes are staged; `blob_size` is the exact
+    // byte span to read from that shm. Both methods hold mailbox_mu_, so a
+    // CTRL_REGISTER concurrent with dispatch_process waits for the in-flight
+    // TASK_DONE before claiming the mailbox.
+    void control_register(const char *shm_name, size_t blob_size, const uint8_t *digest);
     void control_unregister(const uint8_t *digest);
     void control_generic(uint64_t sub_cmd, const char *shm_name, double timeout_s, const uint8_t *digest);
 

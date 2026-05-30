@@ -98,8 +98,7 @@ public:
     // Tags inside `args` drive dependency inference; OUTPUT tensors with
     // null data are auto-allocated from the HeapRing.
     // `worker`: logical worker id for affinity (-1 = unconstrained).
-    SubmitResult
-    submit_next_level(
+    SubmitResult submit_next_level(
         const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker = -1
     );
 
@@ -191,8 +190,7 @@ private:
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
     SubmitResult submit_impl(
         WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config,
-        std::vector<TaskArgs> args_list,
-        std::vector<int8_t> affinities = {}
+        std::vector<TaskArgs> args_list, std::vector<int8_t> affinities = {}
     );
 
     // Size, in aligned bytes, an OUTPUT tensor should occupy in the HeapRing.
