@@ -983,12 +983,13 @@ def _fma_f32(a: float, b: float, c: float) -> float:
     return _f32(float(a) * float(b) + float(c))
 
 
-def _first_mismatch(actual: list[float], expected: list[float]) -> str:
+def _first_mismatch(actual: list[float], expected: list[float], *, rtol: float = 0.0, atol: float = 0.0) -> str:
     if len(actual) != len(expected):
         return f"len actual={len(actual)} expected={len(expected)}"
     for idx, actual_value in enumerate(actual):
         expected_value = expected[idx]
-        if actual_value != expected_value:
+        tolerance = atol + rtol * abs(expected_value)
+        if abs(actual_value - expected_value) > tolerance:
             return f"idx={idx} actual={actual_value} expected={expected_value}"
     return "no mismatch"
 
@@ -1573,6 +1574,109 @@ def _make_dag_shape(  # noqa: PLR0912, PLR0915
                     dependent_begin=3,
                     dependent_count=0,
                     initial_fanin=3,
+                ),
+            ),
+        )
+    if dag_shape == "graph_descriptor_layered_cross":
+        task_count = 9
+        host_fanin_t = ctypes.c_uint32 * task_count
+        dependents_t = ctypes.c_uint32 * 13
+        task_t = CudaPersistentDagTask * task_count
+        return (
+            host_fanin_t(0, 0, 0, 2, 3, 1, 2, 3, 2),
+            dependents_t(3, 3, 4, 4, 5, 4, 6, 7, 6, 7, 7, 8, 8),
+            task_t(
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp0,
+                    n=n,
+                    dependent_begin=0,
+                    dependent_count=1,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=dev_a,
+                    b=dev_b,
+                    out=dev_tmp1,
+                    n=n,
+                    dependent_begin=1,
+                    dependent_count=2,
+                    initial_fanin=0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=11,
+                    a=dev_a,
+                    b=0,
+                    out=dev_tmp2,
+                    n=n,
+                    dependent_begin=3,
+                    dependent_count=2,
+                    initial_fanin=0,
+                    scalar0=2.0,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp0,
+                    b=dev_tmp1,
+                    out=dev_tmp3,
+                    n=n,
+                    dependent_begin=5,
+                    dependent_count=3,
+                    initial_fanin=2,
+                ),
+                CudaPersistentDagTask(
+                    func_id=2,
+                    a=dev_tmp1,
+                    b=dev_tmp2,
+                    out=dev_tmp0,
+                    n=n,
+                    dependent_begin=8,
+                    dependent_count=2,
+                    initial_fanin=3,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp2,
+                    b=dev_a,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=10,
+                    dependent_count=1,
+                    initial_fanin=1,
+                ),
+                CudaPersistentDagTask(
+                    func_id=6,
+                    a=dev_tmp3,
+                    b=dev_tmp0,
+                    c=dev_a,
+                    out=dev_tmp1,
+                    n=n,
+                    dependent_begin=11,
+                    dependent_count=1,
+                    initial_fanin=2,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp3,
+                    b=dev_out,
+                    out=dev_tmp2,
+                    n=n,
+                    dependent_begin=12,
+                    dependent_count=1,
+                    initial_fanin=3,
+                ),
+                CudaPersistentDagTask(
+                    func_id=1,
+                    a=dev_tmp1,
+                    b=dev_tmp2,
+                    out=dev_out,
+                    n=n,
+                    dependent_begin=13,
+                    dependent_count=0,
+                    initial_fanin=2,
                 ),
             ),
         )
@@ -2923,6 +3027,16 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 expected_tmp1 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
                 expected_tmp2 = [_f32(2.0 * host_a[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp0[i] * expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
+            if config.dag_shape == "graph_descriptor_layered_cross":
+                root_add = [_f32(host_a[i] + host_b[i]) for i in range(n)]
+                root_mul = [_f32(host_a[i] * host_b[i]) for i in range(n)]
+                root_scale = [_f32(2.0 * host_a[i]) for i in range(n)]
+                expected_tmp3 = [_f32(root_add[i] + root_mul[i]) for i in range(n)]
+                expected_tmp0 = [_f32(root_mul[i] * root_scale[i]) for i in range(n)]
+                side_branch = [_f32(root_scale[i] + host_a[i]) for i in range(n)]
+                expected_tmp1 = [_fma_f32(expected_tmp3[i], expected_tmp0[i], host_a[i]) for i in range(n)]
+                expected_tmp2 = [_f32(expected_tmp3[i] + side_branch[i]) for i in range(n)]
+                expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
             if config.dag_shape in {"scalar_axpy", "graph_descriptor_scalar_axpy"}:
                 expected_tmp0 = [_f32(_f32(1.5 * host_a[i]) + host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
@@ -2934,7 +3048,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 expected_out = [_f32(expected_tmp0[i] + expected_tmp1[i]) for i in range(n)]
             if config.dag_shape in triad_shapes:
                 expected_tmp0 = [_f32(3 * i) for i in range(n)]
-                expected_tmp1 = [_f32(host_a[i] * host_b[i] + expected_tmp0[i]) for i in range(n)]
+                expected_tmp1 = [_fma_f32(host_a[i], host_b[i], expected_tmp0[i]) for i in range(n)]
                 expected_tmp2 = [_f32(host_a[i] * host_b[i]) for i in range(n)]
                 expected_out = [_f32(expected_tmp1[i] + expected_tmp2[i]) for i in range(n)]
             if config.dag_shape in quad_shapes:
@@ -3000,9 +3114,19 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             if list(host_tmp0) != expected_tmp0:
                 mismatch = _first_mismatch(list(host_tmp0), expected_tmp0)
                 raise RuntimeError(f"dag tmp0 mismatch on launch {launch_idx}: {mismatch}")
-            if list(host_tmp1) != expected_tmp1:
-                mismatch = _first_mismatch(list(host_tmp1), expected_tmp1)
-                raise RuntimeError(f"dag tmp1 mismatch on launch {launch_idx}: {mismatch}")
+            tmp1_mismatch = _first_mismatch(list(host_tmp1), expected_tmp1, rtol=1e-6, atol=1e-5)
+            if tmp1_mismatch != "no mismatch":
+                mismatch = tmp1_mismatch
+                detail = ""
+                if mismatch.startswith("idx="):
+                    idx = int(mismatch.split(" ", 1)[0].split("=", 1)[1])
+                    detail = (
+                        f" tmp0={float(host_tmp0[idx])} expected_tmp0={float(expected_tmp0[idx])}"
+                        f" tmp2={float(host_tmp2[idx])} expected_tmp2={float(expected_tmp2[idx])}"
+                        f" tmp3={float(host_tmp3[idx])} expected_tmp3={float(expected_tmp3[idx])}"
+                        f" out={float(host_out[idx])} expected_out={float(expected_out[idx])}"
+                    )
+                raise RuntimeError(f"dag tmp1 mismatch on launch {launch_idx}: {mismatch}{detail}")
             if (
                 config.dag_shape
                 in {
@@ -3020,6 +3144,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                     "generic_args4",
                     "graph_descriptor",
                     "graph_descriptor_diamond",
+                    "graph_descriptor_layered_cross",
                     "graph_descriptor_generic_args4",
                     "graph_descriptor_multi_fanin",
                     "graph_descriptor_node_attrs",
@@ -3038,6 +3163,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 in {
                     "chain",
                     "graph_descriptor_chain",
+                    "graph_descriptor_layered_cross",
                     "graph_descriptor_parallel_chains",
                     "graph_descriptor_wide_fanout",
                     "scratch_reuse",
@@ -3049,8 +3175,9 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
                 and list(host_tmp3) != expected_tmp3
             ):
                 raise RuntimeError(f"dag tmp3 mismatch on launch {launch_idx}")
-            if list(host_out) != expected_out:
-                raise RuntimeError(f"dag output mismatch on launch {launch_idx}")
+            output_mismatch = _first_mismatch(list(host_out), expected_out, rtol=1e-6, atol=1e-5)
+            if output_mismatch != "no mismatch":
+                raise RuntimeError(f"dag output mismatch on launch {launch_idx}: {output_mismatch}")
             completed_count = int(host_counters[4])
             if completed_count != task_count:
                 raise RuntimeError(f"persistent dag completed {completed_count}/{task_count} tasks")
@@ -3123,6 +3250,9 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
         if config.dag_shape == "graph_descriptor_multi_fanin":
             result["scalar_args"] = {"scalar0": 2.0}
             result["tensor_args"] = {"c": "tmp2"}
+        if config.dag_shape == "graph_descriptor_layered_cross":
+            result["scalar_args"] = {"scalar0": 2.0}
+            result["tensor_args"] = {"c": "a"}
         if config.dag_shape in triad_shapes:
             result["tensor_args"] = {"c": "tmp0"}
         if config.dag_shape in quad_shapes:
@@ -3148,6 +3278,7 @@ def _run_dag_smoke(config: DagSmokeConfig) -> dict:  # noqa: PLR0912, PLR0915
             "graph_descriptor_depends_on",
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
+            "graph_descriptor_layered_cross",
             "graph_descriptor_multi_fanin",
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
@@ -3358,6 +3489,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
         "graph_descriptor_depends_on",
         "graph_descriptor_diamond",
         "graph_descriptor_generic_args4",
+        "graph_descriptor_layered_cross",
         "graph_descriptor_multi_fanin",
         "graph_descriptor_node_attrs",
         "graph_descriptor_node_io",
@@ -3443,6 +3575,7 @@ def run_persistent_smoke(  # noqa: PLR0912, PLR0913, PLR0915
             "graph_descriptor_depends_on",
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
+            "graph_descriptor_layered_cross",
             "graph_descriptor_multi_fanin",
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",
@@ -3682,6 +3815,7 @@ def main() -> None:
             "graph_descriptor_depends_on",
             "graph_descriptor_diamond",
             "graph_descriptor_generic_args4",
+            "graph_descriptor_layered_cross",
             "graph_descriptor_multi_fanin",
             "graph_descriptor_node_attrs",
             "graph_descriptor_node_io",

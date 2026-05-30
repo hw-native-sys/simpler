@@ -2,9 +2,9 @@
 
 This archive preserves the earlier CUDA backend evaluation narrative that
 preceded the focused landing page and current-capture summary. See
-[evaluation.md](evaluation.md) for the active index and
-[evaluation-current.md](evaluation-current.md) for the latest paired A100/H200
-capture.
+[evaluation.md](../../evaluation.md) for the active index and
+[evaluation-current.md](../../evaluation-current.md) for the latest paired
+A100/H200 capture.
 
 The archived content below summarizes earlier CUDA backend evaluation
 evidence. The measurements are early runtime microbenchmarks, not end-to-end
@@ -362,7 +362,7 @@ Remote H200:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+  'cd <remote-pto-cu> && git pull --ff-only && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,1048576 --repeats 3 --arch compute_90 \
@@ -393,7 +393,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-dir tmp/cuda-backend/a100-dag-323f4587
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+  'cd <remote-pto-cu> && git pull --ff-only && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,65536,1048576 --repeats 3 --arch compute_90 \
@@ -413,7 +413,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-dir tmp/cuda-backend/a100-reuse-bcf54a88
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+  'cd <remote-pto-cu> && git pull --ff-only && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,65536,1048576 --repeats 3 --arch compute_90 \
@@ -433,7 +433,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-dir tmp/cuda-backend/a100-tensor-8950e029
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+  'cd <remote-pto-cu> && git pull --ff-only && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,65536,1048576 --repeats 3 --arch compute_90 \
@@ -454,7 +454,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-dir tmp/cuda-backend/a100-gridext-3eeb399a
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+  'cd <remote-pto-cu> && git pull --ff-only && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 1024,65536,1048576 --repeats 3 \
@@ -484,7 +484,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-dir tmp/cuda-backend/a100-taskcount-7194bfc9
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+  'cd <remote-pto-cu> && git pull --ff-only && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 65536,1048576 --repeats 3 \
@@ -514,7 +514,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-dir tmp/cuda-backend/a100-rangewide-cc6869f7
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+  'cd <remote-pto-cu> && git pull --ff-only && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --device 0 --sizes 16384,262144,4194304 --repeats 3 \
@@ -542,7 +542,7 @@ PYTHONPATH=$PWD:$PWD/python \
     --output-dir tmp/cuda-backend/a100-stream-37bebf44
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git pull --ff-only && \
+  'cd <remote-pto-cu> && git pull --ff-only && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py \
      --stream-concurrency --device 0 --repeats 7 --arch compute_90 \

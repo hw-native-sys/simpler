@@ -1,0 +1,134 @@
+{
+  "snapshot": {
+    "commit": "743709f3",
+    "gpu_targets": [
+      "A100 compute_80",
+      "H200 compute_90"
+    ],
+    "tensor_tile": "16x16x16",
+    "full_capture": {
+      "samples": 1350,
+      "artifact_root": "tmp/cuda-backend/current-head-full-layered-cross-fixed/combined-current-743709f3/"
+    },
+    "compact_capture": {
+      "samples": 108,
+      "artifact_root": "tmp/cuda-backend/layered-cross-selected-current-fixed/combined-current-743709f3/"
+    },
+    "source_refs": [
+      "tmp/sources/arxiv-2605.03190-vdcores.txt",
+      "tmp/sources/arxiv-2512.22219v1-mirage-persistent-kernel.txt"
+    ]
+  },
+  "headline_results": [
+    {
+      "gpu": "A100",
+      "machine": "hina",
+      "n": 1024,
+      "method": "pto_host_schedule",
+      "host_wall_ns": 55538,
+      "device_wall_ns": 32768,
+      "status": "pass"
+    },
+    {
+      "gpu": "A100",
+      "machine": "hina",
+      "n": 1024,
+      "method": "pto_persistent_dag_graph_layered_cross",
+      "host_wall_ns": 87266,
+      "device_wall_ns": 74752,
+      "status": "pass"
+    },
+    {
+      "gpu": "A100",
+      "machine": "hina",
+      "n": 1024,
+      "method": "cublas_sgemm_graph",
+      "host_wall_ns": 22728,
+      "device_wall_ns": 10239,
+      "status": "pass"
+    },
+    {
+      "gpu": "H200",
+      "machine": "dasys-h200x8",
+      "n": 1024,
+      "method": "pto_host_schedule",
+      "host_wall_ns": 23330,
+      "device_wall_ns": 13632,
+      "status": "pass"
+    },
+    {
+      "gpu": "H200",
+      "machine": "dasys-h200x8",
+      "n": 1024,
+      "method": "pto_persistent_dag_graph_layered_cross",
+      "host_wall_ns": 78521,
+      "device_wall_ns": 69664,
+      "status": "pass"
+    },
+    {
+      "gpu": "H200",
+      "machine": "dasys-h200x8",
+      "n": 1024,
+      "method": "cublas_sgemm_graph",
+      "host_wall_ns": 20277,
+      "device_wall_ns": 9727,
+      "status": "pass"
+    }
+  ],
+  "selected_rows": [
+    {
+      "gpu": "A100",
+      "machine": "hina",
+      "method": "pto_host_schedule",
+      "n": 1024,
+      "task_count": 1,
+      "host_wall_ns": 55538,
+      "device_wall_ns": 32768
+    },
+    {
+      "gpu": "A100",
+      "machine": "hina",
+      "method": "pto_persistent_dag_graph_layered_cross",
+      "n": 1024,
+      "task_count": 9,
+      "host_wall_ns": 87266,
+      "device_wall_ns": 74752
+    },
+    {
+      "gpu": "A100",
+      "machine": "hina",
+      "method": "cublas_sgemm_graph",
+      "n": 1024,
+      "task_count": 1,
+      "host_wall_ns": 22728,
+      "device_wall_ns": 10239
+    },
+    {
+      "gpu": "H200",
+      "machine": "dasys-h200x8",
+      "method": "pto_host_schedule",
+      "n": 1024,
+      "task_count": 1,
+      "host_wall_ns": 23330,
+      "device_wall_ns": 13632
+    },
+    {
+      "gpu": "H200",
+      "machine": "dasys-h200x8",
+      "method": "pto_persistent_dag_graph_layered_cross",
+      "n": 1024,
+      "task_count": 9,
+      "host_wall_ns": 78521,
+      "device_wall_ns": 69664
+    },
+    {
+      "gpu": "H200",
+      "machine": "dasys-h200x8",
+      "method": "cublas_sgemm_graph",
+      "n": 1024,
+      "task_count": 1,
+      "host_wall_ns": 20277,
+      "device_wall_ns": 9727
+    }
+  ]
+}

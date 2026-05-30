@@ -1,0 +1,75 @@
+{
+  "benchmarks": [
+    {
+      "id": "host_schedule_vector_ops",
+      "title": "Host-Schedule Vector Operations",
+      "description": "Compiles a CUDA callable with nvcc, prepares it through the CUDA host runtime, launches it from the host, and validates copied-back vector data.",
+      "math": "For add, out[i] = a[i] + b[i]. The same ABI is also used for unary, scalar, ternary, and quad vector smoke rows.",
+      "code": "__global__ void pto_vector_add_f32(const float *a, const float *b, float *out, size_t n) {\n  size_t i = blockIdx.x * blockDim.x + threadIdx.x;\n  if (i < n) out[i] = a[i] + b[i];\n}",
+      "run": {
+        "command": "PYTHONPATH=$PWD:$PWD/python .venv/bin/python examples/cuda/host_schedule_vector_ops.py --op add --n 1024 --arch compute_80"
+      },
+      "evidence_refs": [
+        {
+          "path": ".agents/skills/cuda-backend-eval/scripts/cuda_smoke.py",
+          "symbols": [
+            "run_worker_smoke",
+            "prepare_cuda_host_schedule_callable"
+          ]
+        },
+        {
+          "path": "src/cuda/platform/onboard/host/pto_runtime_c_api.cpp",
+          "symbols": [
+            "prepare_callable",
+            "run_prepared"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "graph_layered_cross",
+      "title": "Persistent Layered-Cross Graph",
+      "description": "Runs a nine-task explicit graph descriptor through the CUDA persistent-device runtime to validate multi-root, multi-fan-in, and scratch-lifetime behavior.",
+      "math": "The graph combines add, multiply, scale, and fan-in tasks. The review invariant is descriptor correctness: fan-in 0,0,0,2,3,1,2,3,2 and dependents 3,3,4,4,5,4,6,7,6,7,7,8,8.",
+      "code": "dispatch_func_ids = [1, 2, 11, 1, 2, 1, 6, 1, 1]\nfanin = [0, 0, 0, 2, 3, 1, 2, 3, 2]\ndependents = [3, 3, 4, 4, 5, 4, 6, 7, 6, 7, 7, 8, 8]",
+      "run": {
+        "command": "PYTHONPATH=$PWD:$PWD/python .venv/bin/python examples/cuda/persistent_layered_cross.py --n 1024 --arch compute_80 --scheduler-blocks 3"
+      },
+      "evidence_refs": [
+        {
+          "path": ".agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py",
+          "symbols": [
+            "graph_descriptor_layered_cross",
+            "\"dispatch_func_ids\""
+          ]
+        },
+        {
+          "path": "tests/ut/py/test_cuda_backend.py",
+          "symbols": [
+            "graph_descriptor_layered_cross",
+            "[0, 0, 0, 2, 3, 1, 2, 3, 2]"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tensor_core_tile",
+      "title": "Tensor-Core Tile DAG",
+      "description": "Runs the tensor-core persistent DAG row with a 16x16x16 descriptor and compares it with CUDA Graph and cuBLAS baselines.",
+      "math": "A WMMA m16n16k8 TF32/F32 tile contributes C = A x B, followed by the same residual, gate, and fan-in elementwise task family used by the scalar tensor DAG.",
+      "code": "tensor_tile = {\"rows\": 16, \"cols\": 16, \"inner\": 16}\nbaselines = [\"pto_persistent_dag_tensor_core\", \"pto_persistent_dag_graph_tensor_core\", \"cublas_sgemm\", \"cublas_sgemm_graph\"]",
+      "run": {
+        "command": "PYTHONPATH=$PWD:$PWD/python .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py --device 0 --sizes 1024 --repeats 1 --arch compute_80 --include-persistent --tensor-rows 16 --tensor-cols 16 --tensor-inner 16"
+      },
+      "evidence_refs": [
+        {
+          "path": ".agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py",
+          "symbols": [
+            "pto_persistent_dag_graph_tensor_core",
+            "cublas_sgemm_graph"
+          ]
+        }
+      ]
+    }
+  ]
+}

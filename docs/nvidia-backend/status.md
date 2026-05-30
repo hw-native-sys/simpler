@@ -184,6 +184,8 @@ execution modes:
 - six-task scratch-reuse DAG descriptor;
 - four-task multi-fan-in graph descriptor with three independent producers,
   scalar scale metadata, a third-tensor final join, and two scheduler blocks;
+- nine-task layered-cross graph descriptor with three roots, cross-layer
+  joins, a side branch, scalar metadata, and a stable third-tensor input;
 - tensor-tile DAG descriptor with rows/cols/inner/stride metadata;
 - tensor-core tile DAG descriptor with a block-wide CUDA WMMA
   `m16n16k8`/TF32/F32 generated-dispatch task body;
@@ -347,12 +349,12 @@ The current evaluation setup covers local A100 and remote H200 runs with:
 - same-work batch rows;
 - worker-grid batch rows.
 
-The latest full paired capture at commit `5d84690d` uses the `16x16x16`
+The latest full paired capture at commit `743709f3` uses the `16x16x16`
 tensor descriptor, sizes `1024,65536,1048576`, three repeats, task counts
 `2,6,12`, and worker-grid values `32,64,128,256`. It writes artifacts under
-`tmp/cuda-backend/current-head-full-wide-fanout-5d84690d-working/`
-`combined-current-5d84690d/` and validates `1314` combined samples after the
-wide-fanout graph row joined the selected matrix. The paired-runner
+`tmp/cuda-backend/current-head-full-layered-cross-fixed/`
+`combined-current-743709f3/` and validates `1350` combined samples after the
+layered-cross graph row joined the selected matrix. The paired-runner
 validator checked
 source-paper provenance, sanitized command examples, generated Markdown/SVG
 reports, zero scheduler errors, selected tensor throughput reports, graph
@@ -360,16 +362,30 @@ topology reports, graph TaskArgs-like metadata reports, expected generated
 dispatch sequences, tensor tile descriptors, graph fan-in/dependent arrays,
 node attrs/ops metadata, named-callable metadata, task-argument spellings,
 scratch-reuse metadata, the nine-task parallel-chains queue capacity, and the
-seven-task wide-fanout queue capacity. This supersedes the older `4e81fbff`,
-`c183d1ad`, `f99dc6b0`, `9ec5511e`, `cb300e82`, and `61cf96cd` full captures
-while keeping the same three-size/three-repeat comparison role. After adding
-`pto_persistent_dag_graph_multi_fanin`, the full paired-current preset should
-validate `1332` samples; that full three-size gate has not replaced the
-`5d84690d` artifact yet.
+seven-task wide-fanout, four-task multi-fan-in, and nine-task layered-cross
+queue capacities. This supersedes the older `61d73b65`, `5d84690d`,
+`4e81fbff`, `c183d1ad`, `f99dc6b0`,
+`9ec5511e`, `cb300e82`, and `61cf96cd` full captures while keeping the same
+three-size/three-repeat comparison role.
 
 The selected benchmark preset now also includes
-`pto_persistent_dag_graph_multi_fanin`. The compact paired A100/H200 gate
+`pto_persistent_dag_graph_multi_fanin` and
+`pto_persistent_dag_graph_layered_cross`. The compact paired A100/H200 gate
 under
+`tmp/cuda-backend/layered-cross-selected-current-fixed/`
+`combined-current-743709f3/` validates the no-batch `N=1024` selected matrix
+with `108` samples. Its layered-cross row records dispatch
+`1,2,11,1,2,1,6,1,1`, fan-in `0,0,0,2,3,1,2,3,2`, dependents
+`3,3,4,4,5,4,6,7,6,7,7,8,8`, scalar metadata `scalar0=2.0`, tensor metadata
+`c=a`, generated-dispatch PTX, report-visible graph topology,
+source-paper provenance, sanitized local/remote command examples, and zero
+scheduler errors. The compact gate measured layered-cross device times of
+`74752 ns` on A100 and `69664 ns` on H200. The latest full paired gate under
+`tmp/cuda-backend/current-head-full-layered-cross-fixed/`
+`combined-current-743709f3/` validates `1350` rows and reports layered-cross
+median device times of `76800/366336/6703936 ns` on A100 and
+`65408/333920/4474816 ns` on H200 for `N=1024,65536,1048576`.
+The previous compact gate under
 `tmp/cuda-backend/multi-fanin-selected-current-working/`
 `combined-current-c1c5f765/` validates the no-batch `N=1024` selected matrix
 with `106` samples. Its wide-fanout row records dispatch `1,1,2,1,1,2,1`,
@@ -379,13 +395,14 @@ dependents `3,3,3`, scalar metadata `scalar0=2.0`, tensor metadata
 `c=tmp2`, generated-dispatch PTX, report-visible graph topology,
 source-paper provenance, sanitized local/remote command examples, and zero
 scheduler errors. The compact gate measured multi-fan-in device times of
-`51200 ns` on A100 and `46656 ns` on H200. The full `5d84690d` capture
-reports wide-fanout medians of
-`59392/275040/4225504 ns` on A100 and `55232/259168/3492544 ns` on H200 for
-`N=1024,65536,1048576`.
+`51200 ns` on A100 and `46656 ns` on H200. The full `61d73b65` capture
+reports multi-fan-in medians of
+`44032/178240/2373216 ns` on A100 and `36608/145504/1844736 ns` on H200 for
+`N=1024,65536,1048576`; its wide-fanout medians are
+`61440/288064/4105472 ns` on A100 and `55008/257248/3480128 ns` on H200.
 
 Selected current-head full-capture medians show that the compiler-backed
-host-schedule row remains within `0.72x-1.17x` of the handwritten
+host-schedule row remains within `0.85x-1.51x` of the handwritten
 host-schedule row across A100/H200 and vector sizes. The graph task-argument
 spelling rows also validate tag, role-keyed, compact, pair-shaped, and
 role-map spellings through the same in-place graph topology: dispatch
@@ -705,7 +722,11 @@ Evidence:
 - [evaluation.md](evaluation.md) is the evaluation landing page.
 - [evaluation-current.md](evaluation-current.md) summarizes the latest paired
   A100/H200 capture.
-- [evaluation-history.md](evaluation-history.md) preserves earlier captures.
+- [benchmark-viewer/index.html](benchmark-viewer/index.html) is the static
+  human-review viewer backed by committed JSON data.
+- [history/index.md](history/index.md) preserves earlier captures.
+- [changelog/index.md](changelog/index.md) records review-facing change
+  reports.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_benchmark.py` writes JSON,
   Markdown, and SVG reports.
 - `.agents/skills/cuda-backend-eval/scripts/cuda_smoke_report.py` writes
@@ -795,7 +816,7 @@ pushing this change:
 
 ```bash
 ssh bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py -q'
@@ -810,7 +831,7 @@ script:
 
 ```bash
 ssh bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_smoke.py \
@@ -827,7 +848,7 @@ was rerun on the remote H200 checkout:
 
 ```bash
 ssh bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py -q'
@@ -842,7 +863,7 @@ smoke script:
 
 ```bash
 ssh bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python \
@@ -972,7 +993,7 @@ checkout after pushing `6f1497b5`:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && git pull --ff-only >/dev/null && \
+  'cd <remote-pto-cu> && git pull --ff-only >/dev/null && \
    PYTHONPATH=$PWD:$PWD/python \
    python3 .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
      --device 0 --task-count 3 --n 1024 --arch compute_90 \
@@ -1137,7 +1158,7 @@ after pushing this change:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    git fetch origin design/nvidia-backend >/dev/null && \
    git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
@@ -1208,7 +1229,7 @@ after syncing the working tree:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_backend.py \
@@ -1274,8 +1295,8 @@ ctypes-backed real-data scene test was checked on remote H200 without requiring
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
-   CUDA_HOME=/usr/local/cuda PTO_ISA_ROOT=/data/shibizhao/pto-cu/build/pto-isa \
+  'cd <remote-pto-cu> && \
+   CUDA_HOME=/usr/local/cuda PTO_ISA_ROOT=<remote-pto-cu>/build/pto-isa \
    PATH=/usr/local/cuda/bin:$PATH PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest \
      tests/ut/py/test_cuda_scene_test.py::test_scene_test_runs_cuda_persistent_device_triad_with_ctypes_data -q'
@@ -1314,7 +1335,7 @@ the remote Python environment still lacks `torch`:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    git fetch origin design/nvidia-backend >/dev/null && \
    git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
@@ -1328,7 +1349,7 @@ The no-torch tensor-tile persistent DAG smoke was also run on H200:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_persistent_smoke.py \
@@ -1432,7 +1453,7 @@ checkout after pushing this change:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    git fetch origin design/nvidia-backend >/dev/null && \
    git checkout -B design/nvidia-backend FETCH_HEAD >/dev/null && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
@@ -1736,7 +1757,7 @@ syncing the current local tree:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -2443,7 +2464,7 @@ working tree on H200:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && CUDA_HOME=/usr/local/cuda \
+  'cd <remote-pto-cu> && CUDA_HOME=/usr/local/cuda \
    PATH=/usr/local/cuda/bin:$PATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
    PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
    tests/ut/py/test_cuda_scene_test.py -q -k args_alias --platform cuda'
@@ -2493,7 +2514,7 @@ working tree on H200:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && CUDA_HOME=/usr/local/cuda \
+  'cd <remote-pto-cu> && CUDA_HOME=/usr/local/cuda \
    PATH=/usr/local/cuda/bin:$PATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
    PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
    tests/ut/py/test_cuda_scene_test.py -q \
@@ -2525,7 +2546,7 @@ working tree on H200:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && CUDA_HOME=/usr/local/cuda \
+  'cd <remote-pto-cu> && CUDA_HOME=/usr/local/cuda \
    PATH=/usr/local/cuda/bin:$PATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
    PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
    tests/ut/py/test_cuda_scene_test.py -q \
@@ -2587,7 +2608,7 @@ PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
   tests/ut/py/test_cuda_scene_test.py -q -k tagged_graph --platform cuda
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -2654,7 +2675,7 @@ PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
   --platform cuda
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -2724,7 +2745,7 @@ PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
       mixed_cuda_persistent_compact_role_task_arg' --platform cuda
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -2940,7 +2961,7 @@ PYTHONPATH=$PWD:$PWD/python .venv/bin/python -m pytest \
   --platform cuda
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -3053,7 +3074,7 @@ syncing the working tree:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -3088,7 +3109,7 @@ H200:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -3199,7 +3220,7 @@ working tree:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda-12.8 \
    PATH=/usr/local/cuda-12.8/bin:/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
@@ -3296,7 +3317,7 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k scalar_scale --platform cuda
 
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -3376,7 +3397,7 @@ the working tree:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -3391,7 +3412,7 @@ map, so `tmp0` and `tmp1` were allocated from task outputs:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -3499,7 +3520,7 @@ the working tree:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -3551,7 +3572,7 @@ syncing the working tree:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 bizhaoh200 \
-  'cd /data/shibizhao/pto-cu && \
+  'cd <remote-pto-cu> && \
    CUDA_HOME=/usr/local/cuda PATH=/usr/local/cuda/bin:$PATH \
    PYTHONPATH=$PWD:$PWD/python \
    .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
@@ -4895,14 +4916,17 @@ Needed:
   the four-scheduler per-task rows are `19660 ns` vs. `12856 ns` on A100 and
   `14150 ns` vs. `10030 ns` on H200 for diamond vs. parallel chains. The
   parallel-chains descriptor is now also wired into the selected benchmark
-  path as `pto_persistent_dag_graph_parallel_chains`. The full paired
+  path as `pto_persistent_dag_graph_parallel_chains`. The latest full paired
   current-head gate under
-  `tmp/cuda-backend/current-head-full-wide-fanout-5d84690d-working/`
-  `combined-current-5d84690d/` validates 1314 A100/H200 rows, including
-  the parallel-chain dispatch `1,2,1,2,1,1,2,1,1`, queue capacity `9`,
-  fan-in/dependent metadata, generated-dispatch PTX, Markdown/SVG reports,
-  tensor-throughput reports, source-paper provenance, sanitized command
-  examples, and zero scheduler errors. The compact paired gate under
+  `tmp/cuda-backend/current-head-full-layered-cross-fixed/`
+  `combined-current-743709f3/` validates 1350 A100/H200 rows, including
+  parallel-chain dispatch `1,2,1,2,1,1,2,1,1`, wide-fanout dispatch
+  `1,1,2,1,1,2,1`, multi-fan-in dispatch `1,2,11,6`, layered-cross
+  dispatch `1,2,11,1,2,1,6,1,1`,
+  queue-capacity/fan-in/dependent metadata, generated-dispatch PTX,
+  Markdown/SVG reports, tensor-throughput reports, source-paper provenance,
+  sanitized command examples, and zero scheduler errors. The compact paired
+  gate under
   `tmp/cuda-backend/parallel-chains-compact-current-working/`
   `combined-current-c3274430/` remains the 102-row quick path. The remaining
   wide-fanout compact gate under
@@ -4911,8 +4935,8 @@ Needed:
   `pto_persistent_dag_graph_wide_fanout` to the selected benchmark path. The
   wide-fanout row records dispatch `1,1,2,1,1,2,1`, fan-in `0,1,1,1,2,2,2`,
   dependents `1,2,3,4,4,5,5,6,6`, queue capacity `7`, and zero scheduler
-  errors; the full gate reports wide-fanout medians
-  `59392/275040/4225504 ns` on A100 and `55232/259168/3492544 ns` on H200.
+  errors; the latest full gate reports wide-fanout medians
+  `61440/288064/4105472 ns` on A100 and `55008/257248/3480128 ns` on H200.
   The paired smoke under
   `tmp/cuda-backend/wide-fanout-smoke-a540a014/` separately validates two
   repeat launches with scheduler completions split `[3,4]` on A100 and
@@ -4924,9 +4948,23 @@ Needed:
   `tmp/cuda-backend/multi-fanin-working/`
   `persistent-graph_descriptor_multi_fanin-sched2-repeat2-smoke-c1c5f765/`
   separately validates two repeat launches with scheduler completions split
-  `[3,1]` on A100 and `[1,3]` on H200. The remaining policy gap is broader
-  graph families beyond diamond, parallel-chain, wide-fanout, and
-  multi-fan-in shapes, rather than launch
+  `[3,1]` on A100 and `[1,3]` on H200. The latest full gate reports
+  multi-fan-in medians `44032/178240/2373216 ns` on A100 and
+  `36608/145504/1844736 ns` on H200. The layered-cross compact gate under
+  `tmp/cuda-backend/layered-cross-selected-current-fixed/`
+  `combined-current-743709f3/` validates 108 rows and records dispatch
+  `1,2,11,1,2,1,6,1,1`, fan-in `0,0,0,2,3,1,2,3,2`, dependents
+  `3,3,4,4,5,4,6,7,6,7,7,8,8`, scalar metadata `scalar0=2.0`, tensor metadata
+  `c=a`, and zero scheduler errors. Its paired smoke under
+  `tmp/cuda-backend/layered-cross-working/`
+  `persistent-graph_descriptor_layered_cross-sched3-repeat2-smoke-743709f3/`
+  separately validates two repeat launches with scheduler completions split
+  `[2,3,4]` on A100 and `[2,4,3]` on H200. The full layered-cross gate under
+  `tmp/cuda-backend/current-head-full-layered-cross-fixed/`
+  `combined-current-743709f3/` validates 1350 rows across the full selected
+  A100/H200 matrix. The remaining policy gap is
+  broader graph families beyond diamond, parallel-chain, wide-fanout,
+  multi-fan-in, and layered-cross shapes, rather than launch
   resource partitioning, root seeding, completion-ring ownership,
   graph-size reporting, or artifact
   validation;

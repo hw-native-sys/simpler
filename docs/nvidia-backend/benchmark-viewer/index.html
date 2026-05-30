@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CUDA Backend Benchmark Viewer</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">PTO CUDA backend</p>
+        <h1>Benchmark Status</h1>
+      </div>
+      <nav aria-label="Benchmark views">
+        <button type="button" class="tab active" data-view="summary">Summary</button>
+        <button type="button" class="tab" data-view="benchmarks">Benchmarks</button>
+        <button type="button" class="tab" data-view="methods">Methods</button>
+        <button type="button" class="tab" data-view="results">Results</button>
+      </nav>
+    </header>
+
+    <main>
+      <section id="load-error" class="notice hidden"></section>
+
+      <section id="summary" class="view active" aria-labelledby="summary-title">
+        <h2 id="summary-title">Current Snapshot</h2>
+        <div id="snapshot" class="snapshot-grid"></div>
+        <div id="headline-results"></div>
+      </section>
+
+      <section id="benchmarks" class="view" aria-labelledby="benchmarks-title">
+        <h2 id="benchmarks-title">Benchmark Setups</h2>
+        <div id="benchmark-list" class="stack"></div>
+      </section>
+
+      <section id="methods" class="view" aria-labelledby="methods-title">
+        <h2 id="methods-title">Methods And Runtimes</h2>
+        <div id="method-list" class="stack"></div>
+      </section>
+
+      <section id="results" class="view" aria-labelledby="results-title">
+        <h2 id="results-title">Selected Results</h2>
+        <div id="result-table"></div>
+      </section>
+    </main>
+
+    <script src="viewer.js"></script>
+  </body>
+</html>

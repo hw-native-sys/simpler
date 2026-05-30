@@ -962,13 +962,14 @@ The same graph shape is a selected benchmark baseline as
 `N=1024`, including dispatch `1,1,2,1,1,2,1`, fan-in `0,1,1,1,2,2,2`,
 dependents `1,2,3,4,4,5,5,6,6`, source-paper provenance, report files,
 command examples, and zero device scheduler errors.
-The full paired gate under
-`tmp/cuda-backend/current-head-full-wide-fanout-5d84690d-working/`
-`combined-current-5d84690d/` validates 1314 A100/H200 rows across
+The latest full paired gate under
+`tmp/cuda-backend/current-head-full-layered-cross-fixed/`
+`combined-current-743709f3/` validates 1350 A100/H200 rows across
 `N=1024,65536,1048576`, repeats `3`, batch tasks `2,6,12`, and worker grid
-values `32,64,128,256`. The wide-fanout median device times are
-`59392/275040/4225504 ns` on A100 and `55232/259168/3492544 ns` on H200 for
-the three sizes.
+values `32,64,128,256`. The layered-cross median device times are
+`76800/366336/6703936 ns` on A100 and `65408/333920/4474816 ns` on H200 for
+the three sizes. The previous `61d73b65` full gate remains the first full
+multi-fan-in capture with 1332 validated rows.
 Use `--dag-shape graph_descriptor_multi_fanin --scheduler-blocks 2
 --worker-blocks 3 --queue-capacity 3 --repeat-runs 2` to validate a
 four-task explicit graph with three independent producers and one final
@@ -980,6 +981,24 @@ The paired A100/H200 smoke under
 validated repeat completions `[4,4]`, two active scheduler blocks, and zero
 device scheduler errors. A100 reported `90112 ns`; H200 reported
 `60544 ns` for the two-launch capture.
+The full paired gate under
+`tmp/cuda-backend/current-head-full-multi-fanin-working/`
+`combined-current-61d73b65/` reports multi-fan-in medians
+`44032/178240/2373216 ns` on A100 and `36608/145504/1844736 ns` on H200 for
+`N=1024,65536,1048576`.
+Use `--dag-shape graph_descriptor_layered_cross --scheduler-blocks 3
+--worker-blocks 4 --queue-capacity 4 --repeat-runs 2` to validate a nine-task
+explicit graph with three roots, cross-layer joins, a side branch, a triad
+penultimate task, and a final join. The graph carries explicit lifetime edges
+for `tmp0` and `tmp2` scratch reuse. This records fan-in
+`[0,0,0,2,3,1,2,3,2]`, dependents `[3,3,4,4,5,4,6,7,6,7,7,8,8]`, dispatch
+`1,2,11,1,2,1,6,1,1`, scalar metadata `scalar0=2.0`, and tensor metadata
+`c=a`. The paired A100/H200 smoke under
+`tmp/cuda-backend/layered-cross-working/`
+`persistent-graph_descriptor_layered_cross-sched3-repeat2-smoke-743709f3/`
+validated repeat completions `[9,9]`, three active scheduler blocks, and zero
+device scheduler errors. A100 reported `106496 ns`; H200 reported
+`89216 ns` for the two-launch capture.
 For `--dag-shape tensor_tile`, pass `--tensor-rows`, `--tensor-cols`, and
 `--tensor-inner`; the artifact directory includes the descriptor shape, such
 as `persistent-tensor_tile-8x4x12-smoke-<commit>/`.
@@ -2243,14 +2262,12 @@ Use `--dry-run` to print the commands without launching benchmarks. The paired
 benchmark default tensor descriptor is `16x16x16` so the scalar tensor DAG,
 explicit graph tensor DAG, WMMA tensor-core DAG, and cuBLAS rows can run
 together. The current committed summary keeps the full current-head
-`5d84690d` capture plus compact current-head gates in
+`743709f3` capture plus compact current-head gates in
 `docs/nvidia-backend/evaluation-current.md`.
 The latest checked full current-head artifact under
-`tmp/cuda-backend/current-head-full-wide-fanout-5d84690d-working/`
-`combined-current-5d84690d/` validated `1314` A100/H200 samples after the
-wide-fanout graph row joined the selected matrix.
-After adding `pto_persistent_dag_graph_multi_fanin`, full captures should
-validate `1332` samples with sizes
+`tmp/cuda-backend/current-head-full-layered-cross-fixed/`
+`combined-current-743709f3/` validates `1350` A100/H200 samples after the
+layered-cross graph row joined the selected matrix. It uses sizes
 `1024,65536,1048576`, three repeats, tensor descriptor `16x16x16`, task
 counts `2,6,12`, worker-grid values `32,64,128,256`, source-paper
 provenance, sanitized command examples, graph topology and TaskArgs metadata
@@ -2266,6 +2283,11 @@ wide-fanout row must report dispatch `1,1,2,1,1,2,1`, queue capacity `7`,
 fan-in `0,1,1,1,2,2,2`, and dependents `1,2,3,4,4,5,5,6,6`.
 The multi-fan-in row must report dispatch `1,2,11,6`, queue capacity `3`,
 fan-in `0,0,0,3`, and dependents `3,3,3`.
+After the layered-cross graph row is included, the full paired-current
+validator expects `1350` rows. The layered-cross row must report dispatch
+`1,2,11,1,2,1,6,1,1`, queue capacity `9`, fan-in
+`0,0,0,2,3,1,2,3,2`, dependents `3,3,4,4,5,4,6,7,6,7,7,8,8`,
+`scalar0=2.0`, and `c=a`.
 
 Run the full paired-current gate with:
 
@@ -2273,11 +2295,11 @@ Run the full paired-current gate with:
 PYTHONPATH=$PWD:$PWD/python \
   python3 .agents/skills/cuda-backend-eval/scripts/cuda_pair_benchmark.py \
     --sync-remote-tree \
-    --output-root tmp/cuda-backend/current-head-full-wide-fanout-working
+    --output-root tmp/cuda-backend/current-head-full-layered-cross-fixed
 ```
 
 Use this compact paired gate after changing selected persistent graph
-benchmark rows. With `--batch-tasks 0`, it validates 106 non-batch samples
+benchmark rows. With `--batch-tasks 0`, it validates 108 non-batch samples
 across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
 `pto_persistent_dag_graph_node_io`, `pto_persistent_dag_graph_node_link`,
 `pto_persistent_dag_graph_named_callable`, `pto_persistent_dag_graph_node_op`,
@@ -2290,12 +2312,14 @@ across A100 and H200, including `pto_persistent_dag_graph_node_attrs`,
 `pto_persistent_dag_graph_parallel_chains`,
 `pto_persistent_dag_graph_wide_fanout`,
 `pto_persistent_dag_graph_multi_fanin`,
+`pto_persistent_dag_graph_layered_cross`,
 `pto_persistent_dag_graph_compact_role_inout`,
 `pto_persistent_dag_graph_role_map_inout` and
 `pto_persistent_dag_graph_submit_groups` with dispatch `9,2,1`, `1,2,1`,
 `1,2,1`, `1,2,1`, `1,2,1`, `4,2,1`, `11,2,1`, `5,2,1`, `1,9,2`,
 `6,2,1`, `8,2,1`, `1,2,1,2,1,1,2,1,1`, `1,1,2,1,1,2,1`,
-`1,2,11,6`, `1,1,1`, `1,1,1`, and `1,1,1`.
+`1,2,11,6`, `1,2,11,1,2,1,6,1,1`, `1,1,1`, `1,1,1`, and
+`1,1,1`.
 The node-attrs row requires
 `graph_node_attrs=task0=attrs:tensor_args,scalar_args`,
 `scalar_args[0]=1.5,scalar_args[1]=0.25`, and
@@ -2324,15 +2348,29 @@ PYTHONPATH=$PWD:$PWD/python \
 ```
 
 The current compact capture under
+`tmp/cuda-backend/layered-cross-selected-current-fixed/`
+`combined-current-743709f3/` is the latest checked compact form of this gate.
+It validates 108 A100/H200 samples and requires report-visible graph
+topology, node-IO task args, node-link/named-callable graph-node ops,
+scalar/tensor node-attrs descriptor args, selected tensor-throughput rows,
+parallel-chain, wide-fanout, multi-fan-in, and layered-cross graph
+fan-in/dependent metadata, sanitized command examples, source-paper metadata,
+and zero scheduler errors. The layered-cross row reports `74752 ns` on A100
+and `69664 ns` on H200 for `N=1024`; its paired smoke is under
+`tmp/cuda-backend/layered-cross-working/`
+`persistent-graph_descriptor_layered_cross-sched3-repeat2-smoke-743709f3/`.
+The previous compact capture under
 `tmp/cuda-backend/multi-fanin-selected-current-working/`
-`combined-current-c1c5f765/` is the latest checked compact form of this gate.
+`combined-current-c1c5f765/` is the previous checked compact form of this gate.
 It validates 106 A100/H200 samples and requires report-visible graph
 topology, node-IO task args, node-link/named-callable graph-node ops,
 scalar/tensor node-attrs descriptor args, selected tensor-throughput rows,
 parallel-chain, wide-fanout, and multi-fan-in graph fan-in/dependent
 metadata, sanitized command examples, source-paper metadata, and zero
 scheduler errors. The multi-fan-in row reports `51200 ns` on A100 and
-`46656 ns` on H200 for `N=1024`.
+`46656 ns` on H200 for `N=1024`. The full `61d73b65` gate reports
+`44032/178240/2373216 ns` on A100 and `36608/145504/1844736 ns` on H200 for
+`N=1024,65536,1048576`.
 The generated
 `cuda_current_summary.py --section graph-metadata` output includes a
 `Task args` column for copying graph node IO metadata into evaluation docs.

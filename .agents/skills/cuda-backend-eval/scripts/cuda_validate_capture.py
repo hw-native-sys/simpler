@@ -64,6 +64,7 @@ PAIRED_CURRENT_BASELINES = (
     "pto_persistent_dag_graph_parallel_chains",
     "pto_persistent_dag_graph_wide_fanout",
     "pto_persistent_dag_graph_multi_fanin",
+    "pto_persistent_dag_graph_layered_cross",
     "pto_persistent_dag_graph_tagged",
     "pto_persistent_dag_graph_tagged_inout",
     "pto_persistent_dag_graph_role_keyed_inout",
@@ -97,8 +98,8 @@ COMPACT_CURRENT_BASELINES = tuple(
 PAIRED_CURRENT_SIZES = (1024, 65536, 1048576)
 COMPACT_CURRENT_SIZES = (1024,)
 COMPACT_CURRENT_EXPECTED_REPEATS = 1
-COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 106
-PAIRED_CURRENT_EXPECTED_RESULT_COUNT = 1332
+COMPACT_CURRENT_EXPECTED_RESULT_COUNT = 108
+PAIRED_CURRENT_EXPECTED_RESULT_COUNT = 1350
 REQUIRED_SOURCE_PAPER_IDS = ("arXiv:2605.03190", "arXiv:2512.22219v1")
 REPORT_FILES = (
     "cuda-benchmark.md",
@@ -135,6 +136,7 @@ PAIRED_CURRENT_DISPATCH = {
     "pto_persistent_dag_graph_parallel_chains": "1,2,1,2,1,1,2,1,1",
     "pto_persistent_dag_graph_wide_fanout": "1,1,2,1,1,2,1",
     "pto_persistent_dag_graph_multi_fanin": "1,2,11,6",
+    "pto_persistent_dag_graph_layered_cross": "1,2,11,1,2,1,6,1,1",
     "pto_persistent_dag_graph_tagged": "9,2,1",
     "pto_persistent_dag_graph_tagged_inout": "1,1,1",
     "pto_persistent_dag_graph_role_keyed_inout": "1,1,1",
@@ -214,9 +216,11 @@ PAIRED_CURRENT_GRAPH_NODE_OPS = {
     "pto_persistent_dag_graph_node_op": "task0=op:add=1;task1=op:mul=2;task2=op:add=1",
 }
 PAIRED_CURRENT_SCALAR_ARGS = {
+    "pto_persistent_dag_graph_layered_cross": "scalar0=2.0",
     "pto_persistent_dag_graph_node_attrs": "scalar_args[0]=1.5,scalar_args[1]=0.25",
 }
 PAIRED_CURRENT_TENSOR_ARGS = {
+    "pto_persistent_dag_graph_layered_cross": "c=a",
     "pto_persistent_dag_graph_node_attrs": "tensor_args[0]=tmp0,tensor_args[1]=tmp3",
 }
 PAIRED_CURRENT_GRAPH_ROLE_SPELLING_BASELINES = (
@@ -245,6 +249,7 @@ PAIRED_CURRENT_GRAPH_FANIN = {
     "pto_persistent_dag_graph_parallel_chains": "0,0,0,0,2,2,2,2,2",
     "pto_persistent_dag_graph_wide_fanout": "0,1,1,1,2,2,2",
     "pto_persistent_dag_graph_multi_fanin": "0,0,0,3",
+    "pto_persistent_dag_graph_layered_cross": "0,0,0,2,3,1,2,3,2",
     "pto_persistent_dag_graph_tagged": "0,0,2",
     "pto_persistent_dag_graph_tagged_inout": "0,1,1",
     "pto_persistent_dag_graph_role_keyed_inout": "0,1,1",
@@ -277,6 +282,7 @@ PAIRED_CURRENT_GRAPH_DEPENDENTS = {
     "pto_persistent_dag_graph_parallel_chains": "4,4,5,5,6,7,6,7,8,8",
     "pto_persistent_dag_graph_wide_fanout": "1,2,3,4,4,5,5,6,6",
     "pto_persistent_dag_graph_multi_fanin": "3,3,3",
+    "pto_persistent_dag_graph_layered_cross": "3,3,4,4,5,4,6,7,6,7,7,8,8",
     "pto_persistent_dag_graph_tagged": "2,2",
     "pto_persistent_dag_graph_tagged_inout": "1,2",
     "pto_persistent_dag_graph_role_keyed_inout": "1,2",

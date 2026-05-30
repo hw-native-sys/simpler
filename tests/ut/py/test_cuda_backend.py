@@ -967,6 +967,72 @@ assert result["device_scheduler_errors"] == {"count": 0, "code": 0, "task_id": 0
 
 
 @requires_cuda
+def test_cuda_persistent_device_smoke_runs_layered_cross_graph():
+    script = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(".agents/skills/cuda-backend-eval/scripts").resolve()))
+from cuda_persistent_smoke import run_persistent_smoke
+
+for _ in range(8):
+    result = run_persistent_smoke(
+        device=0,
+        task_count=9,
+        n=1024,
+        arch="compute_80",
+        mode="dag",
+        queue_capacity=4,
+        dag_shape="graph_descriptor_layered_cross",
+        scheduler_blocks=3,
+        worker_blocks=4,
+    )
+large_result = run_persistent_smoke(
+    device=0,
+    task_count=9,
+    n=1048576,
+    arch="compute_80",
+    mode="dag",
+    queue_capacity=9,
+    dag_shape="graph_descriptor_layered_cross",
+    scheduler_blocks=1,
+    worker_blocks=9,
+)
+assert large_result["status"] == "pass"
+assert large_result["completed_count"] == 9
+assert large_result["device_scheduler_errors"] == {"count": 0, "code": 0, "task_id": 0}
+assert result["status"] == "pass"
+assert result["runtime"] == "persistent_device"
+assert result["mode"] == "dag"
+assert result["dag_shape"] == "graph_descriptor_layered_cross"
+assert result["task_count"] == 9
+assert result["completed_count"] == 9
+assert result["scheduler_blocks"] == 3
+assert result["worker_blocks"] == 4
+assert result["scheduler_init_count"] == 3
+assert result["scheduler_loop_count"] == 3
+assert result["scheduler_processed_count"] == 9
+assert len(result["scheduler_processed_by_block"]) == 3
+assert sum(result["scheduler_processed_by_block"]) == 9
+assert result["dispatch_func_ids"] == [1, 2, 11, 1, 2, 1, 6, 1, 1]
+assert result["fanin_remaining"] == [0, 0, 0, 0, 0, 0, 0, 0, 0]
+assert result["graph_descriptor"] == {
+    "tasks": 9,
+    "dependents": [3, 3, 4, 4, 5, 4, 6, 7, 6, 7, 7, 8, 8],
+    "fanin": [0, 0, 0, 2, 3, 1, 2, 3, 2],
+}
+assert result["device_scheduler_errors"] == {"count": 0, "code": 0, "task_id": 0}
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+@requires_cuda
 def test_cuda_persistent_device_smoke_reports_device_scheduler_errors():
     script = """
 import sys
