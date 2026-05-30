@@ -381,9 +381,10 @@ Graph tasks may also carry `name` and use those names in outgoing
 edge-list styles while avoiding fragile numeric task IDs in descriptor specs.
 Each edge field may be a single task name/id or a list of task names/ids.
 The graph descriptor may also carry a top-level `edges` list, where each edge
-is either `{"from": <task>, "to": <task>}`, a two-item endpoint pair, or a
-string of the form `"<source> -> <target>"`. This keeps node/task metadata
-separate from dependency metadata when a scene test needs a more graph-shaped
+is either `{"from": <task>, "to": <task>}`, a dep-gen-style
+`{"pred": <task>, "succ": <task>}`, a two-item endpoint pair, or a string of
+the form `"<source> -> <target>"`. This keeps node/task metadata separate
+from dependency metadata when a scene test needs a more graph-shaped
 descriptor.
 `graph.edges` may also be an adjacency dictionary from source task name/id to
 a single target or a list of targets.

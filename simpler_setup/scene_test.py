@@ -1655,8 +1655,8 @@ class _CudaPersistentDagSceneBuffers:
     @staticmethod
     def _graph_edge_endpoints(edge: Any) -> tuple[Any, Any]:
         if isinstance(edge, dict):
-            source = edge.get("from", edge.get("source", edge.get("src")))
-            target = edge.get("to", edge.get("target", edge.get("dst")))
+            source = edge.get("from", edge.get("source", edge.get("src", edge.get("pred"))))
+            target = edge.get("to", edge.get("target", edge.get("dst", edge.get("succ"))))
             if source is None or target is None:
                 raise ValueError("CUDA persistent_dag_graph_f32 graph edges must provide from/to endpoints")
             return source, target

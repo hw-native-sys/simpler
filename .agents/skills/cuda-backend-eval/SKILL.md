@@ -1554,12 +1554,25 @@ normal named PTO task graphs and avoid renumbering errors when inserting
 tasks.
 Each edge field may be a single task name/id or a list of task names/ids.
 For a more graph-shaped descriptor, use top-level `graph.edges` entries such
-as `{"from": "producer", "to": "consumer"}`, two-item endpoint pairs, or
+as `{"from": "producer", "to": "consumer"}`, dep-gen-style
+`{"pred": "producer", "succ": "consumer"}`, two-item endpoint pairs, or
 `"producer -> consumer"` strings.
 `graph.edges` may also be an adjacency dictionary such as
 `{"producer": ["consumer"]}`.
 For node-link style graph schemas, `graph.links` is accepted as the same
 edge-list field as `graph.edges`.
+After changing dep-gen-style edge lowering, validate the local A100 and remote
+H200 real-data scene path with:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k dep_gen_edge_graph_with_ctypes --platform cuda
+```
+
+For H200, sync the changed files or use the paired sync workflow first, then
+export `CUDA_HOME=/usr/local/cuda-12.8` and prepend that `bin` directory to
+`PATH` in the non-interactive shell.
 `graph.tasks` may be a list of task dictionaries or a dictionary keyed by task
 name; in the dictionary form, the key becomes the task name used by edge
 metadata. `graph.nodes` is accepted as an alias for `graph.tasks` when the

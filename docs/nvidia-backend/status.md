@@ -2023,6 +2023,13 @@ H200 with pytest reporting `1 passed, 106 deselected`; the H200 run printed
 the known PTO-ISA SSH refresh warning first. The new string-edge selector
 first failed at `_graph_edge_endpoints`, then passed on local A100 and remote
 H200 with pytest reporting `2 passed, 125 deselected` on both systems.
+Top-level edge dictionaries now also accept dep-gen-style `pred` and `succ`
+endpoint keys, matching the structural edge vocabulary used in `deps.json`.
+The focused builder selector first failed at `_graph_edge_endpoints`, then
+passed with `3 passed, 144 deselected` for the adjacent edge forms. The
+ctypes-backed `dep_gen_edge_graph_with_ctypes` scene passed on local A100 and
+remote H200 with `1 passed, 146 deselected`; the H200 run printed the known
+PTO-ISA SSH refresh warning first.
 The same graph-shaped path now accepts `graph.tasks` as a dictionary keyed by
 task name, so descriptor specs can keep node names in one place and reference
 those names from top-level edges. The ctypes-backed
@@ -4628,11 +4635,11 @@ Needed:
   separation for scratch reuse, order-independent tensor-flow dependency
   inference, explicit outgoing and incoming graph edges with scalar or
   list-valued named task dependencies, top-level graph edge lists including
-  string `source -> target` entries, adjacency dictionaries, `graph.links`
-  aliases, `graph.nodes` aliases, node `id` identity aliases, node-link
-  `data` payloads, node-style IO fields, dictionary-valued node IO port maps,
-  node `op` callable aliases, callable metadata `callable_id` / `cid` aliases,
-  and paired smoke including
+  string `source -> target` entries and dep-gen-style `pred`/`succ` endpoint
+  dictionaries, adjacency dictionaries, `graph.links` aliases, `graph.nodes`
+  aliases, node `id` identity aliases, node-link `data` payloads, node-style
+  IO fields, dictionary-valued node IO port maps, node `op` callable aliases,
+  callable metadata `callable_id` / `cid` aliases, and paired smoke including
   node-link `links` and dictionary-valued node IO port maps,
   tagged TaskArgs-like graph task lowering including `inout` producer
   chaining, role-map task-argument dictionaries with paired smoke,
