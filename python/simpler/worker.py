@@ -1227,6 +1227,8 @@ class Worker:
             raise RuntimeError(f"REGISTER_CLEANUP_UNCERTAIN: {reg.hashid}")
         state = self._identity_registry.get(reg.digest)
         if state is not None:
+            if state.slot_id in self._pending_unregister_cids and state.ref_count <= 0:
+                raise RuntimeError(f"REGISTER_TOMBSTONE_ACTIVE: {reg.hashid}")
             if state.descriptor != reg.descriptor or state.kind != reg.kind:
                 raise RuntimeError(f"HASHID_DESCRIPTOR_MISMATCH: {reg.hashid}")
             state.ref_count += 1
@@ -1685,7 +1687,8 @@ class Worker:
                     sys.stderr.flush()
         finally:
             with self._registry_lock:
-                if remove_target:
+                current = self._identity_registry.get(digest)
+                if remove_target and current is state and current.ref_count <= 0:
                     self._callable_registry.pop(cid, None)
                     self._identity_registry.pop(digest, None)
                 self._pending_unregister_cids.discard(cid)
@@ -1743,7 +1746,8 @@ class Worker:
                     sys.stderr.flush()
         finally:
             with self._registry_lock:
-                if remove_target:
+                current = self._identity_registry.get(digest)
+                if remove_target and current is state and current.ref_count <= 0:
                     self._callable_registry.pop(cid, None)
                     self._identity_registry.pop(digest, None)
                 self._pending_unregister_cids.discard(cid)

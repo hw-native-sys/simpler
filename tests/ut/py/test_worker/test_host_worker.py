@@ -600,6 +600,54 @@ class TestLifecycle:
         handle_after_unregister = hw.register(lambda args: None)
         assert _slot_for(hw, handle_after_unregister) == slot
 
+    def test_same_hashid_register_is_rejected_during_final_unregister(self):
+        from simpler.worker import _CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER  # noqa: PLC0415
+
+        def target(args):
+            return None
+
+        hw = Worker(level=3, num_sub_workers=1)
+        handle = hw.register(target)
+        hw._initialized = True
+        hw._hierarchical_started = True
+
+        unregister_started = threading.Event()
+        release_unregister = threading.Event()
+        errors: list[BaseException] = []
+
+        class FakeWorker:
+            def broadcast_control_all(self, worker_type, sub_cmd, payload=None, digest=None, timeout_s=None):
+                if sub_cmd == _CTRL_PY_UNREGISTER:
+                    unregister_started.set()
+                    assert release_unregister.wait(timeout=2.0)
+                elif sub_cmd != _CTRL_PY_REGISTER:
+                    raise AssertionError(f"unexpected sub_cmd={sub_cmd}")
+                return [_FakeControlResult("SUB", 0, True)]
+
+        hw._worker = FakeWorker()
+        slot = _slot_for(hw, handle)
+
+        def do_unregister():
+            try:
+                hw.unregister(handle)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = threading.Thread(target=do_unregister)
+        t.start()
+        assert unregister_started.wait(timeout=2.0)
+
+        with pytest.raises(RuntimeError, match="REGISTER_TOMBSTONE_ACTIVE"):
+            hw.register(target)
+
+        release_unregister.set()
+        t.join(timeout=2.0)
+        assert not t.is_alive()
+        assert errors == []
+
+        handle_after_unregister = hw.register(target)
+        assert _slot_for(hw, handle_after_unregister) == slot
+
     def test_register_python_sub_callable_after_start_succeeds(self):
         counter_shm, counter_buf = _make_shared_counter()
         try:
