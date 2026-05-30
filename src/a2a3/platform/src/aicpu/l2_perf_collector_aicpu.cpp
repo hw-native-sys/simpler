@@ -37,38 +37,16 @@ static L2PerfBufferState *s_perf_buffer_states[PLATFORM_MAX_CORES] = {};
 
 // Per-core L2PerfAicoreBufferState cache (lives in the same shared region;
 // host writes initial pool + the rotation channel that AICore polls).
+//
+// All AICore-side bookkeeping (rotation channel, free queue,
+// total_record_count, current_buf_seq) is owned by this shared struct — see
+// l2_perf_profiling.h. We deliberately do not keep AICPU-process-local
+// mirror counters because the struct's volatile fields are the single
+// source of truth across init/complete/rotate/flush. The high-water-mark
+// formula `total_record_count - current_buf_seq * BUFFER_SIZE` correctly
+// handles the failed-rotation case (free_queue empty or ready_queue full)
+// since current_buf_seq only bumps on a successful rotation.
 static L2PerfAicoreBufferState *s_aicore_buffer_states[PLATFORM_MAX_CORES] = {};
-
-// Per-core AICore-side completion counter. Bumped once per
-// `l2_perf_aicpu_complete_record` call. When the post-bump value crosses a
-// PLATFORM_AICORE_BUFFER_SIZE boundary, the AICore buffer for that core is
-// rotated. Rotation lives in the completion path (not the dispatch path) so
-// the just-completed task's AICore record write is already in GM before AICPU
-// hands the buffer to the host — closing the dispatch-path race where AICore
-// would write a boundary record into the wrong buffer.
-//
-// Residual race at the next dispatch: under dual-issue, AICPU may have
-// already dispatched task K+1 when it processes the FIN of K=BUFFER_SIZE-1.
-// AICPU's rotation (~1 us — a few wmbs + an enqueue + a pop) needs to
-// complete before AICore's `record_task` for K+1 reads the published
-// rotation channel; otherwise AICore's local `slot_within_buf` hits the
-// `slot >= BUFFER_SIZE` guard and silently drops K+1's record. For typical
-// kernels (>10 us) the rotation completes long before AICore's record write,
-// so this never fires; for adversarial sub-microsecond kernels it can.
-// The host parser surfaces the loss via the `unmatched > 0` warning in
-// join_aicore_records().
-//
-// Counter is uint32_t — wraps after ~4 G completions per core. At realistic
-// dispatch rates this is multi-week continuous-run territory; we accept the
-// limitation rather than carrying a 64-bit counter for it.
-static uint32_t s_aicore_complete_count[PLATFORM_MAX_CORES] = {};
-
-// Per-core successful-rotation counter. `complete_count -
-// rotations_done * BUFFER_SIZE` is the live high-water mark in the current
-// AICore buffer; used at flush time to stamp `buf->count` correctly even
-// when the most recent rotation attempt failed (free_queue empty or ready
-// queue full).
-static uint32_t s_aicore_rotations_done[PLATFORM_MAX_CORES] = {};
 
 // Per-core cached current-records-buffer pointer. Written by AICPU when
 // rotating buffers from inside `complete_record`. AICore writes to its own
@@ -161,8 +139,6 @@ void l2_perf_aicpu_init(int worker_count) {
 
         s_perf_buffer_states[i] = state;
         s_aicore_buffer_states[i] = ac_state;
-        s_aicore_complete_count[i] = 0;
-        s_aicore_rotations_done[i] = 0;
 
         // Pop first buffer from free_queue
         rmb();
@@ -281,9 +257,9 @@ static void switch_records_buffer(int core_id, int thread_idx) {
 // Try to rotate the AICore buffer for `core_id`. Called from the completion
 // path after a successful L2PerfRecord commit so the just-FIN'd task's
 // AICore record is guaranteed to be in the old buffer before we enqueue it.
-// On success bumps `s_aicore_rotations_done[core_id]`; on failure (empty
-// free queue or full ready queue) the old buffer is abandoned in place,
-// AICore overflows it from now on, and the drop count grows.
+// On success bumps `ac_state->current_buf_seq`; on failure (empty free queue
+// or full ready queue) the old buffer is abandoned in place, AICore overflows
+// it from now on, and the drop count grows.
 static void aicore_rotate(int core_id, int thread_idx) {
     L2PerfAicoreBufferState *ac_state = s_aicore_buffer_states[core_id];
     if (ac_state == nullptr) {
@@ -300,7 +276,7 @@ static void aicore_rotate(int core_id, int thread_idx) {
         // No replacement available — AICore continues to write into the
         // old buffer; its slot counter will hit BUFFER_SIZE and drop the
         // overflow. Account the drop on AICPU side too. Note that we do
-        // NOT bump rotations_done here — flush will still see the buffer
+        // NOT bump current_buf_seq here — flush will still see the buffer
         // as the "current full" one and stamp it correctly.
         ac_state->dropped_record_count =
             ac_state->dropped_record_count + static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
@@ -340,8 +316,6 @@ static void aicore_rotate(int core_id, int thread_idx) {
     ac_state->rotation.current_buf_ptr = new_buf_ptr;
     ac_state->rotation.generation = ac_state->rotation.generation + 1;
     wmb();
-
-    s_aicore_rotations_done[core_id] += 1;
 }
 
 // Public no-op shim kept so callers compile during the cross-runtime
@@ -423,11 +397,25 @@ int l2_perf_aicpu_complete_record(
     // path) closes the dispatch-boundary race: at a dispatch boundary AICore
     // may still be running task K-1 with its record write yet to happen, so a
     // dispatch-time rotation could leak K-1's record into the wrong buffer.
+    //
+    // Residual race at the next dispatch: under dual-issue, AICPU may have
+    // already dispatched task K+1 when it processes the FIN of K=BUFFER_SIZE-1.
+    // AICPU's rotation (~1 us — a few wmbs + an enqueue + a pop) needs to
+    // complete before AICore's `record_task` for K+1 reads the published
+    // rotation channel; otherwise AICore's local `slot_within_buf` hits the
+    // `slot >= BUFFER_SIZE` guard and silently drops K+1's record. For typical
+    // kernels (>10 us) the rotation completes long before AICore's record
+    // write, so this never fires; for adversarial sub-microsecond kernels it
+    // can. The host parser surfaces the loss via the `unmatched > 0` warning
+    // in join_aicore_records().
+    //
+    // total_record_count is uint32_t — wraps after ~4 G completions per core.
+    // At realistic dispatch rates this is multi-week continuous-run territory;
+    // we accept the limitation rather than widening the on-device counter.
     L2PerfAicoreBufferState *ac_state = s_aicore_buffer_states[core_id];
     if (ac_state != nullptr) {
-        ac_state->total_record_count += 1;
-        uint32_t completed = s_aicore_complete_count[core_id] + 1;
-        s_aicore_complete_count[core_id] = completed;
+        uint32_t completed = ac_state->total_record_count + 1;
+        ac_state->total_record_count = completed;
         if ((completed & (PLATFORM_AICORE_BUFFER_SIZE - 1)) == 0) {
             aicore_rotate(core_id, thread_idx);
         }
@@ -492,8 +480,8 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
         // Also flush the current AICore buffer to the ready queue so the host
         // sees this session's final batch of AICore timestamps.
         //
-        // High-water mark uses the rotation accounting (complete_count -
-        // rotations_done * BUFFER_SIZE) so the failed-rotation case is
+        // High-water mark uses the rotation accounting (total_record_count -
+        // current_buf_seq * BUFFER_SIZE) so the failed-rotation case is
         // correctly handled: when an earlier rotation couldn't find a free
         // buffer the current buffer holds BUFFER_SIZE valid records plus an
         // unknown number of dropped overflow attempts; the formula clamps
@@ -506,8 +494,8 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
         uint64_t ac_buf_ptr = ac_state->rotation.current_buf_ptr;
         if (ac_buf_ptr == 0) continue;
 
-        uint32_t live = s_aicore_complete_count[core_id] -
-                        s_aicore_rotations_done[core_id] * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+        uint32_t live = ac_state->total_record_count -
+                        ac_state->current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
         if (live == 0) {
             // Last rotation matched the last completion exactly — buffer is
             // freshly popped and empty. Skip.
