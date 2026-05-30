@@ -100,7 +100,7 @@ def test_worker_run_returns_run_timing(st_platform, st_device_ids):
     # device_wall must also be > 0 without --enable-l2-swimlane after the
     # Phase B decoupling: orch_summary is written unconditionally when
     # PTO2_PROFILING is on (default build). Hitting 0 here means either:
-    #   - the AICPU's l2_perf_aicpu_write_orch_summary path regressed back
+    #   - the AICPU's l2_swimlane_aicpu_write_orch_summary path regressed back
     #     under an is_l2_swimlane_enabled() gate, or
     #   - the host stopped reading the phase header after the run.
     assert timing.device_wall_us > 0.0, (

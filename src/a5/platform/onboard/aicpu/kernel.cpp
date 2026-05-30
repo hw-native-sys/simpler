@@ -15,7 +15,7 @@
 #include "common/platform_config.h"
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
-#include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/pmu_collector_aicpu.h"
@@ -105,7 +105,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_orch_device_id(static_cast<int>(k_args->device_id));
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_tensor_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
-    set_platform_l2_perf_base(k_args->l2_perf_data_base);
+    set_platform_l2_swimlane_base(k_args->l2_swimlane_data_base);
     set_l2_swimlane_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
     set_pmu_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_PMU));

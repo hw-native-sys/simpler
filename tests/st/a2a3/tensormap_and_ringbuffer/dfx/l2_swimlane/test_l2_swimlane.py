@@ -8,7 +8,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """L2 swimlane profiling smoke — capture pipeline produces a usable
-``l2_perf_records.json``.
+``l2_swimlane_records.json``.
 
 Re-uses ``vector_example`` as a known-good 5-task AIV-only workload. When the
 ``--enable-l2-swimlane`` flag is on, the helper in :mod:`_swimlane_validate`
@@ -36,7 +36,7 @@ _EXPECTED_TASK_COUNT = 5
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestL2Swimlane(SceneTestCase):
-    """Vector example with --enable-l2-swimlane, then assert l2_perf_records.json."""
+    """Vector example with --enable-l2-swimlane, then assert l2_swimlane_records.json."""
 
     CALLABLE = {
         "orchestration": {

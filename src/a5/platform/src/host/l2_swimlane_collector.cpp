@@ -10,21 +10,21 @@
  */
 
 /**
- * @file l2_perf_collector.cpp
+ * @file l2_swimlane_collector.cpp
  * @brief Performance data collector implementation. The mgmt-thread +
  *        buffer-pool machinery lives in profiling_common::BufferPoolManager
- *        parameterized by L2PerfModule (host/l2_perf_collector.h); the
+ *        parameterized by L2SwimlaneModule (host/l2_swimlane_collector.h); the
  *        poll loop lives in profiling_common::ProfilerBase. This file
  *        owns the per-buffer on_buffer_collected callback and the export
  *        logic.
  *
  * a5 specifics: device↔host transfers go through profiling_copy.h. The
  * framework's mgmt loop mirrors the shm region per tick; per-buffer
- * payloads (L2PerfBuffer / PhaseBuffer) are pulled on demand inside
+ * payloads (L2SwimlaneAicpuTaskBuffer / L2SwimlaneAicpuPhaseBuffer) are pulled on demand inside
  * ProfilerAlgorithms.
  */
 
-#include "host/l2_perf_collector.h"
+#include "host/l2_swimlane_collector.h"
 
 #include <algorithm>
 #include <chrono>
@@ -43,7 +43,7 @@
 #include "host/profiling_copy.h"
 
 // =============================================================================
-// L2PerfCollector Implementation
+// L2SwimlaneCollector Implementation
 // =============================================================================
 
 /**
@@ -51,18 +51,18 @@
  * Scheduler phases: SCHED_COMPLETE(0), SCHED_DISPATCH(1), SCHED_SCAN(2), SCHED_IDLE_WAIT(3)
  * Orchestrator phases: ORCH_SYNC(16) through ORCH_SCOPE_END(24)
  */
-static bool is_scheduler_phase(AicpuPhaseId id) {
-    return static_cast<uint32_t>(id) < static_cast<uint32_t>(AicpuPhaseId::SCHED_PHASE_COUNT);
+static bool is_scheduler_phase(L2SwimlaneAicpuPhaseId id) {
+    return static_cast<uint32_t>(id) < static_cast<uint32_t>(L2SwimlaneAicpuPhaseId::SCHED_PHASE_COUNT);
 }
 
-L2PerfCollector::~L2PerfCollector() {
+L2SwimlaneCollector::~L2SwimlaneCollector() {
     stop();
     if (shm_host_ != nullptr) {
-        LOG_WARN("L2PerfCollector destroyed without finalize()");
+        LOG_WARN("L2SwimlaneCollector destroyed without finalize()");
     }
 }
 
-void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
+void *L2SwimlaneCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
     void *dev_ptr = alloc_cb_(size);
     if (dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate buffer (%zu bytes)", size);
@@ -98,12 +98,12 @@ void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
     return dev_ptr;
 }
 
-int L2PerfCollector::initialize(
-    int num_aicore, int device_id, L2PerfLevel l2_perf_level, const L2PerfAllocCallback &alloc_cb,
-    L2PerfRegisterCallback register_cb, const L2PerfFreeCallback &free_cb, const std::string &output_prefix
+int L2SwimlaneCollector::initialize(
+    int num_aicore, int device_id, L2SwimlaneLevel l2_swimlane_level, const L2SwimlaneAllocCallback &alloc_cb,
+    L2SwimlaneRegisterCallback register_cb, const L2SwimlaneFreeCallback &free_cb, const std::string &output_prefix
 ) {
     if (shm_host_ != nullptr) {
-        LOG_ERROR("L2PerfCollector already initialized");
+        LOG_ERROR("L2SwimlaneCollector already initialized");
         return -1;
     }
 
@@ -115,7 +115,7 @@ int L2PerfCollector::initialize(
     }
 
     num_aicore_ = num_aicore;
-    l2_perf_level_ = l2_perf_level;
+    l2_swimlane_level_ = l2_swimlane_level;
     output_prefix_ = output_prefix;
     total_perf_collected_ = 0;
     total_phase_collected_ = 0;
@@ -135,9 +135,9 @@ int L2PerfCollector::initialize(
 
     LOG_DEBUG("Shared memory allocation plan:");
     LOG_DEBUG("  Number of cores:        %d", num_aicore);
-    LOG_DEBUG("  Header size:            %zu bytes", sizeof(L2PerfDataHeader));
-    LOG_DEBUG("  L2PerfBufferState size: %zu bytes each", sizeof(L2PerfBufferState));
-    LOG_DEBUG("  PhaseBufferState size:  %zu bytes each", sizeof(PhaseBufferState));
+    LOG_DEBUG("  Header size:            %zu bytes", sizeof(L2SwimlaneDataHeader));
+    LOG_DEBUG("  L2SwimlaneAicpuTaskPool size: %zu bytes each", sizeof(L2SwimlaneAicpuTaskPool));
+    LOG_DEBUG("  L2SwimlaneAicpuPhasePool size:  %zu bytes each", sizeof(L2SwimlaneAicpuPhasePool));
     LOG_DEBUG("  Total shared memory:    %zu bytes (%zu KB)", total_size, total_size / 1024);
 
     // Step 2: Allocate shared memory + paired host shadow
@@ -151,21 +151,21 @@ int L2PerfCollector::initialize(
 
     // Step 3: Initialize header on host shadow
     std::memset(perf_host_ptr, 0, total_size);
-    L2PerfDataHeader *header = get_l2_perf_header(perf_host_ptr);
+    L2SwimlaneDataHeader *header = get_l2_swimlane_header(perf_host_ptr);
     for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; t++) {
         header->queue_heads[t] = 0;
         header->queue_tails[t] = 0;
     }
     header->num_cores = num_aicore;
-    header->l2_perf_level = static_cast<uint32_t>(l2_perf_level_);
+    header->l2_swimlane_level = static_cast<uint32_t>(l2_swimlane_level_);
 
-    LOG_DEBUG("Initialized L2PerfDataHeader:");
+    LOG_DEBUG("Initialized L2SwimlaneDataHeader:");
     LOG_DEBUG("  num_cores:              %d", header->num_cores);
-    LOG_DEBUG("  l2_perf_level:          %u", header->l2_perf_level);
+    LOG_DEBUG("  l2_swimlane_level:          %u", header->l2_swimlane_level);
     LOG_DEBUG("  buffer_capacity:        %d", PLATFORM_PROF_BUFFER_SIZE);
     LOG_DEBUG("  queue capacity:         %d", PLATFORM_PROF_READYQUEUE_SIZE);
 
-    // Step 4: Allocate per-core stable L2PerfAicoreRings + the address-table
+    // Step 4: Allocate per-core stable L2SwimlaneAicoreRings + the address-table
     // buffer. Rings are allocated once and never rotated; AICore writes into
     // them at task time, AICPU reads at FIN time. The address-table mirrors
     // each ring's device pointer so the AICore-side `KernelArgs` machinery
@@ -175,23 +175,23 @@ int L2PerfCollector::initialize(
     size_t table_size = static_cast<size_t>(num_aicore) * sizeof(uint64_t);
     void *table_dev_ptr = alloc_single_buffer(table_size, &table_host_ptr);
     if (table_dev_ptr == nullptr) {
-        LOG_ERROR("Failed to allocate L2Perf aicore ring address table (%zu bytes)", table_size);
+        LOG_ERROR("Failed to allocate L2Swimlane aicore ring address table (%zu bytes)", table_size);
         return -1;
     }
     std::memset(table_host_ptr, 0, table_size);
     aicore_ring_addrs_dev_ = table_dev_ptr;
     aicore_ring_addrs_host_ = table_host_ptr;
 
-    // Step 4b: Initialize L2PerfBufferStates — 1 buffer/core in free_queue, rest to recycled pool.
+    // Step 4b: Initialize L2SwimlaneAicpuTaskPools — 1 buffer/core in free_queue, rest to recycled pool.
     for (int i = 0; i < num_aicore; i++) {
-        L2PerfBufferState *state = get_perf_buffer_state(perf_host_ptr, i);
-        std::memset(state, 0, sizeof(L2PerfBufferState));
+        L2SwimlaneAicpuTaskPool *state = get_perf_buffer_state(perf_host_ptr, i);
+        std::memset(state, 0, sizeof(L2SwimlaneAicpuTaskPool));
 
         // Allocate the per-core staging ring (no host shadow needed: AICore
         // writes, AICPU reads — host never touches the ring directly).
-        void *ring_dev = alloc_cb(sizeof(L2PerfAicoreRing));
+        void *ring_dev = alloc_cb(sizeof(L2SwimlaneAicoreRing));
         if (ring_dev == nullptr) {
-            LOG_ERROR("Failed to allocate L2PerfAicoreRing for core %d", i);
+            LOG_ERROR("Failed to allocate L2SwimlaneAicoreRing for core %d", i);
             return -1;
         }
         aicore_rings_dev_[i] = ring_dev;
@@ -200,22 +200,22 @@ int L2PerfCollector::initialize(
 
         for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
-            void *dev_buf_ptr = alloc_single_buffer(sizeof(L2PerfBuffer), &host_buf_ptr);
+            void *dev_buf_ptr = alloc_single_buffer(sizeof(L2SwimlaneAicpuTaskBuffer), &host_buf_ptr);
             if (dev_buf_ptr == nullptr) {
-                LOG_ERROR("Failed to allocate L2PerfBuffer for core %d, buffer %d", i, s);
+                LOG_ERROR("Failed to allocate L2SwimlaneAicpuTaskBuffer for core %d, buffer %d", i, s);
                 return -1;
             }
 
             if (s == 0) {
                 state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(dev_buf_ptr);
             } else {
-                manager_.push_recycled(static_cast<int>(ProfBufferType::PERF_RECORD), dev_buf_ptr);
+                manager_.push_recycled(static_cast<int>(ProfBufferType::AICPU_TASK), dev_buf_ptr);
             }
         }
         state->free_queue.tail = 1;
     }
     LOG_DEBUG(
-        "Initialized %d L2PerfBufferStates: 1 buffer/core, %d in recycled pool", num_aicore,
+        "Initialized %d L2SwimlaneAicpuTaskPools: 1 buffer/core, %d in recycled pool", num_aicore,
         num_aicore * (PLATFORM_PROF_BUFFERS_PER_CORE - 1)
     );
 
@@ -224,21 +224,21 @@ int L2PerfCollector::initialize(
 
     // Step 5: Initialize PhaseBufferStates — 1 buffer/thread in free_queue, rest to recycled pool.
     for (int t = 0; t < num_phase_threads; t++) {
-        PhaseBufferState *state = get_phase_buffer_state(perf_host_ptr, num_aicore, t);
-        std::memset(state, 0, sizeof(PhaseBufferState));
+        L2SwimlaneAicpuPhasePool *state = get_phase_buffer_state(perf_host_ptr, num_aicore, t);
+        std::memset(state, 0, sizeof(L2SwimlaneAicpuPhasePool));
 
         for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_THREAD; s++) {
             void *host_buf_ptr = nullptr;
-            void *dev_buf_ptr = alloc_single_buffer(sizeof(PhaseBuffer), &host_buf_ptr);
+            void *dev_buf_ptr = alloc_single_buffer(sizeof(L2SwimlaneAicpuPhaseBuffer), &host_buf_ptr);
             if (dev_buf_ptr == nullptr) {
-                LOG_ERROR("Failed to allocate PhaseBuffer for thread %d, buffer %d", t, s);
+                LOG_ERROR("Failed to allocate L2SwimlaneAicpuPhaseBuffer for thread %d, buffer %d", t, s);
                 return -1;
             }
 
             if (s == 0) {
                 state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(dev_buf_ptr);
             } else {
-                manager_.push_recycled(static_cast<int>(ProfBufferType::PHASE), dev_buf_ptr);
+                manager_.push_recycled(static_cast<int>(ProfBufferType::AICPU_PHASE), dev_buf_ptr);
             }
         }
         state->free_queue.tail = 1;
@@ -259,7 +259,7 @@ int L2PerfCollector::initialize(
     collected_perf_records_.assign(num_aicore_, {});
     collected_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
 
-    LOG_DEBUG("L2 perf device base = 0x%lx", reinterpret_cast<uint64_t>(perf_dev_ptr));
+    LOG_DEBUG("L2 swimlane device base = 0x%lx", reinterpret_cast<uint64_t>(perf_dev_ptr));
     LOG_INFO_V0("Performance profiling initialized (dynamic buffer mode)");
     return 0;
 }
@@ -268,8 +268,8 @@ int L2PerfCollector::initialize(
 // ProfilerBase callbacks
 // ---------------------------------------------------------------------------
 
-void L2PerfCollector::copy_perf_buffer(const ReadyBufferInfo &info) {
-    L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(info.host_buffer_ptr);
+void L2SwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info) {
+    L2SwimlaneAicpuTaskBuffer *buf = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t count = buf->count;
     if (count > PLATFORM_PROF_BUFFER_SIZE) {
@@ -284,8 +284,8 @@ void L2PerfCollector::copy_perf_buffer(const ReadyBufferInfo &info) {
     }
 }
 
-void L2PerfCollector::copy_phase_buffer(const ReadyBufferInfo &info) {
-    PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(info.host_buffer_ptr);
+void L2SwimlaneCollector::copy_phase_buffer(const ReadyBufferInfo &info) {
+    L2SwimlaneAicpuPhaseBuffer *buf = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t count = buf->count;
     if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
@@ -303,8 +303,8 @@ void L2PerfCollector::copy_phase_buffer(const ReadyBufferInfo &info) {
     }
 }
 
-void L2PerfCollector::on_buffer_collected(const ReadyBufferInfo &info) {
-    if (info.type == ProfBufferType::PERF_RECORD) {
+void L2SwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info) {
+    if (info.type == ProfBufferType::AICPU_TASK) {
         copy_perf_buffer(info);
     } else {
         copy_phase_buffer(info);
@@ -320,13 +320,13 @@ void L2PerfCollector::on_buffer_collected(const ReadyBufferInfo &info) {
 // clear current_buf_ptr on the device side. Host's job here is purely
 // accounting + sanity check.
 //
-// L2PerfBufferState now tracks total / dropped / mismatch counters — same
+// L2SwimlaneAicpuTaskPool now tracks total / dropped / mismatch counters — same
 // three-bucket accounting as PMU and a2a3. The cross-check equation
 // (collected + dropped + mismatch == device_total) is enforced per pool
 // (PERF + PHASE). Empty PHASE pools (runtime emits no phase records) are
 // skipped via the `optional` flag.
 
-void L2PerfCollector::reconcile_counters() {
+void L2SwimlaneCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return;
 
     // Pull the latest BufferStates (current_buf_ptr) before the per-unit
@@ -337,7 +337,7 @@ void L2PerfCollector::reconcile_counters() {
     rmb();
 
     // After stop(), AICPU's per-thread flush hooks
-    // (l2_perf_aicpu_flush_buffers / l2_perf_aicpu_flush_phase_buffers)
+    // (l2_swimlane_aicpu_flush / l2_swimlane_aicpu_flush_phase_buffers)
     // should have either enqueued the active buffer (success →
     // current_buf_ptr=0) or cleared it on enqueue failure. A non-zero
     // pointer with non-zero count means records AICPU neither delivered
@@ -345,16 +345,16 @@ void L2PerfCollector::reconcile_counters() {
     // never written) are fine; AICPU's flush legitimately skips them.
     int leftover_active = 0;
     for (int i = 0; i < num_aicore_; i++) {
-        L2PerfBufferState *state = get_perf_buffer_state(shm_host_, i);
+        L2SwimlaneAicpuTaskPool *state = get_perf_buffer_state(shm_host_, i);
         uint64_t buf_ptr = state->current_buf_ptr;
         if (buf_ptr == 0) continue;
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_ptr));
         if (host_ptr == nullptr) continue;
-        profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_ptr), sizeof(L2PerfBuffer));
-        uint32_t count = reinterpret_cast<L2PerfBuffer *>(host_ptr)->count;
+        profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_ptr), sizeof(L2SwimlaneAicpuTaskBuffer));
+        uint32_t count = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(host_ptr)->count;
         if (count == 0) continue;
         LOG_ERROR(
-            "L2Perf reconcile: core %d has un-flushed PERF buffer (current_buf_ptr=0x%lx, count=%u) "
+            "L2Swimlane reconcile: core %d has un-flushed PERF buffer (current_buf_ptr=0x%lx, count=%u) "
             "after stop() — device flush failed",
             i, static_cast<unsigned long>(buf_ptr), count
         );
@@ -362,16 +362,16 @@ void L2PerfCollector::reconcile_counters() {
     }
 
     for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; t++) {
-        PhaseBufferState *state = get_phase_buffer_state(shm_host_, num_aicore_, t);
+        L2SwimlaneAicpuPhasePool *state = get_phase_buffer_state(shm_host_, num_aicore_, t);
         uint64_t buf_ptr = state->current_buf_ptr;
         if (buf_ptr == 0) continue;
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_ptr));
         if (host_ptr == nullptr) continue;
-        profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_ptr), sizeof(PhaseBuffer));
-        uint32_t count = reinterpret_cast<PhaseBuffer *>(host_ptr)->count;
+        profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_ptr), sizeof(L2SwimlaneAicpuPhaseBuffer));
+        uint32_t count = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(host_ptr)->count;
         if (count == 0) continue;
         LOG_ERROR(
-            "L2Perf reconcile: thread %d has un-flushed PHASE buffer (current_buf_ptr=0x%lx, count=%u) "
+            "L2Swimlane reconcile: thread %d has un-flushed PHASE buffer (current_buf_ptr=0x%lx, count=%u) "
             "after stop() — device flush failed",
             t, static_cast<unsigned long>(buf_ptr), count
         );
@@ -379,7 +379,9 @@ void L2PerfCollector::reconcile_counters() {
     }
 
     if (leftover_active > 0) {
-        LOG_ERROR("L2Perf reconcile: %d unit(s) had un-cleared current_buf_ptr — see prior errors", leftover_active);
+        LOG_ERROR(
+            "L2Swimlane reconcile: %d unit(s) had un-cleared current_buf_ptr — see prior errors", leftover_active
+        );
     }
 
     // Cross-check device-side totals against host CSV.  PERF and PHASE
@@ -391,7 +393,7 @@ void L2PerfCollector::reconcile_counters() {
         uint64_t dropped_device = 0;
         uint64_t mismatch_device = 0;
         for (int i = 0; i < unit_count; i++) {
-            L2PerfBufferState *state = get_state(i);
+            L2SwimlaneAicpuTaskPool *state = get_state(i);
             total_device += state->total_record_count;
             dropped_device += state->dropped_record_count;
             mismatch_device += state->mismatch_record_count;
@@ -403,14 +405,14 @@ void L2PerfCollector::reconcile_counters() {
 
         if (dropped_device > 0) {
             LOG_WARN(
-                "L2Perf reconcile: %lu %s records dropped on device side (buffer full / "
+                "L2Swimlane reconcile: %lu %s records dropped on device side (buffer full / "
                 "ready_queue full / late FIN after flush).",
                 static_cast<unsigned long>(dropped_device), kind
             );
         }
         if (mismatch_device > 0) {
             LOG_ERROR(
-                "L2Perf reconcile: %lu %s records lost to AICore staging-slot task_id mismatch — "
+                "L2Swimlane reconcile: %lu %s records lost to AICore staging-slot task_id mismatch — "
                 "completion-before-dispatch invariant violated",
                 static_cast<unsigned long>(mismatch_device), kind
             );
@@ -418,7 +420,7 @@ void L2PerfCollector::reconcile_counters() {
         uint64_t accounted = collected + dropped_device + mismatch_device;
         if (accounted != total_device) {
             LOG_WARN(
-                "L2Perf reconcile: %s count mismatch (collected=%lu + dropped=%lu + mismatch=%lu != "
+                "L2Swimlane reconcile: %s count mismatch (collected=%lu + dropped=%lu + mismatch=%lu != "
                 "device_total=%lu, silent_loss=%ld)",
                 kind, static_cast<unsigned long>(collected), static_cast<unsigned long>(dropped_device),
                 static_cast<unsigned long>(mismatch_device), static_cast<unsigned long>(total_device),
@@ -426,8 +428,8 @@ void L2PerfCollector::reconcile_counters() {
             );
         } else {
             LOG_INFO_V0(
-                "L2Perf reconcile: %s counts match (collected=%lu, dropped=%lu, mismatch=%lu, device_total=%lu)", kind,
-                static_cast<unsigned long>(collected), static_cast<unsigned long>(dropped_device),
+                "L2Swimlane reconcile: %s counts match (collected=%lu, dropped=%lu, mismatch=%lu, device_total=%lu)",
+                kind, static_cast<unsigned long>(collected), static_cast<unsigned long>(dropped_device),
                 static_cast<unsigned long>(mismatch_device), static_cast<unsigned long>(total_device)
             );
         }
@@ -450,10 +452,10 @@ void L2PerfCollector::reconcile_counters() {
     );
 }
 
-void L2PerfCollector::read_phase_header_metadata() {
+void L2SwimlaneCollector::read_phase_header_metadata() {
     if (shm_host_ == nullptr) return;
 
-    // Pull the AicpuPhaseHeader portion from device (the mgmt loop's final
+    // Pull the L2SwimlaneAicpuPhaseHeader portion from device (the mgmt loop's final
     // mirror covered it, but re-mirror to be safe in case stop() raced with
     // a final write of core_to_thread mapping).
     if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
@@ -461,11 +463,12 @@ void L2PerfCollector::read_phase_header_metadata() {
     }
     rmb();
 
-    AicpuPhaseHeader *phase_header = get_phase_header(shm_host_, num_aicore_);
+    L2SwimlaneAicpuPhaseHeader *phase_header = get_phase_header(shm_host_, num_aicore_);
 
-    if (phase_header->magic != AICPU_PHASE_MAGIC) {
+    if (phase_header->magic != L2_SWIMLANE_AICPU_PHASE_MAGIC) {
         LOG_INFO_V0(
-            "No phase profiling data found (magic mismatch: 0x%x vs 0x%x)", phase_header->magic, AICPU_PHASE_MAGIC
+            "No phase profiling data found (magic mismatch: 0x%x vs 0x%x)", phase_header->magic,
+            L2_SWIMLANE_AICPU_PHASE_MAGIC
         );
         return;
     }
@@ -511,7 +514,7 @@ void L2PerfCollector::read_phase_header_metadata() {
 // export_swimlane_json
 // ---------------------------------------------------------------------------
 
-int L2PerfCollector::export_swimlane_json() {
+int L2SwimlaneCollector::export_swimlane_json() {
     bool has_any_records = false;
     for (const auto &core_records : collected_perf_records_) {
         if (!core_records.empty()) {
@@ -532,7 +535,7 @@ int L2PerfCollector::export_swimlane_json() {
     }
 
     struct TaggedRecord {
-        const L2PerfRecord *record;
+        const L2SwimlaneAicpuTaskRecord *record;
         uint32_t core_id;
     };
     std::vector<TaggedRecord> tagged_records;
@@ -571,7 +574,7 @@ int L2PerfCollector::export_swimlane_json() {
         }
     }
 
-    std::string filepath = output_prefix_ + "/l2_perf_records.json";
+    std::string filepath = output_prefix_ + "/l2_swimlane_records.json";
 
     std::ofstream outfile(filepath);
     if (!outfile.is_open()) {
@@ -579,9 +582,9 @@ int L2PerfCollector::export_swimlane_json() {
         return -1;
     }
 
-    int l2_perf_level = static_cast<int>(l2_perf_level_);
+    int l2_swimlane_level = static_cast<int>(l2_swimlane_level_);
     outfile << "{\n";
-    outfile << "  \"l2_perf_level\": " << l2_perf_level << ",\n";
+    outfile << "  \"l2_swimlane_level\": " << l2_swimlane_level << ",\n";
     outfile << "  \"tasks\": [\n";
 
     for (size_t i = 0; i < tagged_records.size(); ++i) {
@@ -627,41 +630,41 @@ int L2PerfCollector::export_swimlane_json() {
     outfile << "  ]";
 
     // Step: Write phase profiling data (level >= 3)
-    if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-        auto sched_phase_name = [](AicpuPhaseId id) -> const char * {
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+        auto sched_phase_name = [](L2SwimlaneAicpuPhaseId id) -> const char * {
             switch (id) {
-            case AicpuPhaseId::SCHED_COMPLETE:
+            case L2SwimlaneAicpuPhaseId::SCHED_COMPLETE:
                 return "complete";
-            case AicpuPhaseId::SCHED_DISPATCH:
+            case L2SwimlaneAicpuPhaseId::SCHED_DISPATCH:
                 return "dispatch";
-            case AicpuPhaseId::SCHED_SCAN:
+            case L2SwimlaneAicpuPhaseId::SCHED_SCAN:
                 return "scan";
-            case AicpuPhaseId::SCHED_IDLE_WAIT:
+            case L2SwimlaneAicpuPhaseId::SCHED_IDLE_WAIT:
                 return "idle";
             default:
                 return "unknown";
             }
         };
 
-        auto orch_phase_name = [](AicpuPhaseId id) -> const char * {
+        auto orch_phase_name = [](L2SwimlaneAicpuPhaseId id) -> const char * {
             switch (id) {
-            case AicpuPhaseId::ORCH_SYNC:
+            case L2SwimlaneAicpuPhaseId::ORCH_SYNC:
                 return "orch_sync";
-            case AicpuPhaseId::ORCH_ALLOC:
+            case L2SwimlaneAicpuPhaseId::ORCH_ALLOC:
                 return "orch_alloc";
-            case AicpuPhaseId::ORCH_PARAMS:
+            case L2SwimlaneAicpuPhaseId::ORCH_PARAMS:
                 return "orch_params";
-            case AicpuPhaseId::ORCH_LOOKUP:
+            case L2SwimlaneAicpuPhaseId::ORCH_LOOKUP:
                 return "orch_lookup";
-            case AicpuPhaseId::ORCH_HEAP:
+            case L2SwimlaneAicpuPhaseId::ORCH_HEAP:
                 return "orch_heap";
-            case AicpuPhaseId::ORCH_INSERT:
+            case L2SwimlaneAicpuPhaseId::ORCH_INSERT:
                 return "orch_insert";
-            case AicpuPhaseId::ORCH_FANIN:
+            case L2SwimlaneAicpuPhaseId::ORCH_FANIN:
                 return "orch_fanin";
-            case AicpuPhaseId::ORCH_FINALIZE:
+            case L2SwimlaneAicpuPhaseId::ORCH_FINALIZE:
                 return "orch_finalize";
-            case AicpuPhaseId::ORCH_SCOPE_END:
+            case L2SwimlaneAicpuPhaseId::ORCH_SCOPE_END:
                 return "orch_scope_end";
             default:
                 return "unknown";
@@ -684,7 +687,7 @@ int L2PerfCollector::export_swimlane_json() {
                 // Phase-specific deltas (currently only SCHED_DISPATCH carries
                 // pop_hit / pop_miss). Other phases pass zero extras; omitting
                 // them keeps the JSON terse per record.
-                if (pr.phase_id == AicpuPhaseId::SCHED_DISPATCH) {
+                if (pr.phase_id == L2SwimlaneAicpuPhaseId::SCHED_DISPATCH) {
                     outfile << ", \"pop_hit\": " << pr.extra1 << ", \"pop_miss\": " << pr.extra2;
                 }
                 outfile << "}";
@@ -699,12 +702,12 @@ int L2PerfCollector::export_swimlane_json() {
 
         // Per-task orchestrator phase records (level >= 4, filtered from unified collected_phase_records_)
         // Orchestrator timing is no longer emitted as a separate aggregate
-        // block. Per-event AicpuPhaseRecord[] entries (emitted as
+        // block. Per-event L2SwimlaneAicpuPhaseRecord[] entries (emitted as
         // aicpu_orchestrator_phases below) are the single source of truth;
         // the run-window envelope is still visible in the device-side
         // LOG_INFO_V9 "Thread N: orch_start=… orch_end=… orch_cost=…" line.
         bool has_orch_phases = false;
-        if (l2_perf_level_ >= L2PerfLevel::ORCH_PHASES) {
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
             for (const auto &v : collected_phase_records_) {
                 for (const auto &r : v) {
                     if (!is_scheduler_phase(r.phase_id)) {
@@ -764,7 +767,7 @@ int L2PerfCollector::export_swimlane_json() {
 // finalize
 // ---------------------------------------------------------------------------
 
-int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, const L2PerfFreeCallback &free_cb) {
+int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, const L2SwimlaneFreeCallback &free_cb) {
     if (shm_host_ == nullptr) return 0;
 
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
@@ -782,7 +785,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, const L2Pe
     // shadow stays in dev_to_host_ and is freed by clear_mappings() below
     // (single source of truth for shadow lifetime, no double-free risk).
     for (int i = 0; i < num_aicore_; i++) {
-        L2PerfBufferState *state = get_perf_buffer_state(shm_host_, i);
+        L2SwimlaneAicpuTaskPool *state = get_perf_buffer_state(shm_host_, i);
 
         release_dev(reinterpret_cast<void *>(state->current_buf_ptr));
         state->current_buf_ptr = 0;
@@ -804,7 +807,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, const L2Pe
 
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
     for (int t = 0; t < num_phase_threads; t++) {
-        PhaseBufferState *state = get_phase_buffer_state(shm_host_, num_aicore_, t);
+        L2SwimlaneAicpuPhasePool *state = get_phase_buffer_state(shm_host_, num_aicore_, t);
 
         release_dev(reinterpret_cast<void *>(state->current_buf_ptr));
         state->current_buf_ptr = 0;
@@ -831,7 +834,7 @@ int L2PerfCollector::finalize(L2PerfUnregisterCallback unregister_cb, const L2Pe
         release_dev(p);
     });
 
-    // Free per-core L2PerfAicoreRings (no host shadow paired). The rings
+    // Free per-core L2SwimlaneAicoreRings (no host shadow paired). The rings
     // were allocated directly via alloc_cb (not alloc_single_buffer), so no
     // entry exists in dev_to_host_ for them.
     for (auto *ring_dev : aicore_rings_dev_) {

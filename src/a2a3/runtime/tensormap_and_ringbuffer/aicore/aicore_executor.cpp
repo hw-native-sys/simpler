@@ -11,9 +11,9 @@
 
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
-#include "aicore/l2_perf_collector_aicore.h"
+#include "aicore/l2_swimlane_collector_aicore.h"
 #include "aicore/pmu_collector_aicore.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"  // Register-based communication
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
@@ -57,8 +57,8 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * args pointer from it on each dispatch. reg_val is a monotonically
  * increasing task ID used only for dispatch signaling and ACK/FIN protocol.
  *
- * Profiling state (enable flag, L2 perf ring) is published into the platform
- * via set_aicore_profiling_flag / set_aicore_l2_perf_ring at kernel entry —
+ * Profiling state (enable flag, L2 swimlane rotation channel) is published into the platform
+ * via set_aicore_profiling_flag / set_aicore_l2_swimlane_ring at kernel entry —
  * this routine reads it through the matching getters, so neither Handshake
  * nor this signature carry profiling fields.
  *
@@ -98,19 +98,19 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
     uint32_t enable_profiling_flag = get_aicore_profiling_flag();
-    bool l2_perf_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+    bool l2_swimlane_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
     bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
 
-    // Per-core AicoreRotation channel. The pointer to THIS core's rotation
-    // is stored in `KernelArgs::aicore_ring_addr[block_idx]`, but AICPU
-    // populates that table inside `l2_perf_aicpu_init` which runs
+    // Per-core L2SwimlaneAicoreRotation channel. The pointer to THIS core's rotation
+    // is stored in `KernelArgs::l2_swimlane_aicore_rotation_table[block_idx]`, but AICPU
+    // populates that table inside `l2_swimlane_aicpu_init` which runs
     // concurrently with this kernel's entry — so we cannot deref at startup.
-    // Defer the deref via `get_aicore_rotation()` until the first task is
+    // Defer the deref via `get_l2_swimlane_aicore_rotation()` until the first task is
     // dispatched; by then AICPU's init has completed (the very dispatch is
     // proof of that).
-    __gm__ AicoreRotation *l2_perf_rotation = nullptr;
-    AicoreLocalState l2_perf_local = {nullptr, 0, 0};
+    __gm__ L2SwimlaneAicoreRotation *l2_swimlane_rotation = nullptr;
+    L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, 0, 0};
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
@@ -135,10 +135,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             uint32_t task_id = reg_val;  // Decode: register holds task_id directly
 
             // First-task lazy resolve of the rotation channel — see comment
-            // above. `get_aicore_rotation()` caches after first call so this
+            // above. `get_l2_swimlane_aicore_rotation()` caches after first call so this
             // costs nothing on subsequent tasks.
-            if (l2_perf_enabled && l2_perf_rotation == nullptr) {
-                l2_perf_rotation = get_aicore_rotation();
+            if (l2_swimlane_enabled && l2_swimlane_rotation == nullptr) {
+                l2_swimlane_rotation = get_l2_swimlane_aicore_rotation();
             }
 
             // Select dual-buffer slot: same bit as AICPU used when writing payload
@@ -169,9 +169,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             }
 
             // Performance profiling: record task execution
-            if (l2_perf_enabled) {
+            if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                l2_perf_aicore_record_task(l2_perf_rotation, &l2_perf_local, task_id, start_time, end_time);
+                l2_swimlane_aicore_record_task(l2_swimlane_rotation, &l2_swimlane_local, task_id, start_time, end_time);
             }
 
             last_reg_val = reg_val;

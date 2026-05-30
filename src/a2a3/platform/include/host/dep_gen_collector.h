@@ -264,7 +264,7 @@ private:
 inline std::string make_deps_json_path(const std::string &output_dir) {
     // Use std::filesystem::path's operator/ for join — robust against trailing
     // slashes or path quirks that bare string concat would silently pass
-    // through. The sibling make_pmu_csv_path / make_l2_perf_path still use
+    // through. The sibling make_pmu_csv_path / make_l2_swimlane_path still use
     // string concat; converting those is a follow-up cleanup since the
     // project's output_prefix paths come from scene_test.py's pathlib join
     // (never trailing-slashed in practice).

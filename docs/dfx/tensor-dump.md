@@ -432,7 +432,7 @@ allocates and pre-fills free queues, an `on_buffer_collected`
 callback that gathers payload bytes into the in-memory record
 list, plus `reconcile_counters` / `export_dump_files` /
 `finalize`. The mgmt/poll threading, buffer pooling, and `Module`
-trait pattern are shared with PMU and L2Perf — see
+trait pattern are shared with PMU and L2Swimlane — see
 [profiling-framework.md](../profiling-framework.md) for the
 framework reference.
 

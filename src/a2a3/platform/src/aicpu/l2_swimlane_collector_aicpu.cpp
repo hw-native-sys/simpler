@@ -10,15 +10,15 @@
  */
 
 /**
- * @file l2_perf_collector_aicpu.cpp
+ * @file l2_swimlane_collector_aicpu.cpp
  * @brief AICPU performance data collection implementation (SPSC free queue)
  *
- * Uses per-core L2PerfBufferState with SPSC free queues for O(1) buffer switching.
+ * Uses per-core L2SwimlaneAicpuTaskPool with SPSC free queues for O(1) buffer switching.
  * Host memory manager dynamically allocates replacement buffers and pushes
  * them into the free_queue. Device pops from free_queue when switching.
  */
 
-#include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
 
 #include <cinttypes>
 #include <cstring>
@@ -29,79 +29,83 @@
 #include "common/unified_log.h"
 
 // Cached pointers for hot-path access (set during init)
-static AicpuPhaseHeader *s_phase_header = nullptr;
-static L2PerfDataHeader *s_l2_perf_header = nullptr;
+static L2SwimlaneAicpuPhaseHeader *s_l2_swimlane_aicpu_phase_header = nullptr;
+static L2SwimlaneDataHeader *s_l2_swimlane_header = nullptr;
 
-// Per-core L2PerfBufferState cache
-static L2PerfBufferState *s_perf_buffer_states[PLATFORM_MAX_CORES] = {};
+// Per-core L2SwimlaneAicpuTaskPool cache
+static L2SwimlaneAicpuTaskPool *s_aicpu_task_pools[PLATFORM_MAX_CORES] = {};
 
-// Per-core L2PerfAicoreBufferState cache (lives in the same shared region;
+// Per-core L2SwimlaneAicoreTaskPool cache (lives in the same shared region;
 // host writes initial pool + the rotation channel that AICore polls).
 //
 // All AICore-side bookkeeping (rotation channel, free queue,
 // total_record_count, current_buf_seq) is owned by this shared struct — see
-// l2_perf_profiling.h. We deliberately do not keep AICPU-process-local
+// l2_swimlane_profiling.h. We deliberately do not keep AICPU-process-local
 // mirror counters because the struct's volatile fields are the single
 // source of truth across init/complete/rotate/flush. The high-water-mark
 // formula `total_record_count - current_buf_seq * BUFFER_SIZE` correctly
 // handles the failed-rotation case (free_queue empty or ready_queue full)
 // since current_buf_seq only bumps on a successful rotation.
-static L2PerfAicoreBufferState *s_aicore_buffer_states[PLATFORM_MAX_CORES] = {};
+static L2SwimlaneAicoreTaskPool *s_aicore_task_pools[PLATFORM_MAX_CORES] = {};
 
 // Per-core cached current-records-buffer pointer. Written by AICPU when
 // rotating buffers from inside `complete_record`. AICore writes to its own
-// per-core L2PerfAicoreBuffer (host-allocated, AICPU rotates) and AICPU
+// per-core L2SwimlaneAicoreTaskBuffer (host-allocated, AICPU rotates) and AICPU
 // never reads from it on the hot path.
-static L2PerfBuffer *s_perf_records_buffers[PLATFORM_MAX_CORES] = {};
+static L2SwimlaneAicpuTaskBuffer *s_current_aicpu_task_buffers[PLATFORM_MAX_CORES] = {};
 
-// Per-thread PhaseBufferState cache
-static PhaseBufferState *s_phase_buffer_states[PLATFORM_MAX_AICPU_THREADS] = {};
-static PhaseBuffer *s_current_phase_buf[PLATFORM_MAX_AICPU_THREADS] = {};
+// Per-thread L2SwimlaneAicpuPhasePool cache
+static L2SwimlaneAicpuPhasePool *s_aicpu_phase_pools[PLATFORM_MAX_AICPU_THREADS] = {};
+static L2SwimlaneAicpuPhaseBuffer *s_current_aicpu_phase_buffers[PLATFORM_MAX_AICPU_THREADS] = {};
 
 static int s_orch_thread_idx = -1;
 
-// L2 perf platform state. Published by the host (via dlsym'd setters on sim)
+// L2 swimlane platform state. Published by the host (via dlsym'd setters on sim)
 // or by the AICPU kernel entry (onboard) before perf init runs, so downstream
 // perf code can discover enablement + device-base without reading the generic
 // Runtime struct. Two channels (mirrors PMU):
 //   - g_enable_l2_swimlane (bool) — set at kernel entry from the bitmask bit
-//   - g_l2_perf_level (L2PerfLevel) — promoted in
-//     l2_perf_aicpu_init from the shared-memory header so
+//   - g_l2_swimlane_level (L2SwimlaneLevel) — promoted in
+//     l2_swimlane_aicpu_init from the shared-memory header so
 //     `>= AICPU_TIMING / SCHED_PHASES / ORCH_PHASES` gates have the granular
-//     value (exposed via get_l2_perf_level()).
-static uint64_t g_platform_l2_perf_base = 0;
+//     value (exposed via get_l2_swimlane_level()).
+static uint64_t g_platform_l2_swimlane_base = 0;
 static bool g_enable_l2_swimlane = false;
-static L2PerfLevel g_l2_perf_level = L2PerfLevel::DISABLED;
+static L2SwimlaneLevel g_l2_swimlane_level = L2SwimlaneLevel::DISABLED;
 
-// AICore rotation-table device pointer (= KernelArgs::aicore_ring_addr).
+// AICore rotation-table device pointer (= KernelArgs::l2_swimlane_aicore_rotation_table).
 // Published by the host (sim: dlsym'd setter; onboard: from k_args via the
 // kernel entry); AICPU init walks it to fill per-core &rotation addresses.
-static uint64_t g_platform_aicore_rotation_table = 0;
+static uint64_t g_platform_l2_swimlane_aicore_rotation_table = 0;
 
-extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base) { g_platform_l2_perf_base = l2_perf_data_base; }
-extern "C" uint64_t get_platform_l2_perf_base() { return g_platform_l2_perf_base; }
+extern "C" void set_platform_l2_swimlane_base(uint64_t l2_swimlane_data_base) {
+    g_platform_l2_swimlane_base = l2_swimlane_data_base;
+}
+extern "C" uint64_t get_platform_l2_swimlane_base() { return g_platform_l2_swimlane_base; }
 extern "C" void set_l2_swimlane_enabled(bool enable) { g_enable_l2_swimlane = enable; }
 extern "C" bool is_l2_swimlane_enabled() { return g_enable_l2_swimlane; }
-extern "C" void set_platform_aicore_rotation_table(uint64_t table_addr) {
-    g_platform_aicore_rotation_table = table_addr;
+extern "C" void set_platform_l2_swimlane_aicore_rotation_table(uint64_t table_addr) {
+    g_platform_l2_swimlane_aicore_rotation_table = table_addr;
 }
-extern "C" uint64_t get_platform_aicore_rotation_table() { return g_platform_aicore_rotation_table; }
-L2PerfLevel get_l2_perf_level() { return g_l2_perf_level; }
+extern "C" uint64_t get_platform_l2_swimlane_aicore_rotation_table() {
+    return g_platform_l2_swimlane_aicore_rotation_table;
+}
+L2SwimlaneLevel get_l2_swimlane_level() { return g_l2_swimlane_level; }
 
 /**
  * Enqueue ready buffer to per-thread queue
  *
- * @param header L2PerfDataHeader pointer
+ * @param header L2SwimlaneDataHeader pointer
  * @param thread_idx Thread index
  * @param core_index Core index (or thread_idx for phase entries)
  * @param buffer_ptr Device pointer to the full buffer
  * @param buffer_seq Sequence number for ordering
- * @param is_phase 0 = L2PerfRecord, 1 = Phase
+ * @param kind Buffer kind discriminator (see L2SwimlaneBufferKind)
  * @return 0 on success, -1 if queue full
  */
 static int enqueue_ready_buffer(
-    L2PerfDataHeader *header, int thread_idx, uint32_t core_index, uint64_t buffer_ptr, uint32_t buffer_seq,
-    uint32_t is_phase
+    L2SwimlaneDataHeader *header, int thread_idx, uint32_t core_index, uint64_t buffer_ptr, uint32_t buffer_seq,
+    L2SwimlaneBufferKind kind
 ) {
     uint32_t capacity = PLATFORM_PROF_READYQUEUE_SIZE;
     uint32_t current_tail = header->queue_tails[thread_idx];
@@ -114,7 +118,7 @@ static int enqueue_ready_buffer(
     }
 
     header->queues[thread_idx][current_tail].core_index = core_index;
-    header->queues[thread_idx][current_tail].is_phase = is_phase;
+    header->queues[thread_idx][current_tail].kind = kind;
     header->queues[thread_idx][current_tail].buffer_ptr = buffer_ptr;
     header->queues[thread_idx][current_tail].buffer_seq = buffer_seq;
     header->queue_tails[thread_idx] = next_tail;
@@ -122,42 +126,42 @@ static int enqueue_ready_buffer(
     return 0;
 }
 
-void l2_perf_aicpu_init(int worker_count) {
-    void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
-    if (l2_perf_base == nullptr) {
-        LOG_ERROR("l2_perf_data_base is NULL, cannot initialize profiling");
+void l2_swimlane_aicpu_init(int worker_count) {
+    void *l2_swimlane_base = reinterpret_cast<void *>(g_platform_l2_swimlane_base);
+    if (l2_swimlane_base == nullptr) {
+        LOG_ERROR("l2_swimlane_data_base is NULL, cannot initialize profiling");
         return;
     }
 
-    s_l2_perf_header = get_l2_perf_header(l2_perf_base);
+    s_l2_swimlane_header = get_l2_swimlane_header(l2_swimlane_base);
 
     // Read the granular perf_level from the shared-memory header (host wrote
-    // it in L2PerfCollector::initialize). The kernel-entry setter only seeded
+    // it in L2SwimlaneCollector::initialize). The kernel-entry setter only seeded
     // the binary g_enable_l2_swimlane via the bitmask bit.
-    g_l2_perf_level = static_cast<L2PerfLevel>(s_l2_perf_header->l2_perf_level);
+    g_l2_swimlane_level = static_cast<L2SwimlaneLevel>(s_l2_swimlane_header->l2_swimlane_level);
 
     LOG_INFO_V0(
-        "Initializing performance profiling for %d cores (free queue), l2_perf_level=%u", worker_count,
-        static_cast<uint32_t>(g_l2_perf_level)
+        "Initializing performance profiling for %d cores (free queue), l2_swimlane_level=%u", worker_count,
+        static_cast<uint32_t>(g_l2_swimlane_level)
     );
 
-    // Populate the per-core AicoreRotation device-address table. AICore reads
-    // `aicore_ring_addr[block_idx]` from KernelArgs to find its rotation
+    // Populate the per-core L2SwimlaneAicoreRotation device-address table. AICore reads
+    // `l2_swimlane_aicore_rotation_table[block_idx]` from KernelArgs to find its rotation
     // channel; the table itself is host-allocated, but the entries are
     // device-internal addresses (`&ac_state->rotation`) that the host would
     // otherwise have to translate from host-mapped to device-mapped. AICPU
     // already runs on the device, so it can write the addresses directly
     // without any translation — that keeps the host side decoupled from the
     // AICore shared-memory layout.
-    uint64_t *rotation_table = reinterpret_cast<uint64_t *>(g_platform_aicore_rotation_table);
+    uint64_t *rotation_table = reinterpret_cast<uint64_t *>(g_platform_l2_swimlane_aicore_rotation_table);
 
     // Pop first buffer from free_queue for each core
     for (int i = 0; i < worker_count; i++) {
-        L2PerfBufferState *state = get_perf_buffer_state(l2_perf_base, i);
-        L2PerfAicoreBufferState *ac_state = get_aicore_buffer_state(l2_perf_base, worker_count, i);
+        L2SwimlaneAicpuTaskPool *state = get_perf_buffer_state(l2_swimlane_base, i);
+        L2SwimlaneAicoreTaskPool *ac_state = get_aicore_buffer_state(l2_swimlane_base, worker_count, i);
 
-        s_perf_buffer_states[i] = state;
-        s_aicore_buffer_states[i] = ac_state;
+        s_aicpu_task_pools[i] = state;
+        s_aicore_task_pools[i] = ac_state;
 
         if (rotation_table != nullptr) {
             rotation_table[i] = reinterpret_cast<uint64_t>(&ac_state->rotation);
@@ -176,15 +180,15 @@ void l2_perf_aicpu_init(int worker_count) {
             state->current_buf_seq = 0;
             wmb();
 
-            L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(buf_ptr);
+            L2SwimlaneAicpuTaskBuffer *buf = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(buf_ptr);
             buf->count = 0;
-            s_perf_records_buffers[i] = buf;
+            s_current_aicpu_task_buffers[i] = buf;
 
             LOG_DEBUG("Core %d: popped initial buffer (addr=0x%lx)", i, buf_ptr);
         } else {
             LOG_ERROR("Core %d: free_queue is empty during init!", i);
             state->current_buf_ptr = 0;
-            s_perf_records_buffers[i] = nullptr;
+            s_current_aicpu_task_buffers[i] = nullptr;
         }
 
         // Prime the AICore rotation channel with the initial buffer.
@@ -201,7 +205,7 @@ void l2_perf_aicpu_init(int worker_count) {
             ac_state->rotation.current_buf_ptr = ac_buf_ptr;
             ac_state->rotation.generation = 1;
             wmb();
-            L2PerfAicoreBuffer *ac_buf = reinterpret_cast<L2PerfAicoreBuffer *>(ac_buf_ptr);
+            L2SwimlaneAicoreTaskBuffer *ac_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(ac_buf_ptr);
             ac_buf->count = 0;
             LOG_DEBUG("Core %d: primed AICore rotation with buf=0x%lx, gen=1", i, ac_buf_ptr);
         } else {
@@ -218,18 +222,18 @@ void l2_perf_aicpu_init(int worker_count) {
 }
 
 /**
- * Internal records-buffer rotation. Called from `l2_perf_aicpu_complete_record`
+ * Internal records-buffer rotation. Called from `l2_swimlane_aicpu_complete_task`
  * after a record is committed and the buffer hits capacity. Only swaps an
  * AICPU-private records pointer — AICore reads from a stable ring and is
  * unaffected by this call.
  */
 static void switch_records_buffer(int core_id, int thread_idx) {
-    L2PerfBufferState *state = s_perf_buffer_states[core_id];
+    L2SwimlaneAicpuTaskPool *state = s_aicpu_task_pools[core_id];
     if (state == nullptr) {
         return;
     }
 
-    L2PerfBuffer *full_buf = s_perf_records_buffers[core_id];
+    L2SwimlaneAicpuTaskBuffer *full_buf = s_current_aicpu_task_buffers[core_id];
     if (full_buf == nullptr) {
         return;
     }
@@ -252,7 +256,9 @@ static void switch_records_buffer(int core_id, int thread_idx) {
 
     // Enqueue full buffer to ReadyQueue
     uint32_t seq = state->current_buf_seq;
-    int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, state->current_buf_ptr, seq, 0);
+    int rc = enqueue_ready_buffer(
+        s_l2_swimlane_header, thread_idx, core_id, state->current_buf_ptr, seq, L2SwimlaneBufferKind::AicpuTask
+    );
     if (rc != 0) {
         LOG_ERROR("Thread %d: Core %d failed to enqueue buffer (queue full), data lost!", thread_idx, core_id);
         // Revert: discard data and keep writing
@@ -270,21 +276,21 @@ static void switch_records_buffer(int core_id, int thread_idx) {
     state->current_buf_seq = seq + 1;
     wmb();
 
-    L2PerfBuffer *new_buf = reinterpret_cast<L2PerfBuffer *>(new_buf_ptr);
+    L2SwimlaneAicpuTaskBuffer *new_buf = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(new_buf_ptr);
     new_buf->count = 0;
-    s_perf_records_buffers[core_id] = new_buf;
+    s_current_aicpu_task_buffers[core_id] = new_buf;
 
     LOG_INFO_V0("Thread %d: Core %d switched to new buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
 }
 
 // Try to rotate the AICore buffer for `core_id`. Called from the completion
-// path after a successful L2PerfRecord commit so the just-FIN'd task's
+// path after a successful L2SwimlaneAicpuTaskRecord commit so the just-FIN'd task's
 // AICore record is guaranteed to be in the old buffer before we enqueue it.
 // On success bumps `ac_state->current_buf_seq`; on failure (empty free queue
 // or full ready queue) the old buffer is abandoned in place, AICore overflows
 // it from now on, and the drop count grows.
 static void aicore_rotate(int core_id, int thread_idx) {
-    L2PerfAicoreBufferState *ac_state = s_aicore_buffer_states[core_id];
+    L2SwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
     if (ac_state == nullptr) {
         return;
     }
@@ -312,10 +318,12 @@ static void aicore_rotate(int core_id, int thread_idx) {
 
     // Enqueue the just-filled AICore buffer with count = BUFFER_SIZE.
     if (old_buf_ptr != 0) {
-        L2PerfAicoreBuffer *old_buf = reinterpret_cast<L2PerfAicoreBuffer *>(old_buf_ptr);
+        L2SwimlaneAicoreTaskBuffer *old_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(old_buf_ptr);
         old_buf->count = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
         wmb();
-        int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, old_buf_ptr, seq, /*is_phase=*/2);
+        int rc = enqueue_ready_buffer(
+            s_l2_swimlane_header, thread_idx, core_id, old_buf_ptr, seq, L2SwimlaneBufferKind::AicoreTask
+        );
         if (rc != 0) {
             LOG_ERROR(
                 "Thread %d: Core %d failed to enqueue AICore buffer (queue full), %d records lost", thread_idx, core_id,
@@ -332,7 +340,7 @@ static void aicore_rotate(int core_id, int thread_idx) {
     rmb();
     ac_state->free_queue.head = head + 1;
     ac_state->current_buf_seq = seq + 1;
-    L2PerfAicoreBuffer *new_buf = reinterpret_cast<L2PerfAicoreBuffer *>(new_buf_ptr);
+    L2SwimlaneAicoreTaskBuffer *new_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(new_buf_ptr);
     new_buf->count = 0;
 
     wmb();  // ensure new_buf->count=0 visible before AICore sees new ptr
@@ -342,18 +350,18 @@ static void aicore_rotate(int core_id, int thread_idx) {
 }
 
 // Public no-op shim kept so callers compile during the cross-runtime
-// transition; the rotation has been moved into l2_perf_aicpu_complete_record
+// transition; the rotation has been moved into l2_swimlane_aicpu_complete_task
 // where it is race-free vs in-flight AICore record writes.
-void l2_perf_aicpu_maybe_rotate_aicore(int /*core_id*/, int /*thread_idx*/) {}
+void l2_swimlane_aicpu_maybe_rotate_aicore(int /*core_id*/, int /*thread_idx*/) {}
 
-int l2_perf_aicpu_complete_record(
+int l2_swimlane_aicpu_complete_task(
     int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
     uint64_t dispatch_time, uint64_t finish_time
 ) {
     if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
         return -1;
     }
-    L2PerfBufferState *state = s_perf_buffer_states[core_id];
+    L2SwimlaneAicpuTaskPool *state = s_aicpu_task_pools[core_id];
     if (state == nullptr) {
         return -1;
     }
@@ -362,14 +370,14 @@ int l2_perf_aicpu_complete_record(
     // `device_total - (collected + dropped)`.
     state->total_record_count += 1;
 
-    L2PerfBuffer *l2_perf_buf = s_perf_records_buffers[core_id];
-    if (l2_perf_buf == nullptr) {
+    L2SwimlaneAicpuTaskBuffer *l2_swimlane_buf = s_current_aicpu_task_buffers[core_id];
+    if (l2_swimlane_buf == nullptr) {
         // No active records buffer (init ran out of free buffers); count as drop
         // so host reconciliation stays consistent.
         state->dropped_record_count += 1;
         return -1;
     }
-    uint32_t count = l2_perf_buf->count;
+    uint32_t count = l2_swimlane_buf->count;
     if (count >= PLATFORM_PROF_BUFFER_SIZE) {
         // Defensive: should not happen because we rotate at end of every commit.
         state->dropped_record_count += 1;
@@ -377,14 +385,14 @@ int l2_perf_aicpu_complete_record(
     }
 
     // AICore-as-producer: AICore writes start/end/task_id directly into its
-    // own per-core L2PerfAicoreBuffer (indexed by reg_task_id % SIZE). AICPU
+    // own per-core L2SwimlaneAicoreTaskBuffer (indexed by reg_task_id % SIZE). AICPU
     // writes only AICPU-owned fields here; start/end stay zero on-device and
     // are patched by the host when the buffer is consumed. Join key is
     // `reg_task_id` (monotonic per core), stored alongside the PTO2-encoded
     // `task_id` so the host can match without a hashmap lookup. This
     // eliminates the per-task rmb() + staging cache-line read the previous
     // design required.
-    L2PerfRecord *record = &l2_perf_buf->records[count];
+    L2SwimlaneAicpuTaskRecord *record = &l2_swimlane_buf->records[count];
     record->start_time = 0;
     record->end_time = 0;
     record->duration = 0;
@@ -394,7 +402,7 @@ int l2_perf_aicpu_complete_record(
     record->core_type = core_type;
 
     // AICPU_TIMING and above: dispatch/finish timing.
-    if (g_l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+    if (g_l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
         record->dispatch_time = dispatch_time;
         record->finish_time = finish_time;
     } else {
@@ -403,10 +411,10 @@ int l2_perf_aicpu_complete_record(
     }
 
     uint32_t new_count = count + 1;
-    l2_perf_buf->count = new_count;
+    l2_swimlane_buf->count = new_count;
     wmb();
 
-    // Rotate AICpu's L2PerfBuffer after the write so the just-committed
+    // Rotate AICpu's L2SwimlaneAicpuTaskBuffer after the write so the just-committed
     // record is preserved.
     if (new_count >= PLATFORM_PROF_BUFFER_SIZE) {
         switch_records_buffer(core_id, thread_idx);
@@ -435,7 +443,7 @@ int l2_perf_aicpu_complete_record(
     // total_record_count is uint32_t — wraps after ~4 G completions per core.
     // At realistic dispatch rates this is multi-week continuous-run territory;
     // we accept the limitation rather than widening the on-device counter.
-    L2PerfAicoreBufferState *ac_state = s_aicore_buffer_states[core_id];
+    L2SwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
     if (ac_state != nullptr) {
         uint32_t completed = ac_state->total_record_count + 1;
         ac_state->total_record_count = completed;
@@ -447,13 +455,13 @@ int l2_perf_aicpu_complete_record(
     return 0;
 }
 
-void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int core_num) {
+void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int core_num) {
     if (!g_enable_l2_swimlane) {
         return;
     }
 
-    void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
-    if (l2_perf_base == nullptr) {
+    void *l2_swimlane_base = reinterpret_cast<void *>(g_platform_l2_swimlane_base);
+    if (l2_swimlane_base == nullptr) {
         return;
     }
 
@@ -465,7 +473,7 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
 
     for (int i = 0; i < core_num; i++) {
         int core_id = cur_thread_cores[i];
-        L2PerfBufferState *state = s_perf_buffer_states[core_id];
+        L2SwimlaneAicpuTaskPool *state = s_aicpu_task_pools[core_id];
         if (state == nullptr) continue;
 
         rmb();
@@ -473,15 +481,17 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
         if (buf_ptr == 0) {
             // No active buffer
         } else {
-            L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(buf_ptr);
+            L2SwimlaneAicpuTaskBuffer *buf = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(buf_ptr);
             if (buf->count > 0) {
                 uint32_t seq = state->current_buf_seq;
-                int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, buf_ptr, seq, 0);
+                int rc = enqueue_ready_buffer(
+                    s_l2_swimlane_header, thread_idx, core_id, buf_ptr, seq, L2SwimlaneBufferKind::AicpuTask
+                );
                 if (rc == 0) {
                     LOG_INFO_V0("Thread %d: Core %d flushed buffer with %u records", thread_idx, core_id, buf->count);
                     flushed_count++;
                     state->current_buf_ptr = 0;
-                    s_perf_records_buffers[core_id] = nullptr;
+                    s_current_aicpu_task_buffers[core_id] = nullptr;
                     wmb();
                 } else {
                     // ready_queue full at end-of-run: account the loss and clear the
@@ -494,7 +504,7 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
                     state->dropped_record_count = state->dropped_record_count + buf->count;
                     buf->count = 0;
                     state->current_buf_ptr = 0;
-                    s_perf_records_buffers[core_id] = nullptr;
+                    s_current_aicpu_task_buffers[core_id] = nullptr;
                     wmb();
                 }
             }
@@ -510,7 +520,7 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
         // unknown number of dropped overflow attempts; the formula clamps
         // to BUFFER_SIZE in that case rather than stamping a stale partial
         // count.
-        L2PerfAicoreBufferState *ac_state = s_aicore_buffer_states[core_id];
+        L2SwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
         if (ac_state == nullptr) continue;
 
         rmb();
@@ -527,12 +537,14 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
         uint32_t ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
                                static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
                                live;
-        L2PerfAicoreBuffer *ac_buf = reinterpret_cast<L2PerfAicoreBuffer *>(ac_buf_ptr);
+        L2SwimlaneAicoreTaskBuffer *ac_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(ac_buf_ptr);
         ac_buf->count = ac_mark;
         wmb();
 
         uint32_t ac_seq = ac_state->current_buf_seq;
-        int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, core_id, ac_buf_ptr, ac_seq, /*is_phase=*/2);
+        int rc = enqueue_ready_buffer(
+            s_l2_swimlane_header, thread_idx, core_id, ac_buf_ptr, ac_seq, L2SwimlaneBufferKind::AicoreTask
+        );
         if (rc == 0) {
             LOG_INFO_V0(
                 "Thread %d: Core %d flushed AICore buffer (seq=%u, count=%u)", thread_idx, core_id, ac_seq, ac_mark
@@ -552,22 +564,24 @@ void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, in
     LOG_INFO_V0("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
-void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads) {
-    void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
-    if (l2_perf_base == nullptr) {
-        LOG_ERROR("l2_perf_data_base is NULL, cannot initialize phase profiling");
+void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_threads) {
+    void *l2_swimlane_base = reinterpret_cast<void *>(g_platform_l2_swimlane_base);
+    if (l2_swimlane_base == nullptr) {
+        LOG_ERROR("l2_swimlane_data_base is NULL, cannot initialize phase profiling");
         return;
     }
 
-    s_phase_header = get_phase_header(l2_perf_base, worker_count);
-    s_l2_perf_header = get_l2_perf_header(l2_perf_base);
+    s_l2_swimlane_aicpu_phase_header = get_phase_header(l2_swimlane_base, worker_count);
+    s_l2_swimlane_header = get_l2_swimlane_header(l2_swimlane_base);
 
-    s_phase_header->magic = AICPU_PHASE_MAGIC;
-    s_phase_header->num_sched_threads = num_sched_threads;
-    s_phase_header->records_per_thread = PLATFORM_PHASE_RECORDS_PER_THREAD;
-    s_phase_header->num_cores = 0;
+    s_l2_swimlane_aicpu_phase_header->magic = L2_SWIMLANE_AICPU_PHASE_MAGIC;
+    s_l2_swimlane_aicpu_phase_header->num_sched_threads = num_sched_threads;
+    s_l2_swimlane_aicpu_phase_header->records_per_thread = PLATFORM_PHASE_RECORDS_PER_THREAD;
+    s_l2_swimlane_aicpu_phase_header->num_cores = 0;
 
-    memset(s_phase_header->core_to_thread, -1, sizeof(s_phase_header->core_to_thread));
+    memset(
+        s_l2_swimlane_aicpu_phase_header->core_to_thread, -1, sizeof(s_l2_swimlane_aicpu_phase_header->core_to_thread)
+    );
 
     // Cache per-thread record pointers and clear buffers
     // Include all threads: scheduler + orchestrator (orchestrators may become schedulers)
@@ -576,9 +590,9 @@ void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads) {
         total_threads = PLATFORM_MAX_AICPU_THREADS;
     }
     for (int t = 0; t < total_threads; t++) {
-        PhaseBufferState *state = get_phase_buffer_state(l2_perf_base, worker_count, t);
+        L2SwimlaneAicpuPhasePool *state = get_phase_buffer_state(l2_swimlane_base, worker_count, t);
 
-        s_phase_buffer_states[t] = state;
+        s_aicpu_phase_pools[t] = state;
 
         // Pop first buffer from free_queue
         rmb();
@@ -593,22 +607,22 @@ void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads) {
             state->current_buf_seq = 0;
             wmb();
 
-            PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(buf_ptr);
+            L2SwimlaneAicpuPhaseBuffer *buf = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(buf_ptr);
             buf->count = 0;
-            s_current_phase_buf[t] = buf;
+            s_current_aicpu_phase_buffers[t] = buf;
 
             LOG_DEBUG("Thread %d: popped initial phase buffer (addr=0x%lx)", t, buf_ptr);
         } else {
             LOG_ERROR("Thread %d: phase free_queue is empty during init!", t);
             state->current_buf_ptr = 0;
-            s_current_phase_buf[t] = nullptr;
+            s_current_aicpu_phase_buffers[t] = nullptr;
         }
     }
 
     // Clear remaining slots
     for (int t = total_threads; t < PLATFORM_MAX_AICPU_THREADS; t++) {
-        s_phase_buffer_states[t] = nullptr;
-        s_current_phase_buf[t] = nullptr;
+        s_aicpu_phase_pools[t] = nullptr;
+        s_current_aicpu_phase_buffers[t] = nullptr;
     }
 
     wmb();
@@ -623,28 +637,30 @@ void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads) {
  * Switch phase buffer when current buffer is full (free queue version)
  *
  * Enqueues the full buffer to ReadyQueue and pops the next buffer from free_queue.
- * If no free buffer is available, sets s_current_phase_buf to nullptr so subsequent
+ * If no free buffer is available, sets s_current_aicpu_phase_buffers to nullptr so subsequent
  * records are dropped (preserving already-enqueued data).
  */
 static void switch_phase_buffer(int thread_idx) {
-    PhaseBufferState *state = s_phase_buffer_states[thread_idx];
+    L2SwimlaneAicpuPhasePool *state = s_aicpu_phase_pools[thread_idx];
     if (state == nullptr) return;
 
-    PhaseBuffer *full_buf = s_current_phase_buf[thread_idx];
+    L2SwimlaneAicpuPhaseBuffer *full_buf = s_current_aicpu_phase_buffers[thread_idx];
     if (full_buf == nullptr) return;
 
     LOG_INFO_V0("Thread %d: phase buffer is full (count=%u)", thread_idx, full_buf->count);
 
     // Enqueue to ReadyQueue
     uint32_t seq = state->current_buf_seq;
-    int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, thread_idx, state->current_buf_ptr, seq, 1);
+    int rc = enqueue_ready_buffer(
+        s_l2_swimlane_header, thread_idx, thread_idx, state->current_buf_ptr, seq, L2SwimlaneBufferKind::AicpuPhase
+    );
     if (rc != 0) {
         LOG_ERROR(
             "Thread %d: failed to enqueue phase buffer (queue full), %u records lost!", thread_idx, full_buf->count
         );
         state->dropped_record_count = state->dropped_record_count + full_buf->count;
         full_buf->count = 0;
-        s_current_phase_buf[thread_idx] = nullptr;
+        s_current_aicpu_phase_buffers[thread_idx] = nullptr;
         state->current_buf_ptr = 0;
         wmb();
         return;
@@ -663,29 +679,29 @@ static void switch_phase_buffer(int thread_idx) {
         state->current_buf_seq = seq + 1;
         wmb();
 
-        PhaseBuffer *new_buf = reinterpret_cast<PhaseBuffer *>(new_buf_ptr);
+        L2SwimlaneAicpuPhaseBuffer *new_buf = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(new_buf_ptr);
         new_buf->count = 0;
-        s_current_phase_buf[thread_idx] = new_buf;
+        s_current_aicpu_phase_buffers[thread_idx] = new_buf;
 
         LOG_INFO_V0("Thread %d: switched to new phase buffer", thread_idx);
     } else {
         // No free buffer available, drop subsequent records
         LOG_WARN("Thread %d: no free phase buffer available, dropping records until Host catches up", thread_idx);
-        s_current_phase_buf[thread_idx] = nullptr;
+        s_current_aicpu_phase_buffers[thread_idx] = nullptr;
         state->current_buf_ptr = 0;
         wmb();
     }
 }
 
-void l2_perf_aicpu_record_phase(
-    int thread_idx, AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
+void l2_swimlane_aicpu_record_phase(
+    int thread_idx, L2SwimlaneAicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
     uint64_t tasks_processed, uint32_t extra1, uint32_t extra2
 ) {
-    if (s_phase_header == nullptr) {
+    if (s_l2_swimlane_aicpu_phase_header == nullptr) {
         return;
     }
 
-    PhaseBufferState *state = s_phase_buffer_states[thread_idx];
+    L2SwimlaneAicpuPhasePool *state = s_aicpu_phase_pools[thread_idx];
     if (state == nullptr) {
         return;
     }
@@ -694,7 +710,7 @@ void l2_perf_aicpu_record_phase(
     // as `device_total - (collected + dropped)` (mirrors PERF accounting).
     state->total_record_count += 1;
 
-    PhaseBuffer *buf = s_current_phase_buf[thread_idx];
+    L2SwimlaneAicpuPhaseBuffer *buf = s_current_aicpu_phase_buffers[thread_idx];
 
     // Try to recover from nullptr (no buffer was available on previous switch)
     if (buf == nullptr) {
@@ -710,9 +726,9 @@ void l2_perf_aicpu_record_phase(
             state->current_buf_seq = state->current_buf_seq + 1;
             wmb();
 
-            buf = reinterpret_cast<PhaseBuffer *>(buf_ptr);
+            buf = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(buf_ptr);
             buf->count = 0;
-            s_current_phase_buf[thread_idx] = buf;
+            s_current_aicpu_phase_buffers[thread_idx] = buf;
 
             LOG_INFO_V0("Thread %d: recovered phase buffer", thread_idx);
         }
@@ -727,7 +743,7 @@ void l2_perf_aicpu_record_phase(
     if (idx >= PLATFORM_PHASE_RECORDS_PER_THREAD) {
         // Buffer full, switch to next buffer
         switch_phase_buffer(thread_idx);
-        buf = s_current_phase_buf[thread_idx];
+        buf = s_current_aicpu_phase_buffers[thread_idx];
         if (buf == nullptr) {
             state->dropped_record_count += 1;
             return;
@@ -739,7 +755,7 @@ void l2_perf_aicpu_record_phase(
         }
     }
 
-    AicpuPhaseRecord *record = &buf->records[idx];
+    L2SwimlaneAicpuPhaseRecord *record = &buf->records[idx];
     record->start_time = start_time;
     record->end_time = end_time;
     record->loop_iter = loop_iter;
@@ -751,21 +767,21 @@ void l2_perf_aicpu_record_phase(
     buf->count = idx + 1;
 }
 
-void l2_perf_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
+void l2_swimlane_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
 
-void l2_perf_aicpu_record_orch_phase(
-    AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint64_t task_id
+void l2_swimlane_aicpu_record_orch_phase(
+    L2SwimlaneAicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint64_t task_id
 ) {
-    if (s_orch_thread_idx < 0 || s_phase_header == nullptr) return;
-    l2_perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
+    if (s_orch_thread_idx < 0 || s_l2_swimlane_aicpu_phase_header == nullptr) return;
+    l2_swimlane_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
 }
 
-void l2_perf_aicpu_flush_phase_buffers(int thread_idx) {
-    if (s_phase_header == nullptr || s_l2_perf_header == nullptr) {
+void l2_swimlane_aicpu_flush_phase_buffers(int thread_idx) {
+    if (s_l2_swimlane_aicpu_phase_header == nullptr || s_l2_swimlane_header == nullptr) {
         return;
     }
 
-    PhaseBufferState *state = s_phase_buffer_states[thread_idx];
+    L2SwimlaneAicpuPhasePool *state = s_aicpu_phase_pools[thread_idx];
     if (state == nullptr) return;
 
     rmb();
@@ -775,13 +791,15 @@ void l2_perf_aicpu_flush_phase_buffers(int thread_idx) {
         return;
     }
 
-    PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(buf_ptr);
+    L2SwimlaneAicpuPhaseBuffer *buf = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(buf_ptr);
     if (buf->count == 0) {
         return;
     }
 
     uint32_t seq = state->current_buf_seq;
-    int rc = enqueue_ready_buffer(s_l2_perf_header, thread_idx, thread_idx, buf_ptr, seq, 1);
+    int rc = enqueue_ready_buffer(
+        s_l2_swimlane_header, thread_idx, thread_idx, buf_ptr, seq, L2SwimlaneBufferKind::AicpuPhase
+    );
     if (rc == 0) {
         LOG_INFO_V0("Thread %d: flushed phase buffer with %u records", thread_idx, buf->count);
     } else {
@@ -790,28 +808,30 @@ void l2_perf_aicpu_flush_phase_buffers(int thread_idx) {
         buf->count = 0;
     }
     state->current_buf_ptr = 0;
-    s_current_phase_buf[thread_idx] = nullptr;
+    s_current_aicpu_phase_buffers[thread_idx] = nullptr;
     wmb();
 }
 
-void l2_perf_aicpu_init_core_assignments(int total_cores) {
-    if (s_phase_header == nullptr) {
+void l2_swimlane_aicpu_init_core_assignments(int total_cores) {
+    if (s_l2_swimlane_aicpu_phase_header == nullptr) {
         return;
     }
-    memset(s_phase_header->core_to_thread, -1, sizeof(s_phase_header->core_to_thread));
-    s_phase_header->num_cores = static_cast<uint32_t>(total_cores);
+    memset(
+        s_l2_swimlane_aicpu_phase_header->core_to_thread, -1, sizeof(s_l2_swimlane_aicpu_phase_header->core_to_thread)
+    );
+    s_l2_swimlane_aicpu_phase_header->num_cores = static_cast<uint32_t>(total_cores);
     wmb();
     LOG_INFO_V0("Core-to-thread mapping init: %d cores", total_cores);
 }
 
-void l2_perf_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num) {
-    if (s_phase_header == nullptr) {
+void l2_swimlane_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num) {
+    if (s_l2_swimlane_aicpu_phase_header == nullptr) {
         return;
     }
     for (int i = 0; i < core_num; i++) {
         int core_id = core_ids[i];
         if (core_id >= 0 && core_id < PLATFORM_MAX_CORES) {
-            s_phase_header->core_to_thread[core_id] = static_cast<int8_t>(thread_idx);
+            s_l2_swimlane_aicpu_phase_header->core_to_thread[core_id] = static_cast<int8_t>(thread_idx);
         }
     }
     wmb();

@@ -104,7 +104,7 @@ constexpr int PLATFORM_MAX_CORES = PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BL
 
 /**
  * Performance buffer capacity per buffer
- * Number of L2PerfRecord entries per dynamically allocated L2PerfBuffer
+ * Number of L2SwimlaneAicpuTaskRecord entries per dynamically allocated L2SwimlaneAicpuTaskBuffer
  */
 constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 
@@ -118,13 +118,13 @@ constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
 
 /**
- * L2PerfBuffer pre-allocation count per AICore.
+ * L2SwimlaneAicpuTaskBuffer pre-allocation count per AICore.
  * 1 goes into the free_queue at init, the rest into the recycled pool.
  */
 constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
 
 /**
- * PhaseBuffer pre-allocation count per AICPU thread.
+ * L2SwimlaneAicpuPhaseBuffer pre-allocation count per AICPU thread.
  * 1 goes into the free_queue at init, the rest into the recycled pool.
  */
 constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
@@ -139,7 +139,7 @@ constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
 
 /**
  * Performance buffer capacity per AICPU thread
- * Maximum number of AicpuPhaseRecord entries per PhaseBuffer.
+ * Maximum number of L2SwimlaneAicpuPhaseRecord entries per L2SwimlaneAicpuPhaseBuffer.
  */
 constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 500000;
 
@@ -229,14 +229,14 @@ constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 constexpr int PLATFORM_PMU_RECORDS_PER_BUFFER = 512;
 
 /**
- * Per-core L2Perf staging ring depth (AICore-side WIP slots).
+ * Per-core L2Swimlane staging ring depth (AICore-side WIP slots).
  *
  * Must be ≥ the maximum number of in-flight tasks per core (today's
  * dual-issue dispatch keeps this at 2). The ring lives outside the
- * rotating L2PerfBuffer so AICore's write address never changes mid-run.
+ * rotating L2SwimlaneAicpuTaskBuffer so AICore's write address never changes mid-run.
  *
  * Indexing uses `task_id % PLATFORM_L2_AICORE_RING_SIZE` (see
- * `l2_perf_aicore_record_task`), so non-power-of-two values are correct
+ * `l2_swimlane_aicore_record_task`), so non-power-of-two values are correct
  * but compile to an integer divide on the AICore hot path. Prefer a power
  * of two so the compiler reduces the modulo to a mask.
  */

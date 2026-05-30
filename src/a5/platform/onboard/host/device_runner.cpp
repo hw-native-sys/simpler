@@ -108,9 +108,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_perf(num_aicore, device_id_);
+        rc = init_l2_swimlane(num_aicore, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_l2_perf failed: %d", rc);
+            LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
         }
     }
@@ -219,8 +219,8 @@ int DeviceRunner::finalize() {
     // shadows). All four shared collectors use the same alloc/free shape
     // on a5: no unregister callback (a5 doesn't use halHostRegister) +
     // prof_free_cb (rtFree directly).
-    if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+    if (l2_swimlane_collector_.is_initialized()) {
+        l2_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (dump_collector_.is_initialized()) {
         dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
@@ -252,8 +252,8 @@ int DeviceRunner::finalize() {
 // `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
 void DeviceRunner::finalize_collectors() {
-    if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.stop();
+    if (l2_swimlane_collector_.is_initialized()) {
+        l2_swimlane_collector_.stop();
     }
     if (dump_collector_.is_initialized()) {
         dump_collector_.stop();
@@ -263,15 +263,15 @@ void DeviceRunner::finalize_collectors() {
     }
 }
 
-int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
-    int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, l2_perf_level_, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
+int DeviceRunner::init_l2_swimlane(int num_aicore, int device_id) {
+    int rc = l2_swimlane_collector_.initialize(
+        num_aicore, device_id, l2_swimlane_level_, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
-        kernel_args_.args.l2_perf_data_base =
-            reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
-        kernel_args_.args.aicore_l2_perf_ring_addrs =
-            reinterpret_cast<uint64_t>(l2_perf_collector_.get_aicore_ring_addrs_device_ptr());
+        kernel_args_.args.l2_swimlane_data_base =
+            reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_l2_swimlane_setup_device_ptr());
+        kernel_args_.args.aicore_l2_swimlane_ring_addrs =
+            reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_aicore_ring_addrs_device_ptr());
     }
     return rc;
 }

@@ -43,12 +43,12 @@
 #include "device_runner_helpers.h"  // common DeviceArgs + KernelArgsHelper
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
-#include "host/l2_perf_collector.h"
+#include "host/l2_swimlane_collector.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
 #include "host/tensor_dump_collector.h"
@@ -141,7 +141,7 @@ private:
     // (`ChipCallableBuffer`, `CallableState`, `OrchSoBuffer`) are
     // inherited from `DeviceRunnerBase`.
 
-    // Shared collectors (`l2_perf_collector_`, `dump_collector_`,
+    // Shared collectors (`l2_swimlane_collector_`, `dump_collector_`,
     // `pmu_collector_`, `scope_stats_collector_`) live on `DeviceRunnerBase`.
 
     // `query_max_block_dim`, `validate_block_dim`, `ensure_binaries_loaded`,
@@ -151,16 +151,16 @@ private:
     /**
      * Initialize performance profiling device buffers
      *
-     * Allocates L2PerfSetupHeader and per-core/per-thread buffers on device;
-     * caller publishes the device pointer via kernel_args.l2_perf_data_base
-     * (AICPU reads it through get_platform_l2_perf_base()).
+     * Allocates L2SwimlaneSetupHeader and per-core/per-thread buffers on device;
+     * caller publishes the device pointer via kernel_args.l2_swimlane_data_base
+     * (AICPU reads it through get_platform_l2_swimlane_base()).
      *
      * @param runtime Runtime instance to configure
      * @param num_aicore Number of AICore instances
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
-    int init_l2_perf(int num_aicore, int device_id);
+    int init_l2_swimlane(int num_aicore, int device_id);
 
     /**
      * Initialize tensor dump device buffers.
@@ -180,7 +180,7 @@ private:
      * Signature matches a2a3 for cross-platform consistency.
      */
     // Shared enable flags (`enable_l2_swimlane_`, `enable_dump_tensor_`,
-    // `enable_pmu_`, `enable_scope_stats_`, `l2_perf_level_`,
+    // `enable_pmu_`, `enable_scope_stats_`, `l2_swimlane_level_`,
     // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.
 
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);

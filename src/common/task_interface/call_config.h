@@ -16,7 +16,7 @@
  * `enable_dump_tensor`, `enable_pmu`, `enable_dep_gen`, and
  * `enable_scope_stats`. All five require `output_prefix` because they each
  * write a sibling artifact into that directory
- * (`l2_perf_records.json` / `tensor_dump/` / `pmu.csv` / `deps.json` /
+ * (`l2_swimlane_records.json` / `tensor_dump/` / `pmu.csv` / `deps.json` /
  * `scope_stats.json`).
  *
  * `block_dim == 0` is a sentinel for "auto" — DeviceRunner resolves it at
@@ -35,7 +35,7 @@
  * across compilers (sizeof(bool) is implementation-defined).
  *
  * `output_prefix` is a NUL-terminated directory path under which all
- * diagnostic artifacts (l2_perf_records.json / tensor_dump/ / pmu.csv /
+ * diagnostic artifacts (l2_swimlane_records.json / tensor_dump/ / pmu.csv /
  * deps.json / scope_stats.json) are written. The caller is responsible for
  * filling it whenever any diagnostic flag is enabled — `validate()` enforces
  * this contract at every submit/run entry point so the runtime never has to

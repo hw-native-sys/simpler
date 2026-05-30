@@ -1,0 +1,3 @@
+{"version": 4, "fatal": false, "dropped": 0, "total": 2, "task_window_max": [16384, 16384, 16384, 16384], "heap_max": [268435456, 268435456, 268435456, 268435456], "tensormap_max": 65536}
+{"site": "(unknown):0", "phase": "begin", "depth": 0, "ring": 0, "task_window_start": 0, "task_window_end": 0, "heap_start": 0, "heap_end": 0, "tensormap": 0}
+{"site": "(unknown):0", "phase": "end", "depth": 0, "ring": 0, "task_window_start": 0, "task_window_end": 1, "heap_start": 0, "heap_end": 0, "tensormap": 1}

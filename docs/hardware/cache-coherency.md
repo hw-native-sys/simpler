@@ -80,19 +80,19 @@ Two separate concerns, often conflated:
   stale value from a previous round). The AICPU side must emit
   `rmb()` between the COND check and the slot reads.
 
-Concretely, the L2 perf staging-slot read in
-`src/{a2a3,a5}/platform/src/aicpu/l2_perf_collector_aicpu.cpp` does
+Concretely, the L2 swimlane staging-slot read in
+`src/{a2a3,a5}/platform/src/aicpu/l2_swimlane_collector_aicpu.cpp` does
 **not** call `cache_invalidate_range` on the slot, but it **does** call
 `rmb()` before reading `slot->task_id` and the timing fields. All of
 those fields are AICore writes covered by the AICore-side `dcci` in
-`l2_perf_aicore_record_task`. The same pattern applies to the PMU
+`l2_swimlane_aicore_record_task`. The same pattern applies to the PMU
 staging slot
 (`src/{a2a3,a5}/platform/src/aicpu/pmu_collector_aicpu.cpp`).
 
 ### Historical pitfall
 
 PR #540 (2026-04-15) added `cache_invalidate_range(slot, 64)` on the
-AICPU side of the L2 perf staging slot, mirroring the
+AICPU side of the L2 swimlane staging slot, mirroring the
 host-DMA-protocol pattern from PR #204. The two situations are
 **not** the same: host DMA bypasses the AICPU cache; AICore stores
 plus `dcci` do not. The cache invalidate was redundant — but the
@@ -171,11 +171,11 @@ forever once they ship.
 
 - `src/{a2a3,a5}/platform/onboard/aicpu/cache_ops.cpp` — `cache_invalidate_range` implementation (`dc civac` / `dsb sy` / `isb`).
 - `src/{a2a3,a5}/platform/sim/aicpu/cache_ops.cpp` — sim no-op.
-- AICore-side `dcci` usage lives in the L2 perf / PMU AICore collectors and any kernel that publishes to a GM slot AICPU reads.
+- AICore-side `dcci` usage lives in the L2 swimlane / PMU AICore collectors and any kernel that publishes to a GM slot AICPU reads.
 
 ## Related docs
 
 - [PMU staging-slot ordering](../dfx/pmu-profiling.md) —
   detailed AICore-side `dcci` + barrier order for staging-slot writes.
 - [L2 swimlane profiling](../dfx/l2-swimlane-profiling.md) —
-  the consumer of the rules above on the L2 perf path.
+  the consumer of the rules above on the L2 swimlane path.

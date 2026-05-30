@@ -11,7 +11,7 @@
 
 /**
  * @file profiler_base.h
- * @brief CRTP scaffolding shared by L2Perf / Dump / PMU collectors.
+ * @brief CRTP scaffolding shared by L2Swimlane / Dump / PMU collectors.
  *
  * Owns the BufferPoolManager<Module>, the mgmt thread (which polls AICPU
  * ready queues and recycles buffers), and the collector poll thread.
@@ -19,12 +19,12 @@
  * Module concept contract
  * -----------------------
  *
- * Each profiling subsystem provides a `Module` struct (e.g., L2PerfModule,
+ * Each profiling subsystem provides a `Module` struct (e.g., L2SwimlaneModule,
  * DumpModule, PmuModule) that supplies the data-layout traits the unified
  * mgmt-loop algorithms (ProfilerAlgorithms<Module>) need. Required members:
  *
  *   // Types
- *   using DataHeader      = ...;   // Shared-memory header (e.g. L2PerfDataHeader).
+ *   using DataHeader      = ...;   // Shared-memory header (e.g. L2SwimlaneDataHeader).
  *   using ReadyEntry      = ...;   // Per-AICPU-thread ready-queue entry.
  *   using ReadyBufferInfo = ...;   // Hand-off struct to the collector thread
  *                                  // (carries dev/host ptrs, optional kind
@@ -34,10 +34,10 @@
  *                                  // `buffer_ptrs[kSlotCount]`.
  *
  *   // Constants
- *   static constexpr int      kBufferKinds;    // L2Perf=2 (perf+phase), Dump=1, PMU=1.
+ *   static constexpr int      kBufferKinds;    // L2Swimlane=2 (perf+phase), Dump=1, PMU=1.
  *   static constexpr uint32_t kReadyQueueSize; // Per-thread ready-queue depth.
  *   static constexpr uint32_t kSlotCount;      // FreeQueue::buffer_ptrs[] length.
- *   static constexpr const char* kSubsystemName; // "PMU" / "L2Perf" / "Dump".
+ *   static constexpr const char* kSubsystemName; // "PMU" / "L2Swimlane" / "Dump".
  *
  *   // Header pointer cast (host_ptr → DataHeader*)
  *   static DataHeader* header_from_shm(void* shared_mem_host);
@@ -117,7 +117,7 @@
  *       (use the subsystem's PLATFORM_*_TIMEOUT_SECONDS).
  *
  *   static constexpr const char*  kSubsystemName;
- *       Used in the idle-timeout log line (e.g. "L2Perf", "PMU", "TensorDump").
+ *       Used in the idle-timeout log line (e.g. "L2Swimlane", "PMU", "TensorDump").
  */
 
 #ifndef SRC_A2A3_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_PROFILER_BASE_H_
@@ -138,7 +138,7 @@
 namespace profiling_common {
 
 // Common subsystem callback signatures. All four collectors (PMU / TensorDump
-// / L2Perf / DepGen) used to declare their own typedefs with identical
+// / L2Swimlane / DepGen) used to declare their own typedefs with identical
 // shapes; these are the canonical types stashed in ProfilerBase via
 // set_memory_context().
 //

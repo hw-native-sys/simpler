@@ -301,7 +301,7 @@ shared-memory layout, an `init()` that allocates and pre-fills the free
 queues, an `on_buffer_collected()` callback that appends records to the
 CSV, and `reconcile_counters()` / `finalize()`. The mgmt/poll threading,
 buffer pooling, and `Module` trait pattern are shared with TensorDump
-and L2Perf — see [profiling-framework.md](../profiling-framework.md) for
+and L2Swimlane — see [profiling-framework.md](../profiling-framework.md) for
 the framework reference.
 
 ### 5.3 a5 — same framework, host-shadow transport (DAV_3510, 10 counters)

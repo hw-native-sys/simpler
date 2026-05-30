@@ -9,17 +9,17 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * @file l2_perf_collector_aicpu.h
+ * @file l2_swimlane_collector_aicpu.h
  * @brief AICPU performance data collection interface
  *
  * Provides performance profiling management interface for AICPU side.
  * Handles buffer initialization, switching, and flushing.
  */
 
-#ifndef PLATFORM_AICPU_L2_PERF_COLLECTOR_AICPU_H_
-#define PLATFORM_AICPU_L2_PERF_COLLECTOR_AICPU_H_
+#ifndef PLATFORM_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_
+#define PLATFORM_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_
 
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 
 // Include platform-specific timestamp implementation
 // Build system selects the correct inner_aicpu.h based on platform:
@@ -29,51 +29,51 @@
 // ============= Public Interface =============
 
 /**
- * L2 perf handshake setters — called by the host (sim) or the AICPU kernel
- * entry (onboard) before `l2_perf_aicpu_init()` so AICPU code can read perf
+ * L2 swimlane handshake setters — called by the host (sim) or the AICPU kernel
+ * entry (onboard) before `l2_swimlane_aicpu_init()` so AICPU code can read perf
  * state without reaching into the generic `Runtime` struct.
  *
  * Two-channel level transport (mirrors the PMU pattern):
  *   - binary on/off — `enable_profiling_flag` bit1 → `set_l2_swimlane_enabled(bool)`
  *     at kernel entry; queried via `is_l2_swimlane_enabled()`.
- *   - granular L2PerfLevel — `L2PerfDataHeader::l2_perf_level`
- *     (shared memory); read in `l2_perf_aicpu_init` and cached, then queried
- *     via `get_l2_perf_level()` for
+ *   - granular L2SwimlaneLevel — `L2SwimlaneDataHeader::l2_swimlane_level`
+ *     (shared memory); read in `l2_swimlane_aicpu_init` and cached, then queried
+ *     via `get_l2_swimlane_level()` for
  *     `>= AICPU_TIMING / SCHED_PHASES / ORCH_PHASES` gates.
  */
-extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base);
-extern "C" uint64_t get_platform_l2_perf_base();
+extern "C" void set_platform_l2_swimlane_base(uint64_t l2_swimlane_data_base);
+extern "C" uint64_t get_platform_l2_swimlane_base();
 extern "C" void set_l2_swimlane_enabled(bool enable);
 extern "C" bool is_l2_swimlane_enabled();
 
-// AICore rotation-table device pointer (= KernelArgs::aicore_ring_addr).
+// AICore rotation-table device pointer (= KernelArgs::l2_swimlane_aicore_rotation_table).
 // Published by the host before AICPU init runs; AICPU init fills the table
-// with the per-core `&L2PerfAicoreBufferState::rotation` device addresses so
-// AICore can index `aicore_ring_addr[block_idx]` to find its rotation channel.
+// with the per-core `&L2SwimlaneAicoreTaskPool::rotation` device addresses so
+// AICore can index `l2_swimlane_aicore_rotation_table[block_idx]` to find its rotation channel.
 // Moved from host into AICPU so the host stays decoupled from the AICore-side
 // shared-memory layout (host previously did host-to-device address translation
 // + reached into get_aicore_buffer_state to fill this).
-extern "C" void set_platform_aicore_rotation_table(uint64_t table_addr);
-extern "C" uint64_t get_platform_aicore_rotation_table();
+extern "C" void set_platform_l2_swimlane_aicore_rotation_table(uint64_t table_addr);
+extern "C" uint64_t get_platform_l2_swimlane_aicore_rotation_table();
 
 // Typed getter for the granular perf_level (promoted from the shared-memory
-// header inside l2_perf_aicpu_init). Gate sites should use this so the
-// comparison RHS is a named L2PerfLevel constant.
-L2PerfLevel get_l2_perf_level();
+// header inside l2_swimlane_aicpu_init). Gate sites should use this so the
+// comparison RHS is a named L2SwimlaneLevel constant.
+L2SwimlaneLevel get_l2_swimlane_level();
 
 /**
  * Initialize performance profiling
  *
  * Sets up the AICPU buffer pool for each core and initializes tracking state.
- * Reads the perf device-base pointer published via `set_platform_l2_perf_base()`.
+ * Reads the perf device-base pointer published via `set_platform_l2_swimlane_base()`.
  *
  * Also primes the per-core AICore rotation channel: pops the initial
- * L2PerfAicoreBuffer from L2PerfAicoreBufferState::free_queue and writes its
- * address into the AicoreRotation channel that AICore polls per task.
+ * L2SwimlaneAicoreTaskBuffer from L2SwimlaneAicoreTaskPool::free_queue and writes its
+ * address into the L2SwimlaneAicoreRotation channel that AICore polls per task.
  *
  * @param worker_count  Number of AICore workers (cores) to initialize
  */
-void l2_perf_aicpu_init(int worker_count);
+void l2_swimlane_aicpu_init(int worker_count);
 
 /**
  * Rotate the AICore buffer for a given core, if needed.
@@ -89,22 +89,22 @@ void l2_perf_aicpu_init(int worker_count);
  * (and AICore has finished writing their records into the old buffer) before
  * the old buffer enters the ready queue.
  *
- * Called regardless of l2_perf_level — internally gates on AICORE_TIMING.
+ * Called regardless of l2_swimlane_level — internally gates on AICORE_TIMING.
  *
  * @param core_id     Core index
  * @param thread_idx  Owning AICPU thread (target ready-queue)
  */
-void l2_perf_aicpu_maybe_rotate_aicore(int core_id, int thread_idx);
+void l2_swimlane_aicpu_maybe_rotate_aicore(int core_id, int thread_idx);
 
 /**
- * Complete a L2PerfRecord with AICPU-side metadata after AICore task completion
+ * Complete a L2SwimlaneAicpuTaskRecord with AICPU-side metadata after AICore task completion
  *
  * AICore-as-producer: AICore writes start/end/task_id directly into the
- * per-core L2PerfAicoreBuffer at `records[reg_task_id % SIZE]`. AICPU does
+ * per-core L2SwimlaneAicoreTaskBuffer at `records[reg_task_id % SIZE]`. AICPU does
  * NOT read that buffer on the hot path — it only writes AICPU-owned fields
  * (task_id, reg_task_id, func_id, core_type, dispatch_time, finish_time)
  * here, leaving start/end as zero. The host post-processor joins the AICore
- * stream into the L2PerfRecord stream by `reg_task_id` at flush time.
+ * stream into the L2SwimlaneAicpuTaskRecord stream by `reg_task_id` at flush time.
  *
  * Per-core counter accounting:
  *   total_record_count++       — every commit attempt (success or failure)
@@ -115,14 +115,14 @@ void l2_perf_aicpu_maybe_rotate_aicore(int core_id, int thread_idx);
  * @param core_id               Core index — used to resolve buffer state and update counters
  * @param thread_idx            Owning AICPU thread (used when rotating records buffer)
  * @param expected_reg_task_id  Register dispatch token (low 32 bits) — written
- *                              into L2PerfRecord.reg_task_id as the join key
+ *                              into L2SwimlaneAicpuTaskRecord.reg_task_id as the join key
  * @param task_id               Task identifier to write (PTO2 encoding or plain id)
  * @param func_id               Kernel function identifier
  * @param core_type             Core type (AIC/AIV)
  * @param dispatch_time         AICPU timestamp when task was dispatched
  * @param finish_time           AICPU timestamp when task completion was observed
  */
-int l2_perf_aicpu_complete_record(
+int l2_swimlane_aicpu_complete_task(
     int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
     uint64_t dispatch_time, uint64_t finish_time
 );
@@ -136,24 +136,24 @@ int l2_perf_aicpu_complete_record(
  * @param cur_thread_cores Array of core IDs managed by this thread
  * @param core_num Number of cores managed by this thread
  */
-void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int core_num);
+void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int core_num);
 
 /**
  * Initialize AICPU phase profiling
  *
- * Sets up AicpuPhaseHeader and clears per-thread phase record buffers.
- * Must be called once from thread 0 after l2_perf_aicpu_init().
+ * Sets up L2SwimlaneAicpuPhaseHeader and clears per-thread phase record buffers.
+ * Must be called once from thread 0 after l2_swimlane_aicpu_init().
  *
  * @param worker_count       Number of AICore workers (cores) — used to resolve
- *                           the phase region's offset relative to the L2Perf base
+ *                           the phase region's offset relative to the L2Swimlane base
  * @param num_sched_threads  Number of scheduler threads
  */
-void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads);
+void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_threads);
 
 /**
  * Record a single scheduler phase
  *
- * Appends an AicpuPhaseRecord to the specified thread's buffer.
+ * Appends an L2SwimlaneAicpuPhaseRecord to the specified thread's buffer.
  * Silently drops records when the buffer is full.
  *
  * @param thread_idx Scheduler thread index
@@ -164,12 +164,12 @@ void l2_perf_aicpu_init_phase(int worker_count, int num_sched_threads);
  * @param tasks_processed Number of tasks processed in this batch (scheduler phases), or
  *                        full PTO2 task_id encoding (ring_id << 32) | local_id (orchestrator
  *                        phases in tensormap_and_ringbuffer)
- * @param extra1, extra2  Phase-specific delta counters (see AicpuPhaseRecord doc).
+ * @param extra1, extra2  Phase-specific delta counters (see L2SwimlaneAicpuPhaseRecord doc).
  *                        SCHED_DISPATCH uses extra1=pop_hit, extra2=pop_miss; other
  *                        phases pass 0.
  */
-void l2_perf_aicpu_record_phase(
-    int thread_idx, AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
+void l2_swimlane_aicpu_record_phase(
+    int thread_idx, L2SwimlaneAicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
     uint64_t tasks_processed, uint32_t extra1 = 0, uint32_t extra2 = 0
 );
 
@@ -177,22 +177,22 @@ void l2_perf_aicpu_record_phase(
  * Set orchestrator thread index for per-task phase recording
  *
  * Must be called once from the orchestrator thread before any
- * l2_perf_aicpu_record_orch_phase() calls.
+ * l2_swimlane_aicpu_record_orch_phase() calls.
  *
  * @param thread_idx Thread index for the orchestrator (typically num_sched_threads)
  */
-void l2_perf_aicpu_set_orch_thread_idx(int thread_idx);
+void l2_swimlane_aicpu_set_orch_thread_idx(int thread_idx);
 
 /**
  * Record one orchestrator submit envelope
  *
- * Appends an AicpuPhaseRecord covering an entire submit_task() / alloc_tensors()
+ * Appends an L2SwimlaneAicpuPhaseRecord covering an entire submit_task() / alloc_tensors()
  * call. Uses the orchestrator's dedicated buffer slot (set via
  * set_orch_thread_idx). Per-sub-step phase records (ORCH_SYNC..ORCH_FANIN)
  * were dropped — the per-step cumulatives (`g_orch_*_cycle`) in the
  * cold-path log carry the breakdown that those records were duplicating.
  *
- * @param phase_id Always AicpuPhaseId::ORCH_SUBMIT. (Param kept for API
+ * @param phase_id Always L2SwimlaneAicpuPhaseId::ORCH_SUBMIT. (Param kept for API
  *                 stability; legacy values are ignored by the host parser.)
  * @param start_time Submit start timestamp
  * @param end_time Submit end timestamp
@@ -200,28 +200,28 @@ void l2_perf_aicpu_set_orch_thread_idx(int thread_idx);
  * @param task_id Task identifier. For tensormap_and_ringbuffer, this is the full PTO2 encoding:
  * (ring_id << 32) | local_id, enabling cross-view correlation between orchestrator and scheduler swimlanes.
  */
-void l2_perf_aicpu_record_orch_phase(
-    AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint64_t task_id
+void l2_swimlane_aicpu_record_orch_phase(
+    L2SwimlaneAicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint64_t task_id
 );
 
 /**
  * Write core-to-thread assignment mapping to shared memory.
  *
- * Callers invoke `l2_perf_aicpu_init_core_assignments(total_cores)` once, then
- * `l2_perf_aicpu_write_core_assignments_for_thread(t, ids, n)` for every
+ * Callers invoke `l2_swimlane_aicpu_init_core_assignments(total_cores)` once, then
+ * `l2_swimlane_aicpu_write_core_assignments_for_thread(t, ids, n)` for every
  * scheduler thread.
  */
-void l2_perf_aicpu_init_core_assignments(int total_cores);
-void l2_perf_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num);
+void l2_swimlane_aicpu_init_core_assignments(int total_cores);
+void l2_swimlane_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num);
 
 /**
  * Flush remaining phase records for a thread
  *
  * Marks the current WRITING phase buffer as READY and enqueues it
- * for host collection. Called at thread exit (analogous to l2_perf_aicpu_flush_buffers).
+ * for host collection. Called at thread exit (analogous to l2_swimlane_aicpu_flush).
  *
  * @param thread_idx Thread index (scheduler thread or orchestrator)
  */
-void l2_perf_aicpu_flush_phase_buffers(int thread_idx);
+void l2_swimlane_aicpu_flush_phase_buffers(int thread_idx);
 
-#endif  // PLATFORM_AICPU_L2_PERF_COLLECTOR_AICPU_H_
+#endif  // PLATFORM_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_

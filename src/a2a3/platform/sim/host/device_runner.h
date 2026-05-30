@@ -49,12 +49,12 @@
 #include "common/core_type.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
-#include "host/l2_perf_collector.h"
+#include "host/l2_swimlane_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/dep_gen_collector.h"
@@ -187,8 +187,8 @@ public:
      * Runtime struct / run() arg list so all three travel the same way.
      */
     void set_l2_swimlane_enabled(int level) {
-        l2_perf_level_ = static_cast<L2PerfLevel>(level);
-        enable_l2_swimlane_ = (l2_perf_level_ != L2PerfLevel::DISABLED);
+        l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
+        enable_l2_swimlane_ = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
     }
     void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
     void set_pmu_enabled(int enable_pmu) {
@@ -197,7 +197,7 @@ public:
     }
     void set_dep_gen_enabled(bool enable) { enable_dep_gen_ = enable; }
     void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
-    // Directory under which all diagnostic artifacts (l2_perf_records.json /
+    // Directory under which all diagnostic artifacts (l2_swimlane_records.json /
     // tensor_dump/ / pmu.csv) land. Required (non-empty) when any diagnostic
     // is enabled; CallConfig::validate() enforces this contract upstream.
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
@@ -381,7 +381,7 @@ private:
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_dump_tensor_enabled_func_)(bool){nullptr};
-    void (*set_platform_l2_perf_base_func_)(uint64_t){nullptr};
+    void (*set_platform_l2_swimlane_base_func_)(uint64_t){nullptr};
     void (*set_platform_aicore_rotation_table_func_)(uint64_t){nullptr};
     void (*set_l2_swimlane_enabled_func_)(bool){nullptr};
     void (*set_platform_pmu_base_func_)(uint64_t){nullptr};
@@ -395,7 +395,7 @@ private:
     std::string aicore_so_path_;
 
     // Performance profiling
-    L2PerfCollector l2_perf_collector_;
+    L2SwimlaneCollector l2_swimlane_collector_;
 
     // Tensor dump (independent shared memory + memory manager)
     TensorDumpCollector dump_collector_;
@@ -429,7 +429,7 @@ private:
      * @param device_id Device ID (ignored in simulation)
      * @return 0 on success, error code on failure
      */
-    int init_l2_perf(int num_aicore, int device_id);
+    int init_l2_swimlane(int num_aicore, int device_id);
 
     int init_tensor_dump(Runtime &runtime, int device_id);
 
@@ -456,9 +456,9 @@ private:
     bool enable_pmu_{false};
     bool enable_dep_gen_{false};
     bool enable_scope_stats_{false};
-    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};             // resolved from set_l2_swimlane_enabled()
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
-    std::string output_prefix_{};                                  // diagnostic artifact root directory
+    L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
+    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
+    std::string output_prefix_{};                                   // diagnostic artifact root directory
 };
 
 #endif  // SRC_A2A3_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

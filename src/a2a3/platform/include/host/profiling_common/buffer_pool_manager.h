@@ -11,7 +11,7 @@
 
 /**
  * @file buffer_pool_manager.h
- * @brief Generic buffer-pool data structure shared by L2Perf, TensorDump,
+ * @brief Generic buffer-pool data structure shared by L2Swimlane, TensorDump,
  *        and PMU collectors. Owns:
  *
  *   - ready_queue (mgmt → collector) with mutex/cv,
@@ -333,7 +333,7 @@ private:
     // dev → host mapping (single source of truth for resolve_host_ptr)
     std::unordered_map<void *, void *> dev_to_host_;
 
-    // Per-kind recycled buffer pools (vector indexed by Module's BufferKind id)
+    // Per-kind recycled buffer pools (vector indexed by Module-defined kind id)
     std::vector<std::vector<void *>> recycled_;
 };
 

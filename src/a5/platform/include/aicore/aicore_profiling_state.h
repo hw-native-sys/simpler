@@ -25,7 +25,7 @@
  *
  * Lifecycle:
  *   1. Host fills `KernelArgs::enable_profiling_flag`, the two per-core
- *      ring address arrays (`aicore_l2_perf_ring_addrs`,
+ *      ring address arrays (`aicore_l2_swimlane_ring_addrs`,
  *      `aicore_pmu_ring_addrs`), and `regs` (the per-physical-core
  *      register-base array — already required for AICPU).
  *   2. AICore kernel entry indexes the ring arrays by `block_idx` and
@@ -44,7 +44,7 @@
 #include <cstdint>
 
 #include "aicore/aicore.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/pmu_profiling.h"
 
 /**
@@ -56,12 +56,12 @@ __aicore__ void set_aicore_profiling_flag(uint32_t flag);
 __aicore__ uint32_t get_aicore_profiling_flag();
 
 /**
- * Per-core L2Perf staging ring. Set once at kernel entry from
- * `((__gm__ uint64_t*)k_args->aicore_l2_perf_ring_addrs)[block_idx]`;
+ * Per-core L2Swimlane staging ring. Set once at kernel entry from
+ * `((__gm__ uint64_t*)k_args->aicore_l2_swimlane_ring_addrs)[block_idx]`;
  * nullptr when the L2 swimlane bit is off or the address table is null.
  */
-__aicore__ void set_aicore_l2_perf_ring(__gm__ L2PerfAicoreRing *ring);
-__aicore__ __gm__ L2PerfAicoreRing *get_aicore_l2_perf_ring();
+__aicore__ void set_aicore_l2_swimlane_ring(__gm__ L2SwimlaneAicoreRing *ring);
+__aicore__ __gm__ L2SwimlaneAicoreRing *get_aicore_l2_swimlane_ring();
 
 /**
  * Per-core PMU staging ring (a5-only — AICore writes the snapshot).

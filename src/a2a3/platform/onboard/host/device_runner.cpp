@@ -253,9 +253,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_perf(num_aicore, device_id_);
+        rc = init_l2_swimlane(num_aicore, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_l2_perf failed: %d", rc);
+            LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
         }
     }
@@ -296,7 +296,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // On any exit from run() — success or early error — release the diagnostics
     // collectors' shared memory. They are only re-initialized per run(), so a
     // Worker reused across runs (e.g. a pytest session-scoped worker pool) would
-    // otherwise re-enter init_l2_perf() with stale state still allocated.
+    // otherwise re-enter init_l2_swimlane() with stale state still allocated.
     auto perf_cleanup = RAIIScopeGuard([this]() {
         finalize_collectors();
     });
@@ -457,7 +457,7 @@ int DeviceRunner::finalize() {
 
 // `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
-int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
+int DeviceRunner::init_l2_swimlane(int num_aicore, int device_id) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -479,16 +479,17 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, l2_perf_level_, alloc_cb, register_cb, free_cb, output_prefix_
+    int rc = l2_swimlane_collector_.initialize(
+        num_aicore, device_id, l2_swimlane_level_, alloc_cb, register_cb, free_cb, output_prefix_
     );
     if (rc != 0) {
         return rc;
     }
 
-    kernel_args_.args.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
-    kernel_args_.args.aicore_ring_addr =
-        reinterpret_cast<uint64_t>(l2_perf_collector_.get_aicore_ring_addr_table_device_ptr());
+    kernel_args_.args.l2_swimlane_data_base =
+        reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_l2_swimlane_setup_device_ptr());
+    kernel_args_.args.l2_swimlane_aicore_rotation_table =
+        reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_aicore_ring_addr_table_device_ptr());
     return 0;
 }
 
@@ -634,8 +635,8 @@ void DeviceRunner::finalize_collectors() {
         return mem_alloc_.free(dev_ptr);
     };
 
-    if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.finalize(unregister_cb, free_cb);
+    if (l2_swimlane_collector_.is_initialized()) {
+        l2_swimlane_collector_.finalize(unregister_cb, free_cb);
     }
     if (dump_collector_.is_initialized()) {
         dump_collector_.finalize(unregister_cb, free_cb);

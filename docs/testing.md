@@ -104,7 +104,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
 | `--manual` | | `exclude` | `exclude`/`include`/`only` for manual cases |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
-| `--enable-l2-swimlane [PERF_LEVEL]` | | `0` | Enable L2 swimlane collection on first round only. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md#31-enable-l2-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `l2_perf_records.json` lands; parallel runs never collide. |
+| `--enable-l2-swimlane [PERF_LEVEL]` | | `0` | Enable L2 swimlane collection on first round only. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md#31-enable-l2-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `l2_swimlane_records.json` lands; parallel runs never collide. |
 | `--dump-tensor` | | false | Dump per-task tensor I/O during runtime execution |
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
@@ -318,13 +318,13 @@ A single file can declare both L2 and L3 classes; they're grouped by `(runtime, 
 
 Each test case sets its own `CallConfig.output_prefix` (chosen by `scene_test.py::_build_output_prefix` as `outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/`). The C++ runtime writes all diagnostic artifacts under that prefix with fixed filenames:
 
-- `outputs/<case>_<ts>/l2_perf_records.json` — swimlane (`--enable-l2-swimlane`)
+- `outputs/<case>_<ts>/l2_swimlane_records.json` — swimlane (`--enable-l2-swimlane`)
 - `outputs/<case>_<ts>/tensor_dump/` — tensor dump (`--dump-tensor`)
 - `outputs/<case>_<ts>/pmu.csv` — PMU counters (`--enable-pmu`)
 
 Because each case gets its own directory, parallel runs (xdist workers, L3 case fanout, L2 device fanout) can never collide on filename — there is no per-file timestamp, no env-var scoping, and no post-run flatten step. `CallConfig::validate()` throws if any diagnostic flag is enabled but `output_prefix` is empty; `scene_test.py::run_class_cases` always fills it from the case label.
 
-Standalone invocations of CLIs (`python -m simpler_setup.tools.swimlane_converter`, etc.) auto-detect the latest `outputs/*/l2_perf_records.json` (sorted by mtime); pass `--input <path>` to override.
+Standalone invocations of CLIs (`python -m simpler_setup.tools.swimlane_converter`, etc.) auto-detect the latest `outputs/*/l2_swimlane_records.json` (sorted by mtime); pass `--input <path>` to override.
 
 ### Dispatcher skip conditions (normal pytest runs)
 

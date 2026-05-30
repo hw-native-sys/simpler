@@ -14,11 +14,11 @@ Converts performance data JSON (.json) to Chrome Trace Event Format JSON
 for visualization in Perfetto (https://ui.perfetto.dev/).
 
 Usage:
-    python -m simpler_setup.tools.swimlane_converter  # latest l2_perf_records_*.json under ./outputs/
-    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json
-    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json -o out.json
-    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json -k kernel_config.py
-    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json -v
+    python -m simpler_setup.tools.swimlane_converter  # latest l2_swimlane_records_*.json under ./outputs/
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -o out.json
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -k kernel_config.py
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -v
 """
 
 import argparse
@@ -93,7 +93,7 @@ def read_perf_data(filepath):
 
     Returns:
         dict: Parsed performance data with keys:
-            - l2_perf_level
+            - l2_swimlane_level
             - tasks (list)
 
     Raises:
@@ -102,13 +102,13 @@ def read_perf_data(filepath):
     with open(filepath) as f:
         data = json.load(f)
 
-    required_fields = ["l2_perf_level", "tasks"]
+    required_fields = ["l2_swimlane_level", "tasks"]
     for field in required_fields:
         if field not in data:
             raise ValueError(f"Missing required field: {field}")
 
-    if data["l2_perf_level"] not in [1, 2, 3, 4]:
-        raise ValueError(f"Unsupported l2_perf_level: {data['l2_perf_level']} (expected 1, 2, 3, or 4)")
+    if data["l2_swimlane_level"] not in [1, 2, 3, 4]:
+        raise ValueError(f"Unsupported l2_swimlane_level: {data['l2_swimlane_level']} (expected 1, 2, 3, or 4)")
 
     return data
 
@@ -393,15 +393,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         output_path: Path to output JSON file
         func_id_to_name: Optional dict mapping func_id to function name
         verbose: Print progress information
-        scheduler_phases: Optional list of per-thread phase record lists (l2_perf_level >= 3)
-        orchestrator_phases: Optional list of per-task orchestrator phase records (l2_perf_level >= 4)
+        scheduler_phases: Optional list of per-thread phase record lists (l2_swimlane_level >= 3)
+        orchestrator_phases: Optional list of per-task orchestrator phase records (l2_swimlane_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
 
     Generates processes in the trace:
         - pid=1 "AICore View": start_time_us to end_time_us (kernel execution)
         - pid=2 "AICPU View": dispatch_time_us to finish_time_us (AICPU perspective)
-        - pid=3 "AICPU Scheduler": scheduler phase bars (l2_perf_level >= 3)
-        - pid=4 "AICPU Orchestrator": orchestrator phase bars or summary (l2_perf_level >= 4)
+        - pid=3 "AICPU Scheduler": scheduler phase bars (l2_swimlane_level >= 3)
+        - pid=4 "AICPU Orchestrator": orchestrator phase bars or summary (l2_swimlane_level >= 4)
     """
     if verbose:
         print("Generating Chrome Trace JSON...")
@@ -698,7 +698,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         if hb_violation_count > 0:
             print(f"  Happens-before violations: {hb_violation_count} edge(s) flagged as 'hb_violation'")
 
-    # AICPU Scheduler phase events (l2_perf_level >= 3)
+    # AICPU Scheduler phase events (l2_swimlane_level >= 3)
     if scheduler_phases:
         # Process metadata
         events.append(
@@ -764,7 +764,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     }
                 )
 
-    # AICPU Orchestrator lane (l2_perf_level >= 4)
+    # AICPU Orchestrator lane (l2_swimlane_level >= 4)
     #
     # Per-event AicpuPhaseRecord[] is the single source of truth for
     # orchestrator timing. There is no separate aggregate summary — the
@@ -1094,17 +1094,18 @@ def _build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                                       # Use latest .json in outputs/, output to outputs/
-  %(prog)s l2_perf_records_20260210_143526.json   # Output: outputs/merged_swimlane_20260210_143526.json
-  %(prog)s l2_perf_records_20260210_143526.json -o custom_output.json
-  %(prog)s l2_perf_records_20260210_143526.json -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
-  %(prog)s l2_perf_records_20260210_143526.json -v
+  %(prog)s                                            # Use latest .json in outputs/, output to outputs/
+  %(prog)s outputs/<case>_<ts>/l2_swimlane_records.json   # Output: outputs/merged_swimlane_20260210_143526.json
+  %(prog)s outputs/<case>_<ts>/l2_swimlane_records.json -o custom_output.json
+  %(prog)s outputs/<case>_<ts>/l2_swimlane_records.json \
+      -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
+  %(prog)s outputs/<case>_<ts>/l2_swimlane_records.json -v
         """,
     )
     parser.add_argument(
         "input",
         nargs="?",
-        help="Input JSON file (.json). If not specified, uses the latest l2_perf_records_*.json in outputs/",
+        help="Input JSON file (.json). If not specified, uses the latest l2_swimlane_records_*.json in outputs/",
     )
     parser.add_argument("-o", "--output", help="Output JSON file (default: <input_dir>/merged_swimlane.json)")
     parser.add_argument(
@@ -1128,7 +1129,7 @@ Examples:
 
 
 def _resolve_input_path(args):
-    """Resolve input path, auto-selecting newest outputs/<case>/l2_perf_records.json if unspecified."""
+    """Resolve input path, auto-selecting newest outputs/<case>/l2_swimlane_records.json if unspecified."""
     if args.input is not None:
         input_path = Path(args.input)
         if not input_path.exists():
@@ -1137,9 +1138,9 @@ def _resolve_input_path(args):
         return input_path
 
     outputs_dir = Path.cwd() / "outputs"
-    json_files = list(outputs_dir.glob("*/l2_perf_records.json"))
+    json_files = list(outputs_dir.glob("*/l2_swimlane_records.json"))
     if not json_files:
-        print(f"Error: No outputs/*/l2_perf_records.json found under {outputs_dir}", file=sys.stderr)
+        print(f"Error: No outputs/*/l2_swimlane_records.json found under {outputs_dir}", file=sys.stderr)
         print("Run a test with --enable-l2-swimlane first, or specify an explicit input.", file=sys.stderr)
         return None
 
@@ -1161,11 +1162,11 @@ def _resolve_output_path(args, input_path):
 
 def _print_verbose_data_info(data, verbose):
     """Print verbose summary of loaded performance data, including phase counts
-    when present (l2_perf_level >= SCHED_PHASES)."""
+    when present (l2_swimlane_level >= SCHED_PHASES)."""
     if not verbose:
         return
     print("\n=== Performance Data ===")
-    print(f"  L2 perf level: {data['l2_perf_level']}")
+    print(f"  L2 perf level: {data['l2_swimlane_level']}")
     print(f"  Task Count: {len(data['tasks'])}")
     if data["tasks"]:
         start_times = [t["start_time_us"] for t in data["tasks"]]

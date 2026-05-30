@@ -40,7 +40,7 @@
 #include "prepare_callable_common.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "device_arena.h"
@@ -48,7 +48,7 @@
 #include "device_runner_helpers.h"  // common DeviceArgs + KernelArgsHelper
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
-#include "host/l2_perf_collector.h"
+#include "host/l2_swimlane_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/dep_gen_collector.h"
@@ -195,7 +195,7 @@ private:
     // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
     bool acl_ready_{false};
 
-    // Shared collectors (`l2_perf_collector_`, `dump_collector_`,
+    // Shared collectors (`l2_swimlane_collector_`, `dump_collector_`,
     // `pmu_collector_`, `scope_stats_collector_`) live on `DeviceRunnerBase`.
     //
     // dep_gen collector — captures orchestrator submit_task inputs for
@@ -217,7 +217,7 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_l2_perf(int num_aicore, int device_id);
+    int init_l2_swimlane(int num_aicore, int device_id);
 
     /**
      * Initialize tensor dump shared memory and collector.
@@ -274,7 +274,7 @@ private:
      */
     void finalize_collectors();
     // Shared enable flags (`enable_l2_swimlane_`, `enable_dump_tensor_`,
-    // `enable_pmu_`, `enable_scope_stats_`, `l2_perf_level_`,
+    // `enable_pmu_`, `enable_scope_stats_`, `l2_swimlane_level_`,
     // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.
     //
     // dep_gen enablement is a2a3-only.

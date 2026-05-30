@@ -9,18 +9,18 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * @file l2_perf_collector_aicore.h
+ * @file l2_swimlane_collector_aicore.h
  * @brief AICore performance data collection interface
  *
  * Provides lightweight performance recording interface for AICore kernels.
  * Uses dcci for efficient cache management instead of memory barriers.
  */
 
-#ifndef PLATFORM_AICORE_L2_PERF_COLLECTOR_AICORE_H_
-#define PLATFORM_AICORE_L2_PERF_COLLECTOR_AICORE_H_
+#ifndef PLATFORM_AICORE_L2_SWIMLANE_COLLECTOR_AICORE_H_
+#define PLATFORM_AICORE_L2_SWIMLANE_COLLECTOR_AICORE_H_
 
 #include "aicore/aicore.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 
 // Include platform-specific timestamp implementation
@@ -35,29 +35,30 @@
 /**
  * Record task execution performance data
  *
- * Writes timing metrics to the per-core L2PerfAicoreRing slot
+ * Writes timing metrics to the per-core L2SwimlaneAicoreRing slot
  * (`dual_issue_slots[task_id % PLATFORM_L2_AICORE_RING_SIZE]`). The
  * ring is allocated once by the host and never reassigned, so AICore writes
  * to a stable address regardless of AICPU buffer rotations. AICPU reads the
- * slot in `l2_perf_aicpu_complete_record` and commits the record into the
- * rotating L2PerfBuffer.
+ * slot in `l2_swimlane_aicpu_complete_task` and commits the record into the
+ * rotating L2SwimlaneAicpuTaskBuffer.
  *
- * AICore writes L2PerfRecord.task_id as the register dispatch token (low 32 bits, zero-extended).
+ * AICore writes L2SwimlaneAicpuTaskRecord.task_id as the register dispatch token (low 32 bits, zero-extended).
  * For tensormap_and_ringbuffer, AICPU overwrites with the full (ring_id << 32) | local_id
  * encoding after handshake match.
  *
- * @param ring        Per-core L2PerfAicoreRing pointer (from get_aicore_l2_perf_ring())
+ * @param ring        Per-core L2SwimlaneAicoreRing pointer (from get_aicore_l2_swimlane_ring())
  * @param task_id     Register dispatch id (DATA_MAIN_BASE), stored in task_id low 32 bits
  * @param start_time  Start timestamp
  * @param end_time    End timestamp
  */
-__aicore__ __attribute__((always_inline)) static inline void
-l2_perf_aicore_record_task(__gm__ L2PerfAicoreRing *ring, uint32_t task_id, uint64_t start_time, uint64_t end_time) {
+__aicore__ __attribute__((always_inline)) static inline void l2_swimlane_aicore_record_task(
+    __gm__ L2SwimlaneAicoreRing *ring, uint32_t task_id, uint64_t start_time, uint64_t end_time
+) {
     // Modulo-indexed slot. PLATFORM_L2_AICORE_RING_SIZE is conventionally a
     // power of two so the compiler reduces this to a mask, but using `%`
     // keeps the index correct if the ring size is ever retuned to a
     // non-power-of-two value (matches the a2a3 convention).
-    __gm__ L2PerfRecord *record = &ring->dual_issue_slots[task_id % PLATFORM_L2_AICORE_RING_SIZE];
+    __gm__ L2SwimlaneAicpuTaskRecord *record = &ring->dual_issue_slots[task_id % PLATFORM_L2_AICORE_RING_SIZE];
 
     record->start_time = start_time;
     record->end_time = end_time;
@@ -71,4 +72,4 @@ l2_perf_aicore_record_task(__gm__ L2PerfAicoreRing *ring, uint32_t task_id, uint
     dsb((mem_dsb_t)0);
 }
 
-#endif  // PLATFORM_AICORE_L2_PERF_COLLECTOR_AICORE_H_
+#endif  // PLATFORM_AICORE_L2_SWIMLANE_COLLECTOR_AICORE_H_

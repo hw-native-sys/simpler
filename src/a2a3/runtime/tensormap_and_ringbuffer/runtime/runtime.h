@@ -37,7 +37,7 @@
 #include <vector>
 
 #include "common/core_type.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"

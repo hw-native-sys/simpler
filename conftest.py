@@ -572,7 +572,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
     items.sort(key=sort_key)
 
     # L3 perf collection is not supported yet: a single L3 case forks N chip-processes
-    # that all write l2_perf_records_<ts>.json to the same directory with
+    # that all write l2_swimlane_records_<ts>.json to the same directory with
     # second-precision timestamps, so they trample each other. Block the
     # combination up front; waiting for a proper device-id-in-filename fix.
     if config.getoption("--enable-l2-swimlane", default=0):

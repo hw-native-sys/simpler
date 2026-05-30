@@ -11,7 +11,7 @@
 
 /**
  * @file buffer_pool_manager.h
- * @brief Generic buffer-pool data structure shared by L2Perf, TensorDump,
+ * @brief Generic buffer-pool data structure shared by L2Swimlane, TensorDump,
  *        and PMU collectors. Owns:
  *
  *   - ready_queue (mgmt → collector) with mutex/cv,
@@ -44,7 +44,7 @@
  *      `mirror_shm_to_device` is kept for init/teardown but is NOT used by
  *      the mgmt loop — bulk write-back races with AICPU writes to
  *      device-only fields (current_buf_ptr, total/dropped/mismatch
- *      counters, queue_tails, free_queue.head, AicpuPhaseHeader::magic).
+ *      counters, queue_tails, free_queue.head, L2SwimlaneAicpuPhaseHeader::magic).
  *   2. `reg` allocates a paired host shadow (instead of mapping a HAL view
  *      onto the device pointer); `release_owned_buffers` therefore frees
  *      both the device pointer (via `release_fn`) and the host shadow
@@ -267,7 +267,7 @@ public:
      *
      * NOTE: deprecated for a5 — bulk write_back races with AICPU writes to
      * device-owned fields (BufferState::current_buf_ptr, total/dropped/mismatch
-     * counters, queue_tails, free_queue.head, AicpuPhaseHeader::magic, ...).
+     * counters, queue_tails, free_queue.head, L2SwimlaneAicpuPhaseHeader::magic, ...).
      * The bulk write rolls those updates back to whatever was in the host
      * shadow at mirror_from_device time. Keep the method around so callers
      * outside the mgmt loop (init/teardown) still have a way to push the
@@ -352,7 +352,7 @@ public:
     }
 
     /**
-     * Pull a single buffer's contents (e.g. an L2PerfBuffer / PmuBuffer /
+     * Pull a single buffer's contents (e.g. an L2SwimlaneAicpuTaskBuffer / PmuBuffer /
      * DumpMetaBuffer) from device to its host shadow. Called by
      * ProfilerAlgorithms::process_entry after resolving the host pointer
      * for a popped ready entry, before delivering it to the collector.
@@ -548,7 +548,7 @@ private:
     // dev → host mapping (single source of truth for resolve_host_ptr)
     std::unordered_map<void *, void *> dev_to_host_;
 
-    // Per-kind recycled buffer pools (vector indexed by Module's BufferKind id)
+    // Per-kind recycled buffer pools (vector indexed by Module-defined kind id)
     std::vector<std::vector<void *>> recycled_;
 };
 

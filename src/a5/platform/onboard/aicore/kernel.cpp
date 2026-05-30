@@ -15,7 +15,7 @@
 #include "aicore/aicore_profiling_state.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
 
@@ -47,17 +47,19 @@ class Runtime;
 // linker dedup the otherwise-duplicate symbol definitions across the two
 // compilation units.
 [[block_local]] static uint32_t s_aicore_profiling_flag;
-[[block_local]] static __gm__ L2PerfAicoreRing *s_aicore_l2_perf_ring;
+[[block_local]] static __gm__ L2SwimlaneAicoreRing *s_aicore_l2_swimlane_ring;
 [[block_local]] static __gm__ PmuAicoreRing *s_aicore_pmu_ring;
 [[block_local]] static uint64_t s_aicore_pmu_reg_base;
 
 __attribute__((weak)) __aicore__ void set_aicore_profiling_flag(uint32_t flag) { s_aicore_profiling_flag = flag; }
 __attribute__((weak)) __aicore__ uint32_t get_aicore_profiling_flag() { return s_aicore_profiling_flag; }
 
-__attribute__((weak)) __aicore__ void set_aicore_l2_perf_ring(__gm__ L2PerfAicoreRing *ring) {
-    s_aicore_l2_perf_ring = ring;
+__attribute__((weak)) __aicore__ void set_aicore_l2_swimlane_ring(__gm__ L2SwimlaneAicoreRing *ring) {
+    s_aicore_l2_swimlane_ring = ring;
 }
-__attribute__((weak)) __aicore__ __gm__ L2PerfAicoreRing *get_aicore_l2_perf_ring() { return s_aicore_l2_perf_ring; }
+__attribute__((weak)) __aicore__ __gm__ L2SwimlaneAicoreRing *get_aicore_l2_swimlane_ring() {
+    return s_aicore_l2_swimlane_ring;
+}
 
 __attribute__((weak)) __aicore__ void set_aicore_pmu_ring(__gm__ PmuAicoreRing *ring) { s_aicore_pmu_ring = ring; }
 __attribute__((weak)) __aicore__ __gm__ PmuAicoreRing *get_aicore_pmu_ring() { return s_aicore_pmu_ring; }
@@ -80,7 +82,7 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  *
  * Each core (AIC or AIV) gets its own handshake buffer indexed by block_idx.
  * Profiling state flows from KernelArgs into platform-owned per-core slots
- * via set_aicore_profiling_flag() / set_aicore_l2_perf_ring() /
+ * via set_aicore_profiling_flag() / set_aicore_l2_swimlane_ring() /
  * set_aicore_pmu_ring() / set_aicore_pmu_reg_base(); the runtime's
  * Handshake stays profiling-free and aicore_execute keeps its original
  * signature.
@@ -105,14 +107,14 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     // does not depend on any AICPU init ordering.
     set_aicore_profiling_flag(k_args->enable_profiling_flag);
     if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE)) {
-        __gm__ uint64_t *ring_table = reinterpret_cast<__gm__ uint64_t *>(k_args->aicore_l2_perf_ring_addrs);
+        __gm__ uint64_t *ring_table = reinterpret_cast<__gm__ uint64_t *>(k_args->aicore_l2_swimlane_ring_addrs);
         if (ring_table != nullptr) {
-            set_aicore_l2_perf_ring(reinterpret_cast<__gm__ L2PerfAicoreRing *>(ring_table[block_idx]));
+            set_aicore_l2_swimlane_ring(reinterpret_cast<__gm__ L2SwimlaneAicoreRing *>(ring_table[block_idx]));
         } else {
-            set_aicore_l2_perf_ring(nullptr);
+            set_aicore_l2_swimlane_ring(nullptr);
         }
     } else {
-        set_aicore_l2_perf_ring(nullptr);
+        set_aicore_l2_swimlane_ring(nullptr);
     }
     if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_PMU)) {
         __gm__ uint64_t *pmu_ring_table = reinterpret_cast<__gm__ uint64_t *>(k_args->aicore_pmu_ring_addrs);

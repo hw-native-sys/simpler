@@ -28,7 +28,7 @@
 #pragma once
 
 #include "device_arena.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
@@ -92,8 +92,8 @@ struct PTO2OrchestratorState {
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
 #if PTO2_PROFILING
-    // L2 perf_level copied from get_l2_perf_level().
-    L2PerfLevel l2_perf_level{L2PerfLevel::DISABLED};
+    // L2 swimlane_level copied from get_l2_swimlane_level().
+    L2SwimlaneLevel l2_swimlane_level{L2SwimlaneLevel::DISABLED};
 #endif
 
     // === GM HEAP (for output buffers) ===

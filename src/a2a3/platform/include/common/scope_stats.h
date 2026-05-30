@@ -17,7 +17,7 @@
  * scope_end — each carrying the task/heap ring start/end and the tensormap
  * live-entry count sampled at that boundary, tagged with a phase flag. Records
  * stream off the device in
- * fixed-capacity buffers, mirroring PMU / dep_gen / tensor_dump / l2_perf (the
+ * fixed-capacity buffers, mirroring PMU / dep_gen / tensor_dump / l2_swimlane (the
  * single source of mgmt-loop truth is
  * src/a2a3/platform/include/host/profiling_common/profiler_base.h):
  *

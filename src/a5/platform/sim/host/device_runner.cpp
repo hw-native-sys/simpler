@@ -47,7 +47,7 @@
 typedef int (*aicpu_execute_func_t)(Runtime *runtime);
 typedef void (*aicore_execute_func_t)(
     Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
-    uint32_t enable_profiling_flag, uint64_t aicore_l2_perf_ring_addrs, uint64_t aicore_pmu_ring_addrs
+    uint32_t enable_profiling_flag, uint64_t aicore_l2_swimlane_ring_addrs, uint64_t aicore_pmu_ring_addrs
 );
 typedef void (*set_platform_regs_func_t)(uint64_t regs);
 
@@ -253,10 +253,10 @@ int DeviceRunner::ensure_binaries_loaded() {
             return -1;
         }
 
-        set_platform_l2_perf_base_func_ =
-            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_l2_perf_base"));
-        if (set_platform_l2_perf_base_func_ == nullptr) {
-            LOG_ERROR("dlsym failed for set_platform_l2_perf_base: %s", dlerror());
+        set_platform_l2_swimlane_base_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_l2_swimlane_base"));
+        if (set_platform_l2_swimlane_base_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_l2_swimlane_base: %s", dlerror());
             return -1;
         }
 
@@ -478,9 +478,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_perf(num_aicore, device_id_);
+        rc = init_l2_swimlane(num_aicore, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_l2_perf failed: %d", rc);
+            LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
         }
     }
@@ -567,7 +567,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     set_platform_regs_func_(kernel_args_.regs);
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
     set_dump_tensor_enabled_func_(enable_dump_tensor_);
-    set_platform_l2_perf_base_func_(kernel_args_.l2_perf_data_base);
+    set_platform_l2_swimlane_base_func_(kernel_args_.l2_swimlane_data_base);
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
     set_pmu_enabled_func_(enable_pmu_);
@@ -586,7 +586,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return create_thread(std::move(fn));
     };
     if (enable_l2_swimlane_) {
-        l2_perf_collector_.start(thread_factory);
+        l2_swimlane_collector_.start(thread_factory);
     }
     if (enable_dump_tensor_) {
         dump_collector_.start(thread_factory);
@@ -640,7 +640,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         aicore_threads.push_back(create_thread([this, &runtime, i, core_type, physical_core_id]() {
             aicore_execute_func_(
                 &runtime, i, core_type, physical_core_id, kernel_args_.regs, kernel_args_.enable_profiling_flag,
-                kernel_args_.aicore_l2_perf_ring_addrs, kernel_args_.aicore_pmu_ring_addrs
+                kernel_args_.aicore_l2_swimlane_ring_addrs, kernel_args_.aicore_pmu_ring_addrs
             );
         }));
     }
@@ -674,10 +674,10 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // directory the user set on CallConfig (validate() enforces non-empty
     // upstream).
     if (enable_l2_swimlane_) {
-        l2_perf_collector_.stop();
-        l2_perf_collector_.read_phase_header_metadata();
-        l2_perf_collector_.reconcile_counters();
-        l2_perf_collector_.export_swimlane_json();
+        l2_swimlane_collector_.stop();
+        l2_swimlane_collector_.read_phase_header_metadata();
+        l2_swimlane_collector_.reconcile_counters();
+        l2_swimlane_collector_.export_swimlane_json();
     }
 
     if (enable_dump_tensor_) {
@@ -739,7 +739,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_regs_func_ = nullptr;
         set_platform_dump_base_func_ = nullptr;
         set_dump_tensor_enabled_func_ = nullptr;
-        set_platform_l2_perf_base_func_ = nullptr;
+        set_platform_l2_swimlane_base_func_ = nullptr;
         set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
         set_pmu_enabled_func_ = nullptr;
@@ -939,8 +939,8 @@ int DeviceRunner::finalize() {
     }
 
     // Cleanup all profiling subsystems.
-    if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+    if (l2_swimlane_collector_.is_initialized()) {
+        l2_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (dump_collector_.is_initialized()) {
         dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
@@ -1119,8 +1119,8 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
 // =============================================================================
 
 void DeviceRunner::finalize_collectors() {
-    if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.stop();
+    if (l2_swimlane_collector_.is_initialized()) {
+        l2_swimlane_collector_.stop();
     }
     if (dump_collector_.is_initialized()) {
         dump_collector_.stop();
@@ -1130,14 +1130,15 @@ void DeviceRunner::finalize_collectors() {
     }
 }
 
-int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
-    int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, l2_perf_level_, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
+int DeviceRunner::init_l2_swimlane(int num_aicore, int device_id) {
+    int rc = l2_swimlane_collector_.initialize(
+        num_aicore, device_id, l2_swimlane_level_, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
-        kernel_args_.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
-        kernel_args_.aicore_l2_perf_ring_addrs =
-            reinterpret_cast<uint64_t>(l2_perf_collector_.get_aicore_ring_addrs_device_ptr());
+        kernel_args_.l2_swimlane_data_base =
+            reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_l2_swimlane_setup_device_ptr());
+        kernel_args_.aicore_l2_swimlane_ring_addrs =
+            reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_aicore_ring_addrs_device_ptr());
     }
     return rc;
 }

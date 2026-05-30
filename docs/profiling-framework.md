@@ -1,6 +1,6 @@
 # Profiling Framework
 
-Shared host-side infrastructure that the PMU, L2Perf, and TensorDump
+Shared host-side infrastructure that the PMU, L2Swimlane, and TensorDump
 collectors are built on. Each architecture maintains its own copy of the
 framework headers under `src/<arch>/platform/include/host/profiling_common/`
 ([a2a3](../src/a2a3/platform/include/host/profiling_common/),
@@ -25,7 +25,7 @@ Each profiling subsystem on a2a3 needs the same plumbing on the host:
 - A collector thread that drains the host-side hand-off queue and copies
   records out of each ready buffer.
 - A pool of pre-registered device buffers (allocated up-front, refilled on
-  demand) keyed by "kind" — PMU has 1 kind, TensorDump has 1, L2Perf has 2
+  demand) keyed by "kind" — PMU has 1 kind, TensorDump has 1, L2Swimlane has 2
   (perf records + phase markers).
 - A dev↔host pointer map so the management thread can resolve a device
   pointer popped off a ready queue to the host-mapped pointer the collector
@@ -40,7 +40,7 @@ a small per-subsystem trait.
 
 ```text
                 ┌──────────────────────────────────────────┐
-                │  PmuCollector / L2PerfCollector /        │  Derived (CRTP)
+                │  PmuCollector / L2SwimlaneCollector /        │  Derived (CRTP)
                 │  TensorDumpCollector                     │  ─ on_buffer_collected
                 └─────────────┬────────────────────────────┘  ─ kIdleTimeoutSec / kSubsystemName
                               │ public ProfilerBase<Derived, Module>
@@ -58,7 +58,7 @@ a small per-subsystem trait.
                               ▲
                               │ Module trait wires layout into algorithms
               ┌───────────────┴────────────────┐
-              │  PmuModule / L2PerfModule /    │  Pure static trait (no state)
+              │  PmuModule / L2SwimlaneModule /    │  Pure static trait (no state)
               │  DumpModule                    │  ─ DataHeader / ReadyEntry / FreeQueue
               └────────────────────────────────┘  ─ kBufferKinds / kReadyQueueSize
                                                   ─ resolve_entry / for_each_instance
@@ -129,7 +129,7 @@ is where the unified algorithms live:
 
 ### 3.3 `Module` — trait layer
 
-A stateless `struct` per subsystem (`PmuModule`, `L2PerfModule`,
+A stateless `struct` per subsystem (`PmuModule`, `L2SwimlaneModule`,
 `DumpModule`) that tells the generic algorithms what the shared-memory
 layout looks like. The contract lives in the docblock at the top of
 [`profiler_base.h`](../src/a2a3/platform/include/host/profiling_common/profiler_base.h);
@@ -138,7 +138,7 @@ the required members are:
 | Member | Purpose |
 | ------ | ------- |
 | `using DataHeader / ReadyEntry / ReadyBufferInfo / FreeQueue` | Layout types |
-| `kBufferKinds` (PMU=1, Dump=1, L2Perf=2) | Number of per-kind recycled pools |
+| `kBufferKinds` (PMU=1, Dump=1, L2Swimlane=2) | Number of per-kind recycled pools |
 | `kReadyQueueSize`, `kSlotCount` | AICPU ready queue / free queue depth |
 | `kSubsystemName` | Tag used in framework log lines |
 | `header_from_shm(void*) → DataHeader*` | Cast shared-memory base to header |
@@ -149,7 +149,7 @@ the required members are:
 
 The Module structs are defined alongside their collectors in
 [pmu_collector.h](../src/a2a3/platform/include/host/pmu_collector.h),
-[l2_perf_collector.h](../src/a2a3/platform/include/host/l2_perf_collector.h),
+[l2_swimlane_collector.h](../src/a2a3/platform/include/host/l2_swimlane_collector.h),
 and [tensor_dump_collector.h](../src/a2a3/platform/include/host/tensor_dump_collector.h)
 — each is a few dozen lines of static methods over the subsystem's own
 `DataHeader` / ringbuffer types.
@@ -168,7 +168,7 @@ and only has to provide:
   the collector loop. Use the subsystem's `PLATFORM_*_TIMEOUT_SECONDS`
   constant.
 - `static constexpr const char* kSubsystemName` — appears in the idle
-  timeout log line (e.g. `"PMU"`, `"L2Perf"`, `"TensorDump"`).
+  timeout log line (e.g. `"PMU"`, `"L2Swimlane"`, `"TensorDump"`).
 - `init(...)` and `finalize(...)` — domain-specific setup/teardown.
   `init` must call `set_memory_context()` on the success path so
   `start(tf)` is not a no-op. `finalize` must release framework-owned
@@ -297,7 +297,7 @@ Existing collectors are the canonical examples:
   — single kind, per-core instances. See [pmu-profiling.md](dfx/pmu-profiling.md).
 - [`TensorDumpCollector`](../src/a2a3/platform/include/host/tensor_dump_collector.h)
   — single kind, per-AICPU-thread instances. See [tensor-dump.md](dfx/tensor-dump.md).
-- [`L2PerfCollector`](../src/a2a3/platform/include/host/l2_perf_collector.h)
+- [`L2SwimlaneCollector`](../src/a2a3/platform/include/host/l2_swimlane_collector.h)
   — two kinds (perf records + phase markers), per-core / per-thread
   instances; the canonical multi-kind example. See
   [l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md).
@@ -332,8 +332,8 @@ changes capture that:
    **not** called from the mgmt loop — it would race with AICPU writes
    to device-only fields (`current_buf_ptr`, `total/dropped/mismatch`
    counters, `queue_tails`, `free_queue.head`,
-   `AicpuPhaseHeader::magic`, `core_to_thread[]`), rolling them back
-   to whatever the host shadow had at the start of the tick. Per-buffer payloads (`L2PerfBuffer` / `PmuBuffer` /
+   `L2SwimlaneAicpuPhaseHeader::magic`, `core_to_thread[]`), rolling them back
+   to whatever the host shadow had at the start of the tick. Per-buffer payloads (`L2SwimlaneAicpuTaskBuffer` / `PmuBuffer` /
    `DumpMetaBuffer`) are still pulled on demand inside
    `ProfilerAlgorithms::process_entry` after resolving the host pointer
    for a popped ready entry. The bulk `mirror_shm_to_device` is kept
@@ -363,7 +363,7 @@ per-core ring/reg addresses travel through `KernelArgs`:
 | `KernelArgs` field | Producer | Consumer |
 | ------------------ | -------- | -------- |
 | `enable_profiling_flag` (bitmask) | host (DeviceRunner) | AICPU `kernel.cpp` → `set_l2_swimlane_enabled` / `set_pmu_enabled` / `set_dump_tensor_enabled`; AICore `KERNEL_ENTRY` → `set_aicore_profiling_flag` |
-| `aicore_l2_perf_ring_addrs` (table) | host (`L2PerfCollector::initialize`) | AICore `KERNEL_ENTRY` indexes `table[block_idx]` → `set_aicore_l2_perf_ring` |
+| `aicore_l2_swimlane_ring_addrs` (table) | host (`L2SwimlaneCollector::initialize`) | AICore `KERNEL_ENTRY` indexes `table[block_idx]` → `set_aicore_l2_swimlane_ring` |
 | `aicore_pmu_ring_addrs` (table) | host (`PmuCollector::init`) | AICore `KERNEL_ENTRY` → `set_aicore_pmu_ring` |
 | `regs` (per-physical-core register-base table) | host (already required for AICPU MMIO) | AICore `KERNEL_ENTRY` resolves `regs[get_physical_core_id()]` → `set_aicore_pmu_reg_base`; AICore `aicore_execute` caches the value at Phase-3 |
 
@@ -376,16 +376,16 @@ state surface, never the runtime protocol.
 
 ### 8.2 Stable AICore staging ring (decouples AICore write from AICPU buffer rotation)
 
-L2Perf and PMU on a5 both use the "AICore writes, AICPU commits" model.
+L2Swimlane and PMU on a5 both use the "AICore writes, AICPU commits" model.
 The AICore-side write target is a per-core
-[`L2PerfAicoreRing`](../src/a5/platform/include/common/l2_perf_profiling.h) /
+[`L2SwimlaneAicoreRing`](../src/a5/platform/include/common/l2_swimlane_profiling.h) /
 [`PmuAicoreRing`](../src/a5/platform/include/common/pmu_profiling.h) of
 `PLATFORM_{L2,PMU}_AICORE_RING_SIZE` (= 2, dual-issue) slots, allocated
 once by the host and addressed by
 `BufferState::aicore_ring_ptr` (AICPU-visible) and the per-core
 `aicore_*_ring_addrs[block_idx]` (AICore-visible). The address is
 never reassigned, so AICore's write target is stable across AICPU's
-rotating `L2PerfBuffer` / `PmuBuffer` flips — flipping is now
+rotating `L2SwimlaneAicpuTaskBuffer` / `PmuBuffer` flips — flipping is now
 fully internal to `*_complete_record` and never crosses into Handshake.
 
 Everything else — Module concept contract, alloc policy

@@ -63,7 +63,7 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 typedef int (*aicpu_execute_func_t)(Runtime *runtime);
 typedef void (*aicore_execute_func_t)(
     Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
-    uint32_t enable_profiling_flag, uint64_t aicore_ring_addr
+    uint32_t enable_profiling_flag, uint64_t l2_swimlane_aicore_rotation_table
 );
 typedef void (*set_platform_regs_func_t)(uint64_t regs);
 typedef void (*set_platform_dump_base_func_t)(uint64_t dump_data_base);
@@ -266,17 +266,18 @@ int DeviceRunner::ensure_binaries_loaded() {
             return -1;
         }
 
-        set_platform_l2_perf_base_func_ =
-            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_l2_perf_base"));
-        if (set_platform_l2_perf_base_func_ == nullptr) {
-            LOG_ERROR("dlsym failed for set_platform_l2_perf_base: %s", dlerror());
+        set_platform_l2_swimlane_base_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_l2_swimlane_base"));
+        if (set_platform_l2_swimlane_base_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_l2_swimlane_base: %s", dlerror());
             return -1;
         }
 
-        set_platform_aicore_rotation_table_func_ =
-            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_aicore_rotation_table"));
+        set_platform_aicore_rotation_table_func_ = reinterpret_cast<void (*)(uint64_t)>(
+            dlsym(aicpu_so_handle_, "set_platform_l2_swimlane_aicore_rotation_table")
+        );
         if (set_platform_aicore_rotation_table_func_ == nullptr) {
-            LOG_ERROR("dlsym failed for set_platform_aicore_rotation_table: %s", dlerror());
+            LOG_ERROR("dlsym failed for set_platform_l2_swimlane_aicore_rotation_table: %s", dlerror());
             return -1;
         }
 
@@ -523,9 +524,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_perf(num_aicore, device_id_);
+        rc = init_l2_swimlane(num_aicore, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_l2_perf failed: %d", rc);
+            LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
         }
     }
@@ -566,7 +567,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // On any exit from run() — success or early error — release the diagnostics
     // collectors' shared memory. They are only re-initialized per run(), so a
     // Worker reused across runs (e.g. a pytest session-scoped worker pool) would
-    // otherwise re-enter init_l2_perf() with stale state still allocated.
+    // otherwise re-enter init_l2_swimlane() with stale state still allocated.
     auto perf_cleanup = RAIIScopeGuard([this]() {
         finalize_collectors();
     });
@@ -658,8 +659,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     set_platform_regs_func_(kernel_args_.regs);
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
     set_dump_tensor_enabled_func_(enable_dump_tensor_);
-    set_platform_l2_perf_base_func_(kernel_args_.l2_perf_data_base);
-    set_platform_aicore_rotation_table_func_(kernel_args_.aicore_ring_addr);
+    set_platform_l2_swimlane_base_func_(kernel_args_.l2_swimlane_data_base);
+    set_platform_aicore_rotation_table_func_(kernel_args_.l2_swimlane_aicore_rotation_table);
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
     set_platform_pmu_reg_addrs_func_(kernel_args_.pmu_reg_addrs);
@@ -680,7 +681,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return create_thread(std::move(fn));
     };
     if (enable_l2_swimlane_) {
-        l2_perf_collector_.start(thread_factory);
+        l2_swimlane_collector_.start(thread_factory);
     }
     if (enable_dump_tensor_) {
         dump_collector_.start(thread_factory);
@@ -740,7 +741,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         aicore_threads.push_back(create_thread([this, &runtime, i, core_type, physical_core_id]() {
             aicore_execute_func_(
                 &runtime, i, core_type, physical_core_id, kernel_args_.regs, kernel_args_.enable_profiling_flag,
-                kernel_args_.aicore_ring_addr
+                kernel_args_.l2_swimlane_aicore_rotation_table
             );
         }));
     }
@@ -774,10 +775,10 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Diagnostic exports use the per-task `output_prefix_` directory the user
     // set on CallConfig (CallConfig::validate() enforces non-empty upstream).
     if (enable_l2_swimlane_) {
-        l2_perf_collector_.stop();
-        l2_perf_collector_.read_phase_header_metadata();
-        l2_perf_collector_.reconcile_counters();
-        l2_perf_collector_.export_swimlane_json();
+        l2_swimlane_collector_.stop();
+        l2_swimlane_collector_.read_phase_header_metadata();
+        l2_swimlane_collector_.reconcile_counters();
+        l2_swimlane_collector_.export_swimlane_json();
     }
 
     if (enable_dump_tensor_) {
@@ -851,7 +852,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_regs_func_ = nullptr;
         set_platform_dump_base_func_ = nullptr;
         set_dump_tensor_enabled_func_ = nullptr;
-        set_platform_l2_perf_base_func_ = nullptr;
+        set_platform_l2_swimlane_base_func_ = nullptr;
         set_platform_aicore_rotation_table_func_ = nullptr;
         set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
@@ -1225,7 +1226,7 @@ uint64_t DeviceRunner::upload_chip_callable_buffer(const ChipCallable *callable)
 // Performance Profiling Implementation
 // =============================================================================
 
-int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
+int DeviceRunner::init_l2_swimlane(int num_aicore, int device_id) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -1234,16 +1235,17 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     };
 
     // Simulation: dev pointer is directly host-accessible, no register pass-through.
-    int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, l2_perf_level_, alloc_cb, nullptr, free_cb, output_prefix_
+    int rc = l2_swimlane_collector_.initialize(
+        num_aicore, device_id, l2_swimlane_level_, alloc_cb, nullptr, free_cb, output_prefix_
     );
     if (rc != 0) {
         return rc;
     }
 
-    kernel_args_.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
-    kernel_args_.aicore_ring_addr =
-        reinterpret_cast<uint64_t>(l2_perf_collector_.get_aicore_ring_addr_table_device_ptr());
+    kernel_args_.l2_swimlane_data_base =
+        reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_l2_swimlane_setup_device_ptr());
+    kernel_args_.l2_swimlane_aicore_rotation_table =
+        reinterpret_cast<uint64_t>(l2_swimlane_collector_.get_aicore_ring_addr_table_device_ptr());
     return 0;
 }
 
@@ -1331,8 +1333,8 @@ void DeviceRunner::finalize_collectors() {
         return mem_alloc_.free(dev_ptr);
     };
 
-    if (l2_perf_collector_.is_initialized()) {
-        l2_perf_collector_.finalize(nullptr, free_cb);
+    if (l2_swimlane_collector_.is_initialized()) {
+        l2_swimlane_collector_.finalize(nullptr, free_cb);
     }
     if (dump_collector_.is_initialized()) {
         dump_collector_.finalize(nullptr, free_cb);

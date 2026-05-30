@@ -11,7 +11,7 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
 
@@ -135,10 +135,10 @@ private:
     SyncStartDrainState drain_state_;
 
 #if PTO2_PROFILING
-    SchedL2PerfCounters sched_l2_perf_[MAX_AICPU_THREADS];
-    // Cached once at init() from get_l2_perf_level(), AFTER
-    // l2_perf_aicpu_init has promoted the level from the shared-memory header.
-    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};
+    SchedL2SwimlaneCounters sched_l2_swimlane_[MAX_AICPU_THREADS];
+    // Cached once at init() from get_l2_swimlane_level(), AFTER
+    // l2_swimlane_aicpu_init has promoted the level from the shared-memory header.
+    L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};
 #endif
 
     // --- Task-execution tracking ---
@@ -349,7 +349,7 @@ private:
     );
 
 #if PTO2_PROFILING
-    __attribute__((noinline, cold)) void log_l2_perf_summary(int32_t thread_idx, int32_t cur_thread_completed);
+    __attribute__((noinline, cold)) void log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
 #endif
 
     // =========================================================================

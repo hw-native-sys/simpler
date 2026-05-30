@@ -939,7 +939,7 @@ void DeviceRunnerBase::start_shared_collectors_for_run() {
         return create_thread(std::move(fn));
     };
     if (enable_l2_swimlane_) {
-        l2_perf_collector_.start(thread_factory);
+        l2_swimlane_collector_.start(thread_factory);
     }
     if (enable_dump_tensor_) {
         dump_collector_.start(thread_factory);
@@ -958,10 +958,10 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run() {
     // Diagnostic exports use the per-task `output_prefix_` directory the user
     // set on CallConfig (CallConfig::validate() enforces non-empty upstream).
     if (enable_l2_swimlane_) {
-        l2_perf_collector_.stop();
-        l2_perf_collector_.read_phase_header_metadata();
-        l2_perf_collector_.reconcile_counters();
-        l2_perf_collector_.export_swimlane_json();
+        l2_swimlane_collector_.stop();
+        l2_swimlane_collector_.read_phase_header_metadata();
+        l2_swimlane_collector_.reconcile_counters();
+        l2_swimlane_collector_.export_swimlane_json();
     }
 
     if (enable_dump_tensor_) {

@@ -18,7 +18,7 @@
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "pto_runtime2.h"
@@ -26,7 +26,7 @@
 #include "spin_hint.h"
 
 // Performance profiling headers
-#include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 
@@ -74,15 +74,15 @@ int SchedulerContext::pop_ready_tasks_batch(
     PTO2ResourceShape shape, int32_t thread_idx, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count
 ) {
 #if PTO2_PROFILING
-    auto &l2_perf = sched_l2_perf_[thread_idx];
+    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
 #if PTO2_SCHED_PROFILING
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
         shape, local_buf, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx],
-        l2_perf.local_dispatch_count
+        l2_swimlane.local_dispatch_count
     );
-    l2_perf.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
+    l2_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
     int count = sched_->get_ready_tasks_batch(shape, local_buf, out, max_count);
 #endif
@@ -90,9 +90,9 @@ int SchedulerContext::pop_ready_tasks_batch(
     // so dispatch-phase records in aicpu_scheduler_phases[] carry queue-health
     // stats on default builds.
     if (count > 0) {
-        l2_perf.pop_hit += count;
+        l2_swimlane.pop_hit += count;
     } else {
-        l2_perf.pop_miss++;
+        l2_swimlane.pop_miss++;
     }
 #else
     (void)thread_idx;
@@ -155,7 +155,7 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
 #if PTO2_PROFILING
-        if (l2_perf_level_ >= L2PerfLevel::AICPU_TIMING) {
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
             core_exec_state.pending_dispatch_timestamp = get_sys_cnt_aicpu();
         }
 #endif
@@ -164,7 +164,7 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
 #if PTO2_PROFILING
-        if (l2_perf_level_ >= L2PerfLevel::AICPU_TIMING) {
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
             core_exec_state.running_dispatch_timestamp = get_sys_cnt_aicpu();
         }
 #endif
@@ -247,7 +247,7 @@ void SchedulerContext::dispatch_block(
         );
     }
 #if PTO2_PROFILING
-    sched_l2_perf_[thread_idx].phase_dispatch_count += __builtin_popcount(slot_state.active_mask.core_mask());
+    sched_l2_swimlane_[thread_idx].phase_dispatch_count += __builtin_popcount(slot_state.active_mask.core_mask());
 #endif
 }
 
@@ -256,7 +256,7 @@ void SchedulerContext::dispatch_shape(
     PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
 #if PTO2_SCHED_PROFILING
-    auto &l2_perf = sched_l2_perf_[thread_idx];
+    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
 #endif
     if (entered_drain) return;
 
@@ -324,7 +324,7 @@ void SchedulerContext::dispatch_shape(
             }
             made_progress = true;
 #if PTO2_SCHED_PROFILING
-            l2_perf.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
+            l2_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
         }
 
@@ -353,7 +353,7 @@ void SchedulerContext::dispatch_ready_tasks(
     const PTO2ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
 
 #if PTO2_SCHED_PROFILING
-    auto &l2_perf = sched_l2_perf_[thread_idx];
+    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
 #endif
 
     // Note: flush_local_bufs is invoked multiple times per pass (mid-function
@@ -367,7 +367,7 @@ void SchedulerContext::dispatch_ready_tasks(
         for (int32_t s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
             auto &lb = local_bufs[s];
 #if PTO2_SCHED_PROFILING
-            l2_perf.local_overflow_count += lb.count;
+            l2_swimlane.local_overflow_count += lb.count;
 #endif
             if (lb.count > 0) {
                 sched_->ready_queues[s].push_batch(lb.slot_states, lb.count);
@@ -481,9 +481,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     );
 
     // One-time init: assign perf buffers (one thread does it; others wait).
-    // l2_perf_aicpu_init / l2_perf_aicpu_init_phase already ran eagerly in
+    // l2_swimlane_aicpu_init / l2_swimlane_aicpu_init_phase already ran eagerly in
     // SchedulerContext::init() so the orchestrator thread can read the
-    // promoted g_l2_perf_level before caching it on rt->orchestrator. Only
+    // promoted g_l2_swimlane_level before caching it on rt->orchestrator. Only
     // dump_tensor / pmu init remain dispatch-time because they depend on
     // handshake-derived core IDs / counts.
     if (!init_done_.exchange(true, std::memory_order_acq_rel)) {
@@ -512,9 +512,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
 #if PTO2_PROFILING
-    auto &l2_perf = sched_l2_perf_[thread_idx];
-    l2_perf.reset();
-    l2_perf.l2_perf_enabled = (l2_perf_level_ != L2PerfLevel::DISABLED);
+    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
+    l2_swimlane.reset();
+    l2_swimlane.l2_swimlane_enabled = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
 #endif
 
     constexpr int LOCAL_READY_CAP_PER_TYPE = 64;
@@ -529,7 +529,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     bool cores_released = false;
 
 #if PTO2_PROFILING
-    l2_perf.sched_start_ts = get_sys_cnt_aicpu();
+    l2_swimlane.sched_start_ts = get_sys_cnt_aicpu();
 #endif
 
     while (true) {
@@ -539,7 +539,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool made_progress = false;
 #if PTO2_PROFILING
         CYCLE_COUNT_START();
-        l2_perf.sched_loop_count++;
+        l2_swimlane.sched_loop_count++;
         uint64_t _t0_phase = _t0;
 #endif
         int32_t task_count = 0;
@@ -554,7 +554,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 
 #if PTO2_PROFILING
-        CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
+        CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
 #endif
 
         // Phase 1: Check running cores for completion
@@ -616,16 +616,16 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
         if (!try_completed) {
-            CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
+            CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
         } else {
-            CYCLE_COUNT_LAP(l2_perf.sched_complete_cycle);
-            if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES && l2_perf.phase_complete_count > 0) {
-                l2_perf_aicpu_record_phase(
-                    thread_idx, AicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, l2_perf.sched_loop_count,
-                    l2_perf.phase_complete_count
+            CYCLE_COUNT_LAP(l2_swimlane.sched_complete_cycle);
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && l2_swimlane.phase_complete_count > 0) {
+                l2_swimlane_aicpu_record_phase(
+                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                    l2_swimlane.phase_complete_count
                 );
                 _t0_phase = _t1;
-                l2_perf.phase_complete_count = 0;
+                l2_swimlane.phase_complete_count = 0;
             }
         }
 #endif
@@ -644,12 +644,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (wired > 0) {
                 made_progress = true;
 #if PTO2_SCHED_PROFILING
-                l2_perf.phase_wiring_count += wired;
+                l2_swimlane.phase_wiring_count += wired;
 #endif
             }
         }
 #if PTO2_PROFILING
-        CYCLE_COUNT_LAP(l2_perf.sched_wiring_cycle);
+        CYCLE_COUNT_LAP(l2_swimlane.sched_wiring_cycle);
 #endif
 
         // Phase 3b: Drain dummy ready queue (thread 0 only).
@@ -700,28 +700,28 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
         if (!try_pushed) {
-            CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
+            CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
         } else {
-            CYCLE_COUNT_LAP(l2_perf.sched_dispatch_cycle);
-            if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES && l2_perf.phase_dispatch_count > 0) {
+            CYCLE_COUNT_LAP(l2_swimlane.sched_dispatch_cycle);
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && l2_swimlane.phase_dispatch_count > 0) {
                 // Per-emit pop deltas via snapshot diff; the cumulative
                 // pop_hit / pop_miss stay intact for the cold-path log.
-                uint64_t pop_hit_delta = l2_perf.pop_hit - l2_perf.pop_hit_at_last_emit;
-                uint64_t pop_miss_delta = l2_perf.pop_miss - l2_perf.pop_miss_at_last_emit;
-                // AicpuPhaseRecord's extras are uint32 — a delta that overflows means
+                uint64_t pop_hit_delta = l2_swimlane.pop_hit - l2_swimlane.pop_hit_at_last_emit;
+                uint64_t pop_miss_delta = l2_swimlane.pop_miss - l2_swimlane.pop_miss_at_last_emit;
+                // L2SwimlaneAicpuPhaseRecord's extras are uint32 — a delta that overflows means
                 // an emit was missed for ~4 billion pops, which is well outside any
                 // realistic dispatch cadence and silently truncates without this guard.
                 debug_assert(pop_hit_delta < (1ULL << 32));
                 debug_assert(pop_miss_delta < (1ULL << 32));
-                l2_perf_aicpu_record_phase(
-                    thread_idx, AicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, l2_perf.sched_loop_count,
-                    l2_perf.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
+                l2_swimlane_aicpu_record_phase(
+                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                    l2_swimlane.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
                     static_cast<uint32_t>(pop_miss_delta)
                 );
                 _t0_phase = _t1;
-                l2_perf.phase_dispatch_count = 0;
-                l2_perf.pop_hit_at_last_emit = l2_perf.pop_hit;
-                l2_perf.pop_miss_at_last_emit = l2_perf.pop_miss;
+                l2_swimlane.phase_dispatch_count = 0;
+                l2_swimlane.pop_hit_at_last_emit = l2_swimlane.pop_hit;
+                l2_swimlane.pop_miss_at_last_emit = l2_swimlane.pop_miss;
             }
         }
 #endif
@@ -756,17 +756,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     thread_idx, header, runtime, idle_iterations, last_progress_count
 #if PTO2_PROFILING
                     ,
-                    l2_perf.sched_start_ts
+                    l2_swimlane.sched_start_ts
 #endif
                 );
             } else {
                 SPIN_WAIT_HINT();
             }
 #if PTO2_PROFILING
-            CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
-            if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-                l2_perf_aicpu_record_phase(
-                    thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, l2_perf.sched_loop_count, 0
+            CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+                l2_swimlane_aicpu_record_phase(
+                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, l2_swimlane.sched_loop_count, 0
                 );
                 _t0_phase = _t1;
             }
@@ -794,31 +794,31 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // sum(record.pop_*) reconciles with the run-cumulative counter.
     // Gate on SCHED_PHASES — at lower levels the phase buffer is never
     // flushed (see below), so writing this record would be wasted work.
-    if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-        uint64_t final_pop_hit_delta = l2_perf.pop_hit - l2_perf.pop_hit_at_last_emit;
-        uint64_t final_pop_miss_delta = l2_perf.pop_miss - l2_perf.pop_miss_at_last_emit;
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+        uint64_t final_pop_hit_delta = l2_swimlane.pop_hit - l2_swimlane.pop_hit_at_last_emit;
+        uint64_t final_pop_miss_delta = l2_swimlane.pop_miss - l2_swimlane.pop_miss_at_last_emit;
         debug_assert(final_pop_hit_delta < (1ULL << 32));
         debug_assert(final_pop_miss_delta < (1ULL << 32));
         if (final_pop_hit_delta != 0 || final_pop_miss_delta != 0) {
             uint64_t t_now = get_sys_cnt_aicpu();
-            l2_perf_aicpu_record_phase(
-                thread_idx, AicpuPhaseId::SCHED_DISPATCH, t_now, t_now, l2_perf.sched_loop_count, 0,
+            l2_swimlane_aicpu_record_phase(
+                thread_idx, L2SwimlaneAicpuPhaseId::SCHED_DISPATCH, t_now, t_now, l2_swimlane.sched_loop_count, 0,
                 static_cast<uint32_t>(final_pop_hit_delta), static_cast<uint32_t>(final_pop_miss_delta)
             );
-            l2_perf.pop_hit_at_last_emit = l2_perf.pop_hit;
-            l2_perf.pop_miss_at_last_emit = l2_perf.pop_miss;
+            l2_swimlane.pop_hit_at_last_emit = l2_swimlane.pop_hit;
+            l2_swimlane.pop_miss_at_last_emit = l2_swimlane.pop_miss;
         }
     }
-    log_l2_perf_summary(thread_idx, cur_thread_completed);
+    log_l2_swimlane_summary(thread_idx, cur_thread_completed);
 #endif
 
 #if PTO2_PROFILING
-    if (l2_perf.l2_perf_enabled) {
-        l2_perf_aicpu_flush_buffers(
+    if (l2_swimlane.l2_swimlane_enabled) {
+        l2_swimlane_aicpu_flush(
             thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
         );
-        if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-            l2_perf_aicpu_flush_phase_buffers(thread_idx);
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+            l2_swimlane_aicpu_flush_phase_buffers(thread_idx);
         }
     }
 #endif

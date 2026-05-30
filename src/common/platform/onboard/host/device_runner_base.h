@@ -50,11 +50,11 @@
 
 #include "arg_direction.h"
 #include "callable.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "device_arena.h"
 #include "device_runner_helpers.h"
 #include "host/load_aicpu_op.h"
-#include "host/l2_perf_collector.h"
+#include "host/l2_swimlane_collector.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
@@ -378,8 +378,8 @@ public:
      * `set_dep_gen_enabled` is a2a3-only and lives on the subclass.
      */
     void set_l2_swimlane_enabled(int level) {
-        l2_perf_level_ = static_cast<L2PerfLevel>(level);
-        enable_l2_swimlane_ = (l2_perf_level_ != L2PerfLevel::DISABLED);
+        l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
+        enable_l2_swimlane_ = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
     }
     void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
     void set_pmu_enabled(int enable_pmu) {
@@ -390,7 +390,7 @@ public:
 
     /**
      * Directory under which all diagnostic artifacts
-     * (l2_perf_records.json / tensor_dump/ / pmu.csv) land. Required
+     * (l2_swimlane_records.json / tensor_dump/ / pmu.csv) land. Required
      * (non-empty) when any diagnostic is enabled; `CallConfig::validate()`
      * enforces this contract upstream.
      */
@@ -541,7 +541,7 @@ protected:
 
     /**
      * Start collector mgmt + poll threads for the four shared
-     * diagnostics collectors (`l2_perf_collector_`, `dump_collector_`,
+     * diagnostics collectors (`l2_swimlane_collector_`, `dump_collector_`,
      * `pmu_collector_`, `scope_stats_collector_`) that are enabled.
      * Each `start()` is gated on the corresponding `enable_*_` flag;
      * disabled collectors are not started.
@@ -557,7 +557,7 @@ protected:
      * Tear down the four shared diagnostics collectors after the launched
      * kernels have synced. Each block is gated on the corresponding
      * `enable_*_` flag and does: stop() → reconcile_counters() →
-     * export step (`l2_perf` writes swimlane JSON via
+     * export step (`l2_swimlane` writes swimlane JSON via
      * `read_phase_header_metadata` + `export_swimlane_json`; `dump`
      * writes dump files; `pmu` has no export step beyond reconcile;
      * `scope_stats` writes JSONL).
@@ -748,7 +748,7 @@ protected:
     // direct `rtMalloc`/`rtFree`), but the storage and lifetime live
     // on the base. `DepGenCollector` is a2a3-only and stays on the
     // a2a3 subclass.
-    L2PerfCollector l2_perf_collector_;
+    L2SwimlaneCollector l2_swimlane_collector_;
     TensorDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
@@ -760,9 +760,9 @@ protected:
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
     bool enable_scope_stats_{false};
-    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};             // resolved from set_l2_swimlane_enabled()
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
-    std::string output_prefix_{};                                  // diagnostic artifact root directory
+    L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
+    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
+    std::string output_prefix_{};                                   // diagnostic artifact root directory
 };
 
 #endif  // SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_BASE_H

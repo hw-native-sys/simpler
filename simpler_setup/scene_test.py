@@ -558,7 +558,7 @@ def _build_output_prefix(case_label: str) -> Path:
     """Per-case directory for diagnostic artifacts.
 
     Each case gets its own ``outputs/<case_label>_<timestamp>/`` directory; the
-    runtime writes ``l2_perf_records.json``, ``tensor_dump/``, and ``pmu.csv``
+    runtime writes ``l2_swimlane_records.json``, ``tensor_dump/``, and ``pmu.csv``
     under that root with fixed filenames. Two cases of the same name run in
     the same second is not a contemplated scenario (parallel xdist runs differ
     by class+method).
@@ -584,7 +584,7 @@ def _run_swimlane_converter(
 
     When ``input_path`` is given, the converter derives its output filename from
     the input's timestamp (see ``swimlane_converter._resolve_output_path``).
-    Without it, the converter auto-selects the latest ``l2_perf_records_*.json``.
+    Without it, the converter auto-selects the latest ``l2_swimlane_records_*.json``.
     """
     import logging  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
@@ -618,13 +618,13 @@ def _convert_case_swimlane(
     callable_spec: dict | None = None,
 ) -> None:
     """Post-case: invoke the swimlane converter on the perf file the runtime
-    just wrote into ``<output_prefix>/l2_perf_records.json``. No diff/rename
+    just wrote into ``<output_prefix>/l2_swimlane_records.json``. No diff/rename
     dance — the path is known a priori from CallConfig.output_prefix.
     """
     import logging  # noqa: PLC0415
 
     logger = logging.getLogger(__name__)
-    perf_file = output_prefix / "l2_perf_records.json"
+    perf_file = output_prefix / "l2_swimlane_records.json"
     if not perf_file.exists():
         logger.warning(f"[{case_label}] {perf_file} not produced; skipping conversion")
         return
@@ -693,7 +693,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         # Per-case directory the runtime writes into. Required (non-empty) when
         # any diagnostic flag is on; CallConfig::validate() throws otherwise.
         # scope_stats now writes <prefix>/scope_stats/scope_stats.jsonl (sibling of
-        # l2_perf_records.json / deps.json), so it pulls output_prefix the
+        # l2_swimlane_records.json / deps.json), so it pulls output_prefix the
         # same way the other DFX flags do.
         prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
         try:

@@ -38,7 +38,7 @@
 #include <vector>
 
 #include "common/core_type.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "pto_runtime2_types.h"
 #include "tensor_info.h"

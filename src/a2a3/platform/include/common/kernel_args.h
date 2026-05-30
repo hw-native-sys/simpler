@@ -83,17 +83,21 @@ struct KernelArgs {
     __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
     uint64_t ffts_base_addr{0};                             // FFTS base address for AICore
-    uint64_t dump_data_base{0};         // Dump shared memory base address; use explicit flags to detect enablement
-    uint64_t l2_perf_data_base{0};      // L2 perf shared memory base address; use explicit flags to detect enablement
+    uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
+    uint64_t l2_swimlane_data_base{
+        0
+    };  // L2 swimlane shared memory base address; use explicit flags to detect enablement
     uint64_t pmu_data_base{0};          // PMU shared memory base address; use explicit flags to detect enablement
     uint64_t pmu_reg_addrs{0};          // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
     uint64_t dep_gen_data_base{0};      // dep_gen shared memory base address; use explicit flags to detect enablement
     uint64_t scope_stats_data_base{0};  // ScopeStatsBuffer shared memory base; 0 when scope_stats is off.
                                         // Allocated by host's ScopeStatsCollector, read+written by AICPU's
                                         // scope_stats_collector via set_platform_scope_stats_base.
-    uint64_t aicore_ring_addr{0};       // Device ptr to a uint64_t[num_aicore] table holding each core's
-                                        // L2PerfAicoreBuffer address. AICore kernel entry indexes by block_idx
-                                        // and forwards into platform set/get state. 0 when L2 swimlane is off.
+    uint64_t l2_swimlane_aicore_rotation_table{
+        0
+    };  // Device ptr to a uint64_t[num_aicore] table holding each core's
+        // L2SwimlaneAicoreTaskBuffer address. AICore kernel entry indexes by block_idx
+        // and forwards into platform set/get state. 0 when L2 swimlane is off.
     uint32_t log_level{1};              // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
     uint32_t log_info_v{5};             // INFO verbosity threshold (0..9); default V5
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
