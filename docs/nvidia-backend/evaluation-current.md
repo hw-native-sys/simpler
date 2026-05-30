@@ -1069,6 +1069,33 @@ The wider graph keeps every scheduler block active in the four-scheduler row
 on both GPUs. Compared with the matching one-scheduler row, the
 four-scheduler device event time is `0.74x` on A100 and `0.69x` on H200.
 
+## Current Graph-Size Scheduler Scaling Summary
+
+The current-head combined scheduler scaling summary under
+`tmp/cuda-backend/scheduler-graph-size-scaling-working/`
+`scheduler-graph-size-scaling-952bdefd/` uses the same
+`cuda_scheduler_scaling.py` report path, but feeds both the five-task diamond
+and nine-task parallel-chain sweeps into one JSON/Markdown/SVG report. The
+report now carries graph-size fields (`Tasks`, `Device ns/task`, and
+`Tasks/scheduler`) beside the existing active-scheduler and
+busiest-scheduler columns.
+
+Selected rows:
+
+| GPU | Shape | Tasks | Schedulers | Device ns | ns/task | Active | Vs sched=1 |
+| --- | ----- | ----- | ---------- | --------- | ------- | ------ | ---------- |
+| A100 | diamond | 5 | 4 | 98304 | 19660 | `2/4` | `0.89x` |
+| A100 | parallel chains | 9 | 4 | 115712 | 12856 | `4/4` | `0.74x` |
+| H200 | diamond | 5 | 4 | 70752 | 14150 | `4/4` | `0.86x` |
+| H200 | parallel chains | 9 | 4 | 90272 | 10030 | `4/4` | `0.69x` |
+
+The combined view makes the current scheduler trend explicit: adding graph
+width gives the extra scheduler blocks enough completion work to stay active.
+At four scheduler blocks, the nine-task graph lowers per-task event time from
+`19660 ns` to `12856 ns` on A100 and from `14150 ns` to `10030 ns` on H200
+relative to the five-task graph. This is still a microbenchmark over
+generated vector task bodies, not a tuned model-kernel benchmark.
+
 ## Latest Scheduler Error Matrix
 
 The scheduler error matrix at artifact label `35de3303` captures the

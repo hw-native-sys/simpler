@@ -285,17 +285,18 @@ errors. Device times were `97280 ns` on A100 and `71136 ns` on H200 for
 Use `cuda_scheduler_scaling.py` to summarize a scheduler-block sweep after
 capturing the individual paired smokes. Its ratio column is shape-aware:
 each row is compared with the one-scheduler row for the same artifact, DAG
-shape, vector length, and worker-block policy. The paired scheduler scaling
-capture under `tmp/cuda-backend/scheduler-scaling-working/` sweeps
+shape, vector length, and worker-block policy. The report also exposes graph
+size through completed task count, device ns/task, and tasks/scheduler, so
+mixed graph-size summaries are readable without opening each smoke JSON. The
+paired scheduler scaling capture under
+`tmp/cuda-backend/scheduler-scaling-working/` sweeps
 `scheduler_blocks=1,2,4` with `worker_blocks=3`, writes a compact JSON,
 Markdown, and SVG summary under `scheduler-scaling-a5ca4fac/`, and shows
 A100 device times `110592/97280/98304 ns` and H200 device times
-`82240/70368/70752 ns` for `1/2/4` scheduler blocks. The report also exposes
-the load-balance counters, active scheduler count, and busiest scheduler
-completion share. For the four-scheduler row, A100 has active schedulers
-`2/4` with `[0,2,3,0]` and H200 has active schedulers `4/4` with
-`[2,1,1,1]`; the busiest scheduler owns `60.0%` and `40.0%` of completions,
-respectively.
+`82240/70368/70752 ns` for `1/2/4` scheduler blocks. For the
+four-scheduler row, A100 has active schedulers `2/4` with `[0,2,3,0]` and
+H200 has active schedulers `4/4` with `[2,1,1,1]`; the busiest scheduler
+owns `60.0%` and `40.0%` of completions, respectively.
 The paired parallel-chain scheduler scaling capture under
 `tmp/cuda-backend/parallel-chains-scheduler-scaling-working/` sweeps the
 nine-task graph over `scheduler_blocks=1,2,4` with `worker_blocks=4`.
@@ -304,6 +305,27 @@ times `155648/123904/115712 ns` and H200 device times
 `131104/102496/90272 ns` for `1/2/4` scheduler blocks. The four-scheduler
 rows keep all scheduler blocks active on both GPUs, with per-block counters
 `[3,2,2,2]` on A100 and `[2,2,2,3]` on H200.
+To compare graph sizes in one visual report, feed both the diamond and
+parallel-chain smoke JSON files into the same summary command:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python .agents/skills/cuda-backend-eval/scripts/cuda_scheduler_scaling.py \
+    tmp/cuda-backend/scheduler-scaling-working/persistent-graph_descriptor_diamond-repeat2-smoke-a5ca4fac/a100.json \
+    tmp/cuda-backend/scheduler-scaling-working/persistent-graph_descriptor_diamond-repeat2-smoke-a5ca4fac/h200.json \
+    tmp/cuda-backend/scheduler-scaling-working/persistent-graph_descriptor_diamond-sched2-repeat2-smoke-a5ca4fac/a100.json \
+    tmp/cuda-backend/scheduler-scaling-working/persistent-graph_descriptor_diamond-sched2-repeat2-smoke-a5ca4fac/h200.json \
+    tmp/cuda-backend/scheduler-scaling-working/persistent-graph_descriptor_diamond-sched4-repeat2-smoke-a5ca4fac/a100.json \
+    tmp/cuda-backend/scheduler-scaling-working/persistent-graph_descriptor_diamond-sched4-repeat2-smoke-a5ca4fac/h200.json \
+    tmp/cuda-backend/parallel-chains-scheduler-scaling-working/persistent-graph_descriptor_parallel_chains-repeat2-smoke-674ebe2e/a100.json \
+    tmp/cuda-backend/parallel-chains-scheduler-scaling-working/persistent-graph_descriptor_parallel_chains-repeat2-smoke-674ebe2e/h200.json \
+    tmp/cuda-backend/parallel-chains-scheduler-scaling-working/persistent-graph_descriptor_parallel_chains-sched2-repeat2-smoke-674ebe2e/a100.json \
+    tmp/cuda-backend/parallel-chains-scheduler-scaling-working/persistent-graph_descriptor_parallel_chains-sched2-repeat2-smoke-674ebe2e/h200.json \
+    tmp/cuda-backend/parallel-chains-scheduler-scaling-working/persistent-graph_descriptor_parallel_chains-sched4-repeat2-smoke-674ebe2e/a100.json \
+    tmp/cuda-backend/parallel-chains-scheduler-scaling-working/persistent-graph_descriptor_parallel_chains-sched4-repeat2-smoke-674ebe2e/h200.json \
+    --label scheduler-graph-size-scaling-$(git rev-parse --short HEAD) \
+    --output-dir tmp/cuda-backend/scheduler-graph-size-scaling-working/scheduler-graph-size-scaling-$(git rev-parse --short HEAD)
+```
 
 Run the bounded-ring persistent smoke with wraparound:
 

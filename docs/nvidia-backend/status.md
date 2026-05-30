@@ -4737,9 +4737,16 @@ Needed:
   `155648/123904/115712 ns`; H200 reported `131104/102496/90272 ns`.
   The four-scheduler rows compare at `0.74x` and `0.69x` versus each GPU's
   matching one-scheduler row and keep all four scheduler blocks active on
-  both GPUs. The remaining policy gap is now larger graph-size sweeps and
-  baseline integration rather than launch resource partitioning, root seeding,
-  completion-ring ownership, or artifact validation;
+  both GPUs. The current-head graph-size summary under
+  `tmp/cuda-backend/scheduler-graph-size-scaling-working/`
+  `scheduler-graph-size-scaling-952bdefd/` regenerates one JSON/Markdown/SVG
+  report over both the five-task diamond and nine-task parallel-chain sweeps.
+  The report includes task count, device ns/task, and tasks/scheduler columns;
+  the four-scheduler per-task rows are `19660 ns` vs. `12856 ns` on A100 and
+  `14150 ns` vs. `10030 ns` on H200 for diamond vs. parallel chains. The
+  remaining policy gap is now larger graph families and selected-benchmark
+  integration rather than launch resource partitioning, root seeding,
+  completion-ring ownership, graph-size reporting, or artifact validation;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
   invalid-dependent-ID, dependent-range, fan-in-underflow,
   duplicate-dependent, self-dependent, initial-fan-in, and

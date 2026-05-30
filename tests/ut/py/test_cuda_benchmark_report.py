@@ -6058,13 +6058,20 @@ def test_cuda_scheduler_scaling_report_summarizes_by_block_smokes(tmp_path):
     assert len(payload["rows"]) == 6
     assert payload["rows"][1]["active_scheduler_count"] == 2
     assert payload["rows"][1]["scheduler_utilization"] == 1.0
+    assert payload["rows"][1]["completed_task_count"] == 5
+    assert payload["rows"][1]["device_ns_per_task"] == 18000
+    assert payload["rows"][1]["tasks_per_scheduler"] == 2.5
     assert payload["rows"][5]["busiest_scheduler_share"] == 0.4
-    assert ("| a100 | graph_descriptor_diamond | 2 | 90000 | 120000 | `2,3` | `2/2` | `60.0%` | `0.90x` |") in markdown
     assert (
-        "| h200 | graph_descriptor_diamond | 4 | 110007 | 140000 | `2,1,1,1` | `4/4` | `40.0%` | `1.10x` |"
+        "| a100 | graph_descriptor_diamond | 5 | 2 | 90000 | 18000 | 2.50 | 120000 | "
+        "`2,3` | `2/2` | `60.0%` | `0.90x` |"
+    ) in markdown
+    assert (
+        "| h200 | graph_descriptor_diamond | 5 | 4 | 110007 | 22001 | 1.25 | 140000 | "
+        "`2,1,1,1` | `4/4` | `40.0%` | `1.10x` |"
     ) in markdown
     assert "scheduler-scaling-test" in svg
-    assert "sched=4; active=4/4; busiest=40.0%; by_block=2,1,1,1" in svg
+    assert "tasks=5; ns/task=22000; sched=4; active=4/4; busiest=40.0%; by_block=2,1,1,1" in svg
     assert (output_dir / "cuda-scheduler-scaling.md").exists()
     assert (output_dir / "cuda-scheduler-scaling.svg").exists()
 
@@ -6130,9 +6137,11 @@ def test_cuda_scheduler_scaling_report_uses_shape_local_baselines(tmp_path):
         "graph_descriptor_parallel_chains",
         "graph_descriptor_parallel_chains",
     ]
-    assert "| a100 | graph_descriptor_diamond | 4 | 80000 | 81000 | `2,1,1,1` |" in markdown
+    assert "| a100 | graph_descriptor_diamond | 5 | 4 | 80000 | 16000 | 1.25 | 81000 | `2,1,1,1` |" in markdown
     assert "`0.80x` |" in markdown
-    assert "| a100 | graph_descriptor_parallel_chains | 4 | 120000 | 121000 | `2,2,3,2` |" in markdown
+    assert (
+        "| a100 | graph_descriptor_parallel_chains | 9 | 4 | 120000 | 13333 | 2.25 | 121000 | `2,2,3,2` |"
+    ) in markdown
     assert "`0.60x` |" in markdown
 
 

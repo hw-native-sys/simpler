@@ -125,6 +125,11 @@ latest current-head multi-size tensor baseline sweep uses `76422250`:
   parallel-chains scheduler scaling sweep over `scheduler_blocks=1,2,4`,
   with a shape-aware compact report that compares each row against the
   matching one-scheduler row for the same DAG shape and worker-block policy.
+- [Current capture](evaluation-current.md) records the current-head
+  graph-size scheduler scaling summary `952bdefd`, which combines the
+  five-task diamond and nine-task parallel-chain sweeps in one JSON,
+  Markdown, and SVG report with task count, device ns/task, and
+  tasks/scheduler columns.
 - [Current capture](evaluation-current.md) records the `35de3303` scheduler
   error matrix that captures all synthetic malformed-DAG diagnostics on A100
   and H200 with JSON, Markdown, and SVG artifacts validated by

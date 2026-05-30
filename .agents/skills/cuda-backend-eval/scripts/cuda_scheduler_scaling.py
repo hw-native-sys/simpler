@@ -73,6 +73,13 @@ def _comma(values: list[int]) -> str:
     return ",".join(str(value) for value in values)
 
 
+def _completed_task_count(payload: dict[str, Any], processed_count: int) -> int:
+    completed_counts = _int_list(payload.get("launch_completed_counts"))
+    if completed_counts:
+        return max(completed_counts)
+    return processed_count
+
+
 def _baseline_key(row: dict[str, Any]) -> tuple[str, str, int, int]:
     return (
         str(row["artifact"]),
@@ -112,6 +119,8 @@ def load_scaling_rows(paths: list[Path]) -> list[dict[str, Any]]:
         scheduler_blocks = _scheduler_blocks(payload)
         processed_by_block = _int_list(payload.get("scheduler_processed_by_block"))
         scheduler_processed_count = _as_int(payload.get("scheduler_processed_count"))
+        completed_task_count = _completed_task_count(payload, scheduler_processed_count)
+        device_wall_ns = _as_int(payload.get("device_wall_ns"))
         active_scheduler_count = sum(1 for value in processed_by_block if value > 0)
         scheduler_utilization = active_scheduler_count / scheduler_blocks if scheduler_blocks > 0 else 0.0
         busiest_scheduler_share = (
@@ -119,6 +128,8 @@ def load_scaling_rows(paths: list[Path]) -> list[dict[str, Any]]:
             if processed_by_block and scheduler_processed_count > 0
             else 0.0
         )
+        tasks_per_scheduler = completed_task_count / scheduler_blocks if scheduler_blocks > 0 else 0.0
+        device_ns_per_task = device_wall_ns // completed_task_count if completed_task_count > 0 else 0
         rows.append(
             {
                 "artifact": _artifact_label(path),
@@ -128,10 +139,13 @@ def load_scaling_rows(paths: list[Path]) -> list[dict[str, Any]]:
                 "mode": str(payload.get("mode", "unknown")),
                 "dag_shape": str(payload.get("dag_shape", "-")),
                 "n": _as_int(payload.get("n")),
-                "device_wall_ns": _as_int(payload.get("device_wall_ns")),
+                "device_wall_ns": device_wall_ns,
+                "device_ns_per_task": device_ns_per_task,
                 "host_wall_ns": _as_int(payload.get("host_wall_ns")),
                 "scheduler_blocks": scheduler_blocks,
                 "worker_blocks": _worker_blocks(payload),
+                "completed_task_count": completed_task_count,
+                "tasks_per_scheduler": tasks_per_scheduler,
                 "scheduler_loop_count": _as_int(payload.get("scheduler_loop_count")),
                 "scheduler_processed_count": scheduler_processed_count,
                 "scheduler_processed_by_block": processed_by_block,
@@ -158,12 +172,12 @@ def render_markdown_report(rows: list[dict[str, Any]], label: str) -> str:
         "- Busiest column is the largest per-scheduler completion share.",
         "",
         (
-            "| Artifact | DAG shape | Scheduler blocks | Device ns | Host ns | Processed by block | "
-            "Active schedulers | Busiest | Vs sched=1 |"
+            "| Artifact | DAG shape | Tasks | Scheduler blocks | Device ns | Device ns/task | "
+            "Tasks/scheduler | Host ns | Processed by block | Active schedulers | Busiest | Vs sched=1 |"
         ),
         (
-            "| -------- | --------- | ---------------- | --------- | ------- | ------------------ | "
-            "----------------- | ------- | ---------- |"
+            "| -------- | --------- | ----- | ---------------- | --------- | -------------- | "
+            "--------------- | ------- | ------------------ | ----------------- | ------- | ---------- |"
         ),
     ]
     for row in rows:
@@ -171,8 +185,10 @@ def render_markdown_report(rows: list[dict[str, Any]], label: str) -> str:
         active = f"{row['active_scheduler_count']}/{row['scheduler_blocks']}"
         busiest = _percent(float(row["busiest_scheduler_share"]))
         lines.append(
-            f"| {row['artifact']} | {row['dag_shape']} | {row['scheduler_blocks']} | {row['device_wall_ns']} | "
-            f"{row['host_wall_ns']} | `{processed_by_block}` | `{active}` | `{busiest}` | "
+            f"| {row['artifact']} | {row['dag_shape']} | {row['completed_task_count']} | "
+            f"{row['scheduler_blocks']} | {row['device_wall_ns']} | {row['device_ns_per_task']} | "
+            f"{row['tasks_per_scheduler']:.2f} | {row['host_wall_ns']} | `{processed_by_block}` | "
+            f"`{active}` | `{busiest}` | "
             f"`{_ratio(row, baselines)}` |"
         )
     lines.append("")
@@ -215,6 +231,7 @@ def render_svg_report(rows: list[dict[str, Any]], label: str) -> str:
                 ),
                 (
                     f'<text x="{left}" y="{y + 42}" font-family="sans-serif" font-size="11" fill="#555">'
+                    f"tasks={row['completed_task_count']}; ns/task={row['device_ns_per_task']}; "
                     f"sched={row['scheduler_blocks']}; active={active}; busiest={busiest}; "
                     f"by_block={html.escape(by_block)}</text>"
                 ),
