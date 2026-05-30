@@ -33,6 +33,9 @@ latest multi-size tensor baseline sweep uses `e79edba2`:
   size sweep comparing scalar tensor DAG, explicit-graph scalar tensor DAG,
   fixed WMMA tensor-core DAG, explicit-graph WMMA tensor-core DAG, and cuBLAS
   SGEMM rows for a `16x16x16` descriptor.
+- [Current capture](evaluation-current.md) records the regenerated
+  `219042f5` compact tensor sweep report with cuBLAS Graph baseline
+  comparisons for each matching GPU, size, and shape.
 - [Current capture](evaluation-current.md) records the compact `d361006f`
   paired gate that validates the default `16x16x16` tensor descriptor with
   scalar tensor DAG, WMMA tensor-core DAG, and cuBLAS rows in one current-head

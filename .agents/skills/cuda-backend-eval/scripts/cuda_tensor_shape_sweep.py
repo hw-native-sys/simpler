@@ -468,6 +468,45 @@ def _median_summary_rows(
     return sorted(summary, key=lambda row: (row["n"], row["shape"], row["baseline"], row["artifact"]))
 
 
+def _baseline_comparison_rows(summary_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    references: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for row in summary_rows:
+        baseline = row["baseline"]
+        if baseline not in ("cublas_sgemm_graph", "cublas_sgemm"):
+            continue
+        key = (row["artifact"], row["machine"], row["n"], row["shape"])
+        current = references.get(key)
+        if current is None or baseline == "cublas_sgemm_graph":
+            references[key] = row
+
+    comparisons = []
+    for row in summary_rows:
+        if row["baseline"] in ("cublas_sgemm_graph", "cublas_sgemm"):
+            continue
+        key = (row["artifact"], row["machine"], row["n"], row["shape"])
+        reference = references.get(key)
+        if reference is None:
+            continue
+        reference_device = float(reference["median_device_wall_ns"])
+        row_device = float(row["median_device_wall_ns"])
+        if reference_device <= 0 or row_device <= 0:
+            continue
+        comparisons.append(
+            {
+                **row,
+                "reference_baseline": reference["baseline"],
+                "reference_device_wall_ns": reference["median_device_wall_ns"],
+                "device_time_ratio": row_device / reference_device,
+                "throughput_ratio": reference_device / row_device,
+            }
+        )
+    return comparisons
+
+
+def _format_ratio(value: float | None) -> str:
+    return "-" if value is None else f"{value:.2f}x"
+
+
 def render_markdown(payload: dict[str, Any]) -> str:
     metadata = payload["metadata"]
     lines = [
@@ -522,6 +561,26 @@ def render_markdown(payload: dict[str, Any]) -> str:
                 f"| {row['artifact']} | {row['machine']} | {row['baseline']} | {row['n']} | {row['shape']} | "
                 f"{_format_number(row['median_device_wall_ns'])} | {_format_number(row['median_host_wall_ns'])} | "
                 f"{_format_gflops(row['median_gflops'])} | {row['samples']} |"
+            )
+    comparison_rows = _baseline_comparison_rows(summary_rows)
+    if comparison_rows:
+        lines.extend(
+            [
+                "",
+                "## Baseline Comparison",
+                "",
+                "| Artifact | Machine | Baseline | N | Shape | Reference | Reference device ns | "
+                "Median device ns | Device time/reference | Throughput/reference |",
+                "| -------- | ------- | -------- | - | ----- | --------- | ------------------- | "
+                "---------------- | --------------------- | -------------------- |",
+            ]
+        )
+        for row in comparison_rows:
+            lines.append(
+                f"| {row['artifact']} | {row['machine']} | {row['baseline']} | {row['n']} | {row['shape']} | "
+                f"{row['reference_baseline']} | {_format_number(row['reference_device_wall_ns'])} | "
+                f"{_format_number(row['median_device_wall_ns'])} | {_format_ratio(row['device_time_ratio'])} | "
+                f"{_format_ratio(row['throughput_ratio'])} |"
             )
     lines.append("")
     return "\n".join(lines)

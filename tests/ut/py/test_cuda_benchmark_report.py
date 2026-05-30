@@ -3243,6 +3243,7 @@ def test_cuda_tensor_sweep_validator_checks_throughput_reports(tmp_path):
 
     assert "missing report tensor throughput in cuda-tensor-shape-sweep.md: Median Summary" in errors
     assert "missing report tensor throughput in cuda-tensor-shape-sweep.md: Median GF/s" in errors
+    assert "missing report tensor throughput in cuda-tensor-shape-sweep.md: Baseline Comparison" in errors
     assert "missing report tensor throughput in cuda-tensor-shape-throughput.svg: Median GF/s" in errors
     expected_error = (
         "missing report tensor throughput in cuda-tensor-shape-throughput.svg: pto_persistent_dag_tensor_core"
@@ -3252,6 +3253,7 @@ def test_cuda_tensor_sweep_validator_checks_throughput_reports(tmp_path):
     markdown = "\n".join(
         [
             "## Median Summary",
+            "## Baseline Comparison",
             "| Artifact | Baseline | Shape | Median GF/s |",
             *required_baselines,
             *required_shapes,
@@ -5346,6 +5348,19 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
                 "dispatch_func_ids": [3, 1, 2, 1],
                 "tensor_tile": {"rows": 8, "cols": 4, "inner": 12, "tile_count": 128},
             },
+            {
+                "artifact": "a100",
+                "machine": "hina",
+                "baseline": "cublas_sgemm_graph",
+                "n": 4096,
+                "shape": "8x4x12",
+                "repeat": 0,
+                "status": "pass",
+                "device_wall_ns": 250,
+                "host_wall_ns": 400,
+                "dispatch_func_ids": [],
+                "tensor_tile": {"rows": 8, "cols": 4, "inner": 12, "tile_count": 128},
+            },
         ],
     }
 
@@ -5379,6 +5394,14 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
     assert "| a100 | hina | pto_persistent_dag_tensor | 4096 | 8x4x12 | 1000 | 1500 | 98.30 | 1 |" in markdown
     assert "| h200 | h200 | cublas_sgemm | 8192 | 8x4x12 | 800 | 1200 | 122.88 | 1 |" in markdown
     assert "| a100 | hina | pto_persistent_dag_graph_tensor | 4096 | 8x4x12 | 1100 | 1600 | 89.37 | 1 |" in markdown
+    assert "## Baseline Comparison" in markdown
+    assert (
+        "| a100 | hina | pto_persistent_dag_tensor | 4096 | 8x4x12 | cublas_sgemm_graph | 250 | 1000 | 4.00x | 0.25x |"
+    ) in markdown
+    assert (
+        "| a100 | hina | pto_persistent_dag_graph_tensor | 4096 | 8x4x12 | cublas_sgemm_graph | "
+        "250 | 1100 | 4.40x | 0.23x |"
+    ) in markdown
     assert "tensor-shape-sweep-abc123" in svg
     assert "Median device ns" in svg
     assert "samples=1" in svg
@@ -5389,6 +5412,7 @@ def test_cuda_tensor_shape_sweep_parses_shapes_and_renders_report():
     assert "98.30" in throughput_svg
     assert "122.88" in throughput_svg
     assert "cublas_sgemm" in throughput_svg
+    assert "cublas_sgemm_graph" in throughput_svg
 
 
 def test_cuda_tensor_shape_sweep_dry_run_records_source_papers(tmp_path):

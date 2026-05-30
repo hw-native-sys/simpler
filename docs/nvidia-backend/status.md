@@ -623,12 +623,17 @@ baseline set with three repeats and both compact preset shapes,
 `tmp/cuda-backend/tensor-sweep-current-working/tensor-shape-sweep-219042f5/`
 validated 72 rows with `--preset compact-tensor-baselines`,
 `--require-command-examples`, and `--require-source-papers`. That preset now
-also requires visible Markdown/SVG throughput content. Median `16x16x64`
-device times were A100 scalar/graph/tensor-core/graph-tensor-core/cuBLAS/
-cuBLAS-graph `52224/38912/50176/50176/74752/9216 ns`; H200 measured
+also requires visible Markdown/SVG throughput content and visible Markdown
+baseline-comparison content. Median `16x16x64` device times were A100
+scalar/graph/tensor-core/graph-tensor-core/cuBLAS/cuBLAS-graph
+`52224/38912/50176/50176/74752/9216 ns`; H200 measured
 `32288/32512/32480/32127/51135/10176 ns`. Median `16x16x64` GFLOP/s were
 A100 `0.63/0.84/0.65/0.65/0.44/3.56` and H200
-`1.01/1.01/1.01/1.02/0.64/3.22`.
+`1.01/1.01/1.01/1.02/0.64/3.22`. The regenerated Markdown now compares PTO
+tensor rows against matching cuBLAS Graph rows; for example the explicit
+graph tensor row is `4.00x` cuBLAS Graph device time on A100 and `3.36x` on
+H200 for `16x16x16`, while explicit graph tensor-core is `5.44x` on A100 and
+`3.16x` on H200 for `16x16x64`.
 
 Evidence:
 

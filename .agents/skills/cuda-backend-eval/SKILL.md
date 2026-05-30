@@ -2512,15 +2512,18 @@ The sweep writes `cuda-tensor-shape-sweep.json`,
 `cuda-tensor-shape-sweep.md`, `cuda-tensor-shape-sweep.svg`, and
 `cuda-tensor-shape-throughput.svg` under
 `tmp/cuda-backend/tensor-shape-sweep-<commit>/`. The Markdown keeps raw
-repeat rows plus a median summary table with normalized GFLOP/s; the SVG
-files plot median device time and median GFLOP/s per GPU/N/shape/baseline
-with sample counts. The JSON metadata also records sanitized local and remote
-sample command examples so the selected baseline/shape/size setup can be
+repeat rows, a median summary table with normalized GFLOP/s, and a baseline
+comparison table that compares each PTO tensor row with the matching cuBLAS
+Graph row for the same GPU, size, and shape. If a cuBLAS Graph row is absent,
+the comparison falls back to the matching cuBLAS SGEMM row. The SVG files plot
+median device time and median GFLOP/s per GPU/N/shape/baseline with sample
+counts. The JSON metadata also records sanitized local and remote sample
+command examples so the selected baseline/shape/size setup can be
 reconstructed without rerunning the sweep. Publish-time source-paper
 validation checks that the referenced VDCores and MPK notes exist under
 `tmp/sources/`. The compact validation preset also requires the Markdown
-median summary and throughput SVG to expose `Median GF/s`, each required
-baseline, and each required tensor shape.
+median summary, baseline comparison, and throughput SVG to expose
+`Median GF/s`, each required baseline, and each required tensor shape.
 
 Regenerate reports from an existing tensor-sweep JSON without rerunning the
 A100/H200 measurements:

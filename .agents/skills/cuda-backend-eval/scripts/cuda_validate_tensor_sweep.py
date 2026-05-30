@@ -206,7 +206,13 @@ def _validate_report_throughput(
     if artifact_dir is None:
         return ["missing artifact directory for report-throughput validation"]
 
-    markdown_required = ["Median Summary", "Median GF/s", *required_baselines, *required_shapes]
+    markdown_required = [
+        "Median Summary",
+        "Median GF/s",
+        "Baseline Comparison",
+        *required_baselines,
+        *required_shapes,
+    ]
     svg_required = ["Median GF/s", *required_baselines, *required_shapes]
     return [
         *_validate_text_file_contains(

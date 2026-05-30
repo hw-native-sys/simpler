@@ -2757,8 +2757,10 @@ PYTHONPATH=$PWD:$PWD/python \
 
 The preset checked 72 rows, A100/H200 artifacts, the six required baselines,
 both required tensor shapes, three repeats, dispatch IDs for PTO tensor rows,
-report files, visible Markdown/SVG throughput content, command examples, and
-VDCores/MPK source-paper provenance.
+report files, visible Markdown/SVG throughput content, visible Markdown
+baseline-comparison content, command examples, and VDCores/MPK source-paper
+provenance. The regenerated report compares every PTO tensor row with the
+matching cuBLAS Graph row for the same GPU, size, and shape.
 
 | GPU | Shape | Scalar ns | Graph scalar ns | Tensor-core ns | Graph tensor-core ns | cuBLAS ns | cuBLAS Graph ns |
 | --- | ----- | --------- | --------------- | -------------- | -------------------- | --------- | --------------- |
@@ -2766,6 +2768,15 @@ VDCores/MPK source-paper provenance.
 | A100 | 16x16x64 | 52224 | 38912 | 50176 | 50176 | 74752 | 9216 |
 | H200 | 16x16x16 | 38144 | 32448 | 32672 | 33024 | 51104 | 9664 |
 | H200 | 16x16x64 | 32288 | 32512 | 32480 | 32127 | 51135 | 10176 |
+
+Selected cuBLAS Graph comparison rows from the regenerated Markdown report:
+
+| GPU | Shape | PTO baseline | PTO ns | cuBLAS Graph ns | Device time/reference | Throughput/reference |
+| --- | ----- | ------------ | ------ | --------------- | --------------------- | -------------------- |
+| A100 | 16x16x16 | graph tensor | 49152 | 12288 | 4.00x | 0.25x |
+| H200 | 16x16x16 | graph tensor | 32448 | 9664 | 3.36x | 0.30x |
+| A100 | 16x16x64 | graph tensor-core | 50176 | 9216 | 5.44x | 0.18x |
+| H200 | 16x16x64 | graph tensor-core | 32127 | 10176 | 3.16x | 0.32x |
 
 The corresponding median GFLOP/s for `16x16x64` are A100 scalar/graph
 scalar/tensor-core/graph tensor-core/cuBLAS/cuBLAS Graph
