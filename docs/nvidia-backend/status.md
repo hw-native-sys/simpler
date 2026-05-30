@@ -2060,6 +2060,14 @@ failed with `KeyError: 'func_id'`, then passed locally on A100 with
 warning first. This keeps real `deps.json` task lists closer to their captured
 shape while still letting scene tests provide the common callable and TaskArgs
 metadata needed to execute the graph.
+The adapter can now load that graph descriptor from a JSON file through
+`graph_path` or `graph_file`, with inline `graph` metadata applied as an
+overlay. The focused selector first failed because only the inline defaults
+were seen and the graph had no tasks, then passed locally on A100 with
+`2 passed, 153 deselected` and remotely on H200 with
+`2 passed, 153 deselected`; the H200 run printed the known PTO-ISA SSH refresh
+warning first. The JSON-file test uses the v2 `deps.json` shape: large string
+task IDs, `tasks[]`, `tensors[]`, and annotated `pred`/`succ` edges.
 The same graph-shaped path now accepts `graph.tasks` as a dictionary keyed by
 task name, so descriptor specs can keep node names in one place and reference
 those names from top-level edges. The ctypes-backed
@@ -4668,12 +4676,13 @@ Needed:
   string `source -> target` entries and dep-gen-style `pred`/`succ` endpoint
   dictionaries including annotated real `deps.json` rows with `source`
   metadata, dep-gen-style `task_id` graph task identities, graph task defaults
-  for runnable metadata shared by dep-gen task rows, adjacency dictionaries,
-  `graph.links` aliases, `graph.nodes` aliases, node `id` identity aliases,
-  node-link `data` payloads, node-style IO fields, dictionary-valued node IO
-  port maps, node `op` callable aliases, callable metadata `callable_id` /
-  `cid` aliases, and paired smoke including node-link `links` and
-  dictionary-valued node IO port maps,
+  for runnable metadata shared by dep-gen task rows, external JSON graph files
+  with inline overlays, adjacency dictionaries, `graph.links` aliases,
+  `graph.nodes` aliases, node `id` identity aliases, node-link `data`
+  payloads, node-style IO fields, dictionary-valued node IO port maps, node
+  `op` callable aliases, callable metadata `callable_id` / `cid` aliases, and
+  paired smoke including node-link `links` and dictionary-valued node IO port
+  maps,
   tagged TaskArgs-like graph task lowering including `inout` producer
   chaining, role-map task-argument dictionaries with paired smoke,
   submit-shaped graph descriptors, submit-group descriptor expansion in the

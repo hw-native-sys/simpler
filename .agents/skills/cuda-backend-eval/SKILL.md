@@ -1602,6 +1602,15 @@ PYTHONPATH=$PWD:$PWD/python \
     -q -k dep_gen_task_defaults --platform cuda
 ```
 
+After changing external dep-gen JSON loading through `graph_path` or
+`graph_file`, use:
+
+```bash
+PYTHONPATH=$PWD:$PWD/python \
+  .venv/bin/python -m pytest tests/ut/py/test_cuda_scene_test.py \
+    -q -k dep_gen_json_file --platform cuda
+```
+
 For H200, sync the changed files or use the paired sync workflow first, then
 export `CUDA_HOME=/usr/local/cuda-12.8` and prepend that `bin` directory to
 `PATH` in the non-interactive shell.

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import gc
 import inspect
+import json
 import logging
 import os
 import sys
@@ -1248,9 +1249,7 @@ class _CudaPersistentDagSceneBuffers:
         return task
 
     def _setup_graph_descriptor(self, ctypes_module, task_type, n: int, output_nbytes: int) -> None:
-        graph = self.cuda_spec.get("graph")
-        if not isinstance(graph, dict):
-            raise ValueError("CUDA persistent_dag_graph_f32 requires a graph descriptor")
+        graph = self._graph_descriptor(self.cuda_spec)
         task_specs = self._graph_task_specs(graph)
         if not task_specs:
             raise ValueError("CUDA persistent_dag_graph_f32 requires at least one graph task")
@@ -1327,6 +1326,28 @@ class _CudaPersistentDagSceneBuffers:
         self.host_tasks = task_t(*task_values)
         fanin_t = ctypes_module.c_uint32 * len(fanin)
         self.host_fanin = fanin_t(*fanin)
+
+    @staticmethod
+    def _graph_descriptor(cuda_spec: dict[str, Any]) -> dict[str, Any]:
+        graph = cuda_spec.get("graph")
+        graph_path = cuda_spec.get("graph_path", cuda_spec.get("graph_file"))
+        if graph_path is None and isinstance(graph, (str, os.PathLike)):
+            graph_path = graph
+            graph = None
+        if graph_path is None:
+            if not isinstance(graph, dict):
+                raise ValueError("CUDA persistent_dag_graph_f32 requires a graph descriptor")
+            return graph
+
+        with Path(graph_path).open(encoding="utf-8") as graph_file:
+            loaded_graph = json.load(graph_file)
+        if not isinstance(loaded_graph, dict):
+            raise ValueError("CUDA persistent_dag_graph_f32 graph file must contain a JSON object")
+        if graph is None:
+            return loaded_graph
+        if not isinstance(graph, dict):
+            raise ValueError("CUDA persistent_dag_graph_f32 graph overlay must be a dictionary")
+        return {**loaded_graph, **graph}
 
     @staticmethod
     def _graph_task_specs(graph: dict[str, Any]) -> list[dict[str, Any]]:

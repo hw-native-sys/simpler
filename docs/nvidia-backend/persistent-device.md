@@ -398,6 +398,11 @@ remain authoritative. This allows raw `tasks` entries such as
 `{"task_id": "0", "scope": "auto"}` to be tested with a common CUDA callable
 and TaskArgs descriptor without duplicating that metadata onto every imported
 dep-gen row.
+The graph descriptor may be loaded from a JSON file with `graph_path` or
+`graph_file`, or by setting `graph` itself to a path string. Inline `graph`
+metadata is then treated as an overlay on top of the file contents, so a raw
+`deps.json` file can stay unmodified while the CUDA scene spec supplies
+runtime-specific fields such as `task_defaults`.
 `graph.edges` may also be an adjacency dictionary from source task name/id to
 a single target or a list of targets.
 `graph.links` is accepted as the same edge-list field when importing
