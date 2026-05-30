@@ -42,6 +42,7 @@
 #include "common/unified_log.h"
 
 // Register-based communication
+#include "aicpu/platform_aicpu_affinity.h"  // CPU-deterministic exec_idx
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
 
@@ -184,9 +185,21 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // Read execution parameters from runtime. The 0 → 1 fixup runs before the
     // sched_thread_num_ derivation so a zero input doesn't leave the scheduler
     // count at -1.
+    //
+    // Layout convention (matches ALLOWED_CPUS in platform_aicpu_affinity.cpp):
+    //   thread_idx 0..sched_thread_num_-1     → scheduler
+    //   thread_idx == sched_thread_num_       → wiring thread
+    //   thread_idx == sched_thread_num_ + 1   → orchestrator
+    // So aicpu_thread_num_ = sched_thread_num_ + 2.
     aicpu_thread_num_ = runtime->aicpu_thread_num;
     if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
-    sched_thread_num_ = aicpu_thread_num_ - 1;
+    if (aicpu_thread_num_ >= 2) {
+        sched_thread_num_ = aicpu_thread_num_ - 2;
+    } else {
+        // Degenerate config (no wiring thread room) — fall back to old layout
+        // for back-compat; the sched takes over wiring inside its main loop.
+        sched_thread_num_ = aicpu_thread_num_ - 1;
+    }
     orch_to_sched_ = runtime->orch_to_sched;
 
     if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
@@ -211,12 +224,42 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
 int32_t AicpuExecutor::run(Runtime *runtime) {
-    int32_t thread_idx = thread_idx_++;
+    // Use the CPU-deterministic exec_idx from the affinity gate so that
+    // "thread_idx 2/3" reliably maps to ALLOWED_CPUS[2]/[3] (the remote
+    // cluster in directa-stage1). Fall back to the dispatch counter on
+    // platforms where the gate is inactive (sim).
+    int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
+    int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : thread_idx_++;
     int32_t run_rc = 0;
     LOG_INFO_V0("Thread %d: Start", thread_idx);
 
+    // Role classification (matches ALLOWED_CPUS layout):
+    //   thread_idx 0..sched_thread_num_-1     → sched
+    //   thread_idx == sched_thread_num_       → wiring (when aicpu_thread_num_ >= 3)
+    //   thread_idx == sched_thread_num_ + 1   → orch  (when aicpu_thread_num_ >= 2)
+    // When aicpu_thread_num_ < 3 there is no wiring slot; orch is at
+    // sched_thread_num_ and the wiring branch below is skipped.
+    const bool is_orch = (thread_idx == aicpu_thread_num_ - 1);
+    const bool is_wiring = (aicpu_thread_num_ >= 3) && (thread_idx == aicpu_thread_num_ - 2);
+
+    // Wiring thread: drains orch wiring queue and owns per-ring advance.
+    // See SchedulerContext::wiring_thread_run.
+    if (is_wiring) {
+        while (!runtime_init_ready_.load(std::memory_order_acquire)) {
+            SPIN_WAIT_HINT();
+        }
+        if (rt == nullptr) {
+            LOG_ERROR("Thread %d: rt is null, wiring thread cannot start", thread_idx);
+        } else {
+            sched_ctx_.bind_runtime(rt);
+            sched_ctx_.wiring_thread_run(runtime, thread_idx);
+        }
+        // Skip the orch path entirely; sched path below will be skipped because
+        // thread_idx is not < sched_thread_num_.
+    }
+
     // Orchestrator check
-    if (thread_idx >= sched_thread_num_) {
+    if (is_orch) {
 #if PTO2_PROFILING
         uint64_t orch_cycle_start = 0;
         int32_t submitted_tasks = -1;

@@ -18,13 +18,17 @@
 static std::atomic<int32_t> s_thread_counter{0};
 static std::atomic<int32_t> s_cleanup_counter{0};
 
+static thread_local int32_t tl_exec_idx = -1;
+
 bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched) {
     if (logical_count >= total_launched) {
+        tl_exec_idx = -1;
         return true;
     }
 
     int32_t idx = s_thread_counter.fetch_add(1, std::memory_order_acq_rel);
     bool survive = (idx < logical_count);
+    tl_exec_idx = survive ? idx : -1;
 
     if (!survive) {
         LOG_INFO_V0(
@@ -42,3 +46,5 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
 
     return survive;
 }
+
+int32_t platform_aicpu_affinity_thread_idx() { return tl_exec_idx; }

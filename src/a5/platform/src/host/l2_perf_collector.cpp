@@ -593,6 +593,10 @@ int L2PerfCollector::export_swimlane_json() {
         double duration_us = end_us - start_us;
         double dispatch_us = (record.dispatch_time > 0) ? cycles_to_us(record.dispatch_time - base_time_cycles) : 0.0;
         double finish_us = (record.finish_time > 0) ? cycles_to_us(record.finish_time - base_time_cycles) : 0.0;
+        double fanin_zero_us =
+            (record.fanin_zero_time > 0) ? cycles_to_us(record.fanin_zero_time - base_time_cycles) : 0.0;
+        double enter_global_queue_us =
+            (record.enter_global_queue_time > 0) ? cycles_to_us(record.enter_global_queue_time - base_time_cycles) : 0.0;
 
         const char *core_type_str = (record.core_type == CoreType::AIC) ? "aic" : "aiv";
 
@@ -607,6 +611,9 @@ int L2PerfCollector::export_swimlane_json() {
         outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
         outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
         outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
+        outfile << "      \"fanin_zero_us\": " << std::fixed << std::setprecision(3) << fanin_zero_us << ",\n";
+        outfile << "      \"enter_global_queue_us\": " << std::fixed << std::setprecision(3) << enter_global_queue_us
+                << ",\n";
         outfile << "      \"fanout\": [";
         int safe_fanout_count =
             (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT) ? record.fanout_count : 0;

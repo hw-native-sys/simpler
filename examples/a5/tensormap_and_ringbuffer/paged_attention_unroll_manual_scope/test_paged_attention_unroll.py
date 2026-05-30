@@ -66,7 +66,7 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "config": {"aicpu_thread_num": 6, "block_dim": 36},
             "params": {
                 "batch": 256,
                 "num_heads": 16,

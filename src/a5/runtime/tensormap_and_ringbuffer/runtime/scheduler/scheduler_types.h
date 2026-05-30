@@ -390,4 +390,58 @@ struct alignas(64) SyncStartDrainState {
 };
 static_assert(sizeof(SyncStartDrainState) == 64);
 
+// =============================================================================
+// DIAG: dispatch ramp-up probe (observability only; default off).
+// When enabled, samples per-iter (idle/pend/ready/dispatched), classifies
+// stalls (drain / complete_long / mix_residual / pop_race / cross-sched view),
+// and counts peer-idle PENDING gate skips. Output goes via LOG_INFO_V9 from
+// log_l2_perf_summary at sched_end. Enable by `#define DIAG_DISPATCH_RAMP 1`.
+// =============================================================================
+#define DIAG_DISPATCH_RAMP 0
+#if DIAG_DISPATCH_RAMP
+constexpr int32_t DIAG_RAMP_SAMPLES = 128;
+struct DiagRampSample {
+    uint32_t ts_rel;      // us relative to sched_start
+    uint16_t ready_mix;
+    uint16_t ready_aic;
+    uint16_t ready_aiv;
+    uint8_t  idle_mix;
+    uint8_t  idle_aic;
+    uint8_t  idle_aiv;
+    uint8_t  pend_aic;
+    uint8_t  pend_aiv;
+    uint8_t  did_dispatch;
+};
+struct DiagRampState {
+    DiagRampSample samples[DIAG_RAMP_SAMPLES];
+    int32_t count;
+    uint64_t first_ready_ts;
+    uint64_t first_dispatch_ts;
+    uint64_t blocked_iters;
+    uint64_t starved_iters;
+    uint64_t saturated_iters;
+    // Peer-idle gate accounting
+    uint64_t aic_pending_gated_iters;
+    uint64_t aic_pending_gated_slot_count;
+    uint64_t aic_pending_gated_ready_count;
+    // Stall classification: iter where (any_idle_aic_global>0 && any_ready_aic>0 && !dispatched_aic_this_iter)
+    uint64_t stall_total;
+    uint64_t stall_my_idle_zero_peer_nonzero;  // R7: cross-sched view (my=0, peer>0)
+    uint64_t stall_complete_long;              // R1: complete phase > 20us
+    uint64_t stall_drain_mode;                 // R2: drain triggered this iter
+    uint64_t stall_mix_residual_blocked_aic;   // R5: skip_aic_aiv from MIX residual
+    uint64_t stall_pop_race;                   // R3: pop returned 0 while queue non-empty
+    uint64_t stall_unknown;                    // not classified by above
+    // pop race counter
+    uint64_t aic_pop_race_count;               // dispatch_shape AIC-IDLE entered with queue>0, pop returned 0
+    // per-iter scratch
+    uint64_t iter_complete_cycles;
+    uint32_t iter_dispatched_aic_count;
+    bool iter_drain_triggered;
+    bool iter_mix_residual_blocked_aic;
+    bool iter_pop_race_aic;
+};
+extern DiagRampState g_diag_ramp[MAX_AICPU_THREADS];
+#endif
+
 #endif  // SCHEDULER_TYPES_H

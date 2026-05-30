@@ -115,6 +115,13 @@ struct L2PerfRecord {
     // Dependency relationship (fanout only)
     uint64_t fanout[RUNTIME_MAX_FANOUT];  // Successor task task_id array
     int32_t fanout_count;                 // Number of successor tasks
+
+    // Lifecycle profiling (AICPU-side, appended to keep AICore staging-ring
+    // layout — start_time / end_time / task_id — at their original offsets).
+    // enter_global_queue_time == 0 means the task was consumed from sched-local
+    // buffer without going through the global ready queue.
+    uint64_t fanin_zero_time;
+    uint64_t enter_global_queue_time;
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(L2PerfRecord) % 64 == 0, "L2PerfRecord must be 64-byte aligned for optimal cache performance");

@@ -386,6 +386,61 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
         cycles_to_us(sched_end_ts - l2_perf.sched_start_ts)
     );
 
+#if DIAG_DISPATCH_RAMP
+    {
+        DiagRampState &d = g_diag_ramp[thread_idx];
+        double first_ready_us = d.first_ready_ts > l2_perf.sched_start_ts ?
+            cycles_to_us(d.first_ready_ts - l2_perf.sched_start_ts) : -1.0;
+        double first_disp_us = d.first_dispatch_ts > l2_perf.sched_start_ts ?
+            cycles_to_us(d.first_dispatch_ts - l2_perf.sched_start_ts) : -1.0;
+        LOG_INFO_V9(
+            "Thread %d: DIAG_RAMP first_ready=%.2fus first_dispatch=%.2fus "
+            "blocked_iters=%" PRIu64 " starved_iters=%" PRIu64 " saturated_iters=%" PRIu64
+            " aic_pend_gated_iters=%" PRIu64 " avg_pend_slots=%.1f avg_ready=%.1f",
+            thread_idx, first_ready_us, first_disp_us,
+            d.blocked_iters, d.starved_iters, d.saturated_iters,
+            d.aic_pending_gated_iters,
+            d.aic_pending_gated_iters > 0 ? (double)d.aic_pending_gated_slot_count / d.aic_pending_gated_iters : 0.0,
+            d.aic_pending_gated_iters > 0 ? (double)d.aic_pending_gated_ready_count / d.aic_pending_gated_iters : 0.0
+        );
+        LOG_INFO_V9(
+            "Thread %d: DIAG_STALL total=%" PRIu64
+            " r1_complete_long=%" PRIu64 " r2_drain=%" PRIu64 " r3_pop_race=%" PRIu64
+            " r5_mix_residual=%" PRIu64 " r7_my_idle_zero=%" PRIu64 " unknown=%" PRIu64
+            " aic_pop_race_total=%" PRIu64,
+            thread_idx, d.stall_total,
+            d.stall_complete_long, d.stall_drain_mode, d.stall_pop_race,
+            d.stall_mix_residual_blocked_aic, d.stall_my_idle_zero_peer_nonzero, d.stall_unknown,
+            d.aic_pop_race_count
+        );
+        for (int32_t i = 0; i < d.count; i++) {
+            const DiagRampSample &s = d.samples[i];
+            LOG_INFO_V9(
+                "Thread %d: DIAG_RAMP[%3d] t=%5uus rdy(M/A/V)=%u/%u/%u "
+                "idle(M/A/V)=%u/%u/%u pend(A/V)=%u/%u disp=%u",
+                thread_idx, i, s.ts_rel,
+                s.ready_mix, s.ready_aic, s.ready_aiv,
+                s.idle_mix, s.idle_aic, s.idle_aiv,
+                s.pend_aic, s.pend_aiv, s.did_dispatch
+            );
+        }
+        // Reset for next round
+        d.count = 0; d.first_ready_ts = 0; d.first_dispatch_ts = 0;
+        d.blocked_iters = 0; d.starved_iters = 0; d.saturated_iters = 0;
+        d.aic_pending_gated_iters = 0;
+        d.aic_pending_gated_slot_count = 0;
+        d.aic_pending_gated_ready_count = 0;
+        d.stall_total = 0;
+        d.stall_my_idle_zero_peer_nonzero = 0;
+        d.stall_complete_long = 0; d.stall_drain_mode = 0;
+        d.stall_mix_residual_blocked_aic = 0; d.stall_pop_race = 0; d.stall_unknown = 0;
+        d.aic_pop_race_count = 0;
+        d.iter_complete_cycles = 0; d.iter_dispatched_aic_count = 0;
+        d.iter_drain_triggered = false; d.iter_mix_residual_blocked_aic = false;
+        d.iter_pop_race_aic = false;
+    }
+#endif
+
     uint64_t sched_total = l2_perf.sched_wiring_cycle + l2_perf.sched_complete_cycle + l2_perf.sched_scan_cycle +
                            l2_perf.sched_dispatch_cycle + l2_perf.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
@@ -848,7 +903,9 @@ int32_t SchedulerContext::init(
         l2_perf_aicpu_init(runtime->worker_count);
         l2_perf_level_ = get_l2_perf_level();
         if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-            l2_perf_aicpu_init_phase(runtime->worker_count, sched_thread_num_);
+            // Pass aicpu_thread_num_ (sched + wiring + orch) so phase buffers
+            // get allocated for every exec_idx, not just sched + 1 orch.
+            l2_perf_aicpu_init_phase(runtime->worker_count, sched_thread_num_, aicpu_thread_num_);
         }
     }
 #endif
@@ -962,6 +1019,65 @@ void SchedulerContext::wait_init_complete() const {
 void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
     rt_ = rt;
     sched_ = &rt->scheduler;
+}
+
+// =============================================================================
+// Wiring thread entry. Owns the orch → ready_queue handoff and per-ring
+// advance state. Single writer for last_task_alive (no advance_lock CAS),
+// sole producer of ready_queue pushes (sched threads consume), and the only
+// caller of sync_to_sm.
+//
+// Exit condition: completed_ becomes true (sched detects all tasks done and
+// sets this). Even after orchestrator_done_, the wiring queue may hold tasks
+// that orch published just before signaling done — drain those first.
+// =============================================================================
+void SchedulerContext::wiring_thread_run(Runtime *runtime, int32_t thread_idx) {
+    (void)runtime;
+    LOG_INFO_V0("Thread %d: wiring_thread_run start", thread_idx);
+
+    while (!completed_.load(std::memory_order_acquire)) {
+        // 1. Drain orch wiring queue (force-drain after orch_done so any
+        //    last-second submissions don't stall).
+        sched_->drain_wiring_queue(orchestrator_done_);
+
+        // 2. Advance per-ring last_task_alive past CONSUMED slots and publish
+        //    to SM. Wiring is the sole writer; the advance_lock CAS still
+        //    happens for now (cheap when uncontended) — followup commit can
+        //    drop it entirely.
+        for (int32_t r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            auto &rss = sched_->ring_sched_states[r];
+            if (rss.ring == nullptr) continue;
+            int32_t expected = 0;
+            if (rss.advance_lock.compare_exchange_strong(
+                    expected, 1, std::memory_order_acquire, std::memory_order_relaxed
+                )) {
+                rss.advance_ring_pointers();
+                rss.advance_lock.store(0, std::memory_order_release);
+            }
+        }
+    }
+
+    // Final drain pass: orch may have finished but a few tasks may still be
+    // waiting to be advanced/reclaimed for the SM final publish. Once
+    // completed_ is set there's no more work to wire, but flush the last
+    // advances so orch sees the final last_task_alive.
+    for (int32_t r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        auto &rss = sched_->ring_sched_states[r];
+        if (rss.ring == nullptr) continue;
+        int32_t expected = 0;
+        if (rss.advance_lock.compare_exchange_strong(
+                expected, 1, std::memory_order_acquire, std::memory_order_relaxed
+            )) {
+            rss.advance_ring_pointers();
+            // Force a final SM publish regardless of the K=16 throttle so the
+            // orchestrator (next round / shutdown) sees the latest counter.
+            rss.ring->fc.last_task_alive.store(rss.last_task_alive, std::memory_order_release);
+            rss.last_published_to_sm = rss.last_task_alive;
+            rss.advance_lock.store(0, std::memory_order_release);
+        }
+    }
+
+    LOG_INFO_V0("Thread %d: wiring_thread_run exit", thread_idx);
 }
 
 // =============================================================================

@@ -348,6 +348,16 @@ struct alignas(64) PTO2TaskSlotState {
     int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
     int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
 
+    // === Lifecycle profiling (set once per submission) ===
+    // sys_cnt timestamp when the fanin counter dropped to 0 (task became ready).
+    // Set either in wire_task (orch path, no/early-finished fanin) or in
+    // release_fanin_and_check_ready (sched path, last producer FIN).
+    uint64_t fanin_zero_cycles{0};
+    // sys_cnt timestamp when the task was pushed into a globally-visible queue
+    // (ready_queues[shape] or dummy_ready_queue). 0 means it was placed only in
+    // a sched-local buffer (and consumed by the same sched without going global).
+    uint64_t enter_global_queue_cycles{0};
+
     /**
      * Bind the slot-invariant ring id. Called once per slot during
      * RingSchedState::init(); ring_id never changes across reuses.
@@ -385,6 +395,8 @@ struct alignas(64) PTO2TaskSlotState {
         fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx = 0;
+        fanin_zero_cycles = 0;
+        enter_global_queue_cycles = 0;
     }
 
     // === Per-task fanout spinlock ===
@@ -436,6 +448,9 @@ struct alignas(64) PTO2TaskSlotState {
     void unlock_fanout() { fanout_lock.store(0, std::memory_order_release); }
 };
 
-static_assert(sizeof(PTO2TaskSlotState) == 64);
+// First 64 bytes are hot-path fields (one cache line). Lifecycle profile fields
+// live in the second cache line — read/written only on cold paths (submission,
+// completion record emission), so they don't pollute the hot cache line.
+static_assert(sizeof(PTO2TaskSlotState) == 128);
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_RUNTIME2_TYPES_H_

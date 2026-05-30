@@ -17,3 +17,10 @@
 // logical_count: desired active threads (from runtime.aicpu_thread_num)
 // total_launched: actual threads launched (PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)
 bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched);
+
+// Deterministic executor index assigned to the surviving thread by the gate.
+// Range [0, ALLOWED_CPU_COUNT-1]; -1 if this thread was dropped or the gate
+// was bypassed (ALLOWED_CPU_COUNT >= total_launched).
+// Highest index (ALLOWED_CPU_COUNT-1) is the orchestrator slot; lower indices
+// are scheduler slots in declaration order of ALLOWED_CPUS.
+int32_t platform_aicpu_affinity_thread_idx();

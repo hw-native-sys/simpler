@@ -148,42 +148,48 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-    for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
-        uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
-        uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
-        uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
+    // Two-pass emission: pre-emit all QKs in an outer MANUAL scope so
+    // AICore can start its first wave immediately, then run the original
+    // per-(b,q) depth-first emission for SF/PV/UP referencing the
+    // already-emitted QK outputs via explicit set_dependencies(). The
+    // outer scope holds 256 QKs; each inner scope holds 3 tasks
+    // (SF/PV/UP). Manual scope mode requires explicit task-id deps; we
+    // store each QK's task_id + output tensor across passes.
+    //
+    // Tensor's default ctor is private, so sij_buf storage uses a
+    // placement-new wrapper.
+    static constexpr size_t MAX_BQ = 256;
+    struct TensorSlot {
+        alignas(alignof(Tensor)) unsigned char buf[sizeof(Tensor)];
+        Tensor &get() { return *reinterpret_cast<Tensor *>(buf); }
+        void set(const Tensor &src) { new (buf) Tensor(src); }
+    };
 
-        for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
-            CYCLE_COUNT_LAP(prof_scope_and_loop);
-            PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
+    PTO2_SCOPE(PTO2ScopeMode::MANUAL) {  // outer scope: pre-emit QKs
+        TensorSlot sij_buf_arr[MAX_BQ];
+        PTO2TaskId qk_task_ids[MAX_BQ];
+        uint64_t n_blocks_arr[MAX_BQ];
+        uint64_t valid_len_arr[MAX_BQ];
+        size_t n_bq = 0;
+
+        Arg params_qk;
+
+        // === Pass 1: emit ALL QKs back-to-back ===
+        for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
+            uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
+            uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
+            uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
+            for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
-
                 uint32_t qi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
                 uint32_t qi_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
                 Tensor qi = query.view(qi_shapes, qi_offsets);
-                uint32_t out_view_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
-                uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                Tensor out_view = out.view(out_view_shapes, out_view_offsets, true);
 #ifdef ENABLE_PROFILING
-                prof_view_count += 2;
+                prof_view_count += 1;
                 CYCLE_COUNT_LAP(prof_tensor_view);
 #endif
-                CYCLE_COUNT_LAP(prof_param_setup);
-                TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_ci, scalar_ci);
-                const Tensor &oi = alloc_outs.get_ref(0);
-                const Tensor &li_update = alloc_outs.get_ref(1);
-                const Tensor &mi_update = alloc_outs.get_ref(2);
-                PTO2TaskId prev_update_task = PTO2TaskId::invalid();
-#ifdef ENABLE_PROFILING
-                prof_submit_count++;
-                CYCLE_COUNT_LAP(prof_submit_task);
-#endif
-
-                Arg params_qk, params_sf, params_pv, params_up;
-
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
                     uint64_t n_blocks = std::min(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
-
                     uint64_t last_block_seq_start = (bn + n_blocks - 1) * block_size;
                     uint64_t valid_len_last = std::min(block_size, cur_seq - last_block_seq_start);
                     CYCLE_COUNT_LAP(prof_param_extract);
@@ -206,92 +212,134 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
                     params_qk.add_scalar(b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
-                    const Tensor &sij_buf = qk_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 #endif
-
-                    uint32_t pij_buf_shapes[2] = {
-                        static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
-                    };
-                    TensorCreateInfo pij_buf_ci(pij_buf_shapes, 2, data_type);
-#ifdef ENABLE_PROFILING
-                    prof_make_count += 1;
-                    CYCLE_COUNT_LAP(prof_make_tensor);
-#endif
-
-                    params_sf.reset();
-                    params_sf.add_input(sij_buf);
-                    params_sf.add_output(pij_buf_ci);
-                    params_sf.add_output(scalar_ci);
-                    params_sf.add_output(scalar_ci);
-                    PTO2TaskId sf_deps[] = {qk_outs.task_id()};
-                    params_sf.set_dependencies(sf_deps, 1);
-                    params_sf.add_scalar(scale_value);
-                    params_sf.add_scalar(n_blocks);
-                    params_sf.add_scalar(valid_len_last);
-                    CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
-                    const Tensor &pij_buf = sf_outs.get_ref(0);
-                    const Tensor &mi = sf_outs.get_ref(1);
-                    const Tensor &li = sf_outs.get_ref(2);
-#ifdef ENABLE_PROFILING
-                    prof_submit_count++;
-                    CYCLE_COUNT_LAP(prof_submit_task);
-#endif
-
-                    params_pv.reset();
-                    params_pv.add_input(pij_buf);
-                    params_pv.add_input(value_cache);
-                    params_pv.add_input(block_table);
-                    params_pv.add_output(tile2d_ci);
-                    PTO2TaskId pv_deps[] = {sf_outs.task_id()};
-                    params_pv.set_dependencies(pv_deps, 1);
-                    params_pv.add_scalar(n_blocks);
-                    params_pv.add_scalar(b_idx * block_num + bn);
-                    CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
-                    const Tensor &oi_new = pv_outs.get_ref(0);
-#ifdef ENABLE_PROFILING
-                    prof_submit_count++;
-                    CYCLE_COUNT_LAP(prof_submit_task);
-#endif
-
-                    uint64_t is_first = (bn == 0) ? 1 : 0;
-                    uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
-
-                    params_up.reset();
-                    params_up.add_input(mi);
-                    params_up.add_input(li);
-                    params_up.add_input(oi_new);
-                    params_up.add_inout(mi_update);
-                    params_up.add_inout(li_update);
-                    params_up.add_inout(oi);
-                    params_up.add_inout(out_view);
-                    PTO2TaskId up_deps[3];
-                    uint32_t up_dep_count = 0;
-                    up_deps[up_dep_count++] = pv_outs.task_id();
-                    if (prev_update_task.is_valid()) {
-                        up_deps[up_dep_count++] = prev_update_task;
-                    }
-                    // alloc completes inline; this dep only keeps the scratch buffers alive until the last consumer.
-                    if (is_last) {
-                        up_deps[up_dep_count++] = alloc_outs.task_id();
-                    }
-                    params_up.set_dependencies(up_deps, up_dep_count);
-                    params_up.add_scalar(is_first);
-                    params_up.add_scalar(is_last);
-                    CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors update_outs = rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
-                    prev_update_task = update_outs.task_id();
-#ifdef ENABLE_PROFILING
-                    prof_submit_count++;
-                    CYCLE_COUNT_LAP(prof_submit_task);
-#endif
+                    sij_buf_arr[n_bq].set(qk_outs.get_ref(0));
+                    qk_task_ids[n_bq] = qk_outs.task_id();
+                    n_blocks_arr[n_bq] = n_blocks;
+                    valid_len_arr[n_bq] = valid_len_last;
+                    n_bq++;
                 }
             }
-            CYCLE_COUNT_LAP(prof_scope_and_loop);
+        }
+
+        // === Pass 2: per (b,q) — inner manual scope, emit SF/PV/UP
+        //             referencing the QK outputs pre-emitted above. ===
+        size_t bq_idx = 0;
+        Arg params_sf, params_pv, params_up;
+        for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
+            uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
+            uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
+            uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
+            for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
+                CYCLE_COUNT_LAP(prof_scope_and_loop);
+                PTO2_SCOPE(PTO2ScopeMode::MANUAL) {  // inner scope: SF/PV/UP for this (b,q)
+                    uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
+                    uint32_t out_view_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
+                    uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
+                    Tensor out_view = out.view(out_view_shapes, out_view_offsets, true);
+#ifdef ENABLE_PROFILING
+                    prof_view_count += 1;
+                    CYCLE_COUNT_LAP(prof_tensor_view);
+#endif
+                    TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_ci, scalar_ci);
+                    const Tensor &oi = alloc_outs.get_ref(0);
+                    const Tensor &li_update = alloc_outs.get_ref(1);
+                    const Tensor &mi_update = alloc_outs.get_ref(2);
+                    PTO2TaskId prev_update_task = PTO2TaskId::invalid();
+#ifdef ENABLE_PROFILING
+                    prof_submit_count++;
+                    CYCLE_COUNT_LAP(prof_submit_task);
+#endif
+
+                    for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
+                        uint64_t n_blocks = n_blocks_arr[bq_idx];
+                        uint64_t valid_len_last = valid_len_arr[bq_idx];
+
+                        // === SF (depends on QK from outer scope) ===
+                        uint32_t pij_buf_shapes[2] = {
+                            static_cast<uint32_t>(q_tile), static_cast<uint32_t>(n_blocks * block_size)
+                        };
+                        TensorCreateInfo pij_buf_ci(pij_buf_shapes, 2, data_type);
+#ifdef ENABLE_PROFILING
+                        prof_make_count += 1;
+                        CYCLE_COUNT_LAP(prof_make_tensor);
+#endif
+                        params_sf.reset();
+                        params_sf.add_input(sij_buf_arr[bq_idx].get());
+                        params_sf.add_output(pij_buf_ci);
+                        params_sf.add_output(scalar_ci);
+                        params_sf.add_output(scalar_ci);
+                        PTO2TaskId sf_deps[] = {qk_task_ids[bq_idx]};
+                        params_sf.set_dependencies(sf_deps, 1);
+                        params_sf.add_scalar(scale_value);
+                        params_sf.add_scalar(n_blocks);
+                        params_sf.add_scalar(valid_len_last);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                        TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
+                        const Tensor &pij_buf = sf_outs.get_ref(0);
+                        const Tensor &mi = sf_outs.get_ref(1);
+                        const Tensor &li = sf_outs.get_ref(2);
+#ifdef ENABLE_PROFILING
+                        prof_submit_count++;
+                        CYCLE_COUNT_LAP(prof_submit_task);
+#endif
+
+                        // === PV (depends on SF) ===
+                        params_pv.reset();
+                        params_pv.add_input(pij_buf);
+                        params_pv.add_input(value_cache);
+                        params_pv.add_input(block_table);
+                        params_pv.add_output(tile2d_ci);
+                        PTO2TaskId pv_deps[] = {sf_outs.task_id()};
+                        params_pv.set_dependencies(pv_deps, 1);
+                        params_pv.add_scalar(n_blocks);
+                        params_pv.add_scalar(b_idx * block_num + bn);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                        TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
+                        const Tensor &oi_new = pv_outs.get_ref(0);
+#ifdef ENABLE_PROFILING
+                        prof_submit_count++;
+                        CYCLE_COUNT_LAP(prof_submit_task);
+#endif
+
+                        // === UP (depends on SF + PV + chain + alloc) ===
+                        uint64_t is_first = (bn == 0) ? 1 : 0;
+                        uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
+                        params_up.reset();
+                        params_up.add_input(mi);
+                        params_up.add_input(li);
+                        params_up.add_input(oi_new);
+                        params_up.add_inout(mi_update);
+                        params_up.add_inout(li_update);
+                        params_up.add_inout(oi);
+                        params_up.add_inout(out_view);
+                        PTO2TaskId up_deps[3];
+                        uint32_t up_dep_count = 0;
+                        up_deps[up_dep_count++] = pv_outs.task_id();
+                        if (prev_update_task.is_valid()) {
+                            up_deps[up_dep_count++] = prev_update_task;
+                        }
+                        if (is_last) {
+                            up_deps[up_dep_count++] = alloc_outs.task_id();
+                        }
+                        params_up.set_dependencies(up_deps, up_dep_count);
+                        params_up.add_scalar(is_first);
+                        params_up.add_scalar(is_last);
+                        CYCLE_COUNT_LAP(prof_param_setup);
+                        TaskOutputTensors update_outs = rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+                        prev_update_task = update_outs.task_id();
+#ifdef ENABLE_PROFILING
+                        prof_submit_count++;
+                        CYCLE_COUNT_LAP(prof_submit_task);
+#endif
+                        bq_idx++;
+                    }
+                }
+                CYCLE_COUNT_LAP(prof_scope_and_loop);
+            }
         }
     }
     CYCLE_COUNT_LAP(prof_scope_and_loop);
