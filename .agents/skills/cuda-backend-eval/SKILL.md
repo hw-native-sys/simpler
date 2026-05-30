@@ -289,8 +289,11 @@ under `tmp/cuda-backend/scheduler-scaling-working/` sweeps
 Markdown, and SVG summary under `scheduler-scaling-a5ca4fac/`, and shows
 A100 device times `110592/97280/98304 ns` and H200 device times
 `82240/70368/70752 ns` for `1/2/4` scheduler blocks. The report also exposes
-the load-balance counters, including A100 `[0,2,3,0]` and H200 `[2,1,1,1]`
-for the four-scheduler row.
+the load-balance counters, active scheduler count, and busiest scheduler
+completion share. For the four-scheduler row, A100 has active schedulers
+`2/4` with `[0,2,3,0]` and H200 has active schedulers `4/4` with
+`[2,1,1,1]`; the busiest scheduler owns `60.0%` and `40.0%` of completions,
+respectively.
 
 Run the bounded-ring persistent smoke with wraparound:
 

@@ -943,21 +943,22 @@ PYTHONPATH=$PWD:$PWD/python \
 
 Selected rows:
 
-| GPU | Scheduler blocks | Device ns | Host ns | Processed by block | Vs sched=1 |
-| --- | ---------------- | --------- | ------- | ------------------ | ---------- |
-| A100 | 1 | 110592 | 143558 | `5` | `1.00x` |
-| A100 | 2 | 97280 | 132441 | `2,3` | `0.88x` |
-| A100 | 4 | 98304 | 133095 | `0,2,3,0` | `0.89x` |
-| H200 | 1 | 82240 | 101145 | `5` | `1.00x` |
-| H200 | 2 | 70368 | 89642 | `2,3` | `0.86x` |
-| H200 | 4 | 70752 | 89642 | `2,1,1,1` | `0.86x` |
+| GPU | Scheduler blocks | Device ns | Host ns | Processed by block | Active schedulers | Busiest | Vs sched=1 |
+| --- | ---------------- | --------- | ------- | ------------------ | ----------------- | ------- | ---------- |
+| A100 | 1 | 110592 | 143558 | `5` | `1/1` | `100.0%` | `1.00x` |
+| A100 | 2 | 97280 | 132441 | `2,3` | `2/2` | `60.0%` | `0.88x` |
+| A100 | 4 | 98304 | 133095 | `0,2,3,0` | `2/4` | `60.0%` | `0.89x` |
+| H200 | 1 | 82240 | 101145 | `5` | `1/1` | `100.0%` | `1.00x` |
+| H200 | 2 | 70368 | 89642 | `2,3` | `2/2` | `60.0%` | `0.86x` |
+| H200 | 4 | 70752 | 89642 | `2,1,1,1` | `4/4` | `40.0%` | `0.86x` |
 
 All six smoke artifacts reported zero scheduler errors, repeat completions
 `[5,5]`, dispatch `9,2,1,2,1`, graph fan-in `0,0,2,2,2`, graph dependents
 `2,3,2,3,4,4`, scalar args `1.5,0.25`, and tensor args `tmp0,tmp3`. The
 small graph does not provide enough completion work to keep every scheduler
 active on A100 at four scheduler blocks, which is visible in
-`scheduler_processed_by_block=[0,2,3,0]`.
+`scheduler_processed_by_block=[0,2,3,0]`, active scheduler count `2/4`, and
+busiest-scheduler share `60.0%`.
 
 ## Latest Scheduler Error Matrix
 

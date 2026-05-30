@@ -108,7 +108,8 @@ latest multi-size tensor baseline sweep uses `e79edba2`:
   counters with `scheduler_processed_by_block=[2,3]` on A100 and H200.
 - [Current capture](evaluation-current.md) records the `a5ca4fac`
   scheduler scaling smoke sweep over `scheduler_blocks=1,2,4`, with paired
-  A100/H200 JSON, Markdown, SVG, and a compact scaling summary report.
+  A100/H200 JSON, Markdown, SVG, and a compact scaling summary report that
+  includes active scheduler count and busiest scheduler completion share.
 - [Current capture](evaluation-current.md) records the `35de3303` scheduler
   error matrix that captures all synthetic malformed-DAG diagnostics on A100
   and H200 with JSON, Markdown, and SVG artifacts validated by

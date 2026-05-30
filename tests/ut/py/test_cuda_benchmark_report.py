@@ -5990,10 +5990,13 @@ def test_cuda_scheduler_scaling_report_summarizes_by_block_smokes(tmp_path):
 
     payload = json.loads((output_dir / "cuda-scheduler-scaling.json").read_text())
     assert len(payload["rows"]) == 6
-    assert "| a100 | 2 | 90000 | 120000 | `2,3` | `2/5` | `0.90x` |" in markdown
-    assert "| h200 | 4 | 110007 | 140000 | `2,1,1,1` | `4/5` | `1.10x` |" in markdown
+    assert payload["rows"][1]["active_scheduler_count"] == 2
+    assert payload["rows"][1]["scheduler_utilization"] == 1.0
+    assert payload["rows"][5]["busiest_scheduler_share"] == 0.4
+    assert "| a100 | 2 | 90000 | 120000 | `2,3` | `2/2` | `60.0%` | `0.90x` |" in markdown
+    assert "| h200 | 4 | 110007 | 140000 | `2,1,1,1` | `4/4` | `40.0%` | `1.10x` |" in markdown
     assert "scheduler-scaling-test" in svg
-    assert "sched=4; by_block=2,1,1,1" in svg
+    assert "sched=4; active=4/4; busiest=40.0%; by_block=2,1,1,1" in svg
     assert (output_dir / "cuda-scheduler-scaling.md").exists()
     assert (output_dir / "cuda-scheduler-scaling.svg").exists()
 

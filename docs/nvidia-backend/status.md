@@ -4678,10 +4678,11 @@ Needed:
   `110592/97280/98304 ns` for `1/2/4` scheduler blocks; H200 reported
   `82240/70368/70752 ns`. The four-scheduler rows expose the current small
   graph's load-balance limit directly: A100 processed completions as
-  `[0,2,3,0]`, while H200 processed `[2,1,1,1]`. The remaining policy gap is
-  now broader graph-size and load-balance studies rather than launch resource
-  partitioning, root seeding, completion-ring ownership, or artifact
-  validation;
+  `[0,2,3,0]` with active schedulers `2/4` and a `60.0%` busiest-scheduler
+  completion share, while H200 processed `[2,1,1,1]` with active schedulers
+  `4/4` and a `40.0%` busiest share. The remaining policy gap is now broader
+  graph-size and load-balance studies rather than launch resource partitioning,
+  root seeding, completion-ring ownership, or artifact validation;
 - broader scheduler error taxonomy beyond the current unsupported-`func_id`
   invalid-dependent-ID, dependent-range, fan-in-underflow,
   duplicate-dependent, self-dependent, initial-fan-in, and

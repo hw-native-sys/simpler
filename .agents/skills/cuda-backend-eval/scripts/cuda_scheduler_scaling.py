@@ -93,12 +93,24 @@ def _ratio(row: dict[str, Any], baselines: dict[str, int]) -> str:
     return f"{device_ns / baseline:.2f}x"
 
 
+def _percent(value: float) -> str:
+    return f"{value * 100.0:.1f}%"
+
+
 def load_scaling_rows(paths: list[Path]) -> list[dict[str, Any]]:
     rows = []
     for path in paths:
         payload = json.loads(path.read_text())
         scheduler_blocks = _scheduler_blocks(payload)
         processed_by_block = _int_list(payload.get("scheduler_processed_by_block"))
+        scheduler_processed_count = _as_int(payload.get("scheduler_processed_count"))
+        active_scheduler_count = sum(1 for value in processed_by_block if value > 0)
+        scheduler_utilization = active_scheduler_count / scheduler_blocks if scheduler_blocks > 0 else 0.0
+        busiest_scheduler_share = (
+            max(processed_by_block) / scheduler_processed_count
+            if processed_by_block and scheduler_processed_count > 0
+            else 0.0
+        )
         rows.append(
             {
                 "artifact": _artifact_label(path),
@@ -113,9 +125,12 @@ def load_scaling_rows(paths: list[Path]) -> list[dict[str, Any]]:
                 "scheduler_blocks": scheduler_blocks,
                 "worker_blocks": _worker_blocks(payload),
                 "scheduler_loop_count": _as_int(payload.get("scheduler_loop_count")),
-                "scheduler_processed_count": _as_int(payload.get("scheduler_processed_count")),
+                "scheduler_processed_count": scheduler_processed_count,
                 "scheduler_processed_by_block": processed_by_block,
-                "nonzero_scheduler_blocks": sum(1 for value in processed_by_block if value > 0),
+                "active_scheduler_count": active_scheduler_count,
+                "nonzero_scheduler_blocks": active_scheduler_count,
+                "scheduler_utilization": scheduler_utilization,
+                "busiest_scheduler_share": busiest_scheduler_share,
                 "launch_completed_counts": _int_list(payload.get("launch_completed_counts")),
             }
         )
@@ -129,16 +144,25 @@ def render_markdown_report(rows: list[dict[str, Any]], label: str) -> str:
         "",
         f"- Label: `{label}`",
         "- Ratio column compares device time with the same artifact's one-scheduler row.",
+        "- Busiest column is the largest per-scheduler completion share.",
         "",
-        ("| Artifact | Scheduler blocks | Device ns | Host ns | Processed by block | Active schedulers | Vs sched=1 |"),
-        "| -------- | ---------------- | --------- | ------- | ------------------ | ----------------- | ---------- |",
+        (
+            "| Artifact | Scheduler blocks | Device ns | Host ns | Processed by block | "
+            "Active schedulers | Busiest | Vs sched=1 |"
+        ),
+        (
+            "| -------- | ---------------- | --------- | ------- | ------------------ | "
+            "----------------- | ------- | ---------- |"
+        ),
     ]
     for row in rows:
         processed_by_block = _comma(row["scheduler_processed_by_block"])
-        active = f"{row['nonzero_scheduler_blocks']}/{row['scheduler_processed_count']}"
+        active = f"{row['active_scheduler_count']}/{row['scheduler_blocks']}"
+        busiest = _percent(float(row["busiest_scheduler_share"]))
         lines.append(
             f"| {row['artifact']} | {row['scheduler_blocks']} | {row['device_wall_ns']} | "
-            f"{row['host_wall_ns']} | `{processed_by_block}` | `{active}` | `{_ratio(row, baselines)}` |"
+            f"{row['host_wall_ns']} | `{processed_by_block}` | `{active}` | `{busiest}` | "
+            f"`{_ratio(row, baselines)}` |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -168,6 +192,8 @@ def render_svg_report(rows: list[dict[str, Any]], label: str) -> str:
         bar_width = int(chart_width * value / max_value) if max_value else 0
         name = f"{row['artifact']} sched={row['scheduler_blocks']}"
         by_block = _comma(row["scheduler_processed_by_block"])
+        active = f"{row['active_scheduler_count']}/{row['scheduler_blocks']}"
+        busiest = _percent(float(row["busiest_scheduler_share"]))
         lines.extend(
             [
                 f'<text x="24" y="{y + 17}" font-family="sans-serif" font-size="12">{html.escape(name)}</text>',
@@ -178,7 +204,8 @@ def render_svg_report(rows: list[dict[str, Any]], label: str) -> str:
                 ),
                 (
                     f'<text x="{left}" y="{y + 42}" font-family="sans-serif" font-size="11" fill="#555">'
-                    f"sched={row['scheduler_blocks']}; by_block={html.escape(by_block)}</text>"
+                    f"sched={row['scheduler_blocks']}; active={active}; busiest={busiest}; "
+                    f"by_block={html.escape(by_block)}</text>"
                 ),
             ]
         )
