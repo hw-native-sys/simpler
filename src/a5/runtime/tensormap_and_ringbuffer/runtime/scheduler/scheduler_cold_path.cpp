@@ -850,13 +850,22 @@ int32_t SchedulerContext::init(
     // AicpuExecutor::run(). Otherwise the cached value would still be DISABLED
     // (only the binary enable bit has been seeded by kernel.cpp at this point),
     // and the CYCLE_COUNT_START() gate in pto_orchestrator.cpp would suppress
-    // all ORCH_PHASES records.
+    // all ORCH_PHASES records. Reset the cached level on disabled runs so a
+    // prior enabled launch's level can't leak into the phase-record gates in
+    // scheduler_dispatch (`>= SCHED_PHASES`).
     if (is_l2_swimlane_enabled()) {
         l2_swimlane_aicpu_init(runtime->worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-            l2_swimlane_aicpu_init_phase(runtime->worker_count, sched_thread_num_);
+            // When orchestrator phases merge into scheduler threads
+            // (PTO2_ORCH_TO_SCHED=1), phase records flow through
+            // aicpu_thread_num_ pools — matches the same branch in
+            // dump_tensor_init (scheduler_dispatch.cpp).
+            const int phase_threads = orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_;
+            l2_swimlane_aicpu_init_phase(runtime->worker_count, phase_threads);
         }
+    } else {
+        l2_swimlane_level_ = L2SwimlaneLevel::DISABLED;
     }
 #endif
 
