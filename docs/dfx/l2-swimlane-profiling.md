@@ -264,11 +264,12 @@ L2SwimlaneAicpuTaskPool[num_cores]                    (per-core AICPU pool state
 └── mismatch_record_count     (legacy; no longer written)
 
 L2SwimlaneAicoreTaskPool[num_cores]              (per-core AICore pool state)
-├── rotation {current_buf_ptr, generation}      (AICPU writes, AICore reads
-│                                                — cache-line independent)
-├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
-├── total_record_count / dropped_record_count
-└── current_buf_seq
+├── head {current_buf_ptr, current_buf_seq,     (single 64B cache line;
+│         total_record_count,                    AICPU writes, AICore dcci-
+│         dropped_record_count}                  polls per task; AICPU bumps
+│                                                current_buf_seq on rotation
+│                                                so AICore detects the change)
+└── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
 
 [L2SwimlaneAicoreTaskBuffer × PLATFORM_AICORE_BUFFERS_PER_CORE per core]
 └── L2SwimlaneAicoreTaskRecord records[PLATFORM_AICORE_BUFFER_SIZE]  (1024 records, 32B each)
@@ -300,14 +301,14 @@ log via `LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…"`.
 **Producer/consumer protocol on AICore (AICore-as-producer with rotation).**
 AICore writes a slim `L2SwimlaneAicoreTaskRecord` into its currently-active per-core
 `L2SwimlaneAicoreTaskBuffer` at `records[slot_within_buf++]`. The active buffer is
-published via a per-core `L2SwimlaneAicoreRotation` cache line (`current_buf_ptr` +
-`generation`); AICore `dcci`'s it per task — cheap relative to the
-baseline `dcci(payload, ENTIRE_DATA_CACHE)` it already pays per task.
-AICPU drives rotation: immediately before each `write_reg(DATA_MAIN_BASE)`
+published via a per-core `L2SwimlaneActiveHead` cache line (`current_buf_ptr` +
+`current_buf_seq` + counters); AICore `dcci`'s it per task — cheap relative
+to the baseline `dcci(payload, ENTIRE_DATA_CACHE)` it already pays per
+task. AICPU drives rotation: immediately before each `write_reg(DATA_MAIN_BASE)`
 for task `K`, if `K % PLATFORM_AICORE_BUFFER_SIZE == 0`, AICPU enqueues
-the current buffer to the per-thread ready queue (kind `is_phase=2`),
+the current buffer to the per-thread ready queue (kind `AicoreTask`),
 pops the next from `L2SwimlaneAicoreTaskPool::free_queue`, and bumps
-`L2SwimlaneAicoreRotation::generation`. AICore detects the bumped generation on
+`L2SwimlaneActiveHead::current_buf_seq`. AICore detects the bumped seq on
 its next task's `dcci`, refreshes its local cache, and resets its slot
 counter to 0.
 

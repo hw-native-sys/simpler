@@ -25,15 +25,17 @@
  *
  * Lifecycle:
  *   1. Host fills `KernelArgs::enable_profiling_flag` and
- *      `KernelArgs::l2_swimlane_aicore_rotation_table` (points to a per-core `L2SwimlaneAicoreRotation`
- *      device-address table). Host allocates the table bytes; AICPU populates
- *      the entries inside `l2_swimlane_aicpu_init`.
- *   2. AICore kernel entry stashes `&l2_swimlane_aicore_rotation_table[block_idx]` (the slot
- *      pointer — NOT the dereferenced rotation pointer yet) via
- *      `set_l2_swimlane_aicore_rotation_slot()`, and calls `set_aicore_profiling_flag()`,
+ *      `KernelArgs::l2_swimlane_aicore_rotation_table` (an array of per-core
+ *      slots, each holding a device address of an `L2SwimlaneActiveHead`).
+ *      Host allocates the table bytes; AICPU populates the slot entries
+ *      inside `l2_swimlane_aicpu_init` with `&pool.head` for each AicoreTask
+ *      pool.
+ *   2. AICore kernel entry stashes `&l2_swimlane_aicore_rotation_table[block_idx]`
+ *      (the slot pointer — NOT the dereferenced head pointer yet) via
+ *      `set_l2_swimlane_aicore_head_slot()`, and calls `set_aicore_profiling_flag()`,
  *      before invoking `aicore_execute`.
- *   3. `get_l2_swimlane_aicore_rotation()` lazily dereferences the slot the first time
- *      it is called. Callers must defer the call until AFTER AICPU has
+ *   3. `get_l2_swimlane_aicore_head()` lazily dereferences the slot the first
+ *      time it is called. Callers must defer the call until AFTER AICPU has
  *      dispatched the first task (so AICPU init has had a chance to populate
  *      the table). The executor handles this by calling it inside the main
  *      loop's first-task branch.
@@ -56,22 +58,24 @@ __aicore__ void set_aicore_profiling_flag(uint32_t flag);
 __aicore__ uint32_t get_aicore_profiling_flag();
 
 /**
- * Per-core AICore rotation channel.
+ * Per-core AICore head channel.
  *
- * `set_l2_swimlane_aicore_rotation_slot(slot)` stashes the address of THIS core's slot
- * in the rotation-address table — `&((uint64_t*)k_args->l2_swimlane_aicore_rotation_table)[block_idx]`.
- * No dereference happens here, because at kernel entry the AICPU side may
- * not yet have populated the table (the host launches both kernels and
- * AICPU's init runs concurrently with AICore's entry).
+ * `set_l2_swimlane_aicore_head_slot(slot)` stashes the address of THIS core's
+ * slot in the head-address table —
+ * `&((uint64_t*)k_args->l2_swimlane_aicore_rotation_table)[block_idx]`. No
+ * dereference happens here, because at kernel entry the AICPU side may not
+ * yet have populated the table (the host launches both kernels and AICPU's
+ * init runs concurrently with AICore's entry).
  *
- * `get_l2_swimlane_aicore_rotation()` lazily dereferences the stashed slot on first use,
- * caches the result, and returns it on subsequent calls. Callers MUST defer
- * the first call until after AICPU has dispatched the first task — by then
- * AICPU's init has completed and the slot holds a valid device address.
- * The executor's main loop honours this by reading the rotation only inside
- * the first-task branch of the dispatch poll.
+ * `get_l2_swimlane_aicore_head()` lazily dereferences the stashed slot on
+ * first use, caches the result, and returns it on subsequent calls. Callers
+ * MUST defer the first call until after AICPU has dispatched the first task —
+ * by then AICPU's init has completed and the slot holds a valid device
+ * address pointing at the AICore pool's `head` (an `L2SwimlaneActiveHead`).
+ * The executor's main loop honours this by reading the head only inside the
+ * first-task branch of the dispatch poll.
  */
-__aicore__ void set_l2_swimlane_aicore_rotation_slot(__gm__ uint64_t *slot_ptr);
-__aicore__ __gm__ L2SwimlaneAicoreRotation *get_l2_swimlane_aicore_rotation();
+__aicore__ void set_l2_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr);
+__aicore__ __gm__ L2SwimlaneActiveHead *get_l2_swimlane_aicore_head();
 
 #endif  // PLATFORM_AICORE_AICORE_PROFILING_STATE_H_

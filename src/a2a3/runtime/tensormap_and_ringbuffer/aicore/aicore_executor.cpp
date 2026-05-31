@@ -102,15 +102,17 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
 
-    // Per-core L2SwimlaneAicoreRotation channel. The pointer to THIS core's rotation
+    // Per-core L2SwimlaneActiveHead channel. The pointer to THIS core's rotation
     // is stored in `KernelArgs::l2_swimlane_aicore_rotation_table[block_idx]`, but AICPU
     // populates that table inside `l2_swimlane_aicpu_init` which runs
     // concurrently with this kernel's entry — so we cannot deref at startup.
-    // Defer the deref via `get_l2_swimlane_aicore_rotation()` until the first task is
+    // Defer the deref via `get_l2_swimlane_aicore_head()` until the first task is
     // dispatched; by then AICPU's init has completed (the very dispatch is
     // proof of that).
-    __gm__ L2SwimlaneAicoreRotation *l2_swimlane_rotation = nullptr;
-    L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, 0, 0};
+    __gm__ L2SwimlaneActiveHead *l2_swimlane_head = nullptr;
+    // cached_buf_seq must start != AICPU's initial head.current_buf_seq (0)
+    // so the first record_task observes a mismatch and loads the buffer ptr.
+    L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, UINT32_MAX, 0};
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
@@ -135,10 +137,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             uint32_t task_id = reg_val;  // Decode: register holds task_id directly
 
             // First-task lazy resolve of the rotation channel — see comment
-            // above. `get_l2_swimlane_aicore_rotation()` caches after first call so this
+            // above. `get_l2_swimlane_aicore_head()` caches after first call so this
             // costs nothing on subsequent tasks.
-            if (l2_swimlane_enabled && l2_swimlane_rotation == nullptr) {
-                l2_swimlane_rotation = get_l2_swimlane_aicore_rotation();
+            if (l2_swimlane_enabled && l2_swimlane_head == nullptr) {
+                l2_swimlane_head = get_l2_swimlane_aicore_head();
             }
 
             // Select dual-buffer slot: same bit as AICPU used when writing payload
@@ -171,7 +173,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // Performance profiling: record task execution
             if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                l2_swimlane_aicore_record_task(l2_swimlane_rotation, &l2_swimlane_local, task_id, start_time, end_time);
+                l2_swimlane_aicore_record_task(l2_swimlane_head, &l2_swimlane_local, task_id, start_time, end_time);
             }
 
             last_reg_val = reg_val;

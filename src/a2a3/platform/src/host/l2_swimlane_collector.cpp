@@ -182,8 +182,8 @@ int L2SwimlaneCollector::initialize(
 
         state->free_queue.head = 0;
         state->free_queue.tail = 0;
-        state->current_buf_ptr = 0;
-        state->current_buf_seq = 0;
+        state->head.current_buf_ptr = 0;
+        state->head.current_buf_seq = 0;
 
         for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
@@ -242,10 +242,10 @@ int L2SwimlaneCollector::initialize(
     );
 
     // Step 5c: Standalone uint64_t[num_aicore] table that will hold per-core
-    // L2SwimlaneAicoreRotation device addresses. Host only allocates the bytes and
+    // L2SwimlaneActiveHead device addresses. Host only allocates the bytes and
     // hands the device pointer to AICPU via KernelArgs::l2_swimlane_aicore_rotation_table;
     // AICPU itself fills the entries inside `l2_swimlane_aicpu_init` (it has
-    // direct access to `&ac_state->rotation` device addresses, no
+    // direct access to `&ac_state->head` device addresses, no
     // host-to-device translation needed). AICore reads
     // rotation_table[block_idx] at kernel entry.
     {
@@ -266,8 +266,8 @@ int L2SwimlaneCollector::initialize(
 
         state->free_queue.head = 0;
         state->free_queue.tail = 0;
-        state->current_buf_ptr = 0;
-        state->current_buf_seq = 0;
+        state->head.current_buf_ptr = 0;
+        state->head.current_buf_seq = 0;
 
         for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_THREAD; s++) {
             void *host_buf_ptr = nullptr;
@@ -445,7 +445,7 @@ void L2SwimlaneCollector::reconcile_counters() {
         int leftover_active = 0;
         for (int i = 0; i < unit_count; i++) {
             L2SwimlaneAicpuTaskPool *state = get_state(i);
-            uint64_t buf_ptr = state->current_buf_ptr;
+            uint64_t buf_ptr = state->head.current_buf_ptr;
             if (buf_ptr == 0) continue;
             void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_ptr));
             if (host_ptr == nullptr) continue;
@@ -463,8 +463,8 @@ void L2SwimlaneCollector::reconcile_counters() {
         uint64_t dropped_device = 0;
         for (int i = 0; i < unit_count; i++) {
             L2SwimlaneAicpuTaskPool *state = get_state(i);
-            total_device += state->total_record_count;
-            dropped_device += state->dropped_record_count;
+            total_device += state->head.total_record_count;
+            dropped_device += state->head.dropped_record_count;
         }
 
         // PHASE counters are populated only by runtimes that actually emit
@@ -1007,13 +1007,13 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
 
     for (int i = 0; i < num_aicore_; i++) {
         L2SwimlaneAicpuTaskPool *state = get_perf_buffer_state(shm_host_, i);
-        release_one_buffer(reinterpret_cast<void *>(state->current_buf_ptr), unregister_cb, free_cb);
-        state->current_buf_ptr = 0;
+        release_one_buffer(reinterpret_cast<void *>(state->head.current_buf_ptr), unregister_cb, free_cb);
+        state->head.current_buf_ptr = 0;
         drain_free_queue(state->free_queue);
 
         L2SwimlaneAicoreTaskPool *ac_state = get_aicore_buffer_state(shm_host_, num_aicore_, i);
-        release_one_buffer(reinterpret_cast<void *>(ac_state->rotation.current_buf_ptr), unregister_cb, free_cb);
-        ac_state->rotation.current_buf_ptr = 0;
+        release_one_buffer(reinterpret_cast<void *>(ac_state->head.current_buf_ptr), unregister_cb, free_cb);
+        ac_state->head.current_buf_ptr = 0;
         drain_free_queue(ac_state->free_queue);
     }
 
@@ -1021,8 +1021,8 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
     for (int t = 0; t < num_phase_threads; t++) {
         L2SwimlaneAicpuPhasePool *state = get_phase_buffer_state(shm_host_, num_aicore_, t);
 
-        release_one_buffer(reinterpret_cast<void *>(state->current_buf_ptr), unregister_cb, free_cb);
-        state->current_buf_ptr = 0;
+        release_one_buffer(reinterpret_cast<void *>(state->head.current_buf_ptr), unregister_cb, free_cb);
+        state->head.current_buf_ptr = 0;
 
         rmb();
         uint32_t head = state->free_queue.head;

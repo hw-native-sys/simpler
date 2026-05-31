@@ -59,11 +59,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
 
-    // Per-core L2SwimlaneAicoreRotation channel; see tensormap_and_ringbuffer/.../aicore_executor.cpp.
+    // Per-core L2SwimlaneActiveHead channel; see tensormap_and_ringbuffer/.../aicore_executor.cpp.
     // Deferred until first task so AICPU's init has populated the rotation
     // table (the dispatch itself proves init is done).
-    __gm__ L2SwimlaneAicoreRotation *l2_swimlane_rotation = nullptr;
-    L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, 0, 0};
+    __gm__ L2SwimlaneActiveHead *l2_swimlane_head = nullptr;
+    // cached_buf_seq must start != AICPU's initial head.current_buf_seq (0)
+    // so the first record_task observes a mismatch and loads the buffer ptr.
+    L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, UINT32_MAX, 0};
 
     volatile uint32_t task_id = AICPU_IDLE_TASK_ID;
     volatile uint32_t last_task_id = AICPU_IDLE_TASK_ID;
@@ -86,8 +88,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             write_reg(RegId::COND, MAKE_ACK_VALUE(actual_task_id));
 
             // First-task lazy resolve of the rotation channel.
-            if (l2_swimlane_enabled && l2_swimlane_rotation == nullptr) {
-                l2_swimlane_rotation = get_l2_swimlane_aicore_rotation();
+            if (l2_swimlane_enabled && l2_swimlane_head == nullptr) {
+                l2_swimlane_head = get_l2_swimlane_aicore_head();
             }
 
             __gm__ Task *task_ptr = &(runtime->tasks[actual_task_id]);
@@ -110,7 +112,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 l2_swimlane_aicore_record_task(
-                    l2_swimlane_rotation, &l2_swimlane_local, actual_task_id, start_time, end_time
+                    l2_swimlane_head, &l2_swimlane_local, actual_task_id, start_time, end_time
                 );
             }
 

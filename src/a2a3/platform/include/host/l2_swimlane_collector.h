@@ -321,7 +321,7 @@ public:
      * only allocates the bytes here; AICPU populates the entries inside
      * `l2_swimlane_aicpu_init`. Freed by finalize(). Set kernel_args.l2_swimlane_aicore_rotation_table
      * to this so the AICore kernel entry can index by block_idx and feed the
-     * per-core rotation channel into `set_l2_swimlane_aicore_rotation_slot()`. Returns
+     * per-core rotation channel into `set_l2_swimlane_aicore_head_slot()`. Returns
      * nullptr before initialize() succeeds.
      */
     void *get_aicore_ring_addr_table_device_ptr() const { return aicore_ring_addr_table_dev_; }

@@ -34,15 +34,16 @@
 /**
  * AICore-local rotation state. Tracks which buffer this core is currently
  * writing into and which slot is next. Reset by `l2_swimlane_aicore_record_task`
- * when it observes a generation bump on the shared `L2SwimlaneAicoreRotation` channel
- * (AICPU rotates by writing `current_buf_ptr` + bumping `generation`, so the
- * AICore-local state self-recovers without any AICore-side spin-wait).
+ * when it observes a `current_buf_seq` bump on the shared `L2SwimlaneActiveHead`
+ * cache line (AICPU rotates by writing `current_buf_ptr` + bumping
+ * `current_buf_seq`, so the AICore-local state self-recovers without any
+ * AICore-side spin-wait).
  */
 struct L2SwimlaneAicoreLocalState {
     __gm__ L2SwimlaneAicoreTaskBuffer *cached_buf = nullptr;
-    // Must start != AICPU's initial generation (1) so the first record_task
-    // call observes a generation mismatch and loads the buffer pointer.
-    uint32_t cached_generation = 0;
+    // Must start != AICPU's initial head.current_buf_seq (0) so the first
+    // record_task call observes a mismatch and loads the buffer pointer.
+    uint32_t cached_buf_seq = UINT32_MAX;
     uint32_t slot_within_buf = 0;
 };
 
@@ -51,12 +52,12 @@ struct L2SwimlaneAicoreLocalState {
  *
  * AICore writes a slim L2SwimlaneAicoreTaskRecord into its currently-published
  * per-core L2SwimlaneAicoreTaskBuffer at `records[slot_within_buf++]`. The
- * publication channel is an L2SwimlaneAicoreRotation cache line addressed via
- * `KernelArgs::l2_swimlane_aicore_rotation_table[block_idx]` (now points to L2SwimlaneAicoreRotation,
- * not directly to a buffer). AICPU updates `rotation->current_buf_ptr` and
- * bumps `rotation->generation` at dispatch boundaries; AICore detects the
- * change by `dcci`-ing the rotation line per task and comparing generation
- * to its locally cached copy.
+ * publication channel is an L2SwimlaneActiveHead cache line addressed via
+ * `KernelArgs::l2_swimlane_aicore_rotation_table[block_idx]` (points to the
+ * AICore pool's `head`, not directly to a buffer). AICPU updates
+ * `head->current_buf_ptr` and bumps `head->current_buf_seq` at dispatch
+ * boundaries; AICore detects the change by `dcci`-ing the head line per task
+ * and comparing the sequence to its locally cached copy.
  *
  * AICPU and AICore never read each other's data on the hot path. The host
  * post-processor joins the AICore stream (multi-buffer per core, in order)
@@ -69,23 +70,29 @@ struct L2SwimlaneAicoreLocalState {
  * so AICore has already finished writing their records before AICPU enqueues
  * the old buffer to the ready queue.
  *
- * @param rotation Per-core L2SwimlaneAicoreRotation channel (cached at kernel entry
- *                 from KernelArgs::l2_swimlane_aicore_rotation_table[block_idx])
+ * @param head     Per-core L2SwimlaneActiveHead channel — lazy-resolved on
+ *                 the executor's first-task branch via
+ *                 get_l2_swimlane_aicore_head(), which deref's the slot the
+ *                 kernel entry stashed from
+ *                 KernelArgs::l2_swimlane_aicore_rotation_table[block_idx].
+ *                 (Kernel entry can't deref directly — AICPU init runs
+ *                 concurrently with kernel entry, so the slot may not yet
+ *                 hold a valid address at that point.)
  * @param local    Per-core AICore-local state (caller-owned static)
  * @param task_id  Register dispatch id (DATA_MAIN_BASE), low 32 bits
  * @param start_time Start timestamp (get_sys_cnt)
  * @param end_time   End timestamp
  */
 __aicore__ __attribute__((always_inline)) static inline void l2_swimlane_aicore_record_task(
-    __gm__ L2SwimlaneAicoreRotation *rotation, L2SwimlaneAicoreLocalState *local, uint32_t task_id, uint64_t start_time,
+    __gm__ L2SwimlaneActiveHead *head, L2SwimlaneAicoreLocalState *local, uint32_t task_id, uint64_t start_time,
     uint64_t end_time
 ) {
-    // Re-fetch rotation channel each task; cheap relative to the
+    // Re-fetch head channel each task; cheap relative to the
     // baseline `dcci(payload, ENTIRE_DATA_CACHE)` we already pay per task.
-    dcci(rotation, SINGLE_CACHE_LINE);
-    if (rotation->generation != local->cached_generation) {
-        local->cached_generation = rotation->generation;
-        local->cached_buf = reinterpret_cast<__gm__ L2SwimlaneAicoreTaskBuffer *>(rotation->current_buf_ptr);
+    dcci(head, SINGLE_CACHE_LINE);
+    if (head->current_buf_seq != local->cached_buf_seq) {
+        local->cached_buf_seq = head->current_buf_seq;
+        local->cached_buf = reinterpret_cast<__gm__ L2SwimlaneAicoreTaskBuffer *>(head->current_buf_ptr);
         local->slot_within_buf = 0;
     }
     if (local->cached_buf == nullptr) {

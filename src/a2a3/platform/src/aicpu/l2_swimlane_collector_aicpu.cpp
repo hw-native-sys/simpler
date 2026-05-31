@@ -145,15 +145,15 @@ void l2_swimlane_aicpu_init(int worker_count) {
         static_cast<uint32_t>(g_l2_swimlane_level)
     );
 
-    // Populate the per-core L2SwimlaneAicoreRotation device-address table. AICore reads
-    // `l2_swimlane_aicore_rotation_table[block_idx]` from KernelArgs to find its rotation
-    // channel; the table itself is host-allocated, but the entries are
-    // device-internal addresses (`&ac_state->rotation`) that the host would
-    // otherwise have to translate from host-mapped to device-mapped. AICPU
-    // already runs on the device, so it can write the addresses directly
-    // without any translation — that keeps the host side decoupled from the
-    // AICore shared-memory layout.
-    uint64_t *rotation_table = reinterpret_cast<uint64_t *>(g_platform_l2_swimlane_aicore_rotation_table);
+    // Populate the per-core AICore head device-address table. AICore reads
+    // `l2_swimlane_aicore_rotation_table[block_idx]` from KernelArgs to find
+    // its `L2SwimlaneActiveHead` cache line; the table itself is
+    // host-allocated, but the entries are device-internal addresses
+    // (`&ac_state->head`) that the host would otherwise have to translate
+    // from host-mapped to device-mapped. AICPU already runs on the device,
+    // so it can write the addresses directly without any translation — that
+    // keeps the host side decoupled from the AICore shared-memory layout.
+    uint64_t *head_table = reinterpret_cast<uint64_t *>(g_platform_l2_swimlane_aicore_rotation_table);
 
     // Pop first buffer from free_queue for each core
     for (int i = 0; i < worker_count; i++) {
@@ -163,8 +163,8 @@ void l2_swimlane_aicpu_init(int worker_count) {
         s_aicpu_task_pools[i] = state;
         s_aicore_task_pools[i] = ac_state;
 
-        if (rotation_table != nullptr) {
-            rotation_table[i] = reinterpret_cast<uint64_t>(&ac_state->rotation);
+        if (head_table != nullptr) {
+            head_table[i] = reinterpret_cast<uint64_t>(&ac_state->head);
         }
 
         // Pop first buffer from free_queue
@@ -176,8 +176,8 @@ void l2_swimlane_aicpu_init(int worker_count) {
             uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
             rmb();
             state->free_queue.head = head + 1;
-            state->current_buf_ptr = buf_ptr;
-            state->current_buf_seq = 0;
+            state->head.current_buf_ptr = buf_ptr;
+            state->head.current_buf_seq = 0;
             wmb();
 
             L2SwimlaneAicpuTaskBuffer *buf = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(buf_ptr);
@@ -187,13 +187,13 @@ void l2_swimlane_aicpu_init(int worker_count) {
             LOG_DEBUG("Core %d: popped initial buffer (addr=0x%lx)", i, buf_ptr);
         } else {
             LOG_ERROR("Core %d: free_queue is empty during init!", i);
-            state->current_buf_ptr = 0;
+            state->head.current_buf_ptr = 0;
             s_current_aicpu_task_buffers[i] = nullptr;
         }
 
-        // Prime the AICore rotation channel with the initial buffer.
-        // Generation starts at 1 so AICore's cached_generation==0 triggers
-        // a refresh on its first task.
+        // Prime the AICore head channel with the initial buffer. Seq starts
+        // at 0; AICore's local `cached_buf_seq` defaults to UINT32_MAX so the
+        // first record_task call observes a mismatch and loads the buffer.
         rmb();
         uint32_t ac_head = ac_state->free_queue.head;
         uint32_t ac_tail = ac_state->free_queue.tail;
@@ -201,17 +201,22 @@ void l2_swimlane_aicpu_init(int worker_count) {
             uint64_t ac_buf_ptr = ac_state->free_queue.buffer_ptrs[ac_head % PLATFORM_PROF_SLOT_COUNT];
             rmb();
             ac_state->free_queue.head = ac_head + 1;
-            ac_state->current_buf_seq = 0;
-            ac_state->rotation.current_buf_ptr = ac_buf_ptr;
-            ac_state->rotation.generation = 1;
+            // Same publish pattern as aicore_rotate: ptr first, then a fence,
+            // then seq. AICore lazy-resolves the head on its first task, so
+            // strict ordering here matters only if AICore is ever changed to
+            // start polling before the first dispatch — keeping the patterns
+            // aligned future-proofs that.
+            ac_state->head.current_buf_ptr = ac_buf_ptr;
+            wmb();
+            ac_state->head.current_buf_seq = 0;
             wmb();
             L2SwimlaneAicoreTaskBuffer *ac_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(ac_buf_ptr);
             ac_buf->count = 0;
-            LOG_DEBUG("Core %d: primed AICore rotation with buf=0x%lx, gen=1", i, ac_buf_ptr);
+            LOG_DEBUG("Core %d: primed AICore head with buf=0x%lx, seq=0", i, ac_buf_ptr);
         } else {
             LOG_ERROR("Core %d: AICore free_queue is empty during init!", i);
-            ac_state->rotation.current_buf_ptr = 0;
-            ac_state->rotation.generation = 1;
+            ac_state->head.current_buf_ptr = 0;
+            ac_state->head.current_buf_seq = 0;
             wmb();
         }
     }
@@ -248,21 +253,21 @@ static void switch_records_buffer(int core_id, int thread_idx) {
     if (head == tail) {
         // No replacement buffer available — overwrite current buffer to keep AICore alive
         LOG_WARN("Thread %d: Core %d no free buffer, overwriting current buffer (data lost)", thread_idx, core_id);
-        state->dropped_record_count = state->dropped_record_count + full_buf->count;
+        state->head.dropped_record_count = state->head.dropped_record_count + full_buf->count;
         full_buf->count = 0;
         wmb();
         return;
     }
 
     // Enqueue full buffer to ReadyQueue
-    uint32_t seq = state->current_buf_seq;
+    uint32_t seq = state->head.current_buf_seq;
     int rc = enqueue_ready_buffer(
-        s_l2_swimlane_header, thread_idx, core_id, state->current_buf_ptr, seq, L2SwimlaneBufferKind::AicpuTask
+        s_l2_swimlane_header, thread_idx, core_id, state->head.current_buf_ptr, seq, L2SwimlaneBufferKind::AicpuTask
     );
     if (rc != 0) {
         LOG_ERROR("Thread %d: Core %d failed to enqueue buffer (queue full), data lost!", thread_idx, core_id);
         // Revert: discard data and keep writing
-        state->dropped_record_count = state->dropped_record_count + full_buf->count;
+        state->head.dropped_record_count = state->head.dropped_record_count + full_buf->count;
         full_buf->count = 0;
         wmb();
         return;
@@ -272,8 +277,8 @@ static void switch_records_buffer(int core_id, int thread_idx) {
     uint64_t new_buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
     rmb();
     state->free_queue.head = head + 1;
-    state->current_buf_ptr = new_buf_ptr;
-    state->current_buf_seq = seq + 1;
+    state->head.current_buf_ptr = new_buf_ptr;
+    state->head.current_buf_seq = seq + 1;
     wmb();
 
     L2SwimlaneAicpuTaskBuffer *new_buf = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(new_buf_ptr);
@@ -286,7 +291,7 @@ static void switch_records_buffer(int core_id, int thread_idx) {
 // Try to rotate the AICore buffer for `core_id`. Called from the completion
 // path after a successful L2SwimlaneAicpuTaskRecord commit so the just-FIN'd task's
 // AICore record is guaranteed to be in the old buffer before we enqueue it.
-// On success bumps `ac_state->current_buf_seq`; on failure (empty free queue
+// On success bumps `ac_state->head.current_buf_seq`; on failure (empty free queue
 // or full ready queue) the old buffer is abandoned in place, AICore overflows
 // it from now on, and the drop count grows.
 static void aicore_rotate(int core_id, int thread_idx) {
@@ -295,23 +300,29 @@ static void aicore_rotate(int core_id, int thread_idx) {
         return;
     }
 
-    uint64_t old_buf_ptr = ac_state->rotation.current_buf_ptr;
-    uint32_t seq = ac_state->current_buf_seq;
+    uint64_t old_buf_ptr = ac_state->head.current_buf_ptr;
+    uint32_t seq = ac_state->head.current_buf_seq;
 
     rmb();
     uint32_t head = ac_state->free_queue.head;
     uint32_t tail = ac_state->free_queue.tail;
     if (head == tail) {
-        // No replacement available — AICore continues to write into the
-        // old buffer; its slot counter will hit BUFFER_SIZE and drop the
-        // overflow. Account the drop on AICPU side too. Note that we do
-        // NOT bump current_buf_seq here — flush will still see the buffer
-        // as the "current full" one and stamp it correctly.
-        ac_state->dropped_record_count =
-            ac_state->dropped_record_count + static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+        // No replacement available — AICore continues to write into the old
+        // buffer; its slot counter will hit BUFFER_SIZE and the slot guard
+        // silently drops further records. We deliberately do NOT bump
+        // dropped_record_count here: AICPU has no precise view of how many
+        // tasks will actually fall in this gap before the run ends. The
+        // pre-emptive BUFFER_SIZE bump that used to live here over-counted
+        // when the run ended early — the old buffer's already-written
+        // records still flushed (counted toward `collected`), and the
+        // pre-emptive bump on top of that broke the
+        // `collected + dropped == total` reconcile invariant. The drop is
+        // visible at reconcile time as silent loss
+        // (`total - collected - dropped > 0`) and the WARN below records
+        // the failure mode.
         LOG_WARN(
-            "Thread %d: Core %d AICore free_queue empty at rotation; up to %d subsequent records will drop", thread_idx,
-            core_id, PLATFORM_AICORE_BUFFER_SIZE
+            "Thread %d: Core %d AICore free_queue empty at rotation; AICore slot guard will drop overflow records",
+            thread_idx, core_id
         );
         return;
     }
@@ -325,27 +336,38 @@ static void aicore_rotate(int core_id, int thread_idx) {
             s_l2_swimlane_header, thread_idx, core_id, old_buf_ptr, seq, L2SwimlaneBufferKind::AicoreTask
         );
         if (rc != 0) {
+            // Ready queue full — we leave current_buf_ptr pointing at the
+            // old buffer so the run-end flush path retries the enqueue (the
+            // host is draining concurrently; the queue may have space by
+            // then). We deliberately do NOT bump dropped here for the same
+            // reason as the empty-free-queue branch: counting a drop now
+            // would double-count if the flush succeeds in delivering the
+            // buffer to the host. Reconcile reports the actual loss as
+            // silent_loss when neither this rotation nor the flush
+            // delivers the records.
             LOG_ERROR(
-                "Thread %d: Core %d failed to enqueue AICore buffer (queue full), %d records lost", thread_idx, core_id,
-                PLATFORM_AICORE_BUFFER_SIZE
+                "Thread %d: Core %d failed to enqueue AICore buffer at rotation (queue full); will retry at flush",
+                thread_idx, core_id
             );
-            ac_state->dropped_record_count =
-                ac_state->dropped_record_count + static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
             return;
         }
     }
 
-    // Pop next buffer from free_queue and publish via the rotation channel.
+    // Pop next buffer from free_queue and publish via the head channel.
+    // Publish order matters: AICore observes head.current_buf_seq change to
+    // detect rotation, then reads head.current_buf_ptr. Write ptr first so
+    // AICore can never see a new seq with a stale ptr. new_buf->count=0 must
+    // also be visible before AICore's slot writes begin.
     uint64_t new_buf_ptr = ac_state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
     rmb();
     ac_state->free_queue.head = head + 1;
-    ac_state->current_buf_seq = seq + 1;
     L2SwimlaneAicoreTaskBuffer *new_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(new_buf_ptr);
     new_buf->count = 0;
 
-    wmb();  // ensure new_buf->count=0 visible before AICore sees new ptr
-    ac_state->rotation.current_buf_ptr = new_buf_ptr;
-    ac_state->rotation.generation = ac_state->rotation.generation + 1;
+    wmb();
+    ac_state->head.current_buf_ptr = new_buf_ptr;
+    wmb();
+    ac_state->head.current_buf_seq = seq + 1;
     wmb();
 }
 
@@ -368,19 +390,19 @@ int l2_swimlane_aicpu_complete_task(
 
     // Account every commit attempt up front so host can detect silent loss as
     // `device_total - (collected + dropped)`.
-    state->total_record_count += 1;
+    state->head.total_record_count += 1;
 
     L2SwimlaneAicpuTaskBuffer *l2_swimlane_buf = s_current_aicpu_task_buffers[core_id];
     if (l2_swimlane_buf == nullptr) {
         // No active records buffer (init ran out of free buffers); count as drop
         // so host reconciliation stays consistent.
-        state->dropped_record_count += 1;
+        state->head.dropped_record_count += 1;
         return -1;
     }
     uint32_t count = l2_swimlane_buf->count;
     if (count >= PLATFORM_PROF_BUFFER_SIZE) {
         // Defensive: should not happen because we rotate at end of every commit.
-        state->dropped_record_count += 1;
+        state->head.dropped_record_count += 1;
         return -1;
     }
 
@@ -445,8 +467,8 @@ int l2_swimlane_aicpu_complete_task(
     // we accept the limitation rather than widening the on-device counter.
     L2SwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
     if (ac_state != nullptr) {
-        uint32_t completed = ac_state->total_record_count + 1;
-        ac_state->total_record_count = completed;
+        uint32_t completed = ac_state->head.total_record_count + 1;
+        ac_state->head.total_record_count = completed;
         if ((completed & (PLATFORM_AICORE_BUFFER_SIZE - 1)) == 0) {
             aicore_rotate(core_id, thread_idx);
         }
@@ -477,20 +499,20 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
         if (state == nullptr) continue;
 
         rmb();
-        uint64_t buf_ptr = state->current_buf_ptr;
+        uint64_t buf_ptr = state->head.current_buf_ptr;
         if (buf_ptr == 0) {
             // No active buffer
         } else {
             L2SwimlaneAicpuTaskBuffer *buf = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(buf_ptr);
             if (buf->count > 0) {
-                uint32_t seq = state->current_buf_seq;
+                uint32_t seq = state->head.current_buf_seq;
                 int rc = enqueue_ready_buffer(
                     s_l2_swimlane_header, thread_idx, core_id, buf_ptr, seq, L2SwimlaneBufferKind::AicpuTask
                 );
                 if (rc == 0) {
                     LOG_INFO_V0("Thread %d: Core %d flushed buffer with %u records", thread_idx, core_id, buf->count);
                     flushed_count++;
-                    state->current_buf_ptr = 0;
+                    state->head.current_buf_ptr = 0;
                     s_current_aicpu_task_buffers[core_id] = nullptr;
                     wmb();
                 } else {
@@ -501,9 +523,9 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
                         "Thread %d: Core %d failed to enqueue buffer (queue full), %u records lost!", thread_idx,
                         core_id, buf->count
                     );
-                    state->dropped_record_count = state->dropped_record_count + buf->count;
+                    state->head.dropped_record_count = state->head.dropped_record_count + buf->count;
                     buf->count = 0;
-                    state->current_buf_ptr = 0;
+                    state->head.current_buf_ptr = 0;
                     s_current_aicpu_task_buffers[core_id] = nullptr;
                     wmb();
                 }
@@ -524,11 +546,11 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
         if (ac_state == nullptr) continue;
 
         rmb();
-        uint64_t ac_buf_ptr = ac_state->rotation.current_buf_ptr;
+        uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
         if (ac_buf_ptr == 0) continue;
 
-        uint32_t live = ac_state->total_record_count -
-                        ac_state->current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+        uint32_t live = ac_state->head.total_record_count -
+                        ac_state->head.current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
         if (live == 0) {
             // Last rotation matched the last completion exactly — buffer is
             // freshly popped and empty. Skip.
@@ -541,7 +563,7 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
         ac_buf->count = ac_mark;
         wmb();
 
-        uint32_t ac_seq = ac_state->current_buf_seq;
+        uint32_t ac_seq = ac_state->head.current_buf_seq;
         int rc = enqueue_ready_buffer(
             s_l2_swimlane_header, thread_idx, core_id, ac_buf_ptr, ac_seq, L2SwimlaneBufferKind::AicoreTask
         );
@@ -549,12 +571,12 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
             LOG_INFO_V0(
                 "Thread %d: Core %d flushed AICore buffer (seq=%u, count=%u)", thread_idx, core_id, ac_seq, ac_mark
             );
-            ac_state->rotation.current_buf_ptr = 0;
+            ac_state->head.current_buf_ptr = 0;
             wmb();
         } else {
             LOG_ERROR("Thread %d: Core %d failed to enqueue AICore buffer at flush (queue full)", thread_idx, core_id);
-            ac_state->dropped_record_count = ac_state->dropped_record_count + ac_mark;
-            ac_state->rotation.current_buf_ptr = 0;
+            ac_state->head.dropped_record_count = ac_state->head.dropped_record_count + ac_mark;
+            ac_state->head.current_buf_ptr = 0;
             wmb();
         }
     }
@@ -603,8 +625,8 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_threads) {
             uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
             rmb();
             state->free_queue.head = head + 1;
-            state->current_buf_ptr = buf_ptr;
-            state->current_buf_seq = 0;
+            state->head.current_buf_ptr = buf_ptr;
+            state->head.current_buf_seq = 0;
             wmb();
 
             L2SwimlaneAicpuPhaseBuffer *buf = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(buf_ptr);
@@ -614,7 +636,7 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_threads) {
             LOG_DEBUG("Thread %d: popped initial phase buffer (addr=0x%lx)", t, buf_ptr);
         } else {
             LOG_ERROR("Thread %d: phase free_queue is empty during init!", t);
-            state->current_buf_ptr = 0;
+            state->head.current_buf_ptr = 0;
             s_current_aicpu_phase_buffers[t] = nullptr;
         }
     }
@@ -650,18 +672,18 @@ static void switch_phase_buffer(int thread_idx) {
     LOG_INFO_V0("Thread %d: phase buffer is full (count=%u)", thread_idx, full_buf->count);
 
     // Enqueue to ReadyQueue
-    uint32_t seq = state->current_buf_seq;
+    uint32_t seq = state->head.current_buf_seq;
     int rc = enqueue_ready_buffer(
-        s_l2_swimlane_header, thread_idx, thread_idx, state->current_buf_ptr, seq, L2SwimlaneBufferKind::AicpuPhase
+        s_l2_swimlane_header, thread_idx, thread_idx, state->head.current_buf_ptr, seq, L2SwimlaneBufferKind::AicpuPhase
     );
     if (rc != 0) {
         LOG_ERROR(
             "Thread %d: failed to enqueue phase buffer (queue full), %u records lost!", thread_idx, full_buf->count
         );
-        state->dropped_record_count = state->dropped_record_count + full_buf->count;
+        state->head.dropped_record_count = state->head.dropped_record_count + full_buf->count;
         full_buf->count = 0;
         s_current_aicpu_phase_buffers[thread_idx] = nullptr;
-        state->current_buf_ptr = 0;
+        state->head.current_buf_ptr = 0;
         wmb();
         return;
     }
@@ -675,8 +697,8 @@ static void switch_phase_buffer(int thread_idx) {
         uint64_t new_buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
         rmb();
         state->free_queue.head = head + 1;
-        state->current_buf_ptr = new_buf_ptr;
-        state->current_buf_seq = seq + 1;
+        state->head.current_buf_ptr = new_buf_ptr;
+        state->head.current_buf_seq = seq + 1;
         wmb();
 
         L2SwimlaneAicpuPhaseBuffer *new_buf = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(new_buf_ptr);
@@ -688,7 +710,7 @@ static void switch_phase_buffer(int thread_idx) {
         // No free buffer available, drop subsequent records
         LOG_WARN("Thread %d: no free phase buffer available, dropping records until Host catches up", thread_idx);
         s_current_aicpu_phase_buffers[thread_idx] = nullptr;
-        state->current_buf_ptr = 0;
+        state->head.current_buf_ptr = 0;
         wmb();
     }
 }
@@ -708,7 +730,7 @@ void l2_swimlane_aicpu_record_phase(
 
     // Account every commit attempt up front so host can detect silent loss
     // as `device_total - (collected + dropped)` (mirrors PERF accounting).
-    state->total_record_count += 1;
+    state->head.total_record_count += 1;
 
     L2SwimlaneAicpuPhaseBuffer *buf = s_current_aicpu_phase_buffers[thread_idx];
 
@@ -722,8 +744,8 @@ void l2_swimlane_aicpu_record_phase(
             uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
             rmb();
             state->free_queue.head = head + 1;
-            state->current_buf_ptr = buf_ptr;
-            state->current_buf_seq = state->current_buf_seq + 1;
+            state->head.current_buf_ptr = buf_ptr;
+            state->head.current_buf_seq = state->head.current_buf_seq + 1;
             wmb();
 
             buf = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(buf_ptr);
@@ -733,7 +755,7 @@ void l2_swimlane_aicpu_record_phase(
             LOG_INFO_V0("Thread %d: recovered phase buffer", thread_idx);
         }
         if (buf == nullptr) {
-            state->dropped_record_count += 1;
+            state->head.dropped_record_count += 1;
             return;
         }
     }
@@ -745,12 +767,12 @@ void l2_swimlane_aicpu_record_phase(
         switch_phase_buffer(thread_idx);
         buf = s_current_aicpu_phase_buffers[thread_idx];
         if (buf == nullptr) {
-            state->dropped_record_count += 1;
+            state->head.dropped_record_count += 1;
             return;
         }
         idx = buf->count;
         if (idx >= PLATFORM_PHASE_RECORDS_PER_THREAD) {
-            state->dropped_record_count += 1;
+            state->head.dropped_record_count += 1;
             return;
         }
     }
@@ -785,7 +807,7 @@ void l2_swimlane_aicpu_flush_phase_buffers(int thread_idx) {
     if (state == nullptr) return;
 
     rmb();
-    uint64_t buf_ptr = state->current_buf_ptr;
+    uint64_t buf_ptr = state->head.current_buf_ptr;
     if (buf_ptr == 0) {
         // No active buffer
         return;
@@ -796,7 +818,7 @@ void l2_swimlane_aicpu_flush_phase_buffers(int thread_idx) {
         return;
     }
 
-    uint32_t seq = state->current_buf_seq;
+    uint32_t seq = state->head.current_buf_seq;
     int rc = enqueue_ready_buffer(
         s_l2_swimlane_header, thread_idx, thread_idx, buf_ptr, seq, L2SwimlaneBufferKind::AicpuPhase
     );
@@ -804,10 +826,10 @@ void l2_swimlane_aicpu_flush_phase_buffers(int thread_idx) {
         LOG_INFO_V0("Thread %d: flushed phase buffer with %u records", thread_idx, buf->count);
     } else {
         LOG_ERROR("Thread %d: failed to enqueue phase buffer (queue full), %u records lost!", thread_idx, buf->count);
-        state->dropped_record_count = state->dropped_record_count + buf->count;
+        state->head.dropped_record_count = state->head.dropped_record_count + buf->count;
         buf->count = 0;
     }
-    state->current_buf_ptr = 0;
+    state->head.current_buf_ptr = 0;
     s_current_aicpu_phase_buffers[thread_idx] = nullptr;
     wmb();
 }

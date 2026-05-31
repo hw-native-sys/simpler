@@ -17,43 +17,43 @@
  *
  * Memory layout (shared memory between Host and Device):
  * ┌─────────────────────────────────────────────────────────────┐
- * │ L2SwimlaneDataHeader (fixed header)                               │
+ * │ L2SwimlaneDataHeader (fixed header)                         │
  * │  - ReadyQueue (FIFO, capacity=PLATFORM_PROF_READYQUEUE_SIZE)│
- * │  - Metadata (num_cores, flags)                              │
+ * │  - num_cores, l2_swimlane_level                             │
  * ├─────────────────────────────────────────────────────────────┤
- * │ L2SwimlaneAicpuTaskPool[0] (Core 0)                                 │
- * │  - free_queue: SPSC queue of available buffer pointers      │
- * │  - current_buf_ptr, current_buf_seq                         │
+ * │ L2SwimlaneAicpuTaskPool[0..num_cores-1]                     │
+ * │  - head:       active L2SwimlaneAicpuTaskBuffer + counters  │
+ * │  - free_queue: SPSC ring of recycled buffers                │
  * ├─────────────────────────────────────────────────────────────┤
- * │ L2SwimlaneAicpuTaskPool[1] (Core 1)                                 │
+ * │ L2SwimlaneAicoreTaskPool[0..num_cores-1]                    │
+ * │  - head:       active L2SwimlaneAicoreTaskBuffer (AICore    │
+ * │                dcci-polls; AICPU rotates at dispatch        │
+ * │                boundaries by bumping current_buf_seq)       │
+ * │  - free_queue: SPSC ring of recycled AICore buffers         │
  * ├─────────────────────────────────────────────────────────────┤
- * │ ...                                                         │
- * ├─────────────────────────────────────────────────────────────┤
- * │ L2SwimlaneAicpuTaskPool[num_cores-1]                                │
- * ├─────────────────────────────────────────────────────────────┤
- * │ L2SwimlaneAicpuPhaseHeader (optional, present when phase profiling)   │
+ * │ L2SwimlaneAicpuPhaseHeader (optional, present when phase    │
+ * │                             profiling is enabled)           │
  * │  - magic, num_sched_threads, records_per_thread             │
  * │  - core_to_thread mapping                                   │
  * ├─────────────────────────────────────────────────────────────┤
- * │ L2SwimlaneAicpuPhasePool[thread0]                                   │
- * │  - free_queue: SPSC queue of available buffer pointers      │
- * │  - current_buf_ptr, current_buf_seq                         │
- * ├─────────────────────────────────────────────────────────────┤
- * │ L2SwimlaneAicpuPhasePool[thread1]                                   │
- * ├─────────────────────────────────────────────────────────────┤
- * │ ...                                                         │
+ * │ L2SwimlaneAicpuPhasePool[0..num_threads-1]                  │
+ * │  - head, free_queue (same shape as AicpuTaskPool)           │
  * └─────────────────────────────────────────────────────────────┘
  *
- * Actual L2SwimlaneAicpuTaskBuffer / L2SwimlaneAicpuPhaseBuffer are allocated dynamically by Host
- * and pushed into the per-core/thread free_queue.
+ * Actual L2SwimlaneAicpuTaskBuffer / L2SwimlaneAicoreTaskBuffer /
+ * L2SwimlaneAicpuPhaseBuffer are allocated dynamically by Host and pushed
+ * into the per-core/thread free_queue.
  *
  * Base size = sizeof(L2SwimlaneDataHeader) + num_cores * sizeof(L2SwimlaneAicpuTaskPool)
- * With phases = Base + sizeof(L2SwimlaneAicpuPhaseHeader) + num_threads * sizeof(L2SwimlaneAicpuPhasePool)
+ * With phases = Base + num_cores * sizeof(L2SwimlaneAicoreTaskPool)
+ *                    + sizeof(L2SwimlaneAicpuPhaseHeader)
+ *                    + num_threads * sizeof(L2SwimlaneAicpuPhasePool)
  */
 
 #ifndef SRC_A2A3_PLATFORM_INCLUDE_COMMON_L2_SWIMLANE_PROFILING_H_
 #define SRC_A2A3_PLATFORM_INCLUDE_COMMON_L2_SWIMLANE_PROFILING_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -214,101 +214,109 @@ struct L2SwimlaneFreeQueue {
 static_assert(sizeof(L2SwimlaneFreeQueue) == 128, "L2SwimlaneFreeQueue must be 128 bytes for cache alignment");
 
 // =============================================================================
-// L2SwimlaneAicpuTaskPool - Per-Core/Thread Buffer State (Unified for L2SwimlaneAicpuTaskRecord and Phase)
+// L2SwimlaneActiveHead - Shared "Active Buffer" Cache Line
 // =============================================================================
 
 /**
- * Per-core or per-thread buffer state for dynamic profiling.
+ * Single cache-line head describing the per-pool active buffer.
  *
- * Contains:
- * - free_queue: SPSC queue of available buffer addresses
- * - current_buf_ptr: Currently active buffer being written (0 = no active
- *   buffer). AICPU writes records into it; rotated by AICPU when full.
- * - current_buf_seq: Monotonic sequence number for ordering
- * - total_record_count / dropped_record_count: per-core/-thread tallies
- *   AICPU keeps so the host can cross-check `collected + dropped ==
- *   device_total` at end-of-run.
+ * Shared by all three pool kinds (AicpuTask / AicpuPhase / AicoreTask). The
+ * field set is intentionally uniform — every pool needs:
+ *   - current_buf_ptr      : device address of the buffer the producer is
+ *                            currently writing into (0 = no active buffer)
+ *   - current_buf_seq      : monotonic sequence number; bumped on every
+ *                            rotation. For AICore this doubles as the
+ *                            "generation" the per-core local state compares
+ *                            against to detect a rotation.
+ *   - total_record_count   : producer-maintained tally; host cross-checks at
+ *                            end-of-run that `collected + dropped == total`.
+ *   - dropped_record_count : producer-maintained tally; counts records lost
+ *                            (free_queue empty / overwrite / no buffer).
  *
- * Used in two contexts:
- * - Per-core L2SwimlaneAicpuTaskRecord profiling (current_buf_ptr → L2SwimlaneAicpuTaskBuffer)
- * - Per-thread Phase profiling (current_buf_ptr → L2SwimlaneAicpuPhaseBuffer)
+ * Single-writer (AICPU) for every pool; readers are either AICore (via dcci
+ * SINGLE_CACHE_LINE, AicoreTask pool only) or the host at drain time. Because
+ * AICore only reads current_buf_ptr/current_buf_seq and invalidates the whole
+ * line, the cohabiting counter fields are harmless — AICore never reads them.
  *
- * Writers:
- * - free_queue.tail: Host writes (pushes new buffers)
- * - free_queue.head: Device writes (pops buffers)
- * - current_buf_ptr: Device writes (after pop), Host reads (for flush/collect)
- * - current_buf_seq: Device writes (monotonic counter)
- * - total_record_count / dropped_record_count: Device writes, Host reads
- *   at drain time (no concurrency on a per-state basis since each state
- *   belongs to a single core/thread).
+ * Race avoidance for AicoreTask pools: AICPU rotates strictly before
+ * `write_reg(DATA_MAIN_BASE)` for the first task of a new BUFFER_SIZE batch.
+ * The runtime's completion-before-dispatch invariant guarantees all prior
+ * tasks have FIN'd, so AICore has already finished writing their records into
+ * the old buffer before AICPU enqueues it to ready_queue.
  */
-struct L2SwimlaneAicpuTaskPool {
-    L2SwimlaneFreeQueue free_queue;          // SPSC queue of free buffer addresses
-    volatile uint64_t current_buf_ptr;       // Current active L2SwimlaneAicpuTaskBuffer (0 = none)
-    volatile uint32_t current_buf_seq;       // Sequence number for ordering
-    volatile uint32_t total_record_count;    // Records the AICPU attempted to write to this state
-    volatile uint32_t dropped_record_count;  // Records dropped (queue full / overwrite / no buffer)
-    uint32_t pad[11];                        // Pad to 192 bytes (aligned to cache line)
+struct L2SwimlaneActiveHead {
+    volatile uint64_t current_buf_ptr;       // 8 — active buffer device address (0 = none)
+    volatile uint32_t current_buf_seq;       // 4 — monotonic seq / AICore rotation generation
+    volatile uint32_t total_record_count;    // 4 — producer-attempted writes
+    volatile uint32_t dropped_record_count;  // 4 — producer-dropped writes
+    uint32_t pad[11];                        // 44 → 64B
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(L2SwimlaneAicpuTaskPool) == 192, "L2SwimlaneAicpuTaskPool must be 192 bytes for cache alignment");
+static_assert(sizeof(L2SwimlaneActiveHead) == 64, "L2SwimlaneActiveHead must be one cache line");
+
+// =============================================================================
+// Pool layouts: every pool = ActiveHead (64B) + L2SwimlaneFreeQueue (128B) = 192B
+// =============================================================================
+
+/**
+ * Per-core or per-thread AICPU-written pool (Task profiling or Phase profiling).
+ *
+ *   head:       cache line AICPU writes when rotating buffers
+ *   free_queue: SPSC ring; host pushes recycled buffers, AICPU pops
+ *
+ * Used in two contexts:
+ *   - Per-core L2SwimlaneAicpuTaskBuffer  (kind = AicpuTask)
+ *   - Per-thread L2SwimlaneAicpuPhaseBuffer (kind = AicpuPhase)
+ */
+struct L2SwimlaneAicpuTaskPool {
+    L2SwimlaneActiveHead head;       // 64B
+    L2SwimlaneFreeQueue free_queue;  // 128B
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(L2SwimlaneAicpuTaskPool) == 192, "L2SwimlaneAicpuTaskPool must be 192 bytes");
+// Lock the head@0 / free_queue@64 ABI: AICPU publishes `&pool.head` device
+// addresses into the AICore rotation table, and host/device drain paths rely
+// on this layout being byte-stable across builds. Drift here is the kind of
+// silent corruption that doesn't trip any test.
+static_assert(offsetof(L2SwimlaneAicpuTaskPool, head) == 0, "L2SwimlaneAicpuTaskPool::head must be at offset 0");
+static_assert(
+    offsetof(L2SwimlaneAicpuTaskPool, free_queue) == 64, "L2SwimlaneAicpuTaskPool::free_queue must be at offset 64"
+);
 
 // Type alias for semantic clarity in Phase profiling context
 using L2SwimlaneAicpuPhasePool = L2SwimlaneAicpuTaskPool;  // Per-thread Phase profiling
 
-// =============================================================================
-// L2SwimlaneAicoreRotation - Per-Core AICore Buffer Rotation Channel
-// =============================================================================
-
 /**
- * Single cache-line struct AICore reads on every task to decide which
- * L2SwimlaneAicoreTaskBuffer to write into. AICPU updates it when rotating; AICore
- * detects the change via the generation counter and resets its local slot.
+ * Per-core AICore-written pool.
  *
- *   Writer: AICPU (host writes initial values at init)
- *   Reader: AICore (dcci's this line per task — cheap relative to baseline
- *           dcci(payload, ENTIRE_DATA_CACHE))
+ *   head:       cache line AICPU writes when rotating; AICore dcci-polls per
+ *               task to detect a current_buf_seq bump (= "generation" change).
+ *   free_queue: SPSC ring of recycled L2SwimlaneAicoreTaskBuffer*; host pushes,
+ *               AICPU pops when rotating.
  *
- * Race avoidance: AICPU rotates strictly at dispatch boundaries (immediately
- * before write_reg(DATA_MAIN_BASE) for task K when K % BUFFER_SIZE == 0). The
- * runtime's completion-before-dispatch invariant guarantees all tasks < K
- * have FIN'd, so AICore has already finished writing their records into the
- * old buffer before AICPU enqueues it to ready_queue.
- */
-struct L2SwimlaneAicoreRotation {
-    volatile uint64_t current_buf_ptr;  // Device address of the active L2SwimlaneAicoreTaskBuffer
-    volatile uint32_t generation;       // Bumps on each rotation; AICore compares to detect changes
-    uint32_t _pad_a;
-    uint32_t _pad_b[12];
-} __attribute__((aligned(64)));
-
-static_assert(sizeof(L2SwimlaneAicoreRotation) == 64, "L2SwimlaneAicoreRotation must be one cache line");
-
-// =============================================================================
-// L2SwimlaneAicoreTaskPool - Per-Core AICore Pool State
-// =============================================================================
-
-/**
- * Per-core AICore-side rotation state. Owns:
- *   - rotation: the cache line AICore polls
- *   - free_queue: SPSC queue of recycled L2SwimlaneAicoreTaskBuffer*; host pushes,
- *                 AICPU pops when rotating
- *   - total_record_count / dropped_record_count: AICPU-maintained tallies
+ * AICore records flow through the existing per-thread ready_queue in
+ * L2SwimlaneDataHeader (with ReadyQueueEntry::kind = AicoreTask). This keeps
+ * the mgmt-thread drain path uniform with the AICPU buffer paths.
  *
- * Note that AICore records flow through the existing per-thread ready_queue
- * in L2SwimlaneDataHeader (with ReadyQueueEntry::kind = AicoreTask). This keeps the
- * mgmt-thread drain path uniform with the L2SwimlaneAicpuTaskBuffer / L2SwimlaneAicpuPhaseBuffer paths.
+ * The AICore-readable rotation channel that AICore's per-task dcci targets is
+ * exactly `&pool.head` — AICPU publishes that address into
+ * `KernelArgs::l2_swimlane_aicore_rotation_table[block_idx]` during
+ * `l2_swimlane_aicpu_init`, and AICore lazy-resolves it via
+ * `get_l2_swimlane_aicore_head()`.
  */
 struct L2SwimlaneAicoreTaskPool {
-    L2SwimlaneAicoreRotation rotation;       // 64B — cache-line independent
-    L2SwimlaneFreeQueue free_queue;          // 128B
-    volatile uint32_t total_record_count;    // AICPU dispatches that should have been recorded
-    volatile uint32_t dropped_record_count;  // Buffers dropped (free_queue empty at rotation time)
-    volatile uint32_t current_buf_seq;       // Monotonic per-core rotation counter
-    uint32_t pad[13];                        // → 256B total
+    L2SwimlaneActiveHead head;       // 64B
+    L2SwimlaneFreeQueue free_queue;  // 128B
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(L2SwimlaneAicoreTaskPool) == 256, "L2SwimlaneAicoreTaskPool must be 256 bytes");
+static_assert(sizeof(L2SwimlaneAicoreTaskPool) == 192, "L2SwimlaneAicoreTaskPool must be 192 bytes");
+// Same ABI lock as AicpuTaskPool: head must be the line AICore dcci's, so
+// `&pool.head` (= base + 0) and `&pool.free_queue` (= base + 64) must stay
+// at these exact offsets across builds.
+static_assert(offsetof(L2SwimlaneAicoreTaskPool, head) == 0, "L2SwimlaneAicoreTaskPool::head must be at offset 0");
+static_assert(
+    offsetof(L2SwimlaneAicoreTaskPool, free_queue) == 64, "L2SwimlaneAicoreTaskPool::free_queue must be at offset 64"
+);
 
 // =============================================================================
 // ReadyQueueEntry - Queue Entry for Ready Buffers

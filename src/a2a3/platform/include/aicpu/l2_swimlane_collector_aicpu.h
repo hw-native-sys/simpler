@@ -46,13 +46,14 @@ extern "C" uint64_t get_platform_l2_swimlane_base();
 extern "C" void set_l2_swimlane_enabled(bool enable);
 extern "C" bool is_l2_swimlane_enabled();
 
-// AICore rotation-table device pointer (= KernelArgs::l2_swimlane_aicore_rotation_table).
+// AICore head-table device pointer (= KernelArgs::l2_swimlane_aicore_rotation_table).
 // Published by the host before AICPU init runs; AICPU init fills the table
-// with the per-core `&L2SwimlaneAicoreTaskPool::rotation` device addresses so
-// AICore can index `l2_swimlane_aicore_rotation_table[block_idx]` to find its rotation channel.
-// Moved from host into AICPU so the host stays decoupled from the AICore-side
-// shared-memory layout (host previously did host-to-device address translation
-// + reached into get_aicore_buffer_state to fill this).
+// with the per-core `&L2SwimlaneAicoreTaskPool::head` device addresses so
+// AICore can index `l2_swimlane_aicore_rotation_table[block_idx]` to find its
+// active-head cache line. Moved from host into AICPU so the host stays
+// decoupled from the AICore-side shared-memory layout (host previously did
+// host-to-device address translation + reached into get_aicore_buffer_state
+// to fill this).
 extern "C" void set_platform_l2_swimlane_aicore_rotation_table(uint64_t table_addr);
 extern "C" uint64_t get_platform_l2_swimlane_aicore_rotation_table();
 
@@ -69,7 +70,7 @@ L2SwimlaneLevel get_l2_swimlane_level();
  *
  * Also primes the per-core AICore rotation channel: pops the initial
  * L2SwimlaneAicoreTaskBuffer from L2SwimlaneAicoreTaskPool::free_queue and writes its
- * address into the L2SwimlaneAicoreRotation channel that AICore polls per task.
+ * address into the L2SwimlaneActiveHead channel that AICore polls per task.
  *
  * @param worker_count  Number of AICore workers (cores) to initialize
  */
