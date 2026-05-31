@@ -359,7 +359,7 @@ sched overhead per session as price for unbounded session length).
 `halHostRegister` maps device memory into host virtual address
 space so the host can read device buffers directly.
 `L2SwimlaneCollector` runs two background threads on top of a
-[`BufferPoolManager<L2SwimlaneModule>`](../src/a2a3/platform/include/host/profiling_common/buffer_pool_manager.h):
+[`BufferPoolManager<L2SwimlaneModule>`](../src/common/platform/include/host/buffer_pool_manager.h):
 a mgmt thread that polls SPSC ready queues and recycles full
 buffers **while kernels are still executing**, plus a poll
 thread that drains the L2 hand-off queue into
@@ -432,7 +432,7 @@ finalize(unregister, free)
 
 [`L2SwimlaneCollector`](../src/a2a3/platform/include/host/l2_swimlane_collector.h)
 on a2a3 inherits from
-[`profiling_common::ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>`](../src/a2a3/platform/include/host/profiling_common/profiler_base.h):
+[`profiling_common::ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>`](../src/common/platform/include/host/profiler_base.h):
 the base class owns the mgmt thread, the poll thread, and the
 `BufferPoolManager<L2SwimlaneModule>` they share. `L2SwimlaneCollector`
 supplies the L2-specific pieces — the `L2SwimlaneModule` trait
@@ -560,9 +560,9 @@ l2_swimlane_collector_.finalize()
 
 [`L2SwimlaneCollector`](../src/a5/platform/include/host/l2_swimlane_collector.h)
 on a5 inherits the same CRTP base
-([`profiling_common::ProfilerBase`](../src/a5/platform/include/host/profiling_common/profiler_base.h))
+([`profiling_common::ProfilerBase`](../src/common/platform/include/host/profiler_base.h))
 as a2a3 and parameterizes
-[`BufferPoolManager`](../src/a5/platform/include/host/profiling_common/buffer_pool_manager.h)
+[`BufferPoolManager`](../src/common/platform/include/host/buffer_pool_manager.h)
 with `L2SwimlaneModule` (`kBufferKinds = 2`). The only a5-specific
 glue is the 5-callback `MemoryOps` and the per-tick shm mirror.
 

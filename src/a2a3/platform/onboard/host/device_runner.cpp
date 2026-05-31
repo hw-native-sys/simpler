@@ -18,7 +18,7 @@
 #include "device_runner.h"
 
 #include "host_log.h"
-#include "load_aicpu_op.h"
+#include "aicpu_loader/host/load_aicpu_op.h"
 
 #include <dlfcn.h>
 

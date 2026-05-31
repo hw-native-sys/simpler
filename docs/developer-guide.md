@@ -9,7 +9,7 @@ pto-runtime/
 │   └── {arch}/                         # Architecture-specific code (a2a3, a5)
 │       ├── platform/                   # Platform-specific implementations
 │       │   ├── include/                # Shared headers (host/, aicpu/, aicore/, common/)
-│       │   ├── src/                    # Shared source (compiled into both backends)
+│       │   ├── shared/                 # Sources shared between onboard and sim backends (compiled into both)
 │       │   ├── onboard/               # Real hardware backend
 │       │   │   ├── host/              # Host runtime (.so)
 │       │   │   ├── aicpu/             # AICPU kernel (.so)

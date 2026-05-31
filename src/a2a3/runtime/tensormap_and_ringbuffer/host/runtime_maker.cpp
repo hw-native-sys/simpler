@@ -42,7 +42,7 @@
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "prepare_callable_common.h"
 
 // Helper: return current time in milliseconds

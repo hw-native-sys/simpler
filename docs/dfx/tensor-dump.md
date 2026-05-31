@@ -361,7 +361,7 @@ normal execution continues.
 `halHostRegister` maps device memory into host virtual address
 space so the host can read device buffers directly.
 `TensorDumpCollector` runs two background threads on top of a
-[`BufferPoolManager<DumpModule>`](../src/a2a3/platform/include/host/profiling_common/buffer_pool_manager.h):
+[`BufferPoolManager<DumpModule>`](../src/common/platform/include/host/buffer_pool_manager.h):
 a mgmt thread that polls SPSC ready queues and recycles full
 metadata buffers **while kernels are still executing**, plus a
 poll thread that drains the L2 hand-off queue into
@@ -423,7 +423,7 @@ export_dump_files()
 
 [`TensorDumpCollector`](../src/a2a3/platform/include/host/tensor_dump_collector.h)
 on a2a3 inherits from
-[`profiling_common::ProfilerBase<TensorDumpCollector, DumpModule>`](../src/a2a3/platform/include/host/profiling_common/profiler_base.h):
+[`profiling_common::ProfilerBase<TensorDumpCollector, DumpModule>`](../src/common/platform/include/host/profiler_base.h):
 the base class owns the mgmt thread, the poll thread, and the
 `BufferPoolManager<DumpModule>` they share. `TensorDumpCollector`
 only supplies the dump-specific pieces — the `DumpModule` trait
@@ -528,9 +528,9 @@ dump_collector_.finalize()
 
 [`TensorDumpCollector`](../src/a5/platform/include/host/tensor_dump_collector.h)
 on a5 inherits the same CRTP base
-([`profiling_common::ProfilerBase`](../src/a5/platform/include/host/profiling_common/profiler_base.h))
+([`profiling_common::ProfilerBase`](../src/common/platform/include/host/profiler_base.h))
 as a2a3 and parameterizes
-[`BufferPoolManager`](../src/a5/platform/include/host/profiling_common/buffer_pool_manager.h)
+[`BufferPoolManager`](../src/common/platform/include/host/buffer_pool_manager.h)
 with `DumpModule`. The only a5-specific glue is the 5-callback
 `MemoryOps`, the per-tick shm mirror, and the on-demand arena copy
 inside `on_buffer_collected`.

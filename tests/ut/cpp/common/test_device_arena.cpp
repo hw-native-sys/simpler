@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-// Unit tests for src/common/device_comm/device_arena.h.
+// Unit tests for src/common/utils/device_arena.h.
 //
 // DeviceArena lays out multiple sub-regions inside a single backing
 // allocation. Its contract:
@@ -29,7 +29,7 @@
 
 #include <gtest/gtest.h>
 
-#include "device_arena.h"
+#include "utils/device_arena.h"
 
 namespace {
 

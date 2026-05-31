@@ -293,7 +293,7 @@ finalize(unregister, free)
 
 [`PmuCollector`](../src/a2a3/platform/include/host/pmu_collector.h)
 inherits from
-[`profiling_common::ProfilerBase<PmuCollector, PmuModule>`](../src/a2a3/platform/include/host/profiling_common/profiler_base.h):
+[`profiling_common::ProfilerBase<PmuCollector, PmuModule>`](../src/common/platform/include/host/profiler_base.h):
 the base class owns the mgmt thread, the poll thread, and the
 `BufferPoolManager<PmuModule>` they share. `PmuCollector` only supplies
 the PMU-specific pieces — the `PmuModule` trait that describes the
@@ -461,9 +461,9 @@ guarantees neighboring register tokens differ by 1 → different slots).
 
 [`PmuCollector`](../src/a5/platform/include/host/pmu_collector.h) on
 a5 inherits the same CRTP base
-([`profiling_common::ProfilerBase`](../src/a5/platform/include/host/profiling_common/profiler_base.h))
+([`profiling_common::ProfilerBase`](../src/common/platform/include/host/profiler_base.h))
 as a2a3 and parameterizes
-[`BufferPoolManager`](../src/a5/platform/include/host/profiling_common/buffer_pool_manager.h)
+[`BufferPoolManager`](../src/common/platform/include/host/buffer_pool_manager.h)
 with `PmuModule`. The only a5-specific glue is the 5-callback
 `MemoryOps` and the per-tick shm mirror.
 

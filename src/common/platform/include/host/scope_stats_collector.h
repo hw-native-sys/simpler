@@ -57,7 +57,7 @@
 #include "common/platform_config.h"
 #include "common/scope_stats.h"
 #include "common/unified_log.h"
-#include "host/profiling_common/profiler_base.h"
+#include "host/profiler_base.h"
 
 // ---------------------------------------------------------------------------
 // scope_stats Module (drives BufferPoolManager<ScopeStatsModule>)

@@ -43,7 +43,7 @@
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "device_runner_base.h"     // common DeviceRunnerBase
 #include "device_runner_helpers.h"  // common DeviceArgs + KernelArgsHelper
 #include "host/function_cache.h"
@@ -52,7 +52,7 @@
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/dep_gen_collector.h"
-#include "load_aicpu_op.h"
+#include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/scope_stats_collector.h"
 #include "runtime.h"
 

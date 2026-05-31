@@ -35,7 +35,7 @@
  *      `rtFuncHandle`. No per-launch string marshalling, no global op
  *      registry lookups.
  *
- * See common/aicpu_dispatcher/aicpu_dispatcher.h for the bootstrap protocol
+ * See common/aicpu_loader/device/aicpu_dispatcher.h for the bootstrap protocol
  * details (extended DeviceArgs with inner_so_bin/inner_so_len,
  * fingerprint-named preinstall files).
  */

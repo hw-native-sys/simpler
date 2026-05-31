@@ -43,7 +43,7 @@
 #pragma once
 
 #include "common.h"
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 #include "tensor.h"
 

@@ -32,4 +32,4 @@ Key directories:
 
 ## Shared Interface
 
-Platform-agnostic headers in `src/a5/platform/include/`, shared source in `src/a5/platform/src/`.
+Platform-agnostic headers in `src/a5/platform/include/`, shared source in `src/a5/platform/shared/`.

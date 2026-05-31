@@ -47,7 +47,7 @@ Platform-agnostic headers live in `src/a2a3/platform/include/`, split by target:
 - `aicore/` — AICore platform API
 - `common/` — Shared types and utilities (unified_log, tensor, common.h)
 
-Shared source implementations in `src/a2a3/platform/src/`.
+Shared source implementations in `src/a2a3/platform/shared/`.
 
 ## Cache Coherency on GM
 

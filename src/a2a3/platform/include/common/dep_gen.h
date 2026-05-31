@@ -20,7 +20,7 @@
  * carries fanout to keep AICPU off the per-task GM-store critical path.
  *
  * Streaming buffer design mirrors PMU / L2Swimlane / TensorDump (single source of
- * algorithmic truth in src/a2a3/platform/include/host/profiling_common/profiler_base.h):
+ * algorithmic truth in src/common/platform/include/host/profiler_base.h):
  *
  *   DepGenFreeQueue    — SPSC: Host pushes free DepGenBuffers, AICPU pops them.
  *   DepGenBufferState  — Per-instance state: free_queue + current buffer ptr.

@@ -41,7 +41,7 @@
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
-#include "host/profiling_common/profiler_base.h"
+#include "host/profiler_base.h"
 
 // ---------------------------------------------------------------------------
 // L2 Perf profiling Module (drives BufferPoolManager<L2SwimlaneModule>)

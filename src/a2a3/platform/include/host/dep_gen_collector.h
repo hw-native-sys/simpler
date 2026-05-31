@@ -57,7 +57,7 @@
 #include "common/dep_gen.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
-#include "host/profiling_common/profiler_base.h"
+#include "host/profiler_base.h"
 
 // ---------------------------------------------------------------------------
 // dep_gen Module (drives BufferPoolManager<DepGenModule>)

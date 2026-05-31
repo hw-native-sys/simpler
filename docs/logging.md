@@ -99,7 +99,7 @@ Two implementations link the same ABI symbols:
 | Symbol owner | Implementation file | Backend |
 | ------------ | ------------------- | ------- |
 | `libsimpler_log.so` (host) | `src/common/log/unified_log_host.cpp` | `HostLogger` → stderr |
-| AICPU binary (device) | `src/{arch}/platform/src/aicpu/unified_log_device.cpp` | `dev_vlog_*` → backend |
+| AICPU binary (device) | `src/common/platform/shared/aicpu/unified_log_device.cpp` | `dev_vlog_*` → backend |
 
 The host `.so` is loaded with `RTLD_GLOBAL` so all consumer `.so`s
 (`host_runtime`, `cpu_sim_context`, sim `aicore_kernel`, the binding) resolve
@@ -184,7 +184,7 @@ are allowed by default. CMake blocks live in:
 
 - `src/{a5,a2a3}/platform/sim/host/CMakeLists.txt`
 - `src/{a5,a2a3}/platform/sim/aicore/CMakeLists.txt`
-- `src/common/sim_context/CMakeLists.txt`
+- `src/common/platform/sim/sim_context/CMakeLists.txt`
 
 (Onboard host `.so` builds Linux-only and needs no flag.)
 
@@ -274,6 +274,6 @@ RTLD_GLOBAL)`s them before handing off to the C++ `_ChipWorker.init`.
 | Change the host output format / pattern | `src/common/log/host_log.cpp::HostLogger::emit` |
 | Change the sim AICPU output format | `src/{arch}/platform/sim/aicpu/device_log.cpp::dev_vlog_*` |
 | Change the onboard AICPU CANN dlog tagging | `src/{arch}/platform/onboard/aicpu/device_log.cpp::dev_vlog_*` |
-| Add a new C ABI entry point (e.g. dynamic config push) | `src/common/log/include/common/unified_log.h` + `unified_log_host.cpp` + `src/{arch}/platform/src/aicpu/unified_log_device.cpp` |
+| Add a new C ABI entry point (e.g. dynamic config push) | `src/common/log/include/common/unified_log.h` + `unified_log_host.cpp` + `src/common/platform/shared/aicpu/unified_log_device.cpp` |
 | Hook a new consumer `.so` | declare `target_include_directories(target PRIVATE src/common/log/include)`; for host code also link `simpler_log` (or use undefined symbol resolution at runtime via `RTLD_GLOBAL` load) |
 | Add a new severity / verbosity tier | `python/simpler/_log.py` (Python integer + `addLevelName`) + `host_log.h::LogLevel` (if a new severity) + `_split_threshold` (band mapping) + AICPU `set_log_*` setters |

@@ -10,7 +10,7 @@
  */
 /**
  * @file device_malloc.cpp
- * @brief Device Memory Allocation for Real Hardware (a5)
+ * @brief Device Memory Allocation for Real Hardware
  *
  * Implements HBM allocation using HAL memory API (halMemAlloc/halMemFree).
  * These symbols are resolved at runtime via dlsym from libascend_hal.so,

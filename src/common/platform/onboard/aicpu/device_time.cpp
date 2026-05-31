@@ -8,14 +8,10 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include <cstddef>
+#include "aicpu/device_time.h"
 
-#include "aicpu/platform_regs.h"
-
-void cache_invalidate_range(const void * /* addr */, size_t /* size */) {
-    // No-op on simulation: no hardware cache to invalidate
-}
-
-void cache_flush_range(const void * /* addr */, size_t /* size */) {
-    // No-op on simulation: no hardware cache to flush
+uint64_t get_sys_cnt_aicpu() {
+    uint64_t ticks;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+    return ticks;
 }

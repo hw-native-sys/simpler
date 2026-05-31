@@ -39,7 +39,7 @@
 
 #include "callable.h"
 #include "prepare_callable_common.h"
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "common/kernel_args.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"

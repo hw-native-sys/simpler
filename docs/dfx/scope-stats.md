@@ -40,10 +40,10 @@ python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-scope-stats
 Scope stats uses a clean platform-provides / runtime-calls pattern:
 
 ```text
-platform/include/aicpu/scope_stats_collector.h
+platform/include/aicpu/scope_stats_collector_aicpu.h
     Pure-value API declarations. No runtime types cross this boundary.
 
-platform/src/aicpu/scope_stats_collector.cpp
+platform/shared/aicpu/scope_stats_collector_aicpu.cpp
     Owns all collector state (depth stack, peak arrays, shared buffer).
     Implements scope lifecycle (begin/end), peak comparison logic,
     capacity registration, and shared buffer record writes.

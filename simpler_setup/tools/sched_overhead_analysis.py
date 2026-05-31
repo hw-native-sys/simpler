@@ -272,7 +272,7 @@ def validate_perf_tasks_for_overhead_analysis(tasks):
     if missing:
         detail = "; ".join(missing)
         # These fields are produced by runtime-side JSON export in:
-        # src/platform/src/host/performance_collector.cpp (dispatch_time_us, finish_time_us)
+        # src/platform/shared/host/performance_collector.cpp (dispatch_time_us, finish_time_us)
         msg = "\n".join(
             [
                 "Perf JSON is incompatible with scheduler overhead deep-dive analysis.",

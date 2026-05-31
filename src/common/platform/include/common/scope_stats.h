@@ -19,7 +19,7 @@
  * stream off the device in
  * fixed-capacity buffers, mirroring PMU / dep_gen / tensor_dump / l2_swimlane (the
  * single source of mgmt-loop truth is
- * src/a2a3/platform/include/host/profiling_common/profiler_base.h):
+ * src/common/platform/include/host/profiler_base.h):
  *
  *   ScopeStatsFreeQueue   — SPSC: Host pushes free buffers, AICPU pops them.
  *   ScopeStatsBufferState — Per-instance state: free_queue + current buffer ptr
@@ -61,8 +61,8 @@ extern "C" {
 #define SCOPE_STATS_PHASE_END 1
 
 // One record per scope boundary (begin or end). Layout MUST stay in sync with
-// the device-side writer in platform/src/aicpu/scope_stats_collector_aicpu.cpp
-// and the host reader in platform/src/host/scope_stats_collector.cpp.
+// the device-side writer in platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+// and the host reader in platform/shared/host/scope_stats_collector.cpp.
 //
 // Each boundary writes one record into host-visible (uncached) device memory,
 // so record width is directly on the orchestrator hot path. A scope only ever

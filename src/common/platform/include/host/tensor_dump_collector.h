@@ -51,7 +51,7 @@
 #include "common/tensor_dump.h"
 #include "common/unified_log.h"
 #include "data_type.h"
-#include "host/profiling_common/profiler_base.h"
+#include "host/profiler_base.h"
 #include "host/profiling_copy.h"
 
 // ---------------------------------------------------------------------------

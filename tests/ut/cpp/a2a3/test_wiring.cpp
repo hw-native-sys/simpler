@@ -29,7 +29,7 @@
 #include <thread>
 #include <vector>
 
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "scheduler/pto_scheduler.h"
 
 // =============================================================================

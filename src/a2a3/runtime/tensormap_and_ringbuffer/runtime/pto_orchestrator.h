@@ -29,7 +29,7 @@
 #define PTO_ORCHESTRATOR_H
 
 #include "common/l2_swimlane_profiling.h"
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"

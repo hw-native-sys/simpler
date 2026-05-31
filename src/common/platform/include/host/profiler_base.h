@@ -149,8 +149,8 @@
  *       Used in the idle-timeout log line (e.g. "L2Swimlane", "PMU", "TensorDump").
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_PROFILER_BASE_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_PROFILER_BASE_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_
 
 #include <atomic>
 #include <chrono>
@@ -165,7 +165,7 @@
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
-#include "host/profiling_common/buffer_pool_manager.h"
+#include "host/buffer_pool_manager.h"
 #include "host/profiling_copy.h"
 
 namespace profiling_common {
@@ -866,4 +866,4 @@ private:
 
 }  // namespace profiling_common
 
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_PROFILER_BASE_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_

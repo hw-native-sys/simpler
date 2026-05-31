@@ -92,7 +92,7 @@ add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_tensormap.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/src/aicpu/scope_stats_collector_aicpu.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
 target_include_directories(a2a3_rt_objs PUBLIC
@@ -103,7 +103,7 @@ target_include_directories(a2a3_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
+    ${CMAKE_SOURCE_DIR}/../../../src/common
 )
 
 function(add_a2a3_runtime_test name src)
@@ -166,6 +166,8 @@ function(add_a2a3_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        # src/common is needed so `#include "utils/device_arena.h"` resolves.
+        ${CMAKE_SOURCE_DIR}/../../../src/common
     )
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
@@ -186,6 +188,8 @@ function(add_a5_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        # src/common is needed so `#include "utils/device_arena.h"` resolves.
+        ${CMAKE_SOURCE_DIR}/../../../src/common
     )
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
@@ -218,7 +222,7 @@ target_include_directories(a5_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
+    ${CMAKE_SOURCE_DIR}/../../../src/common
 )
 
 function(add_a5_runtime_test name src)
@@ -252,10 +256,9 @@ function(add_common_utils_test name src)
     add_executable(${name} ${src})
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
-        # utils/elf_build_id.h lives under src/common, exposed as "utils/..."
+        # src/common is needed so utils/elf_build_id.h, utils/device_arena.h,
+        # etc. resolve via the "utils/..." prefix.
         ${CMAKE_SOURCE_DIR}/../../../src/common
-        # device_comm/device_arena.h consumed without prefix.
-        ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
     )
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
@@ -314,7 +317,7 @@ add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 # against the test source so it runs on no-hw runners too.
 add_executable(test_orch_so_file
     common/test_orch_so_file.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/onboard/aicpu/orch_so_file.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/aicpu/orch_so_file.cpp
 )
 target_include_directories(test_orch_so_file PRIVATE
     ${GTEST_INCLUDE_DIRS}

@@ -16,7 +16,7 @@ add_library(cpu_sim_context SHARED
 target_include_directories(cpu_sim_context
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
     # libsimpler_log public header (LOG_* macros used here for diagnostics).
-    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../log/include"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../log/include"
 )
 
 target_compile_options(cpu_sim_context PRIVATE

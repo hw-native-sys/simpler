@@ -23,11 +23,11 @@ project(host_runtime_sim LANGUAGES C CXX)
 set(CMAKE_CUSTOM_INCLUDE_DIRS "")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/include")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/worker")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/device_comm")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/sim/host")
 
 if(DEFINED CUSTOM_INCLUDE_DIRS)
@@ -44,12 +44,12 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/src/host/platform_compile_info.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/l2_swimlane_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/pmu_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/src/host/scope_stats_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/src/host/tensor_dump_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../aicpu/platform_aicpu_affinity.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/l2_swimlane_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/tensor_dump_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/sim/aicpu/platform_aicpu_affinity.cpp"
     # Shared POSIX-shm sim comm backend (same source as a2a3 sim).
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/comm_sim.cpp"
 )
@@ -92,7 +92,7 @@ target_compile_options(host_runtime
 )
 
 # Platform name baked into the shared get_platform() impl in
-# src/common/platform/src/host/platform_compile_info.cpp.
+# src/common/platform/shared/host/platform_compile_info.cpp.
 target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a5sim")
 
 # Include directories
@@ -103,7 +103,7 @@ target_include_directories(host_runtime
         # Shared platform_comm headers so the common comm_sim.cpp resolves
         # its #include "platform_comm/comm.h" / "platform_comm/comm_context.h".
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/sim_context
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/sim/sim_context
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
 )
 

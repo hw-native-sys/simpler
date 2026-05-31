@@ -12,7 +12,7 @@
 Re-uses ``vector_example`` (5 submit_task calls). With ``--enable-pmu N``
 the AICore counters land in ``<output_prefix>/pmu.csv``, one data row per
 task. The schema is fixed (see docs/dfx/pmu-profiling.md and
-src/a2a3/platform/src/host/pmu_collector.cpp's "Build CSV header"
+src/a2a3/platform/shared/host/pmu_collector.cpp's "Build CSV header"
 block). Smoke asserts: file exists, header starts with the documented
 prefix, at least one data row present.
 """

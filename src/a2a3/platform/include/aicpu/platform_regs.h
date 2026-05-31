@@ -20,7 +20,7 @@
  * and runtime code calls get_platform_regs() and read_reg/write_reg()
  * for register communication with AICore.
  *
- * Implementation: src/platform/src/aicpu/platform_regs.cpp (shared across all platforms)
+ * Implementation: src/platform/shared/aicpu/platform_regs.cpp (shared across all platforms)
  */
 
 #ifndef PLATFORM_AICPU_PLATFORM_REGS_H_

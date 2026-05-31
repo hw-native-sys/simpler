@@ -68,7 +68,7 @@
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
 #include "common/unified_log.h"
-#include "host/profiling_common/profiler_base.h"
+#include "host/profiler_base.h"
 
 // ---------------------------------------------------------------------------
 // PMU profiling Module (drives BufferPoolManager<PmuModule>)

@@ -34,7 +34,7 @@
 
 #pragma once
 
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
 #include "pto_shared_memory.h"

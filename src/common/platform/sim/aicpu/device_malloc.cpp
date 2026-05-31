@@ -10,7 +10,7 @@
  */
 /**
  * @file device_malloc.cpp
- * @brief Device Memory Allocation for Simulation (a5sim)
+ * @brief Device Memory Allocation for Simulation
  *
  * In simulation, all address spaces are shared between AICPU and AICore,
  * so standard malloc/free is sufficient for device memory allocation.

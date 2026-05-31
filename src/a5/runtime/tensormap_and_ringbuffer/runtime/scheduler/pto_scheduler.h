@@ -32,7 +32,7 @@
 #include <atomic>
 
 #include "common/core_type.h"
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "pto_async_wait.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"

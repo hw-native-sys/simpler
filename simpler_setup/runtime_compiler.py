@@ -453,7 +453,7 @@ class RuntimeCompiler:
         if not self.platform.endswith("sim"):
             raise ValueError(f"compile_sim_context is only for sim platforms, got {self.platform}")
 
-        cmake_source_dir = str(self.project_root / "src" / "common" / "sim_context")
+        cmake_source_dir = str(self.project_root / "src" / "common" / "platform" / "sim" / "sim_context")
         binary_name = "libcpu_sim_context.so"
         cmake_args = self.host_target.toolchain.get_cmake_args() + self._sanitizer_cmake_args()
 

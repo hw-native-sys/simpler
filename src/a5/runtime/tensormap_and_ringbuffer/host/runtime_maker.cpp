@@ -39,7 +39,7 @@
 #include "../runtime/pto_runtime2.h"
 #include "../runtime/pto_shared_memory.h"
 #include "../runtime/runtime.h"
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"

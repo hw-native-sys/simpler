@@ -1,13 +1,12 @@
 # Profiling Framework
 
 Shared host-side infrastructure that the PMU, L2Swimlane, and TensorDump
-collectors are built on. Each architecture maintains its own copy of the
-framework headers under `src/<arch>/platform/include/host/profiling_common/`
-([a2a3](../src/a2a3/platform/include/host/profiling_common/),
-[a5](../src/a5/platform/include/host/profiling_common/)) — the two copies
-are kept byte-for-byte structurally aligned so reviewers can diff them, but
-each arch is free to evolve independently. This page describes the shape;
-§8 covers the a5-specific deviations driven by transport differences.
+collectors are built on. The framework headers live in
+[`src/common/platform/include/host/`](../src/common/platform/include/host/)
+and are consumed verbatim by both a2a3 and a5 collectors (PR #944
+unified the previously-divergent per-arch copies into one set). This page
+describes the shape; §8 covers the a5-specific transport deviations that
+the collectors themselves still carry.
 
 The per-collector pages
 ([pmu-profiling.md](dfx/pmu-profiling.md),
@@ -65,7 +64,7 @@ a small per-subsystem trait.
 ```
 
 `ProfilerBase` is the owner: it holds `BufferPoolManager manager_` as a
-member ([profiler_base.h:414](../src/a2a3/platform/include/host/profiling_common/profiler_base.h#L414)),
+member ([profiler_base.h:414](../src/common/platform/include/host/profiler_base.h#L414)),
 spawns and joins both threads, and dispatches collected buffers to
 `Derived::on_buffer_collected` via CRTP. `BufferPoolManager` owns no
 threads — it is just the shared data structure both threads access.
@@ -76,7 +75,7 @@ subsystem's shared-memory layout is shaped.
 
 ### 3.1 `BufferPoolManager<Module>` — data layer
 
-Defined in [`buffer_pool_manager.h`](../src/a2a3/platform/include/host/profiling_common/buffer_pool_manager.h).
+Defined in [`buffer_pool_manager.h`](../src/common/platform/include/host/buffer_pool_manager.h).
 Owns:
 
 - `ready_queue_` — mgmt → collector hand-off, guarded by mutex+cv.
@@ -97,7 +96,7 @@ Owns no threads. Every entry point is documented as one of:
 
 ### 3.2 `ProfilerBase<Derived, Module>` — control layer
 
-Defined in [`profiler_base.h`](../src/a2a3/platform/include/host/profiling_common/profiler_base.h).
+Defined in [`profiler_base.h`](../src/common/platform/include/host/profiler_base.h).
 Provides:
 
 - The two threads and their lifecycle (`start` / `stop`).
@@ -112,7 +111,7 @@ Provides:
   stash the alloc/reg/free callbacks before threads start; if init aborts
   before stashing, `start(tf)` becomes a no-op.
 
-`ProfilerAlgorithms<Module>` (in the same header, [profiler_base.h:170](../src/a2a3/platform/include/host/profiling_common/profiler_base.h#L170))
+`ProfilerAlgorithms<Module>` (in the same header, [profiler_base.h:170](../src/common/platform/include/host/profiler_base.h#L170))
 is where the unified algorithms live:
 
 - `try_pop_aicpu_entry` — barrier-correct head/tail advance over the
@@ -132,7 +131,7 @@ is where the unified algorithms live:
 A stateless `struct` per subsystem (`PmuModule`, `L2SwimlaneModule`,
 `DumpModule`) that tells the generic algorithms what the shared-memory
 layout looks like. The contract lives in the docblock at the top of
-[`profiler_base.h`](../src/a2a3/platform/include/host/profiling_common/profiler_base.h);
+[`profiler_base.h`](../src/common/platform/include/host/profiler_base.h);
 the required members are:
 
 | Member | Purpose |
@@ -305,7 +304,7 @@ Existing collectors are the canonical examples:
 ## 8. a5 specifics — host-shadow transport
 
 a5's framework headers (under
-[`src/a5/platform/include/host/profiling_common/`](../src/a5/platform/include/host/profiling_common/))
+[`src/common/platform/include/host/`](../src/common/platform/include/host/))
 mirror a2a3's class shapes — same `ProfilerBase<Derived, Module>` /
 `BufferPoolManager<Module>` / `ProfilerAlgorithms<Module>` decomposition,
 same Module concept contract, same start/stop lifecycle. The only

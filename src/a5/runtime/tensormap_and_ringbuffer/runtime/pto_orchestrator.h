@@ -27,7 +27,7 @@
 
 #pragma once
 
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "common/l2_swimlane_profiling.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
