@@ -92,7 +92,7 @@ add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_tensormap.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/src/aicpu/scope_stats_collector_aicpu.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/src/aicpu/scope_stats_collector_aicpu.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
 target_include_directories(a2a3_rt_objs PUBLIC
@@ -100,6 +100,7 @@ target_include_directories(a2a3_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
@@ -162,6 +163,7 @@ function(add_a2a3_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
         ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
         ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     )
@@ -181,6 +183,7 @@ function(add_a5_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime
         ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/common
         ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     )
@@ -212,6 +215,7 @@ target_include_directories(a5_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/common
     ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
@@ -315,6 +319,7 @@ add_executable(test_orch_so_file
 target_include_directories(test_orch_so_file PRIVATE
     ${GTEST_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
 )
 target_link_libraries(test_orch_so_file PRIVATE
     ${GTEST_MAIN_LIB}
@@ -424,6 +429,7 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     target_include_directories(test_comm_lifecycle PRIVATE
         ${GTEST_INCLUDE_DIRS}
         ${PROJECT_ROOT}/src/a2a3/platform/include
+        ${PROJECT_ROOT}/src/common/platform/include
         # Shared platform_comm headers (comm.h / comm_context.h) live under
         # src/common so both a2a3 HCCL and a5/a2a3 sim can use them.
         ${PROJECT_ROOT}/src/common

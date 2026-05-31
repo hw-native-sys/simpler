@@ -111,7 +111,12 @@ class KernelCompiler:
             List of include directory paths (e.g., for device_runner.h, core_type.h)
         """
         return [
-            str(self.platform_dir / "include"),  # For common headers like core_type.h
+            str(self.platform_dir / "include"),  # For arch-specific headers
+            # Shared platform headers (core_type.h, scope_stats.h, etc.) extracted
+            # from per-arch copies into src/common/platform/include. Both arches
+            # must see this on their include path so orchestration cpp can
+            # resolve e.g. "common/core_type.h" the same way it did before.
+            str(self.project_root / "src" / "common" / "platform" / "include"),
         ]
 
     def get_orchestration_include_dirs(self, runtime_name: str) -> list[str]:
