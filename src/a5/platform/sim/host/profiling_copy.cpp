@@ -22,3 +22,12 @@ int profiling_copy_from_device(volatile void *host_dst, const volatile void *dev
     std::memcpy(const_cast<void *>(host_dst), const_cast<const void *>(dev_src), size);
     return 0;
 }
+
+// Non-SVM: install the real copy shim so the framework's mirror loop
+// pulls device-side fields into the host shadow per tick.
+std::function<int(void *, const void *, size_t)> profiling_copy_to_device_or_null() {
+    return &profiling_copy_to_device_for_ops;
+}
+std::function<int(void *, const void *, size_t)> profiling_copy_from_device_or_null() {
+    return &profiling_copy_from_device_for_ops;
+}

@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 
 // Platform-specific copy hooks for profiling collectors.
 //
@@ -37,3 +38,22 @@ inline int profiling_copy_to_device_for_ops(void *dev_dst, const void *host_src,
 inline int profiling_copy_from_device_for_ops(void *host_dst, const void *dev_src, size_t size) {
     return profiling_copy_from_device(host_dst, dev_src, size);
 }
+
+// Per-arch callback selector for leaf collectors that live in `common/`
+// (e.g. scope_stats, tensor_dump). Returns the copy function on non-SVM
+// platforms (a5: real rtMemcpy/memcpy) and an empty `std::function` on SVM
+// platforms (a2a3: host and device share addresses, the framework's
+// null-check then short-circuits all mirror/range/buffer ops to no-ops).
+//
+// Why this exists: the common leaf collector is compiled once per platform
+// target but cannot inspect the arch at runtime. Each arch's
+// `profiling_copy.cpp` defines these to either return the real shim or an
+// empty `std::function`, so the leaf collector can call them blindly and
+// `MemoryOps::copy_to_device`/`copy_from_device` ends up correctly null on
+// SVM. Without this, passing `&profiling_copy_to_device_for_ops`
+// unconditionally on a2a3 sim makes `ProfilerBase::start()` pick the
+// host-shadow malloc path even though the per-arch copy stubs are no-ops;
+// the shadow ends up detached from the device buffer and AICPU writes
+// never surface to the host (segfault on read).
+std::function<int(void *, const void *, size_t)> profiling_copy_to_device_or_null();
+std::function<int(void *, const void *, size_t)> profiling_copy_from_device_or_null();

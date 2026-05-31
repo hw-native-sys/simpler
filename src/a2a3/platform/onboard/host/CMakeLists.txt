@@ -59,11 +59,11 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/src/host/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/l2_swimlane_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/tensor_dump_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/src/host/tensor_dump_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/dep_gen_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/scope_stats_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/src/host/scope_stats_collector.cpp"
 )
 # Add common/host sources (LoadAicpuOp)
 list(APPEND HOST_RUNTIME_SOURCES

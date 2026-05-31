@@ -63,7 +63,7 @@ int TensorDumpCollector::initialize(
     // shm allocation succeeds — that nullptr guard makes a post-failure
     // start(tf) a no-op without further bookkeeping.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
         /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
@@ -142,7 +142,7 @@ int TensorDumpCollector::initialize(
     // is the moment the collector becomes startable.
     dump_shared_mem_dev_ = shm_dev_local;
     set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
         shm_dev_local, shm_host_local, shm_size, device_id
     );
 

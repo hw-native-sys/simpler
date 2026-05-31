@@ -19,9 +19,13 @@
  * each full buffer's ScopeStatsRecords to an in-memory vector. After stop(),
  * write_jsonl() renders them to <output_dir>/scope_stats.jsonl.
  *
- * a5 specifics: device↔host transfers go through profiling_copy.h. The
- * framework's mgmt loop mirrors the shm region per tick; per-buffer payloads
- * (ScopeStatsBuffer) are pulled on demand inside ProfilerAlgorithms.
+ * Memory mirroring is handled by the framework via the MemoryOps installed
+ * at set_memory_context time:
+ *   - SVM platforms (a2a3): no copy_* callbacks installed; mirror_/copy_*
+ *     short-circuit to no-ops, host writes go directly to device memory.
+ *   - Non-SVM platforms (a5): profiling_copy_* installed; the framework's
+ *     mgmt loop mirrors the shm region per tick; per-buffer payloads
+ *     (ScopeStatsBuffer) are pulled on demand inside ProfilerAlgorithms.
  *
  * Lifecycle:
  *   init()               — Allocate header + 1 BufferState + N ScopeStatsBuffers
@@ -40,8 +44,8 @@
  *            "task_window":"u/c","heap":"u/c","tensormap":"u/c"}
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
-#define SRC_A5_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -175,4 +179,4 @@ private:
     void append_buffer_records(const void *buf_host_ptr);
 };
 
-#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_

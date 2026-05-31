@@ -14,26 +14,36 @@
  * @brief Host-side tensor dump collector with independent shared memory.
  *
  * Architecture:
- * - BufferPoolManager<DumpModule>: shared mgmt-thread infrastructure that polls
- *   per-thread DumpReadyQueues, replenishes free_queues, and hands full
- *   DumpMetaBuffers off to the collector thread.
- * - TensorDumpCollector: copies tensor metadata + arena bytes into host vectors
- *   and writes the result to disk (.bin + JSON).
+ * - BufferPoolManager<DumpModule>: shared mgmt-thread infrastructure that
+ *   polls per-thread DumpReadyQueues, replenishes free_queues, and hands
+ *   full DumpMetaBuffers off to the collector thread.
+ * - TensorDumpCollector: copies tensor metadata + arena bytes into host
+ *   vectors and writes the result to disk (.bin + JSON).
+ *
+ * a5 specifics: device↔host transfers use rtMemcpy / memcpy via
+ * profiling_copy.h. The framework's mgmt loop mirrors the shm region per
+ * tick; per-buffer payloads (metadata buffers) are pulled on demand inside
+ * ProfilerAlgorithms. The collector additionally pulls arena bytes inside
+ * on_buffer_collected, since arenas live outside the shm region and only
+ * the part needed for the buffer's records is worth copying.
  */
 
-#ifndef SRC_A2A3_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
-#define SRC_A2A3_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "common/memory_barrier.h"
@@ -42,6 +52,7 @@
 #include "common/unified_log.h"
 #include "data_type.h"
 #include "host/profiling_common/profiler_base.h"
+#include "host/profiling_copy.h"
 
 // ---------------------------------------------------------------------------
 // Tensor Dump profiling Module (drives BufferPoolManager<DumpModule>)
@@ -50,8 +61,8 @@
 /**
  * One buffer kind (DumpMetaBuffer); one ready_queue per AICPU thread.
  * Per-thread arena buffers are owned by the collector itself, not the
- * framework. process_entry refills the originating thread's free_queue with
- * exactly one buffer; proactive_replenish tops up to SLOT_COUNT and
+ * framework. process_entry refills the originating thread's free_queue
+ * with exactly one buffer; proactive_replenish tops up to SLOT_COUNT and
  * batch-allocates when the recycled pool drains.
  */
 
@@ -119,7 +130,9 @@ struct DumpModule {
 // Memory callbacks — thin aliases for the canonical profiling_common shapes.
 // alloc / free are std::function so callers bind their MemoryAllocator via
 // lambda capture; register / unregister stay as plain function pointers
-// because they wrap stateless HAL globals (halHost*).
+// because they wrap stateless HAL globals. On a5 onboard the runner passes
+// register_cb=nullptr and the framework installs a malloc-shadow + DMA
+// fallback inline in ProfilerBase::start().
 using DumpAllocCallback = profiling_common::ProfAllocCallback;
 using DumpRegisterCallback = profiling_common::ProfRegisterCallback;
 using DumpUnregisterCallback = profiling_common::ProfUnregisterCallback;
@@ -147,8 +160,8 @@ struct DumpedTensor {
     bool is_contiguous;
     bool truncated;
     bool overwritten;
-    uint64_t payload_size;  // original payload size (bytes may be cleared after writing)
-    uint64_t bin_offset;    // byte offset into tensors.bin
+    uint64_t payload_size;
+    uint64_t bin_offset;
     std::vector<uint8_t> bytes;
 };
 
@@ -173,16 +186,16 @@ public:
      * buffers are pushed into each thread's free_queue; the rest go into
      * the BufferPoolManager's recycled pool.
      *
-     * `output_prefix` is the per-task directory under which tensor_dump/
+     * `output_prefix` is the per-task directory under which `tensor_dump/`
      * lands. Required (non-empty); CallConfig::validate() enforces this
      * upstream. Stored on the collector so the lazily-started writer thread
-     * (kicked off inside on_buffer_collected) can derive its run_dir without
-     * threading the prefix through the buffer-pool callback path.
+     * (kicked off inside on_buffer_collected) can derive its run_dir
+     * without threading the prefix through the buffer-pool callback path.
      *
      * @param num_dump_threads  Number of AICPU scheduling threads
      * @param device_id         Device ID
      * @param alloc_cb          Memory allocation callback
-     * @param register_cb       Host-visibility callback (nullptr for sim)
+     * @param register_cb       Host-visibility callback (nullptr on a5)
      * @param free_cb           Memory free callback
      * @param user_data         Opaque pointer forwarded to callbacks
      * @param output_prefix     Per-task directory; tensor_dump/ subdir lands here
@@ -194,10 +207,11 @@ public:
     );
 
     /**
-     * Per-buffer callback invoked by ProfilerBase's poll loop. Copies tensor
-     * metadata + arena bytes into host-side DumpedTensor records and queues
-     * payloads to the writer thread. The writer thread is started lazily on
-     * the first invocation per run.
+     * Per-buffer callback invoked by ProfilerBase's poll loop. Pulls the
+     * relevant portion of the originating thread's arena from device, copies
+     * tensor metadata + arena bytes into host-side DumpedTensor records, and
+     * queues payloads to the writer thread. The writer thread is started
+     * lazily on the first invocation per run.
      */
     void on_buffer_collected(const DumpReadyBufferInfo &info);
 
@@ -240,7 +254,6 @@ public:
 
 private:
     void *dump_shared_mem_dev_{nullptr};
-    bool was_registered_{false};
     int num_dump_threads_{0};
 
     // Per-task output directory captured at initialize() time. The writer
@@ -248,16 +261,16 @@ private:
     // first on_buffer_collected.
     std::string output_prefix_;
 
-    // Per-thread arena pointers
+    // Per-thread arena pointers (device + host shadow)
     struct ArenaInfo {
         void *dev_ptr{nullptr};
         void *host_ptr{nullptr};
         uint64_t size{0};
-        uint64_t high_water{0};  // For overwrite detection
+        uint64_t high_water{0};
     };
     std::vector<ArenaInfo> arenas_;
 
-    // Collected dump tensors
+    // Collected dump tensors (metadata only; payloads live in tensors.bin)
     std::vector<DumpedTensor> collected_;
     std::mutex collected_mutex_;
 
@@ -273,7 +286,6 @@ private:
     uint64_t buffers_collected_{0};
     bool writer_started_{false};
 
-    void *alloc_single_buffer(size_t size, void **host_ptr_out);
     void process_dump_buffer(const DumpReadyBufferInfo &info);
     void start_writer_thread_once();
 
@@ -287,7 +299,7 @@ private:
     // Output directory and single binary file
     std::filesystem::path run_dir_;
     std::ofstream bin_file_;
-    uint64_t next_bin_offset_{0};  // only accessed by collect thread
+    uint64_t next_bin_offset_{0};
 
     // Writer stats
     std::atomic<uint64_t> bytes_written_{0};
@@ -295,4 +307,4 @@ private:
     void writer_loop();
 };
 
-#endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_

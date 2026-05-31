@@ -16,6 +16,16 @@
  *        by ScopeStatsModule (host/scope_stats_collector.h); this file owns the
  *        per-buffer on_buffer_collected callback (in-memory append), the
  *        device-side cross-check, and the NDJSON export.
+ *
+ * Memory mirroring is handled by the framework via the MemoryOps installed
+ * at set_memory_context time:
+ *   - SVM platforms (a2a3): copy_* not installed; profiling_copy_*_for_ops
+ *     calls below reach the per-arch stubs that return 0; the host pointer
+ *     IS the device pointer.
+ *   - Non-SVM platforms (a5): copy_* installed; ProfilerAlgorithms pulls each
+ *     ScopeStatsBuffer's contents from device on demand inside process_entry,
+ *     so on_buffer_collected can read `count` and `records[]` directly off
+ *     the host shadow.
  */
 
 #include "host/scope_stats_collector.h"
@@ -23,6 +33,7 @@
 #include <cassert>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
@@ -30,6 +41,7 @@
 
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
+#include "host/profiling_copy.h"
 
 ScopeStatsCollector::~ScopeStatsCollector() { stop(); }
 
@@ -45,77 +57,71 @@ int ScopeStatsCollector::init(
         LOG_ERROR("ScopeStatsCollector::init: invalid arguments");
         return -1;
     }
+    if (initialized_) {
+        LOG_ERROR("ScopeStatsCollector already initialized");
+        return -1;
+    }
 
     num_threads_ = num_threads;
-    buffers_registered_ = (register_cb != nullptr);
     total_collected_ = 0;
     records_.clear();
     execution_complete_.store(false, std::memory_order_release);
 
+    // Stash callbacks on the base up-front so alloc_paired_buffer sees
+    // consistent values during init. shm_host_ stays nullptr until the shm
+    // allocation succeeds — start(tf) gates on shm_host_.
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
+        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+    );
+
     const int num_instances = 1;
-    shm_size_ = calc_scope_stats_shm_size(num_instances);
-    shm_dev_ = alloc_cb(shm_size_);
-    if (shm_dev_ == nullptr) {
-        LOG_ERROR("ScopeStatsCollector: failed to allocate scope_stats shared memory (%zu bytes)", shm_size_);
+    size_t shm_size = calc_scope_stats_shm_size(num_instances);
+    void *shm_host_local = nullptr;
+    void *shm_dev_local = alloc_paired_buffer(shm_size, &shm_host_local);
+    if (shm_dev_local == nullptr) {
+        LOG_ERROR("ScopeStatsCollector: failed to allocate scope_stats shared memory (%zu bytes)", shm_size);
         return -1;
     }
 
-    if (register_cb != nullptr) {
-        int rc = register_cb(shm_dev_, shm_size_, device_id, &shm_host_);
-        if (rc != 0) {
-            LOG_ERROR("ScopeStatsCollector: halHostRegister for scope_stats SHM failed: %d", rc);
-            free_cb(shm_dev_);
-            shm_dev_ = nullptr;
-            return rc;
-        }
-        shm_registered_ = true;
-    } else {
-        shm_host_ = shm_dev_;
-    }
-    std::memset(shm_host_, 0, shm_size_);
-
-    ScopeStatsDataHeader *hdr = get_scope_stats_header(shm_host_);
+    std::memset(shm_host_local, 0, shm_size);
+    ScopeStatsDataHeader *hdr = get_scope_stats_header(shm_host_local);
     hdr->num_instances = static_cast<uint32_t>(num_instances);
 
     const size_t buf_size = sizeof(ScopeStatsBuffer);
-    ScopeStatsBufferState *state = scope_stats_state(0);
+    ScopeStatsBufferState *state = get_scope_stats_buffer_state(shm_host_local, 0);
 
     for (int b = 0; b < PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE; b++) {
-        void *dev_ptr = alloc_cb(buf_size);
+        void *host_ptr = nullptr;
+        void *dev_ptr = alloc_paired_buffer(buf_size, &host_ptr);
         if (dev_ptr == nullptr) {
             LOG_ERROR("ScopeStatsCollector: failed to allocate ScopeStatsBuffer b=%d", b);
             return -1;
         }
 
-        void *host_ptr = dev_ptr;
-        if (register_cb != nullptr) {
-            int rc = register_cb(dev_ptr, buf_size, device_id, &host_ptr);
-            if (rc != 0) {
-                LOG_ERROR("ScopeStatsCollector: halHostRegister for ScopeStatsBuffer b=%d failed: %d", b, rc);
-                free_cb(dev_ptr);
-                return rc;
-            }
-        }
-        std::memset(host_ptr, 0, buf_size);
-
-        manager_.register_mapping(dev_ptr, host_ptr);
-
         if (b < PLATFORM_SCOPE_STATS_SLOT_COUNT) {
             uint32_t tail = state->free_queue.tail;
             assert(tail - state->free_queue.head < PLATFORM_SCOPE_STATS_SLOT_COUNT && "free_queue overflow on init");
             state->free_queue.buffer_ptrs[tail % PLATFORM_SCOPE_STATS_SLOT_COUNT] = reinterpret_cast<uint64_t>(dev_ptr);
-            wmb();
             state->free_queue.tail = tail + 1;
-            wmb();
         } else {
             manager_.push_recycled(0, dev_ptr);
         }
     }
 
+    // Push the entire initialized shm region (header + BufferState +
+    // free_queue contents) to device.
+    profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size);
+
     initialized_ = true;
+    shm_dev_ = shm_dev_local;
+
+    // Re-set_memory_context now that the shm region is ready. start(tf) gates
+    // on shm_host_ being non-null, so this is the moment the collector becomes
+    // startable.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, shm_dev_, shm_host_, shm_size_,
-        device_id
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
+        shm_dev_local, shm_host_local, shm_size, device_id
     );
 
     LOG_INFO_V0(
@@ -153,6 +159,11 @@ void ScopeStatsCollector::on_buffer_collected(const ScopeStatsReadyBufferInfo &i
 bool ScopeStatsCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return false;
 
+    // Pull the latest BufferState (current_buf_ptr, total/dropped counters)
+    // before the cross-check so it sees post-stop() device state.
+    if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
+        profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+    }
     rmb();
     bool clean = true;
 
@@ -161,6 +172,7 @@ bool ScopeStatsCollector::reconcile_counters() {
     if (buf_dev != 0) {
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_dev));
         if (host_ptr != nullptr) {
+            profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_dev), sizeof(ScopeStatsBuffer));
             uint32_t count = reinterpret_cast<const ScopeStatsBuffer *>(host_ptr)->count;
             if (count != 0) {
                 LOG_ERROR(
@@ -291,19 +303,17 @@ void ScopeStatsCollector::finalize(ScopeStatsUnregisterCallback unregister_cb, c
         records_.shrink_to_fit();
     }
 
-    auto release_buf = [&](void *p) {
-        release_one_buffer(p, buffers_registered_ ? unregister_cb : nullptr, free_cb);
+    auto release_dev = [&](void *p) {
+        release_one_buffer(p, unregister_cb, free_cb);
     };
-    manager_.release_owned_buffers(release_buf);
 
+    // Free buffers still parked in the free_queue / current_buf_ptr. Release
+    // the device pointer only — the paired host shadow stays in dev_to_host_
+    // and is freed by clear_mappings() below (single source of truth for
+    // shadow lifetime, no double-free).
     if (shm_host_ != nullptr) {
-        std::unordered_set<void *> already_freed;
-        auto release_unique = [&](void *p) {
-            if (p == nullptr || !already_freed.insert(p).second) return;
-            release_buf(p);
-        };
         ScopeStatsBufferState *state = scope_stats_state(0);
-        release_unique(reinterpret_cast<void *>(state->current_buf_ptr));
+        release_dev(reinterpret_cast<void *>(state->current_buf_ptr));
         state->current_buf_ptr = 0;
         rmb();
         uint32_t head = state->free_queue.head;
@@ -312,23 +322,30 @@ void ScopeStatsCollector::finalize(ScopeStatsUnregisterCallback unregister_cb, c
         if (queued > PLATFORM_SCOPE_STATS_SLOT_COUNT) queued = PLATFORM_SCOPE_STATS_SLOT_COUNT;
         for (uint32_t i = 0; i < queued; i++) {
             uint32_t slot = (head + i) % PLATFORM_SCOPE_STATS_SLOT_COUNT;
-            release_unique(reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]));
+            release_dev(reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]));
             state->free_queue.buffer_ptrs[slot] = 0;
         }
         state->free_queue.head = tail;
     }
-    manager_.clear_mappings();
 
+    // Release framework-owned buffers (recycled pool, ready_queue,
+    // done_queue). release_owned_buffers also frees their host shadows.
+    manager_.release_owned_buffers([&](void *p) {
+        release_dev(p);
+    });
+
+    // Free shared header region (device only — shadow stays in dev_to_host_
+    // until clear_mappings).
     if (shm_dev_ != nullptr) {
-        release_one_buffer(shm_dev_, shm_registered_ ? unregister_cb : nullptr, free_cb);
+        release_dev(shm_dev_);
         shm_dev_ = nullptr;
-        shm_host_ = nullptr;
     }
 
+    // Free remaining host shadows (per-state buffers + shm region).
+    manager_.clear_mappings();
+
     initialized_ = false;
-    buffers_registered_ = false;
-    shm_registered_ = false;
-    shm_size_ = 0;
+    num_threads_ = 0;
     total_collected_ = 0;
     clear_memory_context();
     LOG_INFO_V0("ScopeStats collector finalized");

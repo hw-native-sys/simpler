@@ -26,3 +26,10 @@ int profiling_copy_from_device(
 ) {
     return 0;
 }
+
+// SVM: return empty std::function so common leaf collectors install null
+// copy callbacks; framework's null-check short-circuits all mirror ops
+// and `alloc_paired_buffer` takes the identity-map (host_ptr == dev_ptr)
+// branch.
+std::function<int(void *, const void *, size_t)> profiling_copy_to_device_or_null() { return {}; }
+std::function<int(void *, const void *, size_t)> profiling_copy_from_device_or_null() { return {}; }
