@@ -104,7 +104,21 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     // executor runs. AICore reads via get_aicore_profiling_flag() /
     // get_l2_swimlane_aicore_rotation() — never touches Handshake for profiling.
     set_aicore_profiling_flag(k_args->enable_profiling_flag);
-    if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE)) {
+    // Always publish the rotation slot (nullptr when this launch is disabled
+    // or has no rotation table). [[block_local]] storage persists across
+    // launches on the same loaded kernel binary, so without an explicit
+    // nullptr publication a sequence like enabled(valid)→enabled(NULL table)
+    // or enabled→disabled would leave `get_l2_swimlane_aicore_rotation()`
+    // returning the prior launch's freed pointer. AICore call sites are
+    // additionally flag-gated on this-launch `l2_swimlane_enabled`, so the
+    // disabled-launch read path is currently unreachable through the
+    // executors; the unconditional reset is defensive against future call
+    // sites that don't carry that gate. Mirrors the publish-nullptr branch
+    // in sim/aicore/kernel.cpp (sim keys only on the table pointer; onboard
+    // additionally AND-gates on PROFILING_FLAG_L2_SWIMLANE — intentional,
+    // since the onboard table is shared across collectors).
+    if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE) &&
+        k_args->l2_swimlane_aicore_rotation_table != 0) {
         // Stash only the slot pointer. The slot CONTENTS are written by
         // AICPU's `l2_swimlane_aicpu_init` which runs concurrently with this
         // entry; dereferencing here would race with AICPU's write. The
@@ -113,7 +127,9 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
         // done and the slot is populated.
         __gm__ uint64_t *rotation_table =
             reinterpret_cast<__gm__ uint64_t *>(k_args->l2_swimlane_aicore_rotation_table);
-        set_l2_swimlane_aicore_rotation_slot(rotation_table != nullptr ? &rotation_table[block_idx] : nullptr);
+        set_l2_swimlane_aicore_rotation_slot(&rotation_table[block_idx]);
+    } else {
+        set_l2_swimlane_aicore_rotation_slot(nullptr);
     }
 
     aicore_execute(k_args->runtime_args, block_idx, core_type);

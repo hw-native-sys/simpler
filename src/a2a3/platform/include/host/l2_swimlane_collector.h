@@ -111,6 +111,14 @@ struct L2SwimlaneModule {
         const int num_cores = static_cast<int>(header->num_cores);
         const L2SwimlaneBufferKind kind = entry.kind;
 
+        // Validate kind first — without this, an out-of-range value silently
+        // falls into the AicoreTask branch below and reads a wrong-typed pool.
+        if (kind != L2SwimlaneBufferKind::AicpuTask && kind != L2SwimlaneBufferKind::AicpuPhase &&
+            kind != L2SwimlaneBufferKind::AicoreTask) {
+            LOG_ERROR("L2SwimlaneModule: invalid entry kind=%u", static_cast<uint32_t>(kind));
+            return std::nullopt;
+        }
+
         if (kind == L2SwimlaneBufferKind::AicpuPhase) {
             if (entry.core_index >= static_cast<uint32_t>(PLATFORM_MAX_AICPU_THREADS)) {
                 LOG_ERROR("L2SwimlaneModule: invalid phase entry: thread=%u", entry.core_index);
