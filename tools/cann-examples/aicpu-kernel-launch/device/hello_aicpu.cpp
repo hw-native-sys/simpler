@@ -17,7 +17,8 @@
 //                         as fatal. Returning 0 is enough.
 //   simpler_aicpu_run   — reads DeviceArgs.input_token (so the host can
 //                         prove the kernel saw its input), calls one
-//                         halGetDeviceInfo to show device-side CANN works,
+//                         halGetDeviceInfo(AICPU, OS_SCHED) to show
+//                         device-side CANN works (returns 0x1 on a3/a5),
 //                         and writes a HelloResult to GM at
 //                         DeviceArgs.result_addr.
 //
@@ -120,16 +121,20 @@ __attribute__((visibility("default"))) int simpler_aicpu_run(void *args) {
     out->echoed_token = d->input_token;
     out->_pad = 0;
 
-    // Single device-side HAL call: ask "how many AICPU cores does this die
-    // expose?" — the answer (6 on a3, 6 on a5) is independently verifiable
-    // from the host-side `tools/cann-examples/query` tool. Local device id
-    // 0 means "myself" device-side; using the host's logical did returns
-    // rc=1 (see aicpu-device-query's writeup for why).
+    // Single device-side HAL call: AICPU + OS_SCHED returns a bitmask of
+    // which AICPU cpu_ids the AICPU OS scheduler owns. Per the
+    // aicpu-device-query findings (src/{a2a3,a5}/docs/hardware.md), this
+    // is 0x1 on both a3 and a5 — bit 0 set = cpu_id 0 owned by the AICPU
+    // OS. We pick this query rather than AICPU + CORE_NUM because the
+    // latter is "used in device" / restricted and returns rc=3 from
+    // inside an AICPU OS process. Local device id 0 means "myself"
+    // device-side; using the host's logical did returns rc=1 (see
+    // aicpu-device-query's writeup for why).
     constexpr uint32_t self_did = 0;
     constexpr int kModuleAicpu = 1;
-    constexpr int kInfoCoreNum = 1;
+    constexpr int kInfoOsSched = 5;
     int64_t hal_value = 0;
-    drvError_t hal_rc = halGetDeviceInfo(self_did, kModuleAicpu, kInfoCoreNum, &hal_value);
+    drvError_t hal_rc = halGetDeviceInfo(self_did, kModuleAicpu, kInfoOsSched, &hal_value);
     out->hal_rc = static_cast<int32_t>(hal_rc);
     out->hal_value = (hal_rc == kHalSuccess) ? hal_value : 0;
 

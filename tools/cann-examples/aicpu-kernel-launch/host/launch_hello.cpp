@@ -447,10 +447,14 @@ int main(int argc, char **argv) {
         }
     } json_tmp;
     {
-        char tmpl[] = "/tmp/simpler_inner_XXXXXX";
-        int fd = mkstemp(tmpl);
+        // CANN's rtsBinaryLoadFromFile expects a .json filename — confirmed
+        // by hardware test: with a plain mkstemp temp file (no suffix) the
+        // call returns rc=107000 even though the JSON body is well-formed.
+        // mkstemps keeps the trailing suffix when randomizing XXXXXX.
+        char tmpl[] = "/tmp/simpler_inner_XXXXXX.json";
+        int fd = mkstemps(tmpl, 5);  // 5 = strlen(".json")
         if (fd < 0) {
-            std::fprintf(stderr, "mkstemp failed: %s\n", std::strerror(errno));
+            std::fprintf(stderr, "mkstemps failed: %s\n", std::strerror(errno));
             return 1;
         }
         json_tmp.path = tmpl;
@@ -527,9 +531,12 @@ int main(int argc, char **argv) {
         got.echoed_token == input_token ? "OK" : "BAD", input_token
     );
     if (got.echoed_token != input_token) ok = false;
+    // OS_SCHED bit 0 = AICPU OS owns cpu_id 0; matches
+    // src/{a2a3,a5}/docs/hardware.md and the aicpu-device-query
+    // results. rc=0 val=0x1 is the expected outcome on a3 and a5.
     std::printf(
-        "  hal AICPU+CORE_NUM rc=%d val=%ld  (host-side rtGetAiCpuCount reports 6 on a3/a5)\n", got.hal_rc,
-        (long)got.hal_value
+        "  hal AICPU+OS_SCHED  rc=%d val=0x%lx  %s\n", got.hal_rc, (unsigned long)got.hal_value,
+        (got.hal_rc == 0 && got.hal_value == 0x1) ? "OK" : "(unexpected)"
     );
 
     // Stream destroy + device reset + aclFinalize are handled by

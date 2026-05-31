@@ -72,7 +72,7 @@ zero changes as long as you preserve the two-export contract.
 +---------------------+
 |  libhello_aicpu.so  |   inside AICPU OS process:
 |  (inner SO)         |     DlogRecord("hello kernel running")
-+---------------------+     halGetDeviceInfo(AICPU, CORE_NUM) -> 6
++---------------------+     halGetDeviceInfo(AICPU, OS_SCHED) -> 0x1
           |                 write HelloResult { magic, echoed_token, hal_rc, hal_value }
           | D2H aclrtMemcpy
           v
@@ -170,8 +170,14 @@ Successful output:
 === device=<N>  hello_aicpu HelloResult ===
   magic         = 0xdeadbeefc0ffee01  OK
   echoed_token  = 0x????????????????  OK (expected 0x????????????????)
-  hal AICPU+CORE_NUM rc=0 val=6  (host-side rtGetAiCpuCount reports 6 on a3/a5)
+  hal AICPU+OS_SCHED  rc=0 val=0x1  OK
 ```
+
+The HAL `AICPU + OS_SCHED` result is `0x1` on both a3 and a5: the AICPU
+OS scheduler owns cpu_id 0 in the per-die AICPU layout (see
+[`src/a2a3/docs/hardware.md`](../../../src/a2a3/docs/hardware.md#device-side-probe-resolves-the-aicpu-question)
+and `src/a5/docs/hardware.md` for the device-side probe writeup that
+established this).
 
 Exit code: 0 on full success, 1 on bootstrap / load / launch failure, 2 on
 mismatched magic or token (kernel ran but the I/O contract is broken).
