@@ -203,11 +203,16 @@ class RuntimeCompiler:
 
     @staticmethod
     def _find_executable(name: str) -> bool:
-        """Check if an executable exists (either as absolute path or in PATH)."""
+        """Check if an executable exists (either as absolute path or in PATH).
+
+        Uses an in-process PATH search rather than spawning ``which``: under a
+        sanitizer the test process runs with ``LD_PRELOAD=lib{a,t}san.so``, and
+        the preloaded runtime can abort an uninstrumented child like ``which``,
+        which would otherwise make this falsely report the compiler missing.
+        """
         if os.path.isfile(name) and os.access(name, os.X_OK):
             return True
-        result = subprocess.run(["which", name], check=False, capture_output=True, timeout=1)
-        return result.returncode == 0
+        return shutil.which(name) is not None
 
     def compile(
         self,
