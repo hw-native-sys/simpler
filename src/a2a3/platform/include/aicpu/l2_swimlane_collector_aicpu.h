@@ -142,37 +142,40 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
 /**
  * Initialize AICPU phase profiling
  *
- * Writes phase metadata (num_phase_threads, num_phase_cores, core_to_thread[])
- * into L2SwimlaneDataHeader and clears per-thread phase record buffers.
- * Must be called once from thread 0 after l2_swimlane_aicpu_init().
+ * Writes phase metadata (num_sched_phase_threads, num_orch_phase_threads,
+ * num_phase_cores, core_to_thread[]) into L2SwimlaneDataHeader and primes
+ * per-thread sched and orch phase pools. Must be called once from thread 0
+ * after l2_swimlane_aicpu_init().
  *
- * @param worker_count       Number of AICore workers (cores) — used to resolve
- *                           the phase region's offset relative to the L2Swimlane base
- * @param num_sched_threads  Number of scheduler threads
+ * @param worker_count             Number of AICore workers (cores) — used to
+ *                                 resolve the phase region's offset relative
+ *                                 to the L2Swimlane base
+ * @param num_sched_phase_threads  Number of sched-phase pools to prime
+ * @param num_orch_phase_threads   Number of orch-phase pools to prime
+ *                                 (typically 1; in orch_to_sched mode =
+ *                                 num_aicpu_threads)
  */
-void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_threads);
+void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads, int num_orch_phase_threads);
 
 /**
  * Record a single scheduler phase
  *
- * Appends an L2SwimlaneAicpuPhaseRecord to the specified thread's buffer.
- * Silently drops records when the buffer is full.
+ * Appends an L2SwimlaneAicpuSchedPhaseRecord to the specified thread's sched
+ * pool. Silently drops records when the buffer is full or the pool was not
+ * primed (init failed for this thread).
  *
- * @param thread_idx Scheduler thread index
- * @param phase_id Phase identifier
- * @param start_time Phase start timestamp
- * @param end_time Phase end timestamp
- * @param loop_iter Current loop iteration number
- * @param tasks_processed Number of tasks processed in this batch (scheduler phases), or
- *                        full PTO2 task_id encoding (ring_id << 32) | local_id (orchestrator
- *                        phases in tensormap_and_ringbuffer)
- * @param extra1, extra2  Phase-specific delta counters (see L2SwimlaneAicpuPhaseRecord doc).
- *                        SCHED_DISPATCH uses extra1=pop_hit, extra2=pop_miss; other
- *                        phases pass 0.
+ * @param thread_idx       Scheduler thread index
+ * @param kind             Complete or Dispatch
+ * @param start_time       Phase start timestamp
+ * @param end_time         Phase end timestamp
+ * @param loop_iter        Current scheduler-loop iteration number
+ * @param tasks_processed  Tasks processed in this phase batch
+ * @param pop_hit          Dispatch delta since last emit (0 for Complete)
+ * @param pop_miss         Dispatch delta since last emit (0 for Complete)
  */
-void l2_swimlane_aicpu_record_phase(
-    int thread_idx, L2SwimlaneAicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint64_t tasks_processed, uint32_t extra1 = 0, uint32_t extra2 = 0
+void l2_swimlane_aicpu_record_sched_phase(
+    int thread_idx, L2SwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
+    uint32_t tasks_processed, uint32_t pop_hit = 0, uint32_t pop_miss = 0
 );
 
 /**
@@ -181,30 +184,27 @@ void l2_swimlane_aicpu_record_phase(
  * Must be called once from the orchestrator thread before any
  * l2_swimlane_aicpu_record_orch_phase() calls.
  *
- * @param thread_idx Thread index for the orchestrator (typically num_sched_threads)
+ * @param thread_idx Thread index for the orchestrator (typically num_sched_threads;
+ *                   in orch_to_sched mode each scheduler thread sets its own)
  */
 void l2_swimlane_aicpu_set_orch_thread_idx(int thread_idx);
 
 /**
  * Record one orchestrator submit envelope
  *
- * Appends an L2SwimlaneAicpuPhaseRecord covering an entire submit_task() / alloc_tensors()
- * call. Uses the orchestrator's dedicated buffer slot (set via
- * set_orch_thread_idx). Per-sub-step phase records (ORCH_SYNC..ORCH_FANIN)
- * were dropped — the per-step cumulatives (`g_orch_*_cycle`) in the
- * cold-path log carry the breakdown that those records were duplicating.
+ * Appends an L2SwimlaneAicpuOrchPhaseRecord covering an entire submit_task()
+ * / alloc_tensors() call. Uses the orchestrator's dedicated orch-phase pool
+ * (chosen via set_orch_thread_idx).
  *
- * @param phase_id Always L2SwimlaneAicpuPhaseId::ORCH_SUBMIT. (Param kept for API
- *                 stability; legacy values are ignored by the host parser.)
- * @param start_time Submit start timestamp
- * @param end_time Submit end timestamp
- * @param submit_idx Task submission index (acts as loop_iter)
- * @param task_id Task identifier. For tensormap_and_ringbuffer, this is the full PTO2 encoding:
- * (ring_id << 32) | local_id, enabling cross-view correlation between orchestrator and scheduler swimlanes.
+ * @param start_time  Submit start timestamp
+ * @param end_time    Submit end timestamp
+ * @param task_id     Task identifier. For tensormap_and_ringbuffer, full PTO2
+ *                    encoding: (ring_id << 32) | local_id, enabling
+ *                    cross-view correlation between orchestrator and
+ *                    scheduler swimlanes.
+ * @param submit_idx  Monotonic submit counter
  */
-void l2_swimlane_aicpu_record_orch_phase(
-    L2SwimlaneAicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint64_t task_id
-);
+void l2_swimlane_aicpu_record_orch_phase(uint64_t start_time, uint64_t end_time, uint64_t task_id, uint32_t submit_idx);
 
 /**
  * Write core-to-thread assignment mapping to shared memory.

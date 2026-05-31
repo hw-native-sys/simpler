@@ -90,7 +90,7 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 // The strong symbol from the AICPU build wins when profiling is available.
 // Also hidden to prevent HOST .so from polluting the global symbol table.
 __attribute__((weak, visibility("hidden"))) void
-l2_swimlane_aicpu_record_orch_phase(L2SwimlaneAicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
+l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
@@ -126,20 +126,18 @@ uint64_t g_orch_scope_end_atomic_count = 0;
         acc += (_t1 - _t0);        \
         _t0 = _t1;                 \
     } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                          \
-    do {                                                                                             \
-        if (_prof_active) {                                                                          \
-            l2_swimlane_aicpu_record_orch_phase(                                                     \
-                L2SwimlaneAicpuPhaseId::ORCH_SUBMIT, _submit_start_ts, _t1, g_orch_submit_idx, (tid) \
-            );                                                                                       \
-        }                                                                                            \
+#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                       \
+    do {                                                                                          \
+        if (_prof_active) {                                                                       \
+            l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
+        }                                                                                         \
     } while (0)
 #elif PTO2_PROFILING
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 __attribute__((weak, visibility("hidden"))) void
-l2_swimlane_aicpu_record_orch_phase(L2SwimlaneAicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
+l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
 static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_START()                                                        \
@@ -149,14 +147,12 @@ static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_LAP(acc) \
     do {                     \
     } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                          \
-    do {                                                                                             \
-        if (_prof_active) {                                                                          \
-            _t1 = get_sys_cnt_aicpu();                                                               \
-            l2_swimlane_aicpu_record_orch_phase(                                                     \
-                L2SwimlaneAicpuPhaseId::ORCH_SUBMIT, _submit_start_ts, _t1, g_orch_submit_idx, (tid) \
-            );                                                                                       \
-        }                                                                                            \
+#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                       \
+    do {                                                                                          \
+        if (_prof_active) {                                                                       \
+            _t1 = get_sys_cnt_aicpu();                                                            \
+            l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
+        }                                                                                         \
     } while (0)
 #else
 #define CYCLE_COUNT_START()

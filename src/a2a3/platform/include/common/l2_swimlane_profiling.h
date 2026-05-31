@@ -32,17 +32,21 @@
  * │                boundaries by bumping current_buf_seq)       │
  * │  - free_queue: SPSC ring of recycled AICore buffers         │
  * ├─────────────────────────────────────────────────────────────┤
- * │ L2SwimlaneAicpuPhasePool[0..num_phase_threads-1]            │
+ * │ L2SwimlaneAicpuSchedPhasePool[0..num_sched_phase_threads-1] │
  * │  - head, free_queue (same shape as AicpuTaskPool)           │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ L2SwimlaneAicpuOrchPhasePool[0..num_orch_phase_threads-1]   │
+ * │  - head, free_queue                                         │
  * └─────────────────────────────────────────────────────────────┘
  *
- * Actual L2SwimlaneAicpuTaskBuffer / L2SwimlaneAicoreTaskBuffer /
- * L2SwimlaneAicpuPhaseBuffer are allocated dynamically by Host and pushed
- * into the per-core/thread free_queue.
+ * Actual L2SwimlaneAicpuTaskBuffer / L2SwimlaneAicpuSchedPhaseBuffer /
+ * L2SwimlaneAicpuOrchPhaseBuffer / L2SwimlaneAicoreTaskBuffer are allocated
+ * dynamically by Host and pushed into the per-core/thread free_queue.
  *
  * Base size = sizeof(L2SwimlaneDataHeader) + num_cores * sizeof(L2SwimlaneAicpuTaskPool)
  * With phases = Base + num_cores * sizeof(L2SwimlaneAicoreTaskPool)
- *                    + num_phase_threads * sizeof(L2SwimlaneAicpuPhasePool)
+ *                    + num_sched_phase_threads * sizeof(L2SwimlaneAicpuSchedPhasePool)
+ *                    + num_orch_phase_threads  * sizeof(L2SwimlaneAicpuOrchPhasePool)
  */
 
 #ifndef SRC_A2A3_PLATFORM_INCLUDE_COMMON_L2_SWIMLANE_PROFILING_H_
@@ -215,7 +219,7 @@ static_assert(sizeof(L2SwimlaneFreeQueue) == 128, "L2SwimlaneFreeQueue must be 1
 /**
  * Single cache-line head describing the per-pool active buffer.
  *
- * Shared by all three pool kinds (AicpuTask / AicpuPhase / AicoreTask). The
+ * Shared by all four pool kinds (AicpuTask / AicpuSchedPhase / AicpuOrchPhase / AicoreTask). The
  * field set is intentionally uniform — every pool needs:
  *   - current_buf_ptr      : device address of the buffer the producer is
  *                            currently writing into (0 = no active buffer)
@@ -254,14 +258,17 @@ static_assert(sizeof(L2SwimlaneActiveHead) == 64, "L2SwimlaneActiveHead must be 
 // =============================================================================
 
 /**
- * Per-core or per-thread AICPU-written pool (Task profiling or Phase profiling).
+ * Per-core or per-thread AICPU-written pool (task profiling, sched-phase
+ * profiling, or orch-phase profiling — all three share the same head +
+ * free_queue plumbing; only the buffer payload type differs).
  *
  *   head:       cache line AICPU writes when rotating buffers
  *   free_queue: SPSC ring; host pushes recycled buffers, AICPU pops
  *
- * Used in two contexts:
- *   - Per-core L2SwimlaneAicpuTaskBuffer  (kind = AicpuTask)
- *   - Per-thread L2SwimlaneAicpuPhaseBuffer (kind = AicpuPhase)
+ * Buffer-type aliases (see further below) attach the payload type:
+ *   - L2SwimlaneAicpuTaskPool      → L2SwimlaneAicpuTaskBuffer       (kind = AicpuTask)
+ *   - L2SwimlaneAicpuSchedPhasePool → L2SwimlaneAicpuSchedPhaseBuffer (kind = AicpuSchedPhase)
+ *   - L2SwimlaneAicpuOrchPhasePool  → L2SwimlaneAicpuOrchPhaseBuffer  (kind = AicpuOrchPhase)
  */
 struct L2SwimlaneAicpuTaskPool {
     L2SwimlaneActiveHead head;       // 64B
@@ -277,9 +284,6 @@ static_assert(offsetof(L2SwimlaneAicpuTaskPool, head) == 0, "L2SwimlaneAicpuTask
 static_assert(
     offsetof(L2SwimlaneAicpuTaskPool, free_queue) == 64, "L2SwimlaneAicpuTaskPool::free_queue must be at offset 64"
 );
-
-// Type alias for semantic clarity in Phase profiling context
-using L2SwimlaneAicpuPhasePool = L2SwimlaneAicpuTaskPool;  // Per-thread Phase profiling
 
 /**
  * Per-core AICore-written pool.
@@ -317,23 +321,20 @@ static_assert(
 // ReadyQueueEntry - Queue Entry for Ready Buffers
 // =============================================================================
 
-/**
- * Buffer kind for ReadyQueueEntry::kind. Wire-stable uint32_t underlying so the
- * struct layout matches the prior `is_phase` field byte-for-byte. The AicpuTask
- * and Phase values match the historical 0/1; AicoreTask was 2.
- */
+/** Buffer kind for ReadyQueueEntry::kind. uint32_t underlying. */
 enum class L2SwimlaneBufferKind : uint32_t {
-    AicpuTask = 0,   // Per-core L2SwimlaneAicpuTaskBuffer, AICPU writes
-    AicpuPhase = 1,  // Per-thread L2SwimlaneAicpuPhaseBuffer, AICPU writes
-    AicoreTask = 2,  // Per-core L2SwimlaneAicoreTaskBuffer, AICore writes, AICPU enqueues at rotation
+    AicpuTask = 0,        // Per-core L2SwimlaneAicpuTaskBuffer, AICPU writes
+    AicpuSchedPhase = 1,  // Per-thread L2SwimlaneAicpuSchedPhaseBuffer, AICPU writes
+    AicpuOrchPhase = 2,   // Per-thread L2SwimlaneAicpuOrchPhaseBuffer, AICPU writes
+    AicoreTask = 3,       // Per-core L2SwimlaneAicoreTaskBuffer, AICore writes, AICPU enqueues at rotation
 };
 
 /**
  * Ready queue entry
  *
- * When a buffer on a core/thread is full, the producer (AICPU for
- * AicpuTask/AicpuPhase, AICPU on behalf of AICore for AicoreTask) pushes this
- * entry. Host memory manager retrieves entries from the queue.
+ * When a buffer on a core/thread is full, the producer (AICPU for AICPU
+ * task / sched-phase / orch-phase, AICPU on behalf of AICore for AicoreTask)
+ * pushes this entry. Host memory manager retrieves entries from the queue.
  */
 struct ReadyQueueEntry {
     uint32_t core_index;        // Core index (0 ~ num_cores-1), or thread_idx for phase entries
@@ -377,10 +378,13 @@ struct L2SwimlaneDataHeader {
                                  // at init; AICPU reads in l2_swimlane_aicpu_init.
 
     // Phase profiling metadata (AICPU writes in l2_swimlane_aicpu_init_phase;
-    // Host reads at drain time). num_phase_threads == 0 means phase profiling
-    // was not initialized (no phase pools to drain). Gated by
-    // l2_swimlane_level >= SCHED_PHASES at write time.
-    uint32_t num_phase_threads;                 // Number of phase pools the AICPU initialized
+    // Host reads at drain time). Both thread counts == 0 means phase
+    // profiling was not initialized. Gated by l2_swimlane_level >=
+    // SCHED_PHASES at write time. Sched and orch pools are sized
+    // independently — typically num_orch_phase_threads == 1, but in
+    // orch_to_sched mode both equal num_aicpu_threads.
+    uint32_t num_sched_phase_threads;           // Number of sched-phase pools the AICPU initialized
+    uint32_t num_orch_phase_threads;            // Number of orch-phase pools the AICPU initialized
     uint32_t num_phase_cores;                   // Number of valid entries in core_to_thread (0 = unset)
     int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
 } __attribute__((aligned(64)));
@@ -390,9 +394,14 @@ struct L2SwimlaneDataHeader {
 // layout drift between them is undetectable at runtime (no magic gate
 // anymore). Mirrors the pool-layout asserts in #939.
 static_assert(
-    offsetof(L2SwimlaneDataHeader, num_phase_threads) ==
+    offsetof(L2SwimlaneDataHeader, num_sched_phase_threads) ==
         offsetof(L2SwimlaneDataHeader, l2_swimlane_level) + sizeof(uint32_t),
-    "L2SwimlaneDataHeader: num_phase_threads must follow l2_swimlane_level"
+    "L2SwimlaneDataHeader: num_sched_phase_threads must follow l2_swimlane_level"
+);
+static_assert(
+    offsetof(L2SwimlaneDataHeader, num_orch_phase_threads) ==
+        offsetof(L2SwimlaneDataHeader, num_sched_phase_threads) + sizeof(uint32_t),
+    "L2SwimlaneDataHeader: num_orch_phase_threads must follow num_sched_phase_threads"
 );
 static_assert(
     offsetof(L2SwimlaneDataHeader, core_to_thread) ==
@@ -404,77 +413,77 @@ static_assert(sizeof(L2SwimlaneDataHeader) % 64 == 0, "L2SwimlaneDataHeader must
 // =============================================================================
 // AICPU Phase Profiling - Scheduler and Orchestrator Records
 // =============================================================================
+//
+// Two record types route through two distinct BufferKinds (AicpuSchedPhase /
+// AicpuOrchPhase) into two distinct per-thread pool arrays. Each side carries
+// only the fields it actually uses — no union, no magic phase_id range gate
+// at parse time.
+//
+// Sched records: one per work-emitting phase per scheduler loop iteration.
+//   Idle iterations do not emit; host tooling reconstructs idle spans from
+//   gaps between consecutive sched records on the same thread
+//   (see swimlane_converter.py / sched_overhead_analysis.py).
+//
+// Orch records: one per submit_task() / alloc_tensors() call captures the
+//   entire submit's [start, end] wall-clock window. Per-sub-step cycle
+//   splits live in the device cold-path log as cumulative counters
+//   (`g_orch_*_cycle`) — they answer "which sub-step dominates overall";
+//   the per-submit envelope answers "which submit was slow".
 
-/**
- * AICPU phase identifier
- *
- * Scheduler phases (0-1): the two work-emitting phases per scheduler loop
- * iteration. Idle iterations no longer emit a record — host tooling recovers
- * idle spans from the gap between consecutive sched records on the same
- * thread (see swimlane_converter.py / sched_overhead_analysis.py).
- *
- * Orchestrator phase (25): one record per submit_task() / alloc_tensors()
- * call captures the entire submit's [start, end] wall-clock window.
- * Per-sub-step cycle splits (ALLOC / SYNC / LOOKUP / INSERT / PARAMS /
- * FANIN) still live in the device cold-path log as cumulative counters
- * (`g_orch_*_cycle`) — they are the right tool for "which sub-step
- * dominates overall", while the per-submit record covers "which submit
- * was slow".
- *
- * ORCH_SUBMIT is intentionally numbered above the legacy range so older
- * captures' per-sub-step records do not get re-interpreted as full-submit
- * envelopes by the new host parser (in particular: id 16 used to be
- * ORCH_SYNC — picking 16 for ORCH_SUBMIT would silently relabel every
- * legacy sync record as a submit envelope, breaking backward decoding).
- *
- * Legacy IDs:
- *   - 2, 3: SCHED_SCAN (never emitted) / SCHED_IDLE_WAIT — host parser
- *           silently drops them on old captures (idle reconstructed from
- *           gaps between work records).
- *   - 16-24: pre-fold per-sub-step orch phases (ORCH_SYNC..ORCH_SCOPE_END).
- *           Old captures may carry them; host parser maps to "unknown"
- *           and tools drop them.
- */
-enum class L2SwimlaneAicpuPhaseId : uint32_t {
-    // Scheduler phases (per scheduler loop iter)
-    SCHED_COMPLETE = 0,  // Process completed tasks (fanin traversal)
-    SCHED_DISPATCH = 1,  // Dispatch ready tasks to idle cores
-    // Orchestrator phase (per submit_task() call)
-    ORCH_SUBMIT = 25,  // Entire submit_task() span (placed above legacy 16-24 to avoid collision)
+/** Discriminator for the two SCHED phase records (the orch side has no kind). */
+enum class L2SwimlaneSchedPhaseKind : uint32_t {
+    Complete = 0,  // Process completed tasks (fanin traversal)
+    Dispatch = 1,  // Dispatch ready tasks to idle cores
 };
 
 /**
- * Single AICPU scheduler phase record (40 bytes)
+ * AICPU scheduler phase record (40 bytes).
  *
- * Records one phase within one loop iteration of a scheduler thread.
- * No thread_id field: identity is derived from array index (position = identity).
+ * Position in the per-thread buffer is the identity — no thread_id field.
  *
- * extra1 / extra2 carry phase-specific stats; meaning is keyed by phase_id:
- *   SCHED_DISPATCH: extra1 = pop_hit delta since last emit
- *                   extra2 = pop_miss delta since last emit
- *   SCHED_COMPLETE: extras are 0.
- *   Orchestrator phases: extras are 0 (reserved for future per-phase metrics).
+ * pop_hit / pop_miss carry SCHED_DISPATCH delta counters since the last emit
+ * (zero for Complete). Kept named, not "extra1"/"extra2", so the device-side
+ * commit and the host-side JSON emit don't drift on which extra means which.
  */
-struct L2SwimlaneAicpuPhaseRecord {
-    uint64_t start_time;              // Phase start timestamp
-    uint64_t end_time;                // Phase end timestamp
-    uint32_t loop_iter;               // Loop iteration number
-    L2SwimlaneAicpuPhaseId phase_id;  // Phase type
-    union {
-        uint64_t task_id;          // tensormap_and_ringbuffer: full PTO2 encoding
-                                   // (ring_id << 32) | local_id for cross-view correlation.
-        uint64_t tasks_processed;  // Scheduler phases: number of tasks processed in this batch
-    };
-    uint32_t extra1;  // Phase-specific delta (e.g. SCHED_DISPATCH = pop_hit)
-    uint32_t extra2;  // Phase-specific delta (e.g. SCHED_DISPATCH = pop_miss)
+struct L2SwimlaneAicpuSchedPhaseRecord {
+    uint64_t start_time;            // Phase start timestamp
+    uint64_t end_time;              // Phase end timestamp
+    uint32_t loop_iter;             // Scheduler-loop iteration number on this thread
+    L2SwimlaneSchedPhaseKind kind;  // Complete or Dispatch
+    uint32_t tasks_processed;       // Tasks processed in this phase batch
+    uint32_t pop_hit;               // SCHED_DISPATCH delta since last emit (0 for Complete)
+    uint32_t pop_miss;              // SCHED_DISPATCH delta since last emit (0 for Complete)
+    uint32_t _pad;                  // 40B alignment padding
 };
-static_assert(sizeof(L2SwimlaneAicpuPhaseRecord) == 40, "L2SwimlaneAicpuPhaseRecord layout drift");
+static_assert(sizeof(L2SwimlaneAicpuSchedPhaseRecord) == 40, "L2SwimlaneAicpuSchedPhaseRecord layout drift");
 
-constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 16384;  // ~512KB per thread
+/**
+ * AICPU orchestrator phase record (32 bytes).
+ *
+ * One record per submit. No kind field — only one orch event type exists
+ * (per-submit envelope); if a second is ever needed, add a kind field then.
+ */
+struct L2SwimlaneAicpuOrchPhaseRecord {
+    uint64_t start_time;  // Submit start timestamp
+    uint64_t end_time;    // Submit end timestamp
+    uint64_t task_id;     // Full PTO2 encoding (ring_id << 32) | local_id
+    uint32_t submit_idx;  // Monotonic submit counter
+    uint32_t _pad;        // 32B alignment padding
+};
+static_assert(sizeof(L2SwimlaneAicpuOrchPhaseRecord) == 32, "L2SwimlaneAicpuOrchPhaseRecord layout drift");
 
-// Fixed-size phase record buffer. Same TypedBuffer template as L2SwimlaneAicpuTaskBuffer
-// and L2SwimlaneAicoreTaskBuffer — keeps the drain machinery uniform.
-using L2SwimlaneAicpuPhaseBuffer = TypedBuffer<L2SwimlaneAicpuPhaseRecord, PLATFORM_PHASE_RECORDS_PER_THREAD>;
+constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 16384;  // ~512KB per sched thread, ~512KB per orch thread
+
+// Fixed-size phase record buffers. Same TypedBuffer template as the task
+// buffers — keeps the drain machinery uniform.
+using L2SwimlaneAicpuSchedPhaseBuffer = TypedBuffer<L2SwimlaneAicpuSchedPhaseRecord, PLATFORM_PHASE_RECORDS_PER_THREAD>;
+using L2SwimlaneAicpuOrchPhaseBuffer = TypedBuffer<L2SwimlaneAicpuOrchPhaseRecord, PLATFORM_PHASE_RECORDS_PER_THREAD>;
+
+// Sched and orch phase pools share the same head+free_queue layout as
+// AicpuTaskPool; the buffer payload type differs but the pool plumbing is
+// identical. Aliasing keeps the drain machinery polymorphic.
+using L2SwimlaneAicpuSchedPhasePool = L2SwimlaneAicpuTaskPool;
+using L2SwimlaneAicpuOrchPhasePool = L2SwimlaneAicpuTaskPool;
 
 // =============================================================================
 // Helper Functions - Memory Layout
@@ -531,22 +540,25 @@ inline L2SwimlaneAicpuTaskPool *get_perf_buffer_state(void *base_ptr, int core_i
 }
 
 /**
- * Calculate total memory size including AICore states and phase profiling
- * region (buffer states only, not the record payloads themselves).
+ * Calculate total memory size including AICore states and both phase
+ * profiling regions (buffer states only, not the record payloads themselves).
  *
- * Layout (after the fixed L2SwimlaneDataHeader, which now carries the
- * formerly-standalone phase metadata fields):
- *   [L2SwimlaneAicpuTaskPool × num_cores]
- *   [L2SwimlaneAicoreTaskPool × num_cores]
- *   [L2SwimlaneAicpuPhasePool × num_phase_threads]
+ * Layout (after the fixed L2SwimlaneDataHeader, which carries the phase
+ * metadata fields):
+ *   [L2SwimlaneAicpuTaskPool       × num_cores]
+ *   [L2SwimlaneAicoreTaskPool      × num_cores]
+ *   [L2SwimlaneAicpuSchedPhasePool × num_sched_phase_threads]
+ *   [L2SwimlaneAicpuOrchPhasePool  × num_orch_phase_threads]
  *
- * @param num_cores         Number of AICore instances
- * @param num_phase_threads Number of phase profiling threads (scheduler + orchestrator)
+ * @param num_cores               Number of AICore instances
+ * @param num_sched_phase_threads Number of scheduler-phase pools
+ * @param num_orch_phase_threads  Number of orchestrator-phase pools
  * @return Total bytes needed for header + all buffer states
  */
-inline size_t calc_perf_data_size_with_phases(int num_cores, int num_phase_threads) {
+inline size_t calc_perf_data_size_with_phases(int num_cores, int num_sched_phase_threads, int num_orch_phase_threads) {
     return calc_perf_data_size(num_cores) + num_cores * sizeof(L2SwimlaneAicoreTaskPool) +
-           num_phase_threads * sizeof(L2SwimlaneAicpuPhasePool);
+           num_sched_phase_threads * sizeof(L2SwimlaneAicpuSchedPhasePool) +
+           num_orch_phase_threads * sizeof(L2SwimlaneAicpuOrchPhasePool);
 }
 
 /**
@@ -564,19 +576,41 @@ inline L2SwimlaneAicoreTaskPool *get_aicore_buffer_state(void *base_ptr, int num
 }
 
 /**
- * Get L2SwimlaneAicpuPhasePool array start address (located immediately
- * after the L2SwimlaneAicoreTaskPool array — the standalone phase header
- * was merged into L2SwimlaneDataHeader).
+ * Get L2SwimlaneAicpuSchedPhasePool array start address (located immediately
+ * after the L2SwimlaneAicoreTaskPool array).
  */
-inline L2SwimlaneAicpuPhasePool *get_phase_buffer_states(void *base_ptr, int num_cores) {
-    return reinterpret_cast<L2SwimlaneAicpuPhasePool *>(
+inline L2SwimlaneAicpuSchedPhasePool *get_sched_phase_buffer_states(void *base_ptr, int num_cores) {
+    return reinterpret_cast<L2SwimlaneAicpuSchedPhasePool *>(
         reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(num_cores) +
         num_cores * sizeof(L2SwimlaneAicoreTaskPool)
     );
 }
 
-inline L2SwimlaneAicpuPhasePool *get_phase_buffer_state(void *base_ptr, int num_cores, int thread_idx) {
-    return &get_phase_buffer_states(base_ptr, num_cores)[thread_idx];
+inline L2SwimlaneAicpuSchedPhasePool *get_sched_phase_buffer_state(void *base_ptr, int num_cores, int thread_idx) {
+    return &get_sched_phase_buffer_states(base_ptr, num_cores)[thread_idx];
+}
+
+/**
+ * Get L2SwimlaneAicpuOrchPhasePool array start address (located immediately
+ * after the L2SwimlaneAicpuSchedPhasePool array).
+ *
+ * Layout stride is fixed at `PLATFORM_MAX_AICPU_THREADS`, NOT the runtime
+ * `num_sched_phase_threads` count. The host pre-allocates both phase pool
+ * arrays at the platform max because it doesn't know the actual AICPU
+ * thread count at shm-alloc time; AICPU later picks a smaller count for
+ * iteration. The OFFSET must match the host's alloc layout (max), not
+ * AICPU's iteration count (actual) — otherwise AICPU reads the orch array
+ * from inside the (still allocated) sched array tail, corrupting both.
+ */
+inline L2SwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_states(void *base_ptr, int num_cores) {
+    return reinterpret_cast<L2SwimlaneAicpuOrchPhasePool *>(
+        reinterpret_cast<char *>(get_sched_phase_buffer_states(base_ptr, num_cores)) +
+        PLATFORM_MAX_AICPU_THREADS * sizeof(L2SwimlaneAicpuSchedPhasePool)
+    );
+}
+
+inline L2SwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_state(void *base_ptr, int num_cores, int thread_idx) {
+    return &get_orch_phase_buffer_states(base_ptr, num_cores)[thread_idx];
 }
 
 #ifdef __cplusplus

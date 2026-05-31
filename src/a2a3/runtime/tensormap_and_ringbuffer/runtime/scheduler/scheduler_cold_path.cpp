@@ -866,11 +866,19 @@ int32_t SchedulerContext::init(
         l2_swimlane_aicpu_init(runtime->worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-            // When orchestrator phases merge into scheduler threads, phase
-            // records flow through aicpu_thread_num_ pools — matches the same
-            // branch in dump_tensor_init (scheduler_dispatch.cpp).
-            const int phase_threads = orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_;
-            l2_swimlane_aicpu_init_phase(runtime->worker_count, phase_threads);
+            // Sched-phase pool count: matches the dump_tensor_init branch in
+            // scheduler_dispatch.cpp. Orch-phase pool count: typically 1 (one
+            // orch thread), but in orch_to_sched mode all scheduler threads
+            // can write orch records, so we size both pools to aicpu_thread_num_.
+            // sched_thread_num_ <= 0 means "use all AICPU threads as scheduler
+            // threads" (see assign_cores_to_threads' active_sched_threads_
+            // normalization at line 689). Without this normalization here,
+            // init_phase would prime zero sched pools and all sched_phase
+            // emits would silently drop.
+            const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
+            const int sched_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : active_sched;
+            const int orch_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : 1;
+            l2_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
         l2_swimlane_level_ = L2SwimlaneLevel::DISABLED;

@@ -39,25 +39,9 @@
 // L2SwimlaneCollector Implementation
 // =============================================================================
 
-/**
- * Check if a phase ID belongs to a scheduler phase (vs orchestrator phase).
- * Scheduler phases: SCHED_COMPLETE(0), SCHED_DISPATCH(1).
- * Orchestrator phases: ORCH_SUBMIT(25) — one record per submit_task() call,
- * folded from 6 historical sub-step phases (ORCH_SYNC..ORCH_FANIN). Old
- * captures may carry the per-sub-step ids (16-24) — they fall through the
- * orch branch and the JSON writer labels them "unknown"; downstream tools
- * drop "unknown" records.
- *
- * The boundary is the historical orch id base (16), not ORCH_SUBMIT itself:
- * legacy ids 16-24 must be routed orch-side so they don't accidentally
- * masquerade as scheduler-side phases when decoding old captures.
- *
- * Legacy IDs 2 (SCHED_SCAN, never emitted) and 3 (SCHED_IDLE_WAIT, dropped
- * by PR #869) classify as scheduler-side; the host parser then drops them
- * because idle is reconstructed from record gaps.
- */
-static constexpr uint32_t kAicpuOrchPhaseIdBase = 16;
-static bool is_scheduler_phase(L2SwimlaneAicpuPhaseId id) { return static_cast<uint32_t>(id) < kAicpuOrchPhaseIdBase; }
+// Sched / orch phase records route through separate BufferKinds; no
+// parse-time discriminator function is needed (the device-side type tag is
+// the source of truth).
 
 L2SwimlaneCollector::~L2SwimlaneCollector() {
     stop();
@@ -112,7 +96,8 @@ int L2SwimlaneCollector::initialize(
     l2_swimlane_level_ = l2_swimlane_level;
     output_prefix_ = output_prefix;
     total_perf_collected_ = 0;
-    total_phase_collected_ = 0;
+    total_sched_phase_collected_ = 0;
+    total_orch_phase_collected_ = 0;
 
     // Stash the memory context on the base up-front so alloc_single_buffer
     // sees consistent values during init. shm_host_ stays nullptr until the
@@ -120,15 +105,19 @@ int L2SwimlaneCollector::initialize(
     // start(tf) a no-op.
     set_memory_context(alloc_cb, register_cb, free_cb, /*shm_host=*/nullptr, device_id);
 
-    // Step 1: Calculate shared memory size (slot arrays only, no actual buffers)
+    // Step 1: Calculate shared memory size (slot arrays only, no actual
+    // buffers). Host over-allocates phase pool slots to the platform max for
+    // both sched and orch — AICPU picks the actual counts at init_phase time
+    // and writes them into the header.
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
-    size_t total_size = calc_perf_data_size_with_phases(num_aicore, num_phase_threads);
+    size_t total_size = calc_perf_data_size_with_phases(num_aicore, num_phase_threads, num_phase_threads);
 
     LOG_DEBUG("Shared memory allocation plan:");
     LOG_DEBUG("  Number of cores:      %d", num_aicore);
     LOG_DEBUG("  Header size:          %zu bytes", sizeof(L2SwimlaneDataHeader));
     LOG_DEBUG("  L2SwimlaneAicpuTaskPool size: %zu bytes each", sizeof(L2SwimlaneAicpuTaskPool));
-    LOG_DEBUG("  L2SwimlaneAicpuPhasePool size:%zu bytes each", sizeof(L2SwimlaneAicpuPhasePool));
+    LOG_DEBUG("  L2SwimlaneAicpuSchedPhasePool size: %zu bytes each", sizeof(L2SwimlaneAicpuSchedPhasePool));
+    LOG_DEBUG("  L2SwimlaneAicpuOrchPhasePool size:  %zu bytes each", sizeof(L2SwimlaneAicpuOrchPhasePool));
     LOG_DEBUG("  Total shared memory:  %zu bytes (%zu KB)", total_size, total_size / 1024);
 
     // Step 2: Allocate shared memory for slot arrays
@@ -172,11 +161,13 @@ int L2SwimlaneCollector::initialize(
     // uninitialized device memory; AICPU only writes these fields when
     // phase init runs (level >= SCHED_PHASES). Without zeroing, lower
     // levels (AICORE_TIMING / AICPU_TIMING) leave garbage that
-    // for_each_instance iterates as `num_phase_threads`, walking off the
-    // end of the allocated pool array → segfault. The host-side reader
-    // (read_phase_header_metadata) and BufferPoolManager replenish loop
-    // both gate on this count being a sane value.
-    header->num_phase_threads = 0;
+    // for_each_instance iterates as `num_sched_phase_threads` /
+    // `num_orch_phase_threads`, walking off the end of the allocated pool
+    // array → segfault. The host-side reader (read_phase_header_metadata)
+    // and BufferPoolManager replenish loop both gate on these counts being
+    // sane values.
+    header->num_sched_phase_threads = 0;
+    header->num_orch_phase_threads = 0;
     header->num_phase_cores = 0;
     memset(header->core_to_thread, -1, sizeof(header->core_to_thread));
 
@@ -270,40 +261,68 @@ int L2SwimlaneCollector::initialize(
         aicore_ring_addr_table_dev_ = rotation_table_dev;
     }
 
-    // Step 6: Initialize PhaseBufferStates — 1 buffer per thread in free_queue, rest to recycled pool
-    for (int t = 0; t < num_phase_threads; t++) {
-        L2SwimlaneAicpuPhasePool *state = get_phase_buffer_state(perf_host_ptr, num_aicore, t);
-        memset(state, 0, sizeof(L2SwimlaneAicpuPhasePool));
-
-        state->free_queue.head = 0;
-        state->free_queue.tail = 0;
-        state->head.current_buf_ptr = 0;
-        state->head.current_buf_seq = 0;
-
-        for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_THREAD; s++) {
-            void *host_buf_ptr = nullptr;
-            void *dev_buf_ptr = alloc_single_buffer(sizeof(L2SwimlaneAicpuPhaseBuffer), &host_buf_ptr);
-            if (dev_buf_ptr == nullptr) {
-                LOG_ERROR("Failed to allocate L2SwimlaneAicpuPhaseBuffer for thread %d, buffer %d", t, s);
-                return -1;
+    // Step 6: Initialize per-thread phase pools — both sched and orch. Each
+    // pool is sized to PLATFORM_PROF_BUFFERS_PER_THREAD buffers (1 in
+    // free_queue, rest in the recycled pool tagged by kind). Templated on the
+    // concrete TypedBuffer so the `count` zero-store uses the matching layout
+    // — sched and orch buffers have DIFFERENT sizes (40B vs 32B records),
+    // so a single cast type for both would land the count store past the end
+    // of the orch allocation and corrupt the heap.
+    auto init_phase_pools = [&](auto buffer_tag, L2SwimlaneAicpuTaskPool *(*get_state)(void *, int, int),
+                                int thread_count, ProfBufferType recycle_kind, const char *kind_label) -> int {
+        using Buffer = typename decltype(buffer_tag)::type;
+        constexpr size_t buffer_bytes = sizeof(Buffer);
+        for (int t = 0; t < thread_count; t++) {
+            auto *state = get_state(perf_host_ptr, num_aicore, t);
+            memset(state, 0, sizeof(L2SwimlaneAicpuTaskPool));
+            for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_THREAD; s++) {
+                void *host_buf_ptr = nullptr;
+                void *dev_buf_ptr = alloc_single_buffer(buffer_bytes, &host_buf_ptr);
+                if (dev_buf_ptr == nullptr) {
+                    LOG_ERROR("Failed to allocate %s phase buffer for thread %d, slot %d", kind_label, t, s);
+                    return -1;
+                }
+                // Zero only the `count` word at the buffer's tail, using the
+                // matching Buffer type. The records payload is overwritten by
+                // AICPU on first use.
+                reinterpret_cast<Buffer *>(host_buf_ptr)->count = 0;
+                if (s == 0) {
+                    state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(dev_buf_ptr);
+                } else {
+                    manager_.push_recycled(static_cast<int>(recycle_kind), dev_buf_ptr);
+                }
             }
-            L2SwimlaneAicpuPhaseBuffer *buf = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(host_buf_ptr);
-            memset(buf, 0, sizeof(L2SwimlaneAicpuPhaseBuffer));
-            buf->count = 0;
-
-            if (s == 0) {
-                state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(dev_buf_ptr);
-            } else {
-                manager_.push_recycled(static_cast<int>(ProfBufferType::AICPU_PHASE), dev_buf_ptr);
-            }
+            wmb();
+            state->free_queue.tail = 1;
+            wmb();
         }
-        wmb();
-        state->free_queue.tail = 1;
-        wmb();
+        return 0;
+    };
+
+    // Type tags so the templated lambda can deduce the buffer type without
+    // having to spell out an explicit template argument (not portable on a
+    // generic lambda before C++20 explicit template-parameter syntax).
+    struct SchedTag {
+        using type = L2SwimlaneAicpuSchedPhaseBuffer;
+    };
+    struct OrchTag {
+        using type = L2SwimlaneAicpuOrchPhaseBuffer;
+    };
+
+    if (init_phase_pools(
+            SchedTag{}, get_sched_phase_buffer_state, num_phase_threads, ProfBufferType::AICPU_SCHED_PHASE, "sched"
+        ) != 0) {
+        return -1;
+    }
+    auto orch_get_state = [](void *base, int n_cores, int t) {
+        return get_orch_phase_buffer_state(base, n_cores, t);
+    };
+    if (init_phase_pools(OrchTag{}, orch_get_state, num_phase_threads, ProfBufferType::AICPU_ORCH_PHASE, "orch") != 0) {
+        return -1;
     }
     LOG_DEBUG(
-        "Initialized %d PhaseBufferStates: 1 buffer/thread, %d in recycled pool", num_phase_threads,
-        num_phase_threads * (PLATFORM_PROF_BUFFERS_PER_THREAD - 1)
+        "Initialized %d sched + %d orch PhaseBufferStates: 1 buffer/thread, %d in recycled pool each",
+        num_phase_threads, num_phase_threads, PLATFORM_PROF_BUFFERS_PER_THREAD - 1
     );
 
     wmb();
@@ -317,7 +336,8 @@ int L2SwimlaneCollector::initialize(
 
     collected_perf_records_.assign(num_aicore_, {});
     collected_aicore_records_.assign(num_aicore_, {});
-    collected_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
+    collected_sched_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
+    collected_orch_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
 
     LOG_INFO_V0("Performance profiling initialized (dynamic buffer mode)");
     return 0;
@@ -343,19 +363,38 @@ void L2SwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info) {
     }
 }
 
-void L2SwimlaneCollector::copy_phase_buffer(const ReadyBufferInfo &info) {
-    L2SwimlaneAicpuPhaseBuffer *buf = reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(info.host_buffer_ptr);
+void L2SwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info) {
+    auto *buf = reinterpret_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t count = buf->count;
     if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
         count = PLATFORM_PHASE_RECORDS_PER_THREAD;
     }
     uint32_t tidx = info.index;
-    if (tidx < collected_phase_records_.size()) {
+    if (tidx < collected_sched_phase_records_.size()) {
         for (uint32_t i = 0; i < count; i++) {
-            collected_phase_records_[tidx].push_back(buf->records[i]);
+            collected_sched_phase_records_[tidx].push_back(buf->records[i]);
         }
-        total_phase_collected_ += count;
+        total_sched_phase_collected_ += count;
+        if (count > 0) {
+            has_phase_data_ = true;
+        }
+    }
+}
+
+void L2SwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info) {
+    auto *buf = reinterpret_cast<L2SwimlaneAicpuOrchPhaseBuffer *>(info.host_buffer_ptr);
+    rmb();
+    uint32_t count = buf->count;
+    if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
+        count = PLATFORM_PHASE_RECORDS_PER_THREAD;
+    }
+    uint32_t tidx = info.index;
+    if (tidx < collected_orch_phase_records_.size()) {
+        for (uint32_t i = 0; i < count; i++) {
+            collected_orch_phase_records_[tidx].push_back(buf->records[i]);
+        }
+        total_orch_phase_collected_ += count;
         if (count > 0) {
             has_phase_data_ = true;
         }
@@ -413,12 +452,19 @@ void L2SwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info) {
 }
 
 void L2SwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info) {
-    if (info.type == ProfBufferType::AICPU_TASK) {
+    switch (info.type) {
+    case ProfBufferType::AICPU_TASK:
         copy_perf_buffer(info);
-    } else if (info.type == ProfBufferType::AICPU_PHASE) {
-        copy_phase_buffer(info);
-    } else {
+        break;
+    case ProfBufferType::AICPU_SCHED_PHASE:
+        copy_sched_phase_buffer(info);
+        break;
+    case ProfBufferType::AICPU_ORCH_PHASE:
+        copy_orch_phase_buffer(info);
+        break;
+    case ProfBufferType::AICORE_TASK:
         copy_aicore_buffer(info);
+        break;
     }
 }
 
@@ -527,14 +573,25 @@ void L2SwimlaneCollector::reconcile_counters() {
     );
 
     reconcile_one(
-        "PHASE", "thread", PLATFORM_MAX_AICPU_THREADS,
+        "SCHED_PHASE", "thread", PLATFORM_MAX_AICPU_THREADS,
         [this](int thread_index) {
-            return get_phase_buffer_state(shm_host_, num_aicore_, thread_index);
+            return get_sched_phase_buffer_state(shm_host_, num_aicore_, thread_index);
         },
         [](void *host_ptr) {
-            return reinterpret_cast<L2SwimlaneAicpuPhaseBuffer *>(host_ptr)->count;
+            return reinterpret_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(host_ptr)->count;
         },
-        total_phase_collected_, /*optional=*/true
+        total_sched_phase_collected_, /*optional=*/true
+    );
+
+    reconcile_one(
+        "ORCH_PHASE", "thread", PLATFORM_MAX_AICPU_THREADS,
+        [this](int thread_index) {
+            return get_orch_phase_buffer_state(shm_host_, num_aicore_, thread_index);
+        },
+        [](void *host_ptr) {
+            return reinterpret_cast<L2SwimlaneAicpuOrchPhaseBuffer *>(host_ptr)->count;
+        },
+        total_orch_phase_collected_, /*optional=*/true
     );
 }
 
@@ -547,37 +604,35 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
 
     L2SwimlaneDataHeader *header = get_l2_swimlane_header(shm_host_);
 
-    int num_phase_threads = static_cast<int>(header->num_phase_threads);
-    if (num_phase_threads == 0) {
-        LOG_INFO_V0("No phase profiling data found (num_phase_threads=0; phase init never ran)");
+    int num_sched = static_cast<int>(header->num_sched_phase_threads);
+    int num_orch = static_cast<int>(header->num_orch_phase_threads);
+    if (num_sched == 0 && num_orch == 0) {
+        LOG_INFO_V0("No phase profiling data found (sched/orch phase thread counts both 0; phase init never ran)");
         return;
     }
-    if (num_phase_threads > PLATFORM_MAX_AICPU_THREADS) {
+    if (num_sched > PLATFORM_MAX_AICPU_THREADS || num_orch > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR(
-            "Invalid num_phase_threads %d from shared memory (max=%d)", num_phase_threads, PLATFORM_MAX_AICPU_THREADS
+            "Invalid phase thread counts from shared memory (sched=%d, orch=%d, max=%d)", num_sched, num_orch,
+            PLATFORM_MAX_AICPU_THREADS
         );
         return;
     }
-    LOG_INFO_V0("Collecting phase metadata: %d phase threads", num_phase_threads);
+    LOG_INFO_V0("Collecting phase metadata: %d sched threads, %d orch threads", num_sched, num_orch);
 
-    // Per-thread breakdown of records already collected via the buffer pipeline.
-    for (size_t t = 0; t < collected_phase_records_.size(); t++) {
-        if (!collected_phase_records_[t].empty()) {
-            size_t sched_count = 0, orch_count = 0;
-            for (const auto &r : collected_phase_records_[t]) {
-                if (is_scheduler_phase(r.phase_id)) sched_count++;
-                else orch_count++;
-            }
-            LOG_INFO_V0(
-                "  Thread %zu: %zu records (sched=%zu, orch=%zu)", t, collected_phase_records_[t].size(), sched_count,
-                orch_count
-            );
+    for (size_t t = 0; t < collected_sched_phase_records_.size(); t++) {
+        if (!collected_sched_phase_records_[t].empty()) {
+            LOG_INFO_V0("  Sched thread %zu: %zu records", t, collected_sched_phase_records_[t].size());
+        }
+    }
+    for (size_t t = 0; t < collected_orch_phase_records_.size(); t++) {
+        if (!collected_orch_phase_records_[t].empty()) {
+            LOG_INFO_V0("  Orch thread %zu: %zu records", t, collected_orch_phase_records_[t].size());
         }
     }
 
-    // has_phase_data_ is set by copy_phase_buffer() during the drain — every
-    // push into collected_phase_records_ goes through that single call site
-    // and toggles the flag. No re-scan needed here.
+    // has_phase_data_ is set by copy_sched_phase_buffer / copy_orch_phase_buffer
+    // during the drain — every push goes through those call sites and toggles
+    // the flag. No re-scan needed here.
 
     // Core-to-thread mapping (header-resident; not buffered).
     int num_phase_cores = static_cast<int>(header->num_phase_cores);
@@ -753,9 +808,16 @@ int L2SwimlaneCollector::export_swimlane_json() {
         }
     }
 
-    // Include phase record timestamps in base_time calculation
+    // Include phase record timestamps (sched + orch) in base_time calculation
     if (has_phase_data_) {
-        for (const auto &thread_records : collected_phase_records_) {
+        for (const auto &thread_records : collected_sched_phase_records_) {
+            for (const auto &pr : thread_records) {
+                if (pr.start_time > 0 && pr.start_time < base_time_cycles) {
+                    base_time_cycles = pr.start_time;
+                }
+            }
+        }
+        for (const auto &thread_records : collected_orch_phase_records_) {
             for (const auto &pr : thread_records) {
                 if (pr.start_time > 0 && pr.start_time < base_time_cycles) {
                     base_time_cycles = pr.start_time;
@@ -843,100 +905,74 @@ int L2SwimlaneCollector::export_swimlane_json() {
 
     // Step 8: Write phase profiling data (level >= 3)
     if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-        auto sched_phase_name = [](L2SwimlaneAicpuPhaseId id) -> const char * {
-            switch (id) {
-            case L2SwimlaneAicpuPhaseId::SCHED_COMPLETE:
+        auto sched_phase_name = [](L2SwimlaneSchedPhaseKind kind) -> const char * {
+            switch (kind) {
+            case L2SwimlaneSchedPhaseKind::Complete:
                 return "complete";
-            case L2SwimlaneAicpuPhaseId::SCHED_DISPATCH:
+            case L2SwimlaneSchedPhaseKind::Dispatch:
                 return "dispatch";
-            default:
-                // Legacy SCHED_IDLE_WAIT (3) and SCHED_SCAN (2) land here on
-                // old captures; host tools skip "unknown" sched records and
-                // rebuild idle from gaps between known records on the
-                // same thread.
-                return "unknown";
             }
+            return "unknown";
         };
 
-        auto orch_phase_name = [](L2SwimlaneAicpuPhaseId id) -> const char * {
-            switch (id) {
-            case L2SwimlaneAicpuPhaseId::ORCH_SUBMIT:
-                return "orch_submit";
-            default:
-                // Legacy per-sub-step orch ids 17-24 land here on old captures;
-                // host tools drop "unknown" records.
-                return "unknown";
-            }
-        };
-
-        // AICPU scheduler phases (filtered from unified collected_phase_records_)
+        // AICPU scheduler phases — one nested array per sched-phase thread.
         outfile << ",\n  \"aicpu_scheduler_phases\": [\n";
-        for (size_t t = 0; t < collected_phase_records_.size(); t++) {
+        for (size_t t = 0; t < collected_sched_phase_records_.size(); t++) {
             outfile << "    [\n";
             bool first = true;
-            for (const auto &pr : collected_phase_records_[t]) {
-                if (!is_scheduler_phase(pr.phase_id)) continue;
+            for (const auto &pr : collected_sched_phase_records_[t]) {
                 double start_us = cycles_to_us(pr.start_time - base_time_cycles);
                 double end_us = cycles_to_us(pr.end_time - base_time_cycles);
                 if (!first) outfile << ",\n";
                 outfile << "      {\"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
                         << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ", \"phase\": \""
-                        << sched_phase_name(pr.phase_id) << "\""
+                        << sched_phase_name(pr.kind) << "\""
                         << ", \"loop_iter\": " << pr.loop_iter << ", \"tasks_processed\": " << pr.tasks_processed;
-                // Phase-specific deltas (currently only SCHED_DISPATCH carries
-                // pop_hit / pop_miss). Other phases pass zero extras; omitting
-                // them keeps the JSON terse per record.
-                if (pr.phase_id == L2SwimlaneAicpuPhaseId::SCHED_DISPATCH) {
-                    outfile << ", \"pop_hit\": " << pr.extra1 << ", \"pop_miss\": " << pr.extra2;
+                // Dispatch-only deltas. Complete records carry zeros — omit
+                // them to keep the JSON terse per record.
+                if (pr.kind == L2SwimlaneSchedPhaseKind::Dispatch) {
+                    outfile << ", \"pop_hit\": " << pr.pop_hit << ", \"pop_miss\": " << pr.pop_miss;
                 }
                 outfile << "}";
                 first = false;
             }
             if (!first) outfile << "\n";
             outfile << "    ]";
-            if (t < collected_phase_records_.size() - 1) outfile << ",";
+            if (t < collected_sched_phase_records_.size() - 1) outfile << ",";
             outfile << "\n";
         }
         outfile << "  ]";
 
-        // Orchestrator timing is no longer emitted as a separate aggregate
-        // block. Per-event L2SwimlaneAicpuPhaseRecord[] entries (emitted as
-        // aicpu_orchestrator_phases below) are the single source of truth;
-        // the run-window envelope is still visible in the device-side
-        // LOG_INFO_V9 "Thread N: orch_start=… orch_end=… orch_cost=…" line.
-
-        // Per-task orchestrator phase records (level >= 4, filtered from unified collected_phase_records_)
+        // Per-task orchestrator phase records (level >= 4).
         bool has_orch_phases = false;
         if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
-            for (const auto &v : collected_phase_records_) {
-                for (const auto &r : v) {
-                    if (!is_scheduler_phase(r.phase_id)) {
-                        has_orch_phases = true;
-                        break;
-                    }
+            for (const auto &v : collected_orch_phase_records_) {
+                if (!v.empty()) {
+                    has_orch_phases = true;
+                    break;
                 }
-                if (has_orch_phases) break;
             }
         }
         if (has_orch_phases) {
             outfile << ",\n  \"aicpu_orchestrator_phases\": [\n";
-            for (size_t t = 0; t < collected_phase_records_.size(); t++) {
+            for (size_t t = 0; t < collected_orch_phase_records_.size(); t++) {
                 outfile << "    [\n";
                 bool first = true;
-                for (const auto &pr : collected_phase_records_[t]) {
-                    if (is_scheduler_phase(pr.phase_id)) continue;
+                for (const auto &pr : collected_orch_phase_records_[t]) {
                     double start_us = cycles_to_us(pr.start_time - base_time_cycles);
                     double end_us = cycles_to_us(pr.end_time - base_time_cycles);
                     if (!first) outfile << ",\n";
-                    outfile << "      {\"phase\": \"" << orch_phase_name(pr.phase_id) << "\""
+                    // "phase" key is the only orch event today (ORCH_SUBMIT) —
+                    // hard-coded since the record type tag is "orch".
+                    outfile << "      {\"phase\": \"orch_submit\""
                             << ", \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
                             << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us
-                            << ", \"submit_idx\": " << pr.loop_iter << ", \"task_id\": " << pr.task_id << "}";
+                            << ", \"submit_idx\": " << pr.submit_idx << ", \"task_id\": " << pr.task_id << "}";
                     first = false;
                 }
                 if (!first) outfile << "\n";
                 outfile << "    ]";
-                if (t < collected_phase_records_.size() - 1) outfile << ",";
+                if (t < collected_orch_phase_records_.size() - 1) outfile << ",";
                 outfile << "\n";
             }
             outfile << "  ]";
@@ -1024,10 +1060,7 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
         drain_free_queue(ac_state->free_queue);
     }
 
-    int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
-    for (int t = 0; t < num_phase_threads; t++) {
-        L2SwimlaneAicpuPhasePool *state = get_phase_buffer_state(shm_host_, num_aicore_, t);
-
+    auto release_phase_pool = [&](L2SwimlaneAicpuTaskPool *state) {
         release_one_buffer(reinterpret_cast<void *>(state->head.current_buf_ptr), unregister_cb, free_cb);
         state->head.current_buf_ptr = 0;
 
@@ -1044,6 +1077,13 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
             state->free_queue.buffer_ptrs[slot] = 0;
         }
         state->free_queue.head = tail;
+    };
+    int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
+    for (int t = 0; t < num_phase_threads; t++) {
+        release_phase_pool(get_sched_phase_buffer_state(shm_host_, num_aicore_, t));
+    }
+    for (int t = 0; t < num_phase_threads; t++) {
+        release_phase_pool(get_orch_phase_buffer_state(shm_host_, num_aicore_, t));
     }
 
     // Main shm: unregister + free as a pair, same as every other buffer.
@@ -1060,11 +1100,13 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
     // walking freed buffer state. Mirrors PMU/DepGen/TensorDump collectors.
     shm_host_ = nullptr;
     collected_perf_records_.clear();
-    collected_phase_records_.clear();
+    collected_sched_phase_records_.clear();
+    collected_orch_phase_records_.clear();
     core_to_thread_.clear();
     has_phase_data_ = false;
     total_perf_collected_ = 0;
-    total_phase_collected_ = 0;
+    total_sched_phase_collected_ = 0;
+    total_orch_phase_collected_ = 0;
     clear_memory_context();
 
     LOG_DEBUG("Performance profiling cleanup complete");

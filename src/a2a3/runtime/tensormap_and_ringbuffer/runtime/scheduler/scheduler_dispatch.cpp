@@ -632,8 +632,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         } else {
             CYCLE_COUNT_LAP(l2_swimlane.sched_complete_cycle);
             if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && l2_swimlane.phase_complete_count > 0) {
-                l2_swimlane_aicpu_record_phase(
-                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Complete, _t0_phase, _t1, l2_swimlane.sched_loop_count,
                     l2_swimlane.phase_complete_count
                 );
                 _t0_phase = _t1;
@@ -724,8 +724,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // realistic dispatch cadence and silently truncates without this guard.
                 debug_assert(pop_hit_delta < (1ULL << 32));
                 debug_assert(pop_miss_delta < (1ULL << 32));
-                l2_swimlane_aicpu_record_phase(
-                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Dispatch, _t0_phase, _t1, l2_swimlane.sched_loop_count,
                     l2_swimlane.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
                     static_cast<uint32_t>(pop_miss_delta)
                 );
@@ -838,8 +838,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         debug_assert(final_pop_miss_delta < (1ULL << 32));
         if (final_pop_hit_delta != 0 || final_pop_miss_delta != 0) {
             uint64_t t_now = get_sys_cnt_aicpu();
-            l2_swimlane_aicpu_record_phase(
-                thread_idx, L2SwimlaneAicpuPhaseId::SCHED_DISPATCH, t_now, t_now, l2_swimlane.sched_loop_count, 0,
+            l2_swimlane_aicpu_record_sched_phase(
+                thread_idx, L2SwimlaneSchedPhaseKind::Dispatch, t_now, t_now, l2_swimlane.sched_loop_count, 0,
                 static_cast<uint32_t>(final_pop_hit_delta), static_cast<uint32_t>(final_pop_miss_delta)
             );
             l2_swimlane.pop_hit_at_last_emit = l2_swimlane.pop_hit;
