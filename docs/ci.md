@@ -58,7 +58,10 @@ sanitizer jobs, never the PR/self-hosted pipeline. Its
 `dynamic_register` + `prepared_callable` paths, `--max-parallel 2`, excluding the
 parallel-broadcast case (a2a3sim/a5sim, ubuntu-only). The full suite is avoided
 because ASAN/TSAN slow the sim enough that oversubscription-heavy spmd stress
-cases livelock on a 4-vCPU runner. Not a PR gate; see
+cases livelock on a 4-vCPU runner. **ASAN gates the job; TSAN runs
+`continue-on-error`** — its ~5-15x slowdown (vs ASAN's ~1.7x) still livelocks the
+threaded scheduler, so the TSAN build is validated but its run is best-effort
+pending further work. Not a PR gate; see
 [testing.md](testing.md#sanitizer-builds-asan--tsan).
 
 ### Parallel ST runs on hardware

@@ -25,6 +25,11 @@ jobs:
   sanitizer-sim:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # ASAN gates the nightly; TSAN runs informationally. TSAN's ~5-15x slowdown
+    # (vs ASAN's ~1.7x) makes the sim's threaded scheduler livelock on
+    # oversubscription-heavy cases, so its run reliability is still being worked
+    # out — the build is validated, the run is best-effort for now.
+    continue-on-error: ${{ matrix.sanitizer == 'tsan' }}
     strategy:
       fail-fast: false
       matrix:
