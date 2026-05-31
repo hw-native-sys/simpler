@@ -75,6 +75,12 @@ int ScopeStatsCollector::init(
         /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
+    // RAII rollback: any early return after this point releases every
+    // framework-tracked buffer (shm region + per-buffer-state PmuBuffer-style
+    // entries) via free_cb. `guard.commit()` runs on the success path before
+    // the trailing return 0.
+    profiling_common::InitRollbackGuard<decltype(manager_)> guard(manager_, free_cb);
+
     const int num_instances = 1;
     size_t shm_size = calc_scope_stats_shm_size(num_instances);
     void *shm_host_local = nullptr;
@@ -115,6 +121,7 @@ int ScopeStatsCollector::init(
 
     initialized_ = true;
     shm_dev_ = shm_dev_local;
+    guard.commit();
 
     // Re-set_memory_context now that the shm region is ready. start(tf) gates
     // on shm_host_ being non-null, so this is the moment the collector becomes

@@ -254,6 +254,46 @@ public:
         malloc_shadows_.clear();
     }
 
+    /**
+     * Abort-path cleanup: free EVERY framework-tracked device pointer (via
+     * `release_fn`) and every framework-malloc'd host shadow, then clear all
+     * containers. Distinct from `release_owned_buffers()` + `clear_mappings()`
+     * because this also catches buffers parked in callers' SPSC free_queues
+     * (which the framework tracked via `register_mapping` but does not own a
+     * queue for). Intended for `init()` error paths where `finalize()` has
+     * not run.
+     *
+     * Drains recycled/done/ready first (just discards — release goes via
+     * dev_to_host_ to avoid double-free) and then iterates the full
+     * dev→host map. Each unique dev_ptr is released exactly once.
+     */
+    template <typename ReleaseFn>
+    void release_all_owned(const ReleaseFn &release_fn) {
+        for (auto &pool : recycled_)
+            pool.clear();
+        {
+            std::scoped_lock<std::mutex> lock(done_mutex_);
+            std::queue<DoneInfo>().swap(done_queue_);
+        }
+        {
+            std::scoped_lock<std::mutex> lock(ready_mutex_);
+            std::queue<ReadyBufferInfo>().swap(ready_queue_);
+        }
+        for (auto &kv : dev_to_host_) {
+            if (kv.first != nullptr) {
+                release_fn(kv.first);
+            }
+            // erase-based check (matches release_owned_buffers): atomic
+            // check-and-remove guards against a double-free if any duplicate
+            // mapping ever sneaks into dev_to_host_.
+            if (kv.second != nullptr && malloc_shadows_.erase(kv.second) > 0) {
+                std::free(kv.second);
+            }
+        }
+        dev_to_host_.clear();
+        malloc_shadows_.clear();
+    }
+
     // -------------------------------------------------------------------------
     // Per-tick mirror of the shared-memory region
     // -------------------------------------------------------------------------

@@ -73,6 +73,14 @@ int PmuCollector::init(
         /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
+    // RAII rollback: any early return after this point releases the shm
+    // region + ring address table + per-core PmuAicoreRing + per-core
+    // PmuBuffers. Per-core rings are tracked separately via
+    // `guard.add_direct_ptr()` because they're plain alloc_cb allocations
+    // (no host shadow / not in dev_to_host_). `guard.commit()` runs on the
+    // success path before the trailing return 0.
+    profiling_common::InitRollbackGuard<decltype(manager_)> guard(manager_, free_cb);
+
     // ---- Allocate shared header + buffer-state region ----
     size_t shm_size = calc_pmu_data_size(num_cores);
     void *shm_host_local = nullptr;
@@ -113,6 +121,7 @@ int PmuCollector::init(
             return -1;
         }
         aicore_rings_dev_[c] = ring_dev;
+        guard.add_direct_ptr(ring_dev);
         state->aicore_ring_ptr = reinterpret_cast<uint64_t>(ring_dev);
         reinterpret_cast<uint64_t *>(aicore_ring_addrs_host_)[c] = reinterpret_cast<uint64_t>(ring_dev);
 
@@ -176,6 +185,7 @@ int PmuCollector::init(
         "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
         num_threads, reinterpret_cast<unsigned long>(shm_dev_), csv_path_.c_str()
     );
+    guard.commit();
     return 0;
 }
 

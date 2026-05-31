@@ -67,6 +67,12 @@ int TensorDumpCollector::initialize(
         /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
+    // RAII rollback: any early return after this point releases the shm
+    // region + per-thread arenas + DumpMetaBuffers through the framework's
+    // dev→host map. `guard.commit()` runs on the success path before the
+    // trailing return 0.
+    profiling_common::InitRollbackGuard<decltype(manager_)> guard(manager_, free_cb);
+
     // Allocate dump shared memory (header + buffer states)
     size_t shm_size = calc_dump_data_size(num_dump_threads);
     void *shm_host_local = nullptr;
@@ -151,6 +157,7 @@ int TensorDumpCollector::initialize(
         arena_size / (1024 * 1024), PLATFORM_DUMP_BUFFERS_PER_THREAD
     );
 
+    guard.commit();
     return 0;
 }
 

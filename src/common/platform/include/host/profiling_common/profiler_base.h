@@ -160,6 +160,7 @@
 #include <optional>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -188,6 +189,74 @@ using ProfFreeCallback = std::function<int(void *dev_ptr)>;
 // malloc's can be registered with the manager's `malloc_shadows_` set for
 // safe teardown via `clear_mappings()` / `release_owned_buffers()`. See
 // `ProfilerBase::start()` for the inline definition.
+
+/**
+ * RAII scope guard for collector `init()` rollback. On destruction (without
+ * `commit()`) it (1) calls `manager.release_all_owned(release_fn)` to free
+ * every framework-tracked dev_ptr + host shadow, and (2) releases any extra
+ * direct dev_ptrs the collector added via `add_direct_ptr()` (used for
+ * pointers the collector owns outside the framework — e.g. PMU per-core
+ * `PmuAicoreRing` allocations on a5).
+ *
+ * Pattern:
+ *   int Collector::init(...) {
+ *       ...
+ *       set_memory_context(...);
+ *       InitRollbackGuard<Manager> guard(manager_, free_cb);
+ *       void *dev_ptr = alloc_paired_buffer(size, &host_ptr);
+ *       if (dev_ptr == nullptr) return -1;       // guard runs, frees nothing yet
+ *       ...
+ *       void *direct = alloc_cb(...);
+ *       guard.add_direct_ptr(direct);            // ensure it's freed on abort
+ *       ...
+ *       guard.commit();                          // success — disarm
+ *       initialized_ = true;
+ *       return 0;
+ *   }
+ */
+template <typename Manager>
+class InitRollbackGuard {
+public:
+    using ReleaseFn = std::function<int(void *)>;
+
+    InitRollbackGuard(Manager &manager, ReleaseFn release_fn) :
+        manager_(manager),
+        release_fn_(std::move(release_fn)),
+        committed_(false) {}
+
+    ~InitRollbackGuard() {
+        if (committed_) return;
+        for (void *p : direct_ptrs_) {
+            if (p != nullptr && release_fn_) {
+                release_fn_(p);
+            }
+        }
+        // Call release_all_owned unconditionally: it also frees malloc'd
+        // host shadows (via std::free, no callback needed). Gating on
+        // release_fn_ here would leak shadows if a collector ever passed
+        // an empty free_cb. Device-pointer release is gated inside the
+        // lambda instead.
+        manager_.release_all_owned([this](void *p) {
+            if (p != nullptr && release_fn_) {
+                release_fn_(p);
+            }
+        });
+    }
+
+    InitRollbackGuard(const InitRollbackGuard &) = delete;
+    InitRollbackGuard &operator=(const InitRollbackGuard &) = delete;
+
+    void add_direct_ptr(void *p) {
+        if (p != nullptr) direct_ptrs_.push_back(p);
+    }
+    void commit() { committed_ = true; }
+
+private:
+    Manager &manager_;
+    ReleaseFn release_fn_;
+    std::vector<void *> direct_ptrs_;
+    bool committed_;
+};
 
 // Result of Module::resolve_entry. Carries everything the unified
 // process_entry algorithm needs to (a) refill the originating pool's free
