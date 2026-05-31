@@ -339,6 +339,21 @@ private:
     // the cold diagnostic path.
     int32_t find_core_owner_thread(int32_t core_id) const;
 
+    // Does this thread own any core with a RUNNING task (running_slot_state set)?
+    // Gates the scheduler timeout fatal latch: a thread without an owned
+    // RUNNING task has no first-hand evidence of a stuck dispatch and must
+    // not declare global fatal on its own idle observation. The thread that
+    // does own the stuck task will reach the budget on its own polls and
+    // latch with valid evidence (or recover when the COND register flips).
+    bool self_owns_running_task(int32_t thread_idx) const;
+
+    // Does *any* scheduler thread own a RUNNING task? Used as the second
+    // fatal-latch condition: if the wall-clock budget elapsed AND no thread
+    // owns RUNNING work AND tasks remain incomplete, the system is in a
+    // pre-dispatch / WAIT-only deadlock (e.g. dependency cycle) and the
+    // ownerless idle threads are the only observers — let one of them latch.
+    bool no_thread_owns_running_task() const;
+
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
         int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
         int32_t last_progress_count

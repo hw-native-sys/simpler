@@ -537,6 +537,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     l2_swimlane.sched_start_ts = get_sys_cnt_aicpu();
 #endif
 
+    // Wall-clock timestamp of the last completed task on this thread.
+    // Updated on made_progress; consulted to decide whether the wall-clock
+    // budget for declaring a scheduler hang has elapsed. Initialized to
+    // "now" so the first budget cycle starts when this thread does, not at
+    // an undefined value.
+    uint64_t last_progress_ts = get_sys_cnt_aicpu();
+
     while (true) {
         if (completed_.load(std::memory_order_acquire)) {
             break;
@@ -737,6 +744,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         if (made_progress) {
             idle_iterations = 0;
+            last_progress_ts = get_sys_cnt_aicpu();
         } else {
             while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
@@ -755,17 +763,39 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (idle_iterations % STALL_LOG_INTERVAL == 0) {
                 log_stall_diagnostics(thread_idx, total_tasks_, idle_iterations, last_progress_count);
             }
-            if (idle_iterations >= MAX_IDLE_ITERATIONS) {
-                return handle_timeout_exit(
-                    thread_idx, header, runtime, idle_iterations, last_progress_count
+            // Wall-clock budget gate, with two fatal-latch branches:
+            //
+            // 1. Self owns a RUNNING task — first-hand evidence the
+            //    dispatch is stuck. Latch.
+            // 2. No thread anywhere owns a RUNNING task AND tasks remain
+            //    unfinished — the system is in a pre-dispatch / WAIT-only
+            //    deadlock (e.g. dependency cycle). Ownerless idle threads
+            //    are the only observers; let this one latch on the global
+            //    evidence (`completed_tasks_ < total_tasks_` and
+            //    `no_thread_owns_running_task()`).
+            //
+            // Otherwise: a sibling thread owns a RUNNING task but hasn't
+            // hit its own budget yet (typical distributed startup-skew
+            // case) — refresh last_progress_ts and keep spinning. The
+            // STALL diagnostic above still fires periodically so
+            // observability is preserved.
+            if (get_sys_cnt_aicpu() - last_progress_ts > SCHEDULER_TIMEOUT_CYCLES) {
+                bool self_owns = self_owns_running_task(thread_idx);
+                bool global_stuck = !self_owns && total_tasks_ > 0 &&
+                                    completed_tasks_.load(std::memory_order_relaxed) < total_tasks_ &&
+                                    no_thread_owns_running_task();
+                if (self_owns || global_stuck) {
+                    return handle_timeout_exit(
+                        thread_idx, header, runtime, idle_iterations, last_progress_count
 #if PTO2_PROFILING
-                    ,
-                    l2_swimlane.sched_start_ts
+                        ,
+                        l2_swimlane.sched_start_ts
 #endif
-                );
-            } else {
-                SPIN_WAIT_HINT();
+                    );
+                }
+                last_progress_ts = get_sys_cnt_aicpu();
             }
+            SPIN_WAIT_HINT();
 #if PTO2_PROFILING
             CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
             // Idle iterations no longer emit a phase record. Host tooling

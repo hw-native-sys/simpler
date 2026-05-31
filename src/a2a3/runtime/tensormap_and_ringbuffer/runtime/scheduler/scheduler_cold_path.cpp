@@ -212,6 +212,24 @@ int32_t SchedulerContext::find_core_owner_thread(int32_t core_id) const {
     return -1;
 }
 
+bool SchedulerContext::self_owns_running_task(int32_t thread_idx) const {
+    const int32_t *cores = core_trackers_[thread_idx].core_ids();
+    int32_t core_num = core_trackers_[thread_idx].core_num();
+    for (int32_t i = 0; i < core_num; i++) {
+        if (core_exec_states_[cores[i]].running_slot_state != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SchedulerContext::no_thread_owns_running_task() const {
+    for (int32_t t = 0; t < aicpu_thread_num_; t++) {
+        if (self_owns_running_task(t)) return false;
+    }
+    return true;
+}
+
 void SchedulerContext::log_stall_diagnostics(
     int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count
 ) {
