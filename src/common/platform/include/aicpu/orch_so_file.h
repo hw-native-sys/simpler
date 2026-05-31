@@ -15,15 +15,15 @@
  * Creates a writable, executable-mode file under a candidate directory for
  * staging the device orchestration shared library prior to dlopen.
  *
- * Platform Support:
- * - a5 (onboard): pid-based naming via open() with mode 0755. AICPU device
- *   libc may not provide mkstemps, and only one runtime runs per device process.
- * - a5sim (simulation): mkstemps() with fchmod(0755). Multiple sim workers
- *   can share a process, so names must be unique per call.
+ * Platform Support (same shape for both arches):
+ * - onboard: pid-based naming via open() with mode 0755. AICPU device libc
+ *   may not provide mkstemps, and only one runtime runs per device process.
+ * - sim: mkstemps() with fchmod(0755). Multiple sim workers can share a
+ *   process, so names must be unique per call.
  */
 
-#ifndef PLATFORM_AICPU_ORCH_SO_FILE_H_
-#define PLATFORM_AICPU_ORCH_SO_FILE_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_ORCH_SO_FILE_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_ORCH_SO_FILE_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -54,4 +54,4 @@
 int32_t
 create_orch_so_file(const char *dir, int32_t callable_id, int32_t device_id, char *out_path, size_t out_path_size);
 
-#endif  // PLATFORM_AICPU_ORCH_SO_FILE_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_ORCH_SO_FILE_H_

@@ -17,8 +17,8 @@
  * tensor data copying to arenas, metadata recording, and flushing.
  */
 
-#ifndef SRC_A5_PLATFORM_AICPU_TENSOR_DUMP_AICPU_H_
-#define SRC_A5_PLATFORM_AICPU_TENSOR_DUMP_AICPU_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_TENSOR_DUMP_AICPU_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_TENSOR_DUMP_AICPU_H_
 
 #include <stdint.h>
 
@@ -302,4 +302,4 @@ void dump_tensor_flush(int thread_idx);
 
 #endif
 
-#endif  // SRC_A5_PLATFORM_AICPU_TENSOR_DUMP_AICPU_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_TENSOR_DUMP_AICPU_H_

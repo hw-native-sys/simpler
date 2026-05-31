@@ -24,8 +24,8 @@
  * and shared memory protocols across different processing units.
  */
 
-#ifndef SRC_A2A3_PLATFORM_INCLUDE_COMMON_MEMORY_BARRIER_H_
-#define SRC_A2A3_PLATFORM_INCLUDE_COMMON_MEMORY_BARRIER_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_COMMON_MEMORY_BARRIER_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_COMMON_MEMORY_BARRIER_H_
 
 // =============================================================================
 // Memory Barrier Macros
@@ -60,4 +60,4 @@
 #define OUT_OF_ORDER_STORE_BARRIER() __asm__ __volatile__("" ::: "memory")
 #endif
 
-#endif  // SRC_A2A3_PLATFORM_INCLUDE_COMMON_MEMORY_BARRIER_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_COMMON_MEMORY_BARRIER_H_

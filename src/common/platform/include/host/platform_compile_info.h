@@ -12,12 +12,13 @@
  * Platform Compile Info Interface
  *
  * Minimal interface: platform only declares its identity.
- * Each platform (a2a3, a2a3sim, ...) implements get_platform() to return
- * its name. Runtime code uses this to decide which toolchain to use.
+ * Each platform implements get_platform() to return its name (one of
+ * a2a3 / a2a3sim / a5 / a5sim). Runtime code uses this to decide which
+ * toolchain to use.
  */
 
-#ifndef PLATFORM_COMPILE_INFO_H
-#define PLATFORM_COMPILE_INFO_H
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_PLATFORM_COMPILE_INFO_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_PLATFORM_COMPILE_INFO_H_
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,7 +27,7 @@ extern "C" {
 /**
  * Get the platform name.
  *
- * @return Platform identifier string (e.g., "a2a3", "a2a3sim")
+ * @return Platform identifier string (one of "a2a3", "a2a3sim", "a5", "a5sim")
  */
 const char *get_platform(void);
 
@@ -34,4 +35,4 @@ const char *get_platform(void);
 }
 #endif
 
-#endif /* PLATFORM_COMPILE_INFO_H */
+#endif /* SRC_COMMON_PLATFORM_INCLUDE_HOST_PLATFORM_COMPILE_INFO_H_ */

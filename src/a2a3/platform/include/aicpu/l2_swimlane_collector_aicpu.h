@@ -24,7 +24,7 @@
 // Include platform-specific timestamp implementation
 // Build system selects the correct inner_aicpu.h based on platform:
 // Both provide unified get_sys_cnt_aicpu() interface
-#include "device_time.h"
+#include "aicpu/device_time.h"
 
 // ============= Public Interface =============
 

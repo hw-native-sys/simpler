@@ -13,11 +13,11 @@
  * @brief Function Cache Structures for Kernel Binary Management
  *
  * Defines data structures for caching compiled kernel binaries and managing
- * their addresses in memory (device GM memory for a5, host memory for a5sim).
+ * their addresses in memory (device GM memory onboard, host memory on sim).
  *
- * Platform Support:
- * - a5: Real hardware with device GM memory
- * - a5sim: Host-based simulation with host memory
+ * Platform Support (same shape for both arches):
+ * - onboard: Real hardware with device GM memory
+ * - sim: Host-based simulation with host memory
  *
  * These structures follow the production system design from:
  * - src/interface/cache/core_func_data.h
@@ -76,8 +76,8 @@ struct CoreFunctionBin {
  * to the beginning of the cache.
  *
  * Platform Behavior:
- * - a5: Binaries are copied to device GM memory
- * - a5sim: Binaries are kept in host memory or registered as function pointers
+ * - onboard: Binaries are copied to device GM memory
+ * - sim: Binaries are kept in host memory or registered as function pointers
  */
 struct CoreFunctionBinCache {
     uint64_t data_size;    // Total size of all data (excluding this header)
