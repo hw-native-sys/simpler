@@ -53,16 +53,47 @@ def _parse_compiler_env(var_name: str, default: str) -> tuple[str, list[str]]:
     return tokens[0], tokens[1:]
 
 
-def _host_compiler_cmake_args(default_cc: str, default_cxx: str) -> list[str]:
+def _matches_pinned_name(actual: str, pinned: str) -> bool:
+    """True if *actual* (a CC/CXX value) names the *pinned* compiler.
+
+    Matches the bare name or a versioned/triplet variant — ``g++-15``,
+    ``/opt/tc/bin/g++-15``, ``aarch64-linux-gnu-g++-15`` — but NOT a substring
+    false-positive like ``clang++-15`` (``"g++-15" in "clang++-15"`` is True),
+    whose sanitizer-runtime ABI differs from GCC's.
+    """
+    base = os.path.basename(actual)
+    return base == pinned or base.endswith(f"-{pinned}")
+
+
+def _host_compiler_cmake_args(default_cc: str, default_cxx: str, pin_compiler: bool = False) -> list[str]:
     """CMake ``-D`` args for a host GCC/G++ toolchain.
 
     Reads CC/CXX from the environment and splits off any conda-injected flags
     (e.g. ``-pthread -B <env>/compiler_compat``) into CMAKE_{C,CXX}_FLAGS. The
     flags are re-joined with ``shlex.join`` so tokens containing spaces survive
     CMake's shell-style re-parse of the flag string.
+
+    When ``pin_compiler`` is set, an env CC/CXX naming a *different* GCC is
+    overridden by the caller's ``default_cc``/``default_cxx`` — but any
+    env-injected flags are still preserved, and an env compiler that already
+    names the pinned version (e.g. a custom path ``/opt/tc/bin/g++-15``) is kept
+    so non-PATH installs still work. This is required under a sanitizer: the
+    host compiler is ABI-pinned to g++-15 so its sanitizer runtime
+    (libtsan.so.2 / libasan.so) matches the lib*san the run-step preloads.
+    scikit-build-core exports CXX during ``pip install``; letting it name a
+    different GCC (whose libtsan SONAME is .so.0) produces a runtime mismatch
+    that fails at dlopen with "cannot allocate memory in static TLS block".
     """
     cc, cc_flags = _parse_compiler_env("CC", default_cc)
     cxx, cxx_flags = _parse_compiler_env("CXX", default_cxx)
+    if pin_compiler:
+        # Keep an env compiler that already names the pinned version (bare,
+        # custom-path, or triplet) so non-PATH installs work; override anything
+        # else — a different GCC, or clang++-15 whose runtime ABI differs.
+        if not _matches_pinned_name(cc, os.path.basename(default_cc)):
+            cc = default_cc
+        if not _matches_pinned_name(cxx, os.path.basename(default_cxx)):
+            cxx = default_cxx
     args = [
         f"-DCMAKE_C_COMPILER={cc}",
         f"-DCMAKE_CXX_COMPILER={cxx}",
@@ -227,7 +258,14 @@ class GxxToolchain(Toolchain):
         return flags
 
     def get_cmake_args(self) -> list[str]:
-        args = _host_compiler_cmake_args("gcc-15" if self._prefer_g15 else "gcc", self.cxx_path)
+        # Under prefer_g15 (sanitizer build) the compiler is ABI-pinned: env
+        # CC/CXX must not redirect it away from g++-15, or the built .so link a
+        # different lib*san than the run-step preloads. See pin_compiler above.
+        args = _host_compiler_cmake_args(
+            "gcc-15" if self._prefer_g15 else "gcc",
+            self.cxx_path,
+            pin_compiler=self._prefer_g15,
+        )
         if self.ascend_home_path:
             args.append(f"-DASCEND_HOME_PATH={self.ascend_home_path}")
         return args
