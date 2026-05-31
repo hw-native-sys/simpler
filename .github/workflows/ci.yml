@@ -464,7 +464,7 @@ jobs:
           cmake --build tests/ut/cpp/build
           python3 -c "
           import json, os
-          s, e = os.environ['DEVICE_RANGE'].split('-')
+          p = os.environ['DEVICE_RANGE'].split('-'); s, e = p[0], p[-1]  # tolerate a single id (no hyphen)
           npus = [{'id': str(i), 'slots': 1} for i in range(int(s), int(e)+1)]
           json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
                     open('tests/ut/cpp/build/resources.json', 'w'))
@@ -628,7 +628,7 @@ jobs:
       - name: Run Python hardware unit tests (a5)
         run: |
           source .venv/bin/activate
-          DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware --platform a5 --device ${DEVICE_RANGE} -v"
 
       - name: Build and run C++ hardware unit tests (a5)
@@ -638,12 +638,12 @@ jobs:
           cmake --build tests/ut/cpp/build
           python3 -c "
           import json, os
-          s, e = os.environ['DEVICE_RANGE'].split('-')
+          p = os.environ['DEVICE_RANGE'].split('-'); s, e = p[0], p[-1]  # tolerate a single id (no hyphen)
           npus = [{'id': str(i), 'slots': 1} for i in range(int(s), int(e)+1)]
           json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
                     open('tests/ut/cpp/build/resources.json', 'w'))
           "
-          DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a5)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure"
 
       - name: Build cann-examples/query (CANN host-API smoke)
@@ -693,6 +693,6 @@ jobs:
       - name: Run pytest scene tests (a5)
         run: |
           source .venv/bin/activate
-          DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --clone-protocol ssh --require-pto-isa"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 1200 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}"
