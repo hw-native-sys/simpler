@@ -16,24 +16,24 @@
  * real hardware (using HAL memory API for HBM allocation) and
  * simulation (using standard malloc/free).
  *
- * Platform Support:
- * - a2a3: Real hardware with HAL memory API (halMemAlloc/halMemFree)
- * - a2a3sim: Host-based simulation using malloc/free
+ * Platform Support (same shape for both arches):
+ * - onboard: Real hardware with HAL memory API (halMemAlloc/halMemFree)
+ * - sim: Host-based simulation using malloc/free
  */
 
-#ifndef PLATFORM_DEVICE_MALLOC_H_
-#define PLATFORM_DEVICE_MALLOC_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_MALLOC_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_MALLOC_H_
 
 #include <cstddef>
 
 /**
  * Allocate device memory (HBM on real hardware, heap on simulation).
  *
- * On a2a3: Allocates HBM memory via halMemAlloc. The returned pointer is a
- * device virtual address accessible by AIV/AIC cores. This is NOT the same
- * address space as AICPU-local malloc().
+ * On onboard: Allocates HBM memory via halMemAlloc. The returned pointer is
+ * a device virtual address accessible by AIV/AIC cores. This is NOT the
+ * same address space as AICPU-local malloc().
  *
- * On a2a3sim: Allocates host heap memory via malloc(). In simulation, all
+ * On sim: Allocates host heap memory via malloc(). In simulation, all
  * address spaces are shared, so this is equivalent to regular malloc.
  *
  * @param size  Number of bytes to allocate
@@ -50,4 +50,4 @@ void *aicpu_device_malloc(size_t size);
  */
 void aicpu_device_free(void *ptr);
 
-#endif  // PLATFORM_DEVICE_MALLOC_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_MALLOC_H_

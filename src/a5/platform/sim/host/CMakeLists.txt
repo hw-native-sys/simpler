@@ -44,7 +44,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/platform_compile_info.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/src/host/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/l2_swimlane_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/scope_stats_collector.cpp"
@@ -90,6 +90,10 @@ target_compile_options(host_runtime
         -g
         $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>
 )
+
+# Platform name baked into the shared get_platform() impl in
+# src/common/platform/src/host/platform_compile_info.cpp.
+target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a5sim")
 
 # Include directories
 target_include_directories(host_runtime

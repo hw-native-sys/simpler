@@ -15,9 +15,9 @@
  * This module provides centralized management of memory allocations with
  * automatic tracking and cleanup to prevent memory leaks.
  *
- * Platform Support:
- * - a2a3: Device memory management using CANN runtime API (rtMalloc/rtFree)
- * - a2a3sim: Host memory management using standard malloc/free
+ * Platform Support (same shape for both arches):
+ * - onboard: Device memory management using CANN runtime API (rtMalloc/rtFree)
+ * - sim: Host memory management using standard malloc/free
  *
  * Key Features:
  * - Automatic tracking of all allocated memory
@@ -26,8 +26,8 @@
  * - Idempotent finalize() for explicit cleanup with error checking
  */
 
-#ifndef PLATFORM_MEMORY_ALLOCATOR_H_
-#define PLATFORM_MEMORY_ALLOCATOR_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_
 
 #include <cstddef>
 #include <mutex>
@@ -37,8 +37,8 @@
  * MemoryAllocator class for managing memory allocations
  *
  * Platform Behavior:
- * - a2a3: Wraps CANN runtime memory allocation APIs (rtMalloc/rtFree)
- * - a2a3sim: Wraps standard malloc/free
+ * - onboard: Wraps CANN runtime memory allocation APIs (rtMalloc/rtFree)
+ * - sim: Wraps standard malloc/free
  *
  * Both implementations provide automatic tracking of allocations to
  * prevent memory leaks. Uses RAII pattern for automatic cleanup.
@@ -56,8 +56,8 @@ public:
      * Allocate memory and track the pointer
      *
      * Platform-specific behavior:
-     * - a2a3: Allocates device memory using rtMalloc
-     * - a2a3sim: Allocates host memory using malloc
+     * - onboard: Allocates device memory using rtMalloc
+     * - sim: Allocates host memory using malloc
      *
      * @param size  Size in bytes to allocate
      * @return Memory pointer on success, nullptr on failure
@@ -72,8 +72,8 @@ public:
      * untracked pointers.
      *
      * Platform-specific behavior:
-     * - a2a3: Frees device memory using rtFree
-     * - a2a3sim: Frees host memory using free
+     * - onboard: Frees device memory using rtFree
+     * - sim: Frees host memory using free
      *
      * @param ptr  Memory pointer to free
      * @return 0 on success, error code on failure, 0 if ptr not tracked
@@ -106,4 +106,4 @@ private:
     std::set<void *> ptr_set_;
 };
 
-#endif  // PLATFORM_MEMORY_ALLOCATOR_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_

@@ -8,6 +8,17 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+/**
+ * `get_platform()` shared across all 4 platform variants (a2a3 / a2a3sim /
+ * a5 / a5sim). The build system passes the per-target name via
+ * `target_compile_definitions(... SIMPLER_PLATFORM_NAME="…")` on each
+ * host_runtime target. Replaces 4 byte-identical-modulo-string source files.
+ */
+
 #include "host/platform_compile_info.h"
 
-extern "C" const char *get_platform(void) { return "a5"; }
+#ifndef SIMPLER_PLATFORM_NAME
+#error "SIMPLER_PLATFORM_NAME must be defined by the build system (see host CMakeLists)"
+#endif
+
+extern "C" const char *get_platform(void) { return SIMPLER_PLATFORM_NAME; }

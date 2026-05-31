@@ -55,7 +55,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/platform_compile_info.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/src/host/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/l2_swimlane_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/tensor_dump_collector.cpp"
@@ -105,6 +105,10 @@ target_compile_options(host_runtime
         -O3
         -g
 )
+
+# Platform name baked into the shared get_platform() impl in
+# src/common/platform/src/host/platform_compile_info.cpp.
+target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a2a3")
 
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
