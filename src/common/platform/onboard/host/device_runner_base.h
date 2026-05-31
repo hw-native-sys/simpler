@@ -72,6 +72,10 @@
  */
 class DeviceRunnerBase {
 public:
+    // Public virtual dtor so the shared c_api can `delete` a polymorphic
+    // `DeviceRunnerBase *` (the `destroy_device_context` entrypoint). Each
+    // arch's `DeviceRunner` defaults this through the compiler-generated dtor.
+    virtual ~DeviceRunnerBase() = default;
     DeviceRunnerBase(const DeviceRunnerBase &) = delete;
     DeviceRunnerBase &operator=(const DeviceRunnerBase &) = delete;
     DeviceRunnerBase(DeviceRunnerBase &&) = delete;
@@ -302,6 +306,38 @@ public:
      */
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
+    // ---- Virtual entry points called by the shared c_api ----------------
+    //
+    // The shared `pto_runtime_c_api` glue (`src/common/platform/onboard/host/
+    // c_api_shared.cpp`) works through `DeviceRunnerBase *` and dispatches
+    // through these virtuals. Each arch's `DeviceRunner` overrides
+    // `run` and `finalize`; a2a3 also overrides `set_dep_gen_enabled`
+    // (a5 keeps the default no-op since dep_gen is a2a3-only today).
+
+    /**
+     * Execute a Runtime. Each arch implements its own `run()` — the bodies
+     * are too divergent for a shared implementation (FFTS / dep_gen / ACL
+     * register init on a2a3; MIX core handling on a5). See the subclass
+     * docs for the per-arch contract.
+     */
+    virtual int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) = 0;
+
+    /**
+     * Cleanup all resources. Each arch's `finalize()` wraps
+     * `finalize_common()` with arch-specific device-reset behaviour:
+     * a2a3 has the ACL-ready branch + dep_gen collector teardown;
+     * a5 does straight `rtDeviceReset`. See the subclass docs for the
+     * per-arch contract.
+     */
+    virtual int finalize() = 0;
+
+    /**
+     * a2a3-only diagnostics setter. The shared c_api `run_prepared`
+     * calls this unconditionally; on a5 it's a no-op default (dep_gen
+     * is not implemented there yet).
+     */
+    virtual void set_dep_gen_enabled(bool /*enable*/) {}
+
     /**
      * Launch an AICPU kernel. Internal helper used by the subclass's
      * `run()`; thin wrapper that dispatches through `load_aicpu_op_`'s
@@ -362,11 +398,11 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
 protected:
-    // Ctor / dtor are protected: this class is for inheritance only —
-    // direct instantiation (`new DeviceRunnerBase()`) and polymorphic delete
-    // (`delete (DeviceRunnerBase *)p`) are both compile errors.
+    // Ctor is protected: this class is for inheritance only — direct
+    // instantiation (`new DeviceRunnerBase()`) is a compile error. The
+    // public virtual dtor above lets the shared c_api delete through a
+    // base pointer safely.
     DeviceRunnerBase();
-    ~DeviceRunnerBase() = default;
 
     /**
      * `DeviceArena` callback trampolines bridging from C-style

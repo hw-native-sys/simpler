@@ -106,7 +106,7 @@ public:
      * are captured once by simpler_init (binaries) / libsimpler_log.so (log)
      * and read off DeviceRunner state / HostLogger here — no per-run args.
      */
-    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1);
+    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) override;
 
     // `set_l2_swimlane_enabled`, `set_dump_tensor_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
@@ -121,7 +121,7 @@ public:
      *
      * @return 0 on success, error code on failure
      */
-    int finalize();
+    int finalize() override;
 
     // `upload_chip_callable_buffer`, `register_callable`,
     // `register_callable_host_orch`, `unregister_callable`, `has_callable`,

@@ -114,7 +114,7 @@ public:
      * are captured once by simpler_init (binaries) / libsimpler_log.so (log)
      * and read off DeviceRunner state / HostLogger here — no per-run args.
      */
-    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1);
+    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) override;
 
     /**
      * a2a3-only `dep_gen` enablement setter. The shared
@@ -122,7 +122,7 @@ public:
      * `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
      * `output_prefix`, and `launch_aicpu_kernel` live on `DeviceRunnerBase`.
      */
-    void set_dep_gen_enabled(bool enable) { enable_dep_gen_ = enable; }
+    void set_dep_gen_enabled(bool enable) override { enable_dep_gen_ = enable; }
 
     /**
      * Cleanup all resources
@@ -132,7 +132,7 @@ public:
      *
      * @return 0 on success, error code on failure
      */
-    int finalize();
+    int finalize() override;
 
     // `upload_chip_callable_buffer` is inherited from `DeviceRunnerBase`.
 
