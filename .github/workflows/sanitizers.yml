@@ -6,10 +6,10 @@ name: Sanitizers
 #
 # ASAN and TSAN are separate, mutually-exclusive builds; both instrument only
 # host-compiled code (sim runtime + kernels + orchestration), and sim unifies on
-# g++-15 so the preloaded runtime matches the kernels' ABI. Not a PR gate: too
-# slow (TSAN ~5-15x) and subject to the pre-existing sim-oversubscription flake,
-# so a generous per-session timeout + manual rerun is expected. detect_leaks=0
-# until LSan suppressions exist for the device custom arenas.
+# g++-15 so the preloaded runtime matches the kernels' ABI. Not a PR gate (too
+# slow, esp. TSAN ~5-15x) — runs nightly on main. Each sanitizer runs a scoped,
+# parallelism-limited subset to dodge the sim-oversubscription livelock; see the
+# run step. detect_leaks=0 until LSan suppressions exist for the device arenas.
 on:
   schedule:
     - cron: "0 18 * * *"  # 02:00 Beijing
@@ -25,11 +25,10 @@ jobs:
   sanitizer-sim:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    # ASAN gates the nightly; TSAN runs informationally. TSAN's ~5-15x slowdown
-    # (vs ASAN's ~1.7x) makes the sim's threaded scheduler livelock on
-    # oversubscription-heavy cases, so its run reliability is still being worked
-    # out — the build is validated, the run is best-effort for now.
-    continue-on-error: ${{ matrix.sanitizer == 'tsan' }}
+    # Both ASAN and TSAN gate (no continue-on-error). They run different scopes:
+    # ASAN (~1.7x) takes the broader set with --max-parallel 2; TSAN (~5-15x)
+    # livelocks the chip-fork L3 cases even serial, so it runs only the light
+    # prepared_callable L2 tests, serially, reporting races without aborting.
     strategy:
       fail-fast: false
       matrix:
@@ -69,22 +68,32 @@ jobs:
           # Sim unifies host compilation on g++-15, so preload g++-15's runtime.
           LIB=$(g++-15 -print-file-name=lib${{ matrix.sanitizer }}.so)
           ARCH=$(echo "${{ matrix.platform }}" | sed 's/sim$//')
-          # Scope to the core register / run / dlopen / kernel-compile /
-          # orchestration paths, cap parallelism, and skip the parallel-broadcast
-          # case: ASAN/TSAN slow the sim enough that oversubscription-heavy cases
-          # livelock on a 4-vCPU runner (docs/troubleshooting/sim-oversubscription-hang.md).
-          TARGETS="tests/st/$ARCH/tensormap_and_ringbuffer/prepared_callable"
-          if [ -d "tests/st/$ARCH/tensormap_and_ringbuffer/dynamic_register" ]; then
-            TARGETS="$TARGETS tests/st/$ARCH/tensormap_and_ringbuffer/dynamic_register"
+          PC="tests/st/$ARCH/tensormap_and_ringbuffer/prepared_callable"
+          # dlopen_count tests are excluded everywhere: they assert exact dlopen
+          # accounting that the sanitizers perturb by interposing dlopen.
+          if [ "${{ matrix.sanitizer }}" = "tsan" ]; then
+            # TSAN (~5-15x) livelocks the chip-fork L3 cases even serial, so scope
+            # to the light prepared_callable L2 tests (which still surface races),
+            # run serially, and report-don't-abort. Job gates on hang/crash;
+            # triaging the races into a suppressions file is a follow-up.
+            # exitcode=0: TSAN's default exitcode=66 fires on any reported race
+            # even with halt_on_error=0, which would redden the cell every run —
+            # we want races reported in the log, not failing the job (yet).
+            TARGETS="$PC"
+            MAXPAR=1
+            KFILTER="not dlopen_count"
+            export TSAN_OPTIONS=halt_on_error=0:exitcode=0
+          else
+            # ASAN (~1.7x) takes the broader set; dynamic_register is a2a3-only.
+            TARGETS="$PC"
+            [ -d "tests/st/$ARCH/tensormap_and_ringbuffer/dynamic_register" ] && \
+              TARGETS="$TARGETS tests/st/$ARCH/tensormap_and_ringbuffer/dynamic_register"
+            MAXPAR=2
+            KFILTER="not parallel_broadcast and not dlopen_count"
+            export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1
+            export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
           fi
-          LD_PRELOAD="$LIB" \
-          ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1 \
-          UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-          TSAN_OPTIONS=halt_on_error=1 \
-          # Exclude dlopen_count tests: they assert exact dlopen accounting,
-          # which ASAN/TSAN perturb by interposing dlopen (orthogonal to the
-          # memory/race checks the sanitizers are here for).
-          pytest $TARGETS --platform ${{ matrix.platform }} --device 0-7 --max-parallel 2 \
-            -k "not parallel_broadcast and not dlopen_count" \
+          LD_PRELOAD="$LIB" pytest $TARGETS --platform ${{ matrix.platform }} \
+            --device 0-7 --max-parallel "$MAXPAR" -k "$KFILTER" \
             --sanitizer ${{ matrix.sanitizer }} -v --pto-session-timeout 600 \
             --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https --require-pto-isa

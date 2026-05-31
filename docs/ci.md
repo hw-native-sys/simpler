@@ -54,16 +54,22 @@ runs on a nightly `schedule` — kept out of `ci.yml` so the cron fires only the
 sanitizer jobs, never the PR/self-hosted pipeline. Its
 `sanitizer-sim` job builds the sim runtime + kernels with ASAN or TSAN
 (`pip install --config-settings=cmake.define.SIMPLER_SANITIZER=...`) and runs a
-**scoped** subset under the matching `LD_PRELOAD` — the `tensormap_and_ringbuffer`
-`prepared_callable` path (plus `dynamic_register` where it exists; a5 has only
-the former), `--max-parallel 2`, with `-k "not parallel_broadcast and not
-dlopen_count"` (the `dlopen_count` tests assert exact dlopen accounting that the
-sanitizers perturb by interposing `dlopen`) (a2a3sim/a5sim, ubuntu-only). The full suite is avoided
-because ASAN/TSAN slow the sim enough that oversubscription-heavy spmd stress
-cases livelock on a 4-vCPU runner. **ASAN gates the job; TSAN runs
-`continue-on-error`** — its ~5-15x slowdown (vs ASAN's ~1.7x) still livelocks the
-threaded scheduler, so the TSAN build is validated but its run is best-effort
-pending further work. Not a PR gate; see
+**scoped** subset under the matching `LD_PRELOAD` (a2a3sim/a5sim, ubuntu-only).
+`dlopen_count` tests are excluded everywhere (they assert exact dlopen accounting
+that the sanitizers perturb by interposing `dlopen`). The full suite is avoided
+because ASAN/TSAN slow the sim enough that oversubscription-heavy cases livelock
+on a 4-vCPU runner — so the scope is parallelism-limited per sanitizer:
+
+- **ASAN** (~1.7x): `prepared_callable` + `dynamic_register` (where present),
+  `--max-parallel 2`, skipping `parallel_broadcast`.
+- **TSAN** (~5-15x): livelocks the chip-fork L3 cases even when run serially, so it
+  runs only the light `prepared_callable` L2 tests, `--max-parallel 1`, with
+  `TSAN_OPTIONS=halt_on_error=0:exitcode=0` (report races without aborting *or*
+  failing the job — TSAN's default `exitcode=66` would otherwise redden the cell on
+  every race; the job gates on hang/crash, triaging the reported races into a
+  suppressions file is a follow-up).
+
+Both sanitizer jobs gate (no `continue-on-error`). Not a PR gate; see
 [testing.md](testing.md#sanitizer-builds-asan--tsan).
 
 ### Parallel ST runs on hardware
