@@ -135,6 +135,11 @@ _TASK_DONE = 2
 _SHUTDOWN = 3
 _CONTROL_REQUEST = 4
 _CONTROL_DONE = 5
+# Child writes this after its expensive init (ChipWorker.init) completes.
+# Parent's _start_hierarchical spin-waits for every chip child to reach
+# INIT_DONE before allowing any dispatch — keeps cross-rank init skew out
+# of the per-rank host-side stream sync budget (issue #897).
+_INIT_DONE = 6
 
 # Control sub-commands (written at _OFF_CALLABLE as uint64)
 _CTRL_MALLOC = 0
@@ -707,6 +712,11 @@ def _chip_process_loop(
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
     state_addr = mailbox_addr + _OFF_STATE
+    # Signal init complete. Parent's _start_hierarchical spin-waits for
+    # every chip child to reach _INIT_DONE before dispatching the first
+    # task, so the per-rank host-side stream sync budget only covers
+    # actual op execution rather than absorbing peer-rank init skew.
+    _mailbox_store_i32(state_addr, _INIT_DONE)
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
 
@@ -1373,6 +1383,24 @@ class Worker:
                         os._exit(0)
                     else:
                         self._chip_pids.append(pid)
+
+                # Cross-chip init barrier.  ChipWorker.init can have a long
+                # right tail (e.g. PTO2_RING_HEAP=4 GiB pushes per-rank
+                # device_malloc beyond the host stream sync budget); without
+                # this barrier a fast-init chip starts its aclrtSyncStream
+                # window N seconds before a slow peer reaches the same
+                # point, and any cross-rank wait inside the op (HCCL notify,
+                # etc.) charges the slow peer's remaining init time against
+                # the fast peer's PLATFORM_STREAM_SYNC_TIMEOUT_MS budget —
+                # the cascade documented in issue #897.  Reset each child to
+                # _IDLE once observed so the standard dispatch state machine
+                # resumes from the canonical "ready for work" state.
+                for shm in self._chip_shms:
+                    assert shm.buf is not None
+                    addr = _buffer_field_addr(shm.buf, _OFF_STATE)
+                    while _mailbox_load_i32(addr) != _INIT_DONE:
+                        pass
+                    _mailbox_store_i32(addr, _IDLE)
 
             # Fork next-level Worker children (L4+ with Worker children).
             # Each child process: init the inner Worker (which mmaps its own
