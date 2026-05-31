@@ -20,6 +20,7 @@
  * │ L2SwimlaneDataHeader (fixed header)                         │
  * │  - ReadyQueue (FIFO, capacity=PLATFORM_PROF_READYQUEUE_SIZE)│
  * │  - num_cores, l2_swimlane_level                             │
+ * │  - num_phase_threads, num_phase_cores, core_to_thread[]     │
  * ├─────────────────────────────────────────────────────────────┤
  * │ L2SwimlaneAicpuTaskPool[0..num_cores-1]                     │
  * │  - head:       active L2SwimlaneAicpuTaskBuffer + counters  │
@@ -31,12 +32,7 @@
  * │                boundaries by bumping current_buf_seq)       │
  * │  - free_queue: SPSC ring of recycled AICore buffers         │
  * ├─────────────────────────────────────────────────────────────┤
- * │ L2SwimlaneAicpuPhaseHeader (optional, present when phase    │
- * │                             profiling is enabled)           │
- * │  - magic, num_sched_threads, records_per_thread             │
- * │  - core_to_thread mapping                                   │
- * ├─────────────────────────────────────────────────────────────┤
- * │ L2SwimlaneAicpuPhasePool[0..num_threads-1]                  │
+ * │ L2SwimlaneAicpuPhasePool[0..num_phase_threads-1]            │
  * │  - head, free_queue (same shape as AicpuTaskPool)           │
  * └─────────────────────────────────────────────────────────────┘
  *
@@ -46,8 +42,7 @@
  *
  * Base size = sizeof(L2SwimlaneDataHeader) + num_cores * sizeof(L2SwimlaneAicpuTaskPool)
  * With phases = Base + num_cores * sizeof(L2SwimlaneAicoreTaskPool)
- *                    + sizeof(L2SwimlaneAicpuPhaseHeader)
- *                    + num_threads * sizeof(L2SwimlaneAicpuPhasePool)
+ *                    + num_phase_threads * sizeof(L2SwimlaneAicpuPhasePool)
  */
 
 #ifndef SRC_A2A3_PLATFORM_INCLUDE_COMMON_L2_SWIMLANE_PROFILING_H_
@@ -380,7 +375,31 @@ struct L2SwimlaneDataHeader {
     uint32_t l2_swimlane_level;  // 0=off, 1=AICore timing, 2=+dispatch/fanout,
                                  // 3=+sched phases, 4=+orch phases. Host writes
                                  // at init; AICPU reads in l2_swimlane_aicpu_init.
+
+    // Phase profiling metadata (AICPU writes in l2_swimlane_aicpu_init_phase;
+    // Host reads at drain time). num_phase_threads == 0 means phase profiling
+    // was not initialized (no phase pools to drain). Gated by
+    // l2_swimlane_level >= SCHED_PHASES at write time.
+    uint32_t num_phase_threads;                 // Number of phase pools the AICPU initialized
+    uint32_t num_phase_cores;                   // Number of valid entries in core_to_thread (0 = unset)
+    int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
 } __attribute__((aligned(64)));
+
+// ABI lock for the merged header. The phase metadata fields and the
+// core_to_thread[] array are read by both host and AICPU .so's; silent
+// layout drift between them is undetectable at runtime (no magic gate
+// anymore). Mirrors the pool-layout asserts in #939.
+static_assert(
+    offsetof(L2SwimlaneDataHeader, num_phase_threads) ==
+        offsetof(L2SwimlaneDataHeader, l2_swimlane_level) + sizeof(uint32_t),
+    "L2SwimlaneDataHeader: num_phase_threads must follow l2_swimlane_level"
+);
+static_assert(
+    offsetof(L2SwimlaneDataHeader, core_to_thread) ==
+        offsetof(L2SwimlaneDataHeader, num_phase_cores) + sizeof(uint32_t),
+    "L2SwimlaneDataHeader: core_to_thread[] must follow num_phase_cores"
+);
+static_assert(sizeof(L2SwimlaneDataHeader) % 64 == 0, "L2SwimlaneDataHeader must be 64-byte aligned");
 
 // =============================================================================
 // AICPU Phase Profiling - Scheduler and Orchestrator Records
@@ -451,26 +470,11 @@ struct L2SwimlaneAicpuPhaseRecord {
 };
 static_assert(sizeof(L2SwimlaneAicpuPhaseRecord) == 40, "L2SwimlaneAicpuPhaseRecord layout drift");
 
-constexpr uint32_t L2_SWIMLANE_AICPU_PHASE_MAGIC = 0x41435048;  // "ACPH"
-constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 16384;        // ~512KB per thread
+constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 16384;  // ~512KB per thread
 
 // Fixed-size phase record buffer. Same TypedBuffer template as L2SwimlaneAicpuTaskBuffer
 // and L2SwimlaneAicoreTaskBuffer — keeps the drain machinery uniform.
 using L2SwimlaneAicpuPhaseBuffer = TypedBuffer<L2SwimlaneAicpuPhaseRecord, PLATFORM_PHASE_RECORDS_PER_THREAD>;
-
-/**
- * AICPU phase profiling header
- *
- * Located after the L2SwimlaneAicpuTaskPool array in shared memory.
- * Contains metadata and per-thread tracking.
- */
-struct L2SwimlaneAicpuPhaseHeader {
-    uint32_t magic;                             // Validation magic (L2_SWIMLANE_AICPU_PHASE_MAGIC)
-    uint32_t num_sched_threads;                 // Number of scheduler threads
-    uint32_t records_per_thread;                // Max records per L2SwimlaneAicpuPhaseBuffer
-    uint32_t num_cores;                         // Total number of cores with valid assignments
-    int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
-} __attribute__((aligned(64)));
 
 // =============================================================================
 // Helper Functions - Memory Layout
@@ -530,24 +534,24 @@ inline L2SwimlaneAicpuTaskPool *get_perf_buffer_state(void *base_ptr, int core_i
  * Calculate total memory size including AICore states and phase profiling
  * region (buffer states only, not the record payloads themselves).
  *
- * Layout (after the fixed L2SwimlaneDataHeader):
+ * Layout (after the fixed L2SwimlaneDataHeader, which now carries the
+ * formerly-standalone phase metadata fields):
  *   [L2SwimlaneAicpuTaskPool × num_cores]
  *   [L2SwimlaneAicoreTaskPool × num_cores]
- *   [L2SwimlaneAicpuPhaseHeader]
- *   [L2SwimlaneAicpuPhasePool × num_sched_threads]
+ *   [L2SwimlaneAicpuPhasePool × num_phase_threads]
  *
- * @param num_cores Number of AICore instances
- * @param num_sched_threads Number of phase profiling threads (scheduler + orchestrator)
+ * @param num_cores         Number of AICore instances
+ * @param num_phase_threads Number of phase profiling threads (scheduler + orchestrator)
  * @return Total bytes needed for header + all buffer states
  */
-inline size_t calc_perf_data_size_with_phases(int num_cores, int num_sched_threads) {
+inline size_t calc_perf_data_size_with_phases(int num_cores, int num_phase_threads) {
     return calc_perf_data_size(num_cores) + num_cores * sizeof(L2SwimlaneAicoreTaskPool) +
-           sizeof(L2SwimlaneAicpuPhaseHeader) + num_sched_threads * sizeof(L2SwimlaneAicpuPhasePool);
+           num_phase_threads * sizeof(L2SwimlaneAicpuPhasePool);
 }
 
 /**
  * Get L2SwimlaneAicoreTaskPool array start address (located immediately
- * after the L2SwimlaneAicpuTaskPool array, before the L2SwimlaneAicpuPhaseHeader).
+ * after the L2SwimlaneAicpuTaskPool array).
  */
 inline L2SwimlaneAicoreTaskPool *get_aicore_buffer_states(void *base_ptr, int num_cores) {
     return reinterpret_cast<L2SwimlaneAicoreTaskPool *>(
@@ -560,21 +564,14 @@ inline L2SwimlaneAicoreTaskPool *get_aicore_buffer_state(void *base_ptr, int num
 }
 
 /**
- * Get L2SwimlaneAicpuPhaseHeader pointer (located after the L2SwimlaneAicoreTaskPool array).
- */
-inline L2SwimlaneAicpuPhaseHeader *get_phase_header(void *base_ptr, int num_cores) {
-    return reinterpret_cast<L2SwimlaneAicpuPhaseHeader *>(
-        reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(num_cores) +
-        num_cores * sizeof(L2SwimlaneAicoreTaskPool)
-    );
-}
-
-/**
- * Get L2SwimlaneAicpuPhasePool array start address (located after L2SwimlaneAicpuPhaseHeader)
+ * Get L2SwimlaneAicpuPhasePool array start address (located immediately
+ * after the L2SwimlaneAicoreTaskPool array — the standalone phase header
+ * was merged into L2SwimlaneDataHeader).
  */
 inline L2SwimlaneAicpuPhasePool *get_phase_buffer_states(void *base_ptr, int num_cores) {
     return reinterpret_cast<L2SwimlaneAicpuPhasePool *>(
-        reinterpret_cast<char *>(get_phase_header(base_ptr, num_cores)) + sizeof(L2SwimlaneAicpuPhaseHeader)
+        reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(num_cores) +
+        num_cores * sizeof(L2SwimlaneAicoreTaskPool)
     );
 }
 

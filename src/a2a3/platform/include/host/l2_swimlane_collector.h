@@ -179,11 +179,17 @@ struct L2SwimlaneModule {
             cb(/*kind=*/2, &ac_state->free_queue, sizeof(L2SwimlaneAicoreTaskBuffer));
         }
 
-        // Per-thread phase states (kind 1) — gated on L2SwimlaneAicpuPhaseHeader being
-        // initialized (runtimes that don't emit phase records leave it zero).
-        L2SwimlaneAicpuPhaseHeader *ph = get_phase_header(shm, num_cores);
-        const int num_phase_threads =
-            (ph->magic == L2_SWIMLANE_AICPU_PHASE_MAGIC) ? static_cast<int>(ph->num_sched_threads) : 0;
+        // Per-thread phase states (kind 1) — gated on num_phase_threads in
+        // the root header (runtimes that don't emit phase records leave it
+        // zero; AICPU sets it inside l2_swimlane_aicpu_init_phase). Bounds-
+        // clamp against PLATFORM_MAX_AICPU_THREADS in addition to the
+        // host-side zero-init, so a corrupted device-shared value can't
+        // walk off the pool array. Mirrors the same check in
+        // read_phase_header_metadata.
+        int num_phase_threads = static_cast<int>(header->num_phase_threads);
+        if (num_phase_threads > PLATFORM_MAX_AICPU_THREADS) {
+            num_phase_threads = 0;
+        }
         for (int t = 0; t < num_phase_threads; t++) {
             L2SwimlaneAicpuPhasePool *state = get_phase_buffer_state(shm, num_cores, t);
             cb(/*kind=*/1, &state->free_queue, sizeof(L2SwimlaneAicpuPhaseBuffer));
@@ -219,7 +225,7 @@ using L2SwimlaneFreeCallback = profiling_common::ProfFreeCallback;
  *                                    (mgmt first so its final-drain entries
  *                                    have a consumer).
  *   5. read_phase_header_metadata() — single-shot read of the core→thread
- *                                    mapping from L2SwimlaneAicpuPhaseHeader.
+ *                                    mapping from L2SwimlaneDataHeader.
  *   6. reconcile_counters()        — device-side three-bucket accounting for
  *                                    both PERF and PHASE pools (total /
  *                                    collected / dropped).
@@ -327,7 +333,7 @@ public:
     void *get_aicore_ring_addr_table_device_ptr() const { return aicore_ring_addr_table_dev_; }
 
     /**
-     * Read AICPU phase metadata that lives in L2SwimlaneAicpuPhaseHeader (not on the
+     * Read AICPU phase metadata that lives in L2SwimlaneDataHeader (not on the
      * buffer pipeline): the core→thread mapping plus a has-data signal
      * derived from accumulated per-event records. Single-shot — must be
      * called after stop() so the shm region has settled.

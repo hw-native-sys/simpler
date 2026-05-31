@@ -168,6 +168,17 @@ int L2SwimlaneCollector::initialize(
 
     header->num_cores = num_aicore;
     header->l2_swimlane_level = static_cast<uint32_t>(l2_swimlane_level_);
+    // Phase metadata: must be zero-initialized here. alloc_cb returns
+    // uninitialized device memory; AICPU only writes these fields when
+    // phase init runs (level >= SCHED_PHASES). Without zeroing, lower
+    // levels (AICORE_TIMING / AICPU_TIMING) leave garbage that
+    // for_each_instance iterates as `num_phase_threads`, walking off the
+    // end of the allocated pool array → segfault. The host-side reader
+    // (read_phase_header_metadata) and BufferPoolManager replenish loop
+    // both gate on this count being a sane value.
+    header->num_phase_threads = 0;
+    header->num_phase_cores = 0;
+    memset(header->core_to_thread, -1, sizeof(header->core_to_thread));
 
     LOG_DEBUG("Initialized L2SwimlaneDataHeader:");
     LOG_DEBUG("  num_cores:              %d", header->num_cores);
@@ -534,24 +545,20 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
 
     rmb();
 
-    L2SwimlaneAicpuPhaseHeader *phase_header = get_phase_header(shm_host_, num_aicore_);
+    L2SwimlaneDataHeader *header = get_l2_swimlane_header(shm_host_);
 
-    if (phase_header->magic != L2_SWIMLANE_AICPU_PHASE_MAGIC) {
-        LOG_INFO_V0(
-            "No phase profiling data found (magic mismatch: 0x%x vs 0x%x)", phase_header->magic,
-            L2_SWIMLANE_AICPU_PHASE_MAGIC
-        );
+    int num_phase_threads = static_cast<int>(header->num_phase_threads);
+    if (num_phase_threads == 0) {
+        LOG_INFO_V0("No phase profiling data found (num_phase_threads=0; phase init never ran)");
         return;
     }
-
-    int num_sched_threads = phase_header->num_sched_threads;
-    if (num_sched_threads > PLATFORM_MAX_AICPU_THREADS) {
+    if (num_phase_threads > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR(
-            "Invalid num_sched_threads %d from shared memory (max=%d)", num_sched_threads, PLATFORM_MAX_AICPU_THREADS
+            "Invalid num_phase_threads %d from shared memory (max=%d)", num_phase_threads, PLATFORM_MAX_AICPU_THREADS
         );
         return;
     }
-    LOG_INFO_V0("Collecting phase metadata: %d scheduler threads", num_sched_threads);
+    LOG_INFO_V0("Collecting phase metadata: %d phase threads", num_phase_threads);
 
     // Per-thread breakdown of records already collected via the buffer pipeline.
     for (size_t t = 0; t < collected_phase_records_.size(); t++) {
@@ -573,10 +580,10 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
     // and toggles the flag. No re-scan needed here.
 
     // Core-to-thread mapping (header-resident; not buffered).
-    int num_cores = static_cast<int>(phase_header->num_cores);
-    if (num_cores > 0 && num_cores <= PLATFORM_MAX_CORES) {
-        core_to_thread_.assign(phase_header->core_to_thread, phase_header->core_to_thread + num_cores);
-        LOG_INFO_V0("  Core-to-thread mapping: %d cores", num_cores);
+    int num_phase_cores = static_cast<int>(header->num_phase_cores);
+    if (num_phase_cores > 0 && num_phase_cores <= PLATFORM_MAX_CORES) {
+        core_to_thread_.assign(header->core_to_thread, header->core_to_thread + num_phase_cores);
+        LOG_INFO_V0("  Core-to-thread mapping: %d cores", num_phase_cores);
     }
 
     LOG_INFO_V0("Phase metadata collection complete: has_phase_data=%s", has_phase_data_ ? "yes" : "no");

@@ -28,9 +28,13 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 
-// Cached pointers for hot-path access (set during init)
-static L2SwimlaneAicpuPhaseHeader *s_l2_swimlane_aicpu_phase_header = nullptr;
+// Cached pointers for hot-path access (set during init). Phase metadata
+// (num_phase_threads, num_phase_cores, core_to_thread[]) lives inside
+// L2SwimlaneDataHeader after the phase-header merge; we keep a separate
+// bool so phase-gated paths can check init-ran without re-reading the
+// device-shared header.
 static L2SwimlaneDataHeader *s_l2_swimlane_header = nullptr;
+static bool s_phase_initialized = false;
 
 // Per-core L2SwimlaneAicpuTaskPool cache
 static L2SwimlaneAicpuTaskPool *s_aicpu_task_pools[PLATFORM_MAX_CORES] = {};
@@ -127,6 +131,15 @@ static int enqueue_ready_buffer(
 }
 
 void l2_swimlane_aicpu_init(int worker_count) {
+    // Reset cross-launch state up front. AICPU statics persist across launches
+    // on the same loaded .so; without this reset, an enabled→disabled launch
+    // sequence would leave s_phase_initialized=true from the prior run, and
+    // any subsequent record_phase call would dereference the prior launch's
+    // (now-freed) s_aicpu_phase_pools pointers. Same shape as the
+    // [[block_local]] reset in onboard/aicore/kernel.cpp for the AICore-side
+    // rotation slot (fixed in #936).
+    s_phase_initialized = false;
+
     void *l2_swimlane_base = reinterpret_cast<void *>(g_platform_l2_swimlane_base);
     if (l2_swimlane_base == nullptr) {
         LOG_ERROR("l2_swimlane_data_base is NULL, cannot initialize profiling");
@@ -593,17 +606,12 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_threads) {
         return;
     }
 
-    s_l2_swimlane_aicpu_phase_header = get_phase_header(l2_swimlane_base, worker_count);
     s_l2_swimlane_header = get_l2_swimlane_header(l2_swimlane_base);
 
-    s_l2_swimlane_aicpu_phase_header->magic = L2_SWIMLANE_AICPU_PHASE_MAGIC;
-    s_l2_swimlane_aicpu_phase_header->num_sched_threads = num_sched_threads;
-    s_l2_swimlane_aicpu_phase_header->records_per_thread = PLATFORM_PHASE_RECORDS_PER_THREAD;
-    s_l2_swimlane_aicpu_phase_header->num_cores = 0;
-
-    memset(
-        s_l2_swimlane_aicpu_phase_header->core_to_thread, -1, sizeof(s_l2_swimlane_aicpu_phase_header->core_to_thread)
-    );
+    s_l2_swimlane_header->num_phase_threads = num_sched_threads;
+    s_l2_swimlane_header->num_phase_cores = 0;
+    memset(s_l2_swimlane_header->core_to_thread, -1, sizeof(s_l2_swimlane_header->core_to_thread));
+    s_phase_initialized = true;
 
     // Cache per-thread record pointers and clear buffers
     // Include all threads: scheduler + orchestrator (orchestrators may become schedulers)
@@ -719,7 +727,7 @@ void l2_swimlane_aicpu_record_phase(
     int thread_idx, L2SwimlaneAicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
     uint64_t tasks_processed, uint32_t extra1, uint32_t extra2
 ) {
-    if (s_l2_swimlane_aicpu_phase_header == nullptr) {
+    if (!s_phase_initialized) {
         return;
     }
 
@@ -794,12 +802,12 @@ void l2_swimlane_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx =
 void l2_swimlane_aicpu_record_orch_phase(
     L2SwimlaneAicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint64_t task_id
 ) {
-    if (s_orch_thread_idx < 0 || s_l2_swimlane_aicpu_phase_header == nullptr) return;
+    if (s_orch_thread_idx < 0 || !s_phase_initialized) return;
     l2_swimlane_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
 }
 
 void l2_swimlane_aicpu_flush_phase_buffers(int thread_idx) {
-    if (s_l2_swimlane_aicpu_phase_header == nullptr || s_l2_swimlane_header == nullptr) {
+    if (!s_phase_initialized || s_l2_swimlane_header == nullptr) {
         return;
     }
 
@@ -835,25 +843,23 @@ void l2_swimlane_aicpu_flush_phase_buffers(int thread_idx) {
 }
 
 void l2_swimlane_aicpu_init_core_assignments(int total_cores) {
-    if (s_l2_swimlane_aicpu_phase_header == nullptr) {
+    if (!s_phase_initialized) {
         return;
     }
-    memset(
-        s_l2_swimlane_aicpu_phase_header->core_to_thread, -1, sizeof(s_l2_swimlane_aicpu_phase_header->core_to_thread)
-    );
-    s_l2_swimlane_aicpu_phase_header->num_cores = static_cast<uint32_t>(total_cores);
+    memset(s_l2_swimlane_header->core_to_thread, -1, sizeof(s_l2_swimlane_header->core_to_thread));
+    s_l2_swimlane_header->num_phase_cores = static_cast<uint32_t>(total_cores);
     wmb();
     LOG_INFO_V0("Core-to-thread mapping init: %d cores", total_cores);
 }
 
 void l2_swimlane_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num) {
-    if (s_l2_swimlane_aicpu_phase_header == nullptr) {
+    if (!s_phase_initialized) {
         return;
     }
     for (int i = 0; i < core_num; i++) {
         int core_id = core_ids[i];
         if (core_id >= 0 && core_id < PLATFORM_MAX_CORES) {
-            s_l2_swimlane_aicpu_phase_header->core_to_thread[core_id] = static_cast<int8_t>(thread_idx);
+            s_l2_swimlane_header->core_to_thread[core_id] = static_cast<int8_t>(thread_idx);
         }
     }
     wmb();

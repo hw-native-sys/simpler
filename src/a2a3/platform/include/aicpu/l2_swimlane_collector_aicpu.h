@@ -142,7 +142,8 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
 /**
  * Initialize AICPU phase profiling
  *
- * Sets up L2SwimlaneAicpuPhaseHeader and clears per-thread phase record buffers.
+ * Writes phase metadata (num_phase_threads, num_phase_cores, core_to_thread[])
+ * into L2SwimlaneDataHeader and clears per-thread phase record buffers.
  * Must be called once from thread 0 after l2_swimlane_aicpu_init().
  *
  * @param worker_count       Number of AICore workers (cores) — used to resolve

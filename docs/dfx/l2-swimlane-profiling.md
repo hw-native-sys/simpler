@@ -274,10 +274,13 @@ L2SwimlaneAicoreTaskPool[num_cores]              (per-core AICore pool state)
 [L2SwimlaneAicoreTaskBuffer × PLATFORM_AICORE_BUFFERS_PER_CORE per core]
 └── L2SwimlaneAicoreTaskRecord records[PLATFORM_AICORE_BUFFER_SIZE]  (1024 records, 32B each)
 
-[L2SwimlaneAicpuPhaseHeader + L2SwimlaneAicpuPhasePool[num_threads]]  (optional)
-├── magic / num_sched_threads
-├── core_to_thread[]  (core_id → scheduler thread index)
+[L2SwimlaneAicpuPhasePool[num_phase_threads]]  (optional)
 └── per-thread phase buffers (L2SwimlaneAicpuPhasePool aliases L2SwimlaneAicpuTaskPool)
+
+(Phase metadata — num_phase_threads, num_phase_cores, core_to_thread[] —
+ now lives inside L2SwimlaneDataHeader, not a separate cache line. The
+ old L2SwimlaneAicpuPhaseHeader struct + L2_SWIMLANE_AICPU_PHASE_MAGIC
+ gate were removed; host gates on num_phase_threads > 0 instead.)
 ```
 
 The records themselves are identical across architectures:
@@ -455,8 +458,9 @@ pushes back only the fields host actually modified (advanced
 The bulk `mirror_shm_to_device` is deliberately **not** called from
 the mgmt loop: it would race with AICPU writes to device-only
 fields (`current_buf_ptr`, `total/dropped/mismatch` counters,
-`queue_tails`, `free_queue.head`, `L2SwimlaneAicpuPhaseHeader::magic`,
-`core_to_thread[]`) and roll them back to whatever the host shadow
+`queue_tails`, `free_queue.head`,
+`L2SwimlaneDataHeader::num_phase_threads`,
+`L2SwimlaneDataHeader::core_to_thread[]`) and roll them back to whatever the host shadow
 held at the start of the tick. Per-buffer
 payloads (`L2SwimlaneAicpuTaskBuffer` / `L2SwimlaneAicpuPhaseBuffer`) are pulled on demand
 inside `ProfilerAlgorithms::process_entry` after a popped
@@ -657,10 +661,12 @@ active L2 swimlane buffer at run end. Check the AICPU flush path runs
 for every thread that produced records.
 
 **Phase records empty.** Either the runtime did not emit phase
-data (only `tensormap_and_ringbuffer` does, and only when
-`L2SwimlaneAicpuPhaseHeader::magic == L2_SWIMLANE_AICPU_PHASE_MAGIC`), or the host's
-`L2SwimlaneAicpuPhaseHeader` was not initialized. Verify the runtime sets
-the magic in its scheduler init path.
+data (only `tensormap_and_ringbuffer` does, and only when phase init
+ran — gated on `L2SwimlaneDataHeader::num_phase_threads > 0`), or the
+host did not pre-zero the field. Verify the runtime calls
+`l2_swimlane_aicpu_init_phase()` in its scheduler init path; check
+the host's `L2SwimlaneCollector::initialize` zero-inits
+`num_phase_threads` / `num_phase_cores` / `core_to_thread[]`.
 
 **`dispatch_time_us` < `finish_time_us` mismatch.** Verify the runtime
 overwrites `task_id` with the full encoding on FIN
