@@ -132,8 +132,9 @@ constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
 constexpr int PLATFORM_AICORE_BUFFERS_PER_CORE = 4;
 
 /**
- * L2SwimlaneAicpuPhaseBuffer pre-allocation count per AICPU thread.
- * 1 goes into the free_queue at init, the rest into the recycled pool.
+ * L2SwimlaneAicpuSchedPhaseBuffer / L2SwimlaneAicpuOrchPhaseBuffer
+ * pre-allocation count per AICPU thread (applies independently to both pool
+ * kinds). 1 goes into the free_queue at init, the rest into the recycled pool.
  */
 constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
 
@@ -141,11 +142,12 @@ constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
  * Ready queue capacity for performance data collection.
  * Queue holds ReadyQueueEntry structs for buffers ready to be read by Host.
  * Sized to match pre-allocation total across all cores and threads, summed
- * over the three buffer kinds (AICPU L2SwimlaneAicpuTaskBuffer, L2SwimlaneAicpuPhaseBuffer,
- * AICore L2SwimlaneAicoreTaskBuffer).
+ * over the four buffer kinds (L2SwimlaneAicpuTaskBuffer per core,
+ * L2SwimlaneAicpuSchedPhaseBuffer + L2SwimlaneAicpuOrchPhaseBuffer per
+ * AICPU thread, L2SwimlaneAicoreTaskBuffer per core).
  */
 constexpr int PLATFORM_PROF_READYQUEUE_SIZE = PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE +
-                                              PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_BUFFERS_PER_THREAD +
+                                              2 * PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_BUFFERS_PER_THREAD +
                                               PLATFORM_MAX_CORES * PLATFORM_AICORE_BUFFERS_PER_CORE;
 
 /**

@@ -719,7 +719,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // pop_hit / pop_miss stay intact for the cold-path log.
                 uint64_t pop_hit_delta = l2_swimlane.pop_hit - l2_swimlane.pop_hit_at_last_emit;
                 uint64_t pop_miss_delta = l2_swimlane.pop_miss - l2_swimlane.pop_miss_at_last_emit;
-                // L2SwimlaneAicpuPhaseRecord's extras are uint32 — a delta that overflows means
+                // L2SwimlaneAicpuSchedPhaseRecord's pop_hit / pop_miss are uint32 — a delta that overflows means
                 // an emit was missed for ~4 billion pops, which is well outside any
                 // realistic dispatch cadence and silently truncates without this guard.
                 debug_assert(pop_hit_delta < (1ULL << 32));

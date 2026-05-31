@@ -20,7 +20,8 @@
  * │ L2SwimlaneDataHeader (fixed header)                         │
  * │  - ReadyQueue (FIFO, capacity=PLATFORM_PROF_READYQUEUE_SIZE)│
  * │  - num_cores, l2_swimlane_level                             │
- * │  - num_phase_threads, num_phase_cores, core_to_thread[]     │
+ * │  - num_sched_phase_threads, num_orch_phase_threads,         │
+ * │    num_phase_cores, core_to_thread[]                        │
  * ├─────────────────────────────────────────────────────────────┤
  * │ L2SwimlaneAicpuTaskPool[0..num_cores-1]                     │
  * │  - head:       active L2SwimlaneAicpuTaskBuffer + counters  │

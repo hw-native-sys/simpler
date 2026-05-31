@@ -116,7 +116,7 @@
  *     `write_range_to_device` writes. The bulk `mirror_shm_to_device` is
  *     intentionally NOT called from mgmt_loop: it raced with AICPU writes
  *     to device-only fields (current_buf_ptr, total/dropped/mismatch
- *     counters, queue_tails, free_queue.head,
+ *     counters, queue_tails, free_queue.head, and on a5
  *     L2SwimlaneAicpuPhaseHeader::magic) and rolled them back to the
  *     host-shadow values mirrored in at the top of the tick. Buffer
  *     contents are mirrored on demand inside ProfilerAlgorithms.
@@ -694,10 +694,10 @@ private:
      *
      * The bulk `mirror_shm_to_device` deliberately is NOT called: it races
      * with AICPU writes to device-only fields (current_buf_ptr, total/dropped/
-     * mismatch counters, queue_tails, free_queue.head, L2SwimlaneAicpuPhaseHeader::magic,
-     * core_to_thread[]) and rolls them back to whatever was mirrored in at
-     * the start of the tick. Each host-side modification is written back as
-     * a narrow field write inside Alg.
+     * mismatch counters, queue_tails, free_queue.head, core_to_thread[],
+     * and on a5 L2SwimlaneAicpuPhaseHeader::magic) and rolls them back to
+     * whatever was mirrored in at the start of the tick. Each host-side
+     * modification is written back as a narrow field write inside Alg.
      *
      * On exit (mgmt_running_ → false) it does one final drain pass without
      * sleeping to flush any straggler entries the device pushed before

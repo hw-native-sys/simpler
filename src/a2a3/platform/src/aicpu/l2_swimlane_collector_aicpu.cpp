@@ -29,10 +29,10 @@
 #include "common/unified_log.h"
 
 // Cached pointers for hot-path access (set during init). Phase metadata
-// (num_phase_threads, num_phase_cores, core_to_thread[]) lives inside
-// L2SwimlaneDataHeader after the phase-header merge; we keep a separate
-// bool so phase-gated paths can check init-ran without re-reading the
-// device-shared header.
+// (num_sched_phase_threads, num_orch_phase_threads, num_phase_cores,
+// core_to_thread[]) lives inside L2SwimlaneDataHeader after the phase-header
+// merge; we keep a separate bool so phase-gated paths can check init-ran
+// without re-reading the device-shared header.
 static L2SwimlaneDataHeader *s_l2_swimlane_header = nullptr;
 static bool s_phase_initialized = false;
 
@@ -139,10 +139,11 @@ void l2_swimlane_aicpu_init(int worker_count) {
     // Reset cross-launch state up front. AICPU statics persist across launches
     // on the same loaded .so; without this reset, an enabled→disabled launch
     // sequence would leave s_phase_initialized=true from the prior run, and
-    // any subsequent record_phase call would dereference the prior launch's
-    // (now-freed) s_aicpu_phase_pools pointers. Same shape as the
-    // [[block_local]] reset in onboard/aicore/kernel.cpp for the AICore-side
-    // rotation slot (fixed in #936).
+    // any subsequent record_sched_phase / record_orch_phase call would
+    // dereference the prior launch's (now-freed) s_sched_phase_pools /
+    // s_orch_phase_pools pointers. Same shape as the [[block_local]] reset
+    // in onboard/aicore/kernel.cpp for the AICore-side rotation slot
+    // (fixed in #936).
     s_phase_initialized = false;
 
     void *l2_swimlane_base = reinterpret_cast<void *>(g_platform_l2_swimlane_base);

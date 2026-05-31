@@ -42,7 +42,7 @@
  *      The bulk `mirror_shm_to_device` is kept for init/teardown but is
  *      NOT used by the mgmt loop — bulk write-back races with AICPU writes
  *      to device-only fields (current_buf_ptr, total/dropped/mismatch
- *      counters, queue_tails, free_queue.head,
+ *      counters, queue_tails, free_queue.head, and on a5
  *      L2SwimlaneAicpuPhaseHeader::magic).
  *   2. Pulls each popped buffer's contents from device via
  *      `copy_buffer_from_device` inside ProfilerAlgorithms::process_entry
@@ -278,7 +278,8 @@ public:
      *
      * NOTE: deprecated for a5 — bulk write_back races with AICPU writes to
      * device-owned fields (BufferState::current_buf_ptr, total/dropped/mismatch
-     * counters, queue_tails, free_queue.head, L2SwimlaneAicpuPhaseHeader::magic, ...).
+     * counters, queue_tails, free_queue.head, and on a5
+     * L2SwimlaneAicpuPhaseHeader::magic, ...).
      * The bulk write rolls those updates back to whatever was in the host
      * shadow at mirror_from_device time. Keep the method around so callers
      * outside the mgmt loop (init/teardown) still have a way to push the

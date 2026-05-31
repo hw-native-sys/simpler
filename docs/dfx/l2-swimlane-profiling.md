@@ -274,16 +274,25 @@ L2SwimlaneAicoreTaskPool[num_cores]              (per-core AICore pool state)
 [L2SwimlaneAicoreTaskBuffer × PLATFORM_AICORE_BUFFERS_PER_CORE per core]
 └── L2SwimlaneAicoreTaskRecord records[PLATFORM_AICORE_BUFFER_SIZE]  (1024 records, 32B each)
 
-[L2SwimlaneAicpuPhasePool[num_phase_threads]]  (optional)
-└── per-thread phase buffers (L2SwimlaneAicpuPhasePool aliases L2SwimlaneAicpuTaskPool)
+a2a3 layout (post-#942):
+[L2SwimlaneAicpuSchedPhasePool[num_sched_phase_threads]]  (per-AICPU-thread)
+└── L2SwimlaneAicpuSchedPhaseBuffer × PROF_BUFFERS_PER_THREAD; alias of TaskPool
 
-(Phase metadata — num_phase_threads, num_phase_cores, core_to_thread[] —
- now lives inside L2SwimlaneDataHeader, not a separate cache line. The
- old L2SwimlaneAicpuPhaseHeader struct + L2_SWIMLANE_AICPU_PHASE_MAGIC
- gate were removed; host gates on num_phase_threads > 0 instead.)
+[L2SwimlaneAicpuOrchPhasePool[num_orch_phase_threads]]    (per-AICPU-thread)
+└── L2SwimlaneAicpuOrchPhaseBuffer × PROF_BUFFERS_PER_THREAD; alias of TaskPool
+
+a5 layout (pre-split; pending port to the a2a3 shape above):
+[L2SwimlaneAicpuPhasePool[num_phase_threads]]   (single unified pool, gated
+                                                 by L2SwimlaneAicpuPhaseHeader
+                                                 + L2_SWIMLANE_AICPU_PHASE_MAGIC)
+
+(a2a3 phase metadata — num_sched_phase_threads, num_orch_phase_threads,
+ num_phase_cores, core_to_thread[] — lives inside L2SwimlaneDataHeader,
+ not a separate cache line; the legacy header + magic gate were removed
+ in #941. Host gates on num_{sched,orch}_phase_threads > 0.)
 ```
 
-The records themselves are identical across architectures:
+Task records are identical across architectures:
 
 - `L2SwimlaneAicpuTaskRecord` — per-task AICPU-owned fields (task_id, dispatch_time,
   finish_time, func_id, core_type, reg_task_id), 64-byte aligned.
@@ -291,15 +300,26 @@ The records themselves are identical across architectures:
 - `L2SwimlaneAicoreTaskRecord` — slim AICore-only record (start, end, task_id),
   32 bytes; AICore writes one per task into its currently-active
   per-core buffer.
-- `L2SwimlaneAicpuPhaseRecord` — per-iteration scheduler / orchestrator
-  phase, 40 bytes.
 
-This is the key reason a single `swimlane_converter` consumes
-both architectures' output unchanged. Orchestrator timing is carried
-by per-submit `L2SwimlaneAicpuPhaseRecord` entries (ORCH_SUBMIT, folded from
-the historical per-sub-step records); there is no separate
-shared-memory aggregate. The run-window envelope is emitted to device
-log via `LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…"`.
+Phase records diverge — a2a3 split them into two type-tagged streams
+in #942, a5 still uses the legacy unified shape:
+
+- a2a3:
+  - `L2SwimlaneAicpuSchedPhaseRecord` (40 B) — per-iteration scheduler
+    phase; kind ∈ {Complete, Dispatch} + loop_iter + tasks_processed +
+    pop_hit / pop_miss deltas.
+  - `L2SwimlaneAicpuOrchPhaseRecord` (32 B) — per-submit orchestrator
+    envelope; task_id + submit_idx + start/end.
+- a5:
+  - `L2SwimlaneAicpuPhaseRecord` (40 B) — single record type carrying
+    both sched and orch via a `phase_id` discriminator; pending port to
+    the split shape.
+
+`swimlane_converter` shape-detects per source and produces the same
+output JSON for both. On a2a3 the orch stream replaces the per-sub-step
+records folded into ORCH_SUBMIT; there is no separate shared-memory
+aggregate. The run-window envelope is emitted to device log via
+`LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…"`.
 
 **Producer/consumer protocol on AICore (AICore-as-producer with rotation).**
 AICore writes a slim `L2SwimlaneAicoreTaskRecord` into its currently-active per-core
@@ -345,16 +365,18 @@ buffers **while kernels are still executing**, plus a poll
 thread that drains the L2 hand-off queue into
 `on_buffer_collected`.
 
-`L2SwimlaneModule` declares two buffer kinds going through one ready
+`L2SwimlaneModule` declares four buffer kinds going through one ready
 queue per AICPU thread:
 
-- **kind 0**: per-core `L2SwimlaneAicpuTaskBuffer` (task records).
-- **kind 1**: per-thread `L2SwimlaneAicpuPhaseBuffer` (scheduler / orchestrator
-  phase records).
+- **kind 0** `AicpuTask`        — per-core `L2SwimlaneAicpuTaskBuffer` (AICPU writes).
+- **kind 1** `AicpuSchedPhase`  — per-thread `L2SwimlaneAicpuSchedPhaseBuffer` (AICPU writes).
+- **kind 2** `AicpuOrchPhase`   — per-thread `L2SwimlaneAicpuOrchPhaseBuffer` (AICPU writes).
+- **kind 3** `AicoreTask`       — per-core `L2SwimlaneAicoreTaskBuffer` (AICore writes,
+  AICPU enqueues on rotation).
 
-The `is_phase` flag on each `ReadyQueueEntry` picks between them.
-This is the only multi-kind module in the current framework — PMU
-and TensorDump are single-kind.
+Each `ReadyQueueEntry::kind` carries the discriminator. This is the
+only multi-kind module in the current framework — PMU and TensorDump
+are single-kind.
 
 ```text
         HOST                                         DEVICE
@@ -362,22 +384,22 @@ and TensorDump are single-kind.
 │ L2SwimlaneCollector          │               │ AICPU + AICore           │
 │                          │               │                          │
 │ initialize(prefix)       │  alloc +      │ AICore on task end:      │
-│   rtMalloc + halRegister │──register────>│   write timing into      │
-│   pre-fill free queues   │              │   ring[reg_task_id % N]  │
-│   for kind 0 + kind 1    │               │                          │
-│                          │               │ AICPU on FIN:            │
-│ start(tf)                │               │   commit ring slot →     │
-│   ┌────────────────────┐ │ SPSC ready    │     records[count],      │
-│   │ mgmt thread        │ │ queues        │   fill func_id /         │
-│   │ (BufferPool driver)│ │<──L2Swimlane──────│   dispatch / finish /    │
-│   │   poll ready queue │<┼──+ Phase─────<│   fanout; rotate buffer  │
+│   rtMalloc + halRegister │──register────>│   write slim record into │
+│   pre-fill free queues   │              │   AicoreTaskBuffer (kind │
+│   for kinds 0/1/2/3      │               │   3); AICPU rotates it   │
+│                          │               │                          │
+│ start(tf)                │               │ AICPU on FIN:            │
+│   ┌────────────────────┐ │ SPSC ready    │   commit AicpuTask       │
+│   │ mgmt thread        │ │ queues        │   record (kind 0); fill  │
+│   │ (BufferPool driver)│ │<──4 kinds────<│   func_id / dispatch /   │
+│   │   poll ready queue │<┼──multiplexed──│   finish; rotate buffer  │
 │   │   recycle buffers  │─┼──free queue──>│   when full              │
 │   └────────────────────┘ │               │ AICPU scheduler thread:  │
-│   ┌────────────────────┐ │               │   per-loop-iter:         │
-│   │ poll thread        │ │               │     write AicpuPhase-    │
-│   │   reads via host   │ │ shared mem    │     Record into          │
-│   │   mapping; copies  │<┼──mapping─────<│     L2SwimlaneAicpuPhaseBuffer          │
-│   │   to host vectors  │ │               │                          │
+│   ┌────────────────────┐ │               │   per work iter: write   │
+│   │ poll thread        │ │               │   SchedPhaseRecord       │
+│   │   reads via host   │ │ shared mem    │   (kind 1). Per submit:  │
+│   │   mapping; copies  │<┼──mapping─────<│   write OrchPhaseRecord  │
+│   │   to host vectors  │ │               │   (kind 2).              │
 │   └────────────────────┘ │               │                          │
 │ stop()                   │               │                          │
 │   join mgmt → join poll  │               │                          │
@@ -414,11 +436,12 @@ on a2a3 inherits from
 the base class owns the mgmt thread, the poll thread, and the
 `BufferPoolManager<L2SwimlaneModule>` they share. `L2SwimlaneCollector`
 supplies the L2-specific pieces — the `L2SwimlaneModule` trait
-(notably `kBufferKinds = 2` and `kind_of()`), `initialize` that
-allocates and pre-fills both kinds of free queues, an
-`on_buffer_collected` callback that branches on
-`info.type == PERF_RECORD` vs `PHASE` to copy into the per-core
-or per-thread vector, plus `read_phase_header_metadata` /
+(notably `kBufferKinds = 4` and `kind_of()`), `initialize` that
+allocates and pre-fills all four kinds of free queues, an
+`on_buffer_collected` callback that branches on `info.type` across
+`AICPU_TASK` / `AICPU_SCHED_PHASE` / `AICPU_ORCH_PHASE` / `AICORE_TASK`
+to copy into the right per-core or per-thread vector, plus
+`read_phase_header_metadata` /
 `reconcile_counters` / `export_swimlane_json` / `finalize`. The
 mgmt/poll threading and `Module` trait pattern are shared with
 PMU and TensorDump — see
@@ -450,21 +473,21 @@ profiling fields.
 The framework's `MemoryOps` therefore carries five callbacks on
 a5 (`alloc` / `reg` / `free_` / `copy_to_device` /
 `copy_from_device`); the mgmt loop mirrors the entire shm region
-(`L2SwimlaneDataHeader` + per-core `L2SwimlaneAicpuTaskPool` + per-thread
-`L2SwimlaneAicpuPhasePool`) device → host at the top of every tick, then
-pushes back only the fields host actually modified (advanced
-`queue_heads[q]`, refilled `free_queue.tail` and
-`buffer_ptrs[slot]`) via `BufferPoolManager::write_range_to_device`.
-The bulk `mirror_shm_to_device` is deliberately **not** called from
-the mgmt loop: it would race with AICPU writes to device-only
-fields (`current_buf_ptr`, `total/dropped/mismatch` counters,
-`queue_tails`, `free_queue.head`,
-`L2SwimlaneDataHeader::num_phase_threads`,
-`L2SwimlaneDataHeader::core_to_thread[]`) and roll them back to whatever the host shadow
-held at the start of the tick. Per-buffer
-payloads (`L2SwimlaneAicpuTaskBuffer` / `L2SwimlaneAicpuPhaseBuffer`) are pulled on demand
-inside `ProfilerAlgorithms::process_entry` after a popped
-ready-entry resolves to its host shadow. `BufferPoolManager`'s
+(`L2SwimlaneDataHeader` + per-core `L2SwimlaneAicpuTaskPool` +
+`L2SwimlaneAicpuPhaseHeader` + per-thread `L2SwimlaneAicpuPhasePool`)
+device → host at the top of every tick, then pushes back only the
+fields host actually modified (advanced `queue_heads[q]`, refilled
+`free_queue.tail` and `buffer_ptrs[slot]`) via
+`BufferPoolManager::write_range_to_device`. The bulk
+`mirror_shm_to_device` is deliberately **not** called from the mgmt
+loop: it would race with AICPU writes to device-only fields
+(`current_buf_ptr`, `total/dropped/mismatch` counters, `queue_tails`,
+`free_queue.head`, `L2SwimlaneAicpuPhaseHeader::magic`,
+`L2SwimlaneAicpuPhaseHeader::core_to_thread[]`) and roll them back to
+whatever the host shadow held at the start of the tick. Per-buffer
+payloads (`L2SwimlaneAicpuTaskBuffer` / `L2SwimlaneAicpuPhaseBuffer`)
+are pulled on demand inside `ProfilerAlgorithms::process_entry` after
+a popped ready-entry resolves to its host shadow. `BufferPoolManager`'s
 `release_owned_buffers` frees the device pointer via the
 collector's `release_fn` and the paired shadow via `std::free()`.
 
@@ -556,13 +579,14 @@ PHASE), same shape as a2a3.
 
 | Aspect | a2a3 | a5 |
 | ------ | ---- | -- |
-| Record shape | identical (`L2SwimlaneAicpuTaskRecord` / `L2SwimlaneAicpuPhaseRecord`) | |
+| Task record | `L2SwimlaneAicpuTaskRecord` (64 B) + `L2SwimlaneAicoreTaskRecord` (32 B) | identical |
+| Phase record | split: `L2SwimlaneAicpuSchedPhaseRecord` (40 B) + `L2SwimlaneAicpuOrchPhaseRecord` (32 B) | unified `L2SwimlaneAicpuPhaseRecord` (40 B, `phase_id`-tagged); pending port |
 | AICore WIP-slot protocol | identical | |
 | AICPU commit on FIN | identical | |
 | Buffer model | rotating pool (free + ready queues) per kind | identical |
-| Ready queue | per-AICPU-thread, multiplexes PERF + PHASE via `is_phase` | identical |
+| Ready queue | per-AICPU-thread, multiplexes 4 kinds via `ReadyQueueEntry::kind` | per-AICPU-thread, 2 kinds via `is_phase` |
 | Host threads | mgmt + poll, streams during execution | identical |
-| Host-class shape | `ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>` (`kBufferKinds = 2`) | identical |
+| Host-class shape | `ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>` (`kBufferKinds = 4`) | same base, `kBufferKinds = 2` |
 | Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
 | `reconcile_counters` | passive cross-check (collected + dropped + mismatch == device_total) | identical |
@@ -581,12 +605,18 @@ When enabled, the dominant per-task overhead is:
 - The AICPU commit on FIN, which copies the WIP record into the
   ring buffer plus a few metadata fields.
 
-Per scheduler-loop iteration, AICPU also writes a 32-byte
-`L2SwimlaneAicpuPhaseRecord` per phase (4 phases × 40 B = 160 B per
-iteration). Both architectures drain buffers concurrently with
-execution via the mgmt + poll thread pair; a5 additionally pays
-per-tick `rtMemcpy`/`memcpy` round-trips to keep the host shadow in
-sync, which overlap with device execution.
+Phase-record overhead (only at `--enable-l2-swimlane >= 3`):
+
+- a2a3 — one 40 B `L2SwimlaneAicpuSchedPhaseRecord` per work-emitting
+  scheduler iteration (Complete + Dispatch, idle iters do not emit),
+  plus one 32 B `L2SwimlaneAicpuOrchPhaseRecord` per `submit_task()`.
+- a5 — one 40 B `L2SwimlaneAicpuPhaseRecord` per emitted phase
+  (legacy unified shape).
+
+Both architectures drain buffers concurrently with execution via the
+mgmt + poll thread pair; a5 additionally pays per-tick
+`rtMemcpy`/`memcpy` round-trips to keep the host shadow in sync,
+which overlap with device execution.
 
 `--rounds > 1` collects only on the first round so the steady-state
 benchmark is not perturbed.
@@ -662,11 +692,14 @@ for every thread that produced records.
 
 **Phase records empty.** Either the runtime did not emit phase
 data (only `tensormap_and_ringbuffer` does, and only when phase init
-ran — gated on `L2SwimlaneDataHeader::num_phase_threads > 0`), or the
-host did not pre-zero the field. Verify the runtime calls
-`l2_swimlane_aicpu_init_phase()` in its scheduler init path; check
-the host's `L2SwimlaneCollector::initialize` zero-inits
-`num_phase_threads` / `num_phase_cores` / `core_to_thread[]`.
+ran — on a2a3 gated on
+`L2SwimlaneDataHeader::num_sched_phase_threads > 0` (sched) or
+`num_orch_phase_threads > 0` (orch); on a5 gated on
+`L2SwimlaneAicpuPhaseHeader::magic`), or the host did not pre-zero
+those fields. Verify the runtime calls `l2_swimlane_aicpu_init_phase()`
+in its scheduler init path; check the host's
+`L2SwimlaneCollector::initialize` zero-inits the relevant metadata
+fields.
 
 **`dispatch_time_us` < `finish_time_us` mismatch.** Verify the runtime
 overwrites `task_id` with the full encoding on FIN
