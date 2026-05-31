@@ -118,7 +118,10 @@ int L2SwimlaneCollector::initialize(
     // sees consistent values during init. shm_host_ stays nullptr until the
     // shm allocation succeeds — the nullptr guard makes a post-failure
     // start(tf) a no-op.
-    set_memory_context(alloc_cb, register_cb, free_cb, /*shm_host=*/nullptr, device_id);
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, /*shm_dev=*/nullptr,
+        /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+    );
 
     // Step 1: Calculate shared memory size (slot arrays only, no actual buffers)
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
@@ -302,7 +305,12 @@ int L2SwimlaneCollector::initialize(
     LOG_DEBUG("L2 swimlane device base = 0x%lx", reinterpret_cast<uint64_t>(perf_dev_ptr));
 
     perf_shared_mem_dev_ = perf_dev_ptr;
-    shm_host_ = perf_host_ptr;
+    // Refresh memory context with the now-known SHM tuple. start(tf) (inherited)
+    // gates on shm_host_, so this is the moment the collector becomes startable.
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, perf_dev_ptr, perf_host_ptr,
+        total_size, device_id
+    );
 
     collected_perf_records_.assign(num_aicore_, {});
     collected_aicore_records_.assign(num_aicore_, {});

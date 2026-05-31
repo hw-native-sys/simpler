@@ -38,39 +38,6 @@
 
 PmuCollector::~PmuCollector() { stop(); }
 
-void *PmuCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size);
-    if (dev_ptr == nullptr) {
-        if (host_ptr_out) *host_ptr_out = nullptr;
-        return nullptr;
-    }
-
-    void *host_ptr = nullptr;
-    if (register_cb_ != nullptr) {
-        int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
-        if (rc != 0 || host_ptr == nullptr) {
-            LOG_ERROR("PmuCollector: register failed: %d", rc);
-            free_cb_(dev_ptr);
-            if (host_ptr_out) *host_ptr_out = nullptr;
-            return nullptr;
-        }
-    } else {
-        host_ptr = std::malloc(size);
-        if (host_ptr == nullptr) {
-            LOG_ERROR("PmuCollector: host shadow alloc failed for %zu bytes", size);
-            free_cb_(dev_ptr);
-            if (host_ptr_out) *host_ptr_out = nullptr;
-            return nullptr;
-        }
-        std::memset(host_ptr, 0, size);
-        profiling_copy_to_device(dev_ptr, host_ptr, size);
-    }
-
-    if (host_ptr_out) *host_ptr_out = host_ptr;
-    manager_.register_mapping(dev_ptr, host_ptr);
-    return dev_ptr;
-}
-
 // ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
@@ -98,17 +65,18 @@ int PmuCollector::init(
         csv_file_.close();
     }
 
-    // Stash callbacks on the base up-front so alloc_single_buffer sees
+    // Stash callbacks on the base up-front so alloc_paired_buffer sees
     // consistent values during init. shm_host_ stays nullptr until the shm
     // allocation succeeds — start(tf) gates on shm_host_.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
     // ---- Allocate shared header + buffer-state region ----
     size_t shm_size = calc_pmu_data_size(num_cores);
     void *shm_host_local = nullptr;
-    void *shm_dev_local = alloc_single_buffer(shm_size, &shm_host_local);
+    void *shm_dev_local = alloc_paired_buffer(shm_size, &shm_host_local);
     if (shm_dev_local == nullptr) {
         LOG_ERROR("PmuCollector: failed to allocate PMU shared memory (%zu bytes)", shm_size);
         return -1;
@@ -125,7 +93,7 @@ int PmuCollector::init(
     // so no separate PMU reg-address table is needed.
     aicore_rings_dev_.assign(num_cores, nullptr);
     size_t table_size = static_cast<size_t>(num_cores) * sizeof(uint64_t);
-    aicore_ring_addrs_dev_ = alloc_single_buffer(table_size, &aicore_ring_addrs_host_);
+    aicore_ring_addrs_dev_ = alloc_paired_buffer(table_size, &aicore_ring_addrs_host_);
     if (aicore_ring_addrs_dev_ == nullptr) {
         LOG_ERROR("PmuCollector: failed to allocate aicore ring address table (%zu bytes)", table_size);
         return -1;
@@ -150,7 +118,7 @@ int PmuCollector::init(
 
         for (int b = 0; b < PLATFORM_PMU_BUFFERS_PER_CORE; b++) {
             void *host_ptr = nullptr;
-            void *dev_ptr = alloc_single_buffer(buf_size, &host_ptr);
+            void *dev_ptr = alloc_paired_buffer(buf_size, &host_ptr);
             if (dev_ptr == nullptr) {
                 LOG_ERROR("PmuCollector: failed to allocate PmuBuffer c=%d b=%d", c, b);
                 return -1;
@@ -199,7 +167,10 @@ int PmuCollector::init(
     // Re-set_memory_context now that the shm region is ready. start(tf)
     // gates on shm_host_ being non-null, so this is the moment the
     // collector becomes startable.
-    set_memory_context(alloc_cb, register_cb, free_cb, shm_dev_local, shm_host_local, shm_size, device_id);
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        shm_dev_local, shm_host_local, shm_size, device_id
+    );
 
     LOG_INFO_V0(
         "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
@@ -425,7 +396,7 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
     });
 
     // Free per-core PmuAicoreRings (no host shadow paired). The rings were
-    // allocated directly via alloc_cb (not alloc_single_buffer), so no entry
+    // allocated directly via alloc_cb (not alloc_paired_buffer), so no entry
     // exists in dev_to_host_ for them.
     for (auto *ring_dev : aicore_rings_dev_) {
         if (ring_dev != nullptr) {

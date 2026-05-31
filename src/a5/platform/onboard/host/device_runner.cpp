@@ -307,7 +307,7 @@ int DeviceRunner::init_pmu(
 int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
     // a5: register_cb=nullptr, so the collector mallocs a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device (see
-    // ScopeStatsCollector::alloc_single_buffer). No halHostRegister on a5.
+    // ProfilerBase::alloc_paired_buffer). No halHostRegister on a5.
     int rc = scope_stats_collector_.init(num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, device_id);
     if (rc != 0) {
         return rc;

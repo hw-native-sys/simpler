@@ -8,12 +8,21 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+/**
+ * a2a3 sim profiling_copy stubs.
+ *
+ * a2a3 sim runs every "device" memory access in-process through plain pointers
+ * (the sim DeviceRunner returns host pointers from `allocate_tensor`), so the
+ * mirror/copy hooks are no-ops here. See the a2a3 onboard sibling for the full
+ * rationale on why these stubs exist.
+ */
 
-#pragma once
+#include "host/profiling_copy.h"
 
-#include <cstddef>
+int profiling_copy_to_device(volatile void * /*dev_dst*/, const void * /*host_src*/, size_t /*size*/) { return 0; }
 
-// Platform-specific copy hooks for profiling collectors.
-// Implemented in onboard/sim device_runner.cpp.
-int profiling_copy_to_device(volatile void *dev_dst, const void *host_src, size_t size);
-int profiling_copy_from_device(volatile void *host_dst, const volatile void *dev_src, size_t size);
+int profiling_copy_from_device(
+    volatile void * /*host_dst*/, const volatile void * /*dev_src*/, size_t /*size*/
+) {
+    return 0;
+}

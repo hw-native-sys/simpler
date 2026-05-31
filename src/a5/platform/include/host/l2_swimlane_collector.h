@@ -167,7 +167,7 @@ struct L2SwimlaneModule {
 // lambda capture; register / unregister stay as plain function pointers
 // because they wrap stateless HAL globals. On a5 onboard the runner passes
 // register_cb=nullptr and the framework installs a malloc-shadow + DMA
-// fallback (default_host_shadow_register).
+// fallback inline in ProfilerBase::start().
 using L2SwimlaneAllocCallback = profiling_common::ProfAllocCallback;
 using L2SwimlaneRegisterCallback = profiling_common::ProfRegisterCallback;
 using L2SwimlaneUnregisterCallback = profiling_common::ProfUnregisterCallback;
@@ -359,7 +359,6 @@ private:
 
     // Allocate a single buffer (shm region / L2SwimlaneAicpuTaskBuffer / L2SwimlaneAicpuPhaseBuffer) and
     // its paired host shadow.
-    void *alloc_single_buffer(size_t size, void **host_ptr_out);
 
     // Per-buffer-kind handlers used by on_buffer_collected.
     void copy_perf_buffer(const ReadyBufferInfo &info);

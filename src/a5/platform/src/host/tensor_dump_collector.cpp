@@ -45,40 +45,6 @@
 
 TensorDumpCollector::~TensorDumpCollector() { stop(); }
 
-void *TensorDumpCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size);
-    if (dev_ptr == nullptr) {
-        if (host_ptr_out) *host_ptr_out = nullptr;
-        return nullptr;
-    }
-
-    void *host_ptr = nullptr;
-    if (register_cb_ != nullptr) {
-        int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
-        if (rc != 0 || host_ptr == nullptr) {
-            LOG_ERROR("TensorDumpCollector: register failed: %d", rc);
-            free_cb_(dev_ptr);
-            if (host_ptr_out) *host_ptr_out = nullptr;
-            return nullptr;
-        }
-    } else {
-        // a5 default: malloc a paired shadow, zero it, push zeros to device
-        // so the device buffer starts in a known state.
-        host_ptr = std::malloc(size);
-        if (host_ptr == nullptr) {
-            LOG_ERROR("TensorDumpCollector: host shadow alloc failed for %zu bytes", size);
-            free_cb_(dev_ptr);
-            if (host_ptr_out) *host_ptr_out = nullptr;
-            return nullptr;
-        }
-        std::memset(host_ptr, 0, size);
-        profiling_copy_to_device(dev_ptr, host_ptr, size);
-    }
-
-    if (host_ptr_out) *host_ptr_out = host_ptr;
-    return dev_ptr;
-}
-
 int TensorDumpCollector::initialize(
     int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
     const DumpFreeCallback &free_cb, const std::string &output_prefix
@@ -91,19 +57,20 @@ int TensorDumpCollector::initialize(
     num_dump_threads_ = num_dump_threads;
     output_prefix_ = output_prefix;
 
-    // Stash the memory context on the base up-front so alloc_single_buffer
+    // Stash the memory context on the base up-front so alloc_paired_buffer
     // (which reads alloc_cb_/register_cb_/free_cb_/device_id_)
     // sees consistent values during init. shm_host_ stays nullptr until the
     // shm allocation succeeds — that nullptr guard makes a post-failure
     // start(tf) a no-op without further bookkeeping.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
     // Allocate dump shared memory (header + buffer states)
     size_t shm_size = calc_dump_data_size(num_dump_threads);
     void *shm_host_local = nullptr;
-    void *shm_dev_local = alloc_single_buffer(shm_size, &shm_host_local);
+    void *shm_dev_local = alloc_paired_buffer(shm_size, &shm_host_local);
     if (shm_dev_local == nullptr) {
         LOG_ERROR("Failed to allocate dump shared memory (%zu bytes)", shm_size);
         return -1;
@@ -125,7 +92,7 @@ int TensorDumpCollector::initialize(
     for (int t = 0; t < num_dump_threads; t++) {
         ArenaInfo &ai = arenas_[t];
         ai.size = arena_size;
-        ai.dev_ptr = alloc_single_buffer(arena_size, &ai.host_ptr);
+        ai.dev_ptr = alloc_paired_buffer(arena_size, &ai.host_ptr);
         if (ai.dev_ptr == nullptr) {
             LOG_ERROR("Failed to allocate dump arena for thread %d (%lu bytes)", t, arena_size);
             return -1;
@@ -149,13 +116,12 @@ int TensorDumpCollector::initialize(
 
         for (int b = 0; b < PLATFORM_DUMP_BUFFERS_PER_THREAD; b++) {
             void *host_ptr = nullptr;
-            void *dev_ptr = alloc_single_buffer(sizeof(DumpMetaBuffer), &host_ptr);
+            void *dev_ptr = alloc_paired_buffer(sizeof(DumpMetaBuffer), &host_ptr);
             if (dev_ptr == nullptr) {
                 LOG_ERROR("Failed to allocate dump meta buffer %d for thread %d", b, t);
                 return -1;
             }
-
-            manager_.register_mapping(dev_ptr, host_ptr);
+            // alloc_paired_buffer already registered dev→host via the manager.
 
             if (b < PLATFORM_DUMP_SLOT_COUNT) {
                 uint32_t tail = state->free_queue.tail;
@@ -175,7 +141,10 @@ int TensorDumpCollector::initialize(
     // gates on shm_host_ being non-null, so this re-set_memory_context call
     // is the moment the collector becomes startable.
     dump_shared_mem_dev_ = shm_dev_local;
-    set_memory_context(alloc_cb, register_cb, free_cb, shm_dev_local, shm_host_local, shm_size, device_id);
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        shm_dev_local, shm_host_local, shm_size, device_id
+    );
 
     LOG_INFO_V0(
         "Tensor dump initialized: %d threads, arena=%lu MB/thread, %d buffers/thread", num_dump_threads,

@@ -40,39 +40,6 @@
 
 ScopeStatsCollector::~ScopeStatsCollector() { stop(); }
 
-void *ScopeStatsCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size);
-    if (dev_ptr == nullptr) {
-        if (host_ptr_out) *host_ptr_out = nullptr;
-        return nullptr;
-    }
-
-    void *host_ptr = nullptr;
-    if (register_cb_ != nullptr) {
-        int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
-        if (rc != 0 || host_ptr == nullptr) {
-            LOG_ERROR("ScopeStatsCollector: register failed: %d", rc);
-            free_cb_(dev_ptr);
-            if (host_ptr_out) *host_ptr_out = nullptr;
-            return nullptr;
-        }
-    } else {
-        host_ptr = std::malloc(size);
-        if (host_ptr == nullptr) {
-            LOG_ERROR("ScopeStatsCollector: host shadow alloc failed for %zu bytes", size);
-            free_cb_(dev_ptr);
-            if (host_ptr_out) *host_ptr_out = nullptr;
-            return nullptr;
-        }
-        std::memset(host_ptr, 0, size);
-        profiling_copy_to_device(dev_ptr, host_ptr, size);
-    }
-
-    if (host_ptr_out) *host_ptr_out = host_ptr;
-    manager_.register_mapping(dev_ptr, host_ptr);
-    return dev_ptr;
-}
-
 // ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
@@ -95,17 +62,18 @@ int ScopeStatsCollector::init(
     records_.clear();
     execution_complete_.store(false, std::memory_order_release);
 
-    // Stash callbacks on the base up-front so alloc_single_buffer sees
+    // Stash callbacks on the base up-front so alloc_paired_buffer sees
     // consistent values during init. shm_host_ stays nullptr until the shm
     // allocation succeeds — start(tf) gates on shm_host_.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
     const int num_instances = 1;
     size_t shm_size = calc_scope_stats_shm_size(num_instances);
     void *shm_host_local = nullptr;
-    void *shm_dev_local = alloc_single_buffer(shm_size, &shm_host_local);
+    void *shm_dev_local = alloc_paired_buffer(shm_size, &shm_host_local);
     if (shm_dev_local == nullptr) {
         LOG_ERROR("ScopeStatsCollector: failed to allocate scope_stats shared memory (%zu bytes)", shm_size);
         return -1;
@@ -120,7 +88,7 @@ int ScopeStatsCollector::init(
 
     for (int b = 0; b < PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE; b++) {
         void *host_ptr = nullptr;
-        void *dev_ptr = alloc_single_buffer(buf_size, &host_ptr);
+        void *dev_ptr = alloc_paired_buffer(buf_size, &host_ptr);
         if (dev_ptr == nullptr) {
             LOG_ERROR("ScopeStatsCollector: failed to allocate ScopeStatsBuffer b=%d", b);
             return -1;
@@ -146,7 +114,10 @@ int ScopeStatsCollector::init(
     // Re-set_memory_context now that the shm region is ready. start(tf) gates
     // on shm_host_ being non-null, so this is the moment the collector becomes
     // startable.
-    set_memory_context(alloc_cb, register_cb, free_cb, shm_dev_local, shm_host_local, shm_size, device_id);
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        shm_dev_local, shm_host_local, shm_size, device_id
+    );
 
     LOG_INFO_V0(
         "ScopeStats collector initialized: %d threads, SHM=0x%lx", num_threads,

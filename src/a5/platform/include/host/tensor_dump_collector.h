@@ -132,7 +132,7 @@ struct DumpModule {
 // lambda capture; register / unregister stay as plain function pointers
 // because they wrap stateless HAL globals. On a5 onboard the runner passes
 // register_cb=nullptr and the framework installs a malloc-shadow + DMA
-// fallback (default_host_shadow_register).
+// fallback inline in ProfilerBase::start().
 using DumpAllocCallback = profiling_common::ProfAllocCallback;
 using DumpRegisterCallback = profiling_common::ProfRegisterCallback;
 using DumpUnregisterCallback = profiling_common::ProfUnregisterCallback;
@@ -286,7 +286,6 @@ private:
     uint64_t buffers_collected_{0};
     bool writer_started_{false};
 
-    void *alloc_single_buffer(size_t size, void **host_ptr_out);
     void process_dump_buffer(const DumpReadyBufferInfo &info);
     void start_writer_thread_once();
 

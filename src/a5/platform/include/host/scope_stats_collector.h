@@ -172,7 +172,6 @@ private:
     ScopeStatsDataHeader *scope_stats_header() const { return get_scope_stats_header(shm_host_); }
     ScopeStatsBufferState *scope_stats_state(int idx = 0) const { return get_scope_stats_buffer_state(shm_host_, idx); }
 
-    void *alloc_single_buffer(size_t size, void **host_ptr_out);
     void append_buffer_records(const void *buf_host_ptr);
 };
 

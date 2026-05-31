@@ -103,25 +103,33 @@
  *      Caller is then guaranteed L1 and L2 are both empty and all collected
  *      data has been delivered to Derived::on_buffer_collected.
  *
- * a5 vs a2a3 (intentional differences)
- * ------------------------------------
+ * SVM vs host-shadow paths (chosen at runtime by the collector's MemoryOps)
+ * -------------------------------------------------------------------------
  *
- *   - MemoryOps adds copy_to_device / copy_from_device (a5 has no SVM, so
- *     every device read/write goes through rtMemcpy or memcpy).
- *   - mgmt_loop pulls the device-side shared-memory region into the host
- *     shadow at the top of every tick (`mirror_shm_from_device`) and
+ *   - Collectors on platforms without SVM (a5: no halHostRegister) install
+ *     `copy_to_device` / `copy_from_device` in MemoryOps so every device
+ *     read/write goes through rtMemcpy (onboard) or memcpy (sim). The
+ *     mgmt_loop then pulls the device-side shared-memory region into the
+ *     host shadow at the top of every tick (`mirror_shm_from_device`) and
  *     pushes the few host-modified fields (`queue_heads[q]` after pop,
  *     `free_queue.tail` + `buffer_ptrs[]` after refill) back as narrow
  *     `write_range_to_device` writes. The bulk `mirror_shm_to_device` is
  *     intentionally NOT called from mgmt_loop: it raced with AICPU writes
  *     to device-only fields (current_buf_ptr, total/dropped/mismatch
- *     counters, queue_tails, free_queue.head, L2SwimlaneAicpuPhaseHeader::magic) and
- *     rolled them back to the host-shadow values mirrored in at the top of
- *     the tick. Buffer contents are mirrored on demand inside
- *     ProfilerAlgorithms.
- *   - reg always allocates a paired host shadow; the framework never falls
- *     back to identity-mapping (which would be wrong on a5). Collectors
- *     pass nullptr-safe callbacks via Derived::init.
+ *     counters, queue_tails, free_queue.head,
+ *     L2SwimlaneAicpuPhaseHeader::magic) and rolled them back to the
+ *     host-shadow values mirrored in at the top of the tick. Buffer
+ *     contents are mirrored on demand inside ProfilerAlgorithms.
+ *   - On these platforms `reg` always allocates a paired host shadow; the
+ *     framework never falls back to identity-mapping (which would be wrong
+ *     without SVM). Collectors pass nullptr-safe callbacks via
+ *     Derived::init.
+ *   - SVM platforms (a2a3: halHostRegister maps device pointers into host
+ *     address space) leave `copy_to_device` / `copy_from_device` null and
+ *     pass the same pointer as both shm_dev and shm_host. The mirror /
+ *     write_range / copy_buffer / read_range methods then short-circuit
+ *     via the manager's internal null-check and cost a single function
+ *     call per tick (zero memcpy work).
  *
  * Required Derived contract
  * -------------------------
@@ -141,8 +149,8 @@
  *       Used in the idle-timeout log line (e.g. "L2Swimlane", "PMU", "TensorDump").
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_PROFILER_BASE_H_
-#define SRC_A5_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_PROFILER_BASE_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_PROFILER_BASE_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_PROFILER_BASE_H_
 
 #include <atomic>
 #include <chrono>
@@ -175,30 +183,11 @@ using ProfRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, 
 using ProfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
 using ProfFreeCallback = std::function<int(void *dev_ptr)>;
 
-/**
- * Default a5 host-shadow register: malloc a paired shadow, zero it, and push
- * the zeros to device (so the device buffer starts in a known state). Used
- * when Derived::init does not provide its own register_cb. Collectors that
- * need a specialized register path (e.g. extra metadata initialization) can
- * pass a custom register_cb at init time.
- */
-inline int default_host_shadow_register(void *dev_ptr, size_t size, int /*device_id*/, void **host_ptr_out) {
-    if (host_ptr_out == nullptr) return -1;
-    void *host_ptr = std::malloc(size);
-    if (host_ptr == nullptr) {
-        *host_ptr_out = nullptr;
-        return -1;
-    }
-    std::memset(host_ptr, 0, size);
-    int rc = profiling_copy_to_device(dev_ptr, host_ptr, size);
-    if (rc != 0) {
-        std::free(host_ptr);
-        *host_ptr_out = nullptr;
-        return rc;
-    }
-    *host_ptr_out = host_ptr;
-    return 0;
-}
+// `default_host_shadow_register` was previously a free function; it has been
+// folded into a lambda inside `ProfilerBase::start()` so the shadow it
+// malloc's can be registered with the manager's `malloc_shadows_` set for
+// safe teardown via `clear_mappings()` / `release_owned_buffers()`. See
+// `ProfilerBase::start()` for the inline definition.
 
 // Result of Module::resolve_entry. Carries everything the unified
 // process_entry algorithm needs to (a) refill the originating pool's free
@@ -426,16 +415,28 @@ public:
      * on the init() success path; if init aborts before this, start(tf) is
      * a no-op.
      *
-     * register_cb may be nullptr — start(tf) installs the default a5
-     * host-shadow register in that case (malloc + memset 0 + copy_to_device).
+     * `copy_to_device` / `copy_from_device` are arch-specific: SVM platforms
+     * (a2a3) leave them null and pass `shm_dev == shm_host`; non-SVM
+     * platforms (a5) install `profiling_copy_to_device` /
+     * `profiling_copy_from_device` and pass distinct shm pointers. The
+     * framework picks the right register fallback (identity vs host-shadow
+     * malloc) based on whether `copy_to_device` was provided.
+     *
+     * `register_cb` may be nullptr — start(tf) installs the appropriate
+     * default for the arch path (identity on SVM platforms, host-shadow
+     * malloc + memset 0 + copy_to_device on non-SVM platforms).
      */
     void set_memory_context(
         const ProfAllocCallback &alloc_cb, ProfRegisterCallback register_cb, const ProfFreeCallback &free_cb,
-        void *shm_dev, void *shm_host, size_t shm_size, int device_id
+        std::function<int(void *, const void *, size_t)> copy_to_device,
+        std::function<int(void *, const void *, size_t)> copy_from_device, void *shm_dev, void *shm_host,
+        size_t shm_size, int device_id
     ) {
         alloc_cb_ = alloc_cb;
         register_cb_ = register_cb;
         free_cb_ = free_cb;
+        copy_to_device_ = std::move(copy_to_device);
+        copy_from_device_ = std::move(copy_from_device);
         shm_dev_ = shm_dev;
         shm_host_ = shm_host;
         shm_size_ = shm_size;
@@ -450,6 +451,8 @@ public:
         alloc_cb_ = nullptr;
         register_cb_ = nullptr;
         free_cb_ = nullptr;
+        copy_to_device_ = nullptr;
+        copy_from_device_ = nullptr;
         shm_dev_ = nullptr;
         shm_host_ = nullptr;
         shm_size_ = 0;
@@ -464,8 +467,12 @@ public:
      *
      * Order matters: mgmt is started before poll because mgmt is the only
      * writer to L2 (the ready_queue) and poll is its sole consumer. The
-     * register slot defaults to default_host_shadow_register when Derived
-     * passed nullptr, so BufferPoolManager always has a valid reg path.
+     * register slot defaults to identity on the SVM path (copy_to_device_
+     * is null) or to a host-shadow malloc lambda on the non-SVM path
+     * (copy_to_device_ installed) — so BufferPoolManager always has a
+     * valid reg path. The host-shadow lambda registers each malloc'd
+     * shadow with `manager_.add_malloc_shadow()` so teardown can free
+     * exactly the framework-owned shadows and leave HAL mappings alone.
      */
     void start(const ThreadFactory &thread_factory) {
         if (shm_host_ == nullptr) return;
@@ -475,15 +482,41 @@ public:
         ops.free_ = free_cb_;
         if (register_cb_ != nullptr) {
             ops.reg = register_cb_;
+        } else if (copy_to_device_) {
+            // Non-SVM platform: host-shadow allocate + copy zeros to device.
+            // Capture `this` so the malloc'd shadow can be registered as
+            // framework-owned via the manager.
+            auto copy_to_device = copy_to_device_;
+            ops.reg = [this, copy_to_device](void *dev_ptr, size_t size, int /*device_id*/, void **host_ptr_out) {
+                if (host_ptr_out == nullptr) return -1;
+                void *host_ptr = std::malloc(size);
+                if (host_ptr == nullptr) {
+                    *host_ptr_out = nullptr;
+                    return -1;
+                }
+                std::memset(host_ptr, 0, size);
+                int rc = copy_to_device(dev_ptr, host_ptr, size);
+                if (rc != 0) {
+                    std::free(host_ptr);
+                    *host_ptr_out = nullptr;
+                    return rc;
+                }
+                manager_.add_malloc_shadow(host_ptr);
+                *host_ptr_out = host_ptr;
+                return 0;
+            };
         } else {
-            ops.reg = &default_host_shadow_register;
+            // SVM platform: identity-map (host_ptr == dev_ptr).
+            ops.reg = [](void *dev_ptr, size_t /*size*/, int /*device_id*/, void **host_ptr_out) {
+                *host_ptr_out = dev_ptr;
+                return 0;
+            };
         }
-        ops.copy_to_device = [](void *dev_dst, const void *host_src, size_t size) {
-            return profiling_copy_to_device(dev_dst, host_src, size);
-        };
-        ops.copy_from_device = [](void *host_dst, const void *dev_src, size_t size) {
-            return profiling_copy_from_device(host_dst, dev_src, size);
-        };
+        // copy_to_device_ / copy_from_device_ may be null (SVM path); the
+        // manager's internal null-checks short-circuit mirror_/range_/buffer_
+        // calls to no-ops in that case.
+        ops.copy_to_device = copy_to_device_;
+        ops.copy_from_device = copy_from_device_;
         manager_.set_memory_context(std::move(ops), shm_dev_, shm_host_, shm_size_, device_id_);
 
         mgmt_running_.store(true, std::memory_order_release);
@@ -543,6 +576,11 @@ protected:
     ProfAllocCallback alloc_cb_{nullptr};
     ProfRegisterCallback register_cb_{nullptr};
     ProfFreeCallback free_cb_{nullptr};
+    // copy_to_device_ / copy_from_device_ are set by non-SVM platforms
+    // (a5) to profiling_copy_* wrappers; left null by SVM platforms (a2a3)
+    // so the manager's mirror methods short-circuit to no-ops.
+    std::function<int(void *, const void *, size_t)> copy_to_device_;
+    std::function<int(void *, const void *, size_t)> copy_from_device_;
     void *shm_dev_{nullptr};
     void *shm_host_{nullptr};
     size_t shm_size_{0};
@@ -568,6 +606,72 @@ protected:
         if (free_cb) {
             free_cb(dev_ptr);
         }
+    }
+
+    /**
+     * Allocate a device buffer and its paired host view, picking the right
+     * pairing strategy based on the memory context stashed by
+     * set_memory_context():
+     *
+     *   - `register_cb_` set       (a2a3 onboard): `register_cb_(dev, …)`
+     *     installs the halHostRegister mapping; host_ptr is the
+     *     identity-mapped view of the same memory.
+     *   - non-SVM platform (a5):   `copy_to_device_` is installed →
+     *     malloc a paired host shadow, zero it, push the zeros to the
+     *     device side. The host shadow lives until release_one_buffer
+     *     `std::free()`s it.
+     *   - SVM platform (a2a3 sim): `register_cb_` null AND `copy_to_device_`
+     *     null → identity-map (host_ptr == dev_ptr).
+     *
+     * On any failure the device pointer is freed via `free_cb_` and
+     * nullptr is returned; on success the dev↔host mapping is registered
+     * with the buffer pool so resolve_host_ptr() finds it later.
+     *
+     * Used by leaf collectors' init() to allocate the shared-memory header
+     * region and any per-instance buffers, replacing the per-arch ad-hoc
+     * branch trees they used to carry.
+     */
+    void *alloc_paired_buffer(size_t size, void **host_ptr_out) {
+        if (host_ptr_out == nullptr) return nullptr;
+        *host_ptr_out = nullptr;
+        if (!alloc_cb_) return nullptr;
+
+        void *dev_ptr = alloc_cb_(size);
+        if (dev_ptr == nullptr) return nullptr;
+
+        void *host_ptr = nullptr;
+        if (register_cb_ != nullptr) {
+            int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
+            if (rc != 0 || host_ptr == nullptr) {
+                LOG_ERROR("ProfilerBase::alloc_paired_buffer: register_cb_ failed: %d", rc);
+                if (free_cb_) free_cb_(dev_ptr);
+                return nullptr;
+            }
+        } else if (copy_to_device_) {
+            // Non-SVM: malloc + zero + push to device.
+            host_ptr = std::malloc(size);
+            if (host_ptr == nullptr) {
+                LOG_ERROR("ProfilerBase::alloc_paired_buffer: host shadow alloc failed for %zu bytes", size);
+                if (free_cb_) free_cb_(dev_ptr);
+                return nullptr;
+            }
+            std::memset(host_ptr, 0, size);
+            int rc = copy_to_device_(dev_ptr, host_ptr, size);
+            if (rc != 0) {
+                LOG_ERROR("ProfilerBase::alloc_paired_buffer: copy_to_device failed: %d", rc);
+                std::free(host_ptr);
+                if (free_cb_) free_cb_(dev_ptr);
+                return nullptr;
+            }
+            manager_.add_malloc_shadow(host_ptr);
+        } else {
+            // SVM: identity-map.
+            host_ptr = dev_ptr;
+        }
+
+        *host_ptr_out = host_ptr;
+        manager_.register_mapping(dev_ptr, host_ptr);
+        return dev_ptr;
     }
 
 private:
@@ -693,4 +797,4 @@ private:
 
 }  // namespace profiling_common
 
-#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_PROFILER_BASE_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_PROFILER_BASE_H_

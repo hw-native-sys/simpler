@@ -29,36 +29,47 @@
  * alloc/reg/free/copy callbacks), and DoneInfo (per-buffer ownership info
  * passed through done_queue).
  *
- * a5 vs a2a3 differences (intentional)
- * ------------------------------------
+ * SVM vs host-shadow (chosen at runtime by what the collector installs)
+ * ---------------------------------------------------------------------
  *
- * a5 has no `halHostRegister`, so device↔host transfers go through
- * rtMemcpy (onboard) or memcpy (sim) against a paired host shadow. Two
- * mechanical changes capture that:
+ * Platforms that don't have SVM (a5: no halHostRegister) install
+ * `copy_to_device` / `copy_from_device` in MemoryOps and a `reg` that
+ * allocates a paired host shadow (instead of mapping a HAL view onto the
+ * device pointer). The mgmt loop then:
+ *   1. Calls `mirror_shm_from_device` once per tick to refresh the host
+ *      shadow, then writes back only the fields it actually modifies via
+ *      narrow `write_range_to_device(field_ptr, sizeof(field))` calls.
+ *      The bulk `mirror_shm_to_device` is kept for init/teardown but is
+ *      NOT used by the mgmt loop — bulk write-back races with AICPU writes
+ *      to device-only fields (current_buf_ptr, total/dropped/mismatch
+ *      counters, queue_tails, free_queue.head,
+ *      L2SwimlaneAicpuPhaseHeader::magic).
+ *   2. Pulls each popped buffer's contents from device via
+ *      `copy_buffer_from_device` inside ProfilerAlgorithms::process_entry
+ *      before delivering it to the collector.
  *
- *   1. MemoryOps carries `copy_to_device` and `copy_from_device` in
- *      addition to the {alloc, reg, free_} of a2a3. The mgmt loop calls
- *      `mirror_shm_from_device` once per tick to refresh the host shadow,
- *      then writes back only the fields it actually modifies via
- *      `write_range_to_device(field_ptr, sizeof(field))`. The bulk
- *      `mirror_shm_to_device` is kept for init/teardown but is NOT used by
- *      the mgmt loop — bulk write-back races with AICPU writes to
- *      device-only fields (current_buf_ptr, total/dropped/mismatch
- *      counters, queue_tails, free_queue.head, L2SwimlaneAicpuPhaseHeader::magic).
- *   2. `reg` allocates a paired host shadow (instead of mapping a HAL view
- *      onto the device pointer); `release_owned_buffers` therefore frees
- *      both the device pointer (via `release_fn`) and the host shadow
- *      (`free()` on the value stashed in `dev_to_host_`).
+ * `release_owned_buffers` frees both the device pointer (via `release_fn`)
+ * and any paired host shadow that the framework itself malloc'd. Ownership
+ * is tracked explicitly in `malloc_shadows_`: only shadows allocated via
+ * `default_host_shadow_register` or the `copy_to_device_` branch of
+ * `ProfilerBase::alloc_paired_buffer` are added to the set, so HAL-managed
+ * mappings (e.g. `halHostRegister` results on a2a3 onboard) never see a
+ * spurious `std::free`. The earlier `host_ptr != dev_ptr` alias check is
+ * not sufficient on its own — `halHostRegister` returns a host VA that
+ * may or may not coincide with the device VA, and feeding either case to
+ * `std::free` is UB.
  *
- * Buffer-content mirroring (the per-tick shm copy moves header +
- * BufferStates only — not the bulk records) is done on demand inside
- * ProfilerAlgorithms::process_entry, which calls
- * `manager_.copy_buffer_from_device(host_buf, dev_buf, buffer_size)` after
- * resolving the host pointer.
+ * Platforms with SVM (a2a3: halHostRegister maps device pointers into host
+ * address space) leave `copy_to_device` / `copy_from_device` null and pass
+ * the same pointer as both shm_dev and shm_host (or shm_size=0). All
+ * mirror_* / write_range_* / read_range_* / copy_buffer_* methods then
+ * short-circuit through the internal `if (!ops_.copy_to_device) return 0;`
+ * guard and cost a single function call per tick (zero memcpy work on the
+ * SVM path).
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_BUFFER_POOL_MANAGER_H_
-#define SRC_A5_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_BUFFER_POOL_MANAGER_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_BUFFER_POOL_MANAGER_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_BUFFER_POOL_MANAGER_H_
 
 #include <atomic>
 #include <chrono>
@@ -71,6 +82,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -174,11 +186,11 @@ public:
      * to the collector and must be released by it (the AICPU may still be
      * referencing them via shared memory until execution ends).
      *
-     * For each unique device pointer freed, the paired host shadow recorded
-     * in `dev_to_host_` is also `free()`d before the mapping is erased. On
-     * a5 every shadow comes from `malloc()` (either via ops_.reg or via
-     * collector-side `alloc_single_buffer`), so the unconditional free is
-     * correct.
+     * For each unique device pointer freed, the paired host shadow is
+     * `std::free`d ONLY if it lives in `malloc_shadows_` (i.e. the
+     * framework itself malloc'd it via `default_host_shadow_register` or
+     * `ProfilerBase::alloc_paired_buffer`'s copy-to-device branch). HAL
+     * mappings (e.g. `halHostRegister` results) are never freed here.
      *
      * `release_fn(dev_ptr)` is invoked once per unique pointer; the
      * collector is expected to call its free_cb on the device pointer.
@@ -194,10 +206,7 @@ public:
                 auto it = dev_to_host_.find(p);
                 void *host_ptr = (it != dev_to_host_.end()) ? it->second : nullptr;
                 release_fn(p);
-                // a5: free the paired host shadow (malloc'd by ops_.reg or by
-                // alloc_single_buffer). Skip the self-free corner case where
-                // dev_ptr and host_ptr happen to alias.
-                if (host_ptr != nullptr && host_ptr != p) {
+                if (host_ptr != nullptr && malloc_shadows_.erase(host_ptr) > 0) {
                     std::free(host_ptr);
                 }
                 if (it != dev_to_host_.end()) {
@@ -230,17 +239,19 @@ public:
     /**
      * Drop the dev↔host mapping table — call after the collector has freed
      * its share of buffers (free_queue + current_buf_ptr) and there are no
-     * further resolve_host_ptr() lookups expected. Frees host shadows that
-     * are still mapped (collectors may have invoked free_cb on the dev
-     * pointer without going through release_owned_buffers).
+     * further resolve_host_ptr() lookups expected. `std::free`s any host
+     * shadow still listed in `malloc_shadows_` (collectors may have invoked
+     * free_cb on the dev pointer without going through release_owned_buffers).
+     * HAL mappings are not touched.
      */
     void clear_mappings() {
         for (auto &kv : dev_to_host_) {
-            if (kv.second != nullptr && kv.second != kv.first) {
+            if (kv.second != nullptr && malloc_shadows_.count(kv.second) > 0) {
                 std::free(kv.second);
             }
         }
         dev_to_host_.clear();
+        malloc_shadows_.clear();
     }
 
     // -------------------------------------------------------------------------
@@ -464,7 +475,7 @@ public:
         if (ops_.free_) {
             ops_.free_(dev_ptr);
         }
-        if (host_ptr != nullptr && host_ptr != dev_ptr) {
+        if (host_ptr != nullptr && malloc_shadows_.erase(host_ptr) > 0) {
             std::free(host_ptr);
         }
     }
@@ -486,6 +497,18 @@ public:
      * to be able to resolve them later.
      */
     void register_mapping(void *dev_ptr, void *host_ptr) { dev_to_host_[dev_ptr] = host_ptr; }
+
+    /**
+     * Claim ownership of a host shadow that the framework malloc'd. Only
+     * shadows tracked here are `std::free`d by `clear_mappings()`,
+     * `release_owned_buffers()`, and `free_buffer()` — HAL-managed
+     * mappings (e.g. `halHostRegister` results) must NOT be added here.
+     */
+    void add_malloc_shadow(void *host_ptr) {
+        if (host_ptr != nullptr) {
+            malloc_shadows_.insert(host_ptr);
+        }
+    }
 
     /**
      * Pull from the recycled pool of the given kind, or return nullptr if
@@ -548,10 +571,16 @@ private:
     // dev → host mapping (single source of truth for resolve_host_ptr)
     std::unordered_map<void *, void *> dev_to_host_;
 
+    // Host shadows the framework itself malloc'd (via
+    // `default_host_shadow_register` or `ProfilerBase::alloc_paired_buffer`'s
+    // copy-to-device branch). Only these are `std::free`d on teardown —
+    // HAL-managed mappings (halHostRegister) live outside this set.
+    std::unordered_set<void *> malloc_shadows_;
+
     // Per-kind recycled buffer pools (vector indexed by Module-defined kind id)
     std::vector<std::vector<void *>> recycled_;
 };
 
 }  // namespace profiling_common
 
-#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_BUFFER_POOL_MANAGER_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILING_COMMON_BUFFER_POOL_MANAGER_H_

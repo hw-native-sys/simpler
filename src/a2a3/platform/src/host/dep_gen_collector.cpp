@@ -114,7 +114,10 @@ int DepGenCollector::init(
     }
 
     initialized_ = true;
-    set_memory_context(alloc_cb, register_cb, free_cb, shm_host_, device_id);
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, shm_dev_, shm_host_, shm_size_,
+        device_id
+    );
 
     LOG_INFO_V0(
         "DepGen collector initialized: %d threads, SHM=0x%lx (records held in memory until replay)", num_threads,

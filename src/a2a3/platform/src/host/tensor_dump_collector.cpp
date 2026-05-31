@@ -72,7 +72,10 @@ int TensorDumpCollector::initialize(
     // sees consistent values during init. shm_host_ stays nullptr until the
     // shm allocation succeeds — that nullptr guard makes a post-failure
     // start(tf) a no-op without further bookkeeping.
-    set_memory_context(alloc_cb, register_cb, free_cb, /*shm_host=*/nullptr, device_id);
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, /*shm_dev=*/nullptr,
+        /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+    );
 
     // Allocate dump shared memory (header + buffer states)
     size_t shm_size = calc_dump_data_size(num_dump_threads);
@@ -142,6 +145,16 @@ int TensorDumpCollector::initialize(
             }
         }
     }
+
+    // Refresh memory context with the now-known SHM tuple. The early-init
+    // stash above seeded callbacks only; this call publishes the real
+    // shm_dev/shm_host/shm_size so the framework's mirror/range methods
+    // bounds-check against the actual region (a2a3 SVM short-circuits the
+    // copies, but the metadata should still be honest).
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, dump_shared_mem_dev_, shm_host_,
+        shm_size, device_id
+    );
 
     LOG_INFO_V0(
         "Tensor dump initialized: %d threads, arena=%lu MB/thread, %d buffers/thread", num_dump_threads,

@@ -149,7 +149,10 @@ int PmuCollector::init(
     // a MemoryOps from these and launch mgmt + poll threads. PmuModule's alloc
     // fallback in process_entry can then grow the buffer pool on demand if
     // both the per-core free_queue and the recycled pool drain.
-    set_memory_context(alloc_cb, register_cb, free_cb, shm_host_, device_id);
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, shm_dev_, shm_host_, shm_size_,
+        device_id
+    );
 
     LOG_INFO_V0(
         "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
