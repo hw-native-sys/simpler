@@ -311,8 +311,8 @@ public:
     // The shared `pto_runtime_c_api` glue (`src/common/platform/onboard/host/
     // c_api_shared.cpp`) works through `DeviceRunnerBase *` and dispatches
     // through these virtuals. Each arch's `DeviceRunner` overrides
-    // `run` and `finalize`; a2a3 also overrides `set_dep_gen_enabled`
-    // (a5 keeps the default no-op since dep_gen is a2a3-only today).
+    // `run` and `finalize`; a2a3 and a5 both override `set_dep_gen_enabled`
+    // (an arch without dep_gen keeps the base no-op default).
 
     /**
      * Execute a Runtime. Each arch implements its own `run()` — the bodies
@@ -332,9 +332,9 @@ public:
     virtual int finalize() = 0;
 
     /**
-     * a2a3-only diagnostics setter. The shared c_api `run_prepared`
-     * calls this unconditionally; on a5 it's a no-op default (dep_gen
-     * is not implemented there yet).
+     * dep_gen enablement setter. The shared c_api `run_prepared` calls this
+     * unconditionally; a2a3 and a5 override it to capture submit_task inputs.
+     * The base default is a no-op for any arch that does not implement dep_gen.
      */
     virtual void set_dep_gen_enabled(bool /*enable*/) {}
 
@@ -746,8 +746,8 @@ protected:
     // Shared diagnostics collectors. Each subclass initializes its own
     // (a2a3 wraps `halHostRegister`/`Unregister` callbacks, a5 uses
     // direct `rtMalloc`/`rtFree`), but the storage and lifetime live
-    // on the base. `DepGenCollector` is a2a3-only and stays on the
-    // a2a3 subclass.
+    // on the base. `DepGenCollector` is not shared — each arch that
+    // implements dep_gen (a2a3, a5) keeps it on its own subclass.
     L2SwimlaneCollector l2_swimlane_collector_;
     TensorDumpCollector dump_collector_;
     PmuCollector pmu_collector_;

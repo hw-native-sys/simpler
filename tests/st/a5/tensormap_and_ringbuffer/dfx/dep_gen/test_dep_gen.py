@@ -10,7 +10,7 @@
 """dep_gen capture + replay sim test.
 
 Re-runs the ``vector_example`` orchestration with ``--enable-dep-gen``.
-Verifies the end-to-end dep_gen pipeline on a2a3sim:
+Verifies the end-to-end dep_gen pipeline on a5sim:
 
   ``<output_prefix>/deps.json`` is produced by the host replay
   (PTO2TensorMap replay → JSON edge list), and contains exactly the
@@ -20,7 +20,7 @@ Verifies the end-to-end dep_gen pipeline on a2a3sim:
   implicitly: if it broke, deps.json would be empty or wrong.
 
 deps.json is now the sole source of truth for fanout edges — the device
-hot path no longer records L2SwimlaneAicpuTaskRecord::fanout[], so there is no
+hot path no longer records L2PerfRecord::fanout[], so there is no
 "fanout ⊆ deps" cross-check to run. swimlane_converter.py joins
 deps.json into the Perfetto trace at post-process time.
 
@@ -40,7 +40,7 @@ from simpler.task_interface import ArgDirection as D
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 
-KERNELS_BASE = "../../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
+KERNELS_BASE = "../../../../../../examples/a5/tensormap_and_ringbuffer/vector_example/kernels"
 
 
 def _task_id(ring: int, local: int) -> int:
@@ -86,7 +86,7 @@ class TestDepGen(SceneTestCase):
     CASES = [
         {
             "name": "default",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "params": {},
         },

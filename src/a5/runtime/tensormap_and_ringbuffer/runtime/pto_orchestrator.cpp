@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "aicpu/dep_gen_collector_aicpu.h"
+#include "common/dep_gen.h"
 #include "common/unified_log.h"
 #include "pto_dep_compute.h"
 #include "pto_runtime2_types.h"
@@ -36,6 +38,25 @@
 
 extern "C" void set_dump_tensor_selective_mode(bool enable);
 extern "C" void set_dump_tensor_task_mask(uint64_t task_id, uint64_t mask);
+
+// Verify the captured Tensor blob size in DepGenRecord matches the runtime
+// Tensor layout. The platform header defines DEP_GEN_TENSOR_SIZE without
+// including runtime/tensor.h, so this check lives at the orch callsite.
+static_assert(sizeof(Tensor) == DEP_GEN_TENSOR_SIZE, "DepGenRecord::tensors slot size out of sync with sizeof(Tensor)");
+// DEP_GEN_MAX_EXPLICIT_DEPS is a diagnostic-side capture cap only; the runtime
+// imposes no hard cap on explicit dep count. If a submit exceeds this cap,
+// dep_gen_aicpu_record_submit() logs and truncates — runtime correctness is
+// unaffected, only the captured replay record is truncated.
+
+// Weak fallbacks: dep_gen_collector_aicpu.cpp provides the strong symbols in
+// AICPU builds. Host builds (host_build_graph runtime, future dep_gen replay)
+// link these no-op stubs so the runtime translation unit is self-contained.
+// Visibility is hidden so the HOST .so doesn't export them into the global
+// dynamic symbol table where they'd shadow the AICPU .so's strong symbols
+// (same pattern as get_sys_cnt_aicpu / l2_perf_aicpu_record_orch_phase below).
+extern "C" __attribute__((weak, visibility("hidden"))) bool is_dep_gen_enabled() { return false; }
+__attribute__((weak, visibility("hidden"))) void
+dep_gen_aicpu_record_submit(uint64_t, bool, int, const void *const *, const uint8_t *, int, const uint64_t *) {}
 
 #if PTO2_PROFILING
 #include "aicpu/scope_stats_collector_aicpu.h"
@@ -501,6 +522,38 @@ static TaskOutputTensors submit_task_common(
     PTO2TaskDescriptor &task = *prepared.task;
     PTO2TaskPayload &payload = *prepared.payload;
     result.set_task_id(task_id);
+
+    // dep_gen capture point: snapshot the orch submit_task inputs while the
+    // tensormap is still in its pre-lookup state for this task. Replay reads
+    // these records offline to reconstruct the complete dep graph — the sole
+    // source of truth for fanout now that the swimlane hot path no longer
+    // records it.
+    if (is_dep_gen_enabled()) {
+        const void *tensor_ptrs[MAX_TENSOR_ARGS];
+        // TensorArgType is `enum class : int32_t` (4 bytes); the on-disk record
+        // packs arg_types as uint8_t[16] (5-value enum fits in a byte). Narrow
+        // each tag here rather than letting the AICPU writer reinterpret a
+        // 4×-wider array as bytes — that path silently lost two of every three
+        // tags on little-endian and synthesized phantom self-edges in replay.
+        uint8_t arg_types_u8[MAX_TENSOR_ARGS];
+        // Clamp to MAX_TENSOR_ARGS even though the Arg builder caps adds at
+        // MAX_TENSOR_ARGS: defensive against any future builder bypass /
+        // shared-memory bit-flip that could otherwise overrun the two
+        // MAX_TENSOR_ARGS-sized stack buffers above.
+        const int tc_raw = args.tensor_count();
+        const int tc = tc_raw > MAX_TENSOR_ARGS ? MAX_TENSOR_ARGS : tc_raw;
+        for (int i = 0; i < tc; i++) {
+            // OUTPUT slots carry create_info (not yet a Tensor); skip them —
+            // they have no producer to look up and replay's per-tensor loop
+            // also skips OUTPUT.
+            tensor_ptrs[i] = (args.tag(i) == TensorArgType::OUTPUT) ? nullptr : args.tensor(i).ptr;
+            arg_types_u8[i] = static_cast<uint8_t>(args.tag(i));
+        }
+        dep_gen_aicpu_record_submit(
+            task_id.raw, orch->in_manual_scope(), tc, tensor_ptrs, arg_types_u8,
+            static_cast<int>(args.explicit_dep_count()), reinterpret_cast<const uint64_t *>(args.explicit_deps_data())
+        );
+    }
 
     PTO2FaninBuilder fanin_builder(orch->rings[ring_id].fanin_pool);
 

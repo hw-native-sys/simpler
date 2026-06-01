@@ -59,6 +59,8 @@ extern "C" {
  * - device_args: Written by host, read by AICPU (contains aicpu_so_bin/aicpu_so_len)
  * - runtime_args: Written by host, read by AICPU (task runtime, includes
  *   handshake buffers)
+ * - dep_gen_data_base: Written by host platform, read by AICPU platform layer;
+ *   zero when dep_gen capture is unused
  *
  * Note: AICore kernels receive Runtime* directly, not KernelArgs
  *       - AICPU: accesses runtime_args->workers directly
@@ -73,7 +75,8 @@ struct KernelArgs {
     uint64_t l2_swimlane_data_base{
         0
     };  // L2 swimlane shared memory base address; use explicit flags to detect enablement
-    uint64_t pmu_data_base{0};  // PMU buffer base address (device memory); 0 = PMU disabled
+    uint64_t pmu_data_base{0};      // PMU buffer base address (device memory); 0 = PMU disabled
+    uint64_t dep_gen_data_base{0};  // dep_gen shared memory base address; use explicit flags to detect enablement
     // Profiling per-core address arrays (moved out of Handshake). Each *_addrs
     // field is a device pointer to uint64_t[num_aicore]. AICore KERNEL_ENTRY
     // indexes by block_idx and forwards into per-core platform state.

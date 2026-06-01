@@ -65,7 +65,7 @@ public:
     // --- Pure / no-op virtuals dispatched from the shared c_api glue ----
     virtual int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) = 0;
     virtual int finalize() = 0;
-    // a2a3 overrides (dep_gen on a2a3 only); a5 leaves the default no-op.
+    // a2a3 and a5 both override; an arch without dep_gen leaves the no-op.
     virtual void set_dep_gen_enabled(bool /*enable*/) {}
 
     // --- Shared methods --------------------------------------------------

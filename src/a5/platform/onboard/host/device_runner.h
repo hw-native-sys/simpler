@@ -50,6 +50,7 @@
 #include "host/memory_allocator.h"
 #include "host/l2_swimlane_collector.h"
 #include "host/pmu_collector.h"
+#include "host/dep_gen_collector.h"
 #include "host/scope_stats_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
@@ -112,6 +113,12 @@ public:
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
     // `output_prefix()`, and `launch_aicpu_kernel` live on
     // `DeviceRunnerBase`.
+
+    /**
+     * a5 `dep_gen` enablement setter, overriding the base no-op. Captures
+     * orchestrator submit_task inputs for offline replay into deps.json.
+     */
+    void set_dep_gen_enabled(bool enable) override { enable_dep_gen_ = enable; }
 
     /**
      * Cleanup all resources
@@ -180,6 +187,10 @@ private:
     // Shared collectors (`l2_swimlane_collector_`, `dump_collector_`,
     // `pmu_collector_`, `scope_stats_collector_`) live on `DeviceRunnerBase`.
 
+    // dep_gen collector — captures orchestrator submit_task inputs for
+    // offline replay. a5-specific (the base keeps dep_gen as a virtual hook).
+    DepGenCollector dep_gen_collector_;
+
     // `query_max_block_dim`, `validate_block_dim`, `ensure_binaries_loaded`,
     // `configure_aicore_op_timeout`, and `prepare_orch_so` are inherited
     // (protected) from `DeviceRunnerBase`.
@@ -223,9 +234,21 @@ private:
     // Shared enable flags (`enable_l2_swimlane_`, `enable_dump_tensor_`,
     // `enable_pmu_`, `enable_scope_stats_`, `l2_swimlane_level_`,
     // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.
+    //
+    // dep_gen enablement is a5-specific (a2a3 carries its own copy).
+    bool enable_dep_gen_{false};
 
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
     int init_scope_stats(int num_threads, int device_id);
+
+    /**
+     * Initialize dep_gen capture shared memory.
+     *
+     * Allocates a DepGenDataHeader + 1 DepGenBufferState + N DepGenBuffers,
+     * stores the device pointer to the data header into
+     * kernel_args.dep_gen_data_base.
+     */
+    int init_dep_gen(int num_threads, int device_id);
 
     // Per-run collector teardown: stops mgmt + poll threads on every collector
     // whose init succeeded, in the only safe order (stop() joins mgmt before

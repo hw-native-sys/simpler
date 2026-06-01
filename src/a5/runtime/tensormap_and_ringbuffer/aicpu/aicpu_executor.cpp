@@ -35,6 +35,7 @@
 #include "pto_shared_memory.h"
 
 // Performance profiling headers
+#include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
@@ -559,6 +560,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             scope_stats_aicpu_set_orch_thread_idx(thread_idx);
 #endif
 
+            // dep_gen plugs into the orchestrator thread (single-instance subsystem):
+            // set the per-thread queue index and pop the initial buffer before any
+            // submit_task can fire inside orch_func_.
+            if (is_dep_gen_enabled()) {
+                dep_gen_aicpu_set_orch_thread_idx(thread_idx);
+                dep_gen_aicpu_init();
+            }
+
 #if PTO2_PROFILING
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
@@ -569,6 +578,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt_scope_begin(rt);
             (*p_func)(*orch_args_cached_);
             rt_scope_end(rt);
+
+            // Flush the (potentially partially-filled) DepGenBuffer so the host
+            // collector can pick it up before this orchestrator thread joins.
+            if (is_dep_gen_enabled()) {
+                dep_gen_aicpu_flush();
+            }
 #if PTO2_PROFILING
             // Push the partially-filled scope_stats buffer so the host gets the
             // final scope_end records. Idempotent / no-op when disabled.
@@ -762,6 +777,9 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
     rt = nullptr;
+
+    // Clear dep_gen file-local bookkeeping. No-op when dep_gen is disabled.
+    dep_gen_aicpu_finalize();
 
     LOG_INFO_V0("DeInit: Runtime execution state reset");
 

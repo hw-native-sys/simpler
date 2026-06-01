@@ -38,6 +38,22 @@
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
 
+// dep_gen_replay_emit_deps_json: strong symbol provided by
+// runtime/tensormap_and_ringbuffer/host/dep_gen_replay.cpp when that runtime is
+// linked into host_runtime.so. host_build_graph has no replay implementation
+// today, so its host_runtime.so falls through to this weak stub. visibility=
+// hidden keeps the stub off the global dynamic symbol table so it can't
+// accidentally shadow the strong symbol via RTLD_GLOBAL.
+// LOG_DEBUG (not WARN): runtimes that don't link dep_gen never enable it in
+// practice, so this path is unreachable for end users — the symbol exists
+// purely to keep the .so loadable.
+extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_deps_json(
+    const struct DepGenRecord * /*records*/, size_t /*num_records*/, const char * /*deps_json_path*/
+) {
+    LOG_DEBUG("dep_gen replay not implemented for this runtime — deps.json skipped");
+    return -1;
+}
+
 // =============================================================================
 // DeviceRunner Implementation
 // =============================================================================
@@ -151,6 +167,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_dump_tensor_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     if (enable_l2_swimlane_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
     if (enable_pmu_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+    if (enable_dep_gen_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
     if (enable_scope_stats_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
     kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
@@ -195,6 +212,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
+    if (enable_dep_gen_) {
+        rc = init_dep_gen(launch_aicpu_num, device_id_);
+        if (rc != 0) {
+            LOG_ERROR("init_dep_gen failed: %d", rc);
+            return rc;
+        }
+    }
+
     if (enable_scope_stats_) {
         rc = init_scope_stats(launch_aicpu_num, device_id_);
         if (rc != 0) {
@@ -220,6 +245,13 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (rc != 0) return rc;
 
     start_shared_collectors_for_run();
+    // a5-specific dep_gen collector — share the same thread_factory shape as base.
+    if (enable_dep_gen_) {
+        auto thread_factory = [this](std::function<void()> fn) {
+            return create_thread(std::move(fn));
+        };
+        dep_gen_collector_.start(thread_factory);
+    }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::InitName, 1);
@@ -256,6 +288,19 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     teardown_shared_collectors_after_run();
 
+    // a5-specific dep_gen teardown: stop + reconcile + replay emit.
+    if (enable_dep_gen_) {
+        dep_gen_collector_.stop();
+        if (dep_gen_collector_.reconcile_counters()) {
+            const auto &records = dep_gen_collector_.records();
+            const std::string deps = make_deps_json_path(output_prefix_);
+            int replay_rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+            if (replay_rc != 0) {
+                LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", replay_rc);
+            }
+        }
+    }
+
     // Print handshake results (reads from device memory, must be before free)
     print_handshake_results();
 
@@ -290,6 +335,9 @@ int DeviceRunner::finalize() {
     }
     if (pmu_collector_.is_initialized()) {
         pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+    }
+    if (dep_gen_collector_.is_initialized()) {
+        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (scope_stats_collector_.is_initialized()) {
         scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
@@ -344,6 +392,9 @@ void DeviceRunner::finalize_collectors() {
     if (pmu_collector_.is_initialized()) {
         pmu_collector_.stop();
     }
+    if (dep_gen_collector_.is_initialized()) {
+        dep_gen_collector_.stop();
+    }
 }
 
 int DeviceRunner::init_l2_swimlane(int num_aicore, int device_id) {
@@ -397,5 +448,17 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
     }
     kernel_args_.args.scope_stats_data_base =
         reinterpret_cast<uint64_t>(scope_stats_collector_.get_scope_stats_shm_device_ptr());
+    return 0;
+}
+
+int DeviceRunner::init_dep_gen(int num_threads, int device_id) {
+    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
+    // device buffer + rtMemcpy's the zeroed shadow to device. No
+    // halHostRegister on a5 (matches PMU / L2 swimlane / dump collectors).
+    int rc = dep_gen_collector_.init(num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, device_id);
+    if (rc != 0) {
+        return rc;
+    }
+    kernel_args_.args.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
     return 0;
 }

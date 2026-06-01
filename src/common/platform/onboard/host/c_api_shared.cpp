@@ -389,8 +389,8 @@ int run_prepared(
         runner->set_l2_swimlane_enabled(enable_l2_swimlane);
         runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
         runner->set_pmu_enabled(enable_pmu);
-        // Virtual: a2a3 wires through to its enable_dep_gen_; a5 is a no-op
-        // (dep_gen isn't implemented on a5 today).
+        // Virtual: a2a3 and a5 wire through to their enable_dep_gen_; an arch
+        // without dep_gen falls through to the base no-op.
         runner->set_dep_gen_enabled(enable_dep_gen != 0);
         runner->set_scope_stats_enabled(enable_scope_stats != 0);
         runner->set_output_prefix(output_prefix);

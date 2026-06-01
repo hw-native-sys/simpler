@@ -39,6 +39,22 @@
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
 
+// dep_gen_replay_emit_deps_json: strong symbol provided by
+// runtime/tensormap_and_ringbuffer/host/dep_gen_replay.cpp when that runtime is
+// linked into host_runtime.so. host_build_graph has no replay implementation
+// today, so its host_runtime.so falls through to this weak stub. visibility=
+// hidden keeps the stub off the global dynamic symbol table so it can't
+// accidentally shadow the strong symbol via RTLD_GLOBAL.
+// LOG_DEBUG (not WARN): runtimes that don't link dep_gen never enable it in
+// practice, so this path is unreachable for end users — the symbol exists
+// purely to keep the .so loadable.
+extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_deps_json(
+    const struct DepGenRecord * /*records*/, size_t /*num_records*/, const char * /*deps_json_path*/
+) {
+    LOG_DEBUG("dep_gen replay not implemented for this runtime — deps.json skipped");
+    return -1;
+}
+
 // a5 sim: malloc / free wrappers shared by the four profiling subsystems'
 // init_* methods. Plain function pointers convert implicitly into the
 // framework's std::function alloc / free shapes. Kept on the subclass (not
@@ -88,6 +104,9 @@ int DeviceRunner::ensure_binaries_loaded() {
         if (!load_sym("set_l2_swimlane_enabled", reinterpret_cast<void **>(&set_l2_swimlane_enabled_func_))) return -1;
         if (!load_sym("set_platform_pmu_base", reinterpret_cast<void **>(&set_platform_pmu_base_func_))) return -1;
         if (!load_sym("set_pmu_enabled", reinterpret_cast<void **>(&set_pmu_enabled_func_))) return -1;
+        if (!load_sym("set_platform_dep_gen_base", reinterpret_cast<void **>(&set_platform_dep_gen_base_func_)))
+            return -1;
+        if (!load_sym("set_dep_gen_enabled", reinterpret_cast<void **>(&set_dep_gen_enabled_func_))) return -1;
         if (!load_sym("set_scope_stats_enabled", reinterpret_cast<void **>(&set_scope_stats_enabled_func_))) return -1;
         if (!load_sym("set_platform_scope_stats_base", reinterpret_cast<void **>(&set_platform_scope_stats_base_func_)))
             return -1;
@@ -201,6 +220,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_pmu_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
+    if (enable_dep_gen_) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
+    }
     if (enable_scope_stats_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
     }
@@ -254,6 +276,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
             LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
             kernel_args_.pmu_data_base = 0;
             enable_pmu_ = false;
+        }
+    }
+
+    if (enable_dep_gen_) {
+        rc = init_dep_gen(launch_aicpu_num, device_id_);
+        if (rc != 0) {
+            LOG_ERROR("init_dep_gen failed: %d", rc);
+            return rc;
         }
     }
 
@@ -312,6 +342,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
         set_platform_dump_base_func_ == nullptr || set_dump_tensor_enabled_func_ == nullptr ||
         set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
+        set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
         set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
@@ -324,6 +355,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
     set_pmu_enabled_func_(enable_pmu_);
+    set_platform_dep_gen_base_func_(kernel_args_.dep_gen_data_base);
+    set_dep_gen_enabled_func_(enable_dep_gen_);
     set_scope_stats_enabled_func_(enable_scope_stats_);
     set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
@@ -339,6 +372,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
     if (enable_pmu_) {
         pmu_collector_.start(thread_factory);
+    }
+    if (enable_dep_gen_) {
+        dep_gen_collector_.start(thread_factory);
     }
     if (enable_scope_stats_) {
         scope_stats_collector_.start(thread_factory);
@@ -427,6 +463,18 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         pmu_collector_.reconcile_counters();
     }
 
+    if (enable_dep_gen_) {
+        dep_gen_collector_.stop();
+        if (dep_gen_collector_.reconcile_counters()) {
+            const auto &records = dep_gen_collector_.records();
+            const std::string deps = make_deps_json_path(output_prefix_);
+            int replay_rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
+            if (replay_rc != 0) {
+                LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", replay_rc);
+            }
+        }
+    }
+
     if (enable_scope_stats_) {
         scope_stats_collector_.stop();
         scope_stats_collector_.reconcile_counters();
@@ -460,6 +508,8 @@ void DeviceRunner::unload_executor_binaries() {
         set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
         set_pmu_enabled_func_ = nullptr;
+        set_platform_dep_gen_base_func_ = nullptr;
+        set_dep_gen_enabled_func_ = nullptr;
         set_scope_stats_enabled_func_ = nullptr;
         set_platform_scope_stats_base_func_ = nullptr;
         aicpu_so_loaded_ = false;
@@ -494,6 +544,9 @@ int DeviceRunner::finalize() {
     }
     if (pmu_collector_.is_initialized()) {
         pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+    }
+    if (dep_gen_collector_.is_initialized()) {
+        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (scope_stats_collector_.is_initialized()) {
         scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
@@ -539,6 +592,9 @@ void DeviceRunner::stop_collectors() {
     }
     if (pmu_collector_.is_initialized()) {
         pmu_collector_.stop();
+    }
+    if (dep_gen_collector_.is_initialized()) {
+        dep_gen_collector_.stop();
     }
 }
 
@@ -596,5 +652,17 @@ int DeviceRunner::init_scope_stats(int num_threads) {
     }
     kernel_args_.scope_stats_data_base =
         reinterpret_cast<uint64_t>(scope_stats_collector_.get_scope_stats_shm_device_ptr());
+    return 0;
+}
+
+int DeviceRunner::init_dep_gen(int num_threads, int /*device_id*/) {
+    // a5 sim: register_cb=nullptr; sim's profiling_copy_* are plain memcpys, so
+    // the dev/host shadow path collapses to one allocation pair.
+    int rc =
+        dep_gen_collector_.init(num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1);
+    if (rc != 0) {
+        return rc;
+    }
+    kernel_args_.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
     return 0;
 }

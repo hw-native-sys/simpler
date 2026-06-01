@@ -25,6 +25,7 @@
 
 #include "common/core_type.h"
 #include "device_runner_base.h"
+#include "host/dep_gen_collector.h"
 
 class DeviceRunner : public SimDeviceRunnerBase {
 public:
@@ -33,8 +34,9 @@ public:
 
     int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) override;
     int finalize() override;
-    // a5 has no dep_gen; SimDeviceRunnerBase's default no-op set_dep_gen_enabled
-    // applies (the c_api unconditionally calls it).
+    // a5 dep_gen enablement setter, overriding the base no-op (the c_api
+    // unconditionally calls it).
+    void set_dep_gen_enabled(bool enable) override { enable_dep_gen_ = enable; }
 
 private:
     int ensure_binaries_loaded() override;
@@ -44,6 +46,7 @@ private:
     int init_tensor_dump(Runtime &runtime, int device_id);
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
     int init_scope_stats(int num_threads);
+    int init_dep_gen(int num_threads, int device_id);
 
     // Per-run collector teardown: stops mgmt + poll threads on every collector
     // whose init succeeded. Idempotent. a5 stops only (does not finalize); the
@@ -61,8 +64,14 @@ private:
     void (*set_platform_l2_swimlane_base_func_)(uint64_t){nullptr};
     void (*set_l2_swimlane_enabled_func_)(bool){nullptr};
     void (*set_pmu_enabled_func_)(bool){nullptr};
+    void (*set_platform_dep_gen_base_func_)(uint64_t){nullptr};
+    void (*set_dep_gen_enabled_func_)(bool){nullptr};
     void (*set_scope_stats_enabled_func_)(bool){nullptr};
     void (*set_platform_scope_stats_base_func_)(uint64_t){nullptr};
+
+    // dep_gen collector — captures orchestrator submit_task inputs for offline replay.
+    DepGenCollector dep_gen_collector_;
+    bool enable_dep_gen_{false};
 };
 
 #endif  // SRC_A5_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_
