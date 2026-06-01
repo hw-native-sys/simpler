@@ -508,7 +508,7 @@ struct alignas(64) PTO2SpscQueue {
     int pop_batch(PTO2TaskSlotState **out, int max_count) {
         uint64_t t = tail_.load(std::memory_order_relaxed);
         uint64_t avail = head_cached_ - t;
-        if (avail == 0) {
+        if (avail < static_cast<uint64_t>(max_count)) {
             head_cached_ = head_.load(std::memory_order_acquire);
             avail = head_cached_ - t;
             if (avail == 0) return 0;
