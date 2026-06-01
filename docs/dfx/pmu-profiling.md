@@ -293,7 +293,7 @@ finalize(unregister, free)
 
 [`PmuCollector`](../src/a2a3/platform/include/host/pmu_collector.h)
 inherits from
-[`profiling_common::ProfilerBase<PmuCollector, PmuModule>`](../src/a2a3/platform/include/host/profiling_common/profiler_base.h):
+[`profiling_common::ProfilerBase<PmuCollector, PmuModule>`](../src/common/platform/include/host/profiler_base.h):
 the base class owns the mgmt thread, the poll thread, and the
 `BufferPoolManager<PmuModule>` they share. `PmuCollector` only supplies
 the PMU-specific pieces — the `PmuModule` trait that describes the
@@ -301,7 +301,7 @@ shared-memory layout, an `init()` that allocates and pre-fills the free
 queues, an `on_buffer_collected()` callback that appends records to the
 CSV, and `reconcile_counters()` / `finalize()`. The mgmt/poll threading,
 buffer pooling, and `Module` trait pattern are shared with TensorDump
-and L2Perf — see [profiling-framework.md](../profiling-framework.md) for
+and L2Swimlane — see [profiling-framework.md](../profiling-framework.md) for
 the framework reference.
 
 ### 5.3 a5 — same framework, host-shadow transport (DAV_3510, 10 counters)
@@ -461,9 +461,9 @@ guarantees neighboring register tokens differ by 1 → different slots).
 
 [`PmuCollector`](../src/a5/platform/include/host/pmu_collector.h) on
 a5 inherits the same CRTP base
-([`profiling_common::ProfilerBase`](../src/a5/platform/include/host/profiling_common/profiler_base.h))
+([`profiling_common::ProfilerBase`](../src/common/platform/include/host/profiler_base.h))
 as a2a3 and parameterizes
-[`BufferPoolManager`](../src/a5/platform/include/host/profiling_common/buffer_pool_manager.h)
+[`BufferPoolManager`](../src/common/platform/include/host/buffer_pool_manager.h)
 with `PmuModule`. The only a5-specific glue is the 5-callback
 `MemoryOps` and the per-tick shm mirror.
 

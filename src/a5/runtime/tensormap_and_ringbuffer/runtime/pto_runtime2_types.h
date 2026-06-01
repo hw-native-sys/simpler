@@ -339,8 +339,15 @@ struct alignas(64) PTO2TaskSlotState {
     PTO2TaskDescriptor *task;
 
     // --- Set per-submit (depend on task inputs) ---
-    ActiveMask active_mask;    // Bitmask of active subtask slots (set once)
-    uint8_t ring_id;           // Ring layer (immutable after init)
+    ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
+    uint8_t ring_id;         // Ring layer (immutable after init)
+    // Set by any subtask FIN that pushed deferred-completion CONDITIONs to
+    // the runtime mailbox; read by the last subtask FIN to decide MPSC vs
+    // inline completion. Mirrors a2a3; see that mirror for the full
+    // memory-order argument. Carved out of the padding byte between ring_id
+    // and dep_pool_mark to keep PTO2TaskSlotState at 64 bytes.
+    std::atomic<bool> any_subtask_deferred{false};
+    uint8_t _async_pad{0};
     int32_t dep_pool_mark{0};  // Dep pool top after wiring (thread-0-only)
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
@@ -385,6 +392,7 @@ struct alignas(64) PTO2TaskSlotState {
         fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx = 0;
+        any_subtask_deferred.store(false, std::memory_order_relaxed);
     }
 
     // === Per-task fanout spinlock ===

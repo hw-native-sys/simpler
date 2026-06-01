@@ -96,7 +96,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         a, b = args.a, args.b
         args.f[:] = (a + b + 1) * (a + b + 2)
 
-    def _run_and_validate_l2(
+    def _run_and_validate_l2(  # noqa: PLR0913
         self,
         worker,
         callable_obj,
@@ -107,6 +107,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
+        enable_scope_stats=False,
         output_prefix="",
     ):
         params = case.get("params", {})
@@ -141,7 +142,7 @@ class TestPreparedCallableHbg(SceneTestCase):
     # ------------------------------------------------------------------
     # host_dlopen_count assertions (hbg path).
     #
-    # hbg increments host_dlopen_count on every register_prepared_callable_host_orch
+    # hbg increments host_dlopen_count on every register_callable_host_orch
     # invocation (i.e. each `prepare_callable` call), independent of how many
     # times run is invoked afterwards. AICPU never dlopens the orch
     # SO on this variant, so aicpu_dlopen_count stays at 0.

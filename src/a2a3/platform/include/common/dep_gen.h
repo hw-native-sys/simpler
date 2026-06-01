@@ -19,8 +19,8 @@
  * sole source of truth for fanout edges; the L2 swimlane hot path no longer
  * carries fanout to keep AICPU off the per-task GM-store critical path.
  *
- * Streaming buffer design mirrors PMU / L2Perf / TensorDump (single source of
- * algorithmic truth in src/a2a3/platform/include/host/profiling_common/profiler_base.h):
+ * Streaming buffer design mirrors PMU / L2Swimlane / TensorDump (single source of
+ * algorithmic truth in src/common/platform/include/host/profiler_base.h):
  *
  *   DepGenFreeQueue    — SPSC: Host pushes free DepGenBuffers, AICPU pops them.
  *   DepGenBufferState  — Per-instance state: free_queue + current buffer ptr.
@@ -29,7 +29,7 @@
  *
  * Single-instance: the orchestrator is one AICPU thread, so the BufferState
  * array has length 1. Kept array-shaped (vs scalar) for symmetry with PMU /
- * L2Perf and to match ProfilerBase<DepGenModule>::for_each_instance.
+ * L2Swimlane and to match ProfilerBase<DepGenModule>::for_each_instance.
  *
  * Tensor data is captured as opaque 128-byte blobs (`DEP_GEN_TENSOR_SIZE`)
  * matching the runtime Tensor struct size. The AICPU writer

@@ -48,12 +48,14 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
     matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
     if not matches:
         return
-    perf = matches[-1] / "l2_perf_records.json"
-    assert perf.exists(), f"l2_perf_records.json missing under {matches[-1]} — swimlane capture failed?"
+    perf = matches[-1] / "l2_swimlane_records.json"
+    assert perf.exists(), f"l2_swimlane_records.json missing under {matches[-1]} — swimlane capture failed?"
 
     with perf.open() as f:
         data = json.load(f)
-    assert data.get("l2_perf_level") in (1, 2, 3, 4), f"unexpected l2_perf_level: {data.get('l2_perf_level')}"
+    assert data.get("l2_swimlane_level") in (1, 2, 3, 4), (
+        f"unexpected l2_swimlane_level: {data.get('l2_swimlane_level')}"
+    )
     tasks = data.get("tasks")
     assert isinstance(tasks, list), "tasks field missing or not a list"
     assert len(tasks) > 0, f"perf records empty under {perf}"
@@ -86,7 +88,7 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
 
     # ---- Tool smoke: sched_overhead_analysis ----
     # pop_hit / pop_miss come from the dispatch-phase extras the runtime writes
-    # (l2_perf_collector.cpp). The differential block below cross-validates
+    # (l2_swimlane_collector.cpp). The differential block below cross-validates
     # the script's printed numbers against an independent oracle computed
     # straight from the raw artifacts — any regression in either the runtime
     # capture path or the parser arithmetic fails here in the same CI step
@@ -96,7 +98,7 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
             sys.executable,
             "-m",
             "simpler_setup.tools.sched_overhead_analysis",
-            "--l2-perf-records-json",
+            "--l2-swimlane-records-json",
             str(perf),
         ],
         check=True,
@@ -128,7 +130,7 @@ def verify_sched_overhead_differential(stdout: str, perf: dict, artifact_dir: Pa
 
     Args:
         stdout: captured ``sched_overhead_analysis`` stdout.
-        perf: parsed ``l2_perf_records.json`` dict — passed in by the caller
+        perf: parsed ``l2_swimlane_records.json`` dict — passed in by the caller
             so we don't re-read multi-MB profiling artifacts here.
         artifact_dir: per-case output directory. ``deps.json`` is looked up
             beside the perf JSON; absent → fanout / fanin half is skipped.

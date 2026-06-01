@@ -28,6 +28,9 @@
 
 #include "aicpu/device_time.h"
 #include "common/unified_log.h"
+#if PTO2_PROFILING
+#include "aicpu/scope_stats_collector_aicpu.h"
+#endif
 
 // Weak fallback for HOST .so builds (never called, but satisfies linker).
 // The AICPU build links the strong symbol from platform/.../device_time.cpp.
@@ -231,6 +234,14 @@ void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, cons
     memcpy(ptr, &value, elem_size);
 }
 
+// Ops-table entry that hands the call-site captured by PTO2ScopeGuard to the
+// [ScopeStats] collector. The slot is always present in the struct to keep
+// the layout stable; at PTO2_PROFILING=0 we fill nullptr so the orchestration
+// .so's null-check skips it.
+#if PTO2_PROFILING
+static void scope_set_site_impl(const char *file, int line) { scope_stats_set_pending_site(file, line); }
+#endif
+
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
     .scope_begin = rt_scope_begin,
@@ -246,6 +257,11 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
     .submit_dummy_task = submit_dummy_task_impl,
+#if PTO2_PROFILING
+    .scope_set_site = scope_set_site_impl,
+#else
+    .scope_set_site = nullptr,
+#endif
 };
 
 // =============================================================================

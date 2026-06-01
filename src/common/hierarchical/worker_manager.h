@@ -60,6 +60,13 @@ enum class MailboxState : int32_t {
     SHUTDOWN = 3,
     CONTROL_REQUEST = 4,
     CONTROL_DONE = 5,
+    // Child writes this after its expensive init (ChipWorker::init / inner
+    // Worker::init) completes. Parent's _start_hierarchical spin-waits for
+    // EVERY chip child to reach INIT_DONE before any dispatch (CTRL_PREPARE
+    // or TASK_READY) goes out. This aligns the host-side stream-sync windows
+    // across distributed ranks so cross-rank init skew never charges against
+    // the per-rank PLATFORM_STREAM_SYNC_TIMEOUT_MS budget (issue #897).
+    INIT_DONE = 6,
 };
 
 static constexpr size_t MAILBOX_SIZE = 4096;

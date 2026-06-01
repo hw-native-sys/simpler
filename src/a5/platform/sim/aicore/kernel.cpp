@@ -23,7 +23,7 @@
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
 #include "common/core_type.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
 #include "runtime.h"
@@ -35,7 +35,7 @@ static pthread_key_t g_reg_base_key;
 static pthread_key_t g_core_id_key;
 static pthread_key_t g_block_idx_key;
 static pthread_key_t g_aicore_profiling_flag_key;
-static pthread_key_t g_aicore_l2_perf_ring_key;
+static pthread_key_t g_aicore_l2_swimlane_ring_key;
 static pthread_key_t g_aicore_pmu_ring_key;
 static pthread_key_t g_pmu_reg_base_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
@@ -45,7 +45,7 @@ static void create_tls_keys() {
     pthread_key_create(&g_core_id_key, nullptr);
     pthread_key_create(&g_block_idx_key, nullptr);
     pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
-    pthread_key_create(&g_aicore_l2_perf_ring_key, nullptr);
+    pthread_key_create(&g_aicore_l2_swimlane_ring_key, nullptr);
     pthread_key_create(&g_aicore_pmu_ring_key, nullptr);
     pthread_key_create(&g_pmu_reg_base_key, nullptr);
 }
@@ -68,11 +68,11 @@ __aicore__ uint32_t get_aicore_profiling_flag() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
 }
 
-__aicore__ void set_aicore_l2_perf_ring(__gm__ L2PerfAicoreRing *ring) {
-    pthread_setspecific(g_aicore_l2_perf_ring_key, reinterpret_cast<void *>(ring));
+__aicore__ void set_aicore_l2_swimlane_ring(__gm__ L2SwimlaneAicoreRing *ring) {
+    pthread_setspecific(g_aicore_l2_swimlane_ring_key, reinterpret_cast<void *>(ring));
 }
-__aicore__ __gm__ L2PerfAicoreRing *get_aicore_l2_perf_ring() {
-    return reinterpret_cast<__gm__ L2PerfAicoreRing *>(pthread_getspecific(g_aicore_l2_perf_ring_key));
+__aicore__ __gm__ L2SwimlaneAicoreRing *get_aicore_l2_swimlane_ring() {
+    return reinterpret_cast<__gm__ L2SwimlaneAicoreRing *>(pthread_getspecific(g_aicore_l2_swimlane_ring_key));
 }
 
 __aicore__ void set_aicore_pmu_ring(__gm__ PmuAicoreRing *ring) {
@@ -111,7 +111,7 @@ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 // executor with its original signature.
 extern "C" void aicore_execute_wrapper(
     __gm__ Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
-    uint32_t enable_profiling_flag, uint64_t aicore_l2_perf_ring_addrs, uint64_t aicore_pmu_ring_addrs
+    uint32_t enable_profiling_flag, uint64_t aicore_l2_swimlane_ring_addrs, uint64_t aicore_pmu_ring_addrs
 ) {
     pthread_once(&g_tls_once, create_tls_keys);
 
@@ -130,11 +130,11 @@ extern "C" void aicore_execute_wrapper(
 
     // Publish per-core profiling state before the executor runs.
     set_aicore_profiling_flag(enable_profiling_flag);
-    if ((enable_profiling_flag & PROFILING_FLAG_L2_SWIMLANE) && aicore_l2_perf_ring_addrs != 0) {
-        uint64_t *ring_table = reinterpret_cast<uint64_t *>(aicore_l2_perf_ring_addrs);
-        set_aicore_l2_perf_ring(reinterpret_cast<__gm__ L2PerfAicoreRing *>(ring_table[block_idx]));
+    if ((enable_profiling_flag & PROFILING_FLAG_L2_SWIMLANE) && aicore_l2_swimlane_ring_addrs != 0) {
+        uint64_t *ring_table = reinterpret_cast<uint64_t *>(aicore_l2_swimlane_ring_addrs);
+        set_aicore_l2_swimlane_ring(reinterpret_cast<__gm__ L2SwimlaneAicoreRing *>(ring_table[block_idx]));
     } else {
-        set_aicore_l2_perf_ring(nullptr);
+        set_aicore_l2_swimlane_ring(nullptr);
     }
     if ((enable_profiling_flag & PROFILING_FLAG_PMU) && aicore_pmu_ring_addrs != 0) {
         uint64_t *pmu_ring_table = reinterpret_cast<uint64_t *>(aicore_pmu_ring_addrs);

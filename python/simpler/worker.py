@@ -112,11 +112,11 @@ _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
-# 6 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
-# enable_pmu, enable_dep_gen) + 1024-byte NUL-terminated output_prefix. Log
-# config travels separately via ChipWorker.init(log_level, log_info_v) — not
-# on per-task wire.
-_CFG_FMT = struct.Struct("=iiiiii1024s")
+# 7 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
+# enable_pmu, enable_dep_gen, enable_scope_stats) + 1024-byte NUL-terminated
+# output_prefix. Log config travels separately via ChipWorker.init(log_level,
+# log_info_v) — not on per-task wire.
+_CFG_FMT = struct.Struct("=iiiiiii1024s")
 # Args region starts after CONFIG, rounded up to 8 bytes so the first
 # ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
@@ -135,6 +135,11 @@ _TASK_DONE = 2
 _SHUTDOWN = 3
 _CONTROL_REQUEST = 4
 _CONTROL_DONE = 5
+# Child writes this after its expensive init (ChipWorker.init) completes.
+# Parent's _start_hierarchical spin-waits for every chip child to reach
+# INIT_DONE before allowing any dispatch — keeps cross-rank init skew out
+# of the per-rank host-side stream sync budget (issue #897).
+_INIT_DONE = 6
 
 # Control sub-commands (written at _OFF_CALLABLE as uint64)
 _CTRL_MALLOC = 0
@@ -619,7 +624,7 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     # when a prior _CTRL_UNREGISTER failed before reaching
                     # prepared.discard, while the parent still popped its
                     # registry under best-effort semantics. Without this,
-                    # register_prepared_callable would fail-fast on a slot the
+                    # register_callable would fail-fast on a slot the
                     # user was told is reusable. The `cid in prepared` gate
                     # keeps the happy path at zero added cost.
                     if int(cid) in prepared:
@@ -707,6 +712,11 @@ def _chip_process_loop(
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
     state_addr = mailbox_addr + _OFF_STATE
+    # Signal init complete. Parent's _start_hierarchical spin-waits for
+    # every chip child to reach _INIT_DONE before dispatching the first
+    # task, so the per-rank host-side stream sync budget only covers
+    # actual op execution rather than absorbing peer-rank init skew.
+    _mailbox_store_i32(state_addr, _INIT_DONE)
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
 
@@ -718,7 +728,7 @@ def _chip_process_loop(
 
 def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     """Reconstruct a CallConfig from the unified mailbox layout."""
-    block_dim, aicpu_tn, swl, dt, pmu, dep_gen, prefix_bytes = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
+    block_dim, aicpu_tn, swl, dt, pmu, dep_gen, scope_stats, prefix_bytes = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
     cfg = CallConfig()
     cfg.block_dim = block_dim
     cfg.aicpu_thread_num = aicpu_tn
@@ -726,6 +736,7 @@ def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     cfg.enable_dump_tensor = bool(dt)
     cfg.enable_pmu = pmu
     cfg.enable_dep_gen = bool(dep_gen)
+    cfg.enable_scope_stats = bool(scope_stats)
     # NUL-terminated C string in a 1024-byte field.
     cfg.output_prefix = prefix_bytes.split(b"\x00", 1)[0].decode("utf-8")
     return cfg
@@ -1061,7 +1072,7 @@ class Worker:
         # The AICPU side keeps a fixed-size orch_so_table_ keyed by cid;
         # raise here so the failure surfaces at register-time with a
         # protocol-aware message, not later from
-        # DeviceRunner::register_prepared_callable with a generic
+        # DeviceRunner::register_callable with a generic
         # "out of range" log.
         raise RuntimeError(
             "Worker.register: cid space exhausted "
@@ -1252,7 +1263,7 @@ class Worker:
         device_id = self._config.get("device_id", 0)
 
         builder = RuntimeBuilder(platform)
-        binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
+        binaries = builder.get_binaries(runtime)
 
         self._chip_worker = ChipWorker()
         self._chip_worker.init(device_id, binaries)
@@ -1285,7 +1296,7 @@ class Worker:
             platform = self._config["platform"]
             runtime = self._config["runtime"]
             builder = RuntimeBuilder(platform)
-            binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
+            binaries = builder.get_binaries(runtime)
 
             # Stash the full RuntimeBinaries so forked chip children can
             # construct a ChipWorker with one call (`cw.init(device_id, bins)`)
@@ -1372,6 +1383,24 @@ class Worker:
                         os._exit(0)
                     else:
                         self._chip_pids.append(pid)
+
+                # Cross-chip init barrier.  ChipWorker.init can have a long
+                # right tail (e.g. PTO2_RING_HEAP=4 GiB pushes per-rank
+                # device_malloc beyond the host stream sync budget); without
+                # this barrier a fast-init chip starts its aclrtSyncStream
+                # window N seconds before a slow peer reaches the same
+                # point, and any cross-rank wait inside the op (HCCL notify,
+                # etc.) charges the slow peer's remaining init time against
+                # the fast peer's PLATFORM_STREAM_SYNC_TIMEOUT_MS budget —
+                # the cascade documented in issue #897.  Reset each child to
+                # _IDLE once observed so the standard dispatch state machine
+                # resumes from the canonical "ready for work" state.
+                for shm in self._chip_shms:
+                    assert shm.buf is not None
+                    addr = _buffer_field_addr(shm.buf, _OFF_STATE)
+                    while _mailbox_load_i32(addr) != _INIT_DONE:
+                        pass
+                    _mailbox_store_i32(addr, _IDLE)
 
             # Fork next-level Worker children (L4+ with Worker children).
             # Each child process: init the inner Worker (which mmaps its own

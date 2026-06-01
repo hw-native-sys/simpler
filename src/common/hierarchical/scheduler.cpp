@@ -82,6 +82,11 @@ void Scheduler::run() {
             });
         }
 
+        // Hold loop_mu_ across the entire slot-touching body so drain()'s
+        // reset_to_empty() cannot free TaskSlotStates while on_task_complete /
+        // dispatch_ready are still reading them (heap-use-after-free).
+        std::lock_guard<std::mutex> loop_lk(loop_mu_);
+
         // Phase 1: drain completions
         while (true) {
             TaskSlot slot;
@@ -112,7 +117,7 @@ void Scheduler::run() {
                     on_task_complete(slot);
                 }
                 dispatch_ready();
-                break;
+                break;  // loop_lk released on scope exit before exiting run()
             }
         }
     }

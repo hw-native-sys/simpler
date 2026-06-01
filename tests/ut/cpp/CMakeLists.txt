@@ -34,10 +34,17 @@ option(SIMPLER_ENABLE_HARDWARE_TESTS
 
 # ---------------------------------------------------------------------------
 # GoogleTest — fast path uses the system install (apt libgtest-dev / brew
-# googletest) on GH-hosted runners.  Self-hosted (a2a3/a5) runners don't
-# have GoogleTest preinstalled, so we fall back to FetchContent from
-# upstream.  Either way the rest of the file sees GTEST_LIB / GTEST_MAIN_LIB
-# / GTEST_INCLUDE_DIRS with a consistent meaning.
+# googletest / yum-distributed /usr/local). Fall back to FetchContent on
+# runners that don't preinstall it (currently the a2a3 self-hosted runner).
+# Either way the rest of the file sees GTEST_LIB / GTEST_MAIN_LIB /
+# GTEST_INCLUDE_DIRS with a consistent meaning.
+#
+# Both the system install and FetchContent build gtest with the compiler
+# default libstdc++ ABI (cxx11), matching the tests in this directory. If
+# you hand-compile gtest with `-D_GLIBCXX_USE_CXX11_ABI=0` and drop it in
+# `/usr/local/lib*`, find_library will pick it up and link will fail with
+# `undefined reference to testing::internal::EqFailure(...)` — see
+# docs/troubleshooting/ut-cpp-gtest-abi.md for the workaround.
 # ---------------------------------------------------------------------------
 if(APPLE)
     set(GTEST_SEARCH_PATHS /opt/homebrew/lib /usr/local/lib)
@@ -52,12 +59,6 @@ find_library(GTEST_MAIN_LIB gtest_main PATHS ${GTEST_SEARCH_PATHS})
 
 if(NOT GTEST_LIB OR NOT GTEST_MAIN_LIB)
     message(STATUS "System GoogleTest not found — fetching via FetchContent")
-    # Match the ABI the tests themselves compile with
-    # (-D_GLIBCXX_USE_CXX11_ABI=0 — see add_hierarchical_test).
-    # Without this the FetchContent-built libgtest.a ends up with the default
-    # cxx11 ABI and link fails against our tests.
-    add_compile_options(-D_GLIBCXX_USE_CXX11_ABI=0)
-
     include(FetchContent)
     FetchContent_Declare(
         googletest
@@ -91,6 +92,7 @@ add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_tensormap.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
 target_include_directories(a2a3_rt_objs PUBLIC
@@ -98,11 +100,11 @@ target_include_directories(a2a3_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
+    ${CMAKE_SOURCE_DIR}/../../../src/common
 )
-target_compile_options(a2a3_rt_objs PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
 
 function(add_a2a3_runtime_test name src)
     add_executable(${name} ${src})
@@ -140,7 +142,6 @@ target_include_directories(hierarchical_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${WORKER_SRC_DIR}
 )
-target_compile_options(hierarchical_objs PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
 
 function(add_hierarchical_test name src)
     add_executable(${name} ${src})
@@ -162,10 +163,12 @@ function(add_a2a3_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
         ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
         ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        # src/common is needed so `#include "utils/device_arena.h"` resolves.
+        ${CMAKE_SOURCE_DIR}/../../../src/common
     )
-    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
@@ -182,10 +185,12 @@ function(add_a5_test name src)
         ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime
         ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/common
         ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
         ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        # src/common is needed so `#include "utils/device_arena.h"` resolves.
+        ${CMAKE_SOURCE_DIR}/../../../src/common
     )
-    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
@@ -214,11 +219,11 @@ target_include_directories(a5_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/common
     ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
-    ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
+    ${CMAKE_SOURCE_DIR}/../../../src/common
 )
-target_compile_options(a5_rt_objs PUBLIC -D_GLIBCXX_USE_CXX11_ABI=0)
 
 function(add_a5_runtime_test name src)
     add_executable(${name} ${src})
@@ -239,7 +244,6 @@ function(add_task_interface_test name src)
         ${GTEST_INCLUDE_DIRS}
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     )
-    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
@@ -252,12 +256,10 @@ function(add_common_utils_test name src)
     add_executable(${name} ${src})
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
-        # utils/elf_build_id.h lives under src/common, exposed as "utils/..."
+        # src/common is needed so utils/elf_build_id.h, utils/device_arena.h,
+        # etc. resolve via the "utils/..." prefix.
         ${CMAKE_SOURCE_DIR}/../../../src/common
-        # device_comm/device_arena.h consumed without prefix.
-        ${CMAKE_SOURCE_DIR}/../../../src/common/device_comm
     )
-    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
         ${GTEST_MAIN_LIB}
         ${GTEST_LIB}
@@ -295,7 +297,6 @@ target_include_directories(test_chip_callable_upload_immutable PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
 )
-target_compile_options(test_chip_callable_upload_immutable PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
 target_link_libraries(test_chip_callable_upload_immutable PRIVATE
     ${GTEST_MAIN_LIB}
     ${GTEST_LIB}
@@ -316,13 +317,13 @@ add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 # against the test source so it runs on no-hw runners too.
 add_executable(test_orch_so_file
     common/test_orch_so_file.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/onboard/aicpu/orch_so_file.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/onboard/aicpu/orch_so_file.cpp
 )
 target_include_directories(test_orch_so_file PRIVATE
     ${GTEST_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
 )
-target_compile_options(test_orch_so_file PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
 target_link_libraries(test_orch_so_file PRIVATE
     ${GTEST_MAIN_LIB}
     ${GTEST_LIB}
@@ -347,6 +348,7 @@ add_a2a3_runtime_test(test_a2a3_tensormap   a2a3/test_tensormap.cpp)
 add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
 add_a2a3_runtime_test(test_spsc_queue       a2a3/test_spsc_queue.cpp)
 add_a2a3_runtime_test(test_wiring           a2a3/test_wiring.cpp)
+add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
 
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
@@ -367,6 +369,7 @@ add_a5_runtime_test(test_a5_tensormap        a5/test_tensormap.cpp)
 add_a5_runtime_test(test_a5_fanin_pool       a5/test_fanin_pool.cpp)
 add_a5_runtime_test(test_a5_spsc_queue       a5/test_spsc_queue.cpp)
 add_a5_runtime_test(test_a5_wiring           a5/test_wiring.cpp)
+add_a5_runtime_test(test_a5_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)
 
 # Host logger silent/off behavior — no runtime deps, just compile host_log.cpp
 # alongside the test (faster than dlopen'ing libsimpler_log.so for a unit test).
@@ -380,7 +383,6 @@ target_include_directories(test_host_log_off PRIVATE
     ${SIMPLER_LOG_DIR}
     ${SIMPLER_LOG_DIR}/include
 )
-target_compile_options(test_host_log_off PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
 target_link_libraries(test_host_log_off PRIVATE
     ${GTEST_MAIN_LIB}
     ${GTEST_LIB}
@@ -432,12 +434,12 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     target_include_directories(test_comm_lifecycle PRIVATE
         ${GTEST_INCLUDE_DIRS}
         ${PROJECT_ROOT}/src/a2a3/platform/include
+        ${PROJECT_ROOT}/src/common/platform/include
         # Shared platform_comm headers (comm.h / comm_context.h) live under
         # src/common so both a2a3 HCCL and a5/a2a3 sim can use them.
         ${PROJECT_ROOT}/src/common
         ${ASCEND_HOME_PATH}/include
     )
-    target_compile_options(test_comm_lifecycle PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_compile_definitions(test_comm_lifecycle PRIVATE
         PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}"
         SIMPLER_LOG_LIB_PATH="${SIMPLER_LOG_LIB}"

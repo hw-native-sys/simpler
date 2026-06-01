@@ -11,7 +11,7 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
 
@@ -134,10 +134,10 @@ private:
     SyncStartDrainState drain_state_;
 
 #if PTO2_PROFILING
-    SchedL2PerfCounters sched_l2_perf_[MAX_AICPU_THREADS];
-    // Cached once at init() from get_l2_perf_level(), AFTER
-    // l2_perf_aicpu_init has promoted the level from the shared-memory header.
-    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};
+    SchedL2SwimlaneCounters sched_l2_swimlane_[MAX_AICPU_THREADS];
+    // Cached once at init() from get_l2_swimlane_level(), AFTER
+    // l2_swimlane_aicpu_init has promoted the level from the shared-memory header.
+    L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};
 #endif
 
     // --- Task-execution tracking ---
@@ -334,13 +334,33 @@ private:
     __attribute__((noinline, cold)) void
     log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
 
+    __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
+        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
+    );
+
     // Reverse lookup: given a global core_id, find which scheduler thread's
     // tracker owns it. Returns -1 if not found. Linear scan — only used on
     // the cold diagnostic path.
     int32_t find_core_owner_thread(int32_t core_id) const;
 
+    // Does this thread own any core with a RUNNING task (running_slot_state set)?
+    // Gates the scheduler timeout fatal latch: a thread without an owned
+    // RUNNING task has no first-hand evidence of a stuck dispatch and must
+    // not declare global fatal on its own idle observation. The thread that
+    // does own the stuck task will reach the budget on its own polls and
+    // latch with valid evidence (or recover when the COND register flips).
+    bool self_owns_running_task(int32_t thread_idx) const;
+
+    // Does *any* scheduler thread own a RUNNING task? Used as the second
+    // fatal-latch condition: if the wall-clock budget elapsed AND no thread
+    // owns RUNNING work AND tasks remain incomplete, the system is in a
+    // pre-dispatch / WAIT-only deadlock (e.g. dependency cycle) and the
+    // ownerless idle threads are the only observers — let one of them latch.
+    bool no_thread_owns_running_task() const;
+
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
-        int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations
+        int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
+        int32_t last_progress_count
 #if PTO2_PROFILING
         ,
         uint64_t sched_start_ts
@@ -348,7 +368,7 @@ private:
     );
 
 #if PTO2_PROFILING
-    __attribute__((noinline, cold)) void log_l2_perf_summary(int32_t thread_idx, int32_t cur_thread_completed);
+    __attribute__((noinline, cold)) void log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
 #endif
 
     // =========================================================================

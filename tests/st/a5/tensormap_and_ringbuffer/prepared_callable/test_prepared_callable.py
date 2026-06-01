@@ -98,7 +98,7 @@ class TestPreparedCallable(SceneTestCase):
     def compute_golden(self, args, params):
         args.f[:] = (args.a + args.b + 1) * (args.a + args.b + 2) + (args.a + args.b)
 
-    def _run_and_validate_l2(
+    def _run_and_validate_l2(  # noqa: PLR0913
         self,
         worker,
         callable_obj,
@@ -109,6 +109,7 @@ class TestPreparedCallable(SceneTestCase):
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
+        enable_scope_stats=False,
         output_prefix="",
     ):
         params = case.get("params", {})

@@ -21,11 +21,11 @@ Before running tests, determine whether runtime binaries need recompilation:
 
 | What changed | Rebuild needed? | How |
 | ------------ | --------------- | --- |
-| Runtime/platform C++ (`src/{arch}/runtime/`, `src/{arch}/platform/`) | Yes | Pass `--build` to the pytest or `python test_*.py` invocation |
+| Runtime/platform C++ (`src/{arch}/runtime/`, `src/{arch}/platform/`) | Yes | Re-run `pip install --no-build-isolation -e .` (incremental via `build/cache/`) |
 | Nanobind bindings (`python/bindings/`) | Yes | Re-run `pip install -e .` |
 | Python-only code, examples, kernels | No | Just re-run the test |
 
-In CI, `pip install .` pre-builds all runtimes, so `--build` is never needed on CI runners.
+In CI, `pip install .` pre-builds all runtimes before tests run.
 
 ```bash
 # Python unit tests (no hardware)
@@ -57,9 +57,9 @@ pytest examples tests/st --platform a2a3sim --runtime host_build_graph \
 pytest examples/a2a3/host_build_graph/vector_example --platform a2a3sim \
     --clone-protocol https --pto-isa-commit <commit>
 
-# Single example (standalone, recompile runtime from source after changing runtime C++)
+# Single example (standalone; re-run `pip install --no-build-isolation -e .` first if runtime C++ changed)
 python examples/a2a3/host_build_graph/vector_example/test_vector_example.py \
-    -p a2a3sim --build --clone-protocol https --pto-isa-commit <commit>
+    -p a2a3sim --clone-protocol https --pto-isa-commit <commit>
 ```
 
 ## Pre-Commit Testing Strategy
@@ -94,12 +94,12 @@ Run `git diff --name-only` (or `git diff --cached --name-only` for staged change
 | ------------- | ----- | --------------- |
 | `src/{arch}/platform/*` | Full (all runtimes) | `pytest examples tests/st --platform <platform>` |
 | `src/{arch}/runtime/<rt>/*` | Single runtime | `pytest examples tests/st --platform <platform> --runtime <rt>` |
-| `examples/{arch}/<rt>/<ex>/*` | Single example | `python <ex>/test_*.py -p <platform> --build` (or `pytest <ex> --platform <platform> --build`) |
+| `examples/{arch}/<rt>/<ex>/*` | Single example | `python <ex>/test_*.py -p <platform>` (or `pytest <ex> --platform <platform>`) |
 | `tests/ut/*` (Python) | Python UT only | `pytest tests/ut` (add `--platform <platform>` on a device runner) |
 | `tests/ut/cpp/*` | C++ UT only | `cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build && ctest --test-dir tests/ut/cpp/build -LE requires_hardware` |
 | Mixed (spans multiple categories) | Escalate to the **widest** matching scope | — |
 
-> **Note on `--build`**: When changed paths include `src/{arch}/runtime/` or `src/{arch}/platform/`, pass `--build` so the runtime C++ is recompiled incrementally. Pytest batch runs accept `--build` at the CLI (applies to the whole session).
+> **Note on runtime C++ changes**: When changed paths include `src/{arch}/runtime/` or `src/{arch}/platform/`, re-run `pip install --no-build-isolation -e .` before testing to rebuild the runtime binaries in `build/lib/` (incremental via `build/cache/`). There is no rebuild-on-import — `editable.rebuild = false`.
 
 ### Step 3 — Parallel Strategy
 
@@ -133,7 +133,7 @@ git diff --name-only
        │    ├─ runtime    → single runtime (--runtime ...)
        │    └─ example    → single example (standalone test_*.py or pytest <ex>)
        │
-       ├─ Runtime C++ changed (src/{arch}/)? ──→ add --build
+       ├─ Runtime C++ changed (src/{arch}/)? ──→ pip install --no-build-isolation -e . first
        │
        └─ npu-smi found?
             ├─ Yes → sim + hardware (idle devs, max 4)

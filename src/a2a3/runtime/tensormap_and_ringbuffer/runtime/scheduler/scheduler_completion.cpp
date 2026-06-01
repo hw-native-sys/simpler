@@ -13,7 +13,7 @@
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "pto_runtime2.h"
@@ -21,7 +21,7 @@
 #include "spin_hint.h"
 
 // Performance profiling headers
-#include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 
@@ -77,37 +77,75 @@ void SchedulerContext::complete_slot_task(
 #endif
 ) {
 #if PTO2_PROFILING
-    auto &l2_perf = sched_l2_perf_[thread_idx];
+    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
 #else
     (void)hank;
 #endif
-    bool mixed_complete = sched_->on_subtask_complete(slot_state);
-    if (slot_state.payload != nullptr) {
-        int32_t reg_err = PTO2_ERROR_NONE;
-        AsyncWaitList::RegisterResult reg_result;
-        volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
-        AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
-        do {
-            reg_result = sched_->async_wait_list.register_deferred(slot_state, async_ctx, mixed_complete, reg_err);
-            if (reg_result == AsyncWaitList::RegisterResult::Skipped) {
-                SPIN_WAIT_HINT();
-            }
-        } while (reg_result == AsyncWaitList::RegisterResult::Skipped);
+    // MPSC fast-path is opt-in per task: only tasks with at least one subtask
+    // that registered a deferred condition route through the mailbox. Pure
+    // non-deferred tasks complete inline on this thread (matching pre-MPSC
+    // behavior — keeps the common case parallelized across scheduler threads
+    // instead of serializing through the single consumer). The
+    // any_subtask_deferred flag on slot_state is the discriminator; it's set
+    // (release) before on_subtask_complete and read (acquire) after, so the
+    // last subtask sees flag writes from any earlier subtask of the same task.
+    AICoreCompletionMailbox *mailbox = rt_ != nullptr ? rt_->aicore_mailbox : nullptr;
+    bool defer_completion_to_consumer = false;
 
-        if (reg_result == AsyncWaitList::RegisterResult::Error) {
+    if (slot_state.payload != nullptr) {
+        volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
+        int32_t slab_err = deferred_slab->error_code;
+        if (slab_err != PTO2_ERROR_NONE) {
             int32_t expected = PTO2_ERROR_NONE;
             sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
+                expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
             );
             completed_.store(true, std::memory_order_release);
             return;
         }
 
-        if (mixed_complete && reg_result == AsyncWaitList::RegisterResult::Registered) {
+        uint32_t cond_count = deferred_slab->count;
+        if (cond_count > MAX_COMPLETIONS_PER_TASK) {
+            int32_t expected = PTO2_ERROR_NONE;
+            sched_->sm_header->sched_error_code.compare_exchange_strong(
+                expected, PTO2_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire
+            );
+            completed_.store(true, std::memory_order_release);
             return;
         }
+
+        if (cond_count > 0) {
+            // Publish "this task is deferred" before on_subtask_complete so the
+            // acq_rel fetch_add inside on_subtask_complete makes the flag
+            // visible to whichever subtask sees mixed_complete=true (which may
+            // be this thread or a later one).
+            slot_state.any_subtask_deferred.store(true, std::memory_order_release);
+
+            const PTO2TaskId token = slot_state.task->task_id;
+            for (uint32_t i = 0; i < cond_count; ++i) {
+                volatile DeferredCompletionEntry *e = &deferred_slab->entries[i];
+                while (!mailbox->try_push_condition(token, e->addr, e->expected_value, e->engine, e->completion_type)) {
+                    sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
+                    SPIN_WAIT_HINT();
+                }
+            }
+        }
     }
-    if (mixed_complete) {
+
+    bool mixed_complete = sched_->on_subtask_complete(slot_state);
+
+    if (mixed_complete && slot_state.payload != nullptr &&
+        slot_state.any_subtask_deferred.load(std::memory_order_acquire)) {
+        // Some subtask of this task registered conditions; finish the
+        // registration by handing the slot_state off to the consumer.
+        while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
+            sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
+            SPIN_WAIT_HINT();
+        }
+        defer_completion_to_consumer = true;
+    }
+
+    if (mixed_complete && !defer_completion_to_consumer) {
 #if PTO2_PROFILING
         if (is_dump_tensor_enabled()) {
             dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
@@ -130,7 +168,7 @@ void SchedulerContext::complete_slot_task(
         sched_->on_mixed_task_complete(slot_state, local_bufs);
 #endif
 #if PTO2_PROFILING
-        l2_perf.phase_complete_count++;
+        l2_swimlane.phase_complete_count++;
 #endif
         if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
@@ -151,24 +189,24 @@ void SchedulerContext::complete_slot_task(
     }
 
 #if PTO2_PROFILING
-    if (l2_perf.l2_perf_enabled) {
+    if (l2_swimlane.l2_swimlane_enabled) {
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        uint64_t finish_ts = (l2_perf_level_ >= L2PerfLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
+        uint64_t finish_ts = (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
 
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);
-        if (l2_perf_aicpu_complete_record(
+        if (l2_swimlane_aicpu_complete_task(
                 core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
                 slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts
             ) != 0) {
             LOG_ERROR(
-                "Core %d: l2_perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
+                "Core %d: l2_swimlane_aicpu_complete_task failed for task 0x%" PRIx64, core_id,
                 static_cast<uint64_t>(slot_state.task->task_id.raw)
             );
         }
 #if PTO2_SCHED_PROFILING
-        l2_perf.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
+        l2_swimlane.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
 #endif
     }
 
@@ -205,7 +243,7 @@ void SchedulerContext::check_running_cores_for_completion(
     PTO2LocalReadyBuffer *local_bufs
 ) {
 #if PTO2_SCHED_PROFILING
-    auto &l2_perf = sched_l2_perf_[thread_idx];
+    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
 #endif
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto running_core_states = tracker.get_all_running_cores();
@@ -227,8 +265,8 @@ void SchedulerContext::check_running_cores_for_completion(
         int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
 
 #if PTO2_SCHED_PROFILING
-        if (l2_perf.l2_perf_enabled) {
-            l2_perf.complete_probe_count++;
+        if (l2_swimlane.l2_swimlane_enabled) {
+            l2_swimlane.complete_probe_count++;
         }
 #endif
 
@@ -237,8 +275,8 @@ void SchedulerContext::check_running_cores_for_completion(
         if (!t.matched) continue;
 
 #if PTO2_SCHED_PROFILING
-        if (l2_perf.l2_perf_enabled && (t.running_done || t.pending_done)) {
-            l2_perf.complete_hit_count++;
+        if (l2_swimlane.l2_swimlane_enabled && (t.running_done || t.pending_done)) {
+            l2_swimlane.complete_hit_count++;
         }
 #endif
 
@@ -322,7 +360,7 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
         return false;  // Another thread already holds the drain slot.
     }
     // We own the drain slot.  Store the task and reset election flag before making it visible.
-    drain_state_.pending_task = slot_state;
+    drain_state_.pending_task.store(slot_state, std::memory_order_release);
     drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
     // Release store: all stores above are now visible to any thread that
@@ -344,7 +382,7 @@ int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape) {
 // Called only when global resources >= block_num, so one pass always suffices.
 // All other threads are spinning -- the drain worker has exclusive tracker access.
 void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
-    PTO2TaskSlotState *slot_state = drain_state_.pending_task;
+    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
     if (!slot_state) {
         drain_state_.sync_start_pending.store(0, std::memory_order_release);
         return;
@@ -363,7 +401,7 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
     // Release fence ensures tracker mutations are visible to threads that
     // acquire-load sync_start_pending == 0 and resume normal operation.
     std::atomic_thread_fence(std::memory_order_release);
-    drain_state_.pending_task = nullptr;
+    drain_state_.pending_task.store(nullptr, std::memory_order_release);
     drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
@@ -419,7 +457,17 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
     }
 
     // Elected: check if global resources are sufficient.
-    PTO2TaskSlotState *slot_state = drain_state_.pending_task;
+    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+    if (slot_state == nullptr) {
+        // pending_task is observed null only when a concurrent drain completion
+        // already cleared it (drain_worker_dispatch nulls it before reopening the
+        // gate). That drain is done and this is a stale-elected thread, so just
+        // release the election lock and return. Do NOT clear drain_ack_mask or
+        // sync_start_pending: a *new* drain run may already be active and
+        // accumulating acks, and zeroing them would corrupt it into a hang.
+        drain_state_.drain_worker_elected.store(0, std::memory_order_release);
+        return;
+    }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
     int32_t available = count_global_available(shape);
 

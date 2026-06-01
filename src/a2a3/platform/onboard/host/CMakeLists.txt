@@ -17,13 +17,12 @@ project(host_runtime LANGUAGES C CXX)
 # Build complete include list
 set(CMAKE_CUSTOM_INCLUDE_DIRS "")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/worker")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/device_comm")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/host")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host")
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
@@ -53,24 +52,27 @@ set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/platform_compile_info.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/l2_perf_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/tensor_dump_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/l2_swimlane_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/tensor_dump_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/pmu_collector.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/dep_gen_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/dep_gen_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_collector.cpp"
 )
-# Add common/host sources (LoadAicpuOp)
+# Add common/aicpu_loader/host sources (LoadAicpuOp)
 list(APPEND HOST_RUNTIME_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/host/load_aicpu_op.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_loader/host/load_aicpu_op.cpp"
 )
 # Add common/platform/onboard/host sources (shared between a2a3 / a5 onboard).
-# Currently scaffolding only — real content moves here in follow-up PRs
-# (see .docs/ONBOARD_HOST_COMMON_REFACTOR.md).
+# See .docs/ONBOARD_HOST_COMMON_REFACTOR.md for the migration plan.
 list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_helpers.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
@@ -102,6 +104,10 @@ target_compile_options(host_runtime
         -O3
         -g
 )
+
+# Platform name baked into the shared get_platform() impl in
+# src/common/platform/shared/host/platform_compile_info.cpp.
+target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a2a3")
 
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
@@ -173,3 +179,11 @@ target_link_directories(host_runtime
 )
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")
+
+# Apply compiler sanitizers to this host-compiled target. No-op unless
+# SIMPLER_SANITIZERS is set at configure time, which runtime_compiler only
+# passes for host toolchains (sim + onboard host). See cmake/sanitizers.cmake.
+if(SIMPLER_SANITIZERS)
+    include("${SIMPLER_CMAKE_DIR}/sanitizers.cmake")
+    simpler_apply_sanitizers(host_runtime)
+endif()

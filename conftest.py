@@ -163,7 +163,12 @@ def pytest_addoption(parser):
         help="Enable PMU collection. Bare flag = PIPE_UTILIZATION(2). "
         "Pass event type to override (e.g. --enable-pmu 4)",
     )
-    parser.addoption("--build", action="store_true", default=False, help="Compile runtime from source")
+    parser.addoption(
+        "--enable-scope-stats",
+        action="store_true",
+        default=False,
+        help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
+    )
     parser.addoption(
         "--pto-isa-commit",
         action="store",
@@ -176,6 +181,17 @@ def pytest_addoption(parser):
         default="ssh",
         choices=["ssh", "https"],
         help="Protocol for cloning pto-isa when --pto-isa-commit is set",
+    )
+    parser.addoption(
+        "--sanitizer",
+        action="store",
+        default="none",
+        help=(
+            "Run against sanitizer-built binaries. Preset (asan/ubsan/tsan) or raw "
+            "-fsanitize tokens. Must match the SIMPLER_SANITIZER the runtime was "
+            "pip-installed with, and needs the matching runtime preloaded "
+            "(e.g. LD_PRELOAD=$(g++ -print-file-name=libasan.so))."
+        ),
     )
     parser.addoption(
         "--require-pto-isa",
@@ -349,6 +365,37 @@ def _install_child_faulthandler() -> None:
             pass
 
 
+def _configure_sanitizer(config):
+    """Wire the `--sanitizer` option: drive kernel compile + require the preload.
+
+    The runtime `.so` are sanitizer-built at install time
+    (`pip install --config-settings=cmake.define.SIMPLER_SANITIZER=...`); this
+    only has to (a) compile the per-test kernels/orchestration to match and
+    (b) fail early if the runtime isn't preloaded.
+    """
+    from simpler_setup import sanitizers as san  # noqa: PLC0415
+    from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+    selection = config.getoption("--sanitizer", default="none")
+    tokens = san.resolve(selection)
+    if not tokens:
+        return
+    try:
+        san.validate(tokens)
+    except ValueError as e:
+        raise pytest.UsageError(f"--sanitizer={selection}: {e}") from e
+    KernelCompiler._sanitizers = tokens
+
+    lib = san.preload_lib(tokens)
+    if lib and not san.is_runtime_loaded(lib):
+        platform = config.getoption("--platform", default="") or ""
+        raise pytest.UsageError(
+            f"--sanitizer={selection} needs the {lib} runtime preloaded "
+            f"(the instrumented .so are dlopen'd into this Python). Re-run with:\n"
+            f"  {san.preload_command(tokens, platform)} pytest --sanitizer {selection} ..."
+        )
+
+
 def pytest_configure(config):
     """Register custom markers and apply global config."""
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
@@ -359,6 +406,8 @@ def pytest_configure(config):
         "runtime(name): runtime this standalone test targets; used by runtime-isolation subprocess "
         "filtering so non-@scene_test tests only run under their matching runtime",
     )
+
+    _configure_sanitizer(config)
 
     log_level = config.getoption("--log-level", default=None)
     if log_level:
@@ -523,7 +572,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
     items.sort(key=sort_key)
 
     # L3 perf collection is not supported yet: a single L3 case forks N chip-processes
-    # that all write l2_perf_records_<ts>.json to the same directory with
+    # that all write l2_swimlane_records_<ts>.json to the same directory with
     # second-precision timestamps, so they trample each other. Block the
     # combination up front; waiting for a proper device-id-in-filename fix.
     if config.getoption("--enable-l2-swimlane", default=0):
@@ -960,7 +1009,6 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
 
     level = cls._st_level
     runtime = cls._st_runtime
-    build = request.config.getoption("--build", default=False)
 
     if level == 2:
         # L2 share: reuse any Worker already created for this runtime in the
@@ -984,7 +1032,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
         key = (runtime, dev_id)
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime, build=build)
+        w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime)
         w._st_device_id = dev_id
         w.init()
         _l2_worker_pool[key] = w
@@ -1008,7 +1056,6 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool):
             num_sub_workers=max_subs,
             platform=st_platform,
             runtime=runtime,
-            build=build,
         )
         w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
 

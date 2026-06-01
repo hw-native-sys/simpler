@@ -16,10 +16,11 @@
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
-#include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
+#include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "runtime.h"
 
@@ -104,15 +105,20 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // Dump enable is an execution control flag propagated via handshake.
     // The dump base address is only the backing storage location.
     set_platform_regs(k_args->regs);
+    // Device ordinal for per-device orchestration-SO naming in the executor.
+    set_orch_device_id(static_cast<int>(k_args->device_id));
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_tensor_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
-    set_platform_l2_perf_base(k_args->l2_perf_data_base);
+    set_platform_l2_swimlane_base(k_args->l2_swimlane_data_base);
+    set_platform_l2_swimlane_aicore_rotation_table(k_args->l2_swimlane_aicore_rotation_table);
     set_l2_swimlane_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
     set_platform_pmu_reg_addrs(k_args->pmu_reg_addrs);
     set_pmu_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_PMU));
     set_platform_dep_gen_base(k_args->dep_gen_data_base);
     set_dep_gen_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DEP_GEN));
+    set_scope_stats_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS));
+    set_platform_scope_stats_base(k_args->scope_stats_data_base);
 
     // Affinity gate: drop excess threads before entering runtime
     if (!platform_aicpu_affinity_gate(runtime->aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {

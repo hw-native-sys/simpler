@@ -30,8 +30,6 @@ The flow under test:
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 
@@ -39,9 +37,8 @@ def _sim_binaries():
     """Resolve pre-built a2a3sim runtime binaries, or skip if unavailable."""
     from simpler_setup.runtime_builder import RuntimeBuilder
 
-    build = bool(os.environ.get("PTO_UT_BUILD"))
     try:
-        bins = RuntimeBuilder(platform="a2a3sim").get_binaries("tensormap_and_ringbuffer", build=build)
+        bins = RuntimeBuilder(platform="a2a3sim").get_binaries("tensormap_and_ringbuffer")
     except FileNotFoundError as e:
         pytest.skip(f"a2a3sim runtime binaries unavailable: {e}")
     return bins

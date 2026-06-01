@@ -85,7 +85,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         # dump_tensor orchestration computes f = (a + b) + 1
         args.f[:] = (args.a + args.b) + 1
 
-    def _run_and_validate_l2(
+    def _run_and_validate_l2(  # noqa: PLR0913
         self,
         worker,
         callable_obj,
@@ -96,6 +96,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         enable_dump_tensor=False,
         enable_pmu=0,
         enable_dep_gen=False,
+        enable_scope_stats=False,
         output_prefix="",
     ):
         params = case.get("params", {})

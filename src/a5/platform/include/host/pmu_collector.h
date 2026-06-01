@@ -68,7 +68,7 @@
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
 #include "common/unified_log.h"
-#include "host/profiling_common/profiler_base.h"
+#include "host/profiler_base.h"
 
 // ---------------------------------------------------------------------------
 // PMU profiling Module (drives BufferPoolManager<PmuModule>)
@@ -157,7 +157,7 @@ struct PmuModule {
 // lambda capture; register / unregister stay as plain function pointers
 // because they wrap stateless HAL globals. On a5 onboard the runner passes
 // register_cb=nullptr and the framework installs a malloc-shadow + DMA
-// fallback (default_host_shadow_register).
+// fallback inline in ProfilerBase::start().
 using PmuAllocCallback = profiling_common::ProfAllocCallback;
 using PmuRegisterCallback = profiling_common::ProfRegisterCallback;
 using PmuUnregisterCallback = profiling_common::ProfUnregisterCallback;
@@ -279,7 +279,6 @@ private:
     PmuDataHeader *pmu_header() const { return get_pmu_header(shm_host_); }
     PmuBufferState *pmu_state(int core_id) const { return get_pmu_buffer_state(shm_host_, core_id); }
 
-    void *alloc_single_buffer(size_t size, void **host_ptr_out);
     void write_buffer_to_csv(int core_id, int thread_idx, const void *buf_host_ptr);
     void ensure_csv_open_unlocked();
 };

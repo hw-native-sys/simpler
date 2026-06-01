@@ -139,7 +139,7 @@ struct DumpMetaBuffer {
 
 /**
  * Single Producer Single Consumer (SPSC) lock-free queue.
- * Same layout and semantics as L2PerfFreeQueue, separate type for decoupling.
+ * Same layout and semantics as L2SwimlaneFreeQueue, separate type for decoupling.
  *
  * Producer: Host (DumpMemoryManager thread) pushes recycled/new buffers
  * Consumer: Device (AICPU thread) pops buffers when switching

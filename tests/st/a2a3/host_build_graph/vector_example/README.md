@@ -27,8 +27,8 @@ python tests/st/a2a3/host_build_graph/vector_example/test_vector_example.py -p a
 pytest tests/st/a2a3/host_build_graph/vector_example --platform a2a3sim
 ```
 
-`--log-level debug` enables verbose compile / runtime logs. `--build`
-recompiles runtime C++ before running.
+`--log-level debug` enables verbose compile / runtime logs. After changing
+runtime C++, re-run `pip install --no-build-isolation -e .` to refresh the pre-built binaries.
 
 ## Layout
 

@@ -81,6 +81,68 @@ class TestGxxToolchainCmakeArgs:
         assert "-DCMAKE_CXX_FLAGS=-pthread -B /data/envs/lyf/compiler_compat" in args
 
 
+class TestGxxToolchainPreferG15Pins:
+    """Under a sanitizer, prefer_g15 ABI-pins the host compiler to g++-15 so its
+    sanitizer runtime (libtsan.so.2 / libasan.so) matches the lib*san the
+    pytest/CI run-step preloads. An env CC/CXX naming a different GCC (e.g. the
+    system g++ whose libtsan SONAME is .so.0) must NOT override that pin —
+    scikit-build-core exports CXX during `pip install`, and the mismatch fails
+    at dlopen with "cannot allocate memory in static TLS block"."""
+
+    @pytest.fixture
+    def toolchain(self, monkeypatch):
+        monkeypatch.setattr("simpler_setup.toolchain._is_gcc", lambda _p: True)
+        from simpler_setup.toolchain import GxxToolchain  # noqa: PLC0415
+
+        return GxxToolchain(prefer_g15=True)
+
+    def test_env_cxx_does_not_override_pin(self, toolchain, monkeypatch):
+        # scikit-build-core / a plain dev shell exporting the system g++.
+        monkeypatch.setenv("CC", "gcc")
+        monkeypatch.setenv("CXX", "g++")
+        args = toolchain.get_cmake_args()
+        assert "-DCMAKE_C_COMPILER=gcc-15" in args
+        assert "-DCMAKE_CXX_COMPILER=g++-15" in args
+
+    def test_conda_flags_preserved_but_compiler_pinned(self, toolchain, monkeypatch):
+        # Conda's injected -B compiler_compat flags must survive, but the
+        # compiler binary is still forced to the pinned g++-15.
+        monkeypatch.setenv("CC", "gcc -pthread -B /data/envs/lyf/compiler_compat")
+        monkeypatch.setenv("CXX", "g++ -pthread -B /data/envs/lyf/compiler_compat")
+        args = toolchain.get_cmake_args()
+        assert "-DCMAKE_C_COMPILER=gcc-15" in args
+        assert "-DCMAKE_CXX_COMPILER=g++-15" in args
+        assert "-DCMAKE_C_FLAGS=-pthread -B /data/envs/lyf/compiler_compat" in args
+        assert "-DCMAKE_CXX_FLAGS=-pthread -B /data/envs/lyf/compiler_compat" in args
+
+    def test_custom_path_to_g15_is_preserved(self, toolchain, monkeypatch):
+        # An env CC/CXX that already names g++-15 at a non-PATH location is the
+        # right ABI already — keep it instead of forcing the bare name, which
+        # might not be on PATH.
+        monkeypatch.setenv("CC", "/opt/custom/bin/gcc-15")
+        monkeypatch.setenv("CXX", "/opt/custom/bin/g++-15")
+        args = toolchain.get_cmake_args()
+        assert "-DCMAKE_C_COMPILER=/opt/custom/bin/gcc-15" in args
+        assert "-DCMAKE_CXX_COMPILER=/opt/custom/bin/g++-15" in args
+
+    def test_gnu_triplet_g15_is_preserved(self, toolchain, monkeypatch):
+        # A versioned cross/triplet name is still GCC-15 — keep it.
+        monkeypatch.setenv("CC", "aarch64-linux-gnu-gcc-15")
+        monkeypatch.setenv("CXX", "aarch64-linux-gnu-g++-15")
+        args = toolchain.get_cmake_args()
+        assert "-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc-15" in args
+        assert "-DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++-15" in args
+
+    def test_clang15_is_not_mistaken_for_pinned_gcc(self, toolchain, monkeypatch):
+        # "g++-15" is a substring of "clang++-15", but clang's sanitizer ABI
+        # differs — the pin must override it back to the GCC default.
+        monkeypatch.setenv("CC", "clang-15")
+        monkeypatch.setenv("CXX", "clang++-15")
+        args = toolchain.get_cmake_args()
+        assert "-DCMAKE_C_COMPILER=gcc-15" in args
+        assert "-DCMAKE_CXX_COMPILER=g++-15" in args
+
+
 class TestGxx15ToolchainCmakeArgs:
     """Same split behavior for the simulation-kernel toolchain."""
 

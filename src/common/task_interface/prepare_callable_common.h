@@ -54,7 +54,7 @@ struct ChildKernelAddr {
  * resolves its entry symbol during prepare_callable_impl and stores the
  * resulting function pointer in host_orch_func_ptr directly.
  */
-struct PreparedCallableArtifacts {
+struct CallableArtifacts {
     std::vector<ChildKernelAddr> kernel_addrs;
     // Chip-level entry-tensor directions, copied from ChipCallable::signature_[].
     // Scalars are also present (ArgDirection::SCALAR) and follow the tensor
@@ -70,23 +70,23 @@ struct PreparedCallableArtifacts {
 };
 
 /**
- * Result of DeviceRunner::bind_prepared_callable_to_runtime — what the c_api
- * needs to pass on to bind_prepared_to_runtime_impl for a per-run binding.
+ * Result of DeviceRunner::bind_callable_to_runtime — what the c_api
+ * needs to pass on to bind_callable_to_runtime_impl for a per-run binding.
  *
  * Returning a struct (rather than a `void**` out-parameter) keeps the caller
  * site idiomatic — destructure with C++17 structured bindings:
  *
  *     auto [rc, host_orch_func_ptr] =
- *         runner->bind_prepared_callable_to_runtime(*r, callable_id);
+ *         runner->bind_callable_to_runtime(*r, callable_id);
  *
  * `host_orch_func_ptr` is type-erased as `void *` (rather than the concrete
  * OrchestrationFunc) so this header stays runtime-agnostic; only the hbg path
- * sets it. trb leaves it null and bind_prepared_to_runtime_impl asserts so.
+ * sets it. trb leaves it null and bind_callable_to_runtime_impl asserts so.
  */
-struct BindPreparedCallableResult {
+struct BindCallableResult {
     int rc{0};
     void *host_orch_func_ptr{nullptr};
-    // Pointer into PreparedCallableState's cached signature vector — valid
+    // Pointer into CallableState's cached signature vector — valid
     // until the callable_id is unregistered. Nullptr + 0 when the callable
     // had no recorded signature (legacy path).
     const ArgDirection *signature{nullptr};

@@ -21,7 +21,7 @@ The HTML format scales to any graph the browser's SVG renderer can handle
 gotcha is that high zoom slightly blurs text — that's a CSS-transform tradeoff
 in exchange for 60fps GPU-composited pan/zoom even on huge graphs.
 
-When ``l2_perf_records.json`` is colocated with ``deps.json``, node labels are
+When ``l2_swimlane_records.json`` is colocated with ``deps.json``, node labels are
 enriched with the per-task ``func_id`` and ``core_type`` so a node reads as
 ``t12 · kernel_mul · aiv`` rather than just ``t12``; nodes are colored by
 core_type (AIC blue, AIV orange).
@@ -44,7 +44,7 @@ from pathlib import Path
 
 
 def _normalize_task_id(v):
-    """Unsigned 64-bit task id (matches deps.json edges and l2_perf task_id).
+    """Unsigned 64-bit task id (matches deps.json edges and l2_swimlane task_id).
 
     Accepts ints (legacy) and strings (current schema): deps.json emits all
     uint64 fields as quoted strings to dodge JSON-number precision loss in
@@ -239,7 +239,7 @@ def _backfill_output_tensor_ids(task_table, annotations):
 
 
 def _load_task_meta(deps_path, func_names=None):
-    """Optional l2_perf_records.json sidecar → {task_id: {'func_id', 'core_type', ...}}.
+    """Optional l2_swimlane_records.json sidecar → {task_id: {'func_id', 'core_type', ...}}.
 
     Mixed-kernel tasks (single submit_task that spans both AIC and AIV blocks)
     appear as multiple perf-record entries with the same ``task_id`` but
@@ -252,7 +252,7 @@ def _load_task_meta(deps_path, func_names=None):
     Returns {} if no sidecar present. ``func_names`` (optional dict) overrides
     the default ``f{func_id}`` label with a human name.
     """
-    perf_path = Path(deps_path).parent / "l2_perf_records.json"
+    perf_path = Path(deps_path).parent / "l2_swimlane_records.json"
     if not perf_path.exists():
         return {}
     try:
@@ -318,7 +318,7 @@ def _label(task_id, meta, fmt_task, have_perf=False):
 # is an ellipse; "mix" (single submit_task spanning both core types) is a
 # diamond; "alloc" — a task that came from ``alloc_tensors`` (got a real
 # task_id and shows up as a producer in deps via ``owner_task_id``, but
-# never dispatched a kernel so no l2_perf record and no func_id) — is a
+# never dispatched a kernel so no l2_swimlane record and no func_id) — is a
 # dashed gray note. Distinct shape AND color so each stays readable even
 # without color (B&W print, accessibility, etc.).
 _CORE_STYLE = {

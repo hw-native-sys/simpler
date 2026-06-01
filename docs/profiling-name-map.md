@@ -2,7 +2,7 @@
 
 ## Problem
 
-Profiling data (`l2_perf_records.json`) identifies tasks by numeric IDs
+Profiling data (`l2_swimlane_records.json`) identifies tasks by numeric IDs
 (e.g., `func_id: 0`).  Without a mapping, swimlane visualizations show
 opaque labels like `func_0_a(t0)` instead of human-readable names like
 `QK(t0)`.
@@ -45,7 +45,7 @@ Every level uses the same structure:
 ### L2 (Orchestration + Incores)
 
 `callable_id` = incore `func_id` (the integer assigned in the CALLABLE
-spec).  These are the same IDs that appear in L2 perf data.
+spec).  These are the same IDs that appear in L2 swimlane data.
 
 ```json
 {
@@ -147,10 +147,10 @@ takes precedence over `-k` (kernel_config.py):
 # Automatic (via SceneTest profiling)
 pytest tests/st/... --platform a5onboard --enable-l2-swimlane
 
-# Manual (paths land alongside l2_perf_records.json inside the same
+# Manual (paths land alongside l2_swimlane_records.json inside the same
 # <output_prefix> directory)
 python -m simpler_setup.tools.swimlane_converter \
-    outputs/<case>_<ts>/l2_perf_records.json \
+    outputs/<case>_<ts>/l2_swimlane_records.json \
     --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
 
 python -m simpler_setup.tools.deps_to_graph \
@@ -169,7 +169,7 @@ cannot collide.
 
 ```text
 outputs/TestPA_basic_20260416_151301/
-  l2_perf_records.json         # perf data (runtime)
+  l2_swimlane_records.json         # perf data (runtime)
   name_map_TestPA_basic.json   # name mapping (SceneTest)
   merged_swimlane.json         # Perfetto trace (converter)
 ```

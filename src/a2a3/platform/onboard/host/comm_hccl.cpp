@@ -25,6 +25,8 @@
 #include "platform_comm/comm.h"
 #include "platform_comm/comm_context.h"
 
+#include "common/unified_log.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -162,6 +164,7 @@ static void cleanup_handshake_files(const std::string &rootinfo_path) {
 
 static bool
 wait_for_rootinfo(const std::string &path, HcclRootInfo *root_info, uint64_t *run_token, int timeout_sec = 120) {
+    constexpr int kLogEverySec = 5;
     for (int i = 0; i < timeout_sec * 10; ++i) {
         std::ifstream f(path, std::ios::binary);
         if (f.good()) {
@@ -183,6 +186,9 @@ wait_for_rootinfo(const std::string &path, HcclRootInfo *root_info, uint64_t *ru
             *run_token = header.run_token;
             return true;
         }
+        if (i > 0 && i % (kLogEverySec * 10) == 0) {
+            LOG_INFO_V0("[comm] wait_for_rootinfo: still waiting (%ds elapsed) path=%s", i / 10, path.c_str());
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return false;
@@ -202,9 +208,9 @@ static bool file_barrier(
             std::ifstream f(marker);
             if (f.good()) break;
             if (std::chrono::steady_clock::now() >= deadline) {
-                fprintf(
-                    stderr, "[comm rank %d] file_barrier('%s') timed out after %ds waiting for rank %d\n", rank,
-                    tag.c_str(), timeout_sec, r
+                LOG_ERROR(
+                    "[comm rank %d] file_barrier('%s') timed out after %ds waiting for rank %d", rank, tag.c_str(),
+                    timeout_sec, r
                 );
                 return false;
             }
@@ -222,22 +228,19 @@ static bool file_barrier(
 
 extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *rootinfo_path) try {
     if (stream == nullptr) {
-        fprintf(stderr, "[comm rank %d] comm_init: caller-supplied stream is null\n", rank);
+        LOG_ERROR("[comm rank %d] comm_init: caller-supplied stream is null", rank);
         return nullptr;
     }
     if (rootinfo_path == nullptr || *rootinfo_path == '\0') {
-        fprintf(stderr, "[comm rank %d] comm_init: rootinfo_path is null or empty\n", rank);
+        LOG_ERROR("[comm rank %d] comm_init: rootinfo_path is null or empty", rank);
         return nullptr;
     }
     if (nranks <= 0 || rank < 0 || rank >= nranks) {
-        fprintf(stderr, "[comm rank %d] comm_init: invalid rank/nranks (rank=%d, nranks=%d)\n", rank, rank, nranks);
+        LOG_ERROR("[comm rank %d] comm_init: invalid rank/nranks (rank=%d, nranks=%d)", rank, rank, nranks);
         return nullptr;
     }
     if (static_cast<uint32_t>(nranks) > COMM_MAX_RANK_NUM) {
-        fprintf(
-            stderr, "[comm rank %d] comm_init: nranks=%d exceeds COMM_MAX_RANK_NUM=%u\n", rank, nranks,
-            COMM_MAX_RANK_NUM
-        );
+        LOG_ERROR("[comm rank %d] comm_init: nranks=%d exceeds COMM_MAX_RANK_NUM=%u", rank, nranks, COMM_MAX_RANK_NUM);
         return nullptr;
     }
 
@@ -262,7 +265,7 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
         h->run_token = make_run_token(rank);
         HcclResult hret = hccl_get_root_info(&rootInfo);
         if (hret != HCCL_SUCCESS) {
-            fprintf(stderr, "[comm rank 0] HcclGetRootInfo failed: %d\n", (int)hret);
+            LOG_ERROR("[comm rank 0] HcclGetRootInfo failed: %d", (int)hret);
             delete h;
             return nullptr;
         }
@@ -280,7 +283,7 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
         }
     } else {
         if (!wait_for_rootinfo(h->rootinfo_path, &rootInfo, &h->run_token)) {
-            fprintf(stderr, "[comm rank %d] Timeout waiting for rootinfo\n", rank);
+            LOG_ERROR("[comm rank %d] Timeout waiting for rootinfo", rank);
             delete h;
             return nullptr;
         }
@@ -295,17 +298,17 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     HcclResult hret =
         hccl_comm_init_root_info(static_cast<uint32_t>(nranks), &rootInfo, static_cast<uint32_t>(rank), &h->hccl_comm);
     if (hret != HCCL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] HcclCommInitRootInfo failed: %d\n", rank, (int)hret);
+        LOG_ERROR("[comm rank %d] HcclCommInitRootInfo failed: %d", rank, (int)hret);
         delete h;
         return nullptr;
     }
 
     return h;
 } catch (const std::exception &e) {
-    fprintf(stderr, "[comm rank %d] comm_init: exception: %s\n", rank, e.what());
+    LOG_ERROR("[comm rank %d] comm_init: exception: %s", rank, e.what());
     return nullptr;
 } catch (...) {
-    fprintf(stderr, "[comm rank %d] comm_init: unknown exception\n", rank);
+    LOG_ERROR("[comm rank %d] comm_init: unknown exception", rank);
     return nullptr;
 }
 
@@ -411,7 +414,7 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
     // EnablePeerAccess takes a peer DEVICE id, not a peer rank.
     int32_t myDevice = -1;
     if (aclrtGetDevice(&myDevice) != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] ipc: aclrtGetDevice failed\n", rank);
+        LOG_ERROR("[comm rank %d] ipc: aclrtGetDevice failed", rank);
         return -1;
     }
 
@@ -419,13 +422,13 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
     void *localBuf = nullptr;
     aclError aret = aclrtMalloc(&localBuf, win_size, ACL_MEM_MALLOC_HUGE_FIRST);
     if (aret != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] ipc: aclrtMalloc -> %d\n", rank, static_cast<int>(aret));
+        LOG_ERROR("[comm rank %d] ipc: aclrtMalloc -> %d", rank, static_cast<int>(aret));
         return -1;
     }
     char myName[kIpcNameLen]{};
     aret = aclrtIpcMemGetExportKey(localBuf, win_size, myName, kIpcNameLen, 0);
     if (aret != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] ipc: GetExportKey -> %d\n", rank, static_cast<int>(aret));
+        LOG_ERROR("[comm rank %d] ipc: GetExportKey -> %d", rank, static_cast<int>(aret));
         aclrtFree(localBuf);
         return -1;
     }
@@ -433,7 +436,7 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
     // Announce (pid, device, name) and read every peer's announcement.
     const int32_t myPid = static_cast<int32_t>(getpid());
     if (!ipc_write_announce(rootinfo, rank, run_token, myPid, myDevice, myName)) {
-        fprintf(stderr, "[comm rank %d] ipc: write_announce failed\n", rank);
+        LOG_ERROR("[comm rank %d] ipc: write_announce failed", rank);
         aclrtFree(localBuf);
         return -1;
     }
@@ -448,7 +451,7 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
             continue;
         }
         if (!ipc_read_announce(rootinfo, p, run_token, &peers[p])) {
-            fprintf(stderr, "[comm rank %d] ipc: read_announce(peer=%d) timed out\n", rank, p);
+            LOG_ERROR("[comm rank %d] ipc: read_announce(peer=%d) timed out", rank, p);
             aclrtFree(localBuf);
             return -1;
         }
@@ -460,9 +463,15 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
         if (p == rank) continue;
         aclError r = aclrtDeviceEnablePeerAccess(peers[p].device_id, 0);
         if (r != ACL_SUCCESS) {
-            // Non-fatal: may already be enabled from a prior init in this process.
-            fprintf(
-                stderr, "[comm rank %d] ipc: EnablePeerAccess(peer_dev=%d) -> %d (continuing)\n", rank,
+            // Non-fatal but lossy: CANN 9.x does not expose a dedicated
+            // "already enabled" error code, so we cannot tell a benign
+            // re-enable from a real P2P failure (e.g. missing P2P link)
+            // here.  The subsequent aclrtDevicePeerAccessStatus poll is
+            // the real source of truth — it returns status=1 if access
+            // is genuinely up, and times out (30s) otherwise.  Failures
+            // that matter therefore still surface, just one stage later.
+            LOG_WARN(
+                "[comm rank %d] ipc: EnablePeerAccess(peer_dev=%d) -> %d (deferring to status poll)", rank,
                 peers[p].device_id, static_cast<int>(r)
             );
         }
@@ -474,8 +483,8 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
             int32_t status = 0;
             aclError r = aclrtDevicePeerAccessStatus(myDevice, peers[p].device_id, &status);
             if (r != ACL_SUCCESS) {
-                fprintf(
-                    stderr, "[comm rank %d] ipc: PeerAccessStatus(local_dev=%d peer_dev=%d) -> %d\n", rank, myDevice,
+                LOG_ERROR(
+                    "[comm rank %d] ipc: PeerAccessStatus(local_dev=%d peer_dev=%d) -> %d", rank, myDevice,
                     peers[p].device_id, static_cast<int>(r)
                 );
                 aclrtFree(localBuf);
@@ -483,9 +492,9 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
             }
             if (status == 1) break;
             if (std::chrono::steady_clock::now() >= deadline) {
-                fprintf(
-                    stderr, "[comm rank %d] ipc: P2P enable timeout peer=%d peer_dev=%d status=%d\n", rank, p,
-                    peers[p].device_id, status
+                LOG_ERROR(
+                    "[comm rank %d] ipc: P2P enable timeout peer=%d peer_dev=%d status=%d", rank, p, peers[p].device_id,
+                    status
                 );
                 aclrtFree(localBuf);
                 return -1;
@@ -509,7 +518,7 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
     }
     aret = aclrtIpcMemSetImportPid(myName, peerPids.data(), peerPids.size());
     if (aret != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] ipc: SetImportPid -> %d\n", rank, static_cast<int>(aret));
+        LOG_ERROR("[comm rank %d] ipc: SetImportPid -> %d", rank, static_cast<int>(aret));
         aclrtFree(localBuf);
         return -1;
     }
@@ -524,7 +533,9 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
     // is kept in CommContext only to preserve byte-equivalence with pto-isa's
     // parallel HcclDeviceContext declaration; removing it is gated on the
     // F4 private-ization decision (see .docs/28.l3-comm/ext.01.pr-774-review.md).
-    memset(&h->host_ctx, 0, sizeof(h->host_ctx));
+    // host_ctx was value-initialized at handle construction (CommContext{}),
+    // and the idempotency guard in comm_alloc_windows prevents a second
+    // entry; no re-zero needed before populating it here.
     h->host_ctx.rankId = static_cast<uint32_t>(rank);
     h->host_ctx.rankNum = static_cast<uint32_t>(nranks);
     h->host_ctx.winSize = win_size;
@@ -535,9 +546,8 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
         void *peerVa = nullptr;
         aret = aclrtIpcMemImportByKey(&peerVa, peers[p].name, 0);
         if (aret != ACL_SUCCESS) {
-            fprintf(
-                stderr, "[comm rank %d] ipc: ImportByKey(peer=%d pid=%d) -> %d\n", rank, p, peers[p].pid,
-                static_cast<int>(aret)
+            LOG_ERROR(
+                "[comm rank %d] ipc: ImportByKey(peer=%d pid=%d) -> %d", rank, p, peers[p].pid, static_cast<int>(aret)
             );
             aclrtFree(localBuf);
             return -1;
@@ -663,27 +673,27 @@ static int domain_alloc_via_ipc(
 
     int32_t myDevice = -1;
     if (aclrtGetDevice(&myDevice) != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] alloc_domain: aclrtGetDevice failed\n", h->rank);
+        LOG_ERROR("[comm rank %d] alloc_domain: aclrtGetDevice failed", h->rank);
         return -1;
     }
 
     void *localBuf = nullptr;
     aclError aret = aclrtMalloc(&localBuf, win_size, ACL_MEM_MALLOC_HUGE_FIRST);
     if (aret != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] alloc_domain: aclrtMalloc -> %d\n", h->rank, static_cast<int>(aret));
+        LOG_ERROR("[comm rank %d] alloc_domain: aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
         return -1;
     }
     char myName[kIpcNameLen]{};
     aret = aclrtIpcMemGetExportKey(localBuf, win_size, myName, kIpcNameLen, 0);
     if (aret != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] alloc_domain: GetExportKey -> %d\n", h->rank, static_cast<int>(aret));
+        LOG_ERROR("[comm rank %d] alloc_domain: GetExportKey -> %d", h->rank, static_cast<int>(aret));
         aclrtFree(localBuf);
         return -1;
     }
 
     const int32_t myPid = static_cast<int32_t>(getpid());
     if (!domain_write_announce(rootinfo, allocation_id, domain_rank, run_token, myPid, myDevice, myName)) {
-        fprintf(stderr, "[comm rank %d] alloc_domain: write_announce failed\n", h->rank);
+        LOG_ERROR("[comm rank %d] alloc_domain: write_announce failed", h->rank);
         aclrtFree(localBuf);
         return -1;
     }
@@ -698,16 +708,59 @@ static int domain_alloc_via_ipc(
             continue;
         }
         if (!domain_read_announce(rootinfo, allocation_id, static_cast<uint32_t>(p), run_token, &peers[p])) {
-            fprintf(stderr, "[comm rank %d] alloc_domain: read_announce(peer_dr=%d) timed out\n", h->rank, p);
+            LOG_ERROR("[comm rank %d] alloc_domain: read_announce(peer_dr=%d) timed out", h->rank, p);
             aclrtFree(localBuf);
             return -1;
         }
     }
 
-    // EnablePeerAccess is process-global and idempotent — already done by
-    // the base alloc for every base-comm pair, so domain allocations should
-    // never hit a new pair.  Skip the EnablePeerAccess + wait loop here.
-    // (The base allocation owns the P2P route lifecycle.)
+    // Enable cross-card P2P for every domain peer and poll until ENABLED.
+    // The orch-only allocate_domain model has no base comm_alloc_windows to
+    // own the P2P route, so each allocation must (idempotently) ensure it.
+    // aclrtDeviceEnablePeerAccess is process-global and per device-pair, so
+    // once any allocation has opened a given pair, later ones simply observe
+    // it already enabled — the call + status poll is cheap in that case.
+    // Without this, the IPC VA import below still succeeds, but device-side
+    // cross-chip access from kernels silently fails, so peer TWAIT /
+    // notification writes never land and the scheduler times out.  The
+    // aclrtDevicePeerAccessStatus poll is the source of truth (status==1) and
+    // surfaces a genuinely missing P2P link as a 30s timeout.
+    for (int p = 0; p < subset_n; ++p) {
+        if (p == my_dr) continue;
+        aclError r = aclrtDeviceEnablePeerAccess(peers[p].device_id, 0);
+        if (r != ACL_SUCCESS) {
+            LOG_WARN(
+                "[comm rank %d] alloc_domain: EnablePeerAccess(peer_dev=%d) -> %d (deferring to status poll)", h->rank,
+                peers[p].device_id, static_cast<int>(r)
+            );
+        }
+    }
+    for (int p = 0; p < subset_n; ++p) {
+        if (p == my_dr) continue;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (true) {
+            int32_t status = 0;
+            aclError r = aclrtDevicePeerAccessStatus(myDevice, peers[p].device_id, &status);
+            if (r != ACL_SUCCESS) {
+                LOG_ERROR(
+                    "[comm rank %d] alloc_domain: PeerAccessStatus(local_dev=%d peer_dev=%d) -> %d", h->rank, myDevice,
+                    peers[p].device_id, static_cast<int>(r)
+                );
+                aclrtFree(localBuf);
+                return -1;
+            }
+            if (status == 1) break;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                LOG_ERROR(
+                    "[comm rank %d] alloc_domain: P2P enable timeout peer_dr=%d peer_dev=%d status=%d", h->rank, p,
+                    peers[p].device_id, status
+                );
+                aclrtFree(localBuf);
+                return -1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
 
     if (!file_barrier(rootinfo, my_dr, subset_n, domain_barrier_tag(allocation_id, "p2p_ready"), run_token)) {
         aclrtFree(localBuf);
@@ -722,7 +775,7 @@ static int domain_alloc_via_ipc(
     }
     aret = aclrtIpcMemSetImportPid(myName, peerPids.data(), peerPids.size());
     if (aret != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] alloc_domain: SetImportPid -> %d\n", h->rank, static_cast<int>(aret));
+        LOG_ERROR("[comm rank %d] alloc_domain: SetImportPid -> %d", h->rank, static_cast<int>(aret));
         aclrtFree(localBuf);
         return -1;
     }
@@ -754,8 +807,8 @@ static int domain_alloc_via_ipc(
         void *peerVa = nullptr;
         aret = aclrtIpcMemImportByKey(&peerVa, peers[p].name, 0);
         if (aret != ACL_SUCCESS) {
-            fprintf(
-                stderr, "[comm rank %d] alloc_domain: ImportByKey(peer_dr=%d pid=%d) -> %d\n", h->rank, p, peers[p].pid,
+            LOG_ERROR(
+                "[comm rank %d] alloc_domain: ImportByKey(peer_dr=%d pid=%d) -> %d", h->rank, p, peers[p].pid,
                 static_cast<int>(aret)
             );
             aclrtFree(localBuf);
@@ -767,13 +820,13 @@ static int domain_alloc_via_ipc(
     void *newDevMem = nullptr;
     aret = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
     if (aret != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] alloc_domain: ctx aclrtMalloc -> %d\n", h->rank, static_cast<int>(aret));
+        LOG_ERROR("[comm rank %d] alloc_domain: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
         aclrtFree(localBuf);
         return -1;
     }
     aret = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
     if (aret != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d\n", h->rank, static_cast<int>(aret));
+        LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
         aclrtFree(newDevMem);
         aclrtFree(localBuf);
         return -1;
@@ -786,6 +839,15 @@ static int domain_alloc_via_ipc(
 
 extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *device_ctx_out) try {
     if (!h || !device_ctx_out) return -1;
+
+    // Idempotency guard: comm_alloc_windows is not re-entrant. The localBuf
+    // allocated by alloc_windows_via_ipc is owned by the handle's windowsIn[]
+    // entries and is only reclaimed at aclrtResetDevice; calling this twice
+    // would leak a full per-rank pool. device_ctx is set on first success.
+    if (h->device_ctx != nullptr) {
+        LOG_ERROR("[comm rank %d] comm_alloc_windows: already allocated on this handle", h->rank);
+        return -1;
+    }
 
     // Path D: DIY symmetric pool on stable ACL IPC + EnablePeerAccess.
     // Replaced the prior HcclAllocComResourceByTiling reverse-parse path
@@ -811,10 +873,10 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *devic
     *device_ctx_out = reinterpret_cast<uint64_t>(h->device_ctx);
     return 0;
 } catch (const std::exception &e) {
-    fprintf(stderr, "[comm] comm_alloc_windows: exception: %s\n", e.what());
+    LOG_ERROR("[comm] comm_alloc_windows: exception: %s", e.what());
     return -1;
 } catch (...) {
-    fprintf(stderr, "[comm] comm_alloc_windows: unknown exception\n");
+    LOG_ERROR("[comm] comm_alloc_windows: unknown exception");
     return -1;
 }
 
@@ -836,20 +898,20 @@ extern "C" int comm_derive_context(
 ) try {
     if (!h || !rank_ids || !device_ctx_out) return -1;
     if (h->host_ctx.rankNum == 0) {
-        fprintf(stderr, "[comm rank %d] comm_derive_context: base windows are not allocated\n", h->rank);
+        LOG_ERROR("[comm rank %d] comm_derive_context: base windows are not allocated", h->rank);
         return -1;
     }
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count) {
-        fprintf(
-            stderr, "[comm rank %d] comm_derive_context: invalid rank_count=%zu domain_rank=%u\n", h->rank, rank_count,
+        LOG_ERROR(
+            "[comm rank %d] comm_derive_context: invalid rank_count=%zu domain_rank=%u", h->rank, rank_count,
             domain_rank
         );
         return -1;
     }
     if (window_offset + window_size > static_cast<size_t>(h->host_ctx.winSize)) {
-        fprintf(
-            stderr, "[comm rank %d] comm_derive_context: window range [%zu, %zu) exceeds base window size %llu\n",
-            h->rank, window_offset, window_offset + window_size, static_cast<unsigned long long>(h->host_ctx.winSize)
+        LOG_ERROR(
+            "[comm rank %d] comm_derive_context: window range [%zu, %zu) exceeds base window size %llu", h->rank,
+            window_offset, window_offset + window_size, static_cast<unsigned long long>(h->host_ctx.winSize)
         );
         return -1;
     }
@@ -863,9 +925,9 @@ extern "C" int comm_derive_context(
     for (size_t i = 0; i < rank_count; ++i) {
         uint32_t base_rank = rank_ids[i];
         if (base_rank >= static_cast<uint32_t>(h->nranks)) {
-            fprintf(
-                stderr, "[comm rank %d] comm_derive_context: rank_ids[%zu]=%u out of range [0, %d)\n", h->rank, i,
-                base_rank, h->nranks
+            LOG_ERROR(
+                "[comm rank %d] comm_derive_context: rank_ids[%zu]=%u out of range [0, %d)", h->rank, i, base_rank,
+                h->nranks
             );
             return -1;
         }
@@ -876,16 +938,12 @@ extern "C" int comm_derive_context(
     void *newDevMem = nullptr;
     aclError aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
     if (aRet != ACL_SUCCESS) {
-        fprintf(
-            stderr, "[comm rank %d] comm_derive_context: aclrtMalloc failed: %d\n", h->rank, static_cast<int>(aRet)
-        );
+        LOG_ERROR("[comm rank %d] comm_derive_context: aclrtMalloc failed: %d", h->rank, static_cast<int>(aRet));
         return -1;
     }
     aRet = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
     if (aRet != ACL_SUCCESS) {
-        fprintf(
-            stderr, "[comm rank %d] comm_derive_context: aclrtMemcpy H2D failed: %d\n", h->rank, static_cast<int>(aRet)
-        );
+        LOG_ERROR("[comm rank %d] comm_derive_context: aclrtMemcpy H2D failed: %d", h->rank, static_cast<int>(aRet));
         aclrtFree(newDevMem);
         return -1;
     }
@@ -895,10 +953,10 @@ extern "C" int comm_derive_context(
     *device_ctx_out = reinterpret_cast<uint64_t>(derived);
     return 0;
 } catch (const std::exception &e) {
-    fprintf(stderr, "[comm] comm_derive_context: exception: %s\n", e.what());
+    LOG_ERROR("[comm] comm_derive_context: exception: %s", e.what());
     return -1;
 } catch (...) {
-    fprintf(stderr, "[comm] comm_derive_context: unknown exception\n");
+    LOG_ERROR("[comm] comm_derive_context: unknown exception");
     return -1;
 }
 
@@ -910,7 +968,7 @@ extern "C" int comm_barrier(CommHandle h) {
     // stream for context-checked ACL calls (error 507018).
     HcclResult hret = hccl_barrier(h->hccl_comm, h->stream);
     if (hret != HCCL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] HcclBarrier failed: %d\n", h->rank, static_cast<int>(hret));
+        LOG_ERROR("[comm rank %d] HcclBarrier failed: %d", h->rank, static_cast<int>(hret));
         return static_cast<int>(hret);
     }
     return 0;
@@ -922,22 +980,22 @@ extern "C" int comm_alloc_domain_windows(
 ) try {
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
-        fprintf(
-            stderr, "[comm rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)\n", h->rank,
+        LOG_ERROR(
+            "[comm rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)", h->rank,
             rank_count, domain_rank, window_size
         );
         return -1;
     }
     if (h->domain_allocations.count(allocation_id) > 0) {
-        fprintf(
-            stderr, "[comm rank %d] alloc_domain: allocation_id=%llu already live\n", h->rank,
+        LOG_ERROR(
+            "[comm rank %d] alloc_domain: allocation_id=%llu already live", h->rank,
             static_cast<unsigned long long>(allocation_id)
         );
         return -1;
     }
     if (rank_ids[domain_rank] != static_cast<uint32_t>(h->rank)) {
-        fprintf(
-            stderr, "[comm rank %d] alloc_domain: rank_ids[%u]=%u does not match base rank\n", h->rank, domain_rank,
+        LOG_ERROR(
+            "[comm rank %d] alloc_domain: rank_ids[%u]=%u does not match base rank", h->rank, domain_rank,
             rank_ids[domain_rank]
         );
         return -1;
@@ -947,7 +1005,7 @@ extern "C" int comm_alloc_domain_windows(
     // require comm_alloc_windows on the base in the orch-only model — the
     // dynamic alloc path does its own per-allocation aclrtMalloc + IPC dance.
     if (h->rootinfo_path.empty() || h->hccl_comm == nullptr) {
-        fprintf(stderr, "[comm rank %d] alloc_domain: base communicator not initialised\n", h->rank);
+        LOG_ERROR("[comm rank %d] alloc_domain: base communicator not initialised", h->rank);
         return -1;
     }
 
@@ -959,7 +1017,7 @@ extern "C" int comm_alloc_domain_windows(
     // aclrtMalloc bytes (parity with the sim backend's memset).
     aclError aret = aclrtMemset(alloc->local_buf, window_size, 0, window_size);
     if (aret != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] alloc_domain: aclrtMemset -> %d\n", h->rank, static_cast<int>(aret));
+        LOG_ERROR("[comm rank %d] alloc_domain: aclrtMemset -> %d", h->rank, static_cast<int>(aret));
         aclrtFree(alloc->device_ctx);
         aclrtFree(alloc->local_buf);
         return -1;
@@ -970,10 +1028,10 @@ extern "C" int comm_alloc_domain_windows(
     h->domain_allocations.emplace(allocation_id, std::move(alloc));
     return 0;
 } catch (const std::exception &e) {
-    fprintf(stderr, "[comm] alloc_domain: exception: %s\n", e.what());
+    LOG_ERROR("[comm] alloc_domain: exception: %s", e.what());
     return -1;
 } catch (...) {
-    fprintf(stderr, "[comm] alloc_domain: unknown exception\n");
+    LOG_ERROR("[comm] alloc_domain: unknown exception");
     return -1;
 }
 
@@ -982,18 +1040,17 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     if (!h) return -1;
     auto it = h->domain_allocations.find(allocation_id);
     if (it == h->domain_allocations.end()) {
-        fprintf(
-            stderr, "[comm rank %d] release_domain: allocation_id=%llu not found\n", h->rank,
+        LOG_ERROR(
+            "[comm rank %d] release_domain: allocation_id=%llu not found", h->rank,
             static_cast<unsigned long long>(allocation_id)
         );
         return -1;
     }
     auto &alloc = it->second;
     if (static_cast<size_t>(alloc->nranks) != rank_count || static_cast<uint32_t>(alloc->rank) != domain_rank) {
-        fprintf(
-            stderr,
+        LOG_ERROR(
             "[comm rank %d] release_domain: caller (rank_count=%zu, domain_rank=%u) "
-            "disagrees with alloc-time (nranks=%d, rank=%d)\n",
+            "disagrees with alloc-time (nranks=%d, rank=%d)",
             h->rank, rank_count, domain_rank, alloc->nranks, alloc->rank
         );
         return -1;
@@ -1006,7 +1063,7 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
             h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count),
             domain_barrier_tag(allocation_id, "release"), h->run_token
         )) {
-        fprintf(stderr, "[comm rank %d] release_domain: barrier timed out; releasing local state anyway\n", h->rank);
+        LOG_WARN("[comm rank %d] release_domain: barrier timed out; releasing local state anyway", h->rank);
         rc = -1;
     }
 
@@ -1021,10 +1078,10 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     h->domain_allocations.erase(it);
     return rc;
 } catch (const std::exception &e) {
-    fprintf(stderr, "[comm] release_domain: exception: %s\n", e.what());
+    LOG_ERROR("[comm] release_domain: exception: %s", e.what());
     return -1;
 } catch (...) {
-    fprintf(stderr, "[comm] release_domain: unknown exception\n");
+    LOG_ERROR("[comm] release_domain: unknown exception");
     return -1;
 }
 
@@ -1035,9 +1092,7 @@ extern "C" int comm_destroy(CommHandle h) try {
     // release the local resources we own, so timeout just logs and proceeds.
     int rc = 0;
     if (!file_barrier(h->rootinfo_path, h->rank, h->nranks, "destroy", h->run_token)) {
-        fprintf(
-            stderr, "[comm rank %d] comm_destroy: final barrier timed out; releasing local state anyway\n", h->rank
-        );
+        LOG_WARN("[comm rank %d] comm_destroy: final barrier timed out; releasing local state anyway", h->rank);
         rc = -1;
     }
 
@@ -1062,7 +1117,7 @@ extern "C" int comm_destroy(CommHandle h) try {
     if (h->hccl_comm) {
         HcclResult hret = hccl_comm_destroy(h->hccl_comm);
         if (hret != HCCL_SUCCESS) {
-            fprintf(stderr, "[comm rank %d] HcclCommDestroy failed: %d\n", h->rank, static_cast<int>(hret));
+            LOG_ERROR("[comm rank %d] HcclCommDestroy failed: %d", h->rank, static_cast<int>(hret));
             if (rc == 0) rc = -1;
         }
     }
@@ -1072,18 +1127,23 @@ extern "C" int comm_destroy(CommHandle h) try {
     // lifecycle belongs to DeviceRunner, whose finalize() releases all
     // device memory before resetting the device and running aclFinalize.
 
-    if (h->rank == 0) {
+    // Only rank 0 sweeps the on-disk handshake markers, and only if the
+    // final barrier succeeded.  Deleting them after a timeout would strand
+    // any peer that hasn't observed our marker yet, and leak that peer
+    // into the next run with no rootinfo to discover.  Letting cleanup
+    // ride on the next rank-0 init is the safer recovery path.
+    if (h->rank == 0 && rc == 0) {
         cleanup_handshake_files(h->rootinfo_path);
     }
 
     delete h;
     return rc;
 } catch (const std::exception &e) {
-    fprintf(stderr, "[comm] comm_destroy: exception: %s\n", e.what());
+    LOG_ERROR("[comm] comm_destroy: exception: %s", e.what());
     if (h) delete h;
     return -1;
 } catch (...) {
-    fprintf(stderr, "[comm] comm_destroy: unknown exception\n");
+    LOG_ERROR("[comm] comm_destroy: unknown exception");
     if (h) delete h;
     return -1;
 }

@@ -6,7 +6,7 @@ The swimlane profiler's per-task `fanout[]` array is the obvious place to
 read "which tasks did task X feed into?" — but it is **structurally
 incomplete on real hardware**.
 
-Each producer task carries its own `L2PerfRecord.fanout[RUNTIME_MAX_FANOUT]`,
+Each producer task carries its own `L2SwimlaneAicpuTaskRecord.fanout[RUNTIME_MAX_FANOUT]`,
 populated by the AICPU scheduler at the moment it wires a downstream
 consumer. If a producer has already finished and transitioned to
 `PTO2_TASK_COMPLETED` by the time a later submit wants to register a
@@ -84,11 +84,17 @@ The `--enable-l2-swimlane` flag is independent but recommended in pair
 because:
 
 - `deps.json` is the dep_gen artifact.
-- `l2_perf_records.json` (from swimlane) is the timing artifact;
+- `l2_swimlane_records.json` (from swimlane) is the timing artifact;
   `merged_swimlane.json` (the Perfetto trace) uses `deps.json` for
   dependency arrows when both files exist.
 - The "fanout ⊆ deps" validation gate fires only when both files are
   present.
+
+For perf-sensitive runs where you'd rather measure each profiler in
+isolation, see the **split workflow** described in
+[l2-swimlane-profiling §3.5](l2-swimlane-profiling.md#35-dependency-arrows-from-dep_gen)
+— one dep_gen capture per topology, then any number of swimlane
+runs that the converter joins back to that captured graph.
 
 When `--enable-dep-gen` is on with any other diagnostic flag, an
 `output_prefix` directory must be set (the runtime throws otherwise).
@@ -262,7 +268,7 @@ Node visual encoding (legend top-right of the rendered HTML):
 | Gray dashed note | alloc — task from `alloc_tensors` (got a task_id, references downstream via `owner_task_id`, but never dispatched a kernel so has no perf record) |
 
 Labels read as `(ring, local) · func_name · core_type-implicit-via-shape`.
-When a colocated `l2_perf_records.json` is present the func_id is enriched
+When a colocated `l2_swimlane_records.json` is present the func_id is enriched
 with the kernel name via the sibling `name_map_<case>.json` (written by
 SceneTest's `_dump_name_map`).
 
@@ -288,11 +294,11 @@ sources / args / slices, so the raw `edges[]` count is a superset of the
 underlying task-pair count.
 
 `deps.json` (projected) is a **superset** of the fanout edges in
-`l2_perf_records.json`:
+`l2_swimlane_records.json`:
 
 | Edge source | Captures | Drops on race? |
 | ----------- | -------- | -------------- |
-| `task.fanout[]` (L2PerfRecord) | Successors known at producer-retire time | **Yes** — sealed when producer retires |
+| `task.fanout[]` (L2SwimlaneAicpuTaskRecord) | Successors known at producer-retire time | **Yes** — sealed when producer retires |
 | `deps.json` (this feature) | Every consumer → producer reachable via tensormap / explicit_deps | No — replay sees every submit |
 
 `tests/st/a2a3/tensormap_and_ringbuffer/dep_gen_capture/test_dep_gen_capture.py`

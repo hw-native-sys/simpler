@@ -19,8 +19,10 @@
 #include "common/platform_config.h"
 #include "runtime/rt.h"
 #include "ascend_hal.h"  // CANN HAL API definitions (MODULE_TYPE_AICORE, INFO_TYPE_OCCUPY, etc.)
+#include <chrono>
 #include <dlfcn.h>
 #include <iostream>
+#include <thread>
 
 static int kind_to_addr_type(AicoreRegKind kind) {
     switch (kind) {
@@ -103,10 +105,29 @@ get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, const 
     in_map_para.devid = device_id;
     in_map_para.addr_type = addr_type;
 
-    auto ret = halFunc(
-        0, reinterpret_cast<void *>(&in_map_para), sizeof(struct AddrMapInPara),
-        reinterpret_cast<void *>(&out_map_para), nullptr
-    );
+    // Retry rc=13 (EACCES): concurrent chip_process bring-up across paired dies
+    // can lose a narrow driver-side serialization window for halMemCtl. The
+    // failure consistently lands on dev=11 (last die of last chip in the
+    // 8-11 range); a short backoff lets the prior holder release before the
+    // next attempt. Other return codes are not retried — they indicate a
+    // permanent failure mode (missing capability, invalid devid, etc.).
+    constexpr int kHalMemCtlEacces = 13;
+    constexpr int kHalMemCtlMaxRetries = 3;
+    constexpr int kHalMemCtlRetryDelayMs = 50;
+    int ret = 0;
+    for (int attempt = 0; attempt <= kHalMemCtlMaxRetries; ++attempt) {
+        ret = halFunc(
+            0, reinterpret_cast<void *>(&in_map_para), sizeof(struct AddrMapInPara),
+            reinterpret_cast<void *>(&out_map_para), nullptr
+        );
+        if (ret != kHalMemCtlEacces) break;
+        if (attempt == kHalMemCtlMaxRetries) break;
+        LOG_WARN(
+            "halMemCtl rc=13 (EACCES) on devid=%lld attempt %d/%d, retrying after %d ms", (long long)device_id,
+            attempt + 1, kHalMemCtlMaxRetries, kHalMemCtlRetryDelayMs
+        );
+        std::this_thread::sleep_for(std::chrono::milliseconds(kHalMemCtlRetryDelayMs));
+    }
 
     if (ret != 0) {
         LOG_ERROR("halMemCtl failed with rc=%d", ret);
@@ -135,11 +156,10 @@ get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, const 
 
 /**
  * Get one flat AIC-then-AIV address array for the requested register kind.
- * For Ctrl kind, falls back to placeholder addresses on HAL failure to
- * preserve historical behavior on hardware where halMemCtl rejects
- * ADDR_MAP_TYPE_REG_AIC_CTRL queries (the dispatch path does not actually
- * dereference these addresses).  For Pmu kind, propagates the HAL error so
- * the caller can disable PMU collection cleanly.
+ * Propagates HAL failure unconditionally: the AICPU init/deinit handshake
+ * dereferences these addresses via write_reg/read_reg (FAST_PATH_ENABLE,
+ * DATA_MAIN_BASE, COND), so any placeholder fill would deadlock the next
+ * task on a stream-sync timeout instead of failing the prepare cleanly.
  */
 static int get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id, AicoreRegKind kind) {
     std::vector<int64_t> aic;
@@ -147,19 +167,8 @@ static int get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id, Aicor
 
     int rc = get_aicore_reg_info(aic, aiv, kind_to_addr_type(kind), device_id);
     if (rc != 0) {
-        if (kind == AicoreRegKind::Ctrl) {
-            LOG_ERROR("get_aicore_regs(%s): halMemCtl failed: %d, using placeholder addresses", kind_to_name(kind), rc);
-            aic.clear();
-            aiv.clear();
-            for (uint32_t i = 0; i < DAV_2201::PLATFORM_MAX_PHYSICAL_CORES; i++) {
-                aic.push_back(0xDEADBEEF00000000ULL + (i * 0x800000));
-                aiv.push_back(0xDEADBEEF00000000ULL + (i * 0x800000) + 0x100000);
-                aiv.push_back(0xDEADBEEF00000000ULL + (i * 0x800000) + 0x200000);
-            }
-        } else {
-            LOG_ERROR("get_aicore_regs(%s): halMemCtl failed: %d", kind_to_name(kind), rc);
-            return rc;
-        }
+        LOG_ERROR("get_aicore_regs(%s): halMemCtl failed: %d", kind_to_name(kind), rc);
+        return rc;
     }
 
     // AIC cores first, then AIV cores

@@ -39,6 +39,10 @@
 extern "C" void set_dump_tensor_selective_mode(bool enable);
 extern "C" void set_dump_tensor_task_mask(uint64_t task_id, uint64_t mask);
 
+#if PTO2_PROFILING
+#include "aicpu/scope_stats_collector_aicpu.h"
+#endif
+
 // Verify the captured Tensor blob size in DepGenRecord matches the runtime
 // Tensor layout. The platform header defines DEP_GEN_TENSOR_SIZE without
 // including runtime/tensor.h, so this check lives at the orch callsite.
@@ -53,17 +57,23 @@ static_assert(sizeof(Tensor) == DEP_GEN_TENSOR_SIZE, "DepGenRecord::tensors slot
 // link these no-op stubs so the runtime translation unit is self-contained.
 // Visibility is hidden so the HOST .so doesn't export them into the global
 // dynamic symbol table where they'd shadow the AICPU .so's strong symbols
-// (same pattern as get_sys_cnt_aicpu / l2_perf_aicpu_record_orch_phase below).
+// (same pattern as get_sys_cnt_aicpu / l2_swimlane_aicpu_record_orch_phase below).
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_dep_gen_enabled() { return false; }
 __attribute__((weak, visibility("hidden"))) void
 dep_gen_aicpu_record_submit(uint64_t, bool, int, const void *const *, const uint8_t *, int, const uint64_t *) {}
+
+// Scope_stats enable gate, queried via the same predicate idiom as
+// is_dep_gen_enabled above. The AICPU collector links the strong definition;
+// host builds fall back to this weak `false`. Gating here still skips the
+// cross-agent occupancy reads that feed the sample when scope_stats is disabled.
+extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabled() { return false; }
 
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
 #if PTO2_ORCH_PROFILING
 #include "aicpu/device_time.h"
-#include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
 // Weak fallback for builds that don't link device_time.cpp (e.g. host).
 // The strong symbol from platform/.../device_time.cpp wins in the AICPU build.
 //
@@ -76,11 +86,11 @@ dep_gen_aicpu_record_submit(uint64_t, bool, int, const void *const *, const uint
 // so the AICPU .so's PLT resolves to its own strong definition from
 // device_time.cpp.
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
-// Weak fallback for builds that don't link l2_perf_collector_aicpu.cpp.
+// Weak fallback for builds that don't link l2_swimlane_collector_aicpu.cpp.
 // The strong symbol from the AICPU build wins when profiling is available.
 // Also hidden to prevent HOST .so from polluting the global symbol table.
 __attribute__((weak, visibility("hidden"))) void
-l2_perf_aicpu_record_orch_phase(AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
+l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
@@ -106,9 +116,9 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 // in favour of the cumulatives + per-submit envelope; the dispatcher
 // already inserts one record at the end of each submit path via
 // CYCLE_COUNT_ORCH_SUBMIT_RECORD.
-#define CYCLE_COUNT_START()                                                \
-    bool _prof_active = (orch->l2_perf_level >= L2PerfLevel::ORCH_PHASES); \
-    uint64_t _t0 = get_sys_cnt_aicpu(), _t1;                               \
+#define CYCLE_COUNT_START()                                                        \
+    bool _prof_active = (orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES); \
+    uint64_t _t0 = get_sys_cnt_aicpu(), _t1;                                       \
     uint64_t _submit_start_ts = _t0
 #define CYCLE_COUNT_LAP(acc)       \
     do {                           \
@@ -116,37 +126,33 @@ uint64_t g_orch_scope_end_atomic_count = 0;
         acc += (_t1 - _t0);        \
         _t0 = _t1;                 \
     } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                \
-    do {                                                                                   \
-        if (_prof_active) {                                                                \
-            l2_perf_aicpu_record_orch_phase(                                               \
-                AicpuPhaseId::ORCH_SUBMIT, _submit_start_ts, _t1, g_orch_submit_idx, (tid) \
-            );                                                                             \
-        }                                                                                  \
+#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                       \
+    do {                                                                                          \
+        if (_prof_active) {                                                                       \
+            l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
+        }                                                                                         \
     } while (0)
 #elif PTO2_PROFILING
 #include "aicpu/device_time.h"
-#include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 __attribute__((weak, visibility("hidden"))) void
-l2_perf_aicpu_record_orch_phase(AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
+l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
 static uint32_t g_orch_submit_idx = 0;
-#define CYCLE_COUNT_START()                                                \
-    bool _prof_active = (orch->l2_perf_level >= L2PerfLevel::ORCH_PHASES); \
-    uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0;        \
+#define CYCLE_COUNT_START()                                                        \
+    bool _prof_active = (orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES); \
+    uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0;                \
     uint64_t _submit_start_ts = _t0
 #define CYCLE_COUNT_LAP(acc) \
     do {                     \
     } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                \
-    do {                                                                                   \
-        if (_prof_active) {                                                                \
-            _t1 = get_sys_cnt_aicpu();                                                     \
-            l2_perf_aicpu_record_orch_phase(                                               \
-                AicpuPhaseId::ORCH_SUBMIT, _submit_start_ts, _t1, g_orch_submit_idx, (tid) \
-            );                                                                             \
-        }                                                                                  \
+#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                       \
+    do {                                                                                          \
+        if (_prof_active) {                                                                       \
+            _t1 = get_sys_cnt_aicpu();                                                            \
+            l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
+        }                                                                                         \
     } while (0)
 #else
 #define CYCLE_COUNT_START()
@@ -172,6 +178,14 @@ static int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) 
 static void
 orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code, const char *func, const char *fmt, va_list args) {
     int32_t latched_code = orch_mark_fatal(orch, error_code);
+
+#if PTO2_PROFILING
+    // Flush the current scope's peaks BEFORE the FATAL log line, so the
+    // diagnostic context (which pool/window filled up) appears right next to
+    // the failure reason. on_fatal is latched, so duplicate fatals from
+    // different layers don't print multiple stats lines.
+    scope_stats_on_fatal();
+#endif
 
     if (fmt == nullptr || fmt[0] == '\0') {
         if (latched_code != PTO2_ERROR_NONE && latched_code != error_code) {
@@ -421,6 +435,18 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
     if (mode == PTO2ScopeMode::MANUAL && !already_in_manual_scope) {
         orch->manual_begin_depth = orch->scope_stack_top;
     }
+#if PTO2_PROFILING
+    // Gate via is_scope_stats_enabled() (weak-false in host builds) BEFORE the
+    // collector call: when disabled we pay nothing. Sample the current ring's
+    // task/heap start-end and tensormap usage at the scope boundary.
+    if (is_scope_stats_enabled()) {
+        auto &alloc = orch->rings[orch->current_ring_id()].task_allocator;
+        scope_stats_begin(
+            orch->current_ring_id(), alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(),
+            orch->tensor_map.current_used()
+        );
+    }
+#endif
 }
 
 void PTO2OrchestratorState::end_scope() {
@@ -429,6 +455,21 @@ void PTO2OrchestratorState::end_scope() {
         return;
     }
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
+
+    // Snapshot the ring start/end BEFORE the orchestrator drains pending tasks
+    // via scheduler->on_scope_end, so the end record reflects the scope's
+    // occupancy at close, not the residual after teardown.
+#if PTO2_PROFILING
+    // Gate via is_scope_stats_enabled() (see begin_scope). One collector call
+    // emits the end-boundary record and tears down bookkeeping.
+    if (is_scope_stats_enabled()) {
+        auto &alloc = orch->rings[orch->current_ring_id()].task_allocator;
+        scope_stats_end(
+            orch->current_ring_id(), alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(),
+            orch->tensor_map.current_used()
+        );
+    }
+#endif
 
 #if PTO2_ORCH_PROFILING
     uint64_t _se0 = get_sys_cnt_aicpu();
