@@ -9,8 +9,20 @@
 """
 Object File Parser for AICore Kernel Binaries
 
-Pure Python implementation for extracting .text section from ELF64 or Mach-O .o files.
-Based on the C++ implementation in binary_loader.cpp.
+Pure Python implementation for extracting the ``.text`` section from
+ELF64 or Mach-O ``.o`` files for direct execution on AICore.
+
+The loader extracts only the literal ``.text`` section bytes; it does
+NOT apply ELF relocations or merge ``.text._Z*`` COMDAT group sections
+(out-of-line template instantiations). If a kernel ``.o`` contains
+either, the loader rejects it with an actionable diagnostic — see
+issue #900 and PR #830 / issue #831 for the failure modes that motivate
+this check (CANN 507018 watchdog timeouts and silently-wrong partial
+output, both caused by BL instructions in ``.text`` left with imm26=0).
+
+The workaround on the kernel side is to mark every templated AICore
+function in the call chain with ``__attribute__((always_inline))`` so
+the compiler folds the call graph into a single ``.text`` section.
 """
 
 import logging
@@ -26,6 +38,14 @@ ELFMAG0 = 0x7F
 ELFMAG1 = ord("E")
 ELFMAG2 = ord("L")
 ELFMAG3 = ord("F")
+
+# ELF64 layout constants
+_SHDR_SIZE = 64
+_RELA_SIZE = 24
+
+# ELF section types
+_SHT_PROGBITS = 1
+_SHT_RELA = 4
 
 # Mach-O Magic Numbers
 MH_MAGIC_64 = 0xFEEDFACF
@@ -75,7 +95,7 @@ def extract_text_section(obj_input: Union[str, Path, bytes]) -> bytes:
 
 
 def _extract_text_elf64(elf_data: bytes, source_name: str) -> bytes:
-    """Extract .text section from ELF64 data."""
+    """Extract .text section from ELF64 data; reject out-of-line code."""
     if len(elf_data) < 64:
         raise ValueError(f"Data too small to be a valid ELF: {source_name}")
 
@@ -84,28 +104,103 @@ def _extract_text_elf64(elf_data: bytes, source_name: str) -> bytes:
     e_shnum = struct.unpack("<H", elf_data[60:62])[0]
     e_shstrndx = struct.unpack("<H", elf_data[62:64])[0]
 
+    # Bounds-check the section header table against the buffer; subtract
+    # from len() so the arithmetic stays safe on a 64-bit offset that the
+    # bare addition would overflow on smaller-int architectures (issue #900
+    # review feedback). The same shape repeats for the strtab and per-section
+    # data slices below.
+    if e_shnum == 0:
+        raise ValueError(f"Invalid ELF: section header count is zero in {source_name}")
+    if e_shstrndx >= e_shnum:
+        raise ValueError(f"Invalid ELF: e_shstrndx ({e_shstrndx}) >= e_shnum ({e_shnum}) in {source_name}")
+    if e_shoff > len(elf_data) - e_shnum * _SHDR_SIZE:
+        raise ValueError(f"Invalid ELF: section header table is out of bounds in {source_name}")
+
     # Get string table section header
-    shstr_offset = e_shoff + e_shstrndx * 64
+    shstr_offset = e_shoff + e_shstrndx * _SHDR_SIZE
     shstr_sh_offset = struct.unpack("<Q", elf_data[shstr_offset + 24 : shstr_offset + 32])[0]
     shstr_sh_size = struct.unpack("<Q", elf_data[shstr_offset + 32 : shstr_offset + 40])[0]
-
-    # Extract string table
+    if shstr_sh_size > len(elf_data) or shstr_sh_offset > len(elf_data) - shstr_sh_size:
+        raise ValueError(f"Invalid ELF: section string table is out of bounds in {source_name}")
     strtab = elf_data[shstr_sh_offset : shstr_sh_offset + shstr_sh_size]
 
-    # Find .text section
+    # First pass: walk every section header, find .text, and collect any
+    # out-of-line code sections that would make a literal .text extraction
+    # produce broken code on device.
+    text_data: Union[bytes, None] = None
+    text_size = 0
+    out_of_line: list[tuple[str, int]] = []
+    text_relocs: list[tuple[str, int]] = []
+
     for i in range(e_shnum):
-        section_offset = e_shoff + i * 64
+        section_offset = e_shoff + i * _SHDR_SIZE
         sh_name = struct.unpack("<I", elf_data[section_offset : section_offset + 4])[0]
+        sh_type = struct.unpack("<I", elf_data[section_offset + 4 : section_offset + 8])[0]
         sh_offset = struct.unpack("<Q", elf_data[section_offset + 24 : section_offset + 32])[0]
         sh_size = struct.unpack("<Q", elf_data[section_offset + 32 : section_offset + 40])[0]
-
+        if sh_name >= len(strtab):
+            raise ValueError(f"Invalid ELF: section {i} name offset {sh_name} is out of strtab bounds in {source_name}")
         section_name = _extract_cstring(strtab, sh_name)
-        if section_name == ".text":
-            text_data = elf_data[sh_offset : sh_offset + sh_size]
-            logger.debug(f"Loaded .text section from {source_name} (size: {sh_size} bytes)")
-            return text_data
 
-    raise ValueError(f".text section not found in: {source_name}")
+        if sh_type == _SHT_PROGBITS and section_name == ".text":
+            if sh_size > len(elf_data) or sh_offset > len(elf_data) - sh_size:
+                raise ValueError(f"Invalid ELF: .text section data is out of bounds in {source_name}")
+            text_data = elf_data[sh_offset : sh_offset + sh_size]
+            text_size = sh_size
+        elif sh_type == _SHT_PROGBITS and section_name.startswith(".text."):
+            # `.text._Z*` group sections hold out-of-line template instantiations
+            # (and similar inline-but-not-inlined emissions). `.text.startup`
+            # etc. land here too — none of them get loaded today.
+            out_of_line.append((section_name, sh_size))
+        elif sh_type == _SHT_RELA and section_name.startswith(".rela.text"):
+            text_relocs.append((section_name, sh_size // _RELA_SIZE))
+
+    if out_of_line or text_relocs:
+        _raise_unresolved_text_error(source_name, out_of_line, text_relocs)
+
+    if text_data is None:
+        raise ValueError(f".text section not found in: {source_name}")
+
+    logger.debug(f"Loaded .text section from {source_name} (size: {text_size} bytes)")
+    return text_data
+
+
+def _raise_unresolved_text_error(
+    source_name: str,
+    out_of_line: list[tuple[str, int]],
+    text_relocs: list[tuple[str, int]],
+) -> None:
+    """Raise with an actionable diagnostic naming the offending sections.
+
+    See issue #900 for context: the loader does not yet merge `.text._Z*`
+    sections or apply `.rela.text*` relocations. Silently returning the
+    raw `.text` bytes in that situation produces BL/B instructions with
+    imm26=0, which on AICore manifests as CANN 507018 watchdog timeouts
+    or silently-wrong partial output (e.g. PR #830 / issue #831).
+    """
+    detail_lines = []
+    if out_of_line:
+        detail_lines.append("Out-of-line code sections (likely template instantiations):")
+        for name, size in out_of_line:
+            detail_lines.append(f"  {name}  ({size} bytes)")
+    if text_relocs:
+        detail_lines.append("Unresolved relocations against .text:")
+        for name, count in text_relocs:
+            detail_lines.append(f"  {name}  ({count} entries)")
+    detail = "\n".join(detail_lines)
+    raise ValueError(
+        f"AICore loader cannot extract a runnable payload from {source_name}: the .o file contains "
+        f"out-of-line code or unresolved .text relocations that this loader does not yet apply "
+        f"(see issue #900). On device the BL/B targets in .text would branch to garbage, "
+        f"producing CANN 507018 watchdog timeouts or silently-wrong partial output "
+        f"(historically PR #830 / issue #831).\n\n"
+        f"{detail}\n\n"
+        f"Workaround until the loader applies relocations: annotate every templated AICore "
+        f"function in the call chain with __attribute__((always_inline)) so the compiler folds "
+        f"the call graph into a single .text section. Verify with:\n"
+        f"  readelf -S <file.o> | grep '\\.text'\n"
+        f"  readelf -r <file.o>"
+    )
 
 
 def _extract_text_macho64(data: bytes, source_name: str) -> bytes:
