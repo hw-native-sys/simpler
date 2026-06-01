@@ -27,9 +27,12 @@ available.
 
 - **Per-task AICore timing** — `start_time_us`, `end_time_us`,
   `duration_us`, plus AICPU-stamped `dispatch_time_us` / `finish_time_us`.
-- **Per-task fanout chain** — successor `task_id`s recorded in
-  the L2 record so dependency arrows show up in the Perfetto
-  view.
+- **Per-task dependency arrows** — successor edges are NOT recorded
+  in the swimlane record itself (the device hot path stays clean —
+  see PR #863). Instead, `swimlane_converter` joins
+  `l2_swimlane_records.json` with `deps.json` from
+  [`dep_gen`](dep_gen.md) at post-process time; see
+  [§3.5](#35-dependency-arrows-from-dep_gen).
 - **AICPU scheduler phases** — per-iteration breakdown into
   `complete` / `dispatch`. Idle iterations no longer emit a record
   on a2a3; the host tooling reconstructs idle spans from the gap
@@ -66,10 +69,13 @@ backward-compatible with the old boolean behavior).
 | Level | Collects | Notes |
 | ----- | -------- | ----- |
 | 0 | Nothing (disabled) | Default when flag is absent |
-| 1 | AICore timing only (start_time_us/end_time_us/task_id/func_id/core_type) | No AICPU timestamps, no fanout |
-| 2 | + dispatch_time_us, finish_time_us, fanout | Full per-task record |
+| 1 | AICore timing only (start_time_us/end_time_us/task_id/func_id/core_type) | No AICPU timestamps |
+| 2 | + dispatch_time_us, finish_time_us | Full per-task AICPU record |
 | 3 | + scheduler phases (`aicpu_scheduler_phases[]`) | Skips orchestrator phases |
 | 4 | + orchestrator phases (`aicpu_orchestrator_phases[]`) | Full collection |
+
+Dependency arrows are not produced by any swimlane level — see
+[§3.5](#35-dependency-arrows-from-dep_gen) for the dep_gen join.
 
 ```bash
 # Standalone runner
@@ -93,12 +99,12 @@ level. The host then allocates the per-core / per-thread shared
 region and publishes its base address through
 `kernel_args.l2_swimlane_data_base`. AICore writes timing into
 per-task WIP slots; AICPU commits the records on FIN. Per-task
-dispatch/finish timestamps and fanout are recorded only at
-level >= 2, scheduler phase records only at level >= 3, and
-orchestrator phase records only at level >= 4.
+dispatch/finish timestamps are recorded only at level >= 2,
+scheduler phase records only at level >= 3, and orchestrator phase
+records only at level >= 4.
 
 The JSON output `"l2_swimlane_level"` field is the captured perf_level:
-`1` = AICore timing only, `2` = +dispatch/fanout,
+`1` = AICore timing only, `2` = +AICPU dispatch/finish,
 `3` = +scheduler phases, `4` = +orchestrator phases.
 
 `--rounds > 1` collects only on the **first** round so warm-up
@@ -133,7 +139,10 @@ you pass to `swimlane_converter`. Important fields per task:
 | `start_time_us` / `end_time_us` / `duration_us` | AICore execution window in microseconds |
 | `dispatch_time_us` | AICPU timestamp when this task was dispatched (filled at level >= 2) |
 | `finish_time_us` | AICPU timestamp when AICPU observed FIN (filled at level >= 2) |
-| `fanout[]` / `fanout_count` | Successor task ids (level >= 2), used by Perfetto dependency arrows |
+
+Note: per-task records carry **no** fanout edges. Dependency arrows
+come from a separate `deps.json` (dep_gen) joined at convert time —
+see [§3.5](#35-dependency-arrows-from-dep_gen).
 
 Phase records (per scheduler thread, level >= 3 for
 `aicpu_scheduler_phases[]` and level >= 4 for
@@ -176,7 +185,9 @@ in. The trace contains:
 
 - **AICore View** — one swim-lane per AICore (AIC / AIV / mix
   channel). Each task shows `func_name(t<task_id>)`; dependency
-  arrows follow `fanout[]`.
+  arrows are joined from `deps.json` when it's available — see
+  [§3.5](#35-dependency-arrows-from-dep_gen) for the workflow. No
+  `deps.json` → no arrows (the converter prints a one-line hint).
 - **AICPU View** — scheduler thread lanes with per-iteration
   phase blocks coloured by `phase`.
 - **AICPU Scheduler** — orchestrator phase summary at the top.
@@ -217,6 +228,83 @@ and passes it to `swimlane_converter` automatically. See
 [profiling-name-map.md](../profiling-name-map.md) for the full
 schema and L3 example.
 
+### 3.5 Dependency arrows from dep_gen
+
+Swimlane records carry **timing only**; they do not embed per-task
+fanout. The device hot path deliberately omits it (see the
+`L2SwimlaneAicpuTaskRecord` comment and PR #863 — a per-task ~1 KB
+GM store + a linked-list walk on the scheduler's critical fanin tail
+was the price). Dependency arrows in the Perfetto view come from
+`deps.json`, the dep_gen artifact, joined at post-process time by
+`swimlane_converter`.
+
+Two artifacts, one join:
+
+| File | Producer | What it carries |
+| ---- | -------- | --------------- |
+| `deps.json` | `--enable-dep-gen` (a [`dep_gen`](dep_gen.md) run) | The static task graph for one topology / case |
+| `l2_swimlane_records.json` | `--enable-l2-swimlane` | Per-task / per-phase timing for one run |
+| `merged_swimlane.json` | `swimlane_converter` | Perfetto trace = timing joined to the graph |
+
+**Default workflow (paired flags, recommended for most runs):**
+
+```bash
+python test_my_case.py --platform a2a3 \
+  --enable-dep-gen --enable-l2-swimlane
+```
+
+Both artifacts land under the same `<output_prefix>/`; the
+converter auto-detects `deps.json` and emits flow arrows. This is the
+right default for CI smoke, single debugging runs, and small/medium
+workloads.
+
+**Split workflow (two launches, recommended for strict perf
+measurement):**
+
+```bash
+# Once per topology — produces deps.json.
+python test_my_case.py --platform a2a3 --enable-dep-gen
+
+# Any number of perf-measurement runs against the same topology —
+# each produces its own l2_swimlane_records.json, all joined to the
+# captured graph.
+python test_my_case.py --platform a2a3 --enable-l2-swimlane 4
+python -m simpler_setup.tools.swimlane_converter \
+    outputs/<case_ts>/l2_swimlane_records.json \
+    --deps-json outputs/<case_dep_ts>/deps.json
+```
+
+Use this when:
+
+- You're measuring overhead at the µs level and want each profiler in
+  isolation (combined per-round overhead is still well under 10 µs on
+  measured workloads, but if you need certainty, split).
+- The same topology is being measured under several configurations
+  (one `dep_gen` capture amortizes across N swimlane runs).
+- A workload is so large that the dep_gen replay validation gate
+  would dominate the swimlane run time.
+
+When `--deps-json` is omitted **and** the converter cannot find a
+sibling `deps.json` next to `l2_swimlane_records.json`, the trace is
+emitted without flow events (correct, just no arrows) and the
+converter prints:
+
+```text
+Flow events: 0 (no deps.json — re-run dep_gen and pass --deps-json to add arrows)
+```
+
+That's the rerun breadcrumb — keep an eye on it, it's the signal
+that something dropped on the way from dep_gen to converter.
+
+**What you do NOT need to script:**
+
+- Pairing input shape / RNG seed across the two launches — `deps.json`
+  is graph-shaped, not instance-shaped; two runs of the same case
+  with the same `CASES[...]` entry share the same graph by
+  construction.
+- Running dep_gen ahead of every swimlane run — the graph is stable
+  per topology; one capture is enough until the test class changes.
+
 ## 4. Capabilities
 
 What the swimlane shows:
@@ -229,8 +317,11 @@ What the swimlane shows:
   `dispatch_time_us` and `start_time_us` is the AICPU→AICore
   hand-off latency, and the gap between `end_time_us` and
   `finish_time_us` is the FIN-observation latency.
-- **Dependency chains.** `fanout[]` lets Perfetto draw arrows
-  between predecessor and successor tasks.
+- **Dependency chains.** When `deps.json` from a paired or prior
+  `dep_gen` run is available, `swimlane_converter` emits flow events
+  so Perfetto draws arrows between predecessor and successor tasks
+  — see [§3.5](#35-dependency-arrows-from-dep_gen). Without
+  `deps.json` the trace is correct but unarrowed.
 - **Scheduler-loop time decomposition.** Per-iteration AICPU
   phase records show how long the scheduler spent in each of
   its two work phases (complete / dispatch); idle is recovered

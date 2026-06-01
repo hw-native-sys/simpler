@@ -90,6 +90,12 @@ because:
 - The "fanout ⊆ deps" validation gate fires only when both files are
   present.
 
+For perf-sensitive runs where you'd rather measure each profiler in
+isolation, see the **split workflow** described in
+[l2-swimlane-profiling §3.5](l2-swimlane-profiling.md#35-dependency-arrows-from-dep_gen)
+— one dep_gen capture per topology, then any number of swimlane
+runs that the converter joins back to that captured graph.
+
 When `--enable-dep-gen` is on with any other diagnostic flag, an
 `output_prefix` directory must be set (the runtime throws otherwise).
 The standard SceneTest path
