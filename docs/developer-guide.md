@@ -156,6 +156,10 @@ my_example/
 Run via pytest (`pytest examples tests/st --platform <platform>`) or standalone
 (`python test_my_example.py -p <platform>`).
 
+For the kernel-author contract (SPMD execution context, accessor functions,
+and the gotcha around CCE topology intrinsics that breaks ports from native
+CANN code), see [aicore-kernel-programming.md](aicore-kernel-programming.md).
+
 ## Build Workflow
 
 ### Initial setup
