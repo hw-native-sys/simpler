@@ -654,7 +654,7 @@ def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
     import sys  # noqa: PLC0415
     from pathlib import Path as _Path  # noqa: PLC0415
 
-    tools_dir = _Path(__file__).resolve().parents[1] / "tools"
+    tools_dir = _Path(__file__).resolve().parent / "tools"
     sys.path.insert(0, str(tools_dir))
     try:
         import scope_stats_plot  # noqa: PLC0415

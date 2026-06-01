@@ -38,11 +38,11 @@ scope sample. See [§3](#3-output-scope_statsjsonl) for the schema.
 ### Step 3 — Visualize with `scope_stats_plot.py`
 
 ```bash
-python tools/scope_stats_plot.py <output_prefix>/scope_stats.jsonl
+python simpler_setup/tools/scope_stats_plot.py <output_prefix>/scope_stats.jsonl
 # writes <output_prefix>/scope_stats.html
 
 # or send the report elsewhere:
-python tools/scope_stats_plot.py path/to/scope_stats.jsonl --out-dir /tmp/report
+python simpler_setup/tools/scope_stats_plot.py path/to/scope_stats.jsonl --out-dir /tmp/report
 ```
 
 | Argument | Required | Meaning |
