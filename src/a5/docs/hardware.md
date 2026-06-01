@@ -149,3 +149,85 @@ report what user code can address.
 For cross-generation portable code: **always go through ACL or CANN
 ini, never HAL**. HAL's CORE_NUM semantics shift between a3 and a5 in
 ways that have no public documentation.
+
+## CANN AICPU thread dispatch under varying launch budgets
+
+How CANN distributes N AICPU threads across the user pool determines
+whether a device-side affinity gate — the "every launched thread reads
+`sched_getcpu()`, the gate keeps some and drops the rest" pattern used
+in [`src/common/platform/onboard/aicpu/platform_aicpu_affinity.cpp`](../../common/platform/onboard/aicpu/platform_aicpu_affinity.cpp)
+— has real choice over the user-schedulable cpu_ids. Documented here so
+the gate design has empirical ground truth rather than inference.
+
+### What we measured
+
+[`tools/cann-examples/aicpu-thread-spread/`](../../../tools/cann-examples/aicpu-thread-spread/README.md)
+launches N AICPU threads via `rtsLaunchCpuKernel`; each thread reads
+`sched_getcpu()` and writes the result to a GM slot, the host prints
+back the cpu_id histogram. The dispatcher bootstrap path is identical
+to `aicpu-device-query`'s — only the inner SO and the launch
+`aicpu_num` change.
+
+Verified on a5 device 0 of one box (`Ascend950PR_9599`, OCCUPY=0x1f8 →
+6 user cores at cpu_id 3..8):
+
+| `aicpu_num` | cpu_ids hit (sorted, with duplicates) |
+| ----------- | ------------------------------------- |
+| 1 | 8 |
+| 6 | 3 4 5 6 7 8 |
+| 7 | 3 4 5 6 7 8 **8** |
+| 8 | 3 4 5 6 7 **8 8 8** |
+| 14 | 3 3 4 4 5 5 6 6 7 7 **8 8 8 8** |
+
+### Findings
+
+1. **CANN dispatch set = OCCUPY exactly.** Threads only land on
+   user-schedulable cpu_ids. Asking for `N > popcount(OCCUPY)` does
+   **not** reach more cpus.
+2. **Over-launch doubles up on a sink cpu** (cpu_id 8 here, the highest
+   in OCCUPY). The 7th, 8th, ... thread re-uses an already-busy cpu_id
+   rather than expanding the set.
+3. **`launch_count = popcount(OCCUPY)` is the sweet spot.** Fewer
+   means some user cpus get no thread (the gate has no representative
+   on them to inspect); more is wasted (extras share an already-occupied
+   cpu and there is nothing new to learn from them).
+
+### Implication for the affinity gate
+
+Post-hoc device-side selection is **sound** on a5 — but only when the
+runtime launch count equals `popcount(OCCUPY)`. Empirically observed on
+Scenario A (OCCUPY=0x1f8, 6 user cpus):
+
+- `launch < popcount(OCCUPY)`: gate doesn't see every user cpu, so
+  cluster-aware packing can't choose freely across the pool.
+- `launch == popcount(OCCUPY)`: each user cpu has exactly one
+  representative thread; classifier picks the best 5.
+- `launch > popcount(OCCUPY)`: extras over-subscribe a sink cpu (cpu_id
+  8 in the table above). The minimal spread tool tolerates this, but
+  the **production AICPU kernel deadlocks**: contended init paths on
+  shared cpus prevent the gate barrier from ever closing. CANN reports
+  the failure as `aclrtSynchronizeStream rc=507000` (runtime internal)
+  after the launch.
+
+The runtime implements the safe choice: the host's topology probe sets
+`runtime->aicpu_launch_count = popcount(OCCUPY)` after reading the
+device-side OCCUPY, and the host's `rtsLaunchCpuKernel` is called with
+that exact value. `PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 14`
+remains a compile-time **upper bound** (array sizes, headroom), not the
+actual launch count. See:
+
+- `src/a5/platform/onboard/host/aicpu_topology_probe.{h,cpp}` — probe +
+  cluster-first packing
+- `src/a5/platform/onboard/host/device_runner.cpp` — fills
+  `aicpu_allowed_cpus[]` + `aicpu_launch_count` in Runtime, launches
+  with that count
+- `src/common/platform/onboard/aicpu/platform_aicpu_affinity.cpp` —
+  `platform_aicpu_affinity_gate_filter()` (the post-hoc classifier)
+
+The 0x7ffe SKU's dispatch behavior at `aicpu_num=14` has **not yet
+been measured** — once an a5 0x7ffe device runs an a5 onboard test,
+update this section with the observed (cpu_id → thread) spread. If
+launching 14 threads on 0x7ffe does not reach all 14 cpu_ids (i.e.
+CANN has a tighter dispatch policy than OCCUPY implies), that is a
+stronger constraint and `compute_allowed_cpus` would need to factor in
+the actual reachable set.

@@ -31,6 +31,7 @@
 #include <string>
 #include <vector>
 
+#include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "callable_protocol.h"
 #include "utils/elf_build_id.h"
@@ -156,6 +157,61 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     if (prepare_runtime_for_launch(runtime, block_dim, launch_aicpu_num) != 0) return -1;
 
+    // a5-specific: probe the AICPU topology + compute ALLOWED_CPUS for the
+    // filter-style gate (see src/common/platform/onboard/aicpu/
+    // platform_aicpu_affinity.cpp::platform_aicpu_affinity_gate_filter).
+    // Convention: indices 0..n_sched-1 = sched slots, last = orch slot.
+    // n_sched = launch_aicpu_num - 1 (one orch + the rest sched). When
+    // launch_aicpu_num == 1 (init-only path) we leave allowed_cpus empty —
+    // the gate is a no-op for a single thread.
+    {
+        std::vector<pto::a5::AicpuLogicalCpu> user_cpus;
+        std::vector<int32_t> allowed;
+        const int32_t n_orch = 1;
+        const int32_t n_sched = (launch_aicpu_num > 1) ? (launch_aicpu_num - n_orch) : 0;
+        runtime.aicpu_allowed_cpu_count = 0;
+        if (n_sched > 0) {
+            if (!pto::a5::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
+                LOG_ERROR("AICPU topology probe failed; affinity gate will drop all threads");
+                return -1;
+            }
+            if (!pto::a5::compute_allowed_cpus(user_cpus, n_sched, n_orch, allowed)) {
+                LOG_ERROR(
+                    "AICPU topology has %zu user cpus, cannot fit %d sched + %d orch", user_cpus.size(), n_sched, n_orch
+                );
+                return -1;
+            }
+            const size_t cap = sizeof(runtime.aicpu_allowed_cpus) / sizeof(runtime.aicpu_allowed_cpus[0]);
+            if (allowed.size() > cap) {
+                LOG_ERROR("compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
+                return -1;
+            }
+            for (size_t i = 0; i < allowed.size(); ++i)
+                runtime.aicpu_allowed_cpus[i] = allowed[i];
+            runtime.aicpu_allowed_cpu_count = static_cast<int32_t>(allowed.size());
+            // Launch one AICPU thread per OCCUPY-visible user cpu so CANN
+            // spreads exactly across the user pool — over-subscription on a
+            // SKU with fewer user cpus than the compile-time bound deadlocks
+            // the production AICPU kernel. Capped by the compile-time array
+            // sizing in case the SKU exceeds expectation.
+            int32_t launch_n = static_cast<int32_t>(user_cpus.size());
+            if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
+                launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+            }
+            runtime.aicpu_launch_count = launch_n;
+            std::string dump;
+            for (size_t i = 0; i < allowed.size(); ++i) {
+                if (i) dump += ", ";
+                dump += std::to_string(allowed[i]);
+                if (i + 1 == allowed.size()) dump += "(orch)";
+            }
+            LOG_INFO_V0(
+                "AICPU ALLOWED_CPUS = [%s] (n_sched=%d, n_orch=%d, launch=%d, user_cpus=%zu)", dump.c_str(), n_sched,
+                n_orch, launch_n, user_cpus.size()
+            );
+        }
+    }
+
     // Scope guards for cleanup on all exit paths
     auto regs_cleanup = RAIIScopeGuard([this]() {
         if (kernel_args_.args.regs != 0) {
@@ -229,9 +285,15 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
-    rc = launch_aicpu_kernel(
-        stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
-    );
+    // launch_count = popcount(OCCUPY) from the topology probe — one thread
+    // per user-schedulable cpu_id. The filter gate barriers exactly this
+    // many threads (runtime.aicpu_launch_count is read on the device side
+    // by kernel.cpp). Fall back to the caller-requested active count when
+    // the probe was skipped (single-thread init / launch_aicpu_num == 1)
+    // — over-launching to the compile-time bound on that path would
+    // start 14 threads to do a 1-thread job and deadlock the device.
+    int aicpu_launch_n = (runtime.aicpu_launch_count > 0) ? runtime.aicpu_launch_count : launch_aicpu_num;
+    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, aicpu_launch_n);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
         return rc;

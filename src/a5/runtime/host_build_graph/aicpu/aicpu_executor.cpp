@@ -18,6 +18,7 @@
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
@@ -1114,9 +1115,16 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 }
 
 int AicpuExecutor::run(Runtime *runtime) {
-    int thread_idx = thread_idx_++;
+    // Prefer the filter gate's deterministic exec_idx (host-computed
+    // ALLOWED_CPUS slot) over fetch-add arrival order. host_build_graph
+    // has no orch/sched split — every surviving thread runs the same
+    // dispatch loop — but using exec_idx keeps the (cpu_id, thread_idx)
+    // mapping stable across launches, which matters for the
+    // core_assignments_[thread_idx] tables here and for log readability.
+    int affinity_exec_idx = platform_aicpu_affinity_thread_idx();
+    int thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
 
-    LOG_INFO_V0("Thread %d: Start", thread_idx);
+    LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
 
     const int *cur_thread_cores = core_assignments_[thread_idx];
 

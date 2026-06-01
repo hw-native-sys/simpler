@@ -112,9 +112,31 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_scope_stats_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS));
     set_platform_scope_stats_base(k_args->scope_stats_data_base);
 
-    // Affinity gate: drop excess threads before entering runtime
-    if (!platform_aicpu_affinity_gate(runtime->aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
-        LOG_INFO_V0("Thread dropped by cluster affinity");
+    // Filter-style affinity gate (a5). Host probed the topology, computed
+    // ALLOWED_CPUS, and wrote it into runtime->aicpu_allowed_cpus[]. The
+    // gate barriers exactly runtime->aicpu_launch_count threads (= the
+    // count CANN was told to launch, which equals popcount(OCCUPY) — see
+    // src/a5/platform/onboard/host/device_runner.cpp), keeps those whose
+    // sched_getcpu() ∈ allowed_cpus, and exposes the deterministic
+    // exec_idx via platform_aicpu_affinity_thread_idx() — the executor
+    // reads it to assign sched/orch role.
+    //
+    // If the host probe didn't populate the gate inputs (allowed_count or
+    // launch_count is 0) the gate would unconditionally drop every thread
+    // and we'd silently return success without ever calling aicpu_execute.
+    // That's a host-side bug; fail loud so it surfaces instead of
+    // producing nothing at runtime.
+    if (runtime->aicpu_allowed_cpu_count <= 0 || runtime->aicpu_launch_count <= 0) {
+        LOG_ERROR(
+            "AICPU affinity inputs missing: allowed_cpu_count=%d launch_count=%d (host probe must run before exec)",
+            runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+        );
+        return -1;
+    }
+    if (!platform_aicpu_affinity_gate_filter(
+            runtime->aicpu_allowed_cpus, runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+        )) {
+        LOG_INFO_V0("Thread dropped by filter affinity gate");
         return 0;
     }
 

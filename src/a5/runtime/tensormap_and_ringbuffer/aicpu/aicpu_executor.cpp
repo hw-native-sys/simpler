@@ -24,6 +24,7 @@
 
 #include "aicpu/device_time.h"
 #include "aicpu/orch_so_file.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "callable_protocol.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
@@ -211,9 +212,15 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
 int32_t AicpuExecutor::run(Runtime *runtime) {
-    int32_t thread_idx = thread_idx_++;
+    // Prefer the filter gate's deterministic exec_idx so role assignment
+    // (sched 0..N-2 / orch N-1) is driven by host-computed ALLOWED_CPUS,
+    // not arrival order. Fall back to the legacy fetch-add counter on
+    // platforms where the filter gate is inactive (sim sets exec_idx via
+    // its own stub; the fallback covers any path that bypassed the gate).
+    int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
+    int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
     int32_t run_rc = 0;
-    LOG_INFO_V0("Thread %d: Start", thread_idx);
+    LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
 
     // Orchestrator check
     if (thread_idx >= sched_thread_num_) {

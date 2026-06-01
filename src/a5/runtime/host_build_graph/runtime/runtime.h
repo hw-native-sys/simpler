@@ -223,6 +223,28 @@ public:
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
 
+    // Filter-style affinity gate input (a5 onboard). Placed AFTER `tasks`
+    // because AICore reads runtime->tasks[] by offset (see
+    // src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp); inserting
+    // fields before `tasks` shifts that offset and silently produces NaN
+    // outputs in any test that exercises the AICore task-execute path.
+    // Host fills before launch from device-side OCCUPY + DSMI CPU_TOPO via
+    // pto::a5::compute_allowed_cpus. The on-device gate keeps threads whose
+    // sched_getcpu() lands on one of these cpu_ids; exec_idx = position in
+    // this array drives sched/orch role assignment. Indices 0..count-2 are
+    // scheduler slots, index count-1 is the orchestrator slot. Sized to
+    // PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH for headroom — current
+    // policy is 4 sched + 1 orch = 5 active.
+    int32_t aicpu_allowed_cpus[16];
+    int32_t aicpu_allowed_cpu_count;
+    // Actual AICPU thread launch count for this run. Set by the host
+    // topology probe to popcount(OCCUPY) so CANN spreads threads across
+    // every user-schedulable cpu_id (one per cpu, no over-subscription on
+    // the same physical cpu — over-subscription deadlocks the production
+    // AICPU kernel on SKUs with fewer user cpus than the compile-time
+    // PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH bound).
+    int32_t aicpu_launch_count;
+
 private:
     int next_task_id;  // Next available task ID
 

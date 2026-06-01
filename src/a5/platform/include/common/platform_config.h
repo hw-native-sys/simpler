@@ -52,12 +52,39 @@ constexpr int PLATFORM_AIV_CORES_PER_BLOCKDIM = 2;
 constexpr int PLATFORM_MAX_AICPU_THREADS = 7;
 
 /**
- * Maximum AICPU launch threads (physical)
- * Upper bound for the number of AICPU threads that can be launched by Host.
- * Can be larger than PLATFORM_MAX_AICPU_THREADS to allow threads to be dropped
- * from scheduling while still participating in affinity (e.g. 6 launch, 4 active).
+ * Compile-time upper bound on the number of AICPU threads CANN may
+ * start per launch. The actual launch count is runtime-derived:
+ * the host topology probe sets runtime.aicpu_launch_count =
+ * popcount(OCCUPY), and DeviceRunner passes that count (not this
+ * constant) to rtsLaunchCpuKernel.
+ *
+ * The bound exists for the static gate buffers in
+ * src/common/platform/onboard/aicpu/platform_aicpu_affinity.cpp
+ * (s_filter_thread_cpu[MAX_GATE_THREADS] etc.) — keep it ≥ any
+ * runtime aicpu_launch_count we expect to see.
+ *
+ * Two over-subscription failure modes to keep in mind when choosing
+ * the runtime launch count vs this bound:
+ *   1. "Duplicate drop after barrier" — happens when CANN over-fills
+ *      a subset of OCCUPY cpus (duplicates land on the sink cpu).
+ *      The filter gate first barriers all launched threads, then
+ *      classifies cpu_id and drops the duplicates (only the first
+ *      thread to land on each ALLOWED slot survives). Safe.
+ *   2. "Barrier never closes" — happens when launch_count exceeds
+ *      popcount(OCCUPY) on the production AICPU kernel: contended
+ *      init paths on the over-subscribed sink prevent some threads
+ *      from reaching the barrier publish counter, the wait spins
+ *      forever, and CANN reports aclrtSynchronizeStream rc=507000
+ *      after the stream timeout. This is the reason the runtime
+ *      uses popcount(OCCUPY) rather than this constant.
+ *
+ * Current value 14 = worst-case popcount(OCCUPY) on the Ascend950PR
+ * 0x7ffe SKU (7 phys × 2 SMT = 14 user logical cpus). See
+ * src/a5/docs/hardware.md "CANN AICPU thread dispatch" for the
+ * empirical data and src/a5/platform/onboard/host/device_runner.cpp
+ * for where the runtime count is decided.
  */
-constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 7;
+constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 14;
 
 /**
  * AICore op execution timeout (microseconds).

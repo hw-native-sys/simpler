@@ -16,4 +16,38 @@
 // Returns false if this thread should exit (dropped).
 // logical_count: desired active threads (from runtime.aicpu_thread_num)
 // total_launched: actual threads launched (PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)
+//
+// Used by a2a3 (cluster-majority heuristic) and a5 sim. a5 onboard uses the
+// _filter variant below instead.
 bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched);
+
+// Filter-style affinity gate. Every launched thread reads sched_getcpu(),
+// barriers, and the gate keeps exactly those whose cpu_id appears in
+// `allowed_cpus[0..allowed_count-1]`. The deterministic survivor index
+// (its position in `allowed_cpus`) is exposed through
+// platform_aicpu_affinity_thread_idx() and drives role assignment
+// downstream (sched / orch).
+//
+// Convention used by a5: indices 0..allowed_count-2 are scheduler slots,
+// index allowed_count-1 is the orchestrator slot. The host builds
+// `allowed_cpus` from device-side OCCUPY + DSMI CPU_TOPO via
+// `pto::a5::compute_allowed_cpus` (see
+// src/a5/platform/onboard/host/aicpu_topology_probe.h) and passes the
+// array down through the Runtime struct.
+//
+// total_launched is the number of AICPU threads CANN actually launched
+// (PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH on the target arch); the
+// gate stops exactly that many threads on its barrier and lets only the
+// allowed_count survivors continue.
+bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched);
+
+// Deterministic position (0..allowed_count-1) of the calling thread in the
+// `allowed_cpus[]` array that was passed to the most recent
+// platform_aicpu_affinity_gate_filter() invocation on this thread.
+// Returns -1 if this thread was dropped or did not go through the filter
+// gate.
+//
+// Stable across the lifetime of the surviving thread — safe to call from
+// aicpu_executor as the per-launch role identifier (sched 0..N-2 / orch
+// N-1).
+int32_t platform_aicpu_affinity_thread_idx();

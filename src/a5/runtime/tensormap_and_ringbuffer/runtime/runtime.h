@@ -200,6 +200,21 @@ public:
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
+    // Filter-style affinity gate input (a5 onboard). Host fills before
+    // launch from device-side OCCUPY + DSMI CPU_TOPO via
+    // pto::a5::compute_allowed_cpus. The on-device gate keeps threads whose
+    // sched_getcpu() lands on one of these cpu_ids; exec_idx = position in
+    // this array drives sched/orch role assignment. Indices 0..count-2 are
+    // scheduler slots, index count-1 is the orchestrator slot. Sized to
+    // PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH for headroom — current
+    // policy is 4 sched + 1 orch = 5 active.
+    int32_t aicpu_allowed_cpus[16];
+    int32_t aicpu_allowed_cpu_count;
+    // Actual AICPU thread launch count for this run. Host sets from
+    // popcount(OCCUPY) via the topology probe. See the matching field in
+    // src/a5/runtime/host_build_graph/runtime/runtime.h for rationale.
+    int32_t aicpu_launch_count;
+
     // Ring buffer size overrides (0 = use compile-time defaults)
     uint64_t task_window_size;
     uint64_t heap_size;
