@@ -451,6 +451,9 @@ struct alignas(64) PTO2SpscQueue {
     PTO2TaskSlotState **buffer_c_{nullptr};
     uint64_t mask_c_{0};
 
+    // Padding to exactly 4 cache lines
+    char padding[64 - sizeof(std::atomic<uint64_t>) - sizeof(PTO2TaskSlotState **) - sizeof(uint64_t)];
+
     // Reserve the backing buffer region on the supplied arena. Returns the
     // region offset, to be passed to init_from_layout() after the arena is
     // committed. Cache-line aligned: the buffer is shared between the
@@ -488,7 +491,10 @@ struct alignas(64) PTO2SpscQueue {
     }
 
     // Arena owns the buffer; here we only forget our pointer.
-    void destroy() { buffer_p_ = nullptr; buffer_c_ = nullptr; }
+    void destroy() {
+        buffer_p_ = nullptr;
+        buffer_c_ = nullptr;
+    }
 
     // Push one item (producer only). Returns false if queue is full.
     // Full condition: next_h - tail > mask_ (i.e. > capacity-1), so the
