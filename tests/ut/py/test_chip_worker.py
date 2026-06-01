@@ -24,7 +24,7 @@ class TestCallConfig:
         assert config.block_dim == 0
         assert config.aicpu_thread_num == 3
         assert config.enable_l2_swimlane == 0
-        assert config.enable_dump_tensor is False
+        assert config.enable_dump_tensor == 0
         assert config.enable_pmu == 0
         assert config.enable_dep_gen is False
 
@@ -43,6 +43,14 @@ class TestCallConfig:
         assert config.enable_l2_swimlane == 2
         config.enable_l2_swimlane = False
         assert config.enable_l2_swimlane == 0
+        # enable_dump_tensor is likewise a level (0=off, 1=partial, 2=full):
+        # `True` maps to level 1 (partial), explicit ints select the level.
+        config.enable_dump_tensor = True
+        assert config.enable_dump_tensor == 1
+        config.enable_dump_tensor = 2
+        assert config.enable_dump_tensor == 2
+        config.enable_dump_tensor = False
+        assert config.enable_dump_tensor == 0
 
     def test_diagnostics_subfeatures_are_parallel(self):
         # Guard against drift: the four diagnostics sub-features under the
@@ -53,12 +61,12 @@ class TestCallConfig:
         config.enable_pmu = 2
         config.enable_dep_gen = True
         assert config.enable_l2_swimlane == 4
-        assert config.enable_dump_tensor is True
+        assert config.enable_dump_tensor == 1
         assert config.enable_pmu == 2
         assert config.enable_dep_gen is True
         r = repr(config)
         assert "enable_l2_swimlane=4" in r
-        assert "enable_dump_tensor=True" in r
+        assert "enable_dump_tensor=1" in r
         assert "enable_pmu=2" in r
         assert "enable_dep_gen=True" in r
 

@@ -387,7 +387,7 @@ int run_prepared(
         }
 
         runner->set_l2_swimlane_enabled(enable_l2_swimlane);
-        runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
+        runner->set_dump_tensor_enabled(enable_dump_tensor);
         runner->set_pmu_enabled(enable_pmu);
         // Virtual: a2a3 wires through to its enable_dep_gen_; a5 is a no-op
         // (dep_gen isn't implemented on a5 today).

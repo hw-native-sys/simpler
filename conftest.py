@@ -146,7 +146,15 @@ def pytest_addoption(parser):
         help="Enable L2 swimlane. Bare flag=level 4 (full). "
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
-    parser.addoption("--dump-tensor", action="store_true", default=False, help="Dump per-task tensor I/O at runtime")
+    parser.addoption(
+        "--dump-tensor",
+        nargs="?",
+        const=1,
+        type=int,
+        default=0,
+        help="Dump per-task tensor I/O at runtime. Level: 0=off, 1=partial (only "
+        "tasks marked via Arg::dump(...), default when given without a value), 2=full (all tasks).",
+    )
     parser.addoption(
         "--enable-dep-gen",
         action="store_true",

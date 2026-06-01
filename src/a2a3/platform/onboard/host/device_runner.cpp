@@ -517,7 +517,9 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, register_cb, free_cb, output_prefix_);
+    int rc = dump_collector_.initialize(
+        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, output_prefix_, dump_tensor_level_
+    );
     if (rc != 0) {
         return rc;
     }

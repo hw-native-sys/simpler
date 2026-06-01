@@ -224,6 +224,15 @@ struct DumpReadyQueueEntry {
  * - Queue empty: head == tail
  * - Queue full: (tail + 1) % capacity == head
  */
+
+// Tensor-dump level. Carried in DumpDataHeader so the
+// AICPU latches the mode in dump_tensor_init() before any task is dispatched.
+enum class DumpTensorLevel : uint32_t {
+    OFF = 0,      // no dump
+    PARTIAL = 1,  // only tasks marked with Arg::dump(...)
+    FULL = 2,     // every task's tensor I/O
+};
+
 struct DumpDataHeader {
     // Per-thread ready queues
     DumpReadyQueueEntry queues[PLATFORM_MAX_AICPU_THREADS][PLATFORM_DUMP_READYQUEUE_SIZE];
@@ -235,7 +244,7 @@ struct DumpDataHeader {
     uint32_t records_per_buffer;
     uint64_t arena_size_per_thread;
     uint32_t magic;
-    uint32_t pad;
+    uint32_t dump_tensor_level;  // DumpTensorLevel: 0=off, 1=partial, 2=full
 } __attribute__((aligned(64)));
 
 // =============================================================================

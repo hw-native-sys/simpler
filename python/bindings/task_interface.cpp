@@ -602,10 +602,18 @@ NB_MODULE(_task_interface, m) {
         .def_prop_rw(
             "enable_dump_tensor",
             [](const CallConfig &c) {
-                return static_cast<bool>(c.enable_dump_tensor);
+                return c.enable_dump_tensor;
             },
-            [](CallConfig &c, bool v) {
-                c.enable_dump_tensor = v ? 1 : 0;
+            // Accept either an int dump level (0=off, 1=partial, 2=full) or a
+            // Python bool. `True` maps to level 1 (partial) — the default when
+            // --dump-tensor is passed without a value; `False` maps to 0.
+            [](CallConfig &c, nb::object v) {
+                if (PyBool_Check(v.ptr())) {
+                    c.enable_dump_tensor = nb::cast<bool>(v) ? 1 : 0;
+                } else {
+                    int level = nb::cast<int>(v);
+                    c.enable_dump_tensor = (level < 0) ? 0 : (level > 2) ? 2 : level;
+                }
             }
         )
         .def_rw("enable_pmu", &CallConfig::enable_pmu)
@@ -647,8 +655,8 @@ NB_MODULE(_task_interface, m) {
             std::ostringstream os;
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
                << ", enable_l2_swimlane=" << self.enable_l2_swimlane
-               << ", enable_dump_tensor=" << (self.enable_dump_tensor ? "True" : "False")
-               << ", enable_pmu=" << self.enable_pmu << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
+               << ", enable_dump_tensor=" << self.enable_dump_tensor << ", enable_pmu=" << self.enable_pmu
+               << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
                << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
             if (self.output_prefix_set()) {
                 os << ", output_prefix='" << self.output_prefix << "'";

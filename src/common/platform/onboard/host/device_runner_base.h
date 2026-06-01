@@ -381,7 +381,10 @@ public:
         l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
         enable_l2_swimlane_ = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
     }
-    void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
+    void set_dump_tensor_enabled(int level) {
+        dump_tensor_level_ = static_cast<DumpTensorLevel>(level);
+        enable_dump_tensor_ = (dump_tensor_level_ != DumpTensorLevel::OFF);
+    }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
@@ -758,6 +761,7 @@ protected:
     // `run()`, read inside `run()` and its helpers.
     bool enable_l2_swimlane_{false};
     bool enable_dump_tensor_{false};
+    DumpTensorLevel dump_tensor_level_{DumpTensorLevel::OFF};  // resolved from set_dump_tensor_enabled()
     bool enable_pmu_{false};
     bool enable_scope_stats_{false};
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()

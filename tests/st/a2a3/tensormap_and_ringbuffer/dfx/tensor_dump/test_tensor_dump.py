@@ -32,11 +32,25 @@ KERNELS_BASE = "../../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestTensorDump(SceneTestCase):
-    """Vector example with --dump-tensor, then assert tensor_dump/."""
+    """tensor_dump capture smoke, level-aware on the ``--dump-tensor`` level.
+
+    Uses ``partial_dump_orch`` (5 tasks; two carry ``dump(...)`` markers) so a
+    single orchestration exercises both modes:
+
+    - ``--dump-tensor 1`` (partial): only the two marked tasks are captured —
+      task ``0x..02`` via ``dump(d, inter_ci)`` (tensor granularity: args 0+2,
+      input ``e`` excluded), task ``0x..03`` via no-arg ``dump()`` (task
+      granularity: all three args). Mode is latched host-side before dispatch,
+      so it is race-free regardless of submission order.
+    - ``--dump-tensor 2`` (full): markers are ignored, every task is dumped.
+
+    The dump level comes straight from the CLI ``--dump-tensor`` value
+    (no per-case override).
+    """
 
     CALLABLE = {
         "orchestration": {
-            "source": f"{KERNELS_BASE}/orchestration/example_orchestration.cpp",
+            "source": "kernels/orchestration/partial_dump_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.OUT],
         },
@@ -84,17 +98,12 @@ class TestTensorDump(SceneTestCase):
 
     def test_run(self, st_platform, st_worker, request):
         super().test_run(st_platform, st_worker, request)
-        if not request.config.getoption("--dump-tensor", default=False):
+        level = int(request.config.getoption("--dump-tensor", default=0))
+        if not level:
             return
-        for case in self.CASES:
-            if st_platform in case["platforms"]:
-                self._validate_dump_artifact(case)
-
-    def _validate_dump_artifact(self, case):
-        safe_label = _sanitize_for_filename(f"TestTensorDump_{case['name']}")
+        safe_label = _sanitize_for_filename("TestTensorDump_default")
         matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
-        if not matches:
-            return
+        assert matches, "tensor dump output directory missing"
         dump_dir = matches[-1] / "tensor_dump"
         assert dump_dir.is_dir(), f"tensor_dump/ missing under {matches[-1]} — dump capture failed?"
         manifest = dump_dir / "tensor_dump.json"
@@ -105,22 +114,38 @@ class TestTensorDump(SceneTestCase):
         assert bin_name, f"manifest missing bin_file field: {data}"
         bin_path = dump_dir / bin_name
         assert bin_path.exists(), f"manifest names bin_file={bin_name!r} but {bin_path} not found"
-        # Tensors list is keyed by run / task / arg — exact shape varies with
-        # the collector's chosen schema across runtimes, but we know
-        # vector_example reads/writes ≥1 tensor and the manifest can't be empty
-        # if anything was captured. Robust to schema add/remove of new fields.
         tensors = data.get("tensors", [])
         assert tensors, f"tensor_dump.json has no entries: {data}"
         assert bin_path.stat().st_size > 0, "tensor_dump.bin is empty"
+
+        # Unified manifest (#792): tensors and scalar args share one
+        # tensor_dump.json keyed by a "kind" field; no separate args files.
         assert not (dump_dir / "args_dump.json").exists(), "args_dump.json should not be emitted"
         assert not (dump_dir / "kernel_args_dump.json").exists(), "kernel_args_dump.json should not be emitted"
-
         assert all("kind" in t for t in tensors), tensors
-
         scalar_entries = [t for t in tensors if t.get("kind") == "scalar"]
         assert all(t.get("stage") == "before_dispatch" for t in scalar_entries), scalar_entries
         assert all(t.get("bin_size") == 0 for t in scalar_entries), scalar_entries
         assert all("value" in t for t in scalar_entries), scalar_entries
+
+        # Level-aware checks operate on the tensor entries.
+        tensor_entries = [t for t in tensors if t.get("kind") == "tensor"]
+        task_ids = {t["task_id"] for t in tensor_entries}
+        if level == 1:
+            # Partial: only the two dump()-marked tasks, race-free (host-latched).
+            assert len(tensor_entries) == 5, f"partial expected 5 tensor entries, got {len(tensor_entries)}"
+            assert task_ids == {"0x0000000100000002", "0x0000000100000003"}
+            # Tensor granularity: dump(d, inter_ci) captured args 0 + 2, not arg 1 (e).
+            t02 = sorted(t["arg_index"] for t in tensor_entries if t["task_id"] == "0x0000000100000002")
+            assert t02 == [0, 2]
+            # Task granularity: dump() captured all three tensor args.
+            t03 = sorted(t["arg_index"] for t in tensor_entries if t["task_id"] == "0x0000000100000003")
+            assert t03 == [0, 1, 2]
+            # Selective mode also confines scalar-arg dumps to the marked tasks.
+            assert {t["task_id"] for t in scalar_entries} <= task_ids, scalar_entries
+        else:
+            # Full (level 2): markers ignored — every one of the 5 tasks is dumped.
+            assert len(task_ids) >= 5, f"full dump should cover all 5 tasks, got {sorted(task_ids)}"
 
         # ---- Tool smoke: dump_viewer ----
         # Exit-code-only check; the no-filter default lists every captured
@@ -131,47 +156,6 @@ class TestTensorDump(SceneTestCase):
             check=True,
             timeout=60,
         )
-
-
-@scene_test(level=2, runtime="tensormap_and_ringbuffer")
-class TestTensorDumpPartial(SceneTestCase):
-    """Vector example with one task explicitly selected for tensor dump."""
-
-    CALLABLE = {
-        "orchestration": {
-            "source": "kernels/orchestration/partial_dump_orch.cpp",
-            "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN, D.IN, D.OUT],
-        },
-        "incores": TestTensorDump.CALLABLE["incores"],
-    }
-
-    CASES = TestTensorDump.CASES
-
-    def generate_args(self, params):
-        return TestTensorDump.generate_args(self, params)
-
-    def compute_golden(self, args, params):
-        return TestTensorDump.compute_golden(self, args, params)
-
-    def test_run(self, st_platform, st_worker, request):
-        super().test_run(st_platform, st_worker, request)
-        if not request.config.getoption("--dump-tensor", default=False):
-            return
-        safe_label = _sanitize_for_filename("TestTensorDumpPartial_default")
-        matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
-        assert matches, "partial tensor dump output directory missing"
-        dump_dir = matches[-1] / "tensor_dump"
-        manifest = dump_dir / "tensor_dump.json"
-        assert manifest.exists(), f"tensor_dump.json missing under {dump_dir}"
-        with manifest.open() as f:
-            data = json.load(f)
-        tensors = data.get("tensors", [])
-        assert len(tensors) == 3
-        assert data.get("before_dispatch") == 2
-        assert data.get("after_completion") == 1
-        assert {t["task_id"] for t in tensors} == {"0x0000000100000003"}
-        assert [t["role"] for t in tensors] == ["input", "input", "output"]
 
 
 if __name__ == "__main__":

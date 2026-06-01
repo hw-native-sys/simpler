@@ -559,7 +559,8 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.aicpu_thread_num;
 
     int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
+        num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_,
+        dump_tensor_level_
     );
     if (rc != 0) {
         return rc;

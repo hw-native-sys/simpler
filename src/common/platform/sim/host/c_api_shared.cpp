@@ -342,7 +342,7 @@ int run_prepared(
         }
 
         runner->set_l2_swimlane_enabled(enable_l2_swimlane);
-        runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
+        runner->set_dump_tensor_enabled(enable_dump_tensor);
         runner->set_pmu_enabled(enable_pmu);
         runner->set_dep_gen_enabled(enable_dep_gen != 0);
         runner->set_scope_stats_enabled(enable_scope_stats != 0);

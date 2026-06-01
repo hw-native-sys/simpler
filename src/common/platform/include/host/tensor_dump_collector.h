@@ -199,11 +199,14 @@ public:
      * @param free_cb           Memory free callback
      * @param user_data         Opaque pointer forwarded to callbacks
      * @param output_prefix     Per-task directory; tensor_dump/ subdir lands here
+     * @param dump_tensor_level OFF / PARTIAL (only Arg::dump()-marked tasks) /
+     *                          FULL. Written to DumpDataHeader so the AICPU
+     *                          latches the mode before any dispatch.
      * @return 0 on success, error code on failure
      */
     int initialize(
         int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
-        const DumpFreeCallback &free_cb, const std::string &output_prefix
+        const DumpFreeCallback &free_cb, const std::string &output_prefix, DumpTensorLevel dump_tensor_level
     );
 
     /**

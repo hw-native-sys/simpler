@@ -47,7 +47,7 @@ TensorDumpCollector::~TensorDumpCollector() { stop(); }
 
 int TensorDumpCollector::initialize(
     int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
-    const DumpFreeCallback &free_cb, const std::string &output_prefix
+    const DumpFreeCallback &free_cb, const std::string &output_prefix, DumpTensorLevel dump_tensor_level
 ) {
     if (shm_host_ != nullptr) {
         LOG_ERROR("TensorDumpCollector already initialized");
@@ -88,6 +88,7 @@ int TensorDumpCollector::initialize(
     header->magic = TENSOR_DUMP_MAGIC;
     header->num_dump_threads = static_cast<uint32_t>(num_dump_threads);
     header->records_per_buffer = PLATFORM_DUMP_RECORDS_PER_BUFFER;
+    header->dump_tensor_level = static_cast<uint32_t>(dump_tensor_level);
 
     uint64_t arena_size = calc_dump_arena_size();
     header->arena_size_per_thread = arena_size;

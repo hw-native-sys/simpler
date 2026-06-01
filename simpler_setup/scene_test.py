@@ -1164,7 +1164,7 @@ class SceneTestCase:
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
         enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=0)
-        enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
+        enable_dump_tensor = request.config.getoption("--dump-tensor", default=0)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
         enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)
@@ -1174,7 +1174,7 @@ class SceneTestCase:
                 enable_l2_swimlane = 0
             if enable_dump_tensor:
                 logger.warning("Dump tensor disabled: --rounds > 1")
-                enable_dump_tensor = False
+                enable_dump_tensor = 0
             if enable_pmu:
                 logger.warning("PMU disabled: --rounds > 1")
                 enable_pmu = 0
@@ -1282,7 +1282,15 @@ class SceneTestCase:
             help="Enable L2 swimlane. Bare flag=level 4 (full). "
             "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
         )
-        parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
+        parser.add_argument(
+            "--dump-tensor",
+            nargs="?",
+            const=1,
+            type=int,
+            default=0,
+            help="Dump per-task tensor I/O at runtime. Level: 0=off, 1=partial (only "
+            "tasks marked via Arg::dump(...), default when given without a value), 2=full (all tasks).",
+        )
         parser.add_argument(
             "--enable-dep-gen",
             action="store_true",

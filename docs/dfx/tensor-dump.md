@@ -32,43 +32,58 @@ saw, without the timing distortion of inline printing.
 - **Cross-architecture.** Same flags and on-disk layout family on
   `a2a3` and `a5`. Both runtimes are wired through.
 
-Enable dump capture in one line:
+Enable in one line (`2` = full dump, every task):
 
 ```bash
-python tests/st/<case>/test_<name>.py -p a5sim --dump-tensor
+python tests/st/<case>/test_<name>.py -p a5sim --dump-tensor 2
 ```
 
 ## 3. How to Use
 
 ### 3.1 Enable Tensor Dump
 
+`--dump-tensor` takes an optional **level**:
+
+| Level | Meaning |
+| ----- | ------- |
+| `0` (or flag absent) | off — zero overhead |
+| `1` (bare `--dump-tensor`) | **partial** — only tasks marked with `Arg::dump(...)` (see §3.2) |
+| `2` (`--dump-tensor 2`) | **full** — every task's tensor inputs and outputs |
+
 ```bash
 # Standalone runner
-python tests/st/<case>/test_<name>.py -p a5sim --dump-tensor
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --dump-tensor
+python tests/st/<case>/test_<name>.py -p a5sim --dump-tensor 2     # full
+python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --dump-tensor   # partial (level 1)
 
 # pytest
-pytest tests/st/<case> --platform a5sim --dump-tensor
-pytest examples/a5/host_build_graph/vector_example --platform a5sim --dump-tensor
+pytest tests/st/<case> --platform a5sim --dump-tensor 2
+pytest examples/a5/host_build_graph/vector_example --platform a5sim --dump-tensor 2
 ```
 
-`--dump-tensor` flips `CallConfig::enable_dump_tensor`. The host
+The level sets `CallConfig::enable_dump_tensor` (0/1/2). The host then
 allocates dump storage, publishes its base address through
 `kernel_args.dump_data_base`, and sets `PROFILING_FLAG_DUMP_TENSOR`
-in the worker profiling bitmask. AICPU reads the storage base via
-`set_platform_dump_base()` and the enable state via
-`set_dump_tensor_enabled(...)`.
+(levels 1 and 2) in each worker handshake's `enable_profiling_flag` for
+the enable/disable decision. The **partial-vs-full** distinction is
+carried as a `DumpTensorLevel` in the dump shared-memory header
+(`DumpDataHeader::dump_tensor_level`, host-written before launch) rather
+than in the profiling-flag bitmask. The on-device AICPU reads the storage base
+via `set_platform_dump_base()`, the enable bit via
+`set_dump_tensor_enabled(GET_PROFILING_FLAG(...))`, and latches selective
+mode in `dump_tensor_init()` from the header level (`PARTIAL` →
+selective). Because the level is decided host-side **before any task is
+dispatched**, it is latched up front — there is no dependence on task
+submission order. AICore executors read the same `PROFILING_FLAG_DUMP_TENSOR`
+bit to insert a `pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
+`AFTER_COMPLETION` snapshots see the kernel's final writes.
 
-### 3.2 Select Specific Task Tensors
+### 3.2 Partial Dump — Select Specific Tasks / Tensors
 
-By default, `--dump-tensor` dumps every task's tensor inputs and
-outputs. Device-side orchestration can opt into tensor-argument selection
-by enabling selective mode at the beginning of the orchestration and
-marking the tensor arguments on each `Arg` before submission:
+Partial dump (level 1) captures only the tasks whose `Arg` is marked
+with `dump(...)`; every unmarked task is skipped. Mark the arguments on
+the relevant `Arg` before submission:
 
 ```cpp
-enable_dump_tensor_selective();
-
 Arg args;
 args.add_input(x);
 args.add_input(y);
@@ -87,14 +102,33 @@ selected tensor is captured:
 - output tensors are dumped after completion.
 - inout tensors follow the existing inout dump behavior.
 
-With `enable_dump_tensor_selective()`, tasks without any `dump(...)` marker
-are skipped during AICPU collection. For marked tasks, only the selected
-tensor arguments are dumped. Without `enable_dump_tensor_selective()`, the
-legacy full-dump behavior is unchanged even if an `Arg` carries a
-`dump(...)` marker.
+Selective dump comes at two granularities, both expressed with the same
+`dump(...)` marker:
 
-`--dump-tensor` remains the top-level enable switch; `Arg::dump(...)`
-only narrows what gets recorded after tensor dump is enabled.
+- **Tensor granularity** — `dump(x, y, z)` selects specific tensor
+  arguments of the task (the example above).
+- **Task granularity** — `dump()` with no arguments selects the whole
+  task (every tensor argument on the `Arg`), without enumerating them:
+
+  ```cpp
+  Arg args;
+  args.add_input(x);
+  args.add_input(y);
+  args.add_output(z);
+  args.dump();        // whole task: every tensor arg on this Arg
+  rt_submit_aiv_task(FUNC_ADD, args);
+  ```
+
+Partial vs full is chosen by the **dump level** (§3.1), latched host-side
+before any dispatch — not inferred from the markers, so it never depends
+on task submission order. At level 1, tasks without a marker are skipped
+and marked tasks dump only their selected arguments. At level 2, the
+markers are ignored and every task's tensors are dumped. With no
+`--dump-tensor` (level 0) dump is off entirely.
+
+If you run at level 1 but place no `dump(...)` markers anywhere, the
+manifest is empty — that is the deliberate "only what I marked" contract.
+Use `--dump-tensor 2` when you want everything.
 
 ### 3.3 Output
 
@@ -269,7 +303,8 @@ DumpDataHeader                                  (host init, AICPU reads)
 ├── queue_heads / queue_tails (per-thread)
 ├── num_dump_threads
 ├── records_per_buffer
-└── magic = 0x44554D50 ("DUMP")
+├── magic = 0x44554D50 ("DUMP")
+└── dump_tensor_level  (DumpTensorLevel: 0=off, 1=partial, 2=full; AICPU latches in dump_tensor_init)
 
 DumpBufferState[num_dump_threads]               (per-thread)
 ├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
@@ -750,11 +785,16 @@ Per-thread arena =
 ## 8. FAQ / Debug Guide
 
 **No `tensor_dump/` directory in the output.** Check that
-`--dump-tensor` was passed; without it the host does not allocate
-dump storage. Verify the run wrote to the expected
+`--dump-tensor` was passed; without it (level 0) the host does not
+allocate dump storage. Verify the run wrote to the expected
 `<output_prefix>` and that the kernel actually executed (a kernel
 that exits early before any task dispatch produces an empty
 manifest).
+
+**`tensor_dump/` exists but the manifest captured nothing.** You are
+most likely at the default partial level (`--dump-tensor` = level 1)
+with no `Arg::dump(...)` markers in the orchestration, so every task is
+skipped. Add markers (§3.2), or pass `--dump-tensor 2` for a full dump.
 
 **Manifest has tasks but `tensors[]` is empty.** AICPU received a
 task whose `TensorInfo` was missing or inconsistent. Look for a

@@ -439,6 +439,12 @@ void dump_tensor_init(int num_dump_threads) {
 
     s_dump_header = get_dump_header(dump_base);
 
+    // Latch dump mode from the host-written header before any task is dumped.
+    // PARTIAL → selective (only Arg::dump()-marked tasks); FULL → every task.
+    set_dump_tensor_selective_mode(
+        static_cast<DumpTensorLevel>(s_dump_header->dump_tensor_level) == DumpTensorLevel::PARTIAL
+    );
+
     LOG_INFO_V0("Initializing tensor dump for %d threads", num_dump_threads);
 
     // Pop initial metadata buffer from free_queue for each thread
