@@ -439,13 +439,17 @@ struct alignas(64) PTO2SpscQueue {
     alignas(64) std::atomic<uint64_t> head_{0};
     alignas(64) uint64_t tail_cached_{0};
 
+    // --- Local Copy of mask and data ptr (immutable after init) ---
+    PTO2TaskSlotState **buffer_p_{nullptr};
+    uint64_t mask_p_{0};
+
     // --- Consumer cache lines (scheduler thread 0) ---
     alignas(64) std::atomic<uint64_t> tail_{0};
     alignas(64) uint64_t head_cached_{0};
 
-    // --- Shared (immutable after init) ---
-    PTO2TaskSlotState **buffer_{nullptr};
-    uint64_t mask_{0};
+    // --- Local Copy of mask and data ptr (immutable after init) ---
+    PTO2TaskSlotState **buffer_c_{nullptr};
+    uint64_t mask_c_{0};
 
     // Reserve the backing buffer region on the supplied arena. Returns the
     // region offset, to be passed to init_from_layout() after the arena is
@@ -467,7 +471,8 @@ struct alignas(64) PTO2SpscQueue {
         // observe nullptr.
         for (uint64_t i = 0; i < capacity; i++)
             buf[i] = nullptr;
-        mask_ = capacity - 1;
+        mask_p_ = capacity - 1;
+        mask_c_ = mask_p_;
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
         tail_cached_ = 0;
@@ -478,11 +483,12 @@ struct alignas(64) PTO2SpscQueue {
     // Wire the arena-internal pointer. Called by both host (with host arena)
     // and AICPU (with device arena attached to the prebuilt image).
     void wire_arena_pointers(DeviceArena &arena, size_t buffer_off) {
-        buffer_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
+        buffer_p_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
+        buffer_c_ = buffer_p_;
     }
 
     // Arena owns the buffer; here we only forget our pointer.
-    void destroy() { buffer_ = nullptr; }
+    void destroy() { buffer_p_ = nullptr; buffer_c_ = nullptr; }
 
     // Push one item (producer only). Returns false if queue is full.
     // Full condition: next_h - tail > mask_ (i.e. > capacity-1), so the
@@ -493,13 +499,13 @@ struct alignas(64) PTO2SpscQueue {
     bool push(PTO2TaskSlotState *item) {
         uint64_t h = head_.load(std::memory_order_relaxed);
         uint64_t next_h = h + 1;
-        if (next_h - tail_cached_ > mask_) {
+        if (next_h - tail_cached_ > mask_p_) {
             tail_cached_ = tail_.load(std::memory_order_acquire);
-            if (next_h - tail_cached_ > mask_) {
+            if (next_h - tail_cached_ > mask_p_) {
                 return false;
             }
         }
-        buffer_[h & mask_] = item;
+        buffer_p_[h & mask_p_] = item;
         head_.store(next_h, std::memory_order_release);
         return true;
     }
@@ -515,7 +521,7 @@ struct alignas(64) PTO2SpscQueue {
         }
         int count = (avail < static_cast<uint64_t>(max_count)) ? static_cast<int>(avail) : max_count;
         for (int i = 0; i < count; i++) {
-            out[i] = buffer_[(t + i) & mask_];
+            out[i] = buffer_c_[(t + i) & mask_c_];
         }
         tail_.store(t + count, std::memory_order_release);
         return count;
