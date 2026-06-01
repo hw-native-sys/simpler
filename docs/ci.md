@@ -70,7 +70,7 @@ on a 4-vCPU runner — so the scope is parallelism-limited per sanitizer:
   suppressions file is a follow-up).
 
 Both sanitizer jobs gate (no `continue-on-error`). Not a PR gate; see
-[testing.md](testing.md#sanitizer-builds-asan--tsan).
+[sanitizers.md](sanitizers.md) for the design + usage.
 
 ### Parallel ST runs on hardware
 
