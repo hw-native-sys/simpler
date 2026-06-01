@@ -188,9 +188,8 @@ inline void AicpuExecutor::resolve_task_dependencies(
             int tensor_buffer_count =
                 collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
             dump_tensors_for_task(
-                thread_idx, static_cast<uint64_t>(task->task_id), 0, task->num_args, task->func_id, *callable,
-                tensor_info, tensor_info_count, tensor_buffer_addrs, tensor_buffer_count,
-                TensorDumpStage::AFTER_COMPLETION
+                thread_idx, static_cast<uint64_t>(task->task_id), task->num_args, *callable, tensor_info,
+                tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::AFTER_COMPLETION
             );
         }
     }
@@ -275,9 +274,8 @@ inline bool AicpuExecutor::try_dispatch_task(
                 int tensor_buffer_count =
                     collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
                 dump_tensors_for_task(
-                    thread_idx, static_cast<uint64_t>(task_id), 0, task->num_args, task->func_id, *callable,
-                    tensor_info, tensor_info_count, tensor_buffer_addrs, tensor_buffer_count,
-                    TensorDumpStage::BEFORE_DISPATCH
+                    thread_idx, static_cast<uint64_t>(task_id), task->num_args, *callable, tensor_info,
+                    tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::BEFORE_DISPATCH
                 );
             }
         }

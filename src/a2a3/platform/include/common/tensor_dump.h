@@ -71,6 +71,11 @@ enum class TensorDumpStage : uint8_t {
     AFTER_COMPLETION = 1,
 };
 
+enum class TensorDumpKind : uint8_t {
+    TENSOR = 0,
+    SCALAR = 1,
+};
+
 using TensorDumpArgMask = uint64_t;
 
 // Bitmask stored in the platform-owned mask pool when orchestration selects
@@ -90,31 +95,30 @@ constexpr uint32_t TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK = TENSOR_DUMP_MASK_PO
  * Per-tensor metadata + payload reference.
  *
  * Cache line 1 (64B): identifiers, payload location, compact scalar metadata
- * Cache line 2 (64B): logical/source layout arrays
+ * Cache line 2 (64B): strides and shapes
  */
 struct alignas(64) TensorDumpRecord {
     // === Cache line 1 (64B) ===
     uint64_t task_id;         // PTO2 encoding or plain task index
-    uint8_t subtask_id;       // PTO2SubtaskSlot raw value (AIC=0, AIV0=1, AIV1=2)
     uint8_t role;             // TensorDumpRole (formal callable signature)
     uint8_t stage;            // TensorDumpStage (before/after execution)
     uint8_t ndims;            // Number of dimensions
-    uint32_t func_id;         // Kernel function identifier
-    uint32_t arg_index;       // Position in PTO2TaskPayload::tensors[]
+    uint32_t arg_index;       // Position in the callable signature
     uint8_t dtype;            // DataType raw enum value
     uint8_t truncated;        // 1 if payload was truncated (tensor > arena capacity)
     uint8_t is_contiguous;    // 1 when source view is already PyTorch-contiguous
     uint8_t pad0_align;       // Explicit alignment before 64-bit payload offsets
     uint64_t payload_offset;  // Monotonic byte offset into thread arena
     uint64_t payload_size;    // Bytes actually copied (may be < full tensor bytes)
-    uint8_t pad0[24];         // Preserve 64B cache-line layout
+    uint64_t scalar_value;    // Valid when kind == TensorDumpKind::SCALAR
+    uint8_t kind;             // TensorDumpKind
+    uint8_t pad0[15];         // Preserve 64B cache-line layout + scalar_value + kind
 
     // === Cache line 2 (64B) — strided view descriptor ===
-    // start_offset placed first for 8B alignment without padding gaps; total = 8 + 20 + 20 + 16 = 64B.
+    // start_offset placed first for 8B alignment without padding gaps; total = 8 + 20 + 20 = 48B.
     uint64_t start_offset;                     // 1D ELEMENT offset of the view origin
     uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dimension (strictly > 0, type-enforced)
     uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
-    uint8_t pad1[16];                          // Pad to 128 bytes
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(TensorDumpRecord) == 128, "TensorDumpRecord must be 128 bytes (2 cache lines)");
@@ -148,7 +152,7 @@ struct DumpFreeQueue {
     volatile uint64_t buffer_ptrs[PLATFORM_DUMP_SLOT_COUNT];
     volatile uint32_t head;  // Consumer read position (Device increments)
     volatile uint32_t tail;  // Producer write position (Host increments)
-    uint32_t pad[13];        // Pad to 128 bytes
+    uint32_t pad[22];        // Pad to 128 bytes (32+4+4+88=128)
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(DumpFreeQueue) == 128, "DumpFreeQueue must be 128 bytes");
@@ -240,14 +244,15 @@ struct DumpDataHeader {
  */
 struct TensorDumpInfo {
     uint64_t task_id;
-    uint8_t subtask_id;
     TensorDumpRole role;
     TensorDumpStage stage;
     uint8_t dtype;
     uint8_t ndims;
-    uint32_t func_id;
     uint32_t arg_index;
     uint64_t buffer_addr;
+    uint64_t scalar_value;
+    uint8_t kind;
+    uint8_t pad[15];
     uint64_t start_offset;                     // 1D ELEMENT offset of the view origin
     uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
     uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dimension (strictly > 0, type-enforced)

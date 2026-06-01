@@ -21,15 +21,18 @@ saw, without the timing distortion of inline printing.
   dispatch, outputs snapshotted after FIN; `INOUT` tensors at both
   stages.
 - **Logical shape preserved.** Records carry dtype, shape,
-  `raw_shape`, offsets, and `is_contiguous` so non-contiguous views
-  are reconstructable.
-- **Manifest + binary payload.** A single JSON manifest plus one
-  `.bin` payload per run; each manifest entry has `bin_offset` /
-  `bin_size` into the payload.
-- **Cross-architecture.** Same `--dump-tensor` flag, same on-disk
-  format on `a2a3` and `a5`. Both runtimes are wired through.
+  `strides`, `start_offset`, and `is_contiguous` so logical views are
+  reconstructable.
+- **Manifest + binary payload.** `--dump-tensor` writes a JSON
+  manifest plus one `.bin` payload per run; tensor entries carry
+  `bin_offset` / `bin_size`, while scalar entries stay manifest-only.
+- **Unified scalar args.** Scalar callable slots are emitted as
+  `kind: scalar`, `stage: before_dispatch`, zero-dim records in
+  `tensor_dump.json`; there is no separate args-only manifest.
+- **Cross-architecture.** Same flags and on-disk layout family on
+  `a2a3` and `a5`. Both runtimes are wired through.
 
-Enable in one line:
+Enable dump capture in one line:
 
 ```bash
 python tests/st/<case>/test_<name>.py -p a5sim --dump-tensor
@@ -49,16 +52,12 @@ pytest tests/st/<case> --platform a5sim --dump-tensor
 pytest examples/a5/host_build_graph/vector_example --platform a5sim --dump-tensor
 ```
 
-The flag flips `CallConfig::enable_dump_tensor`. The host then
+`--dump-tensor` flips `CallConfig::enable_dump_tensor`. The host
 allocates dump storage, publishes its base address through
-`kernel_args.dump_data_base`, and sets
-`PROFILING_FLAG_DUMP_TENSOR` in each worker handshake's
-`enable_profiling_flag`. The on-device AICPU kernel reads both:
-the storage base via `set_platform_dump_base()` and the enable bit
-via `set_enable_dump_tensor(GET_PROFILING_FLAG(...))`. AICore
-executors read the same handshake bit to insert a
-`pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
-`AFTER_COMPLETION` snapshots see the kernel's final writes.
+`kernel_args.dump_data_base`, and sets `PROFILING_FLAG_DUMP_TENSOR`
+in the worker profiling bitmask. AICPU reads the storage base via
+`set_platform_dump_base()` and the enable state via
+`set_dump_tensor_enabled(...)`.
 
 ### 3.2 Select Specific Task Tensors
 
@@ -107,12 +106,15 @@ The dump artifacts land under the per-task output prefix
 ```text
 <output_prefix>/
 └── tensor_dump/
-    ├── tensor_dump.json
-    └── tensor_dump.bin
+    ├── tensor_dump.json  # unified tensor/scalar manifest (`--dump-tensor`)
+    └── tensor_dump.bin   # raw tensor payload (`--dump-tensor`)
 ```
 
 Filenames are fixed (no per-file timestamp) — the directory is the
-per-task uniqueness boundary.
+per-task uniqueness boundary. `--dump-tensor` emits both files in the
+same `tensor_dump/` directory.
+
+#### `tensor_dump.json` — Unified manifest
 
 `tensor_dump.json` is the manifest; its `bin_file` field points at
 the sibling binary payload.
@@ -139,15 +141,14 @@ Example manifest (one input tensor captured before dispatch):
   "tensors": [
     {
       "task_id": "0x0000000200000a00",
-      "subtask_id": 1,
       "role": "input",
       "stage": "before_dispatch",
-      "func_id": 0,
       "arg_index": 0,
+      "kind": "tensor",
       "dtype": "float32",
       "shape": [16384],
-      "raw_shape": [16384],
-      "offsets": [0],
+      "strides": [1],
+      "start_offset": 0,
       "is_contiguous": true,
       "truncated": false,
       "overwritten": false,
@@ -160,15 +161,19 @@ Example manifest (one input tensor captured before dispatch):
 
 Key fields:
 
-- `task_id` / `subtask_id` / `func_id` — runtime task identity. Use
-  to correlate with swimlane / PMU output. `subtask_id` distinguishes
-  AIC / AIV0 / AIV1 within a single task.
-- `arg_index` — position in the formal callable signature.
+- `task_id` — runtime task identity. Use to correlate with swimlane / PMU
+  output.
+- `arg_index` — position in the formal callable signature. For scalar
+  entries this equals `payload.tensor_count + scalar_index`.
 - `role` / `stage` — `input` / `output` / `inout`, captured
   `before_dispatch` / `after_completion`.
-- `dtype` / `shape` / `raw_shape` / `offsets` / `is_contiguous` —
-  view geometry. `bin_size` is `numel × elem_size` of the *logical*
-  view, gathered if non-contiguous.
+- `kind` — `tensor` for arena-backed payloads, `scalar` for
+  zero-dim `before_dispatch` scalar args stored directly in the
+  manifest.
+- `dtype` / `shape` / `strides` / `start_offset` /
+  `is_contiguous` — logical view geometry. Tensor `bin_size` is
+  `numel × elem_size` of the *logical* view, gathered if
+  non-contiguous; scalar entries have `bin_size = 0`.
 - `bin_offset` — byte offset into `tensor_dump.bin` where the
   payload starts.
 - `truncated` / `overwritten` — set when the tensor exceeded arena
@@ -187,7 +192,7 @@ uses its `bin_file` field to find the payload:
 python -m simpler_setup.tools.dump_viewer
 
 # Filter and save matching tensors to human-readable .txt files
-python -m simpler_setup.tools.dump_viewer --func 0 --stage before --role input --export
+python -m simpler_setup.tools.dump_viewer --stage before --role input --export
 
 # Export one specific entry by its manifest index
 python -m simpler_setup.tools.dump_viewer --index 42
@@ -204,8 +209,8 @@ spreadsheet.
 
 ### 3.4 Add dump support to a new test
 
-Only `host_build_graph` needs explicit wiring; other runtimes pick
-up metadata automatically.
+Only `host_build_graph` needs explicit wiring; other runtimes derive
+tensor view metadata automatically.
 
 ```cpp
 // In orchestration C++ (host_build_graph only)
@@ -234,13 +239,17 @@ What you can read out of `tensor_dump.json` + `tensor_dump.bin`:
 
 - **Per-task input snapshots** (`role: input`, `stage:
   before_dispatch`) — what each kernel was given.
+- **Per-dispatch scalar args** (`kind: scalar`, `stage:
+  before_dispatch`) — the raw callable-slot scalar values AICPU
+  handed to the kernel.
 - **Per-task output snapshots** (`role: output`, `stage:
   after_completion`) — what each kernel produced. The barrier
   ensures these reflect the kernel's final writes.
 - **`INOUT` deltas** — same arg captured at both stages; diff
   before vs after to see exactly what the kernel modified.
-- **Non-contiguous view reconstruction** — `raw_shape` / `offsets`
-  / `is_contiguous` plus the gathered logical-contiguous payload.
+- **Logical view reconstruction** — `shape` / `strides` /
+  `start_offset` / `is_contiguous` plus the gathered
+  logical-contiguous payload.
 - **Per-task identity** — `task_id` / `subtask_id` / `func_id`
   correlates dump entries with swimlane and PMU rows.
 - **Loss accounting** — `truncated` / `overwritten` per-record
@@ -318,8 +327,9 @@ Each runtime's scheduler dispatch code calls
 ```
 
 `dump_tensors_for_task` walks the formal callable signature,
-matches each non-scalar slot to a `TensorDumpInfo` (dtype + shape + offsets + device address), and calls `dump_tensor_record` for
-slots that match the current stage.
+matches each non-scalar slot to a `TensorDumpInfo` (dtype + shape +
+strides + start offset + device address), and calls
+`dump_tensor_record` for slots that match the current stage.
 
 When dump is enabled, AICore executors also issue
 `pipe_barrier(PIPE_ALL)` after kernel execution and before writing
@@ -564,7 +574,9 @@ Tensor Dump is opt-in and zero-overhead when disabled — without
 AICore skip the dump-specific code paths. The `pipe_barrier(PIPE_ALL)`
 before FIN is also gated on the same handshake bit.
 
-When enabled, the per-task overhead is dominated by:
+With `--dump-tensor`, AICPU records full `BEFORE_DISPATCH` /
+`AFTER_COMPLETION` tensor payloads plus manifest-only
+`BEFORE_DISPATCH` scalar args. The per-task overhead is dominated by:
 
 - The `BEFORE_DISPATCH` / `AFTER_COMPLETION` payload memcpy into
   the per-thread arena (contiguous fast-path; logical traversal for

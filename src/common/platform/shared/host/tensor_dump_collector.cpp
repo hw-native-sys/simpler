@@ -215,13 +215,13 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
 
         DumpedTensor dt;
         dt.task_id = rec.task_id;
-        dt.subtask_id = rec.subtask_id;
-        dt.func_id = rec.func_id;
         dt.arg_index = rec.arg_index;
         dt.role = static_cast<TensorDumpRole>(rec.role);
         dt.stage = static_cast<TensorDumpStage>(rec.stage);
         dt.dtype = rec.dtype;
         dt.ndims = rec.ndims;
+        dt.kind = static_cast<TensorDumpKind>(rec.kind);
+        dt.scalar_value = rec.scalar_value;
         dt.is_contiguous = (rec.is_contiguous != 0);
         dt.truncated = (rec.truncated != 0);
         dt.overwritten = false;
@@ -232,7 +232,7 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         std::memcpy(dt.shapes, rec.shapes, sizeof(dt.shapes));
         std::memcpy(dt.strides, rec.strides, sizeof(dt.strides));
 
-        if (thread_idx >= 0 && thread_idx < static_cast<int>(arenas_.size())) {
+        if (dt.kind == TensorDumpKind::TENSOR && thread_idx >= 0 && thread_idx < static_cast<int>(arenas_.size())) {
             ArenaInfo &ai = arenas_[thread_idx];
             char *arena_host = reinterpret_cast<char *>(ai.host_ptr);
             uint64_t arena_sz = ai.size;
@@ -246,8 +246,6 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
                         "Increase PLATFORM_DUMP_BUFFERS_PER_THREAD."
                     );
                 }
-            } else {
-                dt.overwritten = false;
             }
 
             if (!dt.overwritten && rec.payload_size > 0) {
@@ -270,7 +268,7 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
 
         dt.payload_size = dt.bytes.size();
 
-        bool has_payload = !dt.overwritten && !dt.bytes.empty();
+        bool has_payload = dt.kind == TensorDumpKind::TENSOR && !dt.overwritten && !dt.bytes.empty();
         dt.bin_offset = has_payload ? next_bin_offset_ : 0;
         if (has_payload) {
             next_bin_offset_ += dt.payload_size;
@@ -393,6 +391,16 @@ static const char *tensor_dump_stage_name(TensorDumpStage stage) {
     return "unknown";
 }
 
+static const char *tensor_dump_kind_name(TensorDumpKind kind) {
+    switch (kind) {
+    case TensorDumpKind::TENSOR:
+        return "tensor";
+    case TensorDumpKind::SCALAR:
+        return "scalar";
+    }
+    return "unknown";
+}
+
 static std::string dims_to_string(const uint32_t dims[], int ndims) {
     std::ostringstream ss;
     ss << "[";
@@ -481,8 +489,6 @@ int TensorDumpCollector::export_dump_files() {
 
     std::sort(collected_.begin(), collected_.end(), [](const DumpedTensor &a, const DumpedTensor &b) {
         if (a.task_id != b.task_id) return a.task_id < b.task_id;
-        if (a.subtask_id != b.subtask_id) return a.subtask_id < b.subtask_id;
-        if (a.func_id != b.func_id) return a.func_id < b.func_id;
         if (a.stage != b.stage) return static_cast<uint8_t>(a.stage) < static_cast<uint8_t>(b.stage);
         if (a.arg_index != b.arg_index) return a.arg_index < b.arg_index;
         return static_cast<uint8_t>(a.role) < static_cast<uint8_t>(b.role);
@@ -548,13 +554,16 @@ int TensorDumpCollector::export_dump_files() {
         first_entry = false;
 
         json << "    {\"task_id\": \"0x" << std::hex << std::setfill('0') << std::setw(16) << dt.task_id << std::dec
-             << "\", \"subtask_id\": " << static_cast<uint32_t>(dt.subtask_id) << ", \"func_id\": " << dt.func_id
-             << ", \"role\": \"" << tensor_dump_role_name(dt.role) << "\", \"stage\": \""
-             << tensor_dump_stage_name(dt.stage) << "\", \"arg_index\": " << dt.arg_index << ", \"dtype\": \""
-             << dtype_name << "\", \"is_contiguous\": " << (dt.is_contiguous ? "true" : "false")
-             << ", \"shape\": " << shape_str << ", \"strides\": " << strides_str
-             << ", \"start_offset\": " << dt.start_offset << ", \"numel\": " << numel
-             << ", \"bin_offset\": " << dt.bin_offset << ", \"bin_size\": " << dt.payload_size
+             << "\", \"arg_index\": " << dt.arg_index << ", \"role\": \"" << tensor_dump_role_name(dt.role)
+             << "\", \"stage\": \"" << tensor_dump_stage_name(dt.stage) << "\", \"kind\": \""
+             << tensor_dump_kind_name(dt.kind) << "\", \"dtype\": \"" << dtype_name
+             << "\", \"is_contiguous\": " << (dt.is_contiguous ? "true" : "false") << ", \"shape\": " << shape_str
+             << ", \"strides\": " << strides_str << ", \"start_offset\": " << dt.start_offset
+             << ", \"numel\": " << numel;
+        if (dt.kind == TensorDumpKind::SCALAR) {
+            json << ", \"value\": " << dt.scalar_value;
+        }
+        json << ", \"bin_offset\": " << dt.bin_offset << ", \"bin_size\": " << dt.payload_size
              << ", \"truncated\": " << (dt.truncated ? "true" : "false")
              << ", \"overwritten\": " << (dt.overwritten ? "true" : "false") << "}";
     }

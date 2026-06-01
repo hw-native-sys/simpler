@@ -11,10 +11,10 @@
 ``tensor_dump/`` directory.
 
 Re-uses ``vector_example`` (5 submit_task calls). With ``--dump-tensor`` the
-AICPU writer captures every task's tensor I/O into a manifest + raw-byte
+AICPU writer captures task dump records into a unified manifest + raw-byte
 payload pair under ``<output_prefix>/tensor_dump/``. Smoke asserts:
-manifest exists + parses, the ``bin_file`` field it names exists, and at
-least one entry was captured.
+manifest exists + parses, the ``bin_file`` field it names exists, entries
+use the unified schema, and no legacy args-only manifest is emitted.
 """
 
 import json
@@ -109,7 +109,18 @@ class TestTensorDump(SceneTestCase):
         # the collector's chosen schema across runtimes, but we know
         # vector_example reads/writes ≥1 tensor and the manifest can't be empty
         # if anything was captured. Robust to schema add/remove of new fields.
+        tensors = data.get("tensors", [])
+        assert tensors, f"tensor_dump.json has no entries: {data}"
         assert bin_path.stat().st_size > 0, "tensor_dump.bin is empty"
+        assert not (dump_dir / "args_dump.json").exists(), "args_dump.json should not be emitted"
+        assert not (dump_dir / "kernel_args_dump.json").exists(), "kernel_args_dump.json should not be emitted"
+
+        assert all("kind" in t for t in tensors), tensors
+
+        scalar_entries = [t for t in tensors if t.get("kind") == "scalar"]
+        assert all(t.get("stage") == "before_dispatch" for t in scalar_entries), scalar_entries
+        assert all(t.get("bin_size") == 0 for t in scalar_entries), scalar_entries
+        assert all("value" in t for t in scalar_entries), scalar_entries
 
         # ---- Tool smoke: dump_viewer ----
         # Exit-code-only check; the no-filter default lists every captured

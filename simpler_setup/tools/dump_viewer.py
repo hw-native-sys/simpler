@@ -11,7 +11,6 @@
 
 Filters (freely combinable):
     --task   Filter by task_id (hex, e.g. 0x0000000200000a00)
-    --func   Filter by func_id (int)
     --stage  Filter by stage (before / after)
     --role   Filter by role (input / output / inout)
     --arg    Filter by arg_index (int)
@@ -26,11 +25,11 @@ Usage:
     # List all tensors in a specific dump dir
     python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump/
 
-    # List before-dispatch inputs of func_id=3 (latest dir)
-    python -m simpler_setup.tools.dump_viewer --func 3 --stage before --role input
+    # List before-dispatch inputs of task_id 0x... (latest dir)
+    python -m simpler_setup.tools.dump_viewer --task 0x0000000200000a00 --stage before --role input
 
     # Export them to txt
-    python -m simpler_setup.tools.dump_viewer outputs/<case>/tensor_dump/ --func 3 --stage before --export
+    python -m simpler_setup.tools.dump_viewer outputs/<case>/tensor_dump/ --stage before --export
 
     # Export a specific tensor by index
     python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump/ --index 42 --export
@@ -94,17 +93,15 @@ def tensor_filename(t: dict) -> str:
     role_map = {"input": "in", "output": "out", "inout": "inout"}
     stage_str = stage_map.get(t["stage"], t["stage"])
     role_str = role_map.get(t["role"], t["role"])
-    return f"task_{t['task_id']}_s{t['subtask_id']}_{stage_str}_{role_str}{t['arg_index']}.txt"
+    return f"task_{t['task_id']}_{stage_str}_{role_str}{t['arg_index']}.txt"
 
 
 def write_tensor(tensor: dict, bin_path: Path, out):
     t = tensor
     out.write(f"# task_id: {t['task_id']}\n")
-    out.write(f"# subtask_id: {t['subtask_id']}\n")
     out.write(f"# role: {t['role']}\n")
     out.write(f"# stage: {t['stage']}\n")
     out.write(f"# arg_index: {t['arg_index']}\n")
-    out.write(f"# func_id: {t['func_id']}\n")
     out.write(f"# dtype: {t['dtype']}\n")
     out.write(f"# is_contiguous: {t['is_contiguous']}\n")
     out.write(f"# shape: {t['shape']}\n")
@@ -182,15 +179,15 @@ def collect_valid_values(tensors: list, field: str) -> list:
 
 def list_tensors(tensors: list):
     print(
-        f"{'idx':>6}  {'task_id':>18}  {'s':>1}  {'stage':>7}  {'role':>5}"
-        f"  {'arg':>3}  {'func':>4}  {'dtype':>8}  {'shape':<20}  {'bytes':>10}"
+        f"{'idx':>6}  {'task_id':>18}  {'stage':>7}  {'role':>5}"
+        f"  {'arg':>3}  {'dtype':>8}  {'shape':<20}  {'bytes':>10}"
     )
     print("-" * 100)
     for i, t in enumerate(tensors):
         stage_short = "before" if t["stage"] == "before_dispatch" else "after"
         print(
-            f"{i:>6}  {t['task_id']:>18}  {t['subtask_id']:>1}  {stage_short:>7}  {t['role']:>5}  "
-            f"{t['arg_index']:>3}  {t['func_id']:>4}  {t['dtype']:>8}  {str(t['shape']):<20}  {t['bin_size']:>10}"
+            f"{i:>6}  {t['task_id']:>18}  {stage_short:>7}  {t['role']:>5}  "
+            f"{t['arg_index']:>3}  {t['dtype']:>8}  {str(t['shape']):<20}  {t['bin_size']:>10}"
         )
 
 
@@ -217,14 +214,6 @@ def _apply_filters(tensors: list, args: argparse.Namespace) -> list:
             print(f"  Valid task_ids (showing first {len(sample)}): {', '.join(sample)}", file=sys.stderr)
             sys.exit(1)
         filtered = [t for t in filtered if t["task_id"] == args.task]
-
-    if args.func is not None:
-        valid = collect_valid_values(filtered, "func_id")
-        if str(args.func) not in valid:
-            print(f"Error: --func {args.func} not found in current selection.", file=sys.stderr)
-            print(f"  Valid func_ids: {', '.join(valid)}", file=sys.stderr)
-            sys.exit(1)
-        filtered = [t for t in filtered if t["func_id"] == args.func]
 
     if args.stage:
         stage_map = {"before": "before_dispatch", "after": "after_completion"}
@@ -263,7 +252,6 @@ def main():
         help="Path to outputs/<case>_<ts>/tensor_dump directory (default: latest outputs/*/tensor_dump dir)",
     )
     parser.add_argument("--task", "-t", help="Filter by task_id (e.g. 0x0000000200000a00)")
-    parser.add_argument("--func", "-f", type=int, help="Filter by func_id")
     parser.add_argument("--stage", "-s", help="Filter by stage (before / after)")
     parser.add_argument("--role", "-r", help="Filter by role (input / output / inout)")
     parser.add_argument("--arg", "-a", type=int, help="Filter by arg_index")
@@ -272,12 +260,12 @@ def main():
     args = parser.parse_args()
 
     dump_dir = _resolve_dump_dir(args.dump_dir)
-    manifest_files = list(dump_dir.glob("*.json"))
-    if not manifest_files:
-        print(f"Error: no manifest JSON found in {dump_dir}", file=sys.stderr)
+    manifest_path = dump_dir / "tensor_dump.json"
+    if not manifest_path.exists():
+        print(f"Error: tensor_dump.json not found in {dump_dir}", file=sys.stderr)
         sys.exit(1)
 
-    with open(manifest_files[0]) as f:
+    with open(manifest_path) as f:
         manifest = json.load(f)
 
     bin_path = dump_dir / manifest.get("bin_file", "tensors.bin")
@@ -298,7 +286,7 @@ def main():
         sys.exit(1)
 
     # --- Export or list ---
-    has_filters = any([args.task, args.func is not None, args.stage, args.role, args.arg is not None])
+    has_filters = any([args.task, args.stage, args.role, args.arg is not None])
 
     if args.export or args.index is not None:
         for t in filtered:

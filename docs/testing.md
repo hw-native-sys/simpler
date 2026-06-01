@@ -69,7 +69,7 @@ If a module is pure C++ with no Python binding, test in **ut-cpp** (`tests/ut/cp
 
 Scene tests support advanced CLI options for benchmarking, profiling, and runtime control. These work identically in both pytest and standalone mode.
 
-> "Profiling" is the umbrella for three parallel diagnostics sub-features: `--enable-l2-swimlane` (L2 swimlane), `--dump-tensor` (per-task tensor I/O), and `--enable-pmu` (PMU CSV). They are independent and can be combined.
+> "Profiling" is the umbrella for three parallel diagnostics sub-features: `--enable-l2-swimlane` (L2 swimlane), `--dump-tensor` (unified tensor/scalar dump), and `--enable-pmu` (PMU CSV). They are independent and can be combined.
 
 ### pytest
 
@@ -87,7 +87,7 @@ pytest --platform a2a3sim --log-level debug                        # verbose C++
 python test_xxx.py -p a2a3sim                                    # default: 1 round + golden
 python test_xxx.py -p a2a3 -d 0 --rounds 100 --skip-golden       # benchmark mode
 python test_xxx.py -p a2a3 --enable-l2-swimlane                         # L2 swimlane (first round)
-python test_xxx.py -p a2a3 --dump-tensor                         # dump per-task tensor I/O
+python test_xxx.py -p a2a3 --dump-tensor                         # dump unified tensor/scalar artifacts
 python test_xxx.py -p a2a3 --enable-pmu 4                        # PMU CSV (MEMORY)
 python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ logging
 ```
@@ -105,7 +105,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--manual` | | `exclude` | `exclude`/`include`/`only` for manual cases |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
 | `--enable-l2-swimlane [PERF_LEVEL]` | | `0` | Enable L2 swimlane collection on first round only. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md#31-enable-l2-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `l2_swimlane_records.json` lands; parallel runs never collide. |
-| `--dump-tensor` | | false | Dump per-task tensor I/O during runtime execution |
+| `--dump-tensor` | | false | Dump tensors plus scalar args into unified runtime artifacts |
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
 | `--log-level LEVEL` | | `v5` | Simpler logger threshold. Accepts `debug` / `V0..V9` / `info` / `warn` / `error` / `null` (case-insensitive). pytest's own CLI validator does `int(getattr(logging, level.upper(), level))`, so the V tiers and `NUL`/`NULL` are exposed as attributes on the `logging` module via `setattr` (registration in `conftest.py` runs before pytest's option machinery). `logging.addLevelName` is also called so `%(levelname)s` formatters print `V3` instead of `Level 18`, but it is not what makes the CLI parser accept the value. The "simpler" Python logger is the single source of truth; the value is snapshotted into the platform SO at `Worker.init()` time (not per `Worker.run()`) and pushed to host `HostLogger`, runner state, and (onboard) CANN `dlog_setlevel`. AICPU receives it via `KernelArgs.log_info_v`. Changing the Python logger level after `Worker.init()` does not retroactively affect that worker. See [Log levels](#log-levels). |

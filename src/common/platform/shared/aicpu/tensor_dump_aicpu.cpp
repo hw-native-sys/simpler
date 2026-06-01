@@ -509,8 +509,11 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     uint64_t copy_bytes = bytes;
     bool truncated = false;
     bool is_contiguous = tensor_dump_is_contiguous(info);
+    bool is_scalar = static_cast<TensorDumpKind>(info.kind) == TensorDumpKind::SCALAR;
 
-    if (bytes > state->arena_size) {
+    if (is_scalar) {
+        copy_bytes = 0;
+    } else if (bytes > state->arena_size) {
         // Tensor larger than entire arena — copy a partial sample
         copy_bytes = state->arena_size / 2;
         truncated = true;
@@ -523,15 +526,15 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     char *arena = reinterpret_cast<char *>(state->arena_base);
     uint64_t arena_sz = state->arena_size;
     CircularArenaWriter writer = {arena, arena_sz, offset, 0};
-    write_tensor_dump_logical_prefix(&writer, info, elem_sz, copy_bytes);
+    if (!is_scalar && copy_bytes > 0) {
+        write_tensor_dump_logical_prefix(&writer, info, elem_sz, copy_bytes);
+    }
     wmb();
 
     // Append metadata record
     uint32_t idx = buf->count;
     TensorDumpRecord *rec = &buf->records[idx];
     rec->task_id = info.task_id;
-    rec->subtask_id = info.subtask_id;
-    rec->func_id = info.func_id;
     rec->arg_index = info.arg_index;
     rec->is_contiguous = is_contiguous ? 1 : 0;
     rec->role = static_cast<uint8_t>(info.role);
@@ -541,6 +544,8 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     rec->truncated = truncated ? 1 : 0;
     rec->payload_offset = offset;
     rec->payload_size = copy_bytes;
+    rec->scalar_value = is_scalar ? info.scalar_value : 0;
+    rec->kind = info.kind;
     rec->start_offset = info.start_offset;
     for (int d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
         rec->shapes[d] = info.shapes[d];

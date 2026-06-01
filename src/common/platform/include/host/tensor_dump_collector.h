@@ -147,13 +147,13 @@ using DumpFreeCallback = profiling_common::ProfFreeCallback;
  */
 struct DumpedTensor {
     uint64_t task_id;
-    uint8_t subtask_id;
-    uint32_t func_id;
     uint32_t arg_index;
     TensorDumpRole role;
     TensorDumpStage stage;
     uint8_t dtype;
     uint8_t ndims;
+    TensorDumpKind kind;
+    uint64_t scalar_value;
     uint64_t start_offset;                     // 1D element offset of the view origin
     uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
     uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dim (> 0, type-enforced)
