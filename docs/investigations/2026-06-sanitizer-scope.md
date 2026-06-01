@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-01
 **Verdict**: scoped — ASAN/UBSan gate on Linux CI only; TSAN
-deferred-to-report-only; LSan deferred-pending-arena-suppressions
+deferred-to-report-only; LSan measured-clean, no gate (see §3)
 
 ## Question
 
@@ -81,14 +81,31 @@ host-side race appears in the residual that is worth catching.
 leak detection looks like a free add-on. The nightly explicitly sets
 `detect_leaks=0`, i.e. turns it *off*.
 
-**Why not (now)**: the sim allocates large device **custom arenas**
-(`DeviceArena` / `HeapRing`, ~1 GB) that are intentionally long-lived (released
-at process exit) and bypass ASAN redzones. LSan reports these as leaks → mass
-false-positives that would redden the ASAN job before any real leak is visible.
+**What was tried** (2026-06-01): rebuilt the sim with ASAN and ran the
+worker-reused L2 suites (`prepared_callable` + `dynamic_register`) under
+`detect_leaks=1`. These share a **session-scoped `ChipWorker`**
+(`conftest.py::_l2_worker_pool`), so many `register → run → unregister` cycles
+run in one long-lived process — exactly the condition under which a per-case
+host leak accumulates and becomes visible.
 
-**When to reconsider**: after an `lsan.supp` triages the device-arena and static
-allocations as known non-leaks. Then flip `detect_leaks=1` and let genuine leaks
-surface — the same shape of follow-up as the TSAN suppressions above.
+**Result**: **zero** leaks in our code. `libhost_runtime` appears in **no**
+leak stack across any process; the host process's leak set is a *fixed* 560
+objects (~862 KB) that does not grow with case count, and is **entirely**
+PyTorch/Python import-time bindings (`torch::jit::init...` via `import torch`).
+The rest of the report is structural noise: `cc1plus` compiler subprocesses
+(the `LD_PRELOAD=libasan` is inherited by the per-test kernel compiles, so each
+dumps ~13 MB of its own AST) and ~100 forked sim device processes (the
+by-design device arenas).
+
+**Why not (now)**: a standing gate would have to suppress `cc1plus`, every
+forked device arena, `torch`, and the interpreter — a large, fragile
+suppressions file guarding a **currently-empty** signal. The worker-reuse path
+is verified leak-clean today, so there is nothing to protect.
+
+**When to reconsider**: if a leak-prone host feature lands (new dlopen/unregister
+churn, host-side caches). Re-verify with a *one-shot* pass — not a standing gate:
+pre-compile kernels first (so no `cc1plus` runs under the preload), gate leak
+reporting to the main process, and suppress `torch`/device-arena allocations.
 
 ## References
 
