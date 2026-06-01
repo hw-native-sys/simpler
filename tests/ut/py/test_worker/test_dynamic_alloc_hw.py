@@ -31,13 +31,15 @@ the C ABI.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 
 @pytest.mark.requires_hardware
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(2)
-def test_two_rank_allocate_release_round_trip(st_device_ids):
+def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids):
     """End-to-end 2-rank hardware alloc + release round trip.
 
     Single allocation, one CommBufferSpec, both chips participate.  Locks
@@ -48,7 +50,8 @@ def test_two_rank_allocate_release_round_trip(st_device_ids):
 
     from simpler_setup.runtime_builder import RuntimeBuilder
 
-    _ = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer")
+    build = bool(os.environ.get("PTO_UT_BUILD"))
+    _ = RuntimeBuilder(platform=st_platform).get_binaries("tensormap_and_ringbuffer", build=build)
     assert len(st_device_ids) >= 2, "device_count(2) fixture must yield >= 2 ids"
     device_ids = [int(d) for d in st_device_ids[:2]]
     nranks = len(device_ids)
@@ -81,7 +84,7 @@ def test_two_rank_allocate_release_round_trip(st_device_ids):
 
     worker = Worker(
         level=3,
-        platform="a2a3",
+        platform=st_platform,
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,

@@ -128,6 +128,42 @@ public:
     // `bind_callable_to_runtime`, `aicpu_dlopen_count`, and
     // `host_dlopen_count` are inherited from `DeviceRunnerBase`.
 
+    /**
+     * Make the ACL context ready on the current thread.
+     *
+     * Calls aclInit() once per process (subsequent calls are idempotent and
+     * tolerate the ACL_ERROR_REPEAT_INITIALIZE sentinel) and aclrtSetDevice()
+     * on the current thread. This is the entry point for consumers that need
+     * to call acl* / Hccl* APIs (for example the comm_hccl backend) but
+     * intentionally do not want those modules to own ACL lifecycle themselves.
+     *
+     * Symmetric with finalize(): aclrtResetDevice + aclFinalize run there.
+     *
+     * @param device_id  Device ID to bind on the current thread.
+     * @return 0 on success, error code on failure.
+     */
+    int ensure_acl_ready(int device_id);
+
+    /**
+     * Create a caller-owned aclrtStream for comm_* usage.
+     *
+     * Intended to back the ChipWorker Python wrapper's internal stream
+     * ownership for distributed comm — callers pair it with
+     * destroy_comm_stream() at teardown.  The ACL context must already be
+     * ready on the calling thread (ensure_acl_ready()).
+     *
+     * @return aclrtStream pointer on success, NULL on failure.
+     */
+    void *create_comm_stream();
+
+    /**
+     * Destroy a stream previously returned by create_comm_stream().
+     * Tolerates a nullptr stream (returns 0).
+     *
+     * @return 0 on success, error code on failure.
+     */
+    int destroy_comm_stream(void *stream);
+
 private:
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // worker_count_, executor + dispatcher bytes, aicore_bin_handle_,
@@ -147,6 +183,11 @@ private:
     // `query_max_block_dim`, `validate_block_dim`, `ensure_binaries_loaded`,
     // `configure_aicore_op_timeout`, and `prepare_orch_so` are inherited
     // (protected) from `DeviceRunnerBase`.
+
+    // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
+    // gates it behind this flag. finalize() drives aclFinalize only if we observed
+    // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
+    bool acl_ready_{false};
 
     /**
      * Initialize performance profiling device buffers

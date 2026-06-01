@@ -166,9 +166,14 @@ public:
 
     /**
      * Destroy a stream previously returned by create_comm_stream().
-     * Tolerates a nullptr stream (returns 0).
+     * Tolerates a nullptr stream.
      *
-     * @return 0 on success, error code on failure.
+     * Best-effort: any failure from aclrtSynchronizeStream /
+     * aclrtDestroyStream is logged but not propagated, since leaking a
+     * stream at teardown is strictly better than blocking device
+     * finalization.
+     *
+     * @return Always 0.
      */
     int destroy_comm_stream(void *stream);
 

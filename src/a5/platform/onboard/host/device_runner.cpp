@@ -62,6 +62,69 @@ DeviceRunner::~DeviceRunner() { finalize(); }
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
+// Comm/ACL lifecycle methods are arch-specific (HCCL backend), so they
+// stay on DeviceRunner rather than DeviceRunnerBase. Mirrors a2a3 onboard.
+
+int DeviceRunner::ensure_acl_ready(int device_id) {
+    if (device_id < 0) {
+        LOG_ERROR("ensure_acl_ready: invalid device_id %d", device_id);
+        return -1;
+    }
+
+    // aclInit is process-wide; CANN returns 100002 if it has already been
+    // initialized (possibly by another owner), which we treat as success.
+    constexpr int kAclRepeatInit = 100002;
+    aclError aRet = aclInit(nullptr);
+    if (aRet != ACL_SUCCESS && static_cast<int>(aRet) != kAclRepeatInit) {
+        LOG_ERROR("aclInit failed: %d", static_cast<int>(aRet));
+        return static_cast<int>(aRet);
+    }
+
+    // ACL device binding is per-thread; every caller must still hit it.
+    aRet = aclrtSetDevice(device_id);
+    if (aRet != ACL_SUCCESS) {
+        LOG_ERROR("aclrtSetDevice(%d) failed: %d", device_id, static_cast<int>(aRet));
+        return static_cast<int>(aRet);
+    }
+
+    // Record that we are responsible for aclFinalize at teardown.
+    acl_ready_ = true;
+    if (device_id_ < 0) device_id_ = device_id;
+    return 0;
+}
+
+void *DeviceRunner::create_comm_stream() {
+    aclrtStream stream = nullptr;
+    aclError aRet = aclrtCreateStream(&stream);
+    if (aRet != ACL_SUCCESS) {
+        LOG_ERROR("aclrtCreateStream failed: %d", static_cast<int>(aRet));
+        return nullptr;
+    }
+    return stream;
+}
+
+int DeviceRunner::destroy_comm_stream(void *stream) {
+    if (stream == nullptr) return 0;
+
+    // Best-effort teardown.  HcclBarrier submits async work on the stream;
+    // if the caller never blocked for completion (or hit the HCCL 507018
+    // barrier regression), aclrtDestroyStream will refuse with 507901
+    // ("stream still has pending tasks").  We try to drain first, then
+    // destroy anyway, and log failures without propagating them — leaking
+    // a stream at teardown is strictly better than failing the teardown
+    // itself, which would block device finalization.  This matches the
+    // cleanup behavior of the HCCL C++ hardware UT.
+    aclError sync_rc = aclrtSynchronizeStream(static_cast<aclrtStream>(stream));
+    if (sync_rc != ACL_SUCCESS) {
+        LOG_ERROR("aclrtSynchronizeStream during stream teardown failed: %d", static_cast<int>(sync_rc));
+    }
+    aclError destroy_rc = aclrtDestroyStream(static_cast<aclrtStream>(stream));
+    if (destroy_rc != ACL_SUCCESS) {
+        LOG_ERROR("aclrtDestroyStream failed (leaking stream): %d", static_cast<int>(destroy_rc));
+    }
+    return 0;
+}
+
 int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (validate_launch_aicpu_num(launch_aicpu_num) != 0) return -1;
 
@@ -238,10 +301,30 @@ int DeviceRunner::finalize() {
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
 
-    int reset_rc = rtDeviceReset(device_id_);
-    if (reset_rc != 0) {
-        LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, reset_rc);
-        if (rc == 0) rc = reset_rc;
+    // Reset device and finalize ACL AFTER all device memory is freed. When the
+    // ACL layer was brought up (comm path), aclrtResetDevice supersedes
+    // rtDeviceReset and additionally releases ACL's per-thread ref-count;
+    // calling raw rtDeviceReset in that state would leave ACL with stale
+    // bookkeeping. Pure rt-layer runtimes that never asked for ACL still get
+    // the bare rtDeviceReset.
+    if (acl_ready_ && device_id_ >= 0) {
+        int reset_rc = aclrtResetDevice(device_id_);
+        if (reset_rc != 0) {
+            LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
+            if (rc == 0) rc = reset_rc;
+        }
+        int finalize_rc = aclFinalize();
+        if (finalize_rc != 0) {
+            LOG_ERROR("aclFinalize failed during finalize: %d", finalize_rc);
+            if (rc == 0) rc = finalize_rc;
+        }
+        acl_ready_ = false;
+    } else {
+        int reset_rc = rtDeviceReset(device_id_);
+        if (reset_rc != 0) {
+            LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, reset_rc);
+            if (rc == 0) rc = reset_rc;
+        }
     }
 
     device_id_ = -1;

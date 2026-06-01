@@ -9,7 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#pragma once
+#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_SDMA_SDMA_COMPLETION_KERNEL_H_
+#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_SDMA_SDMA_COMPLETION_KERNEL_H_
 
 #include <stdint.h>
 
@@ -141,3 +142,5 @@ send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, Sc
     pto2::detail::defer_flush(ctx);
     return true;
 }
+
+#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_SDMA_SDMA_COMPLETION_KERNEL_H_

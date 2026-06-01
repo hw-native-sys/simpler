@@ -47,7 +47,7 @@ import pytest
 
 # ---------------------------------------------------------------------------
 # CommContext layout — must stay byte-compatible with
-# src/a2a3/platform/include/common/comm_context.h (static_asserts there).
+# src/common/platform_comm/comm_context.h (static_asserts there).
 # If CANN / HCCL ever shifts these offsets, comm_hccl.cpp's build-time asserts
 # will fail first; this struct mirrors them so the Python side can read back a
 # CommContext without rebuilding nanobind just to expose the layout.
@@ -166,13 +166,14 @@ def _rank_entry(
 
 
 @pytest.mark.requires_hardware
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(2)
-def test_two_rank_comm_lifecycle(st_device_ids):
+def test_two_rank_comm_lifecycle(st_platform, st_device_ids):
     """End-to-end 2-rank hardware smoke test for ChipWorker.comm_* wrappers."""
     from simpler_setup.runtime_builder import RuntimeBuilder
 
-    bins = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer")
+    build = bool(os.environ.get("PTO_UT_BUILD"))
+    bins = RuntimeBuilder(platform=st_platform).get_binaries("tensormap_and_ringbuffer", build=build)
     assert len(st_device_ids) >= 2, "device_count(2) fixture must yield >= 2 ids"
     nranks = 2
     rootinfo_path = f"/tmp/pto_comm_py_ut_rootinfo_{os.getpid()}.bin"

@@ -125,11 +125,11 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
         return -1;
     }
 
-    // aclInit is process-wide; CANN returns 100002 if it has already been
-    // initialized (possibly by another owner), which we treat as success.
-    constexpr int kAclRepeatInit = 100002;
+    // aclInit is process-wide; CANN returns ACL_ERROR_REPEAT_INITIALIZE if it
+    // has already been initialized (possibly by another owner), which we
+    // treat as success.
     aclError aRet = aclInit(nullptr);
-    if (aRet != ACL_SUCCESS && static_cast<int>(aRet) != kAclRepeatInit) {
+    if (aRet != ACL_SUCCESS && static_cast<int>(aRet) != ACL_ERROR_REPEAT_INITIALIZE) {
         LOG_ERROR("aclInit failed: %d", static_cast<int>(aRet));
         return static_cast<int>(aRet);
     }
