@@ -189,11 +189,18 @@ void SchedulerContext::complete_slot_task(
     }
 
 #if PTO2_PROFILING
-    if (l2_swimlane.l2_swimlane_enabled) {
+    // Level gate: at AICORE_TIMING (level=1) the AICore record alone carries
+    // {start, end, task_token_raw}, host resolves func_id/core_type from
+    // dep_gen / per-core mapping, and AICPU has nothing to write. Only at
+    // AICPU_TIMING (level=2) and above does AICPU contribute dispatch/finish
+    // timestamps via complete_task. Bypassing here saves the per-completion
+    // hot-path cost (counter inc + ring lookup + record store + wmb + buffer
+    // rotation bookkeeping) for runs that only want AICore timing.
+    if (l2_swimlane.l2_swimlane_enabled && l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        uint64_t finish_ts = (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
+        uint64_t finish_ts = get_sys_cnt_aicpu();
 
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_swimlane_aicpu_complete_task(

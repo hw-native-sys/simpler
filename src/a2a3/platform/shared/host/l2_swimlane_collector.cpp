@@ -685,11 +685,22 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
 // core" with no wrap loss (the AICore buffer pool is recycled via
 // free_queue while the session runs, so an arbitrarily long session works).
 //
-// We build a small `reg_task_id → (start, end)` map per core (size on the
-// order of N_tasks_per_core) and patch each L2SwimlaneAicpuTaskRecord by its
-// reg_task_id field. Using a map instead of direct indexing tolerates
-// AICPU-side L2SwimlaneAicpuTaskBuffer drops (a missing L2SwimlaneAicpuTaskRecord doesn't break
-// alignment) and lets the same code work for both runtimes.
+// We build a small `reg_task_id → (start, end)` map per core (size on
+// the order of N_dispatches_per_core) and patch each L2SwimlaneAicpuTaskRecord
+// by its per-core reg_task_id. Using a map tolerates AICPU-side drops (a
+// missing AICPU record doesn't break alignment) and lets the same code
+// work for both runtimes.
+//
+// Why reg_task_id and not task_token_raw: SPMD with `block_num > num_cores`
+// (e.g. q_proj in qwen3 decode has block_num=40 over 24 AIC cores) dispatches
+// the same task_token_raw multiple times to the same core. Each dispatch
+// produces its own AICore record (different start/end) and its own AICPU
+// record, but all share the same task_token_raw. A task_token_raw-keyed
+// map would collapse all dispatches into the last AICore record's timing,
+// making every AICPU record on that core show identical (start, end) —
+// visible as "duplicate" task spans in the swimlane viewer. reg_task_id is
+// per-core monotonic per dispatch (scheduler_dispatch.cpp:140) — unique at
+// dispatch granularity, which is what the join needs.
 void L2SwimlaneCollector::join_aicore_records() {
     if (shm_host_ == nullptr) {
         return;
@@ -699,64 +710,30 @@ void L2SwimlaneCollector::join_aicore_records() {
     uint64_t total_patched = 0;
     uint64_t total_unmatched = 0;
 
-    // reg_task_id is per-core monotonic. For sessions that don't run long
-    // enough to wrap the 31-bit `dispatch_seq & TASK_ID_MASK`, a direct
-    // vector index beats a hashmap on both build and lookup. Cap the vector
-    // length to keep memory bounded; if a core ever produces an outlier
-    // reg_task_id (recycled session, manual reset), fall back to the
-    // hashmap so we don't allocate gigabytes.
-    constexpr uint32_t kDirectIndexCap = 1u << 24;  // 16 M slots = 256 MB / core max
-
     for (int core_idx = 0; core_idx < num_aicore_; core_idx++) {
         const auto &ac_stream = collected_aicore_records_[core_idx];
         if (collected_perf_records_[core_idx].empty()) {
             continue;
         }
 
-        uint32_t max_reg = 0;
+        std::unordered_map<uint32_t, std::pair<uint64_t, uint64_t>> ts_by_reg;
+        ts_by_reg.reserve(ac_stream.size() * 2);
         for (const auto &r : ac_stream) {
-            if (r.task_id > max_reg) max_reg = r.task_id;
-        }
-        for (const auto &lr : collected_perf_records_[core_idx]) {
-            if (lr.reg_task_id > max_reg) max_reg = lr.reg_task_id;
+            ts_by_reg[r.reg_task_id] = {r.start_time, r.end_time};
         }
 
         uint64_t patched = 0;
         uint64_t unmatched = 0;
-
-        if (max_reg < kDirectIndexCap) {
-            std::vector<std::pair<uint64_t, uint64_t>> ts_by_task(static_cast<size_t>(max_reg) + 1, {0, 0});
-            for (const auto &r : ac_stream) {
-                ts_by_task[r.task_id] = {r.start_time, r.end_time};
+        for (auto &lr : collected_perf_records_[core_idx]) {
+            auto it = ts_by_reg.find(lr.reg_task_id);
+            if (it == ts_by_reg.end()) {
+                unmatched++;
+                continue;
             }
-            for (auto &lr : collected_perf_records_[core_idx]) {
-                const auto &entry = ts_by_task[lr.reg_task_id];
-                if (entry.first == 0 && entry.second == 0) {
-                    unmatched++;
-                    continue;
-                }
-                lr.start_time = entry.first;
-                lr.end_time = entry.second;
-                lr.duration = (lr.end_time > lr.start_time) ? (lr.end_time - lr.start_time) : 0;
-                patched++;
-            }
-        } else {
-            std::unordered_map<uint32_t, std::pair<uint64_t, uint64_t>> ts_by_task;
-            ts_by_task.reserve(ac_stream.size() * 2);
-            for (const auto &r : ac_stream) {
-                ts_by_task[r.task_id] = {r.start_time, r.end_time};
-            }
-            for (auto &lr : collected_perf_records_[core_idx]) {
-                auto it = ts_by_task.find(lr.reg_task_id);
-                if (it == ts_by_task.end()) {
-                    unmatched++;
-                    continue;
-                }
-                lr.start_time = it->second.first;
-                lr.end_time = it->second.second;
-                lr.duration = (lr.end_time > lr.start_time) ? (lr.end_time - lr.start_time) : 0;
-                patched++;
-            }
+            lr.start_time = it->second.first;
+            lr.end_time = it->second.second;
+            lr.duration = (lr.end_time > lr.start_time) ? (lr.end_time - lr.start_time) : 0;
+            patched++;
         }
 
         total_patched += patched;

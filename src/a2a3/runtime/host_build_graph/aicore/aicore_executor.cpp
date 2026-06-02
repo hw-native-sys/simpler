@@ -111,8 +111,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
+                // host_build_graph uses plain task indices; zero-extend into
+                // the task_token_raw slot (identity) AND pass as reg_task_id
+                // (join key). With block_num always == 1 in this runtime
+                // there is no dispatch fan-out per task, so identity and
+                // dispatch token coincide and a single value covers both.
                 l2_swimlane_aicore_record_task(
-                    l2_swimlane_head, &l2_swimlane_local, actual_task_id, start_time, end_time
+                    l2_swimlane_head, &l2_swimlane_local, static_cast<uint64_t>(actual_task_id),
+                    static_cast<uint32_t>(actual_task_id), start_time, end_time
                 );
             }
 

@@ -170,10 +170,26 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 pipe_barrier(PIPE_ALL);
             }
 
-            // Performance profiling: record task execution
+            // Performance profiling: record task execution.
+            // Two identity fields go into the record (different roles):
+            //   - task_token_raw (PTO2 ring/local) is pulled from the dispatch
+            //     payload's LocalContext.async_ctx — already in AICore cache
+            //     from the just-completed task, no extra GM load. Host uses
+            //     it as the canonical task identity for JSON output / ring
+            //     decoding.
+            //   - reg_task_id is `task_id` (= reg_val, the per-core dispatch
+            //     token AICore just read from DATA_MAIN_BASE). Per-dispatch
+            //     unique within this core; host uses it as the join key
+            //     against the AICPU record stream. Required for correctness
+            //     under SPMD (block_num > num_cores) and MIX cluster spread,
+            //     where multiple dispatches of the same task share the same
+            //     task_token_raw.
             if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                l2_swimlane_aicore_record_task(l2_swimlane_head, &l2_swimlane_local, task_id, start_time, end_time);
+                uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
+                l2_swimlane_aicore_record_task(
+                    l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, start_time, end_time
+                );
             }
 
             last_reg_val = reg_val;

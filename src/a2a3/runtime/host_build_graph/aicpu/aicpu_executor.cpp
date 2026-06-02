@@ -750,8 +750,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 // Profiling: when prev_running_id exists, its AICore timing was
                 // published to the ring slot first, so complete it BEFORE the
                 // pending task's record to maintain buffer ordering.
-                if (l2_swimlane_enabled) {
-                    uint64_t finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
+                // Level gate: AICPU contributes only at AICPU_TIMING+; level=1
+                // is satisfied by the AICore record alone (carries task_token).
+                if (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
+                    uint64_t finish_ts = get_sys_cnt_aicpu();
 
                     if (prev_running_id != AICPU_TASK_INVALID) {
                         Task *prev_task = &runtime.tasks[prev_running_id];
@@ -856,10 +858,11 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 // completed (AICore overwrote COND before we could read its FIN).
                 // Count it here to avoid losing completion.
                 if (prev_running_id != AICPU_TASK_INVALID) {
-                    // Profiling: complete the implicit task's AICore record
-                    if (l2_swimlane_enabled) {
-                        uint64_t finish_ts =
-                            (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
+                    // Profiling: complete the implicit task's AICore record.
+                    // Level gate: see complete-task comment at the matching
+                    // block ~100 lines above.
+                    if (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
+                        uint64_t finish_ts = get_sys_cnt_aicpu();
                         Task *prev_task = &runtime.tasks[prev_running_id];
                         if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
@@ -901,8 +904,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 int completed_task_id = running_task_ids_[core_id];
 
-                if (l2_swimlane_enabled) {
-                    uint64_t finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
+                // Level gate: see complete-task comment at the matching block above.
+                if (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
+                    uint64_t finish_ts = get_sys_cnt_aicpu();
                     Task *task = &runtime.tasks[completed_task_id];
                     if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),

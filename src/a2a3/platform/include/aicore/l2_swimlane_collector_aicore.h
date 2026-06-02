@@ -73,22 +73,37 @@ struct L2SwimlaneAicoreLocalState {
  * their records and dcci'd them out before AICPU enqueues the old buffer to
  * the ready queue.
  *
- * @param head     Per-core L2SwimlaneActiveHead channel — lazy-resolved on
- *                 the executor's first-task branch via
- *                 get_l2_swimlane_aicore_head(), which deref's the slot the
- *                 kernel entry stashed from
- *                 KernelArgs::l2_swimlane_aicore_rotation_table[block_idx].
- *                 (Kernel entry can't deref directly — AICPU init runs
- *                 concurrently with kernel entry, so the slot may not yet
- *                 hold a valid address at that point.)
- * @param local    Per-core AICore-local state (caller-owned static)
- * @param task_id  Register dispatch id (DATA_MAIN_BASE), low 32 bits
- * @param start_time Start timestamp (get_sys_cnt)
- * @param end_time   End timestamp
+ * @param head            Per-core L2SwimlaneActiveHead channel — lazy-resolved on
+ *                        the executor's first-task branch via
+ *                        get_l2_swimlane_aicore_head(), which deref's the slot
+ *                        the kernel entry stashed from
+ *                        KernelArgs::l2_swimlane_aicore_rotation_table[block_idx].
+ *                        (Kernel entry can't deref directly — AICPU init runs
+ *                        concurrently with kernel entry, so the slot may not yet
+ *                        hold a valid address at that point.)
+ * @param local           Per-core AICore-local state (caller-owned static)
+ * @param task_token_raw  Full task identity (PTO2 encoding for tensormap_and_ringbuffer
+ *                        runtime: `(ring_id << 32) | local_id`; plain task index
+ *                        zero-extended for host_build_graph). The caller in the
+ *                        ringbuffer runtime reads this from
+ *                        `exec_payload->local_context.async_ctx.task_token.raw`
+ *                        which is already in AICore cache (it was just dcci'd for
+ *                        the kernel call), so no extra GM load.
+ * @param reg_task_id     Per-core dispatch token (low 32 bits of the per-core
+ *                        monotonic dispatch_seq). Per-dispatch unique within
+ *                        a core; serves as the host-side join key against the
+ *                        AICPU record stream. Required because SPMD with
+ *                        `block_num > num_cores` (and MIX cluster spread)
+ *                        dispatch the same `task_token_raw` multiple times to
+ *                        the same core — each dispatch needs its own AICore
+ *                        record matched to its own AICPU record, which
+ *                        task_token_raw alone cannot disambiguate.
+ * @param start_time      Start timestamp (get_sys_cnt)
+ * @param end_time        End timestamp
  */
 __aicore__ __attribute__((always_inline)) static inline void l2_swimlane_aicore_record_task(
-    __gm__ L2SwimlaneActiveHead *head, L2SwimlaneAicoreLocalState *local, uint32_t task_id, uint64_t start_time,
-    uint64_t end_time
+    __gm__ L2SwimlaneActiveHead *head, L2SwimlaneAicoreLocalState *local, uint64_t task_token_raw, uint32_t reg_task_id,
+    uint64_t start_time, uint64_t end_time
 ) {
     // Re-fetch head channel each task; cheap relative to the
     // baseline `dcci(payload, ENTIRE_DATA_CACHE)` we already pay per task.
@@ -116,7 +131,8 @@ __aicore__ __attribute__((always_inline)) static inline void l2_swimlane_aicore_
     __gm__ L2SwimlaneAicoreTaskRecord *record = &local->cached_buf->records[slot];
     record->start_time = start_time;
     record->end_time = end_time;
-    record->task_id = task_id;
+    record->task_token_raw = task_token_raw;
+    record->reg_task_id = reg_task_id;
     local->slot_within_buf = slot + 1;
 
     // Flush record to GM so host can read it after the buffer is enqueued.

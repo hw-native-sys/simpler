@@ -132,17 +132,47 @@ static_assert(
 /**
  * Slim per-task record written by AICore directly into its own per-core
  * output buffer (no staging slot, no AICPU read). AICPU never touches this
- * record. The host post-processor joins it against the AICPU-side
- * L2SwimlaneAicpuTaskRecord on `task_id` at flush time.
+ * record at AICORE_TIMING (level=1); at AICPU_TIMING+ the host joins it
+ * against the AICPU record stream on `reg_task_id` (NOT `task_token_raw`).
  *
- * Layout: 24B payload + 8B pad → 32B (half a cache line). Two records pack
- * into one cache line so AICore's per-task store is at most a single line
- * commit + dcci.
+ * Two identity fields with different roles:
+ *
+ * - `task_token_raw` — the PTO2 task identity `(ring_id << 32) | local_id`.
+ *   Per-task unique. AICore reads it from
+ *   `LocalContext.async_ctx.task_token.raw` (already in the dispatch
+ *   payload's cache line). Used by the host JSON output as the canonical
+ *   task id + ring decoder; NOT a join key — SPMD `block_num > num_cores`,
+ *   MIX cluster spread, and pipeline dual-issue all dispatch the same
+ *   `task_token_raw` multiple times to the same core, each producing one
+ *   AICore execution record sharing the same token.
+ *
+ *   Why not drop it (the obvious reviewer question): at AICORE_TIMING
+ *   (level=1) AICPU writes no record, so this is the ONLY place the host
+ *   can read full PTO2 identity from. Without it level=1 JSON's `task_id`
+ *   degenerates to per-core (`reg_task_id`), `ring_id` disappears, and the
+ *   `swimlane_converter.py` deps.json join (kernel name + fanout) breaks.
+ *   At level≥2 it is redundant with `L2SwimlaneAicpuTaskRecord.task_id`,
+ *   but the field is free in space (within the 32B half-cacheline pad)
+ *   and on the AICore read path (same cache line as block_idx, which the
+ *   kernel always reads).
+ *
+ * - `reg_task_id` — the per-core dispatch token (low 32 bits of the
+ *   per-core monotonic `dispatch_seq`). Per-dispatch unique within a core.
+ *   This is the host-side join key against the AICPU record stream's
+ *   `L2SwimlaneAicpuTaskRecord.reg_task_id`. Each dispatch produces one
+ *   AICore record + one AICPU record sharing the same reg_task_id, giving
+ *   a clean 1:1 join even when multiple dispatches of the same task land
+ *   on the same core.
+ *
+ * Layout: 24B identity/timing + 4B reg_task_id + 4B pad → 32B (half a
+ * cache line). Two records pack into one cache line so AICore's per-task
+ * store is at most a single line commit + dcci.
  */
 struct L2SwimlaneAicoreTaskRecord {
-    uint64_t start_time;  // Task start timestamp (get_sys_cnt)
-    uint64_t end_time;    // Task end timestamp
-    uint32_t task_id;     // Register dispatch token (low 32 bits)
+    uint64_t start_time;      // Task start timestamp (get_sys_cnt)
+    uint64_t end_time;        // Task end timestamp
+    uint64_t task_token_raw;  // PTO2TaskId::raw — identity (NOT join key)
+    uint32_t reg_task_id;     // Per-core dispatch token — host join key vs AICPU stream
     uint32_t _pad;
 } __attribute__((aligned(32)));
 
