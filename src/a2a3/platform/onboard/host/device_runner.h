@@ -222,7 +222,7 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_l2_swimlane(int num_aicore, int device_id);
+    int init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id);
 
     /**
      * Initialize tensor dump shared memory and collector.

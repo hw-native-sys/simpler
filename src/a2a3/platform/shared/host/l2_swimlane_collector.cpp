@@ -77,8 +77,9 @@ void *L2SwimlaneCollector::alloc_single_buffer(size_t size, void **host_ptr_out)
 }
 
 int L2SwimlaneCollector::initialize(
-    int num_aicore, int device_id, L2SwimlaneLevel l2_swimlane_level, const L2SwimlaneAllocCallback &alloc_cb,
-    L2SwimlaneRegisterCallback register_cb, const L2SwimlaneFreeCallback &free_cb, const std::string &output_prefix
+    int num_aicore, int aicpu_thread_num, int device_id, L2SwimlaneLevel l2_swimlane_level,
+    const L2SwimlaneAllocCallback &alloc_cb, L2SwimlaneRegisterCallback register_cb,
+    const L2SwimlaneFreeCallback &free_cb, const std::string &output_prefix
 ) {
     if (shm_host_ != nullptr) {
         LOG_ERROR("L2SwimlaneCollector already initialized");
@@ -93,6 +94,7 @@ int L2SwimlaneCollector::initialize(
     }
 
     num_aicore_ = num_aicore;
+    aicpu_thread_num_ = aicpu_thread_num;
     l2_swimlane_level_ = l2_swimlane_level;
     output_prefix_ = output_prefix;
     total_perf_collected_ = 0;
@@ -271,13 +273,20 @@ int L2SwimlaneCollector::initialize(
     // — sched and orch buffers have DIFFERENT sizes (40B vs 32B records),
     // so a single cast type for both would land the count store past the end
     // of the orch allocation and corrupt the heap.
+    // state_count pool states are zeroed (so the host's [0, PLATFORM_MAX)
+    // reconcile/iteration reads count=0 for unused slots); buffers are
+    // allocated only for the first buffer_count pools. For sched the two are
+    // equal; orch is a single instance (pool 0), so it zeroes all slots but
+    // allocates buffers for just pool 0 — no buffers wasted on unused slots.
     auto init_phase_pools = [&](auto buffer_tag, L2SwimlaneAicpuTaskPool *(*get_state)(void *, int, int),
-                                int thread_count, ProfBufferType recycle_kind, const char *kind_label) -> int {
+                                int state_count, int buffer_count, ProfBufferType recycle_kind,
+                                const char *kind_label) -> int {
         using Buffer = typename decltype(buffer_tag)::type;
         constexpr size_t buffer_bytes = sizeof(Buffer);
-        for (int t = 0; t < thread_count; t++) {
+        for (int t = 0; t < state_count; t++) {
             auto *state = get_state(perf_host_ptr, num_aicore, t);
             memset(state, 0, sizeof(L2SwimlaneAicpuTaskPool));
+            if (t >= buffer_count) continue;  // zeroed state only; no buffers (unused slot)
             for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_THREAD; s++) {
                 void *host_buf_ptr = nullptr;
                 void *dev_buf_ptr = alloc_single_buffer(buffer_bytes, &host_buf_ptr);
@@ -312,20 +321,27 @@ int L2SwimlaneCollector::initialize(
         using type = L2SwimlaneAicpuOrchPhaseBuffer;
     };
 
+    // Sched: actual scheduler-thread count is unknown at host-alloc time, so
+    // size buffers to the platform max. Orch: a single instance (pool 0), so
+    // allocate buffers for just one pool while still zeroing all MAX states.
     if (init_phase_pools(
-            SchedTag{}, get_sched_phase_buffer_state, num_phase_threads, ProfBufferType::AICPU_SCHED_PHASE, "sched"
+            SchedTag{}, get_sched_phase_buffer_state, /*state_count=*/num_phase_threads,
+            /*buffer_count=*/num_phase_threads, ProfBufferType::AICPU_SCHED_PHASE, "sched"
         ) != 0) {
         return -1;
     }
     auto orch_get_state = [](void *base, int n_cores, int t) {
         return get_orch_phase_buffer_state(base, n_cores, t);
     };
-    if (init_phase_pools(OrchTag{}, orch_get_state, num_phase_threads, ProfBufferType::AICPU_ORCH_PHASE, "orch") != 0) {
+    if (init_phase_pools(
+            OrchTag{}, orch_get_state, /*state_count=*/num_phase_threads, /*buffer_count=*/1,
+            ProfBufferType::AICPU_ORCH_PHASE, "orch"
+        ) != 0) {
         return -1;
     }
     LOG_DEBUG(
-        "Initialized %d sched + %d orch PhaseBufferStates: 1 buffer/thread, %d in recycled pool each",
-        num_phase_threads, num_phase_threads, PLATFORM_PROF_BUFFERS_PER_THREAD - 1
+        "Initialized %d sched (+1 orch) PhaseBufferStates: 1 buffer/thread, %d in recycled pool each",
+        num_phase_threads, PLATFORM_PROF_BUFFERS_PER_THREAD - 1
     );
 
     wmb();
@@ -625,7 +641,17 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
         );
         return;
     }
-    LOG_INFO_V0("Collecting phase metadata: %d sched threads, %d orch threads", num_sched, num_orch);
+    // Scheduler threads occupy AICPU threads [0, num_sched); the dedicated
+    // orchestrator runs on the last AICPU thread (aicpu_thread_num_ - 1). The
+    // orch-phase pool is a single instance, so its pool index does not encode
+    // the AICPU thread — derive the thread number from aicpu_thread_num_.
+    // aicpu_thread_num_ is >= 1 (DeviceRunner::run validates launch_aicpu_num in
+    // [1, PLATFORM_MAX_AICPU_THREADS] before initialize()), so the subtraction
+    // can't go negative. This is a log-only display value, never an index.
+    const int orch_thread = aicpu_thread_num_ - 1;
+    LOG_INFO_V0(
+        "Collecting phase metadata: scheduler threads 0-%d, orchestrator thread %d", num_sched - 1, orch_thread
+    );
 
     for (size_t t = 0; t < collected_sched_phase_records_.size(); t++) {
         if (!collected_sched_phase_records_[t].empty()) {
@@ -634,7 +660,7 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
     }
     for (size_t t = 0; t < collected_orch_phase_records_.size(); t++) {
         if (!collected_orch_phase_records_[t].empty()) {
-            LOG_INFO_V0("  Orch thread %zu: %zu records", t, collected_orch_phase_records_[t].size());
+            LOG_INFO_V0("  Orch thread %d: %zu records", orch_thread, collected_orch_phase_records_[t].size());
         }
     }
 
@@ -752,6 +778,13 @@ void L2SwimlaneCollector::join_aicore_records() {
 }
 
 int L2SwimlaneCollector::export_swimlane_json() {
+    // shm_host_ is read once (phase-header metadata) below; guard it up front
+    // like the other collector methods so a never-initialized / post-finalize
+    // call returns instead of dereferencing null.
+    if (shm_host_ == nullptr) {
+        return -1;
+    }
+
     // Step 0: Join AICore-emitted start/end/task_id records into the AICPU
     // record stream (AICore-as-producer design).
     join_aicore_records();
@@ -962,8 +995,15 @@ int L2SwimlaneCollector::export_swimlane_json() {
             }
         }
         if (has_orch_phases) {
+            // Orch is a single instance (pool ordinal 0): emit only the actual
+            // orch lane count (num_orch_phase_threads), not the full MAX-sized
+            // vector, so the trace shows one orchestrator lane with no empties.
+            size_t orch_lanes = static_cast<size_t>(get_l2_swimlane_header(shm_host_)->num_orch_phase_threads);
+            if (orch_lanes == 0 || orch_lanes > collected_orch_phase_records_.size()) {
+                orch_lanes = collected_orch_phase_records_.size();
+            }
             outfile << ",\n  \"aicpu_orchestrator_phases\": [\n";
-            for (size_t t = 0; t < collected_orch_phase_records_.size(); t++) {
+            for (size_t t = 0; t < orch_lanes; t++) {
                 outfile << "    [\n";
                 bool first = true;
                 for (const auto &pr : collected_orch_phase_records_[t]) {
@@ -980,7 +1020,7 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 }
                 if (!first) outfile << "\n";
                 outfile << "    ]";
-                if (t < collected_orch_phase_records_.size() - 1) outfile << ",";
+                if (t < orch_lanes - 1) outfile << ",";
                 outfile << "\n";
             }
             outfile << "  ]";

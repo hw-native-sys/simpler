@@ -217,13 +217,22 @@ void l2_swimlane_aicpu_init_core_assignments(int total_cores);
 void l2_swimlane_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num);
 
 /**
- * Flush remaining phase records for a thread
+ * Flush the remaining scheduler-phase records for a scheduler thread.
  *
- * Marks the current WRITING phase buffer as READY and enqueues it
- * for host collection. Called at thread exit (analogous to l2_swimlane_aicpu_flush).
+ * Marks the thread's current WRITING sched-phase buffer as READY and enqueues
+ * it for host collection. Called at scheduler-thread exit.
  *
- * @param thread_idx Thread index (scheduler thread or orchestrator)
+ * @param thread_idx Scheduler thread index (= sched pool index = ready queue)
  */
-void l2_swimlane_aicpu_flush_phase_buffers(int thread_idx);
+void l2_swimlane_aicpu_flush_sched_phase_buffer(int thread_idx);
+
+/**
+ * Flush the remaining orchestrator-phase records (single orch instance, pool
+ * ordinal 0). Called once by the orchestrator thread at orchestration end.
+ *
+ * @param thread_idx Calling (orchestrator) AICPU thread index — selects the
+ *                   ready queue to enqueue into. The pool/lane tag is ordinal 0.
+ */
+void l2_swimlane_aicpu_flush_orch_phase_buffer(int thread_idx);
 
 #endif  // PLATFORM_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_

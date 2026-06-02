@@ -855,7 +855,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
         );
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-            l2_swimlane_aicpu_flush_phase_buffers(thread_idx);
+            l2_swimlane_aicpu_flush_sched_phase_buffer(thread_idx);
         }
     }
 #endif

@@ -253,7 +253,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_swimlane(num_aicore, device_id_);
+        rc = init_l2_swimlane(num_aicore, runtime.aicpu_thread_num, device_id_);
         if (rc != 0) {
             LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
@@ -457,7 +457,7 @@ int DeviceRunner::finalize() {
 
 // `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
-int DeviceRunner::init_l2_swimlane(int num_aicore, int device_id) {
+int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -480,7 +480,7 @@ int DeviceRunner::init_l2_swimlane(int num_aicore, int device_id) {
     };
 
     int rc = l2_swimlane_collector_.initialize(
-        num_aicore, device_id, l2_swimlane_level_, alloc_cb, register_cb, free_cb, output_prefix_
+        num_aicore, aicpu_thread_num, device_id, l2_swimlane_level_, alloc_cb, register_cb, free_cb, output_prefix_
     );
     if (rc != 0) {
         return rc;

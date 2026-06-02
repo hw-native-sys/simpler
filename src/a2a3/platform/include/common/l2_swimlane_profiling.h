@@ -379,11 +379,13 @@ struct L2SwimlaneDataHeader {
                                  // at init; AICPU reads in l2_swimlane_aicpu_init.
 
     // Phase profiling metadata (AICPU writes in l2_swimlane_aicpu_init_phase;
-    // Host reads at drain time). Both thread counts == 0 means phase
-    // profiling was not initialized. Gated by l2_swimlane_level >=
-    // SCHED_PHASES at write time. Sched and orch pools are sized
-    // independently — typically num_orch_phase_threads == 1, but in
-    // orch_to_sched mode both equal num_aicpu_threads.
+    // Host reads at drain time). Both counts == 0 means phase profiling was not
+    // initialized. Gated by l2_swimlane_level >= SCHED_PHASES at write time.
+    // num_sched_phase_threads counts the active scheduler threads (sched-phase
+    // pools are per scheduler thread, indexed by thread id). Orchestration is
+    // single-threaded, so orch-phase is a single instance: num_orch_phase_threads
+    // == 1 and records land in orch pool ordinal 0 (dep_gen / scope_stats style),
+    // regardless of which AICPU thread the orchestrator runs on.
     uint32_t num_sched_phase_threads;           // Number of sched-phase pools the AICPU initialized
     uint32_t num_orch_phase_threads;            // Number of orch-phase pools the AICPU initialized
     uint32_t num_phase_cores;                   // Number of valid entries in core_to_thread (0 = unset)

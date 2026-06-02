@@ -867,17 +867,16 @@ int32_t SchedulerContext::init(
         l2_swimlane_level_ = get_l2_swimlane_level();
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
             // Sched-phase pool count: matches the dump_tensor_init branch in
-            // scheduler_dispatch.cpp. Orch-phase pool count: typically 1 (one
-            // orch thread), but in orch_to_sched mode all scheduler threads
-            // can write orch records, so we size both pools to aicpu_thread_num_.
-            // sched_thread_num_ <= 0 means "use all AICPU threads as scheduler
-            // threads" (see assign_cores_to_threads' active_sched_threads_
-            // normalization at line 689). Without this normalization here,
-            // init_phase would prime zero sched pools and all sched_phase
-            // emits would silently drop.
+            // scheduler_dispatch.cpp. sched_thread_num_ <= 0 means "use all
+            // AICPU threads as scheduler threads" (see assign_cores_to_threads'
+            // active_sched_threads_ normalization at line 689). Without this
+            // normalization here, init_phase would prime zero sched pools and
+            // all sched_phase emits would silently drop.
             const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
             const int sched_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : active_sched;
-            const int orch_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : 1;
+            // Orchestration is always single-threaded, so orch-phase is one pool
+            // (ordinal 0) in both modes — see record_orch_phase.
+            const int orch_phase_threads = 1;
             l2_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
@@ -1005,9 +1004,11 @@ void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
 #if PTO2_PROFILING
-    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-        // Flush orchestrator's phase record buffer
-        l2_swimlane_aicpu_flush_phase_buffers(thread_idx);
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
+        // Flush the orchestrator's orch-phase buffer (single instance, pool 0).
+        // The orchestrator has no scheduler-phase pool of its own — those belong
+        // to the scheduler threads and are flushed in scheduler_dispatch.
+        l2_swimlane_aicpu_flush_orch_phase_buffer(thread_idx);
     }
 #endif
 

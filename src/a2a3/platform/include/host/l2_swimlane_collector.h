@@ -322,8 +322,9 @@ public:
      * @return 0 on success, error code on failure
      */
     int initialize(
-        int num_aicore, int device_id, L2SwimlaneLevel l2_swimlane_level, const L2SwimlaneAllocCallback &alloc_cb,
-        L2SwimlaneRegisterCallback register_cb, const L2SwimlaneFreeCallback &free_cb, const std::string &output_prefix
+        int num_aicore, int aicpu_thread_num, int device_id, L2SwimlaneLevel l2_swimlane_level,
+        const L2SwimlaneAllocCallback &alloc_cb, L2SwimlaneRegisterCallback register_cb,
+        const L2SwimlaneFreeCallback &free_cb, const std::string &output_prefix
     );
 
     /**
@@ -413,6 +414,11 @@ private:
     void *aicore_ring_addr_table_dev_{nullptr};
 
     int num_aicore_{0};
+    // Total AICPU threads launched this run. The dedicated orchestrator runs on
+    // the last one (aicpu_thread_num_ - 1); used to report its thread number in
+    // the phase-metadata log (orch-phase is a single pool, so its index alone
+    // does not encode the AICPU thread).
+    int aicpu_thread_num_{0};
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};
 
     // Per-task output directory captured at initialize() time. Consumed by
