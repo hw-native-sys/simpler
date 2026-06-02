@@ -252,7 +252,7 @@ def _split_core_bns_nd(
     )
 
 
-def make_pa_nd_decode_tiling(
+def make_pa_nd_decode_tiling(  # noqa: PLR0913, PLR0915
     batch: int,
     kv_seq_lens: list[int],
     num_heads: int,
