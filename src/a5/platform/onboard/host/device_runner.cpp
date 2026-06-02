@@ -505,7 +505,13 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
     // a5: register_cb=nullptr, so the collector mallocs a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device (see
     // ProfilerBase::alloc_paired_buffer). No halHostRegister on a5.
-    int rc = scope_stats_collector_.init(num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, device_id);
+    // Scope site filter (raw comma-separated CallConfig.scope_stats_scope; the
+    // collector parses + applies it) and per-task sampling. Empty/false = the
+    // baseline per-scope behavior.
+    int rc = scope_stats_collector_.init(
+        num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, device_id, scope_stats_scope().c_str(),
+        scope_stats_task()
+    );
     if (rc != 0) {
         return rc;
     }

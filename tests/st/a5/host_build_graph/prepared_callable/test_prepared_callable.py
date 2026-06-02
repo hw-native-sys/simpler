@@ -97,6 +97,8 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
+        scope_stats_scope="",
+        scope_stats_task=False,
         output_prefix="",
     ):
         params = case.get("params", {})

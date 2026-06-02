@@ -24,25 +24,40 @@ Pass the flag to any T&R example or scene test:
 python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-scope-stats
 ```
 
-The flag is bit 4 of `enable_profiling_flag`; on a T&R run it turns on
-per-scope peak tracking. On other runtimes the flag is accepted but
-produces no records.
+On a T&R run it turns on per-scope peak tracking. On other runtimes the
+flag is accepted but produces no records.
+
+Two optional, orthogonal refinements layer on top — both keep the
+default (bare flag) behavior unchanged and are opt-in:
+
+| Flag | Effect |
+| ---- | ------ |
+| `--enable-scope-stats <lines>` | Collect **only** the listed `PTO2_SCOPE` line numbers (comma-separated, e.g. `--enable-scope-stats 42,108`). The orchestration is one source file, so a line uniquely identifies a scope. Bare flag = collect every scope. |
+| `--scope-stats-task` | Also emit one **per-task** record (`phase: "task"`) at every `submit_task`, carrying the submitted `task_id` and the ring/heap occupancy right after allocation. Implies `--enable-scope-stats`. |
+
+The two compose: `--enable-scope-stats 77 --scope-stats-task` records the
+per-task occupancy curve **inside the scope at line 77 only** — the usual
+way to see which task drove a specific scope to its peak without the
+volume of per-task sampling everywhere.
+
+Equivalent `CallConfig` fields for programmatic use:
+`config.scope_stats_scope = "42,108"` and `config.scope_stats_task = True`.
 
 ### Step 2 — Locate the output
 
-The run writes `scope_stats.jsonl` under the per-task output prefix
-(the same directory other profiling artifacts land in for that run).
+The run writes `scope_stats.jsonl` into a `scope_stats/` subdirectory of
+the per-task output prefix (`<output_prefix>/scope_stats/scope_stats.jsonl`).
 It is NDJSON: line 1 is run metadata, every subsequent line is one
 scope sample. See [§3](#3-output-scope_statsjsonl) for the schema.
 
 ### Step 3 — Visualize with `scope_stats_plot.py`
 
 ```bash
-python simpler_setup/tools/scope_stats_plot.py <output_prefix>/scope_stats.jsonl
-# writes <output_prefix>/scope_stats.html
+python simpler_setup/tools/scope_stats_plot.py <output_prefix>/scope_stats/scope_stats.jsonl
+# writes <output_prefix>/scope_stats/scope_stats.html
 
 # or send the report elsewhere:
-python simpler_setup/tools/scope_stats_plot.py path/to/scope_stats.jsonl --out-dir /tmp/report
+python simpler_setup/tools/scope_stats_plot.py path/to/scope_stats/scope_stats.jsonl --out-dir /tmp/report
 ```
 
 | Argument | Required | Meaning |
@@ -80,12 +95,19 @@ the `real_occupancy` curve.
 - **The whole orchestration, automatically.** You do not mark a region
   to profile — instrumentation lives inside the `PTO2_SCOPE` macro
   itself, so *every* scope in the orchestration is recorded once the
-  flag is on. The executor wraps the orchestration entry in a root
-  `PTO2_SCOPE` (`depth` 0), and every user-written `PTO2_SCOPE` nests
-  under it, so the report covers the entire orch scope tree end to end.
+  flag is on. The executor opens an implicit root scope around the
+  orchestration entry (`depth` 0, rendered as site `<root>` since it has
+  no `PTO2_SCOPE` source location), and every user-written `PTO2_SCOPE`
+  nests under it, so the report covers the entire orch scope tree.
 - **One sample per scope boundary.** Each `PTO2_SCOPE` emits a `begin`
   record on entry and an `end` record on exit. The plot tool pairs them
   by site to compute the metrics above.
+- **Optionally narrowed or refined.** `--enable-scope-stats <lines>`
+  restricts collection to specific scope sites; `--scope-stats-task`
+  adds intermediate `task` records inside a scope (see [§1](#step-1--run-with---enable-scope-stats)).
+  Both are device-side gated — a filtered-out scope is never appended
+  and does not count toward `total`, and the per-task probe costs one
+  bool load when off.
 - **Per-ring.** Each ring's task allocator heap / task-window is tracked
   independently; a scope only ever touches its own ring
   (`ring = min(depth, MAX_RING_DEPTH−1)`).
@@ -98,13 +120,15 @@ the `real_occupancy` curve.
 
 ## 3. Output: `scope_stats.jsonl`
 
-NDJSON. Line 1 is run metadata; each subsequent line is one scope
-sample (`begin` or `end`). Schema version 4:
+NDJSON. Line 1 is run metadata; each subsequent line is one sample —
+`begin`/`end` at scope boundaries, plus `task` records in between when
+`--scope-stats-task` is on. Schema version 4:
 
 ```json
 {"version": 4, "fatal": false, "dropped": 0, "total": 4, "task_window_max": [8, 4], "heap_max": [268435456, 268435456], "tensormap_max": 65536}
-{"site": "example_orchestration.cpp:77", "phase": "begin", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 0, "heap_start": 0, "heap_end": 0, "tensormap": 0}
-{"site": "example_orchestration.cpp:77", "phase": "end", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 4, "heap_start": 0, "heap_end": 8192, "tensormap": 5}
+{"site": "example_orchestration.cpp:77", "phase": "begin", "task_id": 0, "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 0, "heap_start": 0, "heap_end": 0, "tensormap": 0}
+{"site": "example_orchestration.cpp:77", "phase": "task", "task_id": 4294967296, "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 1, "heap_start": 0, "heap_end": 2048, "tensormap": 1}
+{"site": "example_orchestration.cpp:77", "phase": "end", "task_id": 0, "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 4, "heap_start": 0, "heap_end": 8192, "tensormap": 5}
 ```
 
 Metadata line (line 1):
@@ -123,9 +147,10 @@ Per-sample lines, oldest-first:
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `site` | `"basename:line"` | Source location of the `PTO2_SCOPE()` call |
-| `phase` | `"begin"`/`"end"` | Scope entry or exit sample |
-| `depth` | int | Nesting depth (0 = root scope inside the executor) |
+| `site` | `"basename:line"` | Source location of the `PTO2_SCOPE()` call (`<root>:0` for the implicit root scope) |
+| `phase` | `"begin"`/`"end"`/`"task"` | Scope entry, scope exit, or a per-task sample (`--scope-stats-task`) |
+| `task_id` | uint | Submitted task id for `task` records; `0` for `begin`/`end` |
+| `depth` | int | Nesting depth (0 = implicit root scope, site `<root>`) |
 | `ring` | int | Ring this scope used; indexes `task_window_max` / `heap_max` |
 | `task_window_start` | int | Task-window ring tail at this boundary |
 | `task_window_end` | int | Task-window ring head at this boundary |
@@ -143,7 +168,9 @@ and occupancy are derived from a paired begin/end.
 
 This section is for maintainers wiring scope stats into a runtime; users
 do not need it. There is **no public C/C++ API** — the only external
-interfaces are the `--enable-scope-stats` flag and the plot tool above.
+interfaces are the `--enable-scope-stats` / `--scope-stats-task` flags
+(and the `CallConfig.scope_stats_scope` / `scope_stats_task` fields they
+map to) and the plot tool above.
 
 ### 4.1 Layering
 

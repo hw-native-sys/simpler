@@ -173,9 +173,19 @@ def pytest_addoption(parser):
     )
     parser.addoption(
         "--enable-scope-stats",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="LINES",
+        help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill "
+        "peaks). Optionally pass a comma-separated list of PTO2_SCOPE line numbers (e.g. --enable-scope-stats "
+        "42,108) to collect only those scopes; bare flag collects all.",
+    )
+    parser.addoption(
+        "--scope-stats-task",
         action="store_true",
         default=False,
-        help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
+        help='Add per-task scope_stats records (one per submit_task, phase="task"). Implies --enable-scope-stats.',
     )
     parser.addoption(
         "--pto-isa-commit",

@@ -615,7 +615,12 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = scope_stats_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id);
+    // Scope site filter is the raw comma-separated CallConfig.scope_stats_scope
+    // (e.g. "42,108"); the collector parses + applies it. Empty = collect every
+    // scope.
+    int rc = scope_stats_collector_.init(
+        num_threads, alloc_cb, register_cb, free_cb, device_id, scope_stats_scope().c_str(), scope_stats_task()
+    );
     if (rc != 0) {
         return rc;
     }

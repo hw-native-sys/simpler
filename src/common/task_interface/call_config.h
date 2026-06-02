@@ -58,6 +58,15 @@ struct CallConfig {
     int32_t enable_dep_gen = 0;
     int32_t enable_scope_stats = 0;  // writes <output_prefix>/scope_stats.json
     char output_prefix[1024] = {};
+    // Optional scope site filter: comma-separated PTO2_SCOPE line numbers
+    // (e.g. "42,108") restricting scope_stats collection to those scopes.
+    // Empty = collect every scope. Parsed host-side in init_scope_stats.
+    // Sized to hold a full PTO2_SCOPE_STATS_MAX_SITE_FILTERS (16) CSV of
+    // multi-digit line numbers without truncation.
+    char scope_stats_scope[128] = {};
+    // Per-task scope_stats sampling: when non-zero, emit one PHASE_TASK record
+    // per submit_task (subject to scope_stats_scope). 0 = scope boundaries only.
+    int32_t scope_stats_task = 0;
 
     bool diagnostics_any() const noexcept {
         return enable_l2_swimlane != 0 || enable_dump_tensor != 0 || enable_pmu != 0 || enable_dep_gen != 0 ||
@@ -80,4 +89,4 @@ struct CallConfig {
     }
 };
 #pragma pack(pop)
-static_assert(sizeof(CallConfig) == 7 * sizeof(int32_t) + 1024, "CallConfig wire layout drift");
+static_assert(sizeof(CallConfig) == 8 * sizeof(int32_t) + 1024 + 128, "CallConfig wire layout drift");

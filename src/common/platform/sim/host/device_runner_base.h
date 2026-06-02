@@ -119,6 +119,13 @@ public:
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
     void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
+    // scope_stats refinements: line-number filter (empty = all scopes) and
+    // per-task sampling. Stored for parity with the onboard runner; applied
+    // where the collector is initialized.
+    void set_scope_stats_scope(const char *scope) { scope_stats_scope_ = (scope != nullptr) ? scope : ""; }
+    const std::string &scope_stats_scope() const { return scope_stats_scope_; }
+    void set_scope_stats_task(bool enable) { scope_stats_task_ = enable; }
+    bool scope_stats_task() const { return scope_stats_task_; }
     // Diagnostic artifact root directory (CallConfig::validate() enforces non-empty
     // upstream when any diagnostic is enabled).
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
@@ -256,6 +263,8 @@ protected:
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                   // diagnostic artifact root directory
+    std::string scope_stats_scope_{};                               // scope_stats line filter (empty = all scopes)
+    bool scope_stats_task_{false};                                  // per-task scope_stats sampling
 };
 
 namespace simpler::common::sim_host {

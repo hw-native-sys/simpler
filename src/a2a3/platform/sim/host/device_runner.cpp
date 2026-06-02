@@ -705,7 +705,10 @@ int DeviceRunner::init_scope_stats(int num_threads) {
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = scope_stats_collector_.init(num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, /*device_id=*/-1);
+    int rc = scope_stats_collector_.init(
+        num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, /*device_id=*/-1, scope_stats_scope().c_str(),
+        scope_stats_task()
+    );
     if (rc != 0) {
         return rc;
     }

@@ -678,6 +678,8 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     enable_pmu,
     enable_dep_gen,
     enable_scope_stats,
+    scope_stats_scope="",
+    scope_stats_task=False,
 ):
     """Execute a pre-filtered list of cases for one class (layers 5-6).
 
@@ -709,6 +711,8 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
+                scope_stats_scope=scope_stats_scope,
+                scope_stats_task=scope_stats_task,
                 output_prefix=str(prefix) if diagnostics_on else "",
             )
         finally:
@@ -884,6 +888,8 @@ class SceneTestCase:
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
+        scope_stats_scope="",
+        scope_stats_task=False,
         *,
         output_prefix="",
     ):
@@ -901,6 +907,9 @@ class SceneTestCase:
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         config.enable_dep_gen = enable_dep_gen
         config.enable_scope_stats = enable_scope_stats
+        if scope_stats_scope:
+            config.scope_stats_scope = scope_stats_scope
+        config.scope_stats_task = scope_stats_task
         # `output_prefix` is required by CallConfig::validate() whenever any
         # diagnostic flag is enabled. Caller threads it down from the per-case
         # directory built by _build_output_prefix().
@@ -938,6 +947,8 @@ class SceneTestCase:
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
+        scope_stats_scope="",
+        scope_stats_task=False,
         output_prefix="",
     ):
         if self._st_level == 2:
@@ -952,6 +963,8 @@ class SceneTestCase:
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
+                scope_stats_scope=scope_stats_scope,
+                scope_stats_task=scope_stats_task,
                 output_prefix=output_prefix,
             )
         elif self._st_level == 3:
@@ -967,6 +980,8 @@ class SceneTestCase:
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
+                scope_stats_scope=scope_stats_scope,
+                scope_stats_task=scope_stats_task,
                 output_prefix=output_prefix,
             )
 
@@ -982,6 +997,8 @@ class SceneTestCase:
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
+        scope_stats_scope="",
+        scope_stats_task=False,
         output_prefix="",
     ):
         params = case.get("params", {})
@@ -1032,6 +1049,8 @@ class SceneTestCase:
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
+                scope_stats_scope=scope_stats_scope,
+                scope_stats_task=scope_stats_task,
                 output_prefix=output_prefix,
             )
 
@@ -1059,6 +1078,8 @@ class SceneTestCase:
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
+        scope_stats_scope="",
+        scope_stats_task=False,
         output_prefix="",
     ):
         # Defensive belt-and-braces: the pytest dispatcher and run_module both
@@ -1114,6 +1135,8 @@ class SceneTestCase:
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
+                scope_stats_scope=scope_stats_scope,
+                scope_stats_task=scope_stats_task,
                 output_prefix=output_prefix,
             )
 
@@ -1167,7 +1190,16 @@ class SceneTestCase:
         enable_dump_tensor = request.config.getoption("--dump-tensor", default=0)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
-        enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)
+        # nargs="?": None = flag absent, "" = bare flag (collect all), a string
+        # like "42,108" = collect only those PTO2_SCOPE line numbers. The line
+        # filter rides to the device collector via CallConfig.scope_stats_scope
+        # (set in _build_config, parsed host-side in init_scope_stats).
+        scope_stats_opt = request.config.getoption("--enable-scope-stats", default=None)
+        scope_stats_task = request.config.getoption("--scope-stats-task", default=False)
+        # --scope-stats-task implies --enable-scope-stats (the collector only
+        # initializes when scope_stats is on).
+        enable_scope_stats = scope_stats_opt is not None or scope_stats_task
+        scope_stats_scope = scope_stats_opt if isinstance(scope_stats_opt, str) else ""
         if rounds > 1:
             if enable_l2_swimlane:
                 logger.warning("Profiling disabled: --rounds > 1")
@@ -1181,6 +1213,7 @@ class SceneTestCase:
             if enable_scope_stats:
                 logger.warning("scope_stats disabled: --rounds > 1")
                 enable_scope_stats = False
+                scope_stats_task = False
 
         cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
@@ -1222,6 +1255,8 @@ class SceneTestCase:
             enable_pmu=enable_pmu,
             enable_dep_gen=enable_dep_gen,
             enable_scope_stats=enable_scope_stats,
+            scope_stats_scope=scope_stats_scope,
+            scope_stats_task=scope_stats_task,
         )
 
     # ------------------------------------------------------------------
@@ -1308,10 +1343,20 @@ class SceneTestCase:
         )
         parser.add_argument(
             "--enable-scope-stats",
+            nargs="?",
+            const="",
+            default=None,
+            metavar="LINES",
+            help="Enable per-scope peak collection and emit <output_prefix>/scope_stats/scope_stats.jsonl "
+            "(per-scope ring-fill peaks). Optionally pass a comma-separated list of PTO2_SCOPE line "
+            "numbers (e.g. --enable-scope-stats 42,108) to collect only those scopes; bare flag collects all.",
+        )
+        parser.add_argument(
+            "--scope-stats-task",
             action="store_true",
             default=False,
-            help="Enable per-scope peak collection and emit <output_prefix>/scope_stats/scope_stats.jsonl "
-            "(per-scope ring-fill peaks).",
+            help='Add per-task scope_stats records (one per submit_task, phase="task"). Implies '
+            "--enable-scope-stats; combine with a scope filter to restrict to one scope.",
         )
         parser.add_argument(
             "--runtime",
@@ -1394,9 +1439,13 @@ class SceneTestCase:
         if args.rounds > 1 and args.enable_dep_gen:
             logger.warning("dep_gen disabled: --rounds > 1")
             args.enable_dep_gen = False
-        if args.rounds > 1 and args.enable_scope_stats:
+        # --enable-scope-stats is nargs="?": None = absent, "" = bare (all
+        # scopes), "42,108" = only those PTO2_SCOPE lines. The line filter
+        # rides via CallConfig.scope_stats_scope (set in run_class_cases below).
+        if args.rounds > 1 and (args.enable_scope_stats is not None or args.scope_stats_task):
             logger.warning("scope_stats disabled: --rounds > 1")
-            args.enable_scope_stats = False
+            args.enable_scope_stats = None
+            args.scope_stats_task = False
 
         from .parallel_scheduler import default_max_parallel, device_range_to_list  # noqa: PLC0415
 
@@ -1526,7 +1575,11 @@ class SceneTestCase:
                                 enable_dump_tensor=args.dump_tensor,
                                 enable_pmu=args.enable_pmu,
                                 enable_dep_gen=args.enable_dep_gen,
-                                enable_scope_stats=args.enable_scope_stats,
+                                enable_scope_stats=(args.enable_scope_stats is not None or args.scope_stats_task),
+                                scope_stats_scope=(
+                                    args.enable_scope_stats if isinstance(args.enable_scope_stats, str) else ""
+                                ),
+                                scope_stats_task=args.scope_stats_task,
                             )
                             print("PASSED")
                         except Exception as e:  # noqa: BLE001
@@ -1568,8 +1621,11 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common.append("--dump-tensor")
     if args.enable_dep_gen:
         common.append("--enable-dep-gen")
-    if args.enable_scope_stats:
-        common.append("--enable-scope-stats")
+    if args.enable_scope_stats is not None:
+        # Preserve the optional line-filter value ("" = bare flag = collect all).
+        common += ["--enable-scope-stats", args.enable_scope_stats]
+    if args.scope_stats_task:
+        common.append("--scope-stats-task")
 
     # ----- L3 phase: one subprocess per class (not per case).
     # The child's _create_standalone_worker allocates max(cls.CASES.device_count)
