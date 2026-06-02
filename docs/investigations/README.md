@@ -84,5 +84,6 @@ that ...".
 
 Newest first.
 
+- [2026-06 — a5 AICPU filter gate: Scenario B fail-fast guard not added](2026-06-a5-aicpu-filter-gate-scenario-b-validation.md)
 - [2026-06 — Sanitizer rollout scope: macOS, TSAN gating, LSan](2026-06-sanitizer-scope.md)
 - [2026-06 — L2 swimlane: defer per-task wmb to rotation](2026-06-l2-swimlane-defer-wmb.md)
