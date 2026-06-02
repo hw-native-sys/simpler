@@ -96,8 +96,7 @@ def parse_device_range(spec: str) -> list[int]:
         ids = [int(spec)]
     if not (2 <= len(ids) <= K_MAX_SUPPORTED_RANKS):
         raise ValueError(
-            f"allreduce_ring_distributed needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, "
-            f"got {len(ids)} ({ids})"
+            f"allreduce_ring_distributed needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, got {len(ids)} ({ids})"
         )
     if ALLREDUCE_COUNT % len(ids) != 0:
         raise ValueError(f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by nranks={len(ids)} for even chunking")
