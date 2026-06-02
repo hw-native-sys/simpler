@@ -14,13 +14,17 @@
  * Contrasts with mesh ``allreduce_kernel.cpp`` (O(P) full-vector remote reads):
  * each of the (P-1) reduce-scatter and (P-1) allgather rounds moves one chunk
  * to the right neighbour; left neighbour reads the published exchange slot via
- * CommRemotePtr + TLOAD.
+ * CommRemotePtr + TLOAD (same local-write / barrier / remote-read pattern as mesh).
  *
  * Scratch layout (float region then int32 signals):
  *   [0 .. P*chunk)           P chunk slots owned by this rank
  *   [P*chunk .. (P+1)*chunk) single-chunk exchange publish area
- *   tail                     2*(P-1)*kMaxSupportedRanks int32 barrier slots
- *                            (one row per round, indexed by rank)
+ *   tail                     kMaxSupportedRanks int32 barrier slots (one row)
+ *
+ * Multi-round barriers reuse the same signal row with monotonically increasing
+ * generation counters (AtomicAdd + TWAIT GE generation).  Do not zero signal
+ * slots between rounds — a faster rank's TNOTIFY can arrive while a slower
+ * rank is still resetting, which loses the wakeup and deadlocks TWAIT.
  *
  * args layout (see allreduce_ring_orch.cpp):
  *   tensor(0) = input    (ALLREDUCE_COUNT floats)
@@ -62,14 +66,14 @@ using StrideDyn = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYN
 using Global = pto::GlobalTensor<float, ShapeDyn, StrideDyn, pto::Layout::ND>;
 using TileData = pto::Tile<pto::TileType::Vec, float, 1, CHUNK_MAX, pto::BLayout::RowMajor, -1, -1>;
 
-AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_base, int my_rank, int nranks,
-                                int round) {
-    __gm__ int32_t *round_signals = signal_base + round * kMaxSupportedRanks;
+// Mesh-style device barrier with cumulative generation counter on a single signal row.
+AICORE inline void
+DeviceBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_base, int my_rank, int nranks, int32_t generation) {
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) {
             continue;
         }
-        __gm__ int32_t *remote_signal = CommRemotePtr(ctx, round_signals + my_rank, peer);
+        __gm__ int32_t *remote_signal = CommRemotePtr(ctx, signal_base + my_rank, peer);
         pto::comm::Signal sig(remote_signal);
         pto::comm::TNOTIFY(sig, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
     }
@@ -77,8 +81,8 @@ AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_
         if (peer == my_rank) {
             continue;
         }
-        pto::comm::Signal sig(round_signals + peer);
-        pto::comm::TWAIT(sig, (int32_t)1, pto::comm::WaitCmp::GE);
+        pto::comm::Signal sig(signal_base + peer);
+        pto::comm::TWAIT(sig, generation, pto::comm::WaitCmp::GE);
     }
     pipe_barrier(PIPE_ALL);
 }
@@ -96,8 +100,9 @@ AICORE inline void CopyChunkGm(__gm__ float *dst, __gm__ float *src, int chunk_e
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 }
 
-AICORE inline void RecvExchangeFromLeft(__gm__ CommContext *ctx, __gm__ float *exchange_local, int my_rank, int nranks,
-                                        int chunk_elems, TileData &recvTile) {
+AICORE inline void RecvExchangeFromLeft(
+    __gm__ CommContext *ctx, __gm__ float *exchange_local, int my_rank, int nranks, int chunk_elems, TileData &recvTile
+) {
     int left = (my_rank - 1 + nranks) % nranks;
     __gm__ float *remote_exchange = CommRemotePtr(ctx, exchange_local, left);
     ShapeDyn shape(1, 1, 1, 1, chunk_elems);
@@ -133,6 +138,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ int32_t *signal_base =
         reinterpret_cast<__gm__ int32_t *>(scratch + static_cast<size_t>((nranks + 1) * chunk_elems));
 
+    // Zero-init once per invocation (handles stale HCCL window state from a prior run).
+    for (int i = 0; i < nranks; ++i) {
+        signal_base[i] = 0;
+    }
+    pipe_barrier(PIPE_ALL);
+
     TileData chunkTile(1, chunk_elems);
     TileData recvTile(1, chunk_elems);
     TASSIGN(chunkTile, 0x0);
@@ -141,16 +152,20 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     ShapeDyn chunkShape(1, 1, 1, 1, chunk_elems);
     StrideDyn chunkStride(chunk_elems, chunk_elems, chunk_elems, chunk_elems, 1);
 
+    int32_t generation = 0;
+
     // ------------------------------------------------------------------
     // Stage-in: partition local input into P chunk slots in the window.
     // ------------------------------------------------------------------
     for (int chunk = 0; chunk < nranks; ++chunk) {
-        CopyChunkGm(chunks + static_cast<size_t>(chunk * chunk_elems), input + static_cast<size_t>(chunk * chunk_elems),
-                    chunk_elems, chunkTile);
+        CopyChunkGm(
+            chunks + static_cast<size_t>(chunk * chunk_elems), input + static_cast<size_t>(chunk * chunk_elems),
+            chunk_elems, chunkTile
+        );
     }
     pipe_barrier(PIPE_ALL);
 
-    int round = 0;
+    DeviceBarrier(commCtx, signal_base, my_rank, nranks, ++generation);
 
     // ------------------------------------------------------------------
     // Reduce-scatter: (P-1) ring steps; rank r ends with fully reduced chunk r.
@@ -162,7 +177,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         CopyChunkGm(exchange, chunks + static_cast<size_t>(send_idx * chunk_elems), chunk_elems, chunkTile);
         pipe_barrier(PIPE_ALL);
 
-        RoundBarrier(commCtx, signal_base, my_rank, nranks, round++);
+        DeviceBarrier(commCtx, signal_base, my_rank, nranks, ++generation);
 
         RecvExchangeFromLeft(commCtx, exchange, my_rank, nranks, chunk_elems, recvTile);
 
@@ -189,7 +204,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         CopyChunkGm(exchange, chunks + static_cast<size_t>(send_idx * chunk_elems), chunk_elems, chunkTile);
         pipe_barrier(PIPE_ALL);
 
-        RoundBarrier(commCtx, signal_base, my_rank, nranks, round++);
+        DeviceBarrier(commCtx, signal_base, my_rank, nranks, ++generation);
 
         RecvExchangeFromLeft(commCtx, exchange, my_rank, nranks, chunk_elems, recvTile);
 
@@ -206,8 +221,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // Stage-out: concatenated chunks → local output tensor.
     // ------------------------------------------------------------------
     for (int chunk = 0; chunk < nranks; ++chunk) {
-        CopyChunkGm(output + static_cast<size_t>(chunk * chunk_elems),
-                    chunks + static_cast<size_t>(chunk * chunk_elems), chunk_elems, chunkTile);
+        CopyChunkGm(
+            output + static_cast<size_t>(chunk * chunk_elems), chunks + static_cast<size_t>(chunk * chunk_elems),
+            chunk_elems, chunkTile
+        );
     }
     pipe_barrier(PIPE_ALL);
 }

@@ -65,7 +65,8 @@ ALLREDUCE_COUNT = 256
 K_MAX_SUPPORTED_RANKS = 16
 CHUNK_MAX = ALLREDUCE_COUNT // 2  # largest chunk (P=2)
 SCRATCH_FLOAT_ELEMS = (K_MAX_SUPPORTED_RANKS + 1) * CHUNK_MAX
-SIGNAL_SLOTS = 2 * (K_MAX_SUPPORTED_RANKS - 1) * K_MAX_SUPPORTED_RANKS
+# One int32 signal row (same as mesh allreduce); kernel bumps generation each round.
+SIGNAL_SLOTS = K_MAX_SUPPORTED_RANKS
 SCRATCH_NBYTES = SCRATCH_FLOAT_ELEMS * 4 + SIGNAL_SLOTS * 4
 
 
@@ -77,13 +78,10 @@ def parse_device_range(spec: str) -> list[int]:
         ids = [int(spec)]
     if not (2 <= len(ids) <= K_MAX_SUPPORTED_RANKS):
         raise ValueError(
-            f"allreduce_ring_distributed needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, "
-            f"got {len(ids)} ({ids})"
+            f"allreduce_ring_distributed needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, got {len(ids)} ({ids})"
         )
     if ALLREDUCE_COUNT % len(ids) != 0:
-        raise ValueError(
-            f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by nranks={len(ids)} for even chunking"
-        )
+        raise ValueError(f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by nranks={len(ids)} for even chunking")
     return ids
 
 
