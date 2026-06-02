@@ -157,6 +157,11 @@ def run(
 ) -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
+    if not (2 <= nranks <= K_MAX_SUPPORTED_RANKS):
+        raise ValueError(
+            "allreduce_ring_distributed needs between 2 and "
+            f"{K_MAX_SUPPORTED_RANKS} devices, got {nranks} ({device_ids})"
+        )
     float_elems = scratch_float_elems(nranks)
     # Backends may round up; only needs to hold SCRATCH_NBYTES.  A 4 KB floor
     # keeps us clear of minimum-window-size quirks.
