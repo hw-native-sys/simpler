@@ -84,5 +84,6 @@ that ...".
 
 Newest first.
 
+- [2026-06 — a2a3 column-scatter race (#967): PIPE_S→PIPE_V handshake missing in PyPTO codegen](2026-06-scatter-race-a2a3.md)
 - [2026-06 — Sanitizer rollout scope: macOS, TSAN gating, LSan](2026-06-sanitizer-scope.md)
 - [2026-06 — L2 swimlane: defer per-task wmb to rotation](2026-06-l2-swimlane-defer-wmb.md)
