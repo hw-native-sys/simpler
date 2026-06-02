@@ -8,6 +8,21 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+/**
+ * Ring AllReduce orchestration — chunked RS+AG kernel shim.
+ *
+ * Three Tensor args (the kernel reads ``Tensor->buffer.addr`` + start_offset
+ * to get the real device pointer) plus two scalars:
+ *
+ *   tensor(0) input   INPUT           (plain device mem, staged in by bootstrap)
+ *   tensor(1) output  OUTPUT_EXISTING (plain device mem, flushed by bootstrap)
+ *   tensor(2) scratch INOUT           (HCCL window; chunked RS+AG in AIV kernel)
+ *   scalar(0) nranks
+ *   scalar(1) CommContext device pointer
+ *
+ * INOUT on scratch expresses that the kernel both writes (stage-in, ring
+ * publish) and reads (reduce-scatter / allgather remote TLOAD) it.
+ */
 
 #include <stdint.h>
 
