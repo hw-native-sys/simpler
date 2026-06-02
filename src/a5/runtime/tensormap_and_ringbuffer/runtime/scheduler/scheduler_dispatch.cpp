@@ -402,6 +402,7 @@ void SchedulerContext::dispatch_ready_tasks(
             l2_perf.local_overflow_count += lb.count;
 #endif
             if (lb.count > 0) {
+#if PTO2_SCHED_PROFILING
                 // Tag enter_global_queue_cycles for any task whose release path
                 // had only set fanin_zero_cycles (entered via local_buf, never
                 // through the global queue until now).
@@ -411,6 +412,7 @@ void SchedulerContext::dispatch_ready_tasks(
                         lb.slot_states[i]->enter_global_queue_cycles = now;
                     }
                 }
+#endif
                 sched_->ready_queues[s].push_batch(lb.slot_states, lb.count);
                 lb.count = 0;
             }

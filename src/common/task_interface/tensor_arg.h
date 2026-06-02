@@ -52,8 +52,12 @@ static_assert(
 
 /**
  * TensorArgType - Distinguishes inputs, outputs, and in-place updates
+ *
+ * Stored as uint8_t so a full MAX_TENSOR_ARGS=16-slot array fits in a single
+ * 16-byte chunk. Existing AICPU code paths (dep_gen, etc.) already treat the
+ * tag as a raw byte; this just makes the canonical width match.
  */
-enum class TensorArgType : int32_t {
+enum class TensorArgType : uint8_t {
     INPUT = 0,            // Read-only input buffer
     OUTPUT = 1,           // Write-only output buffer (runtime allocates)
     INOUT = 2,            // Read-then-write: modifier for downstream

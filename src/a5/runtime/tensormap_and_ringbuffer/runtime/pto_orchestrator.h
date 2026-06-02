@@ -175,8 +175,13 @@ struct PTO2OrchestratorState {
 #if PTO2_ORCH_PROFILING
 struct PTO2OrchProfilingData {
     uint64_t sync_cycle;
-    uint64_t alloc_cycle;  // Combined task slot + heap allocation
-    uint64_t args_cycle;
+    uint64_t alloc_cycle;           // Combined task slot + heap allocation (outer)
+    uint64_t alloc_alloc_cycle;     // prepare_task: allocator.alloc()
+    uint64_t alloc_prefetch_cycle;  // prepare_task: prefetch_payload
+    uint64_t alloc_bind_cycle;        // prepare_task: bind_buffers + slot_state writes (excl. scope_push)
+    uint64_t alloc_scope_push_cycle;  // prepare_task: scope_tasks_push
+    uint64_t payload_init_cycle;      // descriptor write + payload.init()
+    uint64_t args_cycle;            // wiring-blob snapshot + explicit_dep loop
     uint64_t lookup_cycle;
     uint64_t insert_cycle;
     uint64_t fanin_cycle;

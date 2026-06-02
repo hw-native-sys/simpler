@@ -75,7 +75,6 @@ bool PTO2SchedulerState::RingSchedState::init_data_from_layout(void *sm_dev_base
     // arithmetic, no SM load.
     ring = pto2_sm_layout::ring_header_addr(sm_dev_base, ring_id);
     last_task_alive = 0;
-    advance_lock.store(0, std::memory_order_relaxed);
 
     // Per-slot SM-side initialization (bind_ring + reset_for_reuse +
     // fanin_count/active_mask zero) lives in PTO2SharedMemoryHandle::
@@ -267,6 +266,10 @@ void PTO2OrchestratorState::wire_arena_pointers(
     orch->scope_tasks = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_scope_tasks));
     orch->scope_begins = static_cast<int32_t *>(arena.region_ptr(layout.off_scope_begins));
     orch->scheduler = scheduler_arg;
+    // wiring needs back-channel access to tensor_map / fanin_pool after step 4.
+    if (scheduler_arg != nullptr) {
+        scheduler_arg->orchestrator = orch;
+    }
 }
 
 void PTO2OrchestratorState::destroy() {

@@ -62,6 +62,17 @@ PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
 #endif
 
 // =============================================================================
+// Wiring-thread Profiling Counters (single thread = no per-thread array)
+// Gated by PTO2_WIRING_PROFILING (independent of PTO2_SCHED_PROFILING so we
+// can break down wire_task laps without paying for per-CompletionStats overhead).
+// =============================================================================
+
+// Wiring lap counters now live in `PTO2SchedulerState::wiring_perf`
+// (a `WiringPerfCounters` instance — see scheduler_types.h). The wire_cost
+// envelope (start/end timestamps + log line) is captured in aicpu_executor's
+// wiring branch, mirroring orch_start/end.
+
+// =============================================================================
 // Debug Utilities
 // =============================================================================
 

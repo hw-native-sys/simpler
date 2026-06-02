@@ -30,13 +30,47 @@
 #pragma once
 
 #include <atomic>
+#include <cstring>
 
 #include "common/core_type.h"
 #include "device_arena.h"
 #include "pto_async_wait.h"
+#include "pto_constants.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
+#include "tensor_arg.h"  // TensorArgType, CORE_MAX_TENSOR_ARGS
+
+// Forward decl: scheduler holds a back-pointer to the orchestrator so the
+// wiring thread can reach `orch->tensor_map` / `orch->rings[].fanin_pool`
+// without taking a full include cycle.
+struct PTO2OrchestratorState;
+
+// Wiring-thread lap counters. Single instance (wiring is single-thread)
+// embedded in PTO2SchedulerState (see member `wiring_perf` below) so the
+// hot path reaches them via `sched->wiring_perf.*` — no globals. Same
+// pattern as SchedL2PerfCounters but kept here (not in scheduler_types.h)
+// to avoid pulling platform-specific scheduler config into the orchestrator
+// include path.
+#if PTO2_WIRING_PROFILING
+struct alignas(64) WiringPerfCounters {
+    // === wire_task laps (per TaskSubmit event) ===
+    uint64_t blob_cycle{0};       // tags/refs expansion + builder re-attach
+    uint64_t lookup_cycle{0};     // compute_task_fanin
+    uint64_t insert_cycle{0};     // register_task_outputs
+    uint64_t fanout_cycle{0};     // lock_fanout + prepend + fanout_count++
+    uint64_t ready_cycle{0};      // fanin_count + fanin_refcount + push_ready_routed
+    uint64_t task_count{0};       // number of wire_task calls
+    // === drain_wiring_queue laps ===
+    uint64_t sync_cycle{0};       // tensor_map.sync_tensormap (once per drain)
+    uint64_t drain_pop_cycle{0};  // pop + backoff + capacity gate
+    uint64_t scope_end_cycle{0};  // on_scope_end branch
+    // === wiring_thread_run outer-loop laps ===
+    uint64_t advance_ring_cycle{0};  // advance_ring_pointers across all rings
+
+    void reset() { *this = WiringPerfCounters{}; }
+};
+#endif
 
 // Lifecycle profiling: wire_task / release_fanin_and_check_ready stamp
 // fanin_zero_cycles + enter_global_queue_cycles via get_sys_cnt_aicpu().
@@ -445,30 +479,49 @@ enum class PTO2WiringEventKind : uint32_t {
     ScopeEnd = 1,
 };
 
-// 16-byte tagged event. Payload semantics by kind:
-//   TaskSubmit: slot points to a single PTO2TaskSlotState (slot_count unused).
+// 40-byte tagged event. Payload semantics by kind:
+//   TaskSubmit: slot points to a single PTO2TaskSlotState; the trailing
+//               tags[] + in_manual_scope hold wire_task's compute_task_fanin /
+//               register_task_outputs inputs. slot_count unused.
 //   ScopeEnd:   slot_array points at orch->scope_tasks[begin]; slot_count is
 //               the number of slot pointers in this scope range. Since orch
 //               never rewinds scope_tasks (it is sized to hold a whole run),
 //               the pointer stays valid until completed_ is observed.
+//               tags[] / in_manual_scope are unused (kept for layout
+//               uniformity so push/pop_batch never have to branch on kind).
 struct PTO2WiringEvent {
-    PTO2WiringEventKind kind;  // 4B
-    int32_t slot_count;        // 4B — ScopeEnd only
+    PTO2WiringEventKind kind;  // 4B  @0
+    int32_t slot_count;        // 4B  @4 — ScopeEnd only
     union {
-        PTO2TaskSlotState *slot;          // TaskSubmit
-        PTO2TaskSlotState **slot_array;   // ScopeEnd: &scope_tasks[begin]
+        PTO2TaskSlotState *slot;          // TaskSubmit       @8
+        PTO2TaskSlotState **slot_array;   // ScopeEnd         @8
     };  // 8B
+    // TaskSubmit-only payload. tags[] mirrors args.tag_data() (uint8_t after
+    // the TensorArgType width refactor — the whole 16-slot array fits in 16B,
+    // see for_task_submit). Read in wire_task to drive compute_task_fanin.
+    TensorArgType tags[CORE_MAX_TENSOR_ARGS];  // 16B @16
+    uint8_t in_manual_scope;                   // 1B  @32
+    uint8_t _pad[7];                           // pad to 8B alignment (sizeof == 40B)
 
-    static PTO2WiringEvent for_task_submit(PTO2TaskSlotState *slot) {
-        PTO2WiringEvent ev{};
+    static PTO2WiringEvent for_task_submit(
+        PTO2TaskSlotState *slot, const TensorArgType *tags_src, int32_t /*tensor_count*/, bool in_manual_scope
+    ) {
+        PTO2WiringEvent ev;
         ev.kind = PTO2WiringEventKind::TaskSubmit;
         ev.slot_count = 0;
         ev.slot = slot;
+        // args.tag_data() always points at a fixed-size CORE_MAX_TENSOR_ARGS
+        // backing array (16B with uint8_t). Unconditional 16B memcpy is one
+        // sub-cache-line transfer regardless of actual tensor_count — extra
+        // bytes past tensor_count are uninitialized garbage in the source but
+        // wire_task never reads them.
+        memcpy(ev.tags, tags_src, sizeof(ev.tags));
+        ev.in_manual_scope = in_manual_scope ? 1u : 0u;
         return ev;
     }
 
     static PTO2WiringEvent for_scope_end(PTO2TaskSlotState **slot_array, int32_t slot_count) {
-        PTO2WiringEvent ev{};
+        PTO2WiringEvent ev;
         ev.kind = PTO2WiringEventKind::ScopeEnd;
         ev.slot_count = slot_count;
         ev.slot_array = slot_array;
@@ -476,7 +529,9 @@ struct PTO2WiringEvent {
     }
 };
 
-static_assert(sizeof(PTO2WiringEvent) == 16, "PTO2WiringEvent must be exactly 16B");
+static_assert(sizeof(PTO2WiringEvent) == 40, "PTO2WiringEvent must be exactly 40B");
+static_assert(offsetof(PTO2WiringEvent, tags) == 16, "tags must start at offset 16");
+static_assert(offsetof(PTO2WiringEvent, in_manual_scope) == 32, "in_manual_scope must be at offset 32");
 
 // =============================================================================
 // SPSC Queue (Single-Producer Single-Consumer, wait-free)
@@ -628,18 +683,22 @@ struct PTO2SchedulerState {
     // Shared memory access
     PTO2SharedMemoryHeader *sm_header;
 
+    // Back-pointer to the orchestrator. Wiring reaches `orchestrator->tensor_map`
+    // (sole-writer after step 4) and `orchestrator->rings[r].fanin_pool` (spill
+    // pool for fanin overflow) through this. Set in pto_runtime2_init alongside
+    // the existing `orch->scheduler = …` assignment.
+    PTO2OrchestratorState *orchestrator{nullptr};
+
     // Per-ring state
     struct alignas(64) RingSchedState {
         // --- Cache Line 0: ring pointer (read-only) + hot path (read-write) ---
         PTO2SharedMemoryRingHeader *ring;
         int32_t last_task_alive;
-        // directa-pubonly: shadow of the most recently published SM
-        // `last_task_alive`. Read/written only while advance_lock is held
-        // (sync_to_sm is called from advance_ring_pointers, which is
-        // CAS-protected by advance_lock). Used to throttle SM writes to
-        // every K=16 local advances — see sync_to_sm below.
+        // Shadow of the most recently published SM `last_task_alive`. Used to
+        // throttle SM writes to every K=16 local advances — see sync_to_sm
+        // below. Single-writer (wiring thread); no lock needed after step 1/2
+        // moved wiring + scope_end onto a dedicated thread.
         int32_t last_published_to_sm{0};
-        std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
         // --- Cache Line 1+: Thread 0 only (wiring dep_pool) ---
         alignas(64) PTO2DepListPool dep_pool;
@@ -713,9 +772,10 @@ struct PTO2SchedulerState {
     //   3. orch_needs_drain — orchestrator write, thread 0 read
     struct alignas(64) WiringState {
         // Batch buffer holds at most this many wiring events between pops.
-        // 16 keeps the batch region at 8 cache lines (counts + 16 * 16B events
-        // = 12 + 4 pad + 256 = 272, padded up to 320 via alignas on the next
-        // field). See size asserts below.
+        // 16 keeps drain amortization stable; events are 40B (step-4
+        // tags-on-event layout with uint8_t TensorArgType) so the batch
+        // region is 12 + 4 pad + 16 * 40 = 656B, padded up to 704B (11
+        // cache lines) via alignas on `queue`. See size asserts below.
         static constexpr uint64_t BATCH_SIZE = 16;
         static constexpr int BACKOFF_LIMIT = 32;
 
@@ -729,14 +789,20 @@ struct PTO2SchedulerState {
         alignas(64) PTO2SpscQueue queue;
 
         // --- Orchestrator write, thread 0 read ---
+        // `orch_needs_drain` is poked by orch (rare) to bypass the wiring
+        // backoff. `idle` is poked by wiring every drain iteration: true once
+        // batch + queue are both empty, false the moment events are popped.
+        // wait_for_tensor_ready() spins on (queue.size() == 0 && idle == true)
+        // to know it's safe to read tensor_map without racing wiring writes.
         alignas(64) std::atomic<bool> orch_needs_drain{false};
+        std::atomic<bool> idle{true};
     } wiring;
 
     static_assert(
-        offsetof(WiringState, queue) == 320,
-        "WiringState: batch region must be exactly 5 cache lines before queue"
+        offsetof(WiringState, queue) == 704,
+        "WiringState: batch region must be exactly 11 cache lines before queue"
     );
-    static_assert(sizeof(WiringState) == 640, "WiringState must be exactly 10 cache lines (640B)");
+    static_assert(sizeof(WiringState) == 1024, "WiringState must be exactly 16 cache lines (1024B)");
 
     alignas(64) AsyncWaitList async_wait_list;
 
@@ -744,6 +810,13 @@ struct PTO2SchedulerState {
 #if PTO2_SCHED_PROFILING
     alignas(64) std::atomic<int64_t> tasks_completed;
     std::atomic<int64_t> tasks_consumed;
+#endif
+
+#if PTO2_WIRING_PROFILING
+    // Wiring-thread profiling counters (single thread → no per-thread array).
+    // Read at end-of-run by wiring_thread_run / aicpu_executor for the lap
+    // breakdown log lines; reset by `wiring_perf.reset()`.
+    alignas(64) WiringPerfCounters wiring_perf;
 #endif
     // =========================================================================
     // Inline hot-path methods
@@ -755,65 +828,12 @@ struct PTO2SchedulerState {
      * acquires fanout_lock per producer, allocates dep_pool entries, and
      * pushes ready tasks to the appropriate ready queue.
      *
-     * @return Number of tasks wired this call.
+     * Body is in scheduler_wire.cpp (needs full PTO2OrchestratorState
+     * definition for tensor_map / fanin_pool access).
+     *
+     * @return Number of events processed this call.
      */
-
-    int drain_wiring_queue(bool force_drain = false) {
-        int wired = 0;
-
-        // Refill local batch buffer when exhausted.
-        if (wiring.batch_index >= wiring.batch_count) {
-            // Backoff: defer pop when queue holds fewer than a full batch,
-            // unless force_drain, orch_needs_drain, or backoff limit reached.
-            if (!force_drain && wiring.queue.size() < WiringState::BATCH_SIZE) {
-                if (!wiring.orch_needs_drain.load(std::memory_order_acquire) &&
-                    wiring.backoff_counter < WiringState::BACKOFF_LIMIT) {
-                    wiring.backoff_counter++;
-                    return 0;
-                }
-            }
-            wiring.backoff_counter = 0;
-            wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
-            wiring.batch_index = 0;
-            if (wiring.batch_count == 0) return 0;
-        }
-
-        // Process events from local buffer in strict FIFO order. FIFO matters
-        // for ScopeEnd correctness: every TaskSubmit pushed before a ScopeEnd
-        // has already finalized its producer fanout_count++ by the time we
-        // call on_scope_end, so release_producer cannot prematurely transition
-        // a producer to CONSUMED. See plan
-        // `.claude/plans/wiring-wiring-tensormap-submit-task-sub-zazzy-moore.md`.
-        while (wiring.batch_index < wiring.batch_count) {
-            PTO2WiringEvent &ev = wiring.batch[wiring.batch_index];
-
-            if (ev.kind == PTO2WiringEventKind::TaskSubmit) {
-                PTO2TaskSlotState *ws = ev.slot;
-                int ring_id = ws->ring_id;
-                auto &rss = ring_sched_states[ring_id];
-                int32_t wfanin = ws->payload->fanin_actual_count;
-
-                if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                    rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
-                    if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                        break;  // not enough dep_pool space — keep remainder for next call
-                    }
-                }
-
-                wiring.batch_index++;
-                wire_task(rss, ws, wfanin);
-                wired++;
-            } else {
-                // PTO2WiringEventKind::ScopeEnd: release_producer on each slot
-                // in the scope range. orch never rewinds scope_tasks, so the
-                // slot_array pointer is stable.
-                on_scope_end(ev.slot_array, ev.slot_count);
-                wiring.batch_index++;
-            }
-        }
-
-        return wired;
-    }
+    int drain_wiring_queue(bool force_drain = false);
 
     // Route a ready slot to the right global queue. Dummy tasks (empty
     // active_mask) live in dummy_ready_queue; everything else goes to the
@@ -830,49 +850,18 @@ struct PTO2SchedulerState {
     }
 
     /**
-     * Wire fanout edges for a single task. Sets fanin_count, acquires each
-     * producer's fanout_lock, allocates dep_pool entries for live producers,
-     * pushes the task to the ready queue once its fanin refcount is satisfied.
+     * Wire a single TaskSubmit event:
+     *   - sync_tensormap against current SM last_task_alive
+     *   - run compute_task_fanin to extend the explicit_dep prefix orch left
+     *     in payload.fanin_inline_slot_states[]
+     *   - register_task_outputs into the tensor_map
+     *   - lock_fanout / prepend dep / fanout_count++ on each producer
+     *   - set fanin_count, release wiring sentinel, push to ready queue if
+     *     immediately ready
+     *
+     * Body is in scheduler_wire.cpp (needs full PTO2OrchestratorState).
      */
-    void wire_task(RingSchedState &rss, PTO2TaskSlotState *ws, int32_t wfanin) {
-        PTO2TaskPayload *wp = ws->payload;
-        ws->fanin_count = wfanin + 1;
-
-        if (wfanin != 0) {
-            int32_t early_finished = 0;
-            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-                producer->lock_fanout();
-                int32_t pstate = producer->task_state.load(std::memory_order_acquire);
-                if (pstate >= PTO2_TASK_COMPLETED) {
-                    early_finished++;
-                } else {
-                    producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
-                }
-                producer->unlock_fanout();
-            });
-
-            int32_t init_rc = early_finished + 1;
-            int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
-            if (new_rc >= ws->fanin_count) {
-                // All producers already finished at wire time — task is immediately
-                // ready. orch publishes directly to global queue (no local_buf), so
-                // fanin_zero == enter_global_queue.
-                uint64_t now = get_sys_cnt_aicpu();
-                ws->fanin_zero_cycles = now;
-                ws->enter_global_queue_cycles = now;
-                push_ready_routed(ws);
-            }
-        } else {
-            // No fanin → ready at orch-wire time. Direct push to global queue.
-            uint64_t now = get_sys_cnt_aicpu();
-            ws->fanin_zero_cycles = now;
-            ws->enter_global_queue_cycles = now;
-            ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-            push_ready_routed(ws);
-        }
-
-        ws->dep_pool_mark = rss.dep_pool.top;
-    }
+    void wire_task(RingSchedState &rss, const PTO2WiringEvent &ev);
 
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state) {
         if (slot_state.fanout_refcount.load(std::memory_order_acquire) != slot_state.fanout_count) return;
@@ -943,8 +932,10 @@ struct PTO2SchedulerState {
 
         if (new_refcount == slot_state.fanin_count) {
             // Last producer brought fanin to 0 → task is logically ready.
+#if PTO2_SCHED_PROFILING
             uint64_t now = get_sys_cnt_aicpu();
             slot_state.fanin_zero_cycles = now;
+#endif
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             // DUMMY shape is out of range for local_bufs (sized PTO2_NUM_RESOURCE_SHAPES);
@@ -952,10 +943,14 @@ struct PTO2SchedulerState {
             PTO2ResourceShape shape = slot_state.active_mask.to_shape();
             if (shape == PTO2ResourceShape::DUMMY) {
                 dummy_ready_queue.push(&slot_state);
+#if PTO2_SCHED_PROFILING
                 slot_state.enter_global_queue_cycles = now;
+#endif
             } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
+#if PTO2_SCHED_PROFILING
                 slot_state.enter_global_queue_cycles = now;
+#endif
             }
             // else: pushed to sched-local buf; enter_global_queue_cycles stays 0
             // (set later by flush_local_bufs if it spills to global, or remains 0
@@ -974,8 +969,10 @@ struct PTO2SchedulerState {
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
+#if PTO2_SCHED_PROFILING
             uint64_t now = get_sys_cnt_aicpu();
             slot_state.fanin_zero_cycles = now;
+#endif
             // Local-first: try per-CoreType thread-local buffer before global queue.
             // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
             // and go straight to dummy_ready_queue; use the profiling-aware push so
@@ -983,10 +980,14 @@ struct PTO2SchedulerState {
             PTO2ResourceShape shape = slot_state.active_mask.to_shape();
             if (shape == PTO2ResourceShape::DUMMY) {
                 dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
+#if PTO2_SCHED_PROFILING
                 slot_state.enter_global_queue_cycles = now;
+#endif
             } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
+#if PTO2_SCHED_PROFILING
                 slot_state.enter_global_queue_cycles = now;
+#endif
             }
             return true;
         }

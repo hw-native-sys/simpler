@@ -252,7 +252,18 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             LOG_ERROR("Thread %d: rt is null, wiring thread cannot start", thread_idx);
         } else {
             sched_ctx_.bind_runtime(rt);
+#if PTO2_PROFILING
+            uint64_t wire_cycle_start = get_sys_cnt_aicpu();
+#endif
             sched_ctx_.wiring_thread_run(runtime, thread_idx);
+#if PTO2_PROFILING
+            uint64_t wire_cycle_end = get_sys_cnt_aicpu();
+            LOG_INFO_V9(
+                "Thread %d: wire_start=%" PRIu64 " wire_end=%" PRIu64 " wire_cost=%.3fus", thread_idx,
+                static_cast<uint64_t>(wire_cycle_start), static_cast<uint64_t>(wire_cycle_end),
+                cycles_to_us(wire_cycle_end - wire_cycle_start)
+            );
+#endif
         }
         // Skip the orch path entirely; sched path below will be skipped because
         // thread_idx is not < sched_thread_num_.
@@ -625,8 +636,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = orchestrator_get_profiling();
-            uint64_t total =
-                p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
+            uint64_t total = p.sync_cycle + p.alloc_cycle + p.payload_init_cycle + p.args_cycle + p.lookup_cycle +
+                             p.insert_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero
             LOG_INFO_V9(
                 "Thread %d: === Orchestrator Profiling: %" PRId64 " tasks, total=%.3fus ===", thread_idx,
@@ -639,6 +650,22 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 static_cast<uint64_t>(p.alloc_atomic_count)
             );
             LOG_INFO_V9(
+                "Thread %d:     .alloc       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.alloc_alloc_cycle),
+                p.alloc_alloc_cycle * 100.0 / total
+            );
+            LOG_INFO_V9(
+                "Thread %d:     .prefetch    : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.alloc_prefetch_cycle),
+                p.alloc_prefetch_cycle * 100.0 / total
+            );
+            LOG_INFO_V9(
+                "Thread %d:     .bind+state  : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.alloc_bind_cycle),
+                p.alloc_bind_cycle * 100.0 / total
+            );
+            LOG_INFO_V9(
+                "Thread %d:     .scope_push  : %.3fus (%.1f%%)", thread_idx,
+                cycles_to_us(p.alloc_scope_push_cycle), p.alloc_scope_push_cycle * 100.0 / total
+            );
+            LOG_INFO_V9(
                 "Thread %d:   sync_tensormap : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.sync_cycle),
                 p.sync_cycle * 100.0 / total
             );
@@ -649,6 +676,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             LOG_INFO_V9(
                 "Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.insert_cycle),
                 p.insert_cycle * 100.0 / total
+            );
+            LOG_INFO_V9(
+                "Thread %d:   payload_init   : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.payload_init_cycle),
+                p.payload_init_cycle * 100.0 / total
             );
             LOG_INFO_V9(
                 "Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%" PRIu64 "", thread_idx,
@@ -684,6 +715,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             );
 #endif
 #endif  // PTO2_ORCH_PROFILING
+
+            // Wiring profiling prints from wiring thread exit (see
+            // scheduler_cold_path.cpp::wiring_thread_run) so it sees the final
+            // counters; printing from orch races with wiring's in-flight work.
 
             // Latch task count from PTO2 shared memory to hand off to the
             // scheduler. The orchestrator's run window (start_time / end_time /

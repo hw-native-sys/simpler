@@ -27,7 +27,7 @@
 #include <string.h>
 
 #include "common/unified_log.h"
-#include "pto_dep_compute.h"
+#include "pto_fanin_builder.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
@@ -71,13 +71,18 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 __attribute__((weak, visibility("hidden"))) void
 l2_perf_aicpu_record_orch_phase(AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
-static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
-static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
-static uint64_t g_orch_args_cycle = 0;       // param copy
-static uint64_t g_orch_lookup_cycle = 0;     // tensormap lookup + dep building
-static uint64_t g_orch_insert_cycle = 0;     // tensormap insert
-static uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
-static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
+static uint64_t g_orch_sync_cycle = 0;            // tensormap sync
+static uint64_t g_orch_alloc_cycle = 0;           // unified task+heap alloc (outer LAP across all prepare_task)
+static uint64_t g_orch_alloc_alloc_cycle = 0;     // prepare_task: allocator.alloc() (task slot + heap)
+static uint64_t g_orch_alloc_prefetch_cycle = 0;  // prepare_task: prefetch_payload
+static uint64_t g_orch_alloc_bind_cycle = 0;      // prepare_task: bind_buffers + slot_state writes (excl. scope_push)
+static uint64_t g_orch_alloc_scope_push_cycle = 0;  // prepare_task: scope_tasks_push
+static uint64_t g_orch_payload_init_cycle = 0;    // descriptor write + payload.init() (Tensor::copy + scalars)
+static uint64_t g_orch_args_cycle = 0;            // wiring-blob snapshot + explicit_dep loop
+static uint64_t g_orch_lookup_cycle = 0;          // tensormap lookup + dep building
+static uint64_t g_orch_insert_cycle = 0;          // tensormap insert
+static uint64_t g_orch_fanin_cycle = 0;           // fanin list + early-return check
+static uint64_t g_orch_scope_end_cycle = 0;       // scope_end overhead
 static int64_t g_orch_submit_count = 0;
 static uint32_t g_orch_submit_idx = 0;
 uint64_t g_orch_alloc_wait_cycle = 0;
@@ -189,67 +194,9 @@ void PTO2OrchestratorState::report_fatal(int32_t error_code, const char *func, c
     va_end(args);
 }
 
-struct PTO2FaninBuilder {
-    PTO2FaninBuilder(PTO2FaninPool &spill_pool) :
-        count(0),
-        spill_start(0),
-        spill_pool(spill_pool) {}
-    int32_t count{0};
-    int32_t spill_start{0};
-    PTO2FaninPool &spill_pool;
-    PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
-
-    template <typename Fn>
-    PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const {
-        return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
-    }
-
-    bool contains(PTO2TaskSlotState *prod_state) const {
-        bool found = false;
-        for_each([&](PTO2TaskSlotState *slot_state) {
-            if (slot_state == prod_state) {
-                found = true;
-                return false;
-            }
-            return true;
-        });
-        if (found) {
-            return true;
-        }
-        return false;
-    }
-};
-
-static bool append_fanin_or_fail(
-    PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, uint8_t ring_id
-) {
-    if (fanin_builder->contains(prod_state)) {
-        return true;
-    }
-
-    if (fanin_builder->count < PTO2_FANIN_INLINE_CAP) {
-        fanin_builder->inline_slots[fanin_builder->count++] = prod_state;
-        return true;
-    }
-
-    PTO2FaninPool &fanin_pool = fanin_builder->spill_pool;
-    if (!fanin_pool.ensure_space(orch->sm_header->rings[ring_id], 1)) {
-        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
-        return false;
-    }
-    int32_t spill_idx = fanin_pool.top;
-    PTO2FaninSpillEntry *entry = fanin_pool.alloc();
-    if (entry == nullptr) {
-        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
-        return false;
-    }
-    if (fanin_builder->count == PTO2_FANIN_INLINE_CAP) {
-        fanin_builder->spill_start = spill_idx;
-    }
-    entry->slot_state = prod_state;
-    fanin_builder->count++;
-    return true;
-}
+// PTO2FaninBuilder + append_fanin_or_fail live in pto_ring_buffer.h so both
+// orch (explicit_dep prefix) and wiring (compute_task_fanin lookup) can extend
+// the same payload.fanin_inline_slot_states buffer.
 
 static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state);
 
@@ -325,6 +272,9 @@ static bool prepare_task(
     PTO2OrchestratorState *orch, const Arg &args, int32_t total_output_size, ActiveMask active_mask,
     PTO2PreparedTask *out
 ) {
+#if PTO2_ORCH_PROFILING
+    uint64_t _pt_t0 = get_sys_cnt_aicpu();
+#endif
     uint8_t ring_id = orch->current_ring_id();
     auto &allocator = orch->rings[ring_id].task_allocator;
 
@@ -342,8 +292,27 @@ static bool prepare_task(
     out->slot_state = &orch->sm_header->rings[ring_id].get_slot_state_by_slot(out->alloc_result.slot);
     out->task = &orch->sm_header->rings[ring_id].task_descriptors[out->alloc_result.slot];
     out->payload = &orch->sm_header->rings[ring_id].task_payloads[out->alloc_result.slot];
+#if PTO2_ORCH_PROFILING
+    uint64_t _pt_t1 = get_sys_cnt_aicpu();
+    g_orch_alloc_alloc_cycle += _pt_t1 - _pt_t0;
+#endif
+
+    // Write-prefetch slot_state. The slot was just allocated from a per-ring
+    // rotating window, so its lines are typically in another cluster or
+    // evicted. Kicking the M-state fill in parallel with prefetch_payload
+    // below (which targets a different cache line range entirely) lets the
+    // bind+state phase land in L1 by the time we reach it.
+    //
+    // sizeof(PTO2TaskSlotState) is 64B when SCHED_PROFILING is off (single
+    // hot cache line) and 128B when on (second line for fanin_zero / enter_gq
+    // lifecycle timestamps).
+    // __builtin_prefetch(reinterpret_cast<char *>(out->slot_state), 1, 3);
 
     prefetch_payload(out->payload, args.tensor_count(), args.scalar_count());
+#if PTO2_ORCH_PROFILING
+    uint64_t _pt_t2 = get_sys_cnt_aicpu();
+    g_orch_alloc_prefetch_cycle += _pt_t2 - _pt_t1;
+#endif
 
     // Re-bind payload/task pointers each submit. Value is per-slot constant
     // (same as &task_payloads[slot] / &task_descriptors[slot]), but writing
@@ -370,8 +339,14 @@ static bool prepare_task(
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
     // fanin_count is set by scheduler during wiring
+#if PTO2_ORCH_PROFILING
+    uint64_t _pt_t3 = get_sys_cnt_aicpu();
+    g_orch_alloc_bind_cycle += _pt_t3 - _pt_t2;
+#endif
     scope_tasks_push(orch, out->slot_state);
-
+#if PTO2_ORCH_PROFILING
+    g_orch_alloc_scope_push_cycle += get_sys_cnt_aicpu() - _pt_t3;
+#endif
     return true;
 }
 
@@ -492,9 +467,17 @@ void PTO2OrchestratorState::end_scope() {
 
 // Shared body for submit_task / submit_dummy_task. Caller has already validated
 // args.has_error, decided active_mask (empty for dummy), and resolved the per-slot
-// kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
-// computation (explicit_deps + auto), output registration, slot init, and pushes
-// to the scheduler wiring queue.
+// kernel_ids (all INVALID_KERNEL_ID for dummy).
+//
+// After step 4 the orch hot path only:
+//   - allocs slot/heap, binds payload/task, sets PENDING, scope_tasks_push
+//   - writes task descriptor + payload.init() (tensor/scalar copy)
+//   - resolves explicit_deps into payload.fanin_inline_slot_states[]
+//   - pushes a TaskSubmit event (with args.tag_data() snapshot +
+//     in_manual_scope flag) to the wiring queue
+//
+// All tensormap work (sync / compute_task_fanin / register_task_outputs) and
+// the producer fanout_count++ loop run in the wiring thread inside wire_task.
 static TaskOutputTensors submit_task_common(
     PTO2OrchestratorState *orch, const Arg &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id,
     int32_t aiv1_kernel_id
@@ -506,18 +489,16 @@ static TaskOutputTensors submit_task_common(
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, &prepared)) {
         return result;
     }
+    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, prepared.task_id.raw);
     uint8_t ring_id = prepared.task_id.ring();
     PTO2SchedulerState *sched = orch->scheduler;
-    PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
     PTO2TaskId task_id = prepared.task_id;
     PTO2TaskSlotState &cur_slot_state = *prepared.slot_state;
     PTO2TaskDescriptor &task = *prepared.task;
     PTO2TaskPayload &payload = *prepared.payload;
     result.set_task_id(task_id);
 
-    PTO2FaninBuilder fanin_builder(orch->rings[ring_id].fanin_pool);
-
-    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id.raw);
+    
 
 #if PTO2_PROFILING
     if (layout.total_output_size > 0) {
@@ -526,14 +507,27 @@ static TaskOutputTensors submit_task_common(
     }
 #endif
 
-    // === STEP 2: Sync TensorMap validity and optional cleanup ===
-    // Read current last_task_alive from shared memory for this ring
-    int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
+    // === STEP 1: write task descriptor (GM burst — single cache line) ===
+    __builtin_prefetch(&task, 1, 1);
+    task.task_id = task_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
+    task.packed_buffer_base = prepared.alloc_result.packed_base;
+    task.packed_buffer_end = prepared.alloc_result.packed_end;
 
-    orch->tensor_map.sync_tensormap(task_id, sm_last_task_alive);
+    // === STEP 2: payload tensor/scalar copy ===
+    payload.init(args, result, prepared.alloc_result, layout);
+    CYCLE_COUNT_LAP(g_orch_payload_init_cycle);
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
+    payload.fanin_spill_pool = &orch->rings[ring_id].fanin_pool;
 
+    // === STEP 3: resolve explicit_deps NOW (orch reads last_task_alive at
+    // submit time; deferring to wiring would race against ring advance) and
+    // drop the prefix straight into payload.fanin_inline_slot_states[]. wiring
+    // will continue extending in compute_task_fanin's emit. ===
+    PTO2FaninBuilder fanin_builder(payload.fanin_inline_slot_states, orch->rings[ring_id].fanin_pool);
+    std::atomic<int32_t> *orch_err = &orch->sm_header->orch_error_code;
     for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
         if (!dep_task_id.is_valid()) {
@@ -549,64 +543,13 @@ static TaskOutputTensors submit_task_common(
             continue;
         }
         PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_task_id(dep_local_task_id);
-        if (!append_fanin_or_fail(orch, producer_slot_state, &fanin_builder, ring_id)) {
+        if (!append_fanin_or_fail(dep_ring, orch_err, &fanin_builder, producer_slot_state)) {
             return result;
         }
     }
-
-    // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
-    DepInputs dep_inputs{
-        args.tensor_count(),       args.tensor_data(), args.tag_data(), static_cast<int32_t>(args.explicit_dep_count()),
-        args.explicit_deps_data(),
-    };
-
-    auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
-        PTO2TaskSlotState *prod_state =
-            &orch->sm_header->rings[producer_task_id.ring()].get_slot_state_by_task_id(producer_task_id.local());
-        return append_fanin_or_fail(orch, prod_state, &fanin_builder, ring_id);
-    };
-
-    if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) {
-        return result;
-    }
-
-    CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id.raw);
-
-    // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
-    register_task_outputs(dep_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
-
-    CYCLE_COUNT_LAP_RECORD(g_orch_insert_cycle, AicpuPhaseId::ORCH_INSERT, task_id.raw);
-
-    // === STEP 5: Batch-write to GM (single cache line burst) ===
-    // Deferred from allocation phase to avoid scattered GM writes that get
-    // evicted by TensorMap lookup/insert cache pressure.
-    __builtin_prefetch(&task, 1, 1);
-    task.task_id = task_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
-    task.packed_buffer_base = prepared.alloc_result.packed_base;
-    task.packed_buffer_end = prepared.alloc_result.packed_end;
-
-    // Increment fanout_count on each producer (no lock — only orch writes this field).
-    // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
-    for_each_fanin_storage(
-        fanin_builder.inline_slots, fanin_builder.count, fanin_builder.spill_start, fanin_builder.spill_pool,
-        [](PTO2TaskSlotState *producer) {
-            producer->fanout_count++;
-        }
-    );
-
-    int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
-    // Store fanin metadata in payload for scheduler to iterate
     payload.fanin_actual_count = fanin_builder.count;
     payload.fanin_spill_start = fanin_builder.spill_start;
-    payload.fanin_spill_pool = &fanin_builder.spill_pool;
-    for (int i = 0; i < inline_count; i++) {
-        payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
-    }
 
-    payload.init(args, result, prepared.alloc_result, layout);
 #if PTO2_PROFILING
     if (args.tensor_dump_selective_requested()) {
         set_dump_tensor_selective_mode(true);
@@ -617,16 +560,15 @@ static TaskOutputTensors submit_task_common(
 #endif
 
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
-#if PTO2_ORCH_PROFILING
-    g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
-#endif
 
-    // === STEP 6: push to wiring queue ===
-    // Deferred wiring: orchestrator only stores dependency metadata and increments
-    // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
-    // is handled asynchronously by scheduler thread 0 via the wiring queue.
-    // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    while (!sched->wiring.queue.push(PTO2WiringEvent::for_task_submit(&cur_slot_state))) {
+    // === STEP 4: push to wiring queue ===
+    // Wiring thread will run sync_tensormap / compute_task_fanin /
+    // register_task_outputs / fanout_count++ / dep_pool prepend / ready push.
+    // tag_data() points at args' fixed 16-slot tag array; for_task_submit's
+    // 16B memcpy is safe regardless of actual tensor_count.
+    while (!sched->wiring.queue.push(PTO2WiringEvent::for_task_submit(
+        &cur_slot_state, args.tag_data(), args.tensor_count(), orch->in_manual_scope()
+    ))) {
         SPIN_WAIT_HINT();
     }
 
@@ -862,6 +804,11 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
     d.sync_cycle = g_orch_sync_cycle;
     d.alloc_cycle = g_orch_alloc_cycle;
+    d.alloc_alloc_cycle = g_orch_alloc_alloc_cycle;
+    d.alloc_prefetch_cycle = g_orch_alloc_prefetch_cycle;
+    d.alloc_bind_cycle = g_orch_alloc_bind_cycle;
+    d.alloc_scope_push_cycle = g_orch_alloc_scope_push_cycle;
+    d.payload_init_cycle = g_orch_payload_init_cycle;
     d.args_cycle = g_orch_args_cycle;
     d.lookup_cycle = g_orch_lookup_cycle;
     d.insert_cycle = g_orch_insert_cycle;
@@ -876,6 +823,9 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
 
     // Reset
     g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;
+    g_orch_alloc_alloc_cycle = g_orch_alloc_prefetch_cycle = g_orch_alloc_bind_cycle = 0;
+    g_orch_alloc_scope_push_cycle = 0;
+    g_orch_payload_init_cycle = 0;
     g_orch_lookup_cycle = g_orch_insert_cycle = 0;
     g_orch_fanin_cycle = g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;

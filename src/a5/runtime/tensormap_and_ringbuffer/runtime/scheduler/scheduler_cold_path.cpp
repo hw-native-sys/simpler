@@ -389,54 +389,58 @@ void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_threa
 #if DIAG_DISPATCH_RAMP
     {
         DiagRampState &d = g_diag_ramp[thread_idx];
-        double first_ready_us = d.first_ready_ts > l2_perf.sched_start_ts ?
-            cycles_to_us(d.first_ready_ts - l2_perf.sched_start_ts) : -1.0;
+        double first_ready_us =
+            d.first_ready_ts > l2_perf.sched_start_ts ? cycles_to_us(d.first_ready_ts - l2_perf.sched_start_ts) : -1.0;
         double first_disp_us = d.first_dispatch_ts > l2_perf.sched_start_ts ?
-            cycles_to_us(d.first_dispatch_ts - l2_perf.sched_start_ts) : -1.0;
+                                   cycles_to_us(d.first_dispatch_ts - l2_perf.sched_start_ts) :
+                                   -1.0;
         LOG_INFO_V9(
             "Thread %d: DIAG_RAMP first_ready=%.2fus first_dispatch=%.2fus "
             "blocked_iters=%" PRIu64 " starved_iters=%" PRIu64 " saturated_iters=%" PRIu64
             " aic_pend_gated_iters=%" PRIu64 " avg_pend_slots=%.1f avg_ready=%.1f",
-            thread_idx, first_ready_us, first_disp_us,
-            d.blocked_iters, d.starved_iters, d.saturated_iters,
+            thread_idx, first_ready_us, first_disp_us, d.blocked_iters, d.starved_iters, d.saturated_iters,
             d.aic_pending_gated_iters,
             d.aic_pending_gated_iters > 0 ? (double)d.aic_pending_gated_slot_count / d.aic_pending_gated_iters : 0.0,
             d.aic_pending_gated_iters > 0 ? (double)d.aic_pending_gated_ready_count / d.aic_pending_gated_iters : 0.0
         );
         LOG_INFO_V9(
-            "Thread %d: DIAG_STALL total=%" PRIu64
-            " r1_complete_long=%" PRIu64 " r2_drain=%" PRIu64 " r3_pop_race=%" PRIu64
-            " r5_mix_residual=%" PRIu64 " r7_my_idle_zero=%" PRIu64 " unknown=%" PRIu64
+            "Thread %d: DIAG_STALL total=%" PRIu64 " r1_complete_long=%" PRIu64 " r2_drain=%" PRIu64
+            " r3_pop_race=%" PRIu64 " r5_mix_residual=%" PRIu64 " r7_my_idle_zero=%" PRIu64 " unknown=%" PRIu64
             " aic_pop_race_total=%" PRIu64,
-            thread_idx, d.stall_total,
-            d.stall_complete_long, d.stall_drain_mode, d.stall_pop_race,
-            d.stall_mix_residual_blocked_aic, d.stall_my_idle_zero_peer_nonzero, d.stall_unknown,
-            d.aic_pop_race_count
+            thread_idx, d.stall_total, d.stall_complete_long, d.stall_drain_mode, d.stall_pop_race,
+            d.stall_mix_residual_blocked_aic, d.stall_my_idle_zero_peer_nonzero, d.stall_unknown, d.aic_pop_race_count
         );
         for (int32_t i = 0; i < d.count; i++) {
             const DiagRampSample &s = d.samples[i];
             LOG_INFO_V9(
                 "Thread %d: DIAG_RAMP[%3d] t=%5uus rdy(M/A/V)=%u/%u/%u "
                 "idle(M/A/V)=%u/%u/%u pend(A/V)=%u/%u disp=%u",
-                thread_idx, i, s.ts_rel,
-                s.ready_mix, s.ready_aic, s.ready_aiv,
-                s.idle_mix, s.idle_aic, s.idle_aiv,
+                thread_idx, i, s.ts_rel, s.ready_mix, s.ready_aic, s.ready_aiv, s.idle_mix, s.idle_aic, s.idle_aiv,
                 s.pend_aic, s.pend_aiv, s.did_dispatch
             );
         }
         // Reset for next round
-        d.count = 0; d.first_ready_ts = 0; d.first_dispatch_ts = 0;
-        d.blocked_iters = 0; d.starved_iters = 0; d.saturated_iters = 0;
+        d.count = 0;
+        d.first_ready_ts = 0;
+        d.first_dispatch_ts = 0;
+        d.blocked_iters = 0;
+        d.starved_iters = 0;
+        d.saturated_iters = 0;
         d.aic_pending_gated_iters = 0;
         d.aic_pending_gated_slot_count = 0;
         d.aic_pending_gated_ready_count = 0;
         d.stall_total = 0;
         d.stall_my_idle_zero_peer_nonzero = 0;
-        d.stall_complete_long = 0; d.stall_drain_mode = 0;
-        d.stall_mix_residual_blocked_aic = 0; d.stall_pop_race = 0; d.stall_unknown = 0;
+        d.stall_complete_long = 0;
+        d.stall_drain_mode = 0;
+        d.stall_mix_residual_blocked_aic = 0;
+        d.stall_pop_race = 0;
+        d.stall_unknown = 0;
         d.aic_pop_race_count = 0;
-        d.iter_complete_cycles = 0; d.iter_dispatched_aic_count = 0;
-        d.iter_drain_triggered = false; d.iter_mix_residual_blocked_aic = false;
+        d.iter_complete_cycles = 0;
+        d.iter_dispatched_aic_count = 0;
+        d.iter_drain_triggered = false;
+        d.iter_mix_residual_blocked_aic = false;
         d.iter_pop_race_aic = false;
     }
 #endif
@@ -1038,24 +1042,47 @@ void SchedulerContext::wiring_thread_run(Runtime *runtime, int32_t thread_idx) {
     while (!completed_.load(std::memory_order_acquire)) {
         // 1. Drain orch wiring queue (force-drain after orch_done so any
         //    last-second submissions don't stall).
+        auto &tensor_map = sched_->orchestrator->tensor_map;
         sched_->drain_wiring_queue(orchestrator_done_);
 
-        // 2. Advance per-ring last_task_alive past CONSUMED slots and publish
-        //    to SM. Wiring is the sole writer; the advance_lock CAS still
-        //    happens for now (cheap when uncontended) — followup commit can
-        //    drop it entirely.
+        // 2. Advance per-ring last_task_alive past CONSUMED slots, publish to
+        //    SM, and resync the tensor_map view. Wiring is the sole writer of
+        //    `last_task_alive` (no other thread calls advance_ring_pointers
+        //    after step 1/2 moved wiring + scope_end off the sched threads),
+        //    so no CAS / lock is needed. If a given ring's pointer didn't
+        //    actually advance this iteration, sync_tensormap is skipped.
         for (int32_t r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             auto &rss = sched_->ring_sched_states[r];
             if (rss.ring == nullptr) continue;
-            int32_t expected = 0;
-            if (rss.advance_lock.compare_exchange_strong(
-                    expected, 1, std::memory_order_acquire, std::memory_order_relaxed
-                )) {
-                rss.advance_ring_pointers();
-                rss.advance_lock.store(0, std::memory_order_release);
+            int32_t lta_before = rss.last_published_to_sm;
+#if PTO2_WIRING_PROFILING
+            uint64_t _t0 = get_sys_cnt_aicpu();
+#endif
+            rss.advance_ring_pointers();
+#if PTO2_WIRING_PROFILING
+            uint64_t _t1 = get_sys_cnt_aicpu();
+            sched_->wiring_perf.advance_ring_cycle += _t1 - _t0;
+#endif
+
+            if (rss.last_published_to_sm > lta_before) {
+                auto ring_id = static_cast<uint8_t>(r);
+                tensor_map.sync_validity(ring_id, rss.last_published_to_sm);
+
+                // Only attempt cleanup when last_task_alive has actually advanced;
+                // otherwise cleanup_retired would empty-loop and we'd spin forever.
+                auto overlap = tensor_map.get_task_local_id_slot(r, rss.last_published_to_sm) ==
+                               tensor_map.get_task_local_id_slot(ring_id, tensor_map.last_cleanup[ring_id]);
+                if (rss.last_published_to_sm - tensor_map.last_cleanup[ring_id] >= PTO2_TENSORMAP_CLEANUP_INTERVAL ||
+                    overlap) {
+                    tensor_map.cleanup_retired(ring_id, tensor_map.last_cleanup[ring_id], rss.last_published_to_sm);
+                    tensor_map.last_cleanup[ring_id] = rss.last_published_to_sm;
+                }
+#if PTO2_WIRING_PROFILING
+                sched_->wiring_perf.sync_cycle += get_sys_cnt_aicpu() - _t1;
+#endif
             }
         }
-    }
+    }  // end while (!completed_)
 
     // Final drain pass: orch may have finished but a few tasks may still be
     // waiting to be advanced/reclaimed for the SM final publish. Once
@@ -1064,18 +1091,77 @@ void SchedulerContext::wiring_thread_run(Runtime *runtime, int32_t thread_idx) {
     for (int32_t r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         auto &rss = sched_->ring_sched_states[r];
         if (rss.ring == nullptr) continue;
-        int32_t expected = 0;
-        if (rss.advance_lock.compare_exchange_strong(
-                expected, 1, std::memory_order_acquire, std::memory_order_relaxed
-            )) {
-            rss.advance_ring_pointers();
-            // Force a final SM publish regardless of the K=16 throttle so the
-            // orchestrator (next round / shutdown) sees the latest counter.
-            rss.ring->fc.last_task_alive.store(rss.last_task_alive, std::memory_order_release);
-            rss.last_published_to_sm = rss.last_task_alive;
-            rss.advance_lock.store(0, std::memory_order_release);
-        }
+        rss.advance_ring_pointers();
+        // Force a final SM publish regardless of the K=16 throttle so the
+        // orchestrator (next round / shutdown) sees the latest counter.
+        rss.ring->fc.last_task_alive.store(rss.last_task_alive, std::memory_order_release);
+        rss.last_published_to_sm = rss.last_task_alive;
     }
+
+        // wire_cost (start/end envelope) is logged from aicpu_executor's wiring
+        // branch around the wiring_thread_run call, alongside orch_cost / sched_cost
+        // (PTO2_PROFILING gate). The detailed Wiring Profiling breakdown stays
+        // here for proximity to the lap counters.
+#if PTO2_WIRING_PROFILING
+    {
+        auto &perf = sched_->wiring_perf;
+        // Aggregate accounted-for time. Anything outside this is loop overhead
+        // / idle backoff (computable as wire_cost - busy at print time).
+        uint64_t w_total = perf.sync_cycle + perf.drain_pop_cycle + perf.blob_cycle + perf.lookup_cycle +
+                           perf.insert_cycle + perf.fanout_cycle + perf.ready_cycle + perf.scope_end_cycle +
+                           perf.advance_ring_cycle;
+        uint64_t w_total_safe = (w_total == 0) ? 1 : w_total;
+        LOG_INFO_V9(
+            "Thread %d: === Wiring Profiling: %" PRIu64 " tasks, busy=%.3fus ===", thread_idx,
+            static_cast<uint64_t>(perf.task_count), cycles_to_us(w_total)
+        );
+        LOG_INFO_V9(
+            "Thread %d:   drain_pop      : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.drain_pop_cycle),
+            perf.drain_pop_cycle * 100.0 / w_total_safe
+        );
+        LOG_INFO_V9(
+            "Thread %d:   sync_tensormap : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.sync_cycle),
+            perf.sync_cycle * 100.0 / w_total_safe
+        );
+        LOG_INFO_V9(
+            "Thread %d:   blob_expand    : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.blob_cycle),
+            perf.blob_cycle * 100.0 / w_total_safe
+        );
+        LOG_INFO_V9(
+            "Thread %d:   lookup+dep     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.lookup_cycle),
+            perf.lookup_cycle * 100.0 / w_total_safe
+        );
+        LOG_INFO_V9(
+            "Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.insert_cycle),
+            perf.insert_cycle * 100.0 / w_total_safe
+        );
+        LOG_INFO_V9(
+            "Thread %d:   fanout_wire    : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.fanout_cycle),
+            perf.fanout_cycle * 100.0 / w_total_safe
+        );
+        LOG_INFO_V9(
+            "Thread %d:   ready_push     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.ready_cycle),
+            perf.ready_cycle * 100.0 / w_total_safe
+        );
+        LOG_INFO_V9(
+            "Thread %d:   scope_end      : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.scope_end_cycle),
+            perf.scope_end_cycle * 100.0 / w_total_safe
+        );
+        LOG_INFO_V9(
+            "Thread %d:   advance_ring   : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.advance_ring_cycle),
+            perf.advance_ring_cycle * 100.0 / w_total_safe
+        );
+        LOG_INFO_V9(
+            "Thread %d:   avg/task       : %.3fus", thread_idx,
+            perf.task_count > 0 ?
+                cycles_to_us(
+                    perf.blob_cycle + perf.lookup_cycle + perf.insert_cycle + perf.fanout_cycle + perf.ready_cycle
+                ) / perf.task_count :
+                0.0
+        );
+        perf.reset();
+    }
+#endif  // PTO2_WIRING_PROFILING
 
     LOG_INFO_V0("Thread %d: wiring_thread_run exit", thread_idx);
 }

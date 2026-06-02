@@ -66,6 +66,10 @@
 #define PTO2_SCHED_PROFILING 0
 #endif
 
+#ifndef PTO2_WIRING_PROFILING
+#define PTO2_WIRING_PROFILING 0
+#endif
+
 #ifndef PTO2_TENSORMAP_PROFILING
 #define PTO2_TENSORMAP_PROFILING 0
 #endif
@@ -243,6 +247,9 @@ struct PTO2TaskPayload {
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
+    // 40B implicit pad to the cache-line-aligned tensors[] region. Tag/scope
+    // metadata that wiring needs lives on PTO2WiringEvent (see pto_scheduler.h)
+    // rather than here — those are event-time inputs, not durable task state.
     // === Cache lines 9-40 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 41-44 (256B) — scalars ===
@@ -348,6 +355,7 @@ struct alignas(64) PTO2TaskSlotState {
     int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
     int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
 
+#if PTO2_SCHED_PROFILING
     // === Lifecycle profiling (set once per submission) ===
     // sys_cnt timestamp when the fanin counter dropped to 0 (task became ready).
     // Set either in wire_task (orch path, no/early-finished fanin) or in
@@ -357,6 +365,7 @@ struct alignas(64) PTO2TaskSlotState {
     // (ready_queues[shape] or dummy_ready_queue). 0 means it was placed only in
     // a sched-local buffer (and consumed by the same sched without going global).
     uint64_t enter_global_queue_cycles{0};
+#endif
 
     /**
      * Bind the slot-invariant ring id. Called once per slot during
@@ -395,8 +404,10 @@ struct alignas(64) PTO2TaskSlotState {
         fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx = 0;
+#if PTO2_SCHED_PROFILING
         fanin_zero_cycles = 0;
         enter_global_queue_cycles = 0;
+#endif
     }
 
     // === Per-task fanout spinlock ===
@@ -448,9 +459,14 @@ struct alignas(64) PTO2TaskSlotState {
     void unlock_fanout() { fanout_lock.store(0, std::memory_order_release); }
 };
 
-// First 64 bytes are hot-path fields (one cache line). Lifecycle profile fields
-// live in the second cache line — read/written only on cold paths (submission,
-// completion record emission), so they don't pollute the hot cache line.
+// Hot-path fields occupy the first 64-byte cache line. When SCHED_PROFILING is
+// off, the struct fits in exactly one cache line; when on, the two lifecycle
+// timestamps spill into a second cache line — read/written only on cold paths
+// (submission, completion record emission), so they don't pollute the hot line.
+#if PTO2_SCHED_PROFILING
 static_assert(sizeof(PTO2TaskSlotState) == 128);
+#else
+static_assert(sizeof(PTO2TaskSlotState) == 64);
+#endif
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_RUNTIME2_TYPES_H_

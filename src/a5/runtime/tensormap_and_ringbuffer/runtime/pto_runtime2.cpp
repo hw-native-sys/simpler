@@ -166,22 +166,50 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         }
     };
 
+    // After step 4 the wiring thread is the sole writer of `orch.tensor_map`
+    // (insert / remove_entry / cleanup_retired). orch reading lookup() from
+    // here would race with concurrent bucket-chain mutations. The barrier
+    // below parks wiring: poke orch_needs_drain so wiring stops backing off,
+    // then spin until the queue is empty AND wiring's idle flag is set.
+    //
+    // Only Step B (tensor_map.lookup) needs the wait — Step A reads
+    // tensor.owner_task_id which was set by orch in payload.init and is
+    // stable. So issue the barrier between A and B, not before A.
+    auto park_wiring_for_lookup = [&]() {
+        auto &w = orch.scheduler->wiring;
+        w.orch_needs_drain.store(true, std::memory_order_release);
+        while (w.queue.size() > 0 || !w.idle.load(std::memory_order_acquire)) {
+            SPIN_WAIT_HINT();
+        }
+    };
+
     auto do_wait = [&]() {
-        // Step A: creator retention — read owner directly from tensor metadata
+        // Step A: creator retention — read owner directly from tensor metadata.
+        // owner_task_id is set in orch and not touched by wiring; no barrier
+        // needed.
         if (owner.is_valid()) {
             auto &s = orch.sm_header->rings[owner.ring()].get_slot_state_by_task_id(owner.local());
             try_push(s);
             if (failed) return;
-        }
 
-        // Step B: modifier writer lookup (OverlapMap), direct callback
-        orch.tensor_map.lookup(tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus) -> bool {
-            PTO2TaskId pid = entry.producer_task_id;
-            auto &s = orch.sm_header->rings[pid.ring()].get_slot_state_by_task_id(pid.local());
-            try_push(s);
-            return !failed;
-        });
-        if (failed) return;
+            // Step B: modifier writer lookup (OverlapMap). Tensor_map is
+            // wiring-thread-owned after step 4, so park wiring first to
+            // avoid racing concurrent insert/remove/cleanup_retired.
+            //
+            // Only reached when owner_task_id is valid (i.e., the tensor was
+            // produced by some task). The host-loaded read-only data path
+            // (owner invalid) skips the barrier entirely: by contract such
+            // tensors have no producers in tensor_map, so lookup would
+            // return nothing.
+            park_wiring_for_lookup();
+            orch.tensor_map.lookup(tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus) -> bool {
+                PTO2TaskId pid = entry.producer_task_id;
+                auto &s = orch.sm_header->rings[pid.ring()].get_slot_state_by_task_id(pid.local());
+                try_push(s);
+                return !failed;
+            });
+            if (failed) return;
+        }
         flush_segment();
     };
 
