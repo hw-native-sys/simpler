@@ -249,8 +249,8 @@ inline bool AicpuExecutor::try_dispatch_task(
     head = (head + 1) % MAX_CORES_PER_THREAD;
     ready_count--;
 
-    // Profiling: record the real AICPU dispatch point for this core. Buffer
-    // rotation is handled inside l2_swimlane_aicpu_complete_task.
+    // Profiling: record the real AICPU dispatch point for this core. AICore
+    // buffer rotation is handled below, right before write_reg.
     if (l2_swimlane_enabled && get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) {
         dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
     }
@@ -284,6 +284,14 @@ inline bool AicpuExecutor::try_dispatch_task(
 
     // Set state before writing register to avoid race with AICore ACK
     pending_task_ids_[core_id] = task_id;
+
+    // AICore buffer rotation: count this dispatch and rotate before write_reg
+    // when crossing a BUFFER_SIZE boundary. The completion-before-dispatch
+    // invariant makes this race-free (all prior tasks on this core have FIN'd,
+    // so AICore has dcci'd their records out of the old buffer).
+    if (l2_swimlane_enabled) {
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+    }
 
     // Publish task data before AICore can observe the dispatched task_id.
     // ARM64 needs an explicit store-store fence across Normal-cacheable ->

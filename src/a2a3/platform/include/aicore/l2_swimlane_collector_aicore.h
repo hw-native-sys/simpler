@@ -65,10 +65,13 @@ struct L2SwimlaneAicoreLocalState {
  * `docs/dfx/l2-swimlane-profiling.md`.
  *
  * Race avoidance: AICPU rotates strictly before `write_reg(DATA_MAIN_BASE)`
- * for the first task of a new BUFFER_SIZE batch. The runtime's
- * completion-before-dispatch invariant guarantees all prior tasks have FIN'd,
- * so AICore has already finished writing their records before AICPU enqueues
- * the old buffer to the ready queue.
+ * for the first task of a new BUFFER_SIZE batch — driven by AICPU's own
+ * per-core dispatch count (no AICore-side signal). The runtime's
+ * completion-before-dispatch invariant (AICore per core is single-threaded
+ * and AICPU does not dispatch task K+1 until K FIN'd) guarantees all prior
+ * tasks have FIN'd at rotation time, so AICore has already finished writing
+ * their records and dcci'd them out before AICPU enqueues the old buffer to
+ * the ready queue.
  *
  * @param head     Per-core L2SwimlaneActiveHead channel — lazy-resolved on
  *                 the executor's first-task branch via
@@ -117,6 +120,11 @@ __aicore__ __attribute__((always_inline)) static inline void l2_swimlane_aicore_
     local->slot_within_buf = slot + 1;
 
     // Flush record to GM so host can read it after the buffer is enqueued.
+    // No buffer-full signal is needed: AICPU drives rotation from its own
+    // per-core dispatch count (it knows how many DATA_MAIN_BASE writes it has
+    // sent to this core, and rotates before crossing a BUFFER_SIZE boundary).
+    // The completion-before-dispatch invariant guarantees this dcci has hit
+    // GM before AICPU enqueues the buffer.
     dcci(record, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
 }

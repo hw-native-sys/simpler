@@ -184,6 +184,18 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_offset, core_id, reg_task_id
     );
 
+    // AICore buffer rotation lives on the dispatch path: count this dispatch
+    // and rotate before write_reg when we're about to cross a BUFFER_SIZE
+    // boundary. The completion-before-dispatch invariant makes this race-free
+    // (all prior tasks on this core have FIN'd, so AICore has dcci'd their
+    // records out of the old buffer). Gated on the same enable bit as flush
+    // so level=1 (AICORE_TIMING-only) participates without needing complete_task.
+#if PTO2_PROFILING
+    if (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED) {
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+    }
+#endif
+
     // Publish task data (slot_state / args writes done above) before AICore
     // can observe the dispatched task_id. ARM64 needs an explicit store-store
     // fence across Normal-cacheable -> Device-nGnRnE; the old write_reg()

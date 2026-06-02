@@ -77,25 +77,32 @@ L2SwimlaneLevel get_l2_swimlane_level();
 void l2_swimlane_aicpu_init(int worker_count);
 
 /**
- * Rotate the AICore buffer for a given core, if needed.
+ * Pre-dispatch hook for AICore buffer rotation and per-pool stats.
  *
  * Called from the dispatch path (scheduler_dispatch in tensormap_and_ringbuffer,
- * aicpu_executor in host_build_graph) immediately before write_reg(DATA_MAIN_BASE)
- * for each task. Increments the per-core dispatch counter and, when it crosses
- * a PLATFORM_AICORE_BUFFER_SIZE boundary, enqueues the current AICore buffer
- * to the ready queue (kind=2) and pops the next one from free_queue.
+ * aicpu_executor in host_build_graph) immediately BEFORE `write_reg(DATA_MAIN_BASE)`
+ * for each AICore task. Two responsibilities:
  *
- * Race safety: rotation happens BEFORE the dispatch register write, so by the
- * runtime's completion-before-dispatch invariant all prior tasks have FIN'd
- * (and AICore has finished writing their records into the old buffer) before
- * the old buffer enters the ready queue.
+ *   1. Maintain the per-core AICPU-side dispatch count.
+ *   2. Rotate the AICore buffer when the count is about to cross a
+ *      PLATFORM_AICORE_BUFFER_SIZE boundary — enqueue the just-filled buffer
+ *      to the ready queue and pop the next one from free_queue.
+ *   3. Bump the AICore pool's `total_record_count` so host reconcile
+ *      (total == collected + dropped) stays accurate at all levels —
+ *      including AICORE_TIMING (level=1), where `complete_task` is bypassed.
  *
- * Called regardless of l2_swimlane_level — internally gates on AICORE_TIMING.
+ * Race safety: rotation runs BEFORE the dispatch register write. The runtime's
+ * completion-before-dispatch invariant (AICore per core is single-threaded
+ * and AICPU does not dispatch task K+1 until K FIN'd) guarantees AICore has
+ * FIN'd — and dcci'd out — every record in the old buffer by then. No
+ * AICore-side signal is needed; AICPU has full dispatch visibility itself.
  *
- * @param core_id     Core index
- * @param thread_idx  Owning AICPU thread (target ready-queue)
+ * No-op if l2_swimlane is disabled or `core_id` is out of range.
+ *
+ * @param core_id     Core index this dispatch targets
+ * @param thread_idx  Owning AICPU thread (target ready-queue for rotation)
  */
-void l2_swimlane_aicpu_maybe_rotate_aicore(int core_id, int thread_idx);
+void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx);
 
 /**
  * Complete a L2SwimlaneAicpuTaskRecord with AICPU-side metadata after AICore task completion

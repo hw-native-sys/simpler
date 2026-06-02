@@ -30,7 +30,9 @@
  * │ L2SwimlaneAicoreTaskPool[0..num_cores-1]                    │
  * │  - head:       active L2SwimlaneAicoreTaskBuffer (AICore    │
  * │                dcci-polls; AICPU rotates at dispatch        │
- * │                boundaries by bumping current_buf_seq)       │
+ * │                boundaries by counting per-core dispatches   │
+ * │                and bumping current_buf_seq when the count   │
+ * │                crosses PLATFORM_AICORE_BUFFER_SIZE)         │
  * │  - free_queue: SPSC ring of recycled AICore buffers         │
  * ├─────────────────────────────────────────────────────────────┤
  * │ L2SwimlaneAicpuSchedPhasePool[0..num_sched_phase_threads-1] │
@@ -240,9 +242,11 @@ static_assert(sizeof(L2SwimlaneFreeQueue) == 128, "L2SwimlaneFreeQueue must be 1
  *
  * Race avoidance for AicoreTask pools: AICPU rotates strictly before
  * `write_reg(DATA_MAIN_BASE)` for the first task of a new BUFFER_SIZE batch.
- * The runtime's completion-before-dispatch invariant guarantees all prior
- * tasks have FIN'd, so AICore has already finished writing their records into
- * the old buffer before AICPU enqueues it to ready_queue.
+ * The runtime's completion-before-dispatch invariant (AICore is single-
+ * threaded per core and AICPU does not dispatch task K+1 until K FIN'd)
+ * guarantees all prior tasks have FIN'd at rotation time, so AICore has
+ * already finished writing their records (and dcci'd them out) into the
+ * old buffer before AICPU enqueues it to ready_queue.
  */
 struct L2SwimlaneActiveHead {
     volatile uint64_t current_buf_ptr;       // 8 — active buffer device address (0 = none)
@@ -289,14 +293,21 @@ static_assert(
 /**
  * Per-core AICore-written pool.
  *
- *   head:       cache line AICPU writes when rotating; AICore dcci-polls per
- *               task to detect a current_buf_seq bump (= "generation" change).
- *   free_queue: SPSC ring of recycled L2SwimlaneAicoreTaskBuffer*; host pushes,
- *               AICPU pops when rotating.
+ *   head:        cache line AICPU writes when rotating; AICore dcci-polls per
+ *                task to detect a current_buf_seq bump (= "generation" change).
+ *   free_queue:  SPSC ring of recycled L2SwimlaneAicoreTaskBuffer*; host pushes,
+ *                AICPU pops when rotating.
  *
  * AICore records flow through the existing per-thread ready_queue in
  * L2SwimlaneDataHeader (with ReadyQueueEntry::kind = AicoreTask). This keeps
  * the mgmt-thread drain path uniform with the AICPU buffer paths.
+ *
+ * Rotation trigger: AICPU counts dispatches per core in the scheduler dispatch
+ * path; when a core's count crosses a PLATFORM_AICORE_BUFFER_SIZE boundary,
+ * AICPU rotates BEFORE writing the next DATA_MAIN_BASE. The completion-before-
+ * dispatch invariant guarantees AICore has FIN'd (and dcci'd out) every record
+ * in the old buffer by then. No AICore-side signal is needed — AICPU has full
+ * dispatch-count visibility on its own.
  *
  * The AICore-readable rotation channel that AICore's per-task dcci targets is
  * exactly `&pool.head` — AICPU publishes that address into
@@ -310,9 +321,8 @@ struct L2SwimlaneAicoreTaskPool {
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(L2SwimlaneAicoreTaskPool) == 192, "L2SwimlaneAicoreTaskPool must be 192 bytes");
-// Same ABI lock as AicpuTaskPool: head must be the line AICore dcci's, so
-// `&pool.head` (= base + 0) and `&pool.free_queue` (= base + 64) must stay
-// at these exact offsets across builds.
+// ABI lock: `&pool.head` is what AICPU publishes into the rotation_table for
+// AICore to dcci. Must stay at offset 0 so AICore can index from KernelArgs.
 static_assert(offsetof(L2SwimlaneAicoreTaskPool, head) == 0, "L2SwimlaneAicoreTaskPool::head must be at offset 0");
 static_assert(
     offsetof(L2SwimlaneAicoreTaskPool, free_queue) == 64, "L2SwimlaneAicoreTaskPool::free_queue must be at offset 64"
