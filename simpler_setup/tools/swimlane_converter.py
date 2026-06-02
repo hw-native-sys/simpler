@@ -162,6 +162,74 @@ def load_deps_json(deps_path):
     return dict(by_pred)
 
 
+def load_deps_kernel_map(deps_path):
+    """Build a ``task_id → kernel_ids[3]`` map from deps.json's ``tasks[]``.
+
+    a2a3 dep_gen captures per-task ``kernel_ids = [aic, aiv0, aiv1]`` so the
+    swimlane post-processor can resolve ``func_id`` at AICORE_TIMING (level=1)
+    where the AICore record alone is on disk and carries ``func_id == -1``.
+    The trace generator uses the per-record ``core_type`` to pick the right
+    subslot: ``aic → kernel_ids[0]``, ``aiv → kernel_ids[1]`` (falling back
+    to ``[2]`` if AIV0 is inactive). Same pattern fanout edges already use
+    (deps.json is the offline-joined identity source).
+
+    Returns:
+        dict[int, list[int]] mapping ``task_id_raw → [aic, aiv0, aiv1]``,
+        or ``None`` if the file is missing / unreadable / lacks the field.
+        Entries without ``kernel_ids`` (pre-schema deps.json from older
+        runs) are silently skipped — the caller treats a missing map as
+        "no override available" and emits the ``func_-1_(...)`` fallback.
+    """
+    deps_path = Path(deps_path)
+    if not deps_path.exists():
+        return None
+    try:
+        with deps_path.open() as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    kmap: dict[int, list[int]] = {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        tid = normalize_pto2_task_id_int(task.get("task_id"))
+        kids = task.get("kernel_ids")
+        if tid is None or not isinstance(kids, list) or len(kids) != 3:
+            continue
+        kmap[tid] = [int(k) for k in kids]
+    return kmap if kmap else None
+
+
+def resolve_func_id_from_kernel_map(task_id, core_type, kernel_map):
+    """Look up the active ``func_id`` for an AICORE_TIMING record via dep_gen.
+
+    Picks the kernel_ids[3] subslot by record ``core_type``. Returns the
+    resolved func_id (>= 0) on a hit, or -1 if no usable subslot was found
+    (caller keeps the original -1 and emits the ``func_-1_(...)`` fallback
+    name). The choice for ``aiv`` prefers AIV0 ([1]) and falls back to AIV1
+    ([2]) — works for pure-AIV and MIX-with-single-AIV records; for MIX
+    records that span both AIVs the host swimlane record only tells us the
+    lane is "aiv", so the resolver may name an AIV1 lane after AIV0's
+    kernel. Acceptable trade-off until the host emits a lane-disambiguated
+    core_type ("aiv0" / "aiv1").
+    """
+    if kernel_map is None or task_id is None:
+        return -1
+    kids = kernel_map.get(int(task_id))
+    if not kids:
+        return -1
+    if core_type == "aic":
+        return kids[0] if kids[0] >= 0 else -1
+    # "aiv": prefer AIV0, fall back to AIV1.
+    for idx in (1, 2):
+        if kids[idx] >= 0:
+            return kids[idx]
+    return -1
+
+
 def load_kernel_config(config_path):
     """Load kernel configuration from kernel_config.py file.
 
@@ -381,6 +449,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     core_to_thread=None,
     orchestrator_name=None,
     deps_edges=None,
+    deps_kernel_map=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -468,8 +537,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         ts = task["start_time_us"]
         dur = task["duration_us"]
 
-        # Get function name if available
+        # Get function name if available. At AICORE_TIMING (level=1) the
+        # host emits func_id=-1; recover the real func_id from dep_gen's
+        # per-task kernel_ids[3] using the record's core_type to pick the
+        # active subslot. See resolve_func_id_from_kernel_map() for the
+        # AIV0-vs-AIV1 tie-break and the host-side contract.
         func_id = task["func_id"]
+        if int(func_id) < 0 and deps_kernel_map is not None:
+            resolved = resolve_func_id_from_kernel_map(task["task_id"], task.get("core_type"), deps_kernel_map)
+            if resolved >= 0:
+                func_id = resolved
         tdisp = format_task_display(task["task_id"])
         if func_id_to_name and str(func_id) in func_id_to_name:
             func_name = func_id_to_name[str(func_id)]
@@ -1247,9 +1324,16 @@ def main():
 
         deps_path = Path(args.deps_json) if args.deps_json else Path(input_path).parent / "deps.json"
         deps_edges = load_deps_json(deps_path)
+        # Load the per-task kernel_ids map separately so the trace generator
+        # can resolve func_id=-1 records (AICORE_TIMING / level=1) back to
+        # the real kernel name. Optional — pre-schema deps.json without
+        # kernel_ids and AICPU_TIMING+ runs both leave this at None.
+        deps_kernel_map = load_deps_kernel_map(deps_path)
         if deps_edges is not None:
             if args.verbose:
                 print(f"  Using deps.json edges ({sum(len(v) for v in deps_edges.values())} total) from {deps_path}")
+                if deps_kernel_map is not None:
+                    print(f"  Using deps.json kernel_ids for {len(deps_kernel_map)} tasks (level=1 name recovery)")
         else:
             print(
                 f"Warning: no usable deps.json at {deps_path}; Perfetto trace will have no dependency arrows. "
@@ -1267,6 +1351,7 @@ def main():
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             core_to_thread=data.get("core_to_thread"),
             deps_edges=deps_edges,
+            deps_kernel_map=deps_kernel_map,
         )
 
         print("\n✓ Conversion complete")

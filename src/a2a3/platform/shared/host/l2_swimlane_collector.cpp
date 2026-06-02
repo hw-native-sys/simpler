@@ -754,6 +754,14 @@ void L2SwimlaneCollector::join_aicore_records() {
     );
 }
 
+void L2SwimlaneCollector::set_core_types(const CoreType *types, int n) {
+    if (types == nullptr || n <= 0) {
+        core_types_.clear();
+        return;
+    }
+    core_types_.assign(types, types + n);
+}
+
 int L2SwimlaneCollector::export_swimlane_json() {
     // shm_host_ is read once (phase-header metadata) below; guard it up front
     // like the other collector methods so a never-initialized / post-finalize
@@ -766,12 +774,23 @@ int L2SwimlaneCollector::export_swimlane_json() {
     // record stream (AICore-as-producer design).
     join_aicore_records();
 
-    // Step 1: Validate collected data
+    // Step 1: Validate collected data. AICPU records (collected_perf_records_)
+    // are required at AICPU_TIMING+ but absent at AICORE_TIMING (level=1)
+    // where complete_task is bypassed. At level=1 the AICore stream alone is
+    // the source of truth; check it too before declaring nothing to export.
     bool has_any_records = false;
     for (const auto &core_records : collected_perf_records_) {
         if (!core_records.empty()) {
             has_any_records = true;
             break;
+        }
+    }
+    if (!has_any_records && l2_swimlane_level_ == L2SwimlaneLevel::AICORE_TIMING) {
+        for (const auto &ac_records : collected_aicore_records_) {
+            if (!ac_records.empty()) {
+                has_any_records = true;
+                break;
+            }
         }
     }
     if (!has_any_records) {
@@ -839,6 +858,22 @@ int L2SwimlaneCollector::export_swimlane_json() {
             for (const auto &pr : thread_records) {
                 if (pr.start_time > 0 && pr.start_time < base_time_cycles) {
                     base_time_cycles = pr.start_time;
+                }
+            }
+        }
+    }
+
+    // AICORE_TIMING (level=1): tagged_records is empty (complete_task bypassed)
+    // and phase records are also empty (level < SCHED_PHASES), so the two
+    // loops above leave base_time_cycles == UINT64_MAX. The AICore-records-only
+    // emit path below would then subtract UINT64_MAX from each timestamp and
+    // produce decades-large microsecond values. Scan AICore records here as
+    // the timestamp anchor in that mode.
+    if (l2_swimlane_level_ == L2SwimlaneLevel::AICORE_TIMING) {
+        for (const auto &ac_records : collected_aicore_records_) {
+            for (const auto &r : ac_records) {
+                if (r.start_time > 0 && r.start_time < base_time_cycles) {
+                    base_time_cycles = r.start_time;
                 }
             }
         }
@@ -918,6 +953,42 @@ int L2SwimlaneCollector::export_swimlane_json() {
             outfile << ",";
         }
         outfile << "\n";
+    }
+
+    // AICORE_TIMING (level=1) fallback: at this level complete_task is
+    // bypassed and tagged_records is empty. The AICore record stream alone
+    // carries identity + timing, so synthesize one task[] entry per AICore
+    // record. core_type comes from the host-published core_types_ table
+    // (set_core_types() at init); func_id is left as -1 and the post-process
+    // tool (`swimlane_converter.py`) joins it from deps.json via task_id
+    // (same pattern fanout already uses).
+    if (emit_indices.empty() && l2_swimlane_level_ == L2SwimlaneLevel::AICORE_TIMING) {
+        size_t aicore_emitted = 0;
+        for (int core_id = 0; core_id < num_aicore_; core_id++) {
+            for (const auto &r : collected_aicore_records_[core_id]) {
+                if (r.start_time == 0) continue;
+                double start_us = cycles_to_us(r.start_time - base_time_cycles);
+                double end_us = cycles_to_us(r.end_time - base_time_cycles);
+                double duration_us = end_us - start_us;
+                CoreType ct = (core_id < static_cast<int>(core_types_.size())) ? core_types_[core_id] : CoreType::AIV;
+                const char *core_type_str = (ct == CoreType::AIC) ? "aic" : "aiv";
+                if (aicore_emitted > 0) outfile << ",\n";
+                outfile << "    {\n";
+                outfile << "      \"task_id\": " << r.task_token_raw << ",\n";
+                outfile << "      \"func_id\": -1,\n";
+                outfile << "      \"core_id\": " << core_id << ",\n";
+                outfile << "      \"core_type\": \"" << core_type_str << "\",\n";
+                outfile << "      \"ring_id\": " << static_cast<int>(r.task_token_raw >> 32) << ",\n";
+                outfile << "      \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us << ",\n";
+                outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
+                outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
+                outfile << "      \"dispatch_time_us\": 0.000,\n";
+                outfile << "      \"finish_time_us\": 0.000\n";
+                outfile << "    }";
+                aicore_emitted++;
+            }
+        }
+        if (aicore_emitted > 0) outfile << "\n";
     }
     outfile << "  ]";
 

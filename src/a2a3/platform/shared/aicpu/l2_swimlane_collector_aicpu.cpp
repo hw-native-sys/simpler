@@ -589,16 +589,26 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
         uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
         if (ac_buf_ptr == 0) continue;
 
-        uint32_t live = ac_state->head.total_record_count -
-                        ac_state->head.current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
-        if (live == 0) {
-            // Last rotation matched the last completion exactly — buffer is
-            // freshly popped and empty. Skip.
-            continue;
+        // At AICPU_TIMING+, `total_record_count` is bumped on every complete
+        // and gives an accurate live count for the current buffer. At
+        // AICORE_TIMING (level=1) complete_task is skipped, so that counter
+        // stays 0 and the formula bails even when AICore has filled records.
+        // Fall back to the buffer's full capacity in that case; the host-side
+        // copy_aicore_buffer skips trailing slots whose start_time is still 0,
+        // so over-stating count costs only a scan pass — never spurious records.
+        uint32_t ac_mark;
+        if (g_l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
+            uint32_t live = ac_state->head.total_record_count -
+                            ac_state->head.current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+            if (live == 0) {
+                continue;
+            }
+            ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
+                          static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
+                          live;
+        } else {
+            ac_mark = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
         }
-        uint32_t ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
-                               static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
-                               live;
         L2SwimlaneAicoreTaskBuffer *ac_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(ac_buf_ptr);
         ac_buf->count = ac_mark;
         wmb();

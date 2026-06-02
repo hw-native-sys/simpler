@@ -265,6 +265,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
             LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
         }
+        // Publish per-core core_type to the collector so the level=1 host
+        // emit path can label lanes without an AICPU record. Sim already set
+        // workers[i].core_type via the (i < num_aic) rule at line ~240.
+        std::vector<CoreType> core_types(num_aicore);
+        for (int i = 0; i < num_aicore; i++) {
+            core_types[i] = runtime.workers[i].core_type;
+        }
+        l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
 
     if (enable_dump_tensor_) {

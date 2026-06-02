@@ -336,6 +336,21 @@ public:
     void on_buffer_collected(const ReadyBufferInfo &info);
 
     /**
+     * Publish per-core core_type (AIC/AIV/...) so the host emit path can
+     * resolve the lane label without consulting an AICPU task record. Required
+     * for AICORE_TIMING (level=1) where complete_task is bypassed and the
+     * AICore record alone is on disk. Caller is the device_runner — sim sets
+     * it from `runtime.workers[i].core_type` (rule-based), onboard sets it
+     * from the handshake-discovered table.
+     *
+     * Safe to call multiple times; the last call wins.
+     *
+     * @param types  CoreType[n] table indexed by core_id
+     * @param n      table length (typically `num_aicore`)
+     */
+    void set_core_types(const CoreType *types, int n);
+
+    /**
      * Export collected records as a Chrome Trace Event JSON (swimlane view).
      * Writes <output_prefix>/l2_swimlane_records.json — directory is captured at
      * initialize() time.
@@ -420,6 +435,11 @@ private:
     // does not encode the AICPU thread).
     int aicpu_thread_num_{0};
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};
+
+    // Per-core core_type table populated by set_core_types(). Indexed by
+    // core_id; size matches num_aicore_ once populated. Used by the level=1
+    // emit path which has no AICPU record to read core_type from.
+    std::vector<CoreType> core_types_;
 
     // Per-task output directory captured at initialize() time. Consumed by
     // export_swimlane_json() to build <prefix>/l2_swimlane_records.json.
