@@ -756,10 +756,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     uint64_t finish_ts = get_sys_cnt_aicpu();
 
                     if (prev_running_id != AICPU_TASK_INVALID) {
-                        Task *prev_task = &runtime.tasks[prev_running_id];
                         if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts
                             ) != 0) {
                             LOG_ERROR(
@@ -773,10 +771,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     }
 
                     finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-                    Task *task = &runtime.tasks[completed_task_id];
                     if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts
                         ) != 0) {
                         LOG_ERROR(
@@ -863,10 +859,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     // block ~100 lines above.
                     if (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
                         uint64_t finish_ts = get_sys_cnt_aicpu();
-                        Task *prev_task = &runtime.tasks[prev_running_id];
                         if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts
                             ) != 0) {
                             LOG_ERROR(
@@ -907,10 +901,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 // Level gate: see complete-task comment at the matching block above.
                 if (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
-                    Task *task = &runtime.tasks[completed_task_id];
                     if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts
                         ) != 0) {
                         LOG_ERROR(

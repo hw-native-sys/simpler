@@ -445,8 +445,7 @@ void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx) {
 }
 
 int l2_swimlane_aicpu_complete_task(
-    int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
-    uint64_t dispatch_time, uint64_t finish_time
+    int core_id, int thread_idx, uint32_t reg_task_id, uint64_t dispatch_time, uint64_t finish_time
 ) {
     if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
         return -1;
@@ -474,31 +473,13 @@ int l2_swimlane_aicpu_complete_task(
         return -1;
     }
 
-    // AICore-as-producer: AICore writes start/end/task_id directly into its
-    // own per-core L2SwimlaneAicoreTaskBuffer (indexed by reg_task_id % SIZE). AICPU
-    // writes only AICPU-owned fields here; start/end stay zero on-device and
-    // are patched by the host when the buffer is consumed. Join key is
-    // `reg_task_id` (monotonic per core), stored alongside the PTO2-encoded
-    // `task_id` so the host can match without a hashmap lookup. This
-    // eliminates the per-task rmb() + staging cache-line read the previous
-    // design required.
+    // AICPU-only timing — three fields, two cache half-lines. Identity
+    // (task_token_raw, core_type) lives in the AICore record; the host
+    // joins by reg_task_id. See L2SwimlaneAicpuTaskRecord header comment.
     L2SwimlaneAicpuTaskRecord *record = &l2_swimlane_buf->records[count];
-    record->start_time = 0;
-    record->end_time = 0;
-    record->duration = 0;
-    record->task_id = task_id;
-    record->reg_task_id = expected_reg_task_id;
-    record->func_id = func_id;
-    record->core_type = core_type;
-
-    // AICPU_TIMING and above: dispatch/finish timing.
-    if (g_l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
-        record->dispatch_time = dispatch_time;
-        record->finish_time = finish_time;
-    } else {
-        record->dispatch_time = 0;
-        record->finish_time = 0;
-    }
+    record->reg_task_id = reg_task_id;
+    record->dispatch_time = dispatch_time;
+    record->finish_time = finish_time;
 
     uint32_t new_count = count + 1;
     l2_swimlane_buf->count = new_count;

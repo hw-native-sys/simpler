@@ -85,45 +85,45 @@ enum class L2SwimlaneLevel : uint32_t {
 };
 
 // =============================================================================
-// L2SwimlaneAicpuTaskRecord - Single Task Execution Record
+// L2SwimlaneAicpuTaskRecord - AICPU-side timing record
 // =============================================================================
 
 /**
- * Single task execution record.
+ * AICPU-side timing record. The minimal AICPU-only payload after the
+ * AICore-as-producer split: identity (task_token_raw, core_type) and
+ * AICore-side timing (start/end) all live in L2SwimlaneAicoreTaskRecord; the
+ * AICPU record only carries the two timestamps the AICore side cannot
+ * produce, plus the host-side join key against the AICore stream.
+ *
+ *   - dispatch_time : AICPU timestamp when DATA_MAIN_BASE was written.
+ *   - finish_time   : AICPU timestamp when AICPU observed FIN.
+ *   - reg_task_id   : per-core monotonic dispatch token; join key against
+ *                     L2SwimlaneAicoreTaskRecord.reg_task_id.
+ *
+ * Host post-processing pulls task_token_raw + start_time + end_time from
+ * the matched AICore record, derives core_type from the per-core static
+ * table published via L2SwimlaneCollector::set_core_types, and emits
+ * func_id = -1 (resolved post-process by `swimlane_converter.py` from
+ * deps.json's `kernel_ids[]`). Same path AICORE_TIMING (level=1) uses.
  *
  * Fanout edges live in the static DAG (deps.json from dep_gen) — not in
  * this record. Keeping fanout out of the hot AICPU commit path avoids a
  * per-task ~1 KB GM store + a linked-list walk on the scheduler's
- * critical fanin tail. The host swimlane export emits empty fanout
- * fields; `swimlane_converter.py` joins deps.json at post-process time.
+ * critical fanin tail. `swimlane_converter.py` joins deps.json at
+ * post-process time.
+ *
+ * Layout: 16B timing + 4B reg_task_id → 20B logical; `aligned(32)` rounds
+ * the struct size up to 32B (compiler-inserted trailing pad) and forces
+ * 32B placement alignment so each record sits in one half of a 64B cache
+ * line. Two records per cache line.
  */
 struct L2SwimlaneAicpuTaskRecord {
-    // Timing information (device clock timestamps)
-    uint64_t start_time;  // Task start timestamp (get_sys_cnt) — host-filled at flush from AICore buffer
-    uint64_t end_time;    // Task end timestamp — host-filled at flush from AICore buffer
-    uint64_t duration;    // Execution duration (end - start) — host-filled at flush
-
-    // AICPU-side timestamps (written by AICPU directly)
     uint64_t dispatch_time;  // AICPU timestamp: when task was dispatched to AICore
     uint64_t finish_time;    // AICPU timestamp: when AICPU observed task completion
+    uint32_t reg_task_id;    // Per-core dispatch token; host join key vs AICore record
+} __attribute__((aligned(32)));
 
-    // Full PTO2 task id (host-visible identity, what swimlane export and
-    // dep_gen join keys use). For tensormap_and_ringbuffer this is
-    // (ring_id << 32) | local_id; for host_build_graph it is the plain
-    // integer task index.
-    uint64_t task_id;
-    uint32_t func_id;      // Kernel function identifier
-    CoreType core_type;    // Core type (AIC/AIV)
-    uint32_t reg_task_id;  // Register dispatch token (monotonic per core).
-                           // Used by the host as the join key against
-                           // L2SwimlaneAicoreTaskRecord.task_id, which is what
-                           // AICore writes into the slim record.
-} __attribute__((aligned(64)));
-
-static_assert(
-    sizeof(L2SwimlaneAicpuTaskRecord) % 64 == 0,
-    "L2SwimlaneAicpuTaskRecord must be 64-byte aligned for optimal cache performance"
-);
+static_assert(sizeof(L2SwimlaneAicpuTaskRecord) == 32, "L2SwimlaneAicpuTaskRecord must be 32B");
 
 // =============================================================================
 // L2SwimlaneAicoreTaskRecord - Slim AICore-Only Record (written by AICore, read by Host)
@@ -140,29 +140,23 @@ static_assert(
  * - `task_token_raw` — the PTO2 task identity `(ring_id << 32) | local_id`.
  *   Per-task unique. AICore reads it from
  *   `LocalContext.async_ctx.task_token.raw` (already in the dispatch
- *   payload's cache line). Used by the host JSON output as the canonical
- *   task id + ring decoder; NOT a join key — SPMD `block_num > num_cores`,
+ *   payload's cache line). The host pulls it from here as the canonical
+ *   task id + ring decoder at ALL levels — the AICPU record carries no
+ *   identity after the slim-down (only dispatch/finish timestamps and the
+ *   reg_task_id join key), so AICore is the single source of truth for
+ *   task identity. NOT a join key on its own: SPMD `block_num > num_cores`,
  *   MIX cluster spread, and pipeline dual-issue all dispatch the same
  *   `task_token_raw` multiple times to the same core, each producing one
- *   AICore execution record sharing the same token.
- *
- *   Why not drop it (the obvious reviewer question): at AICORE_TIMING
- *   (level=1) AICPU writes no record, so this is the ONLY place the host
- *   can read full PTO2 identity from. Without it level=1 JSON's `task_id`
- *   degenerates to per-core (`reg_task_id`), `ring_id` disappears, and the
- *   `swimlane_converter.py` deps.json join (kernel name + fanout) breaks.
- *   At level≥2 it is redundant with `L2SwimlaneAicpuTaskRecord.task_id`,
- *   but the field is free in space (within the 32B half-cacheline pad)
- *   and on the AICore read path (same cache line as block_idx, which the
- *   kernel always reads).
+ *   AICore execution record sharing the same token. The host disambiguates
+ *   by `reg_task_id` below.
  *
  * - `reg_task_id` — the per-core dispatch token (low 32 bits of the
  *   per-core monotonic `dispatch_seq`). Per-dispatch unique within a core.
- *   This is the host-side join key against the AICPU record stream's
- *   `L2SwimlaneAicpuTaskRecord.reg_task_id`. Each dispatch produces one
- *   AICore record + one AICPU record sharing the same reg_task_id, giving
- *   a clean 1:1 join even when multiple dispatches of the same task land
- *   on the same core.
+ *   At level≥2 the host uses this as the join key against the AICPU
+ *   record stream's `L2SwimlaneAicpuTaskRecord.reg_task_id`. Each dispatch
+ *   produces one AICore record + one AICPU record sharing the same
+ *   reg_task_id, giving a clean 1:1 join even when multiple dispatches
+ *   of the same task land on the same core.
  *
  * Layout: 24B identity/timing + 4B reg_task_id + 4B pad → 32B (half a
  * cache line). Two records pack into one cache line so AICore's per-task

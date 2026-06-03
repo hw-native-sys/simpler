@@ -31,6 +31,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "common/l2_swimlane_profiling.h"
@@ -479,15 +480,19 @@ private:
     void copy_orch_phase_buffer(const ReadyBufferInfo &info);
     void copy_aicore_buffer(const ReadyBufferInfo &info);
 
-    // AICore-as-producer: AICore writes start/end/task_id directly into a
-    // per-core L2SwimlaneAicoreTaskBuffer (allocated by initialize(), addressed via
-    // L2SwimlaneAicoreTaskPool::rotation, which AICPU rotates per BUFFER_SIZE
-    // completion). AICPU never reads the AICore records on the hot path.
-    // join_aicore_records() runs after stop(): it walks each core's buffer,
-    // builds a `task_id_low32 → (start, end)` map, then patches the matching
-    // L2SwimlaneAicpuTaskRecord entries in collected_perf_records_. Called from
-    // export_swimlane_json() so external callers see a transparent stream.
-    void join_aicore_records();
+    // AICore-as-producer: AICore writes identity (task_token_raw) and timing
+    // (start_time, end_time) into per-core L2SwimlaneAicoreTaskBuffers; AICPU
+    // writes only the two AICPU-only timestamps (dispatch_time, finish_time)
+    // plus the join key reg_task_id. build_aicore_lookup() builds the per-core
+    // reg_task_id → AICore-info map the export pass uses to combine the two
+    // streams.
+    struct AicoreInfo {
+        uint64_t task_token_raw;
+        uint64_t start_time;
+        uint64_t end_time;
+    };
+    using AicoreLookup = std::unordered_map<uint32_t, AicoreInfo>;
+    std::vector<AicoreLookup> build_aicore_lookup() const;
 };
 
 #endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_

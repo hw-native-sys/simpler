@@ -678,80 +678,36 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
     LOG_INFO_V0("Phase metadata collection complete: has_phase_data=%s", has_phase_data_ ? "yes" : "no");
 }
 
-// AICore-as-producer post-processing: walk each L2SwimlaneAicpuTaskRecord we collected
-// and patch start/end/duration from the per-core stream of AICore records
-// that arrived through the ready queue. AICore rotation guarantees each
-// per-core stream is a complete prefix of "all dispatched tasks on this
-// core" with no wrap loss (the AICore buffer pool is recycled via
-// free_queue while the session runs, so an arbitrarily long session works).
+// AICore-as-producer post-processing: build a per-core
+// `reg_task_id → (task_token_raw, start, end)` lookup so the export pass can
+// pull identity + AICore timing for each AICPU record by its join key.
 //
-// We build a small `reg_task_id → (start, end)` map per core (size on
-// the order of N_dispatches_per_core) and patch each L2SwimlaneAicpuTaskRecord
-// by its per-core reg_task_id. Using a map tolerates AICPU-side drops (a
-// missing AICPU record doesn't break alignment) and lets the same code
-// work for both runtimes.
+// AICore rotation guarantees each per-core stream is a complete prefix of
+// "all dispatched tasks on this core" with no wrap loss (the AICore buffer
+// pool is recycled via free_queue while the session runs, so arbitrarily
+// long sessions work). Map keying tolerates AICPU-side drops — a missing
+// AICPU record just produces fewer emitted entries, not a stream desync.
 //
 // Why reg_task_id and not task_token_raw: SPMD with `block_num > num_cores`
-// (e.g. q_proj in qwen3 decode has block_num=40 over 24 AIC cores) dispatches
-// the same task_token_raw multiple times to the same core. Each dispatch
-// produces its own AICore record (different start/end) and its own AICPU
-// record, but all share the same task_token_raw. A task_token_raw-keyed
+// (e.g. q_proj in qwen3 decode has block_num=40 over 24 AIC cores)
+// dispatches the same task_token_raw multiple times to the same core. Each
+// dispatch produces its own AICore record (different start/end) and its own
+// AICPU record, but all share the same task_token_raw. A task_token_raw-keyed
 // map would collapse all dispatches into the last AICore record's timing,
 // making every AICPU record on that core show identical (start, end) —
-// visible as "duplicate" task spans in the swimlane viewer. reg_task_id is
-// per-core monotonic per dispatch (scheduler_dispatch.cpp:140) — unique at
-// dispatch granularity, which is what the join needs.
-void L2SwimlaneCollector::join_aicore_records() {
-    if (shm_host_ == nullptr) {
-        return;
-    }
-    rmb();
-
-    uint64_t total_patched = 0;
-    uint64_t total_unmatched = 0;
-
+// visible as "duplicate" task spans in the viewer. reg_task_id is per-core
+// monotonic per dispatch (scheduler_dispatch.cpp:140) — unique at dispatch
+// granularity, which is what the join needs.
+std::vector<L2SwimlaneCollector::AicoreLookup> L2SwimlaneCollector::build_aicore_lookup() const {
+    std::vector<AicoreLookup> per_core(num_aicore_);
     for (int core_idx = 0; core_idx < num_aicore_; core_idx++) {
         const auto &ac_stream = collected_aicore_records_[core_idx];
-        if (collected_perf_records_[core_idx].empty()) {
-            continue;
-        }
-
-        std::unordered_map<uint32_t, std::pair<uint64_t, uint64_t>> ts_by_reg;
-        ts_by_reg.reserve(ac_stream.size() * 2);
+        per_core[core_idx].reserve(ac_stream.size() * 2);
         for (const auto &r : ac_stream) {
-            ts_by_reg[r.reg_task_id] = {r.start_time, r.end_time};
-        }
-
-        uint64_t patched = 0;
-        uint64_t unmatched = 0;
-        for (auto &lr : collected_perf_records_[core_idx]) {
-            auto it = ts_by_reg.find(lr.reg_task_id);
-            if (it == ts_by_reg.end()) {
-                unmatched++;
-                continue;
-            }
-            lr.start_time = it->second.first;
-            lr.end_time = it->second.second;
-            lr.duration = (lr.end_time > lr.start_time) ? (lr.end_time - lr.start_time) : 0;
-            patched++;
-        }
-
-        total_patched += patched;
-        total_unmatched += unmatched;
-        if (unmatched > 0) {
-            LOG_WARN(
-                "Core %d: %lu L2SwimlaneAicpuTaskRecord(s) had no matching AICore entry (AICore buffer drops on "
-                "rotation? "
-                "PLATFORM_AICORE_BUFFERS_PER_CORE=%d may be undersized for host drain rate)",
-                core_idx, static_cast<unsigned long>(unmatched), PLATFORM_AICORE_BUFFERS_PER_CORE
-            );
+            per_core[core_idx][r.reg_task_id] = {r.task_token_raw, r.start_time, r.end_time};
         }
     }
-
-    LOG_INFO_V0(
-        "AICore-as-producer join: patched=%lu, unmatched=%lu", static_cast<unsigned long>(total_patched),
-        static_cast<unsigned long>(total_unmatched)
-    );
+    return per_core;
 }
 
 void L2SwimlaneCollector::set_core_types(const CoreType *types, int n) {
@@ -770,9 +726,12 @@ int L2SwimlaneCollector::export_swimlane_json() {
         return -1;
     }
 
-    // Step 0: Join AICore-emitted start/end/task_id records into the AICPU
-    // record stream (AICore-as-producer design).
-    join_aicore_records();
+    // Step 0: Build per-core reg_task_id → AICore-info lookup. Used by the
+    // emit loop to pull identity (task_token_raw) and AICore timing
+    // (start_time, end_time) for each AICPU record. AICore is the producer
+    // of those fields; AICPU only writes (reg_task_id, dispatch_time,
+    // finish_time).
+    auto aicore_lookup = build_aicore_lookup();
 
     // Step 1: Validate collected data. AICPU records (collected_perf_records_)
     // are required at AICPU_TIMING+ but absent at AICORE_TIMING (level=1)
@@ -808,9 +767,13 @@ int L2SwimlaneCollector::export_swimlane_json() {
         return -1;
     }
 
-    // Step 3: Flatten per-core vectors into tagged records with core_id derived from index
+    // Step 3: Flatten per-core AICPU records and resolve identity/timing
+    // from the AICore lookup. Records whose reg_task_id has no matching
+    // AICore entry are dropped here (AICore-side rotation dropped the
+    // buffer; surfaced via dropped_record_count and the unmatched log below).
     struct TaggedRecord {
         const L2SwimlaneAicpuTaskRecord *record;
+        const AicoreInfo *aicore;  // identity + AICore timing
         uint32_t core_id;
     };
     std::vector<TaggedRecord> tagged_records;
@@ -819,26 +782,42 @@ int L2SwimlaneCollector::export_swimlane_json() {
         total_records += core_records.size();
     }
     tagged_records.reserve(total_records);
+    size_t total_unmatched = 0;
     for (size_t core_idx = 0; core_idx < collected_perf_records_.size(); core_idx++) {
+        const auto &lookup = aicore_lookup[core_idx];
+        size_t core_unmatched = 0;
         for (const auto &record : collected_perf_records_[core_idx]) {
-            tagged_records.push_back({&record, static_cast<uint32_t>(core_idx)});
+            auto it = lookup.find(record.reg_task_id);
+            if (it == lookup.end()) {
+                core_unmatched++;
+                continue;
+            }
+            tagged_records.push_back({&record, &it->second, static_cast<uint32_t>(core_idx)});
         }
+        if (core_unmatched > 0) {
+            LOG_WARN(
+                "Core %zu: %zu L2SwimlaneAicpuTaskRecord(s) had no matching AICore entry "
+                "(AICore buffer drops on rotation? PLATFORM_AICORE_BUFFERS_PER_CORE=%d may "
+                "be undersized for host drain rate)",
+                core_idx, core_unmatched, PLATFORM_AICORE_BUFFERS_PER_CORE
+            );
+        }
+        total_unmatched += core_unmatched;
+    }
+    if (total_unmatched > 0) {
+        LOG_WARN("Dropped %zu task record(s) with unmatched AICore timing from swimlane export", total_unmatched);
     }
 
-    // Sort by canonical task_id (64-bit PTO2 raw)
+    // Sort by canonical task_id (64-bit PTO2 raw) via the joined AICore entry.
     std::sort(tagged_records.begin(), tagged_records.end(), [](const TaggedRecord &a, const TaggedRecord &b) {
-        return a.record->task_id < b.record->task_id;
+        return a.aicore->task_token_raw < b.aicore->task_token_raw;
     });
 
     // Step 4: Calculate base time (minimum timestamp across all records).
-    // Records whose AICore timing was never filled in by join_aicore_records()
-    // (e.g. AICore buffer wrap) leave start_time = 0 and would otherwise
-    // anchor the entire swimlane at cycle 0 — gate them out alongside the
-    // dispatch_time check.
     uint64_t base_time_cycles = UINT64_MAX;
     for (const auto &tagged : tagged_records) {
-        if (tagged.record->start_time > 0 && tagged.record->start_time < base_time_cycles) {
-            base_time_cycles = tagged.record->start_time;
+        if (tagged.aicore->start_time > 0 && tagged.aicore->start_time < base_time_cycles) {
+            base_time_cycles = tagged.aicore->start_time;
         }
         if (tagged.record->dispatch_time > 0 && tagged.record->dispatch_time < base_time_cycles) {
             base_time_cycles = tagged.record->dispatch_time;
@@ -899,48 +878,35 @@ int L2SwimlaneCollector::export_swimlane_json() {
     outfile << "  \"l2_swimlane_level\": " << l2_swimlane_level << ",\n";
     outfile << "  \"tasks\": [\n";
 
-    // First pass: filter unmatched records (start_time == 0) so we emit a
-    // valid JSON without trailing-comma fix-ups. Unmatched records arise when
-    // the AICore-side rotation dropped a buffer (free queue empty) and that
-    // task's AICore record never made it to the host, leaving the AICPU-side
-    // L2SwimlaneAicpuTaskRecord with `start_time == 0`. Subtracting base_time_cycles from
-    // 0 would underflow to a huge double timestamp, painting an off-the-chart
-    // bar in the swimlane viewer; safer to drop the record. The drop count is
-    // already surfaced via `dropped_record_count` and the join warning logged
-    // in join_aicore_records().
-    std::vector<size_t> emit_indices;
-    emit_indices.reserve(tagged_records.size());
-    size_t unmatched_dropped = 0;
-    for (size_t i = 0; i < tagged_records.size(); ++i) {
-        if (tagged_records[i].record->start_time == 0) {
-            unmatched_dropped++;
-            continue;
-        }
-        emit_indices.push_back(i);
-    }
-    if (unmatched_dropped > 0) {
-        LOG_WARN("Dropped %zu task record(s) with unmatched AICore timing from swimlane export", unmatched_dropped);
-    }
-
-    for (size_t e = 0; e < emit_indices.size(); ++e) {
-        const auto &tagged = tagged_records[emit_indices[e]];
+    // tagged_records was already filtered to entries with a matching AICore
+    // join target in Step 3; unmatched ones were logged and dropped there.
+    // No further filter pass needed — emit straight from tagged_records.
+    // core_type per record comes from the host-published core_types_ table
+    // (set_core_types() at init); func_id is emitted as -1 and resolved
+    // post-process by `swimlane_converter.py` from deps.json's `kernel_ids[]`
+    // — same path AICORE_TIMING (level=1) uses, so all levels go through the
+    // same identity-resolution machinery.
+    for (size_t e = 0; e < tagged_records.size(); ++e) {
+        const auto &tagged = tagged_records[e];
         const auto &record = *tagged.record;
+        const auto &ac = *tagged.aicore;
 
         // Convert times to microseconds
-        double start_us = cycles_to_us(record.start_time - base_time_cycles);
-        double end_us = cycles_to_us(record.end_time - base_time_cycles);
+        double start_us = cycles_to_us(ac.start_time - base_time_cycles);
+        double end_us = cycles_to_us(ac.end_time - base_time_cycles);
         double duration_us = end_us - start_us;
         double dispatch_us = (record.dispatch_time > 0) ? cycles_to_us(record.dispatch_time - base_time_cycles) : 0.0;
         double finish_us = (record.finish_time > 0) ? cycles_to_us(record.finish_time - base_time_cycles) : 0.0;
 
-        const char *core_type_str = (record.core_type == CoreType::AIC) ? "aic" : "aiv";
+        CoreType ct = (tagged.core_id < core_types_.size()) ? core_types_[tagged.core_id] : CoreType::AIV;
+        const char *core_type_str = (ct == CoreType::AIC) ? "aic" : "aiv";
 
         outfile << "    {\n";
-        outfile << "      \"task_id\": " << record.task_id << ",\n";
-        outfile << "      \"func_id\": " << record.func_id << ",\n";
+        outfile << "      \"task_id\": " << ac.task_token_raw << ",\n";
+        outfile << "      \"func_id\": -1,\n";
         outfile << "      \"core_id\": " << tagged.core_id << ",\n";
         outfile << "      \"core_type\": \"" << core_type_str << "\",\n";
-        outfile << "      \"ring_id\": " << static_cast<int>(record.task_id >> 32) << ",\n";
+        outfile << "      \"ring_id\": " << static_cast<int>(ac.task_token_raw >> 32) << ",\n";
         outfile << "      \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us << ",\n";
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
         outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
@@ -949,7 +915,7 @@ int L2SwimlaneCollector::export_swimlane_json() {
         // Fanout is no longer carried on the device hot path — dep_gen replay
         // (deps.json) is the sole source of truth, joined in by tooling.
         outfile << "    }";
-        if (e + 1 < emit_indices.size()) {
+        if (e + 1 < tagged_records.size()) {
             outfile << ",";
         }
         outfile << "\n";
@@ -958,11 +924,9 @@ int L2SwimlaneCollector::export_swimlane_json() {
     // AICORE_TIMING (level=1) fallback: at this level complete_task is
     // bypassed and tagged_records is empty. The AICore record stream alone
     // carries identity + timing, so synthesize one task[] entry per AICore
-    // record. core_type comes from the host-published core_types_ table
-    // (set_core_types() at init); func_id is left as -1 and the post-process
-    // tool (`swimlane_converter.py`) joins it from deps.json via task_id
-    // (same pattern fanout already uses).
-    if (emit_indices.empty() && l2_swimlane_level_ == L2SwimlaneLevel::AICORE_TIMING) {
+    // record. Same identity-resolution rules as the level≥2 emit above
+    // (core_type from core_types_, func_id = -1 → python join).
+    if (tagged_records.empty() && l2_swimlane_level_ == L2SwimlaneLevel::AICORE_TIMING) {
         size_t aicore_emitted = 0;
         for (int core_id = 0; core_id < num_aicore_; core_id++) {
             for (const auto &r : collected_aicore_records_[core_id]) {
