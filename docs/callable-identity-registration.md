@@ -98,8 +98,11 @@ Worker topology:
 Submit APIs validate that the selected execution path can resolve the handle's
 namespace. For example, `submit_next_level` on an L3 Worker with chip children
 requires `LOCAL_CHIP`, while `submit_next_level` on an L4 Worker child path
-requires a Python dispatch handle. The receiving child mailbox determines its
-own namespace, so local task frames carry only the raw `sha256` digest.
+requires a Python dispatch handle. The receiving child mailbox derives its
+resolver namespace from the selected child path: chip child loops resolve
+against `LOCAL_CHIP`, and SUB children plus next-level Worker-child Python loops
+resolve against `LOCAL_PYTHON`. Local task frames carry only the raw `sha256`
+digest because each current child path has exactly one resolver domain.
 
 Each target namespace owns a private mapping:
 
@@ -116,7 +119,8 @@ Rules:
 - `hashid` is valid across the parent and local child workers.
 - `local_slot` is valid only inside the target namespace that allocated it.
 - Public APIs and task records carry `CallableHandle`, not local slots.
-- Local mailbox task frames carry `hashid`, not slots.
+- Local mailbox task frames carry the raw 32-byte digest, not `hashid` strings
+  or slots.
 - A parent, scheduler, `Orchestrator`, or user orchestration function must not
   know a child worker's `hashid -> local_slot` mapping.
 - Registering the same `hashid` with a different descriptor or payload digest
@@ -181,15 +185,15 @@ CHIP_CALLABLE:
   target_arch
   platform
   runtime
-  callable_blob_sha256
-  signature_schema_hash
+  callable_blob_sha256: uint8[32]
+  signature_schema_hash: uint8[32]
 
 PYTHON_SERIALIZED:
   descriptor_schema_version
   callable_kind
   payload_format_version
   serializer_id
-  payload_sha256
+  payload_sha256: uint8[32]
 ```
 
 For `CHIP_CALLABLE`:
@@ -314,6 +318,11 @@ stable callable identity used in task frames, but repeated registrations of
 the same callable may return distinct handle objects with the same `hashid`.
 Unregistering one handle must not invalidate another live handle that shares
 the same `hashid`.
+
+The parent Worker tracks live handle ids separately from the target-local
+`ref_count`. This keeps public handle lifetime independent from target-side
+deduplication: unregistering one live handle consumes exactly that handle and
+only releases target-local state when the `ref_count` reaches zero.
 
 Constructing a `CallableHandle` directly from its public fields does not create
 a live registration. Submit and unregister paths must validate that the handle
@@ -530,6 +539,13 @@ The local mailbox task frame is fixed to `sha256` and carries only the raw
 mailbox determines the target namespace and resolves the digest in its own
 `identity_table`.
 
+This task frame layout is a clean-break wire-format change from the prior
+integer callable-id layout where `MAILBOX_OFF_CALLABLE` carried the callable
+id. Parent and child processes must use the same mailbox layout version. There
+is no compatibility migration path in the current local fork model. The
+task-args capacity is computed after the digest prefix, so `task_args_blob`
+capacity is reduced by 32 bytes relative to a layout without the prefix.
+
 Unregister uses `hashid` as the target-local primary key:
 
 ```text
@@ -610,11 +626,11 @@ Required tests:
 | Test | Expected result |
 | ---- | --------------- |
 | Stable descriptor hash | Same descriptor bytes produce same hashid. |
-| Descriptor mismatch | Same hashid with different descriptor is rejected. |
+| Descriptor mismatch | Rejected with `HASHID_DESCRIPTOR_MISMATCH`. |
 | No public slot | Public APIs never return child-local slots. |
 | L3 run unchanged | `Worker.run(raw_orch_fn, ...)` still works at L3+. |
 | Submit handle only | Submit rejects bare strings and raw callables. |
-| Task frame hashid | Local mailbox task frames carry hashid. |
+| Task frame digest | Local mailbox task frames carry the raw 32-byte digest. |
 | Private slot resolve | Child loop resolves hashid to private slot. |
 | Slot independence | Same hashid runs with different private slots. |
 | Duplicate register | Repeated register returns independent handles. |
