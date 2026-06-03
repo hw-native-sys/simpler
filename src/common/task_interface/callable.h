@@ -107,7 +107,12 @@ struct Callable {
     int32_t child_count_;
     char config_name_[CALLABLE_FUNC_NAME_MAX];
     uint32_t config_name_len_;
-    char storage_[];
+    // Children live in storage_ at CALLABLE_ALIGN-aligned offsets, but the
+    // all-uint32 header above can leave offsetof(storage_) at 4-mod-8, which
+    // would place an 8-byte-aligned Child (CoreCallable has a uint64) on a
+    // misaligned address — UB on reference binding (caught by UBSan). Align
+    // storage_ to the child's alignment so every child lands aligned.
+    alignas(alignof(Child)) char storage_[];
 
     ArgDirection sig(int32_t i) const {
         if (i < 0 || i >= sig_count_) throw std::out_of_range("Callable: sig index out of range");
@@ -153,6 +158,15 @@ private:
 using CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>;
 using ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>;
 
+// storage_ holds CoreCallable children at CALLABLE_ALIGN-aligned offsets; for
+// child() to bind a reference without UB, storage_ itself must be aligned for
+// CoreCallable (which has a uint64 -> alignof 8). The alignas on storage_
+// guarantees this; assert it so a future header tweak can't silently regress.
+static_assert(
+    offsetof(ChipCallable, storage_) % alignof(CoreCallable) == 0,
+    "ChipCallable.storage_ must be aligned for its CoreCallable children"
+);
+
 // ============================================================================
 // Factory: make_callable for static leaf
 // ============================================================================
@@ -186,7 +200,12 @@ template <typename Child, int MaxSig, int MaxChildren>
 std::vector<uint8_t> make_callable(
     const ArgDirection *sig, int32_t sig_count, const char *func_name, const void *binary, uint32_t binary_size,
     const int32_t *child_func_ids, const std::vector<uint8_t> *child_buffers, int32_t child_count,
-    const char *config_name = nullptr
+    // No default arg here: the friend declaration above has none, so a default
+    // on this definition is a "redeclaration may not have default arguments"
+    // error once ChipCallable is instantiated (the static_assert below does
+    // that). Both call sites pass config_name explicitly (the binding defaults
+    // it to "" at the nb::arg level), so the default was dead anyway.
+    const char *config_name
 ) {
     if (sig_count > MaxSig) throw std::invalid_argument("make_callable: sig_count exceeds MaxSig");
     if (child_count > MaxChildren) throw std::invalid_argument("make_callable: child_count exceeds MaxChildren");
