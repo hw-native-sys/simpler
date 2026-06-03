@@ -54,8 +54,9 @@ static_assert(sizeof(Tensor) == DEP_GEN_TENSOR_SIZE, "DepGenRecord::tensors slot
 // dynamic symbol table where they'd shadow the AICPU .so's strong symbols
 // (same pattern as get_sys_cnt_aicpu / l2_perf_aicpu_record_orch_phase below).
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_dep_gen_enabled() { return false; }
-__attribute__((weak, visibility("hidden"))) void
-dep_gen_aicpu_record_submit(uint64_t, bool, int, const void *const *, const uint8_t *, int, const uint64_t *) {}
+__attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
+    uint64_t, bool, int, const void *const *, const uint8_t *, int, const uint64_t *, const int32_t[3]
+) {}
 
 #if PTO2_PROFILING
 #include "aicpu/scope_stats_collector_aicpu.h"
@@ -548,9 +549,11 @@ static TaskOutputTensors submit_task_common(
             tensor_ptrs[i] = (args.tag(i) == TensorArgType::OUTPUT) ? nullptr : args.tensor(i).ptr;
             arg_types_u8[i] = static_cast<uint8_t>(args.tag(i));
         }
+        const int32_t kernel_ids_capture[3] = {aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id};
         dep_gen_aicpu_record_submit(
             task_id.raw, orch->in_manual_scope(), tc, tensor_ptrs, arg_types_u8,
-            static_cast<int>(args.explicit_dep_count()), reinterpret_cast<const uint64_t *>(args.explicit_deps_data())
+            static_cast<int>(args.explicit_dep_count()), reinterpret_cast<const uint64_t *>(args.explicit_deps_data()),
+            kernel_ids_capture
         );
     }
 
