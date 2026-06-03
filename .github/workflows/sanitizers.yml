@@ -84,10 +84,13 @@ jobs:
             KFILTER="not dlopen_count"
             export TSAN_OPTIONS=halt_on_error=0:exitcode=0
           else
-            # ASAN (~1.7x) takes the broader set; dynamic_register is a2a3-only.
+            # ASAN (~1.7x) + UBSan. Like TSAN, the chip-fork L3 cases
+            # (dynamic_register is all level=3) livelock on the 4-vCPU runner
+            # once a sanitizer's slowdown is in play (#884 oversubscription
+            # family — AICPU + AICore + host threads oversubscribe), so scope to
+            # the light prepared_callable L2 set. UBSan halt_on_error=1 keeps it
+            # a real gate: any undefined behaviour fails the cell.
             TARGETS="$PC"
-            [ -d "tests/st/$ARCH/tensormap_and_ringbuffer/dynamic_register" ] && \
-              TARGETS="$TARGETS tests/st/$ARCH/tensormap_and_ringbuffer/dynamic_register"
             MAXPAR=2
             KFILTER="not parallel_broadcast and not dlopen_count"
             export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1

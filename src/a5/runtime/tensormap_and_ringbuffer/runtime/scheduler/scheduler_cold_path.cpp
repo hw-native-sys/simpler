@@ -895,11 +895,19 @@ int32_t SchedulerContext::init(
     // Initialize task counters. Task count comes from PTO2 shared memory.
     if (runtime->get_gm_sm_ptr()) {
         auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-        int32_t task_count = 0;
+        // Read at one-time boot init, before the SM is reset for the run, so a
+        // ring not yet written holds uninitialized memory (0xbe... under ASAN's
+        // malloc-fill). Sum in int64 and only count rings whose value is a
+        // plausible task count — (0, PTO2_SCOPE_TASKS_CAP]; a ring cannot hold
+        // more than the scope cap. This rejects any garbage pattern (negative
+        // or positive), so uninitialized rings contribute 0 (the correct boot
+        // count) while valid counts still add up, with no signed overflow.
+        int64_t task_count = 0;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            task_count += header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+            int32_t ring_tasks = header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+            if (ring_tasks > 0 && ring_tasks <= PTO2_SCOPE_TASKS_CAP) task_count += ring_tasks;
         }
-        total_tasks_ = task_count > 0 ? task_count : 0;
+        total_tasks_ = static_cast<int32_t>(task_count);
     } else {
         total_tasks_ = 0;
     }
