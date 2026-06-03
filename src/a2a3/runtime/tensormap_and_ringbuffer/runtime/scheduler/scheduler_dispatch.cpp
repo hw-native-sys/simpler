@@ -158,20 +158,10 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
-#if PTO2_PROFILING
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-            core_exec_state.pending_dispatch_timestamp = get_sys_cnt_aicpu();
-        }
-#endif
     } else {
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
-#if PTO2_PROFILING
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-            core_exec_state.running_dispatch_timestamp = get_sys_cnt_aicpu();
-        }
-#endif
         tracker.change_core_state(core_offset);
     }
 
@@ -201,6 +191,23 @@ void SchedulerContext::dispatch_subtask_to_core(
     // fence across Normal-cacheable -> Device-nGnRnE; the old write_reg()
     // helper provided this implicitly via __sync_synchronize.
     wmb();
+
+    // Capture dispatch timestamp at the latest possible moment — after wmb,
+    // immediately before the DATA_MAIN_BASE write. Anything earlier (payload
+    // prep, on_aicore_dispatch's per-BUFFER_SIZE rotation work, wmb itself)
+    // would charge AICPU-internal cost to the (dispatch_time → start_time)
+    // span, masquerading as AICore dispatch-chain latency.
+#if PTO2_PROFILING
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
+        uint64_t dispatch_ts = get_sys_cnt_aicpu();
+        if (to_pending) {
+            core_exec_state.pending_dispatch_timestamp = dispatch_ts;
+        } else {
+            core_exec_state.running_dispatch_timestamp = dispatch_ts;
+        }
+    }
+#endif
+
     write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
     tracker.set_pending_occupied(core_offset);
 }

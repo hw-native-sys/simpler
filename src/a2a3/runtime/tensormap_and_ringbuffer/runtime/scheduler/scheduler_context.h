@@ -297,7 +297,7 @@ private:
         PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
         ,
-        uint64_t dispatch_ts
+        uint64_t dispatch_ts, uint64_t finish_ts
 #endif
     );
 

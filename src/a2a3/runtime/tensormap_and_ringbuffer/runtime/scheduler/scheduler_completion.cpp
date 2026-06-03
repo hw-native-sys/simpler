@@ -73,7 +73,7 @@ void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
     ,
-    uint64_t dispatch_ts
+    uint64_t dispatch_ts, uint64_t finish_ts
 #endif
 ) {
 #if PTO2_PROFILING
@@ -200,7 +200,6 @@ void SchedulerContext::complete_slot_task(
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        uint64_t finish_ts = get_sys_cnt_aicpu();
 
         if (l2_swimlane_aicpu_complete_task(
                 core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), dispatch_ts, finish_ts
@@ -285,6 +284,19 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
+#if PTO2_PROFILING
+        // Capture finish_ts at the FIN observation point — right after rmb()
+        // above pinned the cacheable AICore reads downstream of the register
+        // load, and BEFORE any fanin / deferred-release work. Anything later
+        // (slot transition apply, complete_slot_task fanin processing) would
+        // charge AICPU completion-processing cost to the (end → finish)
+        // span, masking the actual FIN-delivery latency.
+        uint64_t finish_ts = 0;
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING && (t.pending_done || t.running_done)) {
+            finish_ts = get_sys_cnt_aicpu();
+        }
+#endif
+
         // --- Apply phase: execute actions based on transition ---
 
         // 1. Complete finished tasks (capture pointers before modifying core state)
@@ -294,7 +306,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                 ,
-                core.pending_dispatch_timestamp
+                core.pending_dispatch_timestamp, finish_ts
 #endif
             );
             cur_thread_completed++;
@@ -305,7 +317,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                 ,
-                core.running_dispatch_timestamp
+                core.running_dispatch_timestamp, finish_ts
 #endif
             );
             cur_thread_completed++;
