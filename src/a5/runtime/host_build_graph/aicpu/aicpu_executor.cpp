@@ -284,9 +284,10 @@ inline bool AicpuExecutor::try_dispatch_task(
     // Set state before writing register to avoid race with AICore ACK
     pending_task_ids_[core_id] = task_id;
 
-    // Record the real AICPU dispatch point for this core.
-    if (l2_swimlane_enabled && get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) {
-        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+    // AICore buffer rotation: count this dispatch and rotate before write_reg
+    // when crossing a BUFFER_SIZE boundary.
+    if (l2_swimlane_enabled) {
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
     }
 
     // Publish task data before AICore can observe the dispatched task_id.
@@ -294,6 +295,13 @@ inline bool AicpuExecutor::try_dispatch_task(
     // Device-nGnRnE; the old write_reg() helper carried this implicitly via
     // __sync_synchronize.
     wmb();
+
+    // Capture dispatch timestamp at the latest possible moment — after wmb,
+    // immediately before the DATA_MAIN_BASE write.
+    if (l2_swimlane_enabled && get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) {
+        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+    }
+
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id));
 
     return true;
@@ -744,10 +752,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     uint64_t finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
 
                     if (prev_running_id != AICPU_TASK_INVALID) {
-                        Task *prev_task = &runtime.tasks[prev_running_id];
                         if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts
                             ) != 0) {
                             LOG_ERROR(
@@ -761,10 +767,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     }
 
                     finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-                    Task *task = &runtime.tasks[completed_task_id];
                     if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts
                         ) != 0) {
                         LOG_ERROR(
@@ -850,10 +854,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     if (l2_swimlane_enabled) {
                         uint64_t finish_ts =
                             (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-                        Task *prev_task = &runtime.tasks[prev_running_id];
                         if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts
                             ) != 0) {
                             LOG_ERROR(
@@ -893,10 +895,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 if (l2_swimlane_enabled) {
                     uint64_t finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-                    Task *task = &runtime.tasks[completed_task_id];
                     if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts
                         ) != 0) {
                         LOG_ERROR(

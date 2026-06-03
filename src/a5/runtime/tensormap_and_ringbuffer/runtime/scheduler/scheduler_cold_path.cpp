@@ -879,8 +879,18 @@ int32_t SchedulerContext::init(
             // (PTO2_ORCH_TO_SCHED=1), phase records flow through
             // aicpu_thread_num_ pools — matches the same branch in
             // dump_tensor_init (scheduler_dispatch.cpp).
-            const int phase_threads = orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_;
-            l2_swimlane_aicpu_init_phase(runtime->worker_count, phase_threads);
+            // Sched phase pool count = number of scheduler threads.
+            // sched_thread_num_ <= 0 is the "use all AICPU threads as
+            // scheduler threads" sentinel (see assign_cores_to_threads'
+            // active_sched_threads_ normalization). Without this
+            // normalization here, init_phase would prime zero sched pools
+            // and all sched_phase emits would silently drop.
+            const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
+            const int sched_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : active_sched;
+            // Orch phase is a single instance (PR #971 design), so the orch
+            // pool count is always 1 regardless of orch_to_sched mode.
+            const int orch_phase_threads = 1;
+            l2_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
         l2_swimlane_level_ = L2SwimlaneLevel::DISABLED;
@@ -1007,9 +1017,9 @@ void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
 #if PTO2_PROFILING
-    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-        // Flush orchestrator's phase record buffer
-        l2_swimlane_aicpu_flush_phase_buffers(thread_idx);
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
+        // Flush orchestrator's phase record buffer (orch pool, ordinal 0)
+        l2_swimlane_aicpu_flush_orch_phase_buffer(thread_idx);
     }
 #endif
 

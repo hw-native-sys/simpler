@@ -154,20 +154,10 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
-#if PTO2_PROFILING
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-            core_exec_state.pending_dispatch_timestamp = get_sys_cnt_aicpu();
-        }
-#endif
     } else {
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
-#if PTO2_PROFILING
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-            core_exec_state.running_dispatch_timestamp = get_sys_cnt_aicpu();
-        }
-#endif
         tracker.change_core_state(core_offset);
     }
 
@@ -180,11 +170,34 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_offset, core_id, reg_task_id
     );
 
+    // AICore buffer rotation lives on the dispatch path: count this dispatch
+    // and rotate before write_reg when we're about to cross a BUFFER_SIZE
+    // boundary. The completion-before-dispatch invariant makes this race-free.
+#if PTO2_PROFILING
+    if (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED) {
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+    }
+#endif
+
     // Publish task data (slot_state / args writes done above) before AICore
     // can observe the dispatched task_id. ARM64 needs an explicit store-store
     // fence across Normal-cacheable -> Device-nGnRnE; the old write_reg()
     // helper provided this implicitly via __sync_synchronize.
     wmb();
+
+    // Capture dispatch timestamp at the latest possible moment — after wmb,
+    // immediately before the DATA_MAIN_BASE write.
+#if PTO2_PROFILING
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
+        uint64_t dispatch_ts = get_sys_cnt_aicpu();
+        if (to_pending) {
+            core_exec_state.pending_dispatch_timestamp = dispatch_ts;
+        } else {
+            core_exec_state.running_dispatch_timestamp = dispatch_ts;
+        }
+    }
+#endif
+
     write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
     tracker.set_pending_occupied(core_offset);
 }
@@ -627,8 +640,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         } else {
             CYCLE_COUNT_LAP(l2_swimlane.sched_complete_cycle);
             if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && l2_swimlane.phase_complete_count > 0) {
-                l2_swimlane_aicpu_record_phase(
-                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Complete, _t0_phase, _t1, l2_swimlane.sched_loop_count,
                     l2_swimlane.phase_complete_count
                 );
                 _t0_phase = _t1;
@@ -720,8 +733,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // realistic dispatch cadence and silently truncates without this guard.
                 debug_assert(pop_hit_delta < (1ULL << 32));
                 debug_assert(pop_miss_delta < (1ULL << 32));
-                l2_swimlane_aicpu_record_phase(
-                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Dispatch, _t0_phase, _t1, l2_swimlane.sched_loop_count,
                     l2_swimlane.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
                     static_cast<uint32_t>(pop_miss_delta)
                 );
@@ -794,12 +807,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             SPIN_WAIT_HINT();
 #if PTO2_PROFILING
             CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
-            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-                l2_swimlane_aicpu_record_phase(
-                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, l2_swimlane.sched_loop_count, 0
-                );
-                _t0_phase = _t1;
-            }
+            // a2a3 design has Complete + Dispatch sched phases only; idle gaps
+            // are reconstructed at post-process time from sched record spacing.
+            (void)_t0_phase;
 #endif
         }
     }
@@ -831,8 +841,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         debug_assert(final_pop_miss_delta < (1ULL << 32));
         if (final_pop_hit_delta != 0 || final_pop_miss_delta != 0) {
             uint64_t t_now = get_sys_cnt_aicpu();
-            l2_swimlane_aicpu_record_phase(
-                thread_idx, L2SwimlaneAicpuPhaseId::SCHED_DISPATCH, t_now, t_now, l2_swimlane.sched_loop_count, 0,
+            l2_swimlane_aicpu_record_sched_phase(
+                thread_idx, L2SwimlaneSchedPhaseKind::Dispatch, t_now, t_now, l2_swimlane.sched_loop_count, 0,
                 static_cast<uint32_t>(final_pop_hit_delta), static_cast<uint32_t>(final_pop_miss_delta)
             );
             l2_swimlane.pop_hit_at_last_emit = l2_swimlane.pop_hit;
@@ -848,7 +858,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
         );
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-            l2_swimlane_aicpu_flush_phase_buffers(thread_idx);
+            l2_swimlane_aicpu_flush_sched_phase_buffer(thread_idx);
         }
     }
 #endif
