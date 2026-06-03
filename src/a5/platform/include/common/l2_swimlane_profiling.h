@@ -60,11 +60,6 @@
 #include "common/core_type.h"
 #include "common/platform_config.h"
 
-// Maximum number of successor tasks per L2SwimlaneAicpuTaskRecord (matches Task::fanout)
-#ifndef RUNTIME_MAX_FANOUT
-#define RUNTIME_MAX_FANOUT 128
-#endif
-
 // =============================================================================
 // L2 swimlane_level — granularity ladder for the L2 swimlane profiler.
 //
@@ -82,7 +77,7 @@
 enum class L2SwimlaneLevel : uint32_t {
     DISABLED = 0,       // No collection at all
     AICORE_TIMING = 1,  // AICore per-task start/end timestamps + task record buffer
-    AICPU_TIMING = 2,   // + AICPU dispatch/finish timestamps + fanout dependency list
+    AICPU_TIMING = 2,   // + AICPU dispatch/finish timestamps
     SCHED_PHASES = 3,   // + scheduler main-loop phase records (SCHED_COMPLETE/DISPATCH/IDLE_WAIT)
     ORCH_PHASES = 4,    // + orchestrator phase records
 };
@@ -92,7 +87,13 @@ enum class L2SwimlaneLevel : uint32_t {
 // =============================================================================
 
 /**
- * Single task execution record
+ * Single task execution record.
+ *
+ * Fanout edges live in the static DAG (deps.json from dep_gen) — not in
+ * this record. Keeping fanout out of the hot AICPU commit path avoids a
+ * per-task ~1 KB GM store + a linked-list walk on the scheduler's
+ * critical fanin tail. The host swimlane export emits no fanout fields;
+ * `swimlane_converter.py` joins deps.json at post-process time.
  */
 struct L2SwimlaneAicpuTaskRecord {
     // Timing information (device clock timestamps)
@@ -111,10 +112,6 @@ struct L2SwimlaneAicpuTaskRecord {
     uint64_t task_id;
     uint32_t func_id;    // Kernel function identifier
     CoreType core_type;  // Core type (AIC/AIV)
-
-    // Dependency relationship (fanout only)
-    uint64_t fanout[RUNTIME_MAX_FANOUT];  // Successor task task_id array
-    int32_t fanout_count;                 // Number of successor tasks
 } __attribute__((aligned(64)));
 
 static_assert(
@@ -299,7 +296,7 @@ struct L2SwimlaneDataHeader {
 
     // Metadata (Host initializes, Device read-only)
     uint32_t num_cores;          // Actual number of cores launched
-    uint32_t l2_swimlane_level;  // 0=off, 1=AICore timing, 2=+dispatch/fanout,
+    uint32_t l2_swimlane_level;  // 0=off, 1=AICore timing, 2=+dispatch,
                                  // 3=+sched phases, 4=+orch phases. Host writes
                                  // at init; AICPU reads in l2_swimlane_aicpu_init.
 } __attribute__((aligned(64)));

@@ -745,18 +745,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                     if (prev_running_id != AICPU_TASK_INVALID) {
                         Task *prev_task = &runtime.tasks[prev_running_id];
-                        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                        int fanout_count = 0;
-                        if (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
-                            for (int i = 0; i < prev_task->fanout_count; i++) {
-                                fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
-                            }
-                            fanout_count = prev_task->fanout_count;
-                        }
                         if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
                                 static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
-                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
+                                dispatch_timestamps_[core_id], finish_ts
                             ) != 0) {
                             LOG_ERROR(
                                 "Core %d: l2_swimlane_aicpu_complete_task failed for implicit task %d", core_id,
@@ -770,18 +762,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                     finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
                     Task *task = &runtime.tasks[completed_task_id];
-                    uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                    int fanout_count = 0;
-                    if (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
-                        for (int i = 0; i < task->fanout_count; i++) {
-                            fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
-                        }
-                        fanout_count = task->fanout_count;
-                    }
                     if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
                             static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
-                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
+                            dispatch_timestamps_[core_id], finish_ts
                         ) != 0) {
                         LOG_ERROR(
                             "Core %d: l2_swimlane_aicpu_complete_task failed for task %d", core_id, completed_task_id
@@ -867,18 +851,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         uint64_t finish_ts =
                             (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
                         Task *prev_task = &runtime.tasks[prev_running_id];
-                        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                        int fanout_count = 0;
-                        if (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
-                            for (int i = 0; i < prev_task->fanout_count; i++) {
-                                fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
-                            }
-                            fanout_count = prev_task->fanout_count;
-                        }
                         if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
                                 static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
-                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
+                                dispatch_timestamps_[core_id], finish_ts
                             ) != 0) {
                             LOG_ERROR(
                                 "Core %d: l2_swimlane_aicpu_complete_task failed for implicit task %d", core_id,
@@ -918,18 +894,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 if (l2_swimlane_enabled) {
                     uint64_t finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
                     Task *task = &runtime.tasks[completed_task_id];
-                    uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                    int fanout_count = 0;
-                    if (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
-                        for (int i = 0; i < task->fanout_count; i++) {
-                            fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
-                        }
-                        fanout_count = task->fanout_count;
-                    }
                     if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
                             static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
-                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, fanout_count
+                            dispatch_timestamps_[core_id], finish_ts
                         ) != 0) {
                         LOG_ERROR(
                             "Core %d: l2_swimlane_aicpu_complete_task failed for task %d", core_id, completed_task_id

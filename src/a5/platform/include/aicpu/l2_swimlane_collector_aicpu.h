@@ -70,9 +70,7 @@ void l2_swimlane_aicpu_init(int worker_count);
  * Reads from the per-core L2SwimlaneAicoreRing dual-issue slot
  * (`s_perf_aicore_rings[core_id]->dual_issue_slots[reg_task_id & ...]`),
  * validates task_id match, and commits the record into
- * `state->current_buf_ptr->records[count++]`. Callers must pre-extract
- * fanout into a plain uint64_t array (platform layer cannot depend on
- * runtime linked-list types).
+ * `state->current_buf_ptr->records[count++]`.
  *
  * @param core_id               Core ID owning the destination buffer (resolved via s_aicpu_task_pools)
  * @param thread_idx            Owning AICPU thread (used when rotating records buffer)
@@ -82,8 +80,6 @@ void l2_swimlane_aicpu_init(int worker_count);
  * @param core_type             Core type (AIC/AIV)
  * @param dispatch_time         AICPU timestamp when task was dispatched
  * @param finish_time           AICPU timestamp when task completion was observed
- * @param fanout                Pre-extracted successor task ID array (nullptr if none)
- * @param fanout_count          Number of entries in fanout array (0 if none)
  *
  * Routes the destination via state->current_buf_ptr (not Handshake), so that
  * flush()-clearing current_buf_ptr deterministically halts subsequent commits
@@ -91,7 +87,7 @@ void l2_swimlane_aicpu_init(int worker_count);
  */
 int l2_swimlane_aicpu_complete_task(
     int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
-    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
+    uint64_t dispatch_time, uint64_t finish_time
 );
 
 /**

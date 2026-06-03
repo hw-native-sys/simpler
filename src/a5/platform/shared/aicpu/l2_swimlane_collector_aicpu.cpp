@@ -225,7 +225,7 @@ static void switch_records_buffer(int core_id, int thread_idx) {
 
 int l2_swimlane_aicpu_complete_task(
     int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
-    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
+    uint64_t dispatch_time, uint64_t finish_time
 ) {
     if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
         return -1;
@@ -287,23 +287,13 @@ int l2_swimlane_aicpu_complete_task(
     record->func_id = func_id;
     record->core_type = core_type;
 
-    // AICPU_TIMING and above: dispatch/finish timing and fanout dependency info
+    // AICPU_TIMING and above: dispatch/finish timing
     if (g_l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
         record->dispatch_time = dispatch_time;
         record->finish_time = finish_time;
-        if (fanout != nullptr && fanout_count > 0) {
-            int32_t n = (fanout_count > RUNTIME_MAX_FANOUT) ? RUNTIME_MAX_FANOUT : fanout_count;
-            for (int32_t i = 0; i < n; i++) {
-                record->fanout[i] = fanout[i];
-            }
-            record->fanout_count = n;
-        } else {
-            record->fanout_count = 0;
-        }
     } else {
         record->dispatch_time = 0;
         record->finish_time = 0;
-        record->fanout_count = 0;
     }
 
     uint32_t new_count = count + 1;

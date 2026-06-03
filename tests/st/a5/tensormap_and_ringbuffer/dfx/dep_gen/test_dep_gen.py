@@ -20,7 +20,7 @@ Verifies the end-to-end dep_gen pipeline on a5sim:
   implicitly: if it broke, deps.json would be empty or wrong.
 
 deps.json is now the sole source of truth for fanout edges — the device
-hot path no longer records L2PerfRecord::fanout[], so there is no
+hot path no longer records L2SwimlaneAicpuTaskRecord::fanout[], so there is no
 "fanout ⊆ deps" cross-check to run. swimlane_converter.py joins
 deps.json into the Perfetto trace at post-process time.
 

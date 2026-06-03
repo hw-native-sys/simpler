@@ -295,9 +295,7 @@ The analysis tools share the same input format - the `l2_swimlane_records_*.json
       "end_time_us": 55.9,
       "duration_us": 8.44,
       "dispatch_time_us": 45.94,
-      "finish_time_us": 60.52,
-      "fanout": [4294967299, 4294967297, 4294967296],
-      "fanout_count": 3
+      "finish_time_us": 60.52
     },
     {
       "task_id": 4294967296,
@@ -309,9 +307,7 @@ The analysis tools share the same input format - the `l2_swimlane_records_*.json
       "end_time_us": 70.42,
       "duration_us": 1.74,
       "dispatch_time_us": 68.24,
-      "finish_time_us": 71.2,
-      "fanout": [4294967298],
-      "fanout_count": 1
+      "finish_time_us": 71.2
     }
   ]
 }

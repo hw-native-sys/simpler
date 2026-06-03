@@ -2,18 +2,20 @@
 
 ## 1. Background & Motivation
 
-The swimlane profiler's per-task `fanout[]` array is the obvious place to
-read "which tasks did task X feed into?" — but it is **structurally
-incomplete on real hardware**.
+The swimlane profiler used to expose a per-task `fanout[]` array — the
+obvious place to read "which tasks did task X feed into?" — but it was
+**structurally incomplete on real hardware**, so it has been removed from
+the record entirely. The device hot path no longer carries fanout;
+`deps.json` is now the sole source of truth for swimlane edges.
 
-Each producer task carries its own `L2SwimlaneAicpuTaskRecord.fanout[RUNTIME_MAX_FANOUT]`,
-populated by the AICPU scheduler at the moment it wires a downstream
-consumer. If a producer has already finished and transitioned to
-`PTO2_TASK_COMPLETED` by the time a later submit wants to register a
-dependency on it, the consumer's edge has nowhere to go — the record is
-sealed, the slot is closed, and the edge is silently dropped. This is
-not a bug in fanout itself; fanout is "successors known at runtime", not
-"successors discoverable from the orchestrator's input". Race window in
+When it existed, each producer task carried its own
+`L2SwimlaneAicpuTaskRecord.fanout[]`, populated by the AICPU scheduler at the
+moment it wired a downstream consumer. If a producer had already finished and
+transitioned to `PTO2_TASK_COMPLETED` by the time a later submit wanted to
+register a dependency on it, the consumer's edge had nowhere to go — the
+record was sealed, the slot was closed, and the edge was silently dropped.
+This was not a bug in fanout itself; fanout is "successors known at runtime",
+not "successors discoverable from the orchestrator's input". Race window in
 [#599](https://github.com/hw-native-sys/simpler/issues/599); see also the
 PR #500 archive for the historical attempt to fix this in-place.
 
@@ -23,9 +25,9 @@ PR #500 archive for the historical attempt to fix this in-place.
 `compute_task_fanin` / `register_task_outputs` primitives the device
 orchestrator uses. The host replay sees every submit — there is no
 "already retired" producer because nothing retires during replay. The
-output, `deps.json`, is a strict superset of fanout: every fanout edge
-appears in deps.json, and the edges fanout dropped due to the race
-appear too.
+output, `deps.json`, was a strict superset of the old fanout edges: every
+fanout edge appeared in deps.json, plus the edges fanout dropped due to the
+race — which is why deps.json now fully replaces the removed `fanout[]`.
 
 ---
 
@@ -86,9 +88,8 @@ because:
 - `deps.json` is the dep_gen artifact.
 - `l2_swimlane_records.json` (from swimlane) is the timing artifact;
   `merged_swimlane.json` (the Perfetto trace) uses `deps.json` for
-  dependency arrows when both files exist.
-- The "fanout ⊆ deps" validation gate fires only when both files are
-  present.
+  dependency arrows when both files exist (without it, the trace has no
+  dependency arrows — the record no longer carries `fanout[]`).
 
 For perf-sensitive runs where you'd rather measure each profiler in
 isolation, see the **split workflow** described in
@@ -293,20 +294,20 @@ When checking fanout coverage, project annotated edges down to a
 sources / args / slices, so the raw `edges[]` count is a superset of the
 underlying task-pair count.
 
-`deps.json` (projected) is a **superset** of the fanout edges in
-`l2_swimlane_records.json`:
+`deps.json` (projected) was a **superset** of the now-removed `fanout[]`
+edges — which is exactly why it replaced them as the sole edge source:
 
 | Edge source | Captures | Drops on race? |
 | ----------- | -------- | -------------- |
-| `task.fanout[]` (L2SwimlaneAicpuTaskRecord) | Successors known at producer-retire time | **Yes** — sealed when producer retires |
+| `task.fanout[]` (removed; formerly on L2SwimlaneAicpuTaskRecord) | Successors known at producer-retire time | **Yes** — sealed when producer retires |
 | `deps.json` (this feature) | Every consumer → producer reachable via tensormap / explicit_deps | No — replay sees every submit |
 
 `tests/st/{a2a3,a5}/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py`
 enforces the 6-edge expectation against the `vector_example`
 orchestration as a validation gate: any edge missing from `deps.json`
-is a replay-side regression and fails the test. Cases where
-`deps - fanout ≠ ∅` are the dep_gen sweet spot — those are
-exactly the race-window edges fanout dropped. The
+is a replay-side regression and fails the test. (The record no longer
+carries `fanout[]`, so there is no longer a `fanout ⊆ deps` cross-check —
+`deps.json` is the only edge source.) The
 `swimlane_converter.py` uses `deps.json` (when present) as the source
 of flow events in the Perfetto trace, and flags any edge whose
 `pred.end_time > succ.start_time` as `hb_violation` (rendered as a

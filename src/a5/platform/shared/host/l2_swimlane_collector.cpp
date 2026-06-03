@@ -577,18 +577,9 @@ int L2SwimlaneCollector::export_swimlane_json() {
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
         outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
         outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
-        outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
-        outfile << "      \"fanout\": [";
-        int safe_fanout_count =
-            (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT) ? record.fanout_count : 0;
-        for (int j = 0; j < safe_fanout_count; ++j) {
-            outfile << record.fanout[j];
-            if (j < safe_fanout_count - 1) {
-                outfile << ", ";
-            }
-        }
-        outfile << "],\n";
-        outfile << "      \"fanout_count\": " << record.fanout_count << "\n";
+        outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << "\n";
+        // Fanout is no longer carried on the device hot path — dep_gen replay
+        // (deps.json) is the sole source of truth, joined in by tooling.
         outfile << "    }";
         if (i < tagged_records.size() - 1) {
             outfile << ",";

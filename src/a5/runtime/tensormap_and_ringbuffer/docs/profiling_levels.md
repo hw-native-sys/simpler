@@ -255,7 +255,7 @@ header just like on onboard.
 | ----- | -------- |
 | 0 | Nothing (disabled) |
 | 1 | AICore timing only (start/end/task_id/func_id/core_type) |
-| 2 | + dispatch_time, finish_time, fanout |
+| 2 | + dispatch_time, finish_time |
 | 3 | + Scheduler phases (`SCHED_*`) |
 | 4 | + Orchestrator phases (full) |
 
@@ -271,7 +271,7 @@ content it depends on instead of relying on magic numbers:
 // Cheap binary check, available immediately after kernel entry.
 if (is_l2_swimlane_enabled()) { ... }
 
-// AICPU dispatch/finish timestamps + fanout.
+// AICPU dispatch/finish timestamps.
 // Granular checks below require l2_swimlane_aicpu_init to have already run
 // (so the level has been promoted from the shared-memory header).
 if (get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) { ... }
