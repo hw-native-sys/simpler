@@ -157,8 +157,6 @@ from host memory, but the runtime handles DMA transparently based on the
 
 ## Common pitfalls
 
-- **Registering after `init()`** → sub task fires but hits `KeyError` for the
-  callable handle. Always register first.
 - **Not using `share_memory_()`** → chip child sees zeros where it expects
   inputs. `torch` tensors without `share_memory_()` live in each process's
   private heap.

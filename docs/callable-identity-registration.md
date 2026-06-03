@@ -157,8 +157,16 @@ The implementation uses internal helpers for descriptor construction and
 hashing:
 
 ```python
-descriptor = build_callable_descriptor(callable)
-hashid = compute_callable_hashid(descriptor)
+chip_descriptor = build_chip_callable_descriptor(
+    target=chip_callable,
+    platform=platform,
+    runtime=runtime,
+)
+
+python_descriptor = build_python_serialized_descriptor(serialized_payload)
+
+chip_hashid = compute_callable_hashid(chip_descriptor)
+python_hashid = compute_callable_hashid(python_descriptor)
 ```
 
 `Worker.register` computes the descriptor and `hashid`. User code does not
@@ -411,21 +419,29 @@ If any target fails or times out:
 - The parent removes the unpublished handle entry.
 - The parent sends cleanup to targets that may have installed the hashid.
 - If cleanup cannot be confirmed, that target/hashid pair is marked uncertain
-  and must not be used again until cleanup is confirmed or the worker restarts.
+  and must not be used again by the current Worker. The current implementation
+  has no recovery path other than Worker restart.
   The local broadcast path returns per-target status; parent-side cleanup sends
   the reverse unregister only to targets that confirmed install or refcount
   increment. A cleanup failure on one of those targets marks the hashid
   uncertain conservatively.
 
-This is failure cleanup with conservative uncertainty handling. It stays on
-the same synchronous install path and does not introduce a separate recovery
-API.
+This is failure cleanup with conservative uncertainty handling. The current
+implementation treats `_uncertain_hashids` as an intentional unrecoverable
+terminal state for the Worker lifetime: a marked digest is blocked until the
+Worker restarts. Recovery by successful retry, timeout expiry, or fail-loud
+Worker teardown is deferred to a later design.
 
 ### Dispatch Contract
 
 Parent-side scheduling assumes the handle's `hashid` is installed on every
 active target in its registration scope. Dispatch choices are constrained by
 the handle namespace, submit-time affinity, and tensor/buffer accessibility.
+Submit-time live validation is a preflight check only. It does not pin the
+target identity through later drain or child dispatch. Callers must not
+concurrently unregister a handle while `Worker.run()` or any in-flight task may
+submit or use that handle; wait for the relevant run/drain to return before
+unregistering it.
 
 Parent-side `TaskSlotState` stores the submitted callable's stable identity:
 the 32-byte `sha256` digest plus parent-side scheduling metadata such as
@@ -457,6 +473,7 @@ CALLABLE_KIND_UNSUPPORTED
 LOCAL_SLOT_EXHAUSTED
 REGISTER_PARTIAL_FAILURE
 REGISTER_CLEANUP_UNCERTAIN
+REGISTER_TOMBSTONE_ACTIVE
 UNREGISTER_TOMBSTONE_ACTIVE
 ```
 
@@ -534,53 +551,57 @@ rule for the current single-flight local mailbox. A future multi-flight target
 must insert a tombstone/drain phase before clearing executable state.
 
 If failed-register cleanup cannot be confirmed, the parent must not dispatch
-that hashid to the uncertain target again until cleanup is confirmed or the
-worker restarts. This protects target-local slot cleanup only; it does not
-allow the same hashid to name a different descriptor or payload.
+that hashid to the uncertain target again during the current Worker lifetime.
+This protects target-local slot cleanup only; it does not allow the same
+hashid to name a different descriptor or payload.
 
-## Implementation Plan
+## Implementation Notes
 
-Milestone 1: descriptor and hash helpers.
+The implementation provides canonical descriptor and hash helpers:
 
-- Add canonical descriptor builders for `ChipCallable` and
+- `build_chip_callable_descriptor` and `build_python_serialized_descriptor`
+  produce canonical descriptor bytes for `ChipCallable` and
   `PYTHON_SERIALIZED`.
-- Add `compute_callable_hashid`.
-- Add descriptor mismatch and malformed descriptor tests.
+- `compute_callable_hashid` returns the public `sha256:<hex>` identity.
+- Descriptor mismatch and malformed descriptor paths are covered by tests.
 
-Milestone 2: public handle API.
+The public API is handle-based:
 
-- Add `CallableHandle` and handle validation.
-- Change `Worker.register` to return `CallableHandle`.
-- Keep L3+ `Worker.run(raw_orch_fn, ...)` behavior unchanged.
-- Keep integer execution slots private to the target child process.
+- `Worker.register` returns `CallableHandle`.
+- `CallableHandle` validation rejects forged, stale, mutated, or
+  wrong-namespace handles.
+- L3+ `Worker.run(raw_orch_fn, ...)` behavior is unchanged.
+- Integer execution slots remain private to the target child process.
 
-Milestone 3: target identity registry.
+Each target owns identity state:
 
-- Add per-target `identity_table` and private slot allocation.
-- Register `hashid -> local_slot` in target child processes.
-- Add target-local refcounts for duplicate public registrations.
-- Ensure control replies do not expose slots.
+- The target-local `identity_table` maps `hashid -> local_slot`.
+- Target child processes install `hashid -> local_slot` mappings.
+- Duplicate public registrations increment target-local refcounts.
+- Control replies do not expose slots.
 
-Milestone 4: submit and task slots.
+Submit and task records carry identities, not slots:
 
-- Change Python `Orchestrator` submit APIs to accept only `CallableHandle`.
-- Update nanobind and C++ `Orchestrator` signatures.
-- Change `TaskSlotState` to store the 32-byte digest plus scheduling metadata
+- Python `Orchestrator` submit APIs accept only `CallableHandle`.
+- Nanobind and C++ `Orchestrator` signatures carry digest, callable kind, and
+  target namespace.
+- `TaskSlotState` stores the 32-byte digest plus scheduling metadata
   instead of integer callable ids.
 
-Milestone 5: local mailbox task hashid.
+Local mailbox task frames are hashid-based:
 
-- Prefix the local mailbox task payload with the 32-byte `sha256` digest.
-- Shift the existing `TaskArgs` blob after the digest prefix.
-- Resolve `hashid -> local_slot` in the chip/sub child loop.
-- Keep `ChipWorker.run(local_slot)` private to the child process.
+- The local mailbox task payload is prefixed with the 32-byte `sha256` digest.
+- The existing `TaskArgs` blob follows the digest prefix.
+- Chip and sub child loops resolve `hashid -> local_slot` immediately before
+  execution.
+- `ChipWorker.run(local_slot)` remains private to the child process.
 
-Milestone 6: register failure cleanup.
+Register failure cleanup is conservative:
 
-- Do not publish a handle until every target in scope installed the hashid.
-- On failed register, remove the unpublished parent handle entry.
-- Clean up targets that may have installed the hashid.
-- Mark target/hashid cleanup uncertainty conservatively.
+- Handles are not published until every target in scope installed the hashid.
+- Failed register removes the unpublished parent handle entry.
+- Targets that may have installed the hashid receive reverse cleanup.
+- Cleanup uncertainty marks the hashid unavailable for the Worker lifetime.
 
 ## Validation
 

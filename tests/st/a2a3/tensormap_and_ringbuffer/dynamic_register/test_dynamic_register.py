@@ -347,7 +347,7 @@ def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_d
         duplicate_handle = worker.register(chip_callable)
         assert duplicate_handle.hashid == pre_handle.hashid
         assert duplicate_handle.digest == pre_handle.digest
-        assert duplicate_handle != pre_handle
+        assert duplicate_handle._handle_id != pre_handle._handle_id
 
         # 3. Drop the first handle. The child must keep the prepared identity
         # alive for duplicate_handle.
@@ -427,7 +427,8 @@ def test_unregister_last_handle_allows_reprepare_same_hashid(st_platform, st_dev
         # Re-prepare the same hashid after its final handle was dropped.
         again_handle = worker.register(post_callable)
         assert again_handle.hashid == dyn_handle.hashid
-        assert again_handle != dyn_handle
+        assert again_handle.digest == dyn_handle.digest
+        assert again_handle._handle_id != dyn_handle._handle_id
 
         def orch_three(o, _args, _cfg):
             o.submit_next_level(again_handle, chip_args_three, config)

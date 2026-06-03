@@ -258,6 +258,64 @@ class TestLifecycle:
                 hw._hierarchical_start_cv.wait = original_wait
             hw.close()
 
+    def test_unregister_waits_for_first_startup_then_uses_post_start_path(self):
+        hw = Worker(level=3, num_sub_workers=1)
+        handle = hw.register(lambda args: None)
+        hw.init()
+        try:
+            with hw._hierarchical_start_cv:
+                hw._hierarchical_start_state = "starting"
+
+            observed = {}
+
+            def fake_broadcast_py_control(worker_types, sub_cmd, *, digest=None, payload=None, strict=False):
+                observed["worker_types"] = worker_types
+                observed["sub_cmd"] = sub_cmd
+                observed["digest"] = digest
+                observed["state"] = hw._hierarchical_start_state
+                observed["hierarchical_started"] = hw._hierarchical_started
+                return []
+
+            hw._broadcast_py_control = fake_broadcast_py_control
+            errors: list[BaseException] = []
+            wait_entered = threading.Event()
+            original_wait = hw._hierarchical_start_cv.wait
+
+            def wait_with_signal(timeout=None):
+                wait_entered.set()
+                return original_wait(timeout)
+
+            hw._hierarchical_start_cv.wait = wait_with_signal
+
+            def do_unregister():
+                try:
+                    hw.unregister(handle)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            t = threading.Thread(target=do_unregister)
+            t.start()
+            assert wait_entered.wait(timeout=2.0)
+            assert handle.digest in hw._identity_registry
+
+            with hw._hierarchical_start_cv:
+                hw._hierarchical_started = True
+                hw._hierarchical_start_state = "started"
+                hw._hierarchical_start_cv.notify_all()
+            t.join(timeout=2.0)
+
+            assert not t.is_alive()
+            assert errors == []
+            assert observed["sub_cmd"] == _CTRL_PY_UNREGISTER
+            assert observed["digest"] == handle.digest
+            assert observed["state"] == "started"
+            assert observed["hierarchical_started"] is True
+            assert handle.digest not in hw._identity_registry
+        finally:
+            if "original_wait" in locals():
+                hw._hierarchical_start_cv.wait = original_wait
+            hw.close()
+
     def test_prepare_blocks_startup_snapshot_from_not_started_window(self):
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
@@ -440,6 +498,20 @@ class TestLifecycle:
         slot = hw._identity_registry[digest].slot_id
         assert hw._callable_registry[slot] is callable_obj
 
+    def test_register_child_chip_rejects_tombstone_active_identity(self):
+        hw = Worker(level=3, num_sub_workers=0)
+        callable_obj = _unique_chip_callable(3)
+        digest = _chip_digest(callable_obj)
+        hw._register_child_chip(callable_obj, digest=digest)
+        state = hw._identity_registry[digest]
+        hw._pending_unregister_cids.add(state.slot_id)
+
+        with pytest.raises(RuntimeError, match="REGISTER_TOMBSTONE_ACTIVE"):
+            hw._register_child_chip(callable_obj, digest=digest)
+
+        assert state.ref_count == 1
+        assert hw._identity_registry[digest] is state
+
     def test_startup_identity_snapshot_filters_by_target_namespace(self):
         from simpler.worker import _make_local_identity_tables  # noqa: PLC0415
 
@@ -447,7 +519,9 @@ class TestLifecycle:
         py_target = _unique_py_callable(1)
         chip_target = _unique_chip_callable(2)
         py_handle = hw.register(py_target)
+        py_duplicate = hw.register(py_target)
         chip_handle = hw.register(chip_target)
+        chip_duplicate = hw.register(chip_target)
         snapshot = [
             (digest, state.target, state.ref_count, state.kind, state.target_namespace)
             for digest, state in hw._identity_registry.items()
@@ -465,13 +539,15 @@ class TestLifecycle:
         )
 
         assert set(py_identity_table) == {py_handle.digest}
-        assert py_refs == {py_handle.digest: 1}
+        assert py_duplicate.digest == py_handle.digest
+        assert py_refs == {py_handle.digest: 2}
         assert len(py_registry) == 1
         assert next(iter(py_registry.values())) is py_target
         assert chip_handle.digest not in py_identity_table
 
         assert set(chip_identity_table) == {chip_handle.digest}
-        assert chip_refs == {chip_handle.digest: 1}
+        assert chip_duplicate.digest == chip_handle.digest
+        assert chip_refs == {chip_handle.digest: 2}
         assert len(chip_registry) == 1
         assert next(iter(chip_registry.values())) is chip_target
         assert py_handle.digest not in chip_identity_table
@@ -647,6 +723,69 @@ class TestLifecycle:
 
         handle_after_unregister = hw.register(target)
         assert _slot_for(hw, handle_after_unregister) == slot
+
+    def test_same_hashid_register_is_rejected_during_nonfinal_unregister(self):
+        from simpler.worker import _CTRL_PY_REGISTER, _CTRL_PY_UNREGISTER  # noqa: PLC0415
+
+        def target(args):
+            return None
+
+        hw = Worker(level=3, num_sub_workers=1)
+        first = hw.register(target)
+        second = hw.register(target)
+        hw._initialized = True
+        hw._hierarchical_started = True
+
+        unregister_started = threading.Event()
+        release_unregister = threading.Event()
+        errors: list[BaseException] = []
+
+        class FakeWorker:
+            def broadcast_control_all(self, worker_type, sub_cmd, payload=None, digest=None, timeout_s=None):
+                if sub_cmd == _CTRL_PY_UNREGISTER:
+                    unregister_started.set()
+                    assert release_unregister.wait(timeout=2.0)
+                elif sub_cmd != _CTRL_PY_REGISTER:
+                    raise AssertionError(f"unexpected sub_cmd={sub_cmd}")
+                return [_FakeControlResult("SUB", 0, True)]
+
+        hw._worker = FakeWorker()
+        slot = _slot_for(hw, first)
+
+        def do_unregister():
+            try:
+                hw.unregister(first)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t = threading.Thread(target=do_unregister)
+        t.start()
+        assert unregister_started.wait(timeout=2.0)
+
+        with pytest.raises(RuntimeError, match="REGISTER_TOMBSTONE_ACTIVE"):
+            hw.register(target)
+        assert hw._identity_registry[second.digest].ref_count == 1
+
+        release_unregister.set()
+        t.join(timeout=2.0)
+        assert not t.is_alive()
+        assert errors == []
+        assert slot not in hw._pending_unregister_cids
+
+    def test_child_digest_unregister_tombstone_error_does_not_decrement_refcount(self):
+        hw = Worker(level=3, num_sub_workers=0)
+        handle = hw.register(lambda args: None)
+        slot = _slot_for(hw, handle)
+        state = hw._identity_registry[handle.digest]
+        initial_ref_count = state.ref_count
+        hw._pending_unregister_cids.add(slot)
+
+        with pytest.raises(KeyError, match="UNREGISTER_TOMBSTONE_ACTIVE"):
+            hw._unregister_child_digest(digest=handle.digest)
+
+        assert state.ref_count == initial_ref_count
+        assert hw._identity_registry[handle.digest] is state
+        assert hw._callable_registry[slot] is state.target
 
     def test_register_python_sub_callable_after_start_succeeds(self):
         counter_shm, counter_buf = _make_shared_counter()

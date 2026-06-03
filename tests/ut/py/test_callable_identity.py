@@ -69,15 +69,15 @@ def test_worker_register_returns_opaque_handle_and_deduplicates_same_identity():
         assert not isinstance(first, int)
         assert first.hashid == second.hashid
         assert first.digest == second.digest
-        assert first != second
-        assert first != worker._identity_registry[first.digest].slot_id
+        assert first._handle_id != second._handle_id
+        assert worker._identity_registry[first.digest].slot_id >= 0
         assert len(worker._callable_registry) == 1
         assert worker._identity_registry[first.digest].ref_count == 2
     finally:
         worker.close()
 
 
-def test_callable_handle_public_constructor_does_not_expose_slot_identity():
+def test_callable_handle_public_constructor_returns_unbound_handle():
     handle = CallableHandle(
         "sha256:" + "0" * 64,
         cast(CallableKindName, "PYTHON_SERIALIZED"),
@@ -85,7 +85,10 @@ def test_callable_handle_public_constructor_does_not_expose_slot_identity():
     )
 
     assert handle.digest == bytes(32)
-    assert not hasattr(handle, "_slot_id")
+    assert handle._handle_id == -1
+    assert handle._owner_id is None
+    assert not hasattr(handle, "slot_id")
+    assert not hasattr(handle, "cid")
 
 
 def test_forged_public_handle_is_rejected_by_worker_apis():

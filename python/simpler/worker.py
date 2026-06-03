@@ -309,7 +309,10 @@ def _make_local_identity_tables(
             continue
         if target_namespace is not None and namespace != target_namespace:
             continue
-        slot = _install_local_identity(registry, identity_table, identity_refs, digest, target)
+        if len(digest) != CALLABLE_HASH_DIGEST_BYTES:
+            raise RuntimeError(f"callable digest must be {CALLABLE_HASH_DIGEST_BYTES} bytes")
+        slot = _allocate_local_slot(registry)
+        identity_table[digest] = slot
         identity_refs[digest] = max(int(ref_count), 1)
         registry[slot] = target
     return registry, identity_table, identity_refs
@@ -1227,7 +1230,7 @@ class Worker:
             raise RuntimeError(f"REGISTER_CLEANUP_UNCERTAIN: {reg.hashid}")
         state = self._identity_registry.get(reg.digest)
         if state is not None:
-            if state.slot_id in self._pending_unregister_cids and state.ref_count <= 0:
+            if state.slot_id in self._pending_unregister_cids:
                 raise RuntimeError(f"REGISTER_TOMBSTONE_ACTIVE: {reg.hashid}")
             if state.descriptor != reg.descriptor or state.kind != reg.kind:
                 raise RuntimeError(f"HASHID_DESCRIPTOR_MISMATCH: {reg.hashid}")
@@ -1471,6 +1474,8 @@ class Worker:
         with self._registry_lock:
             state = self._identity_registry.get(reg.digest)
             if state is not None:
+                if state.slot_id in self._pending_unregister_cids:
+                    raise RuntimeError(f"REGISTER_TOMBSTONE_ACTIVE: {reg.hashid}")
                 state.ref_count += 1
                 existing_slot = state.slot_id
                 slot_id = state.slot_id
@@ -1701,7 +1706,6 @@ class Worker:
             state = self._identity_registry.get(digest)
             if state is None:
                 return
-            state.ref_count -= 1
             cid = state.slot_id
             if cid in self._pending_unregister_cids:
                 raise KeyError("UNREGISTER_TOMBSTONE_ACTIVE: callable identity already pending unregister")
@@ -1709,16 +1713,24 @@ class Worker:
             should_broadcast_decrement = (
                 self.level >= 3 and self._initialized and getattr(self, "_hierarchical_started", False)
             )
-            if state.ref_count > 0 and not should_broadcast_decrement:
+            chip_worker = None
+            if self.level == 2 and self._initialized:
+                assert self._chip_worker is not None
+                chip_worker = self._chip_worker
+
+            new_ref_count = state.ref_count - 1
+            if new_ref_count > 0 and not should_broadcast_decrement:
+                state.ref_count = new_ref_count
                 return
+            state.ref_count = new_ref_count
             remove_target = state.ref_count <= 0
             if should_broadcast_decrement:
                 self._pending_unregister_cids.add(cid)
-                if state.ref_count > 0:
+                if new_ref_count > 0:
                     remove_target = False
             elif self.level == 2 and self._initialized:
-                assert self._chip_worker is not None
-                self._chip_worker._unregister_slot(cid)
+                assert chip_worker is not None
+                chip_worker._unregister_slot(cid)
                 self._callable_registry.pop(cid, None)
                 self._identity_registry.pop(digest, None)
                 return
