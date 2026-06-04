@@ -65,6 +65,7 @@ dep_gen_aicpu_record_submit(uint64_t, bool, int, const void *const *, const uint
 // builds fall back to this weak `false`. Gating here still skips the
 // cross-agent occupancy reads that feed the sample when scope_stats is disabled.
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabled() { return false; }
+extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_task_enabled() { return false; }
 #endif
 
 // =============================================================================
@@ -514,6 +515,18 @@ static TaskOutputTensors submit_task_common(
         return result;
     }
     uint8_t ring_id = prepared.task_id.ring();
+#if PTO2_PROFILING
+    // scope_stats per-task probe: sample ring/heap occupancy here, right after
+    // allocation and before the slot is exposed to the scheduler, so the record
+    // is not timing-dependent on async task completion advancing the ring tail.
+    if (is_scope_stats_task_enabled()) {
+        auto &alloc = orch->rings[ring_id].task_allocator;
+        scope_stats_record_task(
+            prepared.task_id.raw, ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(),
+            orch->tensor_map.current_used()
+        );
+    }
+#endif
     PTO2SchedulerState *sched = orch->scheduler;
     PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
     PTO2TaskId task_id = prepared.task_id;

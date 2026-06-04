@@ -324,7 +324,7 @@ RunTiming ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, 
     int rc = run_prepared_fn_(
         device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.enable_l2_swimlane,
         config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.enable_scope_stats,
-        config.output_prefix, &timing
+        config.scope_stats_scope, config.scope_stats_task, config.output_prefix, &timing
     );
     if (rc != 0) {
         throw std::runtime_error("run_prepared failed with code " + std::to_string(rc));

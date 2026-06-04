@@ -49,9 +49,28 @@ ScopeStatsCollector::~ScopeStatsCollector() { stop(); }
 // init
 // ---------------------------------------------------------------------------
 
+// Parse a comma-separated list of PTO2_SCOPE line numbers ("42,108") into
+// out_lines (capacity PTO2_SCOPE_STATS_MAX_SITE_FILTERS). Non-numeric
+// separators are skipped; only positive values are kept. Returns the count.
+static int parse_site_filter_csv(const char *csv, int32_t *out_lines) {
+    int count = 0;
+    if (csv == nullptr) return 0;
+    for (const char *p = csv; *p != '\0' && count < PTO2_SCOPE_STATS_MAX_SITE_FILTERS;) {
+        char *end = nullptr;
+        long v = strtol(p, &end, 10);
+        if (end == p) {
+            p++;  // skip a non-numeric separator
+            continue;
+        }
+        if (v > 0) out_lines[count++] = static_cast<int32_t>(v);
+        p = end;
+    }
+    return count;
+}
+
 int ScopeStatsCollector::init(
     int num_threads, const ScopeStatsAllocCallback &alloc_cb, ScopeStatsRegisterCallback register_cb,
-    const ScopeStatsFreeCallback &free_cb, int device_id
+    const ScopeStatsFreeCallback &free_cb, int device_id, const char *site_filter_csv, bool task_enabled
 ) {
     if (num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
         LOG_ERROR("ScopeStatsCollector::init: invalid arguments");
@@ -93,6 +112,17 @@ int ScopeStatsCollector::init(
     std::memset(shm_host_local, 0, shm_size);
     ScopeStatsDataHeader *hdr = get_scope_stats_header(shm_host_local);
     hdr->num_instances = static_cast<uint32_t>(num_instances);
+
+    // Scope site filter (run-constant; count == 0 = collect every scope).
+    int n = parse_site_filter_csv(site_filter_csv, hdr->site_filter_lines);
+    hdr->site_filter_count = n;
+    if (n > 0) {
+        LOG_INFO_V0("ScopeStats: site filter active for %d scope line(s)", n);
+    }
+    hdr->task_enabled = task_enabled ? 1 : 0;
+    if (task_enabled) {
+        LOG_INFO_V0("ScopeStats: per-task sampling enabled");
+    }
 
     const size_t buf_size = sizeof(ScopeStatsBuffer);
     ScopeStatsBufferState *state = get_scope_stats_buffer_state(shm_host_local, 0);
@@ -270,17 +300,21 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     std::scoped_lock lock(records_mutex_);
     std::string out;
     out.reserve(records_.size() * 128);
-    char line[320];
+    char line[384];
     for (const ScopeStatsRecord &rec : records_) {
         const int site_len = static_cast<int>(strnlen(rec.site_file_basename, sizeof(rec.site_file_basename)));
-        const char *phase = (rec.phase == SCOPE_STATS_PHASE_BEGIN) ? "begin" : "end";
+        // "phase" distinguishes per-scope boundaries (begin/end) from per-task
+        // samples (task). PHASE_TASK records also carry the submitted task_id.
+        const char *phase = (rec.phase == SCOPE_STATS_PHASE_BEGIN) ? "begin" :
+                            (rec.phase == SCOPE_STATS_PHASE_TASK)  ? "task" :
+                                                                     "end";
         int n = std::snprintf(
             line, sizeof(line),
-            "{\"site\": \"%.*s:%d\", \"phase\": \"%s\", \"depth\": %d, \"ring\": %d, "
+            "{\"site\": \"%.*s:%d\", \"phase\": \"%s\", \"task_id\": %" PRIu64 ", \"depth\": %d, \"ring\": %d, "
             "\"task_window_start\": %d, \"task_window_end\": %d, "
             "\"heap_start\": %" PRIu64 ", \"heap_end\": %" PRIu64 ", "
             "\"tensormap\": %d}\n",
-            site_len, rec.site_file_basename, rec.site_line, phase, rec.depth, rec.ring_id, rec.task_start,
+            site_len, rec.site_file_basename, rec.site_line, phase, rec.task_id, rec.depth, rec.ring_id, rec.task_start,
             rec.task_end, rec.heap_start, rec.heap_end, rec.tensormap_used
         );
         if (n > 0) out.append(line, static_cast<size_t>(n < static_cast<int>(sizeof(line)) ? n : sizeof(line) - 1));

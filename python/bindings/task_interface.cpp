@@ -651,6 +651,31 @@ NB_MODULE(_task_interface, m) {
                 std::memcpy(c.output_prefix, s.data(), s.size());
             }
         )
+        .def_prop_rw(
+            "scope_stats_scope",
+            [](const CallConfig &c) -> std::string {
+                return std::string(c.scope_stats_scope, ::strnlen(c.scope_stats_scope, sizeof(c.scope_stats_scope)));
+            },
+            [](CallConfig &c, const std::string &s) {
+                if (s.size() >= sizeof(c.scope_stats_scope)) {
+                    throw std::invalid_argument(
+                        "CallConfig.scope_stats_scope length " + std::to_string(s.size()) + " exceeds buffer (" +
+                        std::to_string(sizeof(c.scope_stats_scope) - 1) + " bytes)"
+                    );
+                }
+                std::memset(c.scope_stats_scope, 0, sizeof(c.scope_stats_scope));
+                std::memcpy(c.scope_stats_scope, s.data(), s.size());
+            }
+        )
+        .def_prop_rw(
+            "scope_stats_task",
+            [](const CallConfig &c) {
+                return static_cast<bool>(c.scope_stats_task);
+            },
+            [](CallConfig &c, bool v) {
+                c.scope_stats_task = v ? 1 : 0;
+            }
+        )
         .def("__repr__", [](const CallConfig &self) -> std::string {
             std::ostringstream os;
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num

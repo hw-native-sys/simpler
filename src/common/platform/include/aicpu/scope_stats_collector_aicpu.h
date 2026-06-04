@@ -48,6 +48,22 @@ void scope_stats_begin(
 void scope_stats_end(
     int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end, int32_t tensormap_used
 );
+
+// Per-task probe (scope_stats_task). Emits one PHASE_TASK record carrying the
+// submitted task_id plus the current ring/heap occupancy, attributed to the
+// enclosing scope. No-op unless per-task sampling is enabled and the enclosing
+// scope passes the site filter. Called from submit_task; the orchestrator gates
+// on is_scope_stats_task_enabled() first so a disabled run pays one bool load.
+void scope_stats_record_task(
+    uint64_t task_id, int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end,
+    int32_t tensormap_used
+);
+
+// Per-task sampling enabled-state predicate (host-written run-constant cached at
+// set_platform_scope_stats_base). Queried by the orchestrator as its submit-time
+// gate; the orchestrator declares a weak `false` fallback for host builds.
+bool is_scope_stats_task_enabled();
+
 void scope_stats_on_fatal();
 
 // --- Site tracking ---

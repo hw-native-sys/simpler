@@ -52,13 +52,19 @@
 #define PTO2_SCOPE_STATS_MAX_RING_DEPTH 4
 #define PTO2_SCOPE_STATS_MAX_SCOPE_DEPTH 64
 
+// Max distinct PTO2_SCOPE line numbers the host-side site filter can hold.
+#define PTO2_SCOPE_STATS_MAX_SITE_FILTERS 16
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Phase tag: which scope boundary a record was sampled at.
+// Phase tag: which sampling point a record was taken at. BEGIN/END are the
+// per-scope boundaries; TASK is a per-task sample taken at submit_task when
+// scope_stats_task is enabled (carries the submitted task_id).
 #define SCOPE_STATS_PHASE_BEGIN 0
 #define SCOPE_STATS_PHASE_END 1
+#define SCOPE_STATS_PHASE_TASK 2
 
 // One record per scope boundary (begin or end). Layout MUST stay in sync with
 // the device-side writer in platform/shared/aicpu/scope_stats_collector_aicpu.cpp
@@ -83,13 +89,14 @@ struct ScopeStatsRecord {
                                   // orchestration .so, not in shared memory).
     uint64_t heap_start;          // Heap ring reclaim pointer (heap_tail_).
     uint64_t heap_end;            // Heap ring allocation pointer (heap_top_).
+    uint64_t task_id;             // PTO2TaskId.raw for PHASE_TASK records; 0 for begin/end.
     int32_t site_line;
     int32_t task_start;      // Task ring tail (last_task_alive).
     int32_t task_end;        // Task ring head (next task id).
     int32_t tensormap_used;  // tensormap pool live-entry count (not a ring).
     int16_t depth;
     int16_t ring_id;  // Ring whose start/end this record carries.
-    int16_t phase;    // SCOPE_STATS_PHASE_BEGIN / _END.
+    int16_t phase;    // SCOPE_STATS_PHASE_BEGIN / _END / _TASK.
     int16_t _pad;
 };
 
@@ -157,7 +164,23 @@ struct ScopeStatsDataHeader {
     uint64_t heap_cap[PTO2_SCOPE_STATS_MAX_RING_DEPTH];
     int32_t tensormap_cap;
     volatile uint32_t fatal_latched;  // AICPU sets to 1 on first fatal.
-    uint32_t _pad[2];
+
+    // Scope site filter — host-written run-constant (count == 0 = no filter,
+    // the default: every scope is collected). The orchestration is a single
+    // source file, so a PTO2_SCOPE site is uniquely identified by its line
+    // number; the filter is just a list of line numbers. When count > 0 the
+    // AICPU collector emits records only for scopes whose site_line appears in
+    // site_filter_lines[0..count). Depth/site bookkeeping is unaffected so
+    // nesting stays correct; filtered-out scopes are not appended and do not
+    // count toward total_record_count.
+    int32_t site_filter_lines[PTO2_SCOPE_STATS_MAX_SITE_FILTERS];
+    int32_t site_filter_count;
+
+    // Per-task sampling (scope_stats_task). Host-written run-constant: when
+    // non-zero, the AICPU collector also emits a PHASE_TASK record at each
+    // submit_task (subject to the same site filter). 0 = scope boundaries only.
+    int32_t task_enabled;
+    uint32_t _pad[1];
 } __attribute__((aligned(64)));
 
 // =============================================================================

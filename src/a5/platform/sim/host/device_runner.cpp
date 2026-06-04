@@ -646,7 +646,8 @@ int DeviceRunner::init_scope_stats(int num_threads) {
     // device buffer; sim's profiling_copy_* are plain memcpys, so the dev/host
     // shadow path collapses to one allocation pair without address-space tricks.
     int rc = scope_stats_collector_.init(
-        num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1
+        num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1,
+        scope_stats_scope().c_str(), scope_stats_task()
     );
     if (rc != 0) {
         return rc;

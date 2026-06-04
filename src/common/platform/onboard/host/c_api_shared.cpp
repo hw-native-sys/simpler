@@ -320,7 +320,8 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    int enable_scope_stats, const char *output_prefix, PtoRunTiming *out_timing
+    int enable_scope_stats, const char *scope_stats_scope, int scope_stats_task, const char *output_prefix,
+    PtoRunTiming *out_timing
 ) {
     if (out_timing != NULL) {
         out_timing->host_wall_ns = 0;
@@ -393,6 +394,8 @@ int run_prepared(
         // without dep_gen falls through to the base no-op.
         runner->set_dep_gen_enabled(enable_dep_gen != 0);
         runner->set_scope_stats_enabled(enable_scope_stats != 0);
+        runner->set_scope_stats_scope(scope_stats_scope);
+        runner->set_scope_stats_task(scope_stats_task != 0);
         runner->set_output_prefix(output_prefix);
 
         rc = runner->run(*r, block_dim, aicpu_thread_num);

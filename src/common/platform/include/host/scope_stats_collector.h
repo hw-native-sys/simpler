@@ -134,9 +134,14 @@ public:
     static constexpr int kIdleTimeoutSec = PLATFORM_SCOPE_STATS_TIMEOUT_SECONDS;
     static constexpr const char *kSubsystemName = "ScopeStats";
 
+    // site_filter_csv is a comma-separated list of PTO2_SCOPE line numbers to
+    // restrict collection to (e.g. "42,108"); nullptr/empty = no filter, collect
+    // every scope. Parsed here and written into the device-visible
+    // ScopeStatsDataHeader at init so callers only pass the raw string.
     int init(
         int num_threads, const ScopeStatsAllocCallback &alloc_cb, ScopeStatsRegisterCallback register_cb,
-        const ScopeStatsFreeCallback &free_cb, int device_id
+        const ScopeStatsFreeCallback &free_cb, int device_id, const char *site_filter_csv = nullptr,
+        bool task_enabled = false
     );
 
     // Device pointer to the ScopeStatsDataHeader. Set

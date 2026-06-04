@@ -33,6 +33,9 @@
 
 int32_t scope_stats_depth = -1;
 static bool scope_stats_enabled = false;
+// Cached from ScopeStatsDataHeader.task_enabled at set_platform_scope_stats_base
+// so the submit-time predicate is a single bool load (no header deref).
+static bool scope_stats_task_enabled = false;
 
 // Streaming transport state — single dep_gen-style instance (the orchestrator).
 static ScopeStatsDataHeader *s_scope_stats_header = nullptr;
@@ -48,7 +51,10 @@ const char *s_scope_site_file[PTO2_SCOPE_STATS_MAX_SCOPE_DEPTH] = {};
 int32_t s_scope_site_line[PTO2_SCOPE_STATS_MAX_SCOPE_DEPTH] = {};
 
 inline const char *basename_of(const char *path) {
-    if (!path) return "(unknown)";
+    // A null site comes only from the framework's implicit top-level scope
+    // (opened by the executor's rt_scope_begin, not a PTO2_SCOPE — so it has no
+    // __builtin_FILE). Label it "<root>" rather than "(unknown)".
+    if (!path) return "<root>";
     const char *base = path;
     for (const char *p = path; *p; ++p) {
         if (*p == '/' || *p == '\\') base = p + 1;
@@ -76,6 +82,23 @@ inline void copy_basename(char (&dst)[32], const char *src) {
         s_cached_src = src;
         memcpy(s_cached, dst, sizeof(dst));
     }
+}
+
+// Scope site filter gate. The orchestration is a single source file, so a
+// PTO2_SCOPE site is uniquely identified by its line number. Returns true when
+// the scope should be collected: either no filter is set (the default,
+// site_filter_count == 0) or the site's line appears in the host-written
+// site_filter_lines list. Cheap when unset (one count check); the linear scan
+// runs only when a filter is active and over at most a handful of lines.
+bool site_passes_filter(int32_t line) {
+    if (s_scope_stats_header == nullptr) return true;
+    int32_t count = s_scope_stats_header->site_filter_count;
+    if (count <= 0) return true;  // no filter set: collect every scope
+    if (count > PTO2_SCOPE_STATS_MAX_SITE_FILTERS) count = PTO2_SCOPE_STATS_MAX_SITE_FILTERS;
+    for (int32_t i = 0; i < count; i++) {
+        if (s_scope_stats_header->site_filter_lines[i] == line) return true;
+    }
+    return false;
 }
 
 // Enqueue a full buffer onto the orchestrator thread's ready_queue. Returns 0
@@ -169,8 +192,8 @@ void switch_buffer() {
 // tagged with the current depth/site and the boundary phase. Called once per
 // scope boundary.
 void append_record_snapshot(
-    int ring_id, int16_t phase, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end,
-    int32_t tensormap_used
+    int ring_id, int16_t phase, uint64_t task_id, int32_t task_start, int32_t task_end, uint64_t heap_start,
+    uint64_t heap_end, int32_t tensormap_used
 ) {
     if (s_scope_stats_state == nullptr) return;
     // Single volatile read of current_buf_ptr (re-read only after a pop/switch).
@@ -200,6 +223,7 @@ void append_record_snapshot(
     rec.ring_id = static_cast<int16_t>(ring_id);
     rec.phase = phase;
     rec._pad = 0;
+    rec.task_id = task_id;
     rec.task_start = task_start;
     rec.task_end = task_end;
     rec.tensormap_used = tensormap_used;
@@ -218,14 +242,20 @@ extern "C" void set_scope_stats_enabled(bool enable) { scope_stats_enabled = ena
 
 extern "C" bool is_scope_stats_enabled() { return scope_stats_enabled; }
 
+extern "C" bool is_scope_stats_task_enabled() { return scope_stats_enabled && scope_stats_task_enabled; }
+
 extern "C" void set_platform_scope_stats_base(uint64_t scope_stats_data_base) {
     void *base = reinterpret_cast<void *>(scope_stats_data_base);
     if (base != nullptr) {
         s_scope_stats_header = get_scope_stats_header(base);
         s_scope_stats_state = get_scope_stats_buffer_state(base, /*instance_index=*/0);
+        // Cache the host-written per-task run-constant so the submit-time gate
+        // is a bool load rather than a header deref on the hot path.
+        scope_stats_task_enabled = (s_scope_stats_header->task_enabled != 0);
     } else {
         s_scope_stats_header = nullptr;
         s_scope_stats_state = nullptr;
+        scope_stats_task_enabled = false;
     }
     // Reset collector-local statics so a prior run that crashed mid-scope (or
     // reused the same AICPU .so process) can't leak stale depth/peak data into
@@ -287,9 +317,13 @@ extern "C" void scope_stats_begin(
     s_scope_site_line[d] = s_pending_site_line;
     s_pending_site_file = nullptr;
     s_pending_site_line = 0;
-    append_record_snapshot(
-        ring_id, SCOPE_STATS_PHASE_BEGIN, task_start, task_end, heap_start, heap_end, tensormap_used
-    );
+    // Depth/site stack is pushed above unconditionally so nesting stays correct;
+    // only the record emission is gated by the scope site filter.
+    if (site_passes_filter(s_scope_site_line[d])) {
+        append_record_snapshot(
+            ring_id, SCOPE_STATS_PHASE_BEGIN, /*task_id=*/0, task_start, task_end, heap_start, heap_end, tensormap_used
+        );
+    }
 }
 
 // Emit the end-boundary record, then tear down depth/site.
@@ -299,10 +333,29 @@ extern "C" void scope_stats_end(
     if (!scope_stats_enabled) return;
     if (scope_stats_depth < 0) return;
     int32_t d = scope_stats_depth;
-    append_record_snapshot(ring_id, SCOPE_STATS_PHASE_END, task_start, task_end, heap_start, heap_end, tensormap_used);
+    if (site_passes_filter(s_scope_site_line[d])) {
+        append_record_snapshot(
+            ring_id, SCOPE_STATS_PHASE_END, /*task_id=*/0, task_start, task_end, heap_start, heap_end, tensormap_used
+        );
+    }
     s_scope_site_file[d] = nullptr;
     s_scope_site_line[d] = 0;
     --scope_stats_depth;
+}
+
+// Emit one PHASE_TASK record for the submitted task, attributed to the current
+// scope. Gated on per-task sampling and the enclosing scope's site filter so a
+// filtered-out scope's tasks are not recorded.
+extern "C" void scope_stats_record_task(
+    uint64_t task_id, int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end,
+    int32_t tensormap_used
+) {
+    if (!scope_stats_enabled || !scope_stats_task_enabled) return;
+    if (scope_stats_depth < 0) return;  // task submitted outside any scope: nothing to attribute
+    if (!site_passes_filter(s_scope_site_line[scope_stats_depth])) return;
+    append_record_snapshot(
+        ring_id, SCOPE_STATS_PHASE_TASK, task_id, task_start, task_end, heap_start, heap_end, tensormap_used
+    );
 }
 
 extern "C" void scope_stats_on_fatal() {
