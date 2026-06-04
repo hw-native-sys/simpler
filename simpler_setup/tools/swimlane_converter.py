@@ -85,32 +85,229 @@ def format_task_display(task_id):
     return f"r{ring}t{local}"
 
 
-def read_perf_data(filepath):
-    """Read performance data from JSON file.
+def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
+    """Read performance data from a swimlane JSON file.
 
-    Args:
-        filepath: Path to input JSON file
+    Host dumps raw cycle-domain per-stream records plus metadata; this
+    function does the AICore↔AICPU join. Schema:
 
-    Returns:
-        dict: Parsed performance data with keys:
-            - l2_swimlane_level
-            - tasks (list)
+        {
+          "l2_swimlane_level": <1..4>,
+          "metadata": {
+            "clock_freq_hz": <int>,
+            "num_cores": <int>,
+            "core_types": ["aic"|"aiv", ...],   # indexed by core_id
+            "core_to_thread": [<int>, ...]      # optional (level >= 3)
+          },
+          "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles, end_cycles], ...],
+          "aicpu_tasks":  [[core_id, reg_task_id, dispatch_cycles, finish_cycles], ...],
+          "aicpu_scheduler_phases":     [ [ {kind, start_cycles, end_cycles, ...}, ... ], ... ],
+          "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles}, ... ], ... ]
+        }
+
+    Returns a dict shaped for `generate_chrome_trace_json`,
+    `print_task_statistics`, and `sched_overhead_analysis`: `tasks`,
+    `aicpu_scheduler_phases`, `aicpu_orchestrator_phases`,
+    `core_to_thread`.
+
+    The join logic that used to live in `export_swimlane_json` (host C++):
+
+      - per-core `reg_task_id → (task_token_raw, start_cycles, end_cycles)` map
+        from `aicore_tasks` (the AICore is the canonical identity producer)
+      - `base_time_cycles` = min non-zero timestamp across all streams (task,
+        phase, orch)
+      - cycles → µs via `clock_freq_hz` from metadata (a2a3=50 MHz, a5=1 GHz —
+        the freq MUST come from the host, never be hardcoded here)
+      - join `aicpu_tasks` by `(core_id, reg_task_id)`; unmatched rows are
+        dropped and counted
+      - AICORE_TIMING (level=1): aicpu_tasks is empty by construction, so
+        synthesize one task per aicore record (dispatch/finish = 0)
+      - sort joined `tasks` by `task_id` (= task_token_raw)
+      - convert phase records from `*_cycles` → `*_time_us`
 
     Raises:
-        ValueError: If JSON format is invalid
+        ValueError: If the JSON is malformed.
     """
     with open(filepath) as f:
         data = json.load(f)
 
-    required_fields = ["l2_swimlane_level", "tasks"]
-    for field in required_fields:
-        if field not in data:
-            raise ValueError(f"Missing required field: {field}")
+    level = int(data.get("l2_swimlane_level"))
+    if level not in [1, 2, 3, 4]:
+        raise ValueError(f"Unsupported l2_swimlane_level: {level} (expected 1, 2, 3, or 4)")
 
-    if data["l2_swimlane_level"] not in [1, 2, 3, 4]:
-        raise ValueError(f"Unsupported l2_swimlane_level: {data['l2_swimlane_level']} (expected 1, 2, 3, or 4)")
+    metadata = data.get("metadata") or {}
+    clock_freq_hz = int(metadata.get("clock_freq_hz") or 0)
+    if clock_freq_hz <= 0:
+        raise ValueError(f"metadata missing/zero clock_freq_hz: {clock_freq_hz}")
+    core_types = list(metadata.get("core_types") or [])
+    core_to_thread = list(metadata.get("core_to_thread") or [])
 
-    return data
+    aicore_rows = data.get("aicore_tasks") or []
+    aicpu_rows = data.get("aicpu_tasks") or []
+    sched_phases_raw = data.get("aicpu_scheduler_phases") or []
+    orch_phases_raw = data.get("aicpu_orchestrator_phases") or []
+
+    # AICore lookup keyed by (core_id, reg_task_id). Two dispatches of the
+    # same PTO2 task_token_raw to the same core (SPMD over-subscription, MIX
+    # cluster spread) each get their own reg_task_id, so this key is unique
+    # per dispatch even when task_token_raw collides.
+    aicore_lookup: dict[tuple[int, int], tuple[int, int, int]] = {}
+    for row in aicore_rows:
+        core_id, task_token_raw, reg_task_id, start_cycles, end_cycles = row
+        aicore_lookup[(int(core_id), int(reg_task_id))] = (
+            int(task_token_raw),
+            int(start_cycles),
+            int(end_cycles),
+        )
+
+    # base_time = min non-zero timestamp across every stream that will be
+    # emitted. Used as the cycle-domain zero for all µs conversions.
+    base_time_cycles = None
+
+    def _track(v):
+        nonlocal base_time_cycles
+        if v > 0 and (base_time_cycles is None or v < base_time_cycles):
+            base_time_cycles = v
+
+    for _, _, _, s, e in aicore_rows:
+        _track(int(s))
+        _track(int(e))
+    for _, _, d, f in aicpu_rows:
+        _track(int(d))
+        _track(int(f))
+    for thread_records in sched_phases_raw:
+        for pr in thread_records:
+            _track(int(pr.get("start_cycles", 0)))
+            _track(int(pr.get("end_cycles", 0)))
+    for thread_records in orch_phases_raw:
+        for pr in thread_records:
+            _track(int(pr.get("start_cycles", 0)))
+            _track(int(pr.get("end_cycles", 0)))
+
+    if base_time_cycles is None:
+        base_time_cycles = 0
+
+    cycles_to_us_factor = 1_000_000.0 / float(clock_freq_hz)
+
+    def _to_us(cycles):
+        if cycles <= 0:
+            return 0.0
+        return (cycles - base_time_cycles) * cycles_to_us_factor
+
+    def _core_type(core_id):
+        if 0 <= core_id < len(core_types):
+            return core_types[core_id]
+        return "aiv"
+
+    tasks = []
+    unmatched_per_core: dict[int, int] = defaultdict(int)
+
+    if aicpu_rows:
+        for row in aicpu_rows:
+            core_id, reg_task_id, dispatch_cycles, finish_cycles = row
+            core_id = int(core_id)
+            reg_task_id = int(reg_task_id)
+            ac = aicore_lookup.get((core_id, reg_task_id))
+            if ac is None:
+                unmatched_per_core[core_id] += 1
+                continue
+            task_token_raw, start_cycles, end_cycles = ac
+            start_us = _to_us(start_cycles)
+            end_us = _to_us(end_cycles)
+            tasks.append(
+                {
+                    "task_id": task_token_raw,
+                    "func_id": -1,
+                    "core_id": core_id,
+                    "core_type": _core_type(core_id),
+                    "ring_id": (task_token_raw >> 32) & 0xFFFFFFFF,
+                    "start_time_us": start_us,
+                    "end_time_us": end_us,
+                    "duration_us": end_us - start_us,
+                    "dispatch_time_us": _to_us(int(dispatch_cycles)),
+                    "finish_time_us": _to_us(int(finish_cycles)),
+                }
+            )
+    elif level == 1:
+        # AICORE_TIMING fallback: AICPU records are absent (complete_task
+        # bypassed). The AICore stream alone is the source of truth.
+        for row in aicore_rows:
+            core_id, task_token_raw, _reg_task_id, start_cycles, end_cycles = row
+            core_id = int(core_id)
+            task_token_raw = int(task_token_raw)
+            start_us = _to_us(int(start_cycles))
+            end_us = _to_us(int(end_cycles))
+            tasks.append(
+                {
+                    "task_id": task_token_raw,
+                    "func_id": -1,
+                    "core_id": core_id,
+                    "core_type": _core_type(core_id),
+                    "ring_id": (task_token_raw >> 32) & 0xFFFFFFFF,
+                    "start_time_us": start_us,
+                    "end_time_us": end_us,
+                    "duration_us": end_us - start_us,
+                    "dispatch_time_us": 0.0,
+                    "finish_time_us": 0.0,
+                }
+            )
+
+    tasks.sort(key=lambda t: int(t["task_id"]))
+
+    total_unmatched = sum(unmatched_per_core.values())
+    if total_unmatched > 0:
+        worst = sorted(unmatched_per_core.items(), key=lambda kv: -kv[1])[:3]
+        worst_str = ", ".join(f"core {c}: {n}" for c, n in worst)
+        print(
+            f"Warning: {total_unmatched} aicpu_task(s) had no matching AICore record (top offenders: {worst_str}); "
+            "the missing AICore buffer(s) were dropped on rotation. Bump PLATFORM_AICORE_BUFFERS_PER_CORE if you "
+            "see this regularly.",
+            file=sys.stderr,
+        )
+
+    def _phase_us(pr):
+        # Host already omits pop_hit / pop_miss for Complete records (terse
+        # emit), so we don't need to re-strip zero deltas here.
+        out = dict(pr)
+        out["start_time_us"] = _to_us(int(pr.get("start_cycles", 0)))
+        out["end_time_us"] = _to_us(int(pr.get("end_cycles", 0)))
+        out.pop("start_cycles", None)
+        out.pop("end_cycles", None)
+        return out
+
+    aicpu_scheduler_phases = []
+    for thread_records in sched_phases_raw:
+        converted = []
+        for pr in thread_records:
+            kind = pr.get("kind", "unknown")
+            out = _phase_us(pr)
+            # Downstream code branches on "phase" as the sched-record
+            # discriminator; surface "kind" under that name.
+            out["phase"] = kind
+            out.pop("kind", None)
+            converted.append(out)
+        aicpu_scheduler_phases.append(converted)
+
+    aicpu_orchestrator_phases = []
+    for thread_records in orch_phases_raw:
+        converted = []
+        for pr in thread_records:
+            out = _phase_us(pr)
+            out["phase"] = "orch_submit"
+            converted.append(out)
+        aicpu_orchestrator_phases.append(converted)
+
+    out = {
+        "l2_swimlane_level": level,
+        "tasks": tasks,
+    }
+    if aicpu_scheduler_phases:
+        out["aicpu_scheduler_phases"] = aicpu_scheduler_phases
+    if aicpu_orchestrator_phases:
+        out["aicpu_orchestrator_phases"] = aicpu_orchestrator_phases
+    if core_to_thread:
+        out["core_to_thread"] = core_to_thread
+    return out
 
 
 def load_deps_json(deps_path):

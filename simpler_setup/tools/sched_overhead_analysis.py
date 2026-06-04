@@ -339,8 +339,13 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     if perf_data is not None:
         data = perf_data
     else:
-        with open(l2_swimlane_records_path) as f:
-            data = json.load(f)
+        # Lazy import to avoid an import cycle: swimlane_converter imports
+        # run_analysis from this module at top level. read_perf_data does the
+        # AICore↔AICPU join — direct json.load would see only the raw
+        # aicore_tasks / aicpu_tasks arrays.
+        from .swimlane_converter import read_perf_data  # noqa: PLC0415
+
+        data = read_perf_data(l2_swimlane_records_path)
     tasks = data["tasks"]
     n_total = len(tasks)
 
@@ -607,11 +612,15 @@ Examples:
         print(f"Error: Perf JSON not found: {l2_swimlane_records_path}", file=sys.stderr)
         return 1
 
-    # Single load — pass the parsed dict to run_analysis() so it doesn't
-    # reread the file (large artifacts hit JSON parsing twice otherwise).
+    # Single load — go through swimlane_converter.read_perf_data so the raw
+    # per-stream JSON gets joined into the dict run_analysis() expects. Pass
+    # the parsed dict on so the file is only read once.
+    # Lazy import: swimlane_converter imports run_analysis from this module
+    # at top level, so the import must happen at call time.
     try:
-        with open(l2_swimlane_records_path) as _f:
-            perf_data = json.load(_f)
+        from .swimlane_converter import read_perf_data  # noqa: PLC0415
+
+        perf_data = read_perf_data(l2_swimlane_records_path)
     except (OSError, ValueError) as e:
         print(f"Error: failed to read perf JSON {l2_swimlane_records_path}: {e}", file=sys.stderr)
         return 1

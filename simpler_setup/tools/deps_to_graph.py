@@ -256,8 +256,14 @@ def _load_task_meta(deps_path, func_names=None):
     if not perf_path.exists():
         return {}
     try:
-        with perf_path.open() as f:
-            perf = json.load(f)
+        # Route through swimlane_converter.read_perf_data so v2 raw on-disk
+        # JSON (aicore_tasks/aicpu_tasks flat tuples in cycle domain) gets
+        # joined into the v1-shape dict this function expects. Direct
+        # json.load would see no top-level `tasks` array on v2 and silently
+        # return {} — leaving every node uncolored / unlabeled.
+        from .swimlane_converter import read_perf_data  # noqa: PLC0415
+
+        perf = read_perf_data(perf_path)
     except (OSError, ValueError) as e:
         print(f"Warning: couldn't read {perf_path}: {e}", file=sys.stderr)
         return {}

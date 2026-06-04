@@ -128,17 +128,74 @@ runs):
 Filenames are fixed (no per-file timestamp) — the directory is the
 per-task uniqueness boundary.
 
-`l2_swimlane_records.json` carries the raw records — this is the file
-you pass to `swimlane_converter`. Important fields per task:
+`l2_swimlane_records.json` carries the raw records. **There are two
+layers to be aware of:**
+
+- **On-disk (raw, cycle domain).** What the host writes. Compact —
+  per-stream tuples plus a small metadata block. Anyone reading the
+  file directly with `json.load` sees this shape and only this shape.
+- **Reader output (joined, µs domain).**
+  `swimlane_converter.read_perf_data()` joins the on-disk streams, fills
+  in `core_type` / `core_to_thread`, converts cycles to microseconds
+  using `metadata.clock_freq_hz`, and returns the joined dict that every
+  downstream consumer (Perfetto converter, `sched_overhead_analysis`,
+  `deps_to_graph`, in-test validator) reads. Always go through
+  `read_perf_data`; never load `l2_swimlane_records.json` with raw
+  `json.load` from new code.
+
+#### On-disk schema
+
+```jsonc
+{
+  "l2_swimlane_level": <1..4>,
+
+  // Everything the python reader needs that isn't a per-record stream.
+  "metadata": {
+    "clock_freq_hz": <int>,            // cycle→µs factor. a2a3=50e6, a5=1e9.
+    "num_cores": <int>,                // == len(core_types)
+    "core_types": ["aic"|"aiv", ...],  // indexed by core_id
+    "core_to_thread": [<int>, ...]     // optional; level >= 3 only
+  },
+
+  // Bulk task streams — flat array of tuples. Column order is fixed.
+  //   aicore_tasks: [core_id, task_token_raw, reg_task_id,
+  //                  start_cycles, end_cycles]
+  //   aicpu_tasks:  [core_id, reg_task_id,
+  //                  dispatch_cycles, finish_cycles]
+  "aicore_tasks": [[...], ...],
+  "aicpu_tasks":  [[...], ...],
+
+  // Per-scheduler-thread arrays of objects (level >= 3 only).
+  //   sched record: {kind, start_cycles, end_cycles, loop_iter,
+  //                  tasks_processed, [pop_hit, pop_miss]}
+  //   orch record:  {submit_idx, task_id, start_cycles, end_cycles}
+  // pop_hit / pop_miss are present only on Dispatch records.
+  "aicpu_scheduler_phases":    [ [ {...}, ... ], ... ],
+  "aicpu_orchestrator_phases": [ [ {...}, ... ], ... ]   // level >= 4 only
+}
+```
+
+All timestamps on disk are raw `get_sys_cnt` cycles (uint64). The
+join key between `aicore_tasks` and `aicpu_tasks` is
+`(core_id, reg_task_id)` — *not* `task_token_raw`, because SPMD
+`block_num > num_cores` and MIX cluster spread can dispatch the same
+`task_token_raw` to the same core multiple times. AICore is the
+canonical producer of `task_token_raw`; AICPU only stamps the
+dispatch / finish timestamps and the per-core join token.
+
+#### Reader output (µs domain)
+
+After `read_perf_data()` joins the streams and converts to
+microseconds, downstream code sees:
 
 | Field | Meaning |
 | ----- | ------- |
 | `task_id` | Runtime task id (`(ring_id << 32) \| local_id`); also exposed split as`ring_id` |
-| `func_id` | Kernel function id |
+| `func_id` | Kernel function id. Always `-1` on disk; resolved post-process from `deps.json::tasks[].kernel_ids[3]` (see `swimlane_converter.resolve_func_id_from_kernel_map`) |
 | `core_id` / `core_type` | Physical core index and `"aic"` / `"aiv"` string |
 | `start_time_us` / `end_time_us` / `duration_us` | AICore execution window in microseconds |
-| `dispatch_time_us` | AICPU timestamp when this task was dispatched (filled at level >= 2) |
-| `finish_time_us` | AICPU timestamp when AICPU observed FIN (filled at level >= 2) |
+| `dispatch_time_us` | AICPU timestamp when this task was dispatched (filled at level >= 2; `0.0` at level 1) |
+| `finish_time_us` | AICPU timestamp when AICPU observed FIN (filled at level >= 2; `0.0` at level 1) |
 
 Note: per-task records carry **no** fanout edges. Dependency arrows
 come from a separate `deps.json` (dep_gen) joined at convert time —
@@ -150,15 +207,20 @@ Phase records (per scheduler thread, level >= 3 for
 
 | Field | Meaning |
 | ----- | ------- |
-| `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds |
+| `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds (reader-side cycle→µs conversion) |
 | `phase` | Lowercase phase name. Scheduler: `complete` / `dispatch` (`scan` / `idle` may appear in legacy captures and a5; both are dropped by the parser). Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
 | `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
 | `tasks_processed` (scheduler) / `task_id` (orchestrator) | Phase-specific union field |
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
 
+On disk the sched records carry a `kind` field (`complete` /
+`dispatch`); the reader renames it to `phase` so downstream code can
+keep a single discriminator name.
+
 `core_to_thread[]` (level >= 3) maps `core_id` (array index) to the
 scheduler thread index that retired that core's tasks (`-1` =
-unassigned).
+unassigned). On disk it lives under `metadata.core_to_thread`; the
+reader hoists it to the top of the output dict.
 
 ### 3.3 Convert and view in Perfetto
 
