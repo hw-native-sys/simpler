@@ -25,7 +25,8 @@ fork/shm behavior working.
 
 2. Endpoint eligibility metadata.
    - Assign each NEXT_LEVEL child a stable `endpoint_id`.
-   - Store `callable_id -> eligible endpoint ids` in parent runtime metadata.
+   - Store `callable hashid -> eligible endpoint ids` in parent runtime
+     metadata.
    - Extend submit slots with final eligible endpoint sets computed as
      callable eligibility intersected with tensor/buffer data eligibility.
    - Teach Scheduler/WorkerManager to pick only eligible idle workers.
@@ -79,12 +80,18 @@ fork/shm behavior working.
 
 6. Remote callable registry.
    - Implement `RemoteCallable("module:qualname")`.
-   - Preserve the public cid lifecycle from local dynamic Python registration:
-     visibility only after register reply, unregister/cid reuse, stale-state
-     cleanup, and TASK/control ordering.
+   - Preserve the public callable identity lifecycle from PR #891:
+     `Worker.register()` returns `CallableHandle`, TASK/control frames carry
+     the handle hash digest, endpoint-private execution slots stay hidden,
+     visibility starts only after register reply, unregister performs
+     stale-state cleanup, and TASK/control ordering prevents partially visible
+     hashids.
    - Treat import-path callables as the baseline remote mode.
-   - Support PR #839 serialized Python callable payloads only as a negotiated
-     feature with serializer version, payload limit, Python ABI/runtime, and
+   - Add `PYTHON_IMPORT` as the remote baseline callable kind and
+     `REMOTE_TASK_DISPATCHER` as the parent-facing resolver scope for
+     `RemoteCallable` handles.
+   - Support serialized Python callable payloads only as a negotiated feature
+     with serializer version, payload limit, Python ABI/runtime, and
      dependency/runtime-environment compatibility checks. Follow the payload
      contract in `docs/python-callable-serialization.md`.
    - Extend the existing public `register(callable, workers=...)` flow so
@@ -95,16 +102,20 @@ fork/shm behavior working.
      pools and placement policies as future API work, and do not define
      implicit broadcast to all remote endpoints as a contract.
    - Implement multi-endpoint all-or-nothing registration with prepare, commit,
-     and abort controls. Keep the parent cid invisible until every selected
+     and abort controls. Keep the hashid invisible until every selected
      endpoint commits, and mark uncertain endpoints failed rather than leaving a
-     partially visible cid.
-   - Implement unregister tombstones. Do not reuse a cid until every selected
-     endpoint confirms cleanup or is removed from eligibility as failed.
-   - Split cid handling into an outer remote-orch namespace and an inner L3
-     Worker namespace; never assume a parent TASK cid is an inner chip/sub cid.
-   - Make parent/session-assigned cid values the only cid source in each
-     manifest namespace.
-   - Define post-bootstrap namespace-aware prepare, commit, abort, and
+     partially visible hashid.
+   - Implement final-unregister tombstones per endpoint/hashid pair. Do not
+     block dispatch through other live handles that still reference the same
+     hashid. If failed-register rollback cleanup is uncertain, block only the
+     affected endpoint/hashid pair for the current session.
+   - Keep `INNER_L3_WORKER` as a remote-internal install target, not a
+     parent-facing handle scope. Never assume a parent TASK hashid names an
+     inner chip/sub callable.
+   - Make canonical descriptors and their SHA-256 hashids the only public
+     callable identity source in each manifest registry scope; target-private
+     slots are allocated by the receiving endpoint.
+   - Define post-bootstrap registry-scope-aware prepare, commit, abort, and
      unregister frames for Python callables and `ChipCallable` entries.
 
 7. Fork-safe simulation session runner.
@@ -178,9 +189,9 @@ fork/shm behavior working.
 | Manifest handoff | Runner reads manifest before transport starts. |
 | Prestart barrier | HELLO READY only after inner L3 scheduler is started. |
 | Remote sim task | L4 parent dispatches one L3 orch task successfully. |
-| Remote sim error | Remote orch raises; parent raises with host/seq/cid. |
+| Remote sim error | Remote orch raises; parent raises with host/seq/hashid. |
 | Failed dependency | Consumer of failed remote producer is not dispatched. |
-| Remote cid mapping | Daemon resolves non-zero parent-assigned remote cid. |
+| Remote hashid mapping | Daemon resolves an outer remote-orch hashid. |
 | Remote dep key | Shared remote buffer serializes through TensorMap. |
 | Raw pointer rejection | Unstaged host pointer fails before slot commit. |
 | Wire data zero | Non-zero remote TASK tensor data is rejected. |
@@ -189,16 +200,17 @@ fork/shm behavior working.
 | Input-only free deferral | Released input buffer survives queued consumers. |
 | Timeout | Killed session runner produces bounded failure. |
 | Dynamic Python register | Import-path callable register/unregister works. |
-| Serialized Python gate | PR #839 payload works only after feature negotiation. |
-| Callable visibility | TASK with cid works only after register reply. |
-| Register partial failure | Multi-endpoint register is invisible after partial fail. |
-| Unregister tombstone | Reused cid waits for cleanup or failed endpoint removal. |
+| Serialized gate | Serialized payloads require feature negotiation. |
+| Callable visibility | TASK with hashid works only after register reply. |
+| Register partial fail | Multi-endpoint register stays invisible. |
+| Unregister tombstone | Final unregister waits for endpoint cleanup. |
 | Command-lane order | TASK cannot overtake register/unregister control. |
-| Health during long task | Health remains live while command lane runs a task. |
-| Callable kind gate | Unsupported callable kind rejects without cid install. |
-| Dynamic inner register | Inner Python and ChipCallable cids can run. |
-| Remote cid namespace | Outer TASK cid cannot collide with inner cid. |
-| Remote control parity | Register/unregister/domain reaches namespace. |
+| Health during task | Health remains live while command lane runs a task. |
+| Callable kind gate | Unsupported kind rejects without hashid install. |
+| Dynamic inner register | Inner Python and ChipCallable hashids can run. |
+| Remote registry scope | Parent TASK resolves only in dispatcher. |
+| Inner registry target | Inner Worker install is not parent-facing. |
+| Remote control parity | Register/unregister/domain reaches target registry. |
 
 ## Hardware-Gated Tests
 
@@ -213,9 +225,9 @@ fork/shm behavior working.
 
 - Exact platform HAL names for HCCS and UB export/import.
 - Authentication and isolation for remote daemon sessions.
-- Exact remote compatibility metadata required for PR #839 serialized Python
-  callable payloads beyond the local payload contract, serializer version, and
-  Python ABI/runtime.
+- Exact remote compatibility metadata required for serialized Python callable
+  payloads beyond the local payload contract, serializer version, and Python
+  ABI/runtime.
 - How endpoint health feeds scheduler-level eligibility after the transport
   reports a failed health lane.
 - How much of `CommContext` should remain shared with PTO-ISA once remote UB
@@ -308,6 +320,6 @@ Rules:
 Error reporting:
 
 - The first root failure message includes remote host, endpoint id,
-  callable id, and sequence.
+  callable hashid, and sequence.
 - Poisoned downstream slots should reference the root producer slot instead of
   overwriting the first-error-wins message.

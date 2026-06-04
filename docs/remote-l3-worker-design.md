@@ -14,7 +14,12 @@ Detailed protocol, buffer, transport, and rollout notes live in:
 Related callable registration and serialization contracts:
 
 - [callable-ipc-dynamic-register.md](callable-ipc-dynamic-register.md)
+- [callable-identity-registration.md](callable-identity-registration.md)
 - [python-callable-serialization.md](python-callable-serialization.md)
+
+`callable-identity-registration.md` is a prerequisite refinement for this
+design: remote L3 callable routing should use `hashid` identities and
+target-private execution slots instead of cross-worker integer routing.
 
 The current implementation uses pre-forked local child processes and a
 4096-byte shared-memory mailbox. That model depends on copy-on-write callable
@@ -47,23 +52,25 @@ Non-goals:
 - Redesigning remote `CommDomain` or the device `CommContext` ABI in the first
   Remote L3 task-dispatch cut.
 
-Remote callable registration follows the same public cid lifecycle defined for
-local dynamic Python registration by PR #839: registration becomes visible to
-the selected Python-capable endpoint only after the registration control reply
-succeeds, unregister permits cid reuse only after stale state is cleared or the
-endpoint is marked failed, and stale cid residue must not be observable by
-later TASK frames. The remote design reuses those lifecycle semantics, but it
-does not reuse PR #839's local mailbox commands, POSIX shm names,
-process-local pointers, or exact serialized payload wire shape.
+Remote callable registration follows the public callable identity lifecycle
+defined by PR #891: `Worker.register()` returns a `CallableHandle`, `hashid` is
+the stable cross-process identity, and each target owns a private
+`hashid -> local_slot` mapping. A registration becomes visible to the selected
+Python-capable endpoint only after the registration control reply succeeds.
+Final unregister prevents reuse of endpoint-private execution state until stale
+state is cleared or the endpoint is marked failed, and stale callable residue
+must not be observable by later TASK frames. The remote design reuses those
+lifecycle semantics, but it does not reuse PR #891's local mailbox commands,
+POSIX shm names, process-local pointers, or exact serialized payload wire
+shape.
 
 The required baseline remote callable descriptor is an import path such as
-`pkg.module:orch_fn`. A serialized Python callable payload produced by the
-PR #839 serializer described in
-[python-callable-serialization.md](python-callable-serialization.md) is a
-negotiated remote capability, not an unconditional baseline. When enabled, it
-travels as a versioned remote CONTROL payload and must negotiate serializer
-version, payload limits, Python ABI/runtime compatibility, and
-dependency/runtime-environment compatibility.
+`pkg.module:orch_fn`. Serialized Python callable payloads follow
+[python-callable-serialization.md](python-callable-serialization.md), but they
+are a negotiated remote capability, not part of the first required remote L3
+baseline. When enabled, the payload travels as a versioned remote CONTROL
+payload and must negotiate serializer version, payload limits, Python
+ABI/runtime compatibility, and dependency/runtime-environment compatibility.
 
 ## Current Seams
 
@@ -79,8 +86,8 @@ Relevant code paths:
   - Errors are reported through `MAILBOX_OFF_ERROR` and
     `MAILBOX_OFF_ERROR_MSG`.
 - `src/common/hierarchical/orchestrator.{h,cpp}`
-  - `submit_next_level()` stores `TaskArgs`, `CallConfig`, callable id, and
-    optional worker affinity in a parent-side slot.
+  - `submit_next_level()` stores `TaskArgs`, `CallConfig`,
+    `CallableIdentity`, and optional worker affinity in a parent-side slot.
   - Dependency inference happens before dispatch from tags in `TaskArgs`.
 - `src/common/task_interface/task_args.h`
   - Process dispatch writes `[T][S][ContinuousTensor x T][uint64 x S]`.
@@ -110,11 +117,12 @@ session setup, then HCOMM-backed RPC and data adapters for steady-state
 traffic.
 
 `caps()` is part of the endpoint contract because submit-time eligibility must
-know whether an endpoint can run a cid and consume the tensors in a slot. It is
-read-only capability metadata, not a transport escape hatch: the Scheduler sees
-logical features such as callable kinds, memory directions, address spaces, and
-health state, while `RemoteL3Endpoint` remains the only layer that knows the
-selected HCOMM protocol or adapter handles.
+know whether an endpoint can resolve a callable `hashid` and consume the tensors
+in a slot. It is read-only capability metadata, not a transport escape hatch:
+the Scheduler sees logical features such as callable kinds, resolver scopes,
+memory directions, address spaces, and health state, while `RemoteL3Endpoint`
+remains the only layer that knows the selected HCOMM protocol or adapter
+handles.
 
 On dispatch, `WorkerThread` builds a task packet from `TaskSlotState`, calls
 the endpoint, reports endpoint errors, and notifies the Scheduler with an
@@ -175,10 +183,10 @@ initialization has completed.
 
 ## Endpoint Identity and Callable Routing
 
-Remote scheduling needs explicit callable namespaces and an explicit mapping
-from callable ids to eligible NEXT_LEVEL endpoints. The current scheduler can
-otherwise choose any idle worker, which is only correct when every NEXT_LEVEL
-child has the same callable registry.
+Remote scheduling needs explicit callable resolver scopes and an explicit
+mapping from callable identities to eligible NEXT_LEVEL endpoints. The current
+scheduler can otherwise choose any idle worker, which is only correct when
+every NEXT_LEVEL child has the same callable registry.
 
 Required contracts:
 
@@ -187,64 +195,93 @@ Required contracts:
 - `register(callable, workers=...)` is the single public registration API.
   Local Python/callable objects keep the existing local registration path.
   `RemoteCallable` descriptors use the remote control path and bind the
-  allocated parent cid to one or more remote endpoint ids.
+  returned `CallableHandle.hashid` to one or more remote endpoint ids.
+- PR866 extends the PR #891 callable identity surface with one parent-facing
+  remote callable kind, `PYTHON_IMPORT`, and one parent-facing resolver scope,
+  `REMOTE_TASK_DISPATCHER`. `RemoteCallable("pkg.module:orch_fn")`
+  registration returns a normal `CallableHandle` whose `kind` is
+  `PYTHON_IMPORT`, whose resolver scope is `REMOTE_TASK_DISPATCHER`, and whose
+  `hashid` is computed from the canonical remote import descriptor.
 - The first implementation requires `RemoteCallable` registration to pass an
   explicit non-empty `workers=[...]` list. Future releases may replace raw
   worker ids with named remote pools or placement policies, but implicit
   broadcast to all remote endpoints is not part of the contract.
 - Bootstrap manifests are generated by the parent. Users provide remote
-  callable descriptors; users do not hand-author raw `cid -> callable` maps.
+  callable descriptors; users do not hand-author raw `hashid -> callable`
+  maps.
 - Remote callable descriptors have two Python forms:
   - `PYTHON_IMPORT`: a bounded `module:qualname` import path. This is required
     for the remote L3 baseline.
-  - `PYTHON_SERIALIZED`: a versioned payload produced by the PR #839 callable
-    serializer described in
+  - `PYTHON_SERIALIZED`: a versioned payload that follows
     [python-callable-serialization.md](python-callable-serialization.md). This
-    is allowed only when parent and session negotiate the serializer version,
-    payload limits, Python ABI/runtime compatibility, and
-    dependency/runtime-environment compatibility.
-- Remote L3 uses two independent cid namespaces:
-  - **Outer remote cid namespace**: parent-assigned cids carried in L4 TASK
-    frames. These cids select the remote L3 orchestration callable.
-  - **Inner L3 cid namespace**: cids registered on the session runner's
-    `inner_worker = Worker(level=3)`. Remote L3 orch functions use these cids
-    when they call `orch.submit_next_level(...)` or `orch.submit_sub(...)`.
-- The two namespaces may contain the same integer values, but they are not the
-  same registry. A cid from the parent TASK frame must not be assumed to name a
-  chip/sub callable inside the inner L3 Worker.
-- Dynamic Python callable registration follows the public visibility and cid
-  lifecycle semantics from local dynamic registration: registration is
-  synchronous per selected endpoint, future TASK frames may use the cid only
-  after the control reply succeeds, unregister/cid reuse clears stale callable
-  state, and TASK/control ordering prevents a TASK from observing a partially
-  registered cid.
+    is rejected in remote protocol v1 unless parent and session explicitly
+    negotiate serializer version, payload limits, Python ABI/runtime
+    compatibility, and dependency/runtime-environment compatibility.
+- The parent computes each remote callable `hashid` from canonical descriptor
+  bytes before publication. `PYTHON_IMPORT` uses a remote descriptor schema
+  that includes descriptor schema version, callable kind, normalized module
+  string, and normalized qualname string; any future environment compatibility
+  digest or import policy field must bump the schema version.
+  `PYTHON_SERIALIZED` reuses the PR #891 serialized-payload descriptor
+  identity. Inner `CHIP_CALLABLE` entries reuse the PR #891 chip descriptor
+  identity.
+- Remote L3 uses one callable identity scheme: `hashid`. It still has two
+  resolver locations because different runtime objects consume the identity:
+  - **Remote TASK dispatcher registry**: the parent-facing entry registry in
+    the session runner. TASK frames from the L4 parent carry a hash digest; the
+    dispatcher resolves it to the remote L3 orchestration callable and then
+    invokes `inner_worker.run(...)`.
+  - **Inner L3 Worker registry**: remote-internal state owned by
+    `inner_worker = Worker(level=3)`. Remote L3 orchestration functions use
+    this Worker's own `CallableHandle` values when they call
+    `orch.submit_next_level(...)` or `orch.submit_sub(...)`.
+- The remote TASK dispatcher is not a Worker and must not reimplement
+  Scheduler, Orchestrator, TensorMap, or drain semantics. It is an RPC entry
+  adapter that resolves the outer callable, materializes `RemoteTaskArgs`,
+  calls the embedded `inner_worker`, and wraps completion/error reporting.
+- Resolver location is selected by execution context, not by a second identity
+  dimension. A remote TASK frame always resolves in the remote TASK dispatcher
+  registry; an inner `orch.submit_*` call resolves through the inner Worker's
+  normal PR #891 handle validation. The same hashid may appear in both
+  registries, but that means the same canonical descriptor was installed in two
+  places, not that the two registries share executable slots or eligibility.
+- Dynamic Python callable registration follows the public visibility and
+  hashid lifecycle semantics from local dynamic registration: registration is
+  synchronous per selected endpoint, future TASK frames may use the hashid only
+  after the control reply succeeds, unregister clears stale callable state, and
+  TASK/control ordering prevents a TASK from observing a partially registered
+  hashid.
 - Import-path descriptors are the required remote baseline. Serialized Python
-  callable payloads preserve the same cid lifecycle but remain an optional
+  callable payloads preserve the same hashid lifecycle but remain an optional
   negotiated feature because they require Ray-like environment and serializer
   compatibility checks that local fork/COW registration does not need.
 - Multi-endpoint `register(..., workers=[...])` is all-or-nothing by
   default. The parent sends a prepare phase to every selected endpoint, commits
-  the cid only after every prepare succeeds, and exposes the cid to future TASK
-  frames only after every commit reply succeeds. If any endpoint fails prepare
-  or commit, the parent aborts the transaction, keeps the cid invisible, and
-  either rolls back successful endpoints or marks endpoints with unknown state
-  failed.
-- Multi-endpoint unregister uses a tombstone state. A cid is unavailable for
-  reuse until every selected endpoint confirms unregister cleanup, or until any
-  non-responsive endpoint is removed from eligibility and marked failed. This
-  prevents stale callable residue from being observed by later TASK frames.
+  hashid only after every prepare succeeds, and exposes the hashid to future
+  TASK frames only after every commit reply succeeds. If any endpoint fails
+  prepare or commit, the parent aborts the transaction, keeps the hashid
+  invisible, and either rolls back successful endpoints or marks endpoints with
+  unknown state failed.
+- Final multi-endpoint unregister uses a tombstone state for the selected
+  endpoint/hashid pairs. The hashid remains dispatchable through any other live
+  handle that still owns a reference. Once the final reference is dropped for
+  an endpoint, that endpoint/hashid pair is unavailable for dispatch until
+  cleanup is confirmed or the endpoint is removed from eligibility and marked
+  failed. Failed-register rollback whose cleanup cannot be confirmed marks that
+  endpoint/hashid pair cleanup-uncertain and unusable for the current session.
 - `TaskSlotState` stores the final eligible endpoint set for the slot. This is
-  the intersection of endpoints that can run the `callable_id` and endpoints
-  that can access every tensor/buffer referenced by the slot.
+  the intersection of endpoints that can resolve the callable hashid and
+  endpoints that can access every tensor/buffer referenced by the slot.
 - If the user passes `worker=N`, submit-time validation checks that endpoint
-  `N` is eligible for that cid and for the slot's tensor sidecars.
+  `N` is eligible for that hashid and for the slot's tensor sidecars.
 - If `worker=-1`, the Scheduler chooses only from idle endpoints in the
   slot's eligible set.
 - Group submit validates each affinity independently. Unconstrained group
   members are assigned distinct idle eligible endpoints.
-- Mixed local + remote NEXT_LEVEL pools are allowed only when the callable id
-  is registered on every endpoint that can receive the slot and the slot's
-  tensors are materialized in a representation those endpoints can consume.
+- Mixed local + remote NEXT_LEVEL pools are allowed only when the callable
+  hashid is registered on every endpoint that can receive the slot and the
+  slot's tensors are materialized in a representation those endpoints can
+  consume.
   A callable registered on both local and remote endpoints does not make a
   remote-buffer task eligible for the local endpoint.
 
@@ -265,7 +302,7 @@ l3 = RemoteWorkerSpec(
 )
 
 l3_worker_id = w4.add_remote_worker(l3)
-l3_cid = w4.register(
+l3_handle = w4.register(
     RemoteCallable("my_pkg.remote_orch:l3_orch"),
     workers=[l3_worker_id],
 )
@@ -274,11 +311,13 @@ w4.init()
 
 `add_worker(local_worker)` remains unchanged and continues to use fork/shm.
 
-Dynamic remote registration uses the same cid lifecycle whether the descriptor
-is installed at bootstrap or through a later control frame. If a callable refers
-to inner L3 cids, those cids are values from the inner namespace installed by
-the session manifest or by prior remote control registration, not the outer cid
-used to dispatch the remote L3 orch callable.
+Dynamic remote registration uses the same hashid lifecycle whether the
+descriptor is installed at bootstrap or through a later control frame. If a
+remote L3 orchestration callable refers to inner L3 callables, those are
+`CallableHandle` values owned by the embedded inner Worker. The parent may
+include inner Worker registry entries in the bootstrap manifest or send
+registry-scoped controls to install them, but it does not receive or submit a
+parent-facing handle whose resolver scope is `INNER_L3_WORKER`.
 
 ## Remote Worker Session
 
@@ -295,23 +334,25 @@ endpoint_id
 platform, runtime, build flag
 device_ids, num_sub_workers, heap_ring_size
 callable registry:
-  outer registry:
-    parent-assigned outer cid -> remote L3 orch callable descriptor
+  remote TASK dispatcher registry:
+    hashid -> remote L3 orch callable descriptor
       descriptor = PYTHON_IMPORT or negotiated PYTHON_SERIALIZED
-  inner L3 registry:
-    inner cid -> ChipCallable blob metadata, when needed
-    inner cid -> Python sub/orch callable descriptor, when needed
+  inner L3 Worker registry:
+    hashid -> ChipCallable blob metadata, when needed
+    hashid -> Python sub/orch callable descriptor, when needed
 comm policy: roce | hccs | ub | sim
 feature flags
 ```
 
-The session runner installs the outer registry into its remote TASK dispatcher.
-It installs the inner registry into `inner_worker = Worker(level=3)` during
-prestart and before `HELLO READY`. Remote controls may add or remove entries in
-either namespace after bootstrap:
+The session runner installs the remote TASK dispatcher registry for parent
+TASK frames. It installs the inner registry into
+`inner_worker = Worker(level=3)` during prestart and before `HELLO READY`.
+`INNER_L3_WORKER` is a remote-internal install target in manifests and
+controls, not a parent-facing `CallableHandle` resolver scope. Remote controls
+may add or remove entries in either registry location after bootstrap:
 
-- registering an outer Python callable changes what future L4 TASK frames can
-  dispatch on this remote endpoint;
+- registering a remote TASK dispatcher Python callable changes what future L4
+  TASK frames can dispatch on this remote endpoint;
 - registering an inner Python callable changes what already-registered remote
   L3 orch functions can submit to `inner_worker`;
 - registering an inner `ChipCallable` follows the existing dynamic callable IPC
@@ -323,8 +364,8 @@ For a TASK frame, the session runner:
 1. Validates the session and sequence number.
 2. Decodes `RemoteTaskArgs`.
 3. Translates remote tensor descriptors into local `ContinuousTensor` values.
-4. Looks up the L3 orchestration function in the outer registry by
-   parent-assigned outer cid.
+4. Looks up the L3 orchestration function in the remote TASK dispatcher
+   registry by hashid.
 5. Calls `inner_worker.run(orch_fn, args, config)`.
 6. Sends completion with success or bounded traceback text.
 
@@ -335,7 +376,7 @@ Session execution rules:
 
 - The baseline remote endpoint runs at most one TASK at a time. This matches
   the current one-`WorkerThread`-per-child local scheduling model and keeps
-  ordering, buffer lifetime, and cid visibility simple.
+  ordering, buffer lifetime, and callable visibility simple.
 - State-changing CONTROL frames such as register, unregister, buffer free,
   copy, export/import, and import release serialize with TASK execution on the
   ordered command lane. They are not applied concurrently with a running TASK
@@ -408,7 +449,7 @@ Required parent-side behavior:
 - Downstream consumers of a failed producer are marked failed/skipped and are
   not dispatched.
 - `drain()` waits for bookkeeping and cleanup, then raises the first root
-  error with remote host, endpoint id, cid, and sequence in the message.
+  error with remote host, endpoint id, hashid, and sequence in the message.
 
 Local mailbox dispatch keeps first-error-wins only for final error reporting.
 It must not mark a failed child dispatch as successful `COMPLETED`. The remote
@@ -460,11 +501,11 @@ The recommended first cut is conservative:
 2. Add remote tensor sidecars and endpoint eligibility metadata.
 3. Add the versioned frame codec and the independent health-lane contract.
 4. Add remote callable registration with all-or-nothing multi-endpoint
-   visibility and tombstone-based cid reuse.
+   visibility and final-unregister cleanup.
 5. Add the fork-safe simulation session runner with explicit prestart before
    `HELLO READY`.
 6. Prove local behavior is unchanged and remote sim behavior handles success,
-   failure, cid mapping, timeouts, health, and buffer cleanup.
+   failure, hashid mapping, timeouts, health, and buffer cleanup.
 7. Add A2 RoCE, A3 HCCS, and A5 UB profiles behind the HCOMM adapter layer.
 
 See

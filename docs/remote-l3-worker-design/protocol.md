@@ -126,15 +126,23 @@ frames.
 ## TASK Payload
 
 ```text
-callable_id: int32
+callable_hash_digest: uint8[32]
 config: CallConfigWire v1
 args: RemoteTaskArgsWire v1
 ```
 
-TASK frames carry tensor metadata and remote descriptors after parent-side
-dependency inference has already consumed `TaskArgs` tags. Tags are
-Orchestrator input, not the remote L3 wire contract. The endpoint uses the
-sidecar descriptors captured at submit time to materialize local
+The TASK payload has exactly these top-level fields: callable digest,
+`CallConfigWire`, and `RemoteTaskArgsWire`. `RemoteTaskArgsWire` then carries
+tensor metadata, remote tensor descriptors, scalars, and optional inline bytes.
+
+TASK frames carry the raw digest from the submitted parent-facing
+`CallableHandle.hashid`. Parent-side dependency inference has already consumed
+`TaskArgs` tags; tags are Orchestrator input, not the remote L3 wire contract.
+A TASK frame always resolves `callable_hash_digest` in the remote TASK
+dispatcher registry. The dispatcher is not a Worker: it resolves the digest to
+its private orchestration callable slot, materializes the remote arguments, and
+then invokes the embedded `inner_worker = Worker(level=3)`. The endpoint uses
+the sidecar descriptors captured at submit time to materialize local
 `ContinuousTensor` values on the session runner.
 
 `RemoteTaskArgsWire v1` contains:
@@ -231,7 +239,7 @@ Rules:
 - Non-zero error means task failure. The parent marks the slot failed/poisoned
   and does not dispatch downstream consumers.
 - `error_message` is bounded UTF-8. It should include remote host,
-  `endpoint_id`, `callable_id`, and `sequence`.
+  `endpoint_id`, callable hashid, and `sequence`.
 - If health expires or the process exits, the parent fabricates an endpoint
   failure completion for every in-flight sequence.
 
@@ -273,63 +281,97 @@ The first Remote L3 task-dispatch cut rejects the reserved domain controls
 with an unsupported-control reply. They become required only when Remote
 CommDomain enters scope.
 
-The register-family controls are namespace-aware.
+The register-family controls are registry-scope-aware.
 `PREPARE_REGISTER_CALLABLE` carries:
 
 ```text
-target_namespace:
-  OUTER_REMOTE_ORCH
+target_registry:
+  REMOTE_TASK_DISPATCHER
   INNER_L3_WORKER
 callable_kind:
   PYTHON_IMPORT
   CHIP_CALLABLE
   PYTHON_SERIALIZED  # optional negotiated extension
-cid: int32
+callable_hash_digest: uint8[32]
 payload_version: uint32
 payload bytes
 ```
 
 Rules:
 
-- `OUTER_REMOTE_ORCH` registers callables that can be selected by future
-  parent TASK frames. Only Python callable kinds are valid in this namespace.
+- `REMOTE_TASK_DISPATCHER` registers callables that can be selected by future
+  parent TASK frames. Only Python callable kinds are valid in this parent-facing
+  registry.
 - `INNER_L3_WORKER` registers callables on the session runner's
-  `inner_worker = Worker(level=3)`. Python callables become valid targets for
-  inner `submit_sub` / recursive orchestration; `CHIP_CALLABLE` follows the
-  existing prepare/register path for chip workers.
+  `inner_worker = Worker(level=3)`. It is a remote-internal install target, not
+  a parent-facing `CallableHandle` resolver scope. Python callables become
+  valid targets for inner `submit_sub` / recursive orchestration;
+  `CHIP_CALLABLE` follows the existing prepare/register path for chip workers.
 - `PYTHON_IMPORT` payloads carry a bounded UTF-8 `module:qualname` string.
-- `PYTHON_SERIALIZED` payloads are produced by the PR #839 callable serializer
-  described in
+  The payload parser trims surrounding ASCII whitespace, splits on exactly one
+  colon, rejects empty parts, rejects relative module names, and rejects
+  `<locals>`. Module and qualname components must be Python identifiers joined
+  by dots. `PYTHON_IMPORT` uses callable kind value `3`, extending the PR #891
+  values `1 = CHIP_CALLABLE` and `2 = PYTHON_SERIALIZED`.
+
+  The canonical descriptor uses the PR #891 descriptor primitive encoding:
+  `uint32` fields are unsigned little-endian, and strings are encoded as
+  `uint32 byte_len` followed by UTF-8 bytes. It stores:
+
+  ```text
+  REMOTE_PYTHON_IMPORT:
+    uint32 descriptor_schema_version = 1
+    uint32 callable_kind = 3  # PYTHON_IMPORT
+    string module
+    string qualname
+  ```
+
+  PR866 must add `PYTHON_IMPORT` as a stable callable kind in the PR #891
+  identity model. The parent and endpoint rebuild the same descriptor, compute
+  `sha256(descriptor)`, and compare it with `callable_hash_digest` before
+  staging the import.
+- `PYTHON_SERIALIZED` payloads follow
   [../python-callable-serialization.md](../python-callable-serialization.md).
-  They are valid only when parent and session negotiate serializer version,
-  payload limits, Python ABI/runtime compatibility, and dependency/runtime
-  compatibility. Support is optional; `PYTHON_IMPORT` remains the required
-  baseline.
+  They are rejected in remote protocol v1 unless parent and session explicitly
+  negotiate serializer version, payload limits, Python ABI/runtime
+  compatibility, and dependency/runtime compatibility. Support is optional;
+  `PYTHON_IMPORT` remains the required baseline.
 - A session that does not advertise a requested callable kind rejects the
-  control request before installing the cid.
+  control request before installing the hashid.
+- The endpoint recomputes the canonical descriptor hashid from the staged
+  descriptor/payload and rejects the control if it does not match
+  `callable_hash_digest`.
 - `CHIP_CALLABLE` payloads carry the ChipCallable blob metadata or a staged blob
   reference, depending on transport capability. The remote frame never embeds a
-  local POSIX shm name from the parent process.
+  local POSIX shm name from the parent process. The endpoint validates the
+  payload against the PR #891 `CHIP_CALLABLE` canonical descriptor before
+  installing the hashid.
 - `COMMIT_REGISTER_CALLABLE` and `ABORT_REGISTER_CALLABLE` carry
-  `target_namespace`, `callable_kind`, and `cid`.
-- `UNREGISTER_CALLABLE` carries the same `target_namespace`, `callable_kind`,
-  and `cid` so cid cleanup and reuse are scoped to the intended registry.
+  `target_registry`, `callable_kind`, and `callable_hash_digest`.
+- `UNREGISTER_CALLABLE` carries the same `target_registry`, `callable_kind`,
+  and `callable_hash_digest` so cleanup is scoped to the intended registry.
 
 Multi-endpoint parent registration uses two-phase visibility:
 
 1. The parent sends `PREPARE_REGISTER_CALLABLE` to every selected endpoint.
    Each endpoint validates the descriptor/payload, checks feature gates, stages
-   any callable bytes, and records the cid as prepared but not visible to TASK.
+   any callable bytes, and records the hashid as prepared but not visible to
+   TASK.
 2. If every prepare succeeds, the parent sends `COMMIT_REGISTER_CALLABLE` to
-   every selected endpoint. A successful commit makes the cid visible to later
-   TASK frames on that endpoint.
+   every selected endpoint. A successful commit makes the hashid visible to
+   later TASK frames on that endpoint.
 3. If any prepare or commit fails, the parent sends `ABORT_REGISTER_CALLABLE`
-   to endpoints with prepared or uncertain state, keeps the cid invisible, and
-   marks endpoints failed when their final registry state cannot be proven.
+   to endpoints with prepared or uncertain state, keeps the hashid invisible,
+   and marks endpoints failed when their final registry state cannot be proven.
 
-Unregister creates a parent-side tombstone. The cid cannot be reused until
-every selected endpoint has confirmed cleanup, or until any non-responsive
-endpoint has been removed from eligibility and marked failed.
+Final unregister creates a parent-side tombstone for the selected
+endpoint/hashid pairs. The hashid remains dispatchable through any other live
+handle that still owns a reference. Once the final reference is dropped for an
+endpoint, that endpoint/hashid pair cannot be dispatched or published by a new
+handle until cleanup is confirmed, or until any non-responsive endpoint has
+been removed from eligibility and marked failed. If register rollback cleanup
+cannot be confirmed, that endpoint/hashid pair enters a cleanup-uncertain state
+and is unusable for the current session.
 
 ## CONTROL_REPLY Payload
 
@@ -393,8 +435,9 @@ All transports must provide the following visibility rules:
 - Control side effects are visible before the matching `CONTROL_REPLY`.
 - Register-family controls and `UNREGISTER_CALLABLE` serialize with TASK
   dispatch on the same endpoint. A successful commit reply happens-before later
-  TASK frames that use the cid. A successful unregister reply happens-before
-  later cid reuse.
+  TASK frames that use the hashid. A successful final-unregister reply
+  happens-before later same-hashid re-registration or dispatch on the affected
+  endpoint.
 - Health messages may be observed while a TASK is running, but they must not
   expose or mutate task, callable, buffer, or domain state.
 

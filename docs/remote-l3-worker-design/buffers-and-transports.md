@@ -122,7 +122,7 @@ args.add_tensor(
     RemoteTensorRef(out, offset=0, shape=(1024,), dtype=DataType.FLOAT32),
     TensorArgType.OUTPUT,
 )
-orch.submit_next_level(cid, args, cfg, worker=l3_worker_id)
+orch.submit_next_level(l3_handle, args, cfg, worker=l3_worker_id)
 ```
 
 This keeps submit-time validation simple: the slot already carries complete
