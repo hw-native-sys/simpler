@@ -51,6 +51,39 @@ class TimingResult:
     scheduler_log_us: float | None = None
 
 
+@dataclass(frozen=True)
+class ShapePreset:
+    highperf_case: str
+    batch: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    block_size: int
+    context_len: int
+
+
+SHAPE_PRESETS = {
+    "b1_h32_kv8_s128_bs128_fp16": ShapePreset(
+        highperf_case="b1_h32_kv8_s128_bs128_fp16",
+        batch=1,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        block_size=128,
+        context_len=128,
+    ),
+    "b4_h32_kv8_s512_bs128_fp16": ShapePreset(
+        highperf_case="b4_h32_kv8_s512_bs128_fp16",
+        batch=4,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        block_size=128,
+        context_len=512,
+    ),
+}
+
+
 def _backend_for(platform: str) -> BackendType:
     return BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
 
@@ -227,6 +260,38 @@ def _parse_pypto_child_timing(output: str, args: argparse.Namespace) -> TimingRe
         device_us=mean(event_samples) if event_samples else None,
         scheduler_log_us=mean(log_samples) if log_samples else None,
     )
+
+
+def _apply_shape_preset(args: argparse.Namespace, preset: ShapePreset) -> argparse.Namespace:
+    shaped_args = argparse.Namespace(**vars(args))
+    shaped_args.highperf_case = preset.highperf_case
+    shaped_args.batch = preset.batch
+    shaped_args.num_heads = preset.num_heads
+    shaped_args.num_kv_heads = preset.num_kv_heads
+    shaped_args.head_dim = preset.head_dim
+    shaped_args.block_size = preset.block_size
+    shaped_args.context_len = preset.context_len
+    shaped_args.max_model_len = preset.context_len
+    shaped_args.scale = 1.0 / math.sqrt(float(preset.head_dim))
+    if shaped_args.q_tile is None:
+        shaped_args.q_tile = 16
+    return shaped_args
+
+
+def _selected_shape_names(args: argparse.Namespace) -> list[str]:
+    if args.shape_suite:
+        return list(SHAPE_PRESETS)
+    return args.shape or []
+
+
+def _attention_matmul_flops(args: argparse.Namespace) -> int:
+    return 4 * args.batch * args.num_heads * args.context_len * args.head_dim
+
+
+def _device_gflops(args: argparse.Namespace, result: TimingResult) -> float | None:
+    if result.device_us is None or result.device_us <= 0:
+        return None
+    return _attention_matmul_flops(args) / (result.device_us * 1_000.0)
 
 
 def _device_log_snapshot(device: int) -> dict[Path, int]:
@@ -466,6 +531,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-l2-swimlane", action="store_true")
     parser.add_argument("--repo-root", type=Path, default=_default_repo_root())
     parser.add_argument("--pypto-example", type=Path, default=DEFAULT_PYTPO_EXAMPLE)
+    parser.add_argument("--shape", action="append", choices=sorted(SHAPE_PRESETS))
+    parser.add_argument("--shape-suite", action="store_true")
     parser.add_argument("--validate-pypto", action="store_true")
     parser.add_argument("--validate-results", action="store_true")
     parser.add_argument("--highperf-case", default="b4_h32_kv8_s512_bs128_fp16")
@@ -486,16 +553,75 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _print_highperf_result(result: TimingResult) -> None:
+def _print_highperf_result(args: argparse.Namespace, result: TimingResult) -> None:
     print(f"highperf host e2e avg:        {result.host_us:.1f} us")
+    device_gflops = _device_gflops(args, result)
     if result.device_us is not None:
         print(f"highperf runtime device avg:  {result.device_us:.1f} us")
+    if device_gflops is not None:
+        print(f"highperf device throughput:   {device_gflops:.2f} GFLOP/s")
 
 
-def _print_pypto_result(result: TimingResult) -> None:
+def _print_pypto_result(args: argparse.Namespace, result: TimingResult) -> None:
     print(f"PyPTO host e2e avg:           {result.host_us:.1f} us")
+    device_gflops = _device_gflops(args, result)
     if result.device_us is not None:
         print(f"PyPTO torch.npu.Event avg:    {result.device_us:.1f} us")
+    if device_gflops is not None:
+        print(f"PyPTO device throughput:      {device_gflops:.2f} GFLOP/s")
+
+
+def _run_one_shape(args: argparse.Namespace) -> tuple[TimingResult | None, TimingResult | None]:
+    print(f"Note: PyPTO runs from {args.pypto_example} with deterministic highperf-style inputs.")
+    print("Note: host e2e is the primary comparison; PyPTO torch.npu.Event timing is secondary context.")
+    highperf = None if args.skip_highperf else _run_highperf(args)
+    pypto = None if args.skip_pypto else _run_pypto(args)
+
+    print("\n== summary ==")
+    if highperf is not None:
+        _print_highperf_result(args, highperf)
+    if pypto is not None:
+        _print_pypto_result(args, pypto)
+    if highperf is not None and pypto is not None:
+        if highperf.host_us > 0:
+            print(f"PyPTO / highperf host e2e:    {pypto.host_us / highperf.host_us:.2f}x")
+    return highperf, pypto
+
+
+def _run_shape_suite(args: argparse.Namespace, shape_names: list[str]) -> None:
+    rows = []
+    for shape_name in shape_names:
+        shape_args = _apply_shape_preset(args, SHAPE_PRESETS[shape_name])
+        print(f"\n######## shape: {shape_name} ########")
+        highperf, pypto = _run_one_shape(shape_args)
+        rows.append((shape_name, highperf, pypto))
+
+    print("\n== shape suite summary ==")
+    for shape_name, highperf, pypto in rows:
+        highperf_host = f"{highperf.host_us:.1f}" if highperf is not None else "n/a"
+        pypto_host = f"{pypto.host_us:.1f}" if pypto is not None else "n/a"
+        pypto_event = "n/a"
+        if pypto is not None and pypto.device_us is not None:
+            pypto_event = f"{pypto.device_us:.1f}"
+        highperf_gflops = "n/a"
+        if highperf is not None:
+            highperf_gflops_value = _device_gflops(SHAPE_PRESETS[shape_name], highperf)
+            if highperf_gflops_value is not None:
+                highperf_gflops = f"{highperf_gflops_value:.2f}"
+        pypto_gflops = "n/a"
+        if pypto is not None:
+            pypto_gflops_value = _device_gflops(SHAPE_PRESETS[shape_name], pypto)
+            if pypto_gflops_value is not None:
+                pypto_gflops = f"{pypto_gflops_value:.2f}"
+        ratio = "n/a"
+        if highperf is not None and pypto is not None and highperf.host_us > 0:
+            ratio = f"{pypto.host_us / highperf.host_us:.2f}x"
+        print(
+            f"{shape_name}: highperf_host_us={highperf_host} "
+            f"pypto_host_us={pypto_host} pypto_npu_event_us={pypto_event} "
+            f"highperf_device_gflops={highperf_gflops} pypto_device_gflops={pypto_gflops} "
+            f"pypto/highperf={ratio}"
+        )
 
 
 def main() -> None:
@@ -518,20 +644,11 @@ def main() -> None:
         raise SystemExit("nothing to benchmark")
     if args.validate_results:
         args.validate_pypto = True
-
-    print(f"Note: PyPTO runs from {args.pypto_example} with deterministic highperf-style inputs.")
-    print("Note: host e2e is the primary comparison; PyPTO torch.npu.Event timing is secondary context.")
-    highperf = None if args.skip_highperf else _run_highperf(args)
-    pypto = None if args.skip_pypto else _run_pypto(args)
-
-    print("\n== summary ==")
-    if highperf is not None:
-        _print_highperf_result(highperf)
-    if pypto is not None:
-        _print_pypto_result(pypto)
-    if highperf is not None and pypto is not None:
-        if highperf.host_us > 0:
-            print(f"PyPTO / highperf host e2e:    {pypto.host_us / highperf.host_us:.2f}x")
+    shape_names = _selected_shape_names(args)
+    if shape_names:
+        _run_shape_suite(args, shape_names)
+    else:
+        _run_one_shape(args)
 
 
 if __name__ == "__main__":

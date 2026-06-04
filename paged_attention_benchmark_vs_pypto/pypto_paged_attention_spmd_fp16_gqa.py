@@ -828,7 +828,7 @@ def main():
             "config": config,
         },
     )
-    assert torch.allclose(output, expected_out, rtol=2e-2, atol=2e-2), (
+    assert torch.allclose(output, expected_out, rtol=1e-3, atol=1e-3), (
         f"Validation failed: max diff = {(output - expected_out).abs().max().item()}"
     )
     print("PASSED")
