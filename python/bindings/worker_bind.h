@@ -296,12 +296,49 @@ inline void bind_worker(nb::module_ &m) {
             "control_comm_init", &Worker::control_comm_init, nb::arg("worker_id"), nb::arg("request_shm_name"),
             nb::call_guard<nb::gil_scoped_release>(),
             "Drive one NEXT_LEVEL chip child through CTRL_COMM_INIT (lazy base comm init)."
+        )
+        .def(
+            "control_open_mapped_region", &Worker::control_open_mapped_region, nb::arg("worker_id"),
+            nb::arg("data_bytes"), nb::arg("signal_count"), nb::arg("flags"), nb::call_guard<nb::gil_scoped_release>(),
+            "Open a HostDeviceMappedRegion on a NEXT_LEVEL chip child."
+        )
+        .def(
+            "control_close_mapped_region", &Worker::control_close_mapped_region, nb::arg("worker_id"),
+            nb::arg("handle"), nb::call_guard<nb::gil_scoped_release>(),
+            "Close a HostDeviceMappedRegion on a NEXT_LEVEL chip child."
+        )
+        .def(
+            "control_mapped_region_payload", &Worker::control_mapped_region_payload, nb::arg("worker_id"),
+            nb::arg("sub_cmd"), nb::arg("shm_name"), nb::call_guard<nb::gil_scoped_release>(),
+            "Dispatch a HostDeviceMappedRegion side-band shm payload command."
+        )
+        .def(
+            "control_mapped_region_notify", &Worker::control_mapped_region_notify, nb::arg("worker_id"),
+            nb::arg("handle"), nb::arg("signal_id"), nb::arg("value"), nb::call_guard<nb::gil_scoped_release>(),
+            "Notify a HostDeviceMappedRegion signal slot on a NEXT_LEVEL chip child."
+        )
+        .def(
+            "control_mapped_region_wait", &Worker::control_mapped_region_wait, nb::arg("worker_id"), nb::arg("handle"),
+            nb::arg("signal_id"), nb::arg("target"), nb::arg("timeout_us"), nb::call_guard<nb::gil_scoped_release>(),
+            "Wait on a HostDeviceMappedRegion signal slot on a NEXT_LEVEL chip child."
         );
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);
     m.attr("MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
     m.attr("MAILBOX_OFF_ERROR_MSG") = static_cast<int>(MAILBOX_OFF_ERROR_MSG);
     m.attr("MAILBOX_ERROR_MSG_SIZE") = static_cast<int>(MAILBOX_ERROR_MSG_SIZE);
+    m.attr("CTRL_OFF_ARG0") = static_cast<int>(CTRL_OFF_ARG0);
+    m.attr("CTRL_OFF_ARG1") = static_cast<int>(CTRL_OFF_ARG1);
+    m.attr("CTRL_OFF_ARG2") = static_cast<int>(CTRL_OFF_ARG2);
+    m.attr("CTRL_OFF_ARG3") = static_cast<int>(CTRL_OFF_ARG3);
+    m.attr("CTRL_OFF_RESULT") = static_cast<int>(CTRL_OFF_RESULT);
+    m.attr("CTRL_OPEN_MAPPED_REGION") = static_cast<uint64_t>(CTRL_OPEN_MAPPED_REGION);
+    m.attr("CTRL_CLOSE_MAPPED_REGION") = static_cast<uint64_t>(CTRL_CLOSE_MAPPED_REGION);
+    m.attr("CTRL_MAPPED_REGION_INFO") = static_cast<uint64_t>(CTRL_MAPPED_REGION_INFO);
+    m.attr("CTRL_MAPPED_REGION_DATACOPY_H2REGION") = static_cast<uint64_t>(CTRL_MAPPED_REGION_DATACOPY_H2REGION);
+    m.attr("CTRL_MAPPED_REGION_DATACOPY_REGION2H") = static_cast<uint64_t>(CTRL_MAPPED_REGION_DATACOPY_REGION2H);
+    m.attr("CTRL_MAPPED_REGION_NOTIFY") = static_cast<uint64_t>(CTRL_MAPPED_REGION_NOTIFY);
+    m.attr("CTRL_MAPPED_REGION_WAIT") = static_cast<uint64_t>(CTRL_MAPPED_REGION_WAIT);
     m.attr("MAX_RING_DEPTH") = static_cast<int32_t>(MAX_RING_DEPTH);
     m.attr("MAX_SCOPE_DEPTH") = static_cast<int32_t>(MAX_SCOPE_DEPTH);
 

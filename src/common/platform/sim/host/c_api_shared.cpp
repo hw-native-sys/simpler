@@ -25,6 +25,7 @@
 
 #include "callable.h"
 #include "device_runner_base.h"
+#include "host_device_comm/host_device_mapped_region.h"
 #include "prepare_callable_common.h"
 #include "task_args.h"
 
@@ -145,7 +146,10 @@ static void *acquire_pooled_runtime_arena_wrapper() {
  * Public C API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
 
-void destroy_device_context(DeviceContextHandle ctx) { delete static_cast<SimDeviceRunnerBase *>(ctx); }
+void destroy_device_context(DeviceContextHandle ctx) {
+    host_device_mapped_region_close_all_common(ctx);
+    delete static_cast<SimDeviceRunnerBase *>(ctx);
+}
 
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
@@ -186,6 +190,7 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return -1;
     try {
+        host_device_mapped_region_close_all_common(ctx);
         int rc = static_cast<SimDeviceRunnerBase *>(ctx)->finalize();
         int dev = pto_cpu_sim_get_bound_device();
         if (dev >= 0) {

@@ -623,6 +623,10 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
+          git clone https://github.com/hw-native-sys/pto-isa.git build/pto-isa
+          git -C build/pto-isa checkout "$PTO_ISA_COMMIT"
+          export PTO_ISA_ROOT="$PWD/build/pto-isa"
+          echo "PTO_ISA_ROOT=$PTO_ISA_ROOT" >> "$GITHUB_ENV"
           pip install '.[test]'
 
       - name: Run Python hardware unit tests (a5)
@@ -688,6 +692,10 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
+          git clone https://github.com/hw-native-sys/pto-isa.git build/pto-isa
+          git -C build/pto-isa checkout "$PTO_ISA_COMMIT"
+          export PTO_ISA_ROOT="$PWD/build/pto-isa"
+          echo "PTO_ISA_ROOT=$PTO_ISA_ROOT" >> "$GITHUB_ENV"
           pip install '.[test]'
 
       - name: Run pytest scene tests (a5)

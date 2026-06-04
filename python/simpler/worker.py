@@ -56,17 +56,55 @@ Usage::
 """
 
 import ctypes
+import errno
 import os
 import signal
 import struct
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Optional
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    CTRL_CLOSE_MAPPED_REGION as _CPP_CTRL_CLOSE_MAPPED_REGION,
+)
+from _task_interface import (
+    CTRL_MAPPED_REGION_DATACOPY_H2REGION as _CPP_CTRL_MAPPED_REGION_DATACOPY_H2REGION,
+)
+from _task_interface import (
+    CTRL_MAPPED_REGION_DATACOPY_REGION2H as _CPP_CTRL_MAPPED_REGION_DATACOPY_REGION2H,
+)
+from _task_interface import (
+    CTRL_MAPPED_REGION_INFO as _CPP_CTRL_MAPPED_REGION_INFO,
+)
+from _task_interface import (
+    CTRL_MAPPED_REGION_NOTIFY as _CPP_CTRL_MAPPED_REGION_NOTIFY,
+)
+from _task_interface import (
+    CTRL_MAPPED_REGION_WAIT as _CPP_CTRL_MAPPED_REGION_WAIT,
+)
+from _task_interface import (
+    CTRL_OFF_ARG0 as _CPP_CTRL_OFF_ARG0,
+)
+from _task_interface import (
+    CTRL_OFF_ARG1 as _CPP_CTRL_OFF_ARG1,
+)
+from _task_interface import (
+    CTRL_OFF_ARG2 as _CPP_CTRL_OFF_ARG2,
+)
+from _task_interface import (
+    CTRL_OFF_ARG3 as _CPP_CTRL_OFF_ARG3,
+)
+from _task_interface import (
+    CTRL_OFF_RESULT as _CPP_CTRL_OFF_RESULT,
+)
+from _task_interface import (
+    CTRL_OPEN_MAPPED_REGION as _CPP_CTRL_OPEN_MAPPED_REGION,
+)
+from _task_interface import (
     MAX_REGISTERED_CALLABLE_IDS,
     RunTiming,
     WorkerType,
@@ -87,6 +125,7 @@ from .task_interface import (
     ChipWorker,
     CommBufferSpec,
     CommDomainHandle,
+    MappedRegionInfo,
     TaskArgs,
     _Worker,
 )
@@ -174,6 +213,13 @@ _CTRL_RELEASE_DOMAIN = 8
 _CTRL_COMM_INIT = 9
 _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
+_CTRL_OPEN_MAPPED_REGION = int(_CPP_CTRL_OPEN_MAPPED_REGION)
+_CTRL_CLOSE_MAPPED_REGION = int(_CPP_CTRL_CLOSE_MAPPED_REGION)
+_CTRL_MAPPED_REGION_INFO = int(_CPP_CTRL_MAPPED_REGION_INFO)
+_CTRL_MAPPED_REGION_DATACOPY_H2REGION = int(_CPP_CTRL_MAPPED_REGION_DATACOPY_H2REGION)
+_CTRL_MAPPED_REGION_DATACOPY_REGION2H = int(_CPP_CTRL_MAPPED_REGION_DATACOPY_REGION2H)
+_CTRL_MAPPED_REGION_NOTIFY = int(_CPP_CTRL_MAPPED_REGION_NOTIFY)
+_CTRL_MAPPED_REGION_WAIT = int(_CPP_CTRL_MAPPED_REGION_WAIT)
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -213,11 +259,35 @@ assert _DOMAIN_REPLY_HEADER.size == 24
 #   offset 16:                  uint64  arg0 (size for malloc; dev_ptr for free/copy)
 #   offset 24:                  uint64  arg1 (host_ptr for copy)
 #   offset 32:                  uint64  arg2 (nbytes for copy)
-#   offset 40:                  uint64  result (returned ptr from malloc)
-_CTRL_OFF_ARG0 = 16
-_CTRL_OFF_ARG1 = 24
-_CTRL_OFF_ARG2 = 32
-_CTRL_OFF_RESULT = 40
+#   offset 40:                  uint64  arg3 (timeout_us for mapped-region wait)
+#   offset 48:                  uint64  result (returned ptr from malloc/open)
+_CTRL_OFF_ARG0 = int(_CPP_CTRL_OFF_ARG0)
+_CTRL_OFF_ARG1 = int(_CPP_CTRL_OFF_ARG1)
+_CTRL_OFF_ARG2 = int(_CPP_CTRL_OFF_ARG2)
+_CTRL_OFF_ARG3 = int(_CPP_CTRL_OFF_ARG3)
+_CTRL_OFF_RESULT = int(_CPP_CTRL_OFF_RESULT)
+
+_HDMR_MAGIC = b"HMRD"
+_HDMR_VERSION = 1
+_HDMR_OP_INFO = 1
+_HDMR_OP_H2REGION = 2
+_HDMR_OP_REGION2H = 3
+_HDMR_HEADER = struct.Struct("<4sHHQQQiI24x")
+assert _HDMR_HEADER.size == 64
+_HDMR_STATUS_OFFSET = 4 + 2 + 2 + 8 + 8 + 8
+_HDMR_INFO_PAYLOAD = struct.Struct("<QQQQQI4xQI4x")
+assert _HDMR_INFO_PAYLOAD.size == 64
+
+
+def _mapped_region_byte_view(buf: memoryview) -> memoryview:
+    if buf.format == "B" and buf.itemsize == 1:
+        return buf
+    return buf.cast("B")
+
+
+def _release_mapped_region_byte_view(buf: memoryview, raw_buf: memoryview) -> None:
+    if buf is not raw_buf:
+        buf.release()
 
 
 def _pack_py_callable_payload(target) -> bytes:
@@ -499,6 +569,83 @@ def _handle_ctrl_release_domain(cw: "ChipWorker", buf: memoryview) -> None:
     cw._impl.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
 
 
+def _mapped_region_exception_status(exc: BaseException) -> int:
+    if isinstance(exc, (ValueError, TypeError)):
+        return -errno.EINVAL
+    if isinstance(exc, TimeoutError):
+        return -errno.EAGAIN
+    msg = str(exc)
+    if "-95" in msg or "ENOTSUP" in msg:
+        return -errno.ENOTSUP
+    return -errno.EIO
+
+
+def _handle_ctrl_mapped_region_payload(cw: "ChipWorker", buf: memoryview, sub_cmd: int) -> None:
+    shm_name = _read_shm_name(buf, _OFF_ARGS)
+    expected_op = {
+        _CTRL_MAPPED_REGION_INFO: _HDMR_OP_INFO,
+        _CTRL_MAPPED_REGION_DATACOPY_H2REGION: _HDMR_OP_H2REGION,
+        _CTRL_MAPPED_REGION_DATACOPY_REGION2H: _HDMR_OP_REGION2H,
+    }.get(int(sub_cmd))
+    if expected_op is None:
+        raise RuntimeError(f"mapped-region payload: invalid sub-command {int(sub_cmd)}")
+
+    shm = SharedMemory(name=shm_name)
+    try:
+        raw_buf = shm.buf
+        assert raw_buf is not None
+        shm_buf = _mapped_region_byte_view(raw_buf)
+        try:
+            if shm.size < _HDMR_HEADER.size:
+                raise RuntimeError(f"mapped-region payload too small: {shm.size} bytes")
+            magic, version, op, region, offset, nbytes, _status, reserved = _HDMR_HEADER.unpack_from(shm_buf, 0)
+            if magic != _HDMR_MAGIC:
+                raise RuntimeError(f"mapped-region payload invalid magic: {magic!r}")
+            if version != _HDMR_VERSION:
+                raise RuntimeError(f"mapped-region payload unsupported version: {version}")
+            if op != expected_op:
+                raise RuntimeError(f"mapped-region payload op {op} does not match sub-command {int(sub_cmd)}")
+            if reserved != 0:
+                raise RuntimeError(f"mapped-region payload reserved field must be zero, got {reserved}")
+            required_size = _HDMR_HEADER.size + (0 if op == _HDMR_OP_INFO else int(nbytes))
+            if op == _HDMR_OP_INFO:
+                required_size = _HDMR_HEADER.size + _HDMR_INFO_PAYLOAD.size
+            if required_size > shm.size:
+                raise RuntimeError(f"mapped-region payload size mismatch: need {required_size}, shm={shm.size}")
+
+            status = 0
+            try:
+                if op == _HDMR_OP_INFO:
+                    info = cw.mapped_region_info(int(region))
+                    _HDMR_INFO_PAYLOAD.pack_into(
+                        shm_buf,
+                        _HDMR_HEADER.size,
+                        0,
+                        int(info.device_data_ptr),
+                        int(info.data_bytes),
+                        0,
+                        int(info.device_signal_ptr),
+                        int(info.signal_count),
+                        int(info.total_bytes),
+                        int(info.flags),
+                    )
+                elif op == _HDMR_OP_H2REGION:
+                    payload = bytes(shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)])
+                    cw.mapped_region_datacopy_h2region(int(region), int(offset), payload)
+                elif op == _HDMR_OP_REGION2H:
+                    payload = cw.mapped_region_datacopy_region2h(int(region), int(offset), int(nbytes))
+                    shm_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)] = payload
+                else:
+                    status = -errno.EINVAL
+            except Exception as e:  # noqa: BLE001
+                status = _mapped_region_exception_status(e)
+            struct.pack_into("<i", shm_buf, _HDMR_STATUS_OFFSET, int(status))
+        finally:
+            _release_mapped_region_byte_view(shm_buf, raw_buf)
+    finally:
+        shm.close()
+
+
 def _comm_base_handle(cw: "ChipWorker") -> int:
     """Return the cached base-communicator handle the chip allocated during bootstrap.
 
@@ -531,7 +678,7 @@ def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id:
     prepared.add(cid)
 
 
-def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands + SHUTDOWN form the unified state machine; cannot collapse without obscuring dispatch
+def _run_chip_main_loop(  # noqa: PLR0912,PLR0915 -- TASK_READY + control sub-commands + SHUTDOWN form the unified state machine; cannot collapse without obscuring dispatch
     cw: ChipWorker,
     buf: memoryview,
     mailbox_addr: int,
@@ -658,6 +805,32 @@ def _run_chip_main_loop(  # noqa: PLR0912 -- TASK_READY + 6 control sub-commands
                     _handle_ctrl_release_domain(cw, buf)
                 elif sub_cmd == _CTRL_COMM_INIT:
                     _handle_ctrl_comm_init(cw, buf)
+                elif sub_cmd == _CTRL_OPEN_MAPPED_REGION:
+                    data_bytes = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    signal_count = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                    flags = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                    handle = cw.open_mapped_region(int(data_bytes), int(signal_count), int(flags))
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, int(handle))
+                elif sub_cmd == _CTRL_CLOSE_MAPPED_REGION:
+                    handle = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    cw.close_mapped_region(int(handle))
+                elif sub_cmd in (
+                    _CTRL_MAPPED_REGION_INFO,
+                    _CTRL_MAPPED_REGION_DATACOPY_H2REGION,
+                    _CTRL_MAPPED_REGION_DATACOPY_REGION2H,
+                ):
+                    _handle_ctrl_mapped_region_payload(cw, buf, int(sub_cmd))
+                elif sub_cmd == _CTRL_MAPPED_REGION_NOTIFY:
+                    handle = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    signal_id = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                    value = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                    cw.mapped_region_notify(int(handle), int(signal_id), int(value))
+                elif sub_cmd == _CTRL_MAPPED_REGION_WAIT:
+                    handle = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    signal_id = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                    target = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                    timeout_us = struct.unpack_from("Q", buf, _CTRL_OFF_ARG3)[0]
+                    cw.mapped_region_wait(int(handle), int(signal_id), int(target), int(timeout_us))
                 else:
                     raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
             except Exception as e:  # noqa: BLE001
@@ -840,6 +1013,16 @@ def _child_worker_loop(
 # ---------------------------------------------------------------------------
 # Worker factory
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MappedRegion:
+    handle: int
+    worker_id: int
+    data_bytes: int
+    signal_count: int
+    flags: int
+    closed: bool = False
 
 
 class Worker:
@@ -1274,6 +1457,257 @@ class Worker:
         for cid, target in self._callable_registry.items():
             if isinstance(target, ChipCallable):
                 self._chip_worker.prepare_callable(cid, target)
+
+    def _resolve_mapped_region_worker_id(self, region: MappedRegion, worker_id: Optional[int]) -> int:
+        selected = region.worker_id if worker_id is None else int(worker_id)
+        if selected != region.worker_id:
+            raise ValueError(f"mapped region belongs to worker_id={region.worker_id}, got worker_id={selected}")
+        return selected
+
+    def _ensure_open_mapped_region(self, region: MappedRegion, worker_id: Optional[int]) -> int:
+        selected = self._resolve_mapped_region_worker_id(region, worker_id)
+        if region.closed:
+            raise ValueError("mapped region is closed")
+        return selected
+
+    def _mapped_region_chip_worker(self, worker_id: int) -> ChipWorker:
+        if self.level != 2:
+            raise NotImplementedError("mapped-region L3 proxy support is not implemented yet")
+        if worker_id != 0:
+            raise ValueError("level-2 mapped regions only support worker_id=0")
+        if self._chip_worker is None:
+            raise RuntimeError("Worker.init() must be called before mapped-region operations")
+        return self._chip_worker
+
+    def _ensure_mapped_region_l3_control_ready(self, worker_id: int) -> _Worker:
+        if not self._initialized:
+            raise RuntimeError("Worker.init() must be called before mapped-region operations")
+        if self.level != 3:
+            raise RuntimeError("mapped-region L3 proxy support requires a level-3 Worker with chip children")
+        self._check_chip_worker_id(worker_id)
+        if not getattr(self, "_hierarchical_started", False):
+            self._start_hierarchical()
+        if self._worker is None:
+            raise RuntimeError("mapped-region L3 proxy is not available after Worker.close()")
+        return self._worker
+
+    def _raise_mapped_region_control_error(self, exc: RuntimeError) -> None:
+        msg = str(exc)
+        if "TimeoutError" in msg or "timed out" in msg:
+            raise TimeoutError(msg) from exc
+        if "ValueError" in msg or "invalid_argument" in msg or "code -22" in msg:
+            raise ValueError(msg) from exc
+        raise exc
+
+    def _raise_mapped_region_status(self, status: int) -> None:
+        if status == 0:
+            return
+        if status in (-errno.EAGAIN, -errno.EWOULDBLOCK):
+            raise TimeoutError(f"mapped-region operation timed out with status {status}")
+        if status == -errno.EINVAL:
+            raise ValueError(f"mapped-region operation failed with status {status}")
+        raise RuntimeError(f"mapped-region operation failed with status {status}")
+
+    def _mapped_region_shm_name(self, worker_id: int) -> str:
+        counter = getattr(self, "_mapped_region_shm_counter", 0)
+        self._mapped_region_shm_counter = counter + 1
+        name = f"simpler-hdmr-{os.getpid()}-{int(worker_id)}-{counter}"
+        if len(name.encode("utf-8")) + 1 > _CTRL_SHM_NAME_BYTES:
+            raise RuntimeError(f"mapped-region shm name too long: {name}")
+        return name
+
+    def _mapped_region_payload_roundtrip(
+        self,
+        worker_id: int,
+        sub_cmd: int,
+        op: int,
+        region_handle: int,
+        offset: int,
+        payload: bytes,
+        reply_nbytes: int,
+    ) -> tuple[int, bytes]:
+        dw = self._ensure_mapped_region_l3_control_ready(worker_id)
+        nbytes = len(payload) if op == _HDMR_OP_H2REGION else int(reply_nbytes)
+        shm_size = _HDMR_HEADER.size + (_HDMR_INFO_PAYLOAD.size if op == _HDMR_OP_INFO else int(nbytes))
+        shm = SharedMemory(name=self._mapped_region_shm_name(worker_id), create=True, size=shm_size)
+        try:
+            raw_buf = shm.buf
+            assert raw_buf is not None
+            shm_buf = _mapped_region_byte_view(raw_buf)
+            payload_buf = shm_buf[:shm_size]
+            try:
+                payload_buf[:] = b"\x00" * shm_size
+                _HDMR_HEADER.pack_into(
+                    payload_buf,
+                    0,
+                    _HDMR_MAGIC,
+                    _HDMR_VERSION,
+                    int(op),
+                    int(region_handle),
+                    int(offset),
+                    int(nbytes),
+                    0,
+                    0,
+                )
+                if payload:
+                    payload_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + len(payload)] = payload
+                try:
+                    dw.control_mapped_region_payload(int(worker_id), int(sub_cmd), shm.name)
+                except RuntimeError as e:
+                    self._raise_mapped_region_control_error(e)
+                status = struct.unpack_from("<i", payload_buf, _HDMR_STATUS_OFFSET)[0]
+                reply = bytes(payload_buf[_HDMR_HEADER.size : _HDMR_HEADER.size + int(nbytes)])
+                return int(status), reply
+            finally:
+                payload_buf.release()
+                _release_mapped_region_byte_view(shm_buf, raw_buf)
+        finally:
+            try:
+                shm.close()
+            finally:
+                shm.unlink()
+
+    def open_mapped_region(
+        self,
+        data_bytes: int,
+        signal_count: int = 1,
+        flags: int = 0,
+        worker_id: int = 0,
+    ) -> MappedRegion:
+        worker_id = int(worker_id)
+        if self.level == 2:
+            handle = self._mapped_region_chip_worker(worker_id).open_mapped_region(
+                int(data_bytes), int(signal_count), int(flags)
+            )
+        else:
+            dw = self._ensure_mapped_region_l3_control_ready(worker_id)
+            try:
+                handle = dw.control_open_mapped_region(worker_id, int(data_bytes), int(signal_count), int(flags))
+            except RuntimeError as e:
+                self._raise_mapped_region_control_error(e)
+        return MappedRegion(
+            handle=int(handle),
+            worker_id=int(worker_id),
+            data_bytes=int(data_bytes),
+            signal_count=int(signal_count),
+            flags=int(flags),
+        )
+
+    def close_mapped_region(self, region: MappedRegion, worker_id: Optional[int] = None) -> None:
+        selected = self._resolve_mapped_region_worker_id(region, worker_id)
+        if region.closed:
+            return
+        if self.level == 2:
+            self._mapped_region_chip_worker(selected).close_mapped_region(region.handle)
+        else:
+            dw = self._ensure_mapped_region_l3_control_ready(selected)
+            try:
+                dw.control_close_mapped_region(selected, int(region.handle))
+            except RuntimeError as e:
+                self._raise_mapped_region_control_error(e)
+        object.__setattr__(region, "closed", True)
+
+    def mapped_region_info(self, region: MappedRegion, worker_id: Optional[int] = None) -> MappedRegionInfo:
+        selected = self._ensure_open_mapped_region(region, worker_id)
+        if self.level == 2:
+            return self._mapped_region_chip_worker(selected).mapped_region_info(region.handle)
+        status, payload = self._mapped_region_payload_roundtrip(
+            selected, _CTRL_MAPPED_REGION_INFO, _HDMR_OP_INFO, int(region.handle), 0, b"", _HDMR_INFO_PAYLOAD.size
+        )
+        self._raise_mapped_region_status(status)
+        fields = _HDMR_INFO_PAYLOAD.unpack_from(payload, 0)
+        return MappedRegionInfo(*fields)
+
+    def mapped_region_datacopy_h2region(
+        self,
+        region: MappedRegion,
+        offset: int,
+        data,
+        worker_id: Optional[int] = None,
+    ) -> None:
+        if isinstance(data, str):
+            raise ValueError("mapped_region_datacopy_h2region requires a bytes-like object")
+        selected = self._ensure_open_mapped_region(region, worker_id)
+        if self.level == 2:
+            self._mapped_region_chip_worker(selected).mapped_region_datacopy_h2region(region.handle, int(offset), data)
+            return
+        try:
+            payload = memoryview(data)
+        except TypeError as e:
+            raise ValueError("mapped_region_datacopy_h2region requires a bytes-like object") from e
+        if not payload.contiguous:
+            raise ValueError("mapped_region_datacopy_h2region requires a contiguous bytes-like object")
+        status, _ = self._mapped_region_payload_roundtrip(
+            selected,
+            _CTRL_MAPPED_REGION_DATACOPY_H2REGION,
+            _HDMR_OP_H2REGION,
+            int(region.handle),
+            int(offset),
+            bytes(payload),
+            0,
+        )
+        self._raise_mapped_region_status(status)
+
+    def mapped_region_datacopy_region2h(
+        self,
+        region: MappedRegion,
+        offset: int,
+        nbytes: int,
+        worker_id: Optional[int] = None,
+    ) -> bytes:
+        selected = self._ensure_open_mapped_region(region, worker_id)
+        if self.level == 2:
+            return self._mapped_region_chip_worker(selected).mapped_region_datacopy_region2h(
+                region.handle, int(offset), int(nbytes)
+            )
+        status, payload = self._mapped_region_payload_roundtrip(
+            selected,
+            _CTRL_MAPPED_REGION_DATACOPY_REGION2H,
+            _HDMR_OP_REGION2H,
+            int(region.handle),
+            int(offset),
+            b"",
+            int(nbytes),
+        )
+        self._raise_mapped_region_status(status)
+        return payload
+
+    def mapped_region_notify(
+        self,
+        region: MappedRegion,
+        signal_id: int,
+        value: int,
+        worker_id: Optional[int] = None,
+    ) -> None:
+        selected = self._ensure_open_mapped_region(region, worker_id)
+        if self.level == 2:
+            self._mapped_region_chip_worker(selected).mapped_region_notify(region.handle, int(signal_id), int(value))
+            return
+        dw = self._ensure_mapped_region_l3_control_ready(selected)
+        try:
+            dw.control_mapped_region_notify(selected, int(region.handle), int(signal_id), int(value))
+        except RuntimeError as e:
+            self._raise_mapped_region_control_error(e)
+
+    def mapped_region_wait(
+        self,
+        region: MappedRegion,
+        signal_id: int,
+        target: int,
+        timeout_us: int,
+        worker_id: Optional[int] = None,
+    ) -> None:
+        selected = self._ensure_open_mapped_region(region, worker_id)
+        if self.level == 2:
+            self._mapped_region_chip_worker(selected).mapped_region_wait(
+                region.handle, int(signal_id), int(target), int(timeout_us)
+            )
+            return
+        dw = self._ensure_mapped_region_l3_control_ready(selected)
+        try:
+            dw.control_mapped_region_wait(selected, int(region.handle), int(signal_id), int(target), int(timeout_us))
+        except RuntimeError as e:
+            self._raise_mapped_region_control_error(e)
 
     def _init_hierarchical(self) -> None:
         device_ids = self._config.get("device_ids", [])

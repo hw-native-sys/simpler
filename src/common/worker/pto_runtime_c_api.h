@@ -47,6 +47,7 @@ extern "C" {
 
 typedef void *RuntimeHandle;
 typedef void *DeviceContextHandle;
+typedef void *HostDeviceMappedRegionHandle;
 
 /**
  * Timing breakdown for a single run_prepared() invocation.
@@ -72,6 +73,25 @@ typedef struct PtoRunTiming {
     uint64_t host_wall_ns;
     uint64_t device_wall_ns;
 } PtoRunTiming;
+
+typedef struct HostDeviceMappedRegionConfig {
+    uint64_t data_bytes;
+    uint32_t signal_count;
+    uint32_t flags;
+} HostDeviceMappedRegionConfig;
+
+typedef struct HostDeviceMappedRegionInfo {
+    uint64_t host_data_ptr;
+    uint64_t device_data_ptr;
+    uint64_t data_bytes;
+    uint64_t host_signal_ptr;
+    uint64_t device_signal_ptr;
+    uint32_t signal_count;
+    uint32_t reserved0;
+    uint64_t total_bytes;
+    uint32_t flags;
+    uint32_t reserved1;
+} HostDeviceMappedRegionInfo;
 
 /* ===========================================================================
  * Public API (resolved by ChipWorker via dlsym)
@@ -140,6 +160,33 @@ int simpler_init(
  * Must be called before destroy_device_context() / dlclose().
  */
 int finalize_device(DeviceContextHandle ctx);
+
+int open_host_device_mapped_region_ctx(
+    DeviceContextHandle ctx, const HostDeviceMappedRegionConfig *cfg, HostDeviceMappedRegionHandle *out_region
+);
+
+int close_host_device_mapped_region_ctx(DeviceContextHandle ctx, HostDeviceMappedRegionHandle region);
+
+int host_device_mapped_region_info_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, HostDeviceMappedRegionInfo *info
+);
+
+int host_device_mapped_region_datacopy_h2region_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint64_t offset, const void *src, size_t nbytes
+);
+
+int host_device_mapped_region_datacopy_region2h_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint64_t offset, void *dst, size_t nbytes
+);
+
+int host_device_mapped_region_notify_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint32_t signal_id, uint32_t value
+);
+
+int host_device_mapped_region_wait_ctx(
+    DeviceContextHandle ctx, HostDeviceMappedRegionHandle region, uint32_t signal_id, uint32_t target,
+    uint32_t timeout_us
+);
 
 /* ===========================================================================
  * Per-callable_id preparation

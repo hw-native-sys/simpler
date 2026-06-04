@@ -82,6 +82,14 @@ public:
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
 
+    uint64_t open_mapped_region(uint64_t data_bytes, uint32_t signal_count, uint32_t flags);
+    void close_mapped_region(uint64_t handle);
+    HostDeviceMappedRegionInfo mapped_region_info(uint64_t handle);
+    void mapped_region_datacopy_h2region(uint64_t handle, uint64_t offset, const void *src, size_t nbytes);
+    void mapped_region_datacopy_region2h(uint64_t handle, uint64_t offset, void *dst, size_t nbytes);
+    void mapped_region_notify(uint64_t handle, uint32_t signal_id, uint32_t value);
+    void mapped_region_wait(uint64_t handle, uint32_t signal_id, uint32_t target, uint32_t timeout_us);
+
     /// Distributed communication primitives (optional — only available when
     /// the bound runtime exports comm_*).  Wraps the backend-neutral C API
     /// defined in src/<arch>/platform/include/host/comm.h.
@@ -160,6 +168,14 @@ private:
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
+    using OpenMappedRegionFn = int (*)(void *, const HostDeviceMappedRegionConfig *, HostDeviceMappedRegionHandle *);
+    using CloseMappedRegionFn = int (*)(void *, HostDeviceMappedRegionHandle);
+    using MappedRegionInfoFn = int (*)(void *, HostDeviceMappedRegionHandle, HostDeviceMappedRegionInfo *);
+    using MappedRegionDatacopyH2RegionFn =
+        int (*)(void *, HostDeviceMappedRegionHandle, uint64_t, const void *, size_t);
+    using MappedRegionDatacopyRegion2HFn = int (*)(void *, HostDeviceMappedRegionHandle, uint64_t, void *, size_t);
+    using MappedRegionNotifyFn = int (*)(void *, HostDeviceMappedRegionHandle, uint32_t, uint32_t);
+    using MappedRegionWaitFn = int (*)(void *, HostDeviceMappedRegionHandle, uint32_t, uint32_t, uint32_t);
 
     struct CommSession {
         void *handle = nullptr;
@@ -177,6 +193,7 @@ private:
     int destroy_comm_session(CommSession &session);
     uint64_t create_base_comm(int rank, int nranks, const std::string &rootinfo_path);
     void clear_comm_sessions();
+    void check_mapped_region_rc(int rc, const char *op_name);
 
     void *lib_handle_ = nullptr;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
@@ -205,6 +222,13 @@ private:
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
+    OpenMappedRegionFn open_mapped_region_fn_ = nullptr;
+    CloseMappedRegionFn close_mapped_region_fn_ = nullptr;
+    MappedRegionInfoFn mapped_region_info_fn_ = nullptr;
+    MappedRegionDatacopyH2RegionFn mapped_region_datacopy_h2region_fn_ = nullptr;
+    MappedRegionDatacopyRegion2HFn mapped_region_datacopy_region2h_fn_ = nullptr;
+    MappedRegionNotifyFn mapped_region_notify_fn_ = nullptr;
+    MappedRegionWaitFn mapped_region_wait_fn_ = nullptr;
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
     std::unordered_map<uint64_t, size_t> comm_session_index_;

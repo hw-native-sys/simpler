@@ -279,6 +279,7 @@ add_hierarchical_test(test_ring  hierarchical/test_ring.cpp)
 add_hierarchical_test(test_scope      hierarchical/test_scope.cpp)
 add_hierarchical_test(test_orchestrator hierarchical/test_orchestrator.cpp)
 add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
+add_hierarchical_test(test_mailbox_control_layout hierarchical/test_mailbox_control_layout.cpp)
 
 # ---------------------------------------------------------------------------
 # Types / task_interface tests (src/common/task_interface/)
@@ -311,6 +312,24 @@ set_tests_properties(test_chip_callable_upload_immutable PROPERTIES LABELS "no_h
 add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
+
+add_executable(test_host_device_mapped_region
+    common/test_host_device_mapped_region.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/host_device_comm/host_device_mapped_region.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/host_device_comm/host_device_mapped_region_sim.cpp
+)
+target_include_directories(test_host_device_mapped_region PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+)
+target_link_libraries(test_host_device_mapped_region PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_host_device_mapped_region COMMAND test_host_device_mapped_region)
+set_tests_properties(test_host_device_mapped_region PROPERTIES LABELS "no_hardware")
 
 # Per-callable_id orch SO file naming regression (see rtStreamSynchronize
 # 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`

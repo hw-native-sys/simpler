@@ -35,6 +35,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     ContinuousTensor,
     CoreCallable,
     DataType,
+    MappedRegionInfo,
     SubmitResult,
     TaskArgs,
     TaskState,
@@ -63,6 +64,7 @@ __all__ = [
     "ChipCallable",
     "CallConfig",
     "ChipWorker",
+    "MappedRegionInfo",
     "arg_direction_name",
     "scalar_to_uint64",
     # Distributed runtime
@@ -434,6 +436,34 @@ class ChipWorker:
     def copy_from(self, dst, src, size):
         """Copy *size* bytes from worker *src* to host *dst*."""
         self._impl.copy_from(int(dst), int(src), int(size))
+
+    def open_mapped_region(self, data_bytes: int, signal_count: int = 1, flags: int = 0) -> int:
+        """Open a child-owned mapped region and return its opaque handle."""
+        return int(self._impl.open_mapped_region(int(data_bytes), int(signal_count), int(flags)))
+
+    def close_mapped_region(self, handle: int) -> None:
+        """Close a mapped-region handle opened on this chip worker."""
+        self._impl.close_mapped_region(int(handle))
+
+    def mapped_region_info(self, handle: int) -> MappedRegionInfo:
+        """Return public mapped-region info with host pointers masked to zero."""
+        return self._impl.mapped_region_info(int(handle))
+
+    def mapped_region_datacopy_h2region(self, handle: int, offset: int, data) -> None:
+        """Copy bytes-like data into the mapped region's data area."""
+        self._impl.mapped_region_datacopy_h2region(int(handle), int(offset), data)
+
+    def mapped_region_datacopy_region2h(self, handle: int, offset: int, nbytes: int) -> bytes:
+        """Copy bytes out of the mapped region's data area."""
+        return self._impl.mapped_region_datacopy_region2h(int(handle), int(offset), int(nbytes))
+
+    def mapped_region_notify(self, handle: int, signal_id: int, value: int) -> None:
+        """Publish a mapped-region signal slot value."""
+        self._impl.mapped_region_notify(int(handle), int(signal_id), int(value))
+
+    def mapped_region_wait(self, handle: int, signal_id: int, target: int, timeout_us: int) -> None:
+        """Wait until a mapped-region signal slot reaches ``target``."""
+        self._impl.mapped_region_wait(int(handle), int(signal_id), int(target), int(timeout_us))
 
     def comm_init(self, rank: int, nranks: int, rootinfo_path: str) -> int:
         """Initialize a distributed communicator for this rank.

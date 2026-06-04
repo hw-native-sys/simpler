@@ -130,16 +130,25 @@ static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
 static constexpr uint64_t CTRL_COMM_INIT = 9;
 static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
+static constexpr uint64_t CTRL_OPEN_MAPPED_REGION = 12;
+static constexpr uint64_t CTRL_CLOSE_MAPPED_REGION = 13;
+static constexpr uint64_t CTRL_MAPPED_REGION_INFO = 14;
+static constexpr uint64_t CTRL_MAPPED_REGION_DATACOPY_H2REGION = 15;
+static constexpr uint64_t CTRL_MAPPED_REGION_DATACOPY_REGION2H = 16;
+static constexpr uint64_t CTRL_MAPPED_REGION_NOTIFY = 17;
+static constexpr uint64_t CTRL_MAPPED_REGION_WAIT = 18;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy; cid for register)
 //   offset 24: uint64 arg1 (src for copy)
 //   offset 32: uint64 arg2 (nbytes for copy)
-//   offset 40: uint64 result (returned ptr from malloc)
+//   offset 40: uint64 arg3 (timeout_us for mapped-region wait)
+//   offset 48: uint64 result (returned ptr from malloc / open)
 static constexpr ptrdiff_t CTRL_OFF_ARG0 = 16;
 static constexpr ptrdiff_t CTRL_OFF_ARG1 = 24;
 static constexpr ptrdiff_t CTRL_OFF_ARG2 = 32;
-static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
+static constexpr ptrdiff_t CTRL_OFF_ARG3 = 40;
+static constexpr ptrdiff_t CTRL_OFF_RESULT = 48;
 
 // CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS.
 // Fixed-width so the wire layout stays simple; well above the encoded length
@@ -216,6 +225,11 @@ public:
     void control_free(uint64_t ptr);
     void control_copy_to(uint64_t dst, uint64_t src, size_t size);
     void control_copy_from(uint64_t dst, uint64_t src, size_t size);
+    uint64_t control_open_mapped_region(uint64_t data_bytes, uint32_t signal_count, uint32_t flags);
+    void control_close_mapped_region(uint64_t handle);
+    void control_mapped_region_payload(uint64_t sub_cmd, const char *shm_name);
+    void control_mapped_region_notify(uint64_t handle, uint32_t signal_id, uint32_t value);
+    void control_mapped_region_wait(uint64_t handle, uint32_t signal_id, uint32_t target, uint32_t timeout_us);
 
     // Pre-warm a chip child by triggering prepare_callable for `cid` in the
     // child via CTRL_PREPARE. Issued from the parent at end of init() so the
@@ -316,6 +330,13 @@ public:
     void control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name);
     void control_release_domain(int worker_id, const char *request_shm_name);
     void control_comm_init(int worker_id, const char *request_shm_name);
+    uint64_t control_open_mapped_region(int worker_id, uint64_t data_bytes, uint32_t signal_count, uint32_t flags);
+    void control_close_mapped_region(int worker_id, uint64_t handle);
+    void control_mapped_region_payload(int worker_id, uint64_t sub_cmd, const char *shm_name);
+    void control_mapped_region_notify(int worker_id, uint64_t handle, uint32_t signal_id, uint32_t value);
+    void control_mapped_region_wait(
+        int worker_id, uint64_t handle, uint32_t signal_id, uint32_t target, uint32_t timeout_us
+    );
 
     // Broadcast CTRL_REGISTER for `cid` to every NEXT_LEVEL worker in
     // parallel. Stages `blob_size` bytes from `blob_ptr` into a per-call
