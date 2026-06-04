@@ -32,7 +32,7 @@
 #include <atomic>
 
 #include "common/core_type.h"
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "pto_async_wait.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
@@ -1089,9 +1089,34 @@ struct PTO2SchedulerState {
 // Scheduler cold-path API is declared as PTO2SchedulerState member functions.
 // See init()/destroy()/print_stats()/print_queues() below the struct definition.
 
+// Short-circuit NotDeferred completions seen during drain so they don't grow
+// entries[]. Mirrors the a2a3 impl; see that mirror for the rationale.
+inline bool
+AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, PTO2TaskSlotState &slot_state) {
+#if PTO2_SCHED_PROFILING
+    sink.sched->on_mixed_task_complete(slot_state, sink.thread_idx, sink.local_bufs);
+#else
+    sink.sched->on_mixed_task_complete(slot_state, sink.local_bufs);
+#endif
+    if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
+        while (*sink.deferred_release_count > 0) {
+#if PTO2_SCHED_PROFILING
+            (void)sink.sched->on_task_release(
+                *sink.deferred_release_slot_states[--(*sink.deferred_release_count)], sink.thread_idx
+            );
+#else
+            sink.sched->on_task_release(*sink.deferred_release_slot_states[--(*sink.deferred_release_count)]);
+#endif
+        }
+    }
+    sink.deferred_release_slot_states[(*sink.deferred_release_count)++] = &slot_state;
+    sink.inline_completed++;
+    return true;
+}
+
 template <bool Profiling>
 inline AsyncPollResult AsyncWaitList::poll_and_complete(
-    volatile AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
+    AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
     PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count, int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING
     ,
@@ -1101,19 +1126,38 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
     AsyncPollResult result;
     if (!try_lock()) return result;
 
+    AsyncWaitList::DrainCompletionSink sink{};
+    sink.sched = sched;
+    sink.local_bufs = local_bufs;
+    sink.deferred_release_slot_states = deferred_release_slot_states;
+    sink.deferred_release_count = &deferred_release_count;
+    sink.deferred_release_capacity = deferred_release_capacity;
+#if PTO2_SCHED_PROFILING
+    sink.thread_idx = thread_idx;
+#endif
+
     int32_t drain_err = PTO2_ERROR_NONE;
-    drain_aicore_completion_mailbox_locked(aicore_mailbox, drain_err);
+    drain_aicore_completion_mailbox_locked(aicore_mailbox, sink, drain_err);
     if (drain_err != PTO2_ERROR_NONE) {
         result.error_code = drain_err;
         unlock();
         return result;
     }
+    result.completed += sink.inline_completed;
 
     for (int32_t i = count - 1; i >= 0; --i) {
         AsyncWaitEntry &entry = entries[i];
+        uintptr_t last_invalidated_counter_line = static_cast<uintptr_t>(-1);
         for (int32_t c = 0; c < entry.condition_count; c++) {
             CompletionCondition &cond = entry.conditions[c];
             if (cond.satisfied) continue;
+            if (cond.completion_type == COMPLETION_TYPE_COUNTER && cond.counter_addr != nullptr) {
+                uintptr_t counter_line = mailbox_cache_line(cond.counter_addr);
+                if (counter_line != last_invalidated_counter_line) {
+                    cache_invalidate_range(reinterpret_cast<const void *>(counter_line), sizeof(uint32_t));
+                    last_invalidated_counter_line = counter_line;
+                }
+            }
             CompletionPollResult poll = cond.test();
             if (poll.state == CompletionPollState::FAILED) {
                 result.error_code = poll.error_code;
@@ -1123,22 +1167,26 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
             }
             if (poll.state == CompletionPollState::READY) {
                 cond.satisfied = true;
+                cond.retire();
                 entry.waiting_completion_count--;
             }
         }
 
         if (entry.normal_done && entry.waiting_completion_count <= 0) {
-            if (deferred_release_count >= deferred_release_capacity) {
-                result.error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
-                result.failed_slot_state = entry.slot_state;
-                unlock();
-                return result;
-            }
 #if PTO2_SCHED_PROFILING
             sched->on_mixed_task_complete(*entry.slot_state, thread_idx, local_bufs);
 #else
             sched->on_mixed_task_complete(*entry.slot_state, local_bufs);
 #endif
+            if (deferred_release_count >= deferred_release_capacity) {
+                while (deferred_release_count > 0) {
+#if PTO2_SCHED_PROFILING
+                    (void)sched->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
+#else
+                    sched->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+#endif
+                }
+            }
             deferred_release_slot_states[deferred_release_count++] = entry.slot_state;
             result.completed++;
 

@@ -17,10 +17,12 @@ project(aicpu_kernel LANGUAGES C CXX)
 # Build complete include list
 set(CMAKE_CUSTOM_INCLUDE_DIRS "")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/include")
+# Pick up spin_hint.h next to the cross-arch onboard/aicpu sources.
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/aicpu")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/log/include")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/device_comm")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common")
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
         list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${INC_DIR}")
@@ -29,12 +31,23 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build AICPU kernel")
 endif()
 
-# Build complete source list from CUSTOM_SOURCE_DIRS and core sources
+# Build complete source list from CUSTOM_SOURCE_DIRS and core sources.
+# Sources come from three buckets:
+#   1. `${CMAKE_CURRENT_SOURCE_DIR}/*.cpp` — onboard-aicpu sources that are
+#      still arch-specific (a2a3-only files like kernel.cpp).
+#   2. `common/platform/onboard/aicpu/*.cpp` — onboard-aicpu sources shared
+#      by both arches (cache_ops, device_log, device_time, device_malloc,
+#      orch_so_file, platform_aicpu_affinity).
+#   3. arch-shared (between onboard and sim) sources under `../../shared/aicpu/`
+#      and `common/platform/shared/aicpu/` (unified log, scope_stats, tensor_dump).
 set(AICPU_KERNEL_SOURCES "")
 file(GLOB AICPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 list(APPEND AICPU_KERNEL_SOURCES ${AICPU_SOURCES})
-# Add common source list like 1) unified log device implementation; 2) platform register implementation
-file(GLOB COMMON_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../src/aicpu/*.cpp")
+file(GLOB COMMON_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/aicpu/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/aicpu/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/aicpu/*.cpp"
+)
 list(APPEND AICPU_KERNEL_SOURCES ${COMMON_SOURCES})
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
@@ -91,17 +104,17 @@ set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME aicpu_kernel)
 # rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC), invokes
 # DynTileFwkBackendKernelServerInit, which writes the bundled inner SO bytes
 # (passed via the extended DeviceArgs at offsets 120/128) to
-# /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>.so under
-# a content-fingerprint basename. After bootstrap the host registers the
+# /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so
+# under a content-fingerprint + device-id basename. After bootstrap the host registers the
 # preinstall file via rtsBinaryLoadFromFile + rtsFuncGetByName and launches
 # per-task through rtsLaunchCpuKernel; the dispatcher SO itself is never
 # referenced again.
 #
 # Output name is fixed ("simpler_aicpu_dispatcher"). See
-# src/common/aicpu_dispatcher/{aicpu_dispatcher.h,README.md} for the
+# src/common/aicpu_loader/{device/aicpu_dispatcher.h,README.md} for the
 # extended DeviceArgs layout and the FNV-1a/Build-ID fingerprint protocol.
 set(AICPU_DISPATCHER_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher/aicpu_dispatcher.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_loader/device/aicpu_dispatcher.cpp"
 )
 add_library(aicpu_dispatcher SHARED ${AICPU_DISPATCHER_SOURCES})
 

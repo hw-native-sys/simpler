@@ -19,8 +19,8 @@
  * sole source of truth for fanout edges; the L2 swimlane hot path no longer
  * carries fanout to keep AICPU off the per-task GM-store critical path.
  *
- * Streaming buffer design mirrors PMU / L2Perf / TensorDump (single source of
- * algorithmic truth in src/a2a3/platform/include/host/profiling_common/profiler_base.h):
+ * Streaming buffer design mirrors PMU / L2Swimlane / TensorDump (single source of
+ * algorithmic truth in src/common/platform/include/host/profiler_base.h):
  *
  *   DepGenFreeQueue    — SPSC: Host pushes free DepGenBuffers, AICPU pops them.
  *   DepGenBufferState  — Per-instance state: free_queue + current buffer ptr.
@@ -29,7 +29,7 @@
  *
  * Single-instance: the orchestrator is one AICPU thread, so the BufferState
  * array has length 1. Kept array-shaped (vs scalar) for symmetry with PMU /
- * L2Perf and to match ProfilerBase<DepGenModule>::for_each_instance.
+ * L2Swimlane and to match ProfilerBase<DepGenModule>::for_each_instance.
  *
  * Tensor data is captured as opaque 128-byte blobs (`DEP_GEN_TENSOR_SIZE`)
  * matching the runtime Tensor struct size. The AICPU writer
@@ -91,22 +91,25 @@ enum DepGenRecordFlags : uint32_t {
  * Per-submit_task capture. Replay reads these to reconstruct the dep graph.
  *
  * Layout:
- *   - task_id, flags, counts, explicit_deps, arg_types in the first cache lines
+ *   - task_id, flags, counts, explicit_deps, arg_types, kernel_id in the first
+ *     cache lines
  *   - tensors[] (16 × 128 B opaque blobs) at the tail; covers ~64% of the entry
  *
- * Total size: 8 + 4 + 4 + 64*8 + 16 + 32 (pad) + 16*128 = 2624 bytes.
- * Aligned to 64 B → 2624 B (already a multiple of 64). The 32-byte _pad0
- * pushes the tensors[] array to offset 576 = 9 * 64 so each 128-byte tensor
+ * Total size: 8 + 4 + 4 + 64*8 + 16 + 12 (kernel_id) + 20 (pad) + 16*128
+ *           = 2624 bytes.
+ * Aligned to 64 B → 2624 B (already a multiple of 64). kernel_id + _pad0
+ * together pad tensors[] up to offset 576 = 9 * 64 so each 128-byte tensor
  * blob covers exactly two cache lines instead of straddling three.
  */
 struct DepGenRecord {
-    uint64_t task_id;                                            // PTO2 encoding (ring_id << 32) | local_id
-    uint32_t flags;                                              // DepGenRecordFlags bitmask
-    uint16_t tensor_count;                                       // number of valid Tensor slots
-    uint16_t explicit_dep_count;                                 // number of valid explicit_dep slots
-    uint64_t explicit_deps[DEP_GEN_MAX_EXPLICIT_DEPS];           // PTO2TaskId::raw, length = explicit_dep_count
-    uint8_t arg_types[CORE_MAX_TENSOR_ARGS];                     // TensorArgType, length = tensor_count
-    uint8_t _pad0[32];                                           // align tensors[] to 64 B (offset 576)
+    uint64_t task_id;                                   // PTO2 encoding (ring_id << 32) | local_id
+    uint32_t flags;                                     // DepGenRecordFlags bitmask
+    uint16_t tensor_count;                              // number of valid Tensor slots
+    uint16_t explicit_dep_count;                        // number of valid explicit_dep slots
+    uint64_t explicit_deps[DEP_GEN_MAX_EXPLICIT_DEPS];  // PTO2TaskId::raw, length = explicit_dep_count
+    uint8_t arg_types[CORE_MAX_TENSOR_ARGS];            // TensorArgType, length = tensor_count
+    int32_t kernel_id[3];  // per-subslot kernel id (AIC, AIV0, AIV1); INVALID_KERNEL_ID = -1
+    uint8_t _pad0[20];     // align tensors[] to 64 B (offset 576)
     uint8_t tensors[CORE_MAX_TENSOR_ARGS][DEP_GEN_TENSOR_SIZE];  // opaque Tensor blobs
 } __attribute__((aligned(64)));
 

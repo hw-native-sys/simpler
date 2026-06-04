@@ -200,6 +200,21 @@ public:
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
+    // Filter-style affinity gate input (a5 onboard). Host fills before
+    // launch from device-side OCCUPY + DSMI CPU_TOPO via
+    // pto::a5::compute_allowed_cpus. The on-device gate keeps threads whose
+    // sched_getcpu() lands on one of these cpu_ids; exec_idx = position in
+    // this array drives sched/orch role assignment. Indices 0..count-2 are
+    // scheduler slots, index count-1 is the orchestrator slot. Sized to
+    // PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH for headroom — current
+    // policy is 4 sched + 1 orch = 5 active.
+    int32_t aicpu_allowed_cpus[16];
+    int32_t aicpu_allowed_cpu_count;
+    // Actual AICPU thread launch count for this run. Host sets from
+    // popcount(OCCUPY) via the topology probe. See the matching field in
+    // src/a5/runtime/host_build_graph/runtime/runtime.h for rationale.
+    int32_t aicpu_launch_count;
+
     // Ring buffer size overrides (0 = use compile-time defaults)
     uint64_t task_window_size;
     uint64_t heap_size;
@@ -269,7 +284,7 @@ public:
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Prebuilt-arena fast path (trb only). Set by host's
-    // bind_prepared_to_runtime_impl; consumed by AICPU at boot to attach a
+    // bind_callable_to_runtime_impl; consumed by AICPU at boot to attach a
     // DeviceArena to `prebuilt_arena_base_` and pick up the PTO2Runtime at
     // `prebuilt_arena_base_ + prebuilt_runtime_offset_`. Both stay zero on
     // first construction (Runtime() ctor zeros them) so a non-prebuilt boot
@@ -299,7 +314,7 @@ public:
     /**
      * Replay a previously-uploaded kernel address onto a fresh Runtime
      * without recording it in registered_kernel_func_ids_. Used by
-     * DeviceRunner::bind_prepared_callable_to_runtime so prepared kernel
+     * DeviceRunner::bind_callable_to_runtime so prepared kernel
      * binaries are not freed by validate_runtime_impl across runs.
      */
     void replay_function_bin_addr(int func_id, uint64_t addr);

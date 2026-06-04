@@ -28,7 +28,7 @@
 #include <set>
 #include <vector>
 
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "pto_orchestration_api.h"
 #include "pto_tensormap.h"
 

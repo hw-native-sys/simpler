@@ -14,11 +14,11 @@ Converts performance data JSON (.json) to Chrome Trace Event Format JSON
 for visualization in Perfetto (https://ui.perfetto.dev/).
 
 Usage:
-    python -m simpler_setup.tools.swimlane_converter  # latest l2_perf_records_*.json under ./outputs/
-    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json
-    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json -o out.json
-    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json -k kernel_config.py
-    python -m simpler_setup.tools.swimlane_converter l2_perf_records_20260210_143526.json -v
+    python -m simpler_setup.tools.swimlane_converter  # latest l2_swimlane_records_*.json under ./outputs/
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -o out.json
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -k kernel_config.py
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -v
 """
 
 import argparse
@@ -93,7 +93,7 @@ def read_perf_data(filepath):
 
     Returns:
         dict: Parsed performance data with keys:
-            - l2_perf_level
+            - l2_swimlane_level
             - tasks (list)
 
     Raises:
@@ -102,13 +102,13 @@ def read_perf_data(filepath):
     with open(filepath) as f:
         data = json.load(f)
 
-    required_fields = ["l2_perf_level", "tasks"]
+    required_fields = ["l2_swimlane_level", "tasks"]
     for field in required_fields:
         if field not in data:
             raise ValueError(f"Missing required field: {field}")
 
-    if data["l2_perf_level"] not in [1, 2, 3, 4]:
-        raise ValueError(f"Unsupported l2_perf_level: {data['l2_perf_level']} (expected 1, 2, 3, or 4)")
+    if data["l2_swimlane_level"] not in [1, 2, 3, 4]:
+        raise ValueError(f"Unsupported l2_swimlane_level: {data['l2_swimlane_level']} (expected 1, 2, 3, or 4)")
 
     return data
 
@@ -160,6 +160,74 @@ def load_deps_json(deps_path):
         seen.add(key)
         by_pred[pred].append(succ)
     return dict(by_pred)
+
+
+def load_deps_kernel_map(deps_path):
+    """Build a ``task_id → kernel_ids[3]`` map from deps.json's ``tasks[]``.
+
+    a2a3 dep_gen captures per-task ``kernel_ids = [aic, aiv0, aiv1]`` so the
+    swimlane post-processor can resolve ``func_id`` at AICORE_TIMING (level=1)
+    where the AICore record alone is on disk and carries ``func_id == -1``.
+    The trace generator uses the per-record ``core_type`` to pick the right
+    subslot: ``aic → kernel_ids[0]``, ``aiv → kernel_ids[1]`` (falling back
+    to ``[2]`` if AIV0 is inactive). Same pattern fanout edges already use
+    (deps.json is the offline-joined identity source).
+
+    Returns:
+        dict[int, list[int]] mapping ``task_id_raw → [aic, aiv0, aiv1]``,
+        or ``None`` if the file is missing / unreadable / lacks the field.
+        Entries without ``kernel_ids`` (pre-schema deps.json from older
+        runs) are silently skipped — the caller treats a missing map as
+        "no override available" and emits the ``func_-1_(...)`` fallback.
+    """
+    deps_path = Path(deps_path)
+    if not deps_path.exists():
+        return None
+    try:
+        with deps_path.open() as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    kmap: dict[int, list[int]] = {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        tid = normalize_pto2_task_id_int(task.get("task_id"))
+        kids = task.get("kernel_ids")
+        if tid is None or not isinstance(kids, list) or len(kids) != 3:
+            continue
+        kmap[tid] = [int(k) for k in kids]
+    return kmap if kmap else None
+
+
+def resolve_func_id_from_kernel_map(task_id, core_type, kernel_map):
+    """Look up the active ``func_id`` for an AICORE_TIMING record via dep_gen.
+
+    Picks the kernel_ids[3] subslot by record ``core_type``. Returns the
+    resolved func_id (>= 0) on a hit, or -1 if no usable subslot was found
+    (caller keeps the original -1 and emits the ``func_-1_(...)`` fallback
+    name). The choice for ``aiv`` prefers AIV0 ([1]) and falls back to AIV1
+    ([2]) — works for pure-AIV and MIX-with-single-AIV records; for MIX
+    records that span both AIVs the host swimlane record only tells us the
+    lane is "aiv", so the resolver may name an AIV1 lane after AIV0's
+    kernel. Acceptable trade-off until the host emits a lane-disambiguated
+    core_type ("aiv0" / "aiv1").
+    """
+    if kernel_map is None or task_id is None:
+        return -1
+    kids = kernel_map.get(int(task_id))
+    if not kids:
+        return -1
+    if core_type == "aic":
+        return kids[0] if kids[0] >= 0 else -1
+    # "aiv": prefer AIV0, fall back to AIV1.
+    for idx in (1, 2):
+        if kids[idx] >= 0:
+            return kids[idx]
+    return -1
 
 
 def load_kernel_config(config_path):
@@ -381,6 +449,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     core_to_thread=None,
     orchestrator_name=None,
     deps_edges=None,
+    deps_kernel_map=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -393,15 +462,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         output_path: Path to output JSON file
         func_id_to_name: Optional dict mapping func_id to function name
         verbose: Print progress information
-        scheduler_phases: Optional list of per-thread phase record lists (l2_perf_level >= 3)
-        orchestrator_phases: Optional list of per-task orchestrator phase records (l2_perf_level >= 4)
+        scheduler_phases: Optional list of per-thread phase record lists (l2_swimlane_level >= 3)
+        orchestrator_phases: Optional list of per-task orchestrator phase records (l2_swimlane_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
 
     Generates processes in the trace:
         - pid=1 "AICore View": start_time_us to end_time_us (kernel execution)
         - pid=2 "AICPU View": dispatch_time_us to finish_time_us (AICPU perspective)
-        - pid=3 "AICPU Scheduler": scheduler phase bars (l2_perf_level >= 3)
-        - pid=4 "AICPU Orchestrator": orchestrator phase bars or summary (l2_perf_level >= 4)
+        - pid=3 "AICPU Scheduler": scheduler phase bars (l2_swimlane_level >= 3)
+        - pid=4 "AICPU Orchestrator": orchestrator phase bars or summary (l2_swimlane_level >= 4)
     """
     if verbose:
         print("Generating Chrome Trace JSON...")
@@ -468,8 +537,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         ts = task["start_time_us"]
         dur = task["duration_us"]
 
-        # Get function name if available
+        # Get function name if available. At AICORE_TIMING (level=1) the
+        # host emits func_id=-1; recover the real func_id from dep_gen's
+        # per-task kernel_ids[3] using the record's core_type to pick the
+        # active subslot. See resolve_func_id_from_kernel_map() for the
+        # AIV0-vs-AIV1 tie-break and the host-side contract.
         func_id = task["func_id"]
+        if int(func_id) < 0 and deps_kernel_map is not None:
+            resolved = resolve_func_id_from_kernel_map(task["task_id"], task.get("core_type"), deps_kernel_map)
+            if resolved >= 0:
+                func_id = resolved
         tdisp = format_task_display(task["task_id"])
         if func_id_to_name and str(func_id) in func_id_to_name:
             func_name = func_id_to_name[str(func_id)]
@@ -698,7 +775,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         if hb_violation_count > 0:
             print(f"  Happens-before violations: {hb_violation_count} edge(s) flagged as 'hb_violation'")
 
-    # AICPU Scheduler phase events (l2_perf_level >= 3)
+    # AICPU Scheduler phase events (l2_swimlane_level >= 3)
     if scheduler_phases:
         # Process metadata
         events.append(
@@ -764,7 +841,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     }
                 )
 
-    # AICPU Orchestrator lane (l2_perf_level >= 4)
+    # AICPU Orchestrator lane (l2_swimlane_level >= 4)
     #
     # Per-event AicpuPhaseRecord[] is the single source of truth for
     # orchestrator timing. There is no separate aggregate summary — the
@@ -1094,17 +1171,18 @@ def _build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                                       # Use latest .json in outputs/, output to outputs/
-  %(prog)s l2_perf_records_20260210_143526.json   # Output: outputs/merged_swimlane_20260210_143526.json
-  %(prog)s l2_perf_records_20260210_143526.json -o custom_output.json
-  %(prog)s l2_perf_records_20260210_143526.json -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
-  %(prog)s l2_perf_records_20260210_143526.json -v
+  %(prog)s                                            # Use latest .json in outputs/, output to outputs/
+  %(prog)s outputs/<case>_<ts>/l2_swimlane_records.json   # Output: outputs/merged_swimlane_20260210_143526.json
+  %(prog)s outputs/<case>_<ts>/l2_swimlane_records.json -o custom_output.json
+  %(prog)s outputs/<case>_<ts>/l2_swimlane_records.json \
+      -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
+  %(prog)s outputs/<case>_<ts>/l2_swimlane_records.json -v
         """,
     )
     parser.add_argument(
         "input",
         nargs="?",
-        help="Input JSON file (.json). If not specified, uses the latest l2_perf_records_*.json in outputs/",
+        help="Input JSON file (.json). If not specified, uses the latest l2_swimlane_records_*.json in outputs/",
     )
     parser.add_argument("-o", "--output", help="Output JSON file (default: <input_dir>/merged_swimlane.json)")
     parser.add_argument(
@@ -1128,7 +1206,7 @@ Examples:
 
 
 def _resolve_input_path(args):
-    """Resolve input path, auto-selecting newest outputs/<case>/l2_perf_records.json if unspecified."""
+    """Resolve input path, auto-selecting newest outputs/<case>/l2_swimlane_records.json if unspecified."""
     if args.input is not None:
         input_path = Path(args.input)
         if not input_path.exists():
@@ -1137,9 +1215,9 @@ def _resolve_input_path(args):
         return input_path
 
     outputs_dir = Path.cwd() / "outputs"
-    json_files = list(outputs_dir.glob("*/l2_perf_records.json"))
+    json_files = list(outputs_dir.glob("*/l2_swimlane_records.json"))
     if not json_files:
-        print(f"Error: No outputs/*/l2_perf_records.json found under {outputs_dir}", file=sys.stderr)
+        print(f"Error: No outputs/*/l2_swimlane_records.json found under {outputs_dir}", file=sys.stderr)
         print("Run a test with --enable-l2-swimlane first, or specify an explicit input.", file=sys.stderr)
         return None
 
@@ -1161,11 +1239,11 @@ def _resolve_output_path(args, input_path):
 
 def _print_verbose_data_info(data, verbose):
     """Print verbose summary of loaded performance data, including phase counts
-    when present (l2_perf_level >= SCHED_PHASES)."""
+    when present (l2_swimlane_level >= SCHED_PHASES)."""
     if not verbose:
         return
     print("\n=== Performance Data ===")
-    print(f"  L2 perf level: {data['l2_perf_level']}")
+    print(f"  L2 perf level: {data['l2_swimlane_level']}")
     print(f"  Task Count: {len(data['tasks'])}")
     if data["tasks"]:
         start_times = [t["start_time_us"] for t in data["tasks"]]
@@ -1246,9 +1324,16 @@ def main():
 
         deps_path = Path(args.deps_json) if args.deps_json else Path(input_path).parent / "deps.json"
         deps_edges = load_deps_json(deps_path)
+        # Load the per-task kernel_ids map separately so the trace generator
+        # can resolve func_id=-1 records (AICORE_TIMING / level=1) back to
+        # the real kernel name. Optional — pre-schema deps.json without
+        # kernel_ids and AICPU_TIMING+ runs both leave this at None.
+        deps_kernel_map = load_deps_kernel_map(deps_path)
         if deps_edges is not None:
             if args.verbose:
                 print(f"  Using deps.json edges ({sum(len(v) for v in deps_edges.values())} total) from {deps_path}")
+                if deps_kernel_map is not None:
+                    print(f"  Using deps.json kernel_ids for {len(deps_kernel_map)} tasks (level=1 name recovery)")
         else:
             print(
                 f"Warning: no usable deps.json at {deps_path}; Perfetto trace will have no dependency arrows. "
@@ -1266,6 +1351,7 @@ def main():
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             core_to_thread=data.get("core_to_thread"),
             deps_edges=deps_edges,
+            deps_kernel_map=deps_kernel_map,
         )
 
         print("\n✓ Conversion complete")

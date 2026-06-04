@@ -11,9 +11,9 @@
 
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
-#include "aicore/l2_perf_collector_aicore.h"
+#include "aicore/l2_swimlane_collector_aicore.h"
 #include "aicore/pmu_collector_aicore.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"  // Platform configuration (C/C++ compatible)
 #include "common/pmu_profiling.h"
 #include "runtime.h"
@@ -60,10 +60,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // AICore kernel entry from KernelArgs::regs[physical_core_id]), so
     // they are safe to cache here.
     uint32_t profiling_flag = get_aicore_profiling_flag();
-    bool l2_perf_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+    bool l2_swimlane_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
     bool dump_tensor_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     bool pmu_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_PMU);
-    __gm__ L2PerfAicoreRing *l2_perf_ring = l2_perf_enabled ? get_aicore_l2_perf_ring() : nullptr;
+    __gm__ L2SwimlaneAicoreRing *l2_swimlane_ring = l2_swimlane_enabled ? get_aicore_l2_swimlane_ring() : nullptr;
     __gm__ PmuAicoreRing *pmu_ring = pmu_enabled ? get_aicore_pmu_ring() : nullptr;
     uint64_t pmu_reg_base = pmu_enabled ? get_aicore_pmu_reg_base() : 0;
 
@@ -105,9 +105,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 pipe_barrier(PIPE_ALL);
             }
 
-            if (l2_perf_enabled) {
+            if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                l2_perf_aicore_record_task(l2_perf_ring, actual_task_id, start_time, end_time);
+                l2_swimlane_aicore_record_task(l2_swimlane_ring, actual_task_id, start_time, end_time);
             }
 
             last_task_id = task_id;

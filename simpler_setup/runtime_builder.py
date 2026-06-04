@@ -183,7 +183,7 @@ class RuntimeBuilder:
                 f"Pre-built runtime binaries not found for '{name}' "
                 f"(platform={self.platform}):\n"
                 + "\n".join(f"  {m}" for m in missing)
-                + "\nRun 'pip install .' or pass --build to compile them."
+                + "\nRun 'pip install --no-build-isolation .' to compile them."
             )
 
         # Validate sim_context SO exists for sim platforms
@@ -191,7 +191,7 @@ class RuntimeBuilder:
         if sim_context_path is not None and not sim_context_path.is_file():
             raise FileNotFoundError(
                 f"Pre-built libcpu_sim_context.so not found at {sim_context_path}.\n"
-                "Run 'pip install .' or pass --build to compile it."
+                "Run 'pip install --no-build-isolation .' to compile it."
             )
 
         # Validate libsimpler_log.so exists (built once per arch/variant).
@@ -199,7 +199,7 @@ class RuntimeBuilder:
         if not simpler_log_path.is_file():
             raise FileNotFoundError(
                 f"Pre-built libsimpler_log.so not found at {simpler_log_path}.\n"
-                "Run 'pip install .' or pass --build to compile it."
+                "Run 'pip install --no-build-isolation .' to compile it."
             )
 
         # Resolve and validate libsimpler_aicpu_dispatcher.so for onboard
@@ -210,7 +210,7 @@ class RuntimeBuilder:
         if dispatcher_path is not None and not dispatcher_path.is_file():
             raise FileNotFoundError(
                 f"Pre-built libsimpler_aicpu_dispatcher.so not found at {dispatcher_path}.\n"
-                "Run 'pip install .' or pass --build to compile it."
+                "Run 'pip install --no-build-isolation .' to compile it."
             )
 
         return RuntimeBinaries(
@@ -361,7 +361,7 @@ class RuntimeBuilder:
         if not build:
             raise FileNotFoundError(
                 f"Pre-built libsimpler_log.so not found at {so_path}.\n"
-                "Run 'pip install .' or pass --build to compile it."
+                "Run 'pip install --no-build-isolation .' to compile it."
             )
 
         cache_dir = self._CACHE_DIR
@@ -388,7 +388,7 @@ class RuntimeBuilder:
         if not build:
             raise FileNotFoundError(
                 f"Pre-built libcpu_sim_context.so not found at {so_path}.\n"
-                "Run 'pip install .' or pass --build to compile it."
+                "Run 'pip install --no-build-isolation .' to compile it."
             )
 
         cache_dir = self._CACHE_DIR

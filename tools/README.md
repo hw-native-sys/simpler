@@ -35,3 +35,53 @@ Must run from the repo root inside an activated venv.
 source .venv/bin/activate
 bash tools/verify_packaging.sh
 ```
+
+## cann-examples/
+
+Standalone runnable references for the CANN host-side ACL APIs. Each
+subdirectory is its own minimal CMake project — build and run on a host
+with `ASCEND_HOME_PATH` set.
+
+### cann-examples/query
+
+Host-side device-info CLI. Subcommands wrap individual clusters of CANN
+APIs (`aclrtGetDeviceCount`, `aclrtGetSocName`, `aclrtGetStreamResLimit`,
+`aclrtGetMemInfo`, `aclrtGetVersion`). Treat the source as a runnable
+reference for "how do I ask the driver for X?".
+
+```bash
+export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+cd tools/cann-examples/query
+cmake -B build .
+cmake --build build
+
+./build/query              # full overview
+./build/query devices      # device count and IDs
+./build/query device 0     # SoC name, AIC/AIV core counts, HBM total
+./build/query mem 0        # HBM free / total / used
+./build/query version      # CANN runtime version
+```
+
+### cann-examples/aicpu-device-query
+
+Runs `halGetDeviceInfo` queries from **inside an AICPU OS process** —
+resolves the "used in device" HAL queries (`AICPU + OS_SCHED`,
+`AICPU + PF_*`, etc.) that always fail from host code. Uploads a small
+inner SO via the same dispatcher bootstrap path the production runtime
+uses; results come back through GM. Documents the resolution of the
+a3 AICPU 8 → 6 split and the a5 AICPU 9 → 6 split — see the tool's own
+[README](./cann-examples/aicpu-device-query/README.md) for build/run
+instructions and what it confirmed.
+
+### cann-examples/aicpu-kernel-launch
+
+The minimum end-to-end demonstration of launching a custom AICPU kernel
+from a host process using the production dispatcher bootstrap path —
+no sudo, no tar.gz pre-deployment. Strips out everything specific to
+this repo's runtime (ringbuffer setup, tensormap encoding, ChipWorker
+fork, etc.); the inner kernel writes a magic value, an echoed token, and
+one `halGetDeviceInfo` result so the readback proves end-to-end
+correctness. Read this first if you want to add new AICPU work to this
+repo. See the tool's own
+[README](./cann-examples/aicpu-kernel-launch/README.md) for the
+pipeline diagram, I/O contract, and Path A vs Path B (#822) notes.

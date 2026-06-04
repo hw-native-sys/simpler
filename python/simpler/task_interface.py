@@ -21,13 +21,17 @@ Usage:
 
 import ctypes
 import os
+import threading
+import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     CONTINUOUS_TENSOR_MAX_DIMS,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
+    MAX_REGISTERED_CALLABLE_IDS,
     ArgDirection,
     CallConfig,
     ChipCallable,
@@ -35,13 +39,11 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     ContinuousTensor,
     CoreCallable,
     DataType,
-    SubmitResult,
     TaskArgs,
     TaskState,
     TensorArgType,
     WorkerType,
     _ChipWorker,
-    _Orchestrator,
     _Worker,
     arg_direction_name,
     get_dtype_name,
@@ -68,8 +70,6 @@ __all__ = [
     # Distributed runtime
     "WorkerType",
     "TaskState",
-    "_Orchestrator",
-    "SubmitResult",
     "_Worker",
     "MAILBOX_SIZE",
     "MAILBOX_OFF_ERROR_MSG",
@@ -286,19 +286,27 @@ class ChipWorker:
 
     The runtime library and target device are bound once via init() and
     cannot be changed.
+    Public dispatch uses opaque ``CallableHandle`` values. Integer execution
+    slots are private to this wrapper and the runtime ABI.
 
     Usage::
 
         worker = ChipWorker()
         worker.init(device_id=0, bins=bins)
-        worker.prepare_callable(callable_id=0, callable=chip_callable)
-        worker.run(callable_id=0, args=orch_args, config=CallConfig())  # block_dim defaults to 0 = auto
-        worker.unregister_callable(callable_id=0)
+        handle = worker.prepare_callable(chip_callable)
+        worker.run(handle, args=orch_args, config=CallConfig())  # block_dim defaults to 0 = auto
+        worker.unregister_callable(handle)
         worker.finalize()
     """
 
     def __init__(self):
         self._impl = _ChipWorker()
+        self._owner_id = uuid.uuid4().hex
+        self._registry_lock = threading.Lock()
+        self._callable_registry: dict[int, ChipCallable] = {}
+        self._identity_registry: dict[bytes, Any] = {}
+        self._live_handles: dict[int, bytes] = {}
+        self._next_handle_id = 0
 
     def init(self, device_id, bins, log_level=None, log_info_v=None):
         """Attach the calling thread to ``device_id``, load the host runtime
@@ -367,6 +375,8 @@ class ChipWorker:
             "" if dispatcher_path is None else str(dispatcher_path),
             int(device_id),
         )
+        for slot_id, callable_obj in list(self._callable_registry.items()):
+            self._impl.prepare_callable(int(slot_id), callable_obj)
 
     def finalize(self):
         """Tear down everything: device resources and runtime library.
@@ -374,21 +384,125 @@ class ChipWorker:
         Terminal operation — the object cannot be reused after this.
         """
         self._impl.finalize()
+        with self._registry_lock:
+            self._callable_registry.clear()
+            self._identity_registry.clear()
+            self._live_handles.clear()
 
-    def prepare_callable(self, callable_id, callable):
-        """Stage a ChipCallable under ``callable_id`` for repeated cheap launches.
+    def _allocate_slot_locked(self) -> int:
+        for slot_id in range(MAX_REGISTERED_CALLABLE_IDS):
+            if slot_id not in self._callable_registry:
+                return slot_id
+        raise RuntimeError(
+            "ChipWorker.prepare_callable: callable capacity exhausted "
+            f"(MAX_REGISTERED_CALLABLE_IDS={MAX_REGISTERED_CALLABLE_IDS})"
+        )
 
-        Uploads the kernel binaries + the orchestration SO once; subsequent
-        ``run(callable_id, ...)`` skips that work. ``callable_id``
-        must be in ``[0, 64)``. Requires ``init()``.
+    def _make_handle_locked(self, state):
+        from .callable_identity import CallableHandle  # noqa: PLC0415
+
+        handle_id = self._next_handle_id
+        self._next_handle_id += 1
+        self._live_handles[handle_id] = state.digest
+        return CallableHandle._from_registration(
+            hashid=state.hashid,
+            kind=state.kind,
+            target_namespace=state.target_namespace,
+            handle_id=handle_id,
+            owner_id=self._owner_id,
+        )
+
+    def _rollback_handle_locked(self, handle) -> None:
+        state = self._identity_registry.get(handle.digest)
+        self._live_handles.pop(handle._handle_id, None)
+        if state is None:
+            return
+        state.ref_count -= 1
+        if state.ref_count > 0:
+            return
+        self._callable_registry.pop(state.slot_id, None)
+        self._identity_registry.pop(state.digest, None)
+
+    def _resolve_handle_locked(self, handle):
+        from .callable_identity import CallableHandle  # noqa: PLC0415
+
+        if not isinstance(handle, CallableHandle):
+            raise TypeError("ChipWorker.run expects a CallableHandle returned by ChipWorker.prepare_callable")
+        if handle._owner_id != self._owner_id:
+            raise KeyError(f"CallableHandle {handle.hashid} does not belong to this ChipWorker")
+        digest = self._live_handles.get(handle._handle_id)
+        if digest is None or digest != handle.digest:
+            raise KeyError(f"CallableHandle {handle.hashid} is not live on this ChipWorker")
+        state = self._identity_registry.get(digest)
+        if state is None:
+            raise KeyError(f"CallableHandle {handle.hashid} is not registered")
+        if (
+            handle.hashid != state.hashid
+            or handle.kind != state.kind
+            or handle.target_namespace != state.target_namespace
+        ):
+            raise RuntimeError(f"CALLABLE_HANDLE_MUTATED: {handle.hashid}")
+        return state
+
+    def _resolve_handle(self, handle):
+        with self._registry_lock:
+            return self._resolve_handle_locked(handle)
+
+    def prepare_callable(self, callable):
+        """Prepare a ``ChipCallable`` and return an opaque handle.
+
+        The runtime still uses an integer slot internally, but the caller never
+        chooses or observes it.
         """
-        self._impl.prepare_callable(int(callable_id), callable)
+        if not isinstance(callable, ChipCallable):
+            raise TypeError("ChipWorker.prepare_callable only supports ChipCallable targets")
+        from .callable_identity import (  # noqa: PLC0415
+            _CallableIdentityState,
+            build_chip_callable_descriptor,
+            compute_callable_hashid,
+            hashid_to_digest,
+        )
 
-    def run(self, callable_id, args, config=None, **kwargs):
-        """Launch a ``callable_id`` previously staged via ``prepare_callable``.
+        descriptor = build_chip_callable_descriptor(target=callable)
+        hashid = compute_callable_hashid(descriptor)
+        digest = hashid_to_digest(hashid)
+        with self._registry_lock:
+            state = self._identity_registry.get(digest)
+            if state is not None:
+                if state.descriptor != descriptor or state.kind != "CHIP_CALLABLE":
+                    raise RuntimeError(f"HASHID_DESCRIPTOR_MISMATCH: {hashid}")
+                state.ref_count += 1
+                return self._make_handle_locked(state)
+            slot_id = self._allocate_slot_locked()
+            state = _CallableIdentityState(
+                hashid=hashid,
+                digest=digest,
+                kind="CHIP_CALLABLE",
+                target_namespace="LOCAL_CHIP",
+                descriptor=descriptor,
+                payload_digest=descriptor,
+                slot_id=slot_id,
+                target=callable,
+                ref_count=1,
+            )
+            self._identity_registry[digest] = state
+            self._callable_registry[slot_id] = callable
+            handle = self._make_handle_locked(state)
+
+        if self.initialized:
+            try:
+                self._impl.prepare_callable(int(slot_id), callable)
+            except Exception:
+                with self._registry_lock:
+                    self._rollback_handle_locked(handle)
+                raise
+        return handle
+
+    def run(self, handle, args, config=None, **kwargs):
+        """Launch a callable previously returned by ``prepare_callable``.
 
         Args:
-            callable_id: Stable id passed to a prior ``prepare_callable``.
+            handle: ``CallableHandle`` returned by ``prepare_callable``.
             args: ChipStorageTaskArgs for this invocation.
             config: Optional CallConfig. If None, a default is created.
             **kwargs: Overrides applied to config (e.g. ``block_dim=8`` to
@@ -399,19 +513,40 @@ class ChipWorker:
 
         Returns a :class:`RunTiming` with host + device wall.
         """
+        state = self._resolve_handle(handle)
+        return self._run_slot(state.slot_id, args, config, **kwargs)
+
+    def unregister_callable(self, handle) -> None:
+        """Drop one live callable handle and release its private resources when final."""
+        with self._registry_lock:
+            state = self._resolve_handle_locked(handle)
+            self._live_handles.pop(handle._handle_id, None)
+            state.ref_count -= 1
+            if state.ref_count > 0:
+                return
+            slot_id = state.slot_id
+            self._callable_registry.pop(slot_id, None)
+            self._identity_registry.pop(state.digest, None)
+
+        if self.initialized:
+            self._impl.unregister_callable(int(slot_id))
+
+    def _prepare_callable_at_slot(self, callable_id, callable):
+        self._impl.prepare_callable(int(callable_id), callable)
+
+    def _run_slot(self, callable_id, args, config=None, **kwargs):
         if config is None:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
         return self._impl.run(int(callable_id), args, config)
 
-    def unregister_callable(self, callable_id):
-        """Drop prepared state for ``callable_id`` and release its orch SO share."""
+    def _unregister_slot(self, callable_id):
         self._impl.unregister_callable(int(callable_id))
 
     @property
     def aicpu_dlopen_count(self):
-        """Number of distinct callable_ids the AICPU has dlopened for."""
+        """Number of distinct callable identities the AICPU has dlopened for."""
         return self._impl.aicpu_dlopen_count
 
     @property

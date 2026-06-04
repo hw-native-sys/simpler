@@ -20,7 +20,7 @@ Verifies the end-to-end dep_gen pipeline on a2a3sim:
   implicitly: if it broke, deps.json would be empty or wrong.
 
 deps.json is now the sole source of truth for fanout edges — the device
-hot path no longer records L2PerfRecord::fanout[], so there is no
+hot path no longer records L2SwimlaneAicpuTaskRecord::fanout[], so there is no
 "fanout ⊆ deps" cross-check to run. swimlane_converter.py joins
 deps.json into the Perfetto trace at post-process time.
 
@@ -135,11 +135,17 @@ class TestDepGen(SceneTestCase):
         out_dir = matches[-1]
 
         # ---- deps.json (host replay output — sole dep_gen artifact on disk) ----
+        # We only reach here with --enable-dep-gen on and rounds<=1 (the
+        # test_run gate via _effective_enable_dep_gen) AND an output dir present
+        # (the case actually ran). deps.json MUST therefore have been produced;
+        # its absence means the capture->reconcile->replay pipeline silently
+        # produced nothing (reconcile drops or replay failure) — exactly the
+        # regression this test exists to catch (#742). Fail loudly, don't skip.
         deps_path = out_dir / "deps.json"
-        if not deps_path.exists():
-            # Output dir exists but no deps.json — another diagnostic flag was
-            # on (e.g. just --enable-l2-swimlane) but not --enable-dep-gen.
-            return
+        assert deps_path.exists(), (
+            f"--enable-dep-gen is on and {out_dir} exists, but deps.json was not produced "
+            f"— capture/reconcile/replay pipeline regression"
+        )
         with deps_path.open() as f:
             deps = json.load(f)
         # Strided-Tensor schema: annotated edges with tasks[] / tensors[]

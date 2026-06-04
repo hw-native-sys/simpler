@@ -45,8 +45,24 @@
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 
 constexpr int32_t MAX_IDLE_ITERATIONS = PLATFORM_MAX_IDLE_ITERATIONS;  // platform-defined cap (sim vs onboard)
-constexpr int32_t STALL_LOG_INTERVAL = MAX_IDLE_ITERATIONS / 2;  // derived: ~one stall diagnostic halfway to timeout
-constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;             // Check orchestrator error every N idle iters
+constexpr int32_t STALL_LOG_INTERVAL =
+    MAX_IDLE_ITERATIONS * 6 / 10;                     // derived: ~one stall diagnostic halfway to timeout
+constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
+
+// Wall-clock budget for declaring "no progress = scheduler timeout". Replaces
+// the per-thread iteration-count cap for the fatal-latch decision; the
+// iteration cap still drives the STALL diagnostic cadence (which is per-thread
+// observability and benefits from running at the thread's own pace).
+//
+// Using wall-clock here is load-bearing for distributed runs: with per-thread
+// iteration counts, a pure-idle thread spinning ~115 ns/iter hits the cap in
+// ~92 ms while a sibling thread polling a RUNNING task takes ~200 ms for the
+// same iteration count. The fast spinner racing ahead and latching fatal
+// kills the slower-but-correct poller mid-poll — see the distributed
+// startup-skew scenario in issue #897.
+constexpr int32_t SCHEDULER_TIMEOUT_MS = 5000;  // 5 s; > worst observed distributed-init skew + HCCL wait
+constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
+    static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
 constexpr int32_t STALL_DUMP_READY_MAX = 8;
 constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
 constexpr int32_t STALL_DUMP_CORE_MAX = 8;
@@ -340,8 +356,8 @@ struct SlotTransition {
 // =============================================================================
 
 #if PTO2_PROFILING
-struct alignas(64) SchedL2PerfCounters {
-    bool l2_perf_enabled{false};
+struct alignas(64) SchedL2SwimlaneCounters {
+    bool l2_swimlane_enabled{false};
     uint64_t sched_start_ts{0};
     uint64_t sched_complete_cycle{0};
     uint64_t sched_dispatch_cycle{0};
@@ -368,7 +384,7 @@ struct alignas(64) SchedL2PerfCounters {
     uint64_t sched_dispatch_pop_cycle{0};
     uint64_t sched_dispatch_setup_cycle{0};
 #endif
-    void reset() { *this = SchedL2PerfCounters{}; }
+    void reset() { *this = SchedL2SwimlaneCounters{}; }
 };
 #endif
 
@@ -382,7 +398,7 @@ struct alignas(64) SyncStartDrainState {
     std::atomic<int32_t> sync_start_pending{0};    // 0=normal; -1=initializing; >0=active (value=block_num)
     std::atomic<int32_t> drain_worker_elected{0};  // 0=none; >0: elected thread's (thread_idx+1)
     std::atomic<uint32_t> drain_ack_mask{0};       // bit per thread; all-set = all threads reached ack barrier
-    PTO2TaskSlotState *pending_task{nullptr};      // held task (not re-queued)
+    std::atomic<PTO2TaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
     int32_t _pad[10];
 };
 static_assert(sizeof(SyncStartDrainState) == 64);

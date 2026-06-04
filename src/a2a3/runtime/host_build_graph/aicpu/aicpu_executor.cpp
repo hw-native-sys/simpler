@@ -16,13 +16,13 @@
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
-#include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "callable.h"
 #include "common/memory_barrier.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "runtime.h"
@@ -140,7 +140,7 @@ struct AicpuExecutor {
 
     inline bool try_dispatch_task(
         int core_id, uint64_t reg_addr, CoreType core_type, int thread_idx, int *local_queue, int &head,
-        int &ready_count, bool l2_perf_enabled, Runtime &runtime
+        int &ready_count, bool l2_swimlane_enabled, Runtime &runtime
     );
 };
 
@@ -188,9 +188,8 @@ inline void AicpuExecutor::resolve_task_dependencies(
             int tensor_buffer_count =
                 collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
             dump_tensors_for_task(
-                thread_idx, static_cast<uint64_t>(task->task_id), 0, task->num_args, task->func_id, *callable,
-                tensor_info, tensor_info_count, tensor_buffer_addrs, tensor_buffer_count,
-                TensorDumpStage::AFTER_COMPLETION
+                thread_idx, static_cast<uint64_t>(task->task_id), task->num_args, *callable, tensor_info,
+                tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::AFTER_COMPLETION
             );
         }
     }
@@ -239,7 +238,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
 // Try to dispatch a task from thread-local queue to a core
 inline bool AicpuExecutor::try_dispatch_task(
     int core_id, uint64_t reg_addr, CoreType core_type, int thread_idx, int *local_queue, int &head, int &ready_count,
-    bool l2_perf_enabled, [[maybe_unused]] Runtime &runtime
+    bool l2_swimlane_enabled, [[maybe_unused]] Runtime &runtime
 ) {
     if (ready_count <= 0) {
         return false;
@@ -249,12 +248,6 @@ inline bool AicpuExecutor::try_dispatch_task(
     int task_id = local_queue[head];
     head = (head + 1) % MAX_CORES_PER_THREAD;
     ready_count--;
-
-    // Profiling: record the real AICPU dispatch point for this core. Buffer
-    // rotation is handled inside l2_perf_aicpu_complete_record.
-    if (l2_perf_enabled && get_l2_perf_level() >= L2PerfLevel::AICPU_TIMING) {
-        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-    }
 
     const char *core_type_str = (core_type == CoreType::AIC) ? "AIC" : "AIV";
     LOG_INFO_V0(
@@ -275,9 +268,8 @@ inline bool AicpuExecutor::try_dispatch_task(
                 int tensor_buffer_count =
                     collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
                 dump_tensors_for_task(
-                    thread_idx, static_cast<uint64_t>(task_id), 0, task->num_args, task->func_id, *callable,
-                    tensor_info, tensor_info_count, tensor_buffer_addrs, tensor_buffer_count,
-                    TensorDumpStage::BEFORE_DISPATCH
+                    thread_idx, static_cast<uint64_t>(task_id), task->num_args, *callable, tensor_info,
+                    tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::BEFORE_DISPATCH
                 );
             }
         }
@@ -287,11 +279,28 @@ inline bool AicpuExecutor::try_dispatch_task(
     // Set state before writing register to avoid race with AICore ACK
     pending_task_ids_[core_id] = task_id;
 
+    // AICore buffer rotation: count this dispatch and rotate before write_reg
+    // when crossing a BUFFER_SIZE boundary. The completion-before-dispatch
+    // invariant makes this race-free (all prior tasks on this core have FIN'd,
+    // so AICore has dcci'd their records out of the old buffer).
+    if (l2_swimlane_enabled) {
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+    }
+
     // Publish task data before AICore can observe the dispatched task_id.
     // ARM64 needs an explicit store-store fence across Normal-cacheable ->
     // Device-nGnRnE; the old write_reg() helper carried this implicitly via
     // __sync_synchronize.
     wmb();
+
+    // Capture dispatch timestamp at the latest possible moment — after wmb,
+    // immediately before the DATA_MAIN_BASE write. Anything earlier
+    // (LOG_INFO_V0, on_aicore_dispatch's per-BUFFER_SIZE rotation work, wmb
+    // itself) would charge AICPU-internal cost to (dispatch_time → start_time).
+    if (l2_swimlane_enabled && get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) {
+        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+    }
+
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id));
 
     return true;
@@ -329,7 +338,7 @@ int AicpuExecutor::init(Runtime *runtime) {
     }
 
     if (is_l2_swimlane_enabled()) {
-        l2_perf_aicpu_init(runtime->worker_count);
+        l2_swimlane_aicpu_init(runtime->worker_count);
     }
 
     // Perform core discovery: handshake with all cores and collect core type information
@@ -679,8 +688,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
     int verification_warning_count = 0;
     const int MAX_VERIFICATION_WARNINGS = 10;
-    bool l2_perf_enabled = is_l2_swimlane_enabled();
-    L2PerfLevel l2_perf_level = get_l2_perf_level();
+    bool l2_swimlane_enabled = is_l2_swimlane_enabled();
+    L2SwimlaneLevel l2_swimlane_level = get_l2_swimlane_level();
     // PMU runs require single-issue dispatch — overlapping in-flight tasks
     // pollute per-task PMU counters. Cached at function scope:
     // is_pmu_enabled() is extern "C" and the compiler cannot hoist it
@@ -707,7 +716,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
     );
 
     // Initialize dispatch timestamps for all cores (only needed at level >= 2)
-    if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
+    if (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
         uint64_t dispatch_start_time = get_sys_cnt_aicpu();
         for (int i = 0; i < core_num; i++) {
             int core_id = cur_thread_cores[i];
@@ -733,6 +742,14 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
             // Case 1: Pending task finished directly
             if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
+                // Capture finish_ts at FIN-observation — after rmb() above,
+                // BEFORE any logging or completion processing. Both completions
+                // below (implicit prev_running + explicit pending) happen at this
+                // same observation moment, so they share one timestamp.
+                uint64_t finish_ts = (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ?
+                                         get_sys_cnt_aicpu() :
+                                         0;
+
                 LOG_INFO_V0(
                     "Thread %d: Core %d completed task %d (running_id=%d)", thread_idx, core_id,
                     pending_task_ids_[core_id], running_task_ids_[core_id]
@@ -744,39 +761,28 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 // Profiling: when prev_running_id exists, its AICore timing was
                 // published to the ring slot first, so complete it BEFORE the
                 // pending task's record to maintain buffer ordering.
-                if (l2_perf_enabled) {
-                    uint64_t finish_ts = (l2_perf_level >= L2PerfLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-
+                // Level gate: AICPU contributes only at AICPU_TIMING+; level=1
+                // is satisfied by the AICore record alone (carries task_token).
+                if (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
                     if (prev_running_id != AICPU_TASK_INVALID) {
-                        Task *prev_task = &runtime.tasks[prev_running_id];
-                        if (l2_perf_aicpu_complete_record(
+                        if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts
                             ) != 0) {
                             LOG_ERROR(
-                                "Core %d: l2_perf_aicpu_complete_record failed for implicit task %d", core_id,
+                                "Core %d: l2_swimlane_aicpu_complete_task failed for implicit task %d", core_id,
                                 prev_running_id
                             );
                         }
-                        if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
-                            dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-                        }
                     }
 
-                    finish_ts = (l2_perf_level >= L2PerfLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-                    Task *task = &runtime.tasks[completed_task_id];
-                    if (l2_perf_aicpu_complete_record(
+                    if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts
                         ) != 0) {
                         LOG_ERROR(
-                            "Core %d: l2_perf_aicpu_complete_record failed for task %d", core_id, completed_task_id
+                            "Core %d: l2_swimlane_aicpu_complete_task failed for task %d", core_id, completed_task_id
                         );
-                    }
-                    if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
-                        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                     }
                 }
 
@@ -788,16 +794,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 // Try dispatch BEFORE resolve_dependencies
                 // This allows the core to start next task immediately
-                bool dispatched = false;
                 if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
-                    dispatched = try_dispatch_task(
+                    try_dispatch_task(
                         core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                        cur_aic_ready_count, l2_perf_enabled, runtime
+                        cur_aic_ready_count, l2_swimlane_enabled, runtime
                     );
                 } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
-                    dispatched = try_dispatch_task(
+                    try_dispatch_task(
                         core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                        cur_aiv_ready_count, l2_perf_enabled, runtime
+                        cur_aiv_ready_count, l2_swimlane_enabled, runtime
                     );
                 }
 
@@ -827,13 +832,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 );
 
                 made_progress = true;
-
-                // Update timestamp if didn't dispatch (try_dispatch_task updates it if dispatched)
-                if (!dispatched && l2_perf_enabled && l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
-                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-                }
             } else if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_ACK_STATE) {
-                // Case 2: Pending task received ACK
+                // Case 2: Pending task received ACK. The ACK observation is
+                // also the implicit-completion observation point for any prior
+                // running task (AICore overwrote COND before we could read
+                // its FIN). Capture finish_ts here, before LOG_INFO_V0.
+                uint64_t finish_ts = (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ?
+                                         get_sys_cnt_aicpu() :
+                                         0;
+
                 LOG_INFO_V0(
                     "Thread %d: Core %d ACKed task %d (running_id=%d)", thread_idx, core_id, pending_task_ids_[core_id],
                     running_task_ids_[core_id]
@@ -850,22 +857,18 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 // completed (AICore overwrote COND before we could read its FIN).
                 // Count it here to avoid losing completion.
                 if (prev_running_id != AICPU_TASK_INVALID) {
-                    // Profiling: complete the implicit task's AICore record
-                    if (l2_perf_enabled) {
-                        uint64_t finish_ts = (l2_perf_level >= L2PerfLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-                        Task *prev_task = &runtime.tasks[prev_running_id];
-                        if (l2_perf_aicpu_complete_record(
+                    // Profiling: complete the implicit task's AICore record.
+                    // Level gate: see complete-task comment at the matching
+                    // block ~100 lines above.
+                    if (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
+                        if (l2_swimlane_aicpu_complete_task(
                                 core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
                                 dispatch_timestamps_[core_id], finish_ts
                             ) != 0) {
                             LOG_ERROR(
-                                "Core %d: l2_perf_aicpu_complete_record failed for implicit task %d", core_id,
+                                "Core %d: l2_swimlane_aicpu_complete_task failed for implicit task %d", core_id,
                                 prev_running_id
                             );
-                        }
-                        if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
-                            dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                         }
                     }
 
@@ -886,7 +889,12 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 // Core can accept new task now (pipeline!)
                 // Continue to Case 4 to dispatch next task
             } else if (reg_task_id == running_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
-                // Case 3: Running task finished
+                // Case 3: Running task finished. Capture finish_ts at the FIN
+                // observation point, BEFORE LOG_INFO_V0 / completion work.
+                uint64_t finish_ts = (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ?
+                                         get_sys_cnt_aicpu() :
+                                         0;
+
                 LOG_INFO_V0(
                     "Thread %d: Core %d completed task %d (pending_id=%d)", thread_idx, core_id,
                     running_task_ids_[core_id], pending_task_ids_[core_id]
@@ -894,20 +902,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 int completed_task_id = running_task_ids_[core_id];
 
-                if (l2_perf_enabled) {
-                    uint64_t finish_ts = (l2_perf_level >= L2PerfLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
-                    Task *task = &runtime.tasks[completed_task_id];
-                    if (l2_perf_aicpu_complete_record(
+                // Level gate: see complete-task comment at the matching block above.
+                if (l2_swimlane_enabled && l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
+                    if (l2_swimlane_aicpu_complete_task(
                             core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
                             dispatch_timestamps_[core_id], finish_ts
                         ) != 0) {
                         LOG_ERROR(
-                            "Core %d: l2_perf_aicpu_complete_record failed for task %d", core_id, completed_task_id
+                            "Core %d: l2_swimlane_aicpu_complete_task failed for task %d", core_id, completed_task_id
                         );
-                    }
-                    if (l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
-                        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                     }
                 }
 
@@ -916,17 +919,16 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 running_task_ids_[core_id] = AICPU_TASK_INVALID;
 
-                bool dispatched = false;
                 if (pending_task_ids_[core_id] == AICPU_TASK_INVALID) {
                     if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
-                        dispatched = try_dispatch_task(
+                        try_dispatch_task(
                             core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                            cur_aic_ready_count, l2_perf_enabled, runtime
+                            cur_aic_ready_count, l2_swimlane_enabled, runtime
                         );
                     } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
-                        dispatched = try_dispatch_task(
+                        try_dispatch_task(
                             core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                            cur_aiv_ready_count, l2_perf_enabled, runtime
+                            cur_aiv_ready_count, l2_swimlane_enabled, runtime
                         );
                     }
                 }
@@ -938,11 +940,6 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 );
 
                 made_progress = true;
-
-                // Update timestamp if didn't dispatch (try_dispatch_task updates it if dispatched)
-                if (!dispatched && l2_perf_enabled && l2_perf_level >= L2PerfLevel::AICPU_TIMING) {
-                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-                }
             }
 
             // Case 4: Dispatch new task if pending slot is available. When PMU
@@ -953,14 +950,14 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                     if (try_dispatch_task(
                             core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                            cur_aic_ready_count, l2_perf_enabled, runtime
+                            cur_aic_ready_count, l2_swimlane_enabled, runtime
                         )) {
                         made_progress = true;
                     }
                 } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
                     if (try_dispatch_task(
                             core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                            cur_aiv_ready_count, l2_perf_enabled, runtime
+                            cur_aiv_ready_count, l2_swimlane_enabled, runtime
                         )) {
                         made_progress = true;
                     }
@@ -1099,7 +1096,7 @@ int AicpuExecutor::run(Runtime *runtime) {
 
     // Flush performance buffers for cores managed by this thread
     if (is_l2_swimlane_enabled()) {
-        l2_perf_aicpu_flush_buffers(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
+        l2_swimlane_aicpu_flush(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
 #if PTO2_PROFILING
     if (is_pmu_enabled()) {

@@ -447,10 +447,9 @@ NB_MODULE(_task_interface, m) {
                 // serialised representation produced by `buffer_ptr()` /
                 // `buffer_size()`. Used by the L4 cascade in
                 // _child_worker_loop, which receives CTRL_REGISTER bytes
-                // through shared memory and needs a typed ChipCallable to
-                // hand to inner_worker._register_at (the cid is dictated
-                // by the outer cascade, not freshly allocated); see
-                // docs/callable-ipc-dynamic-register.md.
+                // through shared memory and needs a typed ChipCallable for
+                // digest-owned registration on the child Worker; see
+                // docs/callable-identity-registration.md.
                 std::vector<uint8_t> buf(
                     reinterpret_cast<const uint8_t *>(raw.c_str()),
                     reinterpret_cast<const uint8_t *>(raw.c_str()) + raw.size()
@@ -602,10 +601,18 @@ NB_MODULE(_task_interface, m) {
         .def_prop_rw(
             "enable_dump_tensor",
             [](const CallConfig &c) {
-                return static_cast<bool>(c.enable_dump_tensor);
+                return c.enable_dump_tensor;
             },
-            [](CallConfig &c, bool v) {
-                c.enable_dump_tensor = v ? 1 : 0;
+            // Accept either an int dump level (0=off, 1=partial, 2=full) or a
+            // Python bool. `True` maps to level 1 (partial) — the default when
+            // --dump-tensor is passed without a value; `False` maps to 0.
+            [](CallConfig &c, nb::object v) {
+                if (PyBool_Check(v.ptr())) {
+                    c.enable_dump_tensor = nb::cast<bool>(v) ? 1 : 0;
+                } else {
+                    int level = nb::cast<int>(v);
+                    c.enable_dump_tensor = (level < 0) ? 0 : (level > 2) ? 2 : level;
+                }
             }
         )
         .def_rw("enable_pmu", &CallConfig::enable_pmu)
@@ -616,6 +623,15 @@ NB_MODULE(_task_interface, m) {
             },
             [](CallConfig &c, bool v) {
                 c.enable_dep_gen = v ? 1 : 0;
+            }
+        )
+        .def_prop_rw(
+            "enable_scope_stats",
+            [](const CallConfig &c) {
+                return static_cast<bool>(c.enable_scope_stats);
+            },
+            [](CallConfig &c, bool v) {
+                c.enable_scope_stats = v ? 1 : 0;
             }
         )
         .def_prop_rw(
@@ -638,8 +654,9 @@ NB_MODULE(_task_interface, m) {
             std::ostringstream os;
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
                << ", enable_l2_swimlane=" << self.enable_l2_swimlane
-               << ", enable_dump_tensor=" << (self.enable_dump_tensor ? "True" : "False")
-               << ", enable_pmu=" << self.enable_pmu << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False");
+               << ", enable_dump_tensor=" << self.enable_dump_tensor << ", enable_pmu=" << self.enable_pmu
+               << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
+               << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
             if (self.output_prefix_set()) {
                 os << ", output_prefix='" << self.output_prefix << "'";
             }
@@ -728,8 +745,8 @@ NB_MODULE(_task_interface, m) {
             nb::arg("callable_id"), nb::arg("blob_ptr"),
             "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
             "post-fork dynamic register handlers that receive the ChipCallable "
-            "bytes via shared memory; see docs/callable-ipc-dynamic-register.md). "
-            "Equivalent to prepare_callable(cid, ChipCallable) but accepts the "
+            "bytes via shared memory; see docs/callable-identity-registration.md). "
+            "Equivalent to prepare_callable(callable_id, ChipCallable) but accepts the "
             "ChipCallable layout pointer directly so chip-child loops can prepare "
             "from shm without rebuilding a PyChipCallable wrapper."
         )
@@ -785,9 +802,9 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro("initialized", &ChipWorker::initialized)
         .def_prop_ro(
             "aicpu_dlopen_count", &ChipWorker::aicpu_dlopen_count,
-            "Number of distinct callable_ids the AICPU has dlopened for on the "
+            "Number of distinct callable entries the AICPU has dlopened for on the "
             "bound device. Equals 0 when not initialized or the runtime "
-            "variant lacks per-cid registration. Tests assert this to verify "
+            "variant lacks prepared-callable registration. Tests assert this to verify "
             "prepare_callable + repeated run do not redundantly dlopen."
         )
         .def_prop_ro(

@@ -38,3 +38,24 @@ regression barrier behind.
 
 Exceptions: infrastructure/build breakage where a test is impractical, or
 one-character typo fixes where the diff itself is the verification.
+
+## 4. Check `docs/investigations/` before proposing optimizations or refactors
+
+The repo records considered-and-dropped proposals in
+`docs/investigations/`. Before suggesting a non-trivial optimization,
+refactor, or design change, grep that folder for the subsystem and the
+mechanism you're about to propose. If an entry already shut the idea
+down, either:
+
+- Adopt that verdict (and tell the user the proposal was previously
+  rejected, with the link), or
+- If new information changes the calculus, update the existing entry
+  with the new measurement instead of opening a parallel discussion.
+
+When an investigation you ran ends with "we didn't do it" — measured
+no signal, found a blocking constraint, decided the cost outweighs the
+benefit — write a new entry there **and add it to the index in
+`docs/investigations/README.md`** before closing the session. An
+unlinked entry is invisible to the next person; the index is the only
+discovery surface. Future-you will re-derive the same conclusion
+otherwise.

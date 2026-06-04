@@ -14,7 +14,7 @@ no repo checkout required.
 - **[deps_to_graph](#deps_to_graph)** — `deps.json` (dep_gen) → pan/zoom HTML dependency graph
 - **[dump_viewer](#dump_viewer)** — inspect / export tensor dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
 
-Auto-detection paths (`outputs/*/l2_perf_records.json`, `outputs/*/tensor_dump/`)
+Auto-detection paths (`outputs/*/l2_swimlane_records.json`, `outputs/*/tensor_dump/`)
 are resolved relative to the **current working directory** — run these from the
 directory that holds your `outputs/`. Each test case writes into its own
 `outputs/<case>_<ts>/` directory; the tools auto-pick the latest by mtime.
@@ -27,7 +27,7 @@ Convert performance profiling JSON files into Chrome Trace Event format for visu
 
 ### Overview
 
-Converts PTO Runtime profiling data (`l2_perf_records_*.json`) into the format used by the Perfetto trace viewer (<https://ui.perfetto.dev/>). It also produces a task execution statistics summary grouped by function and a scheduler overhead deep-dive report (the same one `sched_overhead_analysis` emits).
+Converts PTO Runtime profiling data (`l2_swimlane_records_*.json`) into the format used by the Perfetto trace viewer (<https://ui.perfetto.dev/>). It also produces a task execution statistics summary grouped by function and a scheduler overhead deep-dive report (the same one `sched_overhead_analysis` emits).
 
 ### Basic Usage
 
@@ -36,20 +36,20 @@ Converts PTO Runtime profiling data (`l2_perf_records_*.json`) into the format u
 python -m simpler_setup.tools.swimlane_converter
 
 # Specify an input file
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json
 
 # Specify an output file
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json -o custom_output.json
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -o custom_output.json
 
 # Load function name mapping from kernel_config.py
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json \
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json \
     -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
 # Verbose mode (for debugging)
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json -v
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -v
 
 # Reuse a deps.json captured in an earlier dep_gen run (different output dir)
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_records.json \
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json \
     --deps-json outputs/<case>_<earlier_ts>/deps.json
 ```
 
@@ -65,7 +65,7 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_perf_rec
 
 | Option | Short | Description |
 | ------ | ----- | ----------- |
-| `input` | | Input JSON file (l2_perf_records_*.json). If omitted, the latest file in outputs/ is used |
+| `input` | | Input JSON file (l2_swimlane_records_*.json). If omitted, the latest file in outputs/ is used |
 | `--output` | `-o` | Output JSON file (default: outputs/merged_swimlane_`<timestamp>`.json) |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
 | `--func-names` | | Path to func_id_names_*.json (SceneTest format) for function name mapping |
@@ -118,7 +118,7 @@ python examples/scripts/run_example.py \
 
 After the test passes, the tool will:
 
-1. Auto-detect the latest `l2_perf_records_*.json` in outputs/
+1. Auto-detect the latest `l2_swimlane_records_*.json` in outputs/
 2. Load function names from the kernel_config.py specified via `-k`
 3. Produce `merged_swimlane_*.json` for visualization
 4. Print the task statistics and scheduler overhead deep-dive report to the console
@@ -133,7 +133,7 @@ Analyze AICPU scheduler overhead and quantitatively decompose the sources of Tai
 
 `sched_overhead_analysis` reads two artifacts produced by the runtime:
 
-1. **Perf profiling data** (`l2_perf_records_*.json`, l2_perf_level >= 3): per-task Exec / Head OH / Tail OH time breakdowns plus `aicpu_scheduler_phases` — per-thread, per-loop-iteration phase records carrying scan / complete / dispatch / idle timings and per-emit pop_hit / pop_miss deltas.
+1. **Perf profiling data** (`l2_swimlane_records_*.json`, l2_swimlane_level >= 3): per-task Exec / Head OH / Tail OH time breakdowns plus `aicpu_scheduler_phases` — per-thread, per-loop-iteration phase records carrying scan / complete / dispatch / idle timings and per-emit pop_hit / pop_miss deltas.
 2. **`deps.json`** (optional, dep_gen replay output): structural task DAG. When colocated with the perf JSON, Part 2 prints per-thread fanout / fanin aggregates derived from it.
 
 ### Basic Usage
@@ -144,11 +144,11 @@ python -m simpler_setup.tools.sched_overhead_analysis
 
 # Specify the perf JSON explicitly
 python -m simpler_setup.tools.sched_overhead_analysis \
-    --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json
+    --l2-swimlane-records-json outputs/<case>_<ts>/l2_swimlane_records.json
 
 # Override the deps.json location
 python -m simpler_setup.tools.sched_overhead_analysis \
-    --l2-perf-records-json outputs/<case>_<ts>/l2_perf_records.json \
+    --l2-swimlane-records-json outputs/<case>_<ts>/l2_swimlane_records.json \
     --deps-json outputs/<case>_<ts>/deps.json
 ```
 
@@ -156,7 +156,7 @@ python -m simpler_setup.tools.sched_overhead_analysis \
 
 | Option | Description |
 | ------ | ----------- |
-| `--l2-perf-records-json` | Path to the l2_perf_records_*.json file. If omitted, the latest file in outputs/ is auto-selected |
+| `--l2-swimlane-records-json` | Path to the l2_swimlane_records_*.json file. If omitted, the latest file in outputs/ is auto-selected |
 | `--deps-json` | Path to deps.json (dep_gen replay output) for fanout / fanin aggregates. Defaults to the deps.json sibling of the perf JSON. |
 
 ### Outputs
@@ -167,7 +167,7 @@ Output is emitted in three parts:
 - **Part 2: AICPU scheduler loop breakdown** — per-scheduler-thread loop statistics, per-phase (scan / complete / dispatch / idle) time ratios, pop_hit / pop_miss totals, and (when deps.json is available) per-thread fanout / fanin aggregates
 - **Part 3: Tail OH distribution & cause analysis** — Tail OH quantile distribution (P10–P99), correlation between scheduler loop iteration time and Tail OH, and data-driven insights into the dominant phase
 
-The perf JSON must be captured at l2_perf_level >= 3 so that `aicpu_scheduler_phases` is non-empty (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
+The perf JSON must be captured at l2_swimlane_level >= 3 so that `aicpu_scheduler_phases` is non-empty (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
 
 ---
 
@@ -279,11 +279,11 @@ python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump/ --ind
 
 ### Input File Format
 
-The analysis tools share the same input format - the `l2_perf_records_*.json` files generated by the PTO Runtime:
+The analysis tools share the same input format - the `l2_swimlane_records_*.json` files generated by the PTO Runtime:
 
 ```json
 {
-  "l2_perf_level": 4,
+  "l2_swimlane_level": 4,
   "tasks": [
     {
       "task_id": 0,
@@ -295,9 +295,7 @@ The analysis tools share the same input format - the `l2_perf_records_*.json` fi
       "end_time_us": 55.9,
       "duration_us": 8.44,
       "dispatch_time_us": 45.94,
-      "finish_time_us": 60.52,
-      "fanout": [4294967299, 4294967297, 4294967296],
-      "fanout_count": 3
+      "finish_time_us": 60.52
     },
     {
       "task_id": 4294967296,
@@ -309,9 +307,7 @@ The analysis tools share the same input format - the `l2_perf_records_*.json` fi
       "end_time_us": 70.42,
       "duration_us": 1.74,
       "dispatch_time_us": 68.24,
-      "finish_time_us": 71.2,
-      "fanout": [4294967298],
-      "fanout_count": 1
+      "finish_time_us": 71.2
     }
   ]
 }
@@ -320,9 +316,9 @@ The analysis tools share the same input format - the `l2_perf_records_*.json` fi
 Dependency edges come from `deps.json` (dep_gen replay) at post-process time —
 not from the perf JSON. See [`swimlane_converter --deps-json`](#swimlane_converter).
 
-Top-level layout depends on `l2_perf_level`:
+Top-level layout depends on `l2_swimlane_level`:
 
-- All levels: `l2_perf_level`, `tasks[]` (per-task fields above).
+- All levels: `l2_swimlane_level`, `tasks[]` (per-task fields above).
 - `>= 3`: also `aicpu_scheduler_phases[]` (per-thread phase records:
   scan / complete / dispatch / idle) and `core_to_thread[]` (core_id →
   scheduler thread index).
@@ -398,7 +394,7 @@ For batch-run hardware regression, see the dev-only script
 
 ## Troubleshooting
 
-### Error: cannot find l2_perf_records_*.json file
+### Error: cannot find l2_swimlane_records_*.json file
 
 - Make sure the test was run with the `--enable-l2-swimlane` flag
 - Check that the outputs/ directory exists and contains profiling data
@@ -408,18 +404,18 @@ For batch-run hardware regression, see the dev-only script
 - Check the kernel_config.py file format
 - Make sure every KERNELS entry has a 'func_id' and 'name' field
 
-### Error: Unsupported l2_perf_level
+### Error: Unsupported l2_swimlane_level
 
-- The tools accept l2_perf_level 1–4 (the integer captured at runtime
+- The tools accept l2_swimlane_level 1–4 (the integer captured at runtime
   via `--enable-l2-swimlane <N>`)
 - Regenerate the profiling data with a supported level
 
 ### Error: Perf JSON missing required fields for scheduler overhead analysis
 
-- This error means the input `l2_perf_records_*.json` lacks fields required by the deep-dive analysis (typically `dispatch_time_us` / `finish_time_us`)
+- This error means the input `l2_swimlane_records_*.json` lacks fields required by the deep-dive analysis (typically `dispatch_time_us` / `finish_time_us`)
 - The basic conversion in `swimlane_converter` can still succeed, but the deep-dive will be skipped or fail
 - Remediation:
-  1. Re-run with `--enable-l2-swimlane` to produce a new `outputs/*/l2_perf_records.json`
+  1. Re-run with `--enable-l2-swimlane` to produce a new `outputs/*/l2_swimlane_records.json`
   2. Re-run `swimlane_converter` or `sched_overhead_analysis`
   3. Verify that each task in the JSON contains `dispatch_time_us` and `finish_time_us`
 
@@ -435,7 +431,7 @@ For batch-run hardware regression, see the dev-only script
 
 | File | Tool | Purpose | Format |
 | ---- | ---- | ------- | ------ |
-| `l2_perf_records_*.json` | Runtime | Raw timing profiling data | JSON |
+| `l2_swimlane_records_*.json` | Runtime | Raw timing profiling data | JSON |
 | `merged_swimlane_*.json` | swimlane_converter | Perfetto visualization | Chrome Trace Event JSON |
 | `deps.json` | Runtime (dep_gen replay) | Structural task dependency graph + per-edge tensor info | JSON |
 | `deps_graph.html` | deps_to_graph | Pan/zoom dependency graph viewer | HTML (self-contained) |

@@ -9,7 +9,7 @@ pto-runtime/
 │   └── {arch}/                         # Architecture-specific code (a2a3, a5)
 │       ├── platform/                   # Platform-specific implementations
 │       │   ├── include/                # Shared headers (host/, aicpu/, aicore/, common/)
-│       │   ├── src/                    # Shared source (compiled into both backends)
+│       │   ├── shared/                 # Sources shared between onboard and sim backends (compiled into both)
 │       │   ├── onboard/               # Real hardware backend
 │       │   │   ├── host/              # Host runtime (.so)
 │       │   │   ├── aicpu/             # AICPU kernel (.so)
@@ -156,6 +156,10 @@ my_example/
 Run via pytest (`pytest examples tests/st --platform <platform>`) or standalone
 (`python test_my_example.py -p <platform>`).
 
+For the kernel-author contract (SPMD execution context, accessor functions,
+and the gotcha around CCE topology intrinsics that breaks ports from native
+CANN code), see [aicore-kernel-programming.md](aicore-kernel-programming.md).
+
 ## Build Workflow
 
 ### Initial setup
@@ -168,38 +172,26 @@ pip install --no-build-isolation -e .
 
 This builds the nanobind `_task_interface` extension **and** pre-builds all runtime binaries for available toolchains into `build/lib/`. Sim platforms (a2a3sim, a5sim) are built when `gcc`/`g++` are available; onboard platforms (a2a3, a5) are built when `ccec` and the cross-compiler under `ASCEND_HOME_PATH` are available. Since a2a3 and a5 share the same compilation — differing only at runtime — both architectures are always built together when their toolchain is present.
 
-### Editable rebuild on import
+### No rebuild on import
 
-`pyproject.toml` enables `editable.rebuild = true`. Every fresh Python process that imports `simpler_setup` or `_task_interface` triggers `cmake --build` on the top-level CMake tree before the import returns. This auto-rebuilds the nanobind module when `python/bindings/` C++ changes — no manual `pip install -e .` needed. Also re-invokes `build_runtimes.py` (an `ALL` target), so the per-runtime cmake caches under `build/cache/` get checked too. Costs:
-
-- Nothing changed: a few hundred ms per inner cmake check (10-30+ inner cmakes total depending on installed toolchains)
-- Real C++ change: full incremental rebuild blocks the import until done
-
-If startup latency becomes painful, run `unset SKBUILD_EDITABLE_REBUILD` before pytest, or run `pip install --no-build-isolation -e .` once and revert. CI should never use editable installs.
+`pyproject.toml` sets `editable.rebuild = false`, so importing the package does **not** trigger a `cmake --build`. (Enabling it breaks under build isolation: the cmake path baked into `build.ninja` points into pip's deleted ephemeral env, so the next import fails with `cmake: No such file or directory` — see [Python packaging](python-packaging.md).) Therefore **any** C++ change — nanobind bindings or runtime/platform sources — only takes effect after re-running `pip install --no-build-isolation -e .`. The rebuild is incremental via the persistent cmake caches under `build/cache/` (~1-2s for a one-file change). CI should never use editable installs.
 
 ### When to rebuild
 
 | What changed | Action |
 | ------------ | ------ |
 | First time / clean checkout | `pip install --no-build-isolation -e .` |
-| Runtime C++ source (`src/{arch}/runtime/`, `src/{arch}/platform/`) | Pass `--build` to a standalone `python test_*.py` invocation (incremental, ~1-2s); editable rebuild does **not** cover this (runtime cmake is decoupled from the top-level cmake target). For pytest batch runs, pass `--build` at the pytest CLI. |
-| Nanobind bindings (`python/bindings/`) | Auto-rebuilt on next import (`editable.rebuild = true`) |
+| Runtime C++ source (`src/{arch}/runtime/`, `src/{arch}/platform/`) | Re-run `pip install --no-build-isolation -e .` (or `.` for a non-editable install). Incremental via the cmake caches under `build/cache/` (~1-2s). |
+| Nanobind bindings (`python/bindings/`) | Re-run `pip install --no-build-isolation -e .` (no rebuild-on-import; `editable.rebuild = false`) |
 | Python-only code (`python/*.py`, `simpler_setup/*.py`) | No rebuild needed (editable install) |
 | Examples / kernels (`examples/{arch}/`, `tests/st/`) | No rebuild needed, just re-run |
 
-### The `--build` flag
+### Runtime binary lookup
 
-By default, scene tests load pre-built runtime binaries from `build/lib/`. When runtime C++ source has changed, pass `--build` to recompile incrementally:
-
-```bash
-# Standalone: single test file
-python examples/a2a3/host_build_graph/vector_example/test_vector_example.py --build -p a2a3sim
-
-# Pytest: applies to every test in the session
-pytest examples tests/st --platform a2a3sim --build
-```
-
-This uses the persistent cmake cache in `build/cache/`, recompiling only what changed. In CI, `pip install .` pre-builds all runtimes before pytest runs, so examples use pre-built binaries.
+Scene tests load pre-built runtime binaries from `build/lib/`. These are produced
+by `build_runtimes.py` during `pip install`, using the persistent cmake cache in
+`build/cache/` to recompile only what changed. If the binaries are missing, the
+runtime loader raises with a hint to run `pip install --no-build-isolation .`.
 
 ### Disk layout
 

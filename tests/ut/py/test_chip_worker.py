@@ -24,7 +24,7 @@ class TestCallConfig:
         assert config.block_dim == 0
         assert config.aicpu_thread_num == 3
         assert config.enable_l2_swimlane == 0
-        assert config.enable_dump_tensor is False
+        assert config.enable_dump_tensor == 0
         assert config.enable_pmu == 0
         assert config.enable_dep_gen is False
 
@@ -43,6 +43,14 @@ class TestCallConfig:
         assert config.enable_l2_swimlane == 2
         config.enable_l2_swimlane = False
         assert config.enable_l2_swimlane == 0
+        # enable_dump_tensor is likewise a level (0=off, 1=partial, 2=full):
+        # `True` maps to level 1 (partial), explicit ints select the level.
+        config.enable_dump_tensor = True
+        assert config.enable_dump_tensor == 1
+        config.enable_dump_tensor = 2
+        assert config.enable_dump_tensor == 2
+        config.enable_dump_tensor = False
+        assert config.enable_dump_tensor == 0
 
     def test_diagnostics_subfeatures_are_parallel(self):
         # Guard against drift: the four diagnostics sub-features under the
@@ -53,12 +61,12 @@ class TestCallConfig:
         config.enable_pmu = 2
         config.enable_dep_gen = True
         assert config.enable_l2_swimlane == 4
-        assert config.enable_dump_tensor is True
+        assert config.enable_dump_tensor == 1
         assert config.enable_pmu == 2
         assert config.enable_dep_gen is True
         r = repr(config)
         assert "enable_l2_swimlane=4" in r
-        assert "enable_dump_tensor=True" in r
+        assert "enable_dump_tensor=1" in r
         assert "enable_pmu=2" in r
         assert "enable_dep_gen=True" in r
 
@@ -152,3 +160,59 @@ class TestChipWorkerPython:
         worker = ChipWorker()
         assert worker.initialized is False
         assert isinstance(PyCallConfig(), CallConfig)
+
+    def test_public_wrapper_uses_handle_and_private_slot(self):
+        from _task_interface import ChipCallable, ChipStorageTaskArgs  # noqa: PLC0415
+        from simpler.callable_identity import CallableHandle  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeImpl:
+            initialized = True
+            device_id = 0
+
+            def __init__(self):
+                self.prepared = []
+                self.runs = []
+                self.unregistered = []
+                self.aicpu_dlopen_count = 0
+                self.host_dlopen_count = 0
+
+            def prepare_callable(self, slot, callable_obj):
+                self.prepared.append((slot, callable_obj))
+
+            def run(self, slot, args, config):
+                self.runs.append((slot, args, config))
+                return "timing"
+
+            def unregister_callable(self, slot):
+                self.unregistered.append(slot)
+
+        worker = ChipWorker()
+        fake = FakeImpl()
+        worker._impl = fake
+        callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
+
+        first = worker.prepare_callable(callable_obj)
+        second = worker.prepare_callable(callable_obj)
+
+        assert isinstance(first, CallableHandle)
+        assert not isinstance(first, int)
+        assert first.hashid == second.hashid
+        assert fake.prepared == [(0, callable_obj)]
+
+        args = ChipStorageTaskArgs()
+        assert worker.run(first, args, CallConfig()) == "timing"
+        assert fake.runs[0][0] == 0
+
+        worker.unregister_callable(first)
+        assert fake.unregistered == []
+        worker.unregister_callable(second)
+        assert fake.unregistered == [0]
+
+    def test_public_wrapper_rejects_raw_slot_run(self):
+        from _task_interface import ChipStorageTaskArgs  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        worker = ChipWorker()
+        with pytest.raises(TypeError, match="CallableHandle returned by ChipWorker.prepare_callable"):
+            worker.run(0, ChipStorageTaskArgs(), CallConfig())

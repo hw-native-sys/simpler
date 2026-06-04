@@ -37,9 +37,6 @@ pytest examples tests/st --platform a2a3 --device 4-7  # hardware with device po
 # Single scene test (standalone)
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py -p a2a3sim
 
-# Standalone with build-from-source
-python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py -p a2a3sim --build
-
 # Benchmark mode (100 rounds, skip golden comparison)
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py \
     -p a2a3 -d 0 --rounds 100 --skip-golden
@@ -72,7 +69,7 @@ If a module is pure C++ with no Python binding, test in **ut-cpp** (`tests/ut/cp
 
 Scene tests support advanced CLI options for benchmarking, profiling, and runtime control. These work identically in both pytest and standalone mode.
 
-> "Profiling" is the umbrella for three parallel diagnostics sub-features: `--enable-l2-swimlane` (L2 swimlane), `--dump-tensor` (per-task tensor I/O), and `--enable-pmu` (PMU CSV). They are independent and can be combined.
+> "Profiling" is the umbrella for three parallel diagnostics sub-features: `--enable-l2-swimlane` (L2 swimlane), `--dump-tensor` (unified tensor/scalar dump), and `--enable-pmu` (PMU CSV). They are independent and can be combined.
 
 ### pytest
 
@@ -81,7 +78,6 @@ pytest --platform a2a3sim                                        # default: 1 ro
 pytest --platform a2a3 --rounds 100 --skip-golden                # benchmark mode
 pytest --platform a2a3 --enable-l2-swimlane                             # L2 swimlane (first round)
 pytest --platform a2a3 --enable-pmu                              # PMU CSV
-pytest --platform a2a3sim --build                                # compile runtime from source
 pytest --platform a2a3sim --log-level debug                        # verbose C++ logging
 ```
 
@@ -91,9 +87,8 @@ pytest --platform a2a3sim --log-level debug                        # verbose C++
 python test_xxx.py -p a2a3sim                                    # default: 1 round + golden
 python test_xxx.py -p a2a3 -d 0 --rounds 100 --skip-golden       # benchmark mode
 python test_xxx.py -p a2a3 --enable-l2-swimlane                         # L2 swimlane (first round)
-python test_xxx.py -p a2a3 --dump-tensor                         # dump per-task tensor I/O
+python test_xxx.py -p a2a3 --dump-tensor                         # dump unified tensor/scalar artifacts
 python test_xxx.py -p a2a3 --enable-pmu 4                        # PMU CSV (MEMORY)
-python test_xxx.py -p a2a3sim --build                            # compile runtime from source
 python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ logging
 ```
 
@@ -109,10 +104,9 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
 | `--manual` | | `exclude` | `exclude`/`include`/`only` for manual cases |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
-| `--enable-l2-swimlane [PERF_LEVEL]` | | `0` | Enable L2 swimlane collection on first round only. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md#31-enable-l2-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `l2_perf_records.json` lands; parallel runs never collide. |
-| `--dump-tensor` | | false | Dump per-task tensor I/O during runtime execution |
+| `--enable-l2-swimlane [PERF_LEVEL]` | | `0` | Enable L2 swimlane collection on first round only. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md#31-enable-l2-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `l2_swimlane_records.json` lands; parallel runs never collide. |
+| `--dump-tensor` | | false | Dump tensors plus scalar args into unified runtime artifacts |
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
-| `--build` | | false | Compile runtime from source (not pre-built) |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
 | `--log-level LEVEL` | | `v5` | Simpler logger threshold. Accepts `debug` / `V0..V9` / `info` / `warn` / `error` / `null` (case-insensitive). pytest's own CLI validator does `int(getattr(logging, level.upper(), level))`, so the V tiers and `NUL`/`NULL` are exposed as attributes on the `logging` module via `setattr` (registration in `conftest.py` runs before pytest's option machinery). `logging.addLevelName` is also called so `%(levelname)s` formatters print `V3` instead of `Level 18`, but it is not what makes the CLI parser accept the value. The "simpler" Python logger is the single source of truth; the value is snapshotted into the platform SO at `Worker.init()` time (not per `Worker.run()`) and pushed to host `HostLogger`, runner state, and (onboard) CANN `dlog_setlevel`. AICPU receives it via `KernelArgs.log_info_v`. Changing the Python logger level after `Worker.init()` does not retroactively affect that worker. See [Log levels](#log-levels). |
 
@@ -217,7 +211,7 @@ Worked examples:
 | `--rounds` | both | **(none)** | pytest-xdist already uses `-n` for worker count. Standalone originally had `-n` for `--rounds`, creating a letter-level collision whenever a user switched between pytest (`-n 8` = 8 workers) and standalone (`-n 8` = 8 rounds). Removed in [#574](https://github.com/hw-native-sys/simpler/pull/574); do not reintroduce. |
 | `--max-parallel` | both | **(none)** | `-j` would be the natural make-style short, but pytest reserves all lowercase single letters (`parser.addoption` rejects lowercase shorts). Standalone mirrors this to keep both CLIs identical — no short in either, always spell out `--max-parallel`. |
 | `--runtime` / `--level` | both | **(none)** | Internal child-mode markers; users rarely type them. No short keeps them distinctive. |
-| `--build`, `--skip-golden`, `--enable-l2-swimlane`, `--dump-tensor`, `--enable-pmu`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
+| `--skip-golden`, `--enable-l2-swimlane`, `--dump-tensor`, `--enable-pmu`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
 
 Practical guidance when adding a new CLI option:
 
@@ -324,13 +318,13 @@ A single file can declare both L2 and L3 classes; they're grouped by `(runtime, 
 
 Each test case sets its own `CallConfig.output_prefix` (chosen by `scene_test.py::_build_output_prefix` as `outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/`). The C++ runtime writes all diagnostic artifacts under that prefix with fixed filenames:
 
-- `outputs/<case>_<ts>/l2_perf_records.json` — swimlane (`--enable-l2-swimlane`)
+- `outputs/<case>_<ts>/l2_swimlane_records.json` — swimlane (`--enable-l2-swimlane`)
 - `outputs/<case>_<ts>/tensor_dump/` — tensor dump (`--dump-tensor`)
 - `outputs/<case>_<ts>/pmu.csv` — PMU counters (`--enable-pmu`)
 
 Because each case gets its own directory, parallel runs (xdist workers, L3 case fanout, L2 device fanout) can never collide on filename — there is no per-file timestamp, no env-var scoping, and no post-run flatten step. `CallConfig::validate()` throws if any diagnostic flag is enabled but `output_prefix` is empty; `scene_test.py::run_class_cases` always fills it from the case label.
 
-Standalone invocations of CLIs (`python -m simpler_setup.tools.swimlane_converter`, etc.) auto-detect the latest `outputs/*/l2_perf_records.json` (sorted by mtime); pass `--input <path>` to override.
+Standalone invocations of CLIs (`python -m simpler_setup.tools.swimlane_converter`, etc.) auto-detect the latest `outputs/*/l2_swimlane_records.json` (sorted by mtime); pass `--input <path>` to override.
 
 ### Dispatcher skip conditions (normal pytest runs)
 
@@ -656,6 +650,15 @@ Key fields:
 ### Sharing an Example Between examples/ and tests/st/
 
 If similar coverage exists in both `examples/` and `tests/st/`, collapse it into a single `test_*.py`: small cases get `platforms: ["a2a3sim", "a2a3"]`; large benchmark cases get `platforms: ["a2a3"], "manual": True`.
+
+## Sanitizer builds (ASAN / UBSan / TSAN)
+
+Opt-in `-fsanitize` instrumentation of host-compiled code via `--sanitizer`
+(build with `SIMPLER_SANITIZER=...`, run with the matching runtime preloaded).
+The design, load-bearing invariants, usage, and presets now live in their own
+page — see **[sanitizers.md](sanitizers.md)**. The nightly CI job is in
+[ci.md](ci.md#sanitizer-sim); the scoping rationale (macOS / TSAN / LSan) is in
+[investigations/2026-06-sanitizer-scope.md](investigations/2026-06-sanitizer-scope.md).
 
 ## CI Pipeline
 

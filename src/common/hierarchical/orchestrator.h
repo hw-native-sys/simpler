@@ -13,10 +13,10 @@
  * Orchestrator — DAG builder.
  *
  * Public API (called by the user's orch fn during Worker::run):
- *   - submit_next_level(callable, TaskArgs, CallConfig)
- *   - submit_next_level_group(callable, vector<TaskArgs>, CallConfig)
- *   - submit_sub(callable_id, TaskArgs)
- *   - submit_sub_group(callable_id, vector<TaskArgs>)
+ *   - submit_next_level(CallableIdentity, TaskArgs, CallConfig)
+ *   - submit_next_level_group(CallableIdentity, vector<TaskArgs>, CallConfig)
+ *   - submit_sub(CallableIdentity, TaskArgs)
+ *   - submit_sub_group(CallableIdentity, vector<TaskArgs>)
  *   - alloc(shape, dtype) — runtime-owned intermediate buffer
  *
  * Each TaskArgs carries per-tensor TensorArgType tags. The Orchestrator
@@ -49,12 +49,13 @@
 class WorkerManager;
 
 // ---------------------------------------------------------------------------
-// SubmitResult — just the slot id
+// SubmitResult — C++ internal slot id
 // ---------------------------------------------------------------------------
 //
 // Downstream consumers reference outputs by their own tensor pointers (the
 // tensors live in the HeapRing allocated by the Worker), and tensormap.lookup
 // finds the producer slot from the data pointer. No outputs[] field needed.
+// This is intentionally not exposed through the Python facade.
 
 struct SubmitResult {
     TaskSlot task_slot{INVALID_SLOT};
@@ -92,27 +93,27 @@ public:
     void copy_to(int worker_id, uint64_t dst, uint64_t src, size_t size);
     void copy_from(int worker_id, uint64_t dst, uint64_t src, size_t size);
 
-    // Submit a NEXT_LEVEL task. `callable_id` is a cid registered via
-    // Worker.register(): the chip child looks it up in its COW-inherited
-    // Python registry to get the actual ChipCallable.
+    // Submit a NEXT_LEVEL task. `callable` is the stable identity returned
+    // by Worker.register(); the child resolves its digest to a private slot.
     // Tags inside `args` drive dependency inference; OUTPUT tensors with
     // null data are auto-allocated from the HeapRing.
     // `worker`: logical worker id for affinity (-1 = unconstrained).
-    SubmitResult
-    submit_next_level(int32_t callable_id, const TaskArgs &args, const CallConfig &config, int8_t worker = -1);
+    SubmitResult submit_next_level(
+        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker = -1
+    );
 
     // Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node.
     // `workers`: per-args affinity (empty = all unconstrained).
     SubmitResult submit_next_level_group(
-        int32_t callable_id, const std::vector<TaskArgs> &args_list, const CallConfig &config,
+        const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
         const std::vector<int8_t> &workers = {}
     );
 
-    // Submit a SUB task by registered callable id.
-    SubmitResult submit_sub(int32_t callable_id, const TaskArgs &args);
+    // Submit a SUB task by registered callable identity.
+    SubmitResult submit_sub(const CallableIdentity &callable, const TaskArgs &args);
 
     // Submit a group of SUB tasks: N args -> N workers, 1 DAG node.
-    SubmitResult submit_sub_group(int32_t callable_id, const std::vector<TaskArgs> &args_list);
+    SubmitResult submit_sub_group(const CallableIdentity &callable, const std::vector<TaskArgs> &args_list);
 
     // Open a nested scope. Every task submitted between this call and the
     // matching `scope_end()` picks a heap ring based on the current scope
@@ -135,6 +136,12 @@ public:
     // dispatch (fail-fast): the wait itself is unaffected — every in-flight
     // task is allowed to finish so ring slots aren't leaked.
     void drain();
+
+    // Wire the Scheduler's loop mutex so drain() can hold it across
+    // reset_to_empty(), preventing the scheduler thread from touching slot
+    // state mid-teardown (heap-use-after-free). Set once by Worker after the
+    // Scheduler is constructed.
+    void set_scheduler_loop_mutex(std::mutex *m) { sched_loop_mu_ = m; }
 
     // Clear any stored dispatch error so the next Worker::run() starts
     // from a clean slate. Called by Worker::run before scope_begin.
@@ -170,6 +177,9 @@ private:
     std::atomic<int32_t> active_tasks_{0};
     std::mutex drain_mu_;
     std::condition_variable drain_cv_;
+    // Scheduler's loop mutex (not owned). Held across reset_to_empty() in
+    // drain() so the scheduler can't be mid-on_task_complete during teardown.
+    std::mutex *sched_loop_mu_{nullptr};
 
     // Slot state lives in the Ring; the pointer stays stable for the
     // slot's lifetime. Throws if the id is out of range — callers that
@@ -179,8 +189,8 @@ private:
     // Shared submit machinery. Takes `args_list` by value so the Orchestrator
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
     SubmitResult submit_impl(
-        WorkerType worker_type, int32_t callable_id, const CallConfig &config, std::vector<TaskArgs> args_list,
-        std::vector<int8_t> affinities = {}
+        WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config,
+        std::vector<TaskArgs> args_list, std::vector<int8_t> affinities = {}
     );
 
     // Size, in aligned bytes, an OUTPUT tensor should occupy in the HeapRing.

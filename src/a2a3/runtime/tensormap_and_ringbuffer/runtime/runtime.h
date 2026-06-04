@@ -37,7 +37,7 @@
 #include <vector>
 
 #include "common/core_type.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"
@@ -261,7 +261,7 @@ public:
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Prebuilt-arena fast path (trb only). Set by host's
-    // bind_prepared_to_runtime_impl; consumed by AICPU at boot to attach a
+    // bind_callable_to_runtime_impl; consumed by AICPU at boot to attach a
     // DeviceArena to `prebuilt_arena_base_` and pick up the PTO2Runtime at
     // `prebuilt_arena_base_ + prebuilt_runtime_offset_`. Both stay zero on
     // first construction (Runtime() ctor zeros them) so a non-prebuilt boot
@@ -291,7 +291,7 @@ public:
     /**
      * Replay a previously-uploaded kernel address onto a fresh Runtime
      * without recording it in registered_kernel_func_ids_. Used by
-     * DeviceRunner::bind_prepared_callable_to_runtime so prepared kernel
+     * DeviceRunner::bind_callable_to_runtime so prepared kernel
      * binaries are not freed by validate_runtime_impl across runs.
      */
     void replay_function_bin_addr(int func_id, uint64_t addr);

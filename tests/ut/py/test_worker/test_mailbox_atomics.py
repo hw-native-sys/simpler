@@ -194,23 +194,22 @@ class TestWorkerSmoke:
             buf = counter_shm.buf
             assert buf is not None
             struct.pack_into("i", buf, 0, 0)
-            counter_addr = _addr(buf, 0)
 
-            def sub(args):
-                v = _mailbox_load_i32(counter_addr)
-                _mailbox_store_i32(counter_addr, v + 1)
+            def sub(args, b=buf):
+                v = struct.unpack_from("i", b, 0)[0]
+                struct.pack_into("i", b, 0, v + 1)
 
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.register(sub)
+            handle = hw.register(sub)
             hw.init()
             try:
 
                 def orch(o, args, cfg):
-                    o.submit_sub(cid)
+                    o.submit_sub(handle)
 
                 hw.run(orch)
                 hw.run(orch)
-                assert _mailbox_load_i32(counter_addr) == 2
+                assert struct.unpack_from("i", buf, 0)[0] == 2
             finally:
                 hw.close()
         finally:

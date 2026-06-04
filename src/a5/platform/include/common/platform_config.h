@@ -52,12 +52,39 @@ constexpr int PLATFORM_AIV_CORES_PER_BLOCKDIM = 2;
 constexpr int PLATFORM_MAX_AICPU_THREADS = 7;
 
 /**
- * Maximum AICPU launch threads (physical)
- * Upper bound for the number of AICPU threads that can be launched by Host.
- * Can be larger than PLATFORM_MAX_AICPU_THREADS to allow threads to be dropped
- * from scheduling while still participating in affinity (e.g. 6 launch, 4 active).
+ * Compile-time upper bound on the number of AICPU threads CANN may
+ * start per launch. The actual launch count is runtime-derived:
+ * the host topology probe sets runtime.aicpu_launch_count =
+ * popcount(OCCUPY), and DeviceRunner passes that count (not this
+ * constant) to rtsLaunchCpuKernel.
+ *
+ * The bound exists for the static gate buffers in
+ * src/common/platform/onboard/aicpu/platform_aicpu_affinity.cpp
+ * (s_filter_thread_cpu[MAX_GATE_THREADS] etc.) — keep it ≥ any
+ * runtime aicpu_launch_count we expect to see.
+ *
+ * Two over-subscription failure modes to keep in mind when choosing
+ * the runtime launch count vs this bound:
+ *   1. "Duplicate drop after barrier" — happens when CANN over-fills
+ *      a subset of OCCUPY cpus (duplicates land on the sink cpu).
+ *      The filter gate first barriers all launched threads, then
+ *      classifies cpu_id and drops the duplicates (only the first
+ *      thread to land on each ALLOWED slot survives). Safe.
+ *   2. "Barrier never closes" — happens when launch_count exceeds
+ *      popcount(OCCUPY) on the production AICPU kernel: contended
+ *      init paths on the over-subscribed sink prevent some threads
+ *      from reaching the barrier publish counter, the wait spins
+ *      forever, and CANN reports aclrtSynchronizeStream rc=507000
+ *      after the stream timeout. This is the reason the runtime
+ *      uses popcount(OCCUPY) rather than this constant.
+ *
+ * Current value 14 = worst-case popcount(OCCUPY) on the Ascend950PR
+ * 0x7ffe SKU (7 phys × 2 SMT = 14 user logical cpus). See
+ * src/a5/docs/hardware.md "CANN AICPU thread dispatch" for the
+ * empirical data and src/a5/platform/onboard/host/device_runner.cpp
+ * for where the runtime count is decided.
  */
-constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 7;
+constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 14;
 
 /**
  * AICore op execution timeout (microseconds).
@@ -104,7 +131,7 @@ constexpr int PLATFORM_MAX_CORES = PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BL
 
 /**
  * Performance buffer capacity per buffer
- * Number of L2PerfRecord entries per dynamically allocated L2PerfBuffer
+ * Number of L2SwimlaneAicpuTaskRecord entries per dynamically allocated L2SwimlaneAicpuTaskBuffer
  */
 constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 
@@ -118,13 +145,13 @@ constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
 
 /**
- * L2PerfBuffer pre-allocation count per AICore.
+ * L2SwimlaneAicpuTaskBuffer pre-allocation count per AICore.
  * 1 goes into the free_queue at init, the rest into the recycled pool.
  */
 constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
 
 /**
- * PhaseBuffer pre-allocation count per AICPU thread.
+ * L2SwimlaneAicpuPhaseBuffer pre-allocation count per AICPU thread.
  * 1 goes into the free_queue at init, the rest into the recycled pool.
  */
 constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
@@ -139,7 +166,7 @@ constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
 
 /**
  * Performance buffer capacity per AICPU thread
- * Maximum number of AicpuPhaseRecord entries per PhaseBuffer.
+ * Maximum number of L2SwimlaneAicpuPhaseRecord entries per L2SwimlaneAicpuPhaseBuffer.
  */
 constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 500000;
 
@@ -148,14 +175,6 @@ constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 500000;
  * Used to convert timestamps to microseconds.
  */
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 1000000000;  // 1000 MHz
-
-/**
- * AICore deinit wait timeout (ticks at PLATFORM_PROF_SYS_CNT_FREQ).
- * platform_deinit_aicore_regs waits for AICore to acknowledge the exit
- * signal. If AICore is stuck (STARS-killed op, hardware fault), waiting
- * forever blocks the AICPU scheduling thread. This timeout bounds the wait.
- */
-constexpr uint64_t PLATFORM_DEINIT_TIMEOUT_TICKS = PLATFORM_PROF_SYS_CNT_FREQ;  // 1s
 
 /**
  * Timeout duration for performance data collection (seconds)
@@ -177,6 +196,8 @@ inline double cycles_to_us(uint64_t cycles) {
 #define PROFILING_FLAG_DUMP_TENSOR (1u << 0)
 #define PROFILING_FLAG_L2_SWIMLANE (1u << 1)
 #define PROFILING_FLAG_PMU (1u << 2)
+#define PROFILING_FLAG_DEP_GEN (1u << 3)
+#define PROFILING_FLAG_SCOPE_STATS (1u << 4)
 #define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
 #define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
 #define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
@@ -236,14 +257,14 @@ constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 constexpr int PLATFORM_PMU_RECORDS_PER_BUFFER = 512;
 
 /**
- * Per-core L2Perf staging ring depth (AICore-side WIP slots).
+ * Per-core L2Swimlane staging ring depth (AICore-side WIP slots).
  *
  * Must be ≥ the maximum number of in-flight tasks per core (today's
  * dual-issue dispatch keeps this at 2). The ring lives outside the
- * rotating L2PerfBuffer so AICore's write address never changes mid-run.
+ * rotating L2SwimlaneAicpuTaskBuffer so AICore's write address never changes mid-run.
  *
  * Indexing uses `task_id % PLATFORM_L2_AICORE_RING_SIZE` (see
- * `l2_perf_aicore_record_task`), so non-power-of-two values are correct
+ * `l2_swimlane_aicore_record_task`), so non-power-of-two values are correct
  * but compile to an integer divide on the AICore hot path. Prefer a power
  * of two so the compiler reduces the modulo to a mask.
  */
@@ -279,6 +300,72 @@ constexpr int PLATFORM_PMU_READYQUEUE_SIZE = PLATFORM_MAX_CORES * PLATFORM_PMU_B
  * Idle timeout duration for PMU collection (seconds).
  */
 constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
+
+// =============================================================================
+// dep_gen (SubmitTrace) Configuration
+// =============================================================================
+
+/**
+ * Number of DepGenRecord entries per DepGenBuffer.
+ * Each DepGenRecord is ~2.3 KB (16 Tensor blobs + small header), so a buffer
+ * is ~74 KB. Mirrors a2a3 sizing — same orchestrator submit cadence.
+ */
+constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 32;
+
+/**
+ * SPSC free_queue slot count for dep_gen buffers (Host→Device hand-off depth).
+ */
+constexpr int PLATFORM_DEP_GEN_SLOT_COUNT = 4;
+
+/**
+ * Pre-allocated DepGenBuffer count per orchestrator instance.
+ */
+constexpr int PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE = 4;
+
+/**
+ * Ready queue capacity for dep_gen (per AICPU thread). dep_gen is single-
+ * instance (orchestrator thread), but the queue array is per-thread to match
+ * the ProfilerBase contract.
+ */
+constexpr int PLATFORM_DEP_GEN_READYQUEUE_SIZE = PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE * 2;
+
+/**
+ * Idle timeout duration for dep_gen collection (seconds).
+ */
+constexpr int PLATFORM_DEP_GEN_TIMEOUT_SECONDS = 30;
+
+// =============================================================================
+// scope_stats Configuration
+// =============================================================================
+
+/**
+ * Number of ScopeStatsRecord entries per ScopeStatsBuffer.
+ * Each record is 52 B. Larger buffers = fewer device-side switch_buffer
+ * hand-offs (barriers, helps Orch) and fewer/larger device→host drain memcpys.
+ * 512 records ≈ 27 KB/buffer (×8 buffers ≈ 213 KB).
+ */
+constexpr int PLATFORM_SCOPE_STATS_RECORDS_PER_BUFFER = 512;
+
+/**
+ * SPSC free_queue slot count for scope_stats buffers (Host→Device hand-off depth).
+ */
+constexpr int PLATFORM_SCOPE_STATS_SLOT_COUNT = 8;
+
+/**
+ * Pre-allocated ScopeStatsBuffer count per orchestrator instance.
+ */
+constexpr int PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE = 8;
+
+/**
+ * Ready queue capacity for scope_stats (per AICPU thread). scope_stats is
+ * single-instance so headroom over BUFFERS_PER_INSTANCE is small.
+ */
+constexpr int PLATFORM_SCOPE_STATS_READYQUEUE_SIZE = PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE * 2;
+
+/**
+ * Idle timeout duration for scope_stats collection (seconds).
+ */
+constexpr int PLATFORM_SCOPE_STATS_TIMEOUT_SECONDS = 30;
 
 // =============================================================================
 // Register Communication Configuration

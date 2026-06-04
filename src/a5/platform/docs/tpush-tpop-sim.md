@@ -183,7 +183,7 @@ Validated with `examples/a5/tensormap_and_ringbuffer/bgemm/`:
 
 | Responsibility | File |
 | -------------- | ---- |
-| Per-device pipe shared state + TLS | `src/common/sim_context/cpu_sim_context.cpp` |
+| Per-device pipe shared state + TLS | `src/common/platform/sim/sim_context/cpu_sim_context.cpp` |
 | Per-thread core identity setup | `src/{arch}/platform/sim/aicore/kernel.cpp` |
 | Hook injection into kernel SOs | `src/{arch}/platform/sim/host/device_runner.cpp` |
 | pto-isa hook registration API | `pto-isa/include/pto/common/cpu_stub.hpp` |

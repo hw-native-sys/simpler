@@ -40,7 +40,7 @@ class BuildTarget:
     def get_binary_name(self) -> str:
         return self._binary_name
 
-    def gen_cmake_args(self, include_dirs: list[str], source_dirs: list[str]) -> list[str]:
+    def gen_cmake_args(self, include_dirs: list[str], source_dirs: list[str], sanitizers: str = "") -> list[str]:
         """Generate CMake arguments list from toolchain args + custom directories."""
         inc = ";".join(os.path.abspath(d) for d in include_dirs)
         src = ";".join(os.path.abspath(d) for d in source_dirs)
@@ -48,6 +48,12 @@ class BuildTarget:
             f"-DCUSTOM_INCLUDE_DIRS={inc}",
             f"-DCUSTOM_SOURCE_DIRS={src}",
         ]
+        # Sanitizers only apply to host-compiled targets — device toolchains
+        # (ccec, aarch64 cross) run on the NPU and can't carry a host sanitizer
+        # runtime. cmake/sanitizers.cmake reads both defines.
+        if sanitizers and self.toolchain.is_host:
+            args.append(f"-DSIMPLER_SANITIZERS={sanitizers}")
+            args.append(f"-DSIMPLER_CMAKE_DIR={PROJECT_ROOT / 'cmake'}")
         if logger.isEnabledFor(logging.DEBUG):
             args.append("--log-level=VERBOSE")
         return args
@@ -70,6 +76,11 @@ class RuntimeCompiler:
     """
 
     _instances = {}
+
+    # Comma-separated `-fsanitize` tokens for host targets, set once by
+    # build_runtimes.build_all() at install time (default "" = no sanitizer).
+    # Only host toolchains honor it; see BuildTarget.gen_cmake_args.
+    _sanitizers = ""
 
     @classmethod
     def get_instance(cls, platform: str = "a2a3") -> "RuntimeCompiler":
@@ -145,7 +156,9 @@ class RuntimeCompiler:
         No Ascend SDK required.
         """
         self._ensure_host_compilers()
-        gxx = GxxToolchain()
+        # Under a sanitizer, match the sim kernels' g++-15 so every host .so
+        # shares one sanitizer runtime (see GxxToolchain prefer_g15).
+        gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
 
         self.aicore_target = BuildTarget(gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so")
         self.aicpu_target = BuildTarget(gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
@@ -174,7 +187,9 @@ class RuntimeCompiler:
         No Ascend SDK required.
         """
         self._ensure_host_compilers()
-        gxx = GxxToolchain()
+        # Under a sanitizer, match the sim kernels' g++-15 so every host .so
+        # shares one sanitizer runtime (see GxxToolchain prefer_g15).
+        gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
 
         self.aicore_target = BuildTarget(gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so")
         self.aicpu_target = BuildTarget(gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
@@ -188,11 +203,15 @@ class RuntimeCompiler:
 
     @staticmethod
     def _find_executable(name: str) -> bool:
-        """Check if an executable exists (either as absolute path or in PATH)."""
-        if os.path.isfile(name) and os.access(name, os.X_OK):
-            return True
-        result = subprocess.run(["which", name], check=False, capture_output=True, timeout=1)
-        return result.returncode == 0
+        """Whether ``name`` resolves to an executable (absolute path or on PATH).
+
+        ``shutil.which`` is used (in-process) rather than spawning ``which``:
+        under a sanitizer the test process runs with ``LD_PRELOAD=lib{a,t}san.so``
+        and the preloaded runtime can abort an uninstrumented ``which`` child,
+        which would otherwise make this falsely report the compiler missing.
+        ``shutil.which`` already handles abs/relative paths and the X_OK check.
+        """
+        return shutil.which(name) is not None
 
     def compile(
         self,
@@ -238,7 +257,7 @@ class RuntimeCompiler:
         else:
             raise ValueError(f"Invalid target platform: {target_platform}. Must be 'aicore', 'aicpu', or 'host'.")
 
-        cmake_args = target.gen_cmake_args(include_dirs, source_dirs)
+        cmake_args = target.gen_cmake_args(include_dirs, source_dirs, sanitizers=self._sanitizers)
         cmake_source_dir = target.get_root_dir()
         binary_name = target.get_binary_name()
         platform = target_platform.upper()
@@ -407,6 +426,19 @@ class RuntimeCompiler:
 
         return binary_path
 
+    def _sanitizer_cmake_args(self) -> list[str]:
+        """Sanitizer defines for the standalone host helper SOs (log, sim_context).
+
+        These are always host-compiled (g++), so they follow the host runtime's
+        instrumentation; cmake/sanitizers.cmake reads both defines.
+        """
+        if not self._sanitizers:
+            return []
+        return [
+            f"-DSIMPLER_SANITIZERS={self._sanitizers}",
+            f"-DSIMPLER_CMAKE_DIR={PROJECT_ROOT / 'cmake'}",
+        ]
+
     def compile_sim_context(
         self,
         build_dir: Optional[str] = None,
@@ -421,9 +453,9 @@ class RuntimeCompiler:
         if not self.platform.endswith("sim"):
             raise ValueError(f"compile_sim_context is only for sim platforms, got {self.platform}")
 
-        cmake_source_dir = str(self.project_root / "src" / "common" / "sim_context")
+        cmake_source_dir = str(self.project_root / "src" / "common" / "platform" / "sim" / "sim_context")
         binary_name = "libcpu_sim_context.so"
-        cmake_args = self.host_target.toolchain.get_cmake_args()
+        cmake_args = self.host_target.toolchain.get_cmake_args() + self._sanitizer_cmake_args()
 
         def _build(actual_build_dir: str) -> Union[bytes, Path]:
             binary_path = self._run_compilation(
@@ -464,7 +496,7 @@ class RuntimeCompiler:
         """
         cmake_source_dir = str(self.project_root / "src" / "common" / "log")
         binary_name = "libsimpler_log.so"
-        cmake_args = self.host_target.toolchain.get_cmake_args()
+        cmake_args = self.host_target.toolchain.get_cmake_args() + self._sanitizer_cmake_args()
 
         def _build(actual_build_dir: str) -> Union[bytes, Path]:
             binary_path = self._run_compilation(

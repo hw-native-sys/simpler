@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_SDMA_SDMA_COMPLETION_KERNEL_H_
-#define SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_SDMA_SDMA_COMPLETION_KERNEL_H_
+#pragma once
 
 #include <stdint.h>
 
@@ -18,7 +17,7 @@
 #include <pto/npu/comm/async/sdma/sdma_async_intrin.hpp>
 
 #include "pto_async_kernel_api.h"
-#include "aicore_completion_mailbox.h"
+#include "aicore_completion_mailbox_types.h"
 #include "pto_runtime_status.h"
 
 #ifndef __aicore__
@@ -142,5 +141,3 @@ send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, Sc
     pto2::detail::defer_flush(ctx);
     return true;
 }
-
-#endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_SDMA_SDMA_COMPLETION_KERNEL_H_

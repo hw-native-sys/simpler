@@ -133,7 +133,6 @@ def run(
     device_ids: list[int],
     platform: str = "a2a3",
     pto_isa_commit: str | None = None,
-    build: bool = False,
 ) -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
@@ -163,9 +162,8 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        build=build,
     )
-    chip_cid = worker.register(chip_callable)
+    chip_handle = worker.register(chip_callable)
 
     try:
         print("[allreduce] init worker (forks chip children; base comm is lazy)...")
@@ -204,7 +202,7 @@ def run(
                     )
                     chip_args.add_scalar(domain.domain_size)
                     chip_args.add_scalar(domain.device_ctx)
-                    orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
+                    orch.submit_next_level(chip_handle, chip_args, cfg, worker=i)
 
         print(f"[allreduce] running {nranks}-chip allreduce DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
@@ -235,15 +233,10 @@ def main() -> int:
     parser.add_argument(
         "-d", "--device", default="0-1", help="Device range, e.g. '0-1' or '0-3'. 2 to 16 chips required."
     )
-    parser.add_argument(
-        "--build", action="store_true", help="Rebuild runtime from source instead of using cached libs."
-    )
     parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
 
-    return run(
-        parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit, build=cli.build
-    )
+    return run(parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit)
 
 
 if __name__ == "__main__":

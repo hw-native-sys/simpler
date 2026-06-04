@@ -38,7 +38,7 @@
 
 #pragma once
 
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 
 // =============================================================================

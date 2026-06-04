@@ -178,6 +178,11 @@ public:
         return local_task_id_ - last_alive;
     }
 
+    // Task ring start/end: tail = oldest live task (last_task_alive), head =
+    // next task id to allocate. head - tail == active_count().
+    int32_t task_tail() const { return last_alive_ptr_->load(std::memory_order_acquire); }
+    int32_t task_head() const { return local_task_id_; }
+
     int32_t window_size() const { return window_size_; }
 
     uint64_t heap_available() const {
@@ -191,7 +196,15 @@ public:
     }
 
     uint64_t heap_top() const { return heap_top_; }
+    // Heap ring start: reclaim pointer (oldest byte still live). heap_top() is
+    // the end (next allocation). heap_top - heap_tail == heap_used_bytes().
+    uint64_t heap_tail() const { return heap_tail_; }
     uint64_t heap_capacity() const { return heap_size_; }
+
+    uint64_t heap_used_bytes() const {
+        if (heap_size_ == 0) return 0;
+        return (heap_top_ + heap_size_ - heap_tail_) % heap_size_;
+    }
 
 private:
     // --- Task Ring ---

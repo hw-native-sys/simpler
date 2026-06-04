@@ -123,6 +123,11 @@ typedef struct PTO2RuntimeOps {
     );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const Arg &args);
+
+    // Stash the call-site of the next PTO2ScopeGuard so the [ScopeStats]
+    // collector can log it. Always present to keep ops-table layout stable
+    // across PTO2_PROFILING settings; set to nullptr at PTO2_PROFILING=0.
+    void (*scope_set_site)(const char *file, int line);
 } PTO2RuntimeOps;
 
 /**
@@ -137,8 +142,6 @@ struct PTO2Runtime {
     const PTO2RuntimeOps *ops;
     PTO2ScopeMode pending_scope_mode;
 };
-
-static inline void enable_dump_tensor_selective() { set_tensor_dump_selective_requested(true); }
 
 // =============================================================================
 // Inline Convenience Wrappers (call through ops table)
@@ -361,10 +364,13 @@ static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const u
  */
 class PTO2ScopeGuard {
 public:
-    explicit PTO2ScopeGuard(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) :
+    explicit PTO2ScopeGuard(
+        PTO2ScopeMode mode = PTO2ScopeMode::AUTO, const char *file = __builtin_FILE(), int line = __builtin_LINE()
+    ) :
         rt_(current_runtime()) {
         if (!rt_->ops->is_fatal(rt_)) {
             rt_->pending_scope_mode = mode;
+            if (rt_->ops->scope_set_site) rt_->ops->scope_set_site(file, line);
             rt_->ops->scope_begin(rt_);
         }
     }

@@ -166,8 +166,8 @@ Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 ```
 
 Per-thread fanout / fanin edge counts and ready-queue pop hit / miss
-stats live in `aicpu_scheduler_phases[]` (in `l2_perf_records.json`
-captured at l2_perf_level >= 3) and `deps.json`; consume them via
+stats live in `aicpu_scheduler_phases[]` (in `l2_swimlane_records.json`
+captured at l2_swimlane_level >= 3) and `deps.json`; consume them via
 `simpler_setup/tools/sched_overhead_analysis.py`.
 
 ---
@@ -241,10 +241,10 @@ mirrors the PMU pattern — two independent channels (one binary, one int):
   (`PROFILING_FLAG_L2_SWIMLANE`). Set by the host whenever level > 0; read
   by AICore (which only needs on/off to decide whether to write timing) and
   by AICPU kernel entry via `set_l2_swimlane_enabled(bool)`.
-- **Granular level (0–4)** — `L2PerfDataHeader::l2_perf_level`
-  (shared memory). Host writes it in `L2PerfCollector::initialize`; AICPU
-  promotes it from the header in `l2_perf_aicpu_init` and exposes it via
-  `get_l2_perf_level()` (typed `L2PerfLevel`) for
+- **Granular level (0–4)** — `L2SwimlaneDataHeader::l2_swimlane_level`
+  (shared memory). Host writes it in `L2SwimlaneCollector::initialize`; AICPU
+  promotes it from the header in `l2_swimlane_aicpu_init` and exposes it via
+  `get_l2_swimlane_level()` (typed `L2SwimlaneLevel`) for
   `>= AICPU_TIMING / SCHED_PHASES / ORCH_PHASES` gates.
 
 On sim, the binary on/off travels via the dlsym'd `set_l2_swimlane_enabled`
@@ -254,10 +254,37 @@ header just like on onboard.
 | Level | Collects |
 | ----- | -------- |
 | 0 | Nothing (disabled) |
-| 1 | AICore timing only (start/end/task_id/func_id/core_type) |
-| 2 | + dispatch_time, finish_time |
+| 1 | AICore timing only (start/end/task_token_raw) — AICPU `complete_task` is bypassed |
+| 2 | + AICPU dispatch_time, finish_time |
 | 3 | + Scheduler phases (`SCHED_*`) |
 | 4 | + Orchestrator phases (full) |
+
+At level 1 the AICore record carries the full PTO2 `task_token_raw`
+(`(ring_id << 32) | local_id`), read straight from
+`LocalContext.async_ctx.task_token.raw` inside the AICore helper —
+already in cache from the dispatch payload, so no extra GM load.
+Identity fields the AICPU side used to write at level 1 (`func_id`,
+`core_type`) are derived host-side:
+
+- `func_id` ← `deps.json`'s per-task `kernel_ids[]`, joined by
+  `task_id` at post-process by `swimlane_converter.py`. Same model
+  `fanout` already uses.
+- `core_type` ← per-core static table published by the host into the
+  collector (`L2SwimlaneCollector::set_core_types`).
+
+AICore buffer rotation no longer piggy-backs on `complete_task`. AICPU
+counts dispatches per core in the dispatch path (scheduler_dispatch in
+tensormap_and_ringbuffer; aicpu_executor in host_build_graph) and rotates
+the AICore buffer when the count is about to cross a
+`PLATFORM_AICORE_BUFFER_SIZE` boundary — strictly before
+`write_reg(DATA_MAIN_BASE)` for the first task of the new batch. The
+hook is `l2_swimlane_aicpu_on_aicore_dispatch`. No AICore-side signal is
+needed: AICPU has full dispatch visibility on its own. Race safety comes
+from the completion-before-dispatch invariant (AICore per core is
+single-threaded and AICPU does not dispatch task K+1 until K FIN'd), which
+guarantees AICore has FIN'd — and `dcci`'d out — every record in the old
+buffer by rotation time. This decoupling is what lets level 1 skip
+`complete_task` without losing rotations.
 
 Fanout edges are no longer carried on the device hot path — `swimlane_converter.py`
 joins them from the sibling `deps.json` (produced by dep_gen) at post-process time.
@@ -266,7 +293,7 @@ Bare `--enable-l2-swimlane` = level 4 (backward compatible).
 
 ### Level gating in AICPU code
 
-Use the strongly-typed `L2PerfLevel` enum so each gate names the
+Use the strongly-typed `L2SwimlaneLevel` enum so each gate names the
 content it depends on instead of relying on magic numbers:
 
 ```cpp
@@ -275,19 +302,19 @@ content it depends on instead of relying on magic numbers:
 if (is_l2_swimlane_enabled()) { ... }
 
 // AICPU dispatch/finish timestamps.
-// Granular checks below require l2_perf_aicpu_init to have already run
+// Granular checks below require l2_swimlane_aicpu_init to have already run
 // (so the level has been promoted from the shared-memory header).
-if (get_l2_perf_level() >= L2PerfLevel::AICPU_TIMING) { ... }
+if (get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) { ... }
 
 // Scheduler main-loop phase records (SCHED_*)
-if (get_l2_perf_level() >= L2PerfLevel::SCHED_PHASES) { ... }
+if (get_l2_swimlane_level() >= L2SwimlaneLevel::SCHED_PHASES) { ... }
 
 // Orchestrator phase records
-if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) { ... }
+if (get_l2_swimlane_level() >= L2SwimlaneLevel::ORCH_PHASES) { ... }
 ```
 
-`L2PerfLevel` is defined in `common/l2_perf_profiling.h` with
-underlying type `uint32_t` (matches the `L2PerfDataHeader::l2_perf_level`
+`L2SwimlaneLevel` is defined in `common/l2_swimlane_profiling.h` with
+underlying type `uint32_t` (matches the `L2SwimlaneDataHeader::l2_swimlane_level`
 shared-memory field and mirrors `PmuEventType : uint32_t`):
 
 | Enumerator | Underlying value |

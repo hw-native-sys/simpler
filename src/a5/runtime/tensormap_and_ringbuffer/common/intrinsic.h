@@ -46,13 +46,42 @@
  * including this header (e.g. via <pto/pto-inst.hpp> or manual #define).
  * The #ifndef guards below provide fallbacks for non-kernel builds
  * (AICPU, HOST) where these qualifiers are not needed.
+ *
+ * IMPORTANT — do NOT mix these with the CCE built-in topology intrinsics
+ * (`get_subblockid()`, `get_block_idx()`, `get_block_num()` declared in
+ * `kernel_operator.h` / tikcfw). Those intrinsics read AICore hardware
+ * registers that simpler's tensormap_and_ringbuffer runtime does NOT
+ * program. Specifically:
+ *
+ *   - CCE `get_subblockid()` returns whatever stale value the AICore
+ *     sub-block register holds — under simpler's MIX dispatch it is 0
+ *     for BOTH AIV0 and AIV1 of every cluster, so a kernel that uses
+ *     it to partition heads will silently have AIV1 redo AIV0's work
+ *     and the AIV1 share of the output is never written. This is the
+ *     exact failure mode that produced the partial-zero output in
+ *     issue #900 (PR #899 spmd_paged_attention_highperf); the kernel
+ *     compiled, ran without error, and produced wrong output. Use
+ *     `get_sub_block_id(args)` instead, which reads from the runtime's
+ *     `GlobalContext.sub_block_id` that the scheduler initializes per
+ *     AIV core in `scheduler_cold_path.cpp::SchedulerContext::init`.
+ *
+ *   - `get_block_idx()` and `get_block_num()` are not redirected to
+ *     simpler's LocalContext either — use the `(args)` variants below
+ *     so the values reflect simpler's logical block_dim (which can
+ *     differ from `RUNTIME_CONFIG.block_dim`, the physical core count).
+ *
+ * If you are porting a kernel originally written for native CANN dispatch
+ * (AscendC, ascend-transformer-boost, etc.), every reference to those
+ * three CCE intrinsics needs to be rewritten against this header. See
+ * `docs/aicore-kernel-programming.md` for the full author contract,
+ * porting checklist, and the worked example from PR #899 / issue #900.
  */
 
 #pragma once
 
 #include <stdint.h>
 
-#include "aicore_completion_mailbox.h"
+#include "aicore_completion_mailbox_types.h"
 #include "pto_task_id.h"
 
 #ifndef __gm__

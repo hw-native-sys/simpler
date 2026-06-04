@@ -24,6 +24,7 @@
 
 #include "aicpu/device_time.h"
 #include "aicpu/orch_so_file.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "callable_protocol.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
@@ -35,9 +36,11 @@
 #include "pto_shared_memory.h"
 
 // Performance profiling headers
-#include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/dep_gen_collector_aicpu.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
+#include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/unified_log.h"
 
 // Register-based communication
@@ -95,7 +98,7 @@ static PTO2Runtime *rt{nullptr};
 // that callable_id, kept warm across runs).
 // MAX_REGISTERED_CALLABLE_IDS is the protocol hard cap on callable_id values
 // (mailbox uint32 callable_id, register() returns small ints) and is shared
-// with the host bounds check in DeviceRunner::register_prepared_callable —
+// with the host bounds check in DeviceRunner::register_callable —
 // see src/common/task_interface/callable_protocol.h.
 
 struct OrchSoEntry {
@@ -210,9 +213,15 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
 int32_t AicpuExecutor::run(Runtime *runtime) {
-    int32_t thread_idx = thread_idx_++;
+    // Prefer the filter gate's deterministic exec_idx so role assignment
+    // (sched 0..N-2 / orch N-1) is driven by host-computed ALLOWED_CPUS,
+    // not arrival order. Fall back to the legacy fetch-add counter on
+    // platforms where the filter gate is inactive (sim sets exec_idx via
+    // its own stub; the fallback covers any path that bypassed the gate).
+    int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
+    int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
     int32_t run_rc = 0;
-    LOG_INFO_V0("Thread %d: Start", thread_idx);
+    LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
 
     // Orchestrator check
     if (thread_idx >= sched_thread_num_) {
@@ -276,7 +285,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
 
                 for (int32_t i = 0; i < num_candidates && !file_created; i++) {
-                    int32_t fd = create_orch_so_file(candidate_dirs[i], callable_id, so_path, sizeof(so_path));
+                    int32_t fd = create_orch_so_file(
+                        candidate_dirs[i], callable_id, get_orch_device_id(), so_path, sizeof(so_path)
+                    );
                     if (fd < 0) {
                         LOG_INFO_V0(
                             "Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx, so_path, errno
@@ -520,7 +531,15 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
 
 #if PTO2_PROFILING
-            rt->orchestrator.l2_perf_level = get_l2_perf_level();
+            rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
+            {
+                auto &orch = rt->orchestrator;
+                for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+                    auto &alloc = orch.rings[r].task_allocator;
+                    scope_stats_set_ring_capacity(r, alloc.window_size(), alloc.heap_capacity());
+                }
+                scope_stats_set_tensormap_capacity(orch.tensor_map.pool_capacity());
+            }
 #endif
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
@@ -538,10 +557,23 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             sched_ctx_.wait_init_complete();
 
 #if PTO2_PROFILING
-            if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
-                l2_perf_aicpu_set_orch_thread_idx(thread_idx);
+            if (get_l2_swimlane_level() >= L2SwimlaneLevel::ORCH_PHASES) {
+                l2_swimlane_aicpu_set_orch_thread_idx(thread_idx);
             }
+            // scope_stats streams scope_end records off the orchestrator thread:
+            // record the per-thread ready_queue index. No-op (writer shared
+            // state null) when scope_stats is disabled; the current buffer is
+            // popped lazily on the first scope_end append.
+            scope_stats_aicpu_set_orch_thread_idx(thread_idx);
 #endif
+
+            // dep_gen plugs into the orchestrator thread (single-instance subsystem):
+            // set the per-thread queue index and pop the initial buffer before any
+            // submit_task can fire inside orch_func_.
+            if (is_dep_gen_enabled()) {
+                dep_gen_aicpu_set_orch_thread_idx(thread_idx);
+                dep_gen_aicpu_init();
+            }
 
 #if PTO2_PROFILING
             orch_cycle_start = get_sys_cnt_aicpu();
@@ -553,6 +585,17 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt_scope_begin(rt);
             (*p_func)(*orch_args_cached_);
             rt_scope_end(rt);
+
+            // Flush the (potentially partially-filled) DepGenBuffer so the host
+            // collector can pick it up before this orchestrator thread joins.
+            if (is_dep_gen_enabled()) {
+                dep_gen_aicpu_flush();
+            }
+#if PTO2_PROFILING
+            // Push the partially-filled scope_stats buffer so the host gets the
+            // final scope_end records. Idempotent / no-op when disabled.
+            scope_stats_aicpu_flush_buffers();
+#endif
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             (void)orch_cycle_end;
@@ -627,7 +670,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // device LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…" line
             // below carries the same envelope info for debugging, and
             // host-side swimlane derives per-phase timing from the per-event
-            // AicpuPhaseRecord[] stream that already covers everything inside
+            // L2SwimlaneAicpuPhaseRecord[] stream that already covers everything inside
             // submit_task().
             int32_t total_tasks = 0;
             if (rt->orchestrator.sm_header) {
@@ -741,6 +784,9 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
     rt = nullptr;
+
+    // Clear dep_gen file-local bookkeeping. No-op when dep_gen is disabled.
+    dep_gen_aicpu_finalize();
 
     LOG_INFO_V0("DeInit: Runtime execution state reset");
 

@@ -1,5 +1,11 @@
 # Orchestrator — DAG Submission Internals
 
+Callable identity update: the Python facade validates `CallableHandle` objects
+and passes callable digest/kind/namespace metadata into the C++ Orchestrator.
+Older `callable_id`/`cid` examples below are target-local or historical
+internals, not public submit arguments. See
+[callable-identity-registration.md](callable-identity-registration.md).
+
 The Orchestrator is the **DAG builder**. It runs single-threaded on the user's
 thread (inside `Worker::run` between `scope_begin` and `drain`) and owns the
 three data structures that turn a sequence of `submit_*` calls into a scheduled
@@ -11,22 +17,29 @@ flows through `submit`, see [task-flow.md](task-flow.md).
 
 ---
 
-## 1. Public API
+## 1. Python Facade and C++ Internal API
 
-The user's orch fn receives an `Orchestrator*` as its first argument:
+The Python user's orch fn receives a `simpler.orchestrator.Orchestrator`
+facade. Its `submit_*` methods enqueue DAG nodes and return `None`; task slots
+remain internal to the worker.
+
+The C++ Orchestrator still returns `SubmitResult` for internal scheduling and
+C++ tests, but nanobind intentionally drops that return value instead of
+exposing it to Python:
 
 ```cpp
 class Orchestrator {
 public:
-    // --- User-facing submit API (tags inside TaskArgs drive deps) ---
-    SubmitResult submit_next_level(uint64_t callable,
+    // --- Internal submit API (tags inside TaskArgs drive deps) ---
+    SubmitResult submit_next_level(const CallableIdentity &callable,
                                     const TaskArgs &args,
                                     const CallConfig &config);
-    SubmitResult submit_next_level_group(uint64_t callable,
+    SubmitResult submit_next_level_group(const CallableIdentity &callable,
                                           const std::vector<TaskArgs> &args_list,
                                           const CallConfig &config);
-    SubmitResult submit_sub(int32_t callable_id, const TaskArgs &args);
-    SubmitResult submit_sub_group(int32_t callable_id,
+    SubmitResult submit_sub(const CallableIdentity &callable,
+                            const TaskArgs &args);
+    SubmitResult submit_sub_group(const CallableIdentity &callable,
                                    const std::vector<TaskArgs> &args_list);
 
     // --- Intermediate-buffer allocation (runtime-owned lifetime) ---
@@ -42,11 +55,11 @@ private:
     // ... components: Ring, TensorMap, Scope, slot pool, active_tasks_ counter
 };
 
-struct SubmitResult { TaskSlot task_slot; };  // field is `task_slot` in current code
+struct SubmitResult { TaskSlot task_slot; };  // internal only; not bound to Python
 ```
 
-**Status**: `submit_sub` takes only `(callable_id, args)` — no `config`,
-since SUB has no per-call config.
+**Status**: `submit_sub` takes only `(CallableIdentity, args)` — no
+`config`, since SUB has no per-call config.
 
 `scope_begin` / `scope_end` / `drain` are invoked from Python `Worker.run` via
 `_scope_begin` / `_scope_end` / `_drain` bindings. They are not part of the
@@ -61,7 +74,7 @@ the same skeleton; `submit_next_level_group` and `submit_sub` differ only in
 how the slot is set up.
 
 ```cpp
-SubmitResult Orchestrator::submit_next_level(Callable cb,
+SubmitResult Orchestrator::submit_next_level(const CallableIdentity &callable,
                                               TaskArgs args,
                                               const CallConfig &config) {
     // 1. Alloc slot (blocks on back-pressure if ring full)
@@ -71,7 +84,7 @@ SubmitResult Orchestrator::submit_next_level(Callable cb,
 
     // 2. Move task data into slot (parent heap, no encoding)
     s.worker_type = WorkerType::NEXT_LEVEL;
-    s.callable    = cb;
+    s.callable    = callable;
     s.task_args   = std::move(args);
     s.config      = config;
 
@@ -158,14 +171,14 @@ Each worker gets its own `TaskArgs`; the node only reaches COMPLETED when all
 N finish.
 
 ```cpp
-SubmitResult Orchestrator::submit_next_level_group(Callable cb,
+SubmitResult Orchestrator::submit_next_level_group(const CallableIdentity &callable,
                                                     std::vector<TaskArgs> args_list,
                                                     const CallConfig &config) {
     TaskSlot sid = ring_.alloc();
     TaskSlotState &s = slots_[sid];
     s.reset();
     s.worker_type     = WorkerType::NEXT_LEVEL;
-    s.callable        = cb;
+    s.callable        = callable;
     s.config          = config;
     s.group_size      = args_list.size();
     s.sub_complete_count = 0;
@@ -206,17 +219,16 @@ Completion is gated on `sub_complete_count.fetch_add(1) + 1 == group_size`.
 
 ## 4. `submit_sub` — Python callable leaf
 
-Sub tasks have no C++ callable — they look up a Python function by id:
+Sub tasks resolve a Python function by callable digest in the SUB child:
 
 ```cpp
-SubmitResult Orchestrator::submit_sub(Callable cb, TaskArgs args, const CallConfig &config) {
+SubmitResult Orchestrator::submit_sub(const CallableIdentity &callable, TaskArgs args) {
     TaskSlot sid = ring_.alloc();
     TaskSlotState &s = slots_[sid];
     s.reset();
     s.worker_type = WorkerType::SUB;
-    s.callable    = cb;                 // interpreted as callable_id
+    s.callable    = callable;
     s.task_args   = std::move(args);
-    s.config      = config;
 
     std::vector<TaskSlot> producers;
     std::unordered_set<TaskSlot> producers_seen;

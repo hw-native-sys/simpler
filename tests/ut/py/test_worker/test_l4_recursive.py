@@ -19,6 +19,7 @@ import struct
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
+from simpler.callable_identity import CallableHandle
 from simpler.task_interface import CallConfig, TaskArgs
 from simpler.worker import Worker
 
@@ -43,6 +44,10 @@ def _read_counter(buf) -> int:
 def _increment_counter(buf) -> None:
     v = struct.unpack_from("i", buf, 0)[0]
     struct.pack_into("i", buf, 0, v + 1)
+
+
+def _slot_for(worker: Worker, handle: CallableHandle) -> int:
+    return worker._identity_registry[handle.digest].slot_id
 
 
 # ---------------------------------------------------------------------------
@@ -144,14 +149,14 @@ class TestL4DynamicRegister:
     The L3 child is sub-only (no chip device) so the cascade hits zero
     chip mailboxes inside the L3 child — but exercises the full path
     from L4 parent → next_level mailbox → ``_child_worker_loop`` CONTROL
-    handler → ``inner_worker._register_at`` recursively. NPU not required.
+    handler → ``inner_worker._register_child_chip`` recursively. NPU not required.
     """
 
     def test_l4_register_chip_callable_after_init_succeeds(self):
         from simpler.task_interface import ChipCallable  # noqa: PLC0415
 
         l3 = Worker(level=3, num_sub_workers=1)
-        l3.register(lambda args: None)  # at least one cid so L3 init is happy
+        l3.register(lambda args: None)  # at least one registered callable so L3 init is happy
 
         w4 = Worker(level=4, num_sub_workers=0)
         w4.register(lambda orch, args, config: None)
@@ -159,9 +164,9 @@ class TestL4DynamicRegister:
         w4.init()
         try:
             callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
-            cid = w4.register(callable_obj)
-            assert isinstance(cid, int)
-            assert cid >= 0
+            handle = w4.register(callable_obj)
+            assert isinstance(handle, CallableHandle)
+            assert _slot_for(w4, handle) >= 0
         finally:
             w4.close()
 
@@ -177,12 +182,13 @@ class TestL4DynamicRegister:
         w4.init()
         try:
             callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
-            cid_a = w4.register(callable_obj)
-            w4.unregister(cid_a)
-            assert cid_a not in w4._callable_registry
+            handle_a = w4.register(callable_obj)
+            slot_a = _slot_for(w4, handle_a)
+            w4.unregister(handle_a)
+            assert slot_a not in w4._callable_registry
             # Slot is freed; the next register reuses it.
-            cid_b = w4.register(callable_obj)
-            assert cid_b == cid_a
+            handle_b = w4.register(callable_obj)
+            assert _slot_for(w4, handle_b) == slot_a
         finally:
             w4.close()
 
@@ -190,25 +196,25 @@ class TestL4DynamicRegister:
         counter_shm, counter_buf = _make_shared_counter()
         try:
             l3 = Worker(level=3, num_sub_workers=1)
-            l3_sub_cid = l3.register(lambda args: _increment_counter(counter_buf))
+            l3_sub_handle = l3.register(lambda args: _increment_counter(counter_buf))
 
             w4 = Worker(level=4, num_sub_workers=0)
-            bootstrap_cid = w4.register(lambda orch, args, config: None)
+            bootstrap_handle = w4.register(lambda orch, args, config: None)
             w4.add_worker(l3)
             w4.init()
 
             def bootstrap(orch, args, config):
-                orch.submit_next_level(bootstrap_cid, TaskArgs(), CallConfig())
+                orch.submit_next_level(bootstrap_handle, TaskArgs(), CallConfig())
 
             w4.run(bootstrap)
 
             def dynamic_l3_orch(orch, args, config):
-                orch.submit_sub(l3_sub_cid)
+                orch.submit_sub(l3_sub_handle)
 
-            dynamic_cid = w4.register(dynamic_l3_orch)
+            dynamic_handle = w4.register(dynamic_l3_orch)
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(dynamic_cid, TaskArgs(), CallConfig())
+                orch.submit_next_level(dynamic_handle, TaskArgs(), CallConfig())
 
             w4.run(l4_orch)
             w4.close()
@@ -236,19 +242,19 @@ class TestL4ToL3SingleDispatch:
         try:
             # L3 child: one sub worker, one sub callable that increments counter
             l3 = Worker(level=3, num_sub_workers=1)
-            l3_sub_cid = l3.register(lambda args: _increment_counter(counter_buf))
+            l3_sub_handle = l3.register(lambda args: _increment_counter(counter_buf))
 
             def l3_orch(orch, args, config):
-                orch.submit_sub(l3_sub_cid)
+                orch.submit_sub(l3_sub_handle)
 
             # L4 parent: one next-level child, register L3 orch fn
             w4 = Worker(level=4, num_sub_workers=0)
-            l3_cid = w4.register(l3_orch)
+            l3_handle = w4.register(l3_orch)
             w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
 
             w4.run(l4_orch)
             w4.close()
@@ -271,19 +277,19 @@ class TestL4ToL3MultipleDispatches:
 
         try:
             l3 = Worker(level=3, num_sub_workers=1)
-            l3_sub_cid = l3.register(lambda args: _increment_counter(counter_buf))
+            l3_sub_handle = l3.register(lambda args: _increment_counter(counter_buf))
 
             def l3_orch(orch, args, config):
-                orch.submit_sub(l3_sub_cid)
+                orch.submit_sub(l3_sub_handle)
 
             w4 = Worker(level=4, num_sub_workers=0)
-            l3_cid = w4.register(l3_orch)
+            l3_handle = w4.register(l3_orch)
             w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
                 for _ in range(3):
-                    orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
+                    orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
 
             w4.run(l4_orch)
             w4.close()
@@ -311,21 +317,21 @@ class TestL4WithOwnSubs:
         try:
             # L3 child: sub worker increments counter
             l3 = Worker(level=3, num_sub_workers=1)
-            l3_sub_cid = l3.register(lambda args: _increment_counter(counter_buf))
+            l3_sub_handle = l3.register(lambda args: _increment_counter(counter_buf))
 
             def l3_orch(orch, args, config):
-                orch.submit_sub(l3_sub_cid)
+                orch.submit_sub(l3_sub_handle)
 
             # L4: own sub worker + L3 child
             w4 = Worker(level=4, num_sub_workers=1)
-            l3_cid = w4.register(l3_orch)
-            l4_verify_cid = w4.register(lambda args: _increment_counter(counter_buf))
+            l3_handle = w4.register(l3_orch)
+            l4_verify_handle = w4.register(lambda args: _increment_counter(counter_buf))
             w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
-                orch.submit_sub(l4_verify_cid)
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_sub(l4_verify_handle)
 
             w4.run(l4_orch)
             w4.close()
@@ -349,18 +355,18 @@ class TestL4MultipleRuns:
 
         try:
             l3 = Worker(level=3, num_sub_workers=1)
-            l3_sub_cid = l3.register(lambda args: _increment_counter(counter_buf))
+            l3_sub_handle = l3.register(lambda args: _increment_counter(counter_buf))
 
             def l3_orch(orch, args, config):
-                orch.submit_sub(l3_sub_cid)
+                orch.submit_sub(l3_sub_handle)
 
             w4 = Worker(level=4, num_sub_workers=0)
-            l3_cid = w4.register(l3_orch)
+            l3_handle = w4.register(l3_orch)
             w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
 
             for _ in range(5):
                 w4.run(l4_orch)
@@ -389,19 +395,19 @@ class TestL4L3WithMultipleSubs:
 
         try:
             l3 = Worker(level=3, num_sub_workers=1)
-            l3_sub_cid = l3.register(lambda args: _increment_counter(counter_buf))
+            l3_sub_handle = l3.register(lambda args: _increment_counter(counter_buf))
 
             def l3_orch(orch, args, config):
-                orch.submit_sub(l3_sub_cid)
-                orch.submit_sub(l3_sub_cid)
+                orch.submit_sub(l3_sub_handle)
+                orch.submit_sub(l3_sub_handle)
 
             w4 = Worker(level=4, num_sub_workers=0)
-            l3_cid = w4.register(l3_orch)
+            l3_handle = w4.register(l3_orch)
             w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
 
             w4.run(l4_orch)
             w4.close()
@@ -425,19 +431,19 @@ class TestL3OwnOrchestrator:
 
         try:
             l3 = Worker(level=3, num_sub_workers=1)
-            l3_sub_cid = l3.register(lambda args: _increment_counter(counter_buf))
+            l3_sub_handle = l3.register(lambda args: _increment_counter(counter_buf))
 
             def l3_orch(orch, args, config):
                 # orch is L3's own Orchestrator — alloc + submit_sub should work
-                orch.submit_sub(l3_sub_cid)
+                orch.submit_sub(l3_sub_handle)
 
             w4 = Worker(level=4, num_sub_workers=0)
-            l3_cid = w4.register(l3_orch)
+            l3_handle = w4.register(l3_orch)
             w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
 
             w4.run(l4_orch)
             w4.close()

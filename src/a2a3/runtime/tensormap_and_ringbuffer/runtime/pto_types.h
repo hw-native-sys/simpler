@@ -45,15 +45,6 @@
 #define MAX_TENSOR_ARGS CORE_MAX_TENSOR_ARGS
 #define MAX_SCALAR_ARGS CORE_MAX_SCALAR_ARGS
 
-inline bool &tensor_dump_selective_requested_ref() {
-    static bool requested = false;
-    return requested;
-}
-
-inline void set_tensor_dump_selective_requested(bool enable) { tensor_dump_selective_requested_ref() = enable; }
-
-inline bool is_tensor_dump_selective_requested() { return tensor_dump_selective_requested_ref(); }
-
 typedef enum {
     ASYNC_ENGINE_SDMA = 0,
     ASYNC_ENGINE_ROCE = 1,
@@ -190,7 +181,6 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         has_error = false;
         error_msg = nullptr;
         tensor_dump_arg_mask_ = 0;
-        tensor_dump_selective_requested_ = is_tensor_dump_selective_requested();
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
     }
@@ -204,7 +194,6 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     template <typename... Args>
     void dump(Args &&...args) {
-        static_assert(sizeof...(Args) >= 1, "dump: at least one tensor argument required");
         static_assert(
             (std::is_lvalue_reference_v<Args> && ...),
             "dump: temporaries are not allowed — pass tensors already added to this Arg"
@@ -214,12 +203,14 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
              ...),
             "dump: all arguments must be Tensor or TensorCreateInfo"
         );
-        tensor_dump_selective_requested_ = is_tensor_dump_selective_requested();
-        (mark_tensor_dump_arg(args), ...);
+        if constexpr (sizeof...(Args) == 0) {
+            mark_all_tensor_dump_arg();
+        } else {
+            (mark_tensor_dump_arg(args), ...);
+        }
     }
 
     uint64_t tensor_dump_arg_mask() const { return tensor_dump_arg_mask_; }
-    bool tensor_dump_selective_requested() const { return tensor_dump_selective_requested_; }
 
     template <typename... Args>
     void add_input(Args &&...args) {
@@ -386,9 +377,19 @@ private:
     // Caller-owned dependency array; lifetime must extend through submit.
     static_assert(MAX_TENSOR_ARGS <= 64, "tensor dump arg mask assumes at most 64 tensor arguments");
     uint64_t tensor_dump_arg_mask_{0};
-    bool tensor_dump_selective_requested_{is_tensor_dump_selective_requested()};
     const PTO2TaskId *explicit_deps_{nullptr};
     uint32_t explicit_dep_count_{0};
+
+    // No-arg dump(): mark every tensor arg already added to this Arg.
+    void mark_all_tensor_dump_arg() {
+        if (tensor_count_ == 0) {
+            set_error("dump: no tensor arguments added to this Arg");
+            return;
+        }
+        for (int32_t i = 0; i < tensor_count_; i++) {
+            tensor_dump_arg_mask_ |= (uint64_t{1} << i);
+        }
+    }
 
     void mark_tensor_dump_arg(const Tensor &tensor) {
         for (int32_t i = 0; i < tensor_count_; i++) {

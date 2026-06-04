@@ -13,12 +13,14 @@
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
 #include "common/platform_config.h"
+#include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
-#include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/pmu_collector_aicpu.h"
+#include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "runtime.h"
 
@@ -100,16 +102,44 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // mirrored into Handshake), so decode the umbrella bitmask once and
     // hand it to the existing platform-state setters.
     set_platform_regs(k_args->regs);
+    // Device ordinal for per-device orchestration-SO naming in the executor.
+    set_orch_device_id(static_cast<int>(k_args->device_id));
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_tensor_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
-    set_platform_l2_perf_base(k_args->l2_perf_data_base);
+    set_platform_l2_swimlane_base(k_args->l2_swimlane_data_base);
     set_l2_swimlane_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
     set_pmu_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_PMU));
+    set_platform_dep_gen_base(k_args->dep_gen_data_base);
+    set_dep_gen_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DEP_GEN));
+    set_scope_stats_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS));
+    set_platform_scope_stats_base(k_args->scope_stats_data_base);
 
-    // Affinity gate: drop excess threads before entering runtime
-    if (!platform_aicpu_affinity_gate(runtime->aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
-        LOG_INFO_V0("Thread dropped by cluster affinity");
+    // Filter-style affinity gate (a5). Host probed the topology, computed
+    // ALLOWED_CPUS, and wrote it into runtime->aicpu_allowed_cpus[]. The
+    // gate barriers exactly runtime->aicpu_launch_count threads (= the
+    // count CANN was told to launch, which equals popcount(OCCUPY) — see
+    // src/a5/platform/onboard/host/device_runner.cpp), keeps those whose
+    // sched_getcpu() ∈ allowed_cpus, and exposes the deterministic
+    // exec_idx via platform_aicpu_affinity_thread_idx() — the executor
+    // reads it to assign sched/orch role.
+    //
+    // If the host probe didn't populate the gate inputs (allowed_count or
+    // launch_count is 0) the gate would unconditionally drop every thread
+    // and we'd silently return success without ever calling aicpu_execute.
+    // That's a host-side bug; fail loud so it surfaces instead of
+    // producing nothing at runtime.
+    if (runtime->aicpu_allowed_cpu_count <= 0 || runtime->aicpu_launch_count <= 0) {
+        LOG_ERROR(
+            "AICPU affinity inputs missing: allowed_cpu_count=%d launch_count=%d (host probe must run before exec)",
+            runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+        );
+        return -1;
+    }
+    if (!platform_aicpu_affinity_gate_filter(
+            runtime->aicpu_allowed_cpus, runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+        )) {
+        LOG_INFO_V0("Thread dropped by filter affinity gate");
         return 0;
     }
 

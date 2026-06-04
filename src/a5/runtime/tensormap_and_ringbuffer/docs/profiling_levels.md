@@ -166,8 +166,8 @@ Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 ```
 
 Per-thread fanout / fanin edge counts and ready-queue pop hit / miss
-stats live in `aicpu_scheduler_phases[]` (in `l2_perf_records.json`
-captured at l2_perf_level >= 3) and `deps.json`; consume them via
+stats live in `aicpu_scheduler_phases[]` (in `l2_swimlane_records.json`
+captured at l2_swimlane_level >= 3) and `deps.json`; consume them via
 `simpler_setup/tools/sched_overhead_analysis.py`.
 
 ---
@@ -241,10 +241,10 @@ mirrors the PMU pattern — two independent channels (one binary, one int):
   (`PROFILING_FLAG_L2_SWIMLANE`). Set by the host whenever level > 0; read
   by AICore (which only needs on/off to decide whether to write timing) and
   by AICPU kernel entry via `set_l2_swimlane_enabled(bool)`.
-- **Granular level (0–4)** — `L2PerfDataHeader::l2_perf_level`
-  (shared memory). Host writes it in `L2PerfCollector::initialize`; AICPU
-  promotes it from the header in `l2_perf_aicpu_init` and exposes it via
-  `get_l2_perf_level()` (typed `L2PerfLevel`) for
+- **Granular level (0–4)** — `L2SwimlaneDataHeader::l2_swimlane_level`
+  (shared memory). Host writes it in `L2SwimlaneCollector::initialize`; AICPU
+  promotes it from the header in `l2_swimlane_aicpu_init` and exposes it via
+  `get_l2_swimlane_level()` (typed `L2SwimlaneLevel`) for
   `>= AICPU_TIMING / SCHED_PHASES / ORCH_PHASES` gates.
 
 On sim, the binary on/off travels via the dlsym'd `set_l2_swimlane_enabled`
@@ -255,7 +255,7 @@ header just like on onboard.
 | ----- | -------- |
 | 0 | Nothing (disabled) |
 | 1 | AICore timing only (start/end/task_id/func_id/core_type) |
-| 2 | + dispatch_time, finish_time, fanout |
+| 2 | + dispatch_time, finish_time |
 | 3 | + Scheduler phases (`SCHED_*`) |
 | 4 | + Orchestrator phases (full) |
 
@@ -263,7 +263,7 @@ Bare `--enable-l2-swimlane` = level 4 (backward compatible).
 
 ### Level gating in AICPU code
 
-Use the strongly-typed `L2PerfLevel` enum so each gate names the
+Use the strongly-typed `L2SwimlaneLevel` enum so each gate names the
 content it depends on instead of relying on magic numbers:
 
 ```cpp
@@ -271,20 +271,20 @@ content it depends on instead of relying on magic numbers:
 // Cheap binary check, available immediately after kernel entry.
 if (is_l2_swimlane_enabled()) { ... }
 
-// AICPU dispatch/finish timestamps + fanout.
-// Granular checks below require l2_perf_aicpu_init to have already run
+// AICPU dispatch/finish timestamps.
+// Granular checks below require l2_swimlane_aicpu_init to have already run
 // (so the level has been promoted from the shared-memory header).
-if (get_l2_perf_level() >= L2PerfLevel::AICPU_TIMING) { ... }
+if (get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) { ... }
 
 // Scheduler main-loop phase records (SCHED_*)
-if (get_l2_perf_level() >= L2PerfLevel::SCHED_PHASES) { ... }
+if (get_l2_swimlane_level() >= L2SwimlaneLevel::SCHED_PHASES) { ... }
 
 // Orchestrator phase records
-if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) { ... }
+if (get_l2_swimlane_level() >= L2SwimlaneLevel::ORCH_PHASES) { ... }
 ```
 
-`L2PerfLevel` is defined in `common/l2_perf_profiling.h` with
-underlying type `uint32_t` (matches the `L2PerfDataHeader::l2_perf_level`
+`L2SwimlaneLevel` is defined in `common/l2_swimlane_profiling.h` with
+underlying type `uint32_t` (matches the `L2SwimlaneDataHeader::l2_swimlane_level`
 shared-memory field and mirrors `PmuEventType : uint32_t`):
 
 | Enumerator | Underlying value |
@@ -405,10 +405,10 @@ add_definitions(-DPTO2_ORCH_PROFILING=1)
 
 ### Code Locations
 
-- Macro definitions: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2_types.h`
-- Scheduler profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp` and `scheduler_cold_path.cpp`
-- Orchestrator profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp`
-- TensorMap profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h`
+- Macro definitions: `src/a5/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2_types.h`
+- Scheduler profiling: `src/a5/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp` and `scheduler_cold_path.cpp`
+- Orchestrator profiling: `src/a5/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp`
+- TensorMap profiling: `src/a5/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h`
 
 ---
 

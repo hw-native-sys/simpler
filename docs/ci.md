@@ -42,10 +42,35 @@ PullRequest
 | `ut` | `ubuntu-latest`, `macos-latest` | `pytest tests/ut` + `ctest -LE requires_hardware` |
 | `st-sim-a2a3` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a2a3sim` |
 | `st-sim-a5` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a5sim` |
-| `ut-a2a3` | a2a3 self-hosted | `pytest tests/ut --platform a2a3` + `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` |
+| `ut-a2a3` | a2a3 self-hosted | `pytest tests/ut --platform a2a3` + `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` + build `tools/cann-examples/query` and run `query version` (no device) + build `tools/cann-examples/aicpu-device-query` and `tools/cann-examples/aicpu-kernel-launch` (host + cross-compiled device SO, link smoke only) |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --device ...` |
-| `ut-a5` | a5 self-hosted | `pytest tests/ut --platform a5` + `ctest -L "^requires_hardware(_a5)?$"` |
+| `ut-a5` | a5 self-hosted | `pytest tests/ut --platform a5` + `ctest -L "^requires_hardware(_a5)?$"` + build `tools/cann-examples/query` and run `query version` (no device) + build `tools/cann-examples/aicpu-device-query` and `tools/cann-examples/aicpu-kernel-launch` (link smoke only) |
 | `st-onboard-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --device ...` |
+
+### Nightly sanitizer sweep
+
+A **separate** workflow, [`sanitizers.yml`](../.github/workflows/sanitizers.yml),
+runs on a nightly `schedule` — kept out of `ci.yml` so the cron fires only the
+sanitizer jobs, never the PR/self-hosted pipeline. Its
+`sanitizer-sim` job builds the sim runtime + kernels with ASAN or TSAN
+(`pip install --config-settings=cmake.define.SIMPLER_SANITIZER=...`) and runs a
+**scoped** subset under the matching `LD_PRELOAD` (a2a3sim/a5sim, ubuntu-only).
+`dlopen_count` tests are excluded everywhere (they assert exact dlopen accounting
+that the sanitizers perturb by interposing `dlopen`). The full suite is avoided
+because ASAN/TSAN slow the sim enough that oversubscription-heavy cases livelock
+on a 4-vCPU runner — so the scope is parallelism-limited per sanitizer:
+
+- **ASAN** (~1.7x): `prepared_callable` + `dynamic_register` (where present),
+  `--max-parallel 2`, skipping `parallel_broadcast`.
+- **TSAN** (~5-15x): livelocks the chip-fork L3 cases even when run serially, so it
+  runs only the light `prepared_callable` L2 tests, `--max-parallel 1`, with
+  `TSAN_OPTIONS=halt_on_error=0:exitcode=0` (report races without aborting *or*
+  failing the job — TSAN's default `exitcode=66` would otherwise redden the cell on
+  every race; the job gates on hang/crash, triaging the reported races into a
+  suppressions file is a follow-up).
+
+Both sanitizer jobs gate (no `continue-on-error`). Not a PR gate; see
+[sanitizers.md](sanitizers.md) for the design + usage.
 
 ### Parallel ST runs on hardware
 
@@ -75,17 +100,23 @@ profiling-vs-parallelism trade-off.
 
 ### Sim jobs on CPU-constrained runners
 
-Sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-latest`, which typically
-has 2 vCPUs. `--device 0-15` is still the right choice for the **pool size**
-(some L3 cases need several virtual ids), but the default `--max-parallel auto`
-caps the in-flight subprocess count to `min(nproc, len(--device))` — on a
-2-core runner that becomes `2`, avoiding CPU thrashing:
+Sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-latest`, whose standard
+GitHub-hosted runner currently has **4 vCPUs**. `--device 0-15` is still the
+right choice for the **pool size** (some L3 cases need several virtual ids), but
+the default `--max-parallel auto` caps the in-flight subprocess count to
+`min(nproc, len(--device))` — on a 4-core runner that becomes `4`. Note
+`os.cpu_count()` reports the host's logical CPUs and ignores any cgroup CPU
+quota, so this is the true core count, not a container limit.
 
 ```bash
-# Sim: --max-parallel auto resolves to 2 on ubuntu-latest
+# Sim: --max-parallel auto resolves to 4 on a standard ubuntu-latest runner
 pytest examples tests/st --platform a2a3sim --device 0-15
 
-# Or pin explicitly if your runner has a different CPU count
+# Throttle further on a CPU-starved runner: 4 concurrent cases (each forking
+# several chip subprocesses with many threads) can oversubscribe 4 cores and
+# trigger the sim handshake/deinit failures in
+# troubleshooting/sim-oversubscription-hang.md. --max-parallel 2 trades
+# throughput for stability.
 pytest examples tests/st --platform a2a3sim --device 0-15 --max-parallel 2
 ```
 
@@ -217,3 +248,5 @@ No `--platform` means "run all sims" — tests with no sim in their `platforms` 
 ## Platform notes
 
 - **macOS libomp collision**: on macOS, the root `conftest.py` sets `KMP_DUPLICATE_LIB_OK=TRUE` before `import pytest` to work around a duplicate-libomp abort triggered by homebrew numpy and pip torch coexisting in one Python process (see [troubleshooting/macos-libomp-collision.md](troubleshooting/macos-libomp-collision.md)). Standalone `python test_*.py` bypasses conftest — rely on the env var being exported by the shell or `tools/verify_packaging.sh`.
+- **sim hangs / `rc=-1` under CPU oversubscription**: on a few-vCPU runner, high `--max-parallel` (or many concurrent sim cases) oversubscribes the host CPUs, where sim's busy-spin handshake can livelock (hang → `rc=124`) or the deinit timeout can false-trip (`run_prepared failed with code -1`). Mitigate with `--max-parallel 2`; onboard is unaffected (see [troubleshooting/sim-oversubscription-hang.md](troubleshooting/sim-oversubscription-hang.md)).
+- **`st-onboard-a2a3` mass 507899 is not OOM**: a whole-suite collapse of `507899`/`507018`/`prepare_callable -1` is an AICPU device-fault cascade (`simpler_aicpu_exec` exception), not memory exhaustion. Diagnosis recipe and the per-device preinstall-name fix are in [troubleshooting/a2a3-507899-aicpu-shared-so-fault.md](troubleshooting/a2a3-507899-aicpu-shared-so-fault.md).

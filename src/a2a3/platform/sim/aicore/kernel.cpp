@@ -23,7 +23,7 @@
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
 #include "common/core_type.h"
-#include "common/l2_perf_profiling.h"
+#include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "runtime.h"
 
@@ -33,14 +33,18 @@
 static pthread_key_t g_reg_base_key;
 static pthread_key_t g_core_id_key;
 static pthread_key_t g_aicore_profiling_flag_key;
-static pthread_key_t g_aicore_l2_perf_ring_key;
+// Slot pointer (NOT the dereferenced head address) — see
+// aicore_profiling_state.h for the lazy-deref contract.
+static pthread_key_t g_l2_swimlane_aicore_head_slot_key;
+static pthread_key_t g_l2_swimlane_aicore_head_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
 static void create_tls_keys() {
     pthread_key_create(&g_reg_base_key, nullptr);
     pthread_key_create(&g_core_id_key, nullptr);
     pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
-    pthread_key_create(&g_aicore_l2_perf_ring_key, nullptr);
+    pthread_key_create(&g_l2_swimlane_aicore_head_slot_key, nullptr);
+    pthread_key_create(&g_l2_swimlane_aicore_head_key, nullptr);
 }
 
 volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key)); }
@@ -61,11 +65,19 @@ __aicore__ uint32_t get_aicore_profiling_flag() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
 }
 
-__aicore__ void set_aicore_l2_perf_ring(__gm__ L2PerfAicoreRing *ring) {
-    pthread_setspecific(g_aicore_l2_perf_ring_key, reinterpret_cast<void *>(ring));
+__aicore__ void set_l2_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
+    pthread_setspecific(g_l2_swimlane_aicore_head_slot_key, reinterpret_cast<void *>(slot_ptr));
+    pthread_setspecific(g_l2_swimlane_aicore_head_key, nullptr);  // force lazy resolve on next get
 }
-__aicore__ __gm__ L2PerfAicoreRing *get_aicore_l2_perf_ring() {
-    return reinterpret_cast<__gm__ L2PerfAicoreRing *>(pthread_getspecific(g_aicore_l2_perf_ring_key));
+__aicore__ __gm__ L2SwimlaneActiveHead *get_l2_swimlane_aicore_head() {
+    auto *cached = reinterpret_cast<__gm__ L2SwimlaneActiveHead *>(pthread_getspecific(g_l2_swimlane_aicore_head_key));
+    if (cached != nullptr) return cached;
+    auto *slot = reinterpret_cast<__gm__ uint64_t *>(pthread_getspecific(g_l2_swimlane_aicore_head_slot_key));
+    if (slot == nullptr) return nullptr;
+    // Lazy first-call resolve — see aicore_profiling_state.h.
+    cached = reinterpret_cast<__gm__ L2SwimlaneActiveHead *>(*slot);
+    pthread_setspecific(g_l2_swimlane_aicore_head_key, reinterpret_cast<void *>(cached));
+    return cached;
 }
 
 // Core identity setter function pointers — set by DeviceRunner after dlopen.
@@ -90,7 +102,7 @@ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 // executor with its original signature.
 extern "C" void aicore_execute_wrapper(
     __gm__ Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
-    uint32_t enable_profiling_flag, uint64_t aicore_ring_addr
+    uint32_t enable_profiling_flag, uint64_t l2_swimlane_aicore_rotation_table
 ) {
     pthread_once(&g_tls_once, create_tls_keys);
 
@@ -106,11 +118,14 @@ extern "C" void aicore_execute_wrapper(
 
     // Publish per-core profiling state before the executor runs.
     set_aicore_profiling_flag(enable_profiling_flag);
-    if (aicore_ring_addr != 0) {
-        uint64_t *ring_table = reinterpret_cast<uint64_t *>(aicore_ring_addr);
-        set_aicore_l2_perf_ring(reinterpret_cast<__gm__ L2PerfAicoreRing *>(ring_table[block_idx]));
+    if (l2_swimlane_aicore_rotation_table != 0) {
+        // Stash only the slot pointer; deref happens lazily inside
+        // get_l2_swimlane_aicore_head() once AICPU has populated the table. See
+        // aicore_profiling_state.h.
+        uint64_t *head_table = reinterpret_cast<uint64_t *>(l2_swimlane_aicore_rotation_table);
+        set_l2_swimlane_aicore_head_slot(reinterpret_cast<__gm__ uint64_t *>(&head_table[block_idx]));
     } else {
-        set_aicore_l2_perf_ring(nullptr);
+        set_l2_swimlane_aicore_head_slot(nullptr);
     }
 
     // Set core identity for pto-isa TPUSH/TPOP simulation.

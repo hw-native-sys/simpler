@@ -23,8 +23,8 @@ TestGroupDependency:
         completed.
 """
 
+import os
 import struct
-from multiprocessing import Value
 from multiprocessing.shared_memory import SharedMemory
 
 from simpler.task_interface import (
@@ -71,45 +71,74 @@ def _sync_args(ptr: int, tag: TensorArgType) -> TaskArgs:
 class TestGroupBasic:
     def test_group_both_workers_execute(self):
         """submit_sub_group with 2 args -> 2 SubWorkers, counter==2."""
-        counter = Value("i", 0)
+        counter = _alloc_counter()
+        counter_name = counter.name
+        lock_path = f"/tmp/simpler-group-{counter_name}.lock"
+        open(lock_path, "a").close()
 
         hw = Worker(level=3, num_sub_workers=2)
 
         def inc(args):
-            with counter.get_lock():
-                counter.value += 1
+            import fcntl  # noqa: PLC0415
 
-        cid = hw.register(inc)
-        hw.init()
+            shm = SharedMemory(name=counter_name)
+            try:
+                assert shm.buf is not None
+                with open(lock_path, "r+") as lock_file:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX)
+                    value = struct.unpack_from("i", shm.buf, 0)[0]
+                    struct.pack_into("i", shm.buf, 0, value + 1)
+            finally:
+                shm.close()
 
-        def orch(o, args, cfg):
-            o.submit_sub_group(cid, [TaskArgs(), TaskArgs()])
+        try:
+            handle = hw.register(inc)
+            hw.init()
 
-        hw.run(orch)
-        hw.close()
+            def orch(o, args, cfg):
+                o.submit_sub_group(handle, [TaskArgs(), TaskArgs()])
 
-        assert counter.value == 2, f"Expected 2, got {counter.value}"
+            hw.run(orch)
+            hw.close()
+
+            assert _read(counter) == 2, f"Expected 2, got {_read(counter)}"
+        finally:
+            hw.close()
+            counter.close()
+            counter.unlink()
+            os.unlink(lock_path)
 
     def test_single_args_group_runs_once(self):
         """submit_sub_group with 1 arg still runs exactly once."""
-        counter = Value("i", 0)
+        counter = _alloc_counter()
+        counter_name = counter.name
 
         hw = Worker(level=3, num_sub_workers=1)
 
         def inc(args):
-            with counter.get_lock():
-                counter.value += 1
+            shm = SharedMemory(name=counter_name)
+            try:
+                assert shm.buf is not None
+                value = struct.unpack_from("i", shm.buf, 0)[0]
+                struct.pack_into("i", shm.buf, 0, value + 1)
+            finally:
+                shm.close()
 
-        cid = hw.register(inc)
-        hw.init()
+        try:
+            handle = hw.register(inc)
+            hw.init()
 
-        def orch(o, args, cfg):
-            o.submit_sub_group(cid, [TaskArgs()])
+            def orch(o, args, cfg):
+                o.submit_sub_group(handle, [TaskArgs()])
 
-        hw.run(orch)
-        hw.close()
+            hw.run(orch)
+            hw.close()
 
-        assert counter.value == 1
+            assert _read(counter) == 1
+        finally:
+            hw.close()
+            counter.close()
+            counter.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -136,15 +165,15 @@ class TestGroupDependency:
             assert gb is not None and db is not None
 
             hw = Worker(level=3, num_sub_workers=3)
-            group_cid = hw.register(lambda args: struct.pack_into("i", gb, 0, 1))
-            dep_cid = hw.register(lambda args: struct.pack_into("i", db, 0, 1))
+            group_handle = hw.register(lambda args: struct.pack_into("i", gb, 0, 1))
+            dep_handle = hw.register(lambda args: struct.pack_into("i", db, 0, 1))
             hw.init()
 
             def orch(o, args, cfg):
                 # Group: both members tag the synthetic ptr as OUTPUT — the
                 # second insert overwrites the first with the same slot id.
                 o.submit_sub_group(
-                    group_cid,
+                    group_handle,
                     [
                         _sync_args(_SYNC_PTR, TensorArgType.OUTPUT),
                         _sync_args(_SYNC_PTR, TensorArgType.OUTPUT),
@@ -152,7 +181,7 @@ class TestGroupDependency:
                 )
                 # Downstream: INPUT on the same ptr → tensormap lookup wires
                 # a fanin on the group slot.
-                o.submit_sub(dep_cid, _sync_args(_SYNC_PTR, TensorArgType.INPUT))
+                o.submit_sub(dep_handle, _sync_args(_SYNC_PTR, TensorArgType.INPUT))
 
             hw.run(orch)
             hw.close()

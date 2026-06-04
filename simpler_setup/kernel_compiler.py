@@ -48,6 +48,12 @@ class KernelCompiler:
     - AARCH64_GXX: aarch64 cross-compiler for device orchestration
     """
 
+    # Comma-separated `-fsanitize` tokens, set once by conftest from the pytest
+    # `--sanitizer` option (default "" = off). Only host toolchains (Gxx15 sim
+    # incore, Gxx sim orchestration) honor it; ccec/aarch64 device builds never
+    # do. Must match the runtime's install-time SIMPLER_SANITIZER.
+    _sanitizers = ""
+
     def __init__(self, platform: str = "a2a3"):
         """
         Initialize KernelCompiler.
@@ -80,9 +86,22 @@ class KernelCompiler:
         else:
             self.ccec = None
             self.aarch64 = None
-            self.host_gxx = GxxToolchain()
+            # Sim orchestration must match the sim kernels' g++-15 under a
+            # sanitizer (one runtime per process); see GxxToolchain prefer_g15.
+            self.host_gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
 
         self.gxx15 = Gxx15Toolchain()
+
+    def _sanitizer_flags(self, toolchain) -> list[str]:
+        """Sanitizer flags for a host-compiled kernel / orchestration .so.
+
+        No-op for device toolchains (ccec/aarch64) and when no sanitizer is
+        selected. `-O1` + frame pointers mirror cmake/sanitizers.cmake so the
+        sim kernel/orchestration match the sanitized runtime.
+        """
+        if not self._sanitizers or not toolchain.is_host:
+            return []
+        return [f"-fsanitize={self._sanitizers}", "-fno-omit-frame-pointer", "-O1"]
 
     def get_platform_include_dirs(self) -> list[str]:
         """
@@ -92,7 +111,12 @@ class KernelCompiler:
             List of include directory paths (e.g., for device_runner.h, core_type.h)
         """
         return [
-            str(self.platform_dir / "include"),  # For common headers like core_type.h
+            str(self.platform_dir / "include"),  # For arch-specific headers
+            # Shared platform headers (core_type.h, scope_stats.h, etc.) extracted
+            # from per-arch copies into src/common/platform/include. Both arches
+            # must see this on their include path so orchestration cpp can
+            # resolve e.g. "common/core_type.h" the same way it did before.
+            str(self.project_root / "src" / "common" / "platform" / "include"),
         ]
 
     def get_orchestration_include_dirs(self, runtime_name: str) -> list[str]:
@@ -452,6 +476,7 @@ class KernelCompiler:
         )
 
         cmd = [toolchain.cxx_path] + toolchain.get_compile_flags()
+        cmd += self._sanitizer_flags(toolchain)
 
         # Force a deterministic ELF GNU Build-ID into every orchestration .so.
         # The host-side DeviceRunner reads `.note.gnu.build-id` to detect when
@@ -531,6 +556,7 @@ class KernelCompiler:
 
         # Build command from toolchain
         cmd = [self.gxx15.cxx_path] + self.gxx15.get_compile_flags(core_type=core_type)
+        cmd += self._sanitizer_flags(self.gxx15)
 
         # Add PTO ISA header paths if provided
         if pto_isa_root:

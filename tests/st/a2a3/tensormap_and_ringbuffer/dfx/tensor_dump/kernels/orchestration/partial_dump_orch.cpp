@@ -24,8 +24,6 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
-    enable_dump_tensor_selective();
-
     Tensor ext_a = from_tensor_arg(orch_args.tensor(0));
     Tensor ext_b = from_tensor_arg(orch_args.tensor(1));
     Tensor ext_f = from_tensor_arg(orch_args.tensor(2));
@@ -63,6 +61,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         params_t3.add_input(e);
         params_t3.add_output(inter_ci);
         params_t3.add_scalar(3u);
+        // Partial dump, tensor granularity: select specific tensors of this task
+        // (input d + the output; input e is left unmarked).
+        params_t3.dump(d, inter_ci);
         TaskOutputTensors outs_t3 = rt_submit_aiv_task(2, params_t3);
         const Tensor &g = outs_t3.get_ref(0);
 
@@ -70,7 +71,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         params_t4.add_input(g);
         params_t4.add_input(c);
         params_t4.add_output(ext_f);
-        params_t4.dump(g, c, ext_f);
+        // Partial dump, task granularity: no-arg dump() selects the whole task
+        // (every tensor arg on this Arg).
+        params_t4.dump();
         rt_submit_aiv_task(0, params_t4);
     }
 }

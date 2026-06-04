@@ -34,7 +34,7 @@
 
 #pragma once
 
-#include "device_arena.h"
+#include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
 #include "pto_shared_memory.h"
@@ -89,6 +89,11 @@ struct PTO2RuntimeOps {
     );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const Arg &args);
+
+    // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
+    // collector. Always present to keep ops-table layout stable across
+    // PTO2_PROFILING settings; set to nullptr at PTO2_PROFILING=0.
+    void (*scope_set_site)(const char *file, int line);
 };
 
 /**

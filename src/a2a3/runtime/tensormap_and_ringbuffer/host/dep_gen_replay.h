@@ -25,7 +25,7 @@
  * extra I/O and an extra file in the output directory.
  *
  * deps.json is the sole source of truth for fanout: the L2 swimlane hot
- * path no longer records ``L2PerfRecord::fanout[]`` (taking the per-task
+ * path no longer records ``L2SwimlaneAicpuTaskRecord::fanout[]`` (taking the per-task
  * 1 KB GM store off the scheduler critical path). Replay sees every
  * submit and reconstructs the complete dependency graph.
  *

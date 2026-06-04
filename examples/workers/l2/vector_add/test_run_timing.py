@@ -41,7 +41,7 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
         device_id=device_id,
     )
     chip_callable = build_chip_callable(platform)
-    chip_cid = worker.register(chip_callable)
+    chip_handle = worker.register(chip_callable)
     worker.init()
     try:
         # Use deterministic inputs so the run never accidentally hits a
@@ -63,7 +63,7 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
         config = CallConfig()
         config.enable_l2_swimlane = enable_l2_swimlane
 
-        timing = worker.run(chip_cid, args, config)
+        timing = worker.run(chip_handle, args, config)
 
         # Verify the output is sane (so we know the kernel actually ran and
         # the timing isn't from an early-error path).
@@ -100,7 +100,7 @@ def test_worker_run_returns_run_timing(st_platform, st_device_ids):
     # device_wall must also be > 0 without --enable-l2-swimlane after the
     # Phase B decoupling: orch_summary is written unconditionally when
     # PTO2_PROFILING is on (default build). Hitting 0 here means either:
-    #   - the AICPU's l2_perf_aicpu_write_orch_summary path regressed back
+    #   - the AICPU's l2_swimlane_aicpu_write_orch_summary path regressed back
     #     under an is_l2_swimlane_enabled() gate, or
     #   - the host stopped reading the phase header after the run.
     assert timing.device_wall_us > 0.0, (

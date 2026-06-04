@@ -161,7 +161,6 @@ def run(
     device_ids: list[int],
     platform: str = "a2a3",
     pto_isa_commit: str | None = None,
-    build: bool = False,
 ) -> int:
     nranks = len(device_ids)
     # scratch = mailbox(nranks * M*N floats) + signal tail (nranks int32).
@@ -188,10 +187,9 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        build=build,
     )
-    ffn_cid = worker.register(ffn_local_cc)
-    allreduce_cid = worker.register(allreduce_cc)
+    ffn_handle = worker.register(ffn_local_cc)
+    allreduce_handle = worker.register(allreduce_cc)
 
     try:
         print("[ffn_tp_parallel] init worker (forks chip children; base comm is lazy)...")
@@ -217,7 +215,7 @@ def run(
                     a1.add_tensor(make_tensor_arg(host_x_shards[i]), TensorArgType.INPUT)
                     a1.add_tensor(make_tensor_arg(host_w_shards[i]), TensorArgType.INPUT)
                     a1.add_tensor(make_tensor_arg(host_partial[i]), TensorArgType.OUTPUT_EXISTING)
-                    orch.submit_next_level(ffn_cid, a1, cfg, worker=i)
+                    orch.submit_next_level(ffn_handle, a1, cfg, worker=i)
 
                     # Stage 2: AIV cross-rank sum. Tagging partial_local INPUT
                     # with the same buffer.addr makes TensorMap auto-link this
@@ -236,7 +234,7 @@ def run(
                     )
                     a2.add_scalar(domain.domain_size)
                     a2.add_scalar(domain.device_ctx)
-                    orch.submit_next_level(allreduce_cid, a2, cfg, worker=i)
+                    orch.submit_next_level(allreduce_handle, a2, cfg, worker=i)
 
         print("[ffn_tp_parallel] running 2-chip 2-stage DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
@@ -277,15 +275,10 @@ def main() -> int:
 
     parser.add_argument("-p", "--platform", default="a2a3", help="Platform backend, e.g. a2a3 or a2a3sim.")
     parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1'. Two chips required.")
-    parser.add_argument(
-        "--build", action="store_true", help="Rebuild runtime from source instead of using cached libs."
-    )
     parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
 
-    return run(
-        parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit, build=cli.build
-    )
+    return run(parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit)
 
 
 if __name__ == "__main__":

@@ -136,26 +136,27 @@ ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataTyp
 // User-facing submit_* — thin wrappers around submit_impl
 // =============================================================================
 
-SubmitResult
-Orchestrator::submit_next_level(int32_t callable_id, const TaskArgs &args, const CallConfig &config, int8_t worker) {
+SubmitResult Orchestrator::submit_next_level(
+    const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker
+) {
     std::vector<int8_t> affinities;
     if (worker >= 0) affinities = {worker};
-    return submit_impl(WorkerType::NEXT_LEVEL, callable_id, config, {args}, std::move(affinities));
+    return submit_impl(WorkerType::NEXT_LEVEL, callable, config, {args}, std::move(affinities));
 }
 
 SubmitResult Orchestrator::submit_next_level_group(
-    int32_t callable_id, const std::vector<TaskArgs> &args_list, const CallConfig &config,
+    const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
     const std::vector<int8_t> &workers
 ) {
-    return submit_impl(WorkerType::NEXT_LEVEL, callable_id, config, args_list, workers);
+    return submit_impl(WorkerType::NEXT_LEVEL, callable, config, args_list, workers);
 }
 
-SubmitResult Orchestrator::submit_sub(int32_t callable_id, const TaskArgs &args) {
-    return submit_impl(WorkerType::SUB, callable_id, CallConfig{}, {args});
+SubmitResult Orchestrator::submit_sub(const CallableIdentity &callable, const TaskArgs &args) {
+    return submit_impl(WorkerType::SUB, callable, CallConfig{}, {args});
 }
 
-SubmitResult Orchestrator::submit_sub_group(int32_t callable_id, const std::vector<TaskArgs> &args_list) {
-    return submit_impl(WorkerType::SUB, callable_id, CallConfig{}, args_list);
+SubmitResult Orchestrator::submit_sub_group(const CallableIdentity &callable, const std::vector<TaskArgs> &args_list) {
+    return submit_impl(WorkerType::SUB, callable, CallConfig{}, args_list);
 }
 
 // =============================================================================
@@ -163,7 +164,7 @@ SubmitResult Orchestrator::submit_sub_group(int32_t callable_id, const std::vect
 // =============================================================================
 
 SubmitResult Orchestrator::submit_impl(
-    WorkerType worker_type, int32_t callable_id, const CallConfig &config, std::vector<TaskArgs> args_list,
+    WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config, std::vector<TaskArgs> args_list,
     std::vector<int8_t> affinities
 ) {
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
@@ -198,7 +199,7 @@ SubmitResult Orchestrator::submit_impl(
     s.reset();
 
     s.worker_type = worker_type;
-    s.callable_id = callable_id;
+    s.callable = callable;
     s.config = config;
 
     // --- Step 2: Walk tags → tensormap.lookup (deps) + tensormap.insert
@@ -455,7 +456,19 @@ void Orchestrator::drain() {
     // Every slot is CONSUMED (active_tasks_ == 0 ⇒ allocator last_alive_ ==
     // next_task_id_). Drop all per-slot state so the next Worker.run()
     // starts from task_id = 0 with no accumulated memory.
-    allocator_->reset_to_empty();
+    //
+    // Hold the scheduler's loop mutex across the reset: active_tasks_ can reach
+    // zero while the scheduler thread is still inside on_task_complete (it reads
+    // the slot after the consume that drives the count to 0). Freeing the slots
+    // here without this guard is a heap-use-after-free. The scheduler releases
+    // loop_mu_ only between iterations, and with active_tasks_ == 0 it has no
+    // further slots to touch, so this blocks at most one in-flight iteration.
+    if (sched_loop_mu_ != nullptr) {
+        std::lock_guard<std::mutex> sched_lk(*sched_loop_mu_);
+        allocator_->reset_to_empty();
+    } else {
+        allocator_->reset_to_empty();
+    }
 
     // Rethrow the first dispatch failure seen during this run. Deferred to
     // after allocator reset so the next Worker.run() can proceed cleanly
