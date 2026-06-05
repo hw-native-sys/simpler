@@ -476,24 +476,9 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
             l2_swimlane.sched_complete_perf_cycle * 100.0 / c_parent
         );
 
-        // pop_hit / pop_miss per-emit deltas live in each dispatch-phase
-        // record's extras in aicpu_scheduler_phases[]; sum-of-deltas equals
-        // the run-cumulative tracked in this struct (final-drain emit covers
-        // the trailing-idle tail).
         LOG_INFO_V9(
             "Thread %d:   dispatch       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_dispatch_cycle),
             l2_swimlane.sched_dispatch_cycle * 100.0 / sched_total
-        );
-        uint64_t global_dispatch_count = l2_swimlane.pop_hit - l2_swimlane.local_dispatch_count;
-        uint64_t total_dispatched = l2_swimlane.local_dispatch_count + global_dispatch_count;
-        double local_hit_rate =
-            total_dispatched > 0 ? l2_swimlane.local_dispatch_count * 100.0 / total_dispatched : 0.0;
-        LOG_INFO_V9(
-            "Thread %d:     local_disp   : local=%" PRIu64 ", global=%" PRIu64 ", overflow=%" PRIu64
-            ", local_rate=%.1f%%",
-            thread_idx, static_cast<uint64_t>(l2_swimlane.local_dispatch_count),
-            static_cast<uint64_t>(global_dispatch_count), static_cast<uint64_t>(l2_swimlane.local_overflow_count),
-            local_hit_rate
         );
 
         uint64_t d_parent = l2_swimlane.sched_dispatch_cycle > 0 ? l2_swimlane.sched_dispatch_cycle : 1;

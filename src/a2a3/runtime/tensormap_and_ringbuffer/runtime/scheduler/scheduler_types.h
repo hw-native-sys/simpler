@@ -366,10 +366,8 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
     uint32_t phase_dispatch_count{0};
-    // Run-cumulative pop counters; the dispatch-phase record emitter
-    // (aicpu_scheduler_phases[]) writes per-emit deltas computed as
-    // (current - pop_*_at_last_emit) and the end-of-run cold-path log reads
-    // the cumulatives directly.
+    // Per-emit delta is (current - *_at_last_emit). Accumulated only when
+    // l2_swimlane_level_ >= SCHED_PHASES.
     uint64_t pop_hit{0};
     uint64_t pop_miss{0};
     uint64_t pop_hit_at_last_emit{0};
@@ -378,8 +376,6 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint32_t phase_wiring_count{0};
     uint64_t complete_probe_count{0};
     uint64_t complete_hit_count{0};
-    uint64_t local_dispatch_count{0};
-    uint64_t local_overflow_count{0};
     uint64_t sched_complete_perf_cycle{0};
     uint64_t sched_dispatch_pop_cycle{0};
     uint64_t sched_dispatch_setup_cycle{0};

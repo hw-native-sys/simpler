@@ -79,20 +79,18 @@ int SchedulerContext::pop_ready_tasks_batch(
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
-        shape, local_buf, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx],
-        l2_swimlane.local_dispatch_count
+        shape, local_buf, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
     );
     l2_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
     int count = sched_->get_ready_tasks_batch(shape, local_buf, out, max_count);
 #endif
-    // pop_hit / pop_miss are PTO2_PROFILING-gated (not the inner verbose tier)
-    // so dispatch-phase records in aicpu_scheduler_phases[] carry queue-health
-    // stats on default builds.
-    if (count > 0) {
-        l2_swimlane.pop_hit += count;
-    } else {
-        l2_swimlane.pop_miss++;
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+        if (count > 0) {
+            l2_swimlane.pop_hit += count;
+        } else {
+            l2_swimlane.pop_miss++;
+        }
     }
 #else
     (void)thread_idx;
@@ -365,23 +363,9 @@ void SchedulerContext::dispatch_ready_tasks(
     };
     const PTO2ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
 
-#if PTO2_SCHED_PROFILING
-    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
-#endif
-
-    // Note: flush_local_bufs is invoked multiple times per pass (mid-function
-    // flush + RAII tail flush). local_overflow_count accumulates each batch
-    // separately — each entry is counted exactly once (count is zeroed after
-    // push_batch). The total reflects "entries this pass pushed to the global
-    // queue", which is slightly larger than the pre-refactor "buf residual at
-    // pass end" semantics — comparing PTO2_SCHED_PROFILING traces across
-    // commits, expect the post-refactor number to be greater-or-equal.
     auto flush_local_bufs = [&]() {
         for (int32_t s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
             auto &lb = local_bufs[s];
-#if PTO2_SCHED_PROFILING
-            l2_swimlane.local_overflow_count += lb.count;
-#endif
             if (lb.count > 0) {
                 sched_->ready_queues[s].push_batch(lb.slot_states, lb.count);
                 lb.count = 0;
@@ -724,8 +708,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         } else {
             CYCLE_COUNT_LAP(l2_swimlane.sched_dispatch_cycle);
             if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && l2_swimlane.phase_dispatch_count > 0) {
-                // Per-emit pop deltas via snapshot diff; the cumulative
-                // pop_hit / pop_miss stay intact for the cold-path log.
+                // Final-drain at loop end emits the trailing-idle tail so
+                // sum-of-deltas == run-cumulative.
                 uint64_t pop_hit_delta = l2_swimlane.pop_hit - l2_swimlane.pop_hit_at_last_emit;
                 uint64_t pop_miss_delta = l2_swimlane.pop_miss - l2_swimlane.pop_miss_at_last_emit;
                 // L2SwimlaneAicpuPhaseRecord's extras are uint32 — a delta that overflows means
