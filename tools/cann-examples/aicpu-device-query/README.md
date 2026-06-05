@@ -118,7 +118,7 @@ export SIMPLER_DISPATCHER_SO=$REPO/build/lib/a2a3/dispatcher/libsimpler_aicpu_di
 export SIMPLER_AICPU_QUERY_SO=$REPO/tools/cann-examples/aicpu-device-query/device/build/libaicpu_query.so
 
 # Always run hardware work via task-submit on this dev box (see
-# .claude/rules/task-submit-isolation.md).
+# .claude/rules/running-onboard.md).
 task-submit --device auto --device-num 1 \
     --run "$REPO/tools/cann-examples/aicpu-device-query/host/build/query_device_hal \$TASK_DEVICE"
 ```

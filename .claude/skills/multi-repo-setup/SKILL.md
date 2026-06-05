@@ -212,5 +212,5 @@ workload (or your code change), not chip contention.
 - ❌ **Treating any failing workload as "simpler broke it"**. Step 5's
   CI-gate check separates "your simpler change broke a CI case" (real)
   from "this file was always expected to fail" (not your problem).
-- ❌ **Skipping `.claude/rules/task-submit-isolation.md`** on onboard
+- ❌ **Skipping `.claude/rules/running-onboard.md`** on onboard
   hardware runs. Multi-repo flows don't waive the per-die lock.
