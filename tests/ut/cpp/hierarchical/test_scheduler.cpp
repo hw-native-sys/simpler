@@ -651,8 +651,8 @@ TEST_F(GroupSchedulerFixture, GroupDependencyChain) {
     worker_b.complete();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-    while (worker_a.dispatched_count() + worker_b.dispatched_count() < 3 && std::chrono::steady_clock::now() < deadline
-    ) {
+    while (worker_a.dispatched_count() + worker_b.dispatched_count() < 3 &&
+           std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     int total = worker_a.dispatched_count() + worker_b.dispatched_count();

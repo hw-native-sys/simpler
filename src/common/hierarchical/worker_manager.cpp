@@ -590,13 +590,15 @@ void LocalMailboxEndpoint::control_remote_prepare_register(
     throw_unsupported_control("control_remote_prepare_register");
 }
 
-void LocalMailboxEndpoint::
-    control_remote_commit_register(remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *) {
+void LocalMailboxEndpoint::control_remote_commit_register(
+    remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *
+) {
     throw_unsupported_control("control_remote_commit_register");
 }
 
-void LocalMailboxEndpoint::
-    control_remote_abort_register(remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *) {
+void LocalMailboxEndpoint::control_remote_abort_register(
+    remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *
+) {
     throw_unsupported_control("control_remote_abort_register");
 }
 
@@ -620,8 +622,9 @@ void LocalMailboxEndpoint::control_remote_copy_from(void *, const RemoteBufferHa
     throw_unsupported_control("control_remote_copy_from");
 }
 
-RemoteBufferExport LocalMailboxEndpoint::
-    control_remote_export(const RemoteBufferHandle &, uint64_t, uint64_t, uint32_t, const std::string &) {
+RemoteBufferExport LocalMailboxEndpoint::control_remote_export(
+    const RemoteBufferHandle &, uint64_t, uint64_t, uint32_t, const std::string &
+) {
     throw_unsupported_control("control_remote_export");
 }
 
