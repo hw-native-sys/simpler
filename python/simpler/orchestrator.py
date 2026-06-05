@@ -30,9 +30,11 @@ Scope/drain lifecycle is managed by ``Worker.run()``; users never call those
 directly.
 """
 
+from __future__ import annotations
+
 import contextlib
 from collections.abc import Iterator, Sequence
-from typing import Any, Optional
+from typing import Any
 
 from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
 
@@ -56,7 +58,7 @@ def _require_handle(
     *,
     kind: str,
     worker: Any = None,
-    expected_namespace: Optional[str] = None,
+    expected_namespace: str | None = None,
 ) -> tuple[bytes, str, str, tuple[int, ...]]:
     """Validate a submit argument is a registered CallableHandle.
 
@@ -90,7 +92,10 @@ def _split_next_level_args(args: TaskArgs) -> tuple[TaskArgs, object | None]:
     raise TypeError("NEXT_LEVEL submit expects TaskArgs")
 
 
-def _remote_data_eligible_endpoint_ids(remote_sidecar: object | None, callable_endpoint_ids: tuple[int, ...]) -> list[int]:
+def _remote_data_eligible_endpoint_ids(
+    remote_sidecar: object | None,
+    callable_endpoint_ids: tuple[int, ...],
+) -> list[int]:
     endpoint_ids = [int(endpoint_id) for endpoint_id in callable_endpoint_ids]
     if remote_sidecar is None:
         return endpoint_ids
@@ -121,7 +126,7 @@ class Orchestrator:
     stays valid.
     """
 
-    def __init__(self, c_orchestrator: _COrchestrator, worker: Optional[Any] = None) -> None:
+    def __init__(self, c_orchestrator: _COrchestrator, worker: Any | None = None) -> None:
         self._o = c_orchestrator
         # Back-reference to the Python Worker so dynamic-allocate APIs
         # (allocate_domain / release_domain) can dispatch CTRL_* through the
@@ -129,7 +134,7 @@ class Orchestrator:
         # in isolation for tests.
         self._worker = worker
 
-    def _expected_next_level_namespace(self) -> Optional[str]:
+    def _expected_next_level_namespace(self) -> str | None:
         if self._worker is None:
             return None
         if getattr(self._worker, "_next_level_workers", []):
@@ -143,7 +148,7 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def submit_next_level(
-        self, callable_handle: Any, args: TaskArgs, config: Optional[CallConfig] = None, *, worker: int = -1
+        self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int = -1
     ):
         """Submit a NEXT_LEVEL task by registered callable handle.
 
@@ -189,9 +194,9 @@ class Orchestrator:
         self,
         callable_handle: Any,
         args_list: list,
-        config: Optional[CallConfig] = None,
+        config: CallConfig | None = None,
         *,
-        workers: Optional[list] = None,
+        workers: list | None = None,
     ):
         """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N workers, 1 DAG node).
 
@@ -253,7 +258,7 @@ class Orchestrator:
         if self._worker is not None:
             self._worker._adopt_remote_slot_refs(captured_refs)
 
-    def submit_sub(self, callable_handle: Any, args: Optional[TaskArgs] = None):
+    def submit_sub(self, callable_handle: Any, args: TaskArgs | None = None):
         """Submit a SUB task by registered callable handle.
 
         ``args`` may be omitted for a tag-less task (no dependencies, no outputs).
@@ -353,7 +358,7 @@ class Orchestrator:
         self._o.scope_end()
 
     @contextlib.contextmanager
-    def scope(self) -> Iterator["Orchestrator"]:
+    def scope(self) -> Iterator[Orchestrator]:
         """Open a nested scope for the ``with`` block.
 
         Tasks submitted inside the block use a deeper heap ring so they

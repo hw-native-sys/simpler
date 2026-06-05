@@ -57,6 +57,8 @@ Usage::
     w4.close()
 """
 
+from __future__ import annotations
+
 import ctypes
 import importlib
 import json
@@ -70,7 +72,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any, Optional
+from typing import Any
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -92,8 +94,8 @@ from .callable_identity import (
     build_python_serialized_descriptor,
     compute_callable_hashid,
     hashid_to_digest,
-    parse_python_import_target,
     parse_python_callable_payload,
+    parse_python_import_target,
 )
 from .orchestrator import Orchestrator
 from .task_interface import (
@@ -106,10 +108,10 @@ from .task_interface import (
     ChipWorker,
     CommBufferSpec,
     CommDomainHandle,
-    TaskArgs,
     RemoteAddressSpace,
     RemoteBufferExport,
     RemoteBufferHandle,
+    TaskArgs,
     _Worker,
 )
 
@@ -254,7 +256,7 @@ class _CallableRegistration:
     hashid: str
     digest: bytes
     payload_digest: bytes
-    payload: Optional[bytes] = None
+    payload: bytes | None = None
     eligible_endpoint_ids: tuple[int, ...] = ()
 
 
@@ -350,7 +352,7 @@ def _remove_local_identity(
     identity_table: dict[bytes, int],
     identity_refs: dict[bytes, int],
     digest: bytes,
-) -> tuple[Optional[int], bool]:
+) -> tuple[int | None, bool]:
     slot = identity_table.get(digest)
     if slot is None:
         return None, False
@@ -367,8 +369,8 @@ def _remove_local_identity(
 def _make_local_identity_tables(
     snapshot: list[_IdentitySnapshotEntry],
     *,
-    callable_kind: Optional[str | tuple[str, ...]] = None,
-    target_namespace: Optional[str] = None,
+    callable_kind: str | tuple[str, ...] | None = None,
+    target_namespace: str | None = None,
 ) -> tuple[dict[int, Any], dict[bytes, int], dict[bytes, int]]:
     registry: dict[int, Any] = {}
     identity_table: dict[bytes, int] = {}
@@ -402,7 +404,7 @@ def _pack_py_callable_payload(target) -> bytes:
     )
 
 
-def _chip_descriptor_context(worker: "Worker") -> tuple[str, str]:
+def _chip_descriptor_context(worker: Worker) -> tuple[str, str]:
     platform = str(worker._config.get("platform", ""))
     runtime = str(worker._config.get("runtime", ""))
     if platform or runtime:
@@ -421,7 +423,7 @@ def _chip_descriptor_context(worker: "Worker") -> tuple[str, str]:
     return first
 
 
-def _build_callable_registration(worker: "Worker", target, *, workers: Optional[list[int]] = None) -> _CallableRegistration:
+def _build_callable_registration(worker: Worker, target, *, workers: list[int] | None = None) -> _CallableRegistration:
     if isinstance(target, RemoteCallable):
         if workers is None or len(workers) == 0:
             raise ValueError("Worker.register(RemoteCallable): workers must be an explicit non-empty list")
@@ -533,12 +535,14 @@ def _read_py_callable_payload_from_shm(shm_name: str) -> bytes:
         shm.close()
 
 
-def _read_raw_payload_from_shm(shm_name: str) -> bytes:
+def _read_raw_payload_from_shm(shm_name: str, payload_size: int) -> bytes:
     shm = SharedMemory(name=shm_name)
     shm_buf = shm.buf
     assert shm_buf is not None
     try:
-        return bytes(shm_buf[: shm.size])
+        if payload_size <= 0 or payload_size > shm.size:
+            raise RuntimeError(f"raw control payload size mismatch: payload={payload_size}, shm={shm.size}")
+        return bytes(shm_buf[:payload_size])
     finally:
         shm_buf.release()
         shm.close()
@@ -618,7 +622,8 @@ def _handle_py_callable_control(
         )
     elif sub_cmd == _CTRL_PY_IMPORT_REGISTER:
         shm_name = _read_shm_name(buf, _OFF_ARGS)
-        payload = _read_raw_payload_from_shm(shm_name)
+        payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+        payload = _read_raw_payload_from_shm(shm_name, int(payload_size))
         target = payload.decode("utf-8")
         module, qualname = parse_python_import_target(target)
         descriptor = build_python_import_descriptor(module, qualname)
@@ -774,7 +779,7 @@ def _read_shm_name(buf, offset: int) -> str:
     return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
 
 
-def _handle_ctrl_alloc_domain(cw: "ChipWorker", buf: memoryview) -> None:
+def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
     """CTRL_ALLOC_DOMAIN handler — runs on the chip child.
 
     Reads the request shm (header + buffer_nbytes + rank_ids), calls
@@ -836,7 +841,7 @@ def _handle_ctrl_alloc_domain(cw: "ChipWorker", buf: memoryview) -> None:
         reply_shm.close()
 
 
-def _handle_ctrl_comm_init(cw: "ChipWorker", buf: memoryview) -> None:
+def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> None:
     """CTRL_COMM_INIT handler — drives `cw.comm_init` on the chip child.
 
     Idempotent: ``ChipWorker.comm_init`` itself caches the handle and returns
@@ -863,7 +868,7 @@ def _handle_ctrl_comm_init(cw: "ChipWorker", buf: memoryview) -> None:
     cw._comm_base_handle_cached = int(handle)
 
 
-def _handle_ctrl_release_domain(cw: "ChipWorker", buf: memoryview) -> None:
+def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
     """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
@@ -879,7 +884,7 @@ def _handle_ctrl_release_domain(cw: "ChipWorker", buf: memoryview) -> None:
     cw._impl.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
 
 
-def _comm_base_handle(cw: "ChipWorker") -> int:
+def _comm_base_handle(cw: ChipWorker) -> int:
     """Return the cached base-communicator handle the chip allocated during bootstrap.
 
     The dynamic-allocate path requires an established base communicator (HCCL
@@ -1140,7 +1145,7 @@ def _chip_process_loop(
         cw.finalize()
 
 
-def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
+def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
     """Reconstruct a CallConfig from the unified mailbox layout."""
     block_dim, aicpu_tn, swl, dt, pmu, dep_gen, scope_stats, prefix_bytes = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
     cfg = CallConfig()
@@ -1161,7 +1166,7 @@ def _child_worker_loop(
     registry: dict[int, Any],
     identity_table: dict[bytes, int],
     identity_refs: dict[bytes, int],
-    inner_worker: "Worker",
+    inner_worker: Worker,
 ) -> None:
     """Runs in forked child process. Any-level Worker as child of its parent.
 
@@ -1304,11 +1309,11 @@ class Worker:
         self._hierarchical_start_cv = threading.Condition(self._hierarchical_start_mu)
 
         # Level-2 internals
-        self._chip_worker: Optional[ChipWorker] = None
+        self._chip_worker: ChipWorker | None = None
 
         # Level-3+ internals
-        self._worker: Optional[_Worker] = None
-        self._orch: Optional[Orchestrator] = None
+        self._worker: _Worker | None = None
+        self._orch: Orchestrator | None = None
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
         self._sub_shms: list[SharedMemory] = []
@@ -1486,7 +1491,8 @@ class Worker:
             return int(ptr.value)
         data_ptr = getattr(ptr, "data_ptr", None)
         if callable(data_ptr):
-            return int(data_ptr())
+            data_ptr_value: Any = data_ptr()
+            return int(data_ptr_value)
         try:
             return ctypes.addressof(ptr)
         except TypeError:
@@ -1842,7 +1848,7 @@ class Worker:
         self,
         handle: CallableHandle,
         *,
-        expected_namespace: Optional[str] = None,
+        expected_namespace: str | None = None,
     ) -> _CallableIdentityState:
         if not isinstance(handle, CallableHandle):
             raise TypeError("expected a CallableHandle returned by Worker.register")
@@ -1870,12 +1876,12 @@ class Worker:
         self,
         handle: CallableHandle,
         *,
-        expected_namespace: Optional[str] = None,
+        expected_namespace: str | None = None,
     ) -> _CallableIdentityState:
         with self._registry_lock:
             return self._resolve_handle_locked(handle, expected_namespace=expected_namespace)
 
-    def register(self, target, *, workers: Optional[list[int]] = None) -> CallableHandle:
+    def register(self, target, *, workers: list[int] | None = None) -> CallableHandle:
         """Register a callable for dispatch and return an opaque handle.
 
         Integer execution slots remain private to the local target process.
@@ -2083,8 +2089,8 @@ class Worker:
         worker_types: list[WorkerType],
         sub_cmd: int,
         *,
-        digest: Optional[bytes] = None,
-        payload: Optional[bytes] = None,
+        digest: bytes | None = None,
+        payload: bytes | None = None,
     ) -> list[Any]:
         if not worker_types:
             return []
@@ -2114,8 +2120,8 @@ class Worker:
         worker_types: list[WorkerType],
         sub_cmd: int,
         *,
-        digest: Optional[bytes] = None,
-        payload: Optional[bytes] = None,
+        digest: bytes | None = None,
+        payload: bytes | None = None,
         strict: bool,
     ) -> list[str]:
         errors = self._control_errors(
@@ -2150,7 +2156,7 @@ class Worker:
             "unregister unused callables before registering more"
         )
 
-    def _register_child_chip(
+    def _register_child_chip(  # noqa: PLR0912
         self, target: ChipCallable, *, digest: bytes, publish_handle: bool = False
     ) -> CallableHandle | None:
         """Install a cascaded ChipCallable on this child Worker by digest."""
@@ -2161,7 +2167,7 @@ class Worker:
             raise RuntimeError(
                 f"HASHID_DESCRIPTOR_MISMATCH: requested {_format_digest(digest)} but rebuilt {reg.hashid}"
             )
-        existing_slot: Optional[int] = None
+        existing_slot: int | None = None
         with self._registry_lock:
             state = self._identity_registry.get(reg.digest)
             if state is not None:
@@ -2241,7 +2247,11 @@ class Worker:
             if state is not None:
                 if state.slot_id in self._pending_unregister_cids:
                     raise RuntimeError(f"REGISTER_TOMBSTONE_ACTIVE: {_format_digest(digest)}")
-                if state.descriptor != descriptor or state.kind != "PYTHON_IMPORT" or state.target_namespace != "LOCAL_PYTHON":
+                if (
+                    state.descriptor != descriptor
+                    or state.kind != "PYTHON_IMPORT"
+                    or state.target_namespace != "LOCAL_PYTHON"
+                ):
                     raise RuntimeError(f"HASHID_DESCRIPTOR_MISMATCH: {_format_digest(digest)}")
                 state.ref_count += 1
                 handle = self._make_handle_locked(state)
@@ -2608,7 +2618,7 @@ class Worker:
             )
             sys.stderr.flush()
 
-    def add_worker(self, worker: "Worker") -> None:
+    def add_worker(self, worker: Worker) -> None:
         """Add a lower-level Worker as a NEXT_LEVEL child. Must be called before init().
 
         The child Worker must NOT be init'd — init happens inside the forked
@@ -2725,6 +2735,7 @@ class Worker:
             session = self._open_remote_session(
                 spec=spec, endpoint_id=endpoint_id, session_id=session_id, timeout_s=timeout_s
             )
+            assert self._worker is not None
             self._worker.add_remote_l3_socket(
                 endpoint_id,
                 session_id,
@@ -2942,7 +2953,7 @@ class Worker:
         self._next_level_shms.clear()
 
     @property
-    def live_domains(self) -> dict[str, "CommDomainHandle"]:
+    def live_domains(self) -> dict[str, CommDomainHandle]:
         """Read-only snapshot of currently-live dynamic CommDomain handles.
 
         Useful for debugging.  Mutating the returned dict has no effect; use
@@ -3247,7 +3258,7 @@ class Worker:
         *,
         workers: tuple[int, ...],
         request_shms: dict[int, SharedMemory],
-        reply_shms: Optional[dict[int, SharedMemory]],
+        reply_shms: dict[int, SharedMemory] | None,
         op: str,
         allocation_id: int,
     ) -> None:
@@ -3544,8 +3555,11 @@ class Worker:
 
         self._initialized = False
 
-    def __enter__(self) -> "Worker":
+    def __enter__(self) -> Worker:
         return self
 
     def __exit__(self, *_: Any) -> None:
         self.close()
+
+
+Worker.run.__annotations__["return"] = RunTiming

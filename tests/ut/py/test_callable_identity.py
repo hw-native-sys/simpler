@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+from multiprocessing.shared_memory import SharedMemory
 from typing import cast
 
 import pytest
@@ -56,7 +57,13 @@ from simpler.task_interface import (
     TaskArgs,
     TensorArgType,
 )
-from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker, _pack_py_callable_payload
+from simpler.worker import (
+    RemoteCallable,
+    RemoteWorkerSpec,
+    Worker,
+    _pack_py_callable_payload,
+    _read_raw_payload_from_shm,
+)
 
 
 def _py_target(args):
@@ -116,7 +123,7 @@ _INNER_SUB_HASHID = compute_callable_hashid(
 
 
 def _remote_submit_inner_sub_orch(orch, args, cfg):
-    from simpler.remote_l3_session import get_inner_handle
+    from simpler.remote_l3_session import get_inner_handle  # noqa: PLC0415
 
     sub_args = TaskArgs()
     sub_args.add_scalar(17)
@@ -301,6 +308,24 @@ def test_python_import_descriptor_hash_is_stable():
     assert compute_callable_hashid(descriptor) == compute_callable_hashid(
         build_python_import_descriptor("pkg.mod", "Class.method")
     )
+
+
+def test_raw_control_payload_uses_explicit_size():
+    payload = b"tests.ut.py.test_callable_identity:_remote_inner_sub_noop"
+    shm = SharedMemory(create=True, size=len(payload) + 16)
+    shm_buf = None
+    try:
+        shm_buf = shm.buf
+        assert shm_buf is not None
+        shm_buf[: len(payload)] = payload
+        shm_buf[len(payload) :] = b"\x00" * 16
+
+        assert _read_raw_payload_from_shm(shm.name, len(payload)) == payload
+    finally:
+        if shm_buf is not None:
+            shm_buf.release()
+        shm.close()
+        shm.unlink()
 
 
 @pytest.mark.parametrize("target", ["pkg.mod.fn", ":fn", "pkg:", ".pkg:fn", "pkg.mod:<locals>.fn", "pkg.mod:bad-name"])

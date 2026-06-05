@@ -19,6 +19,8 @@ Usage:
     from simpler_setup.torch_interop import make_tensor_arg
 """
 
+from __future__ import annotations
+
 import ctypes
 import os
 import threading
@@ -120,7 +122,7 @@ class RemoteBufferHandle:
         "_owner_handle_ref",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         endpoint_id: int,
@@ -136,7 +138,7 @@ class RemoteBufferHandle:
         ub_ldst_va: int = 0,
         access_flags: int = 3,
         released: bool = False,
-        owner_handle_ref: "RemoteBufferHandle | None" = None,
+        owner_handle_ref: RemoteBufferHandle | None = None,
         _internal_token: object | None = None,
     ) -> None:
         address_space = RemoteAddressSpace(int(address_space))
@@ -174,7 +176,10 @@ class RemoteBufferHandle:
             raise ValueError("RemoteBufferHandle.buffer_id must be non-zero for remote buffers")
         if self._address_space == RemoteAddressSpace.REMOTE_DEVICE and self._endpoint_id != self._owner_endpoint_id:
             raise ValueError("REMOTE_DEVICE handles must be consumed on their owner endpoint")
-        if self._address_space in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST) and self._import_id == 0:
+        if (
+            self._address_space in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST)
+            and self._import_id == 0
+        ):
             raise ValueError("imported remote handles require a non-zero import_id")
         if self._access_flags & ~0x3:
             raise ValueError("RemoteBufferHandle.access_flags contains unknown bits")
@@ -192,7 +197,7 @@ class RemoteBufferHandle:
         rkey_or_token: int = 0,
         ub_ldst_va: int = 0,
         released: bool = False,
-    ) -> "RemoteBufferHandle":
+    ) -> RemoteBufferHandle:
         return cls(
             endpoint_id=endpoint_id,
             owner_endpoint_id=endpoint_id,
@@ -211,7 +216,7 @@ class RemoteBufferHandle:
         )
 
     @classmethod
-    def _from_imported_mapping(
+    def _from_imported_mapping(  # noqa: PLR0913
         cls,
         *,
         endpoint_id: int,
@@ -227,8 +232,8 @@ class RemoteBufferHandle:
         ub_ldst_va: int = 0,
         access_flags: int = 0,
         released: bool = False,
-        owner_handle_ref: "RemoteBufferHandle | None" = None,
-    ) -> "RemoteBufferHandle":
+        owner_handle_ref: RemoteBufferHandle | None = None,
+    ) -> RemoteBufferHandle:
         return cls(
             endpoint_id=endpoint_id,
             owner_endpoint_id=owner_endpoint_id,
@@ -330,11 +335,11 @@ class RemoteBufferExport:
     def __post_init__(self) -> None:
         object.__setattr__(self, "address_space", RemoteAddressSpace(int(self.address_space)))
         object.__setattr__(self, "transport_descriptor", bytes(self.transport_descriptor))
-        for field in ("owner_endpoint_id", "buffer_id", "generation", "offset", "nbytes", "export_id", "access_flags"):
-            value = int(getattr(self, field))
-            object.__setattr__(self, field, value)
+        for name in ("owner_endpoint_id", "buffer_id", "generation", "offset", "nbytes", "export_id", "access_flags"):
+            value = int(getattr(self, name))
+            object.__setattr__(self, name, value)
             if value < 0:
-                raise ValueError(f"RemoteBufferExport.{field} must be non-negative")
+                raise ValueError(f"RemoteBufferExport.{name} must be non-negative")
         if self.owner_endpoint_id < 0 or self.buffer_id == 0 or self.generation == 0 or self.export_id == 0:
             raise ValueError("RemoteBufferExport requires live owner buffer identity and export_id")
         if self.nbytes <= 0:
@@ -409,7 +414,7 @@ class RemoteTensorRef:
             raise ValueError("RemoteTensorRef cannot reference a released RemoteBufferHandle")
 
     @classmethod
-    def host_inline(cls, payload: bytes, *, shape: tuple[int, ...], dtype: DataType) -> "RemoteTensorRef":
+    def host_inline(cls, payload: bytes, *, shape: tuple[int, ...], dtype: DataType) -> RemoteTensorRef:
         data = bytes(payload)
         handle = RemoteBufferHandle(
             endpoint_id=0,
@@ -443,13 +448,15 @@ def _sidecar_from_ref(storage: _RemoteTaskArgsStorage, ref: RemoteTensorRef) -> 
         inline_offset = len(storage.inline_payload)
         inline_len = len(ref.inline_payload)
         storage.inline_payload.extend(ref.inline_payload)
+    nbytes = ref.nbytes
+    assert nbytes is not None
 
     desc = _RemoteTensorDesc(
         address_space=handle.address_space,
         owner_endpoint_id=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle.owner_endpoint_id,
         buffer_id=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._buffer_id,
         offset=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._offset + ref.offset,
-        nbytes=int(ref.nbytes),
+        nbytes=int(nbytes),
         remote_addr=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._remote_addr,
         rkey_or_token=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._rkey_or_token,
         generation=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._generation,
@@ -618,7 +625,7 @@ class CommDomainHandle:
         *,
         name: str,
         workers: tuple[int, ...],
-        contexts: dict[int, "ChipDomainContext"],
+        contexts: dict[int, ChipDomainContext],
         allocation_id: int,
         _release_fn,
     ) -> None:
@@ -631,7 +638,7 @@ class CommDomainHandle:
         self._released = False
         self._freed = False
 
-    def __getitem__(self, chip_idx: int) -> "ChipDomainContext":
+    def __getitem__(self, chip_idx: int) -> ChipDomainContext:
         if self._released:
             raise RuntimeError(
                 f"CommDomainHandle({self.name!r}) already released; do not pass it to submit_* "
@@ -680,7 +687,7 @@ class CommDomainHandle:
         # release and runs it after drain.  Worker also flips _freed.
         self._release_fn(self)
 
-    def __enter__(self) -> "CommDomainHandle":
+    def __enter__(self) -> CommDomainHandle:
         return self
 
     def __exit__(self, *_):

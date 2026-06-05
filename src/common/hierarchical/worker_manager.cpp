@@ -106,7 +106,7 @@ RemoteBufferHandle WorkerEndpoint::control_remote_import(int32_t, const RemoteBu
 void WorkerEndpoint::control_remote_release_import(const RemoteBufferHandle &) {
     throw_unsupported_control("control_remote_release_import");
 }
-void WorkerEndpoint::control_generic(uint64_t, const char *, double, const uint8_t *) {
+void WorkerEndpoint::control_generic(uint64_t, const char *, size_t, double, const uint8_t *) {
     throw_unsupported_control("control_generic");
 }
 void WorkerEndpoint::control_alloc_domain(const char *, const char *) {
@@ -634,12 +634,12 @@ void LocalMailboxEndpoint::control_remote_release_import(const RemoteBufferHandl
 }
 
 void LocalMailboxEndpoint::control_generic(
-    uint64_t sub_cmd, const char *shm_name, double timeout_s, const uint8_t *digest
+    uint64_t sub_cmd, const char *shm_name, size_t staged_payload_size, double timeout_s, const uint8_t *digest
 ) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
-    uint64_t reserved = 0;
-    std::memcpy(mbox() + CTRL_OFF_ARG0, &reserved, sizeof(uint64_t));
+    uint64_t payload_size = static_cast<uint64_t>(staged_payload_size);
+    std::memcpy(mbox() + CTRL_OFF_ARG0, &payload_size, sizeof(uint64_t));
     write_control_digest(mbox(), digest);
     const char *name = shm_name ? shm_name : "";
     size_t name_len = std::strlen(name);
@@ -810,9 +810,11 @@ void WorkerThread::control_remote_release_import(const RemoteBufferHandle &handl
     endpoint_->control_remote_release_import(handle);
 }
 
-void WorkerThread::control_generic(uint64_t sub_cmd, const char *shm_name, double timeout_s, const uint8_t *digest) {
+void WorkerThread::control_generic(
+    uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
+) {
     if (!endpoint_) throw std::runtime_error("control_generic: null endpoint");
-    endpoint_->control_generic(sub_cmd, shm_name, timeout_s, digest);
+    endpoint_->control_generic(sub_cmd, shm_name, payload_size, timeout_s, digest);
 }
 
 void WorkerThread::control_free(uint64_t ptr) {
@@ -985,7 +987,7 @@ ControlResult WorkerManager::control_digest_only(
         return result;
     }
     try {
-        threads[static_cast<size_t>(worker_id)]->control_generic(sub_cmd, nullptr, timeout_s, digest);
+        threads[static_cast<size_t>(worker_id)]->control_generic(sub_cmd, nullptr, 0, timeout_s, digest);
         result.ok = true;
     } catch (const std::exception &e) {
         result.error_message = strip_control_prefix(e.what(), "control_generic");
@@ -1235,7 +1237,9 @@ std::vector<ControlResult> WorkerManager::broadcast_control_all(
     for (size_t i = 0; i < threads.size(); ++i) {
         workers.emplace_back([&, i]() {
             try {
-                threads[i]->control_generic(sub_cmd, shm_name.empty() ? nullptr : shm_name.c_str(), timeout_s, digest);
+                threads[i]->control_generic(
+                    sub_cmd, shm_name.empty() ? nullptr : shm_name.c_str(), payload_size, timeout_s, digest
+                );
             } catch (const std::exception &e) {
                 results[i].ok = false;
                 results[i].error_message = strip_control_prefix(e.what(), "control_generic");

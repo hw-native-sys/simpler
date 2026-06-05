@@ -219,7 +219,9 @@ public:
         int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     );
     virtual void control_remote_release_import(const RemoteBufferHandle &handle);
-    virtual void control_generic(uint64_t sub_cmd, const char *shm_name, double timeout_s, const uint8_t *digest);
+    virtual void control_generic(
+        uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
+    );
     virtual void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
     virtual void control_release_domain(const char *request_shm_name);
     virtual void control_comm_init(const char *request_shm_name);
@@ -266,7 +268,9 @@ public:
         int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     ) override;
     void control_remote_release_import(const RemoteBufferHandle &handle) override;
-    void control_generic(uint64_t sub_cmd, const char *shm_name, double timeout_s, const uint8_t *digest) override;
+    void control_generic(
+        uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
+    ) override;
     void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) override;
     void control_release_domain(const char *request_shm_name) override;
     void control_comm_init(const char *request_shm_name) override;
@@ -390,7 +394,9 @@ public:
         int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     );
     void control_remote_release_import(const RemoteBufferHandle &handle);
-    void control_generic(uint64_t sub_cmd, const char *shm_name, double timeout_s, const uint8_t *digest);
+    void control_generic(
+        uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
+    );
 
     // Dynamic CommDomain allocate / release.  `request_shm_name` carries the
     // request payload (header + rank_ids + buffer_nbytes); for alloc the child
