@@ -137,18 +137,29 @@ ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataTyp
 // =============================================================================
 
 SubmitResult Orchestrator::submit_next_level(
-    const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker
+    const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker,
+    const std::vector<int32_t> &eligible_endpoint_ids, const RemoteTaskArgsSidecar &remote_sidecar
 ) {
     std::vector<int8_t> affinities;
     if (worker >= 0) affinities = {worker};
-    return submit_impl(WorkerType::NEXT_LEVEL, callable, config, {args}, std::move(affinities));
+    std::vector<std::vector<int32_t>> endpoint_sets;
+    if (!eligible_endpoint_ids.empty()) endpoint_sets = {eligible_endpoint_ids};
+    std::vector<RemoteTaskArgsSidecar> sidecars;
+    if (!remote_sidecar.tensors.empty() || !remote_sidecar.inline_payload.empty()) sidecars = {remote_sidecar};
+    return submit_impl(
+        WorkerType::NEXT_LEVEL, callable, config, {args}, std::move(affinities), std::move(endpoint_sets),
+        std::move(sidecars)
+    );
 }
 
 SubmitResult Orchestrator::submit_next_level_group(
     const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
-    const std::vector<int8_t> &workers
+    const std::vector<int8_t> &workers, const std::vector<std::vector<int32_t>> &eligible_endpoint_ids,
+    const std::vector<RemoteTaskArgsSidecar> &remote_sidecars
 ) {
-    return submit_impl(WorkerType::NEXT_LEVEL, callable, config, args_list, workers);
+    return submit_impl(
+        WorkerType::NEXT_LEVEL, callable, config, args_list, workers, eligible_endpoint_ids, remote_sidecars
+    );
 }
 
 SubmitResult Orchestrator::submit_sub(const CallableIdentity &callable, const TaskArgs &args) {
@@ -165,10 +176,13 @@ SubmitResult Orchestrator::submit_sub_group(const CallableIdentity &callable, co
 
 SubmitResult Orchestrator::submit_impl(
     WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config, std::vector<TaskArgs> args_list,
-    std::vector<int8_t> affinities
+    std::vector<int8_t> affinities, std::vector<std::vector<int32_t>> eligible_endpoint_ids,
+    std::vector<RemoteTaskArgsSidecar> remote_sidecars
 ) {
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
     config.validate();
+    validate_endpoint_eligibility(worker_type, args_list.size(), affinities, eligible_endpoint_ids);
+    validate_remote_sidecars(args_list, remote_sidecars, eligible_endpoint_ids);
 
     // Fail-fast: if a previously-dispatched task has already failed, abort
     // this submit before any bookkeeping so the orch fn unwinds promptly
@@ -188,7 +202,7 @@ SubmitResult Orchestrator::submit_impl(
     // arrived with a null data pointer. Both resources come from the same
     // merged allocator (Strict-2) so there is no partial-failure rollback
     // path.
-    AllocResult ar = reserve_outputs_and_slot(args_list);
+    AllocResult ar = reserve_outputs_and_slot(args_list, remote_sidecars);
     if (ar.slot == INVALID_SLOT) {
         active_tasks_.fetch_sub(1, std::memory_order_relaxed);
         throw std::runtime_error("Orchestrator: allocator shutdown");
@@ -201,12 +215,13 @@ SubmitResult Orchestrator::submit_impl(
     s.worker_type = worker_type;
     s.callable = callable;
     s.config = config;
+    s.eligible_endpoint_ids = std::move(eligible_endpoint_ids);
 
     // --- Step 2: Walk tags → tensormap.lookup (deps) + tensormap.insert
     // (outputs). Must happen before we move args_list into the slot because
     // infer_deps reads tensor data pointers and tags from it.
     std::vector<TaskSlot> producers;
-    infer_deps(slot, args_list, affinities, producers, s.output_keys);
+    infer_deps(slot, args_list, affinities, remote_sidecars, producers, s.output_keys);
 
     // --- Step 3: Store TaskArgs directly (no chip-storage pre-build) ---
     // Dispatch builds a TaskArgsView on demand via `slot.args_view(i)`
@@ -216,9 +231,11 @@ SubmitResult Orchestrator::submit_impl(
     if (args_list.size() == 1) {
         s.is_group_ = false;
         s.task_args = std::move(args_list.front());
+        if (!remote_sidecars.empty()) s.remote_sidecar = std::move(remote_sidecars.front());
     } else {
         s.is_group_ = true;
         s.task_args_list = std::move(args_list);
+        s.remote_sidecars = std::move(remote_sidecars);
     }
     s.affinities = std::move(affinities);
 
@@ -272,6 +289,150 @@ SubmitResult Orchestrator::submit_impl(
     return SubmitResult{slot};
 }
 
+void Orchestrator::validate_endpoint_eligibility(
+    WorkerType worker_type, size_t args_count, const std::vector<int8_t> &affinities,
+    const std::vector<std::vector<int32_t>> &eligible_endpoint_ids
+) const {
+    if (!affinities.empty() && affinities.size() != args_count) {
+        throw std::invalid_argument(
+            "Orchestrator: workers affinity length " + std::to_string(affinities.size()) +
+            " does not match args length " + std::to_string(args_count)
+        );
+    }
+    if (!eligible_endpoint_ids.empty() && eligible_endpoint_ids.size() != args_count) {
+        throw std::invalid_argument(
+            "Orchestrator: eligible endpoint-set length " + std::to_string(eligible_endpoint_ids.size()) +
+            " does not match args length " + std::to_string(args_count)
+        );
+    }
+
+    for (size_t i = 0; i < args_count; ++i) {
+        const auto &eligible = eligible_endpoint_ids.empty() ? std::vector<int32_t>{} : eligible_endpoint_ids[i];
+        if (!eligible_endpoint_ids.empty() && eligible.empty()) {
+            throw std::invalid_argument(
+                "Orchestrator: final eligible endpoint set is empty for member " + std::to_string(i)
+            );
+        }
+        int8_t affinity = affinities.empty() ? int8_t(-1) : affinities[i];
+        if (affinity < 0) continue;
+
+        if (manager_ != nullptr) {
+            auto *wt = manager_->get_worker(worker_type, affinity);
+            if (wt == nullptr) {
+                throw std::invalid_argument(
+                    "Orchestrator: worker affinity " + std::to_string(affinity) + " is not a registered endpoint"
+                );
+            }
+            int32_t endpoint_id = wt->endpoint_id();
+            bool allowed = eligible_endpoint_ids.empty();
+            for (int32_t id : eligible) {
+                if (id == endpoint_id) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) {
+                throw std::invalid_argument(
+                    "Orchestrator: worker affinity " + std::to_string(affinity) +
+                    " is not in the slot's final eligible endpoint set"
+                );
+            }
+        } else if (!eligible_endpoint_ids.empty()) {
+            bool allowed = false;
+            for (int32_t id : eligible) {
+                if (id == affinity) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) {
+                throw std::invalid_argument(
+                    "Orchestrator: worker affinity " + std::to_string(affinity) +
+                    " is not in the slot's final eligible endpoint set"
+                );
+            }
+        }
+    }
+}
+
+void Orchestrator::validate_remote_sidecars(
+    const std::vector<TaskArgs> &args_list, const std::vector<RemoteTaskArgsSidecar> &remote_sidecars,
+    const std::vector<std::vector<int32_t>> &eligible_endpoint_ids
+) const {
+    if (remote_sidecars.empty()) return;
+    if (remote_sidecars.size() != args_list.size()) {
+        throw std::invalid_argument(
+            "Orchestrator: remote sidecar length " + std::to_string(remote_sidecars.size()) +
+            " does not match args length " + std::to_string(args_list.size())
+        );
+    }
+    if (eligible_endpoint_ids.empty()) {
+        throw std::invalid_argument("Orchestrator: remote sidecars require an explicit eligible endpoint set");
+    }
+    for (size_t g = 0; g < args_list.size(); ++g) {
+        const TaskArgs &args = args_list[g];
+        const RemoteTaskArgsSidecar &sidecar = remote_sidecars[g];
+        if (sidecar.empty() && args.tensor_count() == 0) continue;
+        if (sidecar.tensors.size() != static_cast<size_t>(args.tensor_count())) {
+            throw std::invalid_argument("Orchestrator: remote sidecar tensor count does not match TaskArgs");
+        }
+        for (int32_t endpoint_id : eligible_endpoint_ids[g]) {
+            if (manager_ == nullptr) continue;
+            WorkerThread *wt = manager_->get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+            if (wt == nullptr) {
+                throw std::invalid_argument(
+                    "Orchestrator: remote sidecar names an unknown endpoint " + std::to_string(endpoint_id)
+                );
+            }
+            if (!wt->caps().remote) {
+                throw std::invalid_argument(
+                    "Orchestrator: remote sidecar cannot be submitted to local endpoint " + std::to_string(endpoint_id)
+                );
+            }
+        }
+        for (int32_t i = 0; i < args.tensor_count(); ++i) {
+            const ContinuousTensor &tensor = args.tensor(i);
+            const RemoteTensorSidecar &tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
+            if (tensor_sidecar.present && tensor.data != 0) {
+                throw std::invalid_argument("Orchestrator: remote tensor metadata data field must be zero");
+            }
+            if (!tensor_sidecar.present && tensor.data != 0) {
+                throw std::invalid_argument("Orchestrator: remote tensor uses a bare host pointer without sidecar");
+            }
+            if (args.tag(i) == TensorArgType::OUTPUT && tensor.data == 0 && !tensor_sidecar.present) {
+                throw std::invalid_argument("Orchestrator: remote OUTPUT tensor requires a RemoteTensorRef sidecar");
+            }
+            if (!tensor_sidecar.present && tensor.nbytes() != 0) {
+                throw std::invalid_argument("Orchestrator: remote tensor payload requires a RemoteTensorRef sidecar");
+            }
+            if (tensor.is_child_memory() && !tensor_sidecar.present) {
+                throw std::invalid_argument("Orchestrator: remote child-memory tensor requires a sidecar");
+            }
+            if (tensor_sidecar.present && tensor_sidecar.desc.address_space != RemoteAddressSpace::HOST_INLINE) {
+                if (tensor_sidecar.desc.owner_endpoint_id < 0) {
+                    throw std::invalid_argument("Orchestrator: remote tensor sidecar has invalid owner endpoint");
+                }
+                bool has_allowed_endpoint = false;
+                for (int32_t endpoint_id : eligible_endpoint_ids[g]) {
+                    has_allowed_endpoint = true;
+                    if (tensor_sidecar.desc.address_space == RemoteAddressSpace::REMOTE_DEVICE &&
+                        endpoint_id != tensor_sidecar.desc.owner_endpoint_id) {
+                        throw std::invalid_argument(
+                            "Orchestrator: remote tensor sidecar requires IMPORT_BUFFER before submitting to endpoint " +
+                            std::to_string(endpoint_id)
+                        );
+                    }
+                }
+                if (!has_allowed_endpoint) {
+                    throw std::invalid_argument(
+                        "Orchestrator: remote tensor has no final eligible endpoint"
+                    );
+                }
+            }
+        }
+    }
+}
+
 // =============================================================================
 // reserve_outputs_and_slot — atomic slot + heap carve-up for this submit
 // =============================================================================
@@ -283,12 +444,19 @@ SubmitResult Orchestrator::submit_impl(
 // OUTPUT.data themselves). The single allocator call owns both the slot and
 // the heap range, so there is no partial-failure rollback.
 
-AllocResult Orchestrator::reserve_outputs_and_slot(std::vector<TaskArgs> &args_list) {
+AllocResult Orchestrator::reserve_outputs_and_slot(
+    std::vector<TaskArgs> &args_list, const std::vector<RemoteTaskArgsSidecar> &remote_sidecars
+) {
     uint64_t total_bytes = 0;
-    for (const TaskArgs &a : args_list) {
+    for (size_t g = 0; g < args_list.size(); ++g) {
+        const TaskArgs &a = args_list[g];
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
             if (a.tag(i) != TensorArgType::OUTPUT) continue;
             if (a.tensor(i).data != 0) continue;  // user supplied a pointer — leave alone
+            bool remote_output = !remote_sidecars.empty() &&
+                                 static_cast<size_t>(i) < remote_sidecars[g].tensors.size() &&
+                                 remote_sidecars[g].tensors[static_cast<size_t>(i)].present;
+            if (remote_output) continue;
             total_bytes += output_alloc_bytes(a.tensor(i));
         }
     }
@@ -299,11 +467,16 @@ AllocResult Orchestrator::reserve_outputs_and_slot(std::vector<TaskArgs> &args_l
     // Hand slabs out in the same order we counted them.
     uint64_t off = 0;
     char *base = static_cast<char *>(ar.heap_ptr);
-    for (TaskArgs &a : args_list) {
+    for (size_t g = 0; g < args_list.size(); ++g) {
+        TaskArgs &a = args_list[g];
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
             if (a.tag(i) != TensorArgType::OUTPUT) continue;
             ContinuousTensor &t = a.tensor(i);
             if (t.data != 0) continue;
+            bool remote_output = !remote_sidecars.empty() &&
+                                 static_cast<size_t>(i) < remote_sidecars[g].tensors.size() &&
+                                 remote_sidecars[g].tensors[static_cast<size_t>(i)].present;
+            if (remote_output) continue;
             uint64_t slab = output_alloc_bytes(t);
             t.data = reinterpret_cast<uint64_t>(base + off);
             off += slab;
@@ -318,7 +491,8 @@ AllocResult Orchestrator::reserve_outputs_and_slot(std::vector<TaskArgs> &args_l
 
 void Orchestrator::infer_deps(
     TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int8_t> &affinities,
-    std::vector<TaskSlot> &producers, std::vector<TensorKey> &output_keys
+    const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
+    std::vector<TensorKey> &output_keys
 ) {
     auto add_unique_producer = [&](TaskSlot p) {
         // Group submits walk many TaskArgs under one slot: if two entries in
@@ -348,8 +522,27 @@ void Orchestrator::infer_deps(
         const TaskArgs &a = args_list[g];
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
             const ContinuousTensor &t = a.tensor(i);
-            if (t.data == 0) continue;  // null tensor — nothing to track
-            TensorKey key{t.data, t.is_child_memory() ? worker_id : int8_t(-1)};
+            TensorKey key{};
+            bool has_key = false;
+            if (!remote_sidecars.empty()) {
+                const auto &sidecar = remote_sidecars[g];
+                if (static_cast<size_t>(i) < sidecar.tensors.size() &&
+                    sidecar.tensors[static_cast<size_t>(i)].present) {
+                    const RemoteTensorDesc &desc = sidecar.tensors[static_cast<size_t>(i)].desc;
+                    TensorAddressKind kind = desc.address_space == RemoteAddressSpace::HOST_INLINE ?
+                                                 TensorAddressKind::HOST_INLINE :
+                                                 TensorAddressKind::REMOTE_BUFFER;
+                    key = TensorKey::remote_buffer(
+                        kind, desc.owner_endpoint_id, desc.buffer_id, desc.generation, desc.offset
+                    );
+                    has_key = true;
+                }
+            }
+            if (!has_key) {
+                if (t.data == 0) continue;  // null tensor — nothing to track
+                key = t.is_child_memory() ? TensorKey::local_child(t.data, worker_id) : TensorKey::local_host(t.data);
+                has_key = true;
+            }
             TensorArgType tag = a.tag(i);
             switch (tag) {
             case TensorArgType::INPUT: {
@@ -408,7 +601,8 @@ void Orchestrator::release_ref(TaskSlot slot) {
     // = N + 2 = total + 1 where total = scope_ref + N.
     // Using `>= total + 1` keeps scope_end from prematurely consuming while
     // a consumer (or a HeapRing peer) is still live.
-    if (released >= total + 1 && s.state.load(std::memory_order_acquire) == TaskState::COMPLETED) {
+    TaskState state = s.state.load(std::memory_order_acquire);
+    if (released >= total + 1 && (state == TaskState::COMPLETED || state == TaskState::FAILED)) {
         on_consumed(slot);
     }
 }
@@ -424,7 +618,12 @@ bool Orchestrator::on_consumed(TaskSlot slot) {
     if (!s.state.compare_exchange_strong(
             expected, TaskState::CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
         )) {
-        return false;
+        expected = TaskState::FAILED;
+        if (!s.state.compare_exchange_strong(
+                expected, TaskState::CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            return false;
+        }
     }
 
     tensormap_->erase_task_outputs(s.output_keys);

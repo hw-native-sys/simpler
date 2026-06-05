@@ -35,6 +35,7 @@
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <vector>
 
 #include "../task_interface/call_config.h"
@@ -44,17 +45,60 @@
 // TensorKey — compound key for TensorMap dependency tracking
 // =============================================================================
 
+enum class TensorAddressKind : int32_t {
+    LOCAL_HOST = 0,
+    LOCAL_CHILD = 1,
+    REMOTE_BUFFER = 2,
+    HOST_INLINE = 3,
+};
+
 struct TensorKey {
     uint64_t ptr;
     int8_t worker;  // -1 = host (globally unique), 0..N-1 = next-level worker logical id
+    TensorAddressKind address_kind{TensorAddressKind::LOCAL_HOST};
+    int32_t owner_endpoint_id{-1};
+    uint64_t buffer_id{0};
+    uint64_t generation{0};
+    uint64_t offset_begin{0};
 
-    bool operator==(const TensorKey &o) const { return ptr == o.ptr && worker == o.worker; }
+    static TensorKey local_host(uint64_t ptr) { return TensorKey{ptr, -1, TensorAddressKind::LOCAL_HOST}; }
+    static TensorKey local_child(uint64_t ptr, int8_t worker) {
+        return TensorKey{ptr, worker, TensorAddressKind::LOCAL_CHILD};
+    }
+    static TensorKey remote_buffer(
+        TensorAddressKind address_kind, int32_t owner_endpoint_id, uint64_t buffer_id, uint64_t generation,
+        uint64_t offset_begin
+    ) {
+        TensorKey key{};
+        key.ptr = 0;
+        key.worker = -1;
+        key.address_kind = address_kind;
+        key.owner_endpoint_id = owner_endpoint_id;
+        key.buffer_id = buffer_id;
+        key.generation = generation;
+        key.offset_begin = offset_begin;
+        return key;
+    }
+
+    bool operator==(const TensorKey &o) const {
+        return ptr == o.ptr && worker == o.worker && address_kind == o.address_kind &&
+               owner_endpoint_id == o.owner_endpoint_id && buffer_id == o.buffer_id && generation == o.generation &&
+               offset_begin == o.offset_begin;
+    }
 };
 
 struct TensorKeyHash {
     size_t operator()(const TensorKey &k) const {
         size_t h = std::hash<uint64_t>{}(k.ptr);
-        h ^= std::hash<int>{}(k.worker) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        auto mix = [&h](size_t v) {
+            h ^= v + 0x9e3779b9 + (h << 6) + (h >> 2);
+        };
+        mix(std::hash<int>{}(k.worker));
+        mix(std::hash<int>{}(static_cast<int>(k.address_kind)));
+        mix(std::hash<int>{}(k.owner_endpoint_id));
+        mix(std::hash<uint64_t>{}(k.buffer_id));
+        mix(std::hash<uint64_t>{}(k.generation));
+        mix(std::hash<uint64_t>{}(k.offset_begin));
         return h;
     }
 };
@@ -85,11 +129,13 @@ static constexpr size_t CALLABLE_HASH_DIGEST_SIZE = 32;
 enum class CallableKind : int32_t {
     CHIP_CALLABLE = 1,
     PYTHON_SERIALIZED = 2,
+    PYTHON_IMPORT = 3,
 };
 
 enum class TargetNamespace : int32_t {
     LOCAL_CHIP = 1,
     LOCAL_PYTHON = 2,
+    REMOTE_TASK_DISPATCHER = 3,
 };
 
 struct CallableIdentity {
@@ -117,7 +163,114 @@ enum class TaskState : int32_t {
     READY = 2,      // all fanins satisfied, in ready queue
     RUNNING = 3,    // dispatched to a worker
     COMPLETED = 4,  // worker finished, outputs may still be referenced
-    CONSUMED = 5,   // all references released, slot may be reused
+    FAILED = 5,     // worker failed or a producer poisoned this slot
+    CONSUMED = 6,   // all references released, slot may be reused
+};
+
+enum class EndpointOutcome : int32_t {
+    SUCCESS = 0,
+    TASK_FAILURE = 1,
+    ENDPOINT_FAILURE = 2,
+    SKIPPED = 3,
+};
+
+enum class RemoteAddressSpace : int32_t {
+    HOST_INLINE = 1,
+    REMOTE_DEVICE = 2,
+    REMOTE_WINDOW = 3,
+    UB_LDST = 4,
+};
+
+struct RemoteBufferHandle {
+    int32_t endpoint_id{-1};
+    int32_t owner_endpoint_id{-1};
+    uint64_t buffer_id{0};
+    uint64_t generation{0};
+    uint64_t import_id{0};
+    RemoteAddressSpace address_space{RemoteAddressSpace::REMOTE_DEVICE};
+    uint64_t nbytes{0};
+    uint64_t offset{0};
+    uint64_t remote_addr{0};
+    uint64_t rkey_or_token{0};
+    uint64_t ub_ldst_va{0};
+    uint32_t access_flags{0};
+    bool released{false};
+    int32_t live_slot_refs{0};
+};
+
+struct RemoteBufferExport {
+    int32_t owner_endpoint_id{-1};
+    uint64_t buffer_id{0};
+    uint64_t generation{0};
+    RemoteAddressSpace address_space{RemoteAddressSpace::REMOTE_WINDOW};
+    uint64_t offset{0};
+    uint64_t nbytes{0};
+    uint64_t export_id{0};
+    uint64_t remote_addr{0};
+    uint64_t rkey_or_token{0};
+    uint64_t ub_ldst_va{0};
+    uint32_t access_flags{0};
+    std::string transport_profile;
+    std::vector<uint8_t> transport_descriptor;
+};
+
+struct RemoteTensorDesc {
+    RemoteAddressSpace address_space{RemoteAddressSpace::REMOTE_DEVICE};
+    int32_t owner_endpoint_id{-1};
+    uint64_t buffer_id{0};
+    uint64_t offset{0};
+    uint64_t nbytes{0};
+    uint64_t remote_addr{0};
+    uint64_t rkey_or_token{0};
+    uint64_t generation{0};
+    uint64_t inline_payload_offset{0};
+    uint64_t inline_payload_len{0};
+    uint64_t flags{0};
+};
+
+struct RemoteTensorRef {
+    RemoteBufferHandle handle{};
+    uint64_t offset{0};
+    std::vector<uint32_t> shape;
+    DataType dtype{DataType::FLOAT32};
+};
+
+struct RemoteTensorSidecar {
+    bool present{false};
+    RemoteTensorDesc desc{};
+};
+
+struct RemoteTaskArgsSidecar {
+    std::vector<RemoteTensorSidecar> tensors;
+    std::vector<uint8_t> inline_payload;
+
+    bool empty() const {
+        if (!inline_payload.empty()) return false;
+        for (const auto &tensor : tensors) {
+            if (tensor.present) return false;
+        }
+        return true;
+    }
+
+    void clear() {
+        tensors.clear();
+        inline_payload.clear();
+    }
+};
+
+enum class GroupMemberState : int32_t {
+    NOT_DISPATCHED = 0,
+    RUNNING = 1,
+    SUCCESS = 2,
+    FAILED = 3,
+    SKIPPED = 4,
+};
+
+struct WorkerCompletion {
+    TaskSlot task_slot{INVALID_SLOT};
+    int32_t group_index{0};
+    EndpointOutcome outcome{EndpointOutcome::SUCCESS};
+    std::string error_message;
 };
 
 // =============================================================================
@@ -146,6 +299,11 @@ struct TaskSlotState {
     // --- TensorMap keys registered by this task (for cleanup on CONSUMED) ---
     std::vector<TensorKey> output_keys;
 
+    // Empty outer vector means legacy/unconstrained dispatch. When present,
+    // each group member's vector is the final callable/data endpoint
+    // intersection and must be non-empty.
+    std::vector<std::vector<int32_t>> eligible_endpoint_ids;
+
     // --- Worker affinity (set by submit_next_level with worker= parameter) ---
     // Empty = unconstrained (any idle worker). Otherwise affinities[i] gives
     // the logical worker id for args[i] (-1 = unconstrained for that slot).
@@ -160,6 +318,11 @@ struct TaskSlotState {
     // When this task reaches COMPLETED, the Scheduler releases one fanout ref
     // on each producer — mirroring L2's "deferred release: walk fanin" step.
     std::vector<TaskSlot> fanin_producers;
+
+    // --- Failure state ---
+    // Root worker failures and downstream poison both land here. The
+    // WorkerManager still owns first-error-wins reporting for drain().
+    std::string failure_message;
 
     // --- Task data (stored on parent heap, lives until slot CONSUMED) ---
     WorkerType worker_type{WorkerType::NEXT_LEVEL};
@@ -176,6 +339,8 @@ struct TaskSlotState {
     TaskArgs task_args;
     std::vector<TaskArgs> task_args_list;
     bool is_group_{false};
+    RemoteTaskArgsSidecar remote_sidecar;
+    std::vector<RemoteTaskArgsSidecar> remote_sidecars;
 
     // Runtime-owned OUTPUT slabs live in the Worker's HeapRing and are
     // reclaimed implicitly by Ring::release(slot) — no per-slot
@@ -191,9 +356,43 @@ struct TaskSlotState {
 
     // --- Group bookkeeping ---
     std::atomic<int32_t> sub_complete_count{0};
+    std::mutex group_mu;
+    std::vector<GroupMemberState> group_member_states;
+    std::vector<EndpointOutcome> group_member_outcomes;
+    std::atomic<int32_t> group_terminal_count{0};
+    std::atomic<int32_t> group_dispatched_count{0};
+    bool group_failed{false};
+    int32_t group_first_failure_index{-1};
+    std::string group_first_failure_message;
 
     bool is_group() const { return is_group_; }
     int32_t group_size() const { return is_group_ ? static_cast<int32_t>(task_args_list.size()) : 1; }
+    bool has_endpoint_constraints() const { return !eligible_endpoint_ids.empty(); }
+
+    const std::vector<int32_t> &eligible_endpoints_for(int32_t i) const {
+        static const std::vector<int32_t> empty;
+        if (eligible_endpoint_ids.empty()) return empty;
+        if (i < 0 || static_cast<size_t>(i) >= eligible_endpoint_ids.size()) return empty;
+        return eligible_endpoint_ids[static_cast<size_t>(i)];
+    }
+
+    bool endpoint_allowed(int32_t i, int32_t endpoint_id) const {
+        if (eligible_endpoint_ids.empty()) return true;
+        const auto &eligible = eligible_endpoints_for(i);
+        for (int32_t id : eligible) {
+            if (id == endpoint_id) return true;
+        }
+        return false;
+    }
+
+    const RemoteTaskArgsSidecar &remote_sidecar_for(int32_t i) const {
+        static const RemoteTaskArgsSidecar empty;
+        if (is_group_) {
+            if (i < 0 || static_cast<size_t>(i) >= remote_sidecars.size()) return empty;
+            return remote_sidecars[static_cast<size_t>(i)];
+        }
+        return remote_sidecar;
+    }
 
     // Zero-copy view over the i-th worker's args (THREAD-mode dispatch).
     // `i` must be 0 for non-group slots; 0..group_size()-1 for groups.
