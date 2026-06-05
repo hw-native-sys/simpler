@@ -563,6 +563,8 @@ class TestRemoteL3SessionTaskArgsMaterialization:
     def test_host_inline_descriptor_materializes_local_tensor_data(self):
         from simpler.remote_l3_protocol import (
             RemoteAddressSpace as WireRemoteAddressSpace,
+        )
+        from simpler.remote_l3_protocol import (
             RemoteTaskArgsWire,
             RemoteTensorDesc,
             RemoteTensorSidecar,
@@ -594,11 +596,13 @@ class TestRemoteL3SessionTaskArgsMaterialization:
     def test_remote_buffer_descriptor_materializes_session_registry_address(self):
         from simpler.remote_l3_protocol import (
             RemoteAddressSpace as WireRemoteAddressSpace,
+        )
+        from simpler.remote_l3_protocol import (
             RemoteTaskArgsWire,
             RemoteTensorDesc,
             RemoteTensorSidecar,
         )
-        from simpler.remote_l3_session import _RemoteBufferEntry, _materialize_task_args
+        from simpler.remote_l3_session import _materialize_task_args, _RemoteBufferEntry
 
         backing = ctypes.create_string_buffer(b"01234567", 8)
         entry = _RemoteBufferEntry(backing, 8, 1, WireRemoteAddressSpace.REMOTE_DEVICE)

@@ -81,7 +81,9 @@ void put_string(std::vector<uint8_t> &out, const std::string &value, uint32_t ma
     put_bytes(out, reinterpret_cast<const uint8_t *>(value.data()), value.size());
 }
 
-void put_blob(std::vector<uint8_t> &out, const std::vector<uint8_t> &value, uint32_t max_bytes, const char *field_name) {
+void put_blob(
+    std::vector<uint8_t> &out, const std::vector<uint8_t> &value, uint32_t max_bytes, const char *field_name
+) {
     ensure(value.size() <= max_bytes, std::string("remote_wire: ") + field_name + " exceeds max length");
     put_u32(out, static_cast<uint32_t>(value.size()));
     put_bytes(out, value.data(), value.size());
@@ -96,9 +98,8 @@ std::string get_string(const uint8_t *data, size_t size, size_t &offset, uint32_
     return out;
 }
 
-std::vector<uint8_t> get_blob(
-    const uint8_t *data, size_t size, size_t &offset, uint32_t max_bytes, const char *field_name
-) {
+std::vector<uint8_t>
+get_blob(const uint8_t *data, size_t size, size_t &offset, uint32_t max_bytes, const char *field_name) {
     uint32_t n = get_u32(data, size, offset);
     ensure(n <= max_bytes, std::string("remote_wire: ") + field_name + " exceeds max length");
     ensure_available(size, offset, n, field_name);

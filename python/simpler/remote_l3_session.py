@@ -22,14 +22,23 @@ import importlib
 import json
 import os
 import socket
+import struct
 import sys
 import threading
 import traceback
-import struct
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Callable
 
+from .callable_identity import (
+    CallableHandle,
+    build_chip_callable_descriptor,
+    build_python_import_descriptor,
+    compute_callable_hashid,
+    hashid_to_digest,
+    parse_python_import_target,
+    validate_hashid,
+)
 from .remote_l3_protocol import (
     CallableKind,
     ChipCallableBlobLocation,
@@ -43,13 +52,13 @@ from .remote_l3_protocol import (
     RemoteAddressSpace,
     RemoteRegistryTarget,
     RemoteTaskArgsWire,
-    decode_remote_chip_callable_payload,
-    decode_export_buffer_request,
-    decode_import_buffer_request,
     decode_control,
     decode_digest_callable_command,
+    decode_export_buffer_request,
+    decode_import_buffer_request,
     decode_register_callable_command,
     decode_release_import_request,
+    decode_remote_chip_callable_payload,
     decode_task_payload,
     encode_completion,
     encode_control_reply,
@@ -63,15 +72,6 @@ from .remote_l3_protocol import (
 )
 from .task_interface import ChipCallable, ContinuousTensor, TaskArgs
 from .worker import Worker
-from .callable_identity import (
-    CallableHandle,
-    build_chip_callable_descriptor,
-    build_python_import_descriptor,
-    compute_callable_hashid,
-    hashid_to_digest,
-    parse_python_import_target,
-    validate_hashid,
-)
 
 sys.modules.setdefault("simpler.remote_l3_session", sys.modules[__name__])
 
@@ -113,7 +113,9 @@ class _RemoteBufferEntry:
     @property
     def addr(self) -> int:
         if isinstance(self.data, shared_memory.SharedMemory):
-            return ctypes.addressof(ctypes.c_char.from_buffer(self.data.buf))
+            buf = self.data.buf
+            assert buf is not None
+            return ctypes.addressof(ctypes.c_char.from_buffer(buf))
         return ctypes.addressof(self.data)
 
     @property
@@ -233,7 +235,9 @@ def _prepare_inner_chip_callable(command_payload: bytes, manifest: dict[str, Any
     return command.digest, callable_obj
 
 
-def _prepare_register_callable(command_payload: bytes, manifest: dict[str, Any]) -> tuple[bytes, CallableKind, RemoteRegistryTarget, Any]:
+def _prepare_register_callable(
+    command_payload: bytes, manifest: dict[str, Any]
+) -> tuple[bytes, CallableKind, RemoteRegistryTarget, Any]:
     command = decode_register_callable_command(command_payload)
     if command.callable_kind == CallableKind.PYTHON_SERIALIZED:
         raise ValueError("PYTHON_SERIALIZED is not negotiated for remote protocol v1")
@@ -359,8 +363,13 @@ def _install_manifest_inner_registry(
 
 
 def _control_reply(
-    conn: socket.socket, manifest: dict[str, Any], sequence: int, control_name: ControlName, version: int,
-    error_code: int, error_message: str
+    conn: socket.socket,
+    manifest: dict[str, Any],
+    sequence: int,
+    control_name: ControlName,
+    version: int,
+    error_code: int,
+    error_message: str,
 ) -> None:
     session_id = int(manifest["session_id"])
     endpoint_id = int(manifest["endpoint_id"])
@@ -383,7 +392,7 @@ def _tensor_with_data(tensor: ContinuousTensor, data: int) -> ContinuousTensor:
     return ContinuousTensor.make(int(data), tuple(tensor.shapes), tensor.dtype, bool(tensor.child_memory))
 
 
-def _materialize_task_args(
+def _materialize_task_args(  # noqa: PLR0912
     args: RemoteTaskArgsWire, buffers: dict[tuple[int, ...], _RemoteBufferEntry], endpoint_id: int
 ) -> tuple[TaskArgs, list[Any]]:
     if len(args.remote_desc) != len(args.tensor_metadata):
@@ -434,7 +443,7 @@ def _materialize_task_args(
     return task_args, keepalive
 
 
-def _run_command_loop(
+def _run_command_loop(  # noqa: PLR0912, PLR0915
     conn: socket.socket,
     manifest: dict[str, Any],
     inner_worker: Worker,
@@ -481,7 +490,9 @@ def _run_command_loop(
                             prepared_dispatcher[digest] = target
                         else:
                             prepared_inner[(kind, digest)] = target
-                        _control_reply(conn, manifest, header.sequence, control.control_name, control.control_version, 0, "")
+                        _control_reply(
+                            conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
+                        )
                     elif control.control_name == ControlName.COMMIT_REGISTER_CALLABLE:
                         digest, kind, registry = _decode_digest_command(control.command_bytes)
                         if registry == RemoteRegistryTarget.REMOTE_TASK_DISPATCHER:
@@ -511,14 +522,18 @@ def _run_command_loop(
                             _publish_inner_handle(digest, handle)
                         else:
                             raise ValueError("COMMIT_REGISTER_CALLABLE target/kind mismatch")
-                        _control_reply(conn, manifest, header.sequence, control.control_name, control.control_version, 0, "")
+                        _control_reply(
+                            conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
+                        )
                     elif control.control_name == ControlName.ABORT_REGISTER_CALLABLE:
                         digest, kind, registry = _decode_digest_command(control.command_bytes)
                         if registry == RemoteRegistryTarget.REMOTE_TASK_DISPATCHER:
                             prepared_dispatcher.pop(digest, None)
                         elif registry == RemoteRegistryTarget.INNER_L3_WORKER:
                             prepared_inner.pop((kind, digest), None)
-                        _control_reply(conn, manifest, header.sequence, control.control_name, control.control_version, 0, "")
+                        _control_reply(
+                            conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
+                        )
                     elif control.control_name == ControlName.UNREGISTER_CALLABLE:
                         digest, kind, registry = _decode_digest_command(control.command_bytes)
                         if registry == RemoteRegistryTarget.REMOTE_TASK_DISPATCHER:
@@ -535,14 +550,21 @@ def _run_command_loop(
                                 _unpublish_inner_handle(digest)
                         else:
                             raise ValueError("UNREGISTER_CALLABLE target/kind mismatch")
-                        _control_reply(conn, manifest, header.sequence, control.control_name, control.control_version, 0, "")
+                        _control_reply(
+                            conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
+                        )
                     elif control.control_name == ControlName.PREPARE_CALLABLE:
                         digest, kind, registry = _decode_digest_command(control.command_bytes)
-                        if registry != RemoteRegistryTarget.REMOTE_TASK_DISPATCHER or kind != CallableKind.PYTHON_IMPORT:
+                        if (
+                            registry != RemoteRegistryTarget.REMOTE_TASK_DISPATCHER
+                            or kind != CallableKind.PYTHON_IMPORT
+                        ):
                             raise ValueError("PREPARE_CALLABLE target/kind mismatch")
                         if digest not in dispatch_registry:
                             raise KeyError("PREPARE_CALLABLE digest is not committed in dispatcher registry")
-                        _control_reply(conn, manifest, header.sequence, control.control_name, control.control_version, 0, "")
+                        _control_reply(
+                            conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
+                        )
                     elif control.control_name == ControlName.ALLOC_REMOTE_BUFFER:
                         if len(control.command_bytes) != 8:
                             raise ValueError("ALLOC_REMOTE_BUFFER payload must be uint64 nbytes")
@@ -571,7 +593,11 @@ def _run_command_loop(
                         payload = encode_control_reply(
                             header.sequence, control.control_name, control.control_version, 0, "", result
                         )
-                        send_frame(conn, FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence), payload)
+                        send_frame(
+                            conn,
+                            FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence),
+                            payload,
+                        )
                     elif control.control_name == ControlName.FREE_REMOTE_BUFFER:
                         if len(control.command_bytes) != 20:
                             raise ValueError("FREE_REMOTE_BUFFER payload must be endpoint_id, buffer_id, generation")
@@ -584,9 +610,13 @@ def _run_command_loop(
                             entry.released = True
                             buffers.pop(key, None)
                             entry.close(unlink=True)
-                        _control_reply(conn, manifest, header.sequence, control.control_name, control.control_version, 0, "")
+                        _control_reply(
+                            conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
+                        )
                     elif control.control_name == ControlName.COPY_TO_REMOTE:
-                        owner_endpoint, buffer_id, generation, offset, size, data = _copy_command_header(control.command_bytes)
+                        owner_endpoint, buffer_id, generation, offset, size, data = _copy_command_header(
+                            control.command_bytes
+                        )
                         if owner_endpoint != endpoint_id:
                             raise ValueError("COPY_TO_REMOTE endpoint mismatch")
                         key = _buffer_key(buffer_id, generation)
@@ -600,9 +630,13 @@ def _run_command_loop(
                         if offset + size > entry.nbytes:
                             raise ValueError("COPY_TO_REMOTE range exceeds buffer")
                         ctypes.memmove(entry.addr + offset, data, size)
-                        _control_reply(conn, manifest, header.sequence, control.control_name, control.control_version, 0, "")
+                        _control_reply(
+                            conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
+                        )
                     elif control.control_name == ControlName.COPY_FROM_REMOTE:
-                        owner_endpoint, buffer_id, generation, offset, size, data = _copy_command_header(control.command_bytes)
+                        owner_endpoint, buffer_id, generation, offset, size, data = _copy_command_header(
+                            control.command_bytes
+                        )
                         if data:
                             raise ValueError("COPY_FROM_REMOTE request must not carry data bytes")
                         if owner_endpoint != endpoint_id:
@@ -619,7 +653,11 @@ def _run_command_loop(
                         payload = encode_control_reply(
                             header.sequence, control.control_name, control.control_version, 0, "", result
                         )
-                        send_frame(conn, FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence), payload)
+                        send_frame(
+                            conn,
+                            FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence),
+                            payload,
+                        )
                     elif control.control_name == ControlName.EXPORT_BUFFER:
                         request = decode_export_buffer_request(control.command_bytes)
                         if request.owner_endpoint_id != endpoint_id:
@@ -659,7 +697,11 @@ def _run_command_loop(
                             "",
                             encode_export_buffer_result(result),
                         )
-                        send_frame(conn, FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence), payload)
+                        send_frame(
+                            conn,
+                            FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence),
+                            payload,
+                        )
                     elif control.control_name == ControlName.IMPORT_BUFFER:
                         request = decode_import_buffer_request(control.command_bytes)
                         if request.importer_endpoint_id != endpoint_id:
@@ -703,7 +745,11 @@ def _run_command_loop(
                             "",
                             encode_import_buffer_result(result),
                         )
-                        send_frame(conn, FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence), payload)
+                        send_frame(
+                            conn,
+                            FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence),
+                            payload,
+                        )
                     elif control.control_name == ControlName.RELEASE_IMPORT:
                         request = decode_release_import_request(control.command_bytes)
                         if request.importer_endpoint_id != endpoint_id:
@@ -715,8 +761,14 @@ def _run_command_loop(
                         entry.released = True
                         buffers.pop(key, None)
                         entry.close(unlink=False)
-                        _control_reply(conn, manifest, header.sequence, control.control_name, control.control_version, 0, "")
-                    elif control.control_name in (ControlName.COMM_INIT, ControlName.ALLOC_DOMAIN, ControlName.RELEASE_DOMAIN):
+                        _control_reply(
+                            conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
+                        )
+                    elif control.control_name in (
+                        ControlName.COMM_INIT,
+                        ControlName.ALLOC_DOMAIN,
+                        ControlName.RELEASE_DOMAIN,
+                    ):
                         _control_reply(
                             conn,
                             manifest,
@@ -755,7 +807,9 @@ def _run_command_loop(
                     )
                 continue
             if header.frame_type != FrameType.TASK:
-                payload = encode_completion(header.sequence, 1, f"unsupported remote frame type {int(header.frame_type)}")
+                payload = encode_completion(
+                    header.sequence, 1, f"unsupported remote frame type {int(header.frame_type)}"
+                )
                 send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, endpoint_id, header.sequence), payload)
                 continue
 
@@ -859,7 +913,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--ready-fd", required=True, type=int)
     ns = parser.parse_args(argv)
-    with open(ns.manifest, "r", encoding="utf-8") as f:
+    with open(ns.manifest, encoding="utf-8") as f:
         manifest = json.load(f)
     return run_session(manifest, ns.ready_fd)
 

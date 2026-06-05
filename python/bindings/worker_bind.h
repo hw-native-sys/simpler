@@ -448,8 +448,7 @@ inline void bind_worker(nb::module_ &m) {
                     payload_bytes.data(), payload_bytes.size(), reinterpret_cast<const uint8_t *>(digest_bytes.data())
                 );
             },
-            nb::arg("endpoint_id"), nb::arg("target_registry"), nb::arg("kind"), nb::arg("payload"),
-            nb::arg("digest"),
+            nb::arg("endpoint_id"), nb::arg("target_registry"), nb::arg("kind"), nb::arg("payload"), nb::arg("digest"),
             "Send PREPARE_REGISTER_CALLABLE to one remote endpoint."
         )
         .def(
@@ -551,10 +550,8 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "remote_export",
-            [](
-                Worker &self, int owner_endpoint_id, uint64_t buffer_id, uint64_t generation, uint64_t handle_offset,
-                uint64_t offset, uint64_t size, uint32_t access_flags, const std::string &transport_profile
-            ) {
+            [](Worker &self, int owner_endpoint_id, uint64_t buffer_id, uint64_t generation, uint64_t handle_offset,
+               uint64_t offset, uint64_t size, uint32_t access_flags, const std::string &transport_profile) {
                 RemoteBufferHandle h;
                 h.endpoint_id = owner_endpoint_id;
                 h.owner_endpoint_id = owner_endpoint_id;
@@ -570,7 +567,9 @@ inline void bind_worker(nb::module_ &m) {
                     e.owner_endpoint_id, e.buffer_id, e.generation, static_cast<int32_t>(e.address_space), e.offset,
                     e.nbytes, e.export_id, e.remote_addr, e.rkey_or_token, e.ub_ldst_va, e.access_flags,
                     e.transport_profile,
-                    nb::bytes(reinterpret_cast<const char *>(e.transport_descriptor.data()), e.transport_descriptor.size())
+                    nb::bytes(
+                        reinterpret_cast<const char *>(e.transport_descriptor.data()), e.transport_descriptor.size()
+                    )
                 );
             },
             nb::arg("owner_endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"), nb::arg("handle_offset"),
@@ -579,12 +578,10 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "remote_import",
-            [](
-                Worker &self, int importer_endpoint_id, int owner_endpoint_id, uint64_t buffer_id, uint64_t generation,
-                int address_space, uint64_t offset, uint64_t size, uint64_t export_id, uint64_t remote_addr,
-                uint64_t rkey_or_token, uint64_t ub_ldst_va, uint32_t access_flags,
-                const std::string &transport_profile, nb::object transport_descriptor, uint32_t requested_access_flags
-            ) {
+            [](Worker &self, int importer_endpoint_id, int owner_endpoint_id, uint64_t buffer_id, uint64_t generation,
+               int address_space, uint64_t offset, uint64_t size, uint64_t export_id, uint64_t remote_addr,
+               uint64_t rkey_or_token, uint64_t ub_ldst_va, uint32_t access_flags, const std::string &transport_profile,
+               nb::object transport_descriptor, uint32_t requested_access_flags) {
                 RemoteBufferExport e;
                 e.owner_endpoint_id = owner_endpoint_id;
                 e.buffer_id = buffer_id;
@@ -610,11 +607,11 @@ inline void bind_worker(nb::module_ &m) {
                     h.ub_ldst_va, h.access_flags
                 );
             },
-            nb::arg("importer_endpoint_id"), nb::arg("owner_endpoint_id"), nb::arg("buffer_id"),
-            nb::arg("generation"), nb::arg("address_space"), nb::arg("offset"), nb::arg("size"),
-            nb::arg("export_id"), nb::arg("remote_addr"), nb::arg("rkey_or_token"), nb::arg("ub_ldst_va"),
-            nb::arg("access_flags"), nb::arg("transport_profile"), nb::arg("transport_descriptor"),
-            nb::arg("requested_access_flags"), "Import a remote buffer export into an endpoint."
+            nb::arg("importer_endpoint_id"), nb::arg("owner_endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"),
+            nb::arg("address_space"), nb::arg("offset"), nb::arg("size"), nb::arg("export_id"), nb::arg("remote_addr"),
+            nb::arg("rkey_or_token"), nb::arg("ub_ldst_va"), nb::arg("access_flags"), nb::arg("transport_profile"),
+            nb::arg("transport_descriptor"), nb::arg("requested_access_flags"),
+            "Import a remote buffer export into an endpoint."
         )
         .def(
             "remote_release_import",
@@ -629,8 +626,8 @@ inline void bind_worker(nb::module_ &m) {
                 nb::gil_scoped_release release;
                 self.remote_release_import(h);
             },
-            nb::arg("importer_endpoint_id"), nb::arg("owner_endpoint_id"), nb::arg("buffer_id"),
-            nb::arg("generation"), nb::arg("import_id"), "Release an imported remote buffer mapping."
+            nb::arg("importer_endpoint_id"), nb::arg("owner_endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"),
+            nb::arg("import_id"), "Release an imported remote buffer mapping."
         )
         .def(
             "broadcast_unregister_all",

@@ -418,15 +418,14 @@ void Orchestrator::validate_remote_sidecars(
                     if (tensor_sidecar.desc.address_space == RemoteAddressSpace::REMOTE_DEVICE &&
                         endpoint_id != tensor_sidecar.desc.owner_endpoint_id) {
                         throw std::invalid_argument(
-                            "Orchestrator: remote tensor sidecar requires IMPORT_BUFFER before submitting to endpoint " +
+                            "Orchestrator: remote tensor sidecar requires IMPORT_BUFFER before submitting to "
+                            "endpoint " +
                             std::to_string(endpoint_id)
                         );
                     }
                 }
                 if (!has_allowed_endpoint) {
-                    throw std::invalid_argument(
-                        "Orchestrator: remote tensor has no final eligible endpoint"
-                    );
+                    throw std::invalid_argument("Orchestrator: remote tensor has no final eligible endpoint");
                 }
             }
         }

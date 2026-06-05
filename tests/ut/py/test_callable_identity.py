@@ -318,7 +318,7 @@ def test_raw_control_payload_uses_explicit_size():
         shm_buf = shm.buf
         assert shm_buf is not None
         shm_buf[: len(payload)] = payload
-        shm_buf[len(payload) :] = b"\x00" * 16
+        shm_buf[len(payload) :] = b"\x00" * (len(shm_buf) - len(payload))
 
         assert _read_raw_payload_from_shm(shm.name, len(payload)) == payload
     finally:

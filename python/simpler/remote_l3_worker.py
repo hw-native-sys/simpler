@@ -79,11 +79,21 @@ def _start_session(manifest: dict[str, Any]) -> dict[str, Any]:
     ready_r, ready_w = os.pipe()
     manifest_path = ""
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="simpler-remote-l3-", suffix=".json", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", prefix="simpler-remote-l3-", suffix=".json", delete=False
+        ) as f:
             manifest_path = f.name
             json.dump(manifest, f, sort_keys=True)
         proc = subprocess.Popen(
-            [sys.executable, "-m", "simpler.remote_l3_session", "--manifest", manifest_path, "--ready-fd", str(ready_w)],
+            [
+                sys.executable,
+                "-m",
+                "simpler.remote_l3_session",
+                "--manifest",
+                manifest_path,
+                "--ready-fd",
+                str(ready_w),
+            ],
             pass_fds=(ready_w,),
             close_fds=True,
         )

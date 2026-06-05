@@ -492,7 +492,11 @@ def decode_remote_task_args(data: bytes) -> RemoteTaskArgsWire:
         present = reader.u8()
         if present not in (0, 1):
             raise ValueError("remote_wire: remote descriptor presence must be 0 or 1")
-        sidecars.append(RemoteTensorSidecar(False, None) if present == 0 else RemoteTensorSidecar(True, decode_remote_tensor_desc(reader)))
+        sidecars.append(
+            RemoteTensorSidecar(False, None)
+            if present == 0
+            else RemoteTensorSidecar(True, decode_remote_tensor_desc(reader))
+        )
     scalars = tuple(reader.u64() for _ in range(scalar_count))
     inline_len = reader.u32()
     if inline_len > MAX_INLINE_PAYLOAD_BYTES:
