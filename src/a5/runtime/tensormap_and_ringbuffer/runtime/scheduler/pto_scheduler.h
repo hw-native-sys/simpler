@@ -432,27 +432,23 @@ void ready_queue_destroy(PTO2ReadyQueue *queue);
 // on the hot path. Only when the local cache says "full" or "empty"
 // does the thread issue an acquire load on the remote index.
 //
-// Memory layout: 4 cache-line-aligned fields ensure zero false sharing.
+// Memory layout: 5 cache-line-aligned fields ensure zero false sharing.
 
 struct alignas(64) PTO2SpscQueue {
     // --- Producer cache lines (orchestrator thread) ---
     alignas(64) std::atomic<uint64_t> head_{0};
     alignas(64) uint64_t tail_cached_{0};
 
-    // --- Local Copy of mask and data ptr (immutable after init) ---
-    PTO2TaskSlotState **buffer_p_{nullptr};
-    uint64_t mask_p_{0};
-
     // --- Consumer cache lines (scheduler thread 0) ---
     alignas(64) std::atomic<uint64_t> tail_{0};
     alignas(64) uint64_t head_cached_{0};
 
-    // --- Local Copy of mask and data ptr (immutable after init) ---
-    PTO2TaskSlotState **buffer_c_{nullptr};
-    uint64_t mask_c_{0};
+    // --- Shared Cacheline (read only) with mask and data ptr (immutable after init) ---
+    alignas(64) PTO2TaskSlotState **buffer_{nullptr};
+    uint64_t mask_{0};
 
-    // Padding to exactly 4 cache lines
-    char padding[64 - sizeof(std::atomic<uint64_t>) - sizeof(PTO2TaskSlotState **) - sizeof(uint64_t)];
+    // Padding to exactly 5 cache lines
+    char padding[64 - sizeof(PTO2TaskSlotState **) - sizeof(uint64_t)];
 
     // Reserve the backing buffer region on the supplied arena. Returns the
     // region offset, to be passed to init_from_layout() after the arena is
@@ -474,8 +470,7 @@ struct alignas(64) PTO2SpscQueue {
         // observe nullptr.
         for (uint64_t i = 0; i < capacity; i++)
             buf[i] = nullptr;
-        mask_p_ = capacity - 1;
-        mask_c_ = mask_p_;
+        mask_ = capacity - 1;
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
         tail_cached_ = 0;
@@ -486,15 +481,11 @@ struct alignas(64) PTO2SpscQueue {
     // Wire the arena-internal pointer. Called by both host (with host arena)
     // and AICPU (with device arena attached to the prebuilt image).
     void wire_arena_pointers(DeviceArena &arena, size_t buffer_off) {
-        buffer_p_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
-        buffer_c_ = buffer_p_;
+        buffer_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
     }
 
     // Arena owns the buffer; here we only forget our pointer.
-    void destroy() {
-        buffer_p_ = nullptr;
-        buffer_c_ = nullptr;
-    }
+    void destroy() { buffer_ = nullptr; }
 
     // Push one item (producer only). Returns false if queue is full.
     // Full condition: next_h - tail > mask_ (i.e. > capacity-1), so the
@@ -505,13 +496,13 @@ struct alignas(64) PTO2SpscQueue {
     bool push(PTO2TaskSlotState *item) {
         uint64_t h = head_.load(std::memory_order_relaxed);
         uint64_t next_h = h + 1;
-        if (next_h - tail_cached_ > mask_p_) {
+        if (next_h - tail_cached_ > mask_) {
             tail_cached_ = tail_.load(std::memory_order_acquire);
-            if (next_h - tail_cached_ > mask_p_) {
+            if (next_h - tail_cached_ > mask_) {
                 return false;
             }
         }
-        buffer_p_[h & mask_p_] = item;
+        buffer_[h & mask_] = item;
         head_.store(next_h, std::memory_order_release);
         return true;
     }
@@ -527,7 +518,7 @@ struct alignas(64) PTO2SpscQueue {
         }
         int count = (avail < static_cast<uint64_t>(max_count)) ? static_cast<int>(avail) : max_count;
         for (int i = 0; i < count; i++) {
-            out[i] = buffer_c_[(t + i) & mask_c_];
+            out[i] = buffer_[(t + i) & mask_];
         }
         tail_.store(t + count, std::memory_order_release);
         return count;
@@ -541,7 +532,7 @@ struct alignas(64) PTO2SpscQueue {
     }
 };
 
-static_assert(sizeof(PTO2SpscQueue) == 256, "PTO2SpscQueue must be exactly 4 cache lines (256B)");
+static_assert(sizeof(PTO2SpscQueue) == 5 * 64, "PTO2SpscQueue must be exactly 5 cache lines (320B)");
 // =============================================================================
 
 /**
@@ -658,7 +649,7 @@ struct PTO2SchedulerState {
     static_assert(
         offsetof(WiringState, queue) == 256, "WiringState: batch region must be exactly 4 cache lines before queue"
     );
-    static_assert(sizeof(WiringState) == 576, "WiringState must be exactly 9 cache lines (576B)");
+    static_assert(sizeof(WiringState) == 640, "WiringState must be exactly 10 cache lines (640B)");
 
     alignas(64) AsyncWaitList async_wait_list;
 

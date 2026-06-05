@@ -63,10 +63,8 @@ protected:
 
 TEST_F(SpscQueueTest, InitValidState) {
     EXPECT_EQ(queue.size(), 0u);
-    EXPECT_EQ(queue.mask_p_, CAPACITY - 1);
-    EXPECT_EQ(queue.mask_c_, CAPACITY - 1);
-    EXPECT_NE(queue.buffer_p_, nullptr);
-    EXPECT_NE(queue.buffer_c_, nullptr);
+    EXPECT_EQ(queue.mask_, CAPACITY - 1);
+    EXPECT_NE(queue.buffer_, nullptr);
 }
 
 TEST_F(SpscQueueTest, InitRejectsNonPowerOfTwo) {
