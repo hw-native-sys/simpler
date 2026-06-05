@@ -44,7 +44,10 @@ from .task_interface import (
     CommDomainHandle,
     ContinuousTensor,
     DataType,
+    RemoteAddressSpace,
     TaskArgs,
+    _empty_remote_sidecar_for,
+    _remote_sidecar_for,
 )
 
 
@@ -54,7 +57,7 @@ def _require_handle(
     kind: str,
     worker: Any = None,
     expected_namespace: Optional[str] = None,
-) -> tuple[bytes, str, str]:
+) -> tuple[bytes, str, str, tuple[int, ...]]:
     """Validate a submit argument is a registered CallableHandle.
 
     Raises a clear migration error when the caller still passes a
@@ -72,13 +75,41 @@ def _require_handle(
         raise TypeError(f"{kind} expects a CallableHandle returned by Worker.register")
     if worker is not None:
         state = worker._resolve_handle(callable_or_handle, expected_namespace=expected_namespace)
-        return state.digest, state.kind, state.target_namespace
+        return state.digest, state.kind, state.target_namespace, state.eligible_endpoint_ids
     if expected_namespace is not None and callable_or_handle.target_namespace != expected_namespace:
         raise TypeError(
             f"{kind} cannot run {callable_or_handle.target_namespace}; expected {expected_namespace} "
             f"for {callable_or_handle.hashid}"
         )
-    return callable_or_handle.digest, callable_or_handle.kind, callable_or_handle.target_namespace
+    return callable_or_handle.digest, callable_or_handle.kind, callable_or_handle.target_namespace, ()
+
+
+def _split_next_level_args(args: TaskArgs) -> tuple[TaskArgs, object | None]:
+    if isinstance(args, TaskArgs):
+        return args, _remote_sidecar_for(args)
+    raise TypeError("NEXT_LEVEL submit expects TaskArgs")
+
+
+def _remote_data_eligible_endpoint_ids(remote_sidecar: object | None, callable_endpoint_ids: tuple[int, ...]) -> list[int]:
+    endpoint_ids = [int(endpoint_id) for endpoint_id in callable_endpoint_ids]
+    if remote_sidecar is None:
+        return endpoint_ids
+
+    allowed = set(endpoint_ids)
+    for tensor_sidecar in getattr(remote_sidecar, "tensors", ()):
+        if tensor_sidecar is None or not getattr(tensor_sidecar, "present", False):
+            continue
+        desc = tensor_sidecar.desc
+        if RemoteAddressSpace(int(desc.address_space)) == RemoteAddressSpace.HOST_INLINE:
+            continue
+        handle = getattr(tensor_sidecar, "handle", None)
+        consumable_endpoint_id = int(getattr(handle, "endpoint_id", desc.owner_endpoint_id))
+        allowed.intersection_update({consumable_endpoint_id})
+
+    final_endpoint_ids = [endpoint_id for endpoint_id in endpoint_ids if endpoint_id in allowed]
+    if not final_endpoint_ids:
+        raise ValueError("remote tensor sidecars leave no eligible remote endpoint")
+    return final_endpoint_ids
 
 
 class Orchestrator:
@@ -120,13 +151,39 @@ class Orchestrator:
         ``worker``: logical worker id for affinity (-1 = unconstrained).
         """
         cfg = config if config is not None else CallConfig()
-        digest, kind, target_namespace = _require_handle(
+        expected_namespace = (
+            None
+            if isinstance(callable_handle, CallableHandle)
+            and callable_handle.target_namespace == "REMOTE_TASK_DISPATCHER"
+            else self._expected_next_level_namespace()
+        )
+        digest, kind, target_namespace, eligible_endpoint_ids = _require_handle(
             callable_handle,
             kind="orch.submit_next_level",
             worker=self._worker,
-            expected_namespace=self._expected_next_level_namespace(),
+            expected_namespace=expected_namespace,
         )
-        self._o.submit_next_level(digest, kind, target_namespace, args, cfg, int(worker))
+        c_args, explicit_remote_sidecar = _split_next_level_args(args)
+        if target_namespace == "REMOTE_TASK_DISPATCHER":
+            remote_sidecar = (
+                explicit_remote_sidecar if explicit_remote_sidecar is not None else _empty_remote_sidecar_for(c_args)
+            )
+        else:
+            if explicit_remote_sidecar is not None:
+                raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
+            remote_sidecar = None
+        final_endpoint_ids = _remote_data_eligible_endpoint_ids(remote_sidecar, eligible_endpoint_ids)
+        captured_refs = self._worker._capture_remote_sidecar_refs(remote_sidecar) if self._worker is not None else []
+        try:
+            self._o.submit_next_level(
+                digest, kind, target_namespace, c_args, cfg, int(worker), final_endpoint_ids, remote_sidecar
+            )
+        except BaseException:
+            if self._worker is not None:
+                self._worker._release_remote_slot_refs(captured_refs)
+            raise
+        if self._worker is not None:
+            self._worker._adopt_remote_slot_refs(captured_refs)
 
     def submit_next_level_group(
         self,
@@ -142,13 +199,59 @@ class Orchestrator:
         """
         cfg = config if config is not None else CallConfig()
         w = [int(x) for x in workers] if workers else []
-        digest, kind, target_namespace = _require_handle(
+        expected_namespace = (
+            None
+            if isinstance(callable_handle, CallableHandle)
+            and callable_handle.target_namespace == "REMOTE_TASK_DISPATCHER"
+            else self._expected_next_level_namespace()
+        )
+        digest, kind, target_namespace, eligible_endpoint_ids = _require_handle(
             callable_handle,
             kind="orch.submit_next_level_group",
             worker=self._worker,
-            expected_namespace=self._expected_next_level_namespace(),
+            expected_namespace=expected_namespace,
         )
-        self._o.submit_next_level_group(digest, kind, target_namespace, args_list, cfg, w)
+        c_args_list = []
+        explicit_remote_sidecars = []
+        has_explicit_remote_sidecar = False
+        for args in args_list:
+            c_args, sidecar = _split_next_level_args(args)
+            c_args_list.append(c_args)
+            explicit_remote_sidecars.append(sidecar)
+            has_explicit_remote_sidecar = has_explicit_remote_sidecar or sidecar is not None
+        if target_namespace == "REMOTE_TASK_DISPATCHER":
+            remote_sidecars = [
+                sidecar if sidecar is not None else _empty_remote_sidecar_for(c_args)
+                for c_args, sidecar in zip(c_args_list, explicit_remote_sidecars)
+            ]
+        else:
+            if has_explicit_remote_sidecar:
+                raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
+            remote_sidecars = None
+        endpoint_sets = (
+            [
+                _remote_data_eligible_endpoint_ids(remote_sidecar, eligible_endpoint_ids)
+                for remote_sidecar in remote_sidecars
+            ]
+            if remote_sidecars is not None
+            else [list(eligible_endpoint_ids) for _ in args_list]
+            if eligible_endpoint_ids
+            else []
+        )
+        captured_refs: list[Any] = []
+        if self._worker is not None and remote_sidecars is not None:
+            for sidecar in remote_sidecars:
+                captured_refs.extend(self._worker._capture_remote_sidecar_refs(sidecar))
+        try:
+            self._o.submit_next_level_group(
+                digest, kind, target_namespace, c_args_list, cfg, w, endpoint_sets, remote_sidecars
+            )
+        except BaseException:
+            if self._worker is not None:
+                self._worker._release_remote_slot_refs(captured_refs)
+            raise
+        if self._worker is not None:
+            self._worker._adopt_remote_slot_refs(captured_refs)
 
     def submit_sub(self, callable_handle: Any, args: Optional[TaskArgs] = None):
         """Submit a SUB task by registered callable handle.
@@ -157,7 +260,7 @@ class Orchestrator:
         """
         if args is None:
             args = TaskArgs()
-        digest, kind, target_namespace = _require_handle(
+        digest, kind, target_namespace, _eligible_endpoint_ids = _require_handle(
             callable_handle,
             kind="orch.submit_sub",
             worker=self._worker,
@@ -167,7 +270,7 @@ class Orchestrator:
 
     def submit_sub_group(self, callable_handle: Any, args_list: list):
         """Submit a group of SUB tasks (N TaskArgs → N workers, 1 DAG node)."""
-        digest, kind, target_namespace = _require_handle(
+        digest, kind, target_namespace, _eligible_endpoint_ids = _require_handle(
             callable_handle,
             kind="orch.submit_sub_group",
             worker=self._worker,
