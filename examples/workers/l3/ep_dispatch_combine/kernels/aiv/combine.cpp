@@ -11,22 +11,23 @@
 /**
  * Combine kernel — two-phase pipeline within a single AIV task:
  *
- *   push:   for each (dst, e):
- *             n       = pub_counts[dst][my_rank][e]
- *             src_off = sum_{s<dst} pub_counts[s][my_rank][e]
- *             for row in [0, n):
- *               r = recv_idx_out[e * R + src_off + row]   // = t * TOPK + k
- *               TPUT recv_y[e * R + src_off + row, :]
- *                 to peer dst's routed_y_buf[r * D : (r+1) * D]
- *           then combine_done barrier.
- *   reduce: reduce_sum along the TOPK axis of routed_y_buf into
- *           routed_y[T, D] FP32.
+ *   push:     for each (dst, e):
+ *               n       = pub_counts[dst][my_rank][e]
+ *               src_off = sum_{s<dst} pub_counts[s][my_rank][e]
+ *               for row in [0, n):
+ *                 r = recv_idx_out[e * R + src_off + row]   // = t * TOPK + k
+ *                 TPUT recv_y[e * R + src_off + row, :]
+ *                   to peer dst's routed_y_buf[r * D : (r+1) * D]
+ *             then combine_done barrier.
+ *   reduce:   reduce_sum along the TOPK axis of routed_y_buf into
+ *             routed_y[T, D] FP32 (the fp32 accumulator is written out
+ *             directly, no final cast back to bf16).
  *
  *   Inputs:
- *     recv_y          BF16  [L, R, D]   (local_expert OUTPUT_EXISTING)
- *     recv_idx_out    INT32 [L, R]      (dispatch OUTPUT_EXISTING)
+ *     recv_y          BF16  [L, R, D]      (local_expert OUTPUT_EXISTING)
+ *     recv_idx_out    INT32 [L, R]         (dispatch OUTPUT_EXISTING)
  *   Output:
- *     routed_y        FP32  [T, D]      (verification ground truth)
+ *     routed_y        FP32  [T, D]         (post-reduce; verification ground truth)
  *   Scratch:
  *     window slot — pub_counts (read-only) / routed_y_buf (push dest) /
  *     combine_done_sig
@@ -58,13 +59,14 @@
 
 using namespace pto;
 
-// Demo dimensions — must match dispatch.cpp / main.py.
+// Real DeepSeek-V4 FLASH MoE shapes — must match dispatch.cpp / main.py:
+// T=128, TOPK=6, D=4096, L=16, R=192. Production EP=16; here EP=2 (N=2).
 static constexpr int N = 2;
-static constexpr int T = 8;
-static constexpr int TOPK = 2;
-static constexpr int D = 64;
-static constexpr int L = 4;
-static constexpr int R = 32;
+static constexpr int T = 128;
+static constexpr int TOPK = 6;
+static constexpr int D = 4096;
+static constexpr int L = 16;
+static constexpr int R = 192;
 static constexpr int W_PAD = 8;
 static constexpr int IDX_PAD = 8;
 
@@ -208,7 +210,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     for (int t = 0; t < T; ++t) {
         TEXPANDS(acc_tile, 0.0f);
-        pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_ALL);
 
         for (int k = 0; k < TOPK; ++k) {
             int r = t * TOPK + k;
@@ -219,9 +221,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             pipe_barrier(PIPE_ALL);
 
             TCVT(add_fp_tile, add_bf_tile, RoundMode::CAST_ROUND);
-            pipe_barrier(PIPE_V);
+            pipe_barrier(PIPE_ALL);
             TADD(acc_tile, acc_tile, add_fp_tile);
-            pipe_barrier(PIPE_V);
+            pipe_barrier(PIPE_ALL);
         }
 
         RowFpG out_g(routed_y + t * D);

@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * EP dispatch kernel — 2-rank demo. Publishes per-token routing payload
+ * EP dispatch kernel — EP=2 (production EP=16). Publishes per-token routing payload
  * (x BF16 / weight FP32 / idx INT32) to peer ranks' receive areas keyed by
  * `(local_expert, slot)`, where slot is computed from a globally consistent
  * pub_counts table. Idx encodes `r = t * TOPK + k` so combine can later
@@ -67,14 +67,15 @@
 
 using namespace pto;
 
-// Demo dimensions — must match main.py.
+// Real DeepSeek-V4 FLASH MoE shapes — must match main.py:
+// T=128, TOPK=6, D=4096, L=16, R=192. Production EP=16; here EP=2 (N=2).
 static constexpr int N = 2;
-static constexpr int T = 8;
-static constexpr int TOPK = 2;
-static constexpr int D = 64;
-static constexpr int L = 4;
-static constexpr int R = 32;
-static constexpr int N_ROUTES = T * TOPK;  // 16
+static constexpr int T = 128;
+static constexpr int TOPK = 6;
+static constexpr int D = 4096;
+static constexpr int L = 16;
+static constexpr int R = 192;
+static constexpr int N_ROUTES = T * TOPK;  // 768
 
 // Weight payload tile width. The protocol contract is one FP32 weight per
 // (e, slot) — recv_w[L, R] FP32. AIV vector tiles have a hardware minimum
@@ -91,14 +92,14 @@ static constexpr int IDX_PAD = 8;
 // Window region byte sizes — mirror *_BYTES in main.py.
 //
 // Layout:
-//   pub_counts[N][N][L]            INT32   (64 B)
+//   pub_counts[N][N][L]            INT32   (256 B)
 //   count_done_sig[N]              INT32   (padded slot, 64 B)
-//   recv_x[L][R][D]                BF16    (16 KB)
-//   recv_w[L][R][W_PAD]            FP32    (4  KB; weight at slot [0], rest = 0)
-//   recv_idx[L][R][IDX_PAD]        INT32   (4  KB; r=t*TOPK+k at slot [0], rest = 0)
+//   recv_x[L][R][D]                BF16    (24 MB)
+//   recv_w[L][R][W_PAD]            FP32    (384 KB; weight at slot [0], rest = 0)
+//   recv_idx[L][R][IDX_PAD]        INT32   (384 KB; r=t*TOPK+k at slot [0], rest = 0)
 //   data_done_sig[N]               INT32   (padded slot, 64 B)
 // ---- Cross-rank visible regions consumed by combine.cpp ----
-//   routed_y_buf[T][TOPK][D]       BF16    (2  KB demo; combine push destination,
+//   routed_y_buf[T][TOPK][D]       BF16    (6 MB; combine push destination,
 //                                            addressed directly by (t, k))
 //   combine_done_sig[N]            INT32   (padded slot, 64 B)
 //
@@ -282,7 +283,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     //     — total rows arriving at THIS rank's local expert e (host output)
     //
     // recv_count_out is what the production moe_expert kernel consumes to
-    // decide tile counts; emitting it here lets the demo verify the
+    // decide tile counts; emitting it here lets the host verify the
     // protocol contract without standing up the expert kernel.
     // ------------------------------------------------------------------
     int my_slot_at_dst[N][L];
