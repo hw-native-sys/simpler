@@ -3,9 +3,22 @@
 Deliver remote L3 support in small PRs. Each step should keep existing local
 fork/shm behavior working.
 
+Status for the local PR #866 cut:
+
+- Steps 1-5 are implemented for the simulation transport, including an
+  independent health lane.
+- Step 6 is implemented for dispatcher `PYTHON_IMPORT`, inner manifest/control
+  `PYTHON_IMPORT`, and inner manifest/control inline `CHIP_CALLABLE`.
+  `PYTHON_SERIALIZED` remains a negotiated future extension, and
+  staged chip-callable blobs require a staged-blob adapter before use.
+- Steps 7-9 are implemented for the two-process simulation runner and sim
+  remote buffers, including export/import/release-import.
+- Steps 10-12 remain pending hardware-profile work. Remote CommDomain controls
+  remain reserved/unsupported in this cut.
+
 ## PR Sequence
 
-1. Endpoint interface and local adapter.
+1. Endpoint interface and local adapter. **Implemented.**
    - Add `WorkerEndpoint`.
    - Include read-only `WorkerEndpoint::caps()` capability metadata for
      endpoint eligibility. `caps()` returns logical features only and must not
@@ -23,7 +36,7 @@ fork/shm behavior working.
      without yet changing all downstream DAG poisoning behavior.
    - Add local adapter regression tests for existing L3/L4 examples.
 
-2. Endpoint eligibility metadata.
+2. Endpoint eligibility metadata. **Implemented.**
    - Assign each NEXT_LEVEL child a stable `endpoint_id`.
    - Store `callable hashid -> eligible endpoint ids` in parent runtime
      metadata.
@@ -35,7 +48,8 @@ fork/shm behavior working.
      `LocalMailboxEndpoint` and remote L3 as a framed endpoint, not as another
      mailbox child loop.
 
-3. Remote task sidecars and dependency keys.
+3. Remote task sidecars and dependency keys. **Implemented for explicit
+   sidecars, owner/imported simulation buffers, and slot-ref capture.**
    - Add `RemoteBufferHandle`, `RemoteTensorRef`, and `RemoteTensorDesc`.
    - Store a `RemoteTaskArgsView` sidecar beside existing `TaskArgs`.
    - Extend `TensorKey` for remote endpoint, buffer id, generation, logical
@@ -48,14 +62,16 @@ fork/shm behavior working.
    - Reject remote `OUTPUT` tensors with `data == 0` unless an explicit remote
      allocation API has already produced a `RemoteTensorRef` sidecar.
 
-4. Failed task poisoning.
+4. Failed task poisoning. **Implemented.**
    - Add per-member group state/outcome tracking so group failure can skip
      unstarted members while waiting for already-dispatched members to finish.
    - Add failed/poisoned slot handling.
    - Prevent downstream consumers of failed producers from dispatching.
    - Preserve `drain()` cleanup and first-error-wins reporting.
 
-5. Versioned remote frame codec.
+5. Versioned remote frame codec. **Implemented for frame/TASK/COMPLETION/
+   CONTROL/CONTROL_REPLY, ordered command-lane tests, and simulation health
+   lane.**
    - Add `remote_wire.h/.cpp`.
    - Implement canonical little-endian encode/decode for `CallConfigWire`,
      `ContinuousTensorWire`, frame headers, descriptors, counts, strings, and
@@ -78,7 +94,10 @@ fork/shm behavior working.
    - Include tests that reject non-zero `ContinuousTensorWire.data` in remote
      TASK frames.
 
-6. Remote callable registry.
+6. Remote callable registry. **Implemented for dispatcher `PYTHON_IMPORT`,
+   inner manifest/control `PYTHON_IMPORT`, and inner manifest/control inline
+   `CHIP_CALLABLE` on the simulation path. Serialized Python remote payloads
+   and staged chip blobs remain negotiated extensions.**
    - Implement `RemoteCallable("module:qualname")`.
    - Preserve the public callable identity lifecycle from PR #891:
      `Worker.register()` returns `CallableHandle`, TASK/control frames carry
@@ -117,8 +136,23 @@ fork/shm behavior working.
      slots are allocated by the receiving endpoint.
    - Define post-bootstrap registry-scope-aware prepare, commit, abort, and
      unregister frames for Python callables and `ChipCallable` entries.
+   - Implement the protocol v1 target/kind matrix:
+     dispatcher `PYTHON_IMPORT`, optional negotiated dispatcher
+     `PYTHON_SERIALIZED`, inner `PYTHON_IMPORT`, optional negotiated inner
+     `PYTHON_SERIALIZED`, and inner `CHIP_CALLABLE`.
+   - Reject `CHIP_CALLABLE` for `REMOTE_TASK_DISPATCHER` and reject
+     `PYTHON_SERIALIZED` on any remote target unless the session feature set
+     explicitly negotiated serialized support.
+   - Implement `CHIP_CALLABLE` remote prepare with either bounded inline blob
+     bytes or a session-local staged blob token. Validate the PR #891
+     descriptor hash, executable blob SHA-256, target platform/runtime, and
+     signature hash before commit.
+   - On inner registry commit, install into `inner_worker = Worker(level=3)`;
+     do not add the hashid to the parent-facing dispatcher registry.
+   - Release staged callable bytes after confirmed commit or abort cleanup.
 
-7. Fork-safe simulation session runner.
+7. Fork-safe simulation session runner. **Implemented for the socket-backed
+   simulation transport.**
    - Add `simpler-remote-worker` control entry point.
    - Add per-session `simpler-remote-l3-session` runner.
    - Pass the validated bootstrap manifest from daemon to runner through an
@@ -135,25 +169,45 @@ fork/shm behavior working.
    - Run TASK frames over the sim transport and return completions.
    - Add localhost two-process integration tests.
 
-8. Remote control-plane parity.
+8. Remote control-plane parity. **Implemented for the simulation transport;
+   Remote CommDomain controls remain reserved/unsupported.**
    - Map existing NEXT_LEVEL controls onto typed remote frames:
      prepare, register, unregister, remote buffer allocation, remote buffer
      free, copy to remote, copy from remote, export buffer, import buffer, and
      release import.
+   - Implement versioned request/result codecs for every remote buffer control.
+     `EXPORT_BUFFER`, `IMPORT_BUFFER`, and `RELEASE_IMPORT` must use the v1
+     schemas in `protocol.md`; do not invent backend-specific ad hoc payloads.
+   - Keep `EXPORT_BUFFER` owner-scoped, `IMPORT_BUFFER` importer-scoped, and
+     `RELEASE_IMPORT` importer-scoped. The parent-visible dependency identity
+     for imported handles remains the original owner buffer identity.
+   - Implement rollback for partial import setup: if any importer fails, send
+     `RELEASE_IMPORT` to importers that succeeded and mark uncertain
+     endpoint/buffer pairs ineligible for the current session.
    - Reserve remote `COMM_INIT`, `ALLOC_DOMAIN`, and `RELEASE_DOMAIN` opcodes
      for the later Remote CommDomain phase; the first task-dispatch cut rejects
      them as unsupported controls.
    - Keep local mailbox sub-command ids local-only.
    - Add tests for post-bootstrap ChipCallable registration and remote buffer
-     controls through the session runner.
+     controls through the session runner, including export/import/release.
 
-9. Remote buffer registry.
+9. Remote buffer registry. **Implemented for simulation owner/imported
+   buffers.**
    - Add `ALLOC_REMOTE_BUFFER`, `FREE_REMOTE_BUFFER`, `COPY_TO_REMOTE`, and
      `COPY_FROM_REMOTE`.
+   - Add owner export records and importer-local mapping records for
+     `EXPORT_BUFFER`, `IMPORT_BUFFER`, and `RELEASE_IMPORT`.
+   - De-duplicate live imports by
+     `(importer_endpoint_id, owner_endpoint_id, buffer_id, generation, offset,
+     nbytes, access_flags, transport_profile)` when the transport profile
+     supports reuse; otherwise return distinct `import_id` values and ref-count
+     each mapping independently.
    - Track per-slot capture refs for explicit buffers and imported peer
      buffers.
-   - Tie physical free and release-import to post-drain cleanup after all
-     captured refs drop.
+   - Tie owner physical free to post-drain cleanup after all captured refs and
+     importer mappings drop.
+   - Tie release-import to post-drain cleanup after all captured refs on the
+     imported handle drop.
 
 10. A2 RoCE HCOMM profile.
     - Implement HCOMM endpoint/channel setup with `COMM_PROTOCOL_ROCE`, HCOMM
@@ -193,21 +247,31 @@ fork/shm behavior working.
 | Failed dependency | Consumer of failed remote producer is not dispatched. |
 | Remote hashid mapping | Daemon resolves an outer remote-orch hashid. |
 | Remote dep key | Shared remote buffer serializes through TensorMap. |
+| Remote import eligibility | Imported peer handle makes only the importer endpoint eligible. |
+| Remote import dep key | Owner and imported views use the same owner-based TensorMap key. |
 | Raw pointer rejection | Unstaged host pointer fails before slot commit. |
 | Wire data zero | Non-zero remote TASK tensor data is rejected. |
 | HOST_INLINE desc | Inline payloads require a descriptor and bounds checks. |
 | Remote buffer copy | Host stages input, remote writes output, host pulls. |
 | Input-only free deferral | Released input buffer survives queued consumers. |
+| Import release deferral | Released import survives queued consumers, then tears down. |
+| Owner free with import | Owner free waits for live imports and captured refs. |
+| Import partial fail | Successful imports are released or marked uncertain/ineligible. |
 | Timeout | Killed session runner produces bounded failure. |
+| Health expiry idle | Expired idle endpoint is removed from schedulable set. |
+| Health expiry in-flight | Expiry fabricates failed reply/completion for in-flight work. |
 | Dynamic Python register | Import-path callable register/unregister works. |
-| Serialized gate | Serialized payloads require feature negotiation. |
+| Serialized gate | Unnegotiated serialized payload rejects without hashid install. |
 | Callable visibility | TASK with hashid works only after register reply. |
-| Register partial fail | Multi-endpoint register stays invisible. |
-| Unregister tombstone | Final unregister waits for endpoint cleanup. |
+| Prepare partial fail | Multi-endpoint register stays invisible and aborts prepared peers. |
+| Commit partial fail | Committed/uncertain endpoint hashids are cleaned or blocked. |
+| Abort cleanup fail | Only affected endpoint/hashid pair becomes cleanup-uncertain. |
+| Unregister tombstone | Final unregister keeps tombstone until endpoint cleanup. |
 | Command-lane order | TASK cannot overtake register/unregister control. |
 | Health during task | Health remains live while command lane runs a task. |
 | Callable kind gate | Unsupported kind rejects without hashid install. |
-| Dynamic inner register | Inner Python and ChipCallable hashids can run. |
+| Dynamic inner Python register | Inner Python hashid can run only inside inner Worker. |
+| Dynamic inner chip register | Inner ChipCallable hashid runs through inner chip workers. |
 | Remote registry scope | Parent TASK resolves only in dispatcher. |
 | Inner registry target | Inner Worker install is not parent-facing. |
 | Remote control parity | Register/unregister/domain reaches target registry. |
@@ -228,14 +292,13 @@ fork/shm behavior working.
 - Exact remote compatibility metadata required for serialized Python callable
   payloads beyond the local payload contract, serializer version, and Python
   ABI/runtime.
-- How endpoint health feeds scheduler-level eligibility after the transport
-  reports a failed health lane.
 - How much of `CommContext` should remain shared with PTO-ISA once remote UB
   address metadata is added, when Remote CommDomain enters scope.
 
-The first cut should land endpoint abstraction, endpoint eligibility,
-remote callable registration, failure poisoning, and the simulation runner
-before any hardware transport code.
+The current cut lands endpoint abstraction, endpoint eligibility, remote
+callable identity, remote sidecars, frame codec, failure poisoning, the
+fork-safe simulation runner, and sim buffer import/export. Hardware HCOMM
+profiles and Remote CommDomain controls remain future work.
 
 ## Failure Poisoning Contract
 

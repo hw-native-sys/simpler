@@ -51,12 +51,14 @@ L0  CORE  / AIV, AIC   ── individual compute core (hardware-managed)
   composed of Orchestrator + Scheduler + Worker pool. Communication via IPC
   (fork + shm for today's L3 and for local recursive L4+ composition).
   Cross-host L4/L5/L6 composition, where a parent schedules a remote L3
-  endpoint over RoCE/HCCS/UB/sockets, is a proposed extension.
+  endpoint over RoCE/HCCS/UB/sockets, now has the local endpoint/eligibility
+  boundary and socket-backed simulation session runner implemented; HCOMM
+  hardware profiles are still pending.
 
 | Level | Workers it contains | Status |
 | ----- | ------------------- | ------ |
 | L3 (Host) | `ChipWorker` ×N + `SubWorker` ×M | Implemented |
-| L4 (Pod) | `Worker(level=3)` ×N + `SubWorker` ×M | Local-only implemented; remote proposed |
+| L4 (Pod) | `Worker(level=3)` ×N + `SubWorker` ×M | Local implemented; remote sim implemented; HCOMM profiles pending |
 | L5 (SuperNode) | `Worker(level=4)` ×N | Local L4 code path, untested; remote proposed |
 | L6 (Cluster) | `Worker(level=5)` ×N | Local L4 code path, untested; remote proposed |
 
@@ -79,7 +81,9 @@ first argument of `submit_*`. Runs single-threaded on the user's thread.
 Owns:
 
 - `Ring` — fixed-size slot pool, allocates with back-pressure
-- `TensorMap` — `tensor_base_ptr → producer_slot` lookup, drives automatic dep inference
+- `TensorMap` — tensor dependency key to producer slot lookup, drives automatic
+  dep inference. Local keys contain a pointer; remote keys contain buffer
+  identity and logical offset.
 - `Scope` — lifetime management for intermediate tensors
 
 One `submit_next_level(callable, task_args, config)` call:
@@ -112,7 +116,7 @@ The **execution layer**. `WorkerManager` holds two pools of `WorkerThread`s
 (next-level pool and sub pool). Each `WorkerThread` owns one std::thread that
 encodes `(callable, config, args_blob)` into a `MAILBOX_SIZE`-byte shared
 memory region, signals the pre-forked Python child, and spin-polls
-`TASK_DONE`.
+  `TASK_DONE`, returning an explicit completion outcome to the Scheduler.
 
 - Next-level (chip) children run `_chip_process_loop`, which constructs a
   `ChipWorker` and dispatches each kernel through it.
@@ -147,10 +151,10 @@ what flows through `ChipWorker::run`.
                  │                                 │ wt.dispatch(slot_id) ──────► WorkerThread
                  │                                 │                              encode mailbox → spin-poll TASK_DONE
                  │                                 │                              (blocking; child runs the kernel)
-                 │                                 │◄── completion_queue ────── on_complete_(slot_id)
+                 │                                 │◄── completion_queue ────── on_complete_(completion)
                  │                                 │ on_task_complete:
-                 │                                 │   fanout release
-                 │                                 │   wake downstream
+                 │                                 │   success → COMPLETED
+                 │                                 │   failure → FAILED + poison downstream
                  │                                 │   try_consume → ring release
                  │ drain() ◄── notify when all done │
 ```
@@ -161,7 +165,7 @@ Communication channels:
 | ---- | --------- | ------- |
 | Orch → Scheduler | wiring_queue (mutex + CV) | slot id |
 | Scheduler → WorkerThread | WorkerThread internal queue | slot id |
-| WorkerThread → Scheduler | completion_queue (mutex + CV) | slot id |
+| WorkerThread → Scheduler | completion_queue (mutex + CV) | slot id + group index + outcome |
 | WorkerThread ↔ child | shm mailbox (state + error + task data) | encoded blob |
 | Python ↔ C++ | nanobind bindings | TaskArgs / CallConfig / callable handle |
 | Tensor data | `torch.share_memory_()` or host malloc | zero-copy shared address |
@@ -227,7 +231,7 @@ walk-through.
 | Callable registration | owns handle/hashid registries and child-local Python dispatch mappings | — |
 | Orchestration DAG | user's orch fn, `submit_*` calls | `Orchestrator::submit_*` engine |
 | Scheduling | — | `Scheduler` thread, queues, `WorkerThread` pool |
-| Dispatch | — | `WorkerThread::dispatch_process`, mailbox IPC |
+| Dispatch | — | `WorkerThread::dispatch` → `WorkerEndpoint::run`, mailbox IPC for local endpoints |
 | Runtime execution | — | `ChipWorker` via dlsym'd runtime `.so` |
 
 Python handles **when** things happen (fork ordering, lifecycle). C++ handles
@@ -289,6 +293,8 @@ device allocation algorithm.
 | `src/common/hierarchical/orchestrator.{h,cpp}` | `Orchestrator`: submit, TensorMap, Scope |
 | `src/common/hierarchical/scheduler.{h,cpp}` | `Scheduler`: dispatch loop + queues |
 | `src/common/hierarchical/worker_manager.{h,cpp}` | `WorkerManager` + `WorkerThread`: pool, mailbox-IPC dispatch |
+| `src/common/hierarchical/remote_endpoint.{h,cpp}` | `RemoteL3Endpoint` transport-neutral TASK/COMPLETION boundary |
+| `src/common/hierarchical/remote_wire.{h,cpp}` | Versioned remote L3 frame codec |
 | `src/common/hierarchical/worker.{h,cpp}` | `Worker` (L3+): composes the above |
 | `src/common/hierarchical/ring.{h,cpp}` | slot allocator |
 | `src/common/hierarchical/tensormap.{h,cpp}` | base_ptr → producer slot |

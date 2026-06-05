@@ -60,6 +60,7 @@ to C++:
 | ------- | --------- | ----------------- |
 | `w3.submit_next_level(handle, …)` dispatched to a chip child | `LOCAL_CHIP` | child resolves digest to its private chip slot, then calls `ChipWorker::run(local_slot, …)` |
 | `w4.submit_next_level(handle, …)` dispatched to an L3 `Worker` child | `LOCAL_PYTHON` | child resolves digest to an orchestration function and calls `inner_worker.run(orch_fn, …)` |
+| remote `w4.submit_next_level(handle, …)` dispatched to remote L3 | `REMOTE_TASK_DISPATCHER` | remote endpoint resolves digest in its dispatcher registry and calls its embedded L3 Worker |
 | `w3.submit_sub(handle, …)` dispatched to a SUB child | `LOCAL_PYTHON` | child resolves digest to a Python callable and calls `fn(args)` |
 
 All three paths share one mailbox wire format: `MAILBOX_OFF_CALLABLE` is
@@ -82,6 +83,9 @@ registration uses explicit descriptors: required `PYTHON_IMPORT` paths,
 optional negotiated PR #839 serialized Python callable payloads, and
 `CHIP_CALLABLE` payloads for inner L3 chip work. A remote callable identity
 becomes visible only after the selected endpoint replies success.
+The current Python surface implements `RemoteCallable("module:qualname")` as
+the required `PYTHON_IMPORT` baseline and requires an explicit `workers=[...]`
+list naming remote endpoint ids.
 
 ---
 
@@ -108,6 +112,13 @@ public:
 
 `TensorArgType` has five values (matches existing `tensor_arg.h:53-59`):
 `INPUT`, `OUTPUT`, `INOUT`, `OUTPUT_EXISTING`, `NO_DEP`.
+
+For remote L3 submits, public Python uses `RemoteTaskArgs` as a wrapper around
+the same `TaskArgs` builder. Each `RemoteTensorRef` appends a normal
+`ContinuousTensor` metadata entry with `data == 0` plus a hidden remote
+sidecar at the same tensor index. The local mailbox path rejects non-empty
+remote sidecars; the remote framed path encodes the sidecar as a
+`RemoteTensorDescWire`.
 
 ### Representation at each phase
 
@@ -169,7 +180,7 @@ View does **not** own memory. Valid for the duration of a single
      ▼
 ② slot.task_args: TaskArgs           — parent heap, stored in slot
      │
-     │ WorkerThread::dispatch_process: memcpy into shm mailbox blob
+     │ LocalMailboxEndpoint::run: memcpy into shm mailbox blob
      │   layout = [int32 T][int32 S][ContinuousTensor × T][uint64 × S]
      ▼
 ③ shm mailbox bytes (MAP_SHARED)     — visible to forked child
@@ -199,6 +210,7 @@ struct CallConfig {
     int32_t enable_dump_tensor = 0;
     int32_t enable_pmu = 0;           // 0 = disabled; >0 selects PMU event type
     int32_t enable_dep_gen = 0;
+    int32_t enable_scope_stats = 0;
     char    output_prefix[1024] = {};
     // future fields here - same POD used at all levels
 };
@@ -208,10 +220,13 @@ Propagated by value throughout:
 
 1. User builds `CallConfig` and passes into `submit_next_level`
 2. Orchestrator stores it inline in `slot.config` (POD copy)
-3. Dispatch: `WorkerThread::dispatch_process` memcpys the slot's `CallConfig`
+3. Dispatch: `LocalMailboxEndpoint::run` memcpys the slot's `CallConfig`
    into the shm mailbox
-4. Child reads `CallConfig` from mailbox by value
-5. `ChipWorker::run` receives `const CallConfig&`; passed on to
+4. Remote dispatch: `RemoteL3Endpoint::run` encodes the fields into
+   `CallConfigWire` instead of memcpying the POD
+5. Child reads `CallConfig` from mailbox by value, or the remote session
+   runner reconstructs it from `CallConfigWire`
+6. `ChipWorker::run` receives `const CallConfig&`; passed on to
    `pto2_run_runtime` at the L2 edge
 
 Same type at every level. Used directly at the L2 runtime ABI.
@@ -362,16 +377,18 @@ reclaim independently of outer-scope tasks. See
 ## 8. Data flow on completion
 
 When the child finishes the kernel, it writes `TASK_DONE` to the mailbox;
-the parent's `WorkerThread::dispatch_process` exits its spin-poll and
-calls `on_complete_(slot_id)`, which pushes the slot onto
-`Scheduler::completion_queue_`.
+`LocalMailboxEndpoint::run` exits its spin-poll, reads the mailbox error
+fields, and returns a `WorkerCompletion`. `MAILBOX_OFF_ERROR == 0` maps to
+success; a non-zero child error maps to task failure. The parent
+`WorkerThread` pushes that completion onto `Scheduler::completion_queue_`.
 
 At this point:
 
 - Tensor output data is already written to shm (kernel wrote via
   `ContinuousTensor.data` pointer → shm page visible to parent)
-- Control returns to the Scheduler, which releases fanout refs and wakes
-  downstream consumers
+- Control returns to the Scheduler, which marks the slot `COMPLETED` on
+  success or `FAILED` on task/endpoint failure, then releases fanout refs and
+  either wakes or poisons downstream consumers
 
 For the completion-side mechanics (fanout release, `try_consume`, ring
 release), see [scheduler.md](scheduler.md) §6.
@@ -382,8 +399,8 @@ release), see [scheduler.md](scheduler.md) §6.
 
 A higher-level `Worker` registers a lower-level `Worker` as a
 NEXT_LEVEL child via a mailbox just like L3 does for `ChipWorker`. The
-parent side is uniform — `WorkerThread::dispatch_process` doesn't care
-what kind of child is on the other end of the mailbox. The forked
+parent side is uniform — `WorkerThread` calls the endpoint `run()` contract and
+doesn't care what kind of child is on the other end. The local forked
 child runs `_child_worker_loop`, which resolves each dispatched digest and
 delegates to
 `inner_worker.run(...)` — i.e. another full scheduling engine inside.
@@ -453,7 +470,7 @@ L4 parent process
 | 8 | L3 sub child | child resolves digest to its local Python callable and executes `verify_result()` |
 | 9 | L3 drain | all L3 tasks complete; `scope_end` + `drain` return |
 | 10 | L3 child | `inner_worker.run()` returns; `_child_worker_loop` writes `TASK_DONE` |
-| 11 | L4 WorkerThread | sees `TASK_DONE`; calls `on_complete_(slot)` |
+| 11 | L4 LocalMailboxEndpoint | sees `TASK_DONE`; returns success completion |
 | 12 | L4 drain | L4 scope_end + drain; `w4.run()` returns |
 
 Each level's orch fn receives **its own** `Orchestrator` — the recursion is
@@ -502,7 +519,7 @@ Step-by-step (one chip worker):
 | 7 | `ChipWorker::run` | assemble `ChipStorageTaskArgs` POD (memcpy view); call `pto2_run_runtime(local_slot, &chip_storage, &cfg)` |
 | 8 | runtime.so | translate host ptrs → device ptrs; dispatch AICPU / AICore; write output into `c`'s shm |
 | 9 | chip_0 child | `run` returns; write `TASK_DONE` |
-| 10 | WT_chip_0 parent | see `TASK_DONE`; call `on_complete_(slot)` |
+| 10 | WT_chip_0 parent | see `TASK_DONE`; push success completion |
 | 11 | Scheduler | mark slot COMPLETED; fanout release (none in this DAG); scope_end will release scope ref |
 | 12 | `Worker::run` returns | user's `w3.run(...)` returns; `c` contains result in shm, visible to user |
 

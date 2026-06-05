@@ -26,6 +26,50 @@ The current implementation uses pre-forked local child processes and a
 registries, identical virtual addresses for `MAP_SHARED` regions, and
 parent-visible child PIDs. None of those assumptions holds across hosts.
 
+## Current Implementation Status
+
+The local PR #866 cut has landed the transport-neutral runtime boundary, but
+not the production daemon/HCOMM backends.
+
+Implemented:
+
+- `WorkerEndpoint` with `LocalMailboxEndpoint` and `RemoteL3Endpoint`.
+  `LocalMailboxEndpoint` keeps the existing 4096-byte mailbox local-only.
+  `RemoteL3Endpoint` encodes versioned TASK frames through a
+  `RemoteL3Transport` interface and waits for matching COMPLETION frames.
+- Explicit endpoint outcomes: success, task failure, endpoint failure, and
+  skipped group members. Failed producers poison downstream consumers instead
+  of completing successfully.
+- Stable NEXT_LEVEL `endpoint_id` metadata, submit-time endpoint eligibility,
+  worker affinity validation against eligibility, and Scheduler selection from
+  only eligible idle endpoints.
+- C++ remote tensor sidecars, remote-aware `TensorKey` values, and submit-time
+  rejection of remote sidecars against local endpoints, bare host pointers, and
+  remote null OUTPUT tensors without a sidecar.
+- Python `RemoteCallable("module:qualname")`, `PYTHON_IMPORT`, and
+  `REMOTE_TASK_DISPATCHER` callable identity. Registration requires an
+  explicit `workers=[...]` list naming ids returned by `add_remote_worker()`.
+- Python `RemoteBufferHandle`, `RemoteTensorRef`, and `RemoteTaskArgs`
+  wrappers. They keep `ContinuousTensor.data == 0` and carry the remote
+  descriptor sidecar into C++ submit.
+- Canonical little-endian `remote_wire.{h,cpp}` frame codec with bounds checks
+  for TASK payloads, remote tensor descriptors, COMPLETION, CONTROL_REPLY, and
+  ordered command-lane sequencing.
+- Socket-backed simulation remote sessions via `simpler-remote-worker` and
+  `simpler-remote-l3-session`, including `HELLO READY`, TASK/COMPLETION,
+  CONTROL/CONTROL_REPLY, SHUTDOWN, and an independent health lane.
+- Simulation remote buffer allocation, copy, export, import, release-import,
+  imported-handle scheduling eligibility, and deferred owner free.
+- Registry-scope-aware remote callable manifest/control install for dispatcher
+  `PYTHON_IMPORT`, inner `PYTHON_IMPORT`, and inner inline `CHIP_CALLABLE`.
+
+Still pending:
+
+- A2 RoCE, A3 HCCS, and A5 UB HCOMM profiles.
+- Remote `CommDomain` allocation/import and hardware-gated validation.
+- Negotiated `PYTHON_SERIALIZED` remote callable payloads and staged
+  `CHIP_CALLABLE` blob adapters.
+
 ## Scope
 
 Goals:
@@ -319,6 +363,18 @@ include inner Worker registry entries in the bootstrap manifest or send
 registry-scoped controls to install them, but it does not receive or submit a
 parent-facing handle whose resolver scope is `INNER_L3_WORKER`.
 
+Post-bootstrap inner registry controls use the same prepare/commit/abort and
+final-unregister visibility rules as dispatcher registration. `CHIP_CALLABLE`
+is valid only for `INNER_L3_WORKER`; the remote payload carries bounded inline
+blob bytes or a session-local staged blob token, never a parent-local POSIX
+shm name. A successful inner install makes the hashid visible only to
+`inner_worker = Worker(level=3)` and its chip/sub dispatch paths.
+Remote orchestration code that needs a post-bootstrap inner handle resolves
+the installed hashid through the session-runner-local
+`simpler.remote_l3_session.get_inner_handle(hashid)` helper. That helper
+returns a `CallableHandle` owned by the embedded `inner_worker`; it does not
+publish an `INNER_L3_WORKER` resolver scope to the parent.
+
 ## Remote Worker Session
 
 The parent generates a bootstrap manifest and sends it to the
@@ -338,8 +394,8 @@ callable registry:
     hashid -> remote L3 orch callable descriptor
       descriptor = PYTHON_IMPORT or negotiated PYTHON_SERIALIZED
   inner L3 Worker registry:
-    hashid -> ChipCallable blob metadata, when needed
-    hashid -> Python sub/orch callable descriptor, when needed
+    hashid -> ChipCallable register payload, when needed
+    hashid -> Python import descriptor, when needed
 comm policy: roce | hccs | ub | sim
 feature flags
 ```
@@ -348,8 +404,12 @@ The session runner installs the remote TASK dispatcher registry for parent
 TASK frames. It installs the inner registry into
 `inner_worker = Worker(level=3)` during prestart and before `HELLO READY`.
 `INNER_L3_WORKER` is a remote-internal install target in manifests and
-controls, not a parent-facing `CallableHandle` resolver scope. Remote controls
-may add or remove entries in either registry location after bootstrap:
+controls, not a parent-facing `CallableHandle` resolver scope.
+`inner_l3_worker` manifest entries use the same target/kind matrix and
+validation rules as `PREPARE_REGISTER_CALLABLE`: `PYTHON_IMPORT` entries carry
+`target = "module:qualname"` and inline `CHIP_CALLABLE` entries carry the
+versioned remote chip callable payload as `payload_hex`. Remote controls may
+add or remove entries in either registry location after bootstrap:
 
 - registering a remote TASK dispatcher Python callable changes what future L4
   TASK frames can dispatch on this remote endpoint;
@@ -389,6 +449,10 @@ Session execution rules:
   session has an independent health lane or equivalent transport-level health
   signal so a long-running `inner_worker.run()` does not look like endpoint
   failure merely because queued command-lane frames cannot be serviced.
+- Health expiry removes the endpoint from scheduler eligibility for the
+  current session. In-flight TASK/CONTROL waits receive fabricated failed
+  completions or replies; idle failed endpoints are not automatically re-added
+  by later health frames.
 
 ## Remote TaskArgs Representation
 
@@ -465,6 +529,16 @@ Remote buffers need an owner, generation, and deferred physical free. The
 parent owns the visible handle state; the session runner owns remote physical
 memory and imported mappings.
 
+The v1 peer-buffer model separates owner allocations from imported mappings.
+`EXPORT_BUFFER` runs on the owner endpoint and returns an opaque
+session-scoped descriptor. `IMPORT_BUFFER` runs on the importer endpoint and
+creates an importer-local mapping handle. `RELEASE_IMPORT` tears down only that
+importer-local mapping; owner physical free waits until imports and captured
+slot refs have drained. Imported handles keep the original owner
+`(owner_endpoint_id, buffer_id, generation, offset)` as the dependency
+identity, so owner and peer views of the same logical buffer range serialize
+through the same TensorMap key.
+
 See
 [buffers-and-transports.md](remote-l3-worker-design/buffers-and-transports.md)
 for the handle schema, control commands, release policy, and A2/A3/A5 backend
@@ -497,16 +571,23 @@ remote tensor descriptors, ordering, and bounds-checking requirements.
 
 The recommended first cut is conservative:
 
-1. Land the endpoint abstraction and local adapter.
+1. Land the endpoint abstraction and local adapter. **Implemented.**
 2. Add remote tensor sidecars and endpoint eligibility metadata.
+   **Implemented for C++ submit, Python `RemoteTaskArgs`, owner buffers, and
+   imported simulation buffers.**
 3. Add the versioned frame codec and the independent health-lane contract.
+   **Implemented for the socket-backed simulation transport.**
 4. Add remote callable registration with all-or-nothing multi-endpoint
-   visibility and final-unregister cleanup.
+   visibility and final-unregister cleanup. **Implemented for dispatcher
+   `PYTHON_IMPORT`, inner `PYTHON_IMPORT`, and inner inline
+   `CHIP_CALLABLE`.**
 5. Add the fork-safe simulation session runner with explicit prestart before
-   `HELLO READY`.
+   `HELLO READY`. **Implemented.**
 6. Prove local behavior is unchanged and remote sim behavior handles success,
    failure, hashid mapping, timeouts, health, and buffer cleanup.
+   **Focused Python remote sim and C++ no-hardware UT coverage is present.**
 7. Add A2 RoCE, A3 HCCS, and A5 UB profiles behind the HCOMM adapter layer.
+   **Pending.**
 
 See
 [implementation-plan.md](remote-l3-worker-design/implementation-plan.md)
