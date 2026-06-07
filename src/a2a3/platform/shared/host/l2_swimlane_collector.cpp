@@ -817,6 +817,9 @@ int L2SwimlaneCollector::export_swimlane_json() {
             return "unknown";
         };
 
+        auto emit_depth_array = [&outfile](const char *key, const int16_t arr[L2SWIMLANE_NUM_QUEUE_SHAPES]) {
+            outfile << ", \"" << key << "\": [" << arr[0] << "," << arr[1] << "," << arr[2] << "]";
+        };
         outfile << ",\n  \"aicpu_scheduler_phases\": [\n";
         for (size_t t = 0; t < collected_sched_phase_records_.size(); t++) {
             outfile << "    [";
@@ -829,6 +832,11 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 if (pr.kind == L2SwimlaneSchedPhaseKind::Dispatch) {
                     outfile << ", \"pop_hit\": " << pr.pop_hit << ", \"pop_miss\": " << pr.pop_miss;
                 }
+                // Queue-depth snapshots — [AIC, AIV, MIX] per L2SwimlaneAicpuSchedPhaseRecord docstring.
+                emit_depth_array("local_at_start", pr.local_depth_at_start);
+                emit_depth_array("shared_at_start", pr.shared_depth_at_start);
+                emit_depth_array("local_at_end", pr.local_depth_at_end);
+                emit_depth_array("shared_at_end", pr.shared_depth_at_end);
                 outfile << "}";
                 first = false;
             }

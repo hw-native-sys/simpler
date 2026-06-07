@@ -797,7 +797,8 @@ static Record *acquire_phase_slot(
 
 void l2_swimlane_aicpu_record_sched_phase(
     int thread_idx, L2SwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint32_t tasks_processed, uint32_t pop_hit, uint32_t pop_miss
+    uint32_t tasks_processed, uint32_t pop_hit, uint32_t pop_miss, const int16_t *local_at_start,
+    const int16_t *shared_at_start, const int16_t *local_at_end, const int16_t *shared_at_end
 ) {
     if (!s_phase_initialized) return;
     auto *state = s_sched_phase_pools[thread_idx];
@@ -820,6 +821,19 @@ void l2_swimlane_aicpu_record_sched_phase(
     record->tasks_processed = tasks_processed;
     record->pop_hit = pop_hit;
     record->pop_miss = pop_miss;
+    auto copy_snapshot = [](int16_t dst[L2SWIMLANE_NUM_QUEUE_SHAPES], const int16_t *src) {
+        if (src == nullptr) {
+            for (int i = 0; i < L2SWIMLANE_NUM_QUEUE_SHAPES; i++)
+                dst[i] = 0;
+        } else {
+            for (int i = 0; i < L2SWIMLANE_NUM_QUEUE_SHAPES; i++)
+                dst[i] = src[i];
+        }
+    };
+    copy_snapshot(record->local_depth_at_start, local_at_start);
+    copy_snapshot(record->shared_depth_at_start, shared_at_start);
+    copy_snapshot(record->local_depth_at_end, local_at_end);
+    copy_snapshot(record->shared_depth_at_end, shared_at_end);
 }
 
 void l2_swimlane_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }

@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import bisect
 import importlib.util
 import json
 import sys
@@ -993,6 +994,57 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             "dispatch": "terrible",  # red
         }
 
+        # Per-complete subtask-finish counts surface "how many AICore FINs
+        # did the AICPU poll in this phase" — useful context that
+        # tasks_processed (logical task count) doesn't convey. Computed
+        # with "phase contains finish_us" semantics so it matches how the
+        # AICPU actually attributes finishes to its polling windows.
+        complete_phases_by_thread_pre = []
+        complete_starts_by_thread_pre = []
+        for thread_records in scheduler_phases:
+            sorted_completes = sorted(
+                (r for r in thread_records if r.get("phase") == "complete"),
+                key=lambda r: r["start_time_us"],
+            )
+            complete_phases_by_thread_pre.append(sorted_completes)
+            complete_starts_by_thread_pre.append([c["start_time_us"] for c in sorted_completes])
+
+        def _find_containing_complete(thread_idx: int, finish_us: float):
+            # Bisect into the per-thread sorted start_time_us list. Complete
+            # phases on a thread don't overlap, so the only complete that can
+            # CONTAIN finish_us is the last one whose start is <= finish_us
+            # (= entry at idx-1 after bisect_right). Fall back to the next
+            # starting complete (entry at idx) if it doesn't contain.
+            phases = complete_phases_by_thread_pre[thread_idx]
+            starts = complete_starts_by_thread_pre[thread_idx]
+            if not phases:
+                return None
+            idx = bisect.bisect_right(starts, finish_us)
+            if idx > 0:
+                prev_c = phases[idx - 1]
+                if prev_c["start_time_us"] <= finish_us <= prev_c["end_time_us"]:
+                    return prev_c
+            if idx < len(phases):
+                return phases[idx]
+            return None
+
+        finishes_per_complete: dict[int, int] = defaultdict(int)
+        if core_to_thread:
+            for t in tasks:
+                f_us = t.get("finish_time_us")
+                if f_us is None or f_us < 0:
+                    continue
+                t_cid = t["core_id"]
+                if t_cid >= len(core_to_thread):
+                    continue
+                t_thr = core_to_thread[t_cid]
+                if t_thr < 0 or t_thr >= len(complete_phases_by_thread_pre):
+                    continue
+                t_comp = _find_containing_complete(t_thr, f_us)
+                if t_comp is None:
+                    continue
+                finishes_per_complete[id(t_comp)] += 1
+
         for thread_idx, thread_records in enumerate(scheduler_phases):
             tid = 3000 + thread_idx
 
@@ -1020,16 +1072,57 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 dur = end_us - start_us
                 tasks_processed = record.get("tasks_processed", 0)
 
+                # Queue-depth snapshot fields. Layout per
+                # L2SwimlaneAicpuSchedPhaseRecord docstring: [AIC, AIV, MIX].
+                local_at_start = record.get("local_at_start")
+                local_at_end = record.get("local_at_end")
+                shared_at_start = record.get("shared_at_start")
+                shared_at_end = record.get("shared_at_end")
+                depths_valid = (
+                    isinstance(local_at_start, list)
+                    and isinstance(local_at_end, list)
+                    and isinstance(shared_at_start, list)
+                    and isinstance(shared_at_end, list)
+                    and len(local_at_start) == 3
+                    and len(local_at_end) == 3
+                    and len(shared_at_start) == 3
+                    and len(shared_at_end) == 3
+                )
+
+                # Phase block. When queue depths are present, fold them into
+                # args so hover on a complete/dispatch bar surfaces the
+                # before/after queue state alongside the phase metadata.
+                phase_args = {
+                    "phase": phase,
+                    "loop_iter": record.get("loop_iter", 0),
+                    "tasks_processed": tasks_processed,
+                }
+                if depths_valid:
+                    # Perfetto's args SQL parses key names; `[...]` looks like
+                    # an array-index op and crashes the details-panel query.
+                    # Encode the AIC/AIV/MIX layout inline so the key stays
+                    # parser-safe while still self-documenting.
+                    phase_args.update(
+                        {
+                            f"T{thread_idx}_local_at_start (aic,aiv,mix)": list(local_at_start),
+                            f"T{thread_idx}_local_at_end (aic,aiv,mix)": list(local_at_end),
+                            "shared_at_start (aic,aiv,mix)": list(shared_at_start),
+                            "shared_at_end (aic,aiv,mix)": list(shared_at_end),
+                        }
+                    )
+                if phase == "complete":
+                    # finishes_processed kept in args (hover) for forensics —
+                    # SPMD cases where one logical task has N subtask FINs
+                    # observed in the phase. Label stays minimal.
+                    finishes_count = finishes_per_complete.get(id(record), 0)
+                    phase_args["finishes_processed"] = finishes_count
+                display_name = f"{phase}({tasks_processed})"
                 events.append(
                     {
-                        "args": {
-                            "phase": phase,
-                            "loop_iter": record.get("loop_iter", 0),
-                            "tasks_processed": tasks_processed,
-                        },
+                        "args": phase_args,
                         "cat": "scheduler",
                         "cname": phase_colors.get(phase, "generic_work"),
-                        "name": f"{phase}({tasks_processed})",
+                        "name": display_name,
                         "ph": "X",
                         "pid": 3,
                         "tid": tid,
@@ -1037,6 +1130,69 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                         "dur": dur,
                     }
                 )
+
+                # Queue-depth counter tracks (Perfetto "ph": "C"). Emit ONE
+                # sample per phase at its end_us — phase N's end is phase N+1's
+                # start, so emitting both is redundant. Two samples at the
+                # SAME ts (e.g. final-drain emit where start_time==end_time)
+                # also breaks Perfetto's rate calc (divide-by-zero → NULL).
+                # Track name carries thread index so it reads standalone
+                # even with the thread tree collapsed.
+                if not depths_valid:
+                    continue
+                local_track_name = f"local_ready_buf_T{thread_idx}"
+                events.append(
+                    {
+                        "args": {"AIC": local_at_end[0], "AIV": local_at_end[1], "MIX": local_at_end[2]},
+                        "cat": "queue",
+                        "name": local_track_name,
+                        "ph": "C",
+                        "pid": 3,
+                        "tid": tid,
+                        "ts": end_us,
+                    }
+                )
+                # Shared queue: dedicated tid 3999 so all 3 schedulers'
+                # snapshots compose onto one timeline (it's the same global
+                # queue regardless of who sampled it). Samples from different
+                # threads at slightly different ts are fine — Perfetto plots
+                # them in time order to render the step function.
+                events.append(
+                    {
+                        "args": {"AIC": shared_at_end[0], "AIV": shared_at_end[1], "MIX": shared_at_end[2]},
+                        "cat": "queue",
+                        "name": "shared_ready_queue",
+                        "ph": "C",
+                        "pid": 3,
+                        "tid": 3999,
+                        "ts": end_us,
+                    }
+                )
+
+        # Name the shared-queue pseudo-thread + give it a sort index that
+        # places it after the 3 scheduler threads but still inside the
+        # AICPU Scheduler process row, so the user reads top-to-bottom:
+        # Sched_0 / Sched_1 / Sched_2 / Shared queue (global).
+        events.append(
+            {
+                "args": {"name": "shared_ready_queue (global)"},
+                "cat": "__metadata",
+                "name": "thread_name",
+                "ph": "M",
+                "pid": 3,
+                "tid": 3999,
+            }
+        )
+        events.append(
+            {
+                "args": {"sort_index": 100},
+                "cat": "__metadata",
+                "name": "thread_sort_index",
+                "ph": "M",
+                "pid": 3,
+                "tid": 3999,
+            }
+        )
 
     # AICPU Orchestrator lane (l2_swimlane_level >= 4)
     #
@@ -1166,6 +1322,222 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                         flow_f["bind_id"] = dst_aicpu_eid
                     events.append(flow_f)
 
+                    flow_id += 1
+
+    # Complete-phase flow arrows. The complete phase wraps the AICPU's
+    # completion-polling loop: it observes AICore subtask FINs, increments
+    # the slot's per-task subtask counter, and on the LAST subtask of a
+    # logical task it walks the fanout list and releases each consumer's
+    # fanin refcount. The arrows are built in two stages.
+    #
+    # Inbound: per-task, NOT per-subtask. A task is logically "completed"
+    # only when its LAST subtask is observed (the one that triggers
+    # phase_complete_count++ in firmware). For SPMD with N subtasks across
+    # N cores, the earlier N-1 subtasks just bump the slot's
+    # completed_subtasks counter inside whatever complete phase happened to
+    # poll them; only the LAST subtask's finish actually completes the
+    # task. So per task: take max(finish_time_us) across its subtasks, find
+    # the complete phase that CONTAINS that time, draw one arrow from that
+    # subtask's core lane to the complete phase start.
+    #
+    # Outbound: per-consumer, gated on full fanin. Each consumer in
+    # deps.json has multiple producer fanin edges; refcount += 1 fires
+    # whenever ANY producer's complete walks its fanout, but the consumer
+    # only becomes ready when ALL producers have completed. The complete
+    # that triggers the LAST refcount bump is the one that "released" the
+    # consumer — that's the causal edge. Compute by walking complete
+    # phases in temporal order and tracking each consumer's satisfied
+    # fanin count.
+    if scheduler_phases and core_to_thread:
+        complete_phases_by_thread = []
+        complete_starts_by_thread = []
+        for thread_records in scheduler_phases:
+            sorted_completes = sorted(
+                (r for r in thread_records if r.get("phase") == "complete"),
+                key=lambda r: r["start_time_us"],
+            )
+            complete_phases_by_thread.append(sorted_completes)
+            complete_starts_by_thread.append([c["start_time_us"] for c in sorted_completes])
+
+        # Group subtask records by task_id; SPMD tasks have multiple rows.
+        tasks_by_id: dict[int, list[dict]] = defaultdict(list)
+        for t in tasks:
+            tasks_by_id[t["task_id"]].append(t)
+
+        # For each task: completion = LAST subtask's finish observation.
+        # The owning thread is determined by core_to_thread of that last
+        # subtask's core — typical case is the same thread observed
+        # earlier subtasks too, but we don't assume. The source anchor for
+        # the flow arrow is the last subtask's AICore slice (its end_us)
+        # so the user can click the AICore task block in Perfetto and see
+        # the outbound complete arrow.
+        task_to_complete: dict[int, dict] = {}
+        task_last_subtask: dict[int, tuple[float, float, int]] = {}  # tid -> (last_end_us, last_finish_us, core_id)
+        for tid, recs in tasks_by_id.items():
+            valid_finishes = [
+                (r.get("finish_time_us"), r.get("end_time_us"), r["core_id"])
+                for r in recs
+                if r.get("finish_time_us") is not None and r["finish_time_us"] >= 0 and r.get("end_time_us") is not None
+            ]
+            if not valid_finishes:
+                continue
+            last_finish_us, last_end_us, last_cid = max(valid_finishes, key=lambda x: x[0])
+            if last_cid >= len(core_to_thread):
+                continue
+            owning_thread = core_to_thread[last_cid]
+            if owning_thread < 0 or owning_thread >= len(complete_phases_by_thread):
+                continue
+            task_last_subtask[tid] = (last_end_us, last_finish_us, last_cid)
+            # Find the complete phase that CONTAINS this last_finish_us.
+            # Fall back to the next-starting complete if none contains
+            # (rare: AICore reported the finish but the scheduler hadn't
+            # entered its next complete phase by run end). Bisect for O(log N).
+            chosen = None
+            phases = complete_phases_by_thread[owning_thread]
+            starts = complete_starts_by_thread[owning_thread]
+            if phases:
+                idx = bisect.bisect_right(starts, last_finish_us)
+                if idx > 0:
+                    prev_c = phases[idx - 1]
+                    if prev_c["start_time_us"] <= last_finish_us <= prev_c["end_time_us"]:
+                        chosen = prev_c
+                if chosen is None and idx < len(phases):
+                    chosen = phases[idx]
+            if chosen is not None:
+                task_to_complete[tid] = chosen
+
+        # ---- Inbound: one arrow per task, anchored on the AICore slice ----
+        # Source ts = end_us - epsilon so it lands INSIDE the AICore task
+        # X event (last subtask of this task on its core). Without this
+        # anchoring Perfetto can't bind the flow to a slice and the arrow
+        # is invisible when you click the task. Same convention as the
+        # existing `dependency` arrows.
+        FLOW_EPSILON_US = 0.01
+        for tid, comp in task_to_complete.items():
+            last_end_us, _last_finish_us, last_cid = task_last_subtask[tid]
+            src_tid = core_to_tid[last_cid]
+            owning_thread = core_to_thread[last_cid]
+            dst_tid = 3000 + owning_thread
+            events.append(
+                {
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "complete",
+                    "ph": "s",
+                    "pid": 1,
+                    "tid": src_tid,
+                    "ts": last_end_us - FLOW_EPSILON_US,
+                }
+            )
+            events.append(
+                {
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "complete",
+                    "ph": "f",
+                    "pid": 3,
+                    "tid": dst_tid,
+                    "ts": comp["start_time_us"],
+                    "bp": "e",
+                }
+            )
+            flow_id += 1
+
+        # ---- Outbound: per-consumer, gated on full fanin ----
+        if deps_edges is not None:
+            # Invert deps_edges to consumer → predecessors for fanin counting.
+            preds_for_consumer: dict[int, list[int]] = defaultdict(list)
+            for pred, succs in deps_edges.items():
+                for succ in succs:
+                    preds_for_consumer[succ].append(pred)
+            fanin_total = {c: len(preds) for c, preds in preds_for_consumer.items()}
+            fanin_satisfied: dict[int, int] = defaultdict(int)
+
+            # Reverse map: complete_phase id → list of task_ids it completed.
+            complete_to_tasks: dict[int, list[int]] = defaultdict(list)
+            for tid, comp in task_to_complete.items():
+                complete_to_tasks[id(comp)].append(tid)
+
+            # Walk completes in temporal order (by end_time). Within each,
+            # walk the tasks it completed; for each completed task, bump
+            # its consumers' satisfied fanin. The complete that pushes a
+            # consumer's satisfied count to its total is the one that
+            # released that consumer.
+            all_completes = []
+            for thr_idx, phases in enumerate(complete_phases_by_thread):
+                for p in phases:
+                    all_completes.append((p["end_time_us"], thr_idx, p))
+            # Explicit key restricts the comparison to (end_time_us, thr_idx).
+            # Without it, ties in both fields fall through to comparing the
+            # third element (a dict), which raises TypeError in Python 3.
+            all_completes.sort(key=lambda x: (x[0], x[1]))
+
+            # Earliest dispatch per task_id (for arrow target).
+            earliest_dispatch_us: dict[int, tuple[float, int]] = {}
+            for tid, recs in tasks_by_id.items():
+                valid = [
+                    (r.get("dispatch_time_us"), r["core_id"])
+                    for r in recs
+                    if r.get("dispatch_time_us") is not None and r["dispatch_time_us"] >= 0
+                ]
+                if not valid:
+                    continue
+                d_us, d_cid = min(valid, key=lambda x: x[0])
+                if d_cid >= len(core_to_thread):
+                    continue
+                d_thr = core_to_thread[d_cid]
+                if d_thr < 0:
+                    continue
+                earliest_dispatch_us[tid] = (d_us, d_thr)
+
+            for end_us, comp_thr, comp in all_completes:
+                completed_tids = complete_to_tasks.get(id(comp), ())
+                if not completed_tids:
+                    continue
+                triggered: list[int] = []
+                for completed_tid in completed_tids:
+                    for consumer in deps_edges.get(completed_tid, ()):
+                        fanin_satisfied[consumer] += 1
+                        if fanin_satisfied[consumer] == fanin_total.get(consumer, 0):
+                            triggered.append(consumer)
+                if not triggered:
+                    continue
+                src_tid = 3000 + comp_thr
+                for consumer in triggered:
+                    if consumer not in earliest_dispatch_us:
+                        continue
+                    d_us, d_thr = earliest_dispatch_us[consumer]
+                    # Skip degenerate "dispatched before complete ended" —
+                    # the consumer was popped/dispatched off a still-in-flight
+                    # release path while the complete was still running;
+                    # the arrow would point backwards.
+                    if d_us < end_us:
+                        continue
+                    events.append(
+                        {
+                            "cat": "flow",
+                            "id": flow_id,
+                            "name": "complete→ready",
+                            "ph": "s",
+                            "pid": 3,
+                            "tid": src_tid,
+                            # Anchor inside the complete phase X event so
+                            # clicking the complete block surfaces this arrow.
+                            "ts": end_us - FLOW_EPSILON_US,
+                        }
+                    )
+                    events.append(
+                        {
+                            "cat": "flow",
+                            "id": flow_id,
+                            "name": "complete→ready",
+                            "ph": "f",
+                            "pid": 3,
+                            "tid": 3000 + d_thr,
+                            "ts": d_us,
+                            "bp": "e",
+                        }
+                    )
                     flow_id += 1
 
     # Scheduler DISPATCH → task execution arrows
