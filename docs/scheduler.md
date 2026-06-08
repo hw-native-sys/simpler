@@ -22,9 +22,10 @@ The Scheduler's job:
   submitted slots; if all producers are already done, promote to the ready queue.
 - Drain the **ready queue** (Phase 1): for each ready slot, pick an idle
   `WorkerThread` from the appropriate pool and hand off.
-- Drain the **completion queue** (Phase 2): for each completed slot, release
-  its fanout references, wake downstream consumers, and (if all refs
-  released) retire the ring slot.
+- Drain the **completion queue** (Phase 2): for each worker completion,
+  transition the slot to `COMPLETED` or `FAILED`, release fanout references,
+  wake or poison downstream consumers, and (if all refs released) retire the
+  ring slot.
 
 One Scheduler per `Worker` instance, one thread per Scheduler. The Scheduler
 **does not inspect task data** — it moves slot ids between queues and
@@ -48,9 +49,9 @@ class Scheduler {
     ReadyQueue *ready_next_level_queue_;
     ReadyQueue *ready_sub_queue_;
 
-    // Producer: WorkerThread (on worker->run() return).
+    // Producer: WorkerThread (on endpoint->run() return).
     // Consumer: Scheduler's own loop, Phase 2.
-    LockFreeQueue<TaskSlot> completion_queue_;
+    std::queue<WorkerCompletion> completion_queue_;
 };
 ```
 
@@ -96,9 +97,12 @@ for the other.
 
 ### Completion queue
 
-Slots whose worker returned. The Scheduler runs completion handling
-(fanout release, downstream wake, try_consume) in its own thread so that
-WorkerThreads can immediately return to their next task.
+Endpoint completions whose worker returned or failed. Each
+`WorkerCompletion` carries `{slot, group_index, outcome, error_message}`;
+`outcome` is success, task failure, endpoint failure, or skipped. The
+Scheduler runs completion handling (fanout release, downstream wake/poison,
+try_consume) in its own thread so that WorkerThreads can immediately return to
+their next task.
 
 ---
 
@@ -117,8 +121,9 @@ void Scheduler::run() {
         dispatch_ready();
 
         // Phase 2: completion
-        while (completion_queue_.try_pop(sid)) {
-            on_task_complete(sid);   // see §6
+        WorkerCompletion c;
+        while (completion_queue_.try_pop(c)) {
+            on_task_complete(c);   // see §6
         }
 
         // If all three queues empty, block on a condition variable until
@@ -150,9 +155,14 @@ void Scheduler::wire_fanout(const WiringEntry &w) {
     for (TaskSlot psid : w.producers) {
         TaskSlotState &p = slots_[psid];
         std::lock_guard lk(p.fanout_mu);
-        // If producer has already reached COMPLETED/CONSUMED, its fanout is
-        // already finalized — consumer sees it as "done", no edge to add.
-        if (p.state.load() >= TaskState::COMPLETED) continue;
+        // COMPLETED producers are already done; FAILED producers poison this
+        // consumer instead of making it ready.
+        if (p.state.load() == TaskState::COMPLETED ||
+            p.state.load() == TaskState::CONSUMED) continue;
+        if (p.state.load() == TaskState::FAILED) {
+            poison_task(csid, p.failure_message);
+            continue;
+        }
         p.fanout_consumers.push_back(csid);
         p.fanout_total++;
         actual_live++;
@@ -193,13 +203,26 @@ void Scheduler::dispatch_ready() {
             TaskSlotState &s = slots_[slot];
             int N = s.group_size();  // 1 for single-task slots
 
-            auto workers = manager_->pick_n_idle(s.worker_type, N);
+            std::vector<WorkerThread *> workers;
+            for (int i = 0; i < N; i++) {
+                WorkerThread *wt = nullptr;
+                int8_t affinity = s.get_affinity(i);
+                if (affinity >= 0) {
+                    wt = manager_->get_worker(s.worker_type, affinity);
+                    if (wt && (!wt->idle() || !s.endpoint_allowed(i, wt->endpoint_id())))
+                        wt = nullptr;
+                } else {
+                    wt = manager_->pick_idle_excluding_eligible(
+                        s.worker_type, workers, s.eligible_endpoints_for(i));
+                }
+                if (!wt) break;
+                workers.push_back(wt);
+            }
             if (static_cast<int>(workers.size()) < N) {
                 q->push(slot);   // put back; try again after a completion
                 break;
             }
-            // Slot stays in PENDING through dispatch; running-vs-idle is
-            // tracked via the worker's running_slot_state pointer.
+            s.state.store(TaskState::RUNNING);
             for (int i = 0; i < N; i++) {
                 workers[i]->dispatch({slot, i});
             }
@@ -216,29 +239,35 @@ Dispatch hands off a `WorkerDispatch {slot, group_index}` to a
 and encodes it into the per-WT mailbox — see
 [worker-manager.md](worker-manager.md) §3 for the dispatch protocol.
 
-**Pick-idle back-pressure**: when `pick_n_idle` returns fewer workers
-than the task needs, the slot is pushed back onto *its* queue and that
-queue's drain halts; the other-type queue's drain continues. The ring's
-back-pressure at the Orch side already caps the total number of
-in-flight tasks across both types.
+**Pick-idle back-pressure**: when the manager cannot provide enough idle
+workers that also satisfy affinity and endpoint eligibility, the slot is
+pushed back onto *its* queue and that queue's drain halts; the other-type
+queue's drain continues. The ring's back-pressure at the Orch side already
+caps the total number of in-flight tasks across both types.
+
+Endpoint eligibility is opaque scheduling metadata. The Scheduler compares
+endpoint ids and capability bits exposed through `WorkerEndpoint::caps()`, but
+does not inspect HCOMM, RDMA, socket, or remote buffer internals.
 
 ---
 
 ## 6. Phase 2 — completion
 
-Called by `WorkerThread::on_complete_(sid)` which pushes to
+Called by `WorkerThread::on_complete_(completion)` which pushes to
 `completion_queue_`. The Scheduler then:
 
 ```cpp
-void Scheduler::on_task_complete(TaskSlot sid) {
+void Scheduler::on_task_complete(const WorkerCompletion &completion) {
+    TaskSlot sid = completion.task_slot;
     TaskSlotState &s = slots_[sid];
 
-    // Group tasks require all sub-workers to finish
+    // Group tasks aggregate per-member outcomes before the slot is terminal.
     if (s.group_size > 0) {
-        if (s.sub_complete_count.fetch_add(1) + 1 < s.group_size) return;
+        if (!record_group_member_completion(completion)) return;
     }
 
-    s.state.store(TaskState::COMPLETED);
+    bool failed = completion.outcome != EndpointOutcome::SUCCESS;
+    s.state.store(failed ? TaskState::FAILED : TaskState::COMPLETED);
 
     // Release fanout refs on downstream consumers
     std::vector<TaskSlot> consumers;
@@ -247,6 +276,10 @@ void Scheduler::on_task_complete(TaskSlot sid) {
         consumers = s.fanout_consumers;    // snapshot (mutex protects vector)
     }
     for (TaskSlot csid : consumers) {
+        if (failed) {
+            poison_task(csid, completion.error_message);
+            continue;
+        }
         TaskSlotState &c = slots_[csid];
         if (++c.fanin_released == c.fanin_count) {
             // Strict-4: push to the queue matching the *consumer's*
@@ -268,7 +301,8 @@ void Scheduler::on_task_complete(TaskSlot sid) {
 ```cpp
 void Scheduler::try_consume(TaskSlot sid) {
     TaskSlotState &s = slots_[sid];
-    if (s.state.load() != TaskState::COMPLETED) return;
+    if (s.state.load() != TaskState::COMPLETED &&
+        s.state.load() != TaskState::FAILED) return;
     if (s.fanout_released.load() != s.fanout_total) return;
 
     s.state.store(TaskState::CONSUMED);
@@ -318,13 +352,12 @@ void Scheduler::stop() {
 ## 8. Completion channel from WorkerThread
 
 ```cpp
-// In WorkerThread, after the mailbox round-trip returns TASK_DONE:
+// In WorkerThread, after endpoint->run() returns:
 void WorkerThread::loop() {
     for (;;) {
         TaskSlot sid = queue_.pop();
-        // dispatch_process: encode mailbox, spin-poll TASK_DONE
-        // (see worker-manager.md §3 for the mailbox protocol)
-        scheduler_->completion_queue_.push(sid);   // notify Scheduler
+        WorkerCompletion c = endpoint_->run(ring_, {sid, group_index});
+        scheduler_->completion_queue_.push(c);   // notify Scheduler
     }
 }
 ```
@@ -341,14 +374,19 @@ by completion-handling cost.
 1. **Scheduler is single-threaded**: all three phase handlers run in the
    Scheduler's own thread. Atomics/mutexes on slot state are only needed for
    Orch/WorkerThread ↔ Scheduler coordination.
-2. **Slot transitions are monotonic**: `FREE → PENDING → COMPLETED →
-   CONSUMED` never reverses within one allocation.
+2. **Slot transitions are monotonic**: success follows
+   `FREE → PENDING → READY → RUNNING → COMPLETED → CONSUMED`; failure follows
+   `FREE → PENDING/READY/RUNNING → FAILED → CONSUMED`.
 3. **Dispatch consumes one ready entry**: every `ready_queue.push` is
    matched by exactly one `pick_idle + dispatch`. Group tasks push once,
    dispatch N times via `pick_n_idle`.
-4. **Completion is per-worker for groups**: `on_task_complete` is called
-   `group_size` times; only the last one triggers the actual transition.
-5. **`try_consume` is idempotent on CONSUMED**: a repeated call after
+4. **Completion is per-worker for groups**: `worker_done` is called
+   `group_size` times; only the terminal aggregate pushes one slot completion.
+   If any member fails, not-yet-dispatched members become skipped and already
+   running members are allowed to finish.
+5. **Failed producers poison consumers**: consumers of a failed producer move
+   to `FAILED`, are never dispatched, and still run normal cleanup.
+6. **`try_consume` is idempotent on CONSUMED**: a repeated call after
    CONSUMED is a no-op.
 
 ---
