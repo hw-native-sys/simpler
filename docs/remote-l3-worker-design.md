@@ -10,6 +10,9 @@ Detailed protocol, buffer, transport, and rollout notes live in:
 - [protocol.md](remote-l3-worker-design/protocol.md)
 - [buffers-and-transports.md](remote-l3-worker-design/buffers-and-transports.md)
 - [implementation-plan.md](remote-l3-worker-design/implementation-plan.md)
+- [pr-split-and-audit-plan.md][split-audit-plan]
+
+[split-audit-plan]: remote-l3-worker-design/pr-split-and-audit-plan.md
 
 Related callable registration and serialization contracts:
 
