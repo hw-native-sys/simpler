@@ -143,6 +143,22 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
 }
 
 int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
+    // A prior AICore launch/sync error poisoned the device context and the
+    // in-place drain could not clear it. Refuse to run rather than cascade
+    // into halResMap rc=62 (init_aicore_register_addresses) or rtMalloc
+    // 507899. On a5 the poison is unrecoverable in-process (even close()+reset
+    // + a fresh Worker.init fails with rtStreamCreate 507899); only a fresh
+    // process clears it. Failing fast here turns the rest of an xdist worker
+    // session's tests from a slow, confusing failure cascade into a single
+    // fast, self-explanatory error (the test fixture then skips the remainder).
+    if (device_unusable_) {
+        LOG_ERROR(
+            "DeviceRunner marked unusable by a prior AICore failure; refusing to run. "
+            "The device context is unrecoverable in-process on a5 (close + re-create does "
+            "not reset it); a fresh worker process is required to recover."
+        );
+        return -1;
+    }
     if (validate_launch_aicpu_num(launch_aicpu_num) != 0) return -1;
 
     int rc = ensure_device_initialized();
@@ -352,11 +368,20 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
     if (rc != 0) {
         LOG_ERROR("launch_aicore_kernel failed: %d", rc);
+        recover_device_or_mark_unusable(rc);
         return rc;
     }
 
     rc = sync_run_streams();
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        // sync_run_streams surfaces the AICore op-timeout (STARS-reaped op ->
+        // 507000/507018/507046 at AICPU/AICore stream sync). The op-timeout
+        // leaves the device context poisoned for the SAME DeviceRunner's next
+        // run, so attempt recovery / mark-unusable here too, not only on the
+        // launch-error path above.
+        recover_device_or_mark_unusable(rc);
+        return rc;
+    }
 
     read_device_wall_ns();
 
@@ -379,6 +404,38 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     print_handshake_results();
 
     return 0;
+}
+
+void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
+    // An AICore launch failure (207001) or an op-timeout reaped by STARS
+    // (surfaced as 507000/507018/507046 at stream sync) leaves the device
+    // context in a sticky-error state: the streams stay poisoned and the
+    // SAME DeviceRunner's next run() fails early — observed on a5 as
+    // `halResMap failed (rc=62)` in init_aicore_register_addresses, and on
+    // a2a3 as `rtMalloc failed: 507899`. Reused across a session (the L2
+    // st_worker pool hands one ChipWorker to every test class on a device),
+    // that one error poisons every later test in the xdist worker process.
+    //
+    // Try to drain the device so a subsequent run can recover in place. Use
+    // the BOUNDED aclrtSynchronizeDeviceWithTimeout, NOT an unbounded
+    // aclrtSynchronizeStream* on the error-state stream — the latter wedges
+    // subsequent tests (see DeviceRunnerBase::finalize_common's comment on
+    // why finalize deliberately skips a pre-destroy sync). If the bounded
+    // device drain itself errors, the context is unrecoverable without a full
+    // device reset, so mark the runner unusable: run() then fails fast with a
+    // clear message instead of cascading, and the fixture rebuilds the Worker.
+    int sync_rc = aclrtSynchronizeDeviceWithTimeout(PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (sync_rc != ACL_SUCCESS) {
+        LOG_ERROR(
+            "Device unrecoverable after AICore error %d: aclrtSynchronizeDeviceWithTimeout failed: %d. "
+            "Marking DeviceRunner unusable; run() will fail fast until a fresh worker process runs "
+            "(in-process reset does not clear the poison on a5).",
+            aicore_rc, sync_rc
+        );
+        device_unusable_ = true;
+    } else {
+        LOG_WARN("AICore error %d: device drained via aclrtSynchronizeDeviceWithTimeout", aicore_rc);
+    }
 }
 
 // `print_handshake_results`, `prepare_orch_so`, `register_callable`,
@@ -450,6 +507,9 @@ int DeviceRunner::finalize() {
     }
 
     device_id_ = -1;
+    // A finalized runner has reset the device; clear the poison flag so a
+    // reused DeviceRunner object (re-init after close) starts clean.
+    device_unusable_ = false;
     LOG_INFO_V0("DeviceRunner finalized");
     return rc;
 }

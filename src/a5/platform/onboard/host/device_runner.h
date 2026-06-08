@@ -200,6 +200,25 @@ private:
     // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
     bool acl_ready_{false};
 
+    // Set true when an AICore launch/sync error (e.g. an op-timeout reaped by
+    // STARS, surfaced as 507000/507018 at stream sync, or a 207001 launch
+    // failure) left the device context in a sticky-error state that an
+    // in-place drain could not clear. Once set, run() fails fast instead of
+    // cascading into the confusing downstream failures (halResMap rc=62 at
+    // init_aicore_register_addresses, or rtMalloc 507899) that a poisoned
+    // context produces. On a5 the poison survives close()+device-reset for the
+    // life of the process (an in-process re-init fails with rtStreamCreate
+    // 507899) and a force-reset is unsafe on shared silicon, so the only real
+    // recovery is a fresh process — this flag just contains the blast radius.
+    // See run() and recover_device_or_mark_unusable().
+    bool device_unusable_{false};
+
+    // On an AICore launch/sync error, best-effort drain the device so a later
+    // run() on the same DeviceRunner can recover in place; if the drain itself
+    // errors the context is unrecoverable without a full reset, so flip
+    // device_unusable_ and let run() fail fast.
+    void recover_device_or_mark_unusable(int aicore_rc);
+
     /**
      * Initialize performance profiling device buffers
      *
