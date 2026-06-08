@@ -132,6 +132,7 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/ring.cpp
     ${HIERARCHICAL_SRC_DIR}/scope.cpp
     ${HIERARCHICAL_SRC_DIR}/remote_wire.cpp
+    ${HIERARCHICAL_SRC_DIR}/remote_endpoint.cpp
     ${HIERARCHICAL_SRC_DIR}/orchestrator.cpp
     ${HIERARCHICAL_SRC_DIR}/worker_manager.cpp
     ${HIERARCHICAL_SRC_DIR}/scheduler.cpp
@@ -281,6 +282,7 @@ add_hierarchical_test(test_scope      hierarchical/test_scope.cpp)
 add_hierarchical_test(test_orchestrator hierarchical/test_orchestrator.cpp)
 add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
 add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
+add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
 
 # ---------------------------------------------------------------------------
 # Types / task_interface tests (src/common/task_interface/)
